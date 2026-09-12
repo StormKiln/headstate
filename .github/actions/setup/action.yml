@@ -10,8 +10,94 @@ inputs:
     # saved. The mobile jobs pass `src-mobile`: it is a separate crate
     # with its own lockfile (see src-mobile/Cargo.toml), so a cache keyed
     # on the desktop's lock would never hit for it.
+    #
+    # `crates/headstate-stepup` is DELIBERATELY NOT HERE, and #889 is
+    # closed on this measurement rather than fixed.
+    #
+    # It is a separate root with its own lockfile, so rust-cache never
+    # restores its target/ and 52 crates recompile in every Rust job.
+    # That diagnosis is correct. The fix does not pay for itself:
+    #
+    #   - rust-cache CLEANS the local crate's own artifacts before saving
+    #     ("... Cleaning .../crates/headstate-stepup/target ..."), so
+    #     headstate-stepup itself recompiles regardless -- 21s of the 28s
+    #     phase. Only its dependencies were ever cacheable, and they were
+    #     the cheap part. Adding the root moved the phase ~30s -> ~28s,
+    #     not the ~35s -> "under 5s" #889 predicted.
+    #
+    #   - The Windows `platform` entries are ~1.6GB APIECE, and this
+    #     repository's cache is ALREADY OVER its 10GB quota: measured at
+    #     11.66GB across 14 entries, with two live generations per job.
+    #     A second root per entry makes eviction more likely, and an
+    #     eviction costs ~900s -- turning a 562s job into 1716s. Measured
+    #     across five runs on the branch that added it: the Windows cache
+    #     hit twice and was EVICTED twice, reporting `Cache not found` for
+    #     a key that had reported `full match: true` minutes earlier.
+    #
+    # So it traded ~2s of warm time for a materially worse cold-run rate,
+    # on a quota that cannot absorb it. Revisit only after #901 brings the
+    # cache under quota; the diagnosis is recorded there and in #889.
     description: Cargo workspace roots for the Rust cache, one per line
     required: false
+    # TWO roots, because this repo has two desktop-side lockfiles and a
+    # cache root covers exactly one. `crates/headstate-stepup` is a PATH
+    # DEPENDENCY of src-tauri rather than a workspace member and it has
+    # its OWN Cargo.lock with no root manifest uniting them (#695 put the
+    # step-up canonical bytes, header grammar and verifier there) -- so
+    # `cd crates/headstate-stepup && cargo test`, which `test-rust`, both
+    # `platform` legs and `lint` all run, compiled into a target/ that
+    # rust-cache never saved or restored. It recompiled its whole tree on
+    # every job of every run: 52 crates, measured on Windows CI before
+    # this change (#889).
+    #
+    # The src-tauri cache was never broken -- it reports `full match:
+    # true`. This was a SCOPE bug: the second lockfile was simply never
+    # named, which is why it cost the same on a warm cache as a cold one.
+    #
+    # WHAT THIS ACTUALLY BUYS, measured on run 34712365398 rather than
+    # estimated, because #889's headline number does not survive contact
+    # with a real warm run. The `Compiling` count in the Windows
+    # `Rust tests` step drops from 52 to exactly 1, which is the fix
+    # working as specified -- but the phase only goes ~30s to ~28s, NOT
+    # the ~35s to "under 5s" the issue predicts. rust-cache deliberately
+    # cleans the local workspace crate's own artifacts before saving
+    # ("... Cleaning .../crates/headstate-stepup/target ..."), so
+    # headstate-stepup itself recompiles every run, and on Windows that
+    # single crate is 21s of the 28s. Only its DEPENDENCIES were ever
+    # cacheable, and they were the cheap part.
+    #
+    # Net on the critical path this is break-even: three warm runs restored
+    # BOTH roots in 103s, 95s and 93s, against a 95s baseline for one root,
+    # so the second entry costs about nothing to restore. It is kept
+    # because it is correct and removes 52 redundant compiles per job
+    # across three jobs -- which is real billed runner time, and a much
+    # better no-cache worst case -- not because it shortens the wall clock.
+    # Do not cite #889's ~35s.
+    #
+    # AND THE COST, which is the part to watch. A second root makes each
+    # job's cache entry bigger, and the Windows `platform` entries are
+    # ~1.5GB APIECE. Measured immediately after this landed: the repo sat
+    # at 8GB of its 10GB cache quota across 11 entries, and run
+    # 34713149169 then reported
+    #   ##[warning]Cache not found for keys: v0-rust-platform-Windows_NT-...
+    # for the SAME key that had reported `full match: true` twenty-five
+    # minutes earlier. GitHub evicts least-recently-used at the quota, so
+    # a run can evict the entry the next run needs -- which turns a 562s
+    # job into a 1716s one.
+    #
+    # So if CI starts missing its cache often, this is the first thing to
+    # suspect, and the fix is to shrink what is cached (or raise the
+    # quota) rather than to add a third root. A cache that does not fit
+    # is slower than no cache at all, because it pays the upload too.
+    #
+    # The mobile jobs override this with `src-mobile` alone and must NOT
+    # add the stepup line. Verified rather than assumed: stepup is a path
+    # dependency INSIDE src-mobile's own workspace, so it appears in
+    # src-mobile/Cargo.lock (one of its 679 packages) and compiles into
+    # src-mobile/target, which that root already saves. Every mobile step
+    # is a `make` target that runs `cd src-mobile && cargo ...`; none
+    # ever enters crates/headstate-stepup, so a second root there would
+    # cache a target/ directory nothing in those jobs writes.
     default: src-tauri
 runs:
   using: composite

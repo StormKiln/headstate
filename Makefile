@@ -157,6 +157,39 @@ test-race:
 		cargo test --lib -- --test-threads=8 || { echo "FAILED ON ITERATION $$i"; exit 1; }; \
 	done
 
+# Mutation testing, ONE MODULE AT A TIME and never in CI (#893).
+#
+# `--in-place` is load-bearing, not a preference. cargo-mutants normally
+# copies the crate directory to a temp dir, and two tests read files
+# OUTSIDE it -- `github/model.rs:553` pulls in `src/lib/derive.ts` and
+# `github/query.rs:739` pulls in `README.md`, both via `include_str!` with
+# `../../../`. In a copied tree those reads fail and the baseline never
+# builds:
+#
+#   error: couldn't read `src/github/../../../src/lib/derive.ts`
+#   FAILED   Unmutated baseline
+#
+# Which is worth pausing on: the cross-language mirror tests that FIXED
+# #850 are what broke the tool best suited to finding more #850s. There is
+# no config option to copy extra paths, so `--in-place` -- testing in the
+# source tree -- is the fix. It restores the tree afterwards; only
+# `mutants.out/` is left behind, and that is gitignored.
+#
+# NOT IN CI, deliberately. 3272 mutants crate-wide, each run rebuilding
+# the dependency tree; a single file's shard did not finish in 3 minutes.
+# Against a CI budget whose critical path is ~9 minutes this is not a
+# gate, it is an audit you run on purpose.
+#
+# A MISSED mutant is a test that cannot fail -- which is exactly what this
+# repo shipped in #850 (constants asserted against one side) and #868 (six
+# tests skipping a documented lock). Measured on the first real run:
+# `src/tray.rs` alone has three.
+#
+# Usage: make mutants FILE=src/health/runaway.rs
+FILE ?= src/tray.rs
+mutants:
+	cd src-tauri && cargo mutants --in-place --file $(FILE)
+
 # The Intel target the release also builds.
 #
 # The release ships a UNIVERSAL binary while every test job builds native

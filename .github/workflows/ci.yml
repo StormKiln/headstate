@@ -385,6 +385,43 @@ jobs:
   # reports under its required name, and only its STEPS are conditional
   # (see `mobile-changes`, and `scripts/check-mobile-gate.py`, which is
   # the guard that keeps that wiring honest).
+  #
+  # ---- What this job is for, and what was removed from it (#890) ----
+  #
+  # `platform (windows-latest)` is the ENTIRE critical path: at 619s on
+  # run 34708843018 every other job finished inside its shadow, so only
+  # changes to this job shorten CI at all. That makes duplicated work
+  # here uniquely expensive, and two steps were pure duplication.
+  # Removing them measured 619s -> 562s, 566s and 524s across three warm
+  # runs (34712365398, 34714662969, 34715265386), all nine required checks
+  # green every time: -42s for the vitest step and -7s for the clippy
+  # narrowing, which is #890's prediction essentially exactly. Clippy came
+  # in at 23s, 23s and 21s against the 30s baseline, so that figure is the
+  # firm one.
+  #
+  # TREAT `Rust tests` MOVEMENTS UNDER ~20s AS NOISE. The same 1202 tests
+  # have measured 75.65s and 97.45s on different runners with identical
+  # code, and the step itself came in at 232s, 238s and then 198s -- the
+  # last of those BELOW the 221s baseline. Anyone reading a single run's
+  # step timing as a regression here will be reading the runner, not the
+  # change.
+  #
+  # The job keeps exactly what is target-DEPENDENT: `Rust tests`, because
+  # ~11 of the suite is platform-gated (1213 tests on Ubuntu vs 1202 on
+  # Windows) and that difference is the whole reason these legs exist;
+  # clippy on src-tauri, which has 57 platform-conditional sites across
+  # 11 files; and `Build the app`, which proves the tree compiles and
+  # links per platform. It no longer re-runs the jsdom frontend suite or
+  # clippy on the portable step-up crate; each step says why.
+  #
+  # Still on the table and deliberately NOT done here: `Build the app` is
+  # 218s because `tauri build --no-bundle` compiles the RELEASE profile
+  # with no `[profile.release]` override, for a job that uploads nothing.
+  # A `--debug` build would reuse the debug artifacts already warm from
+  # `cargo test` in this same job, but #890 estimates rather than
+  # measures the saving and notes `--debug` may change link settings --
+  # so it wants its own branch and its own measurement, not a ride on a
+  # caching fix.
   platform:
     # 10m measured on windows-latest, 5m on ubuntu -- this matrix is the
     # critical path, so its ceiling is the highest here. Generous on
@@ -450,15 +487,59 @@ jobs:
           (cd crates/headstate-stepup && cargo test)
           (cd src-tauri && cargo test)
 
-      - name: Frontend tests
-        shell: bash
-        run: yarn vitest run
+      # NO `Frontend tests` step here, deliberately. `test-frontend` is a
+      # required check that runs this exact `yarn vitest run`, and the
+      # suite is jsdom-only: jsdom is a JavaScript DOM implementation, so
+      # it has no platform behaviour for another OS to disagree about.
+      # Running it here proved nothing and cost 42s on Windows and 30s on
+      # Linux (#890). The frontend's one genuinely per-target build, the
+      # `VITE_TARGET=mobile` bundle, is covered by `mobile-ios`, not by
+      # vitest.
+      #
+      # `Build the app` below still runs `tauri build`, which runs the
+      # real `vite build` on each platform -- so a frontend change that
+      # breaks the BUILD on one OS (a case-sensitive import, a path
+      # separator in a config) still fails here. What is gone is only the
+      # duplicate test execution.
 
+      # Clippy on src-tauri ONLY. `lint` already runs both crates on
+      # macOS; this leg is here for the lints that can differ by target,
+      # and `crates/headstate-stepup` provably has none: zero `cfg(windows)`
+      # / `cfg(unix)` / `cfg(target_os)` sites, zero uses of std::os,
+      # std::process, std::fs or MAIN_SEPARATOR, and five pure-Rust
+      # dependencies (serde_json, base64, p256, ml-dsa, thiserror). With no
+      # platform-conditional code there is no second result for a second
+      # platform to produce, so running it again here was duplication with
+      # no predicate attached (#890).
+      #
+      # `--all-targets` STAYS, and it is the load-bearing half of this
+      # step. #890 suggested dropping it as the cheaper narrowing; that
+      # was measured and it is wrong. The one Windows-only clippy finding
+      # in this repo's history, `89bd94b` "docker_at is dead code on
+      # Windows", was a `#[cfg(test)]` function whose only caller was
+      # `#[cfg(unix)] #[test]` -- it lives in the TEST target, so
+      # `--all-targets` is exactly the flag that reaches it. Reproduced
+      # locally by restoring that cfg pair: plain `cargo clippy -D
+      # warnings` PASSES, `--all-targets` FAILS with "function `docker_at`
+      # is never used". Dropping the flag would have missed the very
+      # commit cited to justify keeping this step.
+      #
+      # Nor does `Rust tests` below cover it: `cargo test` compiles the
+      # same test target but not under `-D warnings`, so the same
+      # reproduction emits "warning: function `docker_at` is never used"
+      # and exits 0. dead_code is a warning, and only this step makes
+      # warnings fatal.
+      #
+      # Not gated on "did any Rust file change" (#890's other option):
+      # measured over the last 40 commits, 28 touch src-tauri/ or
+      # crates/, so a gate would fire on 70% of runs and save 30s on the
+      # other 30% -- about 9s expected, bought with a new gate job, a
+      # `needs:` edge on a required matrix job, and a second instance of
+      # the silent-green failure shape that scripts/check-mobile-gate.py
+      # exists to police on the one we already have. Not worth it.
       - name: Clippy
         shell: bash
-        run: |
-          (cd crates/headstate-stepup && cargo clippy --all-targets -- -D warnings)
-          (cd src-tauri && cargo clippy --all-targets -- -D warnings)
+        run: (cd src-tauri && cargo clippy --all-targets -- -D warnings)
 
       - name: Build the app
         shell: bash
