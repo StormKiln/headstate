@@ -246,6 +246,19 @@ lint-deps:
 	# Windows had every later `run:` step reported. Eleven false positives
 	# in the macos-only `lint` job, which is #853's cry-wolf failure
 	# happening inside a guard.
+	#
+	# #899 fixed that by stripping to the left of `#`, which closed the
+	# comment route but left the predicate a substring test over lines --
+	# so the label in a VALUE still voted, and a macos-only job with
+	# `SKIPPED_RUNNER: windows-latest` in its `env:`, or the label in a
+	# step `name:`, was still reported. Measured by running both versions
+	# over the same fixtures: they agree on every true positive and differ
+	# on exactly those two, with #899's wrong (#900). The runner set now
+	# comes from `runs-on` and the matrix it resolves through, so prose
+	# cannot vote at all, and the self-test pins BOTH directions -- the
+	# false positives and a real windows-latest job with a bash body,
+	# because a fix that quietened the noise by checking less would be
+	# worse than the bug.
 	python3 scripts/check-workflow-shells.test.py
 	python3 scripts/check-workflow-shells.py
 	# actionlint, and it does NOT replace the script above it. That was
