@@ -12,6 +12,32 @@
 //! resolves the overlap per field by which source actually knows the
 //! answer -- see [`store::import`].
 //!
+//! [`handoff`] consumes what the hook appends (#913), and [`registry`]
+//! reads `~/.claude/sessions/`, the live session registry -- a THIRD
+//! source the epic missed, and the best of the three for liveness: it
+//! carries the pid, `procStart`, `sessionId`, `cwd` and `name` with no
+//! hook installed at all. A registry file whose pid is dead is a
+//! positive crash signal, which [`crash`] records; see its module docs
+//! for why that is strictly better than inferring a crash from a missing
+//! `SessionEnd`.
+//!
+//! `~/.claude` is read-only by design: those transcripts are Claude
+//! Code's data and the files `claude --resume` depends on. There are
+//! exactly TWO exceptions, and each is narrow for its own reason.
+//!
+//! [`handoff::consume`] truncates the handoff file after committing the
+//! records it read. That file is Headstate's OWN -- the hook writes it,
+//! nothing else reads it -- and rotation is the only side that knows
+//! which records are already stored.
+//!
+//! [`install`] (#915) appends two hook matchers to
+//! `~/.claude/settings.json`, a file shared with other tools, and refuses
+//! to touch anything it cannot parse.
+//!
+//! Nothing else in here writes to `~/.claude` at all. In particular the
+//! registry under `~/.claude/sessions/` is Claude Code's, and one of its
+//! files is rewritten by its owner every few seconds.
+//!
 //! [`overview`] (#921) is the aggregate layer for the overview page. It
 //! counts over the rows [`store`] holds and derives no liveness of its
 //! own -- #917's `liveness` module owns that, and two answers to one
@@ -26,10 +52,13 @@
 //! files `claude --resume` depends on.
 
 pub mod cli;
+pub mod crash;
+pub mod handoff;
 pub mod hook;
 pub mod install;
 pub mod live;
 pub mod overview;
+pub mod registry;
 pub mod store;
 pub mod transcript;
 

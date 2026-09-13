@@ -78,6 +78,17 @@ pub mod keys {
     /// state. A login is already visible in every cache key in the same
     /// table.
     pub const STATS_VIEWER: &str = "stats_viewer";
+
+    /// How far into `~/.claude/headstate/sessions.jsonl` the hook handoff
+    /// consumer has read, as a JSON integer of bytes (#913).
+    ///
+    /// Persisted rather than held in memory so a relaunch does not
+    /// re-parse a file the hook may have been appending to for months.
+    /// Re-reading is harmless -- every record upserts on a key built from
+    /// its own fields -- so an absent or unreadable value falls back to
+    /// zero, which re-reads. That is the safe direction: guessing a
+    /// NON-zero offset would skip records permanently.
+    pub const CLAUDE_HANDOFF_OFFSET: &str = "claude_handoff_offset";
 }
 
 #[cfg(test)]
