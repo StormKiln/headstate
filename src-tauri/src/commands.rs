@@ -3271,6 +3271,49 @@ pub async fn claude_import_transcripts(
     .map_err(|e| e.to_string())?
 }
 
+/// Every stored Claude Code session, with liveness derived NOW (#917).
+///
+/// The Claude Code view's only data source. Each row carries a
+/// three-state liveness and the resume command that matches its cwd's
+/// three-state existence check -- see `claude::sessions` for why both are
+/// tri-state and what collapsing either one breaks.
+///
+/// # Why the whole list, and no paging
+///
+/// 1,438 rows of short strings on the real corpus, which is what the
+/// decision rests on. Paging in SQL would move the sort and the search
+/// to a place that cannot answer a keystroke, and would turn "showing
+/// 200 of 1,438" into a round-trip. The frontend caps what it DRAWS and
+/// says the real total; it never receives a silently short list, which
+/// is the rule #846 exists for.
+///
+/// # Absent is not zero
+///
+/// [`SessionList`] carries `registry_failure` and `registry_unreadable`
+/// as data. An unreadable `~/.claude/sessions` (it is mode `0700`) means
+/// every row's liveness is `Unknown`, and the view has to say that rather
+/// than render 1,438 rows of settled-looking answers. An `Err` from here
+/// means the DATABASE could not be read, which the view renders as
+/// `QueryError` and never as "you have no sessions".
+///
+/// `spawn_blocking` because it reads a directory, probes the process
+/// table and queries SQLite -- all blocking, and none of it belongs on
+/// the async runtime.
+///
+/// [`SessionList`]: crate::claude::sessions::SessionList
+#[tauri::command]
+pub async fn claude_sessions(
+    app: tauri::AppHandle,
+) -> Result<crate::claude::sessions::SessionList, String> {
+    let db = db_path(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&db).map_err(|e| e.to_string())?;
+        crate::claude::sessions::list(&conn).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// What one pass over both live sources found (#913, epic #910).
 ///
 /// The two halves are returned together because they are ONE answer to
@@ -3424,6 +3467,46 @@ pub async fn claude_overview(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Reveal a session's working directory or its transcript in the file
+/// manager (#917).
+///
+/// Modelled on [`reveal_log`], and an app command for the same reason
+/// that one is: `generate_handler!` commands are not ACL-gated, while
+/// the opener plugin's `open-url` is scoped to http/https in
+/// `capabilities/default.json` and would refuse a `file://` path
+/// SILENTLY. So this keeps the capability surface unchanged and reports
+/// its failures.
+///
+/// Returns the path on success, so the caller can show where the thing
+/// is even where revealing is unsupported.
+///
+/// # Why it refuses a path it was not given by us
+///
+/// The argument is a path from a row the frontend already holds, but a
+/// remote caller could send any string -- so this is `Class::Local` and
+/// the phone cannot reach it at all (it has no Finder to reveal into,
+/// which is the stated test). The existence check here is not security,
+/// it is honesty: revealing a deleted worktree silently opens the user's
+/// home directory on macOS, which looks like the button did something
+/// wrong rather than that the directory is one of the 84% that are gone.
+#[tauri::command]
+pub fn claude_reveal_path(path: String) -> Result<String, String> {
+    let p = std::path::Path::new(&path);
+    match std::fs::metadata(p) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!("{path} no longer exists"))
+        }
+        // Not "gone": the same distinction `claude::sessions::check_cwd`
+        // draws. A permission error means the path may well be there.
+        Err(e) => return Err(format!("could not check {path}: {e}")),
+    }
+    match tauri_plugin_opener::reveal_item_in_dir(p) {
+        Ok(()) => Ok(path),
+        Err(e) => Err(format!("could not open {path}: {e}")),
+    }
 }
 
 // ---------------------------------------------------------------------

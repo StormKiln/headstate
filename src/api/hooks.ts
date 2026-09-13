@@ -11,7 +11,9 @@ import type {
   Branch,
   BranchDeleteFrame,
   BranchScanFrame,
+  ClaudeImported,
   ClaudeOverview,
+  ClaudeSessionList,
   CleanupPrefs,
   DockerImage,
   Footprint,
@@ -88,6 +90,7 @@ import {
   scanClaudeMd,
   claudeImportTranscripts,
   claudeOverview,
+  claudeSessions,
   claudeHooksStatus,
   claudeInstallHooks,
   claudeReinstallHooks,
@@ -1087,6 +1090,84 @@ export function useClaudeMdText(path: string | undefined) {
     staleTime: 30_000,
     retry: false,
   });
+}
+
+/// How often the Claude Code view re-derives liveness.
+///
+/// Liveness is not stored (migration 11 has no `status` column), so the
+/// ONLY way a row stops saying "running" is this poll. 10 seconds is the
+/// same order as `useSystemHealth`'s and for the same reason: it is a
+/// question about the machine right now, and the cost is one directory
+/// read of a handful of files plus a scoped `sysinfo` refresh -- three
+/// pids against 1,438 sessions on the real machine.
+///
+/// It also supplies `now` to the page without a clock read during render
+/// (see `useClaudeSessions`).
+const CLAUDE_POLL_MS = 10_000;
+
+/// Every Claude Code session, with liveness derived on each poll (#917).
+///
+/// # Why it imports first, once
+///
+/// A fresh database has no `claude_session` rows at all, so the view
+/// would open empty on a machine with 1,438 real sessions on disk. The
+/// import is a full rescan measured at 1.4s for the real corpus and is
+/// idempotent by construction (it upserts on `session_id`), so running
+/// it once when this view first mounts is simpler and more correct than
+/// any incremental scheme -- #914's own reasoning.
+///
+/// It is a SEPARATE query rather than part of the list's `queryFn` so
+/// that its failure is separable: a rescan that could not read
+/// `~/.claude/projects` must not take the stored list down with it, and
+/// the list's own 10-second poll must not re-scan 1,438 transcripts
+/// every tick. The import runs once per mount; the list polls.
+///
+/// `retry: false` on both: a permission error on `~/.claude` is a
+/// settled refusal, not a flaky call, and three silent re-reads only
+/// delay saying so (the rule #846 applied to `useClaudeMd`).
+///
+/// # `dataUpdatedAt` is the page's `now`
+///
+/// Returned so the page can pass it down rather than reading
+/// `Date.now()` during render -- the purity rule `Sparkline` and
+/// `HealthConditions` both state, and which `yarn lint` enforces. It
+/// advances once per poll, which is also the honest edge for "how old is
+/// this reading": the last moment we actually heard from the machine.
+export function useClaudeSessions(enabled: boolean) {
+  const list = useQuery<ClaudeSessionList>({
+    queryKey: ["claude-sessions"],
+    queryFn: claudeSessions,
+    enabled,
+    refetchInterval: enabled ? CLAUDE_POLL_MS : false,
+    staleTime: CLAUDE_POLL_MS - 1_000,
+    retry: false,
+  });
+
+  // The one-shot import. `staleTime: Infinity` so it does not re-run on
+  // a remount within the session; the "Rescan" button invalidates it
+  // explicitly when the user wants a fresh read of disk.
+  const imported = useQuery<ClaudeImported>({
+    queryKey: ["claude-import"],
+    queryFn: claudeImportTranscripts,
+    enabled,
+    staleTime: Infinity,
+    retry: false,
+  });
+
+  const qc = useQueryClient();
+  return {
+    list,
+    imported,
+    /// `now`, resolved once per poll rather than per render.
+    now: list.dataUpdatedAt,
+    /// Re-read `~/.claude/projects` and then the list. Both, in that
+    /// order: a rescan that did not refresh the list would leave the
+    /// user looking at the rows from before it.
+    rescan: async () => {
+      await qc.invalidateQueries({ queryKey: ["claude-import"] });
+      await qc.invalidateQueries({ queryKey: ["claude-sessions"] });
+    },
+  };
 }
 
 /// How often the Claude Code overview re-reads.

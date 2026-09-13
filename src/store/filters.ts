@@ -279,7 +279,8 @@ const EMPTY_FILTERS: Record<View, Filters> = {
   docker: {},
   artifacts: {},
   packages: {},
-  "claude-md": {}, "claude-code": {},
+  "claude-md": {},
+  "claude-code": {},
   // PR Stats holds its own scope selection (#825): `statsScopeKind`,
   // `statsScopeValue` and `statsSubject`, written by `StatsSidebar`
   // through `setStatsScope`. Empty here like every other view -- the entry

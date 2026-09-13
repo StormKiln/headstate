@@ -57,8 +57,10 @@ pub mod handoff;
 pub mod hook;
 pub mod install;
 pub mod live;
+pub mod liveness;
 pub mod overview;
 pub mod registry;
+pub mod sessions;
 pub mod store;
 pub mod transcript;
 

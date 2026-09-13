@@ -34,6 +34,7 @@ import { ArtifactsPage } from "./components/ArtifactsPage";
 import { ArtifactSidebar } from "./components/ArtifactSidebar";
 import { PackagesPage } from "./components/PackagesPage";
 import { ClaudeMdPage } from "./components/ClaudeMdPage";
+import { ClaudeCodePage } from "./components/ClaudeCodePage";
 import { ClaudeCodeSidebar } from "./components/ClaudeCodeSidebar";
 import { RepoPickerSidebar } from "./components/RepoPickerSidebar";
 import { DockerPage } from "./components/DockerPage";
@@ -248,7 +249,16 @@ export default function App() {
     dataUpdatedAt,
   } = usePullRequests();
   const filters = useActiveFilters();
-  const { view: storedView, selectedPr, selectPr, applyPreset } = useFilters();
+  const {
+    view: storedView,
+    selectedPr,
+    selectPr,
+    applyPreset,
+    // Which of the Claude Code view's two pages is showing. Read here
+    // rather than inside a page because the SPLIT is the route: sessions
+    // and overview get different wrappers and only one of them is lazy.
+    claudePage,
+  } = useFilters();
   const isMobile = useIsMobile();
   // A view the companion does not ship falls back to the default one.
   //
@@ -711,23 +721,44 @@ export default function App() {
           // the switcher offered a destination that rendered the pull
           // request list.
           //
-          // Only the OVERVIEW page is routed here (#921). The sessions
-          // list is #917's, and `ClaudeCodeSidebar` already offers both
-          // rows -- so until that lands, picking "Sessions" leaves this
-          // branch rendering the overview. That is a visible placeholder
-          // rather than a silently wrong page, and the sidebar is the one
-          // place to change when #917 arrives.
-          <div className="p-4">
-            {/* Suspense because the page is a lazy chunk: it reaches
-                `recharts` through `stats/SessionsChart`, and #838's
-                boundary is the route. INSIDE the padded wrapper so the
-                frame it reserves is the same box the page will occupy --
-                outside it the fallback would be unpadded and the content
-                would shift sideways as the chunk landed. */}
-            <Suspense fallback={<ViewLoading />}>
-              <ClaudeOverviewPage />
-            </Suspense>
-          </div>
+          // BOTH pages are routed here now. #921 landed the overview
+          // alone and said so, because `ClaudeCodeSidebar` already
+          // offered both rows and picking "Sessions" fell back to the
+          // overview until #917 arrived. It has: this is that change, so
+          // the placeholder is retired and the sidebar's two rows now
+          // reach two different pages.
+          //
+          // The split is on `claudePage`, not on a second view id. One
+          // view with two destinations is what `ClaudePage` and the
+          // sidebar were built around, and a second entry in `ALL_VIEWS`
+          // would make the persisted `view` and the sidebar's selection
+          // two sources of truth for one position.
+          //
+          // They are wrapped differently ON PURPOSE, which is why this is
+          // not one shared wrapper with a swapped child:
+          //
+          // Sessions owns its own padding -- its search box sits flush
+          // with the list beneath it -- and is NOT lazy. #838's boundary
+          // is for the views that pull in a charting library; this one
+          // imports nothing heavier than `lucide-react` icons the launch
+          // chunk already has, and it is the page a user opens to get
+          // work back after a crash, which is the worst moment to wait on
+          // a chunk fetch.
+          claudePage === "sessions" ? (
+            <ClaudeCodePage />
+          ) : (
+            <div className="p-4">
+              {/* Suspense because the page is a lazy chunk: it reaches
+                  `recharts` through `stats/SessionsChart`, and #838's
+                  boundary is the route. INSIDE the padded wrapper so the
+                  frame it reserves is the same box the page will occupy --
+                  outside it the fallback would be unpadded and the content
+                  would shift sideways as the chunk landed. */}
+              <Suspense fallback={<ViewLoading />}>
+                <ClaudeOverviewPage />
+              </Suspense>
+            </div>
+          )
         ) : view === "packages" ? (
           <PackagesPage />
         ) : view === "artifacts" ? (

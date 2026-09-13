@@ -12,13 +12,40 @@ const mockReviewing = vi.fn<() => PullRequest[]>(() => []);
 const mockRefused = vi.fn<() => number>(() => 0);
 const mockShortfall = vi.fn<() => number>(() => 0);
 
+/// Overridable UI preferences, so the capability-gate tests at the bottom
+/// of this file can turn `claude_integrations_enabled` on and off without
+/// a second copy of this whole mock surface.
+///
+/// `undefined` is a THIRD state and not a synonym for "off": `useUiPrefs`
+/// returns `query.data`, which is undefined while `get_ui_prefs` is in
+/// flight and stays undefined if it rejects. The gate has to fall back in
+/// that case too, so the tests drive it explicitly.
+const uiPrefs = vi.hoisted(() => ({
+  value: { hidden_views: [] as string[], close_hides_to_tray: true } as
+    | Record<string, unknown>
+    | undefined,
+}));
+
 vi.mock("./api/hooks", () => ({
   // Defaults, matching the Rust side: nothing hidden, close hides.
   useUiPrefs: () => ({
-    prefs: { hidden_views: [], close_hides_to_tray: true },
+    prefs: uiPrefs.value,
     set: () => Promise.resolve(),
   }),
   useCleanupPrefs: () => ({ prefs: undefined, set: () => Promise.resolve() }),
+  // The Claude Code view (#917) and the repo picker its neighbours use.
+  // Idle shapes: these tests are about which ROUTE renders, not about
+  // what a loaded page looks like, and a populated mock here would
+  // assert content the real app reaches only after a scan.
+  useClaudeSessions: () => ({
+    list: { data: undefined, isLoading: true, isError: false, error: null, refetch: () => {} },
+    imported: { data: undefined, isError: false, isFetching: false, error: null },
+    now: 0,
+    rescan: () => Promise.resolve(),
+  }),
+  useWorktrees: () => ({ data: [], isLoading: false, isError: false, refetch: () => {} }),
+  useClaudeMd: () => ({ data: [], isLoading: false, isError: false, error: null, refetch: () => {} }),
+  useClaudeMdText: () => ({ data: undefined, isLoading: false, isError: false, error: null, refetch: () => {} }),
   useAutostart: () => ({ enabled: false, set: () => Promise.resolve() }),
   useRemoteEnabled: () => ({ enabled: false, set: () => Promise.resolve() }),
   useActOnPr: () => () => Promise.resolve(),
@@ -484,5 +511,75 @@ describe("an incomplete refresh", () => {
     mockPrs.mockReturnValue([{ ...PR_FIXTURES[0], title: "Survived" }]);
     render(<App />);
     expect(screen.getByText("Survived")).toBeTruthy();
+  });
+});
+
+/// The `claude_integrations_enabled` capability gates the ROUTE, not only
+/// the switcher entry (#917).
+///
+/// # The disagreement these tests prevent
+///
+/// `ViewSwitcher` refuses to offer `claude-code` while the capability is
+/// off -- overriding even its current-view escape hatch -- and its comment
+/// gives the reason as "there is no page behind the entry", adding that
+/// "`App.tsx` is what keeps `view` off such a value in the first place, so
+/// the two cannot disagree about what is on screen."
+///
+/// That was FALSE for this view until `App.tsx` grew the fall-through.
+/// #916 registered the id and routed it to My PRs by a documented
+/// fall-through; #917 gave it a real branch, and a real branch renders
+/// whatever `view` says. So a persisted `view: "claude-code"` with the
+/// flag off gave the collapsed switcher labelled "Claude Code", the
+/// expanded menu refusing to list it, and the page rendering anyway --
+/// the three-call-site bug `MOBILE_HIDDEN_VIEWS` exists to prevent.
+///
+/// Found by review rather than by a test, which is why these exist.
+describe("the Claude Code route is gated on the capability", () => {
+  afterEach(() => {
+    uiPrefs.value = { hidden_views: [], close_hides_to_tray: true };
+    useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, "system-health": {} }, view: "my-prs" } as never);
+  });
+
+  const at = (view: string) => {
+    useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, "system-health": {} }, view } as never);
+    return renderApp();
+  };
+
+  it("renders the page when the capability is on", () => {
+    uiPrefs.value = { hidden_views: [], close_hides_to_tray: true, claude_integrations_enabled: true };
+    at("claude-code");
+    expect(screen.getByRole("heading", { name: "Claude Code" })).toBeTruthy();
+  });
+
+  /// The bug itself: the capability is off, so the switcher denies the
+  /// entry exists, and the route must agree.
+  it("falls back to My PRs when the capability is off", () => {
+    uiPrefs.value = { hidden_views: [], close_hides_to_tray: true, claude_integrations_enabled: false };
+    at("claude-code");
+    expect(screen.queryByRole("heading", { name: "Claude Code" })).toBeNull();
+    expect(screen.getByRole("heading", { name: "Pull requests" })).toBeTruthy();
+  });
+
+  /// Undefined prefs -- in flight, or `get_ui_prefs` REJECTED -- falls
+  /// back too. Fail-CLOSED, deliberately: withholding a page beats
+  /// rendering one for a capability we could not confirm is on. It also
+  /// matches what `ViewSwitcher` does with the same value, so the two
+  /// agree in the uncertain case as well as the settled ones.
+  it("falls back when the preferences could not be read", () => {
+    uiPrefs.value = undefined;
+    at("claude-code");
+    expect(screen.queryByRole("heading", { name: "Claude Code" })).toBeNull();
+    expect(screen.getByRole("heading", { name: "Pull requests" })).toBeTruthy();
+  });
+
+  /// Scoped to this ONE view. A predicate that also suppressed unrelated
+  /// views would be a worse bug than the one it fixes, and it is an easy
+  /// one to over-broaden.
+  it("leaves every other view alone while the capability is off", () => {
+    uiPrefs.value = { hidden_views: [], close_hides_to_tray: true, claude_integrations_enabled: false };
+    at("claude-md");
+    expect(screen.getByRole("heading", { name: "CLAUDE.md" })).toBeTruthy();
   });
 });

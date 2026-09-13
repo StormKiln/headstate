@@ -116,6 +116,14 @@ pub const SURFACE: &[(&str, Class)] = &[
     // why it asks the desktop -- see the desktop table for the full
     // reasoning.
     ("claude_import_transcripts", Class::Read),
+    // The DESKTOP's session list with derived liveness (#917). Read: it
+    // queries the desktop's cache, lists its `~/.claude/sessions` and
+    // probes its process table, writing nothing. "Did the thing I left
+    // running on my laptop die?" is the away-from-desk question this
+    // companion exists for -- see the desktop table for the full
+    // reasoning. The view must say these are the paired desktop's
+    // sessions, not this phone's.
+    ("claude_sessions", Class::Read),
     // The two live sources on the DESKTOP: its hook handoff file and its
     // `~/.claude/sessions` registry (#913). The phone has neither of its
     // own -- it runs no Claude sessions -- which is exactly why it asks
@@ -236,6 +244,10 @@ pub const SURFACE: &[(&str, Class)] = &[
     // local: not exposed remotely.
     ("diag_log", Class::Local),
     ("reveal_log", Class::Local),
+    // Reveals a session's directory or transcript in the DESKTOP's file
+    // manager (#917). Local: this phone cannot see that Finder, which is
+    // the stated test for the class.
+    ("claude_reveal_path", Class::Local),
     ("get_autostart", Class::Local),
     ("set_autostart", Class::Local),
     ("get_notify_prefs", Class::Local),

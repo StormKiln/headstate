@@ -19,7 +19,9 @@ import type {
   Branch,
   DeleteOutcome,
   ClaudeFile,
+  ClaudeImported,
   ClaudeOverview,
+  ClaudeSessionList,
   ProjectReport,
   UpdateRequest,
   UpdateFilter,
@@ -702,19 +704,25 @@ export const scanClaudeMd = (repoPath: string) =>
 /// The text of one file, for rendering.
 export const readClaudeMd = (path: string) => call<string>("read_claude_md", { path });
 
-/// Re-read `~/.claude/projects` and upsert every session into the cache.
+/// Rescan `~/.claude/projects` into our own cache. Returns what it read
+/// AND what it could not read.
+export const claudeImportTranscripts = () => call<ClaudeImported>("claude_import_transcripts");
+
+/// Every stored Claude Code session, with liveness derived NOW (#917).
 ///
-/// A FULL rescan, every time, and idempotent by construction -- it upserts
-/// on `session_id`. Rust side: `src-tauri/src/claude/store.rs` (#914).
+/// Liveness is never stored, so this is the only way to know it -- see
+/// `ClaudeSessionList`. Rejects when the DATABASE could not be read,
+/// which is different from an empty list and must never render as "you
+/// have no sessions".
+export const claudeSessions = () => call<ClaudeSessionList>("claude_sessions");
+
+/// Reveal a session's directory or transcript in the file manager.
+/// Returns the path on success.
 ///
-/// The return value is #914's `Imported`, whose unreadable counts are the
-/// point of it. This wrapper types it as `unknown` deliberately: #917 is
-/// the change that adds a `ClaudeImported` interface and the hook that
-/// renders those counts, and declaring a second shape for the same payload
-/// here would be two definitions to keep in step. The overview needs only
-/// to know the rescan SUCCEEDED, so it reads nothing out of the body.
-export const claudeImportTranscripts = () =>
-  call<unknown>("claude_import_transcripts");
+/// `Class::Local` -- the phone has no Finder to reveal into -- so every
+/// caller sits behind `IS_MOBILE_BUILD`.
+export const claudeRevealPath = (path: string) =>
+  call<string>("claude_reveal_path", { path });
 
 /// Aggregates for the Claude Code overview page (#921).
 ///

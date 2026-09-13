@@ -1,4 +1,4 @@
-import type { Lock, PullRequest, Safety, Upstream, Worktree } from "@/types/pr";
+import type { Lock, PullRequest, Safety, Upstream, Worktree, WorktreeRepo } from "@/types/pr";
 
 /// Only `safe` may be deleted.
 ///
@@ -1114,4 +1114,113 @@ export function sortWorktrees<T extends Worktree>(
     if (va === vb) return a.path.localeCompare(b.path);
     return biggestFirst ? vb - va : va - vb;
   });
+}
+
+/// A Claude Code session's recorded directory, matched against a known
+/// worktree (#920).
+///
+/// `null` from [`sessionWorktree`] means no match, and the caller MUST
+/// then offer no jump: a button that navigates to a list where the thing
+/// is absent is worse than no button.
+export interface SessionWorktree {
+  /// The repository holding it. `setFilter("repo", repoPath)` is what
+  /// selects a repository on the Worktrees page, so this is the
+  /// navigation target.
+  repoPath: string;
+  /// The repository's display name, for the button's label.
+  repoName: string;
+  /// The matched worktree itself, so the caller can show the state that
+  /// actually answers "what was this session doing" -- whether the branch
+  /// merged, whether there is uncommitted work, whether it is safe to
+  /// remove.
+  worktree: Worktree;
+  /// The branch the session recorded, when it differs from the branch the
+  /// worktree is on NOW. `null` when they agree, or when either is
+  /// unknown.
+  ///
+  /// # Why this is reported and not matched on
+  ///
+  /// MEASURED over the real corpus: of 206 sessions whose cwd matches a
+  /// registered worktree, the recorded branch **disagrees with the
+  /// current one on 54 of them (26.2%)** -- and the disagreements are
+  /// ordinary, not corruption. A repository's main checkout accumulates
+  /// sessions across every branch it ever held (`ghstat` alone:
+  /// `stats-dashboard` x10, `audit-top-five` x2, all now on `main`) while
+  /// its path never changes.
+  ///
+  /// So matching on `(path, branch)` would refuse a quarter of the valid
+  /// jumps. The path is the key; the branch is a fact the UI states, so
+  /// the user is not led to believe they are looking at the session's
+  /// branch when the tree has moved on.
+  movedOnFrom: string | null;
+}
+
+/// Normalise a path for comparison.
+///
+/// Trailing separators and `.` segments are stripped, because git's
+/// `worktree list` output and Claude Code's recorded `cwd` are two
+/// independent spellings of the same directory and need not agree on
+/// either.
+///
+/// Case is deliberately PRESERVED. macOS is case-insensitive by default,
+/// so lowercasing would match more often there -- and would be wrong on
+/// Linux, where `/code/Widget` and `/code/widget` are two different
+/// directories. A jump to the wrong tree is worse than a missing button.
+function normalisePath(path: string): string {
+  const parts = path.split(/[\\/]/).filter((p) => p !== "" && p !== ".");
+  const lead = /^[\\/]/.test(path) ? "/" : "";
+  return lead + parts.join("/");
+}
+
+/// Find the worktree a session ran in, or `null` when none matches.
+///
+/// # Why the cwd is the key and the branch is not
+///
+/// `Worktree.path` is the row identity throughout `WorktreesPage`
+/// (`key={wt.path}`, and both the safety-verdict and size streams are
+/// keyed by it), so the absolute path is the only join key that lines up
+/// with what that page already believes. See
+/// [`SessionWorktree.movedOnFrom`] for the measurement that rules the
+/// branch out as a second key.
+///
+/// # Match rate, measured
+///
+/// Over 1,461 real sessions: 206 match a registered worktree, which is
+/// 14.1% of all sessions but **83.1% of the 248 whose directory still
+/// exists**. The gap is the point -- the sessions that do not match are
+/// overwhelmingly the ones whose agent worktree was deleted when the work
+/// landed, and for those there is genuinely nothing to jump to.
+///
+/// # Why a vanished directory can still match
+///
+/// This compares strings against a listing git produced; it does not
+/// stat anything. That listing is itself the evidence: a path git still
+/// reports is a registered worktree, and one whose directory was deleted
+/// is a real state git calls prunable and `WorktreesPage` already
+/// renders. Measured, 0 of 206 matches were in that state, but it is one
+/// `rm -rf` away and refusing to match it would hide exactly the row
+/// that explains where the session's work went.
+export function sessionWorktree(
+  cwd: string | null,
+  gitBranch: string | null,
+  repos: WorktreeRepo[] | undefined,
+): SessionWorktree | null {
+  // `undefined` repos means the worktree listing has not loaded or could
+  // not be read, which is NOT "no match". It yields the same absent
+  // button, so the CALLER distinguishes the two for the user rather than
+  // this function inventing a third return value nothing could act on.
+  if (!cwd || !repos) return null;
+  const want = normalisePath(cwd);
+  for (const repo of repos) {
+    for (const wt of repo.worktrees) {
+      if (normalisePath(wt.path) !== want) continue;
+      return {
+        repoPath: repo.path,
+        repoName: repo.name,
+        worktree: wt,
+        movedOnFrom: gitBranch && wt.branch && gitBranch !== wt.branch ? gitBranch : null,
+      };
+    }
+  }
+  return null;
 }

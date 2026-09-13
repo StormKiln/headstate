@@ -85,6 +85,12 @@ describe("the remote surface's frontend half", () => {
     // which only ever built a string), delete its line.
     // Note `diag_log` is absent: it is `Class::Local` but has no
     // wrapper in `tauri.ts` at all, so there is nothing to guard.
+    // `claudeRevealPath` (#917) reveals a session's directory or its
+    // transcript, so it is `reveal_log`'s sibling and `Class::Local` for
+    // the same stated reason: the phone has no Finder to reveal into.
+    // Both of its callers in `ClaudeCodePage` sit behind
+    // `!IS_MOBILE_BUILD`, which is the precondition this list's comment
+    // above requires before an entry is added.
     //
     // #915 added the three Claude hook installers. They edit
     // `~/.claude/settings.json`, a config file shared with other tools, and
@@ -98,6 +104,7 @@ describe("the remote surface's frontend half", () => {
     const DESKTOP_ONLY_WRAPPERS = [
       "claudeInstallHooks",
       "claudeReinstallHooks",
+      "claudeRevealPath",
       "claudeUninstallHooks",
       "getAutostart",
       "getNotifyPrefs",
