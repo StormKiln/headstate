@@ -1,12 +1,13 @@
 import { useState } from "react";
 import { useIsMobile } from "@/lib/useIsMobile";
 import { FileText } from "lucide-react";
-import type { ClaudeFile, ClaudeMdScan, ImportNode } from "@/types/pr";
+import type { ClaudeFile, ImportNode } from "@/types/pr";
 import { useClaudeMd, useClaudeMdText } from "@/api/hooks";
 import { useActiveFilters } from "@/store/filters";
 import { formatSize } from "@/lib/worktrees";
 import { Markdown } from "./Markdown";
 import { QueryError, errorMessage } from "./QueryError";
+import { PartialScanNotice } from "./PartialScanNotice";
 import { copyText } from "@/lib/clipboard";
 import { toast } from "sonner";
 
@@ -58,10 +59,12 @@ export function ClaudeMdPage() {
   // mistake one layer down: the scan now reports what it could not read,
   // and a defaulted-away `scan` would make that report unreachable.
   const files = scan?.files ?? [];
-  // Everything the scan proved it could not read. The third arm's input:
-  // a repository with no readable files and something unreadable is
-  // "we could not look", not "there are none" (#972).
-  const unreadable = scan ? scan.unreadable_dirs.length + scan.unreadable_files.length : 0;
+  // Everything the scan proved it could not read. A directory and a file
+  // are ONE list to the reader -- both are "we could not look here" -- and
+  // `PartialScanNotice` shows the message the Rust side attached to each,
+  // which is what distinguishes a permission wall from a stray byte.
+  const unreadablePaths = scan ? [...scan.unreadable_dirs, ...scan.unreadable_files] : [];
+  const unreadable = unreadablePaths.length;
   const [selected, setSelected] = useState<string | undefined>(undefined);
   const isMobile = useIsMobile();
 
@@ -115,32 +118,43 @@ export function ClaudeMdPage() {
       </div>
     );
   }
-  // A THIRD arm, between the error arm and the empty one, and it exists
-  // because #846's fix could not reach this case (#972). That fix gave the
-  // page a correct `isError` arm ordered before the empty arm -- but
-  // `scan_claude_md` could only ever return `Ok`, so a read failure
-  // arrived as an empty list and the empty arm claimed the repository had
-  // none. The error arm was unreachable in the case it existed for.
+  // The FOURTH answer, and the one #846's fix could not reach (#972).
   //
-  // Not a replacement for either neighbour. `isError` still means the scan
-  // never ran; this means it ran and could not see everything; and the
-  // empty arm below now only speaks for a scan that saw the whole tree.
+  // That fix gave this page a correct `isError` arm ordered BEFORE the
+  // empty arm. It is sound and untouched -- but the arm can only fire on
+  // `isError`, and `scan_claude_md` could only ever return `Ok`. So a read
+  // failure arrived as an empty list, the empty arm was reached first, and
+  // the page said "No CLAUDE.md files in this repository" about a file the
+  // user can see on disk.
+  //
+  // Ordered before the empty arm for the reason that fix states, and here
+  // it is not merely a nicety: "this repository has none" and "we could
+  // not read it" have opposite remedies.
+  //
+  // No retry, and NOT reported as a failed scan -- the decision #951 made
+  // for `RepoPickerSidebar` and wrote into `PartialScanNotice`. `isError`
+  // above is a rejection of the whole command; this is a walk that ran and
+  // came back short, and a second identical walk will not read what the
+  // first could not. The paths below are the action, not a button.
   if (files.length === 0 && unreadable > 0) {
     return (
       <div className="p-4">
-        <QueryError
-          title="Could not read this repository's CLAUDE.md files"
-          message={`${unreadable} path${unreadable === 1 ? "" : "s"} could not be read, so whether this repository has any CLAUDE.md files is unknown.`}
-          onRetry={() => void refetch()}
-        >
-          <UnreadablePaths scan={scan} />
-        </QueryError>
+        <p className="text-sm text-[#8b949e]">
+          No CLAUDE.md file could be read. The paths below explain why — this repository may well
+          have some.
+        </p>
+        <div className="mt-2">
+          <PartialScanNotice
+            unreadable={unreadablePaths}
+            consequence="no CLAUDE.md file could be read from them."
+          />
+        </div>
       </div>
     );
   }
   if (files.length === 0) {
-    // Only a scan that read EVERYTHING gets to say this. The guard above
-    // has already taken the partial case, so this is now a true statement
+    // Only a scan that read EVERYTHING gets to say this. The arm above has
+    // already taken the partial case, so this is now a true statement
     // rather than #846's confident wrong answer.
     return <p className="p-4 text-sm text-[#8b949e]">No CLAUDE.md files in this repository.</p>;
   }
@@ -165,27 +179,24 @@ export function ClaudeMdPage() {
             : "w-96 shrink-0 overflow-y-auto border-r border-[#30363d] p-3"
         }
       >
-        {/* A PARTIAL scan, stated beside the files that did read (#972).
+        {/* A PARTIAL scan, stated beside the files that DID read (#972).
 
-            Not an early return, and not in place of the list: the files
-            here are real, and blanking them to report one unreadable
-            sibling would replace a silent loss with a louder one. The
-            same trade `ArtifactsPage` makes, and the rule
-            `transcript.rs`'s `is_partial()` states -- a partial answer
-            labelled partial beats both a silent truncation and an error
-            page.
+            The SAME component #951 added for the worktree scan, not a
+            second one: it is the same third answer with the same reasoning
+            about why it is a notice rather than an error panel, and a
+            parallel implementation of it is exactly the drift the app's
+            shared constants exist to prevent.
 
-            The all-unreadable case never reaches here; the third arm
-            above took it. */}
-        {unreadable > 0 ? (
-          <div className="mb-3 rounded-md border border-[#d29922]/40 bg-[#d29922]/5 p-2">
-            <p className="text-xs text-[#d29922]">
-              {unreadable} path{unreadable === 1 ? "" : "s"} could not be read, so this list may be
-              incomplete.
-            </p>
-            <UnreadablePaths scan={scan} />
-          </div>
-        ) : null}
+            Above the list rather than instead of it. The files here are
+            real, and blanking them to report one unreadable sibling would
+            replace a silent loss with a louder one -- the trade
+            `ArtifactsPage` states and the rule `transcript.rs`'s
+            `is_partial()` gives. The all-unreadable case never reaches
+            here; the arm above took it. */}
+        <PartialScanNotice
+          unreadable={unreadablePaths}
+          consequence={`the ${files.length === 1 ? "file" : `${files.length} files`} below may not be all of them.`}
+        />
         {files.map((f) => (
           <FileEntry
             key={f.path}
@@ -262,35 +273,6 @@ export function ClaudeMdPage() {
     </div>
   );
 }
-
-/// WHICH paths could not be read, and why.
-///
-/// Named rather than counted alone. A number tells the user something is
-/// wrong and nothing about where to look; these are absolute paths with
-/// the OS's own message, which is what a `chmod` or a symlink repair
-/// actually needs. Capped, because a permission wall on a large tree can
-/// produce a great many and a wall of paths is as unreadable as none.
-function UnreadablePaths({ scan }: { scan: ClaudeMdScan | undefined }) {
-  if (!scan) return null;
-  const all = [...scan.unreadable_dirs, ...scan.unreadable_files];
-  const shown = all.slice(0, PATH_CAP);
-  const rest = all.length - shown.length;
-  return (
-    <ul className="mx-auto mt-2 max-w-lg text-left">
-      {shown.map((p) => (
-        <li key={p} className="break-all font-mono text-[11px] text-[#8b949e]">
-          {p}
-        </li>
-      ))}
-      {rest > 0 ? (
-        <li className="mt-1 text-[11px] text-[#8b949e]">and {rest} more</li>
-      ) : null}
-    </ul>
-  );
-}
-
-/// How many unreadable paths to name before summarising the rest.
-const PATH_CAP = 8;
 
 function FileEntry({
   file,

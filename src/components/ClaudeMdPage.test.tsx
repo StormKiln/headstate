@@ -182,6 +182,33 @@ describe("ClaudeMdPage", () => {
     expect(screen.getByText(/\/code\/app\/packages/)).toBeTruthy();
   });
 
+  /// A partial scan offers NO retry, and is not reported as a failed scan.
+  ///
+  /// The decision #951 made for `RepoPickerSidebar` and wrote into
+  /// `PartialScanNotice`: `isError` is a rejection of the whole command,
+  /// while this is a walk that RAN and came back short. A second identical
+  /// walk will not read what the first could not, so a "Try again" button
+  /// would promise something it cannot deliver.
+  it("offers no retry for a scan that ran and came back short", () => {
+    state.files = [];
+    state.unreadableFiles = ["/code/app/CLAUDE.md (Permission denied)"];
+    render(<ClaudeMdPage />);
+    expect(screen.queryByRole("button", { name: /try again/i })).toBeNull();
+    expect(refetchFn).not.toHaveBeenCalled();
+  });
+
+  /// The `isError` arm still fires, and still DOES offer a retry.
+  ///
+  /// The new arm is a third state, not a replacement: a rejected command is
+  /// a different claim from a walk that came back short, and it is the one
+  /// a retry can genuinely help.
+  it("still reports a rejected scan as a failure, with a retry", () => {
+    state.failed = true;
+    render(<ClaudeMdPage />);
+    expect(screen.getByText(/Could not look for CLAUDE.md files/)).toBeTruthy();
+    expect(screen.queryByText(/No CLAUDE.md files in this repository/)).toBeNull();
+  });
+
   /// A scan that read EVERYTHING still gets to say the repository has none.
   ///
   /// The false-positive half: if the new arm swallowed the ordinary empty
@@ -199,13 +226,16 @@ describe("ClaudeMdPage", () => {
   /// The files that did read are real. A partial answer labelled partial
   /// beats both a silent truncation and an error page -- the rule
   /// `transcript.rs`'s `is_partial()` states, and the same trade
-  /// `ArtifactsPage` makes.
+  /// `ArtifactsPage` makes. Rendered through `PartialScanNotice`, the
+  /// component #951 added, rather than a second banner of our own.
   it("keeps the files that read and states the shortfall beside them", () => {
     state.files = [file({ path: "/code/app/CLAUDE.md" })];
     state.unreadableFiles = ["/code/app/nested/CLAUDE.md (Permission denied)"];
     render(<ClaudeMdPage />);
     expect(screen.getByText("CLAUDE.md")).toBeTruthy();
-    expect(screen.getByText(/may be incomplete/)).toBeTruthy();
+    expect(screen.getByText(/may not be all of them/)).toBeTruthy();
+    // And the path, which is what a `chmod` actually needs.
+    expect(screen.getByText(/nested\/CLAUDE.md/)).toBeTruthy();
   });
 
   /// A total missing an unmeasured import is a FLOOR, not a value.
