@@ -3872,16 +3872,22 @@ pub async fn health_alerts(app: AppHandle) -> Result<Vec<crate::health::AlertRep
         //
         // Appended after the alerts, so anything that would interrupt
         // the user sorts above anything that merely wants a look.
-        out.extend(
-            app.state::<std::sync::Arc<crate::health::runaway::Watched>>()
-                .get()
-                .into_iter()
-                .map(|n| crate::health::AlertReport {
-                    key: n.key(),
-                    title: n.title(),
-                    body: n.body(),
-                }),
-        );
+        // `get` returns None both before the first pass and once the newest
+        // pass is older than `NOTICE_MAX_AGE` (#908), so a dead poll loop
+        // serves nothing rather than its last answer. The age is folded into
+        // each body, because a claim about the present should carry the age
+        // of its evidence -- the same honesty #788 put on the worktree row's
+        // "up to date with upstream".
+        if let Some((age, notices)) = app
+            .state::<std::sync::Arc<crate::health::runaway::Watched>>()
+            .get()
+        {
+            out.extend(notices.into_iter().map(|n| crate::health::AlertReport {
+                key: n.key(),
+                title: n.title(),
+                body: crate::health::runaway::with_age(&n.body(), age),
+            }));
+        }
         Ok(out)
     })
     .await
