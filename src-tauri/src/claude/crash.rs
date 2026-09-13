@@ -149,10 +149,12 @@ fn upsert_session(conn: &Connection, rec: &Live, now: &str) -> Result<(), rusqli
 /// write a new row per tick for one session. The session row is still
 /// written, so nothing is lost except a run we could not identify.
 fn record_running(conn: &Connection, rec: &Live) -> Result<bool, rusqlite::Error> {
-    let (Some(epoch), Some(started)) = (rec.pid_start_epoch, pid_start(rec)) else {
+    // `pid_start` is already `None` for a missing or unparseable
+    // `procStart`, so this one check covers both: no confirmed start
+    // time means no stable key, which means no run.
+    let Some(started) = pid_start(rec) else {
         return Ok(false);
     };
-    let _ = epoch;
     conn.execute(
         // No `source`: the registry does not record why a session
         // started, and only the hook knows. A row inserted here leaves
