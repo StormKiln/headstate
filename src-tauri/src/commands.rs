@@ -1962,15 +1962,68 @@ pub fn set_worktree_dirs(app: AppHandle, dirs: Vec<String>) -> Result<Vec<String
     Ok(ok)
 }
 
-/// Trim, drop blanks, and reject anything that is not a directory.
+/// Expand a leading `~`, or return the path unchanged.
+///
+/// `~` and `~/...` only. `~otheruser/...` is deliberately NOT handled: it
+/// needs the passwd database, it is not what the placeholder offers, and
+/// silently treating `~bob/code` as a literal directory name is a clearer
+/// failure than half-expanding it into someone else's home.
+///
+/// Returns the input untouched when there is no home directory to expand
+/// against, so the caller's `is_dir()` check then rejects it with the same
+/// "not a directory" message rather than this returning a confusing
+/// half-path. A machine with no `HOME` (or `USERPROFILE` on Windows) has
+/// no `~` to mean anything.
+fn expand_tilde(d: &str) -> String {
+    let rest = match d.strip_prefix('~') {
+        Some(r) => r,
+        None => return d.to_string(),
+    };
+    // `~` alone, or `~/` and `~\` on Windows. `~foo` falls through: it is
+    // another user's home, which is out of scope above.
+    let rest = match rest {
+        "" => "",
+        r if r.starts_with('/') || (cfg!(windows) && r.starts_with('\\')) => &r[1..],
+        _ => return d.to_string(),
+    };
+    match crate::auth::home_dir() {
+        Some(home) if rest.is_empty() => home.to_string_lossy().into_owned(),
+        Some(home) => home.join(rest).to_string_lossy().into_owned(),
+        None => d.to_string(),
+    }
+}
+
+/// Trim, expand `~`, drop blanks, and reject anything that is not a
+/// directory.
 ///
 /// Split from the command so it is testable without an AppHandle. A typo
 /// must fail HERE, visibly, rather than being stored and producing an
 /// empty worktrees view that looks like "you have no worktrees".
+///
+/// # Why the tilde is expanded, and why the EXPANDED form is stored
+///
+/// The field's own placeholder is `~/code` (`SettingsDialog.tsx:444`), and
+/// before #945 typing exactly that was rejected with `not a directory:
+/// ~/code` -- the app refusing the value it suggested. This is the second
+/// thing a new user does, after `gh auth login`, and six of the nine views
+/// are empty until it succeeds, so the first-run cost of getting it wrong
+/// is most of the app.
+///
+/// The expanded path is what gets stored, not the `~` form. There is one
+/// consumer of the stored value (`commands.rs:1491`, feeding the scan), so
+/// expanding once at this boundary means nothing downstream has to know
+/// about tildes -- as against storing `~/code` and re-expanding at every
+/// read, which is the same rule in two places waiting to disagree.
+///
+/// The visible cost is that Settings redisplays `/Users/me/code` after a
+/// save rather than the `~/code` that was typed. That is the honest
+/// direction: it is the path being scanned, and a stored `~` would also
+/// silently follow the user to a different machine or a changed `HOME`,
+/// pointing the scan somewhere they never chose.
 pub fn validate_dirs(dirs: Vec<String>) -> Result<Vec<String>, String> {
     let (ok, bad): (Vec<String>, Vec<String>) = dirs
         .into_iter()
-        .map(|d| d.trim().to_string())
+        .map(|d| expand_tilde(d.trim()))
         .filter(|d| !d.is_empty())
         .partition(|d| std::path::Path::new(d).is_dir());
 
@@ -4007,6 +4060,76 @@ mod tests {
         let f = d.path().join("a-file");
         std::fs::write(&f, "x").unwrap();
         assert!(validate_dirs(vec![f.to_string_lossy().into_owned()]).is_err());
+    }
+
+    /// #945: the field's own placeholder is `~/code`, and typing it used to
+    /// be rejected with `not a directory: ~/code`.
+    ///
+    /// Asserted against the REAL home directory rather than a temporary
+    /// one. Setting `HOME` would be a process-wide mutation in a test
+    /// binary that runs in parallel, which is the shape that makes other
+    /// tests fail for reasons they cannot see -- and there is no env lock
+    /// in this crate to serialise against. `expand_tilde` reads
+    /// `auth::home_dir`, so the real value is the honest input anyway.
+    ///
+    /// Uses a directory that must exist inside any home on any platform:
+    /// the home itself, via bare `~`.
+    #[test]
+    fn validate_dirs_expands_a_bare_tilde_to_the_home_directory() {
+        let Some(home) = crate::auth::home_dir() else {
+            // No HOME in this environment, so there is nothing `~` could
+            // mean. Skipped rather than asserted, and said out loud.
+            eprintln!("skipped: no home directory in this environment");
+            return;
+        };
+        let out = validate_dirs(vec!["~".into()]).expect("a bare ~ is the home directory");
+        assert_eq!(
+            out,
+            vec![home.to_string_lossy().into_owned()],
+            "the stored value must be the EXPANDED path, not `~`: one consumer \
+             reads it and re-expanding at every read is the same rule in two places"
+        );
+    }
+
+    /// `~/<subdir>` is the placeholder's actual shape.
+    #[test]
+    fn validate_dirs_expands_a_tilde_prefixed_subdirectory() {
+        let Some(home) = crate::auth::home_dir() else {
+            eprintln!("skipped: no home directory in this environment");
+            return;
+        };
+        // Created inside the real home so the `is_dir()` check passes on a
+        // path we control, then removed. A name unlikely to collide.
+        let name = ".headstate-tilde-test";
+        let dir = home.join(name);
+        std::fs::create_dir_all(&dir).expect("create a scratch dir in home");
+
+        let out = validate_dirs(vec![format!("~/{name}")]);
+
+        // Removed BEFORE asserting, so a failure cannot leave it behind.
+        let _ = std::fs::remove_dir(&dir);
+
+        assert_eq!(
+            out.expect("~/<subdir> must expand"),
+            vec![dir.to_string_lossy().into_owned()]
+        );
+    }
+
+    /// `~otheruser/...` is NOT expanded, and the refusal is the point.
+    ///
+    /// Expanding it needs the passwd database, it is not what the
+    /// placeholder offers, and half-expanding `~bob/code` into this user's
+    /// home would point the scan at a path nobody chose. Falling through to
+    /// the `is_dir()` check rejects it by name instead.
+    #[test]
+    fn validate_dirs_does_not_expand_another_users_home() {
+        let err = validate_dirs(vec!["~nobody-such-user/code".into()])
+            .expect_err("another user's home is not expanded, so it is not a directory");
+        assert!(
+            err.contains("~nobody-such-user/code"),
+            "the error must name the path as TYPED, so the user can see it was \
+             taken literally: {err}"
+        );
     }
 
     #[test]
