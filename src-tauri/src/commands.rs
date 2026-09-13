@@ -3352,6 +3352,8 @@ pub fn claude_reveal_path(path: String) -> Result<String, String> {
         Ok(()) => Ok(path),
         Err(e) => Err(format!("could not open {path}: {e}")),
     }
+}
+
 // ---------------------------------------------------------------------
 // The Claude Code hook installer (#915). Rust side:
 // `claude/install.rs`, which is where every rule below is argued.

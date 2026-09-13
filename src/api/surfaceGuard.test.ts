@@ -91,8 +91,6 @@ describe("the remote surface's frontend half", () => {
     // Both of its callers in `ClaudeCodePage` sit behind
     // `!IS_MOBILE_BUILD`, which is the precondition this list's comment
     // above requires before an entry is added.
-    const DESKTOP_ONLY_WRAPPERS = [
-      "claudeRevealPath",
     //
     // #915 added the three Claude hook installers. They edit
     // `~/.claude/settings.json`, a config file shared with other tools, and
@@ -106,6 +104,7 @@ describe("the remote surface's frontend half", () => {
     const DESKTOP_ONLY_WRAPPERS = [
       "claudeInstallHooks",
       "claudeReinstallHooks",
+      "claudeRevealPath",
       "claudeUninstallHooks",
       "getAutostart",
       "getNotifyPrefs",
