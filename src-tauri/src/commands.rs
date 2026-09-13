@@ -3226,6 +3226,51 @@ pub fn get_auth_state(state: State<'_, AuthState>) -> AuthState {
     state.inner().clone()
 }
 
+/// Import the Claude Code transcripts already on disk (#914, epic #910).
+///
+/// A FULL rescan of `~/.claude/projects`, every time. That is the whole
+/// design and it is a measurement, not a shortcut: extracting all 1,430
+/// real sessions on the development machine costs well under a second,
+/// because each transcript is a bounded head read plus one 16 KB tail
+/// seek rather than a whole-file read of an 881 MB corpus. At that price
+/// there is no cache to invalidate, no stored offset to get wrong, and no
+/// filesystem watcher to fail silently -- which on macOS a dead FSEvents
+/// stream does, producing exactly the "watch that fails" the epic's own
+/// constraints warn about.
+///
+/// `elapsed_ms` comes back in the result so that claim stays checkable on
+/// a machine other than the one it was measured on.
+///
+/// # Why this is safe to call at startup
+///
+/// It is read-only against `~/.claude` -- those transcripts are Claude
+/// Code's data and the file `claude --resume` depends on -- and one
+/// transaction against our own cache. `spawn_blocking` keeps the disk
+/// walk off the async runtime.
+///
+/// # Absent is not zero
+///
+/// [`Imported`] carries `unreadable_dirs`, `unreadable_files` and
+/// `write_failures` as data. An empty session list with a non-empty
+/// `unreadable_dirs` means "we could not read your history", which the UI
+/// must not render as "you have no sessions": the two have opposite
+/// remedies and the second is alarming when it is false.
+///
+/// [`Imported`]: crate::claude::store::Imported
+#[tauri::command]
+pub async fn claude_import_transcripts(
+    app: tauri::AppHandle,
+) -> Result<crate::claude::store::Imported, String> {
+    let db = db_path(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let scan = crate::claude::scan_default()?;
+        let mut conn = open_db(&db).map_err(|e| e.to_string())?;
+        crate::claude::store::import(&mut conn, scan).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[cfg(test)]
 mod tests {
     /// #336: `docker_builds` must actually ENRICH.
