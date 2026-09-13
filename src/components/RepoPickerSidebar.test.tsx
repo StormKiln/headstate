@@ -8,11 +8,15 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 /// colour: the selection is navigation state, and a screen reader reading a
 /// list of repository names has no other way to know which one is open."
 const repos = vi.hoisted(() => vi.fn<() => unknown>(() => []));
-const scan = vi.hoisted(() => ({ loading: false }));
+const scan = vi.hoisted(() => ({ loading: false, unreadable: [] as string[] }));
 const selected = vi.hoisted(() => ({ repo: undefined as string | undefined }));
 
 vi.mock("@/api/hooks", () => ({
-  useWorktrees: () => ({ data: repos(), isLoading: scan.loading }),
+  useWorktrees: () => ({
+    data: repos(),
+    isLoading: scan.loading,
+    unreadable: scan.unreadable,
+  }),
 }));
 vi.mock("./ViewSwitcher", () => ({ ViewSwitcher: () => null }));
 vi.mock("@/store/filters", () => ({
@@ -21,6 +25,10 @@ vi.mock("@/store/filters", () => ({
 }));
 
 import { RepoPickerSidebar } from "./RepoPickerSidebar";
+
+/// One report entry, in the `<path>: <why>` shape the Rust side sends.
+/// Synthetic per `CONTRIBUTING.md`: the real ones name a real machine.
+const UNREADABLE = "/code/broken: fatal: not a repository";
 
 const repo = (name: string) => ({
   identity: null,
@@ -32,6 +40,7 @@ const repo = (name: string) => ({
 beforeEach(() => {
   repos.mockReturnValue([]);
   scan.loading = false;
+  scan.unreadable = [];
   selected.repo = undefined;
 });
 
@@ -58,6 +67,64 @@ describe("RepoPickerSidebar", () => {
     repos.mockReturnValue([]);
     render(<RepoPickerSidebar reviewingCount={0} />);
     expect(screen.getByText(/no repositories found in the scanned folders/i)).toBeTruthy();
+  });
+
+  /// #951, and the second proof that issue asks for.
+  ///
+  /// The copy this asserts ABSENT is the one `emptyStateGuard.test.ts`
+  /// names the worst in the app: "No repositories found in the scanned
+  /// folders" is a diagnosis pointing at the user's settings, so a scan
+  /// that could not READ those folders sent someone to fix a
+  /// configuration that was never wrong. Before the fix the walk had
+  /// nowhere to report the shortfall and this copy rendered regardless.
+  describe("a scan that could not read everything (#951)", () => {
+    it("does not blame the scanned folders when it could not read them", () => {
+      repos.mockReturnValue([]);
+      scan.unreadable = [UNREADABLE];
+      render(<RepoPickerSidebar reviewingCount={0} />);
+      expect(screen.queryByText(/no repositories found in the scanned folders/i)).toBeNull();
+      expect(screen.getByText(/no repositories could be read/i)).toBeTruthy();
+    });
+
+    /// The reason, not just the fact. A count alone is unactionable: a
+    /// refusal, a permission wall and a missing binary send the user to
+    /// three different places, and only the message distinguishes them.
+    it("names the path and the reason", () => {
+      repos.mockReturnValue([]);
+      scan.unreadable = [UNREADABLE];
+      render(<RepoPickerSidebar reviewingCount={0} />);
+      expect(screen.getByText(UNREADABLE)).toBeTruthy();
+    });
+
+    /// The repositories that DID read stay listed -- the trade
+    /// `ArtifactsPage` states. A fix that blanked the list on one
+    /// unreadable directory would trade a silent failure for a louder
+    /// one.
+    it("still lists what it did read, and says the list may be short", () => {
+      repos.mockReturnValue([repo("alpha")]);
+      scan.unreadable = [UNREADABLE];
+      render(<RepoPickerSidebar reviewingCount={0} />);
+      expect(screen.getByText("alpha")).toBeTruthy();
+      expect(screen.getByText(/may not be all of them/i)).toBeTruthy();
+    });
+
+    /// And silent when there is nothing to report, or the banner becomes
+    /// permanent furniture nobody reads.
+    it("says nothing when the scan read everything", () => {
+      repos.mockReturnValue([repo("alpha")]);
+      render(<RepoPickerSidebar reviewingCount={0} />);
+      expect(screen.queryByText(/could not be read/i)).toBeNull();
+    });
+
+    /// Before the scan answers there is no shortfall to report either --
+    /// "we have not looked yet" must not read as "we could not look".
+    it("says nothing while the scan is still running", () => {
+      scan.loading = true;
+      scan.unreadable = [UNREADABLE];
+      render(<RepoPickerSidebar reviewingCount={0} />);
+      expect(screen.getByText(/looking for repositories/i)).toBeTruthy();
+      expect(screen.queryByText(/could not be read/i)).toBeNull();
+    });
   });
 
   describe("selection is not conveyed by colour alone", () => {

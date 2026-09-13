@@ -1,5 +1,6 @@
 import { useWorktrees } from "@/api/hooks";
 import { useActiveFilters, useFilters } from "@/store/filters";
+import { PartialScanNotice } from "./PartialScanNotice";
 import { ViewSwitcher } from "./ViewSwitcher";
 
 /// A plain repository list, for views whose only axis is "which repo".
@@ -21,7 +22,22 @@ export function RepoPickerSidebar({ reviewingCount }: { reviewingCount: number }
   // makes it the sharpest instance of the four: it is a diagnosis naming
   // the user's settings, so a failed scan sent someone to fix a
   // configuration that was never wrong.
-  const { data: repos = [], isLoading, isError, refetch } = useWorktrees();
+  //
+  // `unreadable` since #951, and it is what finally gives that diagnosis
+  // something to lose to. #854's `isError` arm was added for a command
+  // that CANNOT reject: `list_worktrees` returned a bare `Vec<Repo>` from
+  // an infallible walk, so a repository whose worktree listing failed was
+  // dropped from the list and the diagnosis rendered anyway. The failure
+  // now travels in the payload instead of being unrepresentable.
+  const {
+    data: repos = [],
+    isLoading,
+    isError,
+    refetch,
+    // `= []` as `WorktreesPage` explains: a pre-#951 test double mocks
+    // only what it needs, and absent reads the same as empty here.
+    unreadable = [],
+  } = useWorktrees();
 
   const rowClass = (active: boolean) =>
     `flex w-full items-center justify-between rounded px-3 py-2 text-sm ${
@@ -76,10 +92,44 @@ export function RepoPickerSidebar({ reviewingCount }: { reviewingCount: number }
           </div>
         ) : isLoading ? (
           <p className="px-3 py-2 text-xs text-[#8b949e]">Looking for repositories…</p>
+        ) : repos.length === 0 && unreadable.length > 0 ? (
+          /* The FOURTH answer, and the one this component existed to get
+             wrong: the scan ran, found nothing, and could not read some
+             of where it looked. Placed BEFORE the empty arm for the
+             ordering reason `ClaudeMdPage` states -- an arm after it is
+             unreachable in exactly the case it exists for -- and it is
+             not merely an ordering nicety here: "no repositories" and
+             "we could not read the folders" have OPPOSITE remedies, and
+             the copy below names the user's settings.
+
+             The scan is not reported as failed either, because it did
+             not fail: `isError` above is a rejection of the whole
+             command, and this is a walk that ran and came back short.
+             Offering "Try again" would promise that a second identical
+             walk might read what the first could not. */
+          <p className="px-3 py-2 text-xs text-[#8b949e]">
+            No repositories could be read. The paths below explain why — the
+            scanned folders may well be correct.
+          </p>
         ) : repos.length === 0 ? (
           <p className="px-3 py-2 text-xs text-[#8b949e]">
             No repositories found in the scanned folders.
           </p>
+        ) : null}
+        {/* Below whichever message above applies, and shown alongside a
+            NON-empty list too: some repositories reading is not evidence
+            that all of them did, and a list that is quietly short is the
+            finding. */}
+        {!isLoading && !isError ? (
+          <PartialScanNotice
+            unreadable={unreadable}
+            consequence={
+              repos.length === 0
+                ? "no repository could be listed from them."
+                : `the ${repos.length === 1 ? "repository" : `${repos.length} repositories`} below ` +
+                  "may not be all of them."
+            }
+          />
         ) : null}
         {repos.map((r) => (
           <button

@@ -348,6 +348,28 @@ export interface WorktreeRepo {
   fetched_at?: string | null;
 }
 
+/// What a worktree scan found, INCLUDING what it could not read (#951).
+///
+/// Mirrors `RepoScan` in `src-tauri/src/worktrees/scan.rs`. A repository
+/// whose worktree listing failed used to be dropped from the payload, so
+/// the page read it as "not a repository" -- and `RepoPickerSidebar` then
+/// rendered "No repositories found in the scanned folders", a DIAGNOSIS
+/// pointing at settings that were fine.
+export interface WorktreeScan {
+  repos: WorktreeRepo[];
+  /// Paths the walk could not read, each with WHY.
+  ///
+  /// A message rather than a count, because "not a repository" and
+  /// "permission denied" send the user to different places. Non-empty
+  /// means the repo list beside it is a FLOOR, and an orphan count taken
+  /// over it is not a verdict.
+  ///
+  /// Optional in the TYPE so a fixture need not enumerate it, and
+  /// `undefined` reads the same as `[]` at every use. The Rust side
+  /// always sends the key.
+  unreadable?: string[];
+}
+
 /// Everything the detail view renders.
 ///
 /// Separate from `PullRequest`, which is a list row fetched 100 at a time

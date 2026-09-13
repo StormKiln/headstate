@@ -2,7 +2,7 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 import { renderHook } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
-import type { Worktree, WorktreeRepo } from "@/types/pr";
+import type { Worktree, WorktreeRepo, WorktreeScan } from "@/types/pr";
 
 const invoke = vi.hoisted(() =>
   vi.fn<(...a: unknown[]) => Promise<{ path: string; error: string | null }[]>>(() =>
@@ -52,16 +52,25 @@ describe("useRemoveWorktrees", () => {
   /// removed row until a refetch lands.
   it("drops it from the base listing too, not only the classification", async () => {
     const { qc, wrapper } = harness();
-    qc.setQueryData<WorktreeRepo[]>(
-      ["worktrees"],
-      [{ path: "/code/a", worktrees: [wt("/code/a/wt1"), wt("/code/a/wt2")] } as WorktreeRepo],
-    );
+    // A `WorktreeScan`, not a bare array, since #951: the cached payload
+    // now carries the repositories AND what the walk could not read.
+    qc.setQueryData<WorktreeScan>(["worktrees"], {
+      repos: [
+        { path: "/code/a", worktrees: [wt("/code/a/wt1"), wt("/code/a/wt2")] } as WorktreeRepo,
+      ],
+      unreadable: ["/code/broken: not a git repository"],
+    });
 
     const { result } = renderHook(() => useRemoveWorktrees(), { wrapper });
     await result.current("/code/a", ["/code/a/wt1"]);
 
-    const after = qc.getQueryData<WorktreeRepo[]>(["worktrees"]);
-    expect(after?.[0].worktrees.map((w) => w.path)).toEqual(["/code/a/wt2"]);
+    const after = qc.getQueryData<WorktreeScan>(["worktrees"]);
+    expect(after?.repos[0].worktrees.map((w) => w.path)).toEqual(["/code/a/wt2"]);
+    // And the shortfall SURVIVES the edit (#951). Removing a worktree
+    // says nothing about a path the scan could not read, so clearing the
+    // report here would make the partial-scan banner vanish on an
+    // unrelated action and reappear at the next refetch.
+    expect(after?.unreadable).toEqual(["/code/broken: not a git repository"]);
   });
 
   /// A worktree that could NOT be removed is still on disk and must stay

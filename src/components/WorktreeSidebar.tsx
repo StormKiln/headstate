@@ -1,6 +1,7 @@
 import { useWorktrees } from "../api/hooks";
 import { type View, useActiveFilters, useFilters } from "../store/filters";
 import { isOrphaned, ORPHAN_FILTER } from "../lib/worktrees";
+import { PartialScanNotice } from "./PartialScanNotice";
 import { ViewSwitcher } from "./ViewSwitcher";
 
 /// Repos that have worktrees.
@@ -25,7 +26,21 @@ export function WorktreeSidebar({
   // version of -- has always distinguished the two, and states why:
   // "'We have not looked yet' and 'we looked and there is nothing' are
   // opposite answers".
-  const { data: repos, isLoading, isError, refetch } = useWorktrees();
+  //
+  // `unreadable` since #951: the scan can come back SHORT without
+  // rejecting, and every count in this column is then a floor. See the
+  // orphan section below for the one number where that matters most.
+  const {
+    data: repos,
+    isLoading,
+    isError,
+    refetch,
+    // `= []` for the same reason `WorktreesPage` states: a test double
+    // predating #951 mocks only the fields it cares about, and absent
+    // means the same as empty -- no shortfall reported.
+    unreadable = [],
+  } = useWorktrees();
+  const partial = unreadable.length > 0;
   const filters = useActiveFilters();
   const { setFilter } = useFilters();
 
@@ -124,6 +139,17 @@ export function WorktreeSidebar({
             </button>
           </div>
         ) : null}
+        {/* And the third answer, above the counts it qualifies (#951).
+            Every number in this column -- the all-repositories total, the
+            per-repo counts, and the orphan count most of all -- is taken
+            over whatever the walk managed to read, so the reason it read
+            less has to sit where those numbers are read. */}
+        {!isLoading && !isError ? (
+          <PartialScanNotice
+            unreadable={unreadable}
+            consequence="the counts below are floors rather than totals."
+          />
+        ) : null}
         {/* Missing entirely before: with no "all" entry, clearing the
             repo filter fell through to `repos?.[0]` and silently showed
             the FIRST repo -- so across 37 repos there was no way to ask
@@ -146,7 +172,7 @@ export function WorktreeSidebar({
               unknown renders as a dash, never as a number, because zero
               is an ANSWER and this has none. */}
           <span className="ml-2 shrink-0">
-            {repos === undefined ? "—" : allCount}
+            {repos === undefined ? "—" : partial ? `≥ ${allCount}` : allCount}
           </span>
         </button>
         {withWorktrees.map((r) => (
@@ -183,7 +209,20 @@ export function WorktreeSidebar({
               className={rowClass(filters.repo === ORPHAN_FILTER)}
             >
               <span className="truncate text-[#d29922]">Orphaned</span>
-              <span className="ml-2 shrink-0">{orphanCount}</span>
+              {/* "at least N" on a partial scan (#951), and the reasoning
+                  is the same as the size total's on `WorktreesPage`: a
+                  count that silently treats what it could not read as
+                  zero is a confident wrong answer.
+
+                  QUALIFIED rather than suppressed, which is the decision
+                  that matters here and is argued in full at the orphan
+                  section of `WorktreesPage`. Short version: each orphan
+                  is a POSITIVE finding, so a short walk cannot invent
+                  one -- only miss one. The direction of the error is
+                  "too few", and the honest word for that is "at least". */}
+              <span className="ml-2 shrink-0">
+                {partial ? `≥ ${orphanCount}` : orphanCount}
+              </span>
             </button>
           </div>
         ) : null}
