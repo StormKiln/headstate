@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { render, screen, waitFor, within } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AlertReport, Footprint, HealthSample } from "@/types/pr";
 import { stubViewport } from "@/test-utils";
 
@@ -882,6 +882,149 @@ describe("the at-a-glance pressure cards", () => {
                          "Every mounted volume"]) {
       expect(screen.getByText(title)).toBeTruthy();
     }
+  });
+});
+
+/// The pressure row at phone width (#966).
+///
+/// # The measurement
+///
+/// The row was a fixed `grid-cols-3` at every width, on the premise --
+/// written into its own doc comment -- that "these are short numbers".
+/// The NUMBERS are short (`94%` is 36.2px). The captions and the absence
+/// text are not, and those are what broke the row.
+///
+/// At a 390px viewport: `App.tsx` wraps the page in `p-4` (390 - 32 =
+/// 358px), and `grid-cols-3 gap-2` gives (358 - 16) / 3 = 114px per
+/// track; `PressureCard`'s `px-3` leaves a 90.0px content box. Measured
+/// against the shipped Geist face at `wght` 400:
+///
+/// - `183 GB free of 494 GB` at `text-[11px]` = 113.3px (over by 23px)
+/// - `1.2 TB free of 2.0 TB` at `text-[11px]` = 101.9px (over by 12px)
+/// - `Not measured` at `text-lg`               = 118.4px (over by 28px)
+///
+/// so the Disk caption wrapped to three lines and the calmest state in
+/// the row became its tallest cell. Three cells at three different
+/// heights is not a row, and a row is the one property this thing exists
+/// for.
+///
+/// Two tracks give (358 - 8) / 2 = 175px, a 151px content box, which
+/// clears all three with room.
+///
+/// # Why not `grid-cols-1`
+///
+/// Because the doc comment's concern is real and #966 says so
+/// explicitly: "stacking them would push the panels below the fold on
+/// exactly the device where a glance matters most". This row is the one
+/// grid in the file that should NOT follow the `grid-cols-1 md:*`
+/// pattern the rest of it uses, which is why that is asserted here
+/// rather than left to a reader to re-derive.
+describe("the pressure row at phone width (#966)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    liveFn.mockResolvedValue(sample());
+    historyFn.mockResolvedValue([]);
+    alertsFn.mockResolvedValue([]);
+    mobileBuild.current = false;
+    connection.current = { kind: "local" };
+    // Without this the block renders the DESKTOP layout however it is
+    // named -- jsdom has no `matchMedia`.
+    stubViewport(390);
+  });
+
+  afterEach(() => stubViewport(null));
+
+  it("really is at a phone width", () => {
+    expect(window.matchMedia("(max-width: 767px)").matches).toBe(true);
+    // A narrower query must not match, so nothing below passes because
+    // the stub answered everything true.
+    expect(window.matchMedia("(max-width: 300px)").matches).toBe(false);
+  });
+
+  /// THE #966 defect. Two tracks below `sm`, three from `sm` up.
+  it("gives each card a content box its caption fits in", async () => {
+    show();
+    const row = await screen.findByRole("group", { name: /pressure at a glance/i });
+    // Three 114px tracks were what squeezed a 113.3px caption into a
+    // 90px box.
+    expect(row.className).not.toMatch(/(^|\s)grid-cols-3(\s|$)/);
+    expect(row.className).toContain("grid-cols-2");
+    // And the desktop keeps its three across, unchanged.
+    expect(row.className).toContain("sm:grid-cols-3");
+  });
+
+  /// Not the stack the rest of the file uses. The glance is the whole
+  /// reason this row is above the panels, and one card per line would
+  /// push them below the fold -- which is precisely what the original
+  /// comment warned against and what #966 declines to do.
+  it("does not stack to one card per line", async () => {
+    show();
+    const row = await screen.findByRole("group", { name: /pressure at a glance/i });
+    expect(row.className).not.toMatch(/(^|\s)grid-cols-1(\s|$)/);
+  });
+
+  /// The odd card takes the pair rather than sitting alone beside a gap
+  /// -- and it is the card with the longest caption of the three, so the
+  /// full width goes where it is needed most.
+  it("spans the third card across the pair below sm", async () => {
+    show();
+    const row = await screen.findByRole("group", { name: /pressure at a glance/i });
+    const disk = within(row).getByText(/free of 500 GB/).closest("div") as HTMLElement;
+    expect(disk.className).toContain("col-span-2");
+    // Back to one track from `sm`, where three across fits again.
+    expect(disk.className).toContain("sm:col-span-1");
+  });
+
+  /// The absence case is NOT exotic: `percent === null` is the normal
+  /// state for Disk on a machine with no root disk identified and for
+  /// CPU wherever `cpu_per_core` comes back empty, so a first-run user
+  /// on a non-macOS machine can see two of three cards in it at once.
+  /// The 118.4px phrase must be intact, not shortened to fit.
+  it("keeps 'Not measured' whole rather than abbreviating it to fit", async () => {
+    liveFn.mockResolvedValue(sample({ cpu_percent: null, disks: [] }));
+    show();
+    const row = await screen.findByRole("group", { name: /pressure at a glance/i });
+    const absent = within(row).getAllByText("Not measured");
+    // Two of the three cards, which is the real first-run state.
+    expect(absent.length).toBe(2);
+    for (const span of absent) {
+      // Not clipped: "Not measu" would be worse than the wrap it
+      // replaces, and the phrase is not abbreviable -- the words, the
+      // colour and the fact that it is NOT A NUMBER are decided in one
+      // place.
+      expect(span.className).not.toMatch(/truncate/);
+      expect(span.textContent).toBe("Not measured");
+      const card = span.closest("div") as HTMLElement;
+      expect(card.className).not.toMatch(/overflow-hidden/);
+    }
+    // And still never a confident zero where nothing was measured.
+    expect(within(row).queryByText("0%")).toBeNull();
+  });
+
+  /// The bar-less arm's spacer stays, so a card with no reading is the
+  /// same height as one with a bar and the row does not jump.
+  it("keeps the spacer that holds an unmeasured card's height", async () => {
+    liveFn.mockResolvedValue(sample({ cpu_percent: null }));
+    show();
+    const row = await screen.findByRole("group", { name: /pressure at a glance/i });
+    const card = within(row).getByText("Not measured").closest("div") as HTMLElement;
+    // No bar -- a confident green 0% would be the page's own rule broken
+    // in the place people look first...
+    expect(card.querySelector('[role="img"]')).toBeNull();
+    // ...but the 6px the bar would have taken is still reserved.
+    expect(card.querySelector(".h-1\\.5")).not.toBeNull();
+  });
+
+  /// Everything the row is FOR must still be there at this width: the
+  /// percentages as text, and the captions behind them.
+  it("still prints every figure as text", async () => {
+    show();
+    const row = await screen.findByRole("group", { name: /pressure at a glance/i });
+    expect(within(row).getByText("18%")).toBeTruthy();
+    expect(within(row).getByText("50%")).toBeTruthy();
+    expect(within(row).getByText("80%")).toBeTruthy();
+    expect(within(row).getByText(/of 16 GB/)).toBeTruthy();
+    expect(within(row).getByText(/free of 500 GB/)).toBeTruthy();
   });
 });
 

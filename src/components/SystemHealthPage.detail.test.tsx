@@ -878,6 +878,65 @@ describe("the Power page", () => {
     expect(fill.style.backgroundColor).not.toBe("rgb(248, 81, 73)");
   });
 
+  /// The scale label sits ON the scale it names (#981).
+  ///
+  /// The arithmetic is asserted in `lib/health.battery.test.ts`, which is
+  /// where the defect lived; this is the DOM half -- that the label is
+  /// POSITIONED from that number rather than pinned to the container's
+  /// right edge by `justify-between`, which is the specific markup that
+  /// put the "100%" mark at the 120% position.
+  it("puts the rated-capacity label at the mark it names", async () => {
+    const { container } = renderPage();
+    const label = await screen.findByText(/rated capacity: 100%/i);
+
+    // Positioned from `capacityBarFill(100)`, i.e. 83.33% -- not flush
+    // right, which is where `justify-between` put it and which is the
+    // 16.67%-of-track misplacement #981 measured.
+    expect(label.style.left).toBe("83.33333333333334%");
+    // Centred on the mark rather than starting at it.
+    expect(label.className).toContain("-translate-x-1/2");
+
+    // `justify-between` is GONE from the scale row: it is what pinned
+    // the label to the `CAPACITY_BAR_MAX` end of the track.
+    const row = label.parentElement as HTMLElement;
+    expect(row.className).not.toMatch(/justify-between/);
+    // The "0%" end is still labelled, so the scale still has two points.
+    expect(within(row).getByText("0%")).toBeTruthy();
+
+    // A tick on the track at the same position, so the label names a
+    // visible point rather than a remembered one.
+    const meter = container.querySelector(
+      '[aria-label="Battery capacity relative to design"]',
+    ) as HTMLElement;
+    const tick = meter.querySelector("[aria-hidden]") as HTMLElement;
+    expect(tick).toBeTruthy();
+    expect(tick.style.left).toBe(label.style.left);
+
+    // The announced scale is untouched: a screen-reader user was always
+    // getting "N out of 120", which was correct and unambiguous, and
+    // this was a sighted-users-only defect.
+    expect(meter.getAttribute("aria-valuemax")).toBe("120");
+  });
+
+  /// The fill and the mark must agree at EVERY reading, which is the
+  /// property the panel exists to present. The default fixture is 84%,
+  /// below nameplate, so the fill must fall short of the mark -- and it
+  /// must do so by the real amount rather than by the stretched one.
+  it("draws a worn cell short of the mark and a healthy one past it", async () => {
+    const { container } = renderPage();
+    await screen.findByText("Battery capacity");
+    const meter = container.querySelector(
+      '[aria-label="Battery capacity relative to design"]',
+    ) as HTMLElement;
+    const fill = meter.querySelector("div") as HTMLElement;
+    const mark = Number.parseFloat(
+      (await screen.findByText(/rated capacity: 100%/i)).style.left,
+    );
+    // 84 / 120 = 70%, against a mark at 83.33%.
+    expect(Number.parseFloat(fill.style.width)).toBeCloseTo(70, 5);
+    expect(Number.parseFloat(fill.style.width)).toBeLessThan(mark);
+  });
+
   /// A worn battery keeps the wording that was always correct for it,
   /// so the fix cannot have been made by deleting the sentence.
   it("still explains wear for a battery below its design capacity", async () => {
@@ -1605,5 +1664,132 @@ describe("navigation at phone width", () => {
     expect(
       screen.queryByRole("button", { name: /system health overview/i }),
     ).toBeNull();
+  });
+});
+
+/// The process table at phone width (#973).
+///
+/// # The measurement
+///
+/// `App.tsx` wraps this page in `p-4` (390 - 32 = 358px) and `Panel`
+/// carries `p-4` (358 - 32 = 326px of table). Against that the table
+/// measured 533.6px on a real process list -- a 56-character name at
+/// `text-sm` is 407.8px, the numeric columns are 101.8px and the three
+/// `pr-2` are 24px -- so 207.6px of overflow. Nothing wrapped the table,
+/// so the excess reached the DOCUMENT: the whole page gained a
+/// horizontal scrollbar, every panel above and below slid sideways, and
+/// the PID/CPU/Memory columns -- the answer to "what is eating my CPU" --
+/// sat off-screen to the right.
+///
+/// # Why the assertions are on classes
+///
+/// jsdom does no layout, so the 207.6px cannot be measured here. What
+/// can be pinned is the containment that decides it, and that is exactly
+/// what was missing. `max-w-0` is the load-bearing half: a table cell's
+/// width is CONTENT-driven, so a bare `truncate` on a `<td>` does
+/// nothing at all -- which is why the network table two panels over
+/// (`:2283`) has carried `max-w-0 truncate` since it shipped while these
+/// two tables never received it.
+///
+/// The fixtures stay synthetic, per `CONTRIBUTING.md` and the privacy
+/// guard: a long name is an invented one made longer, not the
+/// 56-character bundle id off anybody's machine.
+describe("the process table at phone width (#973)", () => {
+  // Without this the block renders the DESKTOP layout however it is
+  // named -- jsdom has no `matchMedia`. Asserted below rather than
+  // trusted, because a phone-shaped test that silently runs at desktop
+  // width is worse than none, and that bug was real in
+  // `ClaudeCodePage.mobile.test.tsx`.
+  beforeEach(() => {
+    stubViewport(390);
+    useFilters.setState({ healthPage: "cpu" });
+  });
+
+  it("really is at a phone width", () => {
+    expect(window.matchMedia("(max-width: 767px)").matches).toBe(true);
+    // A 1400px query must NOT match, so nothing below can be passing
+    // because the stub answered everything true.
+    expect(window.matchMedia("(max-width: 300px)").matches).toBe(false);
+  });
+
+  /// THE #973 defect: the excess must be the table's to scroll, not the
+  /// page's. A scrolling table is acceptable; a scrolling page is the
+  /// failure being fixed.
+  it("contains its own overflow instead of scrolling the page", async () => {
+    renderPage();
+    await screen.findByText("What is using the CPU");
+    const table = await screen.findByRole("table");
+    const scroller = table.parentElement as HTMLElement;
+    expect(scroller.className).toContain("overflow-x-auto");
+    // `min-w-full`, not `w-full`: inside a scroll container `w-full`
+    // resolves against the scroll width and lets the numeric columns
+    // collapse instead of staying reachable.
+    expect(table.className).toContain("min-w-full");
+    expect(table.className).not.toMatch(/(^|\s)w-full(\s|$)/);
+  });
+
+  /// `max-w-0` is what makes the name column give at all. Without it the
+  /// cell is sized by its content and any truncate on it is inert.
+  it("lets the process name column be the one that gives", async () => {
+    const longName = "acme-render-worker-subprocess-supervisor-shim";
+    footprintFn.mockResolvedValue(
+      footprint({ top_cpu: [proc(701, longName, 412, 900)] }),
+    );
+    renderPage();
+    await screen.findByText("What is using the CPU");
+    const cell = (await screen.findByText(longName)).closest("td") as HTMLElement;
+    expect(cell.className).toContain("max-w-0");
+    // Truncated from `md` up, where a hover can recover the full name...
+    expect(cell.className).toContain("md:truncate");
+    // ...and NOT below it, where a hover cannot. `title` is unreachable
+    // on touch and this is the phone bug, so the phone gets the whole
+    // name over two lines rather than an ellipsis it cannot open.
+    expect(cell.className).not.toMatch(/(^|\s)truncate(\s|$)/);
+    expect(cell.className).toContain("break-words");
+    // The desktop's recovery is still wired, for the width that has it.
+    expect(cell.getAttribute("title")).toBe(longName);
+  });
+
+  /// The three columns the issue says must survive: the PID a reader
+  /// copies into `ps`, the CPU heading that carries its denominator, and
+  /// the memory figure. None may be dropped or shortened to fit.
+  it("keeps the PID column and the full CPU heading", async () => {
+    renderPage();
+    await screen.findByText("What is using the CPU");
+    const table = await screen.findByRole("table");
+    // Not narrowed to a bare "CPU": `cpu_percent` is a share of ONE
+    // core, so a process using four legitimately reads 412%, and under
+    // a bare heading that looks like a bug.
+    expect(within(table).getByText("CPU (of one core)")).toBeTruthy();
+    expect(within(table).getByText("PID")).toBeTruthy();
+    expect(within(table).getByText("Memory")).toBeTruthy();
+    // And the PID itself is still printed, not pushed off-screen.
+    expect(within(table).getByText("701")).toBeTruthy();
+    expect(within(table).getByText("412%")).toBeTruthy();
+  });
+
+  /// The grouped table gets the same containment -- it was the other
+  /// table the network panel's idiom never reached.
+  it("contains the grouped table too, without truncating the count", async () => {
+    renderPage();
+    await screen.findByText("What is using the CPU");
+    // Awaited: the toggle only exists once the footprint query has
+    // resolved with grouped rows in it.
+    fireEvent.click(await screen.findByRole("button", { name: "Grouped" }));
+
+    const name = await screen.findByText("acme-agent");
+    const cell = name.closest("td") as HTMLElement;
+    const table = cell.closest("table") as HTMLElement;
+    expect((table.parentElement as HTMLElement).className).toContain("overflow-x-auto");
+    expect(cell.className).toContain("max-w-0");
+    expect(cell.getAttribute("title")).toBe("acme-agent");
+    // The NAME truncates; the count does not. A summed row read as a
+    // single process is a wrong number with no visible cause, which is
+    // the whole reason the count is printed -- so it must not be the
+    // half that gets ellipsised.
+    expect(name.className).toContain("md:truncate");
+    const count = within(cell).getByText("(26)");
+    expect(count.className).toContain("shrink-0");
+    expect(count.className).not.toMatch(/truncate/);
   });
 });

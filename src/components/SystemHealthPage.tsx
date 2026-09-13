@@ -12,6 +12,7 @@ import { QueryError, errorMessage } from "./QueryError";
 import { formatSize } from "@/lib/worktrees";
 import {
   CAPACITY_BAR_MAX,
+  NAMEPLATE_MARK,
   THERMAL_MEANING,
   barColor,
   capacityBarFill,
@@ -309,7 +310,31 @@ function Sparkline({
 function ProcessRow({ p, hint }: { p: FootprintProcess; hint?: string }) {
   return (
     <tr className="border-t border-[#30363d]">
-      <td className="py-1 pr-2">
+      {/* `max-w-0` is what makes the name column give (#973). A table
+          cell's width is content-driven, so a bare `truncate` on a
+          `<td>` does nothing at all -- `max-w-0` is the idiom the
+          network process table two panels down this same file already
+          uses (`:2283`), and it is the one these two tables did not
+          receive. Without it the widest real process name on this
+          machine, `com.apple.MobileSoftwareUpdate.CleanupPreparePathService`,
+          is 407.8px at `text-sm`: a 533.6px table in a 326px panel,
+          207.6px of overflow, and because nothing contained it the
+          WHOLE PAGE scrolled sideways and the PID/CPU/Memory columns --
+          the answer to "what is eating my CPU" -- sat off-screen.
+
+          `md:truncate` rather than a bare `truncate`, so the name
+          WRAPS below `md` and is truncated at or above it. The `title`
+          below recovers a truncated name with a hover, but a hover is
+          unreachable on touch and #973's whole subject is the phone --
+          so the phone gets the name in full over two lines instead of
+          an ellipsis it cannot open. `md` is Tailwind's 768px, which is
+          `MOBILE_BREAKPOINT` by construction (see `useIsMobile`), so
+          the two cannot disagree about what "narrow" means and this
+          needs no hook: it is one column's wrapping, not a layout
+          fork. `break-words` lets a 56-character dotted bundle id
+          break at all -- it contains no spaces, so it would otherwise
+          refuse to wrap and push the table wide again. */}
+      <td className="max-w-0 py-1 pr-2 break-words md:truncate" title={p.name}>
         <span className="text-[#e6edf3]">{p.name}</span>
         {hint ? <span className="ml-2 text-xs text-[#8b949e]">{hint}</span> : null}
       </td>
@@ -455,6 +480,7 @@ function PressureCard({
   label,
   percent,
   detail,
+  className,
 }: {
   label: string;
   /// `null` when the platform did not report it. Never coerced to 0.
@@ -463,12 +489,30 @@ function PressureCard({
   /// A percentage alone cannot distinguish a nearly-full small disk
   /// from a nearly-full large one.
   detail?: string;
+  /// Grid placement from the caller, for the odd card in a two-column
+  /// phone row (#966). Placement only -- the card's own padding, border
+  /// and colours are not the caller's to override, because the three
+  /// cards reading as one row depends on their being identical.
+  className?: string;
 }) {
   return (
-    <div className="flex flex-col gap-1.5 rounded-md border border-[#30363d] bg-[#0d1117] px-3 py-2.5">
+    <div
+      className={`flex min-w-0 flex-col gap-1.5 rounded-md border border-[#30363d] bg-[#0d1117] px-3 py-2.5${
+        className === undefined ? "" : ` ${className}`
+      }`}
+    >
       <span className="text-xs text-[#8b949e]">{label}</span>
       {percent === null ? (
         <>
+          {/* No `truncate` and no `overflow-hidden`, deliberately:
+              clipping this to "Not measu" would be worse than the wrap
+              it replaces, and the phrase is not abbreviable -- the
+              whole reason `NotMeasured` exists is that the words, the
+              colour and the fact that it is NOT A NUMBER are decided in
+              one place, so shortening it for layout reintroduces the
+              unexplained dash. The fix for its 118.4px is the 151px
+              content box the two-column row gives it (#966), not a
+              shorter string. */}
           <span className="text-lg font-semibold text-[#8b949e]">Not measured</span>
           <div className="h-1.5" />
         </>
@@ -765,13 +809,40 @@ export function SystemHealthPage() {
           anything has to be read. Everything below is unchanged; this
           is an addition, not a reorganisation (#683).
 
-          Three across on a phone as well as a desktop: these are short
-          numbers, and stacking them would push the panels below the
-          fold on exactly the device where a glance matters most. The
-          grid handles both widths without a media query, as the panels
-          below already do. */}
+          # Two columns on a phone, three from `sm` up (#966)
+
+          The goal this row was built for -- a glance that survives on
+          the phone -- is right, and "stacking them would push the
+          panels below the fold on exactly the device where a glance
+          matters most" is still true, so `grid-cols-1` is NOT the fix
+          here even though it is what every other grid in this file
+          does.
+
+          What was wrong was the premise that "these are short numbers".
+          The numbers are short (`94%` is 36.2px); the CAPTIONS are not,
+          and neither is the absence text. `grid-cols-3 gap-2` at a
+          390px viewport gives (358 - 16) / 3 = 114px per track, and
+          `PressureCard`'s `px-3` leaves a 90.0px content box. Measured
+          against the shipped Geist face: the Disk caption
+          `183 GB free of 494 GB` is 113.3px (over by 23px, so it wrapped
+          to three lines) and `Not measured` at `text-lg` is 118.4px
+          (over by 28px, so the calmest state in the row became its
+          tallest cell). Three cells at three different heights is not a
+          row, and a row is the one property this thing exists for.
+
+          Two tracks give (358 - 8) / 2 = 175px, a 151px content box --
+          which clears both of those with room, and clears the worse
+          `1.2 TB free of 2.0 TB` (101.9px) too.
+
+          `percent === null` is NOT exotic, which is why the absence
+          width is sized for rather than treated as an edge case: it is
+          the normal state for Disk on a machine with no root disk
+          identified, and for CPU wherever `cpu_per_core` comes back
+          empty (`health/collect.rs`). A first-run user on a non-macOS
+          machine can see two of these three cards in that state at
+          once. */}
       <div
-        className="grid grid-cols-3 gap-2 sm:gap-4"
+        className="grid grid-cols-2 gap-2 sm:grid-cols-3 sm:gap-4"
         role="group"
         aria-label="System pressure at a glance"
       >
@@ -785,7 +856,16 @@ export function SystemHealthPage() {
           percent={memUsedPct}
           detail={`${formatSize(s.memory.used)} of ${formatSize(s.memory.total)}`}
         />
+        {/* The odd card spans the pair below `sm` rather than sitting
+            alone in a half-width cell beside a gap. It is the card with
+            the LONGEST caption of the three -- `183 GB free of 494 GB`
+            -- so the full width goes to the cell that needs it most,
+            and a two-plus-one arrangement still reads as one block
+            above the panels rather than as a stack. Heights stay equal
+            where it matters: the grid equalises each row, and CPU and
+            Memory share theirs. */}
         <PressureCard
+          className="col-span-2 sm:col-span-1"
           label="Disk"
           percent={rootUsed}
           detail={
@@ -1528,43 +1608,67 @@ function TopProcesses({
         </div>
       ) : null}
 
-      <table className="w-full text-sm">
-        <thead>
-          <tr className="text-left text-xs text-[#8b949e]">
-            <th className="font-normal">Process</th>
-            {/* No PID column under grouping, rather than an empty or
-                a "first PID" one. A group has no PID: printing one of
-                the twenty-six would name a process the row is not
-                about, and it is the column a reader copies into `ps`. */}
-            {showGrouped ? null : <th className="font-normal text-right">PID</th>}
-            {/* Same heading as the footprint panel's, and for the same
-                reason: `cpu_percent` is a share of ONE core, so a
-                process using three legitimately reads 280%. Under a
-                bare "CPU" that looks like a bug. */}
-            <th
-              className={`font-normal text-right ${by === "cpu" ? "text-[#e6edf3]" : ""}`}
-            >
-              CPU (of one core)
-            </th>
-            <th
-              className={`font-normal text-right ${by === "memory" ? "text-[#e6edf3]" : ""}`}
-            >
-              Memory
-            </th>
-          </tr>
-        </thead>
-        <tbody>
-          {showGrouped
-            ? // Keyed on the NAME, which is what identifies a group --
-              // and unlike the individual rows, it is unique here by
-              // construction: one row per distinct name.
-              (groups ?? []).map((g) => <ProcessGroupRow key={g.name} group={g} />)
-            : /* Keyed on the PID, not the name: several processes of one
-                 app share a name, and keying on it would make React reuse
-                 one row's DOM for another process. */
-              processes.map((p) => <ProcessRow key={p.pid} p={p} />)}
-        </tbody>
-      </table>
+      {/* The table gets its OWN horizontal scroll rather than letting
+          the excess reach the document (#973). Before this the table
+          measured 533.6px inside a 326px panel at 390px, and with no
+          container the 207.6px of overflow scrolled the WHOLE PAGE
+          sideways -- the pressure row, the sparklines and the headings
+          all slid when a reader tried to reach the process names.
+
+          A scrolling table is acceptable where a scrolling page is not,
+          and this table specifically needs the affordance: the headings
+          ALONE are 231.0px of the 326px budget (`Process` 45.0 +
+          `PID` 19.4 + `CPU (of one core)` 97.0 + `Memory` 45.6 + 24px
+          of padding), and none of those strings may be shortened --
+          `CPU (of one core)` carries the denominator that stops a
+          three-core process reading as a bug, and the PID is the column
+          a reader copies into `ps`. So the columns stay and become
+          reachable, instead of being dropped or clipped.
+
+          `min-w-full` on the table rather than `w-full`: inside a
+          scroll container `w-full` would resolve against the scroll
+          width and let the numeric columns collapse, while `min-w-full`
+          keeps the table filling the panel when it fits and lets it
+          exceed it when it does not. */}
+      <div className="overflow-x-auto">
+        <table className="min-w-full text-sm">
+          <thead>
+            <tr className="text-left text-xs text-[#8b949e]">
+              <th className="font-normal">Process</th>
+              {/* No PID column under grouping, rather than an empty or
+                  a "first PID" one. A group has no PID: printing one of
+                  the twenty-six would name a process the row is not
+                  about, and it is the column a reader copies into `ps`. */}
+              {showGrouped ? null : <th className="font-normal text-right">PID</th>}
+              {/* Same heading as the footprint panel's, and for the same
+                  reason: `cpu_percent` is a share of ONE core, so a
+                  process using three legitimately reads 280%. Under a
+                  bare "CPU" that looks like a bug. */}
+              <th
+                className={`font-normal text-right ${by === "cpu" ? "text-[#e6edf3]" : ""}`}
+              >
+                CPU (of one core)
+              </th>
+              <th
+                className={`font-normal text-right ${by === "memory" ? "text-[#e6edf3]" : ""}`}
+              >
+                Memory
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {showGrouped
+              ? // Keyed on the NAME, which is what identifies a group --
+                // and unlike the individual rows, it is unique here by
+                // construction: one row per distinct name.
+                (groups ?? []).map((g) => <ProcessGroupRow key={g.name} group={g} />)
+              : /* Keyed on the PID, not the name: several processes of one
+                   app share a name, and keying on it would make React reuse
+                   one row's DOM for another process. */
+                processes.map((p) => <ProcessRow key={p.pid} p={p} />)}
+          </tbody>
+        </table>
+      </div>
       {rest !== null && rest > 0 ? (
         <p className="mt-2 text-xs leading-relaxed text-[#8b949e]">
           {showGrouped ? (
@@ -1629,13 +1733,24 @@ function TopProcesses({
 function ProcessGroupRow({ group: g }: { group: FootprintProcessGroup }) {
   return (
     <tr className="border-t border-[#30363d]">
-      <td className="py-1 pr-2">
-        <span className="text-[#e6edf3]">{g.name}</span>
-        {/* The count is not decoration: it is what stops a summed row
-            being read as a single process. `(1)` is printed too --
-            omitting it for groups of one would make the presence of a
-            number mean "several", which is a second thing to learn. */}
-        <span className="ml-1.5 text-xs tabular-nums text-[#8b949e]">({g.count})</span>
+      {/* `max-w-0` + `md:truncate`, the same containment `ProcessRow`
+          takes and for the same #973 measurement -- see the comment
+          there. `flex` on the inner row rather than truncating the
+          `<td>` text directly, because this cell has TWO children and
+          the count must not be the half that gets ellipsised: a summed
+          row read as a single process is a wrong number with no visible
+          cause, which is exactly what the count exists to prevent. So
+          the NAME truncates and the count is `shrink-0` beside it --
+          `Outliers`' rule, applied to a table cell. */}
+      <td className="max-w-0 py-1 pr-2" title={g.name}>
+        <div className="flex items-baseline gap-1.5">
+          <span className="min-w-0 break-words text-[#e6edf3] md:truncate">{g.name}</span>
+          {/* The count is not decoration: it is what stops a summed row
+              being read as a single process. `(1)` is printed too --
+              omitting it for groups of one would make the presence of a
+              number mean "several", which is a second thing to learn. */}
+          <span className="shrink-0 text-xs tabular-nums text-[#8b949e]">({g.count})</span>
+        </div>
       </td>
       <td className="py-1 pr-2 text-right tabular-nums text-[#e6edf3]">
         {g.cpu_percent.toFixed(0)}%
@@ -2873,9 +2988,15 @@ function CapacityPanel({
         {/* Not `Bar`: see the note above. The track is wider than the
             reading's nominal maximum, so a cell above nameplate sits
             comfortably inside it rather than overflowing its own
-            container. */}
+            container.
+
+            `relative`, and no longer `overflow-hidden`, so the
+            nameplate tick below can be positioned against this track
+            without being clipped at its own edge. The FILL carries the
+            rounding and the clipping instead -- it is the only child
+            that was ever being clipped. */}
         <div
-          className="h-2 w-full overflow-hidden rounded-full bg-[#30363d]"
+          className="relative h-2 w-full rounded-full bg-[#30363d]"
           role="meter"
           aria-valuenow={Math.round(percent)}
           aria-valuemin={0}
@@ -2889,14 +3010,43 @@ function CapacityPanel({
               backgroundColor: capacityColor(percent),
             }}
           />
+          {/* The nameplate figure, drawn ON the track at the position
+              the fill would reach if the cell were exactly at 100%.
+              #981: this used to be a `justify-between` label pinned
+              flush right, i.e. at the 120% end of the track -- so a
+              cell at exactly 100% drew its fill 16.67% of the track
+              SHORT of the mark named "100%", and a perfectly healthy
+              battery read as falling short of nameplate. Every reading
+              was under-reported by the same 1.2x.
+
+              Positioned from `capacityBarFill(100)` rather than a
+              hardcoded 83.33%, so the mark and the fill cannot drift
+              apart if `CAPACITY_BAR_MAX` is ever retuned. */}
+          <div
+            className="absolute -top-0.5 h-3 w-px bg-[#8b949e]"
+            style={{ left: `${NAMEPLATE_MARK}%` }}
+            aria-hidden="true"
+          />
         </div>
         {/* The 100% mark, named. Without it the bar is unreadable: a
             fill that stops four-fifths along means nothing unless the
             reader knows where the nameplate figure sits, and that is
-            precisely the comparison this panel is about. */}
-        <div className="mt-1 flex justify-between text-[11px] text-[#8b949e]">
-          <span>0%</span>
-          <span>Rated capacity: 100%</span>
+            precisely the comparison this panel is about.
+
+            The label rides at the tick's position rather than at the
+            container's right edge, because the two have to name the
+            same point to calibrate anything. `-translate-x-1/2` centres
+            it on the tick, which at the 83.33% mark of a 326px phone
+            panel puts its right edge almost exactly at the panel's --
+            the same place it used to sit, now for the right reason. */}
+        <div className="relative mt-1 h-4 text-[11px] text-[#8b949e]">
+          <span className="absolute left-0">0%</span>
+          <span
+            className="absolute -translate-x-1/2 whitespace-nowrap"
+            style={{ left: `${NAMEPLATE_MARK}%` }}
+          >
+            Rated capacity: 100%
+          </span>
         </div>
       </div>
       <p className="mt-2 text-xs leading-relaxed text-[#8b949e]">
