@@ -444,8 +444,15 @@ export function SettingsDialog({
             placeholder="~/code"
             className="rounded border border-[#30363d] bg-[#0d1117] px-2 py-1 font-mono text-sm"
           />
+          {/* Says `~` works, and says the saved form differs from the
+              typed one. Both halves earn their words: #945 was the field
+              REJECTING its own placeholder, and the fix stores the
+              expanded path -- so someone who types `~/code` and sees
+              `/Users/me/code` come back needs to know that is the
+              intended outcome rather than the app mangling their input. */}
           <p className="text-xs text-[#8b949e]">
-            One path per line. Used to find git worktrees.
+            One path per line. Used to find git worktrees. <code>~</code> is expanded and
+            saved as the full path.
           </p>
           {error ? (
             <p role="alert" className="text-xs text-[#f85149]">
