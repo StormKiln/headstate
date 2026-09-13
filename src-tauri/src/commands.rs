@@ -668,18 +668,31 @@ pub async fn get_pr_detail(
     out
 }
 
-/// Repos and their worktrees, unclassified.
+/// Repos and their worktrees, unclassified, WITH what could not be read.
 ///
 /// Fast enough to block a view on: ~800ms for 37 repos and 295 worktrees
 /// on this machine. Safety classification is four git calls per worktree
 /// and takes ~16s across that set, so it is a separate command the UI
 /// calls per repo as results arrive.
+///
+/// Returns `RepoScan` rather than `Vec<Repo>` since #951. A repository
+/// whose `git worktree list` failed was previously dropped from this
+/// payload entirely, so the page read it as "not a repository" -- and
+/// `RepoPickerSidebar` then rendered "No repositories found in the
+/// scanned folders", a DIAGNOSIS pointing at settings that were fine.
+/// The shortfall has to travel in the same payload as the repositories:
+/// a second command asking a second time would mean a second full walk,
+/// which is what `hooks.ts` and #846's `retry: false` reasoning forbid.
+///
+/// Deliberately NOT an `Err`. The repositories that did read are real and
+/// worth showing -- the trade `ArtifactsPage` states -- so a single
+/// unreadable directory labels the list partial rather than blanking it.
 #[tauri::command]
-pub async fn list_worktrees(app: AppHandle) -> Result<Vec<crate::worktrees::Repo>, String> {
+pub async fn list_worktrees(app: AppHandle) -> Result<crate::worktrees::RepoScan, String> {
     let dirs = get_worktree_dirs(app);
     // Blocking filesystem and subprocess work: keep it off the async
     // runtime's worker threads.
-    tauri::async_runtime::spawn_blocking(move || crate::worktrees::scan_dirs_fast(&dirs))
+    tauri::async_runtime::spawn_blocking(move || crate::worktrees::scan_dirs_fast_reporting(&dirs))
         .await
         .map_err(|e| e.to_string())
 }
@@ -1605,7 +1618,39 @@ fn docker_images_blocking(dirs: Vec<String>) -> Result<Vec<crate::docker::Image>
     //
     // `scan_dirs_fast` is the same expansion the Worktrees view uses,
     // which is why that view worked and this one did not.
-    let repos: Vec<std::path::PathBuf> = crate::worktrees::scan_dirs_fast(&dirs)
+    //
+    // The REPORTING form, and the report is logged rather than returned
+    // (#951). This command's payload is `Vec<Image>` and an unreadable
+    // repository is not a property of any image in it, so there is
+    // nowhere honest to put the shortfall -- but losing it silently is
+    // the bug being fixed, not a lesser version of it. What it costs here
+    // is bounded and worth naming: a repository the walk could not read
+    // is a repository `classify` never gets to ask about, so an image
+    // built there resolves no origin and its provenance column reads
+    // blank -- the SAME failure, measured at 0-of-24 versus 20-of-26,
+    // that the expansion above exists to fix. A warning naming the paths
+    // is what turns "provenance is missing for some images" from a
+    // mystery into a lookup.
+    //
+    // Not escalated to an `Err`: the images that DID resolve are real,
+    // and blanking the Docker page because one directory in `~/code` was
+    // unreadable is the trade `ArtifactsPage` explicitly refuses.
+    let scan = crate::worktrees::scan_dirs_fast_reporting(&dirs);
+    if scan.is_partial() {
+        log::warn!(
+            "docker: {} scan {} could not be read, so image provenance may be \
+             incomplete: {}",
+            scan.unreadable.len(),
+            if scan.unreadable.len() == 1 {
+                "path"
+            } else {
+                "paths"
+            },
+            scan.unreadable.join("; ")
+        );
+    }
+    let repos: Vec<std::path::PathBuf> = scan
+        .repos
         .into_iter()
         .map(|r| std::path::PathBuf::from(r.path))
         .collect();

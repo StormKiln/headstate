@@ -64,6 +64,7 @@ import { rollupRepos } from "../lib/rollup";
 import { useActiveFilters, useFilters } from "../store/filters";
 import type { PullRequest, Worktree } from "../types/pr";
 import { toast } from "sonner";
+import { PartialScanNotice } from "./PartialScanNotice";
 import { QueryError, errorMessage } from "./QueryError";
 import { Button } from "./ui/button";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
@@ -957,7 +958,17 @@ export function WorktreesPage() {
     error,
     refetch,
     dataUpdatedAt,
+    // What the walk could not read (#951). Every count on this page is
+    // taken over what it DID read, so a non-empty list makes each of them
+    // a floor -- and the orphan header below is the one where that had to
+    // be decided rather than merely noted.
+    // `= []` so a test double of `useWorktrees` that predates #951 --
+    // and there are several, each mocking only the fields it cares about
+    // -- renders as "nothing unreadable" rather than crashing. Absent and
+    // empty mean the same thing here: no shortfall was reported.
+    unreadable = [],
   } = useWorktrees();
+  const partial = unreadable.length > 0;
   const filters = useActiveFilters();
   const { setFilter } = useFilters();
   const isMobile = useIsMobile();
@@ -1571,6 +1582,30 @@ export function WorktreesPage() {
   }
 
   if (!repos || repos.length === 0) {
+    // The same diagnosis-versus-shortfall split as `RepoPickerSidebar`
+    // (#951): "Set the directories to scan in Settings" names the user's
+    // configuration, and sending someone there when the directories were
+    // fine and merely unreadable is the failure that issue is about.
+    if (partial) {
+      return (
+        <div className="rounded-md border border-[#30363d] px-4 py-12 text-center">
+          <p className="text-sm font-semibold text-[#e6edf3]">
+            No repositories could be read
+          </p>
+          <p className="mx-auto mt-2 max-w-md text-sm text-[#8b949e]">
+            The scan ran but could not read where it looked, so it cannot say
+            whether there are repositories there. The scanned directories may
+            well be correct.
+          </p>
+          <div className="mx-auto mt-4 max-w-lg text-left">
+            <PartialScanNotice
+              unreadable={unreadable}
+              consequence="nothing could be listed from them."
+            />
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="rounded-md border border-[#30363d] px-4 py-12 text-center">
         <p className="text-sm font-semibold text-[#e6edf3]">No repositories found</p>
@@ -1601,7 +1636,59 @@ export function WorktreesPage() {
       {orphanDialog}
       <div className="rounded-md border border-[#30363d]">
         <div className="border-b border-[#30363d] px-4 py-3">
+          {/* # The orphan verdict over an incomplete walk (#951)
+
+              `caches/mod.rs` exists because of exactly this shape, and it
+              takes the hardest line available: on a `truncated` walk it
+              downgrades `Orphaned` to `Unknown` (`:202-206`) and REFUSES
+              the deletion outright (`:495`, citing #747). The question
+              #951 asks is whether this page must do the same, and the
+              answer is NO -- for a reason specific to how the two
+              verdicts are reached, not because this one matters less.
+
+              A venv is called orphaned RESIDUALLY: "no live project in
+              the index hashes to it". That verdict is a claim about the
+              whole index, so an index that is too small turns a live
+              venv into a deletion candidate. The completeness of the
+              walk is load-bearing for correctness, and a short walk
+              produces FALSE POSITIVES -- which is why it must refuse.
+
+              An orphaned worktree is called orphaned POSITIVELY.
+              `orphan_gitdir` in `scan.rs` reads the worktree's own `.git`
+              file, takes the `gitdir:` path out of it, and checks that
+              path does not exist. Nothing about that consults the rest of
+              the walk. A directory the scan never reached cannot make a
+              worktree we DID read look orphaned, so a short walk here
+              produces no false positives at all -- only false NEGATIVES:
+              orphans we failed to find.
+
+              So the error has a known direction, and the honest response
+              to a one-directional error is to name the direction. The
+              count becomes "at least N", which is what the size total on
+              the all-repositories header already does for an unmeasured
+              worktree and for the same stated reason: a number that
+              silently counts unknowns as zero is a confident wrong
+              answer.
+
+              QUALIFIED rather than SUPPRESSED, and that is a deliberate
+              refusal of the tempting symmetry with `caches/mod.rs`.
+              Hiding the section on a partial scan would hide orphans that
+              are real, individually verified, and sitting on disk -- and
+              this page exists to reclaim exactly them. It would also be
+              the failure `ArtifactsPage:196-203` names: refusing what was
+              measured because something else was not.
+
+              And the DELETION is not gated, which is the sharpest part of
+              this decision. It is safe not because the walk is complete
+              but because it never depended on the walk: the removal path
+              re-derives the orphan verdict on the one path it is about,
+              and `Safety::Orphaned` is already un-removable through every
+              other gate. Gating it on `partial` would block a delete on
+              evidence that has no bearing on it -- a guard that looks
+              careful and is merely in the way, which is how a real guard
+              gets disabled later. */}
           <span className="text-sm font-semibold text-[#e6edf3]">
+            {partial ? "at least " : ""}
             {orphans.length} orphaned worktree{orphans.length === 1 ? "" : "s"}
             {/* The most important help in the app: this is the only
                 place it offers a delete having verified nothing. */}
@@ -1618,6 +1705,13 @@ export function WorktreesPage() {
             outright.
           </p>
         </div>
+        {/* Why the header says "at least". The rows below are each real;
+            what the shortfall costs is orphans that were never found, so
+            the paths go here rather than the count being hidden. */}
+        <PartialScanNotice
+          unreadable={unreadable}
+          consequence="there may be more orphans than the rows below."
+        />
         {orphans.map((wt) => (
           <Row
             key={wt.path}
@@ -1668,7 +1762,14 @@ export function WorktreesPage() {
     return (
       <div className="rounded-md border border-[#30363d]">
         <div className="flex items-baseline justify-between border-b border-[#30363d] px-4 py-3">
+          {/* "at least" on a partial scan (#951), for the same reason the
+              size total beside it already says it: both numbers were
+              silently low, and a total that counts what it could not read
+              as zero is a confident wrong answer. One "at least" covers
+              both halves of the phrase, because both are short together --
+              an unreadable repository takes its worktrees with it. */}
           <span className="text-sm font-semibold text-[#e6edf3]">
+            {partial ? "at least " : ""}
             {worktrees.length} worktree{worktrees.length === 1 ? "" : "s"} across{" "}
             {repos.length} repositor{repos.length === 1 ? "y" : "ies"}
           </span>
@@ -1680,6 +1781,10 @@ export function WorktreesPage() {
             {formatSize(totalBytes)}
           </span>
         </div>
+        <PartialScanNotice
+          unreadable={unreadable}
+          consequence="the counts and the total above are floors."
+        />
         {/* Sizes arrive one repository at a time, and this says how
             many are still outstanding.
             

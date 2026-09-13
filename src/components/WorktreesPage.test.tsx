@@ -9,6 +9,12 @@ const state = vi.hoisted(() => ({
   repos: undefined as WorktreeRepo[] | undefined,
   isLoading: false,
   isError: false,
+  /// What the walk could not read (#951). A FOURTH state beside loading,
+  /// failed and empty: the scan ran, came back, and read less than it
+  /// looked at -- so every count on the page is a floor rather than a
+  /// total. Defaults to empty, so tests that do not care keep the exact
+  /// counts they already assert.
+  unreadable: [] as string[],
   /// The scan's own `dataUpdatedAt`, epoch ms, which is the instant every
   /// ref age on the page is measured against (#788).
   ///
@@ -163,6 +169,7 @@ vi.mock("../api/hooks", () => ({
     error: "boom",
     refetch: vi.fn(),
     dataUpdatedAt: state.dataUpdatedAt,
+    unreadable: state.unreadable,
   }),
   // Mirrors the real hook (#830): verdicts stream in per worktree, so
   // `partial` is what the page renders from and the settled `data` wins
@@ -292,6 +299,11 @@ const wt = (over: Partial<Worktree>): Worktree => ({
   ...over,
 });
 
+/// One shortfall report entry, in the `<path>: <why>` shape the Rust side
+/// sends (#951). Synthetic per `CONTRIBUTING.md`: this repository is
+/// public and the real ones name a real machine.
+const UNREADABLE = "/code/broken: fatal: not a repository";
+
 const EMPTY = { "my-prs": {}, "to-review": {}, worktrees: {},
   branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, "system-health": {} } as const;
 
@@ -305,6 +317,9 @@ describe("WorktreesPage on a phone", () => {
       // Reset like every other field, so a test that pins the scan
       // instant cannot leak its clock into the next one (#788).
       dataUpdatedAt: 0,
+      // #951. A leaked shortfall turns every count on the page into "at
+      // least N" and puts a banner above the rows other tests assert on.
+      unreadable: [],
       classified: [wt({ safety: { kind: "safe" } })],
       classifying: false,
       // #830. Leaked either way these are confusing: a stale
@@ -453,6 +468,9 @@ describe("WorktreesPage", () => {
       // Reset like every other field, so a test that pins the scan
       // instant cannot leak its clock into the next one (#788).
       dataUpdatedAt: 0,
+      // #951. A leaked shortfall turns every count on the page into "at
+      // least N" and puts a banner above the rows other tests assert on.
+      unreadable: [],
       classified: undefined,
       classifying: false,
       // #830, and the same reasoning as `sizingFailed` below: a leaked
@@ -1738,6 +1756,85 @@ describe("WorktreesPage", () => {
       render(<WorktreesPage />);
       const btn = screen.getByRole("button", { name: /^delete…$/i }) as HTMLButtonElement;
       expect(btn.disabled).toBe(false);
+    });
+
+    /// #951: the orphan VERDICT over a walk that admits it is incomplete.
+    ///
+    /// The decision these three pin, argued at length in the component:
+    /// the count is QUALIFIED, the section is NOT suppressed, and the
+    /// delete is NOT gated.
+    ///
+    /// The split from `caches/mod.rs` -- which downgrades the verdict and
+    /// refuses the deletion on a `truncated` walk -- turns on how the
+    /// verdict is reached. A venv is orphaned RESIDUALLY ("nothing in the
+    /// index hashes to it"), so a short index invents false positives. An
+    /// orphaned worktree is orphaned POSITIVELY: `orphan_gitdir` reads
+    /// this worktree's own `.git` file and checks the repository it names
+    /// is gone, consulting nothing else. A short walk therefore cannot
+    /// invent one, only miss one -- so the error has a single direction
+    /// and the honest response is to name it.
+    describe("over a scan that could not read everything (#951)", () => {
+      /// The Orphaned SECTION, which is where the count and the verdict
+      /// live -- a repository page that happens to contain an orphan row
+      /// states no count at all. Same setup as the confirmation test
+      /// below, for the same reason.
+      const onTheOrphanSection = () => {
+        state.repos = [
+          { identity: null, name: "veil-coh", path: "/code/veil-coh", worktrees: [orphan()] },
+        ];
+        state.classified = undefined;
+        useFilters.setState({
+          filtersByView: { ...EMPTY, worktrees: { repo: ORPHAN_FILTER } },
+          view: "worktrees",
+        } as never);
+      };
+
+      it("says at least, rather than a confident count", () => {
+        onTheOrphanSection();
+        state.unreadable = [UNREADABLE];
+        render(<WorktreesPage />);
+        expect(screen.getByText(/at least 1 orphaned worktree/i)).toBeTruthy();
+      });
+
+      /// The rows stay. Suppressing the section would hide orphans that
+      /// are real, individually verified and sitting on disk -- and
+      /// reclaiming exactly those is why this page exists. It would also
+      /// be the failure `ArtifactsPage` names: refusing what WAS
+      /// measured because something else was not.
+      it("still lists the orphans it did find, with the reason it may be short", () => {
+        onTheOrphanSection();
+        state.unreadable = [UNREADABLE];
+        render(<WorktreesPage />);
+        // The orphan row is still drawn -- `getAllByText` because the
+        // path appears in the row and in its Delete affordance, and this
+        // test is about the row EXISTING rather than about how many times
+        // its path is written.
+        expect(screen.getAllByText(/veil-coh/).length).toBeGreaterThan(0);
+        expect(screen.getByText(UNREADABLE)).toBeTruthy();
+        expect(screen.getByText(/may be more orphans/i)).toBeTruthy();
+      });
+
+      /// And the delete stays offered. It is safe not because the walk
+      /// finished but because it never depended on the walk: the removal
+      /// path re-derives the verdict on the one path it is about. Gating
+      /// it on the shortfall would block an action on evidence with no
+      /// bearing on it, which is how a real guard gets disabled later.
+      it("does not gate the deletion on the shortfall", () => {
+        onTheOrphanSection();
+        state.unreadable = [UNREADABLE];
+        render(<WorktreesPage />);
+        const btn = screen.getByRole("button", { name: /^delete…$/i }) as HTMLButtonElement;
+        expect(btn.disabled).toBe(false);
+      });
+
+      /// An exact count when the walk finished, or the qualifier is
+      /// permanent furniture and stops carrying information.
+      it("gives an exact count when the scan read everything", () => {
+        onTheOrphanSection();
+        render(<WorktreesPage />);
+        expect(screen.getByText(/1 orphaned worktree/i)).toBeTruthy();
+        expect(screen.queryByText(/at least/i)).toBeNull();
+      });
     });
 
     /// #845: the row must ASK, not delete.

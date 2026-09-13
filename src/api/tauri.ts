@@ -53,7 +53,7 @@ import type {
   StatsReviewers,
   StatsTree,
   Worktree,
-  WorktreeRepo,
+  WorktreeScan,
 } from "../types/pr";
 
 export interface AuthState {
@@ -346,10 +346,18 @@ export const statsReviewers = (
   logins: string[],
 ) => call<StatsReviewers>("stats_reviewers", { scopeKind, scopeValue, days, logins });
 
-/// Repos and their worktrees, WITHOUT safety classification.
+/// Repos and their worktrees, WITHOUT safety classification, and what the
+/// walk could not read.
 ///
 /// ~800ms for 37 repos and 295 worktrees; safe to block a view on.
-export const listWorktrees = () => call<WorktreeRepo[]>("list_worktrees");
+///
+/// A `WorktreeScan` rather than a bare `WorktreeRepo[]` since #951: a
+/// repository whose worktree listing failed was dropped from the payload
+/// entirely, so the page read it as "not a repository". The shortfall
+/// rides in the SAME payload rather than in a second command, because a
+/// second command would mean a second full walk -- which `useWorktrees`'
+/// own comment and #846's `retry: false` reasoning both forbid.
+export const listWorktrees = () => call<WorktreeScan>("list_worktrees");
 
 /// Classify one repo's worktrees. Per repo, and STREAMING: each verdict
 /// is also emitted on `worktree-safety` as it is reached.
