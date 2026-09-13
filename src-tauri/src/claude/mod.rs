@@ -19,7 +19,15 @@
 //! particular are read-only by design -- they are Claude Code's data and the
 //! files `claude --resume` depends on.
 
+//! [`overview`] (#921) is the aggregate layer for the overview page. It
+//! counts over the rows [`store`] holds and derives no liveness of its
+//! own -- #917's `liveness` module owns that, and two answers to one
+//! question disagree the first time either changes. [`live`] is the seam
+//! between them until #917 lands, and its own comment says so.
+
 pub mod install;
+pub mod live;
+pub mod overview;
 pub mod store;
 pub mod transcript;
 

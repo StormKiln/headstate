@@ -11,6 +11,7 @@ import boardRs from "../../src-tauri/src/github/stats/board.rs?raw";
 import companionRs from "../../src-mobile/src/companion.rs?raw";
 import eventsRs from "../../src-tauri/src/remote/events.rs?raw";
 import { ACTIVE_SECS } from "@/components/ArtifactsPage";
+import { ACTIVITY_DAYS } from "@/components/ClaudeOverviewPage";
 import { TOP_N } from "@/components/stats/Leaderboard";
 import { ABSOLUTE_GAP_MS } from "./health";
 import { CANCELLED } from "./cancelled";
@@ -221,6 +222,35 @@ describe("the leaderboard cut", () => {
 describe("the biometric cancel marker", () => {
   it("is the exact string the companion rejects with", () => {
     expect(CANCELLED).toBe(rustStrConst(companionRs, "CANCELLED", "src-mobile/src/companion.rs"));
+  });
+});
+
+/// 6. The Claude Code activity window: 30 days, in the Rust bucketing and
+/// in the sentence the chart prints under itself (#921).
+///
+/// Exactly the `TOP_N` shape one case up, and it fails the same way if
+/// left unasserted: Rust's `fill_window` is what actually cuts the window,
+/// and `ACTIVITY_DAYS` in `ClaudeOverviewPage` is only the number the
+/// SUBTITLE quotes. `ClaudeOverviewPage.test.tsx` uses its constant
+/// symbolically -- `data-points` against `String(ACTIVITY_DAYS)` -- which
+/// is self-consistent at any value, so setting the TS copy to 14 passes
+/// the whole suite while the page renders "the last 14 days" over 30 bars.
+///
+/// A mislabelled time axis is the specific misinformation a chart is worst
+/// at: the reader has no way to count the columns against the claim, and
+/// `SessionsChart`'s own test asserts the label states the INTENDED window
+/// rather than the array it received, precisely so this drift is visible
+/// as a mismatch rather than papered over.
+describe("the Claude Code activity window", () => {
+  it("is the same number of days the Rust side buckets", async () => {
+    const overviewRs = (await import("../../src-tauri/src/claude/overview.rs?raw")).default;
+    const rustDays = rustConst(overviewRs, "ACTIVITY_DAYS", "claude/overview.rs");
+    expect(ACTIVITY_DAYS).toBe(rustDays);
+    // The literal as well as the agreement, so a coordinated change to
+    // both sides still has to be deliberate. 30 is measured: the corpus
+    // spans 41 days with any activity, of which the last 30 hold 1,375 of
+    // 1,461 sessions.
+    expect(ACTIVITY_DAYS).toBe(30);
   });
 });
 
