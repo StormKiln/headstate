@@ -1,4 +1,5 @@
 use super::model::{Lock, Repo, Safety, Upstream, Worktree};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Command;
 
@@ -1891,18 +1892,97 @@ pub(super) fn default_branch(repo: &Path) -> String {
     }
 }
 
-/// Repos and their worktrees, WITHOUT classifying safety.
+/// What a walk of the scan roots found, INCLUDING what it could not read.
+///
+/// `Vec<Repo>` alone made "we could not read it" structurally
+/// unrepresentable, and the walk had three places it fell open into
+/// silence (#951):
+///
+/// - a directory whose `.git` DIRECTORY proved it a repository, but whose
+///   `git worktree list` then failed -- git missing from a GUI-launched
+///   app's PATH, a permission wall, a corrupt `.git`, an index lock, a
+///   `safe.directory` refusal on a repo owned by another uid. The repo
+///   was dropped entirely, so it read as "not a repository".
+/// - an unreadable scan ROOT, which yielded zero repositories and the
+///   empty-list copy then blamed the user's settings.
+/// - `is_dir()` on a path we cannot stat, which collapses a permission
+///   error into `false` -- the exact fail-open `claude/overview.rs`
+///   rejects: *"`exists()` collapses every error into `false`."*
+///
+/// This is `claude::transcript::Scan`'s shape, for its stated reason: a
+/// caller that gets a short list must be able to tell "you have nothing
+/// there" from "we could not read it", because those two have opposite
+/// remedies and the first is alarming if it is false.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RepoScan {
+    pub repos: Vec<Repo>,
+    /// Paths the walk could not read, each with WHY.
+    ///
+    /// A message, not a count and not a boolean, for the reason
+    /// `transcript.rs` gives: each entry hides an unknown number of
+    /// repositories, and "git refused: not a git repository" and
+    /// "permission denied" send the user to different places. The path
+    /// comes first so the string is greppable and sortable.
+    #[serde(default)]
+    pub unreadable: Vec<String>,
+}
+
+impl RepoScan {
+    /// Whether anything at all could not be read.
+    ///
+    /// The UI's cue for "this list may be incomplete", and the gate on
+    /// the orphan verdict. DELIBERATELY not a reason to discard the
+    /// repositories that WERE read: a partial answer labelled partial
+    /// beats both a silent truncation and an error page, which is the
+    /// trade `ArtifactsPage` states.
+    pub fn is_partial(&self) -> bool {
+        !self.unreadable.is_empty()
+    }
+}
+
+/// Repos and their worktrees, WITHOUT classifying safety, reporting what
+/// could not be read.
 ///
 /// Fast: one `git worktree list` per repo. Classification is four git
 /// calls per worktree, which across 295 worktrees takes ~15s -- far too
 /// long to block a view on. The UI lists first and classifies after.
+///
+/// The reporting stays free: every entry in `unreadable` comes from a
+/// syscall or a `git` call the walk ALREADY made and already had to
+/// branch on. Nothing here stats a path twice and nothing here does
+/// safety work, so the fast path is still the fast path.
+pub fn scan_dirs_fast_reporting(dirs: &[String]) -> RepoScan {
+    scan_reporting(dirs, false)
+}
+
+/// Repos and their worktrees, WITHOUT classifying safety.
+///
+/// A thin wrapper over [`scan_dirs_fast_reporting`] keeping the bare
+/// `Vec<Repo>` shape, so the ~30 existing call sites that only care about
+/// what WAS found stayed unchanged across #951.
+///
+/// `#[cfg(test)]` like [`scan_dirs`] beside it, because after #951 both
+/// production callers take the reporting form: discarding the shortfall
+/// is a choice a test can make freely and a command cannot make
+/// invisibly. A new production caller that needs this shape should spell
+/// `.repos` at its own call site and say why the report is not wanted.
+#[cfg(test)]
 pub fn scan_dirs_fast(dirs: &[String]) -> Vec<Repo> {
-    let mut repos = Vec::new();
+    scan_dirs_fast_reporting(dirs).repos
+}
+
+fn scan_reporting(dirs: &[String], with_safety: bool) -> RepoScan {
+    let mut scan = RepoScan::default();
     for base in dirs {
-        collect_inner(Path::new(base), 0, &mut repos, false);
+        collect_inner(Path::new(base), 0, &mut scan, with_safety);
     }
-    sort_for_sidebar(&mut repos);
-    repos
+    sort_for_sidebar(&mut scan.repos);
+    // Sorted so the report reads the same way twice, whatever order the
+    // directory scan returned entries in. `sort_for_sidebar` already
+    // does this for the repos, and a report that shuffled between runs
+    // would make a diff of two scans unreadable.
+    scan.unreadable.sort();
+    scan
 }
 
 /// How many threads share the walk of ONE directory tree.
@@ -2506,17 +2586,43 @@ pub fn classify_repo_streaming(
 /// `~/code/acme`. Walking arbitrarily deep would descend into the
 /// worktrees themselves and into `node_modules`.
 pub fn scan_dirs(dirs: &[String]) -> Vec<Repo> {
-    let mut repos = Vec::new();
-    for base in dirs {
-        collect_inner(Path::new(base), 0, &mut repos, true);
-    }
-    sort_for_sidebar(&mut repos);
-    repos
+    scan_dirs_reporting(dirs).repos
 }
 
-fn collect_inner(dir: &Path, depth: usize, out: &mut Vec<Repo>, with_safety: bool) {
-    if depth > 2 || !dir.is_dir() {
+/// [`scan_dirs`] with the shortfall report. See [`RepoScan`].
+#[cfg(test)]
+pub fn scan_dirs_reporting(dirs: &[String]) -> RepoScan {
+    scan_reporting(dirs, true)
+}
+
+fn collect_inner(dir: &Path, depth: usize, out: &mut RepoScan, with_safety: bool) {
+    if depth > 2 {
         return;
+    }
+    // `symlink_metadata` rather than `is_dir()`, for the reason
+    // `claude/overview.rs` states about `exists()`: `is_dir()` returns a
+    // plain `false` for a path it could not STAT, so a directory behind a
+    // permission wall was indistinguishable from one that is not a
+    // directory at all -- and the walk simply stopped, reporting nothing
+    // (#951).
+    //
+    // `symlink_metadata` rather than `metadata` for the same reason
+    // `overview.rs` chose it: it does not follow a link, so a symlink
+    // into an unreadable tree is judged as the link it is rather than as
+    // whatever it points at. A symlinked directory is deliberately NOT
+    // descended into here -- the tree it points at is reachable by its
+    // real path, and following it would double-count -- so it is not
+    // unreadable either, just not a directory for our purposes.
+    match std::fs::symlink_metadata(dir) {
+        Ok(md) if md.is_dir() => {}
+        // Really not a directory: a file, or a symlink. Nothing to walk
+        // and nothing was hidden, so there is nothing to report.
+        Ok(_) => return,
+        Err(e) => {
+            out.unreadable
+                .push(format!("{}: {e}", dir.to_string_lossy()));
+            return;
+        }
     }
     // A `.git` DIRECTORY is a real checkout; a `.git` FILE is a worktree
     // pointing back at one. That distinction is load-bearing: worktrees
@@ -2532,7 +2638,7 @@ fn collect_inner(dir: &Path, depth: usize, out: &mut Vec<Repo>, with_safety: boo
         // across three orphans whose parent repos were deleted weeks
         // earlier.
         if orphan_gitdir(dir).is_some() {
-            out.push(Repo {
+            out.repos.push(Repo {
                 name: dir
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
@@ -2572,41 +2678,101 @@ fn collect_inner(dir: &Path, depth: usize, out: &mut Vec<Repo>, with_safety: boo
         return;
     }
     if dir.join(".git").is_dir() {
-        if let Ok(list) = git(dir, &["worktree", "list", "--porcelain"]) {
-            let branch = default_branch(dir);
-            let worktrees = parse_porcelain(&list)
-                .into_iter()
-                .map(|mut w| {
-                    if with_safety {
-                        classify(&mut w, dir, &branch);
-                    }
-                    w
-                })
-                .collect();
-            out.push(Repo {
-                identity: repo_identity(&dir.to_string_lossy()),
-                fetched_at: fetched_at(dir),
-                name: dir
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-                path: dir.to_string_lossy().into_owned(),
-                worktrees,
-            });
+        // The PRIMARY hole of #951, and the reason this function had to
+        // gain a report at all.
+        //
+        // The `.git` directory has already PROVED this is a repository.
+        // If git then cannot answer, that is not "no repository here" --
+        // it is a repository we could not read, and the two must not
+        // render the same. This branch used to be `if let Ok(list)` with
+        // a bare `return` and no `else`, so every one of git's real
+        // failure modes -- git absent from a GUI-launched app's PATH (the
+        // trap `docker/cli.rs` documents for `gh`), a permission wall, a
+        // corrupt `.git`, an index lock, a `safe.directory` refusal on a
+        // repo owned by another uid -- dropped the repository silently.
+        //
+        // No `Repo` is pushed, because there is nothing honest to put in
+        // one: the worktree list is exactly what failed, and a repo row
+        // with an empty `worktrees` would claim "this repository has no
+        // worktrees", which is a confident wrong answer of the same kind.
+        // The path and git's own message go in the report instead.
+        match git(dir, &["worktree", "list", "--porcelain"]) {
+            Ok(list) => {
+                let branch = default_branch(dir);
+                let worktrees = parse_porcelain(&list)
+                    .into_iter()
+                    .map(|mut w| {
+                        if with_safety {
+                            classify(&mut w, dir, &branch);
+                        }
+                        w
+                    })
+                    .collect();
+                out.repos.push(Repo {
+                    identity: repo_identity(&dir.to_string_lossy()),
+                    fetched_at: fetched_at(dir),
+                    name: dir
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    path: dir.to_string_lossy().into_owned(),
+                    worktrees,
+                });
+            }
+            Err(e) => out
+                .unreadable
+                .push(format!("{}: {e}", dir.to_string_lossy())),
         }
         return;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+    // An unreadable scan ROOT used to yield zero repositories, and the
+    // empty-list copy then blamed the user's settings (#951). Reported,
+    // never silently treated as empty: it may hold any number of
+    // repositories.
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            out.unreadable
+                .push(format!("{}: {e}", dir.to_string_lossy()));
+            return;
+        }
     };
-    for e in entries.flatten() {
+    for e in entries {
+        // A single unreadable ENTRY does not abort the listing of its
+        // siblings -- the repositories that did read are real and worth
+        // showing -- but it is no longer dropped on the floor either. It
+        // hides a subtree of unknown size, which is the whole finding.
+        let e = match e {
+            Ok(e) => e,
+            Err(err) => {
+                out.unreadable
+                    .push(format!("{}: {err}", dir.to_string_lossy()));
+                continue;
+            }
+        };
         let p = e.path();
-        if p.is_dir()
-            && !p
-                .file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+        if p.file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with('.'))
         {
-            collect_inner(&p, depth + 1, out, with_safety);
+            continue;
+        }
+        // `file_type()` rather than `p.is_dir()`, for `caches/mod.rs`'
+        // measured reason -- it reads what the directory scan already
+        // returned instead of costing a stat per entry -- and because
+        // `is_dir()` is the same fail-open closed at the top of this
+        // function. `file_type()` can still fail on the platforms that do
+        // not carry the type in the scan, and that failure hides a
+        // possible subtree, so it is reported rather than skipped.
+        //
+        // `is_dir()` here does NOT follow symlinks (unlike `Path::is_dir`),
+        // which keeps the existing behaviour of not descending into a
+        // linked tree: it is reachable by its real path.
+        match e.file_type() {
+            Ok(ft) if ft.is_dir() => collect_inner(&p, depth + 1, out, with_safety),
+            Ok(_) => {}
+            Err(err) => out
+                .unreadable
+                .push(format!("{}: {err}", p.to_string_lossy())),
         }
     }
 }
@@ -2912,6 +3078,233 @@ prunable gitdir file points to non-existent location
         assert!(
             !names.contains(&"proj-feature"),
             "a worktree must not be listed as its own repository: {names:?}"
+        );
+    }
+
+    /// A directory holding a `.git` DIRECTORY that is not a repository.
+    ///
+    /// This is the platform-neutral way to make `git worktree list`
+    /// fail on a path the walk has already accepted as a repository:
+    /// `.git/` exists, so the `is_dir()` branch is taken, and git then
+    /// exits non-zero because the directory has no object database, no
+    /// HEAD, and no config. Nothing here depends on file permissions,
+    /// on uid ownership, or on a `safe.directory` refusal -- the three
+    /// things that behave differently on Windows and would have made a
+    /// fifth Windows-only failure in this repository.
+    ///
+    /// It stands in for the REAL failure modes (git absent from a
+    /// GUI-launched app's PATH, a permission wall, an index lock, a
+    /// `safe.directory` refusal). Those all reach the same branch: a
+    /// non-`Ok` return from `git`, which is the only thing the fix
+    /// keys on.
+    fn a_git_dir_that_is_not_a_repo(base: &Path, name: &str) -> std::path::PathBuf {
+        let dir = base.join(name);
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        assert!(
+            dir.join(".git").is_dir(),
+            "the fixture's .git must be a DIRECTORY, or the scan takes the worktree branch"
+        );
+        assert!(
+            git(&dir, &["worktree", "list", "--porcelain"]).is_err(),
+            "the fixture must make git FAIL, or this test proves nothing"
+        );
+        dir
+    }
+
+    /// #951, the primary hole: the `.git` directory has already PROVED
+    /// this is a repository, so a failed `git worktree list` means "we
+    /// could not read a repository", never "there is no repository
+    /// here". Before the fix it fell through a bare `return` and the
+    /// path vanished from the scan entirely.
+    #[test]
+    fn a_repo_whose_git_call_fails_is_reported_not_dropped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path().join("code");
+        std::fs::create_dir_all(&base).unwrap();
+        let broken = a_git_dir_that_is_not_a_repo(&base, "brokenrepo");
+
+        let scan = scan_dirs_fast_reporting(&[base.to_string_lossy().into_owned()]);
+
+        // Not silently dropped: SOMETHING must say the path exists and
+        // could not be read.
+        assert!(
+            scan.is_partial(),
+            "a repo whose git call failed must make the scan partial: {scan:?}"
+        );
+        let path = broken.to_string_lossy().into_owned();
+        assert!(
+            scan.unreadable.iter().any(|u| u.starts_with(&path)),
+            "the unreadable path must be named: {:?}",
+            scan.unreadable
+        );
+        // And it carries WHY, not just THAT -- the reason
+        // `transcript.rs` gives for a message over a boolean.
+        assert!(
+            scan.unreadable.iter().any(|u| u.len() > path.len() + 2),
+            "the report must carry git's reason, not only the path: {:?}",
+            scan.unreadable
+        );
+        // No half-built `Repo`: a row claiming this repository has zero
+        // worktrees would be the same confident wrong answer in a new
+        // place, because the worktree list is exactly what failed.
+        assert!(
+            !scan.repos.iter().any(|r| r.path == path),
+            "a repo we could not read must not be listed as one with no worktrees"
+        );
+    }
+
+    /// The repositories that DID read are real and worth showing. A fix
+    /// that reported the shortfall by blanking the list would trade one
+    /// silent failure for a louder one -- the trade `ArtifactsPage`
+    /// states and refuses.
+    #[test]
+    fn one_unreadable_repo_does_not_abort_the_scan() {
+        let (_t, repo, _wt) = merged_worktree_fixture();
+        let base = repo.parent().unwrap();
+        a_git_dir_that_is_not_a_repo(base, "brokenrepo");
+
+        let scan = scan_dirs_fast_reporting(&[base.to_string_lossy().into_owned()]);
+
+        let names: Vec<&str> = scan.repos.iter().map(|r| r.name.as_str()).collect();
+        assert!(
+            names.contains(&"proj"),
+            "the readable repo must still be listed: {names:?}"
+        );
+        assert!(
+            scan.is_partial(),
+            "and the shortfall must still be reported"
+        );
+    }
+
+    /// #951, hole three: a scan root we cannot even STAT.
+    ///
+    /// `is_dir()` collapsed the error into `false` and the walk returned
+    /// having reported nothing -- the exact fail-open
+    /// `claude/overview.rs` rejects: *"`exists()` collapses every error
+    /// into `false`."* A misconfigured or unmounted root is the ordinary
+    /// way to reach this, and it must not read as "you have no
+    /// repositories".
+    ///
+    /// Portable: a path that does not exist errors from
+    /// `symlink_metadata` on every platform.
+    #[test]
+    fn a_scan_root_that_cannot_be_stated_is_reported() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("no-such-root");
+        let root = missing.to_string_lossy().into_owned();
+
+        let scan = scan_dirs_fast_reporting(std::slice::from_ref(&root));
+
+        assert!(scan.repos.is_empty());
+        assert!(
+            scan.is_partial(),
+            "an unstatable root must not read as 'you have no repositories'"
+        );
+        assert!(
+            scan.unreadable.iter().any(|u| u.starts_with(&root)),
+            "the root must be named: {:?}",
+            scan.unreadable
+        );
+    }
+
+    /// #951, hole two: a scan root that stats fine as a directory but
+    /// cannot be LISTED. `read_dir` failed into a bare `return`, so the
+    /// scan yielded zero repositories and `RepoPickerSidebar` rendered
+    /// "No repositories found in the scanned folders" -- a diagnosis
+    /// sending the user to fix settings that were fine.
+    ///
+    /// `#[cfg(unix)]` and DELIBERATELY so. This is the one case that
+    /// needs a directory which succeeds at `symlink_metadata` and fails
+    /// at `read_dir`, and the only portable way to build one is to
+    /// remove the read bit -- which is a Unix mode bit. On Windows
+    /// directory access is an ACL, `set_permissions` there only toggles
+    /// the read-ONLY flag (which does not block enumeration), and a
+    /// process running as Administrator bypasses a DACL anyway. This
+    /// repository has had four Windows-only test failures from tests
+    /// encoding one platform's behaviour as universal; gating is the
+    /// alternative to being the fifth.
+    ///
+    /// What is NOT gated is the fix: `read_dir` returns `Err` on Windows
+    /// too (a vanished directory, a network share that dropped, a
+    /// sharing violation), and the guard this test pins has no
+    /// platform-specific code in it. Only the way of PROVOKING it is
+    /// Unix-only.
+    ///
+    /// Skipped when running as root, which ignores mode bits entirely
+    /// and would make the assertions fail for a reason that is not the
+    /// code's fault.
+    #[cfg(unix)]
+    #[test]
+    fn a_scan_root_that_cannot_be_listed_is_reported() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path().join("code");
+        std::fs::create_dir_all(base.join("someproj")).unwrap();
+        // Execute but not read: statable as a directory, not listable.
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o111)).unwrap();
+
+        let listable = std::fs::read_dir(&base).is_err();
+        let scan = scan_dirs_fast_reporting(&[base.to_string_lossy().into_owned()]);
+        // Restored before any assertion, so a failure cannot leave the
+        // TempDir undeletable and turn one red test into a leaked
+        // directory on the machine that ran it.
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        if !listable {
+            // Running as root, or a filesystem that ignores mode bits.
+            // Asserting here would test the environment, not the code.
+            eprintln!("skipped: this user can list a 0o111 directory");
+            return;
+        }
+        let root = base.to_string_lossy().into_owned();
+        assert!(scan.repos.is_empty());
+        assert!(
+            scan.is_partial(),
+            "an unlistable root must not read as 'you have no repositories': {scan:?}"
+        );
+        assert!(
+            scan.unreadable.iter().any(|u| u.starts_with(&root)),
+            "the root must be named: {:?}",
+            scan.unreadable
+        );
+    }
+
+    /// The same root, present and readable and genuinely empty, must NOT
+    /// be reported -- or `is_partial()` would be true always and the
+    /// frontend banner would never go away, which is the way a warning
+    /// stops being read.
+    #[test]
+    fn an_empty_readable_root_is_not_partial() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path().join("code");
+        std::fs::create_dir_all(&base).unwrap();
+
+        let scan = scan_dirs_fast_reporting(&[base.to_string_lossy().into_owned()]);
+
+        assert!(scan.repos.is_empty());
+        assert!(
+            !scan.is_partial(),
+            "a readable, empty root is an ANSWER: {scan:?}"
+        );
+    }
+
+    /// A plain FILE among the scan roots' children is not unreadable --
+    /// it is read, and it is not a directory. Reporting it would fill the
+    /// banner with noise from every `README.md` in `~/code` and drown the
+    /// entries that matter.
+    #[test]
+    fn a_plain_file_is_not_reported_as_unreadable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path().join("code");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("notes.txt"), "hello").unwrap();
+
+        let scan = scan_dirs_fast_reporting(&[base.to_string_lossy().into_owned()]);
+
+        assert!(
+            !scan.is_partial(),
+            "a file is not an unreadable directory: {scan:?}"
         );
     }
 

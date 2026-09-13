@@ -23,7 +23,7 @@ import type {
   PullRequest,
   Venv,
   Worktree,
-  WorktreeRepo,
+  WorktreeScan,
 } from "../types/pr";
 import type { PrActionName } from "./tauri";
 import {
@@ -1496,14 +1496,50 @@ export function usePrDetail(repo: string | undefined, number: number | undefined
 /// discovery is part of what that gate has to cover. `list_worktrees`
 /// is not free, and a scan that runs on view open is the beginning of
 /// the #661 shape even when the sizing behind it is deferred.
+///
+/// # `data` is still the repository list (#951)
+///
+/// The command now returns a `WorktreeScan` -- the repositories AND the
+/// paths the walk could not read -- but this hook keeps `data` as
+/// `WorktreeRepo[]` and hands the shortfall back beside it as
+/// `unreadable`. That is deliberate, and it is the frontend half of the
+/// wrapper design on the Rust side: four components read `data` and every
+/// one of them wants the repositories, so folding the scan object into
+/// `data` would have churned all four plus their fixtures for no gain and
+/// obscured the actual fix.
+///
+/// ONE query, spread and re-shaped -- not two `useQuery` calls on the same
+/// key and not a second command. There is only one scan, and asking twice
+/// would mean walking `~/code` twice, which is what this hook's own note
+/// above and #846's `retry: false` reasoning both forbid.
+///
+/// `data` is left `undefined` while the query is pending and on a
+/// rejection, exactly as before, because three of the four consumers
+/// distinguish those from an empty list and `WorktreeSidebar`'s comment
+/// says why.
 export function useWorktrees(enabled = true) {
-  return useQuery({
+  const q = useQuery({
     queryKey: ["worktrees"],
     queryFn: listWorktrees,
     enabled,
     staleTime: 30_000,
   });
+  return {
+    ...q,
+    data: q.data?.repos,
+    /// What the walk could not read. `[]` rather than `undefined` when
+    /// there is nothing to report AND while the scan is still pending: a
+    /// scan that has not answered has not reported a shortfall either,
+    /// and the difference between "not yet" and "nothing" is already
+    /// carried by `isLoading`.
+    unreadable: q.data?.unreadable ?? EMPTY_UNREADABLE,
+  };
 }
+
+/// One frozen empty array, so `unreadable` keeps a stable identity when
+/// there is nothing to report. A fresh `[]` per render would make every
+/// `useMemo` keyed on it recompute forever.
+const EMPTY_UNREADABLE: readonly string[] = Object.freeze<string[]>([]);
 
 /// Verdicts streaming in from the Rust side, one worktree at a time.
 ///
@@ -1996,11 +2032,20 @@ export function useRemoveWorktrees() {
       // screen until the refetch lands, which is what "the same 3
       // worktrees are still listed" was: they really were removed, and
       // the fallback was still serving them.
-      qc.setQueryData<WorktreeRepo[]>(["worktrees"], (old) =>
-        old?.map((r) => ({
-          ...r,
-          worktrees: r.worktrees.filter((w) => !removed.has(w.path)),
-        })),
+      //
+      // `unreadable` is carried through UNCHANGED (#951). Removing a
+      // worktree says nothing about a path the scan could not read, so
+      // dropping the report here would clear the partial-scan banner on
+      // an unrelated action -- and the next refetch would bring it back,
+      // which is how a warning becomes noise nobody trusts.
+      qc.setQueryData<WorktreeScan>(["worktrees"], (old) =>
+        old && {
+          ...old,
+          repos: old.repos.map((r) => ({
+            ...r,
+            worktrees: r.worktrees.filter((w) => !removed.has(w.path)),
+          })),
+        },
       );
       void qc.invalidateQueries({ queryKey: ["worktrees"] });
       return outcomes;
