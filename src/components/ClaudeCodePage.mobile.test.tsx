@@ -1,6 +1,8 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClaudeSession, ClaudeSessionList } from "@/types/pr";
+import { useFilters } from "@/store/filters";
+import { stubViewport } from "@/test-utils";
 
 /// The companion OFFERS this view and hides only what cannot work (#922).
 ///
@@ -20,6 +22,17 @@ import type { ClaudeSession, ClaudeSessionList } from "@/types/pr";
 /// Run under the mobile build by mocking `@/lib/target`. `IS_MOBILE_BUILD`
 /// is a Vite `define` that folds to a literal, so there is no environment
 /// variable to set at test time -- see `lib/target.ts`.
+///
+/// And at a PHONE VIEWPORT, as of #939, which is a second thing and now a
+/// necessary one. `IS_MOBILE_BUILD` says which build this is;
+/// `useIsMobile()` says whether the narrow LAYOUT is on, and jsdom has no
+/// `matchMedia`, so every test in this file previously read as desktop
+/// width while claiming to be the phone. That was harmless while both
+/// widths drew the same single component. It is not harmless now: #939
+/// moved the session list into `ClaudeCodeSidebar` on the desktop and left
+/// `ClaudeCodePage` mounting it itself on the phone, so the two widths
+/// render different trees and only the narrow one is this file's subject.
+/// `stubViewport` below is what makes these assertions about the phone.
 vi.mock("@/lib/target", () => ({ IS_MOBILE_BUILD: true, IS_DESKTOP_BUILD: false }));
 
 const copyFn = vi.hoisted(() => vi.fn(() => Promise.resolve(null as string | null)));
@@ -82,8 +95,19 @@ const listOf = (sessions: ClaudeSession[]): ClaudeSessionList => ({
 
 beforeEach(() => {
   state.list = listOf([session()]);
+  // 390px: an iPhone 15's CSS width, comfortably under `MOBILE_BREAKPOINT`.
+  stubViewport(390);
+  // The search text and the selection live in the store since #939, and it
+  // is a module singleton -- so a selection made by one test would open a
+  // detail screen in the next one before it clicked anything, which on the
+  // phone means the LIST is the thing that is hidden.
+  useFilters.setState({ claudeQuery: "", claudeSelected: undefined });
   copyFn.mockClear();
   revealFn.mockClear();
+});
+
+afterEach(() => {
+  stubViewport(null);
 });
 
 function open(name: string) {
@@ -130,6 +154,47 @@ describe("the companion offers the view and hides only the Local actions", () =>
   it("says the sessions belong to the paired desktop", () => {
     render(<ClaudeCodePage />);
     expect(screen.getByText(/paired desktop's Claude Code sessions/i)).toBeTruthy();
+  });
+
+  /// **The #939 mobile guard.** The search box is REACHABLE on the phone,
+  /// in the main panel, without opening the navigation sheet.
+  ///
+  /// This is the objection `ClaudeCodeSidebar`'s doc comment used to raise
+  /// against putting the box in that column at all -- "on a phone this
+  /// column is a sheet that closes on navigation, which would take the
+  /// search with it" -- and it is answered by the list having a second
+  /// mount point here rather than by the objection being deleted. Move the
+  /// `isMobile` mount in `ClaudeCodePage` behind `!isMobile`, or drop it,
+  /// and this fails: the phone would be left with a search box only
+  /// reachable from behind a hamburger that closes when you tap a result.
+  ///
+  /// `ClaudeCodePage` alone, with no sidebar rendered, which is the point:
+  /// on the phone the sidebar is inside a closed `Sheet` and contributes
+  /// nothing to the screen.
+  it("puts the search box in the main panel, not behind the navigation sheet", () => {
+    render(<ClaudeCodePage />);
+    expect(screen.getByLabelText(/search claude code sessions/i)).toBeTruthy();
+  });
+
+  /// And searching from there narrows the rows. Reaching the box is not the
+  /// same claim as the box working at this width.
+  it("filters the phone's rows from that search box", () => {
+    state.list = listOf([
+      session(),
+      session({
+        session_id: "aaaaaaaa-0000-0000-0000-000000000000",
+        name: "Notarization plumbing",
+      }),
+    ]);
+    render(<ClaudeCodePage />);
+    expect(screen.getByRole("button", { name: /notarization plumbing/i })).toBeTruthy();
+
+    fireEvent.change(screen.getByLabelText(/search claude code sessions/i), {
+      target: { value: "notarization" },
+    });
+
+    expect(screen.getByRole("button", { name: /notarization plumbing/i })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /HeadState GitHub issues filing/i })).toBeNull();
   });
 
   /// The resume command STAYS, and the issue asked for this to be decided

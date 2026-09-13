@@ -737,13 +737,15 @@ export default function App() {
           // They are wrapped differently ON PURPOSE, which is why this is
           // not one shared wrapper with a swapped child:
           //
-          // Sessions owns its own padding -- its search box sits flush
-          // with the list beneath it -- and is NOT lazy. #838's boundary
-          // is for the views that pull in a charting library; this one
-          // imports nothing heavier than `lucide-react` icons the launch
-          // chunk already has, and it is the page a user opens to get
-          // work back after a crash, which is the worst moment to wait on
-          // a chunk fetch.
+          // Sessions owns its own padding -- its banners sit flush with
+          // the pane beneath them, and on the phone it mounts the session
+          // list itself (#939), which sits flush with its own search box.
+          // It is also NOT lazy. #838's boundary is for the views that
+          // pull in a charting library; this one imports nothing heavier
+          // than `lucide-react` icons the launch chunk already has, and
+          // `ClaudeCodeSidebar` imports `ClaudeSessionColumn` from it on
+          // every Claude Code render anyway, so a lazy boundary here would
+          // split a chunk the sidebar has already fetched.
           claudePage === "sessions" ? (
             <ClaudeCodePage />
           ) : (
