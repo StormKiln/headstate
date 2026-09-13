@@ -16,7 +16,30 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2.11", features = ["tray-icon", "image-png"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order` is load-bearing for `claude/install.rs`, which edits a
+# file Headstate does not own: `~/.claude/settings.json`.
+#
+# Without it a `serde_json::Value` object is a `BTreeMap`, so every write
+# SORTS the document's keys. The installer appends two hook matchers and must
+# leave the rest of the file alone -- and a sorted rewrite is not leaving it
+# alone. Someone who hand-ordered their settings, or who keeps them in git,
+# would get one line changed by us and the whole file reordered by the
+# serialiser.
+#
+# It also decides our own matcher's shape: `hooks` then `_headstate`, and
+# `type` then `command`, are insertion order; sorting reverses both.
+#
+# Found by SABOTAGE rather than foresight, and the reason it was nearly
+# missed is worth recording: Claude Code writes that file with its keys
+# already sorted -- measured, twelve top-level keys and ten hook events, both
+# exactly alphabetical -- so every round-trip test built from the real file's
+# shape passed either way. `install::tests::a_hand_ordered_document_keeps_its_key_order`
+# is the guard, and it uses a deliberately non-alphabetical document.
+#
+# Adds no new code to the supply chain: it pulls `indexmap`, which is already
+# compiled into this tree at 2.14.0. Enabling it added exactly one line to
+# `Cargo.lock`.
+serde_json = { version = "1", features = ["preserve_order"] }
 # `rustls-webpki-tokio` is load-bearing, not decoration. Without it
 # hyper-rustls falls back to its default feature `native-tokio`, which is
 # `rustls-native-certs` -- certificates read from the SYSTEM KEYCHAIN at

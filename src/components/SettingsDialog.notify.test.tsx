@@ -18,6 +18,15 @@ vi.mock("../api/hooks", () => ({
   useRevokePairedDevice: () => () => Promise.resolve(),
   usePollInterval: () => ({ seconds: 120, set: vi.fn() }),
   useWorktreeDirs: () => ({ dirs: [], set: vi.fn(() => Promise.resolve()) }),
+  // #915's panel, which this file does not exercise but does mount.
+  useClaudeHooks: () => ({
+    status: { state: "not_installed" },
+    isLoading: false,
+    error: null,
+    install: () => Promise.resolve({ command: "x", added: [], replaced: [], created_file: false }),
+    reinstall: () => Promise.resolve({ command: "x", added: [], replaced: [], created_file: false }),
+    uninstall: () => Promise.resolve({ removed: [], was_absent: true }),
+  }),
   useNotifyPrefs: () => ({ prefs: prefsState.prefs, set: setPrefs }),
 }));
 
