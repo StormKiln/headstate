@@ -1,6 +1,13 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { ClaudeImported, ClaudeSession, ClaudeSessionList } from "@/types/pr";
+import type {
+  ClaudeImported,
+  ClaudeSession,
+  ClaudeSessionList,
+  Worktree,
+  WorktreeRepo,
+} from "@/types/pr";
+import { useFilters } from "@/store/filters";
 
 const copyFn = vi.hoisted(() => vi.fn(() => Promise.resolve(null as string | null)));
 const revealFn = vi.hoisted(() => vi.fn(() => Promise.resolve("/code/app")));
@@ -23,6 +30,12 @@ const state = vi.hoisted(() => ({
   /// `the_page_never_reads_the_clock_during_render` checks the source as
   /// well.
   now: Date.parse("2026-09-13T12:00:00Z"),
+  /// What `useWorktrees` returns, for the #920 jump. `undefined` with
+  /// `worktreesFailed: false` is the still-loading case, and with
+  /// `worktreesFailed: true` it is the could-not-read case -- the two the
+  /// section must not render alike.
+  worktrees: undefined as WorktreeRepo[] | undefined,
+  worktreesFailed: false,
 }));
 
 vi.mock("../api/hooks", () => ({
@@ -43,6 +56,13 @@ vi.mock("../api/hooks", () => ({
     now: state.now,
     rescan: rescanFn,
   }),
+  // The #920 jump reads the SAME query the Worktrees page does, so a
+  // session detail costs a cache hit rather than a second scan.
+  useWorktrees: () => ({
+    data: state.worktrees,
+    isError: state.worktreesFailed,
+    error: state.worktreesFailed ? "could not list worktrees" : undefined,
+  }),
 }));
 vi.mock("sonner", () => ({ toast: { success: toastSuccess, error: toastError } }));
 vi.mock("../lib/clipboard", () => ({ copyText: copyFn }));
@@ -61,6 +81,10 @@ const session = (over: Partial<ClaudeSession> = {}): ClaudeSession => ({
   last_activity_at: "2026-09-13T09:00:00Z",
   liveness: { state: "dead", why: "pid 14779 is no longer running" },
   cwd_state: { state: "exists" },
+  // Defaults to present, because that is the real default: 0 of 1,461
+  // measured transcripts were missing. A fixture defaulting to `gone`
+  // would make the common case the one no test exercised.
+  transcript_state: { state: "exists" },
   resume: {
     command: "cd '/Users/acme/code/widget' && claude --resume e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2",
     caveat: null,
@@ -98,6 +122,17 @@ beforeEach(() => {
   state.imported = imported();
   state.importFailed = false;
   state.importFetching = false;
+  // A LOADED, empty listing by default -- not `undefined`. `undefined`
+  // means "still loading or unreadable", and leaving it there would make
+  // every unrelated test render the wrong one of the #920 section's three
+  // arms.
+  state.worktrees = [];
+  state.worktreesFailed = false;
+  // The REAL store, not a mock: the #920 jump's whole assertion is that
+  // it writes `repo` and `view` the way `WorktreesPage` reads them, and a
+  // mocked store would let those two drift apart while the test passed.
+  useFilters.setState({ view: "claude-code" });
+  useFilters.getState().setFilter("repo", undefined);
   copyFn.mockClear();
   revealFn.mockClear();
   toastError.mockClear();
@@ -523,16 +558,6 @@ describe("what the detail says about provenance", () => {
     );
   });
 
-  /// Revealing a directory that is gone is not offered at all -- 84% of
-  /// rows -- because macOS silently opens the home directory instead,
-  /// which reads as the button misfiring.
-  it("offers no reveal for a directory that is gone", () => {
-    state.list = listOf([session({ cwd_state: { state: "gone" }, transcript_path: null })]);
-    render(<ClaudeCodePage />);
-    open("HeadState GitHub issues filing");
-    expect(screen.queryByRole("button", { name: /reveal directory/i })).toBeNull();
-  });
-
   it("rescans on request", () => {
     render(<ClaudeCodePage />);
     fireEvent.click(screen.getByRole("button", { name: /rescan transcripts/i }));
@@ -545,6 +570,232 @@ describe("what the detail says about provenance", () => {
   it("shows how long the rescan took", () => {
     render(<ClaudeCodePage />);
     expect(screen.getByText(/1,438 read in 1374/)).toBeTruthy();
+  });
+});
+
+/// #919: the reveal buttons, and the three reasons one cannot fire.
+///
+/// The behaviour under test is that a reveal which CANNOT work is present
+/// and disabled with a stated reason, rather than absent (indistinguishable
+/// from "this app has no such action") or enabled and inert (on macOS,
+/// revealing a deleted path silently opens the home folder).
+describe("revealing a path that may be gone", () => {
+  const revealDirectory = () => screen.getByRole("button", { name: /reveal directory/i });
+  const revealTranscript = () => screen.getByRole("button", { name: /reveal transcript/i });
+
+  it("reveals a directory that exists", () => {
+    render(<ClaudeCodePage />);
+    open("HeadState GitHub issues filing");
+    expect(revealDirectory().hasAttribute("disabled")).toBe(false);
+    fireEvent.click(revealDirectory());
+    expect(revealFn).toHaveBeenCalledWith("/Users/acme/code/widget");
+  });
+
+  /// 83.0% of real rows. The button STAYS, disabled, with the reason --
+  /// which is what distinguishes "this path is gone" from "this app
+  /// cannot do that".
+  it("disables the reveal for a gone directory and says why", () => {
+    state.list = listOf([session({ cwd_state: { state: "gone" } })]);
+    render(<ClaudeCodePage />);
+    open("HeadState GitHub issues filing");
+    const btn = revealDirectory();
+    expect(btn.hasAttribute("disabled")).toBe(true);
+    expect(screen.getByText(/the path no longer exists/i)).toBeTruthy();
+    // And it really is inert: clicking a disabled button must not reach
+    // the command.
+    fireEvent.click(btn);
+    expect(revealFn).not.toHaveBeenCalled();
+  });
+
+  /// **The sabotage test for #919.** "Could not check" must NOT read as
+  /// "gone".
+  ///
+  /// This is the absent-is-not-zero rule at the UI boundary. The remedies
+  /// differ -- one is "fix the permission", the other is "expect it to
+  /// stay missing" -- so the two must not share a string. The assertion
+  /// that the gone wording is ABSENT is the half that fails if someone
+  /// collapses the two arms into one.
+  it("distinguishes a path it could not check from one that is gone", () => {
+    state.list = listOf([
+      session({
+        cwd_state: { state: "unknown", why: "Permission denied (os error 13)" },
+      }),
+    ]);
+    render(<ClaudeCodePage />);
+    open("HeadState GitHub issues filing");
+
+    expect(revealDirectory().hasAttribute("disabled")).toBe(true);
+    // The reason is NAMED, because a "could not check" with nothing to
+    // act on is barely better than "gone".
+    expect(screen.getByText(/could not check whether it exists/i)).toBeTruthy();
+    expect(screen.getByText(/Permission denied \(os error 13\)/)).toBeTruthy();
+    // And it must NOT claim the path is gone.
+    expect(screen.queryByText(/no longer exists/i)).toBeNull();
+  });
+
+  it("says no path was recorded rather than calling it gone", () => {
+    state.list = listOf([session({ cwd: null, cwd_state: { state: "not-recorded" } })]);
+    render(<ClaudeCodePage />);
+    open("HeadState GitHub issues filing");
+    expect(revealDirectory().hasAttribute("disabled")).toBe(true);
+    expect(screen.queryByText(/no longer exists/i)).toBeNull();
+  });
+
+  /// **The 83%-vs-0% asymmetry, as a render test.** This is the defect
+  /// #919 is really about.
+  ///
+  /// The common real row has a deleted worktree AND a perfectly readable
+  /// transcript -- 1,213 of 1,461 measured. The transcript button must
+  /// therefore be live on exactly the rows where the directory button is
+  /// dead. A single shared state, or a transcript gated on `cwd_state`,
+  /// fails here.
+  it("keeps the transcript reveal live when the directory is gone", () => {
+    state.list = listOf([
+      session({
+        cwd_state: { state: "gone" },
+        transcript_state: { state: "exists" },
+      }),
+    ]);
+    render(<ClaudeCodePage />);
+    open("HeadState GitHub issues filing");
+
+    expect(revealDirectory().hasAttribute("disabled")).toBe(true);
+    expect(revealTranscript().hasAttribute("disabled")).toBe(false);
+    fireEvent.click(revealTranscript());
+    expect(revealFn).toHaveBeenCalledWith("/Users/acme/.claude/projects/slug/e5dff3bd.jsonl");
+  });
+
+  /// The mirror: a transcript that IS gone disables its own button and
+  /// leaves the directory's alone. Without this, a version that simply
+  /// swapped the two fields would pass the test above.
+  it("disables only the transcript when only the transcript is gone", () => {
+    state.list = listOf([
+      session({
+        cwd_state: { state: "exists" },
+        transcript_state: { state: "gone" },
+      }),
+    ]);
+    render(<ClaudeCodePage />);
+    open("HeadState GitHub issues filing");
+    expect(revealDirectory().hasAttribute("disabled")).toBe(false);
+    expect(revealTranscript().hasAttribute("disabled")).toBe(true);
+  });
+
+  it("disables the transcript reveal when none was recorded", () => {
+    state.list = listOf([
+      session({ transcript_path: null, transcript_state: { state: "not-recorded" } }),
+    ]);
+    render(<ClaudeCodePage />);
+    open("HeadState GitHub issues filing");
+    expect(revealTranscript().hasAttribute("disabled")).toBe(true);
+  });
+});
+
+/// #920: jumping from a session to the worktree it ran in.
+describe("the jump to a session's worktree", () => {
+  const worktree = (over: Partial<Worktree> = {}): Worktree => ({
+    path: "/Users/acme/code/widget",
+    branch: "feat/spoon",
+    head: "abc1234",
+    size_bytes: 1024,
+    safety: { kind: "safe" },
+    is_main: false,
+    merged_at: "2026-09-12",
+    upstream: { kind: "current" },
+    last_commit: "2026-09-12T10:00:00Z",
+    ...over,
+  });
+  const repo = (worktrees: Worktree[]): WorktreeRepo => ({
+    identity: "acme/widget",
+    name: "widget",
+    path: "/Users/acme/code/widget",
+    worktrees,
+  });
+
+  it("offers the jump and navigates the way WorktreesPage reads it", () => {
+    state.worktrees = [repo([worktree()])];
+    render(<ClaudeCodePage />);
+    open("HeadState GitHub issues filing");
+
+    // The worktree's own state is what answers "what was this session
+    // doing", so it is shown before the jump rather than only after it.
+    expect(screen.getByText(/merged, pushed — safe to delete/i)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /show in worktrees/i }));
+
+    // BOTH writes, and against the real store: `WorktreesPage` selects a
+    // repository with `filters.repo` and renders on `view`. Asserting
+    // only the view would pass while landing on the wrong repository.
+    const after = useFilters.getState();
+    expect(after.view).toBe("worktrees");
+    expect(after.filtersByView.worktrees.repo).toBe("/Users/acme/code/widget");
+  });
+
+  /// No jump unless a worktree actually matches. A button that navigated
+  /// to a list where the row is absent is worse than no button -- and this
+  /// is 1,213 of 1,461 real rows, so it is the common case.
+  it("offers no jump when the directory is not a known worktree", () => {
+    state.worktrees = [repo([worktree({ path: "/Users/acme/code/other" })])];
+    render(<ClaudeCodePage />);
+    open("HeadState GitHub issues filing");
+    expect(screen.queryByRole("button", { name: /show in worktrees/i })).toBeNull();
+    expect(screen.getByText(/not a worktree Headstate knows about/i)).toBeTruthy();
+  });
+
+  /// **The absent-is-not-zero test for #920.** A worktree listing that
+  /// could not be READ must not render as "this is not a worktree".
+  ///
+  /// Opposite remedies: one is "retry, or check the configured
+  /// directories", the other is "this directory never was one". #846 is
+  /// the precedent -- a `= []` default made a failed scan read as a
+  /// confident empty answer.
+  it("says the worktree list could not be read rather than claiming no match", () => {
+    state.worktrees = undefined;
+    state.worktreesFailed = true;
+    render(<ClaudeCodePage />);
+    open("HeadState GitHub issues filing");
+    expect(screen.getByText(/could not read the worktree list/i)).toBeTruthy();
+    expect(screen.queryByText(/not a worktree Headstate knows about/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: /show in worktrees/i })).toBeNull();
+  });
+
+  it("says it is still looking while the listing loads", () => {
+    state.worktrees = undefined;
+    state.worktreesFailed = false;
+    render(<ClaudeCodePage />);
+    open("HeadState GitHub issues filing");
+    expect(screen.getByText(/looking for a matching worktree/i)).toBeTruthy();
+    // Not the could-not-read arm, and not the no-match arm.
+    expect(screen.queryByText(/could not read the worktree list/i)).toBeNull();
+    expect(screen.queryByText(/not a worktree Headstate knows about/i)).toBeNull();
+  });
+
+  /// MEASURED: the recorded branch disagrees with the current one on 54
+  /// of 206 matches (26.2%). The jump is still offered -- the path is the
+  /// key -- but the row must not read as "this session's branch".
+  it("says so when the worktree has moved to another branch", () => {
+    state.worktrees = [repo([worktree({ branch: "main" })])];
+    render(<ClaudeCodePage />);
+    open("HeadState GitHub issues filing");
+    expect(screen.getByText(/has since moved to/i)).toBeTruthy();
+    // The jump is NOT withheld: matching on the branch too would refuse a
+    // quarter of the valid jumps.
+    expect(screen.getByRole("button", { name: /show in worktrees/i })).toBeTruthy();
+  });
+
+  it("says nothing about branches when they agree", () => {
+    state.worktrees = [repo([worktree()])];
+    render(<ClaudeCodePage />);
+    open("HeadState GitHub issues filing");
+    expect(screen.queryByText(/has since moved to/i)).toBeNull();
+  });
+
+  it("says there is no worktree to find when no directory was recorded", () => {
+    state.list = listOf([session({ cwd: null, cwd_state: { state: "not-recorded" } })]);
+    state.worktrees = [repo([worktree()])];
+    render(<ClaudeCodePage />);
+    open("HeadState GitHub issues filing");
+    expect(screen.getByText(/no directory was recorded/i)).toBeTruthy();
   });
 });
 

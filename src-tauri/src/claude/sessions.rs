@@ -1,10 +1,20 @@
-//! What the Claude Code view renders: one row per session (#917), and
-//! the resume command that actually works (#918).
+//! What the Claude Code view renders: one row per session (#917), the
+//! resume command that actually works (#918), and whether each of the
+//! two paths a session records is still on disk (#919).
 //!
 //! Reads `claude_session` and `claude_run` (migration 11), pairs each row
 //! with a liveness derived from the machine ([`super::liveness`]), and
 //! answers the one question the resume action turns on: does the
 //! directory this session ran in still exist?
+//!
+//! # Two paths, two survival rates, two fields
+//!
+//! A session records a `cwd` AND a `transcript_path`, and they are not
+//! interchangeable. Measured over 1,461 real session transcripts for
+//! #919: **83.0% of cwds are gone (1,213) and 0% of transcripts are.**
+//! So [`SessionRow`] carries [`SessionRow::cwd_state`] and
+//! [`SessionRow::transcript_state`] as independent tri-states, and
+//! neither is derived from the other. See [`check_transcript`].
 //!
 //! # Why the cwd check is a tri-state and not a bool
 //!
@@ -64,9 +74,12 @@ use super::liveness::{derive, Liveness, ProcessProbe, Registry, Run, SysinfoProb
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "kebab-case")]
 pub enum CwdState {
-    /// The path exists and is a directory.
+    /// The path exists and is of the kind the caller needs -- a
+    /// directory for a cwd, a regular file for a transcript.
     Exists,
-    /// The path is definitely not there. 84% of the real corpus.
+    /// The path is definitely not there. 83% of the real corpus for a
+    /// cwd; 0% for a transcript (#919 measured both -- see
+    /// [`check_transcript`]).
     Gone,
     /// The check itself failed -- a permission error, a stalled network
     /// mount -- so the directory may well be there.
@@ -88,24 +101,89 @@ pub enum CwdState {
 /// live tree is a directory the `cd` would succeed into, and reporting
 /// it as gone because the link itself is a link would be wrong.
 pub fn check_cwd(cwd: Option<&str>) -> CwdState {
-    let Some(path) = cwd else {
+    // A path that exists but is a FILE is not somewhere `cd` can go, so
+    // it is reported as gone-for-this-purpose rather than as `Exists`,
+    // which would produce a `cd` that fails in the user's shell after
+    // they pasted it.
+    check_path(cwd, Want::Directory)
+}
+
+/// Whether a path is expected to be a directory or a regular file.
+///
+/// The two checks differ in exactly one respect and share every error
+/// rule, so they share an implementation. Splitting them into two
+/// hand-written `match` blocks is how the `NotFound`-is-the-only-`Gone`
+/// discipline drifts on one side and not the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Want {
+    Directory,
+    File,
+}
+
+/// Check a recorded path, with the three-state honesty [`CwdState`]
+/// carries.
+///
+/// `NotFound` is the ONLY error that becomes [`CwdState::Gone`]; every
+/// other error becomes [`CwdState::Unknown`] with the reason, because
+/// each of those is consistent with the path existing.
+fn check_path(path: Option<&str>, want: Want) -> CwdState {
+    let Some(path) = path else {
         return CwdState::NotRecorded;
     };
     if path.is_empty() {
         return CwdState::NotRecorded;
     }
     match std::fs::metadata(path) {
-        Ok(m) if m.is_dir() => CwdState::Exists,
-        // A path that exists but is a FILE is not somewhere `cd` can go.
-        // Reported as gone-for-this-purpose with the reason said out
-        // loud rather than as `Exists`, which would produce a `cd` that
-        // fails in the user's shell after they pasted it.
-        Ok(_) => CwdState::Gone,
+        Ok(m) => {
+            let right_kind = match want {
+                Want::Directory => m.is_dir(),
+                // `is_file` and not `!is_dir`: a socket or a fifo at the
+                // transcript's path is not a file the reveal can show,
+                // and calling it `Exists` would produce a button that
+                // opens a Finder window on nothing.
+                Want::File => m.is_file(),
+            };
+            if right_kind {
+                CwdState::Exists
+            } else {
+                CwdState::Gone
+            }
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => CwdState::Gone,
         Err(e) => CwdState::Unknown {
             why: format!("{e}"),
         },
     }
+}
+
+/// Check whether a session's transcript file is still on disk (#919).
+///
+/// # Why this is a SEPARATE check from the cwd, measured separately
+///
+/// The transcript is a different path from the cwd with a radically
+/// different survival rate, and assuming they behave alike is what makes
+/// a reveal button dead. Measured on the development machine over the
+/// real corpus of 1,461 session transcripts:
+///
+/// ```text
+/// cwd         exists=248   gone=1213  (83.0% gone)
+/// transcript  exists=1461  gone=0     ( 0.0% gone)
+/// ```
+///
+/// The asymmetry is not a coincidence: the cwds are overwhelmingly agent
+/// worktrees that were deleted when the work landed, while the
+/// transcripts are the files `claude --resume` itself reads, so Claude
+/// Code keeps them. That is why the two states are carried as two
+/// fields and never derived from one another -- a UI that gated the
+/// transcript reveal on `cwd_state` would hide the button that works on
+/// 83% of rows.
+///
+/// A transcript expects a FILE where the cwd expects a directory. Every
+/// other rule -- `NotFound` alone means gone, any other error means we
+/// could not look -- is shared, which is why both go through
+/// [`check_path`].
+pub fn check_transcript(transcript_path: Option<&str>) -> CwdState {
+    check_path(transcript_path, Want::File)
 }
 
 /// The resume command to put on the clipboard, and what to say about it.
@@ -230,6 +308,14 @@ pub struct SessionRow {
     /// Derived every read, never stored. Three states.
     pub liveness: Liveness,
     pub cwd_state: CwdState,
+    /// Whether the transcript file is still on disk (#919).
+    ///
+    /// A SEPARATE check from `cwd_state`, because the two paths survive
+    /// at opposite rates: 83% of cwds are gone and 0% of transcripts
+    /// are. Deriving one from the other -- or gating the transcript's
+    /// reveal on the cwd's state -- would suppress the button that works
+    /// on almost every row. See [`check_transcript`] for the numbers.
+    pub transcript_state: CwdState,
     /// The command to copy, already resolved against `cwd_state`.
     ///
     /// Built on the backend rather than in the component because the
@@ -404,6 +490,11 @@ fn assemble<P: ProcessProbe>(
                 .or_else(|| s.cwd.clone());
             let cwd_state = check_cwd(cwd.as_deref());
             let resume = resume_command(&s.session_id, cwd.as_deref(), &cwd_state);
+            // One `metadata` call per row, the same cost as the cwd
+            // check beside it. Measured: 1,461 transcripts stat in well
+            // under the poll tick, and unlike the cwds they are all on
+            // local disk under `~/.claude/projects`.
+            let transcript_state = check_transcript(s.transcript_path.as_deref());
             SessionRow {
                 session_id: s.session_id,
                 name: s.name,
@@ -415,6 +506,7 @@ fn assemble<P: ProcessProbe>(
                 last_activity_at: s.last_activity_at,
                 liveness,
                 cwd_state,
+                transcript_state,
                 resume,
                 runs: session_runs.len(),
             }
@@ -643,6 +735,212 @@ mod tests {
             "{caveat}"
         );
         assert!(!caveat.contains("gone"), "{caveat}");
+    }
+
+    // ---- #919: the transcript is a DIFFERENT path from the cwd ----
+
+    /// A transcript that is on disk is `Exists` -- and `check_cwd` on the
+    /// same path is `Gone`.
+    ///
+    /// This is the reuse trap #919 walks into if the two checks share one
+    /// function: `check_cwd` requires a DIRECTORY, so pointing it at a
+    /// transcript file reports the 100%-surviving path as gone and the
+    /// reveal button disappears on every row. The assertion below is the
+    /// guard against someone "simplifying" the two into one call.
+    #[test]
+    fn a_live_transcript_exists_where_the_cwd_check_would_call_it_gone() {
+        let dir = std::env::temp_dir().join("headstate-transcript-919");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("c8518222.jsonl");
+        std::fs::write(&file, b"{}\n").unwrap();
+        let path = file.to_string_lossy().into_owned();
+
+        assert_eq!(
+            check_transcript(Some(&path)),
+            CwdState::Exists,
+            "a transcript on disk must be revealable"
+        );
+        assert_eq!(
+            check_cwd(Some(&path)),
+            CwdState::Gone,
+            "the cwd check requires a directory, which is exactly why the transcript \
+             needs its own check rather than reusing this one"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A directory at the transcript's path is not a transcript.
+    ///
+    /// The mirror of the test above, and it matters because
+    /// `!metadata.is_dir()` would have passed here while `is_file()`
+    /// does not. A Finder window opened on a directory we called a
+    /// transcript is the silent-nothing failure in a different costume.
+    #[test]
+    fn a_directory_at_the_transcript_path_is_not_a_transcript() {
+        let dir = std::env::temp_dir().join("headstate-transcript-isdir-919");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(
+            check_transcript(Some(&dir.to_string_lossy())),
+            CwdState::Gone
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A missing transcript is `Gone`, and a session with none recorded
+    /// is `NotRecorded` -- two different facts.
+    ///
+    /// `NotRecorded` happens for a hook-sourced session Headstate saw
+    /// start before any transcript import ran: we know the session
+    /// exists and do not know where its transcript is. Rendering that as
+    /// "the transcript is gone" would send the user looking for a deleted
+    /// file that was never missing.
+    #[test]
+    fn a_missing_transcript_is_gone_and_an_unrecorded_one_is_not() {
+        let missing = std::env::temp_dir().join("headstate-919-no-such-transcript.jsonl");
+        let _ = std::fs::remove_file(&missing);
+        assert_eq!(
+            check_transcript(Some(&missing.to_string_lossy())),
+            CwdState::Gone
+        );
+        assert_eq!(check_transcript(None), CwdState::NotRecorded);
+        assert_eq!(check_transcript(Some("")), CwdState::NotRecorded);
+    }
+
+    /// **The sabotage test for #919.** A transcript we could not CHECK
+    /// reports `Unknown` with the reason, and never `Gone`.
+    ///
+    /// This provokes a REAL `EACCES` from the operating system rather
+    /// than constructing `CwdState::Unknown` by hand -- a hand-built
+    /// value proves the type has three variants, not that `check_path`
+    /// ever produces the third one. Chmod 000 on the parent directory
+    /// makes `metadata` on the child fail with a permission error while
+    /// the file is still there, which is precisely the case that must
+    /// not read as absence: the remedy is "fix the permission", not
+    /// "the transcript was deleted".
+    ///
+    /// `#[cfg(unix)]` because Windows has no chmod and its ACL
+    /// equivalent is not a one-liner. Two agents in this epic shipped
+    /// Windows-only failures by assuming a Unix filesystem behaviour
+    /// held on both, so this asserts nothing about Windows rather than
+    /// guessing. The platform-independent half of the distinction is
+    /// covered by `an_unknown_transcript_is_not_reported_as_gone` below,
+    /// which runs everywhere.
+    #[cfg(unix)]
+    #[test]
+    fn a_transcript_that_could_not_be_checked_is_not_reported_as_gone() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join("headstate-919-eacces");
+        let locked = root.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        let file = locked.join("c8518222.jsonl");
+        std::fs::write(&file, b"{}\n").unwrap();
+        let path = file.to_string_lossy().into_owned();
+
+        // Sanity: readable BEFORE the sabotage, so a failure below is
+        // the chmod and not a broken fixture.
+        assert_eq!(check_transcript(Some(&path)), CwdState::Exists);
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let got = check_transcript(Some(&path));
+        // Restore BEFORE asserting, so a failure cannot leak an
+        // undeletable directory into the temp dir -- the pattern
+        // `transcript::tests::an_unreadable_project_directory...` uses.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Running as root defeats the sabotage: root reads through mode
+        // 000. Skip rather than assert a falsehood -- a test that only
+        // passes because it was not actually sabotaged is worse than no
+        // test, and CI containers do run as root.
+        if got == CwdState::Exists {
+            eprintln!("skipped: mode 000 did not deny this user (running as root?)");
+            return;
+        }
+
+        match &got {
+            CwdState::Unknown { why } => {
+                assert!(
+                    !why.is_empty(),
+                    "an Unknown with no reason is indistinguishable from a shrug"
+                );
+                eprintln!("real EACCES surfaced as: Unknown {{ why: {why:?} }}");
+            }
+            other => panic!(
+                "a permission error must NOT collapse into an absence verdict -- \
+                 the file is still on disk. Got {other:?}"
+            ),
+        }
+        assert_ne!(
+            got,
+            CwdState::Gone,
+            "this is the whole of the absent-is-not-zero rule for #919"
+        );
+    }
+
+    /// The could-not-check and gone verdicts are distinguishable by a
+    /// caller on EVERY platform, not only where chmod works.
+    ///
+    /// The `#[cfg(unix)]` test above proves the OS error really reaches
+    /// `Unknown`; this proves the two verdicts do not compare equal, so a
+    /// UI matching on the state cannot render them the same way by
+    /// accident.
+    #[test]
+    fn an_unknown_transcript_is_not_reported_as_gone() {
+        let unknown = CwdState::Unknown {
+            why: "Permission denied (os error 13)".into(),
+        };
+        assert_ne!(unknown, CwdState::Gone);
+        assert_ne!(unknown, CwdState::NotRecorded);
+        assert_ne!(unknown, CwdState::Exists);
+        // And the reason survives, because a "could not check" with
+        // nothing to act on is not materially better than "gone".
+        let CwdState::Unknown { why } = &unknown else {
+            unreachable!()
+        };
+        assert!(why.contains("Permission denied"));
+    }
+
+    /// The row carries BOTH states, and a dead cwd does not drag the
+    /// transcript down with it.
+    ///
+    /// This is the 83%-vs-0% asymmetry as an assertion: the common real
+    /// row has a deleted worktree and a perfectly readable transcript,
+    /// and a UI that gated the transcript's reveal on `cwd_state` would
+    /// hide the one button that works.
+    #[test]
+    fn a_gone_cwd_leaves_the_transcript_state_untouched() {
+        let dir = std::env::temp_dir().join("headstate-919-both-states");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("c8518222.jsonl");
+        std::fs::write(&file, b"{}\n").unwrap();
+
+        let conn = db();
+        conn.execute(
+            "INSERT INTO claude_session
+                (session_id, cwd, transcript_path, first_seen_at)
+             VALUES ('s1', '/Users/acme/code/widget/.worktrees/deleted', ?1,
+                     '2026-09-01T00:00:00Z')",
+            rusqlite::params![file.to_string_lossy()],
+        )
+        .unwrap();
+
+        let got = assemble(
+            &Fake(Ok(None)),
+            &Registry::default(),
+            &Default::default(),
+            stored_rows(&conn).unwrap(),
+        );
+        let row = &got.sessions[0];
+        assert_eq!(row.cwd_state, CwdState::Gone);
+        assert_eq!(
+            row.transcript_state,
+            CwdState::Exists,
+            "the transcript survives the worktree, which is the whole point of \
+             carrying two states"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- #917: the list ----
@@ -890,6 +1188,14 @@ mod tests {
         let mut uncheckable = 0;
         let mut unnamed = 0;
         let mut undated = 0;
+        // #919: the transcript's survival, measured rather than assumed
+        // to match the cwd's. The two columns printed side by side are
+        // the evidence for carrying two fields.
+        let mut t_exists = 0;
+        let mut t_gone = 0;
+        let mut t_uncheckable = 0;
+        let mut t_unrecorded = 0;
+        let mut dead_cwd_live_transcript = 0;
         for s in &got.sessions {
             match &s.liveness {
                 Liveness::Running { .. } => running += 1,
@@ -907,6 +1213,15 @@ mod tests {
                 CwdState::Gone => gone += 1,
                 CwdState::Unknown { .. } => uncheckable += 1,
                 CwdState::NotRecorded => {}
+            }
+            match &s.transcript_state {
+                CwdState::Exists => t_exists += 1,
+                CwdState::Gone => t_gone += 1,
+                CwdState::Unknown { .. } => t_uncheckable += 1,
+                CwdState::NotRecorded => t_unrecorded += 1,
+            }
+            if s.cwd_state == CwdState::Gone && s.transcript_state == CwdState::Exists {
+                dead_cwd_live_transcript += 1;
             }
             if s.name.is_none() {
                 unnamed += 1;
@@ -951,9 +1266,22 @@ mod tests {
         eprintln!("registry failure         {:?}", got.registry_failure);
         eprintln!("registry unreadable      {}", got.registry_unreadable.len());
         eprintln!("liveness  running {running}  dead {dead}  unknown {unknown}");
+        let n = got.sessions.len().max(1);
         eprintln!(
-            "cwd       exists {anchored}  gone {gone}  uncheckable {uncheckable}  ({:.1}% gone)",
-            100.0 * gone as f64 / got.sessions.len().max(1) as f64
+            "cwd        exists {anchored}  gone {gone}  uncheckable {uncheckable}  ({:.1}% gone)",
+            100.0 * gone as f64 / n as f64
+        );
+        // #919's headline finding: the two paths do NOT survive alike.
+        eprintln!(
+            "transcript exists {t_exists}  gone {t_gone}  uncheckable {t_uncheckable}  \
+             unrecorded {t_unrecorded}  ({:.1}% gone)",
+            100.0 * t_gone as f64 / n as f64
+        );
+        eprintln!(
+            "rows with a DEAD cwd and a LIVE transcript: {dead_cwd_live_transcript} \
+             ({:.1}%) -- each one is a reveal-transcript button that a \
+             cwd-gated UI would have hidden",
+            100.0 * dead_cwd_live_transcript as f64 / n as f64
         );
         eprintln!("no aiTitle name          {unnamed}");
         eprintln!("no recorded activity     {undated}");

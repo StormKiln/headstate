@@ -1,13 +1,15 @@
 import { useMemo, useState } from "react";
-import { Bot, Circle, FolderOpen, RefreshCw, Search, Terminal } from "lucide-react";
+import { Bot, Circle, FolderOpen, GitBranch, RefreshCw, Search, Terminal } from "lucide-react";
 import { toast } from "sonner";
 import type { ClaudeSession, CwdState, Liveness } from "@/types/pr";
-import { useClaudeSessions } from "@/api/hooks";
+import { useClaudeSessions, useWorktrees } from "@/api/hooks";
 import { claudeRevealPath } from "@/api/tauri";
 import { copyText } from "@/lib/clipboard";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { relativeTime } from "@/lib/time";
 import { useIsMobile } from "@/lib/useIsMobile";
+import { pathBasename, safetyReason, sessionWorktree } from "@/lib/worktrees";
+import { useFilters } from "@/store/filters";
 import { QueryError, errorMessage } from "./QueryError";
 
 /// How many rows are drawn before the list stops and says so.
@@ -550,6 +552,150 @@ function SessionDetail({
 
   return (
     <div className="flex flex-col gap-4">
+      <SessionBody session={s} now={now} copy={copy} reveal={reveal} />
+      <WorktreeJump session={s} />
+    </div>
+  );
+}
+
+/// Jump from a session to the worktree it ran in (#920).
+///
+/// # Why this is the link that makes the feature part of the app
+///
+/// "What was this session doing" is usually answered by the worktree's
+/// own state -- whether the branch merged, whether there is uncommitted
+/// work, whether it is safe to remove -- and that state already has a
+/// view. So the session detail states the verdict and offers the jump,
+/// rather than reproducing the Worktrees page inside itself.
+///
+/// # No jump is offered unless one actually matches
+///
+/// Measured over 1,461 real sessions: 206 match a registered worktree --
+/// 14.1% of all sessions, but **83.1% of the 248 whose directory still
+/// exists**. The other 1,213 are overwhelmingly agent worktrees deleted
+/// when their work landed, and for those there is genuinely nothing to
+/// jump to. A button that navigated to a list where the row is absent
+/// would be worse than no button, so the section renders the reason
+/// instead.
+///
+/// # Three absences, three renderings
+///
+/// | condition | rendering |
+/// |---|---|
+/// | the worktree listing could not be read | says so. NOT "no worktree". |
+/// | it loaded and nothing matched | says the directory is not a worktree Headstate knows |
+/// | a worktree matched | the verdict, the branch caveat, and the jump |
+///
+/// The first two are the absent-is-not-zero rule: a failed scan and a
+/// successful scan that found nothing have opposite remedies, and only
+/// the second licenses "this is not a worktree".
+function WorktreeJump({ session: s }: { session: ClaudeSession }) {
+  const setView = useFilters((f) => f.setView);
+  const setFilter = useFilters((f) => f.setFilter);
+  // The same query the Worktrees page and the sidebar use, so opening a
+  // session detail costs a cache hit rather than a second scan. `enabled`
+  // is left at its default true for the reason `useWorktrees`' own
+  // comment gives: the three callers that discover repositories all want
+  // this, and this is now a fourth.
+  const { data: repos, isError, error } = useWorktrees();
+  const match = sessionWorktree(s.cwd, s.git_branch, repos);
+
+  return (
+    <section className="rounded-md border border-[#30363d] bg-[#161b22] p-3">
+      <h3 className="text-xs font-semibold text-[#e6edf3]">Its worktree</h3>
+      {isError ? (
+        // A failed scan is NOT "no worktree" (#846). The remedies differ:
+        // one is "retry or check the configured directories", the other
+        // is "this directory was never a worktree".
+        <p className="mt-2 text-xs text-[#8b949e]">
+          Could not read the worktree list, so whether this session ran in one is unknown
+          {errorMessage(error) ? ` (${errorMessage(error)})` : ""}.
+        </p>
+      ) : repos === undefined ? (
+        <p className="mt-2 text-xs text-[#8b949e]">Looking for a matching worktree…</p>
+      ) : match === null ? (
+        <p className="mt-2 text-xs text-[#8b949e]">
+          {s.cwd === null
+            ? "No directory was recorded for this session, so there is no worktree to find."
+            : "This directory is not a worktree Headstate knows about — most agent worktrees are deleted once their work lands."}
+        </p>
+      ) : (
+        <>
+          <dl className="mt-2 space-y-1.5 text-xs">
+            <Field label="Repository">{match.repoName}</Field>
+            <Field label="Worktree">
+              <span className="break-all font-mono">{pathBasename(match.worktree.path)}</span>
+            </Field>
+            <Field label="On branch">
+              <span className="break-all font-mono">{match.worktree.branch}</span>
+            </Field>
+            {/* The verdict is the ANSWER to "what was this session doing"
+                -- merged, dirty, safe to remove. `safetyReason` is the
+                same prose the Worktrees page shows, so the two cannot
+                disagree about the same tree. */}
+            <Field label="State">{safetyReason(match.worktree.safety)}</Field>
+          </dl>
+          {/* MEASURED: the recorded branch disagrees with the current one
+              on 54 of 206 matches (26.2%), because a main checkout
+              accumulates sessions across every branch it held. Saying so
+              is what stops the row above reading as "this session's
+              branch". */}
+          {match.movedOnFrom !== null ? (
+            <p className="mt-2 text-xs text-[#d29922]">
+              This session recorded the branch{" "}
+              <span className="font-mono">{match.movedOnFrom}</span>, but the worktree has since
+              moved to <span className="font-mono">{match.worktree.branch}</span>.
+            </p>
+          ) : null}
+          <button
+            type="button"
+            onClick={() => {
+              // `setView` FIRST, and the order is load-bearing.
+              //
+              // `setFilter` writes into `filtersByView[state.view]` --
+              // the CURRENT view -- so calling it before the switch files
+              // the repo under `claude-code`, where nothing reads it, and
+              // the Worktrees page opens on its default repository
+              // instead. A test asserting only `view` would not have
+              // noticed; `the jump navigates the way WorktreesPage reads
+              // it` asserts both and caught exactly this.
+              //
+              // Safe in this order because `setView` clears only the
+              // selection state (`selectedPr`, `checked`, `cursor`), never
+              // `filtersByView`.
+              setView("worktrees");
+              setFilter("repo", match.repoPath);
+            }}
+            className="tap-target mt-3 flex items-center gap-1.5 rounded-md border border-[#30363d] bg-[#21262d] px-2 py-1 text-xs text-[#e6edf3] hover:bg-[#30363d]"
+          >
+            <GitBranch className="h-3 w-3" aria-hidden="true" />
+            Show in Worktrees
+          </button>
+        </>
+      )}
+    </section>
+  );
+}
+
+/// The session detail's own fields, split from [`SessionDetail`] so the
+/// worktree section can sit beside them without this function growing a
+/// second concern.
+function SessionBody({
+  session: s,
+  now,
+  copy,
+  reveal,
+}: {
+  session: ClaudeSession;
+  now: number;
+  copy: (value: string, what: string) => void;
+  reveal: (path: string, what: string) => void;
+}) {
+  // A fragment, not a wrapper: `SessionDetail` owns the column gap so
+  // that `WorktreeJump` is spaced from these sections by the same rule
+  // they are spaced from each other.
+  return (
+    <>
       <div>
         <h2 className="text-sm font-semibold text-[#e6edf3]">{s.name ?? s.session_id}</h2>
         <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[#8b949e]">
@@ -613,30 +759,150 @@ function SessionDetail({
           {/* Behind `IS_MOBILE_BUILD`, per `surfaceGuard.test.ts`:
               `claude_reveal_path` is `Class::Local`, so the phone would
               render a control that can only reject. */}
-          {!IS_MOBILE_BUILD && s.cwd && s.cwd_state.state === "exists" ? (
-            <button
-              type="button"
-              onClick={() => reveal(s.cwd as string, "directory")}
-              className="tap-target flex items-center gap-1.5 rounded-md border border-[#30363d] bg-[#21262d] px-2 py-1 text-xs text-[#e6edf3] hover:bg-[#30363d]"
-            >
-              <FolderOpen className="h-3 w-3" aria-hidden="true" />
-              Reveal directory
-            </button>
+          {!IS_MOBILE_BUILD ? (
+            <RevealButton
+              label="Reveal directory"
+              path={s.cwd}
+              state={s.cwd_state}
+              what="directory"
+              onReveal={reveal}
+            />
           ) : null}
-          {!IS_MOBILE_BUILD && s.transcript_path ? (
-            <button
-              type="button"
-              onClick={() => reveal(s.transcript_path as string, "transcript")}
-              className="tap-target flex items-center gap-1.5 rounded-md border border-[#30363d] bg-[#21262d] px-2 py-1 text-xs text-[#e6edf3] hover:bg-[#30363d]"
-            >
-              <FolderOpen className="h-3 w-3" aria-hidden="true" />
-              Reveal transcript
-            </button>
+          {!IS_MOBILE_BUILD ? (
+            <RevealButton
+              label="Reveal transcript"
+              path={s.transcript_path}
+              /* The TRANSCRIPT's own state, not the cwd's (#919). These
+                 were the same expression until the corpus was measured:
+                 1,213 of 1,461 rows (83.0%) have a dead cwd and a live
+                 transcript, so a shared reading disables the button that
+                 works on almost every row. */
+              state={s.transcript_state}
+              what="transcript"
+              onReveal={reveal}
+            />
           ) : null}
         </div>
       </section>
+    </>
+  );
+}
+
+/// A reveal button that is DISABLED with a reason rather than absent
+/// (#919).
+///
+/// # Why not hide it
+///
+/// 83.0% of recorded cwds no longer exist (1,213 of 1,461, measured), so
+/// a button that is simply absent on a gone path is absent on the common
+/// case -- and a reader cannot tell "this app has no such action" from
+/// "this particular path is gone". Worse is the version that renders
+/// enabled and does nothing: revealing a deleted directory on macOS
+/// silently opens the user's home folder, which looks like the app
+/// misfired.
+///
+/// So the button is always rendered (on the desktop), and when it cannot
+/// work it is `disabled` with the reason in its `title` and in visible
+/// text beside it. A disabled control with a stated reason is the only
+/// one of the three that answers the question the reader actually has.
+///
+/// # Three refusal reasons, not one
+///
+/// `gone` and `unknown` get DIFFERENT wording, and that is the whole of
+/// the absent-is-not-zero rule here:
+///
+/// - `gone` -- the path is definitely not there. Nothing to reveal;
+///   expect it to stay that way.
+/// - `unknown` -- the check itself failed, so the path may well be
+///   there. The remedy is to fix whatever blocked the check, and saying
+///   "gone" would send the user looking for work that was never lost.
+/// - `not-recorded` -- we never knew the path. Distinct again: there is
+///   no missing file, only a fact we do not hold.
+///
+/// A single shared "unavailable" string would collapse all three into
+/// the shrug the tri-state exists to prevent.
+function RevealButton({
+  label,
+  path,
+  state,
+  what,
+  onReveal,
+}: {
+  label: string;
+  /// The path to reveal. `null` is its own refusal reason and is not
+  /// folded into `state`: a row can carry a path whose check failed, and
+  /// a row can carry no path at all.
+  path: string | null;
+  state: CwdState;
+  /// Names the thing in the failure toast, so "Could not reveal the
+  /// transcript" is distinguishable from the directory's message.
+  what: string;
+  onReveal: (path: string, what: string) => void;
+}) {
+  const refusal = revealRefusal(path, state);
+  // Narrowed rather than cast. `revealRefusal` returns non-null for
+  // every null path, so `path as string` under `refusal === null` would
+  // have been sound -- but only because of a fact stated in another
+  // function, and a cast asks the reader to take that on trust. This
+  // makes the compiler check it instead.
+  const revealable = refusal === null && path !== null ? path : null;
+  return (
+    <div className="flex items-center gap-1.5">
+      <button
+        type="button"
+        // `disabled` and not merely styled: a click that reaches
+        // `claude_reveal_path` with a gone path produces a Finder window
+        // on the home directory, which is the silent-nothing failure
+        // this whole component exists to replace.
+        disabled={revealable === null}
+        // The reason on hover as well as beside the button. Belt and
+        // braces on purpose: the visible text is what a keyboard or
+        // screen-reader user gets, the title is what a mouse user
+        // reaching for a greyed control looks for.
+        title={refusal ?? undefined}
+        onClick={revealable === null ? undefined : () => onReveal(revealable, what)}
+        className={
+          revealable !== null
+            ? "tap-target flex items-center gap-1.5 rounded-md border border-[#30363d] bg-[#21262d] px-2 py-1 text-xs text-[#e6edf3] hover:bg-[#30363d]"
+            : "tap-target flex cursor-not-allowed items-center gap-1.5 rounded-md border border-[#30363d] bg-[#161b22] px-2 py-1 text-xs text-[#6e7681]"
+        }
+      >
+        <FolderOpen className="h-3 w-3" aria-hidden="true" />
+        {label}
+      </button>
+      {/* The reason is VISIBLE, not only a tooltip. A greyed button whose
+          explanation is hover-only is unreadable on a touch screen and
+          invisible to a screen reader. */}
+      {refusal !== null ? <span className="text-[11px] text-[#8b949e]">{refusal}</span> : null}
     </div>
   );
+}
+
+/// Why a reveal cannot happen, or `null` when it can.
+///
+/// NOT exported: the three distinct strings are asserted through the
+/// rendered DOM by `revealing a path that may be gone`, which is the
+/// level a reader of the UI cares about, and exporting a helper nothing
+/// imports is what `yarn knip` exists to catch.
+function revealRefusal(path: string | null, state: CwdState): string | null {
+  // Checked before the state, because a row with no path has nothing for
+  // the state to be about. A hook-sourced session Headstate saw start
+  // before any transcript import ran is exactly this case.
+  if (path === null || path === "") return "no path recorded";
+  switch (state.state) {
+    case "exists":
+      return null;
+    case "gone":
+      return "the path no longer exists";
+    case "unknown":
+      // NAMES the error. "Could not check" with nothing to act on is
+      // barely better than "gone"; the point of the third state is that
+      // its remedy is different, and the user needs the reason to apply
+      // it.
+      return `could not check whether it exists (${state.why})`;
+    case "not-recorded":
+      return "no path recorded";
+  }
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
