@@ -18,7 +18,7 @@ import type {
   Artifact,
   Branch,
   DeleteOutcome,
-  ClaudeFile,
+  ClaudeMdScan,
   ClaudeImported,
   ClaudeOverview,
   ClaudeSessionList,
@@ -697,9 +697,10 @@ export const packagesMarkdown = (
 /// Reveal the diagnostic log in the file manager. Returns its path.
 export const revealLog = () => call<string>("reveal_log");
 
-/// Every CLAUDE.md in a repository, with its import tree resolved.
+/// Every CLAUDE.md in a repository, with its import tree resolved, AND
+/// what the scan could not read (#972).
 export const scanClaudeMd = (repoPath: string) =>
-  call<ClaudeFile[]>("scan_claude_md", { repoPath });
+  call<ClaudeMdScan>("scan_claude_md", { repoPath });
 
 /// The text of one file, for rendering.
 export const readClaudeMd = (path: string) => call<string>("read_claude_md", { path });

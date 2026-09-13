@@ -108,6 +108,28 @@ describe("PackagesPage", () => {
     expect(screen.queryByText(/Nothing matches this filter/)).toBeNull();
   });
 
+  /// The Cargo case specifically (#954).
+  ///
+  /// `error` was hardcoded `None` for Cargo, Swift and Terraform because
+  /// they answer from FILES rather than a command, so there was no spawn
+  /// failure to report -- and every file-read failure beneath them was
+  /// therefore unrepresentable. An unreadable `Cargo.lock` dropped every
+  /// crate through the missing-resolved-version branch and the page read
+  /// "up to date". This pins the render for the newly-reachable message:
+  /// the error line shows, and NO empty-list copy appears for it.
+  it("states an unreadable Cargo lock file instead of reading as up to date", () => {
+    state.reports = [
+      report({
+        ecosystem: "cargo",
+        outdated: [],
+        error: "1 file could not be read, so this list is incomplete: /r/Cargo.lock (Permission denied)",
+      }),
+    ];
+    render(<PackagesPage />);
+    expect(screen.getByText(/Cargo.lock/)).toBeTruthy();
+    expect(screen.queryByText(/Nothing matches this filter/)).toBeNull();
+  });
+
   it("says when there is genuinely nothing to do", () => {
     state.reports = [report()];
     render(<PackagesPage />);

@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useIsMobile } from "@/lib/useIsMobile";
 import { FileText } from "lucide-react";
-import type { ClaudeFile, ImportNode } from "@/types/pr";
+import type { ClaudeFile, ClaudeMdScan, ImportNode } from "@/types/pr";
 import { useClaudeMd, useClaudeMdText } from "@/api/hooks";
 import { useActiveFilters } from "@/store/filters";
 import { formatSize } from "@/lib/worktrees";
@@ -21,6 +21,18 @@ function tokenLabel(n: number): string {
   return `~${n.toLocaleString()} est. tokens`;
 }
 
+/// A total that is a FLOOR, in the app's existing idiom (#972).
+///
+/// "at least" is what `ArtifactsPage` and `WorktreesPage` already put in
+/// front of a size that is not fully measured, so this reuses the phrasing
+/// rather than inventing a second one for the same fact. Reached when an
+/// import's weight could not be counted: the real total is higher by an
+/// unknown amount, and a user budgeting context otherwise reads a number
+/// that is too small with nothing on screen to say so.
+function totalLabel(n: number, partial: boolean): string {
+  return partial ? `at least ${tokenLabel(n)}` : tokenLabel(n);
+}
+
 /// CLAUDE.md files for the selected repository.
 ///
 /// Read-only: a wrong render costs a confused reader rather than a
@@ -34,12 +46,22 @@ export function ClaudeMdPage() {
   // could not answer, on a page whose own doc comment above stakes its
   // design on "a wrong render costs a confused reader".
   const {
-    data: files = [],
+    data: scan,
     isLoading,
     isError,
     error,
     refetch,
   } = useClaudeMd(repo);
+  // NOT `data.files = []`. The default lives here rather than on `data`
+  // because the guards below need to see `undefined` -- a `= []` on the
+  // query result is exactly what #846 was about, and #972 is the same
+  // mistake one layer down: the scan now reports what it could not read,
+  // and a defaulted-away `scan` would make that report unreachable.
+  const files = scan?.files ?? [];
+  // Everything the scan proved it could not read. The third arm's input:
+  // a repository with no readable files and something unreadable is
+  // "we could not look", not "there are none" (#972).
+  const unreadable = scan ? scan.unreadable_dirs.length + scan.unreadable_files.length : 0;
   const [selected, setSelected] = useState<string | undefined>(undefined);
   const isMobile = useIsMobile();
 
@@ -93,7 +115,33 @@ export function ClaudeMdPage() {
       </div>
     );
   }
+  // A THIRD arm, between the error arm and the empty one, and it exists
+  // because #846's fix could not reach this case (#972). That fix gave the
+  // page a correct `isError` arm ordered before the empty arm -- but
+  // `scan_claude_md` could only ever return `Ok`, so a read failure
+  // arrived as an empty list and the empty arm claimed the repository had
+  // none. The error arm was unreachable in the case it existed for.
+  //
+  // Not a replacement for either neighbour. `isError` still means the scan
+  // never ran; this means it ran and could not see everything; and the
+  // empty arm below now only speaks for a scan that saw the whole tree.
+  if (files.length === 0 && unreadable > 0) {
+    return (
+      <div className="p-4">
+        <QueryError
+          title="Could not read this repository's CLAUDE.md files"
+          message={`${unreadable} path${unreadable === 1 ? "" : "s"} could not be read, so whether this repository has any CLAUDE.md files is unknown.`}
+          onRetry={() => void refetch()}
+        >
+          <UnreadablePaths scan={scan} />
+        </QueryError>
+      </div>
+    );
+  }
   if (files.length === 0) {
+    // Only a scan that read EVERYTHING gets to say this. The guard above
+    // has already taken the partial case, so this is now a true statement
+    // rather than #846's confident wrong answer.
     return <p className="p-4 text-sm text-[#8b949e]">No CLAUDE.md files in this repository.</p>;
   }
 
@@ -117,6 +165,27 @@ export function ClaudeMdPage() {
             : "w-96 shrink-0 overflow-y-auto border-r border-[#30363d] p-3"
         }
       >
+        {/* A PARTIAL scan, stated beside the files that did read (#972).
+
+            Not an early return, and not in place of the list: the files
+            here are real, and blanking them to report one unreadable
+            sibling would replace a silent loss with a louder one. The
+            same trade `ArtifactsPage` makes, and the rule
+            `transcript.rs`'s `is_partial()` states -- a partial answer
+            labelled partial beats both a silent truncation and an error
+            page.
+
+            The all-unreadable case never reaches here; the third arm
+            above took it. */}
+        {unreadable > 0 ? (
+          <div className="mb-3 rounded-md border border-[#d29922]/40 bg-[#d29922]/5 p-2">
+            <p className="text-xs text-[#d29922]">
+              {unreadable} path{unreadable === 1 ? "" : "s"} could not be read, so this list may be
+              incomplete.
+            </p>
+            <UnreadablePaths scan={scan} />
+          </div>
+        ) : null}
         {files.map((f) => (
           <FileEntry
             key={f.path}
@@ -194,6 +263,35 @@ export function ClaudeMdPage() {
   );
 }
 
+/// WHICH paths could not be read, and why.
+///
+/// Named rather than counted alone. A number tells the user something is
+/// wrong and nothing about where to look; these are absolute paths with
+/// the OS's own message, which is what a `chmod` or a symlink repair
+/// actually needs. Capped, because a permission wall on a large tree can
+/// produce a great many and a wall of paths is as unreadable as none.
+function UnreadablePaths({ scan }: { scan: ClaudeMdScan | undefined }) {
+  if (!scan) return null;
+  const all = [...scan.unreadable_dirs, ...scan.unreadable_files];
+  const shown = all.slice(0, PATH_CAP);
+  const rest = all.length - shown.length;
+  return (
+    <ul className="mx-auto mt-2 max-w-lg text-left">
+      {shown.map((p) => (
+        <li key={p} className="break-all font-mono text-[11px] text-[#8b949e]">
+          {p}
+        </li>
+      ))}
+      {rest > 0 ? (
+        <li className="mt-1 text-[11px] text-[#8b949e]">and {rest} more</li>
+      ) : null}
+    </ul>
+  );
+}
+
+/// How many unreadable paths to name before summarising the rest.
+const PATH_CAP = 8;
+
 function FileEntry({
   file,
   repo,
@@ -218,7 +316,12 @@ function FileEntry({
   // Only worth stating separately when the tree adds something. On a
   // file with no imports the two numbers are equal and printing both
   // reads as a mistake.
-  const treeAdds = file.total_tokens > file.tokens;
+  //
+  // `total_partial` also qualifies: an import whose weight could not be
+  // counted adds nothing to the number, so `total_tokens` equals `tokens`
+  // and the old condition hid the row that carries the "at least" (#972)
+  // -- the exact case in which the total most needs saying.
+  const treeAdds = file.total_tokens > file.tokens || file.total_partial;
 
   return (
     <div className="mb-2">
@@ -259,7 +362,7 @@ function FileEntry({
             secondary text does not need to be dimmed on top of that. */}
         <span className={`text-xs ${active ? "text-white" : "text-[#8b949e]"}`}>
           {formatSize(file.bytes)} · {tokenLabel(file.tokens)}
-          {treeAdds ? ` · ${tokenLabel(file.total_tokens)} with imports` : ""}
+          {treeAdds ? ` · ${totalLabel(file.total_tokens, file.total_partial)} with imports` : ""}
         </span>
       </button>
       {menu ? (

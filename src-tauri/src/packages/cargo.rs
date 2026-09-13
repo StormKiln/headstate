@@ -33,7 +33,7 @@
 //!
 //! Nothing here runs a command or writes a file.
 
-use super::model::{Bump, Ecosystem, Outdated};
+use super::model::{Bump, Ecosystem, FileScan, Outdated};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -133,8 +133,31 @@ pub enum Source {
 /// workspace's business and it shares the workspace's single lockfile.
 /// Its dependencies have to be gathered from here or they are invisible.
 pub fn declared(project: &Path) -> Vec<Declared> {
-    let Some(root) = read_manifest(&project.join("Cargo.toml")) else {
-        return Vec::new();
+    declared_reporting(project, &mut FileScan::default())
+}
+
+/// `declared`, recording every manifest it could not read.
+///
+/// The reporting variant exists because a manifest that cannot be read
+/// yields ZERO declared crates, and zero declared crates is
+/// indistinguishable from a project with no dependencies (#954). The root
+/// manifest is the sharpest case: it silences the whole project.
+pub fn declared_reporting(project: &Path, scan: &mut FileScan) -> Vec<Declared> {
+    let root_path = project.join("Cargo.toml");
+    let root = match read_manifest_reporting(&root_path) {
+        Ok(doc) => doc,
+        // ABSENT means this is not a Cargo project at all, which is a
+        // correct empty answer rather than a failure; only a manifest that
+        // EXISTS and could not be read or parsed is reported.
+        Err(ManifestError::Absent) => return Vec::new(),
+        Err(ManifestError::Unusable(why)) => {
+            // The ROOT. Without it there is no member list and no
+            // inherited table either, so this is not a partial answer --
+            // it is no answer, and it must say so rather than render as a
+            // project with nothing to update.
+            scan.failed_with(&root_path, &why);
+            return Vec::new();
+        }
     };
 
     // Workspace-level `[workspace.dependencies]`, which is what a
@@ -144,9 +167,20 @@ pub fn declared(project: &Path) -> Vec<Declared> {
     let mut out = Vec::new();
     let mut seen: BTreeMap<String, ()> = BTreeMap::new();
 
-    for manifest in manifests(project, &root) {
-        let Some(doc) = read_manifest(&manifest) else {
-            continue;
+    for manifest in manifests(project, &root, scan) {
+        let doc = match read_manifest_reporting(&manifest) {
+            Ok(doc) => doc,
+            // `manifests` only offers paths it has already `is_file`'d, so
+            // a member vanishing between the two is a race, not a state
+            // worth alarming about.
+            Err(ManifestError::Absent) => continue,
+            Err(ManifestError::Unusable(why)) => {
+                // A MEMBER. The rest of the workspace still reads, so the
+                // rows already gathered stay and the shortfall is reported
+                // beside them.
+                scan.failed_with(&manifest, &why);
+                continue;
+            }
         };
         for mut d in from_document(&doc, &inherited) {
             // Recorded HERE, where the file is known. `from_document`
@@ -186,13 +220,13 @@ pub fn declared(project: &Path) -> Vec<Declared> {
 /// is ONE project on the page -- a member under a Cargo root adds no
 /// ecosystem the root does not already claim -- so the members'
 /// dependencies have to be gathered here or they are invisible.
-fn manifests(project: &Path, root: &toml::Value) -> Vec<PathBuf> {
+fn manifests(project: &Path, root: &toml::Value, scan: &mut FileScan) -> Vec<PathBuf> {
     let mut out = vec![project.join("Cargo.toml")];
     for member in members(root) {
         // Globs are expanded because they are the common shape:
         // `members = ["crates/*"]` is what most workspaces write, and
         // ignoring it would silently report nothing for them.
-        for dir in expand_member(project, &member) {
+        for dir in expand_member(project, &member, scan) {
             let m = dir.join("Cargo.toml");
             if m.is_file() && !out.contains(&m) {
                 out.push(m);
@@ -223,26 +257,41 @@ fn members(root: &toml::Value) -> Vec<String> {
 /// as a literal path, which simply will not exist and is therefore
 /// dropped rather than mis-expanded. Reporting a subset beats inventing
 /// directories.
-fn expand_member(project: &Path, member: &str) -> Vec<PathBuf> {
+fn expand_member(project: &Path, member: &str, scan: &mut FileScan) -> Vec<PathBuf> {
     let Some((prefix, last)) = member.rsplit_once('/') else {
         // No slash: either a plain directory name or a bare `*`.
-        return expand_segment(project, member);
+        return expand_segment(project, member, scan);
     };
     if prefix.contains('*') {
         // A wildcard anywhere but the last component. Not expanded, and
-        // not guessed at.
+        // not guessed at. Deliberate, not a failure, so nothing is
+        // recorded: the member is declared in a shape this does not
+        // expand, which is the doc comment's stated trade and not
+        // something a permission change could fix.
         return Vec::new();
     }
-    expand_segment(&project.join(prefix), last)
+    expand_segment(&project.join(prefix), last, scan)
 }
 
 /// One path component, wildcard or literal.
-fn expand_segment(parent: &Path, segment: &str) -> Vec<PathBuf> {
+fn expand_segment(parent: &Path, segment: &str, scan: &mut FileScan) -> Vec<PathBuf> {
     if !segment.contains('*') {
         return vec![parent.join(segment)];
     }
-    let Ok(entries) = std::fs::read_dir(parent) else {
-        return Vec::new();
+    let entries = match std::fs::read_dir(parent) {
+        Ok(e) => e,
+        // ABSENT is not the same as UNREADABLE, and only the second is
+        // reportable. A workspace can legitimately declare `plugins/*`
+        // with no `plugins` directory yet -- Cargo itself tolerates it --
+        // and calling that a failure would raise an alarm on a healthy
+        // repository. A permission wall, by contrast, expands `crates/*`
+        // to nothing and drops every member of the workspace (#954),
+        // rendering it as a project with no dependencies at all.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            scan.failed(parent, &e);
+            return Vec::new();
+        }
     };
     let mut out: Vec<PathBuf> = entries
         .flatten()
@@ -459,10 +508,36 @@ fn classify(spec: &toml::Value) -> Source {
 /// at the top of the tree actually got. Picking arbitrarily would report
 /// a transitive pin as the project's version.
 pub fn locked(lockfile: &Path) -> BTreeMap<String, String> {
-    let Ok(text) = std::fs::read_to_string(lockfile) else {
-        return BTreeMap::new();
+    locked_reporting(lockfile).unwrap_or_default()
+}
+
+/// `locked`, saying why when the lockfile could not be read.
+///
+/// An empty map was the single worst value in this module (#954): every
+/// declared crate is dropped for want of a resolved version, `pinned`
+/// returns `[]`, and the page reports the project as up to date. The
+/// caller needs to be able to tell that from a lockfile that genuinely
+/// holds no packages.
+///
+/// `Ok` with an empty map is still possible and still correct in two
+/// cases. A `Cargo.lock` for a project with no dependencies has no
+/// `[[package]]` tables -- a real answer. And an ABSENT lock is `Ok` too:
+/// a library crate gitignores its lockfile, so a missing one is the
+/// ordinary state of a great many real projects, and reporting it would
+/// raise an alarm on every one of them -- the false-positive half of the
+/// same mistake this change is about. Only a lock that EXISTS and cannot
+/// be read or parsed is an error.
+pub fn locked_reporting(lockfile: &Path) -> Result<BTreeMap<String, String>, String> {
+    let text = match std::fs::read_to_string(lockfile) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(e.to_string()),
     };
-    locked_from_str(&text)
+    // A lockfile that is not TOML cannot be believed to hold no packages.
+    // `locked_from_str` answers the same empty map either way, so the
+    // malformation is caught here where it can be named.
+    toml::from_str::<toml::Value>(&text).map_err(|e| format!("not valid TOML: {e}"))?;
+    Ok(locked_from_str(&text))
 }
 
 /// The parsing half of `locked`, so it can be tested from a fixture.
@@ -517,10 +592,35 @@ pub fn locked_from_str(text: &str) -> BTreeMap<String, String> {
 /// list is shorter than it is. Shown with `Bump::Unknown` it says "this
 /// exists and cannot be compared", which is true.
 pub fn pinned(project: &Path) -> Vec<Outdated> {
-    let versions = locked(&project.join("Cargo.lock"));
+    scan(project).outdated
+}
+
+/// Every declared crate with its resolved version, and everything that
+/// could not be read on the way.
+///
+/// The reason this shape exists at all: an unreadable `Cargo.lock` made
+/// every crate drop out through the `continue` below, and `pinned`
+/// returned `[]` with no way to say why (#954). The rows that DID resolve
+/// are still returned beside the report -- a partial answer labelled
+/// partial beats both a silent truncation and an error page.
+pub fn scan(project: &Path) -> FileScan {
+    let mut scan = FileScan::default();
+    let lockfile = project.join("Cargo.lock");
+    let versions = match locked_reporting(&lockfile) {
+        Ok(v) => v,
+        // Only a lock that could not be READ lands here; see
+        // `locked_reporting` for why an absent one does not, and note that
+        // a STALE lock is untouched -- it reads fine, and a crate missing
+        // from it still falls through the `continue` below exactly as
+        // before.
+        Err(why) => {
+            scan.failed_with(&lockfile, &why);
+            BTreeMap::new()
+        }
+    };
     let mut out = Vec::new();
 
-    for d in declared(project) {
+    for d in declared_reporting(project, &mut scan) {
         // No lock entry means the project has never been built, or the
         // lock is stale. There is no resolved version to report, and
         // inventing one from the constraint would print a number Cargo
@@ -546,7 +646,8 @@ pub fn pinned(project: &Path) -> Vec<Outdated> {
     // twice -- once plainly and once under a target -- and sorting on
     // the name alone leaves those two in whatever order they were read.
     out.sort_by(|a, b| a.name.cmp(&b.name).then(a.manifest.cmp(&b.manifest)));
-    out
+    scan.outdated = out;
+    scan
 }
 
 /// Where to edit this dependency, and under which table.
@@ -688,9 +789,33 @@ pub fn parse_index(body: &str) -> Vec<IndexVersion> {
         .collect()
 }
 
-/// Read and parse one manifest.
-fn read_manifest(path: &Path) -> Option<toml::Value> {
-    toml::from_str(&std::fs::read_to_string(path).ok()?).ok()
+/// Why a manifest could not be used.
+///
+/// THREE outcomes, not two (#954). `Option` collapsed absent, unreadable
+/// and malformed into one `None`, and only the first of those is an
+/// ordinary answer -- so a caller given `None` had no way to tell "this is
+/// not a Cargo project" from "we could not look".
+enum ManifestError {
+    /// No such file. An ordinary answer, not a failure.
+    Absent,
+    /// It exists and cannot be used: a permission wall, or a syntax error
+    /// in the user's own file. Both yielded zero declared crates, and zero
+    /// declared crates renders as "nothing to update".
+    Unusable(String),
+}
+
+/// Read and parse one manifest, saying WHY when it cannot.
+fn read_manifest_reporting(path: &Path) -> Result<toml::Value, ManifestError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(ManifestError::Absent),
+        Err(e) => return Err(ManifestError::Unusable(e.to_string())),
+    };
+    // A manifest that read but is not TOML is a read that SUCCEEDED and
+    // produced nothing usable. Distinguished from an I/O failure because
+    // the remedies differ entirely: one is a permission, the other is a
+    // syntax error in the user's own file.
+    toml::from_str(&text).map_err(|e| ManifestError::Unusable(format!("not valid TOML: {e}")))
 }
 
 #[cfg(test)]
@@ -1413,6 +1538,234 @@ version = "2.0.17"
     fn a_malformed_manifest_yields_nothing() {
         let t = project(&[("Cargo.toml", "not [[[ toml")]);
         assert!(declared(t.path()).is_empty());
+    }
+    /// The lockfile is the SINGLE point of failure for this ecosystem, and
+    /// an unreadable one used to read as good news (#954).
+    ///
+    /// Every declared crate needs a resolved version, and `locked`
+    /// answered an empty map on an I/O failure -- so the `continue` below
+    /// dropped every crate, `pinned` returned `[]`, `error` was hardcoded
+    /// `None`, and the page said the project was up to date. "We could not
+    /// look" rendered as "nothing to update", which is the worst available
+    /// answer because nobody investigates good news.
+    ///
+    /// # Why `#[cfg(unix)]`
+    ///
+    /// `chmod 000` is what makes a file unreadable here, and Windows does
+    /// not honour it -- a `0o000` file stays readable, so the same test
+    /// there would assert the opposite of what it means and fail for a
+    /// reason that has nothing to do with this code. The BEHAVIOUR is
+    /// cross-platform (a permission wall is a permission wall); only this
+    /// way of producing one is not. The suite's existing idiom, and the
+    /// same gate `claude::transcript`'s permission tests carry.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_lockfile_is_an_error_not_an_empty_update_list() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = project(&[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"app\"\n\n[dependencies]\nserde = \"1\"\n",
+            ),
+            (
+                "Cargo.lock",
+                "[[package]]\nname = \"serde\"\nversion = \"1.0.200\"\n",
+            ),
+        ]);
+        let lock = t.path().join("Cargo.lock");
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let report = crate::packages::run::check(t.path(), Ecosystem::Cargo);
+
+        // Restored BEFORE any assertion can panic, so a failure cannot
+        // leave an undeletable file behind in the temp dir.
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(
+            report.error.is_some(),
+            "an unreadable lockfile must report an error: {report:?}"
+        );
+        // The precise inversion this is about: NOT an empty list presented
+        // as though the check had run.
+        assert!(
+            !(report.outdated.is_empty() && report.error.is_none()),
+            "an empty list with no error reads as 'up to date': {report:?}"
+        );
+        let message = report.error.unwrap();
+        assert!(
+            message.contains("Cargo.lock"),
+            "the message must name the file: {message}"
+        );
+    }
+
+    /// A lock that READS is untouched, including a stale one.
+    ///
+    /// The `continue` for a crate absent from the lock is correct and has
+    /// its own reasoning -- inventing a version from the constraint would
+    /// print a number Cargo never chose. Only the READ FAILURE became an
+    /// error, so a stale-but-readable lock must still behave exactly as it
+    /// did: no error, and the crate simply not reported.
+    #[test]
+    fn a_stale_but_readable_lockfile_is_not_an_error() {
+        let t = project(&[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"app\"\n\n[dependencies]\nserde = \"1\"\nnewcomer = \"2\"\n",
+            ),
+            (
+                "Cargo.lock",
+                "[[package]]\nname = \"serde\"\nversion = \"1.0.200\"\n",
+            ),
+        ]);
+
+        let report = crate::packages::run::check(t.path(), Ecosystem::Cargo);
+
+        assert_eq!(report.error, None, "a readable lock is not a failure");
+        assert_eq!(report.outdated.len(), 1, "{report:?}");
+        assert_eq!(report.outdated[0].name, "serde");
+    }
+
+    /// An ABSENT lockfile is not a failure.
+    ///
+    /// The false-positive half of the same mistake. A library crate
+    /// gitignores its `Cargo.lock`, so flagging a missing one would raise
+    /// an alarm on a great many perfectly healthy projects.
+    #[test]
+    fn an_absent_lockfile_is_not_an_error() {
+        let t = project(&[(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\n\n[dependencies]\nserde = \"1\"\n",
+        )]);
+
+        let report = crate::packages::run::check(t.path(), Ecosystem::Cargo);
+
+        assert_eq!(
+            report.error, None,
+            "a gitignored lockfile is the ordinary state of a library crate: {report:?}"
+        );
+    }
+
+    /// An unreadable glob parent drops every member of a workspace.
+    ///
+    /// `expand_segment` answered `Vec::new()` on a `read_dir` failure, so
+    /// `crates/*` expanded to nothing and a whole workspace reported as a
+    /// project with no dependencies (#954).
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_workspace_directory_is_reported_not_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = project(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"crates/*\"]\n\n[workspace.dependencies]\nserde = \"1\"\n",
+            ),
+            (
+                "crates/one/Cargo.toml",
+                "[package]\nname = \"one\"\n\n[dependencies]\nserde.workspace = true\n",
+            ),
+            (
+                "Cargo.lock",
+                "[[package]]\nname = \"serde\"\nversion = \"1.0.200\"\n",
+            ),
+        ]);
+        let crates = t.path().join("crates");
+        fs::set_permissions(&crates, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let report = crate::packages::run::check(t.path(), Ecosystem::Cargo);
+
+        // Restored before any assertion, so a failure cannot leave an
+        // undeletable directory behind.
+        fs::set_permissions(&crates, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            report.error.is_some(),
+            "a workspace whose members all vanished must say so: {report:?}"
+        );
+    }
+
+    /// An unreadable ROOT manifest silences the whole project.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_root_manifest_is_reported_not_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = project(&[(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\n\n[dependencies]\nserde = \"1\"\n",
+        )]);
+        let manifest = t.path().join("Cargo.toml");
+        fs::set_permissions(&manifest, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let report = crate::packages::run::check(t.path(), Ecosystem::Cargo);
+
+        fs::set_permissions(&manifest, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(
+            report.error.is_some(),
+            "an unreadable root manifest must report an error: {report:?}"
+        );
+        assert!(report.outdated.is_empty(), "{report:?}");
+    }
+
+    /// A malformed manifest is a read that SUCCEEDED and produced nothing.
+    ///
+    /// Distinguished from an I/O failure because the remedies differ
+    /// entirely, but it is just as unreportable through an `Option` -- and
+    /// it yielded the same zero declared crates.
+    #[test]
+    fn a_manifest_that_is_not_toml_is_reported_not_empty() {
+        let t = project(&[("Cargo.toml", "this is not [ valid toml at all\n")]);
+
+        let report = crate::packages::run::check(t.path(), Ecosystem::Cargo);
+
+        let message = report
+            .error
+            .expect("a manifest that will not parse cannot report zero dependencies");
+        assert!(message.contains("TOML"), "say what went wrong: {message}");
+    }
+
+    /// A partial answer is labelled partial, NOT discarded.
+    ///
+    /// The rule `claude::transcript::Scan::is_partial` states: the member
+    /// that read is real, and blanking it to report the one that did not
+    /// would replace a silent loss with a louder one.
+    #[cfg(unix)]
+    #[test]
+    fn a_workspace_with_one_unreadable_member_still_reports_the_others() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = project(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"open\", \"shut\"]\n",
+            ),
+            (
+                "open/Cargo.toml",
+                "[package]\nname = \"open\"\n\n[dependencies]\nserde = \"1\"\n",
+            ),
+            (
+                "shut/Cargo.toml",
+                "[package]\nname = \"shut\"\n\n[dependencies]\ntokio = \"1\"\n",
+            ),
+            (
+                "Cargo.lock",
+                "[[package]]\nname = \"serde\"\nversion = \"1.0.200\"\n\n[[package]]\nname = \"tokio\"\nversion = \"1.40.0\"\n",
+            ),
+        ]);
+        let shut = t.path().join("shut/Cargo.toml");
+        fs::set_permissions(&shut, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let report = crate::packages::run::check(t.path(), Ecosystem::Cargo);
+
+        fs::set_permissions(&shut, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(
+            report.error.is_some(),
+            "the shortfall is stated: {report:?}"
+        );
+        // And the half that read is still here.
+        assert!(
+            report.outdated.iter().any(|o| o.name == "serde"),
+            "the readable member's crates survive: {report:?}"
+        );
     }
 }
 

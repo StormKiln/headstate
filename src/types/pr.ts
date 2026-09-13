@@ -814,6 +814,15 @@ export interface ImportNode {
   /// is SHOWN rather than dropped -- omitting it makes the tree look
   /// complete when it is not.
   problem: string | null;
+  /// Whether this node's weight could not be MEASURED (#972).
+  ///
+  /// Separate from `problem`, because only ONE of the three problems makes
+  /// a total inexact. "file not found" and "circular import" both
+  /// contribute a correct zero -- nothing to weigh, and already counted
+  /// once respectively -- while "could not read" hides real weight. A page
+  /// that inferred partiality from `problem` would put "at least" in front
+  /// of two totals that are exact.
+  unreadable: boolean;
   children: ImportNode[];
 }
 
@@ -828,7 +837,32 @@ export interface ClaudeFile {
   /// number that matters: a 2 KB file pulling in 40 KB of imports is the
   /// case this view exists to surface.
   total_tokens: number;
+  /// Whether `total_tokens` is a FLOOR rather than a value: some import's
+  /// weight could not be counted, so the real total is higher by an
+  /// unknown amount (#972). Rendered with the app's existing "at least"
+  /// idiom.
+  total_partial: boolean;
   imports: ImportNode[];
+}
+
+/// What a CLAUDE.md scan found, INCLUDING what it could not read (#972).
+///
+/// A bare `ClaudeFile[]` could not tell "this repository has none" from
+/// "we could not look", so an unreadable file rendered as #846's own
+/// sentence -- "No CLAUDE.md files in this repository" -- about a file on
+/// disk. The `Scan` shape is `ClaudeCodePage`'s, one view over.
+export interface ClaudeMdScan {
+  /// What DID read. Never blanked because something else did not.
+  files: ClaudeFile[];
+  /// Directories that could not be listed, with why. Each hides an
+  /// unknown number of files.
+  unreadable_dirs: string[];
+  /// CLAUDE.md files proven to exist and not readable, with why.
+  unreadable_files: string[];
+  /// Directories deliberately not walked -- the skip list and the
+  /// worktree prune. NOT failures: counted separately so a correct
+  /// exclusion can never be mistaken for something going wrong.
+  skipped_dirs: number;
 }
 
 /// Whether a Claude Code session's process is running (#917).
