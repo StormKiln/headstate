@@ -3271,6 +3271,51 @@ pub async fn claude_import_transcripts(
     .map_err(|e| e.to_string())?
 }
 
+/// Aggregates for the Claude Code overview page (#921, epic #910).
+///
+/// Counts over the sessions already in the cache, plus the set of ids the
+/// live registry says are running. It derives NO liveness of its own --
+/// see `claude/overview.rs`, which argues why a second derivation on the
+/// same page is a defect rather than a convenience.
+///
+/// # Two failures, kept separate on purpose
+///
+/// A database that could not be read is an `Err`: there is nothing honest
+/// to draw, and a struct of zeros would render 30 chart columns and a
+/// "0 resumable" tile that look exactly like a measured quiet month. That
+/// is the worst version of the absent-is-not-zero bug because a flat line
+/// does not look absent, and #846 is the same defect one view over.
+///
+/// A live registry that could not be read is NOT an error: every count
+/// over stored history is still valid, so the report comes back with
+/// `live_failure` set and the page draws the aggregates above a banner
+/// saying the running figure cannot be trusted. Refusing the whole page
+/// for a 3-file directory would hide 1,461 sessions of real data.
+///
+/// `spawn_blocking` because it stats one directory per session -- 1,461
+/// of them on the development machine, measured at 22-31 ms warm, which
+/// is small but is still disk work that does not belong on the async
+/// runtime.
+#[tauri::command]
+pub async fn claude_overview(
+    app: tauri::AppHandle,
+) -> Result<crate::claude::overview::OverviewReport, String> {
+    let db = db_path(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let live = crate::claude::live::running_ids_default();
+        let conn = open_db(&db).map_err(|e| e.to_string())?;
+        let overview = crate::claude::overview::aggregate(&conn, &live.ids, chrono::Utc::now())
+            .map_err(|e| e.to_string())?;
+        Ok(crate::claude::overview::OverviewReport {
+            overview,
+            live_failure: live.failure,
+            live_unreadable: live.unreadable,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 // ---------------------------------------------------------------------
 // The Claude Code hook installer (#915). Rust side:
 // `claude/install.rs`, which is where every rule below is argued.

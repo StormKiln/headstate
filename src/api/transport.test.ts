@@ -184,6 +184,12 @@ const ROWS: Row[] = [
   row(api.revealLog, [], "reveal_log"),
   row(api.scanClaudeMd, [repoPath], "scan_claude_md", { repoPath }),
   row(api.readClaudeMd, [path], "read_claude_md", { path }),
+  // The Claude Code session cache and its aggregates (#914, #921). Neither
+  // takes an argument: both operate on `~/.claude` and Headstate's own
+  // database, whose locations the Rust side resolves. A path over the wire
+  // would be a way to make the desktop read somewhere else.
+  row(api.claudeImportTranscripts, [], "claude_import_transcripts"),
+  row(api.claudeOverview, [], "claude_overview"),
   // The Claude Code hook installer (#915). All four take no arguments: the
   // settings path and the binary path are resolved on the Rust side, which
   // is deliberate -- a path supplied over the wire would be a way to make
