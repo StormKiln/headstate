@@ -43,6 +43,12 @@ export const ALL_VIEWS = [
   "artifacts",
   "packages",
   "claude-md",
+  // Gated by the `claude_integrations_enabled` capability rather than by
+  // `hidden_views` (#916). Registered here regardless of the switch, because
+  // `View` is the type every route and preference is keyed on -- a view that
+  // existed only while enabled would make a persisted `view` unparseable the
+  // moment someone switched the integrations off.
+  "claude-code",
   // Last, deliberately: the only entry that is not about pull requests.
   "system-health",
 ] as const;
@@ -238,7 +244,7 @@ const EMPTY_FILTERS: Record<View, Filters> = {
   docker: {},
   artifacts: {},
   packages: {},
-  "claude-md": {},
+  "claude-md": {}, "claude-code": {},
   // PR Stats holds its own scope selection (#825): `statsScopeKind`,
   // `statsScopeValue` and `statsSubject`, written by `StatsSidebar`
   // through `setStatsScope`. Empty here like every other view -- the entry

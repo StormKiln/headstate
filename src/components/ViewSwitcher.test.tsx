@@ -6,7 +6,7 @@ import { useFilters } from "../store/filters";
 import { VIEWS, ViewSwitcher } from "./ViewSwitcher";
 
 const EMPTY = { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} } as const;
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, "system-health": {} } as const;
 
 describe("ViewSwitcher", () => {
   /// PR Stats leads the menu (#823).
@@ -22,6 +22,43 @@ describe("ViewSwitcher", () => {
   /// renders, so this is the order the user sees -- `ALL_VIEWS` in
   /// `store/filters.ts` is kept in step for readers, but only derives a
   /// type.
+  /// The capability gate, and specifically the case the escape hatches
+  /// would otherwise defeat (#916).
+  ///
+  /// `ViewSwitcher` honours `hidden_views` loosely on purpose: a user
+  /// sitting on a view they hid keeps it, via the `id === view` hatch. That
+  /// is right for a preference and wrong for a capability -- a switched-off
+  /// integration has no page behind the entry, so being the current view
+  /// must not make it offerable.
+  ///
+  /// Asserted with `view` set TO the gated id, because that is the only
+  /// configuration where the two rules disagree. A test that left `view`
+  /// elsewhere would pass against a gate placed after the hatch, which is
+  /// the bug this is written to catch.
+  it("does not offer the Claude Code view while the capability is off", () => {
+    useFilters.setState({ filtersByView: EMPTY, view: "claude-code" } as never);
+    render(<ViewSwitcher counts={{ "to-review": 0 }} />);
+    fireEvent.click(screen.getByRole("button", { name: /claude code|my pull requests/i }));
+    // Absent from the MENU, not merely from a collapsed control.
+    expect(screen.queryByRole("menuitem", { name: /claude code/i })).toBeNull();
+    // A view that is NOT gated proves the menu rendered at all, rather
+    // than the assertion above passing because nothing is on screen.
+    expect(screen.getByRole("menuitem", { name: /worktrees/i })).toBeTruthy();
+  });
+
+  /// Absent prefs read as OFF, not as on.
+  ///
+  /// The hook returns `undefined` before the first fetch resolves, and a
+  /// capability that defaults to "available" during that window would flash
+  /// a view the user has not enabled. Absent is not enabled -- the same
+  /// direction every other unknown in this codebase fails in.
+  it("treats unknown prefs as the capability being off", () => {
+    useFilters.setState({ filtersByView: EMPTY, view: "my-prs" } as never);
+    render(<ViewSwitcher counts={{ "to-review": 0 }} />);
+    fireEvent.click(screen.getByRole("button", { name: /my pull requests/i }));
+    expect(screen.queryByRole("menuitem", { name: /claude code/i })).toBeNull();
+  });
+
   it("offers PR Stats first", () => {
     expect(VIEWS[0].id).toBe("pr-stats");
     expect(VIEWS[0].label).toBe("PR Stats");
@@ -94,7 +131,7 @@ describe("ViewSwitcher", () => {
   it("does not leak filters between views", () => {
     useFilters.setState({
       filtersByView: { "my-prs": { repo: "octocat/hello-world" }, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} },
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, "system-health": {} },
       view: "my-prs",
     });
     render(<ViewSwitcher />);
