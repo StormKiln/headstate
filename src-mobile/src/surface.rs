@@ -124,6 +124,11 @@ pub const SURFACE: &[(&str, Class)] = &[
     // reasoning. The view must say these are the paired desktop's
     // sessions, not this phone's.
     ("claude_sessions", Class::Read),
+    // The two live sources on the DESKTOP: its hook handoff file and its
+    // `~/.claude/sessions` registry (#913). The phone has neither of its
+    // own -- it runs no Claude sessions -- which is exactly why it asks
+    // the desktop. See the desktop table for why this is a Read.
+    ("claude_poll_live", Class::Read),
     // The DESKTOP's Claude Code overview aggregates (#921). Read: two
     // SELECTs over Headstate's own cache plus a directory listing, and it
     // writes nothing at all -- not even the cache, unlike the rescan above.

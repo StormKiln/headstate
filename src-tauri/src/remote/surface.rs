@@ -232,6 +232,22 @@ pub const SURFACE: &[(&str, Class)] = &[
     // reach a desktop shell -- the same reasoning that makes
     // `claudify_command` Read.
     ("claude_sessions", Class::Read),
+    // One pass over the two LIVE sources: the hook's handoff file and the
+    // `~/.claude/sessions` registry (#913).
+    //
+    // A `Read` even though it writes, and the distinction this table
+    // draws is "changes GitHub state or a desktop setting", which this
+    // does not: every write lands in Headstate's own cache, plus a
+    // truncation of Headstate's OWN handoff file after the records in it
+    // are committed. `claude_import_transcripts` above is classed the
+    // same way for the same reason -- both populate a cache from disk
+    // rather than changing anything a user would call state.
+    //
+    // NOT `Local`, and the test the class docs give is whether the phone
+    // could act on the answer. It can: the answer is which sessions are
+    // running on the paired desktop and which crashed, which is the whole
+    // of what the companion's session list shows.
+    ("claude_poll_live", Class::Read),
     // Aggregates for the Claude Code overview page (#921).
     //
     // `Read`, and for a narrower reason than the rescan above: it runs two
@@ -698,6 +714,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "read_claude_md" => res(commands::read_claude_md(a.get("path")?)),
         "claude_import_transcripts" => res(commands::claude_import_transcripts(app.clone()).await),
         "claude_sessions" => res(commands::claude_sessions(app.clone()).await),
+        "claude_poll_live" => res(commands::claude_poll_live(app.clone()).await),
         "claude_overview" => res(commands::claude_overview(app.clone()).await),
         "claude_hooks_status" => res(commands::claude_hooks_status()),
         "get_poll_interval" => ok(commands::get_poll_interval(app.state())),
