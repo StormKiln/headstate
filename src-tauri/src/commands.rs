@@ -1351,9 +1351,18 @@ pub fn reveal_log(app: AppHandle) -> Result<String, String> {
     }
 }
 
-/// Every CLAUDE.md in a repository, with its import tree resolved.
+/// Every CLAUDE.md in a repository, with its import tree resolved, AND
+/// everything the scan could not read.
+///
+/// Returns a `Scan` rather than a bare `Vec` since #972. The list alone
+/// could not distinguish "this repository has none" from "we could not
+/// look", so an unreadable file rendered as #846's own sentence -- "No
+/// CLAUDE.md files in this repository" -- about a file the user can see on
+/// disk. `Ok` is still the only outcome for a scan that RAN, because a
+/// partial answer labelled partial beats an error page: the files that did
+/// read are real, and the shortfall travels beside them.
 #[tauri::command]
-pub async fn scan_claude_md(repo_path: String) -> Result<Vec<crate::claudemd::ClaudeFile>, String> {
+pub async fn scan_claude_md(repo_path: String) -> Result<crate::claudemd::Scan, String> {
     tauri::async_runtime::spawn_blocking(move || {
         crate::claudemd::scan_repo(std::path::Path::new(&repo_path))
     })

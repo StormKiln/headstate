@@ -19,7 +19,7 @@
 //! A parser would be a dependency for two fields whose format Terraform
 //! controls and does not vary.
 
-use super::model::{Bump, Ecosystem, Outdated};
+use super::model::{Bump, Ecosystem, FileScan, Outdated};
 use std::path::Path;
 
 /// How deep to look for lock files.
@@ -32,15 +32,45 @@ const MAX_DEPTH: usize = 3;
 
 /// Every provider pinned anywhere in this repository.
 ///
+/// The `Vec`-only view, for a caller that only asks "is there anything
+/// here" -- `detect::projects`. Anything RENDERING the result wants
+/// `scan`, because this shape cannot say that a lock file was skipped.
+pub fn pinned(repo: &Path) -> Vec<Outdated> {
+    scan(repo).outdated
+}
+
+/// Every provider pinned anywhere in this repository, and every lock file
+/// that could not be read.
+///
 /// `latest` is left EQUAL to `current` and `bump` is `Unknown`: this
 /// pass reports what is installed, and `registry::enrich` fills in what
 /// is available. Reporting an unknown latest as an update would be the
 /// confidently-wrong answer this module exists to avoid.
-pub fn pinned(repo: &Path) -> Vec<Outdated> {
+///
+/// A lock file the walk PROVED exists and then could not read is
+/// reported, not skipped (#954). It holds an unknown number of providers,
+/// so dropping it silently shortens the list by an amount nothing on
+/// screen accounts for -- and an empty list on this page reads as "up to
+/// date". `error` was hardcoded `None` for Terraform precisely because
+/// there is no command to fail here, which left every file-read failure
+/// unrepresentable.
+pub fn scan(repo: &Path) -> FileScan {
+    let mut scan = FileScan::default();
+    let (locks, unreadable_dirs) = lock_files(repo);
+    for dir in unreadable_dirs {
+        // A directory that could not be listed may hold any number of
+        // lock files, so it is a bigger unknown than a single file and
+        // must not be silently treated as empty.
+        scan.failed_with(&dir, "directory could not be listed");
+    }
     let mut out = Vec::new();
-    for lock in lock_files(repo) {
-        let Ok(text) = std::fs::read_to_string(&lock) else {
-            continue;
+    for lock in locks {
+        let text = match std::fs::read_to_string(&lock) {
+            Ok(t) => t,
+            Err(e) => {
+                scan.failed(&lock, &e);
+                continue;
+            }
         };
         // The path RELATIVE to the repo, so a row says which module it
         // came from -- with many locks per repo, the bare filename would
@@ -50,6 +80,10 @@ pub fn pinned(repo: &Path) -> Vec<Outdated> {
             .unwrap_or(&lock)
             .to_string_lossy()
             .to_string();
+        // A lock file that READ and yielded nothing is not a failure:
+        // `terraform init` writes one with no provider blocks when a
+        // module has no providers, and calling that unreadable would turn
+        // a correct empty answer into a false alarm.
         for (name, version) in providers(&text) {
             out.push(Outdated {
                 name,
@@ -61,7 +95,8 @@ pub fn pinned(repo: &Path) -> Vec<Outdated> {
             });
         }
     }
-    out
+    scan.outdated = out;
+    scan
 }
 
 /// `(source, version)` for each provider block.
@@ -96,13 +131,21 @@ fn providers(text: &str) -> Vec<(String, String)> {
     out
 }
 
-/// Lock files under `repo`, to `MAX_DEPTH`.
-fn lock_files(repo: &Path) -> Vec<std::path::PathBuf> {
+/// Lock files under `repo`, to `MAX_DEPTH`, and the directories that could
+/// not be listed.
+///
+/// The second half is returned rather than swallowed, for the reason
+/// `claude::transcript::session_files` returns its own: an unreadable
+/// directory may hold any number of lock files, and treating it as empty is
+/// indistinguishable from it genuinely being empty.
+fn lock_files(repo: &Path) -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
     const SKIP: &[&str] = &[".git", ".terraform", "node_modules", "target", ".worktrees"];
     let mut out = Vec::new();
+    let mut unreadable = Vec::new();
     let mut stack = vec![(repo.to_path_buf(), 0usize)];
     while let Some((dir, depth)) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
+            unreadable.push(dir);
             continue;
         };
         for e in entries.flatten() {
@@ -118,7 +161,10 @@ fn lock_files(repo: &Path) -> Vec<std::path::PathBuf> {
         }
     }
     out.sort();
-    out
+    // Both sorted: directory order is not stable across machines, and the
+    // report should not reshuffle between scans.
+    unreadable.sort();
+    (out, unreadable)
 }
 
 #[cfg(test)]
@@ -233,6 +279,103 @@ provider "registry.terraform.io/hashicorp/aws" {
             out[0].manifest.contains(&*expected.to_string_lossy()),
             "the row must name its module: {}",
             out[0].manifest
+        );
+    }
+
+    /// A lock file proven to exist and dropped unread (#954).
+    ///
+    /// `error` was hardcoded `None` for Terraform because there is no
+    /// command to fail, so a read failure beneath it was unrepresentable and
+    /// the page reported the repository as up to date.
+    ///
+    /// `#[cfg(unix)]` because `chmod 000` is the mechanism and Windows does
+    /// not honour it -- a `0o000` file stays readable there, so this test
+    /// would fail for a reason unrelated to the code. The behaviour is not
+    /// platform-specific; only this way of producing an unreadable file is.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_lock_file_is_reported_not_dropped() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::TempDir::new().unwrap();
+        let lock = t.path().join(".terraform.lock.hcl");
+        std::fs::write(&lock, LOCK).unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let got = scan(t.path());
+
+        // Restored before any assertion can panic, so a failure cannot
+        // leave an undeletable file behind.
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(got.is_partial(), "{got:?}");
+        assert!(
+            got.error().is_some(),
+            "an empty provider list with no error reads as 'up to date': {got:?}"
+        );
+    }
+
+    /// A lock file that READS and declares no providers is a real answer.
+    ///
+    /// `terraform init` writes one for a module with no providers, so calling
+    /// that unreadable would turn a correct empty answer into a false alarm
+    /// -- the false-positive half of the same mistake.
+    #[test]
+    fn a_lock_file_with_no_providers_is_not_a_failure() {
+        let t = tempfile::TempDir::new().unwrap();
+        std::fs::write(t.path().join(".terraform.lock.hcl"), "# nothing here").unwrap();
+
+        let got = scan(t.path());
+
+        assert!(!got.is_partial(), "{got:?}");
+        assert_eq!(got.error(), None);
+    }
+
+    /// A partial answer is labelled partial, NOT discarded.
+    #[cfg(unix)]
+    #[test]
+    fn the_readable_lock_files_survive_an_unreadable_sibling() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::TempDir::new().unwrap();
+        std::fs::write(t.path().join(".terraform.lock.hcl"), LOCK).unwrap();
+        let nested = t.path().join("modules").join("vpc");
+        std::fs::create_dir_all(&nested).unwrap();
+        let shut = nested.join(".terraform.lock.hcl");
+        std::fs::write(&shut, LOCK).unwrap();
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let got = scan(t.path());
+
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(got.is_partial(), "{got:?}");
+        assert!(
+            !got.outdated.is_empty(),
+            "the readable lock's providers survive: {got:?}"
+        );
+    }
+
+    /// An unreadable DIRECTORY is reported too.
+    ///
+    /// It may hold any number of lock files, so treating it as empty is
+    /// indistinguishable from it genuinely being empty -- the distinction
+    /// `claude::registry` draws between a directory and a single file.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_directory_is_reported_not_treated_as_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::TempDir::new().unwrap();
+        let nested = t.path().join("environments");
+        std::fs::create_dir_all(nested.join("prod")).unwrap();
+        std::fs::write(nested.join("prod").join(".terraform.lock.hcl"), LOCK).unwrap();
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let got = scan(t.path());
+
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            got.is_partial(),
+            "an unlistable directory hides an unknown number of locks: {got:?}"
         );
     }
 }

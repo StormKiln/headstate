@@ -7,6 +7,7 @@ import { useActiveFilters } from "@/store/filters";
 import { formatSize } from "@/lib/worktrees";
 import { Markdown } from "./Markdown";
 import { QueryError, errorMessage } from "./QueryError";
+import { PartialScanNotice } from "./PartialScanNotice";
 import { copyText } from "@/lib/clipboard";
 import { toast } from "sonner";
 
@@ -19,6 +20,18 @@ import { toast } from "sonner";
 /// refuses to ship, so the word "est." travels with it everywhere.
 function tokenLabel(n: number): string {
   return `~${n.toLocaleString()} est. tokens`;
+}
+
+/// A total that is a FLOOR, in the app's existing idiom (#972).
+///
+/// "at least" is what `ArtifactsPage` and `WorktreesPage` already put in
+/// front of a size that is not fully measured, so this reuses the phrasing
+/// rather than inventing a second one for the same fact. Reached when an
+/// import's weight could not be counted: the real total is higher by an
+/// unknown amount, and a user budgeting context otherwise reads a number
+/// that is too small with nothing on screen to say so.
+function totalLabel(n: number, partial: boolean): string {
+  return partial ? `at least ${tokenLabel(n)}` : tokenLabel(n);
 }
 
 /// CLAUDE.md files for the selected repository.
@@ -34,12 +47,24 @@ export function ClaudeMdPage() {
   // could not answer, on a page whose own doc comment above stakes its
   // design on "a wrong render costs a confused reader".
   const {
-    data: files = [],
+    data: scan,
     isLoading,
     isError,
     error,
     refetch,
   } = useClaudeMd(repo);
+  // NOT `data.files = []`. The default lives here rather than on `data`
+  // because the guards below need to see `undefined` -- a `= []` on the
+  // query result is exactly what #846 was about, and #972 is the same
+  // mistake one layer down: the scan now reports what it could not read,
+  // and a defaulted-away `scan` would make that report unreachable.
+  const files = scan?.files ?? [];
+  // Everything the scan proved it could not read. A directory and a file
+  // are ONE list to the reader -- both are "we could not look here" -- and
+  // `PartialScanNotice` shows the message the Rust side attached to each,
+  // which is what distinguishes a permission wall from a stray byte.
+  const unreadablePaths = scan ? [...scan.unreadable_dirs, ...scan.unreadable_files] : [];
+  const unreadable = unreadablePaths.length;
   const [selected, setSelected] = useState<string | undefined>(undefined);
   const isMobile = useIsMobile();
 
@@ -93,7 +118,44 @@ export function ClaudeMdPage() {
       </div>
     );
   }
+  // The FOURTH answer, and the one #846's fix could not reach (#972).
+  //
+  // That fix gave this page a correct `isError` arm ordered BEFORE the
+  // empty arm. It is sound and untouched -- but the arm can only fire on
+  // `isError`, and `scan_claude_md` could only ever return `Ok`. So a read
+  // failure arrived as an empty list, the empty arm was reached first, and
+  // the page said "No CLAUDE.md files in this repository" about a file the
+  // user can see on disk.
+  //
+  // Ordered before the empty arm for the reason that fix states, and here
+  // it is not merely a nicety: "this repository has none" and "we could
+  // not read it" have opposite remedies.
+  //
+  // No retry, and NOT reported as a failed scan -- the decision #951 made
+  // for `RepoPickerSidebar` and wrote into `PartialScanNotice`. `isError`
+  // above is a rejection of the whole command; this is a walk that ran and
+  // came back short, and a second identical walk will not read what the
+  // first could not. The paths below are the action, not a button.
+  if (files.length === 0 && unreadable > 0) {
+    return (
+      <div className="p-4">
+        <p className="text-sm text-[#8b949e]">
+          No CLAUDE.md file could be read. The paths below explain why — this repository may well
+          have some.
+        </p>
+        <div className="mt-2">
+          <PartialScanNotice
+            unreadable={unreadablePaths}
+            consequence="no CLAUDE.md file could be read from them."
+          />
+        </div>
+      </div>
+    );
+  }
   if (files.length === 0) {
+    // Only a scan that read EVERYTHING gets to say this. The arm above has
+    // already taken the partial case, so this is now a true statement
+    // rather than #846's confident wrong answer.
     return <p className="p-4 text-sm text-[#8b949e]">No CLAUDE.md files in this repository.</p>;
   }
 
@@ -117,6 +179,24 @@ export function ClaudeMdPage() {
             : "w-96 shrink-0 overflow-y-auto border-r border-[#30363d] p-3"
         }
       >
+        {/* A PARTIAL scan, stated beside the files that DID read (#972).
+
+            The SAME component #951 added for the worktree scan, not a
+            second one: it is the same third answer with the same reasoning
+            about why it is a notice rather than an error panel, and a
+            parallel implementation of it is exactly the drift the app's
+            shared constants exist to prevent.
+
+            Above the list rather than instead of it. The files here are
+            real, and blanking them to report one unreadable sibling would
+            replace a silent loss with a louder one -- the trade
+            `ArtifactsPage` states and the rule `transcript.rs`'s
+            `is_partial()` gives. The all-unreadable case never reaches
+            here; the arm above took it. */}
+        <PartialScanNotice
+          unreadable={unreadablePaths}
+          consequence={`the ${files.length === 1 ? "file" : `${files.length} files`} below may not be all of them.`}
+        />
         {files.map((f) => (
           <FileEntry
             key={f.path}
@@ -218,7 +298,12 @@ function FileEntry({
   // Only worth stating separately when the tree adds something. On a
   // file with no imports the two numbers are equal and printing both
   // reads as a mistake.
-  const treeAdds = file.total_tokens > file.tokens;
+  //
+  // `total_partial` also qualifies: an import whose weight could not be
+  // counted adds nothing to the number, so `total_tokens` equals `tokens`
+  // and the old condition hid the row that carries the "at least" (#972)
+  // -- the exact case in which the total most needs saying.
+  const treeAdds = file.total_tokens > file.tokens || file.total_partial;
 
   return (
     <div className="mb-2">
@@ -259,7 +344,7 @@ function FileEntry({
             secondary text does not need to be dimmed on top of that. */}
         <span className={`text-xs ${active ? "text-white" : "text-[#8b949e]"}`}>
           {formatSize(file.bytes)} · {tokenLabel(file.tokens)}
-          {treeAdds ? ` · ${tokenLabel(file.total_tokens)} with imports` : ""}
+          {treeAdds ? ` · ${totalLabel(file.total_tokens, file.total_partial)} with imports` : ""}
         </span>
       </button>
       {menu ? (

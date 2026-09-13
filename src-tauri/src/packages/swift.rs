@@ -16,7 +16,7 @@
 //! knowing how to update an Xcode project's package reference, so apply
 //! stays refused.
 
-use super::model::{Bump, Ecosystem, Outdated};
+use super::model::{Bump, Ecosystem, FileScan, Outdated};
 use std::path::Path;
 
 /// How deep to look. Xcode buries `Package.resolved` inside the project
@@ -25,17 +25,51 @@ const MAX_DEPTH: usize = 6;
 
 /// Every Swift package pinned in this repository.
 ///
+/// The `Vec`-only view, kept for callers that only need the rows. A caller
+/// that RENDERS the result wants `scan`, which can also say what it could
+/// not read.
+pub fn pinned(repo: &Path) -> Vec<Outdated> {
+    scan(repo).outdated
+}
+
+/// Every Swift package pinned in this repository, and every
+/// `Package.resolved` that could not be read.
+///
 /// `latest` starts equal to `current` with `Bump::Unknown`, and
 /// `registry::enrich` fills it in. A pin without a version -- by branch
 /// or bare revision -- is reported with its revision and left
 /// uncomparable, because there is no version to compare and calling it
 /// current would be a lie.
-pub fn pinned(repo: &Path) -> Vec<Outdated> {
+///
+/// A `Package.resolved` the walk PROVED exists and then could not read or
+/// could not parse is reported rather than skipped (#954): both produced
+/// an empty list, and an empty list on this page reads as "up to date".
+pub fn scan(repo: &Path) -> FileScan {
+    let mut scan = FileScan::default();
+    let (files, unreadable_dirs) = resolved_files(repo);
+    for dir in unreadable_dirs {
+        // A directory that could not be listed may hold any number of
+        // resolved files, so it is a bigger unknown than a single file.
+        scan.failed_with(&dir, "directory could not be listed");
+    }
     let mut out = Vec::new();
-    for file in resolved_files(repo) {
-        let Ok(text) = std::fs::read_to_string(&file) else {
-            continue;
+    for file in files {
+        let text = match std::fs::read_to_string(&file) {
+            Ok(t) => t,
+            Err(e) => {
+                scan.failed(&file, &e);
+                continue;
+            }
         };
+        // A `Package.resolved` that is not JSON at all cannot be believed
+        // to hold no pins. `parse` answers an empty list for "bad JSON" and
+        // for "genuinely no pins" alike, so the malformation is checked
+        // HERE where it can be reported -- otherwise a truncated file reads
+        // as a project with no Swift dependencies.
+        if serde_json::from_str::<serde_json::Value>(&text).is_err() {
+            scan.failed_with(&file, "not valid JSON");
+            continue;
+        }
         let manifest = file
             .strip_prefix(repo)
             .unwrap_or(&file)
@@ -67,7 +101,8 @@ pub fn pinned(repo: &Path) -> Vec<Outdated> {
     for o in &mut out {
         o.latest = o.current.clone();
     }
-    out
+    scan.outdated = out;
+    scan
 }
 
 /// One pinned dependency.
@@ -172,13 +207,20 @@ pub fn github_repo(location: &str) -> Option<(String, String)> {
     Some((owner, name))
 }
 
-/// `Package.resolved` files under `repo`.
-fn resolved_files(repo: &Path) -> Vec<std::path::PathBuf> {
+/// `Package.resolved` files under `repo`, and the directories that could
+/// not be listed.
+///
+/// The second half travels rather than being swallowed: an unreadable
+/// directory may hold any number of resolved files, so treating it as empty
+/// is indistinguishable from it genuinely being empty.
+fn resolved_files(repo: &Path) -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
     const SKIP: &[&str] = &[".git", "build", ".build", "node_modules", ".worktrees"];
     let mut out = Vec::new();
+    let mut unreadable = Vec::new();
     let mut stack = vec![(repo.to_path_buf(), 0usize)];
     while let Some((dir, depth)) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
+            unreadable.push(dir);
             continue;
         };
         for e in entries.flatten() {
@@ -194,7 +236,9 @@ fn resolved_files(repo: &Path) -> Vec<std::path::PathBuf> {
         }
     }
     out.sort();
-    out
+    // Both sorted, so a rescan does not reshuffle either list.
+    unreadable.sort();
+    (out, unreadable)
 }
 
 #[cfg(test)]
@@ -338,5 +382,109 @@ mod tests {
         std::fs::create_dir_all(&deep).unwrap();
         std::fs::write(deep.join("Package.resolved"), V3).unwrap();
         assert_eq!(pinned(t.path()).len(), 1);
+    }
+
+    /// A `Package.resolved` proven to exist and dropped unread (#954).
+    ///
+    /// The walk matched the filename; the read then failed and the file
+    /// vanished with no record. `error` was hardcoded `None` for Swift, so
+    /// the page reported the repository as having nothing to update -- "we
+    /// could not look" rendered as good news, which is the worst available
+    /// answer because nobody investigates good news.
+    ///
+    /// # Why `#[cfg(unix)]`
+    ///
+    /// `chmod 000` is the mechanism, and Windows does not honour it: a
+    /// `0o000` file stays readable there, so this test would fail for a
+    /// reason that has nothing to do with this code. The BEHAVIOUR is not
+    /// platform-specific -- a permission wall is a permission wall -- only
+    /// this way of producing one is. Same gate the suite's other permission
+    /// tests carry, in `claude::transcript`.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_resolved_file_is_reported_not_dropped() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::TempDir::new().unwrap();
+        let file = t.path().join("Package.resolved");
+        std::fs::write(&file, V3).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let got = scan(t.path());
+
+        // Restored before any assertion can panic, so a failure cannot
+        // leave an undeletable file behind in the temp dir.
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(
+            got.is_partial(),
+            "the scan must know it is partial: {got:?}"
+        );
+        assert!(
+            got.error().is_some(),
+            "an empty list with no error reads as 'up to date': {got:?}"
+        );
+    }
+
+    /// A malformed `Package.resolved` is not a project with no packages.
+    ///
+    /// `parse` answers an empty list for "not JSON" and for "genuinely no
+    /// pins" alike, so a truncated file read as a repository with no Swift
+    /// dependencies at all.
+    #[test]
+    fn a_resolved_file_that_is_not_json_is_reported() {
+        let t = tempfile::TempDir::new().unwrap();
+        std::fs::write(t.path().join("Package.resolved"), "{ truncated").unwrap();
+
+        let got = scan(t.path());
+
+        assert!(
+            got.error().is_some(),
+            "a file that will not parse cannot report zero pins: {got:?}"
+        );
+    }
+
+    /// A file that READS and holds no pins is a real answer, not a failure.
+    ///
+    /// The false-positive half of the same mistake: an alarm here would fire
+    /// on a perfectly healthy project.
+    #[test]
+    fn an_empty_but_valid_resolved_file_is_not_a_failure() {
+        let t = tempfile::TempDir::new().unwrap();
+        std::fs::write(t.path().join("Package.resolved"), "{\"pins\": []}").unwrap();
+
+        let got = scan(t.path());
+
+        assert!(!got.is_partial(), "{got:?}");
+        assert_eq!(got.error(), None);
+        assert!(got.outdated.is_empty());
+    }
+
+    /// A partial answer is labelled partial, NOT discarded.
+    ///
+    /// The rule `claude::transcript::Scan::is_partial` states. The pins that
+    /// read are real, and blanking them to report the sibling that did not
+    /// would replace a silent loss with a louder one.
+    #[cfg(unix)]
+    #[test]
+    fn the_readable_resolved_files_survive_an_unreadable_sibling() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::TempDir::new().unwrap();
+        std::fs::write(t.path().join("Package.resolved"), V3).unwrap();
+        let nested = t.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let shut = nested.join("Package.resolved");
+        std::fs::write(&shut, V3).unwrap();
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let got = scan(t.path());
+
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(got.is_partial(), "{got:?}");
+        assert_eq!(
+            got.outdated.len(),
+            1,
+            "the readable file's pins survive: {got:?}"
+        );
     }
 }
