@@ -47,3 +47,12 @@ pub mod cli;
 pub mod hook;
 pub mod store;
 pub mod transcript;
+
+// Re-exported so `commands.rs` names the operation rather than the module it
+// happens to live in. `claude_import_transcripts` reaches the importer this
+// way, so dropping these breaks the CALL SITE rather than the module -- which
+// is how a merge lost them twice: once in my first resolution of the #912 +
+// #914 add/add conflict, and again when a later merge of the same branches
+// reintroduced the same gap. The compiler is what caught it both times
+// (`cannot find function scan_default in module crate::claude`), never review.
+pub use transcript::{scan, scan_default, Scan, Transcript};
