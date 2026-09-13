@@ -89,6 +89,10 @@ import {
   scanClaudeMd,
   claudeImportTranscripts,
   claudeSessions,
+  claudeHooksStatus,
+  claudeInstallHooks,
+  claudeReinstallHooks,
+  claudeUninstallHooks,
   cleanupLog,
   getCleanupPrefs,
   previewCleanup,
@@ -2726,6 +2730,52 @@ export function useRemoteEnabled() {
       qc.invalidateQueries({ queryKey: ["remote-enabled"] }),
     );
   return { enabled: query.data ?? false, set };
+}
+
+// ---------------------------------------------------------------------
+// The Claude Code hook installer (#915).
+// Rust side: src-tauri/src/claude/install.rs
+// ---------------------------------------------------------------------
+
+/// Whether the hooks are in `~/.claude/settings.json`, plus the three
+/// actions that change that.
+///
+/// # Why there is no `staleTime: Infinity` here
+///
+/// Every other settings query in this file caches forever, because it reads a
+/// value only this app writes. This one reads a file that OTHER things edit:
+/// the user's editor, another tool's installer, a `git checkout` of their
+/// dotfiles. A cached "installed" is wrong the moment any of those happens,
+/// which is the same staleness argument the schema makes for liveness -- and
+/// the issue states it as a rule: never infer "installed" from "we wrote the
+/// file", read it back.
+///
+/// So it refetches when the settings dialog is focused, and every action
+/// invalidates rather than writing an optimistic value. An optimistic
+/// "installed" would be precisely the lie the feature is built to avoid: it
+/// would show a green tick for a write that Claude Code will silently ignore.
+export function useClaudeHooks() {
+  const qc = useQueryClient();
+  const query = useQuery({
+    queryKey: ["claude-hooks-status"],
+    queryFn: claudeHooksStatus,
+    // Short rather than Infinity, and refetched on focus: see above.
+    staleTime: 5_000,
+    refetchOnWindowFocus: true,
+  });
+  // `invalidateQueries` and NOT `setQueryData`: the result of an install is
+  // what the FILE says afterwards, not what we asked for.
+  const reread = () => qc.invalidateQueries({ queryKey: ["claude-hooks-status"] });
+  return {
+    status: query.data,
+    /// Distinct from `status === undefined` after an error: a caller must be
+    /// able to tell "still loading" from "the call itself failed".
+    isLoading: query.isLoading,
+    error: query.error,
+    install: () => claudeInstallHooks().finally(reread),
+    reinstall: () => claudeReinstallHooks().finally(reread),
+    uninstall: () => claudeUninstallHooks().finally(reread),
+  };
 }
 
 // ---------------------------------------------------------------------

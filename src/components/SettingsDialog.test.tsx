@@ -46,6 +46,18 @@ vi.mock("../api/hooks", () => ({
   useRevokePairedDevice: () => () => Promise.resolve(),
   usePollInterval: () => ({ seconds: 120, set: setInterval_ }),
   useWorktreeDirs: () => ({ dirs: dirs.current, set: setDirs }),
+  // #915's panel. "Not installed" is the state a fresh machine is in, and
+  // deliberately not `undefined`: an unresolved status renders a "checking"
+  // line rather than any of the four answers, which would make the
+  // reachability assertions below depend on a loading state.
+  useClaudeHooks: () => ({
+    status: { state: "not_installed" },
+    isLoading: false,
+    error: null,
+    install: () => Promise.resolve({ command: "x", added: [], replaced: [], created_file: false }),
+    reinstall: () => Promise.resolve({ command: "x", added: [], replaced: [], created_file: false }),
+    uninstall: () => Promise.resolve({ removed: [], was_absent: true }),
+  }),
   // Defaults, matching the Rust side: absent prefs mean everything on.
   useNotifyPrefs: () => ({
     prefs: { enabled: true, ci_failed: true, conflicted: true },

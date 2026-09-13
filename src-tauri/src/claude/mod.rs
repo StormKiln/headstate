@@ -12,23 +12,22 @@
 //! resolves the overlap per field by which source actually knows the
 //! answer -- see [`store::import`].
 //!
-//! [`liveness`] is the reader's half (#917): whether a stored session is
-//! still running is DERIVED from the machine every time a row is
-//! rendered, never stored, and has three answers rather than two. The
-//! third -- "could not tell" -- is what keeps a failed probe from
-//! offering to resurrect a session that is alive and mid-work.
-//!
-//! [`sessions`] assembles what the Claude Code view renders: the stored
-//! rows, each one's derived liveness, and the tri-state cwd check that
-//! decides which resume command is safe to copy (#918).
-//!
-//! Nothing in here writes to `~/.claude`. Read-only by design: those
-//! transcripts are Claude Code's data and the file `claude --resume`
-//! depends on.
+//! [`install`] (#915) is the ONE exception to the rule below, and it is
+//! narrow on purpose: it appends two hook matchers to
+//! `~/.claude/settings.json` and refuses to touch anything it cannot parse.
+//! Nothing else in here writes to `~/.claude`. The transcripts in
+//! particular are read-only by design -- they are Claude Code's data and the
+//! files `claude --resume` depends on.
 
+pub mod install;
 pub mod liveness;
 pub mod sessions;
 pub mod store;
 pub mod transcript;
 
+// Re-exported so `commands.rs` names the operation rather than the module it
+// happens to live in. Dropping these breaks the CALL SITE rather than the
+// module, which is how a merge has eaten them twice in this epic -- the error
+// names a function in a module that still contains it, and five CI checks
+// fail for one missing line. Do not remove them to "tidy" a conflict.
 pub use transcript::{scan, scan_default, Scan, Transcript};

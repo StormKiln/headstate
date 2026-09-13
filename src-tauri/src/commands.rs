@@ -3352,6 +3352,107 @@ pub fn claude_reveal_path(path: String) -> Result<String, String> {
         Ok(()) => Ok(path),
         Err(e) => Err(format!("could not open {path}: {e}")),
     }
+// ---------------------------------------------------------------------
+// The Claude Code hook installer (#915). Rust side:
+// `claude/install.rs`, which is where every rule below is argued.
+// ---------------------------------------------------------------------
+
+/// `~/.claude/settings.json` and this process's binary, or a reason not to.
+///
+/// The one place the real paths are resolved, so that every function in
+/// `claude::install` keeps taking them as parameters -- which is what makes
+/// the tests in that module incapable of reaching the developer's own
+/// settings file.
+fn claude_settings_target() -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
+    let home = crate::auth::home_dir()
+        .ok_or_else(|| "no home directory, so there is no ~/.claude to install into".to_string())?;
+    let exe = crate::claude::install::current_exe().map_err(|e| e.to_string())?;
+    Ok((crate::claude::install::settings_path_in(&home), exe))
+}
+
+/// Whether Headstate's hooks are in `~/.claude/settings.json` right now.
+///
+/// READ every time, never cached (epic #910 §5.5). A cached "installed" is
+/// wrong the moment the user hand-edits the file -- and this is a file we
+/// invite them to edit, because the malformed refusal tells them to.
+///
+/// Returns a [`Status`] rather than a bool, and that is the whole point:
+/// the third state, `CannotTell`, must not render as "not installed". Claude
+/// Code IGNORES a settings file it cannot parse, silently -- measured -- so a
+/// user in that state has every hook in the file dead with no symptom, and
+/// the remedy is an editor rather than the Install button.
+///
+/// A `Read` on the remote surface: it reads one file and has no side
+/// effects, and "is that desktop recording?" is a reasonable thing to ask
+/// from a phone.
+///
+/// [`Status`]: crate::claude::install::Status
+#[tauri::command]
+pub fn claude_hooks_status() -> Result<crate::claude::install::Status, String> {
+    let (path, exe) = match claude_settings_target() {
+        Ok(t) => t,
+        // Even THIS is a status rather than an error, for the same reason:
+        // a caller that got an `Err` would have to choose a state to show,
+        // and the tempting choice is "not installed".
+        Err(e) => {
+            return Ok(crate::claude::install::Status::CannotTell(
+                crate::claude::install::Refusal::Io {
+                    path: "~/.claude/settings.json".to_string(),
+                    detail: e,
+                },
+            ))
+        }
+    };
+    Ok(crate::claude::install::status(&path, &exe))
+}
+
+/// Install the hooks, appending to whatever is already there.
+///
+/// `Class::Local` -- the phone cannot do this at all. It edits a config file
+/// outside Headstate's ownership, shared with other tools, and the refusal
+/// cases need a human reading an explanation at the machine with the broken
+/// file. Nobody needs to install a hook from a phone: it only matters for
+/// sessions started at that desktop's keyboard.
+///
+/// This is also the REINSTALL: it drops every matcher it recognises as ours
+/// and appends one fresh matcher per event, in one atomic write. So it is
+/// idempotent, and it is the repair for a stale path after the app moves.
+#[tauri::command]
+pub fn claude_install_hooks() -> Result<crate::claude::install::Installed, String> {
+    let (path, exe) = claude_settings_target()?;
+    crate::claude::install::install(&path, &exe).map_err(|e| e.to_string())
+}
+
+/// Reinstall the hooks. Identical to [`claude_install_hooks`] by design.
+///
+/// A separate command rather than a flag because it is a separate BUTTON
+/// with a separate meaning to the user -- "repair this" rather than "set
+/// this up" -- and the UI needs to be able to offer one without the other.
+/// That they share an implementation is the point of §5.3: one code path
+/// means the repair cannot drift from the install.
+#[tauri::command]
+pub fn claude_reinstall_hooks() -> Result<crate::claude::install::Installed, String> {
+    claude_install_hooks()
+}
+
+/// Remove Headstate's hooks and nothing else.
+///
+/// `Class::Local`, like install: the risk is not deletion, it is corrupting
+/// another tool's config remotely with no way to see the result. Refusing
+/// outright beats gating it behind a biometric step-up.
+///
+/// Takes no binary path: ownership is decided by the marker and the
+/// subcommand, neither of which depends on where the app currently lives.
+/// An uninstall keyed on today's path would strand the matcher of an app
+/// that has since moved -- which is precisely the hook that most needs
+/// removing.
+#[tauri::command]
+pub fn claude_uninstall_hooks() -> Result<crate::claude::install::Uninstalled, String> {
+    let home = crate::auth::home_dir().ok_or_else(|| {
+        "no home directory, so there is no ~/.claude to uninstall from".to_string()
+    })?;
+    crate::claude::install::uninstall(&crate::claude::install::settings_path_in(&home))
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

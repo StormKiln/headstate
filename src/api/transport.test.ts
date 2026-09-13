@@ -191,6 +191,14 @@ const ROWS: Row[] = [
   row(api.claudeSessions, [], "claude_sessions"),
   row(api.claudeRevealPath, [path], "claude_reveal_path", { path }),
   row(api.readClaudeMd, [path], "read_claude_md", { path }),
+  // The Claude Code hook installer (#915). All four take no arguments: the
+  // settings path and the binary path are resolved on the Rust side, which
+  // is deliberate -- a path supplied over the wire would be a way to make
+  // the desktop write to an arbitrary file.
+  row(api.claudeHooksStatus, [], "claude_hooks_status"),
+  row(api.claudeInstallHooks, [], "claude_install_hooks"),
+  row(api.claudeReinstallHooks, [], "claude_reinstall_hooks"),
+  row(api.claudeUninstallHooks, [], "claude_uninstall_hooks"),
   row(api.listBranches, [repoPath], "list_branches", { repoPath }),
   row(api.deleteBranches, [repoPath, names], "delete_branches", { repoPath, names }),
   row(api.deleteRemoteBranches, [repoPath, names], "delete_remote_branches", { repoPath, names }),

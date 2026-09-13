@@ -29,6 +29,17 @@ vi.mock("../api/hooks", () => ({
   useRevokePairedDevice: () => () => Promise.resolve(),
   usePollInterval: () => ({ seconds: 120, set: () => Promise.resolve() }),
   useWorktreeDirs: () => ({ dirs: [], set: () => Promise.resolve() }),
+  // #915's panel. Status is a `Class::Read` and so is present on the phone;
+  // the three install actions are `Class::Local` and the panel hides their
+  // buttons behind `IS_MOBILE_BUILD`, which is why they are never called here.
+  useClaudeHooks: () => ({
+    status: { state: "not_installed" },
+    isLoading: false,
+    error: null,
+    install: () => Promise.resolve({ command: "x", added: [], replaced: [], created_file: false }),
+    reinstall: () => Promise.resolve({ command: "x", added: [], replaced: [], created_file: false }),
+    uninstall: () => Promise.resolve({ removed: [], was_absent: true }),
+  }),
   useNotifyPrefs: () => ({
     prefs: { enabled: true, ci_failed: true, conflicted: true },
     set: () => Promise.resolve(),
