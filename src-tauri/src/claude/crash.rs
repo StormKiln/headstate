@@ -192,15 +192,48 @@ fn record_running(conn: &Connection, rec: &Live) -> Result<bool, rusqlite::Error
 /// (the hook wrote `prompt_input_exit`) and whose registry file was left
 /// behind anyway is not relabelled as a crash. That ordering matters:
 /// the hook's reason is a first-hand report and ours is an inference.
+///
+/// # The key when `procStart` will not parse
+///
+/// `started_at` is part of the primary key, so the value chosen decides
+/// whether repeated sweeps of one orphan address one row or many. With a
+/// confirmable start time that is easy: the process's own start time,
+/// which is also the key the handoff consumer would have used, so a crash
+/// lands ON the existing run rather than beside it.
+///
+/// Without one there is no process-derived key, and the obvious fallback
+/// -- the observation time -- is WRONG, which was found by the test rather
+/// than by foresight: `now` differs on every tick, so a 60-second sweep
+/// minted a fresh row and a fresh "new crash" every minute for one
+/// session that crashed once. **Measured: four sweeps produced four
+/// rows.**
+///
+/// So the fallback reuses the `started_at` of a crashed run already
+/// recorded for this `(session_id, pid)`, and only mints an observation
+/// time when there is none. That makes the second sweep address the first
+/// sweep's row, which is the property the primary key cannot give us on
+/// its own here.
 fn record_crashed(conn: &Connection, rec: &Live, now: &str) -> Result<bool, rusqlite::Error> {
     let session_id = rec.session_id.as_deref().expect("checked by the caller");
-    // `started_at` is the process start time when we have it, matching
-    // the key the handoff consumer would have used for the same run, so
-    // a crash lands ON the existing run rather than beside it. Without a
-    // confirmable start time there is no shared key, and the fallback is
-    // the observation time -- which makes the row a record of what we
-    // found rather than of when it began.
-    let started = pid_start(rec).unwrap_or_else(|| now.to_owned());
+    let started = match pid_start(rec) {
+        Some(s) => s,
+        None => conn
+            .query_row(
+                // The run WE recorded for this pid, if any. Narrowed to
+                // our own `end_reason` so this cannot adopt the key of a
+                // cleanly-ended run the hook recorded and then relabel
+                // it -- that row is found by the INSERT's conflict clause
+                // when the start times genuinely match, and must not be
+                // reached by a fallback that guesses.
+                "SELECT started_at FROM claude_run
+                  WHERE session_id = ?1 AND pid = ?2 AND end_reason = ?3
+                  ORDER BY started_at
+                  LIMIT 1",
+                rusqlite::params![session_id, rec.pid, CRASHED],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap_or_else(|_| now.to_owned()),
+    };
     conn.execute(
         "INSERT INTO claude_run
             (session_id, pid, pid_start_time, source, end_reason,
@@ -582,6 +615,50 @@ mod tests {
         let rows = runs(&conn);
         assert_eq!(rows[0].2.as_deref(), Some(CRASHED));
         assert_eq!(rows[0].3, None, "cannot confirm is NULL, not a guess");
+    }
+
+    /// An orphan with NO confirmable start time is still only ONE crash,
+    /// however often it is swept.
+    ///
+    /// This is the case the single-sweep test above cannot see, and it is
+    /// the one that matters operationally: a registry file whose
+    /// `procStart` will not parse has no process-derived key, so a naive
+    /// fallback to "now" would mint a new `started_at` on every tick. On
+    /// a 60-second sweep that is 1,440 rows a day, each counted as a
+    /// fresh crash, for one session that crashed once.
+    ///
+    /// The fix is that the fallback key is derived from the RECORD, not
+    /// from the clock -- see [`record_crashed`].
+    #[test]
+    fn an_orphan_with_no_start_time_is_still_only_one_crash() {
+        let mut conn = db();
+        let sweep = Sweep {
+            orphaned: vec![live(80043, Some("s-crashed"), None)],
+            ..Default::default()
+        };
+
+        let first = record(&mut conn, &sweep).unwrap();
+        assert_eq!(first.crashed, 1);
+        let when: String = conn
+            .query_row("SELECT ended_at FROM claude_run", [], |r| r.get(0))
+            .unwrap();
+
+        for _ in 0..3 {
+            record(&mut conn, &sweep).unwrap();
+        }
+
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM claude_run", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            n, 1,
+            "four sweeps of one unparseable orphan must be one row -- a \
+             clock-derived key would mint a new one every tick"
+        );
+        let still: String = conn
+            .query_row("SELECT ended_at FROM claude_run", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(still, when, "and the first observation still stands");
     }
 
     /// The registry's `name` fills a NULL and never overwrites.
