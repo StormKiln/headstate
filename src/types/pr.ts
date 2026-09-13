@@ -831,6 +831,139 @@ export interface ClaudeFile {
   imports: ImportNode[];
 }
 
+/// Whether a Claude Code session's process is running (#917).
+///
+/// THREE states, never two, and the discriminated union is the point: a
+/// consumer has to switch on `state` and cannot coerce this to a
+/// boolean. `"unknown"` is what a check that could not be COMPLETED
+/// returns -- an unreadable `~/.claude/sessions` (mode `0700`), an
+/// unparseable `procStart`, or a session whose process we never watched,
+/// which is the entire imported history.
+///
+/// Rendering `"unknown"` as "not running" is #841's fail-open: "not
+/// running" is what offers Resume, and resuming a session that is in
+/// fact alive starts a SECOND copy of it. `SystemHealthPage`'s
+/// `HealthConditions` is the house pattern for keeping the three
+/// distinct on screen.
+export type Liveness =
+  /// Alive, and its start time matches what was recorded -- so it is the
+  /// same process and not a reused pid.
+  | {
+      state: "running";
+      pid: number;
+      /// `busy` / `idle` as the session last published it. A REFINEMENT
+      /// of an answer already derived, never the answer itself: it is a
+      /// stored status that a killed session never corrects. Carried
+      /// only on `running`, so there is no way to show "busy" for a
+      /// process we did not find.
+      status: string | null;
+    }
+  /// Not running. `why` says which of the two ways we established it,
+  /// because one of them -- an orphaned registry entry -- is a crash.
+  | { state: "dead"; why: string }
+  /// The check could not be completed. NOT a shade of `dead`.
+  | { state: "unknown"; why: string };
+
+/// Whether the directory a session ran in still exists (#918).
+///
+/// Tri-state for the same reason `Liveness` is: `"gone"` and
+/// `"unknown"` have different remedies. A permission error means the
+/// tree may well be there and the `cd` would have worked; `"gone"`
+/// means it certainly is not. 84.4% of the real corpus (1,213 of 1,438)
+/// is `"gone"`, so that is the NORMAL rendering and must not look
+/// broken.
+export type CwdState =
+  | { state: "exists" }
+  | { state: "gone" }
+  | { state: "unknown"; why: string }
+  /// No cwd was ever recorded. Distinct from `gone`: there is no path to
+  /// report as missing.
+  | { state: "not-recorded" };
+
+/// The resume command to copy, and what to say before pasting it (#918).
+///
+/// Built on the backend because the existence check behind it is a
+/// filesystem read the webview cannot do, and splitting the check from
+/// the string it produces is how the two drift into a command whose
+/// caveat no longer matches it.
+/// Not exported: it is reached only through `ClaudeSession.resume`, and
+/// `yarn knip` is right that a second name for the same shape earns
+/// nothing. Exporting it the moment something else needs it is one word.
+interface ResumeCommand {
+  /// The text to copy. Always correct to run: `claude --resume <id>`
+  /// resolves by id and works after the recorded directory is deleted.
+  command: string;
+  /// What the user must know before pasting, or `null` when there is
+  /// nothing to warn about. Non-null for every case that omits the `cd`.
+  caveat: string | null;
+  /// Whether the command carries its own `cd`. Decides whether Resume
+  /// is the primary action or a secondary one.
+  anchored: boolean;
+}
+
+/// What a transcript rescan read, and what it could not read (#914).
+///
+/// The unreadable lists are the point: an empty session table with a
+/// non-empty `unreadable_dirs` means "we could not read your history",
+/// which must not render as "you have no sessions". Opposite remedies,
+/// and the second is alarming when it is false.
+export interface ClaudeImported {
+  /// Sessions written (inserted or updated).
+  sessions: number;
+  /// Rows the database refused, with why.
+  write_failures: string[];
+  /// `.jsonl` files correctly excluded because they are subagent
+  /// transcripts, not sessions. Just under half the corpus -- counted so
+  /// the exclusion stays visible rather than invisible.
+  subagent_files_skipped: number;
+  unreadable_dirs: string[];
+  unreadable_files: string[];
+  metadata_beyond_first_record: number;
+  elapsed_ms: number;
+}
+
+/// One row of the Claude Code session list (#917).
+export interface ClaudeSession {
+  /// The `claude --resume` handle, and the row's identity. Verified to
+  /// survive `--resume` and `--continue` unchanged, so it never goes
+  /// stale.
+  session_id: string;
+  /// Claude's own `aiTitle`, present for 1,436 of 1,438 real sessions.
+  /// `null` for the two that never got one -- never the UUID in
+  /// disguise, because a fabricated name cannot be told from a real one.
+  name: string | null;
+  cwd: string | null;
+  git_branch: string | null;
+  claude_version: string | null;
+  transcript_path: string | null;
+  first_seen_at: string;
+  /// The newest record in the transcript, NOT when we scanned it.
+  last_activity_at: string | null;
+  liveness: Liveness;
+  cwd_state: CwdState;
+  resume: ResumeCommand;
+  /// Runs the hook recorded. `0` for every imported session, which lets
+  /// the UI say "never observed" rather than implying we watched and
+  /// lost it.
+  runs: number;
+}
+
+/// The session list, INCLUDING what could not be read (#917).
+///
+/// `registry_failure` is the reason this is a envelope rather than a
+/// bare array: a list built from a registry we could not read is a list
+/// in which every liveness is `unknown`, and the view must say so rather
+/// than show rows that look like settled answers.
+export interface ClaudeSessionList {
+  sessions: ClaudeSession[];
+  /// Why the live registry could not be listed. `null` means it was read
+  /// -- so an absence of running sessions is a real answer.
+  registry_failure: string | null;
+  /// Registry files that could not be parsed. Each one hides a session
+  /// whose liveness cannot be stated.
+  registry_unreadable: string[];
+}
+
 /// One project's worth of reports.
 ///
 /// The unit the UI groups by. A repository can hold several -- a

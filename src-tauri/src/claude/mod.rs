@@ -12,10 +12,22 @@
 //! resolves the overlap per field by which source actually knows the
 //! answer -- see [`store::import`].
 //!
+//! [`liveness`] is the reader's half (#917): whether a stored session is
+//! still running is DERIVED from the machine every time a row is
+//! rendered, never stored, and has three answers rather than two. The
+//! third -- "could not tell" -- is what keeps a failed probe from
+//! offering to resurrect a session that is alive and mid-work.
+//!
+//! [`sessions`] assembles what the Claude Code view renders: the stored
+//! rows, each one's derived liveness, and the tri-state cwd check that
+//! decides which resume command is safe to copy (#918).
+//!
 //! Nothing in here writes to `~/.claude`. Read-only by design: those
 //! transcripts are Claude Code's data and the file `claude --resume`
 //! depends on.
 
+pub mod liveness;
+pub mod sessions;
 pub mod store;
 pub mod transcript;
 

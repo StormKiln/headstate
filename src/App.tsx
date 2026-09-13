@@ -33,6 +33,8 @@ import { ArtifactsPage } from "./components/ArtifactsPage";
 import { ArtifactSidebar } from "./components/ArtifactSidebar";
 import { PackagesPage } from "./components/PackagesPage";
 import { ClaudeMdPage } from "./components/ClaudeMdPage";
+import { ClaudeCodePage } from "./components/ClaudeCodePage";
+import { ClaudeCodeSidebar } from "./components/ClaudeCodeSidebar";
 import { RepoPickerSidebar } from "./components/RepoPickerSidebar";
 import { DockerPage } from "./components/DockerPage";
 import { DockerSidebar } from "./components/DockerSidebar";
@@ -429,6 +431,14 @@ export default function App() {
       // in the app holds -- and the natural occupant of a column that
       // was previously the view switcher alone.
       <SystemHealthSidebar viewCounts={{ "to-review": reviewingCount }} />
+    ) : view === "claude-code" ? (
+      // NOT one of the repository sidebars, and not a fall-through
+      // either. A Claude Code session is not scoped to a repository:
+      // 662 distinct working directories over 1,438 sessions, mostly
+      // deleted agent worktrees, 84% of them no longer on disk. A repo
+      // picker here would be a column of inert rows -- the same
+      // reasoning the `system-health` branch above states.
+      <ClaudeCodeSidebar viewCounts={{ "to-review": reviewingCount }} />
     ) : view === "packages" || view === "claude-md" ? (
       <RepoPickerSidebar reviewingCount={reviewingCount} />
     ) : view === "artifacts" ? (
@@ -533,6 +543,12 @@ export default function App() {
                 ? "System health"
               : view === "claude-md"
                 ? "CLAUDE.md"
+              // Matching the switcher entry exactly, per #794's finding:
+              // a header naming the page something other than the menu
+              // item that opened it is how a user doubts they are where
+              // they meant to be.
+              : view === "claude-code"
+                ? "Claude Code"
               : view === "packages"
                 ? "Package updates"
               : view === "artifacts"
@@ -586,6 +602,15 @@ export default function App() {
         view !== "worktrees" &&
         view !== "branches" &&
         view !== "pr-stats" &&
+        // Claude Code joins them (#917), and for the reason the list
+        // above shares: it is local state about this machine's sessions,
+        // with no notion of a selected pull request to go back to. A PR
+        // picked earlier in My PRs would otherwise render over it --
+        // `setView` clears `selectedPr`, so the switcher path cannot
+        // reach that today, but this branch is FIRST in the chain and
+        // therefore wins over every view branch below, which is exactly
+        // what the `pr-stats` comment says not to rely on.
+        view !== "claude-code" &&
         view !== "system-health" ? (
           <div className="p-4">
             <PrDetailView
@@ -596,6 +621,26 @@ export default function App() {
           </div>
         ) : view === "claude-md" ? (
           <ClaudeMdPage />
+        ) : view === "claude-code" ? (
+          // This branch is what makes #916's registered view id a real
+          // route. Until it existed, `claude-code` fell through to My
+          // PRs by the documented fall-through at the end of this chain
+          // -- so the switcher offered a destination that rendered the
+          // pull request list.
+          //
+          // No `p-4` wrapper and no `FilterBar`: the page owns its own
+          // padding because its search box has to sit flush with the list
+          // beneath it, and every control in that bar narrows a list of
+          // pull requests, of which this page has none.
+          //
+          // NOT lazy, deliberately. #838's boundary is for the two views
+          // that pull in a charting library, and this one imports
+          // nothing heavier than `lucide-react` icons the launch chunk
+          // already has. It is also the page a user opens to get work
+          // back after a crash, which is the worst moment to wait on a
+          // chunk fetch. The overview page (#921) is the one that will
+          // need the boundary, since it reaches `stats/ActivityChart`.
+          <ClaudeCodePage />
         ) : view === "packages" ? (
           <PackagesPage />
         ) : view === "artifacts" ? (

@@ -19,6 +19,8 @@ import type {
   Branch,
   DeleteOutcome,
   ClaudeFile,
+  ClaudeImported,
+  ClaudeSessionList,
   ProjectReport,
   UpdateRequest,
   UpdateFilter,
@@ -700,6 +702,26 @@ export const scanClaudeMd = (repoPath: string) =>
 
 /// The text of one file, for rendering.
 export const readClaudeMd = (path: string) => call<string>("read_claude_md", { path });
+
+/// Rescan `~/.claude/projects` into our own cache. Returns what it read
+/// AND what it could not read.
+export const claudeImportTranscripts = () => call<ClaudeImported>("claude_import_transcripts");
+
+/// Every stored Claude Code session, with liveness derived NOW (#917).
+///
+/// Liveness is never stored, so this is the only way to know it -- see
+/// `ClaudeSessionList`. Rejects when the DATABASE could not be read,
+/// which is different from an empty list and must never render as "you
+/// have no sessions".
+export const claudeSessions = () => call<ClaudeSessionList>("claude_sessions");
+
+/// Reveal a session's directory or transcript in the file manager.
+/// Returns the path on success.
+///
+/// `Class::Local` -- the phone has no Finder to reveal into -- so every
+/// caller sits behind `IS_MOBILE_BUILD`.
+export const claudeRevealPath = (path: string) =>
+  call<string>("claude_reveal_path", { path });
 
 /// Every branch in a repository, classified.
 ///

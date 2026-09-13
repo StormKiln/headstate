@@ -216,6 +216,22 @@ pub const SURFACE: &[(&str, Class)] = &[
     // costs a bounded head read plus a 16 KB tail seek, and the ceiling
     // lives inside the command rather than in this table.
     ("claude_import_transcripts", Class::Read),
+    // The session list with derived liveness (#917). Read: it queries our
+    // own cache, lists `~/.claude/sessions` and probes the process table.
+    // Nothing is written anywhere, and `~/.claude` is only ever read.
+    //
+    // Exposed for the reason `claude_import_transcripts` above is, and
+    // this one is the stronger case: "did the thing I left running on my
+    // laptop die?" is the away-from-desk question the companion exists
+    // for, and it is the same question `system_health` answers remotely.
+    // The answer describes the PAIRED DESKTOP's sessions, which is what
+    // the view must say on the phone.
+    //
+    // The row's resume command comes back as text, so the phone can read
+    // what would resurrect a session even though its clipboard cannot
+    // reach a desktop shell -- the same reasoning that makes
+    // `claudify_command` Read.
+    ("claude_sessions", Class::Read),
     ("get_poll_interval", Class::Read),
     ("get_worktree_dirs", Class::Read),
     ("get_ui_prefs", Class::Read),
@@ -346,6 +362,12 @@ pub const SURFACE: &[(&str, Class)] = &[
     // local: not exposed remotely.
     ("diag_log", Class::Local),
     ("reveal_log", Class::Local),
+    // Reveals a session's directory or transcript in the file manager
+    // (#917). `Local` for exactly the reason this class's own doc comment
+    // gives: "Revealing a file in a Finder the phone cannot see fails
+    // that test." The same call as `reveal_log` above, pointed at a path
+    // from a session row instead of at our log.
+    ("claude_reveal_path", Class::Local),
     ("get_autostart", Class::Local),
     ("set_autostart", Class::Local),
     ("get_notify_prefs", Class::Local),
@@ -617,6 +639,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "scan_claude_md" => res(commands::scan_claude_md(a.get("repoPath")?).await),
         "read_claude_md" => res(commands::read_claude_md(a.get("path")?)),
         "claude_import_transcripts" => res(commands::claude_import_transcripts(app.clone()).await),
+        "claude_sessions" => res(commands::claude_sessions(app.clone()).await),
         "get_poll_interval" => ok(commands::get_poll_interval(app.state())),
         "get_worktree_dirs" => ok(commands::get_worktree_dirs(app.clone())),
         "get_ui_prefs" => ok(commands::get_ui_prefs(app.clone())),

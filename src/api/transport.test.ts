@@ -183,6 +183,13 @@ const ROWS: Row[] = [
   row(api.packagesMarkdown, [repoPath, reports, filter], "packages_markdown", { repoPath, reports, filter }),
   row(api.revealLog, [], "reveal_log"),
   row(api.scanClaudeMd, [repoPath], "scan_claude_md", { repoPath }),
+  // The Claude Code trio (#914, #917). Two are argument-free because
+  // both read THIS machine (or, over the wire, the paired desktop):
+  // there is nothing for a caller to scope. `claudeRevealPath` takes the
+  // path from a row the caller already holds.
+  row(api.claudeImportTranscripts, [], "claude_import_transcripts"),
+  row(api.claudeSessions, [], "claude_sessions"),
+  row(api.claudeRevealPath, [path], "claude_reveal_path", { path }),
   row(api.readClaudeMd, [path], "read_claude_md", { path }),
   row(api.listBranches, [repoPath], "list_branches", { repoPath }),
   row(api.deleteBranches, [repoPath, names], "delete_branches", { repoPath, names }),
