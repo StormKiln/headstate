@@ -701,6 +701,95 @@ export const scanClaudeMd = (repoPath: string) =>
 /// The text of one file, for rendering.
 export const readClaudeMd = (path: string) => call<string>("read_claude_md", { path });
 
+// ---------------------------------------------------------------------
+// The Claude Code hook installer (#915). Rust side:
+// `src-tauri/src/claude/install.rs`, where every rule here is argued.
+// ---------------------------------------------------------------------
+
+/// Why an install, uninstall or status read could not proceed.
+///
+/// Mirrors the Rust `Refusal`, which is serialised with an internal `kind`
+/// tag. Each variant exists because the REMEDY differs -- `malformed` needs
+/// an editor and `io` needs permissions -- so the UI must not flatten them
+/// to one message.
+export type ClaudeHookRefusal =
+  | { kind: "malformed"; path: string; detail: string }
+  | { kind: "hooks_not_an_object"; path: string; found: string }
+  | { kind: "matcher_not_understood"; path: string; event: string }
+  | { kind: "io"; path: string; detail: string };
+
+/// Whether the hooks are installed -- three states, because two would lie.
+///
+/// `cannot_tell` is the state that must NOT render as `not_installed`. Claude
+/// Code silently ignores a `settings.json` it cannot parse, so a user in that
+/// state has every hook in the file dead with no symptom -- and the remedy is
+/// to fix the JSON, not to press Install. Rendering the two the same sends
+/// them round a loop with no explanation.
+///
+/// # Why `cannot_tell` is an INTERSECTION rather than a nested field
+///
+/// The Rust enum is `#[serde(tag = "state")]` with `CannotTell(Refusal)` as a
+/// newtype variant, and serde FLATTENS a newtype variant's fields into the
+/// same object. So the refusal's own `kind`, `path` and `detail` arrive as
+/// siblings of `state`, not under a `refusal` key.
+///
+/// Spelling it the intuitive way (`{ state: "cannot_tell"; refusal: ... }`)
+/// would compile, type-check, and read `undefined` at runtime -- a silent
+/// failure in the very code path whose whole purpose is to explain a silent
+/// failure. `install::tests::the_wire_shape_matches_the_typescript_type`
+/// pins the JSON on the Rust side, because nothing generates this type.
+export type ClaudeHooksStatus =
+  | { state: "installed"; command: string }
+  | { state: "not_installed" }
+  | { state: "stale"; detail: string }
+  | ({ state: "cannot_tell" } & ClaudeHookRefusal);
+
+/// What an install changed.
+export interface ClaudeHooksInstalled {
+  /// The command line written into every matcher.
+  command: string;
+  /// Events that had no hook of ours and now have one.
+  added: string[];
+  /// Events where a hook of ours was dropped and rewritten.
+  ///
+  /// Surfaced rather than swallowed: this is the count that tells a user
+  /// their hand-edit was reverted, and reverting an edit without saying so
+  /// is its own defect.
+  replaced: string[];
+  /// True when the settings file did not exist and was created.
+  created_file: boolean;
+}
+
+/// What an uninstall removed.
+export interface ClaudeHooksUninstalled {
+  /// Events a hook of ours was removed from.
+  removed: string[];
+  /// True when there was nothing of ours to remove. Not an error.
+  was_absent: boolean;
+}
+
+/// Whether the hooks are in `~/.claude/settings.json` right now.
+///
+/// Read every time, never cached: a cached "installed" is wrong the moment
+/// the user hand-edits the file, and this is a file we invite them to edit.
+export const claudeHooksStatus = () => call<ClaudeHooksStatus>("claude_hooks_status");
+
+/// Install the hooks, appending to whatever is already there.
+///
+/// Also the reinstall: it drops every matcher it recognises as ours and
+/// appends one fresh matcher per event, so running it twice leaves one.
+export const claudeInstallHooks = () =>
+  call<ClaudeHooksInstalled>("claude_install_hooks");
+
+/// Reinstall. Identical to installing, by design -- a separate button with a
+/// separate meaning, sharing one code path so the repair cannot drift.
+export const claudeReinstallHooks = () =>
+  call<ClaudeHooksInstalled>("claude_reinstall_hooks");
+
+/// Remove Headstate's hooks and nothing else.
+export const claudeUninstallHooks = () =>
+  call<ClaudeHooksUninstalled>("claude_uninstall_hooks");
+
 /// Every branch in a repository, classified.
 ///
 /// Slow by nature -- ~9s on a 675-branch repository, most of it the

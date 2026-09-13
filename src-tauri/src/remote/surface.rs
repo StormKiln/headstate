@@ -216,6 +216,21 @@ pub const SURFACE: &[(&str, Class)] = &[
     // costs a bounded head read plus a 16 KB tail seek, and the ceiling
     // lives inside the command rather than in this table.
     ("claude_import_transcripts", Class::Read),
+    // Whether the Claude Code hooks are in `~/.claude/settings.json`
+    // (#915).
+    //
+    // `Read`: it reads one file and writes nothing. Exposed even though
+    // the three commands that CHANGE that file are `Local` below, because
+    // reading status remotely is both harmless and useful -- "is that
+    // desktop recording?" is a real away-from-desk question, and the
+    // answer does not depend on being able to act on it.
+    //
+    // Note the return type is a three-state `Status`, not a bool. The
+    // phone must be able to render "cannot tell" as its own thing: a
+    // settings file Claude Code cannot parse is IGNORED silently, so a
+    // desktop in that state has every hook dead, and showing that as
+    // "not installed" points at a button the phone does not even have.
+    ("claude_hooks_status", Class::Read),
     ("get_poll_interval", Class::Read),
     ("get_worktree_dirs", Class::Read),
     ("get_ui_prefs", Class::Read),
@@ -361,6 +376,33 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("revoke_paired_device", Class::Local),
     ("get_remote_enabled", Class::Local),
     ("set_remote_enabled", Class::Local),
+    // The Claude Code hook installer (#915). All three, deliberately.
+    //
+    // Not Read, not Write, not Destructive -- `Local` is the right
+    // REFUSAL, and the reasoning is worth stating because none of the
+    // other three classes is obviously wrong:
+    //
+    // - It edits a config file OUTSIDE Headstate's ownership, shared with
+    //   other tools. `Write`'s own definition above is "changes GitHub
+    //   state through the existing write module, or a desktop setting",
+    //   and this is neither.
+    // - Apply `Local`'s stated test: could the phone act on the answer?
+    //   Installing hooks only matters for sessions started at that
+    //   desktop's keyboard, so nobody needs to install one from a phone.
+    //   And the REFUSAL cases need a human reading an explanation at the
+    //   machine with the broken file -- a settings file Claude Code
+    //   cannot parse is ignored silently, which is a conversation, not a
+    //   status code.
+    // - `Destructive` would technically fit uninstall, and its biometric
+    //   step-up is the wrong frame: the risk here is not deletion, it is
+    //   corrupting another tool's config remotely with no way to see the
+    //   result. Refusing outright beats gating.
+    //
+    // `claude_hooks_status` above stays `Read`, because reading is the
+    // half that remains useful without being able to act.
+    ("claude_install_hooks", Class::Local),
+    ("claude_reinstall_hooks", Class::Local),
+    ("claude_uninstall_hooks", Class::Local),
 ];
 
 /// The class of a registered command, or `None` when no such command
@@ -617,6 +659,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "scan_claude_md" => res(commands::scan_claude_md(a.get("repoPath")?).await),
         "read_claude_md" => res(commands::read_claude_md(a.get("path")?)),
         "claude_import_transcripts" => res(commands::claude_import_transcripts(app.clone()).await),
+        "claude_hooks_status" => res(commands::claude_hooks_status()),
         "get_poll_interval" => ok(commands::get_poll_interval(app.state())),
         "get_worktree_dirs" => ok(commands::get_worktree_dirs(app.clone())),
         "get_ui_prefs" => ok(commands::get_ui_prefs(app.clone())),
