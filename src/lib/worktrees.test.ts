@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 // resolves its own paths with `import.meta.url` for the same reason.
 import modelRs from "../../src-tauri/src/worktrees/model.rs?raw";
 import testSource from "./worktrees.test.ts?raw";
-import type { Lock, Safety, Worktree } from "@/types/pr";
+import type { Lock, Safety, Worktree, WorktreeRepo } from "@/types/pr";
 import {
   canClaudify,
   forceWarning,
@@ -20,6 +20,7 @@ import {
   prForWorktree,
   safetyReason,
   safetyTone,
+  sessionWorktree,
   sortWorktrees,
   totalSize,
   WORKTREE_SORT_LABELS,
@@ -921,5 +922,143 @@ describe("sortWorktrees", () => {
       sortWorktrees(list, "size-desc");
       expect(names(list)).toEqual(["bravo", "alpha"]);
     });
+  });
+});
+
+/// #920: matching a Claude Code session's recorded cwd to a worktree.
+describe("sessionWorktree", () => {
+  const wt = (over: Partial<Worktree> = {}): Worktree => ({
+    path: "/Users/acme/code/widget/.worktrees/spoon",
+    branch: "feat/spoon",
+    head: "abc1234",
+    size_bytes: 1024,
+    safety: { kind: "safe" },
+    is_main: false,
+    merged_at: "2026-09-12",
+    upstream: { kind: "current" },
+    last_commit: "2026-09-12T10:00:00Z",
+    ...over,
+  });
+  const repo = (worktrees: Worktree[], over: Partial<WorktreeRepo> = {}): WorktreeRepo => ({
+    identity: "acme/widget",
+    name: "widget",
+    path: "/Users/acme/code/widget",
+    worktrees,
+    ...over,
+  });
+
+  it("matches on the absolute path and returns the navigation target", () => {
+    const got = sessionWorktree(
+      "/Users/acme/code/widget/.worktrees/spoon",
+      "feat/spoon",
+      [repo([wt()])],
+    );
+    expect(got).not.toBeNull();
+    expect(got?.repoPath).toBe("/Users/acme/code/widget");
+    expect(got?.repoName).toBe("widget");
+    expect(got?.worktree.branch).toBe("feat/spoon");
+    expect(got?.movedOnFrom).toBeNull();
+  });
+
+  it("returns null when no worktree has that path", () => {
+    expect(
+      sessionWorktree("/Users/acme/code/widget/.worktrees/deleted", "feat/gone", [repo([wt()])]),
+    ).toBeNull();
+  });
+
+  /// `undefined` repos is "the listing has not loaded or could not be
+  /// read", which is NOT the same fact as "no match" -- the caller renders
+  /// them differently. This only pins that it does not throw or invent a
+  /// match.
+  it("returns null when the listing is absent", () => {
+    expect(sessionWorktree("/Users/acme/code/widget", "main", undefined)).toBeNull();
+  });
+
+  it("returns null when the session recorded no directory", () => {
+    expect(sessionWorktree(null, "main", [repo([wt()])])).toBeNull();
+  });
+
+  /// **The measurement-driven test.** The branch is NOT part of the key.
+  ///
+  /// MEASURED over the real corpus: of 206 sessions whose cwd matches a
+  /// registered worktree, the recorded branch disagrees with the current
+  /// one on 54 (26.2%) -- a main checkout accumulates sessions across
+  /// every branch it ever held. Matching on `(path, branch)` would refuse
+  /// a quarter of the valid jumps, so this must still match and must
+  /// report the divergence instead.
+  it("still matches when the worktree has moved to another branch", () => {
+    const got = sessionWorktree(
+      "/Users/acme/code/widget",
+      "stats-dashboard",
+      [repo([wt({ path: "/Users/acme/code/widget", branch: "main", is_main: true })])],
+    );
+    expect(got).not.toBeNull();
+    expect(got?.worktree.branch).toBe("main");
+    expect(got?.movedOnFrom).toBe("stats-dashboard");
+  });
+
+  it("reports no divergence when the branches agree", () => {
+    expect(
+      sessionWorktree("/Users/acme/code/widget/.worktrees/spoon", "feat/spoon", [repo([wt()])])
+        ?.movedOnFrom,
+    ).toBeNull();
+  });
+
+  it("reports no divergence when either branch is unknown", () => {
+    expect(
+      sessionWorktree("/Users/acme/code/widget/.worktrees/spoon", null, [repo([wt()])])
+        ?.movedOnFrom,
+    ).toBeNull();
+  });
+
+  /// git's `worktree list` and Claude Code's `cwd` are independent
+  /// spellings of the same directory, so a trailing separator or a `.`
+  /// segment must not decide whether the jump is offered.
+  it("ignores trailing separators and dot segments", () => {
+    for (const cwd of [
+      "/Users/acme/code/widget/.worktrees/spoon/",
+      "/Users/acme/code/widget/./.worktrees/spoon",
+      "/Users/acme/code/widget/.worktrees/spoon//",
+    ]) {
+      expect(sessionWorktree(cwd, "feat/spoon", [repo([wt()])]), cwd).not.toBeNull();
+    }
+  });
+
+  /// Case is PRESERVED, deliberately. Lowercasing would match more often
+  /// on macOS and would be wrong on Linux, where these are two
+  /// directories -- and a jump to the wrong tree is worse than a missing
+  /// button.
+  it("does not match paths differing only in case", () => {
+    expect(
+      sessionWorktree("/Users/acme/code/WIDGET/.worktrees/spoon", "feat/spoon", [repo([wt()])]),
+    ).toBeNull();
+  });
+
+  it("searches every repository, not only the first", () => {
+    const other = repo([wt({ path: "/Users/acme/code/other" })], {
+      name: "other",
+      path: "/Users/acme/code/other",
+    });
+    const got = sessionWorktree(
+      "/Users/acme/code/widget/.worktrees/spoon",
+      "feat/spoon",
+      [other, repo([wt()])],
+    );
+    expect(got?.repoName).toBe("widget");
+  });
+
+  /// A registered worktree whose directory was deleted is a real state
+  /// (git calls it prunable and `WorktreesPage` renders it), and it is
+  /// exactly the row that explains where a session's work went. This
+  /// function compares against git's own listing and does not stat, so
+  /// such a row still matches.
+  it("matches a prunable worktree whose directory is gone", () => {
+    const got = sessionWorktree(
+      "/Users/acme/code/widget/.worktrees/spoon",
+      "feat/spoon",
+      [repo([wt({ prunable: "gitdir file points to non-existent location" })])],
+    );
+    expect(got).not.toBeNull();
+    expect(got?.worktree.prunable).toBeTruthy();
   });
 });

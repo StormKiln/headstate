@@ -864,14 +864,26 @@ export type Liveness =
   /// The check could not be completed. NOT a shade of `dead`.
   | { state: "unknown"; why: string };
 
-/// Whether the directory a session ran in still exists (#918).
+/// Whether a path a session recorded still exists (#918, #919).
 ///
 /// Tri-state for the same reason `Liveness` is: `"gone"` and
 /// `"unknown"` have different remedies. A permission error means the
 /// tree may well be there and the `cd` would have worked; `"gone"`
-/// means it certainly is not. 84.4% of the real corpus (1,213 of 1,438)
-/// is `"gone"`, so that is the NORMAL rendering and must not look
-/// broken.
+/// means it certainly is not.
+///
+/// Used for BOTH paths a session records, which survive at opposite
+/// rates. Measured over 1,461 real sessions for #919:
+///
+/// ```text
+/// cwd         exists  248  gone 1213   (83.0% gone)
+/// transcript  exists 1461  gone    0   ( 0.0% gone)
+/// ```
+///
+/// So `"gone"` is the NORMAL rendering for a cwd and must not look
+/// broken, while for a transcript it is genuinely rare. The two states
+/// are never derived from one another: 1,213 rows (83.0%) have a dead
+/// cwd and a live transcript, and gating the transcript's action on the
+/// cwd's state would disable the button that works on almost every row.
 export type CwdState =
   | { state: "exists" }
   | { state: "gone" }
@@ -941,6 +953,12 @@ export interface ClaudeSession {
   last_activity_at: string | null;
   liveness: Liveness;
   cwd_state: CwdState;
+  /// Whether the transcript file is still on disk (#919).
+  ///
+  /// A SEPARATE reading from `cwd_state`, never derived from it: 0% of
+  /// transcripts are gone against 83% of cwds, so a transcript action
+  /// gated on the cwd would be disabled on 1,213 of 1,461 real rows.
+  transcript_state: CwdState;
   resume: ResumeCommand;
   /// Runs the hook recorded. `0` for every imported session, which lets
   /// the UI say "never observed" rather than implying we watched and
