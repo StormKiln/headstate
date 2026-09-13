@@ -284,6 +284,30 @@ pub struct UiPrefs {
     /// other preference alongside it.
     #[serde(default = "default_true")]
     pub announce_updates: bool,
+    /// Whether the Claude Code integrations are switched on (#916, epic
+    /// #910).
+    ///
+    /// A CAPABILITY flag, deliberately not an entry in `hidden_views`, and
+    /// the distinction is load-bearing rather than pedantic:
+    ///
+    /// `hidden_views` means "I do not want to see this". It is a user
+    /// preference, reversible with no consequences, and `ViewSwitcher`
+    /// honours it loosely on purpose -- `ALWAYS_OFFERED` and its
+    /// current-view hatch both override it, so a user sitting on a view
+    /// keeps it. That is right for a preference and WRONG for a
+    /// capability: a switched-off integration must not stay on screen
+    /// because someone happened to be looking at it.
+    ///
+    /// Routing it through `hidden_views` would also clobber a real
+    /// preference. Someone who had hidden the Claude Code view for their
+    /// own reasons would lose that the first time the capability toggled,
+    /// because the two meanings would share one list.
+    ///
+    /// Defaults OFF. The integrations install hooks into another tool's
+    /// configuration, and a feature that edits `~/.claude/settings.json`
+    /// should be asked for rather than assumed.
+    #[serde(default)]
+    pub claude_integrations_enabled: bool,
     /// Whether to write the verbose `[diag]` timing log.
     ///
     /// Added in v3.5.3 to diagnose a slow review query on one machine,
@@ -346,6 +370,10 @@ impl Default for UiPrefs {
             // change behaviour for someone who never opens Settings.
             hidden_views: Vec::new(),
             close_hides_to_tray: true,
+            // OFF by default, for the reason the field's own doc gives:
+            // this installs hooks into another tool's config file, which
+            // is a thing to be asked for rather than assumed on upgrade.
+            claude_integrations_enabled: false,
             // Announcing is the point of checking. The status bar has
             // always shown the hint and it was easy to miss; a user who
             // finds the dialog intrusive can turn it off, which is what

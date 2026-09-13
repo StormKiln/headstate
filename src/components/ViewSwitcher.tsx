@@ -1,4 +1,4 @@
-import { Activity, BarChart3, ChevronDown, Container, Eye, FileText, FolderGit2, GitBranch, GitPullRequest, HardDrive, Package } from "lucide-react";
+import { Activity, BarChart3, Bot, ChevronDown, Container, Eye, FileText, FolderGit2, GitBranch, GitPullRequest, HardDrive, Package } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { MOBILE_HIDDEN_VIEWS, type View, useFilters } from "../store/filters";
 import { useUiPrefs } from "../api/hooks";
@@ -31,6 +31,9 @@ export const VIEWS: { id: View; label: string; Icon: typeof GitPullRequest }[] =
   { id: "artifacts", label: "Artifacts", Icon: HardDrive },
   { id: "packages", label: "Package updates", Icon: Package },
   { id: "claude-md", label: "CLAUDE.md", Icon: FileText },
+  // Offered only while `claude_integrations_enabled` is on -- see the
+  // `capabilityOff` check below for why that is not a `hidden_views` entry.
+  { id: "claude-code", label: "Claude Code", Icon: Bot },
   // Last, and deliberately so: it is the only entry that is not about
   // the user's code at all. Grouping it with the repo-scoped views
   // would imply it takes a repository, which it does not.
@@ -127,8 +130,23 @@ export function ViewSwitcher({ counts }: { counts?: Partial<Record<View, number>
   // show behind the entry. `App.tsx` is what keeps `view` off such a
   // value in the first place, so the two cannot disagree about what is
   // on screen.
+  // A CAPABILITY check, in the same position and for the same reason as
+  // the build-time set above: it overrides both escape hatches (#916).
+  //
+  // The distinction from `hidden_views` is the whole point. That list means
+  // "I do not want to see this", so honouring it loosely is correct -- a
+  // user sitting on a view they hid keeps it rather than being thrown off
+  // mid-task. A switched-off integration is not that: there is no page
+  // behind the entry, so "but it is the current view" must not make it
+  // offerable, exactly as for a view the companion does not ship.
+  //
+  // Routing this through `hidden_views` instead would also clobber a real
+  // preference -- someone who hid the Claude Code view for their own
+  // reasons would lose that the first time the capability toggled.
+  const capabilityOff = (id: View) =>
+    id === "claude-code" && !prefs?.claude_integrations_enabled;
   const offered = VIEWS.filter(({ id }) =>
-    IS_MOBILE_BUILD && MOBILE_HIDDEN_VIEWS.has(id)
+    (IS_MOBILE_BUILD && MOBILE_HIDDEN_VIEWS.has(id)) || capabilityOff(id)
       ? false
       : ALWAYS_OFFERED.has(id) || id === view || !hidden.has(id),
   );
