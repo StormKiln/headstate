@@ -37,7 +37,7 @@ const EMPTY = {
   docker: {},
   artifacts: {},
   packages: {},
-  "claude-md": {},
+  "claude-md": {}, "claude-code": {},
   "pr-stats": {},
   "system-health": {},
 } as const;
@@ -112,7 +112,7 @@ beforeEach(() => {
   refetchFn.mockClear();
   useFilters.setState({
     filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} },
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, "system-health": {} },
     view: "worktrees",
   } as never);
 });
