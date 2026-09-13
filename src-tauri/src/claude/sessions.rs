@@ -138,8 +138,27 @@ pub struct ResumeCommand {
 /// or a `;` cannot change what the pasted line does. An embedded single
 /// quote is escaped the POSIX way (`'\''`), which is the only escape a
 /// single-quoted string admits.
+///
+/// # The ID is quoted too, and it has to be
+///
+/// This quoted only the path until a review pointed out that the id was
+/// interpolated bare -- while the comment above promised the whole line
+/// was safe. And the id is NOT a validated UUID: `transcript::extract`
+/// takes it verbatim from `path.file_stem()` of any `*.jsonl` one level
+/// under `~/.claude/projects/<slug>/`, with no format check anywhere.
+///
+/// So a file named `` `id`.jsonl `` or `$(whoami).jsonl` produced a
+/// copied command carrying live shell syntax. The blast radius was small
+/// -- it needs write access to `~/.claude/projects` and a paste -- but
+/// the standard this function sets for itself is "does the pasted line do
+/// what the button said it would", and for the id half it did not.
+///
+/// Quoting rather than validating, because quoting is total: it is
+/// correct for every id Claude Code might legitimately adopt later,
+/// whereas a UUID check would reject a future format and turn a working
+/// resume into a refusal.
 pub fn resume_command(session_id: &str, cwd: Option<&str>, state: &CwdState) -> ResumeCommand {
-    let bare = format!("claude --resume {session_id}");
+    let bare = format!("claude --resume {}", shell_quote(session_id));
     match state {
         CwdState::Exists => ResumeCommand {
             // The `cd` is the whole point of #918. Without it the
@@ -429,6 +448,17 @@ mod tests {
         conn
     }
 
+    /// A directory that really exists, on every platform.
+    ///
+    /// These tests used the literal `"/tmp"`, which does not exist on
+    /// Windows -- so `check_cwd` correctly returned `Gone` and two tests
+    /// failed on the `platform (windows-latest)` job while passing
+    /// locally. `temp_dir()` is what the rest of this module's tests
+    /// already use, and it is `TEMP` on Windows and `/tmp` here.
+    fn real_dir() -> String {
+        std::env::temp_dir().to_string_lossy().into_owned()
+    }
+
     fn insert(conn: &Connection, id: &str, cwd: Option<&str>, last: Option<&str>) {
         conn.execute(
             "INSERT INTO claude_session
@@ -462,7 +492,7 @@ mod tests {
             got.command
         );
         assert!(
-            got.command.ends_with("&& claude --resume abc-123"),
+            got.command.ends_with("&& claude --resume 'abc-123'"),
             "{}",
             got.command
         );
@@ -483,7 +513,7 @@ mod tests {
         assert_eq!(state, CwdState::Gone);
         let got = resume_command("abc-123", Some(path), &state);
         assert!(!got.anchored);
-        assert_eq!(got.command, "claude --resume abc-123");
+        assert_eq!(got.command, "claude --resume 'abc-123'");
         let caveat = got.caveat.expect("a bare command MUST carry its caveat");
         assert!(caveat.contains("gone"), "{caveat}");
         assert!(
@@ -507,7 +537,7 @@ mod tests {
         };
         let got = resume_command("abc-123", Some("/private/locked/tree"), &state);
         assert!(!got.anchored);
-        assert_eq!(got.command, "claude --resume abc-123");
+        assert_eq!(got.command, "claude --resume 'abc-123'");
         let caveat = got.caveat.expect("could-not-check MUST carry a caveat");
         assert!(
             caveat.contains("Could not check"),
@@ -559,14 +589,48 @@ mod tests {
         );
         assert_eq!(
             got.command,
-            "cd '/Users/acme/my code/$(echo pwned); rm -rf ~' && claude --resume abc"
+            "cd '/Users/acme/my code/$(echo pwned); rm -rf ~' && claude --resume 'abc'"
         );
         // And an embedded single quote survives.
         let quoted = resume_command("abc", Some("/Users/acme/it's here"), &CwdState::Exists);
         assert_eq!(
             quoted.command,
-            r"cd '/Users/acme/it'\''s here' && claude --resume abc"
+            r"cd '/Users/acme/it'\''s here' && claude --resume 'abc'"
         );
+    }
+
+    /// **The ID is quoted too**, not just the path.
+    ///
+    /// `session_id` comes verbatim from a transcript's `file_stem()` with
+    /// no format validation anywhere, so a file named `$(whoami).jsonl`
+    /// under `~/.claude/projects/<slug>/` became a copied command carrying
+    /// live shell syntax. Found by review: the path was quoted while the
+    /// id was interpolated bare, under a comment promising the whole line
+    /// was safe.
+    #[test]
+    fn the_session_id_is_quoted_as_well_as_the_path() {
+        let nasty = "$(whoami)`id`; rm -rf ~";
+        // Both halves, on the anchored shape.
+        let anchored = resume_command(nasty, Some("/tmp/x"), &CwdState::Exists);
+        assert_eq!(
+            anchored.command,
+            "cd '/tmp/x' && claude --resume '$(whoami)`id`; rm -rf ~'"
+        );
+        // And on the BARE shape, which is 84% of rows and where there is
+        // no path quoting to hide behind.
+        let bare = resume_command(nasty, None, &CwdState::NotRecorded);
+        assert_eq!(bare.command, "claude --resume '$(whoami)`id`; rm -rf ~'");
+        // Nothing outside the quotes on either.
+        for cmd in [anchored.command, bare.command] {
+            let after = cmd.split("--resume ").nth(1).unwrap();
+            assert!(
+                after.starts_with('\'') && after.ends_with('\''),
+                "the id must be wholly inside single quotes: {after}"
+            );
+        }
+        // An id containing a single quote is escaped, not terminated.
+        let quoted = resume_command("a'b", None, &CwdState::NotRecorded);
+        assert_eq!(quoted.command, r"claude --resume 'a'\''b'");
     }
 
     /// A session with no recorded cwd is its own case, not `Gone`.
@@ -610,7 +674,7 @@ mod tests {
     #[test]
     fn an_unreadable_registry_reaches_the_list_and_poisons_every_liveness() {
         let conn = db();
-        insert(&conn, "s1", Some("/tmp"), Some("2026-09-01T00:00:00Z"));
+        insert(&conn, "s1", Some(&real_dir()), Some("2026-09-01T00:00:00Z"));
         insert(&conn, "s2", None, Some("2026-09-02T00:00:00Z"));
         let registry = Registry {
             failure: Some("Permission denied".into()),
@@ -643,7 +707,7 @@ mod tests {
         let s0 = got.sessions.iter().find(|s| s.session_id == "s1").unwrap();
         assert_eq!(
             s0.cwd.as_deref(),
-            Some("/tmp"),
+            Some(real_dir().as_str()),
             "the stored cwd is the fallback"
         );
         assert!(
@@ -658,7 +722,7 @@ mod tests {
     #[test]
     fn a_running_session_carries_its_status() {
         let conn = db();
-        insert(&conn, "s1", Some("/tmp"), Some("2026-09-01T00:00:00Z"));
+        insert(&conn, "s1", Some(&real_dir()), Some("2026-09-01T00:00:00Z"));
         let mut registry = Registry::default();
         registry.entries.insert(
             "s1".into(),
@@ -694,7 +758,7 @@ mod tests {
     #[test]
     fn the_registry_cwd_wins_for_a_session_it_knows_about() {
         let conn = db();
-        insert(&conn, "s1", Some("/tmp/where-it-started"), None);
+        insert(&conn, "s1", Some("/nonexistent/where-it-started"), None);
         let mut registry = Registry::default();
         registry.entries.insert(
             "s1".into(),
@@ -702,7 +766,7 @@ mod tests {
                 pid: 1,
                 session_id: "s1".into(),
                 proc_start: Some(PROC_START.into()),
-                cwd: Some("/tmp/where-it-is-now".into()),
+                cwd: Some(real_dir()),
                 ..Default::default()
             },
         );
@@ -712,7 +776,7 @@ mod tests {
             &Default::default(),
             stored_rows(&conn).unwrap(),
         );
-        assert_eq!(got.sessions[0].cwd.as_deref(), Some("/tmp/where-it-is-now"));
+        assert_eq!(got.sessions[0].cwd.as_deref(), Some(real_dir().as_str()));
     }
 
     /// A transcript-imported session -- zero runs, no registry entry --
@@ -770,13 +834,17 @@ mod tests {
     #[test]
     fn list_composes_against_the_real_registry() {
         let conn = db();
-        insert(&conn, "s1", Some("/tmp"), Some("2026-09-01T00:00:00Z"));
+        insert(&conn, "s1", Some(&real_dir()), Some("2026-09-01T00:00:00Z"));
         let got = list(&conn).unwrap();
         assert_eq!(got.sessions.len(), 1);
         let row = &got.sessions[0];
-        assert_eq!(row.cwd_state, CwdState::Exists, "/tmp exists");
+        assert_eq!(
+            row.cwd_state,
+            CwdState::Exists,
+            "the temp directory exists on every platform"
+        );
         assert!(row.resume.anchored);
-        assert!(row.resume.command.contains("claude --resume s1"));
+        assert!(row.resume.command.contains("claude --resume 's1'"));
         eprintln!("liveness for an unobserved session: {:?}", row.liveness);
     }
 

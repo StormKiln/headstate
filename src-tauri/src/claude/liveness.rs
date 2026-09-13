@@ -102,18 +102,46 @@ use serde::{Deserialize, Serialize};
 /// How far apart two readings of one process's start time may be and
 /// still be the same process.
 ///
-/// `procStart` is written by Claude Code from its own clock at startup;
-/// `sysinfo` reports what the kernel recorded. Measured on this machine
-/// the registry's `startedAt` (epoch ms) sits 2.7 seconds AFTER
-/// `procStart`, so the two writers disagree by seconds already, and
-/// `procStart` is second-resolution text on top of that.
+/// # What the two sources actually disagree by: nothing
 ///
-/// 120 seconds is generous next to that and still far tighter than any
-/// plausible pid reuse: a machine would have to churn through the whole
-/// pid space inside two minutes for a recycled number to also land
-/// within the window. The alternative -- an exact match -- would report
-/// live sessions as dead the first time a clock adjusted, which is the
-/// failure this whole module is written against.
+/// MEASURED, against the three live sessions on the development machine,
+/// comparing `procStart` parsed as UTC against `sysinfo`'s
+/// `start_time()` (documented as "the time where the process was started
+/// (in seconds) from epoch"):
+///
+/// ```text
+/// pid 95843  procStart 1789214253  sysinfo 1789214253  delta 0s
+/// pid 14779  procStart 1789119828  sysinfo 1789119828  delta 0s
+/// pid 29025  procStart 1789135501  sysinfo 1789135501  delta 0s
+/// ```
+///
+/// Exactly zero on all three. `procStart` is the kernel's process start
+/// time truncated to the second, not Claude Code's own clock reading, so
+/// the two agree by construction rather than by luck.
+///
+/// (An earlier version of this comment justified the window with a 2.7s
+/// disagreement between the two writers. That figure is real but it is
+/// the gap between `procStart` and `startedAt` -- the process starting
+/// versus the SESSION starting -- and says nothing about the comparison
+/// this constant governs. It is corrected here rather than deleted
+/// because a tolerance justified by the wrong measurement is the kind of
+/// number nobody later dares to change.)
+///
+/// # So why a tolerance at all
+///
+/// Because 0s is what was observed, not what is guaranteed. Truncation
+/// alone permits 1s; a clock adjustment between the registry write and
+/// our read permits more; and a future Claude Code that writes its own
+/// clock reading instead would reintroduce the 2.7s class of gap without
+/// telling us.
+///
+/// 120s is generous against all of those and still far tighter than any
+/// plausible pid reuse -- a machine would have to exhaust the pid space
+/// inside two minutes for a recycled number to also land in the window.
+/// An exact match would be the wrong trade in the other direction: it
+/// would report live sessions as dead the first time any of the above
+/// moved by one second, and "every session reads as dead" is the exact
+/// failure this module is written against.
 pub const START_TOLERANCE_SECS: i64 = 120;
 
 /// Whether a session's process is running, and what we could not tell.
@@ -233,7 +261,22 @@ pub fn read_registry(dir: &Path) -> Registry {
             return out;
         }
     };
-    for entry in listing.flatten() {
+    for entry in listing {
+        // `flatten()` stood here and SILENTLY DISCARDED a per-entry
+        // error, which is the absent-is-not-zero mistake in its smallest
+        // form: a directory entry we could not stat might be the record
+        // proving a session is alive, and dropping it would leave that
+        // session reading as merely missing. Counted instead, which
+        // `derive` turns into Unknown for every session it cannot
+        // positively find.
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                out.unreadable
+                    .push(format!("{}: could not list an entry: {e}", dir.display()));
+                continue;
+            }
+        };
         let path = entry.path();
         if path.extension().is_none_or(|e| e != "json") {
             continue;
@@ -322,14 +365,32 @@ impl SysinfoProbe {
 
 impl ProcessProbe for SysinfoProbe {
     fn start_time(&self, pid: u32) -> Result<Option<i64>, String> {
-        // `sysinfo` reports absence and failure identically -- a pid
+        // `sysinfo` reports absence and failure identically: a pid
         // missing from the map is all we get, and there is no error
-        // channel. That is honest here because `refresh_processes_specifics`
-        // asking about specific pids on a readable process table cannot
-        // partially fail: either the pid is there or it is gone. The
-        // `Err` arm of the trait exists for probes that CAN fail to look,
-        // and the tests use it; keeping it in the signature is what makes
-        // `Unknown` reachable and testable rather than theoretical.
+        // channel to consult.
+        //
+        // This comment previously claimed the refresh "cannot partially
+        // fail: either the pid is there or it is gone". That is NOT true
+        // on macOS, and a review checking the vendored source found the
+        // case: `create_new_process` drops a process from the map
+        // entirely when it cannot obtain a NAME for it, even though
+        // `proc_bsdinfo` -- and therefore the start time we actually want
+        // -- was read fine. So `sysinfo` collapses genuine absence and a
+        // narrow class of read failure into one answer, and this
+        // implementation inherits that.
+        //
+        // It stays `Ok(None)` rather than guessing, for two reasons. The
+        // case needs a process whose name is unreadable, which a
+        // same-user `claude` is not; and inventing `Unknown` for every
+        // absent pid would make the common, correct "this session has
+        // exited" indistinguishable from a failure, which is the same
+        // collapse in the opposite direction.
+        //
+        // The `Err` arm of the trait is what makes `Unknown` reachable
+        // and testable rather than theoretical -- the tests drive it
+        // directly -- and it is the arm a probe that CAN distinguish the
+        // two would use. `derive`'s registry-level checks are what cover
+        // the failures this one cannot see.
         Ok(self
             .system
             .process(sysinfo::Pid::from_u32(pid))
@@ -438,9 +499,36 @@ pub fn derive<P: ProcessProbe>(
         };
     }
 
-    // No registry entry. Fall back to what the hook recorded, newest
-    // un-ended run first: a run with an `ended_at` reported its own
-    // `SessionEnd`, so there is nothing to probe.
+    // No registry ENTRY for this session -- but an entry we could not
+    // PARSE is not an absent one.
+    //
+    // The directory listed fine, so `registry.failure` is None and the
+    // check above passed; yet a `<pid>.json` that failed to parse may be
+    // the very record proving this session is alive. Claude Code owning
+    // that format means a release changing it puts us here, which is
+    // exactly the case the module docs anticipate.
+    //
+    // Reported as Unknown rather than falling through, because the
+    // fall-through's `Dead` arm below ("every recorded run reported that
+    // it ended") would be a confident claim resting on a record we could
+    // not read -- and the UI turns "not running" into a primary Resume
+    // button. This is the same fail-open as a failed pid probe, one level
+    // out, and it was a live bug until a review caught the mismatch
+    // between this function and the banner that already told the user
+    // these sessions read as "could not tell".
+    if !registry.unreadable.is_empty() {
+        return Liveness::Unknown {
+            why: format!(
+                "{} live-session record(s) in the registry could not be read, so this session \
+                 not appearing among the rest is not evidence that it is gone",
+                registry.unreadable.len()
+            ),
+        };
+    }
+
+    // Fall back to what the hook recorded, newest un-ended run first: a
+    // run with an `ended_at` reported its own `SessionEnd`, so there is
+    // nothing to probe.
     let Some(run) = runs.iter().find(|r| r.ended_at.is_none()) else {
         if runs.is_empty() {
             return Liveness::Unknown {
@@ -736,6 +824,84 @@ mod tests {
         }
     }
 
+    /// **A registry record we could not PARSE is not an absent one.**
+    ///
+    /// The directory listed fine -- so the `registry.failure` check does
+    /// not fire -- but one `<pid>.json` failed to parse, and it might be
+    /// the record proving this session is alive. Claude Code owns that
+    /// format, so a release changing it puts every session here.
+    ///
+    /// This was a LIVE BUG until a review caught it: `derive` consulted
+    /// only `failure` and `entries`, so this session fell through to the
+    /// run fallback and a session whose recorded runs had all ended
+    /// reported `Dead` -- "not running", which is what the UI turns into a
+    /// primary Resume button -- on the strength of a record we could not
+    /// read. The banner above the list already told the user these
+    /// sessions read as "could not tell", so the code and the copy
+    /// disagreed.
+    #[test]
+    fn an_unparseable_registry_record_makes_other_sessions_unknown_not_dead() {
+        let registry = Registry {
+            // Listing succeeded; one record did not parse.
+            failure: None,
+            unreadable: vec!["/Users/acme/.claude/sessions/99.json: expected value".into()],
+            ..Default::default()
+        };
+        // A session whose every recorded run ENDED -- the arm that would
+        // otherwise confidently report Dead.
+        let ended = [Run {
+            pid: 4242,
+            pid_start_time: Some(PROC_START.into()),
+            ended_at: Some("2026-09-11T12:00:00Z".into()),
+        }];
+        let got = derive(&gone(), &registry, "s1", &ended);
+        match &got {
+            Liveness::Unknown { why } => assert!(
+                why.contains("could not be read"),
+                "the reason must name the unreadable record: {why}"
+            ),
+            other => panic!(
+                "a session we cannot rule out must not read as {other:?} -- \
+                 'not running' is what offers Resume"
+            ),
+        }
+        assert!(
+            !matches!(got, Liveness::Dead { .. }),
+            "an unreadable record must not licence a Dead verdict"
+        );
+        // And with a CLEAN registry the same session is legitimately Dead,
+        // so the test above is about the unreadable record rather than
+        // about this run shape.
+        assert!(matches!(
+            derive(&gone(), &Registry::default(), "s1", &ended),
+            Liveness::Dead { .. }
+        ));
+    }
+
+    /// A per-entry listing error is counted, not dropped.
+    ///
+    /// `flatten()` stood in `read_registry` and silently discarded these.
+    /// Each one could be the record proving a session alive, so it has to
+    /// reach `derive`, which turns a non-empty `unreadable` into Unknown.
+    #[test]
+    fn the_unreadable_list_is_what_derive_consults() {
+        // Asserted as the CONTRACT between the two functions rather than
+        // by provoking a real `read_dir` entry error, which needs a race
+        // that cannot be staged portably.
+        let mut r = Registry::default();
+        assert!(matches!(
+            derive(&gone(), &r, "s1", &[]),
+            Liveness::Unknown { .. }
+        ));
+        r.unreadable
+            .push("whatever: could not list an entry".into());
+        let got = derive(&gone(), &r, "s1", &[]);
+        match got {
+            Liveness::Unknown { why } => assert!(why.contains("could not be read"), "{why}"),
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
     /// A hook-recorded run is the fallback source when the registry has
     /// forgotten the session.
     #[test]
@@ -845,6 +1011,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `sysinfo`'s `start_time()` is EPOCH SECONDS, and this pins it.
+    ///
+    /// The whole comparison in [`derive`] rests on the two sides sharing
+    /// a unit: `procStart` parsed as UTC epoch seconds against
+    /// `start_time()`. If a future `sysinfo` returned milliseconds, or
+    /// seconds since boot, the subtraction would still compile and every
+    /// session would read as a reused pid -- silently, and in the same
+    /// direction as the format trap in the module docs.
+    ///
+    /// Asserted against THIS process, which is the one process guaranteed
+    /// to exist while the test runs, and bounded rather than exact: it
+    /// must sit between a fixed past date and a little way into the
+    /// future. Milliseconds-since-epoch would be ~1000x too large and
+    /// seconds-since-boot ~1000x too small, so either fails the range
+    /// even though neither could fail an "is it non-zero" check.
+    #[test]
+    fn sysinfo_reports_a_start_time_in_epoch_seconds() {
+        let me = std::process::id();
+        let probe = SysinfoProbe::for_pids(&[me]);
+        let got = probe
+            .start_time(me)
+            .expect("the process table is readable")
+            .expect("this very process is in it");
+        // 2020-01-01 .. 2100-01-01, in epoch SECONDS.
+        assert!(
+            (1_577_836_800..4_102_444_800).contains(&got),
+            "start_time() must be epoch seconds; got {got}, which is the wrong \
+             magnitude and would make every liveness check report a reused pid"
+        );
+        // And it is in the past: a start time in the future would mean the
+        // units line up but the epoch does not.
+        let now = chrono::Utc::now().timestamp();
+        assert!(
+            got <= now + 60,
+            "a process cannot have started {got} > now {now}"
+        );
+    }
+
     /// The real registry on this machine, when there is one.
     ///
     /// Prints rather than asserts the counts -- the number of live
@@ -852,6 +1056,11 @@ mod tests {
     /// DOES assert is the invariant that matters: every entry either
     /// parses into a state with a reason, or is reported as unreadable.
     /// Nothing is silently dropped.
+    ///
+    /// It also prints the DELTA between each registry `procStart` and
+    /// `sysinfo`'s reading, which is the measurement
+    /// [`START_TOLERANCE_SECS`] is justified by -- 0s on all three live
+    /// sessions when that constant's comment was written.
     #[test]
     fn real_registry() {
         let Some(dir) = registry_dir() else {
@@ -870,8 +1079,19 @@ mod tests {
         );
         for (id, e) in &reg.entries {
             let state = derive(&probe, &reg, id, &[]);
+            // The delta the tolerance is justified by. Printed rather
+            // than asserted: an entry whose pid has legitimately exited
+            // between the read and here has no delta to report, and that
+            // is a correct `Dead` rather than a failure.
+            let delta = match (
+                e.proc_start.as_deref().and_then(parse_proc_start),
+                probe.start_time(e.pid),
+            ) {
+                (Some(r), Ok(Some(a))) => format!("{}s", (a - r).abs()),
+                _ => "n/a".into(),
+            };
             eprintln!(
-                "  pid {:>7} {:<40} procStart={:?} -> {state:?}",
+                "  pid {:>7} {:<40} procStart={:?} delta={delta} -> {state:?}",
                 e.pid,
                 e.name.as_deref().unwrap_or("-"),
                 e.proc_start

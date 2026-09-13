@@ -15,6 +15,7 @@ import {
   usePollError,
   useUpdateRunOutcome,
   useUpdateRunResume,
+  useUiPrefs,
 } from "./api/hooks";
 import { useReviewingDiag } from "./api/diag";
 import { useScrollReset } from "./lib/scrollReset";
@@ -212,8 +213,34 @@ export default function App() {
   //
   // On the BUILD, not the viewport, per `lib/target.ts`: a desktop user
   // who drags their window under 768px keeps the page.
+  // The CAPABILITY fall-through, alongside the build-time one (#917).
+  //
+  // `ViewSwitcher` refuses to offer `claude-code` while
+  // `claude_integrations_enabled` is off, and its comment states the
+  // reason as "there is no page behind the entry" -- overriding even the
+  // current-view escape hatch, exactly as the build-time set does. That
+  // claim is only true if the ROUTE agrees, and until this line it did
+  // not: a persisted `view: "claude-code"` rendered the page while the
+  // switcher denied the entry existed, which is the three-call-site
+  // disagreement `MOBILE_HIDDEN_VIEWS` exists to prevent.
+  //
+  // Derived, never written back, for the reason the mobile case states
+  // just above: the stored value is the user's and a desktop that later
+  // turns the capability on should land back where it was.
+  //
+  // `prefs` is undefined while `get_ui_prefs` is in flight AND if it
+  // rejects, so this falls back to My PRs in both cases. That is the
+  // fail-CLOSED direction and it is the right one here: the alternative
+  // is rendering a page for a capability we could not confirm is on. It
+  // is also what `ViewSwitcher` already does with the same value, so the
+  // two agree in the uncertain case as well as the settled ones.
+  const { prefs } = useUiPrefs();
+  const claudeCodeOff = !prefs?.claude_integrations_enabled;
   const view =
-    IS_MOBILE_BUILD && MOBILE_HIDDEN_VIEWS.has(storedView) ? "my-prs" : storedView;
+    (IS_MOBILE_BUILD && MOBILE_HIDDEN_VIEWS.has(storedView)) ||
+    (storedView === "claude-code" && claudeCodeOff)
+      ? "my-prs"
+      : storedView;
   // The sidebar is a sheet on the phone, opened from a button in the
   // header. Any navigation closes it: the point of picking a repo is
   // to look at it, and a sheet still covering the list would hide the
