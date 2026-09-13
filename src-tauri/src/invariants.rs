@@ -1613,4 +1613,198 @@ mod tests {
             contradicted.join("\n  ")
         );
     }
+
+    /// Every registered command is REACHABLE from the desktop (#947).
+    ///
+    /// `claude_poll_live` shipped in #927 registered in `generate_handler!`,
+    /// classified in the remote surface, wired into the phone's dispatch
+    /// arm, and covered by ten passing tests -- with no caller on the
+    /// machine that needs it. So the hook it exists to consume wrote a
+    /// file nothing read, `claude_run` stayed empty in production, and
+    /// every one of those tests passed the whole time.
+    ///
+    /// Nothing could have caught it. The tests call the functions
+    /// directly, and the remote dispatch arm makes the command genuinely
+    /// reachable -- just not from the desktop. This is the module's own
+    /// thesis in miniature: a property about the set of call sites, which
+    /// no behavioural test at one call site can express.
+    ///
+    /// A command is reachable if EITHER:
+    ///   - `src/api/tauri.ts` names it, so the frontend can invoke it, or
+    ///   - some production Rust outside `commands.rs` calls it, which is
+    ///     how a background timer reaches one.
+    ///
+    /// Being in the remote dispatch arm is deliberately NOT enough: that
+    /// is the phone asking the desktop, and a desktop-only capability
+    /// reachable only from a paired phone is exactly the defect.
+    #[test]
+    fn every_registered_command_is_reachable_from_the_desktop() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let lib = std::fs::read_to_string(manifest.join("src/lib.rs")).expect("read lib.rs");
+
+        // The handler list, discovered rather than enumerated: every
+        // `commands::name,` line inside `generate_handler!`.
+        // Scoped to the `generate_handler!` block, not the whole file:
+        // the poll loop also writes `commands::read_ui_prefs(..)`, which
+        // is a CALL rather than a registration, and a whole-file scan
+        // reports it as an unreachable command. The macro invocation is
+        // the only place a registration can appear.
+        let block = lib
+            .split_once("generate_handler!")
+            .map(|(_, rest)| rest)
+            .and_then(|rest| rest.split_once("])"))
+            .map(|(inside, _)| inside)
+            .expect("locate the generate_handler! block in lib.rs");
+        let names: Vec<String> = block
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("commands::"))
+            .filter_map(|l| l.strip_suffix(','))
+            .map(str::to_owned)
+            .collect();
+        assert!(
+            names.len() > 50,
+            "expected to discover the handler list; found {} entries, so the \
+             `commands::name,` shape this scan depends on has changed",
+            names.len()
+        );
+
+        let ts = std::fs::read_to_string(manifest.join("../src/api/tauri.ts"))
+            .expect("read src/api/tauri.ts");
+
+        // Production Rust outside `commands.rs` itself. A command calling
+        // a sibling command inside that file is not a desktop entry point.
+        let rust: String = rust_files(&manifest.join("src"))
+            .into_iter()
+            // `remote/surface.rs` is EXCLUDED, and that exclusion is the
+            // whole point rather than a convenience: its dispatch arm
+            // spells `commands::name(app.clone())` for every remotely
+            // reachable command, so counting it would make every
+            // `Class::Read` command look called and this guard would
+            // pass on the exact defect it exists for. Verified by
+            // sabotage: with the file included, removing the Claude live
+            // pass's caller still passed.
+            //
+            // `commands.rs` itself: a command calling a sibling command
+            // in the same file is not a desktop entry point.
+            .filter(|p| {
+                !p.ends_with("commands.rs")
+                    && !p.ends_with("invariants.rs")
+                    && !p.ends_with("remote/surface.rs")
+            })
+            .filter_map(|p| std::fs::read_to_string(&p).ok().map(|src| production(&src)))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // `diag_log` is the one documented exception and says so in
+        // `surfaceGuard.test.ts`: it is called through the raw `call()`
+        // helper rather than a named wrapper, so `tauri.ts` never spells
+        // it. Named here, with its reason, rather than silently skipped.
+        const CALLED_THROUGH_RAW_INVOKE: &[&str] = &["diag_log"];
+
+        // A command whose body is a thin wrapper over a shared function
+        // is reachable when that FUNCTION is called, not the command.
+        // `claude_poll_live` is the case: it and the background timer
+        // both call `claude_live_pass`, so the ordering rules inside it
+        // exist once rather than twice (#947). Requiring the command
+        // name here would push a caller into wrapping the async command
+        // just to satisfy a guard, which is the wrong shape.
+        //
+        // Discovered from the source rather than listed: the body of a
+        // one-line delegating command names the function it forwards to,
+        // so a command is also reachable if some production Rust calls
+        // any `fn` that `commands.rs` shows it delegating to.
+        let commands_src =
+            std::fs::read_to_string(manifest.join("src/commands.rs")).expect("read commands.rs");
+        let delegates_to = |name: &str| -> Option<String> {
+            let at = commands_src.find(&format!("pub async fn {name}("))?;
+            let body = &commands_src[at..];
+            let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+            // `spawn_blocking(move || some_fn(..))` -- the shape the
+            // extraction in #947 produced. Everything after the marker,
+            // up to the first `(`, is the delegated function's name.
+            let marker = "spawn_blocking(move || ";
+            let after = body.split_once(marker)?.1;
+            let name = after.split_once('(')?.0.trim();
+            (!name.is_empty() && !name.contains(char::is_whitespace)).then(|| name.to_string())
+        };
+
+        // Two commands are unreachable TODAY and tracked in #964:
+        // `apply_package_updates` and `open_update_pr` were superseded by
+        // the per-package flow and never unregistered, so they remain
+        // remotely dispatchable with nothing on the desktop calling them.
+        //
+        // Listed rather than silently tolerated, and deliberately not
+        // fixed here: unregistering a command changes what a paired phone
+        // can reach, which is a remote-surface decision with its own
+        // allowlist copies to update, and it does not belong inside the
+        // fix for a different defect. This guard found them
+        // independently, which is the evidence #964 wanted.
+        //
+        // Deleting an entry here must make the test FAIL, not pass -- so
+        // when #964 lands, these lines come out with it.
+        const KNOWN_UNREACHABLE: &[&str] = &["apply_package_updates", "open_update_pr"];
+
+        let mut unreachable = Vec::new();
+        let mut stale_exemptions = Vec::new();
+        for name in &names {
+            if CALLED_THROUGH_RAW_INVOKE.contains(&name.as_str()) {
+                continue;
+            }
+            if ts.contains(name.as_str()) {
+                continue;
+            }
+            // `commands::name(` from another module, or a re-export used
+            // as a path. Either is a real desktop caller.
+            if rust.contains(&format!("commands::{name}(")) {
+                continue;
+            }
+            // The delegation case described above.
+            if let Some(target) = delegates_to(name) {
+                if !target.is_empty() && rust.contains(&format!("commands::{target}(")) {
+                    continue;
+                }
+            }
+            if KNOWN_UNREACHABLE.contains(&name.as_str()) {
+                continue;
+            }
+            unreachable.push(name.clone());
+        }
+
+        // The exemption list must not outlive what it excuses. A command
+        // named here that HAS become reachable means #964 landed and the
+        // entry should go, so this fails rather than quietly passing --
+        // the failure mode a hand-written list otherwise has (#844).
+        for name in KNOWN_UNREACHABLE {
+            let reachable = ts.contains(name) || rust.contains(&format!("commands::{name}("));
+            if reachable || !names.iter().any(|n| n == name) {
+                stale_exemptions.push((*name).to_string());
+            }
+        }
+        assert!(
+            stale_exemptions.is_empty(),
+            "KNOWN_UNREACHABLE names {} that no longer needs excusing:\n  {}\n\n\
+             It is now called, or no longer registered. Remove it from the list.",
+            if stale_exemptions.len() == 1 {
+                "a command"
+            } else {
+                "commands"
+            },
+            stale_exemptions.join("\n  ")
+        );
+
+        assert!(
+            unreachable.is_empty(),
+            "{} registered command(s) have no desktop caller:\n  {}\n\n\
+             A command in `generate_handler!` with no `tauri.ts` wrapper and no \
+             production Rust caller can only be invoked by a paired phone. If it is a \
+             background pass, call it from the timer in `lib.rs` the way the Claude \
+             live pass is (#947). If the frontend should drive it, add the wrapper. If \
+             it is superseded, unregister it -- leaving it registered keeps it \
+             remotely dispatchable while nothing on the desktop uses it.\n\n\
+             `claude_poll_live` shipped in exactly this state and its ten tests all \
+             passed while `claude_run` stayed empty in production.",
+            unreachable.len(),
+            unreachable.join("\n  ")
+        );
+    }
 }

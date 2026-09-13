@@ -586,6 +586,71 @@ pub fn run() {
                             }
                             Err(e) => log::warn!("system health: could not record a sample: {e}"),
                         }
+
+                        // ---- The Claude Code live pass (#947) ----
+                        //
+                        // Here rather than in a frontend `useQuery`,
+                        // which is what #947 suggested. The difference
+                        // matters: a hook only runs while its page is
+                        // MOUNTED, so the handoff file would be consumed
+                        // only while the user happens to be looking at
+                        // the Claude Code view. The file is written by
+                        // every session start and end regardless of
+                        // which view is open -- and `handoff.rs` makes
+                        // truncation the consumer's job, deliberately,
+                        // so a consumer that runs only sometimes leaves
+                        // a file that grows the rest of the time. That
+                        // is the defect #947 reports, and a
+                        // page-scoped poll would only narrow it.
+                        //
+                        // Gated per tick, not once at startup, so
+                        // turning the capability off stops the
+                        // consumption on the next pass -- which is what
+                        // `claude_integrations_enabled`'s own doc
+                        // promises ("hide the view AND stop
+                        // consuming"), and the same read-per-tick rule
+                        // the notify prefs above follow so a setting
+                        // change lands on the next sample rather than
+                        // the next relaunch.
+                        //
+                        // A 60-second cadence, which is this loop's, not
+                        // the 10 seconds the view's own queries use.
+                        // Liveness for the VIEW is derived per read from
+                        // the registry and does not depend on this pass
+                        // at all; what this pass adds is the recorded
+                        // run history and crash rows, where a minute of
+                        // latency costs nothing. Sharing the existing
+                        // thread also avoids a second timer to reason
+                        // about.
+                        if commands::read_ui_prefs(&app_handle).claude_integrations_enabled {
+                            match commands::claude_live_pass(&commands::db_path(&app_handle)) {
+                                Ok(state) => {
+                                    // Logged only when it did something.
+                                    // A quiet machine ticking every
+                                    // minute would otherwise bury every
+                                    // other line in the log.
+                                    if state.handoff.runs > 0
+                                        || state.sweep.crashed > 0
+                                        || !state.handoff.unparseable.is_empty()
+                                    {
+                                        log::info!(
+                                            "claude: consumed {} run(s), {} crash(es), \
+                                             {} unparseable, {} running",
+                                            state.handoff.runs,
+                                            state.sweep.crashed,
+                                            state.handoff.unparseable.len(),
+                                            state.running.len()
+                                        );
+                                    }
+                                }
+                                // Warned and skipped, never fatal, for
+                                // the reason the health sample above
+                                // gives: a pass that could not read
+                                // `~/.claude` must not stop the loop
+                                // that also records system health.
+                                Err(e) => log::warn!("claude: live pass failed: {e}"),
+                            }
+                        }
                     }
                 });
             }
