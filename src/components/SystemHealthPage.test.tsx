@@ -588,6 +588,80 @@ describe("SystemHealthPage", () => {
     expect(core1.getAttribute("aria-valuenow")).toBe("26");
   });
 
+  /// #960. `Stat` and `NotMeasured` exist so an unreadable reading is
+  /// never coerced to 0 -- and the `Bar` beside them was handed `?? 0`
+  /// and drew a green, empty, `aria-valuenow=0` meter.
+  ///
+  /// A disk reporting `total: 0` is what `percentOf` returns `null` for,
+  /// and it is an ordinary shape on somebody else's machine: an unusual
+  /// filesystem, a container mount, a platform read the collector could
+  /// not complete. The row's own text line correctly said "Not measured"
+  /// while a full-width bar sat empty and GREEN immediately above it --
+  /// the two halves of one row disagreeing, with the wrong half the one
+  /// the eye reads first.
+  ///
+  /// Scoped to that disk's own meter by its label, because a page-wide
+  /// `aria-valuenow` search would find every other bar on the page.
+  it("an unmeasurable disk draws no meter value rather than zero", async () => {
+    liveFn.mockResolvedValue(
+      sample({
+        disks: [{ mount: "/", total: 0, available: 0, is_root: true }],
+      }),
+    );
+    show();
+    await screen.findByText("1.25");
+
+    const meter = screen.getByLabelText("/ used");
+    // The affirmative numeric claim is GONE. `role="meter"` with
+    // `aria-valuenow=0` tells a screen reader the value IS zero, which is
+    // a statement, not an absence.
+    expect(meter.getAttribute("aria-valuenow")).toBeNull();
+    expect(meter.getAttribute("aria-valuenow")).not.toBe("0");
+    // And the meter says what it does not know, which is the only way a
+    // meter can express "unknown".
+    expect(meter.getAttribute("aria-valuetext")).toBe("Not measured");
+    // The text line still says it, as it always did -- the bar now agrees.
+    expect(screen.getAllByText(/Not measured/).length).toBeGreaterThan(0);
+  });
+
+  /// The other half of #960: a genuine 0% is a MEASURED reading and must
+  /// still render as one. A fix that erased the real zero along with the
+  /// fabricated one would trade one wrong answer for another, and
+  /// `Bar`'s clamp comment records a real case that depends on it.
+  it("still reports a measured zero as zero", async () => {
+    liveFn.mockResolvedValue(
+      sample({
+        // Completely empty disk: a real, readable 0% used.
+        disks: [
+          { mount: "/", total: 500 * 1024 ** 3, available: 500 * 1024 ** 3, is_root: true },
+        ],
+      }),
+    );
+    show();
+    await screen.findByText("1.25");
+
+    const meter = screen.getByLabelText("/ used");
+    expect(meter.getAttribute("aria-valuenow")).toBe("0");
+    expect(meter.getAttribute("aria-valuetext")).toBeNull();
+  });
+
+  /// The memory equivalent (#960). `percentOf(used, total)` is `null` on
+  /// a zero or unreadable total, and the Memory panel's bar laundered it
+  /// the same way.
+  it("an unmeasurable memory total draws no meter value rather than zero", async () => {
+    liveFn.mockResolvedValue(
+      sample({
+        memory: { total: 0, used: 0, available: 0, swap_total: 0, swap_used: 0 },
+      }),
+    );
+    show();
+    await screen.findByText("1.25");
+
+    const meter = screen.getByLabelText("Memory used");
+    expect(meter.getAttribute("aria-valuenow")).toBeNull();
+    expect(meter.getAttribute("aria-valuetext")).toBe("Not measured");
+  });
+
   /// The GPU's utilization is a meter, like every other bar here, so
   /// its value is readable without inferring it from a pixel width.
   it("renders the GPU's utilization and the memory it holds", async () => {

@@ -16,12 +16,27 @@ pub struct Build {
     pub reference: String,
     /// The build target, e.g. `octocat-api/docker`.
     pub name: String,
-    pub status: String,
+    /// Buildx's own word for the outcome: `Completed`, `Error`, and so on.
+    ///
+    /// `Option`, not `String` (#963). `.unwrap_or_default()` gave an empty
+    /// string for a record missing the field, and `failed()` is
+    /// `status != "Completed"` -- so a MISSING status was reported as a
+    /// FAILED BUILD. `None` means we do not know what happened, which is
+    /// not the same claim.
+    pub status: Option<String>,
     /// RFC 3339.
     pub started: String,
     pub duration_secs: f64,
-    pub total_steps: u64,
-    pub cached_steps: u64,
+    /// Step counts, or `None` when buildx did not report them.
+    ///
+    /// `Option`, not `u64` (#963). `.unwrap_or(0)` made a missing field
+    /// indistinguishable from a genuine 0% cache hit -- and `cache_percent`
+    /// returns 0 for `total_steps == 0`, so an ABSENT field fabricated
+    /// exactly the alarm the field exists to raise: this module's own doc
+    /// says a sudden return to a cold build "means something invalidated
+    /// it".
+    pub total_steps: Option<u64>,
+    pub cached_steps: Option<u64>,
     /// The build context directory, and the revision it built. Resolved
     /// lazily via `inspect`, which is slower than the listing.
     pub context: Option<String>,
@@ -29,24 +44,39 @@ pub struct Build {
 }
 
 impl Build {
-    /// What fraction of steps came from cache, 0-100.
+    /// What fraction of steps came from cache, 0-100, or `None` when
+    /// there is no fraction to give (#963).
     ///
     /// Shown WITH the duration rather than instead of it: duration alone
     /// says "slow", but duration plus cache ratio says why. Real data
     /// shows the same target going 7m8s -> 1m20s -> 56.9s as the cache
     /// warms, and a sudden return to 7 minutes means something
     /// invalidated it.
-    pub fn cache_percent(&self) -> u64 {
-        if self.total_steps == 0 {
-            return 0;
+    ///
+    /// Three cases, and the middle one is the bug that was here: buildx
+    /// did not report the counts (`None`), buildx reported zero total
+    /// steps (nothing to cache, so there is no ratio), or a real ratio.
+    /// `.unwrap_or(0)` upstream collapsed the first into "0% cached",
+    /// which is the strongest alarm this number can raise -- a build that
+    /// used to be warm going cold -- fabricated from an absent field.
+    pub fn cache_percent(&self) -> Option<u64> {
+        let (total, cached) = (self.total_steps?, self.cached_steps?);
+        if total == 0 {
+            // Nothing to cache. Not a 0% hit rate -- there was no rate.
+            return None;
         }
-        self.cached_steps * 100 / self.total_steps
+        Some(cached * 100 / total)
     }
 
     /// Whether the build failed. Failures are as interesting as
     /// successes -- arguably more -- so they are never filtered out.
-    pub fn failed(&self) -> bool {
-        self.status != "Completed"
+    ///
+    /// `None` when there is no status to judge (#963). A missing field
+    /// used to read as `""`, which is `!= "Completed"` and therefore a
+    /// FAILED build -- inventing the most alarming reading available out
+    /// of an absence. Callers get to say "unknown" instead.
+    pub fn failed(&self) -> Option<bool> {
+        self.status.as_deref().map(|s| s != "Completed")
     }
 }
 
@@ -62,11 +92,17 @@ pub fn parse_history(out: &str) -> Vec<Build> {
             Some(Build {
                 reference: v["ref"].as_str()?.to_string(),
                 name: v["name"].as_str().unwrap_or_default().to_string(),
-                status: v["status"].as_str().unwrap_or_default().to_string(),
+                // NOT `.unwrap_or_default()` (#963): an empty string is
+                // `!= "Completed"`, so a missing status read as a failed
+                // build.
+                status: v["status"].as_str().map(str::to_string),
                 started: created.to_string(),
                 duration_secs: duration_between(created, completed),
-                total_steps: v["total_steps"].as_u64().unwrap_or(0),
-                cached_steps: v["cached_steps"].as_u64().unwrap_or(0),
+                // NOT `.unwrap_or(0)` (#963): a zero total makes
+                // `cache_percent` answer 0, so an absent field fabricated
+                // a 0%-cached alarm.
+                total_steps: v["total_steps"].as_u64(),
+                cached_steps: v["cached_steps"].as_u64(),
                 context: None,
                 revision: None,
             })
@@ -123,27 +159,94 @@ mod tests {
         let builds = parse_history(HISTORY);
         let b = builds
             .iter()
-            .find(|b| b.total_steps == 43)
+            .find(|b| b.total_steps == Some(43))
             .expect("fixture has a 43-step build");
-        assert_eq!(b.cached_steps, 21);
-        assert_eq!(b.cache_percent(), 48);
+        assert_eq!(b.cached_steps, Some(21));
+        assert_eq!(b.cache_percent(), Some(48));
     }
 
     /// A build with no steps must not divide by zero.
     #[test]
     fn a_build_with_no_steps_reports_no_cache_rather_than_panicking() {
         let b = Build {
+            total_steps: Some(0),
+            cached_steps: Some(0),
+            ..fixture()
+        };
+        // `None`, not `Some(0)` (#963): zero steps means there was no
+        // ratio, which is not the same claim as a 0% hit rate.
+        assert_eq!(b.cache_percent(), None);
+    }
+
+    /// A `Build` with every field measured, for the cases below to vary
+    /// one thing from.
+    fn fixture() -> Build {
+        Build {
             reference: "r".into(),
             name: "n".into(),
-            status: "Completed".into(),
+            status: Some("Completed".into()),
             started: String::new(),
             duration_secs: 0.0,
-            total_steps: 0,
-            cached_steps: 0,
+            total_steps: Some(10),
+            cached_steps: Some(5),
             context: None,
             revision: None,
-        };
-        assert_eq!(b.cache_percent(), 0);
+        }
+    }
+
+    /// #963. `.unwrap_or(0)` on the step counts made a MISSING field
+    /// indistinguishable from a genuine 0% cache hit -- and 0% cached is
+    /// the strongest alarm this figure can raise, since this module's own
+    /// doc says a build returning to its cold time "means something
+    /// invalidated it". The alarm was fabricated out of an absence.
+    ///
+    /// Fed through `parse_history` rather than built as a literal, because
+    /// the coercion was in the PARSER: a struct literal would pass whatever
+    /// the parser did.
+    #[test]
+    fn a_build_missing_its_step_counts_does_not_report_zero_percent_cached() {
+        let line = r#"{"ref":"abc","name":"api","status":"Completed","created_at":"2026-09-01T10:00:00Z","completed_at":"2026-09-01T10:01:00Z"}"#;
+        let builds = parse_history(line);
+        assert_eq!(builds.len(), 1, "the record itself is still parsed");
+        let b = &builds[0];
+
+        assert_eq!(b.total_steps, None);
+        assert_eq!(b.cached_steps, None);
+        assert_eq!(
+            b.cache_percent(),
+            None,
+            "an absent step count must not answer 0% cached"
+        );
+        // The rest of the record survived: a partial answer labelled
+        // partial beats dropping the row.
+        assert_eq!(b.name, "api");
+        assert_eq!(b.failed(), Some(false));
+    }
+
+    /// #963. `status` via `.unwrap_or_default()` gave `""`, and `failed()`
+    /// is `status != "Completed"` -- so a record missing its status was
+    /// reported as a FAILED BUILD. The most alarming available reading,
+    /// invented from an absence.
+    #[test]
+    fn a_build_missing_its_status_is_not_reported_as_failed() {
+        let line = r#"{"ref":"abc","name":"api","created_at":"2026-09-01T10:00:00Z","total_steps":10,"cached_steps":5}"#;
+        let builds = parse_history(line);
+        assert_eq!(builds.len(), 1);
+        let b = &builds[0];
+
+        assert_eq!(b.status, None);
+        assert_ne!(b.failed(), Some(true), "an absent status is not a failure");
+        assert_eq!(b.failed(), None);
+        // And a real status is still judged, in both directions.
+        assert_eq!(
+            Build {
+                status: Some("Error".into()),
+                ..fixture()
+            }
+            .failed(),
+            Some(true)
+        );
+        assert_eq!(fixture().failed(), Some(false));
     }
 
     /// Failed builds are as interesting as successful ones -- arguably
@@ -152,7 +255,7 @@ mod tests {
     #[test]
     fn failed_builds_are_kept_not_filtered() {
         let builds = parse_history(HISTORY);
-        let failed: Vec<&Build> = builds.iter().filter(|b| b.failed()).collect();
+        let failed: Vec<&Build> = builds.iter().filter(|b| b.failed() == Some(true)).collect();
         assert!(
             !failed.is_empty(),
             "the fixture has Error builds; they must survive parsing"
@@ -209,11 +312,14 @@ mod live {
         for b in builds.iter_mut().take(4) {
             enrich(b);
             println!(
-                "  {:24} {:>7.1}s  {:>3}% cached  {}  ctx={:?}",
+                "  {:24} {:>7.1}s  {:>3} cached  {}  ctx={:?}",
                 b.name,
                 b.duration_secs,
-                b.cache_percent(),
-                b.status,
+                // `Option`, so both are printed as themselves rather than
+                // one masquerading as the other (#963).
+                b.cache_percent()
+                    .map_or_else(|| "  ?".to_string(), |p| format!("{p}%")),
+                b.status.as_deref().unwrap_or("(no status)"),
                 b.context
                     .as_deref()
                     .map(|c| c.rsplit('/').next().unwrap_or(c))

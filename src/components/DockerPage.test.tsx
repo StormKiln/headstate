@@ -10,6 +10,10 @@ const state = vi.hoisted(() => ({
   diskFailed: false,
   volumes: [] as { name: string; size_bytes: number }[],
   builds: [] as DockerBuild[],
+  /// #963: whether the build-history call REJECTED, as opposed to
+  /// answering with nothing. The two share the same `[]` and mean
+  /// opposite things.
+  buildsFailed: false,
 }));
 
 type Outcome = { id: string; error: string | null };
@@ -26,7 +30,7 @@ vi.mock("../api/hooks", () => ({
   // The image row joins to builds on the commit (#326). Empty is the
   // ordinary case -- a project tagging by version rather than by commit
   // matches nothing here.
-  useDockerBuilds: () => ({ data: state.builds ?? [] }),
+  useDockerBuilds: () => ({ data: state.builds ?? [], isError: state.buildsFailed }),
   useDockerImages: () => ({
     data: state.images,
     isLoading: false,
@@ -91,6 +95,10 @@ beforeEach(() => {
   state.imagesFailed = false;
   state.diskFailed = false;
   state.volumes = [];
+  state.builds = [];
+  // #963. Leaked, this replaces every cache-health assertion on the page
+  // with the "could not read" note.
+  state.buildsFailed = false;
   removeImagesFn.mockClear();
   pruneFn.mockClear();
   removeVolumeFn.mockClear();
@@ -539,6 +547,51 @@ describe("DockerPage", () => {
     state.builds = [] as never;
     render(<DockerPage />);
     expect(screen.queryByText(/% cached/)).toBeNull();
+    // ...and says nothing about a failure, because there was none. The
+    // empty-history arm and the error arm must not be the same arm (#963).
+    expect(screen.queryByText(/could not read the build history/i)).toBeNull();
+  });
+
+  /// #963. `const { data: builds = [] } = useDockerBuilds(up)` discarded
+  /// `isError` entirely -- the literal `= []` shape of #846. `docker buildx
+  /// history ls` fails for ordinary reasons on somebody else's machine (the
+  /// `buildx` PLUGIN absent or too old, the history feature disabled, a
+  /// permission wall on the socket, the 20s ceiling in `docker/cli.rs`), and
+  /// the empty array was then read as a measurement: two prop doc comments
+  /// asserted "Empty is ordinary".
+  ///
+  /// So the cache-health figure -- "the number the Builds page existed to
+  /// show" -- silently vanished with no explanation, inviting the reader to
+  /// treat the last number they saw as still true.
+  it("says a failed build history could not be read rather than showing nothing", () => {
+    state.images = [img()];
+    state.builds = [] as never;
+    state.buildsFailed = true;
+    render(<DockerPage />);
+
+    // The cache-health SLOT says what happened...
+    expect(screen.getByText(/could not read the build history/i)).toBeTruthy();
+    // ...and carries no figure, rather than a confident one over no data.
+    expect(screen.queryByText(/% cached/)).toBeNull();
+    // The images list still renders: one failed query must not take the
+    // page with it, which is the whole reason this is a slot rather than
+    // an early return.
+    expect(screen.getByText("registry/app:13901886")).toBeTruthy();
+    // And the disk figures beside it are untouched.
+    expect(screen.getByText("Build cache")).toBeTruthy();
+  });
+
+  /// The same distinction one level down: an expanded image row showed no
+  /// build provenance at all on a rejected history, indistinguishable from
+  /// an image that genuinely has none (#963).
+  it("says so on an expanded row when the build history could not be read", () => {
+    state.images = [img()];
+    state.builds = [] as never;
+    state.buildsFailed = true;
+    render(<DockerPage />);
+
+    fireEvent.click(screen.getByText("registry/app:13901886"));
+    expect(screen.getByText(/build history could not be read/i)).toBeTruthy();
   });
 });
 

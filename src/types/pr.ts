@@ -561,11 +561,16 @@ export interface ImageRemovalOutcome {
 export interface DockerBuild {
   reference: string;
   name: string;
-  status: string;
+  /// `null` when buildx did not report one. Never `""`: an empty string
+  /// is `!== "Completed"` and therefore read as a FAILED build (#963).
+  status: string | null;
   started: string;
   duration_secs: number;
-  total_steps: number;
-  cached_steps: number;
+  /// `null` when buildx did not report the counts. Never 0, which
+  /// `cachePercent` answers as "0% cached" -- the strongest alarm this
+  /// figure raises, fabricated from an absent field (#963).
+  total_steps: number | null;
+  cached_steps: number | null;
   /// Resolved on demand: `inspect` is a subprocess per build.
   context: string | null;
   revision: string | null;
@@ -585,9 +590,20 @@ export interface Assessment {
   /// Relative, as git prints it: "3 weeks ago".
   last_activity: string | null;
   /// Never pushed means these commits exist only on this machine.
-  has_upstream: boolean;
-  subjects: string[];
+  ///
+  /// Three states, not two (#976). `null` means git could not be asked
+  /// whether there is an upstream -- missing from a GUI-launched app's
+  /// PATH, refusing on `safe.directory` -- which is not the same claim
+  /// as "this branch was never pushed".
+  has_upstream: boolean | null;
+  /// `null` when `git log` could not be read at all, which is not the
+  /// same as a branch with no commits (`[]`).
+  subjects: string[] | null;
   subjects_elided: number;
+  /// Uncommitted paths in the working tree, or `null` when `git status`
+  /// could not be read. Never coerced to 0: a fabricated zero here reads
+  /// as a clean tree (#976).
+  uncommitted: number | null;
   /// The ref the counts above were measured against, by name:
   /// `origin/main` with a remote, a bare `main` on a purely local repo.
   ///
@@ -1163,7 +1179,11 @@ export type Deletable =
   | { kind: "merged"; how: "ancestor" | "squash" }
   | { kind: "defaultBranch" }
   | { kind: "checkedOut"; path: string }
-  | { kind: "unmerged"; ahead: number }
+  /// `ahead` is `number | null`: `%(ahead-behind:)` needs git 2.41, and
+  /// on an older git the count is simply unavailable. `null` renders as
+  /// "commit count unavailable", never as "0 commits" -- which read as a
+  /// branch with nothing to lose, beside a delete checkbox (#967).
+  | { kind: "unmerged"; ahead: number | null }
   | { kind: "pending" }
   | { kind: "unknown"; reason: string };
 
@@ -1174,8 +1194,11 @@ export interface Branch {
   /// two operations against two different things.
   location: "local" | "remote" | "tracked";
   upstream: string | null;
-  ahead: number;
-  behind: number;
+  /// `null` when the count could not be read -- git older than 2.41, git
+  /// missing from a GUI-launched app's PATH, a `safe.directory` refusal.
+  /// Never coerced to 0 (#967).
+  ahead: number | null;
+  behind: number | null;
   /// ISO 8601, as git reports it.
   committed: string;
   author: string;

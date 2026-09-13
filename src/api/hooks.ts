@@ -819,6 +819,19 @@ export function useArtifactSizes(artifacts: Artifact[], enabled: boolean) {
     /// makes a partially-filled page legible rather than broken.
     pending: results.filter((r) => r.isFetching).length,
     total: results.length,
+    /// How many batches FAILED outright (#956).
+    ///
+    /// Counted separately from `pending`, because a failed batch leaves
+    /// `pending` and never comes back: a caller that only watches
+    /// `pending` sees the number fall to zero and concludes everything was
+    /// measured. #769 is the shape of that mistake -- silence read as
+    /// success. Copied from `useAllWorktreeSizes`, whose comment has said
+    /// exactly this for longer than this hook has been wrong.
+    ///
+    /// `size_artifacts` genuinely rejects: it `map_err`s a semaphore
+    /// acquire and then runs inside `spawn_blocking`, whose join can fail.
+    /// With `retry: false` reasoning nearby, one rejection is final.
+    failed: results.filter((r) => r.isError).length,
   };
 }
 
@@ -969,6 +982,15 @@ export function useVenvSizes(venvs: Venv[], enabled: boolean) {
     /// than looking stuck -- the same thing `useArtifactSizes` reports.
     pending: results.filter((r) => r.isFetching).length,
     total: results.length,
+    /// How many chunks FAILED outright (#956).
+    ///
+    /// The same field, for the same reason, as `useArtifactSizes` and
+    /// `useAllWorktreeSizes`: a rejected chunk is neither fetching nor
+    /// holding data, so it contributes nothing to `pending` and `pending`
+    /// reaches 0 with measurements missing. A caller reading `pending ===
+    /// 0` as "fully measured" then puts an understated byte count on a
+    /// Remove button.
+    failed: results.filter((r) => r.isError).length,
   };
 }
 

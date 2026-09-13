@@ -698,7 +698,15 @@ function Row({
             {/* An empty summary means git answered none of it, which is
                 worth saying rather than rendering a blank line. */}
             <p>{assessmentSummary(assessment) || "Nothing could be measured here."}</p>
-            {assessment.subjects.length > 0 ? (
+            {/* Three arms, not two (#976). `null` is a failed `git log`,
+                and rendering nothing for it looks identical to a branch
+                with no commits -- so it says which. An intentional
+                elision (`subjects_elided`) stays a separate line, for the
+                reason `claude/transcript.rs` keeps its skipped count
+                apart from its unreadable one. */}
+            {assessment.subjects === null ? (
+              <p className="mt-1">Commit list could not be read.</p>
+            ) : assessment.subjects.length > 0 ? (
               <ul className="mt-1 list-inside list-disc">
                 {assessment.subjects.map((subject, i) => (
                   <li key={`${i}-${subject}`} className="truncate">

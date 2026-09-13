@@ -428,6 +428,10 @@ describe("the Memory page names what is holding it", () => {
     );
     renderPage();
     await screen.findByText(/no swap configured, so nothing can be paged out/i);
+    // And no swap meter at all -- not one reading 0% (#960). "There is no
+    // swap" and "0% of the swap is used" are different claims, and the
+    // panel's own comment says so; the bar must not contradict it.
+    expect(screen.queryByLabelText("Swap used")).toBeNull();
   });
 });
 

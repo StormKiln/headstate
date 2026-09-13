@@ -15,6 +15,10 @@ const state = vi.hoisted(() => ({
   ages: new Map<string, number>(),
   pending: 0,
   total: 0,
+  /// #956: how many size batches REJECTED. A rejection leaves `pending`
+  /// and never comes back, so `pending === 0` alone reads as "fully
+  /// measured".
+  sizesFailed: 0,
 }));
 
 // Typed so a test can resolve with real outcomes: a bare
@@ -61,10 +65,19 @@ vi.mock("../api/hooks", () => ({
     ages: state.ages,
     pending: state.pending,
     total: state.total,
+    failed: state.sizesFailed,
   }),
 }));
 
 import { ArtifactsPage } from "./ArtifactsPage";
+
+/// The hoisted `state` is shared across every describe in this file, and
+/// only some of them reset each field. `sizesFailed` defaults to the
+/// healthy value after EVERY test so a failure fixture cannot leak the
+/// "sizes are incomplete" advisory into an unrelated assertion.
+afterEach(() => {
+  state.sizesFailed = 0;
+});
 
 const art = (over: Partial<Artifact> = {}): Artifact => ({
   path: "/code/repo/target",
@@ -158,6 +171,63 @@ describe("ArtifactsPage", () => {
     render(<ArtifactsPage />);
     expect(screen.queryByText(/at least/)).toBeNull();
     expect(screen.queryByText(/measuring/)).toBeNull();
+  });
+
+  /// #956. A REJECTED batch drops out of `pending` and never returns, so
+  /// the old `pending > 0` test treated it as having answered: the total
+  /// lost its "at least" while still being summed over a partial set, and
+  /// the Remove button gained a byte figure understating what the click
+  /// deletes.
+  ///
+  /// The qualifier must survive a failure exactly as it survives a
+  /// pending batch -- and unlike a pending batch this one will not clear,
+  /// so the page also says WHY the number is a floor.
+  it("keeps the total qualified and off the remove button after a failed size batch", () => {
+    // TWO rows: the "Remove all" button appears only for a group of more
+    // than one, which is the case this figure actually labels.
+    state.artifacts = [art(), art({ path: "/code/repo/node_modules", kind: "node_modules" })];
+    state.sizes = new Map([["/code/repo/target", 1_000_000_000]]);
+    state.ages = new Map([
+      ["/code/repo/target", 60 * 60 * 24 * 30],
+      ["/code/repo/node_modules", 60 * 60 * 24 * 30],
+    ]);
+    // Every batch has stopped fetching, and one of them rejected.
+    state.pending = 0;
+    state.total = 5;
+    state.sizesFailed = 1;
+    render(<ArtifactsPage />);
+
+    expect(screen.getByText(/at least/)).toBeTruthy();
+    // And it says what is missing, which "at least" alone cannot.
+    expect(screen.getByText(/could not be measured/)).toBeTruthy();
+
+    // The destructive button carries the count but NOT a byte figure.
+    const btn = screen.getByRole("button", { name: /Remove all/ });
+    expect(btn.textContent).toContain("Remove all 2");
+    expect(btn.textContent).not.toMatch(/\bGB\b|\bMB\b|\bB\b·/);
+    expect(btn.textContent).not.toContain("·");
+
+    // The list is NOT blanked: the scan succeeded and the rows are real.
+    expect(screen.getByText("/code/repo/target")).toBeTruthy();
+  });
+
+  /// The confirmation is the last place the figure is read before the
+  /// click, so a partial measurement must say so there too (#956).
+  it("states the freed bytes as a floor in the dialog when sizes are incomplete", () => {
+    state.artifacts = [art(), art({ path: "/code/repo/node_modules", kind: "node_modules" })];
+    state.sizes = new Map([["/code/repo/target", 1_000_000_000]]);
+    state.ages = new Map([
+      ["/code/repo/target", 60 * 60 * 24 * 30],
+      ["/code/repo/node_modules", 60 * 60 * 24 * 30],
+    ]);
+    state.pending = 0;
+    state.total = 5;
+    state.sizesFailed = 1;
+    render(<ArtifactsPage />);
+
+    fireEvent.click(screen.getByRole("button", { name: /Remove all/ }));
+    expect(screen.getByText(/This frees at least/)).toBeTruthy();
+    expect(screen.getByText(/real figure is larger/)).toBeTruthy();
   });
 
   /// A build writing into a directory does not show up in `git status`,

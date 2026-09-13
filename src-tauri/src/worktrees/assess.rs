@@ -91,14 +91,39 @@ pub struct Assessment {
     pub last_activity: Option<String>,
     /// Never pushed means these commits exist only on this machine. The
     /// single most important fact in the whole struct.
-    pub has_upstream: bool,
+    ///
+    /// `Option`, not `bool` (#976): a three-state question. `git
+    /// rev-parse @{u}` fails for two unrelated reasons -- there is no
+    /// upstream, or git could not be asked at all (missing from a
+    /// GUI-launched app's PATH, refusing on `safe.directory`, broken).
+    /// A bare `false` reported the second as the first, which is a
+    /// fabricated claim about the fact this struct calls the most
+    /// important one it carries. `None` means we could not tell, and
+    /// `prompt()` says so in those words rather than asserting either
+    /// way.
+    pub has_upstream: Option<bool>,
     /// Newest first, capped at `MAX_SUBJECTS`.
-    pub subjects: Vec<String>,
+    ///
+    /// `None` when `git log` could not be run at all, which is not the
+    /// same as a branch with no commits. `Some(vec![])` is the latter.
+    /// Kept distinct for the reason `claude/transcript.rs` keeps
+    /// `subagent_files_skipped` apart from `unreadable_files`: an
+    /// intentional absence and a failed read have opposite remedies.
+    pub subjects: Option<Vec<String>>,
     /// How many subjects were elided by the cap.
     pub subjects_elided: u64,
     /// Uncommitted paths. Not covered by the diff against the default
     /// branch, so an agent would otherwise assess an incomplete picture.
-    pub uncommitted: u64,
+    ///
+    /// `Option`, not `u64` (#976). A failed `git status` used to leave
+    /// this at its `Default` of 0, and `prompt()` mentions the topic
+    /// only when the count is positive -- so an unread status produced a
+    /// prompt that said NOTHING about uncommitted work, telling an agent
+    /// by omission that the tree was clean. An agent acting on that may
+    /// stash, reset or check out over work that is really there.
+    /// `Some(0)` is a measured clean tree and stays silent; `None` gets
+    /// an explicit line.
+    pub uncommitted: Option<u64>,
     /// The ref every count above was measured against, by name --
     /// `origin/main` on a repository with a remote, a bare `main` on a
     /// purely local one (#815).
@@ -171,7 +196,18 @@ pub fn assess(repo_path: &str, worktree_path: &str, branch: &str) -> Assessment 
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty()),
-        has_upstream: git(dir, &["rev-parse", "--abbrev-ref", "@{u}"]).is_ok(),
+        // Three states, not two (#976). `rev-parse @{u}` exits non-zero
+        // both for "no upstream configured" and for "git could not
+        // answer", and only the first is a fact about the branch. The
+        // two are separated by asking a question git can always answer
+        // when it is working at all: `rev-parse --git-dir` succeeds in
+        // any repository regardless of upstreams, so its failure means
+        // the tooling is the problem rather than the branch.
+        has_upstream: match git(dir, &["rev-parse", "--abbrev-ref", "@{u}"]) {
+            Ok(_) => Some(true),
+            Err(_) if git(dir, &["rev-parse", "--git-dir"]).is_ok() => Some(false),
+            Err(_) => None,
+        },
         ..Default::default()
     };
 
@@ -190,12 +226,17 @@ pub fn assess(repo_path: &str, worktree_path: &str, branch: &str) -> Assessment 
             .map(str::to_string)
             .collect();
         a.subjects_elided = all.len().saturating_sub(MAX_SUBJECTS) as u64;
-        a.subjects = all.into_iter().take(MAX_SUBJECTS).collect();
+        a.subjects = Some(all.into_iter().take(MAX_SUBJECTS).collect());
     }
+    // No `else`: `subjects` stays `None`, which is what a failed `git
+    // log` is. An empty `Vec` would say "this branch has no commits".
 
     if let Ok(status) = git(dir, &["status", "--porcelain"]) {
-        a.uncommitted = status.lines().filter(|l| !l.trim().is_empty()).count() as u64;
+        a.uncommitted = Some(status.lines().filter(|l| !l.trim().is_empty()).count() as u64);
     }
+    // No `else` here either, and that is now safe: `uncommitted` stays
+    // `None` rather than falling to a 0 the prompt would read as a clean
+    // tree (#976).
 
     a
 }
@@ -212,6 +253,21 @@ impl Assessment {
     /// A fact that could not be gathered is OMITTED rather than guessed.
     /// "0 commits ahead" when the check failed would send an agent looking
     /// for work that is there.
+    ///
+    /// # Omission is not always the safe direction (#976)
+    ///
+    /// Omission is right for a COUNT: no line about commits ahead makes
+    /// no claim, and the agent re-derives it. It is wrong wherever the
+    /// absent line is itself the reassurance. `uncommitted` and
+    /// `has_upstream` are both of that kind: the prompt mentions
+    /// uncommitted work only when there is some, so silence reads as "the
+    /// tree is clean" -- a statement, made by omission, to a reader that
+    /// may act on it by stashing or resetting. So those two carry an
+    /// explicit "could not be read" line for `None` while a MEASURED zero
+    /// stays silent exactly as before. The distinction is the whole
+    /// point: a caveat on every clean worktree is a caveat nobody reads,
+    /// and one on an unread status is the only thing standing between an
+    /// agent and somebody's uncommitted work.
     ///
     /// # Refresh first, and say how stale these numbers are (#815)
     ///
@@ -299,19 +355,43 @@ impl Assessment {
         if let Some(when) = &self.last_activity {
             facts.push(format!("  last commit {when}"));
         }
-        if self.uncommitted > 0 {
+        match self.uncommitted {
             // Not covered by the diff against the base ref, so an agent
             // would otherwise assess an incomplete picture.
-            facts.push(format!(
-                "  {} uncommitted file{} in the working tree",
-                self.uncommitted,
-                plural(self.uncommitted)
-            ));
+            Some(n) if n > 0 => facts.push(format!(
+                "  {n} uncommitted file{} in the working tree",
+                plural(n)
+            )),
+            // A MEASURED clean tree stays silent, deliberately: a caveat
+            // on every clean worktree is a caveat nobody reads, which is
+            // the argument `worktrees.ts`'s staleness threshold makes.
+            Some(_) => {}
+            // An UNREAD status gets a line, because silence here is read
+            // as clean and the reader is an agent about to stash, reset
+            // or check out (#976). Worded as an instruction rather than
+            // a note: the caveat is only worth carrying if it changes
+            // what the agent does before it touches the tree.
+            None => facts.push(
+                "  UNCOMMITTED WORK UNKNOWN -- `git status` could not be read here, so \
+                 the working tree may hold uncommitted changes. Check it yourself \
+                 before any command that discards them (stash, reset, checkout)"
+                    .to_string(),
+            ),
         }
-        if !self.has_upstream {
+        match self.has_upstream {
             // The single most important line here, so it goes last where
             // it is read rather than buried among the counts.
-            facts.push("  NOT PUSHED -- these commits exist only on this machine".to_string());
+            Some(false) => {
+                facts.push("  NOT PUSHED -- these commits exist only on this machine".to_string())
+            }
+            Some(true) => {}
+            // Not "NOT PUSHED": that is an affirmative claim about the
+            // most important fact in the struct, and we do not have it.
+            None => facts.push(
+                "  PUSH STATE UNKNOWN -- git could not be asked whether this branch has \
+                 an upstream, so treat it as possibly unpushed"
+                    .to_string(),
+            ),
         }
         // The staleness header goes WITH the facts, inside this guard,
         // rather than above it. When every git call failed there are no
@@ -336,15 +416,23 @@ impl Assessment {
             out.push_str("\n\n");
         }
 
-        if !self.subjects.is_empty() {
-            out.push_str("Commits:\n");
-            for s in &self.subjects {
-                out.push_str(&format!("  - {s}\n"));
+        match &self.subjects {
+            Some(subjects) if !subjects.is_empty() => {
+                out.push_str("Commits:\n");
+                for s in subjects {
+                    out.push_str(&format!("  - {s}\n"));
+                }
+                if self.subjects_elided > 0 {
+                    out.push_str(&format!("  ... and {} more\n", self.subjects_elided));
+                }
+                out.push('\n');
             }
-            if self.subjects_elided > 0 {
-                out.push_str(&format!("  ... and {} more\n", self.subjects_elided));
-            }
-            out.push('\n');
+            // A measured empty list says nothing, as before -- there is
+            // no heading worth printing over no commits.
+            Some(_) => {}
+            // A failed `git log` says so instead of rendering as "no
+            // commits", which is what an absent heading reads as (#976).
+            None => out.push_str("Commits: could not be read.\n\n"),
         }
 
         // `base` again rather than "the default branch": question 2 is
@@ -467,10 +555,10 @@ mod tests {
             insertions: Some(240),
             deletions: Some(18),
             last_activity: Some("3 weeks ago".into()),
-            has_upstream: true,
-            subjects: vec!["add retry to the client".into()],
+            has_upstream: Some(true),
+            subjects: Some(vec!["add retry to the client".into()]),
             subjects_elided: 0,
-            uncommitted: 0,
+            uncommitted: Some(0),
             base: "origin/main".into(),
             fetched_at: Some("2026-09-11T08:00:00Z".into()),
         }
@@ -481,7 +569,7 @@ mod tests {
     #[test]
     fn never_pushed_is_called_out_explicitly() {
         let p = Assessment {
-            has_upstream: false,
+            has_upstream: Some(false),
             ..base()
         }
         .prompt();
@@ -497,7 +585,7 @@ mod tests {
     #[test]
     fn uncommitted_files_are_mentioned_only_when_present() {
         let dirty = Assessment {
-            uncommitted: 3,
+            uncommitted: Some(3),
             ..base()
         }
         .prompt();
@@ -505,11 +593,104 @@ mod tests {
         assert!(!base().prompt().contains("uncommitted"));
     }
 
+    /// The counterpart the test above was missing (#976).
+    ///
+    /// `prompt()` mentions uncommitted work only when the count is
+    /// positive, so a failed `git status` -- which used to leave the field
+    /// at 0 -- produced a prompt that said nothing about the working tree
+    /// at all. An agent reads that silence as "clean" and may stash,
+    /// reset or check out over work that is really there.
+    ///
+    /// The INEQUALITY against the measured-zero prompt is the whole
+    /// guarantee, and it is what makes this test non-vacuous: it fails if
+    /// the two zeros ever render the same, whatever words are used.
+    #[test]
+    fn an_unread_status_says_so_rather_than_reading_as_a_clean_tree() {
+        let unread = Assessment {
+            uncommitted: None,
+            ..base()
+        }
+        .prompt();
+        let measured_clean = Assessment {
+            uncommitted: Some(0),
+            ..base()
+        }
+        .prompt();
+
+        assert!(
+            unread.contains("UNCOMMITTED WORK UNKNOWN"),
+            "an unread status must say so: {unread}"
+        );
+        assert!(
+            unread.contains("uncommitted"),
+            "the topic must appear at all: {unread}"
+        );
+        assert_ne!(
+            unread, measured_clean,
+            "an unread status must not produce the same prompt as a measured clean tree"
+        );
+
+        // And the measured zero is still silent, which is the other half:
+        // a caveat on every clean worktree is a caveat nobody reads.
+        assert!(!measured_clean.contains("uncommitted"), "{measured_clean}");
+    }
+
+    /// `has_upstream: false` used to cover both "no upstream configured"
+    /// and "git could not be asked", and the prompt asserts the former in
+    /// capitals as the single most important fact it carries (#976).
+    #[test]
+    fn an_unreadable_upstream_is_not_reported_as_never_pushed() {
+        let unknown = Assessment {
+            has_upstream: None,
+            ..base()
+        }
+        .prompt();
+        assert!(
+            !unknown.contains("NOT PUSHED"),
+            "an unread upstream must not be asserted as never pushed: {unknown}"
+        );
+        assert!(!unknown.contains("only on this machine"), "{unknown}");
+        assert!(unknown.contains("PUSH STATE UNKNOWN"), "{unknown}");
+
+        // Distinct from BOTH measured answers, which is what makes the
+        // third state worth having.
+        let never = Assessment {
+            has_upstream: Some(false),
+            ..base()
+        }
+        .prompt();
+        assert_ne!(unknown, never);
+        assert_ne!(unknown, base().prompt());
+    }
+
+    /// A failed `git log` yields no subjects, which is not a branch with
+    /// no commits (#976). `MAX_SUBJECTS` elision must stay distinguishable
+    /// from a failed read, the reason `claude/transcript.rs` keeps
+    /// `subagent_files_skipped` apart from `unreadable_files`.
+    #[test]
+    fn an_unreadable_commit_list_says_so_rather_than_reading_as_no_commits() {
+        let unread = Assessment {
+            subjects: None,
+            ..base()
+        }
+        .prompt();
+        let measured_empty = Assessment {
+            subjects: Some(Vec::new()),
+            ..base()
+        }
+        .prompt();
+
+        assert!(unread.contains("could not be read"), "{unread}");
+        assert_ne!(unread, measured_empty);
+        // A measured empty list prints no heading, exactly as before.
+        assert!(!measured_empty.contains("Commits"), "{measured_empty}");
+    }
+
     /// A branch with 200 commits must not produce a prompt nobody reads.
     #[test]
     fn the_commit_list_is_capped_and_says_what_it_elided() {
         let p = Assessment {
-            subjects: (0..MAX_SUBJECTS).map(|i| format!("commit {i}")).collect(),
+            subjects: Some((0..MAX_SUBJECTS).map(|i| format!("commit {i}")).collect()),
             subjects_elided: 190,
             ..base()
         }
@@ -554,7 +735,7 @@ mod tests {
             "--- NEVER FETCHED ---\n{}",
             Assessment {
                 fetched_at: None,
-                has_upstream: false,
+                has_upstream: Some(false),
                 ..base()
             }
             .prompt()
@@ -657,8 +838,8 @@ mod tests {
             insertions: None,
             deletions: None,
             last_activity: None,
-            uncommitted: 0,
-            has_upstream: true,
+            uncommitted: Some(0),
+            has_upstream: Some(true),
             ..base()
         }
         .prompt();
@@ -820,7 +1001,7 @@ mod tests {
         );
         assert_eq!(a.files_changed, Some(1));
         assert_eq!(a.insertions, Some(2));
-        assert_eq!(a.subjects, vec!["add the feature".to_string()]);
+        assert_eq!(a.subjects, Some(vec!["add the feature".to_string()]));
 
         // The ref the counts came from, carried by name so the prompt can
         // quote it (#815). Same value the comparison above used -- if

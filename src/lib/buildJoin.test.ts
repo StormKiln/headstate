@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildForImage, recentCacheHealth } from "./buildJoin";
+import { buildForImage, cachePercent, recentCacheHealth } from "./buildJoin";
 import type { DockerBuild, DockerImage } from "@/types/pr";
 
 const build = (over: Partial<DockerBuild> = {}): DockerBuild => ({
@@ -124,5 +124,44 @@ describe("recentCacheHealth", () => {
   /// and the row omits it rather than showing a confident zero.
   it("returns nothing when there are no builds", () => {
     expect(recentCacheHealth([])).toBeNull();
+  });
+});
+
+/// #963. `.unwrap_or(0)` on the Rust side made a missing step count
+/// indistinguishable from a genuine 0% cache hit -- and 0% cached is the
+/// strongest alarm this figure raises, since `buildJoin`'s own doc says a
+/// cold build that used to be warm means something invalidated the cache.
+describe("cachePercent", () => {
+  it("declines to answer when the step counts were not reported", () => {
+    expect(cachePercent(build({ total_steps: null, cached_steps: null }))).toBeNull();
+    expect(cachePercent(build({ total_steps: 14, cached_steps: null }))).toBeNull();
+    expect(cachePercent(build({ total_steps: null, cached_steps: 8 }))).toBeNull();
+  });
+
+  /// Zero steps means there was nothing to cache, which is not a 0% hit
+  /// rate. Distinct from a real ratio of zero, which a build with steps
+  /// and no cache hits genuinely has.
+  it("declines to answer for a build with no steps at all", () => {
+    expect(cachePercent(build({ total_steps: 0, cached_steps: 0 }))).toBeNull();
+  });
+
+  it("reports a real ratio, including a real zero", () => {
+    expect(cachePercent(build({ total_steps: 14, cached_steps: 8 }))).toBe(57);
+    expect(cachePercent(build({ total_steps: 10, cached_steps: 0 }))).toBe(0);
+  });
+
+  /// A build missing its counts must not drag the weighted average, which
+  /// is computed over both sides of the ratio.
+  it("leaves an unmeasured build out of the cache-health average", () => {
+    const measured = build({ total_steps: 10, cached_steps: 10, reference: "a" });
+    const unmeasured = build({ total_steps: null, cached_steps: null, reference: "b" });
+    const health = recentCacheHealth([measured, unmeasured]);
+    expect(health).toEqual({ percent: 100, count: 1 });
+  });
+
+  it("reports no cache health at all when nothing was measured", () => {
+    expect(
+      recentCacheHealth([build({ total_steps: null, cached_steps: null })]),
+    ).toBeNull();
   });
 });

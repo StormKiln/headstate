@@ -67,8 +67,17 @@ export function formatDuration(secs: number): string {
 /// the same target at 48% cached took 56.9s, at 23% took 80.7s. A cold
 /// build is not a problem in itself -- a cold build that used to be warm
 /// is.
-export function cachePercent(b: DockerBuild): number {
-  return b.total_steps === 0 ? 0 : Math.floor((b.cached_steps * 100) / b.total_steps);
+/// `null` when the ratio cannot be computed (#963).
+///
+/// Mirrors the Rust `Build::cache_percent`. Three cases: buildx did not
+/// report the counts, buildx reported no steps at all (nothing to cache,
+/// so there was no rate), or a real ratio. The first two used to answer
+/// `0`, and 0% cached is the alarm -- a build that used to be warm going
+/// cold -- so an absence raised it.
+export function cachePercent(b: DockerBuild): number | null {
+  if (b.total_steps === null || b.cached_steps === null) return null;
+  if (b.total_steps === 0) return null;
+  return Math.floor((b.cached_steps * 100) / b.total_steps);
 }
 
 export function cacheTone(pct: number): string {
@@ -92,8 +101,16 @@ export function recentCacheHealth(
   builds: DockerBuild[],
   recent = 10,
 ): { percent: number; count: number } | null {
+  // Only builds whose counts were actually reported. A build missing its
+  // step counts contributes nothing rather than a fabricated zero to
+  // both sides of the ratio (#963) -- which is what `total_steps > 0`
+  // already achieved for the old `0` coercion, and now reads as what it
+  // means.
   const usable = builds
-    .filter((b) => b.total_steps > 0)
+    .filter(
+      (b): b is DockerBuild & { total_steps: number; cached_steps: number } =>
+        b.total_steps !== null && b.cached_steps !== null && b.total_steps > 0,
+    )
     // Newest first. `started` is RFC 3339, so lexical order is
     // chronological.
     .sort((a, b) => b.started.localeCompare(a.started))

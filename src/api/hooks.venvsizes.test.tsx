@@ -134,6 +134,48 @@ describe("useVenvSizes chunking", () => {
     await waitFor(() => expect(result.current.pending).toBe(0));
   });
 
+  /// #956. `pending` counts only IN-FLIGHT chunks, so a rejected one is
+  /// neither fetching nor holding data and contributes nothing to it --
+  /// `pending` reaches 0 with measurements missing. Every honesty
+  /// qualifier on `ArtifactsPage` and in `VenvSection` hung off that one
+  /// number, so a failure dropped the "at least" from a total and put an
+  /// understated byte count on a Remove button.
+  ///
+  /// Asserting `failed === 1` AND `pending === 0` SIMULTANEOUSLY is the
+  /// whole point of the test: `pending` alone reads as "done", and the
+  /// pair is the only thing that proves the two are distinguishable.
+  it("counts a rejected chunk as failed rather than as answered", async () => {
+    let call = 0;
+    invoke.mockImplementation((cmd, args) => {
+      if (cmd !== "size_venvs") return Promise.resolve([]);
+      call += 1;
+      if (call === 1) return Promise.reject(new Error("permission denied"));
+      const paths = (args as { paths: string[] }).paths;
+      return Promise.resolve(paths.map((p) => [p, 2048, 30]));
+    });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result } = renderHook(() => useVenvSizes(venvs(8), true), {
+      wrapper: wrapper(qc),
+    });
+
+    await waitFor(() => expect(result.current.failed).toBe(1));
+    // The pair. `pending` has gone quiet and the work is NOT complete.
+    expect(result.current.pending).toBe(0);
+    expect(result.current.measuring).toBe(false);
+    // And the other chunks' sizes survived, which is the trade this
+    // chunking exists to make: a partial answer labelled partial.
+    expect(result.current.sizes.size).toBeGreaterThan(0);
+  });
+
+  it("reports no failures when every chunk answers", async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result } = renderHook(() => useVenvSizes(venvs(9), true), {
+      wrapper: wrapper(qc),
+    });
+    await waitFor(() => expect(result.current.sizes.size).toBe(9));
+    expect(result.current.failed).toBe(0);
+  });
+
   it("asks for nothing when there are no virtualenvs", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     renderHook(() => useVenvSizes([], true), { wrapper: wrapper(qc) });
