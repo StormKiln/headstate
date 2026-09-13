@@ -3372,7 +3372,24 @@ pub struct ClaudeLiveState {
 #[tauri::command]
 pub async fn claude_poll_live(app: tauri::AppHandle) -> Result<ClaudeLiveState, String> {
     let db = db_path(&app);
-    tauri::async_runtime::spawn_blocking(move || {
+    tauri::async_runtime::spawn_blocking(move || claude_live_pass(&db))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// One pass over both live sources, synchronously (#947).
+///
+/// Extracted from [`claude_poll_live`] so the background timer in
+/// `lib.rs` and the command share ONE implementation. The ordering rules
+/// below are safety properties, and two copies of them is two things to
+/// keep in step -- which is the drift `CLAUDE_PAGES` and `HEALTH_PAGES`
+/// exist to prevent, applied to a pair of orderings rather than a pair of
+/// lists.
+///
+/// Sync on purpose: both callers already have a blocking context. The
+/// command wraps it in `spawn_blocking`, and the timer is its own thread.
+pub fn claude_live_pass(db: &std::path::Path) -> Result<ClaudeLiveState, String> {
+    {
         let home = crate::auth::home_dir()
             .ok_or_else(|| "no home directory, so ~/.claude cannot be read".to_string())?;
 
@@ -3381,7 +3398,7 @@ pub async fn claude_poll_live(app: tauri::AppHandle) -> Result<ClaudeLiveState, 
         let swept = crate::claude::registry::sweep(&crate::claude::registry::dir_in(&home))?;
         let start_times = crate::claude::crash::start_times(&swept);
 
-        let mut conn = open_db(&db).map_err(|e| e.to_string())?;
+        let mut conn = open_db(db).map_err(|e| e.to_string())?;
         let sweep = crate::claude::crash::record(&mut conn, &swept)?;
 
         // A stored offset that cannot be read falls back to zero, which
@@ -3419,9 +3436,7 @@ pub async fn claude_poll_live(app: tauri::AppHandle) -> Result<ClaudeLiveState, 
             running: swept.running,
             unconfirmed: swept.unknown,
         })
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    }
 }
 
 /// Aggregates for the Claude Code overview page (#921, epic #910).
