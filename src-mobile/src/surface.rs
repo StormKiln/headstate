@@ -110,6 +110,12 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("packages_markdown", Class::Read),
     ("scan_claude_md", Class::Read),
     ("read_claude_md", Class::Read),
+    // Rescan the DESKTOP's `~/.claude/projects` (#914). Read: it reads
+    // local disk without writing to it and populates only Headstate's own
+    // cache. The phone has no transcripts of its own, which is exactly
+    // why it asks the desktop -- see the desktop table for the full
+    // reasoning.
+    ("claude_import_transcripts", Class::Read),
     ("get_poll_interval", Class::Read),
     ("get_worktree_dirs", Class::Read),
     ("get_ui_prefs", Class::Read),
