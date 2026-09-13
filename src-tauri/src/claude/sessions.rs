@@ -610,7 +610,7 @@ mod tests {
     #[test]
     fn an_unreadable_registry_reaches_the_list_and_poisons_every_liveness() {
         let conn = db();
-        insert(&conn, "s1", None, Some("2026-09-01T00:00:00Z"));
+        insert(&conn, "s1", Some("/tmp"), Some("2026-09-01T00:00:00Z"));
         insert(&conn, "s2", None, Some("2026-09-02T00:00:00Z"));
         let registry = Registry {
             failure: Some("Permission denied".into()),
@@ -632,6 +632,25 @@ mod tests {
                 s.liveness
             );
         }
+        // The RESUME action survives the registry failure, and that
+        // matters: liveness and the resume command come from different
+        // sources, so a registry we could not read must not also cost the
+        // user the `cd` that the stored transcript cwd already provides.
+        // Rendering these rows with a bare command would be the failure
+        // of #918 caused by an unrelated failure of #917.
+        let s1 = got.sessions.iter().find(|s| s.session_id == "s2").unwrap();
+        assert!(!s1.resume.anchored, "s2 has no cwd at all");
+        let s0 = got.sessions.iter().find(|s| s.session_id == "s1").unwrap();
+        assert_eq!(
+            s0.cwd.as_deref(),
+            Some("/tmp"),
+            "the stored cwd is the fallback"
+        );
+        assert!(
+            s0.resume.anchored,
+            "an unreadable registry must not cost the `cd`: {}",
+            s0.resume.command
+        );
     }
 
     /// A running session is reported running, with its published
