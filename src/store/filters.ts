@@ -131,6 +131,32 @@ export const ALL_HEALTH_PAGES = [
 
 export type HealthPage = (typeof ALL_HEALTH_PAGES)[number];
 
+/// The Claude Code view's two pages (#921).
+///
+/// A separate axis from `healthPage`, for the reason that one gives for
+/// being separate from `panel`: a page that only exists inside one view
+/// must not be nameable from another. Widening `HealthPage` to hold
+/// `"sessions"` would mean every consumer of it -- `healthPagesFor`, the
+/// sidebar's filter, the phone's card list -- had to know about a page
+/// System Health does not have.
+///
+/// `"sessions"` is FIRST and is the default, unlike System Health's
+/// `"overview"`. The list is what a user opens this view to do -- get a
+/// crashed session back -- and #917's route comment makes the same point
+/// about why the list is not behind a lazy boundary: the moment you need
+/// it is the worst moment to wait. The overview is where you go to see
+/// the shape of things, which is a second question rather than the first.
+/// A plain union, not an `as const` array like `ALL_HEALTH_PAGES`.
+///
+/// That one is an array because `healthPagesFor` FILTERS it at runtime --
+/// a machine with no discoverable GPU is offered no GPU page. Both Claude
+/// Code pages are offered unconditionally, so nothing ever iterates the
+/// set: the sidebar's own `CLAUDE_PAGES` carries the labels and icons and
+/// is the only list there is. An array here would be a second declaration
+/// of the same two names with nothing reading it, which is what `yarn
+/// knip` objects to and it is right.
+export type ClaudePage = "sessions" | "overview";
+
 interface FilterStore {
   /// Filters are PER VIEW: a repo selected in My PRs must not leak into
   /// Worktrees, which has an entirely different repo list.
@@ -193,6 +219,15 @@ interface FilterStore {
   /// on launch, or it stops being one.
   healthPage: HealthPage;
   setHealthPage: (page: HealthPage) => void;
+  /// Which Claude Code page is open (#921).
+  ///
+  /// Not persisted, for the same reason `healthPage` is not -- and with a
+  /// sharper edge. This view is opened to resurrect a session after
+  /// something died; relaunching onto the overview would put a chart
+  /// between the user and the list they came for. The landing page has to
+  /// be the landing page on launch.
+  claudePage: ClaudePage;
+  setClaudePage: (page: ClaudePage) => void;
   /// How tightly PR rows pack.
   ///
   /// A global preference rather than per-view: it is about the user's
@@ -244,7 +279,8 @@ const EMPTY_FILTERS: Record<View, Filters> = {
   docker: {},
   artifacts: {},
   packages: {},
-  "claude-md": {}, "claude-code": {},
+  "claude-md": {},
+  "claude-code": {},
   // PR Stats holds its own scope selection (#825): `statsScopeKind`,
   // `statsScopeValue` and `statsSubject`, written by `StatsSidebar`
   // through `setStatsScope`. Empty here like every other view -- the entry
@@ -361,9 +397,17 @@ export const useFilters = create<FilterStore>()(
           // returning to a detail page skips the one that says whether
           // there is a new question worth asking.
           healthPage: "overview",
+          // Same rule, opposite default (#921). Leaving Claude Code and
+          // coming back lands on the SESSIONS list, because that is the
+          // page the view is for: the overview answers "what is the shape
+          // of this", which is not the question you have when you come
+          // back to resurrect something.
+          claudePage: "sessions",
         }),
       healthPage: "overview",
       setHealthPage: (healthPage) => set({ healthPage }),
+      claudePage: "sessions",
+      setClaudePage: (claudePage) => set({ claudePage }),
       selectedPr: null,
       selectPr: (selectedPr) => set({ selectedPr }),
       checked: [],

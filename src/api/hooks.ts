@@ -12,6 +12,7 @@ import type {
   BranchDeleteFrame,
   BranchScanFrame,
   ClaudeImported,
+  ClaudeOverview,
   ClaudeSessionList,
   CleanupPrefs,
   DockerImage,
@@ -88,6 +89,7 @@ import {
   readClaudeMd,
   scanClaudeMd,
   claudeImportTranscripts,
+  claudeOverview,
   claudeSessions,
   claudeHooksStatus,
   claudeInstallHooks,
@@ -1164,6 +1166,84 @@ export function useClaudeSessions(enabled: boolean) {
     rescan: async () => {
       await qc.invalidateQueries({ queryKey: ["claude-import"] });
       await qc.invalidateQueries({ queryKey: ["claude-sessions"] });
+    },
+  };
+}
+
+/// How often the Claude Code overview re-reads.
+///
+/// 10 seconds, the same order as `useSystemHealth`, and for the same
+/// reason: the running count is derived per read (nothing is stored, per
+/// migration 11's deliberate lack of a `status` column), so this poll is
+/// the ONLY thing that makes a session stop saying "running". The cost is
+/// two SELECTs and a stat per session -- measured at 7ms for 1,461
+/// sessions -- which makes a 10-second tick trivially affordable.
+///
+/// It also supplies `now` without a clock read during render; see below.
+const CLAUDE_OVERVIEW_POLL_MS = 10_000;
+
+/// The Claude Code overview's aggregates (#921).
+///
+/// # `retry: false`, and the page retries explicitly
+///
+/// A permission error on `~/.claude` is a settled refusal, not a flaky
+/// call, so three silent re-reads only delay saying so. That is the rule
+/// #846 applied to `useClaudeMd` one view over, and the stakes are higher
+/// here: this page's failure mode is a CHART, and a chart of zeros reads
+/// as a measured quiet month rather than as an absent reading.
+///
+/// There is deliberately no `= {}` default anywhere in the chain. The page
+/// switches on `isError` BEFORE it switches on emptiness, so a rejected
+/// query renders the reason and never "no sessions".
+///
+/// # `dataUpdatedAt` is the page's `now`
+///
+/// Returned so the page can pass it down rather than reading `Date.now()`
+/// during render -- the purity rule `Sparkline` and `HealthConditions`
+/// both state, and which `yarn lint` enforces. It advances once per poll,
+/// which is also the honest edge for "how old is this reading": the last
+/// moment we actually heard from the machine.
+///
+/// # The rescan is separate, and manual
+///
+/// `claude_overview` READS the cache; it never populates it. So on a
+/// machine whose cache is empty the page says so and offers Rescan, rather
+/// than silently running a 1,461-transcript disk walk on every mount. Two
+/// reasons it is not folded into the poll: a rescan that failed must not
+/// take the stored aggregates down with it, and a 10-second poll must not
+/// re-read 881 MB of transcript tails every tick.
+///
+/// #917's session list owns the one-shot import at mount. Once both ship,
+/// opening either page fills the cache for both -- they share
+/// `["claude-import"]`, so the query key is the coordination and neither
+/// page needs to know about the other.
+export function useClaudeOverview(enabled: boolean) {
+  const query = useQuery<ClaudeOverview>({
+    queryKey: ["claude-overview"],
+    queryFn: claudeOverview,
+    enabled,
+    refetchInterval: enabled ? CLAUDE_OVERVIEW_POLL_MS : false,
+    staleTime: CLAUDE_OVERVIEW_POLL_MS - 1_000,
+    retry: false,
+  });
+
+  const qc = useQueryClient();
+  return {
+    query,
+    /// Resolved once per poll rather than per render.
+    now: query.dataUpdatedAt,
+    /// Re-read `~/.claude/projects`, then the aggregates. In that order:
+    /// refreshing the aggregates first would show the user the figures
+    /// from before their rescan.
+    ///
+    /// The error is thrown rather than swallowed, so the caller can say
+    /// which half failed. A rescan that could not read the transcript
+    /// directory and then silently refreshed unchanged aggregates is the
+    /// button that looks like it worked.
+    rescan: async () => {
+      await claudeImportTranscripts();
+      await qc.invalidateQueries({ queryKey: ["claude-import"] });
+      await qc.invalidateQueries({ queryKey: ["claude-overview"] });
     },
   };
 }

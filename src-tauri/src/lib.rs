@@ -206,6 +206,7 @@ pub fn run() {
             commands::claude_import_transcripts,
             commands::claude_sessions,
             commands::claude_reveal_path,
+            commands::claude_overview,
             commands::claude_hooks_status,
             commands::claude_install_hooks,
             commands::claude_reinstall_hooks,

@@ -20,6 +20,7 @@ import type {
   DeleteOutcome,
   ClaudeFile,
   ClaudeImported,
+  ClaudeOverview,
   ClaudeSessionList,
   ProjectReport,
   UpdateRequest,
@@ -722,6 +723,13 @@ export const claudeSessions = () => call<ClaudeSessionList>("claude_sessions");
 /// caller sits behind `IS_MOBILE_BUILD`.
 export const claudeRevealPath = (path: string) =>
   call<string>("claude_reveal_path", { path });
+
+/// Aggregates for the Claude Code overview page (#921).
+///
+/// Two SELECTs over the cache plus a stat per session and one directory
+/// listing; measured at 7ms for 1,461 sessions. Writes nothing.
+export const claudeOverview = () => call<ClaudeOverview>("claude_overview");
+
 // ---------------------------------------------------------------------
 // The Claude Code hook installer (#915). Rust side:
 // `src-tauri/src/claude/install.rs`, where every rule here is argued.

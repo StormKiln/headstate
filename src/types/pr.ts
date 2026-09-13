@@ -982,6 +982,106 @@ export interface ClaudeSessionList {
   registry_unreadable: string[];
 }
 
+/// The headline figures on the Claude Code overview (#921).
+///
+/// Every field is a COUNT over sessions Headstate has a row for. The
+/// three cwd states are mutually exclusive and sum with `running` to
+/// `sessions`, so a reader can check the page's arithmetic -- which is
+/// the point of carrying `cwd_unknown` at all rather than folding it into
+/// the larger bucket.
+///
+/// Rust side: `src-tauri/src/claude/overview.rs`, which argues the
+/// resurrection predicate.
+export interface ClaudeCounts {
+  /// Every session in the cache. Context for the figures below, NOT a
+  /// hero number -- "1,461 sessions ever" answers nothing on its own,
+  /// which is why #921's total-sessions tile is cut.
+  sessions: number;
+  /// Running right now, derived from the live registry checked against
+  /// the process table. Trustworthy only while `live_failure` is null.
+  running: number;
+  /// Not running, and the recorded directory still exists.
+  ///
+  /// **The page's headline.** 248 of 1,461 on the development machine:
+  /// the sessions that can be resumed back into the tree they came from.
+  resumable: number;
+  /// Not running, and the recorded directory is gone. 1,213 of 1,461, so
+  /// this is the NORMAL state and must not be rendered as damage.
+  archived: number;
+  /// Not running, and the directory could not be CHECKED. Neither
+  /// `resumable` nor `archived`: a permission error means the tree may
+  /// well be there, and counting it as archived tells the user to give up
+  /// on work that was never lost.
+  cwd_unknown: number;
+  /// Runs the hook saw start and never saw end, for sessions that are not
+  /// running. #921 proposes this as the headline figure; it is **0** on
+  /// every machine whose history predates the hook, which is why the
+  /// headline is `resumable` instead. See the Rust module comment.
+  orphaned_runs: number;
+  /// Sessions the hook never observed at all. Without this a reader
+  /// cannot tell "nothing crashed" from "nothing was watched".
+  never_observed: number;
+}
+
+/// One day of the activity chart (#921).
+export interface ClaudeDayCount {
+  /// `YYYY-MM-DD`, UTC.
+  day: string;
+  /// Sessions whose FIRST activity fell on this day. A session resumed
+  /// over four days counts once, on the day it began, so the series reads
+  /// as intake rather than as touches.
+  started: number;
+}
+
+/// One row of the resumable list (#921).
+///
+/// Deliberately thinner than #917's `ClaudeSession`: the resume command
+/// and its caveat live there, and a second definition of the same shape
+/// would drift. This carries the id so the page hands off to the list.
+export interface ClaudeResumable {
+  session_id: string;
+  /// Claude's own `aiTitle`, or `null` -- never the UUID dressed up as a
+  /// name.
+  name: string | null;
+  cwd: string | null;
+  git_branch: string | null;
+  last_activity_at: string | null;
+}
+
+/// Everything the Claude Code overview draws, plus what it could not
+/// establish (#921).
+///
+/// `live_failure` is why this is an envelope. A live registry we could not
+/// read leaves every count over stored history valid, so the honest
+/// rendering is the page WITH a banner rather than no page -- but
+/// `running` is then not an answer, and showing "0 running" as though it
+/// were is #841's fail-open in the one place a user acts on it: "nothing
+/// is running" is what makes a Resume button look safe.
+///
+/// A failed DATABASE read is not in this type at all; it is a rejected
+/// query the page renders as `QueryError`. A struct of zeros would draw 30
+/// chart columns and a "0 resumable" tile that look exactly like a
+/// measured quiet month -- the worst form of absent-is-not-zero, because
+/// a flat line does not look absent (#846 is the same defect one view
+/// over).
+export interface ClaudeOverview {
+  counts: ClaudeCounts;
+  /// Exactly `ACTIVITY_DAYS` buckets, oldest first, INCLUDING days with
+  /// no sessions. The empty days are the point: a series of only the days
+  /// that had activity draws a dense chart in which a week off reads as a
+  /// week of steady work.
+  activity: ClaudeDayCount[];
+  /// The newest few of `counts.resumable`. A stated subset, never a
+  /// silently short list.
+  resumable: ClaudeResumable[];
+  /// Why the live session registry could not be listed. `null` means it
+  /// WAS read, so `counts.running` is real -- including when it is zero.
+  live_failure: string | null;
+  /// Registry records present but unusable. Each one hides a session that
+  /// may be running, so a non-empty list makes `counts.running` a floor.
+  live_unreadable: string[];
+}
+
 /// One project's worth of reports.
 ///
 /// The unit the UI groups by. A repository can hold several -- a
