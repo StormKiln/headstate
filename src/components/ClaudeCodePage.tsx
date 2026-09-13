@@ -51,6 +51,24 @@ const RENDER_CAP = 200;
 
 /// Claude Code sessions on this machine, and how to get one back.
 ///
+/// # What this component holds, after #939
+///
+/// The selected session's DETAIL, and the banners saying what could not
+/// be read. Not the list: the search box and the session rows moved into
+/// `ClaudeCodeSidebar` as `ClaudeSessionColumn`, because a `w-96` column of
+/// searchable rows inside the main panel was a second sidebar standing
+/// beside the real one. This file still states the rules the list obeys --
+/// ordering, the four search fields, the cap -- because they are rules
+/// about the same data this page is about, and `useMatchedSessions` below
+/// is the one place they are implemented.
+///
+/// The phone is the exception, and it is why the list is a component
+/// rather than a block of JSX in the sidebar: below `MOBILE_BREAKPOINT`
+/// the sidebar is a `Sheet` that closes on navigation, so this page mounts
+/// `ClaudeSessionColumn` in the main panel instead and keeps the
+/// list-then-detail pair of screens it always had. The sidebar's doc
+/// comment carries the table of both mount points.
+///
 /// # What the list is ordered by, and why it is not grouped
 ///
 /// **Most recent activity first, with running sessions pinned above
@@ -114,14 +132,130 @@ const RENDER_CAP = 200;
 /// for.
 export function ClaudeCodePage() {
   const { list, imported, now, rescan } = useClaudeSessions(true);
-  const [query, setQuery] = useState("");
-  const [selected, setSelected] = useState<string | undefined>(undefined);
-  const [showAll, setShowAll] = useState(false);
+  const { all, matched } = useMatchedSessions();
+  const selected = useFilters((f) => f.claudeSelected);
+  const selectSession = useFilters((f) => f.selectClaudeSession);
   const isMobile = useIsMobile();
 
-  // NO `= []` default (#846). A rejected read must reach the error arm
-  // below rather than arriving here as an empty list that reads as "you
-  // have no sessions".
+  // By LOOKUP against the current list, never a remembered session. The
+  // store holds only the id (see `claudeSelected`), so a transcript
+  // deleted between two polls makes this `undefined` and the
+  // choose-a-session prompt renders -- a detail pane assembled from a
+  // copy of a row that no longer exists cannot happen by construction.
+  const active = matched?.ordered.find((s) => s.session_id === selected);
+  // On a phone the two panes are two screens, so which is showing keys
+  // off whether the user has PICKED a session -- the pattern
+  // `ClaudeMdPage` uses. No first-row fallback here, deliberately: with
+  // 1,438 rows, opening straight into an arbitrary session's detail
+  // would bury the search box this list depends on.
+  //
+  // `active` rather than `selected`, as of #939: a stale id whose session
+  // has gone must send the phone BACK to the list, because the alternative
+  // is a detail screen with nothing on it but a back link.
+  const showingList = !isMobile || active === undefined;
+
+  if (list.isLoading) {
+    return <p className="p-4 text-sm text-[#8b949e]">Reading Claude Code sessions…</p>;
+  }
+  // BEFORE the arm that would say "choose a session", per #846: `active`
+  // is undefined on a rejection exactly as it is when nothing is selected,
+  // so an error arm placed after it would never render in the case it
+  // exists for -- the pane would invite the user to choose from a list
+  // that could not be read.
+  //
+  // Says something DIFFERENT from `ClaudeSessionColumn`'s arm, which is
+  // showing at the same moment on the desktop. That one is about the rows
+  // it cannot draw; this one is about the detail it cannot resolve, and it
+  // is the pane that carries the retry because it is the larger surface.
+  // Two copies of one sentence side by side would read as two failures.
+  if (list.isError || !matched || !all) {
+    return (
+      <div className="p-4">
+        <QueryError
+          title="No session detail to show"
+          // The REASON is stated once, by the column, which is where the
+          // list that failed was going to be. Repeating it here would put
+          // the same string on screen twice and read as two failures.
+          message="The Claude Code session list could not be read, so there is nothing to select from."
+          onRetry={() => void list.refetch()}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <Banners
+        registryFailure={list.data?.registry_failure ?? null}
+        registryUnreadable={list.data?.registry_unreadable ?? []}
+        imported={imported}
+        onRescan={rescan}
+      />
+      <div className={isMobile ? "flex min-h-0 flex-1 flex-col" : "flex min-h-0 flex-1"}>
+        {/* The phone's mount point for the list (#939). On the desktop it
+            is `ClaudeCodeSidebar` that renders `ClaudeSessionColumn`, and
+            this branch renders nothing at all -- that comment carries the
+            table of both mount points and why the phone cannot use the
+            sidebar's. `hidden` rather than unmounted for the detail
+            screen, so scrolling back to the list keeps its position. */}
+        {isMobile ? (
+          <div className={showingList ? "flex min-h-0 flex-1 flex-col" : "hidden"}>
+            <ClaudeSessionColumn />
+          </div>
+        ) : null}
+
+        <div
+          className={
+            isMobile
+              ? showingList
+                ? "hidden"
+                : "flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto p-4"
+              : "min-w-0 flex-1 overflow-y-auto p-4"
+          }
+        >
+          {isMobile && !showingList ? (
+            <button
+              type="button"
+              onClick={() => selectSession(undefined)}
+              className="tap-target -ml-1 mb-2 flex items-center self-start rounded px-2 text-sm text-[#58a6ff] hover:bg-[#161b22]"
+            >
+              ← All sessions
+            </button>
+          ) : null}
+          {active ? (
+            <SessionDetail session={active} now={now} />
+          ) : (
+            <p className="text-sm text-[#8b949e]">
+              Choose a session to see where it ran and how to resume it.
+            </p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/// The sessions the current search matches, running ones first.
+///
+/// A hook rather than a prop, because the list and the detail render in
+/// two different columns since #939 -- `ClaudeSessionColumn` in the sidebar
+/// and `ClaudeCodePage` in the main panel -- with no ancestor between them
+/// to hold this. Both call `useClaudeSessions(true)`, which is one query
+/// and therefore one poll: react-query serves the second caller from the
+/// cache, so the split costs nothing on the wire.
+///
+/// Stating the matching ONCE is the point. The rule has three parts that
+/// must not drift -- which fields search covers, running-first ordering,
+/// and no `= []` default -- and two copies of it would be two chances for
+/// the list and the detail to disagree about which session the same id
+/// names.
+function useMatchedSessions() {
+  const { list } = useClaudeSessions(true);
+  const query = useFilters((f) => f.claudeQuery);
+
+  // NO `= []` default (#846). A rejected read must reach the caller's
+  // error arm rather than arriving there as an empty list that reads as
+  // "you have no sessions".
   const all = list.data?.sessions;
 
   const matched = useMemo(() => {
@@ -144,23 +278,58 @@ export function ClaudeCodePage() {
     return { live, rest, ordered: [...live, ...rest] };
   }, [all, query]);
 
-  const active = matched?.ordered.find((s) => s.session_id === selected);
-  // On a phone the two panes are two screens, so which is showing keys
-  // off whether the user has PICKED a session -- the pattern
-  // `ClaudeMdPage` uses. No first-row fallback here, deliberately: with
-  // 1,438 rows, opening straight into an arbitrary session's detail
-  // would bury the search box this list depends on.
-  const showingList = !isMobile || selected === undefined;
+  return { list, all, matched };
+}
+
+/// The search box and the session rows, wherever they are mounted (#939).
+///
+/// # Two mount points, one component
+///
+/// `ClaudeCodeSidebar` renders this under its `Sessions` row on the
+/// desktop; `ClaudeCodePage` renders it in the main panel on the phone,
+/// because that column is a `Sheet` there and a sheet closes the moment
+/// you tap a result. The sidebar's doc comment carries the table and the
+/// reasoning. One component at both points rather than a phone copy, per
+/// `useIsMobile`'s rule: a component that forks drifts from its twin the
+/// first time one of them is touched.
+///
+/// It therefore lays itself out to FILL its parent (`min-h-0 flex-1`) and
+/// sets no width of its own. The `w-96` the old in-panel column carried
+/// is gone with the column; the sidebar's `w-64` and the phone's full
+/// width are both decided by the parent, which is the only thing that
+/// knows how much room there is.
+///
+/// # Its own loading and error arms, not the page's
+///
+/// On the desktop this is the only thing on screen that is about the list,
+/// so a failed read has to be stated HERE -- the page beside it is showing
+/// the overview or a detail prompt and would otherwise leave the column
+/// simply blank. The arms are in #846's order for the reason the page's
+/// doc comment gives at length: the error arm BEFORE the empty arm, and no
+/// `= []` default, so a rejected read can never render as "no sessions".
+export function ClaudeSessionColumn() {
+  const { list, all, matched } = useMatchedSessions();
+  const { now } = useClaudeSessions(true);
+  const query = useFilters((f) => f.claudeQuery);
+  const setQuery = useFilters((f) => f.setClaudeQuery);
+  const selected = useFilters((f) => f.claudeSelected);
+  const selectSession = useFilters((f) => f.selectClaudeSession);
+  // Local, not in the store: unlike the query and the selection nothing
+  // outside this component reads it, and it is a statement about how much
+  // of ONE rendering of the list has been asked for.
+  const [showAll, setShowAll] = useState(false);
 
   if (list.isLoading) {
-    return <p className="p-4 text-sm text-[#8b949e]">Reading Claude Code sessions…</p>;
+    return <p className="p-3 text-xs text-[#8b949e]">Reading Claude Code sessions…</p>;
   }
   // BEFORE the empty arm, per #846. `list.data` is undefined on a
   // rejection, so an error arm placed after the empty one would never
-  // render in the case it exists for.
-  if (list.isError || !matched) {
+  // render in the case it exists for -- it would be reached with an empty
+  // `ordered` and say "No Claude Code sessions on this machine", which is
+  // a confident wrong answer to a question we could not answer.
+  if (list.isError || !matched || !all) {
     return (
-      <div className="p-4">
+      <div className="p-3">
         <QueryError
           title="Could not read the Claude Code sessions"
           message={errorMessage(list.error)}
@@ -173,117 +342,74 @@ export function ClaudeCodePage() {
   const capped = showAll ? matched.ordered : matched.ordered.slice(0, RENDER_CAP);
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
-      <Banners
-        registryFailure={list.data?.registry_failure ?? null}
-        registryUnreadable={list.data?.registry_unreadable ?? []}
-        imported={imported}
-        onRescan={rescan}
-      />
-      <div className={isMobile ? "flex min-h-0 flex-1 flex-col" : "flex min-h-0 flex-1"}>
-        <div
-          className={
-            isMobile
-              ? showingList
-                ? "flex min-h-0 flex-1 flex-col"
-                : "hidden"
-              : "flex w-96 shrink-0 flex-col border-r border-[#30363d]"
-          }
-        >
-          <div className="shrink-0 border-b border-[#30363d] p-3">
-            <label className="flex items-center gap-2 rounded-md border border-[#30363d] bg-[#0d1117] px-2">
-              <Search className="h-3.5 w-3.5 shrink-0 text-[#8b949e]" aria-hidden="true" />
-              <input
-                type="search"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="Search title, directory, branch or id"
-                aria-label="Search Claude Code sessions"
-                className="min-w-0 flex-1 bg-transparent py-1.5 text-xs text-[#e6edf3] outline-none placeholder:text-[#8b949e]"
-              />
-            </label>
-            {/* The counts, always. With a cap in play the footer alone
-                would not say how much the SEARCH removed, and "showing
-                200 of 1,438" is a different fact from "12 of 1,438
-                match". */}
-            <p className="mt-2 text-[11px] text-[#8b949e]">
-              {query.trim()
-                ? `${matched.ordered.length.toLocaleString()} of ${all?.length.toLocaleString()} match`
-                : `${all?.length.toLocaleString()} sessions`}
-              {matched.live.length > 0
-                ? ` · ${matched.live.length} running now`
-                : ""}
-            </p>
-          </div>
-          <div className="min-h-0 flex-1 overflow-y-auto p-2">
-            {/* Only when the read SUCCEEDED, which the error arm above
-                has already established. A machine that has never run
-                Claude Code genuinely has none. */}
-            {matched.ordered.length === 0 ? (
-              <p className="p-2 text-sm text-[#8b949e]">
-                {query.trim()
-                  ? "No session matches that search."
-                  : "No Claude Code sessions on this machine."}
-              </p>
-            ) : (
-              capped.map((s) => (
-                <SessionEntry
-                  key={s.session_id}
-                  session={s}
-                  now={now}
-                  active={s.session_id === active?.session_id}
-                  onSelect={() => setSelected(s.session_id)}
-                />
-              ))
-            )}
-            {/* A cap that STATES the total, never a silent short list.
-                The house rule (#846) is that showing fewer rows than
-                exist without saying so is the same defect as an empty
-                list on a failed read. */}
-            {!showAll && matched.ordered.length > RENDER_CAP ? (
-              <div className="mt-2 rounded-md border border-[#30363d] bg-[#161b22] p-2 text-center">
-                <p className="text-[11px] text-[#8b949e]">
-                  Showing the {RENDER_CAP} most recent of{" "}
-                  {matched.ordered.length.toLocaleString()}.
-                </p>
-                <button
-                  type="button"
-                  onClick={() => setShowAll(true)}
-                  className="tap-target mt-1 rounded px-2 text-xs text-[#58a6ff] hover:bg-[#21262d]"
-                >
-                  Show all {matched.ordered.length.toLocaleString()}
-                </button>
-              </div>
-            ) : null}
-          </div>
-        </div>
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="shrink-0 border-b border-[#30363d] p-3">
+        <label className="flex items-center gap-2 rounded-md border border-[#30363d] bg-[#0d1117] px-2">
+          <Search className="h-3.5 w-3.5 shrink-0 text-[#8b949e]" aria-hidden="true" />
+          <input
+            type="search"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search title, directory, branch or id"
+            aria-label="Search Claude Code sessions"
+            className="min-w-0 flex-1 bg-transparent py-1.5 text-xs text-[#e6edf3] outline-none placeholder:text-[#8b949e]"
+          />
+        </label>
+        {/* The counts, always. With a cap in play the footer alone
+            would not say how much the SEARCH removed, and "showing
+            200 of 1,438" is a different fact from "12 of 1,438
+            match". */}
+        <p className="mt-2 text-[11px] text-[#8b949e]">
+          {query.trim()
+            ? `${matched.ordered.length.toLocaleString()} of ${all.length.toLocaleString()} match`
+            : `${all.length.toLocaleString()} sessions`}
+          {matched.live.length > 0 ? ` · ${matched.live.length} running now` : ""}
+        </p>
+      </div>
+      <div className="min-h-0 flex-1 overflow-y-auto p-2">
+        {/* Only when the read SUCCEEDED, which the error arm above
+            has already established. A machine that has never run
+            Claude Code genuinely has none. */}
+        {matched.ordered.length === 0 ? (
+          <p className="p-2 text-sm text-[#8b949e]">
+            {query.trim()
+              ? "No session matches that search."
+              : "No Claude Code sessions on this machine."}
+          </p>
+        ) : (
+          capped.map((s) => (
+            <SessionEntry
+              key={s.session_id}
+              session={s}
+              now={now}
+              active={s.session_id === selected}
+              onSelect={() => selectSession(s.session_id)}
+            />
+          ))
+        )}
+        {/* A cap that STATES the total, never a silent short list.
+            The house rule (#846) is that showing fewer rows than
+            exist without saying so is the same defect as an empty
+            list on a failed read.
 
-        <div
-          className={
-            isMobile
-              ? showingList
-                ? "hidden"
-                : "flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto p-4"
-              : "min-w-0 flex-1 overflow-y-auto p-4"
-          }
-        >
-          {isMobile && !showingList ? (
+            A DIFFERENT fact from the "N of M match" count above, which is
+            why both are rendered: one says how much the search removed,
+            the other how much of what survived is drawn. */}
+        {!showAll && matched.ordered.length > RENDER_CAP ? (
+          <div className="mt-2 rounded-md border border-[#30363d] bg-[#161b22] p-2 text-center">
+            <p className="text-[11px] text-[#8b949e]">
+              Showing the {RENDER_CAP} most recent of{" "}
+              {matched.ordered.length.toLocaleString()}.
+            </p>
             <button
               type="button"
-              onClick={() => setSelected(undefined)}
-              className="tap-target -ml-1 mb-2 flex items-center self-start rounded px-2 text-sm text-[#58a6ff] hover:bg-[#161b22]"
+              onClick={() => setShowAll(true)}
+              className="tap-target mt-1 rounded px-2 text-xs text-[#58a6ff] hover:bg-[#21262d]"
             >
-              ← All sessions
+              Show all {matched.ordered.length.toLocaleString()}
             </button>
-          ) : null}
-          {active ? (
-            <SessionDetail session={active} now={now} />
-          ) : (
-            <p className="text-sm text-[#8b949e]">
-              Choose a session to see where it ran and how to resume it.
-            </p>
-          )}
-        </div>
+          </div>
+        ) : null}
       </div>
     </div>
   );

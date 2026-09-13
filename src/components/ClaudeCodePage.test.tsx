@@ -68,7 +68,30 @@ vi.mock("sonner", () => ({ toast: { success: toastSuccess, error: toastError } }
 vi.mock("../lib/clipboard", () => ({ copyText: copyFn }));
 vi.mock("../api/tauri", () => ({ claudeRevealPath: revealFn }));
 
-import { ClaudeCodePage } from "./ClaudeCodePage";
+import { ClaudeCodePage, ClaudeSessionColumn } from "./ClaudeCodePage";
+
+/// The desktop pair, which is TWO components since #939.
+///
+/// `ClaudeSessionColumn` moved into `ClaudeCodeSidebar` and
+/// `ClaudeCodePage` kept the banners and the detail, so a test rendering
+/// only the page would be asserting on half the view -- every row click
+/// below would find no row. This renders both, in the order `App` puts
+/// them on screen.
+///
+/// Not the real `ClaudeCodeSidebar`, deliberately. That component carries
+/// `ViewSwitcher`, which reads `useUiPrefs` and every view's label, so
+/// pulling it in would make these tests depend on the whole navigation
+/// chrome to assert something about a session's resume command.
+/// `ClaudeCodeSidebar.test.tsx` is where the sidebar's own claims -- the
+/// page order, and that the search box is in the column -- are asserted.
+function renderView() {
+  return render(
+    <>
+      <ClaudeSessionColumn />
+      <ClaudeCodePage />
+    </>,
+  );
+}
 
 const session = (over: Partial<ClaudeSession> = {}): ClaudeSession => ({
   session_id: "e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2",
@@ -133,6 +156,11 @@ beforeEach(() => {
   // mocked store would let those two drift apart while the test passed.
   useFilters.setState({ view: "claude-code" });
   useFilters.getState().setFilter("repo", undefined);
+  // The search text and the selection live in the store since #939, and
+  // the store is a MODULE singleton -- so without this a query typed by
+  // one test would still be filtering the list in the next one, and a
+  // selected id would open a detail pane nobody clicked.
+  useFilters.setState({ claudeQuery: "", claudeSelected: undefined });
   copyFn.mockClear();
   revealFn.mockClear();
   toastError.mockClear();
@@ -163,7 +191,7 @@ describe("liveness renders as three states, not two", () => {
         },
       }),
     ]);
-    render(<ClaudeCodePage />);
+    renderView();
     expect(screen.getAllByText(/could not tell/i).length).toBeGreaterThan(0);
     expect(screen.queryByText(/^Not running$/)).toBeNull();
   });
@@ -177,7 +205,7 @@ describe("liveness renders as three states, not two", () => {
         },
       }),
     ]);
-    render(<ClaudeCodePage />);
+    renderView();
     expect(screen.getAllByText(/not running/i).length).toBeGreaterThan(0);
     expect(screen.queryByText(/could not tell/i)).toBeNull();
     open("HeadState GitHub issues filing");
@@ -191,7 +219,7 @@ describe("liveness renders as three states, not two", () => {
     state.list = listOf([
       session({ liveness: { state: "running", pid: 14779, status: "busy" } }),
     ]);
-    render(<ClaudeCodePage />);
+    renderView();
     expect(screen.getAllByText(/running/i).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/busy/i).length).toBeGreaterThan(0);
   });
@@ -203,7 +231,7 @@ describe("liveness renders as three states, not two", () => {
     state.list = listOf([
       session({ liveness: { state: "dead", why: "pid 1 is no longer running" } }),
     ]);
-    render(<ClaudeCodePage />);
+    renderView();
     expect(screen.queryByText(/busy/i)).toBeNull();
   });
 
@@ -227,7 +255,7 @@ describe("liveness renders as three states, not two", () => {
         liveness: { state: "running", pid: 7, status: "idle" },
       }),
     ]);
-    render(<ClaudeCodePage />);
+    renderView();
     const rows = screen.getAllByRole("button", { pressed: false });
     const titles = rows.map((r) => r.textContent ?? "");
     const live = titles.findIndex((t) => t.includes("Running but quiet"));
@@ -239,7 +267,7 @@ describe("liveness renders as three states, not two", () => {
 
 describe("the resume command carries the cwd that makes it work", () => {
   it("offers the cd-prefixed command with no caveat when the directory exists", () => {
-    render(<ClaudeCodePage />);
+    renderView();
     open("HeadState GitHub issues filing");
     expect(
       screen.getByText(
@@ -272,7 +300,7 @@ describe("the resume command carries the cwd that makes it work", () => {
         },
       }),
     ]);
-    render(<ClaudeCodePage />);
+    renderView();
     open("HeadState GitHub issues filing");
     expect(screen.getByText(/is gone .*\.worktrees\/deleted/)).toBeTruthy();
     expect(screen.getByText(/resume in whatever directory you run it from/)).toBeTruthy();
@@ -298,7 +326,7 @@ describe("the resume command carries the cwd that makes it work", () => {
         },
       }),
     ]);
-    render(<ClaudeCodePage />);
+    renderView();
     open("HeadState GitHub issues filing");
     expect(screen.getByText(/Could not check whether/)).toBeTruthy();
     expect(screen.queryByText(/is gone \(/)).toBeNull();
@@ -313,7 +341,7 @@ describe("the resume command carries the cwd that makes it work", () => {
     state.list = listOf([
       session({ liveness: { state: "running", pid: 14779, status: "busy" } }),
     ]);
-    render(<ClaudeCodePage />);
+    renderView();
     open("HeadState GitHub issues filing");
     expect(screen.queryByRole("button", { name: /copy resume command/i })).toBeNull();
     expect(screen.getByText(/starts a second copy of it/i)).toBeTruthy();
@@ -328,7 +356,7 @@ describe("the resume command carries the cwd that makes it work", () => {
         liveness: { state: "unknown", why: "this session's process was never observed" },
       }),
     ]);
-    render(<ClaudeCodePage />);
+    renderView();
     open("HeadState GitHub issues filing");
     expect(screen.getByRole("button", { name: /copy resume command/i })).toBeTruthy();
     expect(screen.getByText(/may already be open somewhere/i)).toBeTruthy();
@@ -336,7 +364,7 @@ describe("the resume command carries the cwd that makes it work", () => {
 
   it("reports a clipboard failure rather than doing nothing", async () => {
     copyFn.mockResolvedValueOnce("This window has no clipboard access.");
-    render(<ClaudeCodePage />);
+    renderView();
     open("HeadState GitHub issues filing");
     fireEvent.click(screen.getByRole("button", { name: /copy resume command/i }));
     await vi.waitFor(() =>
@@ -356,7 +384,7 @@ describe("absent is not zero", () => {
   it("renders a failed read as an error and not as an empty list", () => {
     state.list = undefined;
     state.failed = true;
-    render(<ClaudeCodePage />);
+    renderView();
     expect(screen.getByText(/could not read the claude code sessions/i)).toBeTruthy();
     expect(screen.getByText(/database is locked/)).toBeTruthy();
     expect(screen.queryByText(/no claude code sessions/i)).toBeNull();
@@ -371,14 +399,14 @@ describe("absent is not zero", () => {
   it("prefers the error arm over the empty arm when both could apply", () => {
     state.list = listOf([]);
     state.failed = true;
-    render(<ClaudeCodePage />);
+    renderView();
     expect(screen.getByText(/could not read the claude code sessions/i)).toBeTruthy();
     expect(screen.queryByText(/no claude code sessions on this machine/i)).toBeNull();
   });
 
   it("says there are none only when the read succeeded", () => {
     state.list = listOf([]);
-    render(<ClaudeCodePage />);
+    renderView();
     expect(screen.getByText(/no claude code sessions on this machine/i)).toBeTruthy();
   });
 
@@ -388,7 +416,7 @@ describe("absent is not zero", () => {
     state.list = listOf([session()], {
       registry_failure: "could not read /Users/acme/.claude/sessions: Permission denied",
     });
-    render(<ClaudeCodePage />);
+    renderView();
     expect(screen.getByText(/could not tell which sessions are running/i)).toBeTruthy();
     expect(screen.getByText(/not the same as .not running./i)).toBeTruthy();
     // And the rows are STILL shown: a partial answer labelled partial
@@ -400,7 +428,7 @@ describe("absent is not zero", () => {
     state.list = listOf([session()], {
       registry_unreadable: ["/Users/acme/.claude/sessions/1.json: expected value"],
     });
-    render(<ClaudeCodePage />);
+    renderView();
     expect(screen.getByText(/1 live-session record could not be read/i)).toBeTruthy();
   });
 
@@ -412,7 +440,7 @@ describe("absent is not zero", () => {
       unreadable_dirs: ["/Users/acme/.claude/projects/secret: Permission denied"],
       unreadable_files: ["/Users/acme/.claude/projects/a/b.jsonl: Permission denied"],
     });
-    render(<ClaudeCodePage />);
+    renderView();
     expect(screen.getByText(/2 could not be/i)).toBeTruthy();
     expect(screen.getByText(/incomplete by an unknown amount/i)).toBeTruthy();
   });
@@ -421,7 +449,7 @@ describe("absent is not zero", () => {
   /// be perfectly readable, just stale.
   it("reports a failed rescan without hiding the stored sessions", () => {
     state.importFailed = true;
-    render(<ClaudeCodePage />);
+    renderView();
     expect(screen.getByText(/could not re-read the transcripts/i)).toBeTruthy();
     expect(screen.getByText(/newer ones may be missing/i)).toBeTruthy();
     expect(screen.getAllByRole("button", { name: /HeadState GitHub/i }).length).toBeGreaterThan(0);
@@ -442,7 +470,7 @@ describe("the list at the real corpus size", () => {
   /// the same defect class as an empty list on a failed read.
   it("caps the rendered rows and says how many there really are", () => {
     state.list = listOf(many(1438));
-    render(<ClaudeCodePage />);
+    renderView();
     expect(screen.getByText(/showing the 200 most recent of 1,438/i)).toBeTruthy();
     expect(screen.getByText(/1,438 sessions/i)).toBeTruthy();
     // `queryByText`, not `queryByRole(…, { name })` -- see the next test
@@ -467,7 +495,7 @@ describe("the list at the real corpus size", () => {
   /// cap is lifted, and it is absent in the capped test above.
   it("shows every row when asked to", () => {
     state.list = listOf(many(1438));
-    render(<ClaudeCodePage />);
+    renderView();
     fireEvent.click(screen.getByRole("button", { name: /show all 1,438/i }));
     expect(screen.getByText("Session number 500")).toBeTruthy();
     expect(screen.queryByText(/showing the 200 most recent/i)).toBeNull();
@@ -481,7 +509,7 @@ describe("the list at the real corpus size", () => {
       session({ session_id: "a", name: "Notarization fix", cwd: "/code/alpha", git_branch: "main" }),
       session({ session_id: "b-unique-id", name: "Something else", cwd: "/code/beta", git_branch: "feat/x" }),
     ]);
-    const { container } = render(<ClaudeCodePage />);
+    const { container } = renderView();
     const search = within(container).getByLabelText(/search claude code sessions/i);
 
     fireEvent.change(search, { target: { value: "notariz" } });
@@ -498,7 +526,7 @@ describe("the list at the real corpus size", () => {
   });
 
   it("says nothing matched rather than claiming there are no sessions", () => {
-    render(<ClaudeCodePage />);
+    renderView();
     fireEvent.change(screen.getByLabelText(/search claude code sessions/i), {
       target: { value: "nothing whatsoever" },
     });
@@ -511,7 +539,7 @@ describe("the list at the real corpus size", () => {
   /// handle.
   it("falls back to the session id rather than inventing a name", () => {
     state.list = listOf([session({ name: null })]);
-    render(<ClaudeCodePage />);
+    renderView();
     expect(
       screen.getAllByRole("button", { name: /e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2/ }).length,
     ).toBeGreaterThan(0);
@@ -520,14 +548,14 @@ describe("the list at the real corpus size", () => {
   /// Every row carries a DATE, because title alone cannot identify one:
   /// 147 sessions in the largest directory share a title with a sibling.
   it("shows a relative date on every row, computed from the prop", () => {
-    render(<ClaudeCodePage />);
+    renderView();
     // 2026-09-13T09:00:00Z against a `now` of 12:00:00Z.
     expect(screen.getAllByText(/3 hours ago/).length).toBeGreaterThan(0);
   });
 
   it("says so rather than inventing a date when none was recorded", () => {
     state.list = listOf([session({ last_activity_at: null })]);
-    render(<ClaudeCodePage />);
+    renderView();
     expect(screen.getAllByText(/no recorded activity/i).length).toBeGreaterThan(0);
   });
 });
@@ -538,14 +566,14 @@ describe("what the detail says about provenance", () => {
   /// is also the difference between two liveness answers.
   it("says a transcript-read session was never watched", () => {
     state.list = listOf([session({ runs: 0 })]);
-    render(<ClaudeCodePage />);
+    renderView();
     open("HeadState GitHub issues filing");
     expect(screen.getByText(/not watched while it ran/i)).toBeTruthy();
   });
 
   it("names the reason a reveal failed rather than appearing inert", async () => {
     revealFn.mockRejectedValueOnce("/Users/acme/code/widget no longer exists");
-    render(<ClaudeCodePage />);
+    renderView();
     open("HeadState GitHub issues filing");
     fireEvent.click(screen.getByRole("button", { name: /reveal directory/i }));
     await vi.waitFor(() =>
@@ -559,7 +587,7 @@ describe("what the detail says about provenance", () => {
   });
 
   it("rescans on request", () => {
-    render(<ClaudeCodePage />);
+    renderView();
     fireEvent.click(screen.getByRole("button", { name: /rescan transcripts/i }));
     expect(rescanFn).toHaveBeenCalled();
   });
@@ -568,7 +596,7 @@ describe("what the detail says about provenance", () => {
   /// `Scan` carries `elapsed_ms`: it keeps the "no incremental
   /// machinery" decision checkable on someone else's machine.
   it("shows how long the rescan took", () => {
-    render(<ClaudeCodePage />);
+    renderView();
     expect(screen.getByText(/1,438 read in 1374/)).toBeTruthy();
   });
 });
@@ -584,7 +612,7 @@ describe("revealing a path that may be gone", () => {
   const revealTranscript = () => screen.getByRole("button", { name: /reveal transcript/i });
 
   it("reveals a directory that exists", () => {
-    render(<ClaudeCodePage />);
+    renderView();
     open("HeadState GitHub issues filing");
     expect(revealDirectory().hasAttribute("disabled")).toBe(false);
     fireEvent.click(revealDirectory());
@@ -596,7 +624,7 @@ describe("revealing a path that may be gone", () => {
   /// cannot do that".
   it("disables the reveal for a gone directory and says why", () => {
     state.list = listOf([session({ cwd_state: { state: "gone" } })]);
-    render(<ClaudeCodePage />);
+    renderView();
     open("HeadState GitHub issues filing");
     const btn = revealDirectory();
     expect(btn.hasAttribute("disabled")).toBe(true);
@@ -621,7 +649,7 @@ describe("revealing a path that may be gone", () => {
         cwd_state: { state: "unknown", why: "Permission denied (os error 13)" },
       }),
     ]);
-    render(<ClaudeCodePage />);
+    renderView();
     open("HeadState GitHub issues filing");
 
     expect(revealDirectory().hasAttribute("disabled")).toBe(true);
@@ -635,7 +663,7 @@ describe("revealing a path that may be gone", () => {
 
   it("says no path was recorded rather than calling it gone", () => {
     state.list = listOf([session({ cwd: null, cwd_state: { state: "not-recorded" } })]);
-    render(<ClaudeCodePage />);
+    renderView();
     open("HeadState GitHub issues filing");
     expect(revealDirectory().hasAttribute("disabled")).toBe(true);
     expect(screen.queryByText(/no longer exists/i)).toBeNull();
@@ -656,7 +684,7 @@ describe("revealing a path that may be gone", () => {
         transcript_state: { state: "exists" },
       }),
     ]);
-    render(<ClaudeCodePage />);
+    renderView();
     open("HeadState GitHub issues filing");
 
     expect(revealDirectory().hasAttribute("disabled")).toBe(true);
@@ -675,7 +703,7 @@ describe("revealing a path that may be gone", () => {
         transcript_state: { state: "gone" },
       }),
     ]);
-    render(<ClaudeCodePage />);
+    renderView();
     open("HeadState GitHub issues filing");
     expect(revealDirectory().hasAttribute("disabled")).toBe(false);
     expect(revealTranscript().hasAttribute("disabled")).toBe(true);
@@ -685,7 +713,7 @@ describe("revealing a path that may be gone", () => {
     state.list = listOf([
       session({ transcript_path: null, transcript_state: { state: "not-recorded" } }),
     ]);
-    render(<ClaudeCodePage />);
+    renderView();
     open("HeadState GitHub issues filing");
     expect(revealTranscript().hasAttribute("disabled")).toBe(true);
   });
@@ -714,7 +742,7 @@ describe("the jump to a session's worktree", () => {
 
   it("offers the jump and navigates the way WorktreesPage reads it", () => {
     state.worktrees = [repo([worktree()])];
-    render(<ClaudeCodePage />);
+    renderView();
     open("HeadState GitHub issues filing");
 
     // The worktree's own state is what answers "what was this session
@@ -736,7 +764,7 @@ describe("the jump to a session's worktree", () => {
   /// is 1,213 of 1,461 real rows, so it is the common case.
   it("offers no jump when the directory is not a known worktree", () => {
     state.worktrees = [repo([worktree({ path: "/Users/acme/code/other" })])];
-    render(<ClaudeCodePage />);
+    renderView();
     open("HeadState GitHub issues filing");
     expect(screen.queryByRole("button", { name: /show in worktrees/i })).toBeNull();
     expect(screen.getByText(/not a worktree Headstate knows about/i)).toBeTruthy();
@@ -752,7 +780,7 @@ describe("the jump to a session's worktree", () => {
   it("says the worktree list could not be read rather than claiming no match", () => {
     state.worktrees = undefined;
     state.worktreesFailed = true;
-    render(<ClaudeCodePage />);
+    renderView();
     open("HeadState GitHub issues filing");
     expect(screen.getByText(/could not read the worktree list/i)).toBeTruthy();
     expect(screen.queryByText(/not a worktree Headstate knows about/i)).toBeNull();
@@ -762,7 +790,7 @@ describe("the jump to a session's worktree", () => {
   it("says it is still looking while the listing loads", () => {
     state.worktrees = undefined;
     state.worktreesFailed = false;
-    render(<ClaudeCodePage />);
+    renderView();
     open("HeadState GitHub issues filing");
     expect(screen.getByText(/looking for a matching worktree/i)).toBeTruthy();
     // Not the could-not-read arm, and not the no-match arm.
@@ -775,7 +803,7 @@ describe("the jump to a session's worktree", () => {
   /// key -- but the row must not read as "this session's branch".
   it("says so when the worktree has moved to another branch", () => {
     state.worktrees = [repo([worktree({ branch: "main" })])];
-    render(<ClaudeCodePage />);
+    renderView();
     open("HeadState GitHub issues filing");
     expect(screen.getByText(/has since moved to/i)).toBeTruthy();
     // The jump is NOT withheld: matching on the branch too would refuse a
@@ -785,7 +813,7 @@ describe("the jump to a session's worktree", () => {
 
   it("says nothing about branches when they agree", () => {
     state.worktrees = [repo([worktree()])];
-    render(<ClaudeCodePage />);
+    renderView();
     open("HeadState GitHub issues filing");
     expect(screen.queryByText(/has since moved to/i)).toBeNull();
   });
@@ -793,7 +821,7 @@ describe("the jump to a session's worktree", () => {
   it("says there is no worktree to find when no directory was recorded", () => {
     state.list = listOf([session({ cwd: null, cwd_state: { state: "not-recorded" } })]);
     state.worktrees = [repo([worktree()])];
-    render(<ClaudeCodePage />);
+    renderView();
     open("HeadState GitHub issues filing");
     expect(screen.getByText(/no directory was recorded/i)).toBeTruthy();
   });

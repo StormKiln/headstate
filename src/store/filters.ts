@@ -219,15 +219,66 @@ interface FilterStore {
   /// on launch, or it stops being one.
   healthPage: HealthPage;
   setHealthPage: (page: HealthPage) => void;
-  /// Which Claude Code page is open (#921).
+  /// Which Claude Code page is open (#921, reordered by #939).
   ///
-  /// Not persisted, for the same reason `healthPage` is not -- and with a
-  /// sharper edge. This view is opened to resurrect a session after
-  /// something died; relaunching onto the overview would put a chart
-  /// between the user and the list they came for. The landing page has to
-  /// be the landing page on launch.
+  /// Not persisted, for the same reason `healthPage` is not: this is a
+  /// position within a view rather than a preference, and the landing
+  /// page has to be the landing page on launch.
+  ///
+  /// The DEFAULT is `"overview"` as of #939, which reverses #921's
+  /// choice. #921 argued the sessions list is what the view is opened
+  /// for, so relaunching onto the overview "would put a chart between the
+  /// user and the list they came for". Using it showed the premise wrong
+  /// on both halves: the overview is not only a chart -- it carries the
+  /// resurrection tiles and the resumable list, which IS what a user
+  /// acts on -- and since #939 the sessions list is no longer behind the
+  /// overview at all. It lives in the sidebar, on screen whichever page
+  /// is selected, so landing on the overview costs nothing the old
+  /// default was protecting.
+  ///
+  /// No migration is needed for the change of default, and that is worth
+  /// stating rather than assuming: `partialize` has never listed this key,
+  /// so no install has one on disk. And `"sessions"` is still a member of
+  /// `ClaudePage`, so even a hand-edited store carrying it would spread
+  /// through `merge` into a value the sidebar can render -- the change
+  /// moves which page you LAND on, not which pages exist.
   claudePage: ClaudePage;
   setClaudePage: (page: ClaudePage) => void;
+  /// The Claude Code session list's search text (#939).
+  ///
+  /// In the store rather than `useState` inside `ClaudeCodePage` because
+  /// the box and the rows it filters moved into `ClaudeCodeSidebar`,
+  /// which is a SIBLING of the page rather than its child -- the two
+  /// components that need this value have no common ancestor below
+  /// `App`. This is where cross-component view state already lives, next
+  /// to `claudePage`, which those same two components already share for
+  /// the same reason.
+  ///
+  /// Not persisted, deliberately: `partialize` already strips every
+  /// per-view `query` because "a search box restored with yesterday's
+  /// text renders a filtered list that looks like an empty one". This is
+  /// the same box over a longer list, so it gets the same treatment.
+  claudeQuery: string;
+  setClaudeQuery: (query: string) => void;
+  /// The Claude Code session whose detail the main panel shows, or
+  /// undefined for none (#939).
+  ///
+  /// Store state for the same reason as `claudeQuery`: the rows that set
+  /// it are in the sidebar and the detail that reads it is in the page.
+  ///
+  /// Holds the session ID and not the session, so a rescan cannot leave a
+  /// stale COPY of a row on screen. The consequence is that the id may
+  /// name a session the current list no longer contains -- a transcript
+  /// deleted between polls -- which is why `ClaudeCodePage` resolves it
+  /// by lookup against the live list on every render. A lookup that
+  /// misses renders the choose-a-session prompt; it can never render a
+  /// detail pane built out of remembered fields.
+  ///
+  /// Not persisted: relaunching onto the detail of a session whose
+  /// transcript has since been deleted is worse than landing on the list,
+  /// which is the reason `selectedPr` gives for the same choice.
+  claudeSelected: string | undefined;
+  selectClaudeSession: (id: string | undefined) => void;
   /// How tightly PR rows pack.
   ///
   /// A global preference rather than per-view: it is about the user's
@@ -397,17 +448,36 @@ export const useFilters = create<FilterStore>()(
           // returning to a detail page skips the one that says whether
           // there is a new question worth asking.
           healthPage: "overview",
-          // Same rule, opposite default (#921). Leaving Claude Code and
-          // coming back lands on the SESSIONS list, because that is the
-          // page the view is for: the overview answers "what is the shape
-          // of this", which is not the question you have when you come
-          // back to resurrect something.
-          claudePage: "sessions",
+          // Same rule, and since #939 the same default. Leaving Claude
+          // Code and coming back lands on the OVERVIEW: it carries the
+          // resurrection tiles and the resumable list, which is what the
+          // returning user acts on, and the sessions list is in the
+          // sidebar either way so returning here loses nothing. #921 had
+          // this reset to "sessions" on the premise that the overview was
+          // a chart standing between the user and the list; #939 moved the
+          // list out from behind it, so the premise is gone.
+          //
+          // The search text and the selected session go with it, for the
+          // reason the block above gives for `checked` and `anchor`: a
+          // query typed against this machine's sessions means nothing on
+          // the review list, and a session id selected before leaving
+          // would restore a detail pane the user did not ask for.
+          claudePage: "overview",
+          claudeQuery: "",
+          claudeSelected: undefined,
         }),
       healthPage: "overview",
       setHealthPage: (healthPage) => set({ healthPage }),
-      claudePage: "sessions",
+      // `"overview"` here and in `setView` above, which must agree: one is
+      // the value on a cold launch and the other the value on re-entry,
+      // and two different landing pages for the same view would be a
+      // position that depends on how you got there.
+      claudePage: "overview",
       setClaudePage: (claudePage) => set({ claudePage }),
+      claudeQuery: "",
+      setClaudeQuery: (claudeQuery) => set({ claudeQuery }),
+      claudeSelected: undefined,
+      selectClaudeSession: (claudeSelected) => set({ claudeSelected }),
       selectedPr: null,
       selectPr: (selectedPr) => set({ selectedPr }),
       checked: [],
