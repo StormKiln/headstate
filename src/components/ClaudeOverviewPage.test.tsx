@@ -158,9 +158,15 @@ describe("ClaudeOverviewPage", () => {
     // The stored aggregates survive.
     expect(screen.getByText("248")).toBeTruthy();
     expect(screen.getByTestId("sessions-chart")).toBeTruthy();
-    // And it says the stored figures are unaffected, so the banner is not
-    // read as casting doubt on all of them.
-    expect(screen.getByText(/stored history, which is unaffected/)).toBeTruthy();
+    // And it names the OVER-count, not just the under-count. `aggregate`
+    // classifies a session as resumable exactly when it is not in the
+    // running set, so a registry we could not read leaves every live
+    // session counted as resumable -- and resuming one that is already
+    // alive starts a second copy of it. Sabotage: the wording this
+    // replaced said the figures below "are unaffected", which is true of
+    // the history and false of the one figure a user acts on.
+    expect(screen.getByText(/nothing could be subtracted/)).toBeTruthy();
+    expect(screen.getByText(/starts a second copy/)).toBeTruthy();
   });
 
   /// A registry we COULD read, reporting nothing running, is a real answer.
@@ -186,6 +192,13 @@ describe("ClaudeOverviewPage", () => {
     expect(screen.getByText(/at least 3 rather than exactly 3/)).toBeTruthy();
     // The number is still shown: it is a floor, not an absence.
     expect(screen.getByText("3")).toBeTruthy();
+    // And the other direction, which is the one that misleads an ACTION:
+    // a session the unreadable record hides is missing from the running
+    // set, so `aggregate` classifies it by its directory and it can land
+    // in the resumable list while still running.
+    expect(
+      screen.getByText(/counted as resumable while in fact still running/),
+    ).toBeTruthy();
   });
 
   /// #921's predicate is reported, including when it is zero.

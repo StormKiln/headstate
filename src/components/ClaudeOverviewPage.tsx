@@ -304,9 +304,20 @@ export function ClaudeOverviewPage() {
           className="flex items-start gap-2 rounded-md border border-[#30363d] bg-[#161b22] px-3 py-2 text-xs text-[#8b949e]"
         >
           <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+          {/* NOT "the figures below are unaffected", which is what this
+              said first and is too strong. `aggregate` classifies a
+              session as resumable precisely when it is NOT in the running
+              set, so a registry we could not read leaves every live
+              session counted as resumable -- and resuming one that is
+              already alive starts a second copy of it. The over-count is
+              small (never more than the handful that can be live at once)
+              and the direction is the one that misleads an action, so it
+              is named rather than glossed. */}
           <span>
-            Could not tell which sessions are running: {live_failure}. The figures
-            below count stored history, which is unaffected.
+            Could not tell which sessions are running: {live_failure}. The
+            history below is unaffected, but nothing could be subtracted from
+            &ldquo;resumable&rdquo; — so any session that IS running is counted
+            there, and resuming one that is already alive starts a second copy.
           </span>
         </div>
       ) : live_unreadable.length > 0 ? (
@@ -315,11 +326,20 @@ export function ClaudeOverviewPage() {
           className="flex items-start gap-2 rounded-md border border-[#30363d] bg-[#161b22] px-3 py-2 text-xs text-[#8b949e]"
         >
           <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+          {/* Both halves, because the unreadable record cuts two ways. A
+              session it hides is missing from the running set, so
+              "running" under-counts -- and `aggregate` then classifies
+              that same session by its directory, which can put a LIVE
+              session in the resumable list. Resuming one that is already
+              alive starts a second copy of it, so the over-count is the
+              half that can mislead an action and it has to be said. */}
           <span>
             {live_unreadable.length} live session{" "}
             {live_unreadable.length === 1 ? "record" : "records"} could not be
             used, so &ldquo;running&rdquo; is at least {counts.running} rather
-            than exactly {counts.running}. {live_unreadable[0]}
+            than exactly {counts.running} — and a session it hides may be
+            counted as resumable while in fact still running.{" "}
+            {live_unreadable[0]}
           </span>
         </div>
       ) : null}

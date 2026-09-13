@@ -308,10 +308,27 @@ struct Row {
 /// established are alive -- #917's liveness derivation, passed in rather
 /// than repeated. An EMPTY set is ambiguous on its own ("nothing is
 /// running" or "we could not look"), and this function does not try to
-/// resolve that: the caller knows which, and the view says so from
-/// #917's own `registry_failure`. What this guarantees is only that a
-/// session in the set is never counted as resumable, so a live session
-/// can never appear in the list offering to resurrect it.
+/// resolve that: the caller knows which, and the view says so from its
+/// own `live_failure`. What this guarantees is only that a session IN the
+/// set is never counted as resumable, so a live session the caller told
+/// us about can never appear in the list offering to resurrect it.
+///
+/// # The direction this cannot guarantee, and who has to say so
+///
+/// The converse does not hold, and it is the half worth stating because
+/// it is the one that misleads an ACTION. A session is classified as
+/// resumable exactly when it is NOT in the set and its directory exists.
+/// So a session that is running but absent from the set -- because the
+/// registry could not be listed, or because its record could not be
+/// parsed -- lands in the resumable list, and resuming a session that is
+/// already alive starts a second copy of it.
+///
+/// That is not fixable here: this function is given a set and cannot know
+/// whether the set is complete. It is the caller's failure to report, and
+/// [`OverviewReport`] carries `live_failure` and `live_unreadable` for
+/// exactly that reason -- the page names the over-count in both banners
+/// rather than claiming the figures below are unaffected, which is true
+/// of the history and false of the one figure a user acts on.
 ///
 /// # Cost
 ///
@@ -611,6 +628,40 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["dead"],
         );
+    }
+
+    /// A session missing from the set IS counted resumable, and that is
+    /// the caller's problem to report.
+    ///
+    /// Pinned rather than left implicit, because it is the one direction
+    /// `aggregate` cannot get right on its own and the page's banners are
+    /// the whole mitigation. If this behaviour ever changed -- if some
+    /// future edit tried to guess at liveness here -- the banners would
+    /// become wrong in the other direction, and a reader of this file
+    /// would have no way to know the wording depends on it.
+    #[test]
+    fn a_session_absent_from_the_running_set_is_counted_resumable() {
+        let conn = db();
+        let dir = std::env::temp_dir();
+        let cwd = dir.to_str().unwrap();
+        insert(
+            &conn,
+            "actually-running",
+            Some(cwd),
+            "2026-09-13T10:00:00Z",
+            Some("2026-09-13T11:00:00Z"),
+        );
+
+        // The caller could not read the registry, so it passes an empty
+        // set even though this session is alive.
+        let out = aggregate(&conn, &none(), today()).unwrap();
+        assert_eq!(
+            out.counts.resumable, 1,
+            "this function is given a set and cannot know it is incomplete"
+        );
+        assert_eq!(out.counts.running, 0);
+        // Which is exactly why `OverviewReport` carries `live_failure`
+        // and the page says a running session may be counted here.
     }
 
     /// #921's predicate is reported, and it is zero for imported history.
