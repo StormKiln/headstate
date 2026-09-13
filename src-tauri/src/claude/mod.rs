@@ -43,9 +43,18 @@
 //! own -- #917's `liveness` module owns that, and two answers to one
 //! question disagree the first time either changes. [`live`] is the seam
 //! between them until #917 lands, and its own comment says so.
+//!
+//! [`install`] (#915) is the ONE exception to the read-only rule below, and
+//! it is narrow on purpose: it appends two hook matchers to
+//! `~/.claude/settings.json` and refuses to touch anything it cannot parse.
+//! Nothing else in here writes to `~/.claude`. The transcripts in
+//! particular are read-only by design -- they are Claude Code's data and the
+//! files `claude --resume` depends on.
 
+pub mod cli;
 pub mod crash;
 pub mod handoff;
+pub mod hook;
 pub mod install;
 pub mod live;
 pub mod overview;

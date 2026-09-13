@@ -44,7 +44,16 @@ set -euo pipefail
 # `org` and `owner` are the generic placeholders used in format examples
 # (`- [org/repo#123] Title`), not real accounts.
 # `acme` is the synthetic placeholder this repo uses in path examples.
-ALLOWED='octocat|pktstorm|tauri-apps|shadcn-ui|rust-lang|actions|dtolnay|Swatinem|org|owner|acme'
+#
+# `anthropics` is the upstream of Claude Code itself, whose PUBLIC issue
+# numbers are the citations behind the Claude integration's design
+# (#910): the 1.5s `SessionEnd` budget is anthropics/claude-code#41577
+# and the stale-payload behaviour is #9188. Both are public issues on a
+# public repository, which is exactly the "legitimate public dependency"
+# case this list exists for -- and a comment that cites a measured
+# constraint without saying where the constraint came from is the kind
+# of unsourced claim this codebase's comments are written to avoid.
+ALLOWED='octocat|pktstorm|tauri-apps|shadcn-ui|rust-lang|actions|dtolnay|Swatinem|org|owner|acme|anthropics'
 
 # Ticket-ID-shaped tokens (PREFIX-NUMBER) that are legitimate public
 # identifiers, not internal tracker references.
