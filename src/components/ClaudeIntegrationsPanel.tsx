@@ -168,9 +168,19 @@ export function ClaudeIntegrationsPanel({
         />
         Show Claude Code sessions
       </label>
-      <p className="text-xs text-[#8b949e]">
+      {/* Greyed further when the switch is off -- the epic asks for a greyed
+          section, and THIS is the part the switch actually governs: a
+          description of a view that is not currently offered.
+
+          Deliberately not the install controls below. Greying those would
+          imply the switch disables them, which is the exact conflation §6
+          settled against -- and someone who turned the view off months ago
+          still has a legitimate reason to remove the hook. A panel that
+          cannot uninstall while disabled is a dead end. */}
+      <p className={`text-xs ${enabled ? "text-[#8b949e]" : "text-[#6e7681]"}`}>
         Lists the sessions on this machine, which of them are still running, and the
         command to resume one that is not.
+        {enabled ? null : " Hidden while this is off."}
       </p>
 
       {/* THE thing this panel exists to say. Shown whatever the switch is

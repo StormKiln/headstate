@@ -92,6 +92,13 @@ describe("the Claude integrations settings section", () => {
 
   /// The section is reachable while the capability is OFF -- greyed, not
   /// hidden, per the epic -- because that is where the switch lives.
+  ///
+  /// And the INSTALL CONTROLS stay live, which is the half worth pinning. The
+  /// epic asks for a greyed section and the tempting reading is to grey
+  /// everything, but a panel that cannot uninstall while the view is off is a
+  /// dead end: someone who turned the view off months ago still has a
+  /// legitimate reason to remove a hook that is still writing to disk. Only
+  /// the description of the hidden view is dimmed.
   it("offers the install controls even while the integrations are off", () => {
     panel();
     expect(screen.getByRole("checkbox", { name: /show claude code sessions/i })).toHaveProperty(
@@ -99,6 +106,26 @@ describe("the Claude integrations settings section", () => {
       false,
     );
     expect(screen.getByRole("button", { name: /install/i }).hasAttribute("disabled")).toBe(false);
+    // The view description says it is currently hidden, rather than
+    // describing a view the user cannot reach as though they could.
+    expect(document.body.textContent).toMatch(/hidden while this is off/i);
+  });
+
+  /// With the switch ON, the "hidden while this is off" note is gone.
+  ///
+  /// Guards the guard above: a component that printed that sentence
+  /// unconditionally would satisfy it while telling an enabled user their
+  /// view is hidden.
+  it("drops the hidden note once the integrations are on", () => {
+    render(
+      <ClaudeIntegrationsPanel
+        prefs={{ ...PREFS, claude_integrations_enabled: true }}
+        setPrefs={setPrefs}
+      />,
+    );
+    expect(document.body.textContent).not.toMatch(/hidden while this is off/i);
+    // The permanence warning is NOT conditional and must survive.
+    expect(document.body.textContent).toMatch(/does\s*not\s*remove the hook/i);
   });
 
   /// A malformed settings file must NOT offer the Install button.
