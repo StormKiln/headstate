@@ -12,10 +12,14 @@
 //! resolves the overlap per field by which source actually knows the
 //! answer -- see [`store::import`].
 //!
-//! Nothing in here writes to `~/.claude`. Read-only by design: those
-//! transcripts are Claude Code's data and the file `claude --resume`
-//! depends on.
+//! [`install`] (#915) is the ONE exception to the rule below, and it is
+//! narrow on purpose: it appends two hook matchers to
+//! `~/.claude/settings.json` and refuses to touch anything it cannot parse.
+//! Nothing else in here writes to `~/.claude`. The transcripts in
+//! particular are read-only by design -- they are Claude Code's data and the
+//! files `claude --resume` depends on.
 
+pub mod install;
 pub mod store;
 pub mod transcript;
 

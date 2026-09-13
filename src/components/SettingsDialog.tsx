@@ -11,6 +11,7 @@ import { ALWAYS_OFFERED, VIEWS } from "./ViewSwitcher";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { PairedDevicesList } from "./PairedDevicesList";
 import { PhoneNotifyPanel } from "./PhoneNotifyPanel";
+import { ClaudeIntegrationsPanel } from "./ClaudeIntegrationsPanel";
 import {
   useAutostart,
   useNotifyPrefs,
@@ -57,6 +58,12 @@ const SECTIONS = [
   { id: "notifications", label: "Notifications" },
   { id: "cleanup", label: "Cleanup" },
   { id: "phone", label: "Phone" },
+  // Its own topic rather than a row under Views, because the switch is a
+  // CAPABILITY and not a view preference -- and because the section carries
+  // the hook installer, which edits a file outside this app (#915). Placed
+  // before Views so the last entry stays the one that is about nothing but
+  // what is on screen.
+  { id: "claude", label: "Claude Code" },
   { id: "views", label: "Views" },
 ] as const;
 
@@ -794,6 +801,13 @@ export function SettingsDialog({
         <PairPhonePanel />
         <PairedDevicesList />
         </>}
+            </div>
+            {/* Rendered always and hidden with CSS, like every panel here:
+                unmounting would drop the status query and refetch it on
+                every topic switch, and the `hidden` attribute would take
+                the install buttons out of the accessibility tree. */}
+            <div className={section === "claude" ? "" : "hidden"}>
+              <ClaudeIntegrationsPanel prefs={ui} setPrefs={setUi} />
             </div>
             {/* Rendered always, hidden with CSS -- never unmounted and
                 never the `hidden` ATTRIBUTE.
