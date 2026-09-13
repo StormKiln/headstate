@@ -7,7 +7,15 @@ const repos = vi.hoisted(() => vi.fn<() => unknown>(() => []));
 // `undefined` -- which is also what it is before the scan runs -- so the
 // column could not distinguish "we have not looked" from "we looked and
 // could not" from "we looked and there is nothing".
-const scan = vi.hoisted(() => ({ loading: false, failed: false }));
+// `unreadable` since #951: the scan can come back SHORT without
+// rejecting, which is a FOURTH state -- "we looked, and could not read
+// all of where we looked" -- and every count in this column is then a
+// floor rather than a total.
+const scan = vi.hoisted(() => ({
+  loading: false,
+  failed: false,
+  unreadable: [] as string[],
+}));
 const refetchFn = vi.hoisted(() => vi.fn());
 
 vi.mock("../api/hooks", () => ({
@@ -16,6 +24,7 @@ vi.mock("../api/hooks", () => ({
     isLoading: scan.loading,
     isError: scan.failed,
     refetch: refetchFn,
+    unreadable: scan.unreadable,
   }),
 }));
 vi.mock("./ViewSwitcher", () => ({ ViewSwitcher: () => null }));
@@ -41,6 +50,10 @@ const EMPTY = {
   "pr-stats": {},
   "system-health": {},
 } as const;
+
+/// One report entry, in the `<path>: <why>` shape the Rust side sends.
+/// Synthetic per `CONTRIBUTING.md`: the real ones name a real machine.
+const UNREADABLE = "/code/broken: fatal: not a repository";
 
 afterEach(() => stubViewport(null));
 
@@ -109,6 +122,10 @@ beforeEach(() => {
   // "No repositories found" diagnosis every other test expects.
   scan.loading = false;
   scan.failed = false;
+  // Same reasoning, for the same reason (#951): a leaked `unreadable`
+  // turns every count in every other test into a floor and puts a banner
+  // above the rows they assert on.
+  scan.unreadable = [];
   refetchFn.mockClear();
   useFilters.setState({
     filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
@@ -195,6 +212,47 @@ describe("WorktreeSidebar", () => {
       const all = screen.getByText("All repositories").closest("button");
       // 2 removable in `busy`, plus the 1 orphan = 3.
       expect(all?.textContent).toContain("3");
+    });
+
+    /// #951: an orphan count over an incomplete walk.
+    ///
+    /// QUALIFIED, not suppressed. Each orphan is a POSITIVE finding --
+    /// `orphan_gitdir` reads the worktree's own `.git` file and checks
+    /// the repository it names is gone, consulting nothing else -- so a
+    /// short walk cannot invent an orphan, only miss one. The error has
+    /// one direction, and "at least" is the honest word for it. Hiding
+    /// the section instead would hide orphans that are real and on disk,
+    /// which is the entire reason this page exists.
+    it("says at least, rather than an exact count, on a partial scan", () => {
+      repos.mockReturnValue([orphanRepo("a"), orphanRepo("b")]);
+      scan.unreadable = [UNREADABLE];
+      render(<WorktreeSidebar />);
+      const orphan = screen.getByText("Orphaned").closest("button");
+      // The count SURVIVES -- the two orphans are real -- and is marked
+      // as a floor.
+      expect(orphan?.textContent).toContain("2");
+      expect(orphan?.textContent).toContain("\u2265");
+    });
+
+    /// And an exact count when the walk finished, or the qualifier is
+    /// permanent furniture and stops meaning anything.
+    it("gives an exact count when the scan read everything", () => {
+      repos.mockReturnValue([orphanRepo("a"), orphanRepo("b")]);
+      render(<WorktreeSidebar />);
+      const orphan = screen.getByText("Orphaned").closest("button");
+      expect(orphan?.textContent).toContain("2");
+      expect(orphan?.textContent).not.toContain("\u2265");
+    });
+
+    /// The shortfall is REPORTED, with the reason, above the counts it
+    /// qualifies -- not left in a log nobody reads, which is the
+    /// argument `caches/mod.rs` makes about `truncated`.
+    it("names what it could not read", () => {
+      repos.mockReturnValue([orphanRepo("a")]);
+      scan.unreadable = [UNREADABLE];
+      render(<WorktreeSidebar />);
+      expect(screen.getByText(UNREADABLE)).toBeTruthy();
+      expect(screen.getByText(/floors rather than totals/i)).toBeTruthy();
     });
   });
 

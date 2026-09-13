@@ -16,9 +16,12 @@ mod model;
 pub(crate) mod scan;
 
 pub use assess::{assess, Assessment};
+// `Repo` is still the payload `RepoScan` carries, so it stays exported
+// even though #951 left `list_worktrees`' signature naming only the scan.
+#[allow(unused_imports)]
 pub use model::{Repo, Worktree};
 pub use scan::{
     classify_repo_streaming, fetch_refs, head_oid, prune_worktrees, pull_checkout, remove_orphan,
     remove_worktree, remove_worktree_forced, remove_worktrees_with_progress, repo_identity,
-    scan_dirs_fast, size_repo_streaming, unlock_worktree, RemovalOutcome,
+    scan_dirs_fast_reporting, size_repo_streaming, unlock_worktree, RemovalOutcome, RepoScan,
 };

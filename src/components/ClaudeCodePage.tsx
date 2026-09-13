@@ -723,7 +723,15 @@ function WorktreeJump({ session: s }: { session: ClaudeSession }) {
   // is left at its default true for the reason `useWorktrees`' own
   // comment gives: the three callers that discover repositories all want
   // this, and this is now a fourth.
-  const { data: repos, isError, error } = useWorktrees();
+  //
+  // `unreadable` since #951: a "no match" verdict is a claim about the
+  // WHOLE scan, so an incomplete one cannot support it. This is the
+  // residual shape `caches/mod.rs` refuses a deletion for -- unlike the
+  // orphan count on `WorktreesPage`, which is a positive per-path finding
+  // -- so here the verdict really is qualified rather than merely
+  // annotated. Nothing is deleted on the strength of it, so it is said in
+  // prose rather than gated.
+  const { data: repos, isError, error, unreadable = [] } = useWorktrees();
   const match = sessionWorktree(s.cwd, s.git_branch, repos);
 
   return (
@@ -742,8 +750,16 @@ function WorktreeJump({ session: s }: { session: ClaudeSession }) {
       ) : match === null ? (
         <p className="mt-2 text-xs text-[#8b949e]">
           {s.cwd === null
-            ? "No directory was recorded for this session, so there is no worktree to find."
-            : "This directory is not a worktree Headstate knows about — most agent worktrees are deleted once their work lands."}
+            ? // Nothing to do with the scan: there is no directory to
+              // match, so a short scan changes nothing about this answer.
+              "No directory was recorded for this session, so there is no worktree to find."
+            : unreadable.length > 0
+              ? // "Not a worktree we know about" is a claim over the whole
+                // scan, and the scan came back short (#951). The honest
+                // answer names that rather than converting a gap in the
+                // walk into a fact about this directory.
+                `This directory did not match any worktree Headstate could read — and ${unreadable.length} path${unreadable.length === 1 ? "" : "s"} could not be read, so it may be one of them rather than not a worktree at all.`
+              : "This directory is not a worktree Headstate knows about — most agent worktrees are deleted once their work lands."}
         </p>
       ) : (
         <>
