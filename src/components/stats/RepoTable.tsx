@@ -88,17 +88,48 @@ export function RepoTable({
                 }}
                 className="flex items-center gap-3 rounded px-2 py-1.5 text-sm hover:bg-[#161b22]"
               >
-                <span className="w-56 shrink-0 truncate text-left">{r.repo}</span>
-                <span className="relative h-1.5 flex-1 overflow-hidden rounded bg-[#21262d]">
+                {/* `min-w-0 flex-1` rather than `w-56 shrink-0`, which
+                    is the pattern `Outliers.tsx` uses one directory over
+                    for the same row shape (#942): the long field
+                    absorbs the slack and truncates, the short ones are
+                    bare `shrink-0`.
+
+                    `w-56` was 224px of a 356px row minimum in a 326px
+                    card at 390px, so the row overflowed by 30px and the
+                    bar -- the only column that could give -- was
+                    squeezed to ZERO width for every repo. A table whose
+                    doc comment calls itself "a way in, not just a
+                    readout" cannot answer "which repo is this happening
+                    in" with five identical zero-width bars, and because
+                    `Card` is `overflow-hidden` the clipped `%` column
+                    was silently gone rather than scrollable.
+
+                    `title` is added with the truncation: the repo name
+                    is what the row is ABOUT, and the desktop kept its
+                    full width, so the phone needs the name recoverable
+                    rather than merely shortened. */}
+                <span className="min-w-0 flex-1 truncate text-left" title={r.repo}>
+                  {r.repo}
+                </span>
+                <span
+                  // `basis-16 shrink-0`, not `flex-1`: beside a
+                  // `flex-1` name the bar would split the slack evenly
+                  // and both would be starved at phone width. 64px is
+                  // the floor at which the share comparison still
+                  // reads, and this is the column that must never
+                  // return to zero.
+                  className="relative h-1.5 basis-16 shrink-0 overflow-hidden rounded bg-[#21262d]"
+                >
                   <span
                     className="absolute inset-y-0 left-0 rounded bg-[#3fb950]"
                     style={{ width: `${pct}%` }}
                   />
                 </span>
-                <span className="w-10 shrink-0 text-right tabular-nums">{r.merged}</span>
-                <span className="w-10 shrink-0 text-right text-xs text-[#8b949e]">
-                  {pct}%
-                </span>
+                {/* Bare `shrink-0`: both figures size themselves, per
+                    `Outliers`. `tabular-nums` still keeps the counts
+                    aligned down the column. */}
+                <span className="shrink-0 text-right tabular-nums">{r.merged}</span>
+                <span className="shrink-0 text-right text-xs text-[#8b949e]">{pct}%</span>
               </button>
             );
           })}

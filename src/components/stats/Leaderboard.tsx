@@ -138,11 +138,32 @@ function Ranked<T extends { login: string }>({
                 <span className="w-4 shrink-0 text-right text-xs tabular-nums text-[#8b949e]">
                   {i + 1}
                 </span>
-                <span className="w-40 shrink-0 truncate text-left" title={r.login}>
+                {/* `min-w-0 flex-1` rather than `w-40 shrink-0`, which
+                    is `Outliers.tsx`' pattern in this same directory
+                    for the same row shape: the field that CAN be long
+                    absorbs the slack and truncates, the fields that
+                    cannot are bare `shrink-0` with no width (#942).
+
+                    The old `w-40` was the larger half of a 340px row
+                    minimum in a 326px card, so the row overflowed an
+                    `overflow-hidden` Card by 14px at 390px and the bar
+                    between these two columns was squeezed to ZERO --
+                    first place and fifth place drew identical bars,
+                    which is the one thing this component's own doc says
+                    the bar length is for. `title` already carried the
+                    full login, so truncating sooner loses nothing. */}
+                <span className="min-w-0 flex-1 truncate text-left" title={r.login}>
                   {r.login}
                 </span>
                 <span
-                  className="relative h-1.5 flex-1 overflow-hidden rounded bg-[#21262d]"
+                  // `basis-16 shrink-0` rather than `flex-1`: as a
+                  // second `flex-1` beside the login above, the bar
+                  // would split the slack evenly with it and both would
+                  // be starved at 390px. A fixed 64px basis is the
+                  // narrowest width at which "how far ahead is first
+                  // place" is still legible, and it is the column that
+                  // must never reach zero again.
+                  className="relative h-1.5 basis-16 shrink-0 overflow-hidden rounded bg-[#21262d]"
                   // The bar is decoration over a number that is already
                   // printed beside it, so it is hidden rather than given an
                   // ARIA value that would read the same figure twice.
@@ -153,7 +174,10 @@ function Ranked<T extends { login: string }>({
                     style={{ width: `${pct}%` }}
                   />
                 </span>
-                <span className="w-28 shrink-0 text-right tabular-nums text-xs">
+                {/* Bare `shrink-0`, no width: the figure sizes itself,
+                    which is what `Outliers` does and what keeps this
+                    column from claiming 112px it does not always need. */}
+                <span className="shrink-0 text-right tabular-nums text-xs">
                   {format(r)}
                 </span>
               </li>

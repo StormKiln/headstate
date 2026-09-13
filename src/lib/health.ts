@@ -589,6 +589,28 @@ export function capacityBarFill(percent: number): number {
   return Math.max(0, Math.min(100, (percent / CAPACITY_BAR_MAX) * 100));
 }
 
+/// Where the "100%" scale mark belongs on the capacity track, as a
+/// percentage of its width.
+///
+/// # Why this is a name rather than `justify-between`
+///
+/// The panel draws a label reading "Rated capacity: 100%" so the
+/// stretched track above can be read at all. Before #981 that label was
+/// the second child of a `justify-between` row, which pins it to the
+/// container's RIGHT EDGE -- the `CAPACITY_BAR_MAX` end, i.e. the 120%
+/// position. So a cell at exactly 100% drew its fill at 83.33% of the
+/// track while the mark named "100%" sat at 100% of it: the one
+/// comparison the panel exists to make read as "below nameplate" on a
+/// battery that was exactly at nameplate, and every reading was
+/// under-reported by the same 1.2x factor.
+///
+/// Derived from `capacityBarFill` rather than written as 83.33, because
+/// the ONLY property that matters is that the mark and the fill share
+/// one scale. A literal would be correct today and silently wrong the
+/// first time `CAPACITY_BAR_MAX` is retuned -- which is exactly the
+/// class of drift that produced the bug.
+export const NAMEPLATE_MARK = capacityBarFill(100);
+
 /// The colour of a capacity bar.
 ///
 /// NOT `barColor`, and the inversion is the reason: `barColor` reads a
