@@ -1674,6 +1674,11 @@ function CpuDetail({
   // unmounts. Cheap on the five-second cadence -- 19-24ms for 1436
   // processes, measured; see the Rust module docs.
   const fp = useSystemFootprint(true);
+  // `null` when the platform reported no per-core figures, so every
+  // reader below asks "did we measure this" rather than reading a length
+  // of 0 as a core count. Absent is not zero (`caches/mod.rs:550`), and a
+  // machine with zero cores does not exist (#958).
+  const cores = s.cpu_per_core.length === 0 ? null : s.cpu_per_core.length;
   const series = useMemo(
     () => samples.map((x) => ({ t: Date.parse(x.sampled_at), v: x.cpu_percent })),
     [samples],
@@ -1716,11 +1721,37 @@ function CpuDetail({
           <Stat label="Load (1m)" value={s.load ? s.load[0].toFixed(2) : null} />
           <Stat label="Load (5m)" value={s.load ? s.load[1].toFixed(2) : null} />
           <Stat label="Load (15m)" value={s.load ? s.load[2].toFixed(2) : null} />
-          <Stat label="Cores" value={`${s.cpu_per_core.length}`} />
+          {/* `null`, not `0`, when the platform reported no cores.
+              `Stat`'s own doc says the value "is never coerced to 0" --
+              and this call site passed a template string, which made
+              `Stat` render the literal "0" and skip the `NotMeasured`
+              branch entirely. No machine has zero cores; an empty
+              `cpu_per_core` means nothing was discoverable (#958). */}
+          <Stat label="Cores" value={cores === null ? null : `${cores}`} />
         </div>
         {s.load === null ? (
           <p className="mt-2 text-xs text-[#8b949e]">
             This platform does not report load averages.
+          </p>
+        ) : cores === null ? (
+          // Load averages WITHOUT a core count, which is a real
+          // platform state and the one this paragraph used to get
+          // wrong. The guard was `s.load === null`, so on a machine
+          // that reports load but not per-core usage the prose rendered
+          // "On this machine's 0 cores, a load near 0 means it is busy
+          // but keeping up" -- telling a reader that a machine at load
+          // 2.41 with work queuing was coping.
+          //
+          // The paragraph exists to stop the single most misread number
+          // on this page being misread, so in that state it caused
+          // precisely the error it is for. The general explanation is
+          // still worth giving; the arithmetic is not, because the
+          // number it needs was never measured.
+          <p className="mt-2 text-xs leading-relaxed text-[#8b949e]">
+            A load average is the number of processes wanting to run, not a
+            percentage, so whether a given figure is high depends on how many
+            cores the machine has. This platform did not report its core count,
+            so there is nothing to compare these against.
           </p>
         ) : (
           // What a load average MEANS, which the overview has no room
@@ -1729,9 +1760,9 @@ function CpuDetail({
           // whether 4.0 is bad depends entirely on the core count.
           <p className="mt-2 text-xs leading-relaxed text-[#8b949e]">
             A load average is the number of processes wanting to run, not a
-            percentage. On this machine&apos;s {s.cpu_per_core.length} cores,
-            a load near {s.cpu_per_core.length} means it is busy but keeping
-            up; well above that means work is queuing.
+            percentage. On this machine&apos;s {cores} cores, a load near{" "}
+            {cores} means it is busy but keeping up; well above that means work
+            is queuing.
           </p>
         )}
       </Panel>

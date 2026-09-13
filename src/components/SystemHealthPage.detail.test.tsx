@@ -1283,6 +1283,59 @@ describe("a machine with no discoverable GPU gets no GPU page at all", () => {
   });
 });
 
+describe("a core count that was never measured (#958)", () => {
+  beforeEach(() => useFilters.setState({ healthPage: "cpu" }));
+
+  /// A platform that reports load averages but not per-core usage is a
+  /// real state, and it is the one this got wrong: the prose was guarded
+  /// on `load === null`, so it rendered "On this machine's 0 cores, a load
+  /// near 0 means it is busy but keeping up" -- telling a reader that a
+  /// machine at load 2.41 with work queuing was coping.
+  ///
+  /// The paragraph exists to stop the most misread number on the page
+  /// being misread, so in that state it caused the error it is for.
+  it("does not claim the machine has zero cores", async () => {
+    liveFn.mockResolvedValue(sample({ cpu_per_core: [], load: [2.41, 2.18, 1.95] }));
+    renderPage();
+    // The load figure still renders, so this is the has-load-no-cores
+    // case rather than a page that failed to load.
+    expect(await screen.findByText("2.41")).toBeTruthy();
+    expect(screen.queryByText(/0 cores/)).toBeNull();
+    expect(screen.queryByText(/a load near 0 /)).toBeNull();
+  });
+
+  /// And says the count was not measured, rather than printing a 0 that
+  /// looks like a reading. `Stat`'s own doc says the value "is never
+  /// coerced to 0"; the call site passed a template string, which skipped
+  /// that branch entirely.
+  it("renders the core count as not measured", async () => {
+    liveFn.mockResolvedValue(sample({ cpu_per_core: [], load: [2.41, 2.18, 1.95] }));
+    renderPage();
+    await screen.findByText("2.41");
+    expect(screen.getAllByText(/not measured/i).length).toBeGreaterThan(0);
+  });
+
+  /// The general explanation survives -- a load average still needs
+  /// explaining, and dropping the paragraph entirely would lose that.
+  /// Only the arithmetic that needs a core count goes.
+  it("still explains what a load average is", async () => {
+    liveFn.mockResolvedValue(sample({ cpu_per_core: [], load: [2.41, 2.18, 1.95] }));
+    renderPage();
+    await screen.findByText("2.41");
+    expect(screen.getByText(/number of processes wanting to run/i)).toBeTruthy();
+    expect(screen.getByText(/did not report its core count/i)).toBeTruthy();
+  });
+
+  /// The measured case is unchanged, which is what keeps this a fix to one
+  /// state rather than a removal of the explanation.
+  it("keeps the core arithmetic when the count IS measured", async () => {
+    liveFn.mockResolvedValue(sample({ cpu_per_core: [10, 26], load: [2.41, 2.18, 1.95] }));
+    renderPage();
+    await screen.findByText("2.41");
+    expect(screen.getByText(/On this machine's 2 cores/i)).toBeTruthy();
+  });
+});
+
 describe("grouping processes by name (#721)", () => {
   beforeEach(() => useFilters.setState({ healthPage: "cpu" }));
 
