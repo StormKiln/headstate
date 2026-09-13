@@ -12,6 +12,21 @@ const periods: Periods = {
   month_previous: 515,
 };
 
+/// The one card whose label matches, scoped to `[data-slot="card"]`.
+///
+/// `querySelectorAll("div")` also matches the render container, whose
+/// `innerHTML` holds all four cards -- so a glyph assertion against it sees
+/// every card's icon and cannot distinguish them. The existing colour
+/// assertions survive that looseness only because they check a colour one
+/// card alone has.
+function card(container: HTMLElement, label: string): HTMLElement {
+  const found = Array.from(container.querySelectorAll<HTMLElement>('[data-slot="card"]')).find(
+    (c) => c.textContent?.startsWith(label),
+  );
+  expect(found, `no card labelled ${label}`).toBeTruthy();
+  return found as HTMLElement;
+}
+
 describe("DeltaCards", () => {
   it("shows the merged count and its week-over-week change", () => {
     render(<DeltaCards periods={periods} />);
@@ -34,6 +49,49 @@ describe("DeltaCards", () => {
   it("renders a dash when both periods are empty", () => {
     render(<DeltaCards periods={{ ...periods, week_current: 0, week_previous: 0 }} />);
     expect(screen.getAllByText("--").length).toBeGreaterThan(0);
+  });
+
+  // #950: growth from zero is a RISE, and the glyph has to agree with the
+  // word. `pctChange` returns `Infinity` when the previous period is zero
+  // and the current one is not -- which is every card in a new user's
+  // first week -- and the icon branch used to lump that in with "no
+  // reading" and draw `Minus`. So the first thing the app said about
+  // someone's work was a minus sign in front of the word "new".
+  //
+  // Asserted on the ARROW, not only on the text: the text was already
+  // right, which is exactly why this shipped unnoticed.
+  it("marks growth from zero as a rise, not a decrease", () => {
+    const { container } = render(
+      <DeltaCards periods={{ ...periods, week_current: 12, week_previous: 0 }} />,
+    );
+    expect(screen.getByText("new")).toBeTruthy();
+    // lucide renders the icon name as a class, so the glyph is checkable.
+    const merged = card(container, "Merged this week");
+    expect(merged.innerHTML).toContain("lucide-arrow-up");
+    expect(merged.innerHTML).not.toContain("lucide-minus");
+  });
+
+  // The no-reading case keeps `Minus`, and that is the point of splitting
+  // them: `previous === 0` AND `current === 0` has no direction at all, so
+  // an arrow either way would invent one.
+  it("keeps the dash glyph when there is genuinely nothing to compare", () => {
+    const { container } = render(
+      <DeltaCards periods={{ ...periods, week_current: 0, week_previous: 0 }} />,
+    );
+    const merged = card(container, "Merged this week");
+    expect(merged.innerHTML).toContain("lucide-minus");
+    expect(merged.innerHTML).not.toContain("lucide-arrow");
+  });
+
+  // Colour follows direction, but polarity still governs: a brand-new
+  // user's rising INTAKE must not be cheered green just because it is new.
+  it("does not paint a new open count green", () => {
+    const { container } = render(
+      <DeltaCards
+        periods={{ ...periods, opened_week_current: 40, opened_week_previous: 0 }}
+      />,
+    );
+    expect(card(container, "Opened this week").innerHTML).not.toContain("#3fb950");
   });
 
   // A rising intake is not good news on its own: the activity chart's own

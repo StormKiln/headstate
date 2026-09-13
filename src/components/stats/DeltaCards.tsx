@@ -28,11 +28,35 @@ function DeltaCard({
   /// between opened and merged as the signal, not either count alone.
   polarity?: "more-is-better" | "neutral";
 }) {
-  const finite = delta !== null && Number.isFinite(delta);
-  const up = finite && (delta as number) >= 0;
-  const Icon = !finite ? Minus : up ? ArrowUp : ArrowDown;
+  // THREE cases, not two, because `formatPct` already renders three and
+  // this row has to agree with the words beside it (#950):
+  //
+  //   delta === null   "--"    nothing to compare. No direction exists.
+  //   !isFinite        "new"   growth from zero. Unambiguously a RISE.
+  //   finite           "+N%"   a measured change, signed.
+  //
+  // These were collapsed into one `!finite` branch, which put a `Minus`
+  // glyph in front of the word "new". A brand-new user has zero of
+  // everything in the previous period, so `pctChange` returns `Infinity`
+  // (`stats.ts:8`: `previous === 0` and `current !== 0`) for every card --
+  // making "a minus sign beside the word new" the FIRST thing the app
+  // shows about their work, on every card, on first launch.
+  //
+  // `Minus` stays for `null` alone, where it is right: `previous === 0`
+  // AND `current === 0` is a genuine absence of a reading, and no arrow
+  // would be honest about it.
+  const isNull = delta === null;
+  const isNew = !isNull && !Number.isFinite(delta as number);
+  const finite = !isNull && !isNew;
+  const up = isNew || (finite && (delta as number) >= 0);
+  const Icon = isNull ? Minus : up ? ArrowUp : ArrowDown;
+  // Tone follows the DIRECTION, so "new" is coloured like the rise it is
+  // -- subject to polarity, which is why a growing backlog is not
+  // cheered. `neutral` and the no-reading case both stay grey: one
+  // because the direction carries no verdict, the other because there is
+  // no direction.
   const tone =
-    !finite || polarity === "neutral"
+    isNull || polarity === "neutral"
       ? "text-[#8b949e]"
       : up
         ? "text-[#3fb950]"
