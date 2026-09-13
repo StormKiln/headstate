@@ -72,6 +72,14 @@ export interface UiPrefs {
   hidden_views: string[];
   close_hides_to_tray: boolean;
   announce_updates: boolean;
+  /// Whether the Claude Code integrations are switched on (#916).
+  ///
+  /// A CAPABILITY, not a `hidden_views` entry. That list means "I do not
+  /// want to see this" and `ViewSwitcher` honours it loosely on purpose --
+  /// `ALWAYS_OFFERED` and the current-view hatch both override it. A
+  /// switched-off integration must not survive either, because there is no
+  /// page behind the entry. See the note at the `capabilityOff` check.
+  claude_integrations_enabled: boolean;
   /// Whether to write the verbose `[diag]` timing log.
   ///
   /// Kept as a switch rather than removed after v3.5.3: the next
