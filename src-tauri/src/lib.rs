@@ -204,6 +204,7 @@ pub fn run() {
             commands::scan_claude_md,
             commands::read_claude_md,
             commands::claude_import_transcripts,
+            commands::claude_poll_live,
             commands::check_packages,
             commands::packages_markdown,
             commands::scan_venvs,

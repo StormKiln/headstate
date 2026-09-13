@@ -3271,6 +3271,120 @@ pub async fn claude_import_transcripts(
     .map_err(|e| e.to_string())?
 }
 
+/// The settings key holding the handoff file's byte offset.
+///
+/// Persisted rather than held in memory so a relaunch does not re-read
+/// the whole file: re-reading is harmless (every record upserts on a key
+/// built from its own fields) but it is wasted work on every start, and a
+/// user who has been running the hook for months would re-parse all of it.
+const HANDOFF_OFFSET_KEY: &str = "claude_handoff_offset";
+
+/// What one pass over both live sources found (#913, epic #910).
+///
+/// The two halves are returned together because they are ONE answer to
+/// "what are my Claude sessions doing", and because separating them would
+/// let a UI render a sweep against a stale consumption or vice versa.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ClaudeLiveState {
+    /// What the hook's handoff file contributed.
+    pub handoff: crate::claude::handoff::Consumed,
+    /// What the registry sweep contributed, including crashes found.
+    pub sweep: crate::claude::crash::Recorded,
+    /// The sessions the registry says are running right now, with the
+    /// pid, `procStart`, `cwd` and `name` it carries. Returned as data so
+    /// the list view (#917) can show live rows without asking a second
+    /// time and getting a different moment's answer.
+    pub running: Vec<crate::claude::registry::Live>,
+    /// Registry records whose liveness could not be confirmed. NOT folded
+    /// into `running`: migration 11's NULL `pid_start_time` means "cannot
+    /// confirm", which must read as Unknown rather than Running.
+    pub unconfirmed: Vec<crate::claude::registry::Live>,
+}
+
+/// Consume the hook's handoff file and sweep the live session registry
+/// (#913, epic #910).
+///
+/// Two sources, one pass, in this order and for this reason: the sweep
+/// resolves each pid's `procStart`, and the consumer needs those to fill
+/// `pid_start_time`. The hook cannot supply it -- reading its own
+/// parent's start time is `sysctl` work inside a 1.5 second budget -- and
+/// this side gets it from a file read it is doing anyway.
+///
+/// # Polling, not a watcher
+///
+/// Called on a timer. `notify` is not a dependency and adding one would
+/// buy the exact failure this epic forbids: a dead FSEvents stream
+/// reports "no new sessions" indistinguishably from "the watch died", and
+/// on macOS it dies silently. A poll that stops shows up as a log that
+/// stops.
+///
+/// # Absent is not zero
+///
+/// Every count that could not be read reaches the caller as data --
+/// `handoff.unparseable`, `handoff.unknown_version`, `sweep.unreadable`,
+/// both `write_failures`. An `Err` means the source could not be read at
+/// all, which the UI must render as a failure rather than as "no
+/// sessions": the two have opposite remedies and the second is alarming
+/// when it is false (#846, where a `= []` default made a REJECTED scan
+/// read as "no CLAUDE.md files in this repository").
+///
+/// # What it writes
+///
+/// Its own database, plus a truncation of Headstate's OWN handoff file
+/// after the records in it are committed. Nothing else under `~/.claude`
+/// is written: the registry belongs to Claude Code and one of those files
+/// is rewritten by its owner every few seconds.
+#[tauri::command]
+pub async fn claude_poll_live(app: tauri::AppHandle) -> Result<ClaudeLiveState, String> {
+    let db = db_path(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let home = crate::auth::home_dir()
+            .ok_or_else(|| "no home directory, so ~/.claude cannot be read".to_string())?;
+
+        // The sweep first: it is what resolves `procStart` into the
+        // confirmed start times the consumer stores as `pid_start_time`.
+        let swept = crate::claude::registry::sweep(&crate::claude::registry::dir_in(&home))?;
+        let start_times = crate::claude::crash::start_times(&swept);
+
+        let mut conn = open_db(&db).map_err(|e| e.to_string())?;
+        let sweep = crate::claude::crash::record(&mut conn, &swept)?;
+
+        // A stored offset that cannot be read falls back to zero, which
+        // re-reads the file. That is the safe direction: re-reading is a
+        // no-op by construction, whereas guessing a non-zero offset would
+        // skip records permanently.
+        let offset = crate::claude::handoff::Offset(
+            crate::store::settings::get::<u64>(&conn, HANDOFF_OFFSET_KEY)
+                .unwrap_or(None)
+                .unwrap_or(0),
+        );
+        let handoff = crate::claude::handoff::consume(
+            &mut conn,
+            &crate::claude::handoff::path_in(&home),
+            offset,
+            &start_times,
+        )?;
+        // Persisted AFTER the consume committed. The reverse order would
+        // advance the offset past records that never reached the
+        // database, and nothing would ever read them again.
+        if let Err(e) = crate::store::settings::set(&conn, HANDOFF_OFFSET_KEY, &handoff.offset) {
+            // Not a failure of the pass: the records are stored. The cost
+            // is that the next pass re-reads them, which the upserts make
+            // a no-op. Said out loud rather than swallowed.
+            log::warn!("claude: could not persist the handoff offset: {e}");
+        }
+
+        Ok(ClaudeLiveState {
+            handoff,
+            sweep,
+            running: swept.running,
+            unconfirmed: swept.unknown,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[cfg(test)]
 mod tests {
     /// #336: `docker_builds` must actually ENRICH.

@@ -116,6 +116,11 @@ pub const SURFACE: &[(&str, Class)] = &[
     // why it asks the desktop -- see the desktop table for the full
     // reasoning.
     ("claude_import_transcripts", Class::Read),
+    // The two live sources on the DESKTOP: its hook handoff file and its
+    // `~/.claude/sessions` registry (#913). The phone has neither of its
+    // own -- it runs no Claude sessions -- which is exactly why it asks
+    // the desktop. See the desktop table for why this is a Read.
+    ("claude_poll_live", Class::Read),
     ("get_poll_interval", Class::Read),
     ("get_worktree_dirs", Class::Read),
     ("get_ui_prefs", Class::Read),

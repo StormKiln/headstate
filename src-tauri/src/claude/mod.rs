@@ -12,10 +12,25 @@
 //! resolves the overlap per field by which source actually knows the
 //! answer -- see [`store::import`].
 //!
+//! [`handoff`] consumes what the hook appends (#913), and [`registry`]
+//! reads `~/.claude/sessions/`, the live session registry -- a THIRD
+//! source the epic missed, and the best of the three for liveness: it
+//! carries the pid, `procStart`, `sessionId`, `cwd` and `name` with no
+//! hook installed at all. A registry file whose pid is dead is a
+//! positive crash signal, which [`crash`] records; see its module docs
+//! for why that is strictly better than inferring a crash from a missing
+//! `SessionEnd`.
+//!
 //! Nothing in here writes to `~/.claude`. Read-only by design: those
 //! transcripts are Claude Code's data and the file `claude --resume`
-//! depends on.
+//! depends on. The ONE exception is the handoff file, which is
+//! Headstate's own: [`handoff::consume`] truncates it after committing
+//! the records it read, because rotation is the only side that knows
+//! which records are already stored.
 
+pub mod crash;
+pub mod handoff;
+pub mod registry;
 pub mod store;
 pub mod transcript;
 
