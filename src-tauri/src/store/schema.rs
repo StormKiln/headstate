@@ -269,6 +269,86 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (key, window_start, window_end)
      );
      CREATE INDEX IF NOT EXISTS stats_cache_fetched ON stats_cache (fetched_at DESC);",
+    // 11: Claude Code sessions and their runs (#911, epic #910).
+    //
+    // # Why TWO tables when a session has one id
+    //
+    // Measured, not assumed: `session_id` SURVIVES A RESUME. Starting a
+    // session, `/exit`, then `claude --resume <id>` reports the same
+    // `session_id` with `source: "resume"` -- and `--continue` does too --
+    // while the pid is different every time:
+    //
+    //     startup  sid c8518222  ppid 34164
+    //     resume   sid c8518222  ppid 38366
+    //     resume   sid c8518222  ppid 44163
+    //     startup  sid 1db49024  ppid 46351   <- a fresh session mints a new id
+    //
+    // So there is no parent/child session to model, and the id is a stable
+    // primary key. But a single table would have to overwrite `pid` on every
+    // resume, losing the history of how many times a session was revived and
+    // when -- which is most of what the overview page (#921) is for. The pid
+    // belongs to a RUN, not to the session.
+    //
+    // # Why there is no `status` or `is_running` column, deliberately
+    //
+    // Liveness is DERIVED at read time and never stored. The reason is the
+    // whole premise of this feature: `SessionEnd` does not fire on SIGKILL,
+    // a closed terminal, a crash, or an OS reap -- only on `/exit`, Ctrl+D
+    // and clean completion. So a stored flag would say "running" forever
+    // for precisely the sessions the user wants to resurrect, with nothing
+    // to correct it.
+    //
+    // That is the `is_some_and` fail-open of #841 in another costume: a
+    // value we could not refresh, presented as a fact. `caches/mod.rs:550`
+    // states the house rule -- an idle time we could not read is not
+    // evidence that anything is disposable.
+    //
+    // `schema_has_no_claude_status_column` asserts the absence, because a
+    // well-meaning later change would otherwise add one for speed.
+    //
+    // # Why `pid_start_time` rides alongside `pid`
+    //
+    // A pid alone is a fail-open: pids are recycled, so a long-dead
+    // session whose number has been reissued would read as running. Pairing
+    // the pid with the process start time is the same defence
+    // `health/runaway.rs` already uses for its `(pid, start_time)` identity,
+    // and for the same reason.
+    //
+    // NULLABLE on purpose. It comes from `~/.claude/sessions/<pid>.json`'s
+    // `procStart`, and a run recorded when that file is gone has no start
+    // time to pair. NULL then means "cannot confirm", which the liveness
+    // function reports as Unknown rather than Running -- absent is not zero.
+    //
+    // # Timestamps
+    //
+    // RFC 3339 text, matching every other timestamp in this file.
+    // `last_activity_at` is the newest record in the transcript rather than
+    // the moment we scanned it, so a session does not appear to have been
+    // active whenever Headstate happened to look.
+    "CREATE TABLE IF NOT EXISTS claude_session (
+        session_id       TEXT PRIMARY KEY,
+        name             TEXT,
+        cwd              TEXT,
+        git_branch       TEXT,
+        claude_version   TEXT,
+        transcript_path  TEXT,
+        first_seen_at    TEXT NOT NULL,
+        last_activity_at TEXT
+     );
+     CREATE INDEX IF NOT EXISTS claude_session_activity
+        ON claude_session (last_activity_at DESC);
+     CREATE TABLE IF NOT EXISTS claude_run (
+        session_id     TEXT NOT NULL,
+        pid            INTEGER NOT NULL,
+        pid_start_time TEXT,
+        source         TEXT,
+        end_reason     TEXT,
+        started_at     TEXT NOT NULL,
+        ended_at       TEXT,
+        PRIMARY KEY (session_id, pid, started_at)
+     );
+     CREATE INDEX IF NOT EXISTS claude_run_session
+        ON claude_run (session_id, started_at DESC);",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
@@ -347,6 +427,109 @@ mod tests {
     /// version 5, which is every install that predates the mobile
     /// companion. Checked from a real v5 state rather than a fresh
     /// database, so a migration that only works when it runs first in
+    /// A v10 database gains the Claude session tables (#911).
+    ///
+    /// The same shape as the v5 case below, and for the same reason: an
+    /// existing install must upgrade rather than need its database deleted.
+    #[test]
+    fn migration_eleven_adds_claude_tables_to_a_v10_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE snapshot (id INTEGER PRIMARY KEY, payload TEXT NOT NULL,
+                fetched_at TEXT NOT NULL);
+             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 10i64).unwrap();
+
+        migrate(&conn).unwrap();
+
+        assert!(has_table(&conn, "claude_session"));
+        assert!(has_table(&conn, "claude_run"));
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+
+        // One row per session: the id is the `claude --resume` handle, and
+        // two rows for one id would make "which session is this" ambiguous.
+        let insert = "INSERT INTO claude_session (session_id, first_seen_at)
+            VALUES (?1, '2026-01-01T00:00:00Z')";
+        conn.execute(insert, ["abc"]).unwrap();
+        assert!(
+            conn.execute(insert, ["abc"]).is_err(),
+            "session_id must be unique"
+        );
+
+        // But MANY runs per session, which is the whole reason for the
+        // second table: a resumed session keeps its id and gets a new pid.
+        let run = "INSERT INTO claude_run (session_id, pid, started_at)
+            VALUES ('abc', ?1, ?2)";
+        conn.execute(
+            run,
+            [&"100" as &dyn rusqlite::ToSql, &"2026-01-01T00:00:00Z"],
+        )
+        .unwrap();
+        conn.execute(
+            run,
+            [&"200" as &dyn rusqlite::ToSql, &"2026-01-01T01:00:00Z"],
+        )
+        .unwrap();
+        let runs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claude_run WHERE session_id = 'abc'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(runs, 2, "a resumed session keeps its id and gains a run");
+    }
+
+    /// Liveness is derived, so there is no column to go stale (#911).
+    ///
+    /// Asserted rather than trusted to review. `SessionEnd` does not fire on
+    /// SIGKILL, a closed terminal or a crash, so a stored `status` would read
+    /// "running" forever for exactly the sessions this feature exists to
+    /// resurrect, with nothing to correct it -- the #841 fail-open in another
+    /// costume.
+    ///
+    /// Reads the BUILT schema, after every migration has run, so a column
+    /// added by a later migration is caught as well as one added to 11
+    /// itself. (An earlier draft of this comment claimed it scanned the
+    /// migration source; it does not, and the built schema is the stronger
+    /// check anyway -- it is what the database actually has.)
+    ///
+    /// `pid_start_time` is the allowed near-miss and is deliberately not in
+    /// the banned list: it is half of a process IDENTITY, not a state flag.
+    /// The distinction is that identity is fixed for the life of the process
+    /// while state is not, so only state can go stale.
+    #[test]
+    fn schema_has_no_claude_status_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        for table in ["claude_session", "claude_run"] {
+            let stmt = conn
+                .prepare(&format!("SELECT * FROM {table} LIMIT 0"))
+                .unwrap();
+            let cols: Vec<String> = stmt
+                .column_names()
+                .iter()
+                .map(|c| (*c).to_string())
+                .collect();
+            for banned in ["status", "is_running", "alive", "running", "state"] {
+                assert!(
+                    !cols.iter().any(|c| c == banned),
+                    "{table} has a `{banned}` column; liveness is derived, \
+                     never stored -- see migration 11's note on #841"
+                );
+            }
+            assert!(
+                !cols.is_empty(),
+                "{table} reported no columns, so this guard checked nothing"
+            );
+        }
+    }
+
     /// the list would be caught.
     #[test]
     fn migration_six_adds_paired_devices_to_a_v5_database() {
