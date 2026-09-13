@@ -203,6 +203,7 @@ pub fn run() {
             commands::update_run_state,
             commands::scan_claude_md,
             commands::read_claude_md,
+            commands::claude_import_transcripts,
             commands::check_packages,
             commands::packages_markdown,
             commands::scan_venvs,

@@ -193,6 +193,29 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("packages_markdown", Class::Read),
     ("scan_claude_md", Class::Read),
     ("read_claude_md", Class::Read),
+    // Rescan `~/.claude/projects` and upsert into our own cache (#914).
+    //
+    // `Read`, by the same reasoning `refresh_now` is Read: it reads
+    // local disk WITHOUT writing to it -- the transcripts are Claude
+    // Code's data and `claude --resume` depends on them, so nothing here
+    // touches `~/.claude` -- and the only thing it writes is Headstate's
+    // own cache. It changes no GitHub state and no desktop setting, which
+    // is what `Write` is for.
+    //
+    // Exposed rather than `Local` even though the PHONE has no
+    // transcripts of its own, because that is the point: a remote call
+    // asks the DESKTOP to re-read the desktop's history, and "which of my
+    // sessions died?" is precisely the away-from-desk question the
+    // companion exists for. Apply `Local`'s stated test -- could the phone
+    // act on the answer? -- and the answer is yes: the resurrect action is
+    // a copy of `claude --resume <id>`, which is why `claudify_command`
+    // above is Read on the same grounds.
+    //
+    // Not cheap, but bounded: a full rescan of the real 1,430-session,
+    // 881 MB corpus measures well under a second because each transcript
+    // costs a bounded head read plus a 16 KB tail seek, and the ceiling
+    // lives inside the command rather than in this table.
+    ("claude_import_transcripts", Class::Read),
     ("get_poll_interval", Class::Read),
     ("get_worktree_dirs", Class::Read),
     ("get_ui_prefs", Class::Read),
@@ -593,6 +616,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         )),
         "scan_claude_md" => res(commands::scan_claude_md(a.get("repoPath")?).await),
         "read_claude_md" => res(commands::read_claude_md(a.get("path")?)),
+        "claude_import_transcripts" => res(commands::claude_import_transcripts(app.clone()).await),
         "get_poll_interval" => ok(commands::get_poll_interval(app.state())),
         "get_worktree_dirs" => ok(commands::get_worktree_dirs(app.clone())),
         "get_ui_prefs" => ok(commands::get_ui_prefs(app.clone())),
