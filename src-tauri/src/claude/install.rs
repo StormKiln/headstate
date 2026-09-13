@@ -1332,6 +1332,38 @@ mod tests {
         );
     }
 
+    /// A settings file whose ROOT is not an object is refused.
+    ///
+    /// Valid JSON, so `read_settings` passes it through happily -- and then
+    /// there is nowhere to put a `hooks` key without replacing what is
+    /// there, which is the same refusal a non-object `hooks` gets. Worth a
+    /// test because the alternative is not a wrong answer but a PANIC: an
+    /// `as_object_mut().unwrap()` here would take down the command.
+    #[test]
+    fn a_settings_file_that_is_not_an_object_is_refused() {
+        for body in ["[1, 2, 3]", "\"a string\"", "42", "null"] {
+            let (_home, path) = scratch(Some(body));
+
+            let r = install(&path, Path::new(EXE));
+
+            assert!(
+                matches!(r, Err(Refusal::HooksNotAnObject { .. })),
+                "{body} must be refused rather than panicking or being \
+                 replaced -- got {r:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+            // And the same for status, which must say cannot-tell rather
+            // than reporting the hook absent.
+            assert!(
+                matches!(
+                    status(&path, Path::new(EXE)),
+                    Status::NotInstalled | Status::CannotTell(_)
+                ),
+                "status must not claim anything is installed in {body}"
+            );
+        }
+    }
+
     /// A matcher whose `hooks` key is not an array is refused, and refused
     /// BEFORE anything is written -- including the other event, which
     /// `install` would otherwise have already appended to.
