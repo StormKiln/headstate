@@ -71,7 +71,7 @@
 //! observed position is 6. But the human-readable name lives in an
 //! `ai-title` record, which is written only once Claude has produced one
 //! -- measured median position 10, p95 18, **deepest 33**, present for
-//! 1,428 of 1,430 sessions.
+//! 1,434 of 1,436 sessions.
 //!
 //! 40 therefore has 7 records of headroom over the worst real case and
 //! covers both fields in one pass. It is a bound rather than a whole-file
@@ -88,24 +88,30 @@
 //! Measured by `tests::real_corpus` against the real tree, release build:
 //!
 //! ```text
-//! sessions found            1430
+//! sessions found            1436
 //! subagent .jsonl skipped   1370
-//! elapsed              178-232 ms warm, ~1040 ms cold
-//! metadata beyond record 1  1430
+//! elapsed              192-252 ms warm, ~1040 ms cold
+//! metadata beyond record 1  1436
 //! deepest cwd record           6
-//! with an ai-title name     1428
-//! with a last-activity time 1427
+//! with an ai-title name     1434
+//! with a last-activity time 1436   <- every one, after the tail retry
 //! ```
 //!
+//! (The session count climbs as the machine is used -- it was 1,430 a few
+//! hours earlier, and #914 quotes 1,433. Only the ratios and the
+//! per-session facts are stable, which is why `real_corpus` asserts those
+//! and prints the counts rather than asserting them.)
+//!
 //! Both numbers are stated because only one of them is the honest answer
-//! to "what will the user feel". 178-232 ms is the warm-page-cache figure
+//! to "what will the user feel". 192-252 ms is the warm-page-cache figure
 //! over three consecutive runs; the FIRST scan after boot reads 881 MB of
 //! cold file tails and takes about a second. The startup rescan is
 //! therefore a ~1s background cost once per boot, not 200 ms, and quoting
 //! only the warm figure would be picking the flattering measurement.
 //!
 //! Either way it is fast because each file costs a bounded head read plus
-//! one 16 KB tail seek and -- see the pre-filter in [`extract`] -- most
+//! one 16 KB tail seek (rarely a second, wider one -- see
+//! [`TAIL_BYTES_RETRY`]) and -- see the pre-filter in [`extract`] -- most
 //! records are never handed to the JSON parser at all. At that price a
 //! complete rescan at startup and behind a button is simpler AND more
 //! correct than any cache: there is no stored offset to invalidate, no
@@ -144,14 +150,47 @@ use std::path::{Path, PathBuf};
 /// into an 881 MB corpus.
 const HEAD_RECORDS: usize = 40;
 
-/// How much of the tail to read for the last-activity timestamp.
+/// How much of the tail to read for the last-activity timestamp, on the
+/// first attempt.
 ///
 /// Transcript records run from a few hundred bytes to a few KB, so 16 KB
 /// reaches back several records -- enough that the trailing ones carrying
-/// no `timestamp` do not hide the ones that do. Measured: a timestamp was
-/// recovered for 1,427 of 1,430 sessions; the other 3 genuinely have none
-/// anywhere in their tail and get [`None`].
+/// no `timestamp` (`atis-latch`, `ai-title`, `last-prompt`) do not hide
+/// the ones that do. It dates all but 3 of the 1,436 real sessions.
+///
+/// The other 3 are why [`TAIL_BYTES_RETRY`] exists; see it for the
+/// measurement.
 const TAIL_BYTES: u64 = 16 * 1024;
+
+/// The second, wider tail read, for a transcript whose last timestamped
+/// record is enormous.
+///
+/// ONE record can be far larger than the whole first window. Measured on
+/// the real corpus, the 3 sessions that a 16 KB tail cannot date:
+///
+/// ```text
+/// record  -1  atis-latch     83 B     no timestamp
+/// record  -2  ai-title      122 B     no timestamp
+/// record  -3  last-prompt   343 B     no timestamp
+/// record  -4  attachment  92897 B     HAS the timestamp, 93 KB from the end
+/// ```
+///
+/// A 92 KB `attachment` pushes the newest usable timestamp past any
+/// window a first read would sensibly use. The design attributed these 3
+/// to having no timestamp at all; they have one, and reading 16 KB is
+/// simply not enough to see it.
+///
+/// That distinction matters rather than being a curiosity: an undated
+/// session sorts last and reads as ancient, so the cost of giving up too
+/// early is three real sessions looking dead in the list. 256 KB clears
+/// the observed worst case by better than 2x and is paid only by the
+/// ~0.2% of files that need it -- the common case still does one 16 KB
+/// read.
+///
+/// Bounded, not unbounded, because the honest answer for a transcript
+/// whose tail is bigger than this is still [`None`]: the corpus is 881 MB
+/// and a whole-file read to date one row is the wrong trade.
+const TAIL_BYTES_RETRY: u64 = 256 * 1024;
 
 /// Whether one JSON line looks like a Claude transcript record at all.
 ///
@@ -418,9 +457,9 @@ pub fn extract(path: &Path) -> Result<Transcript, String> {
             // out of it, and measured 738 ms for the corpus.
             //
             // A substring test over the raw line first drops that to
-            // 178-232 ms (`real_corpus`, release, warm) for
-            // byte-identical output -- same 1,430 sessions, same 1,428
-            // titles, same 1,427 timestamps -- because a record with no
+            // 192-252 ms (`real_corpus`, release, warm) for
+            // byte-identical output -- same session count, same titles,
+            // same timestamps -- because a record with no
             // `"cwd"`, no `"aiTitle"` and no needed `"timestamp"` is
             // never parsed at all.
             //
@@ -459,49 +498,61 @@ pub fn extract(path: &Path) -> Result<Transcript, String> {
         }
     }
 
-    // --- tail: the last TAIL_BYTES, for the newest timestamp.
+    // --- tail: the newest timestamp, from a seek rather than a whole
+    // read, because the corpus is 881 MB.
     //
-    // A seek rather than a read-to-end because the corpus is 881 MB and
-    // the single largest transcript is many MB on its own. The last
-    // record with a `timestamp` wins; trailing records without one (a
-    // bare `ai-title`, for instance) are skipped rather than making the
-    // session look undated.
-    let start = size.saturating_sub(TAIL_BYTES);
-    if file.seek(SeekFrom::Start(start)).is_ok() {
-        let mut buf = Vec::new();
-        if file.read_to_end(&mut buf).is_ok() {
-            let text = String::from_utf8_lossy(&buf);
-            let mut lines: &str = &text;
-            if start > 0 {
-                // The seek almost certainly landed mid-record. Drop
-                // everything up to the first newline: a half record is
-                // unparseable anyway, and keeping it would mean the
-                // partial-JSON case has to be reasoned about.
-                if let Some(nl) = lines.find('\n') {
-                    lines = &lines[nl + 1..];
-                } else {
-                    lines = "";
-                }
-            }
-            for line in lines.lines().rev() {
-                // Same pre-filter as the head scan, for the same reason:
-                // a trailing `ai-title` or tool record with no timestamp
-                // is not worth a full parse.
-                if !line.contains("\"timestamp\"") {
-                    continue;
-                }
-                let Ok(rec) = serde_json::from_str::<serde_json::Value>(line) else {
-                    continue;
-                };
-                if let Some(ts) = field(&rec, "timestamp") {
-                    out.last_activity_at = Some(ts);
-                    break;
-                }
-            }
-        }
+    // Two attempts, because one record can be bigger than the first
+    // window -- see [`TAIL_BYTES_RETRY`]. The retry is skipped entirely
+    // when the file is already no larger than the first window, since
+    // re-reading the same bytes cannot produce a different answer.
+    out.last_activity_at = newest_timestamp(&mut file, size, TAIL_BYTES);
+    if out.last_activity_at.is_none() && size > TAIL_BYTES {
+        out.last_activity_at = newest_timestamp(&mut file, size, TAIL_BYTES_RETRY);
     }
 
     Ok(out)
+}
+
+/// The newest `timestamp` within the last `window` bytes of `file`.
+///
+/// Returns [`None`] when no COMPLETE record in that window carries one --
+/// which is a statement about the window, not about the file, and is why
+/// [`extract`] retries with a wider one before believing it.
+fn newest_timestamp(file: &mut std::fs::File, size: u64, window: u64) -> Option<String> {
+    let start = size.saturating_sub(window);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).ok()?;
+
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: &str = &text;
+    if start > 0 {
+        // The seek almost certainly landed mid-record. Drop everything up
+        // to the first newline: a half record is unparseable anyway, and
+        // keeping it would mean reasoning about partial JSON.
+        lines = match lines.find('\n') {
+            Some(nl) => &lines[nl + 1..],
+            None => "",
+        };
+    }
+
+    // Last timestamped record wins. Trailing records without one
+    // (`atis-latch`, `ai-title`, `last-prompt`) are skipped rather than
+    // making the session look undated.
+    for line in lines.lines().rev() {
+        // Same pre-filter as the head scan, for the same reason: a record
+        // with no timestamp is not worth a full parse.
+        if !line.contains("\"timestamp\"") {
+            continue;
+        }
+        let Ok(rec) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some(ts) = field(&rec, "timestamp") {
+            return Some(ts);
+        }
+    }
+    None
 }
 
 /// Scan every session transcript under `root`.
@@ -829,6 +880,95 @@ mod tests {
         );
         // And the head fields still came from the head, unaffected.
         assert_eq!(got.cwd.as_deref(), Some("/Users/acme/code/widget"));
+    }
+
+    /// A 92 KB record does not make a dated session look undated.
+    ///
+    /// The real case, reproduced from the 3 sessions of 1,430 that a 16 KB
+    /// tail could not date. Their shape, measured:
+    ///
+    /// ```text
+    /// record -1  atis-latch     83 B   no timestamp
+    /// record -2  ai-title      122 B   no timestamp
+    /// record -3  last-prompt   343 B   no timestamp
+    /// record -4  attachment  92897 B   HAS the timestamp
+    /// ```
+    ///
+    /// The design called these three "no timestamp anywhere". They have
+    /// one; 16 KB simply cannot see past a 92 KB record. Giving up would
+    /// sort three live sessions to the bottom of the list as undated,
+    /// which is the absent-is-not-zero failure in miniature -- an unread
+    /// value rendered as a fact about the session.
+    #[test]
+    fn a_huge_record_does_not_hide_the_last_activity() {
+        let t = Tmp::new("hugerecord");
+        let f = t.path().join("slug").join("s1.jsonl");
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        let mut fh = std::fs::File::create(&f).unwrap();
+        for l in realistic() {
+            writeln!(fh, "{l}").unwrap();
+        }
+        // The timestamped giant, larger than TAIL_BYTES all by itself.
+        let pad = "z".repeat(92_000);
+        writeln!(
+            fh,
+            r#"{{"type":"attachment","sessionId":"s1","timestamp":"2026-09-12T17:30:22Z","pad":"{pad}"}}"#
+        )
+        .unwrap();
+        // The three untimestamped trailers that follow it in the real files.
+        writeln!(fh, r#"{{"type":"last-prompt","sessionId":"s1"}}"#).unwrap();
+        writeln!(
+            fh,
+            r#"{{"type":"ai-title","aiTitle":"Late title","sessionId":"s1"}}"#
+        )
+        .unwrap();
+        writeln!(fh, r#"{{"type":"atis-latch","sessionId":"s1"}}"#).unwrap();
+        drop(fh);
+
+        let got = extract(&f).unwrap();
+        assert_eq!(
+            got.last_activity_at.as_deref(),
+            Some("2026-09-12T17:30:22Z"),
+            "the retry window must reach past a 92 KB record"
+        );
+        // And the giant really was beyond the first window, so this test
+        // exercises the retry rather than passing by accident.
+        assert!(std::fs::metadata(&f).unwrap().len() > TAIL_BYTES + 16 * 1024);
+    }
+
+    /// Past the RETRY window, undated is the honest answer.
+    ///
+    /// The retry is bounded on purpose: the corpus is 881 MB and reading a
+    /// whole file to date one row is the wrong trade. So this asserts the
+    /// giving-up point exists and is not silently unbounded.
+    #[test]
+    fn past_the_retry_window_undated_is_honest() {
+        let t = Tmp::new("pastretry");
+        let f = t.path().join("slug").join("s1.jsonl");
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        let mut fh = std::fs::File::create(&f).unwrap();
+        writeln!(
+            fh,
+            r#"{{"type":"user","cwd":"/tmp/x","sessionId":"s1","timestamp":"2026-01-01T00:00:00Z"}}"#
+        )
+        .unwrap();
+        // Bigger than TAIL_BYTES_RETRY, and carrying no timestamp itself.
+        let pad = "z".repeat(TAIL_BYTES_RETRY as usize + 4096);
+        writeln!(
+            fh,
+            r#"{{"type":"attachment","sessionId":"s1","pad":"{pad}"}}"#
+        )
+        .unwrap();
+        drop(fh);
+
+        let got = extract(&f).unwrap();
+        assert_eq!(
+            got.last_activity_at, None,
+            "beyond the bound, undated is honest -- not a fabricated time"
+        );
+        // The head still found what it could: the fields are independent.
+        assert_eq!(got.cwd.as_deref(), Some("/tmp/x"));
+        assert_eq!(got.first_seen_at.as_deref(), Some("2026-01-01T00:00:00Z"));
     }
 
     /// A file that opens but says nothing is not an error.
