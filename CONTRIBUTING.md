@@ -126,6 +126,50 @@ fired on CI's 1.98 while passing locally on 1.93.1. A clean local `make
 lint` is necessary but not sufficient; if CI disagrees, check
 `rustc --version` before assuming a flake.
 
+## When `main` goes red
+
+A red `main` is a stop. It blocks everyone, and it blocks tagging — so the
+first question is not "whose change was it" but "is anyone about to
+release".
+
+**Reproduce before you re-run.** A re-run is evidence only when the failure
+does *not* reproduce. If it reproduces locally, it is a bug and the re-run
+is how it gets shipped anyway. Two examples from one day:
+
+- `a_seeded_budget_can_actually_refuse` reproduced at **4 failures in 6
+  local runs** (#868). It had also *passed* on one `main` commit, so a
+  green re-run was always available and would have proved nothing.
+- `App.test.tsx:246` did **not** reproduce in 5 local runs (#898) — so the
+  re-run was justified, and the work was to find out *why* CI differed. It
+  races a lazy import that resolves in single-digit milliseconds locally.
+
+The distinction is the whole rule: re-running a reproducible failure hides
+it; re-running an unreproducible one is a legitimate step, and the next
+step is to explain the difference.
+
+**Capture the log before it disappears.** A superseding push cancels the
+run, and a cancelled run's logs can become unreadable. If you re-run first,
+you may destroy the only evidence.
+
+**A flake that blocks a tag gets an issue, not a shrug.** Four were fixed
+in one cycle, and two of them had doc comments *naming the hazard they then
+committed* (#861, #868). `invariants.rs` now catches that shape
+mechanically. Fix the assertion so it tests the property rather than a
+proxy — do not add a retry, and do not raise a timeout. A retried race
+check is a race check that no longer detects races.
+
+**Revert or fix forward?** Fix forward if the cause is understood and the
+fix is one cycle away. Otherwise revert — every minute red is a minute
+nobody else can merge. Branch protection requires branches be current with
+`main`, so a red `main` also means every open PR needs another cycle once
+it clears.
+
+**A merged release epic is not a shipped release.** The tag is the only
+source of truth (see below). v5.12.0's work was merged and never tagged,
+and the next person to pull "5.12" got the old build with every fixed bug
+apparently still broken. Whoever merges the last PR owns cutting the tag,
+or says out loud that they are not.
+
 ## Cutting a release
 
 Releases are driven entirely by tags. There is nothing to click and no

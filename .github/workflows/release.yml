@@ -663,12 +663,68 @@ jobs:
           # to the same bundle.
           add_platform "darwin-aarch64" "Headstate-${GITHUB_REF_NAME}.app.tar.gz"
           add_platform "darwin-x86_64"  "Headstate-${GITHUB_REF_NAME}.app.tar.gz"
-          for f in release-assets/*_x64-setup.exe; do
-            [ -f "$f" ] && add_platform "windows-x86_64" "$(basename "$f")"
-          done
-          for f in release-assets/*_amd64.AppImage; do
-            [ -f "$f" ] && add_platform "linux-x86_64" "$(basename "$f")"
-          done
+          # Exactly one bundle per platform key, asserted before the call
+          # rather than discovered afterwards (#896).
+          #
+          # The globbed platforms previously ran `add_platform` once PER
+          # MATCH, so two matching files appended the same key twice and
+          # `latest.json` was published with a duplicate
+          # `"windows-x86_64"` -- exit 0, nothing downstream objecting.
+          # Verified by running the extracted loop against two `.exe`
+          # fixtures before fixing it.
+          #
+          # Nothing caught it. `python3 -m json.tool` accepts duplicate
+          # keys (also verified), and #884's assertion below is a
+          # substring test for `"windows-x86_64":` -- the key IS present,
+          # twice, so it reports nothing. #884 guards the MISSING
+          # direction; this is the duplicated one, the mirror image.
+          #
+          # It matters because the two entries can point at different
+          # bundles with different signatures, and which one an updater
+          # honours is then whatever its JSON parser happens to do with a
+          # repeated key -- last-wins, first-wins or an error, by
+          # implementation. A release could hand half its Windows users a
+          # bundle whose signature belongs to the other file.
+          #
+          # The realistic trigger is the same one #884 names: Tauri's
+          # NSIS output gaining a variant, an `en-US` locale infix
+          # alongside a plain name, or a per-installer-type split. Both
+          # land in `release-assets/` and both match `*_x64-setup.exe`.
+          #
+          # `find` rather than a glob, for a measured reason. With
+          # `nullglob` off -- the default, and this shell never sets it --
+          # a `for f in <pattern>` with no matches still runs its body
+          # ONCE with the pattern as a literal. The old body survived that
+          # only because a failing `[ -f ] && cmd` is the one construct
+          # `set -e` exempts; written as a bare `[ -f "$f" ]` the same
+          # loop exits 1 immediately, and as the last command of a script
+          # it exits 1 with no message at all. Both confirmed by probe.
+          # Counting with `find` avoids the whole trap instead of
+          # tiptoeing around it.
+          one_bundle() {
+            local key="$1" pattern="$2"
+            local matches=()
+            while IFS= read -r f; do matches+=("$f"); done < <(
+              find release-assets -maxdepth 1 -type f -name "$pattern" | sort
+            )
+            if [ ${#matches[@]} -gt 1 ]; then
+              echo "Ambiguous bundle for ${key}: ${pattern} matched ${#matches[@]} files." >&2
+              printf '  %s\n' "${matches[@]}" >&2
+              echo "One bundle per platform: a second match publishes a duplicate" >&2
+              echo "\"${key}\" key in latest.json, and which entry an updater" >&2
+              echo "honours is then whatever its JSON parser does (#896)." >&2
+              exit 1
+            fi
+            # Zero matches is NOT failed here: that is #884's question,
+            # and its assertion below reports the whole missing set at
+            # once rather than dying on the first gap.
+            if [ ${#matches[@]} -eq 1 ]; then
+              add_platform "$key" "$(basename "${matches[0]}")"
+            fi
+          }
+
+          one_bundle "windows-x86_64" '*_x64-setup.exe'
+          one_bundle "linux-x86_64" '*_amd64.AppImage'
 
           if [ -z "$MANIFEST_PLATFORMS" ]; then
             echo "No signed updater bundles; not publishing a manifest." >&2
@@ -727,7 +783,51 @@ jobs:
             "$VERSION" \
             "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             "${MANIFEST_PLATFORMS%,}" > release-assets/latest.json
-          python3 -m json.tool release-assets/latest.json > /dev/null
+          # Validate the manifest that is actually about to be published,
+          # and reject a REPEATED key rather than only malformed JSON
+          # (#896).
+          #
+          # `python3 -m json.tool` used to be this line, and it accepts
+          # duplicate keys silently -- verified, so it was never a check
+          # on the defect above. Neither is #884's assertion, which asks
+          # whether each key appears and is satisfied by a key that
+          # appears twice.
+          #
+          # Kept even though `one_bundle` now closes the only route to a
+          # duplicate that we know of. That is the point of asking here
+          # instead of only there: this validates the OUTPUT against the
+          # defect class, so a future third way of producing a repeated
+          # key -- a new platform appended by hand, a key templated from a
+          # matrix value, `add_platform` called twice for one platform the
+          # way macOS deliberately is for two -- fails at publication
+          # rather than reaching users. Input assertions cover the routes
+          # you thought of; this covers the shape that is wrong.
+          #
+          # Exercised directly against a hand-written duplicate manifest
+          # rather than through the pipeline, since `one_bundle` makes it
+          # unreachable from the glob: it rejects a repeat at any nesting
+          # level, `platforms` or top level, and passes a clean manifest.
+          #
+          # The malformed-JSON check `json.tool` was here for is NOT lost:
+          # `JSONDecodeError` subclasses `ValueError`, so the one `except`
+          # catches a truncated manifest and an unescaped quote as well as
+          # a duplicate key. Confirmed against all three.
+          python3 - release-assets/latest.json <<'VALIDATE_MANIFEST'
+          import collections, json, sys
+
+          def no_dupes(pairs):
+              counts = collections.Counter(k for k, _ in pairs)
+              dupes = sorted(k for k, n in counts.items() if n > 1)
+              if dupes:
+                  raise ValueError("duplicate key(s): " + ", ".join(dupes))
+              return dict(pairs)
+
+          path = sys.argv[1]
+          try:
+              json.loads(open(path).read(), object_pairs_hook=no_dupes)
+          except ValueError as e:
+              sys.exit(f"{path} is not a publishable updater manifest: {e}")
+          VALIDATE_MANIFEST
           ASSETS+=("release-assets/latest.json")
 
           # Idempotent: a rerun after a partial failure -- exactly what
