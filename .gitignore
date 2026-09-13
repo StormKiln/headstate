@@ -126,3 +126,8 @@ src-mobile/gen/android/keystore.properties
 # scripts; #556 committed one by accident.
 __pycache__
 *.pyc
+
+# cargo-mutants output (see the `mutants` target); `--in-place` leaves it
+# in the source tree rather than a temp dir.
+mutants.out/
+mutants.out.old/
