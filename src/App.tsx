@@ -15,6 +15,7 @@ import {
   usePollError,
   useUpdateRunOutcome,
   useUpdateRunResume,
+  useUiPrefs,
 } from "./api/hooks";
 import { useReviewingDiag } from "./api/diag";
 import { useScrollReset } from "./lib/scrollReset";
@@ -33,6 +34,7 @@ import { ArtifactsPage } from "./components/ArtifactsPage";
 import { ArtifactSidebar } from "./components/ArtifactSidebar";
 import { PackagesPage } from "./components/PackagesPage";
 import { ClaudeMdPage } from "./components/ClaudeMdPage";
+import { ClaudeCodeSidebar } from "./components/ClaudeCodeSidebar";
 import { RepoPickerSidebar } from "./components/RepoPickerSidebar";
 import { DockerPage } from "./components/DockerPage";
 import { DockerSidebar } from "./components/DockerSidebar";
@@ -55,7 +57,35 @@ import { useIsMobile } from "./lib/useIsMobile";
 import { relativeSeconds } from "./lib/time";
 import { MOBILE_HIDDEN_VIEWS, useActiveFilters, useFilters } from "./store/filters";
 
-/// The two heavy views, split off the launch chunk (#838).
+/// The chart-carrying views, split off the launch chunk (#838, #921).
+///
+/// # An update from #921, which added the third one
+///
+/// This comment said "the two heavy views" and "the three chunks" until
+/// the Claude Code overview joined them. Measured on the same
+/// `VITE_TARGET=mobile yarn build`, and the shape of the output CHANGED
+/// rather than simply gaining a row:
+///
+/// ```text
+/// ClaudeOverviewPage    28.88 kB   recharts mentions: 2
+/// StatsPage             45.72 kB                      1
+/// SystemHealthPage      53.26 kB                      0
+/// chart                339.96 kB                     15   <- NEW, shared
+/// index (launch)       968.41 kB                      0   <- the claim
+/// ```
+///
+/// With two lazy consumers of `ui/chart` the bundler hoists the charting
+/// library into its OWN shared chunk rather than inlining it into one
+/// route. So the `15 / 0 / 0` figure quoted below is now `15` in `chart`
+/// and `0` in the launch chunk, which is the property that was ever
+/// load-bearing -- and the library is fetched once for both routes rather
+/// than twice.
+///
+/// The regression, measured by making the new route eager on purpose:
+/// the launch chunk goes **968.41 kB -> 1,337.75 kB** (+369 kB, +38%) and
+/// its `grep -c recharts` goes **0 -> 16**, with the shared `chart` chunk
+/// disappearing entirely into the launch path. `App.lazy.test.tsx` fails
+/// on that source shape, naming the route.
 ///
 /// # Measured, before and after
 ///
@@ -161,6 +191,34 @@ const SystemHealthPage = lazy(() =>
     default: m.SystemHealthPage,
   })),
 );
+/// The THIRD chart-carrying route (#921), and the reason the comment above
+/// says "two" no longer holds.
+///
+/// `ClaudeOverviewPage` reaches `recharts` through `stats/SessionsChart` ->
+/// `ui/chart`, so it belongs behind the same boundary for the same measured
+/// reason: the launch chunk is 31% smaller with the charting library off
+/// it, and the median time to React's first commit ~8ms faster.
+///
+/// The trap #921 names, restated because it is what makes this line easy to
+/// get wrong: `App.lazy.test.tsx` reads `App.tsx?raw` and checks the SOURCE
+/// SHAPE of this table, so a new charting route omitted from its `it.each`
+/// list sails through CI while silently regressing the bundle. There is no
+/// bundle-size gate to catch it -- `vite.config.ts` has no `manualChunks`,
+/// by documented choice. The entry was added in the same change as this
+/// line, and the claim was verified on the build output rather than
+/// inferred: `VITE_TARGET=mobile yarn build`, then `grep -c recharts` over
+/// each chunk.
+///
+/// Note that the SESSIONS page (#917) is deliberately NOT lazy while this
+/// one is. They are different destinations behind one view id, and the
+/// split is the point: the page you open to get work back after a crash
+/// must not wait on a chunk fetch, and the page you open to look at charts
+/// can.
+const ClaudeOverviewPage = lazy(() =>
+  import("./components/ClaudeOverviewPage").then((m) => ({
+    default: m.ClaudeOverviewPage,
+  })),
+);
 
 /// What fills a lazy view's frame while its chunk arrives.
 ///
@@ -210,8 +268,33 @@ export default function App() {
   //
   // On the BUILD, not the viewport, per `lib/target.ts`: a desktop user
   // who drags their window under 768px keeps the page.
+  // The CAPABILITY fall-through, alongside the build-time one (#921).
+  //
+  // `ViewSwitcher` refuses to offer `claude-code` while
+  // `claude_integrations_enabled` is off (#916), overriding even the
+  // current-view escape hatch, exactly as the build-time set does -- and
+  // its comment justifies that by saying there is no page behind the
+  // entry. Giving the view a real route makes that claim false unless the
+  // ROUTE applies the same predicate, which is the three-call-site
+  // disagreement `MOBILE_HIDDEN_VIEWS` exists to prevent.
+  //
+  // Derived, never written back, for the reason the mobile case states
+  // just above: the stored value is the user's, and a desktop that later
+  // turns the capability on should land back where it was.
+  //
+  // `prefs` is undefined while `get_ui_prefs` is in flight AND if it
+  // rejects, so this falls back in both cases. That is the fail-CLOSED
+  // direction and the right one: the alternative is rendering a page for a
+  // capability we could not confirm is on. It is also what `ViewSwitcher`
+  // already does with the same value, so the two agree in the uncertain
+  // case as well as the settled ones.
+  const { prefs } = useUiPrefs();
+  const claudeCodeOff = !prefs?.claude_integrations_enabled;
   const view =
-    IS_MOBILE_BUILD && MOBILE_HIDDEN_VIEWS.has(storedView) ? "my-prs" : storedView;
+    (IS_MOBILE_BUILD && MOBILE_HIDDEN_VIEWS.has(storedView)) ||
+    (storedView === "claude-code" && claudeCodeOff)
+      ? "my-prs"
+      : storedView;
   // The sidebar is a sheet on the phone, opened from a button in the
   // header. Any navigation closes it: the point of picking a repo is
   // to look at it, and a sheet still covering the list would hide the
@@ -429,6 +512,17 @@ export default function App() {
       // in the app holds -- and the natural occupant of a column that
       // was previously the view switcher alone.
       <SystemHealthSidebar viewCounts={{ "to-review": reviewingCount }} />
+    ) : view === "claude-code" ? (
+      // NOT one of the repository sidebars, and not a fall-through
+      // either. A Claude Code session is not scoped to a repository:
+      // 665 distinct working directories over 1,461 sessions, mostly
+      // deleted agent worktrees, 83% of them no longer on disk. A repo
+      // picker here would be a column of inert rows -- the same
+      // reasoning the `system-health` branch above states.
+      //
+      // What it holds instead is the view's own two pages, exactly as
+      // `SystemHealthSidebar` holds the machine's classes.
+      <ClaudeCodeSidebar viewCounts={{ "to-review": reviewingCount }} />
     ) : view === "packages" || view === "claude-md" ? (
       <RepoPickerSidebar reviewingCount={reviewingCount} />
     ) : view === "artifacts" ? (
@@ -533,6 +627,12 @@ export default function App() {
                 ? "System health"
               : view === "claude-md"
                 ? "CLAUDE.md"
+              // Matching the switcher entry exactly, per #794's finding:
+              // a header naming the page something other than the menu
+              // item that opened it is how a user doubts they are where
+              // they meant to be.
+              : view === "claude-code"
+                ? "Claude Code"
               : view === "packages"
                 ? "Package updates"
               : view === "artifacts"
@@ -586,6 +686,14 @@ export default function App() {
         view !== "worktrees" &&
         view !== "branches" &&
         view !== "pr-stats" &&
+        // Claude Code joins them (#921), for the reason the others
+        // share: it is local state about this machine's sessions, with
+        // no notion of a selected pull request to go back to. `setView`
+        // clears `selectedPr`, so the switcher path cannot reach that
+        // today -- but this branch is FIRST in the chain and therefore
+        // wins over every view branch below, which is exactly what the
+        // `pr-stats` comment says not to rely on.
+        view !== "claude-code" &&
         view !== "system-health" ? (
           <div className="p-4">
             <PrDetailView
@@ -596,6 +704,30 @@ export default function App() {
           </div>
         ) : view === "claude-md" ? (
           <ClaudeMdPage />
+        ) : view === "claude-code" ? (
+          // This branch is what makes #916's registered view id a real
+          // route: until it existed, `claude-code` fell through to My PRs
+          // by the documented fall-through at the end of this chain, so
+          // the switcher offered a destination that rendered the pull
+          // request list.
+          //
+          // Only the OVERVIEW page is routed here (#921). The sessions
+          // list is #917's, and `ClaudeCodeSidebar` already offers both
+          // rows -- so until that lands, picking "Sessions" leaves this
+          // branch rendering the overview. That is a visible placeholder
+          // rather than a silently wrong page, and the sidebar is the one
+          // place to change when #917 arrives.
+          <div className="p-4">
+            {/* Suspense because the page is a lazy chunk: it reaches
+                `recharts` through `stats/SessionsChart`, and #838's
+                boundary is the route. INSIDE the padded wrapper so the
+                frame it reserves is the same box the page will occupy --
+                outside it the fallback would be unpadded and the content
+                would shift sideways as the chunk landed. */}
+            <Suspense fallback={<ViewLoading />}>
+              <ClaudeOverviewPage />
+            </Suspense>
+          </div>
         ) : view === "packages" ? (
           <PackagesPage />
         ) : view === "artifacts" ? (

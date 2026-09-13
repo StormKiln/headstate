@@ -19,6 +19,7 @@ import type {
   Branch,
   DeleteOutcome,
   ClaudeFile,
+  ClaudeOverview,
   ProjectReport,
   UpdateRequest,
   UpdateFilter,
@@ -700,6 +701,26 @@ export const scanClaudeMd = (repoPath: string) =>
 
 /// The text of one file, for rendering.
 export const readClaudeMd = (path: string) => call<string>("read_claude_md", { path });
+
+/// Re-read `~/.claude/projects` and upsert every session into the cache.
+///
+/// A FULL rescan, every time, and idempotent by construction -- it upserts
+/// on `session_id`. Rust side: `src-tauri/src/claude/store.rs` (#914).
+///
+/// The return value is #914's `Imported`, whose unreadable counts are the
+/// point of it. This wrapper types it as `unknown` deliberately: #917 is
+/// the change that adds a `ClaudeImported` interface and the hook that
+/// renders those counts, and declaring a second shape for the same payload
+/// here would be two definitions to keep in step. The overview needs only
+/// to know the rescan SUCCEEDED, so it reads nothing out of the body.
+export const claudeImportTranscripts = () =>
+  call<unknown>("claude_import_transcripts");
+
+/// Aggregates for the Claude Code overview page (#921).
+///
+/// Two SELECTs over the cache plus a stat per session and one directory
+/// listing; measured at 7ms for 1,461 sessions. Writes nothing.
+export const claudeOverview = () => call<ClaudeOverview>("claude_overview");
 
 // ---------------------------------------------------------------------
 // The Claude Code hook installer (#915). Rust side:
