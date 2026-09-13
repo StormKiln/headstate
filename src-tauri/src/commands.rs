@@ -3271,14 +3271,6 @@ pub async fn claude_import_transcripts(
     .map_err(|e| e.to_string())?
 }
 
-/// The settings key holding the handoff file's byte offset.
-///
-/// Persisted rather than held in memory so a relaunch does not re-read
-/// the whole file: re-reading is harmless (every record upserts on a key
-/// built from its own fields) but it is wasted work on every start, and a
-/// user who has been running the hook for months would re-parse all of it.
-const HANDOFF_OFFSET_KEY: &str = "claude_handoff_offset";
-
 /// What one pass over both live sources found (#913, epic #910).
 ///
 /// The two halves are returned together because they are ONE answer to
@@ -3354,7 +3346,7 @@ pub async fn claude_poll_live(app: tauri::AppHandle) -> Result<ClaudeLiveState, 
         // no-op by construction, whereas guessing a non-zero offset would
         // skip records permanently.
         let offset = crate::claude::handoff::Offset(
-            crate::store::settings::get::<u64>(&conn, HANDOFF_OFFSET_KEY)
+            crate::store::settings::get::<u64>(&conn, settings::keys::CLAUDE_HANDOFF_OFFSET)
                 .unwrap_or(None)
                 .unwrap_or(0),
         );
@@ -3367,7 +3359,11 @@ pub async fn claude_poll_live(app: tauri::AppHandle) -> Result<ClaudeLiveState, 
         // Persisted AFTER the consume committed. The reverse order would
         // advance the offset past records that never reached the
         // database, and nothing would ever read them again.
-        if let Err(e) = crate::store::settings::set(&conn, HANDOFF_OFFSET_KEY, &handoff.offset) {
+        if let Err(e) = crate::store::settings::set(
+            &conn,
+            settings::keys::CLAUDE_HANDOFF_OFFSET,
+            &handoff.offset,
+        ) {
             // Not a failure of the pass: the records are stored. The cost
             // is that the next pass re-reads them, which the upserts make
             // a no-op. Said out loud rather than swallowed.
