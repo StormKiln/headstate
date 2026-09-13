@@ -205,6 +205,7 @@ pub fn run() {
             commands::read_claude_md,
             commands::claude_import_transcripts,
             commands::claude_poll_live,
+            commands::claude_overview,
             commands::claude_hooks_status,
             commands::claude_install_hooks,
             commands::claude_reinstall_hooks,

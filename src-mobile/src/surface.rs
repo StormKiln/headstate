@@ -121,6 +121,15 @@ pub const SURFACE: &[(&str, Class)] = &[
     // own -- it runs no Claude sessions -- which is exactly why it asks
     // the desktop. See the desktop table for why this is a Read.
     ("claude_poll_live", Class::Read),
+    // The DESKTOP's Claude Code overview aggregates (#921). Read: two
+    // SELECTs over Headstate's own cache plus a directory listing, and it
+    // writes nothing at all -- not even the cache, unlike the rescan above.
+    //
+    // The strongest away-from-desk case in this whole group: the page's
+    // headline figure is how many sessions are resumable, which is
+    // "how much work is waiting for me back at the laptop". See the
+    // desktop copy for the full argument.
+    ("claude_overview", Class::Read),
     // Whether the DESKTOP's hooks are installed (#915). Read: one file
     // read, no side effects, and "is that desktop recording?" is a real
     // away-from-desk question.

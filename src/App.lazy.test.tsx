@@ -31,6 +31,28 @@ import { describe, expect, it } from "vitest";
 /// what importing `App` would erase -- a `lazy()` call and a static import
 /// both hand you a component. Reading the source is the only way to see the
 /// difference from inside a test.
+/// Every route that must stay off the launch chunk, and the specifier it
+/// is loaded by.
+///
+/// Hoisted out of the `it.each` so the Suspense-count assertion below can
+/// be derived from its LENGTH rather than from a literal. A hard-coded
+/// count keeps passing when a route is added without a boundary, which is
+/// a crash on first navigation to that view.
+const LAZY_ROUTES: [name: string, specifier: string][] = [
+  ["StatsPage", "./components/StatsPage"],
+  ["SystemHealthPage", "./components/SystemHealthPage"],
+  // #921. The entry that this guard's own design makes easy to forget: it
+  // reads `App.tsx?raw` and checks SOURCE SHAPE, so a new charting route
+  // absent from this table is not merely untested -- it passes, while the
+  // launch chunk silently grows by the charting library. There is no
+  // bundle-size gate behind this one (`vite.config.ts` has no
+  // `manualChunks`, by documented choice), so this list IS the gate.
+  //
+  // `ClaudeOverviewPage` reaches `recharts` through `stats/SessionsChart`
+  // -> `ui/chart`, which is the same path `StatsPage` reaches it by.
+  ["ClaudeOverviewPage", "./components/ClaudeOverviewPage"],
+];
+
 describe("the launch chunk", () => {
   const app = appSource;
 
@@ -38,10 +60,7 @@ describe("the launch chunk", () => {
   ///
   /// Named per route rather than asserted as a count, so a regression says
   /// WHICH page came back onto the launch path.
-  it.each([
-    ["StatsPage", "./components/StatsPage"],
-    ["SystemHealthPage", "./components/SystemHealthPage"],
-  ])("loads %s as its own chunk", (name, path) => {
+  it.each(LAZY_ROUTES)("loads %s as its own chunk", (name, path) => {
     // The `lazy` declaration, with the dynamic import inside it. Matched
     // together rather than separately: a `lazy` over a statically-imported
     // component compiles and renders perfectly, and splits nothing.
@@ -72,11 +91,16 @@ describe("the launch chunk", () => {
   /// navigated to, which is a crash in the one place nothing else covers.
   it("wraps each lazy route in Suspense", () => {
     const boundaries = app.match(/<Suspense\b/g) ?? [];
+    // Counted against the TABLE rather than a literal, so adding a route
+    // above raises this floor automatically. The literal `2` that stood
+    // here was correct and inert: it would have kept passing with a third
+    // lazy route added and no boundary for it, which is a crash on first
+    // navigation and nothing else covers it.
     expect(
       boundaries.length,
       "each lazy route needs its own Suspense boundary; a lazy component " +
         "with none above it throws when that view is first opened",
-    ).toBeGreaterThanOrEqual(2);
+    ).toBeGreaterThanOrEqual(LAZY_ROUTES.length);
   });
 
   /// `recharts` must not be reachable from `App.tsx` except through the

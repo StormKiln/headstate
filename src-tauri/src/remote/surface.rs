@@ -232,6 +232,22 @@ pub const SURFACE: &[(&str, Class)] = &[
     // running on the paired desktop and which crashed, which is the whole
     // of what the companion's session list shows.
     ("claude_poll_live", Class::Read),
+    // Aggregates for the Claude Code overview page (#921).
+    //
+    // `Read`, and for a narrower reason than the rescan above: it runs two
+    // SELECTs over our own cache, stats one directory per session, and
+    // lists `~/.claude/sessions`. It writes nothing anywhere -- not even
+    // to Headstate's cache, unlike `claude_import_transcripts`, which
+    // upserts.
+    //
+    // Exposed rather than `Local` on `Local`'s own stated test: could the
+    // phone act on the answer? Yes, and this is the strongest case in the
+    // set. The page's headline number is how many sessions are resumable,
+    // and "did the thing I left running on my laptop die, and how much is
+    // waiting for me?" is exactly the away-from-desk question. The action
+    // it leads to is a copy of `claude --resume <id>`, which
+    // `claudify_command` is already `Read` for.
+    ("claude_overview", Class::Read),
     // Whether the Claude Code hooks are in `~/.claude/settings.json`
     // (#915).
     //
@@ -676,6 +692,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "read_claude_md" => res(commands::read_claude_md(a.get("path")?)),
         "claude_import_transcripts" => res(commands::claude_import_transcripts(app.clone()).await),
         "claude_poll_live" => res(commands::claude_poll_live(app.clone()).await),
+        "claude_overview" => res(commands::claude_overview(app.clone()).await),
         "claude_hooks_status" => res(commands::claude_hooks_status()),
         "get_poll_interval" => ok(commands::get_poll_interval(app.state())),
         "get_worktree_dirs" => ok(commands::get_worktree_dirs(app.clone())),

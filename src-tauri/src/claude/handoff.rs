@@ -1149,18 +1149,41 @@ mod tests {
     /// Sabotage: returning `Ok(None)` for every `Err` from `metadata`
     /// makes this pass as "nothing to read" and the failure becomes
     /// invisible.
+    ///
+    /// `#[cfg(unix)]` because the only honest way to make a file
+    /// unreadable-but-present is a mode, and Windows has no equivalent we
+    /// can set from a test. An earlier version used a DIRECTORY at the
+    /// file's path as a proxy and failed on Windows for a reason worth
+    /// recording: a directory's `metadata.len()` is 0 there, so
+    /// `Offset::advance` returns `Resume::Unchanged` and `read_new`
+    /// returns `Ok` before it ever calls `File::open`. The production
+    /// code was right -- that early return is load-bearing for the common
+    /// case of a file that has not grown -- and the test was encoding one
+    /// platform's `len()` as universal. A real file with real bytes
+    /// reaches `File::open` on every platform, so what is gated here is
+    /// only the ability to set the mode. Do not "tidy" the gate away.
+    #[cfg(unix)]
     #[test]
     fn an_unreadable_file_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
         let t = tempfile::TempDir::new().unwrap();
-        // A DIRECTORY where the file should be. `metadata` succeeds, so
-        // this exercises the read path's failure rather than the
-        // NotFound arm -- which is the one that must not be swallowed.
+        // A real file, with real records in it, that we then make
+        // unreadable -- the `0600`-owned-by-root case from the doc
+        // comment above. Non-empty so `advance` sees growth and the read
+        // path is actually entered, rather than the NotFound arm, which
+        // is a different guarantee.
         let p = path_in(t.path());
-        std::fs::create_dir_all(&p).unwrap();
+        write_file(&p, &[start("s1", 100, "2026-09-13T10:00:00Z")]);
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
 
         let mut conn = db();
-        let err = consume(&mut conn, &p, Offset(0), &no_registry())
-            .expect_err("a directory is not a readable file");
+        let got = consume(&mut conn, &p, Offset(0), &no_registry());
+
+        // Restore before any assertion can panic and leak a file the
+        // temp dir cannot clean up.
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let err = got.expect_err("an unreadable file is not an empty read");
         assert!(
             err.contains("sessions.jsonl"),
             "the error must name the path: {err}"

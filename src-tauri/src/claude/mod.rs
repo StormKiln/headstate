@@ -37,10 +37,18 @@
 //! Nothing else in here writes to `~/.claude` at all. In particular the
 //! registry under `~/.claude/sessions/` is Claude Code's, and one of its
 //! files is rewritten by its owner every few seconds.
+//!
+//! [`overview`] (#921) is the aggregate layer for the overview page. It
+//! counts over the rows [`store`] holds and derives no liveness of its
+//! own -- #917's `liveness` module owns that, and two answers to one
+//! question disagree the first time either changes. [`live`] is the seam
+//! between them until #917 lands, and its own comment says so.
 
 pub mod crash;
 pub mod handoff;
 pub mod install;
+pub mod live;
+pub mod overview;
 pub mod registry;
 pub mod store;
 pub mod transcript;
