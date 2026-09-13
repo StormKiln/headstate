@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PullRequest } from "./types/pr";
@@ -104,6 +104,48 @@ vi.mock("./components/AuthGate", () => ({
 
 const { default: App } = await import("./App");
 
+/// Settle the lazy routes' dynamic imports BEFORE any test runs (#898).
+///
+/// `App.tsx:156-163` reaches `StatsPage` and `SystemHealthPage` through
+/// `lazy(() => import(...))` (#838, to keep `recharts` off the launch
+/// chunk). A test that asserts on one of those pages' own content is
+/// therefore waiting on a module load, and the only test in this suite
+/// that does -- "shows no priorities strip on the PR Stats view" -- was
+/// waiting on it through `findByText`'s default 1000ms budget. That is a
+/// wall-clock threshold wearing an assertion's clothes: it held on a
+/// developer machine, where the import settles in single-digit
+/// milliseconds, and failed on `platform (ubuntu-latest)` on a branch
+/// whose only change was `README.md`. The suite runs in ~6s locally and
+/// 26-42s in CI, which is the whole story.
+///
+/// Awaiting the same specifiers here makes the wait deterministic instead
+/// of budgeted. Vite's module graph caches by specifier, so by the time
+/// any test calls `renderApp` the promise `lazy` awaits is already
+/// settled, and the page needs only React's next commit -- not I/O -- to
+/// appear. The cost is paid once at module load, where being slow cannot
+/// fail anything.
+///
+/// Raising the timeout was the other option and was rejected: it converts
+/// a 1-in-N flake into a 1-in-10N flake without changing its nature, and
+/// this repo has form against exactly that -- `invariants.rs` Invariant 8
+/// (`no_test_asserts_wall_clock_under_a_doc_that_disclaims_it`) exists
+/// because #861 and #868 were both wall-clock thresholds asserted under
+/// docs denying them.
+///
+/// Both routes, though only `StatsPage` has a test that needs it. The
+/// boundary is the hazard rather than the page, so listing both means a
+/// future assertion on System Health's content inherits the fix instead of
+/// reintroducing the bug. Verified rather than assumed: both imports were
+/// slowed by 12s at the `lazy` boundary and the whole suite run, and of the
+/// 2215 tests exactly one failed -- the one below. `App.mobile.test.tsx`'s
+/// four `pr-stats` tests survive that delay because they assert on the
+/// SHELL (the switcher entry, and the `<h1>` at `App.tsx:529`, which is
+/// driven by `view` alone), not on the lazy page's body.
+await Promise.all([
+  import("./components/StatsPage"),
+  import("./components/SystemHealthPage"),
+]);
+
 function renderApp() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
@@ -208,18 +250,29 @@ describe("App — priorities strip scoping", () => {
   /// Set through `view` since #794, not `panel`. The page is routed on
   /// one axis now, and a test that still set the old panel value would
   /// render the PR list and pass for the wrong reason.
-  /// `async` + `findByText` since #838: `StatsPage` is a `React.lazy`
-  /// chunk now, so its content arrives on a microtask rather than in the
-  /// synchronous render. The assertion is unchanged in substance -- the
-  /// strip must be absent while the page's OWN content is present -- but a
-  /// `getByText` would now run against the Suspense fallback and fail for a
+  /// `async` since #838: `StatsPage` is a `React.lazy` chunk, so its
+  /// content arrives after the synchronous render rather than in it. The
+  /// assertion is unchanged in substance -- the strip must be absent while
+  /// the page's OWN content is present -- but a bare `getByText` straight
+  /// after `render` would run against the Suspense fallback and fail for a
   /// reason that has nothing to do with the strip.
+  ///
+  /// `act` rather than `findByText` since #898. `findByText` polls against
+  /// a 1000ms budget, and with the import unsettled that budget was the
+  /// real assertion: it held locally, where the import takes single-digit
+  /// milliseconds, and failed on CI. The module is now pre-imported at the
+  /// top of this file, so the only thing left to wait for is React's next
+  /// commit -- which `act` flushes, with no clock involved. See the
+  /// pre-import's comment for why the timeout was not simply raised.
   ///
   /// The absence check stays SYNCHRONOUS and stays first: if the strip
   /// rendered it would render eagerly, so checking for it before the lazy
-  /// content lands is the stronger ordering. It is then repeated after the
-  /// page commits, so the absence cannot pass merely because the page had
-  /// not arrived yet.
+  /// content lands is the stronger ordering. That ordering is why the flush
+  /// sits between the two checks rather than inside `renderApp` -- hoisting
+  /// it into the helper would let the page commit before the first check and
+  /// quietly retire the eager-tree half of this test. It is then repeated
+  /// after the page commits, so the absence cannot pass merely because the
+  /// page had not arrived yet.
   it("shows no priorities strip on the PR Stats view", async () => {
     const blocked = prWithState("failure", "mergeable", "none", {
       number: 101,
@@ -243,7 +296,14 @@ describe("App — priorities strip scoping", () => {
     // showed between #829 and that reopening -- and the caveat line is
     // StatsPage's own content either way, which is what makes the absence of
     // the strip meaningful.
-    expect(await screen.findByText(/across every organization/i)).toBeDefined();
+    //
+    // The flush is an empty `act`: the lazy module is already resolved (see
+    // the pre-import at the top of this file), so this only lets React
+    // commit the resolved component. It waits on the scheduler, not on a
+    // deadline, which is the difference that makes this test insensitive to
+    // how loaded the runner is.
+    await act(async () => {});
+    expect(screen.getByText(/across every organization/i)).toBeDefined();
     // And still absent once the lazy page has actually committed: the check
     // above could only see the eager tree.
     expect(screen.queryByText(/Needs your attention/)).toBeNull();
