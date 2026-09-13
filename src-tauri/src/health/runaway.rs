@@ -838,8 +838,21 @@ pub enum Notice {
     /// One process worth a human glance (#865).
     Process {
         name: String,
+        /// How many processes of this name met the rule (#908).
+        ///
+        /// Collapsed into ONE notice rather than emitted per process,
+        /// because `key` is derived from the name: two `zsh` processes
+        /// produced two notices with an IDENTICAL key, which rendered as
+        /// two indistinguishable blocks and read as one condition repeated.
+        /// A user reported exactly that as a suspected staleness bug.
+        ///
+        /// It also broke the contract `key` is for -- a caller
+        /// deduplicating a standing condition saw two rows it could not
+        /// tell apart, and a React list keyed on it had duplicate keys.
+        count: usize,
         /// CPU as a percentage of ONE core, so a multi-core process reads
-        /// above 100 legitimately.
+        /// above 100 legitimately. The WORST of the collapsed set, not a
+        /// mean: the question is whether anything is pegging a core.
         cpu_percent: f64,
         minutes: f64,
         /// Raises the wording, never gates the notice. See
@@ -891,8 +904,30 @@ impl Notice {
         }
     }
 
+    /// The worst CPU of the processes this row stands for, as a percentage
+    /// of one core. `0.0` for the machine-wide variant, which has no single
+    /// process to report.
+    pub fn cpu_percent(&self) -> f64 {
+        match self {
+            Notice::Process { cpu_percent, .. } => *cpu_percent,
+            Notice::Oversubscribed { .. } => 0.0,
+        }
+    }
+
+    /// How many processes this row stands for. 1 for the machine-wide
+    /// variant, which is not a process count at all.
+    pub fn count(&self) -> usize {
+        match self {
+            Notice::Process { count, .. } => *count,
+            Notice::Oversubscribed { .. } => 1,
+        }
+    }
+
     pub fn title(&self) -> String {
         match self {
+            Notice::Process { name, count, .. } if *count > 1 => {
+                format!("{count} {name} processes have been busy for a while")
+            }
             Notice::Process { name, .. } => format!("{name} has been busy for a while"),
             // Names the SHAPE, not the level, for the reason
             // `Alert::title` gives: "load average 53" is a number the
@@ -1002,16 +1037,79 @@ impl Notice {
 ///
 /// Empty before the first pass, which is honest: on a cold start nothing
 /// has been observed long enough to have held anything for five minutes.
+/// How stale an answer may be before it is withheld (#908).
+///
+/// The poll loop writes every 60 seconds, so three minutes is three missed
+/// passes -- generous enough that a slow sampler or a machine that just woke
+/// from sleep does not blank the panel, short enough that a dead loop stops
+/// presenting its last answer as the present.
+///
+/// The direction matters. Withholding a stale answer makes the panel say
+/// nothing, which is honest; serving one makes it assert a live condition
+/// it cannot support, which is this codebase's characteristic defect
+/// (#769, #841, #847). A user reported exactly this suspicion -- two
+/// notices they believed were an hour stale -- and on that occasion the
+/// processes were genuinely still running. The notices were right and there
+/// was no way for them to tell.
+pub const NOTICE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// The most recent [`watch`] result and WHEN it was taken.
+///
+/// The timestamp is the whole point of the pairing. `set` replaces the list
+/// each pass, so a process that has exited drops out correctly -- verified
+/// -- but only while the loop runs. If the poll thread dies, the last value
+/// would otherwise sit in this mutex forever and `health_alerts` would keep
+/// serving it, rendered identically to a fresh answer.
+///
+/// `Instant` rather than a wall clock: this is an elapsed-time question, and
+/// a clock that jumps (NTP correction, sleep/wake) must not make an answer
+/// look fresh or ancient. The same reasoning `Watcher` gives for GAP_MS.
 #[derive(Debug, Default)]
-pub struct Watched(std::sync::Mutex<Vec<Notice>>);
+pub struct Watched(std::sync::Mutex<Option<(std::time::Instant, Vec<Notice>)>>);
 
 impl Watched {
     pub fn set(&self, notices: Vec<Notice>) {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = notices;
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((std::time::Instant::now(), notices));
     }
 
-    pub fn get(&self) -> Vec<Notice> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    /// The notices, and how long ago they were taken.
+    ///
+    /// `None` before the first pass -- a cold start has observed nothing
+    /// long enough to have held anything for five minutes -- and `None`
+    /// again once the newest pass is older than [`NOTICE_MAX_AGE`], so a
+    /// caller cannot accidentally present a dead loop's last answer.
+    pub fn get(&self) -> Option<(std::time::Duration, Vec<Notice>)> {
+        let held = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let (at, notices) = held.as_ref()?;
+        let age = at.elapsed();
+        if age > NOTICE_MAX_AGE {
+            return None;
+        }
+        Some((age, notices.clone()))
+    }
+}
+
+/// A notice body with the age of its evidence appended (#908).
+///
+/// Below a minute says "just now" rather than a number of seconds: the poll
+/// cadence is 60s, so any smaller figure is noise about when the timer
+/// happened to fire rather than information about the machine.
+///
+/// Separate from `Notice::body` so the notice stays a statement about a
+/// process and the freshness stays a statement about the reading. They have
+/// different lifetimes -- the body is the same on every pass, the age is not
+/// -- and keying a notice on a body that changed every minute would make a
+/// standing condition a new row each tick, which is the trap `Notice::key`
+/// and `Alert::key` both document.
+pub fn with_age(body: &str, age: std::time::Duration) -> String {
+    let secs = age.as_secs();
+    if secs < 60 {
+        format!("{body} (as of just now)")
+    } else {
+        let mins = secs / 60;
+        let plural = if mins == 1 { "" } else { "s" };
+        format!("{body} (as of {mins} minute{plural} ago)")
     }
 }
 
@@ -1058,6 +1156,7 @@ pub fn watch(
         }
         out.push(Notice::Process {
             name: p.name.clone(),
+            count: 1,
             cpu_percent: p.cpu_percent,
             minutes,
             niced: p.nice.is_some_and(|n| n > SUSPICIOUS_NICE),
@@ -1065,10 +1164,59 @@ pub fn watch(
             long: minutes >= WATCH_LONG_MINUTES,
         });
     }
+
+    // Collapse by name, because `key` is derived from the name (#908). Two
+    // processes of one name produced two notices with the SAME key, which
+    // is both a broken deduplication contract and two rows a reader cannot
+    // tell apart.
+    //
+    // The collapsed row takes the WORST of each figure rather than a mean:
+    // the question a reader has is "is something pegging a core, and for how
+    // long", and an average of one runaway and one mild process answers
+    // neither. `niced`/`orphaned`/`long` are OR-ed for the same reason --
+    // they raise the wording, so any member raising it is enough.
+    let mut collapsed: Vec<Notice> = Vec::new();
+    for n in out {
+        let Notice::Process {
+            name,
+            cpu_percent,
+            minutes,
+            niced,
+            orphaned,
+            long,
+            ..
+        } = &n
+        else {
+            collapsed.push(n);
+            continue;
+        };
+        if let Some(Notice::Process {
+            count: c,
+            cpu_percent: cp,
+            minutes: m,
+            niced: ni,
+            orphaned: o,
+            long: l,
+            ..
+        }) = collapsed
+            .iter_mut()
+            .find(|e| matches!(e, Notice::Process { name: existing, .. } if existing == name))
+        {
+            *c += 1;
+            *cp = cp.max(*cpu_percent);
+            *m = m.max(*minutes);
+            *ni |= *niced;
+            *o |= *orphaned;
+            *l |= *long;
+            continue;
+        }
+        collapsed.push(n);
+    }
+
     // Longest first: if the list is ever truncated for display, the one
     // that has been going longest is the one that survives.
-    out.sort_by(|a, b| b.minutes().total_cmp(&a.minutes()));
-    out
+    collapsed.sort_by(|a, b| b.minutes().total_cmp(&a.minutes()));
+    collapsed
 }
 
 /// A run of consecutive, ungapped samples at the end of the series whose
@@ -1714,6 +1862,96 @@ mod tests {
 
     // ---- The watch tier (#865) --------------------------------------
 
+    /// A stale answer is WITHHELD rather than served (#908).
+    ///
+    /// The expiry is the whole point of stamping the set. `set` replaces the
+    /// list each pass, so an exited process drops out -- but only while the
+    /// loop runs. If the poll thread dies, the last value would sit in the
+    /// mutex forever and the page would render it identically to a fresh
+    /// answer.
+    #[test]
+    fn a_stale_answer_is_withheld() {
+        let w = Watched::default();
+        assert!(w.get().is_none(), "nothing before the first pass");
+
+        let p = proc(910, "node", 60.0, Some(42));
+        w.set(watch(std::slice::from_ref(&p), &durations(&[(&p, 10.0)])));
+        let (age, notices) = w.get().expect("a fresh pass is served");
+        assert_eq!(notices.len(), 1);
+        assert!(age < NOTICE_MAX_AGE, "just written, so young");
+
+        // Reach past the accessor to age the stamp, because the alternative
+        // is sleeping for three minutes in a unit test -- a wall-clock wait
+        // is exactly what `invariants.rs` Invariant 8 exists to keep out.
+        {
+            let mut held = w.0.lock().expect("not poisoned");
+            let (at, kept) = held.take().expect("just set");
+            *held = Some((
+                at - NOTICE_MAX_AGE - std::time::Duration::from_secs(1),
+                kept,
+            ));
+        }
+        assert!(
+            w.get().is_none(),
+            "past NOTICE_MAX_AGE the answer is withheld, not served stale"
+        );
+    }
+
+    /// Processes of one name are ONE row, counting them (#908).
+    ///
+    /// `key` is derived from the name, so per-process notices collided: two
+    /// `zsh` processes produced two notices with an identical key, which
+    /// rendered as indistinguishable repeated blocks. A user reported that
+    /// as a suspected staleness bug -- the notices were correct and there
+    /// was no way to tell them apart.
+    #[test]
+    fn processes_of_one_name_collapse_into_a_counted_row() {
+        let a = proc_niced(920, "zsh", 55.0, Some(1), Some(5));
+        let b = proc_niced(921, "zsh", 99.0, Some(42), None);
+        let c = proc(922, "node", 60.0, Some(42));
+        let out = watch(
+            &[a.clone(), b.clone(), c.clone()],
+            &durations(&[(&a, 6.0), (&b, 40.0), (&c, 10.0)]),
+        );
+
+        assert_eq!(out.len(), 2, "two names, two rows");
+        let zsh = out
+            .iter()
+            .find(|n| n.title().contains("zsh"))
+            .expect("a zsh row");
+        assert_eq!(zsh.count(), 2);
+        assert!(
+            zsh.title().starts_with("2 zsh processes"),
+            "{}",
+            zsh.title()
+        );
+        // WORST of each, not a mean: the question is whether anything is
+        // pegging a core and for how long.
+        assert!(
+            (zsh.cpu_percent() - 99.0).abs() < f64::EPSILON,
+            "the worst CPU, not an average"
+        );
+        assert!(
+            (zsh.minutes() - 40.0).abs() < f64::EPSILON,
+            "the longest run"
+        );
+        // OR-ed, because these raise the wording: one niced member is
+        // enough for the sentence to be worth saying.
+        assert!(zsh.niced(), "one of the two is niced");
+        assert!(zsh.orphaned(), "one of the two is orphaned");
+    }
+
+    /// The age reaches the body, and reads as prose below a minute (#908).
+    #[test]
+    fn a_body_carries_the_age_of_its_evidence() {
+        let fresh = with_age("x", std::time::Duration::from_secs(5));
+        assert!(fresh.ends_with("(as of just now)"), "{fresh}");
+        let one = with_age("x", std::time::Duration::from_secs(60));
+        assert!(one.ends_with("(as of 1 minute ago)"), "{one}");
+        let many = with_age("x", std::time::Duration::from_secs(185));
+        assert!(many.ends_with("(as of 3 minutes ago)"), "{many}");
+    }
+
     /// THE incident, as a fixture. Twelve orphaned busy-loops, niced to
     /// 5, each holding ~50% of a core on a 12-core machine for 8.5
     /// hours, load average 53 -- and System Health said nothing for the
@@ -1734,11 +1972,14 @@ mod tests {
 
         let out = watch(&obs, &durations(&pairs));
 
-        assert_eq!(
-            out.len(),
-            12,
-            "every spinner is surfaced, not just the top one"
-        );
+        // ONE row, counting twelve (#908). This asserted 12 rows until the
+        // user who hit this incident reported the result as a suspected
+        // staleness bug: twelve notices sharing one `key` rendered as
+        // indistinguishable repeated blocks. The condition is still fully
+        // surfaced -- the count is on the row -- and the deduplication
+        // contract `key` exists for is no longer broken.
+        assert_eq!(out.len(), 1, "twelve spinners are ONE condition");
+        assert_eq!(out[0].count(), 12, "and the row says there are twelve");
         let n = &out[0];
         assert!(
             n.niced(),
