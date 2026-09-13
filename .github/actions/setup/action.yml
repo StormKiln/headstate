@@ -170,3 +170,113 @@ runs:
     - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.1
       with:
         workspaces: ${{ inputs.rust-workspaces }}
+        # ---- Only `main` WRITES the cache. Every ref still READS it (#901) ----
+        #
+        # The repository was at 9.92GB of a 10GB Actions cache quota and
+        # evicting mid-day, which is how run 34713149169 came to report
+        #   ##[warning]Cache not found for keys: v0-rust-platform-Windows_NT-...
+        # for a key that had reported `full match: true` twenty-five
+        # minutes earlier, turning a 562s job into 1716s.
+        #
+        # WHERE IT ACTUALLY WENT, measured rather than assumed. #901
+        # guessed "two live generations per job from recent dependency
+        # churn". It is not churn -- the duplicate entries split cleanly
+        # BY REF:
+        #
+        #   refs/heads/main       5.29GB   6 entries
+        #   refs/pull/895/merge   4.63GB   6 entries
+        #
+        # One open pull request held 46% of the entire repository quota.
+        # That is the structural leak, and it is permanent: GitHub scopes
+        # cache WRITES to the branch that made them, so nothing but that
+        # PR could ever read those 4.63GB, and they became garbage the
+        # moment it merged. Every open PR paid the same toll simultaneously.
+        #
+        # Restoring is NOT scoped the same way: a run reads its own ref AND
+        # falls back to the base branch. THIS IS THE LOAD-BEARING CLAIM --
+        # if it were wrong, this line would make every pull request cold --
+        # so it was verified on a run that could not possibly have written
+        # what it read. Run 34715265676, the first CI run on branch
+        # `adopt-actionlint-float-cmp-promise-rules`:
+        #
+        #   mobile-ios           restored ...-860d4a2f  full match: true
+        #   platform (windows)   restored ...-2f89bd52  full match: false
+        #   build                restored ...-2f89bd52  full match: false
+        #   platform (ubuntu)    restored ...-2f89bd52  full match: false
+        #
+        # That branch had never run before and wrote none of those. The
+        # exact-match entry is held on `refs/heads/main` in the live cache
+        # list, and the `full match: false` ones are the bare-prefix
+        # restore key finding an older generation. So a pull request keeps
+        # every hit it gets today; it just stops paying to write a copy
+        # only it can read.
+        #
+        # One case this does NOT change, noted so it is not mistaken for a
+        # regression from this line: a pull request from a FORK cannot read
+        # the base repository's caches at all, which is GitHub's token
+        # scoping and was already true. It is theoretical here -- the last
+        # sixty pull requests were all from in-repo branches or dependabot,
+        # which also pushes in-repo -- but a fork PR was cold before this
+        # change and is cold after it.
+        #
+        # It also removes the self-eviction that produced #901's symptom:
+        # in that run the two jobs that MISSED (`build`, `platform
+        # (windows-latest)`) missed a hash the same PR had written
+        # earlier. A branch over quota evicts its own entries.
+        #
+        # Steady state after this, one entry per job class, measured:
+        #   1.65 platform-Linux      1.52 mobile-android
+        #   1.48 platform-Windows    0.86 build
+        #   0.61 test-rust           0.54 mobile-ios
+        #   0.40 lint                0.16 supply-chain
+        #   0.15 test-frontend
+        #                            ----> 7.37GB of 10GB (74%)
+        #
+        # `scripts/check-cache-budget.py` asserts that ceiling so it is a
+        # number someone chose rather than one discovered by a 3x-slower
+        # run, which is what #901 asked for.
+        #
+        # THE COST, stated plainly and in two parts.
+        #
+        # 1. A pull request that CHANGES a lockfile no longer warms its own
+        #    new hash across pushes. Its first run falls back to the
+        #    base-branch generation by restore-key prefix -- the "full
+        #    match: false" lines above -- so cargo reuses what still
+        #    applies and rebuilds the rest. Every later push on that branch
+        #    does the same work again instead of resuming from the previous
+        #    one. That is the real regression here, and it is bounded: it
+        #    costs the delta of one dependency change, on the branch that
+        #    made it, and only while it is open.
+        #
+        # 2. The first run on `main` after such a PR merges is cold for the
+        #    jobs that bump re-keys, since no PR warmed the new hash.
+        #
+        # Both are PREDICTABLE and attach to the change that caused them.
+        # What they replace is not: over quota, a cold run could hit any
+        # job on any ref at any time, including the ones that had just
+        # measured a hit -- which is how the same key reported `full match:
+        # true` and then `Cache not found` twenty-five minutes apart, and
+        # why no CI timing could be trusted. Trading unbounded randomness
+        # for a bounded cost on the branch responsible is the better deal,
+        # and it is reversible in one line if the lockfile-churning branches
+        # turn out to dominate.
+        #
+        # Deliberately NOT done here, and why:
+        #   - `cache-targets: false` would drop target/ and take the
+        #     Windows entries from ~1.5GB to near nothing, but target/ IS
+        #     the expensive half to rebuild. Untested against a real run,
+        #     so it would trade a measured problem for an unmeasured one.
+        #   - A scheduled REST prune is real new surface -- a workflow, a
+        #     token, a deletion loop -- to solve a leak that has a
+        #     one-line cause. If the budget guard ever fires on steady
+        #     state alone, that is when to revisit.
+        #   - Adding cache scope, which is what #889 proposed and #895
+        #     reverted on exactly this evidence.
+        #
+        # Tags and the merge queue save too: `release.yml` waits on a tag
+        # run's CI, and a merge-group run is the last build before a merge
+        # lands, so both are as worth warming as `main` itself.
+        # One line on purpose. A folded scalar keeps the newlines INSIDE
+        # `${{ }}`, and an expression is not the place to find out which
+        # whitespace GitHub's parser forgives.
+        save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') || github.event_name == 'merge_group' }}
