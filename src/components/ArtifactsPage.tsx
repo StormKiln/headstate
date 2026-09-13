@@ -128,7 +128,21 @@ export function ArtifactsPage() {
     group === undefined || group === VENV_GROUP
       ? allArtifacts
       : allArtifacts.filter((a) => a.kind === group);
-  const { sizes, ages, pending, total } = useArtifactSizes(artifacts, artifacts.length > 0);
+  const { sizes, ages, pending, total, failed } = useArtifactSizes(artifacts, artifacts.length > 0);
+  /// Whether the byte figures on this page are the whole answer (#956).
+  ///
+  /// `pending > 0` alone was the test, and a REJECTED batch satisfies it:
+  /// a failed query is neither fetching nor holding data, so `pending`
+  /// falls to zero with measurements still missing. Every honesty
+  /// qualifier on this page hung off that one number and therefore failed
+  /// open -- the total lost its "at least", and a destructive button
+  /// gained a byte count summed over a map that is missing the failed
+  /// batch's paths.
+  ///
+  /// A failure is PERMANENT where pending is temporary (`retry: false`,
+  /// #846), so this does not clear on its own. That is why the copy below
+  /// says WHY the number is a floor rather than only that it is one.
+  const sizesComplete = pending === 0 && failed === 0;
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [sort, setSort] = useState<"size" | "age">("size");
   const [confirming, setConfirming] = useState(false);
@@ -275,11 +289,31 @@ export function ArtifactsPage() {
         {/* "at least" until every batch has answered, because a total
             over a partial set is not the total. Claiming a finished
             number while measurement is still running is the kind of
-            quiet wrongness this app tries not to ship. */}
+            quiet wrongness this app tries not to ship.
+
+            ANSWERED includes "rejected" (#956). A failed batch had
+            answered by the old `pending > 0` test, so the qualifier came
+            off a total that was still partial -- and unlike a pending
+            batch, a failed one never comes back to correct it. */}
         <span className="text-[#8b949e]">
-          {pending > 0 ? "at least " : ""}
+          {sizesComplete ? "" : "at least "}
           {formatSize(totalBytes)}
         </span>
+        {/* Says WHY the total is a floor, which "at least" alone cannot.
+            Not a `QueryError`: the scan succeeded and every row on this
+            page is real -- it is the SIZES that are short, which is the
+            partial-answer case `PartialScanNotice` exists for and which
+            this app answers with a label rather than a blank page. No
+            retry, for the reason that component states: `retry: false` is
+            deliberate here (`useRemoveArtifacts` measured a 20.4s freeze
+            from re-running these very calls), and a second identical walk
+            does not read what the first could not. */}
+        {failed > 0 ? (
+          <span role="status" className="text-xs text-[#d29922]">
+            {failed} of {total} size {failed === 1 ? "batch" : "batches"} could not be
+            measured, so every byte figure here is a floor
+          </span>
+        ) : null}
         {/* The measuring advisory has MOVED, to after the Remove buttons
             (#852). See the comment beside it down there -- ordering is
             #817's actual remedy, and it was upstream of two destructive
@@ -364,9 +398,15 @@ export function ArtifactsPage() {
               >
                 {/* The COUNT and the size in the label, so the scope is
                     legible before the dialog rather than only inside it. */}
+                {/* Same rule as the "Remove all" label (#956):
+                    `selectedBytes` sums with `?? 0` over a map that a
+                    failed batch left holes in, so it is a floor rather
+                    than a figure and does not go on the button. */}
                 {busy
                   ? "Removing…"
-                  : `Remove ${checked.size} · ${formatSize(selectedBytes)}`}
+                  : sizesComplete
+                    ? `Remove ${checked.size} · ${formatSize(selectedBytes)}`
+                    : `Remove ${checked.size}`}
               </button>
             ) : (
               <button
@@ -379,7 +419,16 @@ export function ArtifactsPage() {
                 className="rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#f85149] hover:bg-[#f85149]/10 disabled:opacity-50"
               >
                 Remove all {removable.length}
-                {pending > 0 ? "" : ` · ${formatSize(removableBytes)}`}
+                {/* The size appears only when it IS the size (#956). The
+                    old test was `pending === 0`, which a rejection
+                    satisfies, so the button carried a figure summed with
+                    `?? 0` over a map missing the failed batch's paths --
+                    an understated number on the label of the click that
+                    deletes. Omitted rather than qualified here, because a
+                    button label is not where a caveat is read; the
+                    advisory above says what is missing, and the dialog
+                    below states the floor in words. */}
+                {sizesComplete ? ` · ${formatSize(removableBytes)}` : ""}
               </button>
             )}
           </span>
@@ -441,9 +490,19 @@ export function ArtifactsPage() {
                 something anyone can act on -- and here the honest answer
                 is that the loss is TIME, not work, which is exactly what
                 makes this different from removing a worktree. */}
+            {/* The specific loss, and how sure of it we are (#956).
+                `selectedBytes` is a `?? 0` sum over a map that a failed
+                size batch left holes in, so a user reading "This frees
+                180 MB" on a partial measurement reads a small number and
+                confirms. The dialog is the last place the figure is seen
+                before the click, so it is where the floor is stated in
+                words rather than left to a qualifier on a button. */}
             <p className="mt-3 text-sm text-[#e6edf3]">
-              This frees {formatSize(selectedBytes)}. Everything here is rebuilt by the
-              command shown beside it — the cost is the rebuild, not lost work.
+              {sizesComplete
+                ? `This frees ${formatSize(selectedBytes)}.`
+                : `This frees at least ${formatSize(selectedBytes)} — some sizes could not be measured, so the real figure is larger.`}{" "}
+              Everything here is rebuilt by the command shown beside it — the cost is
+              the rebuild, not lost work.
             </p>
             {selectedActive > 0 ? (
               <p className="mt-2 text-sm text-[#d29922]">

@@ -132,7 +132,46 @@ function Stat({
 /// `percent` is clamped rather than trusted: a disk can report more
 /// used than total during a snapshot, and a bar wider than its track
 /// would break the layout for a rounding artefact.
-function Bar({ percent, label }: { percent: number; label?: string }) {
+///
+/// # `null` is not 0 (#960)
+///
+/// `percentOf` returns `null` when the platform did not report a usable
+/// total -- an unusual filesystem, a container mount, a machine with swap
+/// disabled, a read the collector could not complete. Six call sites used
+/// to launder that with `?? 0`, and the result was a full-width bar
+/// sitting EMPTY and GREEN (`barColor(0)` is the healthy tone) directly
+/// above its own row's "Not measured" label: the two halves of one row
+/// disagreeing, with the wrong half the one the eye reads first.
+///
+/// Worse for assistive tech, because `role="meter"` made it an
+/// affirmative numeric claim: a screen reader was told the value IS 0.
+/// So `aria-valuenow` is OMITTED for `null` and `aria-valuetext` says
+/// "Not measured" instead -- a meter that expresses absence rather than
+/// zero.
+///
+/// Grey and unfilled, not amber: the same reasoning `NotMeasured`'s doc
+/// gives -- "an absent reading is not a warning, and amber would tell the
+/// user to act on something the app simply did not look at." And the bar
+/// is still RENDERED rather than hidden, so a row does not silently lose
+/// its layout when a sibling `Stat` is healthy.
+///
+/// A genuine `0` still renders as a real, measured 0% -- distinct from
+/// `null`, and with the clamp intact.
+function Bar({ percent, label }: { percent: number | null; label?: string }) {
+  if (percent === null) {
+    return (
+      <div
+        className="h-2 w-full overflow-hidden rounded-full bg-[#30363d]"
+        role="meter"
+        // No `aria-valuenow`: the meter has no value, and asserting 0
+        // is the bug. `aria-valuetext` is how a meter says "unknown".
+        aria-valuetext="Not measured"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-label={label}
+      />
+    );
+  }
   const clamped = Math.max(0, Math.min(100, percent));
   return (
     <div
@@ -875,7 +914,7 @@ export function SystemHealthPage() {
             />
           </div>
           <div className="mt-3">
-            <Bar percent={memUsedPct ?? 0} label="Memory used" />
+            <Bar percent={memUsedPct} label="Memory used" />
           </div>
 
           <div className="mt-4 flex flex-wrap gap-6">
@@ -984,7 +1023,7 @@ export function SystemHealthPage() {
                       </span>
                     </div>
                     <div className="mt-1">
-                      <Bar percent={usedPct ?? 0} label={`${d.mount} used`} />
+                      <Bar percent={usedPct} label={`${d.mount} used`} />
                     </div>
                     <div className="mt-1 text-xs tabular-nums text-[#8b949e]">
                       {usedPct === null ? (
@@ -1885,7 +1924,7 @@ function MemoryDetail({
           />
         </div>
         <div className="mt-3">
-          <Bar percent={usedPct ?? 0} label="Memory used" />
+          <Bar percent={usedPct} label="Memory used" />
         </div>
         {/* The same warning the overview's hint gives in four words,
             with room here to say why it matters: a reader who subtracts
@@ -1920,7 +1959,7 @@ function MemoryDetail({
           </p>
         ) : (
           <div className="mt-3">
-            <Bar percent={swapPct ?? 0} label="Swap used" />
+            <Bar percent={swapPct} label="Swap used" />
           </div>
         )}
       </Panel>
@@ -1994,7 +2033,7 @@ function DiskDetail({ sample: s }: { sample: HealthSample }) {
                     </span>
                   </div>
                   <div className="mt-1">
-                    <Bar percent={usedPct ?? 0} label={`${d.mount} used`} />
+                    <Bar percent={usedPct} label={`${d.mount} used`} />
                   </div>
                   <div className="mt-1 text-xs tabular-nums text-[#8b949e]">
                     {usedPct === null ? (
@@ -2489,7 +2528,7 @@ function NetworkDetail({
                   </div>
                   <div className="mt-1">
                     <Bar
-                      percent={share ?? 0}
+                      percent={share}
                       label={`${n.name} share of total traffic`}
                     />
                   </div>

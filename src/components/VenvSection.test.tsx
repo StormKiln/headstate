@@ -17,6 +17,12 @@ const state = vi.hoisted(() => ({
   measuring: false,
   pending: 0,
   total: 0,
+  /// How many SIZE chunks rejected (#956). Distinct from `failed` below,
+  /// which is the venv scan itself: the scan can succeed while the sizing
+  /// of some chunks does not, and those two have different consequences
+  /// -- one blanks the section, the other only makes the byte figures a
+  /// floor.
+  sizesFailed: 0,
   loading: false,
   // #846: a REJECTED scan. The sharpest case in that issue, because the
   // `isLoading` half was already fixed here for the adjacent bug and
@@ -45,6 +51,10 @@ vi.mock("../api/hooks", () => ({
     measuring: state.measuring,
     pending: state.pending,
     total: state.total,
+    /// #956: how many size chunks REJECTED. A rejection stops
+    /// `measuring` without answering, so `!measuring` alone reads as
+    /// "fully measured".
+    failed: state.sizesFailed,
   }),
   useRemoveVenvs: () => removeFn,
 }));
@@ -71,6 +81,9 @@ beforeEach(() => {
   state.measuring = false;
   // #846. Leaked, this replaces every test's section with an error panel.
   state.failed = false;
+  // #956. Leaked, this suppresses every byte figure in the section and
+  // adds an advisory that unrelated `role="status"` assertions would find.
+  state.sizesFailed = 0;
 });
 
 describe("VenvSection on a phone", () => {
@@ -470,6 +483,39 @@ describe("measuring progress", () => {
     state.measuring = false;
     render(<VenvSection />);
     expect(screen.queryByText(/measuring/i)).toBeNull();
+  });
+
+  /// #956. `measuring` is false for a REJECTED chunk as much as for a
+  /// finished one, so the byte figures appeared -- on two destructive
+  /// buttons -- summed over a map missing the failed chunk's paths.
+  ///
+  /// The section must keep its rows (the venv scan succeeded; every row is
+  /// real) while withholding the figures that are now a floor, and say
+  /// which.
+  it("withholds the byte figures and says why after a failed size chunk", () => {
+    state.venvs = [
+      venv(),
+      venv({ path: "/cache/other-BBBBBBBB-py3.13", project: "other" }),
+    ];
+    // Only the first row's size landed; the chunk holding the second
+    // rejected.
+    state.sizes = new Map([
+      ["/cache/hello-world-delivery-AAAAAAAA-py3.13", 1_000_000_000],
+    ]);
+    state.measuring = false;
+    state.pending = 0;
+    state.total = 3;
+    state.sizesFailed = 1;
+    render(<VenvSection />);
+
+    // Says the sizes are short, rather than letting the figure silently
+    // not appear.
+    expect(screen.getByText(/could not be measured/)).toBeTruthy();
+    // The bulk button keeps its count and loses its understated size.
+    const btn = screen.getByRole("button", { name: /Remove all 2 orphaned/ });
+    expect(btn.textContent).not.toContain("·");
+    // And the rows are still there: one failure must not blank a list.
+    expect(screen.getByText("other")).toBeTruthy();
   });
 });
 

@@ -13,6 +13,7 @@ const a = (over: Partial<Assessment> = {}): Assessment => ({
   has_upstream: true,
   subjects: [],
   subjects_elided: 0,
+  uncommitted: 0,
   base: "origin/main",
   fetched_at: "2026-09-11T08:00:00Z",
   ...over,
@@ -53,6 +54,28 @@ describe("assessmentSummary", () => {
   // A pure-deletion diff has no insertions line at all.
   it("renders a one-sided diff without inventing the other side", () => {
     expect(assessmentSummary(a({ insertions: null }))).toContain("+0/-18");
+  });
+
+  // #976. The absence of "never pushed" reads as pushed, so `null` --
+  // git could not be asked -- must not borrow that silence.
+  it("does not report an unreadable upstream as never pushed", () => {
+    const s = assessmentSummary(a({ has_upstream: null }));
+    expect(s).not.toContain("never pushed");
+    expect(s).toContain("push state unknown");
+  });
+
+  // #976. The same asymmetry for uncommitted work, which is the number a
+  // fabricated zero makes dangerous: no mention of it reads as clean.
+  it("says when the uncommitted count could not be read", () => {
+    expect(assessmentSummary(a({ uncommitted: null }))).toContain("uncommitted work unknown");
+  });
+
+  it("stays quiet about a measured clean tree, which is the normal case", () => {
+    expect(assessmentSummary(a({ uncommitted: 0 }))).not.toContain("uncommitted");
+  });
+
+  it("names a measured dirty tree", () => {
+    expect(assessmentSummary(a({ uncommitted: 3 }))).toContain("3 uncommitted");
   });
 
   it("returns an empty string when git answered nothing", () => {

@@ -121,6 +121,29 @@ describe("reason", () => {
   it("names where a checked-out branch is checked out", () => {
     expect(reason({ kind: "checkedOut", path: "/w/foo" })).toContain("/w/foo");
   });
+
+  /// #967. `%(ahead-behind:)` needs git 2.41, and on an older git the
+  /// Rust side used to coerce the missing count to 0 -- so this rendered,
+  /// verbatim, "Not merged — 0 commits not on the default branch". A
+  /// self-contradiction resolving in the dangerous direction: "Not merged"
+  /// is the warning, "0 commits" is the reassurance that cancels it, and
+  /// the row sits beside a delete checkbox where that number is the only
+  /// thing telling the user what deleting costs.
+  it("does not render an unknown ahead count as zero commits", () => {
+    const s = reason({ kind: "unmerged", ahead: null });
+    expect(s).not.toContain("0 commits not on the default branch");
+    expect(s).not.toMatch(/\b0 commits?\b/);
+    // Still says it is unmerged -- that part WAS measured.
+    expect(s).toMatch(/not merged/i);
+    expect(s).toMatch(/unavailable/i);
+  });
+
+  /// The other half: a real zero is still a real zero. A branch level
+  /// with the default branch legitimately reports 0, and erasing that
+  /// would trade one wrong answer for another.
+  it("still counts a measured zero", () => {
+    expect(reason({ kind: "unmerged", ahead: 0 })).toContain("0 commits");
+  });
 });
 
 describe("BranchesPage", () => {
@@ -146,6 +169,28 @@ describe("BranchesPage", () => {
     expect(await screen.findByText("done")).toBeTruthy();
     expect(screen.getByText(/Merged \(squashed\)/)).toBeTruthy();
     expect(screen.getByText(/Not merged — 2 commits/)).toBeTruthy();
+  });
+
+  /// The page-level half of #967: on a git older than 2.41 EVERY unmerged
+  /// branch arrives with an absent count, and the contradictory sentence
+  /// must appear nowhere on the page -- nor may the row reach the bulk
+  /// "Select all merged" set, which the count's absence must not widen.
+  it("an unknown ahead count does not render as zero commits", async () => {
+    listFn.mockResolvedValue([
+      branch({ name: "done" }),
+      branch({
+        name: "oldgit",
+        ahead: null,
+        behind: null,
+        deletable: { kind: "unmerged", ahead: null },
+      }),
+    ]);
+    show();
+    expect(await screen.findByText("oldgit")).toBeTruthy();
+    expect(screen.queryByText(/0 commits not on the default branch/)).toBeNull();
+    expect(screen.getByText(/Not merged — commit count unavailable/)).toBeTruthy();
+    // One merged branch on the page, and the unreadable one is not it.
+    expect(screen.getByText(/Select all 1 merged/)).toBeTruthy();
   });
 
   /// The gate the UI enforces before the backend re-checks it.

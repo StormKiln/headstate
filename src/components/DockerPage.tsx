@@ -68,12 +68,25 @@ function UsageRow({
 function DiskSummary({
   onPrune,
   builds,
+  buildsFailed,
 }: {
   onPrune: () => void;
   /// For the cache-health figure. Empty is ordinary -- a machine that
   /// has never built anything has no health to report, and the row
   /// simply omits it.
+  ///
+  /// True of a genuinely empty history and FALSE of a rejected one, which
+  /// is why `buildsFailed` rides alongside (#963).
   builds: DockerBuild[];
+  /// Whether the build-history call REJECTED, as opposed to answering
+  /// with nothing.
+  ///
+  /// The two have opposite meanings and the same `[]`: one says the
+  /// cache has no health to report, the other says we could not ask. The
+  /// figure this row exists to show is, in this module's own words, "the
+  /// number the Builds page existed to show", so it must not vanish with
+  /// nothing said.
+  buildsFailed: boolean;
 }) {
   const { data: du, isError } = useDockerDiskUsage(true);
   const cacheHealth = recentCacheHealth(builds);
@@ -102,7 +115,24 @@ function DiskSummary({
                 more means something invalidated the cache. Sitting
                 beside "clear" also makes the trade legible -- clearing
                 is what turns this number cold. */}
-            {cacheHealth ? (
+            {/* The ERROR arm first, ALWAYS before the empty arm (#846,
+                #963). `cacheHealth` is `null` on a rejection too -- the
+                builds list is left at its `[]` default -- so without this
+                ordering the figure simply disappeared and the reader was
+                told nothing, which invites reading the last number they
+                saw as still true.
+
+                A one-line note in the cache-health SLOT rather than an
+                error panel: the disk figures beside it are independently
+                healthy and this is the partial-answer case. No retry, for
+                `useArtifacts`' reason -- `retry: false` is right for these
+                local calls, and the missing `buildx` plugin a second call
+                would find is the same one it found first. */}
+            {buildsFailed ? (
+              <span role="status" className="text-[#8b949e]">
+                Could not read the build history
+              </span>
+            ) : cacheHealth ? (
               <span
                 className={cacheTone(cacheHealth.percent)}
                 title={`Across the last ${cacheHealth.count} builds, weighted by steps`}
@@ -110,7 +140,7 @@ function DiskSummary({
                 {cacheHealth.percent}% cached
               </span>
             ) : null}
-            {cacheHealth ? (
+            {!buildsFailed && cacheHealth ? (
               <HelpButton topic="build-cache" />
             ) : null}
             {du.build_cache_bytes > 0 ? (
@@ -150,17 +180,31 @@ function ImageRow({
   onRemove,
   removing,
   builds,
+  buildsFailed,
 }: {
   img: DockerImage;
   onRemove: (img: DockerImage) => void;
   removing: boolean;
-  /// Every known build, for the commit join. Empty is ordinary.
+  /// Every known build, for the commit join. Empty is ordinary -- a
+  /// project that tags by version rather than by commit matches nothing
+  /// here.
+  ///
+  /// Ordinary for an EMPTY history, not for a rejected one (#963), which
+  /// is why `buildsFailed` rides alongside: an expanded row showing no
+  /// provenance is indistinguishable from an image that genuinely has
+  /// none.
   builds: DockerBuild[];
+  /// Whether the build-history call rejected rather than answering.
+  buildsFailed: boolean;
 }) {
   const [open, setOpen] = useState(false);
   // Only once the row is expanded: the join is cheap, but the builds
   // themselves are not fetched at all unless something needs them.
   const build = open ? buildForImage(img, builds) : null;
+  // Computed once rather than three times in the JSX below, and as
+  // `number | null` so the absent case is a branch rather than a
+  // fabricated 0 (#963).
+  const cached = build === null ? null : cachePercent(build);
   // `repository:tag`, not the tag alone.
   //
   // Docker reports Repository and Tag separately and `tags` holds only
@@ -306,15 +350,29 @@ function ImageRow({
               Absent freely: a project that tags by version rather than
               by commit matches nothing here, which is ordinary rather
               than an error. */}
-          {build ? (
+          {/* ERROR arm before the absent arm (#963). A rejected history
+              leaves `builds` empty, so `build` is `null` for every image
+              and the row showed no provenance at all -- identical to an
+              image that genuinely has none, which is what the "Absent
+              freely" note above is about and which is true only of a
+              history that ANSWERED. */}
+          {buildsFailed ? (
+            <>
+              <dt>Build</dt>
+              <dd className="text-[#8b949e]">Build history could not be read</dd>
+            </>
+          ) : build ? (
             <>
               <dt>Build</dt>
               <dd>
                 {formatDuration(build.duration_secs)}
-                {build.total_steps > 0 ? (
-                  <span className={`ml-2 ${cacheTone(cachePercent(build))}`}>
-                    {cachePercent(build)}% cached
-                  </span>
+                {/* The cache ratio only when there IS one (#963).
+                    `cachePercent` now returns `null` for a build whose
+                    step counts buildx did not report, instead of the `0`
+                    that read as "nothing was cached" -- the alarm this
+                    figure exists to raise. */}
+                {cached !== null ? (
+                  <span className={`ml-2 ${cacheTone(cached)}`}>{cached}% cached</span>
                 ) : null}
               </dd>
             </>
@@ -334,7 +392,17 @@ export function DockerPage() {
   // For the build join on an expanded row (#326). Fetched with the
   // page rather than per row: one listing serves every image, and the
   // Builds page it replaces fetched exactly this.
-  const { data: builds = [] } = useDockerBuilds(up);
+  //
+  // `isError` DESTRUCTURED, not discarded (#963). This was the literal
+  // `= []` shape of #846: `docker buildx history ls` fails for ordinary
+  // reasons on somebody else's machine -- the `buildx` plugin absent or
+  // too old (it is a plugin, not part of the daemon), the history feature
+  // disabled, a permission wall on the socket, the 20s ceiling in
+  // `docker/cli.rs` -- and an empty array was then read as a MEASUREMENT:
+  // "this machine has never built anything". `DiskSummary` one query over
+  // already handles its own `isError` correctly and states why: "Vanishing
+  // silently is a wrong answer by omission."
+  const { data: builds = [], isError: buildsFailed } = useDockerBuilds(up);
   const removeVolume = useRemoveVolume();
   const prune = usePruneCache();
 
@@ -523,7 +591,7 @@ export function DockerPage() {
 
       {/* ASKS, rather than pruning (#852). The handler is now `setState`;
           the pruning itself moved into the dialog's confirm button. */}
-      <DiskSummary builds={builds} onPrune={() => setPruning(true)} />
+      <DiskSummary builds={builds} buildsFailed={buildsFailed} onPrune={() => setPruning(true)} />
 
       <div className="rounded-md border border-[#30363d]">
         {isLoading ? (
@@ -547,6 +615,7 @@ export function DockerPage() {
               removing={removing === img.id}
               onRemove={setPending}
               builds={builds}
+              buildsFailed={buildsFailed}
             />
           ))
         )}

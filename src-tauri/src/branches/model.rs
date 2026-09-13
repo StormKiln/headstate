@@ -46,7 +46,20 @@ pub enum Deletable {
     /// since the next question is always "where?".
     CheckedOut { path: String },
     /// Not merged: it has commits the default branch does not have.
-    Unmerged { ahead: u64 },
+    ///
+    /// `ahead` is `Option`, not `u64` (#967). `%(ahead-behind:)` needs
+    /// git 2.41; on an older git -- or with git missing from a
+    /// GUI-launched app's PATH, or refusing on `safe.directory` -- the
+    /// count is simply unavailable, and `.unwrap_or(0)` turned that into
+    /// the sentence "Not merged -- 0 commits not on the default branch"
+    /// beside a delete checkbox. The warning and the reassurance
+    /// cancelling it, in one row, resolving in the dangerous direction:
+    /// the number is the only thing telling the user what deleting costs.
+    ///
+    /// A real `0` is still a real `0` -- a branch level with the default
+    /// branch legitimately reports it -- and `None` is only the unread
+    /// case.
+    Unmerged { ahead: Option<u64> },
     /// Listed, not yet classified. A skeleton in the UI, never an
     /// answer -- distinct from `Unknown`, which means the check ran.
     Pending,
@@ -91,9 +104,18 @@ pub struct Branch {
     pub location: Location,
     /// The tracked upstream, when there is one.
     pub upstream: Option<String>,
-    /// Commits ahead of / behind the default branch.
-    pub ahead: u64,
-    pub behind: u64,
+    /// Commits ahead of / behind the default branch, or `None` when the
+    /// count could not be read.
+    ///
+    /// `Option`, not `u64` (#967). `ahead_behind`'s doc has always said
+    /// "a missing count is treated as unknown by the caller, never as
+    /// zero", and the caller did `.unwrap_or((0, 0))` -- which, on a git
+    /// older than 2.41, is EVERY branch reporting 0/0. The same rule
+    /// `worktrees/assess.rs` states two directories over: "a prompt that
+    /// asserts '0 commits ahead' when the check failed sends an agent
+    /// looking for work that is there. Absent means absent."
+    pub ahead: Option<u64>,
+    pub behind: Option<u64>,
     /// Last commit date, ISO 8601, as git reports it.
     pub committed: String,
     pub author: String,
@@ -128,7 +150,7 @@ mod tests {
         .is_deletable());
 
         assert!(!Deletable::DefaultBranch.is_deletable());
-        assert!(!Deletable::Unmerged { ahead: 3 }.is_deletable());
+        assert!(!Deletable::Unmerged { ahead: Some(3) }.is_deletable());
         assert!(!Deletable::CheckedOut {
             path: "/w/x".into()
         }

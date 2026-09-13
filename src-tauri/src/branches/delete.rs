@@ -147,8 +147,17 @@ fn still_deletable(branches: &[Branch], name: &str) -> Result<(), String> {
         Deletable::Merged { .. } => Ok(()),
         Deletable::DefaultBranch => Err(format!("{name} is the default branch")),
         Deletable::CheckedOut { path } => Err(format!("{name} is checked out in {path}")),
-        Deletable::Unmerged { ahead } => Err(format!(
-            "{name} is not merged: {ahead} commit(s) are not on the default branch"
+        // The refusal does not depend on the count -- `Unmerged` is the
+        // refusal -- but the REASON must not fabricate one (#967). "0
+        // commit(s) are not on the default branch" beside a refusal is a
+        // self-contradiction the user reads as the app being broken, and
+        // on a git older than 2.41 it was every unmerged branch.
+        Deletable::Unmerged { ahead: Some(n) } => Err(format!(
+            "{name} is not merged: {n} commit(s) are not on the default branch"
+        )),
+        Deletable::Unmerged { ahead: None } => Err(format!(
+            "{name} is not merged, and the commit count could not be read \
+             (git 2.41 or newer is needed to count)"
         )),
         Deletable::Pending => Err(format!("{name} has not been checked yet")),
         Deletable::Unknown { reason } => Err(format!("{name}: {reason}")),

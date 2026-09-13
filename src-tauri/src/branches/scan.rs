@@ -237,6 +237,14 @@ fn parse_ref(line: &str, remote: bool) -> Option<(String, Option<String>, String
 /// back empty and every branch reports 0/0 -- which would make an
 /// unmerged branch look like it had nothing to lose. So a missing
 /// count is treated as unknown by the caller, never as zero.
+///
+/// That last sentence was true of the intent and false of the code until
+/// #967: both callers did `.unwrap_or(0)`, and the row read "Not merged
+/// -- 0 commits not on the default branch" beside a delete checkbox. The
+/// counts are `Option` on `Branch` and on `Deletable::Unmerged` now, so
+/// an absent entry in this map stays absent all the way to the screen.
+/// `emptyStateGuard.test.ts` names this failure mode exactly: a guard
+/// that passed on a comment rather than on behaviour.
 fn ahead_behind(dir: &Path, default: &str) -> std::collections::HashMap<String, (u64, u64)> {
     let fmt = format!("%(refname:short)\t%(ahead-behind:{default})");
     let mut map = std::collections::HashMap::new();
@@ -404,8 +412,13 @@ fn classify(
         Some(pid) if mainline.contains(&pid) => Deletable::Merged {
             how: MergedHow::Squash,
         },
+        // The verdict stays `Unmerged` -- that part was measured, by the
+        // patch-id comparison right above, and is independent of whether
+        // the COUNT could be read. Only the number becomes absent (#967).
+        // Routing this to `Unknown` instead would widen nothing (both are
+        // already non-deletable) but would lose the one fact we do have.
         Some(_) => Deletable::Unmerged {
-            ahead: ahead.map(|(a, _)| a).unwrap_or(0),
+            ahead: ahead.map(|(a, _)| a),
         },
         // No diff against the merge-base, and not an ancestor. Nothing
         // was established either way, so this is a failed check rather
@@ -538,7 +551,14 @@ pub fn scan_with_progress(dir: &Path, progress: &dyn Progress) -> Result<Vec<Bra
             Some(u) if remote_names.contains(u) => Location::Tracked,
             _ => Location::Local,
         };
-        let (ahead, behind) = ab.get(&name).copied().unwrap_or((0, 0));
+        // NOT `.unwrap_or((0, 0))` (#967). An empty map is what an old
+        // git, a missing git, or a `safe.directory` refusal produces, and
+        // that fallback made every branch claim it was level with the
+        // default branch.
+        let (ahead, behind) = match ab.get(&name).copied() {
+            Some((a, b)) => (Some(a), Some(b)),
+            None => (None, None),
+        };
         out.push(Branch {
             name,
             location,
@@ -566,8 +586,12 @@ pub fn scan_with_progress(dir: &Path, progress: &dyn Progress) -> Result<Vec<Bra
             name,
             location: Location::Remote,
             upstream: None,
-            ahead: 0,
-            behind: 0,
+            // `None`, not `0` (#967). `ahead_behind` only queries
+            // `refs/heads`, so a remote-only branch was never measured at
+            // all -- and a 0 here was an answer to a question nobody
+            // asked.
+            ahead: None,
+            behind: None,
             committed,
             author,
             tip,
@@ -873,9 +897,86 @@ mod tests {
         let out = scan(&repo).unwrap();
         assert_eq!(
             find(&out, "wip").deletable,
-            Deletable::Unmerged { ahead: 2 }
+            Deletable::Unmerged { ahead: Some(2) }
         );
         assert!(!find(&out, "wip").deletable.is_deletable());
+        // A real count, not the `Some(0)` an old git would have produced.
+        assert_eq!(find(&out, "wip").ahead, Some(2));
+    }
+
+    /// #967. `ahead_behind`'s doc says "a missing count is treated as
+    /// unknown by the caller, never as zero", and for a long time the
+    /// caller did `.unwrap_or(0)` anyway.
+    ///
+    /// An empty `ahead_behind` map is precisely the state git older than
+    /// 2.41 produces -- `%(ahead-behind:)` comes back empty and every line
+    /// is skipped -- and it is also what a failed `for-each-ref` produces,
+    /// since that path returns the map empty. Both are ordinary
+    /// fresh-machine conditions: Debian stable and several LTS images ship
+    /// 2.39, and a GUI-launched app may not find git on its PATH at all.
+    ///
+    /// The verdict must stay `Unmerged` (that part WAS measured, by the
+    /// patch-id comparison) while the count becomes absent. What must not
+    /// happen is `Unmerged { ahead: 0 }`, which `BranchesPage` renders as
+    /// "Not merged — 0 commits not on the default branch" beside a delete
+    /// checkbox: the warning and the reassurance that cancels it, in one
+    /// sentence, resolving in the dangerous direction.
+    #[test]
+    fn a_branch_whose_ahead_count_could_not_be_read_does_not_report_zero() {
+        let (_t, repo) = fixture();
+        run(&repo, &["checkout", "-q", "-b", "wip"]);
+        commit(&repo, "wip-one");
+        run(&repo, &["checkout", "-q", "main"]);
+
+        let default = default_branch(&repo).unwrap();
+        let mainline = mainline_patch_ids(&repo, &default);
+
+        // No ancestors, no worktrees, and -- the point -- NO entry in the
+        // ahead/behind map, which is what `ahead_behind` returns wholesale
+        // on an old or absent git.
+        let verdict = classify(
+            &repo,
+            "wip",
+            &default,
+            &HashSet::new(),
+            &[],
+            None,
+            &mainline,
+        );
+
+        assert_ne!(
+            verdict,
+            Deletable::Unmerged { ahead: Some(0) },
+            "an unread count must not render as a branch with nothing to lose"
+        );
+        match verdict {
+            Deletable::Unmerged { ahead: None } | Deletable::Unknown { .. } => {}
+            other => panic!("expected an absent count or Unknown, got {other:?}"),
+        }
+
+        // And the branch is still refused, which was never in doubt: the
+        // fix is to what is REPORTED, not to what is permitted.
+        assert!(!verdict.is_deletable());
+    }
+
+    /// The other half: a genuinely level branch keeps reporting a real
+    /// zero (#967). Only the UNREAD case became absent, and a fix that
+    /// erased the measured zero would have traded one wrong answer for
+    /// another.
+    #[test]
+    fn a_measured_zero_ahead_is_still_a_measured_zero() {
+        let (_t, repo) = fixture();
+        // Branch at the tip of main: nothing ahead, and `--merged` will
+        // settle it as an ancestor.
+        run(&repo, &["branch", "level"]);
+
+        let out = scan(&repo).unwrap();
+        assert_eq!(
+            find(&out, "level").ahead,
+            Some(0),
+            "a branch level with the default branch has a MEASURED zero"
+        );
+        assert_eq!(find(&out, "level").behind, Some(0));
     }
 
     /// Checked-out beats merged: git refuses to delete a branch that is

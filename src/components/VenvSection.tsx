@@ -102,7 +102,18 @@ export function VenvSection() {
   // this renders an explicit retry, which is the pairing
   // `useStatsBoard`'s rule requires.
   const { data: venvs = [], isLoading, isError, error, refetch } = useVenvs(true);
-  const { sizes, idle, measuring, pending, total } = useVenvSizes(venvs, venvs.length > 0);
+  const { sizes, idle, measuring, pending, total, failed } = useVenvSizes(
+    venvs,
+    venvs.length > 0,
+  );
+  /// Whether the byte figures below are the whole answer (#956).
+  ///
+  /// `measuring` alone was the test, and it is false for a REJECTED chunk
+  /// as much as for a finished one -- so the sizes appeared, on two
+  /// destructive buttons, summed over a map missing the failed chunk's
+  /// paths. A failure does not clear on its own either (`retry: false`),
+  /// so this is not a transient state that corrects itself.
+  const sizesComplete = !measuring && failed === 0;
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -186,8 +197,24 @@ export function VenvSection() {
       <div className="mb-3 flex items-center gap-2 text-sm">
         <span className="font-semibold text-[#e6edf3]">Poetry virtualenvs</span>
         <span className="text-[#8b949e]">
-          {orphans.length} orphaned{measuring ? "" : ` · ${formatSize(orphanBytes)}`}
+          {/* `sizesComplete`, not `!measuring` (#956): a rejected chunk
+              stops measuring without answering, and the figure would then
+              be a partial sum presented as a total. */}
+          {orphans.length} orphaned{sizesComplete ? ` · ${formatSize(orphanBytes)}` : ""}
         </span>
+        {/* Says the sizes are short and why the number is missing, rather
+            than letting it silently not appear. Not a `QueryError`: the
+            venv SCAN succeeded and every row below is real -- only the
+            byte figures are incomplete -- which is the partial-answer case
+            this app labels rather than blanks. No retry, for
+            `PartialScanNotice`'s reason: `retry: false` is deliberate on
+            these calls and a second identical walk reads no more. */}
+        {failed > 0 ? (
+          <span role="status" className="text-xs text-[#d29922]">
+            {failed} of {total} size {failed === 1 ? "chunk" : "chunks"} could not be
+            measured, so the sizes here are incomplete
+          </span>
+        ) : null}
         {/* COUNTED, not a bare "measuring…". Sizing is chunked now, so
             there is real progress to report -- and a bare word on a
             pass that took 73 seconds is indistinguishable from being
@@ -222,7 +249,10 @@ export function VenvSection() {
             className="ml-auto rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#f85149] hover:bg-[#f85149]/10 disabled:opacity-50"
           >
             Remove all {orphans.length} orphaned
-            {measuring ? "" : ` · ${formatSize(orphanBytes)}`}
+            {/* The size only when it IS the size (#956). A destructive
+                button's label is the last number a user reads before
+                clicking, and an understated one is worse than none. */}
+            {sizesComplete ? ` · ${formatSize(orphanBytes)}` : ""}
           </button>
         ) : null}
 
@@ -233,7 +263,13 @@ export function VenvSection() {
             onClick={() => setConfirming(true)}
             className="ml-auto rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#f85149] hover:bg-[#f85149]/10 disabled:opacity-50"
           >
-            {busy ? "Removing…" : `Remove ${checked.size} · ${formatSize(selectedBytes)}`}
+            {/* Same rule (#956): `selectedBytes` is a `?? 0` sum over a
+                map a failed chunk left holes in. */}
+            {busy
+              ? "Removing…"
+              : sizesComplete
+                ? `Remove ${checked.size} · ${formatSize(selectedBytes)}`
+                : `Remove ${checked.size}`}
           </button>
         ) : null}
       </div>
@@ -284,8 +320,14 @@ export function VenvSection() {
                 the one sentence that matters. The stale sentence names the
                 threshold and the consequence -- `poetry install` -- so the
                 judgement is reviewable rather than merely flagged. */}
+            {/* A floor when it is a floor (#956). This dialog is the last
+                place the figure is read before the click, so an
+                understated total here is exactly the "rubber stamp with
+                wrong words on it" the comment above warns about. */}
             <p className="mt-3 text-sm text-[#e6edf3]">
-              This frees {formatSize(selectedBytes)}.
+              {sizesComplete
+                ? `This frees ${formatSize(selectedBytes)}.`
+                : `This frees at least ${formatSize(selectedBytes)} — some sizes could not be measured, so the real figure is larger.`}
             </p>
             {chosenOrphans > 0 ? (
               <p className="mt-2 text-sm text-[#8b949e]">
