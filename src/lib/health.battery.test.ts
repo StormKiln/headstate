@@ -9,6 +9,7 @@
 import { describe, expect, it } from "vitest";
 import {
   CAPACITY_BAR_MAX,
+  NAMEPLATE_MARK,
   barColor,
   capacityBarFill,
   capacityColor,
@@ -130,6 +131,58 @@ describe("the capacity visual survives a reading over 100 (#772)", () => {
     expect(CAPACITY_BAR_MAX).toBeGreaterThan(100);
     expect(capacityBarFill(100)).toBeLessThan(100);
     expect(capacityBarFill(103)).toBeGreaterThan(capacityBarFill(100));
+  });
+});
+
+/// The scale LABEL and the FILL must share one scale (#981).
+///
+/// A unit test rather than a DOM one, because the defect was
+/// arithmetic: the label reading "Rated capacity: 100%" was the second
+/// child of a `justify-between` row, which pins it to the container's
+/// right edge -- the `CAPACITY_BAR_MAX` end. So the mark named "100%"
+/// rendered at 100% of the track while a reading of 100% filled 83.33%
+/// of it, and a perfectly healthy battery looked short of nameplate by
+/// a sixth of the bar. Nothing about that needs rendering to show.
+describe("the capacity scale label shares the fill's scale (#981)", () => {
+  /// THE #981 bug, as an assertion.
+  ///
+  /// The mark is where a reading of exactly 100 puts the fill. If these
+  /// two ever disagree the panel is miscalibrated, whatever the numbers
+  /// happen to be.
+  it("puts the nameplate mark exactly where a 100% reading fills to", () => {
+    expect(NAMEPLATE_MARK).toBe(capacityBarFill(100));
+  });
+
+  /// The mark is NOT at the right-hand end, which is what the
+  /// `justify-between` label was. 16.67% of the track is the whole
+  /// defect, expressed as the gap it used to leave.
+  it("does not sit flush with the end of the track", () => {
+    expect(NAMEPLATE_MARK).toBeLessThan(100);
+    expect(100 - NAMEPLATE_MARK).toBeCloseTo(16.67, 1);
+    expect(NAMEPLATE_MARK).toBeCloseTo(83.33, 1);
+  });
+
+  /// Every reading is now read against the right point: below nameplate
+  /// falls short of the mark, at nameplate meets it, above nameplate
+  /// passes it. Under the old label all three read as "short".
+  it("reads correctly in both directions around the mark", () => {
+    // Below nameplate: the amber service threshold and the red one.
+    expect(capacityBarFill(80)).toBeLessThan(NAMEPLATE_MARK);
+    expect(capacityBarFill(50)).toBeLessThan(NAMEPLATE_MARK);
+    // At nameplate.
+    expect(capacityBarFill(100)).toBe(NAMEPLATE_MARK);
+    // Above nameplate -- the 103% reading that opened #772, which must
+    // read as PAST the mark rather than as still short of it.
+    expect(capacityBarFill(103)).toBeGreaterThan(NAMEPLATE_MARK);
+  });
+
+  /// Derived, not hardcoded. A literal 83.33 would be correct today and
+  /// silently wrong the first time `CAPACITY_BAR_MAX` is retuned --
+  /// which is the class of drift that produced the bug in the first
+  /// place, so the test asserts the DERIVATION rather than the value.
+  it("stays correct if the track maximum is retuned", () => {
+    // The relationship, stated independently of both constants.
+    expect(NAMEPLATE_MARK).toBeCloseTo((100 / CAPACITY_BAR_MAX) * 100, 10);
   });
 });
 
