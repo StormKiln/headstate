@@ -1,11 +1,16 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { ClaudeFile, ImportNode } from "@/types/pr";
+import type { ClaudeFile, ClaudeMdScan, ImportNode } from "@/types/pr";
 
 const copyFn = vi.hoisted(() => vi.fn(() => Promise.resolve(null as string | null)));
 const state = vi.hoisted(() => ({
   repo: "/code/app" as string | undefined,
   files: [] as ClaudeFile[],
+  // What the scan could not read (#972). Separate from `files` in the
+  // harness because they are separate facts on the wire: a scan can return
+  // files AND a shortfall, and the page has to render both.
+  unreadableDirs: [] as string[],
+  unreadableFiles: [] as string[],
   loading: false,
   text: "# hello" as string | undefined,
   // #846: the two queries fail independently. The scan failing means the
@@ -22,7 +27,14 @@ const refetchTextFn = vi.hoisted(() => vi.fn());
 
 vi.mock("../api/hooks", () => ({
   useClaudeMd: () => ({
-    data: state.files,
+    // A `Scan`, not a bare array (#972). The bare array was what made the
+    // page unable to tell "none" from "could not look".
+    data: {
+      files: state.files,
+      unreadable_dirs: state.unreadableDirs,
+      unreadable_files: state.unreadableFiles,
+      skipped_dirs: 0,
+    } satisfies ClaudeMdScan,
     isLoading: state.loading,
     isError: state.failed,
     error: "could not read the repository",
@@ -48,6 +60,7 @@ const node = (over: Partial<ImportNode> = {}): ImportNode => ({
   bytes: 400,
   tokens: 100,
   problem: null,
+  unreadable: false,
   children: [],
   ...over,
 });
@@ -57,6 +70,7 @@ const file = (over: Partial<ClaudeFile> = {}): ClaudeFile => ({
   bytes: 2000,
   tokens: 500,
   total_tokens: 500,
+  total_partial: false,
   imports: [],
   ...over,
 });
@@ -66,6 +80,8 @@ beforeEach(() => {
   copyFn.mockResolvedValue(null);
   state.repo = "/code/app";
   state.files = [];
+  state.unreadableDirs = [];
+  state.unreadableFiles = [];
   state.loading = false;
   state.text = "# hello";
   state.failed = false;
@@ -136,6 +152,120 @@ describe("ClaudeMdPage", () => {
     render(<ClaudeMdPage />);
     expect(screen.getByText("@a.md")).toBeTruthy();
     expect(screen.getByText("@leaf.md")).toBeTruthy();
+  });
+
+  /// #846's exact copy must be unreachable on a scan that could not look.
+  ///
+  /// #846 gave this page a correct `isError` arm ordered BEFORE the empty
+  /// arm. That fix is sound and untouched -- but the arm can only fire on
+  /// `isError`, and `scan_claude_md` could only ever return `Ok`. So a read
+  /// failure arrived as an empty list, the empty arm was reached first, and
+  /// the page said "No CLAUDE.md files in this repository" about a file the
+  /// user can see on disk (#972). `emptyStateGuard.test.ts` records that its
+  /// own `RepoPickerSidebar` check was passing on a COMMENT rather than the
+  /// behaviour, so this asserts the sentence is absent rather than that some
+  /// error copy is present.
+  it("does not say there are no CLAUDE.md files when the scan reports unreadable entries", () => {
+    state.files = [];
+    state.unreadableFiles = ["/code/app/CLAUDE.md (Permission denied)"];
+    render(<ClaudeMdPage />);
+    expect(screen.queryByText(/No CLAUDE.md files in this repository/)).toBeNull();
+    expect(screen.getByText(/could not be read/)).toBeTruthy();
+  });
+
+  /// The path is NAMED. A count says something is wrong and nothing about
+  /// where to look; a `chmod` needs the path.
+  it("names the path it could not read", () => {
+    state.files = [];
+    state.unreadableDirs = ["/code/app/packages (Permission denied)"];
+    render(<ClaudeMdPage />);
+    expect(screen.getByText(/\/code\/app\/packages/)).toBeTruthy();
+  });
+
+  /// A partial scan offers NO retry, and is not reported as a failed scan.
+  ///
+  /// The decision #951 made for `RepoPickerSidebar` and wrote into
+  /// `PartialScanNotice`: `isError` is a rejection of the whole command,
+  /// while this is a walk that RAN and came back short. A second identical
+  /// walk will not read what the first could not, so a "Try again" button
+  /// would promise something it cannot deliver.
+  it("offers no retry for a scan that ran and came back short", () => {
+    state.files = [];
+    state.unreadableFiles = ["/code/app/CLAUDE.md (Permission denied)"];
+    render(<ClaudeMdPage />);
+    expect(screen.queryByRole("button", { name: /try again/i })).toBeNull();
+    expect(refetchFn).not.toHaveBeenCalled();
+  });
+
+  /// The `isError` arm still fires, and still DOES offer a retry.
+  ///
+  /// The new arm is a third state, not a replacement: a rejected command is
+  /// a different claim from a walk that came back short, and it is the one
+  /// a retry can genuinely help.
+  it("still reports a rejected scan as a failure, with a retry", () => {
+    state.failed = true;
+    render(<ClaudeMdPage />);
+    expect(screen.getByText(/Could not look for CLAUDE.md files/)).toBeTruthy();
+    expect(screen.queryByText(/No CLAUDE.md files in this repository/)).toBeNull();
+  });
+
+  /// A scan that read EVERYTHING still gets to say the repository has none.
+  ///
+  /// The false-positive half: if the new arm swallowed the ordinary empty
+  /// case, a repository that genuinely has no CLAUDE.md would look broken.
+  it("still says a repository has none when the scan read everything", () => {
+    state.files = [];
+    state.unreadableDirs = [];
+    state.unreadableFiles = [];
+    render(<ClaudeMdPage />);
+    expect(screen.getByText(/No CLAUDE.md files in this repository/)).toBeTruthy();
+  });
+
+  /// One unreadable file must NOT blank the list.
+  ///
+  /// The files that did read are real. A partial answer labelled partial
+  /// beats both a silent truncation and an error page -- the rule
+  /// `transcript.rs`'s `is_partial()` states, and the same trade
+  /// `ArtifactsPage` makes. Rendered through `PartialScanNotice`, the
+  /// component #951 added, rather than a second banner of our own.
+  it("keeps the files that read and states the shortfall beside them", () => {
+    state.files = [file({ path: "/code/app/CLAUDE.md" })];
+    state.unreadableFiles = ["/code/app/nested/CLAUDE.md (Permission denied)"];
+    render(<ClaudeMdPage />);
+    expect(screen.getByText("CLAUDE.md")).toBeTruthy();
+    expect(screen.getByText(/may not be all of them/)).toBeTruthy();
+    // And the path, which is what a `chmod` actually needs.
+    expect(screen.getByText(/nested\/CLAUDE.md/)).toBeTruthy();
+  });
+
+  /// A total missing an unmeasured import is a FLOOR, not a value.
+  ///
+  /// Reuses the app's existing "at least" idiom -- the one `ArtifactsPage`
+  /// and `WorktreesPage` already put in front of a partially-measured size
+  /// -- rather than inventing a second phrasing for the same fact.
+  it("prefixes a partial token total with at least", () => {
+    state.files = [
+      file({
+        tokens: 500,
+        total_tokens: 500,
+        total_partial: true,
+        imports: [node({ tokens: 0, problem: "could not read: Permission denied", unreadable: true })],
+      }),
+    ];
+    render(<ClaudeMdPage />);
+    expect(screen.getByText(/at least .* with imports/)).toBeTruthy();
+  });
+
+  /// An EXACT total is not hedged.
+  ///
+  /// "at least" everywhere would mean nothing anywhere.
+  it("does not say at least when every import was counted", () => {
+    state.files = [
+      file({ tokens: 500, total_tokens: 4000, total_partial: false, imports: [node()] }),
+    ];
+    render(<ClaudeMdPage />);
+    expect(screen.queryByText(/at least/)).toBeNull();
+    expect(screen.getByText(/4,000 est\. tokens with imports/)).toBeTruthy();
   });
 
   it("renders the selected file's content", () => {

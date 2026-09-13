@@ -60,12 +60,13 @@ pub fn check(repo: &Path, eco: Ecosystem) -> EcosystemReport {
     // does not diff, so there is nothing to spawn and parse. The lock
     // file carries the resolved versions, and `enrich` fills in the
     // latest asynchronously afterwards.
+    //
+    // A lock file it could not READ is reported through `error` rather
+    // than dropped (#954): `error` is documented as "the check could not
+    // run" and was hardcoded `None` here because there is no command to
+    // fail, which left every file-read failure beneath it unrepresentable.
     if eco == Ecosystem::Terraform {
-        return EcosystemReport {
-            ecosystem: eco,
-            outdated: terraform::pinned(repo),
-            error: None,
-        };
+        return from_files(eco, terraform::scan(repo));
     }
 
     // Swift answers from a FILE plus the Git host, never a command.
@@ -75,11 +76,7 @@ pub fn check(repo: &Path, eco: Ecosystem) -> EcosystemReport {
     // repositories and their versions are TAGS, so `Package.resolved`
     // plus a tag listing answers the question -- see `packages::swift`.
     if eco == Ecosystem::Swift {
-        return EcosystemReport {
-            ecosystem: eco,
-            outdated: swift::pinned(repo),
-            error: None,
-        };
+        return from_files(eco, swift::scan(repo));
     }
 
     // Cargo answers from TWO FILES plus the crates.io index, never a
@@ -94,11 +91,7 @@ pub fn check(repo: &Path, eco: Ecosystem) -> EcosystemReport {
     // silence the ecosystem. `Cargo.toml` says which crates, `Cargo.lock`
     // says which versions, and `enrich` asks the sparse index.
     if eco == Ecosystem::Cargo {
-        return EcosystemReport {
-            ecosystem: eco,
-            outdated: cargo::pinned(repo),
-            error: None,
-        };
+        return from_files(eco, cargo::scan(repo));
     }
 
     let fallbacks = tools::fallback_dirs();
@@ -208,6 +201,25 @@ pub fn check(repo: &Path, eco: Ecosystem) -> EcosystemReport {
         ecosystem: eco,
         outdated: parsed,
         error: None,
+    }
+}
+
+/// The report for an ecosystem that answers from FILES.
+///
+/// The whole of #954's fix: `FileScan` can say what it could not read, and
+/// this is where that reaches the `error` field the UI has always
+/// rendered. The rows that DID read are carried through unchanged -- a
+/// partial answer labelled partial beats both a silent truncation and an
+/// error page, which is the rule `claude::transcript::Scan::is_partial`
+/// states and the reason this does not return early on a failure.
+fn from_files(eco: Ecosystem, scan: super::model::FileScan) -> EcosystemReport {
+    // `None` when nothing failed, so an unaffected repository reports
+    // exactly what it reported before.
+    let error = scan.error();
+    EcosystemReport {
+        ecosystem: eco,
+        outdated: scan.outdated,
+        error,
     }
 }
 

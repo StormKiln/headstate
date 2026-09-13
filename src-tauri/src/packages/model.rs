@@ -166,6 +166,78 @@ pub struct EcosystemReport {
     pub error: Option<String>,
 }
 
+/// What a FILE-reading ecosystem scan found, including what it could not
+/// read.
+///
+/// The unreadable list is the point of the type, exactly as it is for
+/// `claude::transcript::Scan`. Cargo, Swift and Terraform answer from
+/// files rather than from a command, so there is no spawn failure to
+/// report and `error` was left hardcoded `None` (#954) -- which made
+/// every read failure beneath them unrepresentable. An unreadable
+/// `Cargo.lock` dropped every crate and the page said "up to date": a
+/// confident wrong answer where the truth is "we could not look".
+///
+/// A bare `Vec` cannot carry that, so this does. `run::check` turns a
+/// non-empty `unreadable` into the `error` the UI already renders.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FileScan {
+    /// What DID read. Never discarded because something else did not: a
+    /// partial answer labelled partial beats both a silent truncation and
+    /// an error page, the rule `claude::transcript::Scan::is_partial`
+    /// states.
+    pub outdated: Vec<Outdated>,
+    /// Paths that could not be read, with why.
+    ///
+    /// Messages rather than a count, because a lock file hides an
+    /// unknown number of packages and naming it is what makes the report
+    /// actionable.
+    pub unreadable: Vec<String>,
+}
+
+impl FileScan {
+    /// Whether anything at all could not be read.
+    ///
+    /// Deliberately NOT a reason to discard `outdated`; see the field's
+    /// own comment.
+    pub fn is_partial(&self) -> bool {
+        !self.unreadable.is_empty()
+    }
+
+    /// The sentence the UI shows instead of an empty list.
+    ///
+    /// `None` when nothing failed, so a caller can write
+    /// `error: scan.error()` and have the no-failure case be exactly the
+    /// `None` it was before.
+    ///
+    /// Says WHAT was skipped and that the rest is still real, because
+    /// this text lands beside a list the user can see: a message that
+    /// only said "failed" would read as though the whole list were
+    /// suspect.
+    pub fn error(&self) -> Option<String> {
+        if self.unreadable.is_empty() {
+            return None;
+        }
+        let count = self.unreadable.len();
+        Some(format!(
+            "{count} file{} could not be read, so this list is incomplete: {}",
+            if count == 1 { "" } else { "s" },
+            self.unreadable.join("; ")
+        ))
+    }
+
+    /// Record an unreadable path.
+    pub(super) fn failed(&mut self, path: &std::path::Path, why: &std::io::Error) {
+        self.unreadable.push(format!("{} ({why})", path.display()));
+    }
+
+    /// Record an unreadable path from a message that is not an
+    /// `io::Error` -- a malformed file, which is a read that SUCCEEDED
+    /// and produced nothing usable.
+    pub(super) fn failed_with(&mut self, path: &std::path::Path, why: &str) {
+        self.unreadable.push(format!("{} ({why})", path.display()));
+    }
+}
+
 /// One project's worth of reports.
 ///
 /// The unit the UI groups by. A repository can hold several, and their

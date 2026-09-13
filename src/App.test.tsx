@@ -44,7 +44,14 @@ vi.mock("./api/hooks", () => ({
     rescan: () => Promise.resolve(),
   }),
   useWorktrees: () => ({ data: [], isLoading: false, isError: false, refetch: () => {} }),
-  useClaudeMd: () => ({ data: [], isLoading: false, isError: false, error: null, refetch: () => {} }),
+  // A `Scan`, not a bare array (#972).
+  useClaudeMd: () => ({
+    data: { files: [], unreadable_dirs: [], unreadable_files: [], skipped_dirs: 0 },
+    isLoading: false,
+    isError: false,
+    error: null,
+    refetch: () => {},
+  }),
   useClaudeMdText: () => ({ data: undefined, isLoading: false, isError: false, error: null, refetch: () => {} }),
   useAutostart: () => ({ enabled: false, set: () => Promise.resolve() }),
   useRemoteEnabled: () => ({ enabled: false, set: () => Promise.resolve() }),
