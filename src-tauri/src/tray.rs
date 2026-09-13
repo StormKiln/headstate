@@ -57,6 +57,29 @@ pub fn badge_text(needs_attention: u64) -> Option<String> {
 /// every 2 minutes would close it under a user who had it open.
 pub struct CountItem(pub MenuItem<tauri::Wry>);
 
+/// # What is not covered here, and why (#905)
+///
+/// `cargo mutants --in-place --file src/tray.rs` reports four surviving
+/// mutants in this function and `set_badge`: the whole body can be replaced
+/// with `Ok(())`, and each of the "show", "refresh" and "quit" match arms
+/// can be DELETED, with all 1200+ tests still green. So nothing asserts
+/// that the tray menu's three actions are wired at all -- and the tray is
+/// what a user reaches for when the window is closed, so a dropped arm
+/// would present as "the menu bar item does nothing".
+///
+/// That gap is real and is recorded rather than papered over, because
+/// closing it needs infrastructure this crate does not have: every item
+/// here takes an `&AppHandle`, and there is no mock runtime anywhere in
+/// `src-tauri` (no `tauri::test`, no `MockRuntime`). Introducing one is a
+/// larger change than #905, and it would be the only test in the crate of
+/// its kind -- so it is a deliberate decision rather than a rider on a
+/// boundary-condition fix.
+///
+/// `badge_text` by contrast is a pure function with no such excuse, and its
+/// surviving mutant IS fixed: see `the_cap_begins_above_two_digits`.
+///
+/// If you add a Tauri mock runtime for any reason, these four are the first
+/// things to point it at.
 pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     // Disabled: a status line, not an action. It is the first item so the
     // count is the first thing read when the menu opens -- which on
@@ -176,6 +199,32 @@ mod tests {
     #[test]
     fn large_counts_are_capped() {
         assert_eq!(badge_text(150).as_deref(), Some("99+"));
+    }
+
+    /// The cap's BOUNDARY, which is where the rule actually lives (#905).
+    ///
+    /// 99 is two digits and fits, so it must render as itself; 100 is the
+    /// first value that must become "99+". Asserting 0, 3 and 150 -- which
+    /// is what this module did -- pins the three regions and leaves the
+    /// edge between them free: `n > 99` and `n >= 99` both satisfied every
+    /// one of those, so the off-by-one that turns "99" into "99+" was
+    /// invisible.
+    ///
+    /// Found by `make mutants FILE=src/tray.rs`, which reported `replace >
+    /// with >= in badge_text` as MISSED. A surviving mutant is a test that
+    /// cannot fail, and this is the smallest possible example of one.
+    #[test]
+    fn the_cap_begins_above_two_digits() {
+        assert_eq!(
+            badge_text(99).as_deref(),
+            Some("99"),
+            "99 fits in two digits"
+        );
+        assert_eq!(
+            badge_text(100).as_deref(),
+            Some("99+"),
+            "100 is the first capped value"
+        );
     }
 
     /// The tooltip is prose, not a bare number: a tooltip reading "3" is
