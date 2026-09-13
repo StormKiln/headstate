@@ -12,23 +12,30 @@
 //! resolves the overlap per field by which source actually knows the
 //! answer -- see [`store::import`].
 //!
-//! [`install`] (#915) is the ONE exception to the rule below, and it is
-//! narrow on purpose: it appends two hook matchers to
-//! `~/.claude/settings.json` and refuses to touch anything it cannot parse.
-//! Nothing else in here writes to `~/.claude`. The transcripts in
-//! particular are read-only by design -- they are Claude Code's data and the
-//! files `claude --resume` depends on.
-
 //! [`overview`] (#921) is the aggregate layer for the overview page. It
 //! counts over the rows [`store`] holds and derives no liveness of its
 //! own -- #917's `liveness` module owns that, and two answers to one
 //! question disagree the first time either changes. [`live`] is the seam
 //! between them until #917 lands, and its own comment says so.
+//!
+//! [`install`] (#915) is the ONE exception to the read-only rule below, and
+//! it is narrow on purpose: it appends two hook matchers to
+//! `~/.claude/settings.json` and refuses to touch anything it cannot parse.
+//! Nothing else in here writes to `~/.claude`. The transcripts in
+//! particular are read-only by design -- they are Claude Code's data and the
+//! files `claude --resume` depends on.
 
+pub mod cli;
+pub mod hook;
 pub mod install;
 pub mod live;
 pub mod overview;
 pub mod store;
 pub mod transcript;
 
+// Re-exported so `commands.rs` names the operation rather than the module it
+// happens to live in. Dropping these breaks the CALL SITE rather than the
+// module, which is how a merge has eaten them twice in this epic -- the error
+// names a function in a module that still contains it, and five CI checks
+// fail for one missing line. Do not remove them to "tidy" a conflict.
 pub use transcript::{scan, scan_default, Scan, Transcript};
