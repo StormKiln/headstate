@@ -283,13 +283,33 @@ mod tests {
         let body =
             std::fs::read_to_string(super::super::hook::handoff_path_in(home.path())).unwrap();
         assert!(body.contains("\"session_id\":\"abc\""), "got {body}");
-        // The pid is the real one here -- this test runs as a child of the
-        // test harness, so the only thing worth asserting is that a real
-        // pid was recorded rather than the `0` sentinel.
+        // The pid assertion is PER-PLATFORM, because the two platforms
+        // promise opposite things and asserting one on both is how this
+        // test failed on `platform (windows-latest)` after passing
+        // everywhere else: the message read "a Unix build must record a
+        // real parent pid" while running on a build that must not.
+        //
+        // Both arms are asserted rather than one skipped. A
+        // `#[cfg(unix)]` on the assertion alone would leave Windows
+        // covering nothing for the field the whole record is keyed on,
+        // which is the shape of a guard that passes because it checked
+        // nothing.
+        #[cfg(unix)]
         assert!(
             !body.contains("\"ppid\":0,"),
-            "a Unix build must record a real parent pid, not the \
+            "a unix build must record a real parent pid, not the \
              cannot-say sentinel: {body}"
+        );
+        // Windows has no `getppid`, so the record carries the sentinel --
+        // and `0` is never a valid pid, so liveness reads it as "cannot
+        // say" rather than as a pid to go and check. Asserting it here
+        // pins that the sentinel is what ships rather than a plausible
+        // wrong number.
+        #[cfg(not(unix))]
+        assert!(
+            body.contains("\"ppid\":0,"),
+            "a non-unix build has no getppid, so it must record the \
+             cannot-say sentinel rather than a plausible pid: {body}"
         );
     }
 
