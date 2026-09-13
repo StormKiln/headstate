@@ -85,7 +85,20 @@ describe("the remote surface's frontend half", () => {
     // which only ever built a string), delete its line.
     // Note `diag_log` is absent: it is `Class::Local` but has no
     // wrapper in `tauri.ts` at all, so there is nothing to guard.
+    //
+    // #915 added the three Claude hook installers. They edit
+    // `~/.claude/settings.json`, a config file shared with other tools, and
+    // the refusal cases need a human reading an explanation at the machine
+    // with the broken file -- so all three are `Class::Local` and the phone
+    // cannot reach them at all. `ClaudeIntegrationsPanel` renders the three
+    // buttons behind `IS_MOBILE_BUILD`, showing the phone an explanatory
+    // sentence in their place; the STATUS read beside them is
+    // `claude_hooks_status`, a `Class::Read`, which is why it is absent from
+    // this list and visible on both builds.
     const DESKTOP_ONLY_WRAPPERS = [
+      "claudeInstallHooks",
+      "claudeReinstallHooks",
+      "claudeUninstallHooks",
       "getAutostart",
       "getNotifyPrefs",
       "getRemoteEnabled",

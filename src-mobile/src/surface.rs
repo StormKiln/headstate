@@ -121,6 +121,20 @@ pub const SURFACE: &[(&str, Class)] = &[
     // own -- it runs no Claude sessions -- which is exactly why it asks
     // the desktop. See the desktop table for why this is a Read.
     ("claude_poll_live", Class::Read),
+    // Whether the DESKTOP's hooks are installed (#915). Read: one file
+    // read, no side effects, and "is that desktop recording?" is a real
+    // away-from-desk question.
+    //
+    // The three commands that CHANGE that file are `Local` and therefore
+    // absent from this table entirely -- see the desktop copy for why
+    // editing another tool's config is a thing the phone must not do.
+    // Reading is the half that stays useful without being able to act.
+    //
+    // The answer is three-state, and the phone must render "cannot tell"
+    // as its own thing rather than as "not installed": a settings file
+    // Claude Code cannot parse is ignored silently, so a desktop in that
+    // state has every hook dead, and the remedy is at that keyboard.
+    ("claude_hooks_status", Class::Read),
     ("get_poll_interval", Class::Read),
     ("get_worktree_dirs", Class::Read),
     ("get_ui_prefs", Class::Read),
@@ -228,6 +242,20 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("revoke_paired_device", Class::Local),
     ("get_remote_enabled", Class::Local),
     ("set_remote_enabled", Class::Local),
+    // The Claude Code hook installer (#915). All three `Local`: they edit
+    // `~/.claude/settings.json`, a config file shared with other tools, and
+    // the refusal cases need a human reading an explanation at the machine
+    // with the broken file. See the desktop table for the full argument.
+    //
+    // Present in this copy even though the phone can never run them --
+    // `table_is_identical_to_the_desktop_table` requires the table to be
+    // VERBATIM, and that is the point: the phone knows a command exists and
+    // is refused, which is a different answer from a command it has never
+    // heard of. `claude_hooks_status` above is the `Read` half and is
+    // genuinely callable.
+    ("claude_install_hooks", Class::Local),
+    ("claude_reinstall_hooks", Class::Local),
+    ("claude_uninstall_hooks", Class::Local),
 ];
 
 /// The class of a command, or `None` when the desktop has no such
