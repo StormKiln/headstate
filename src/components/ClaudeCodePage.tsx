@@ -23,11 +23,28 @@ import { QueryError, errorMessage } from "./QueryError";
 /// difference between a cap and a truncation: a truncation lies about how
 /// much there is.
 ///
-/// 200 rather than 50 because of what the corpus looks like: **1,399 of
-/// 1,438 sessions were last active within 30 days** and 349 within a
-/// week, so a short cap would hide work from the same fortnight as the
-/// rows above it. 200 covers every session from the last three days with
-/// room to spare.
+/// 200 rather than 50 because of how tightly the corpus clusters.
+/// Measured by last activity:
+///
+/// ```text
+/// within  1 day    80
+/// within  3 days  276
+/// within  7 days  425
+/// within 30 days 1422   of 1,459
+/// ```
+///
+/// 97% of sessions are inside a month, so there is no cap that cleanly
+/// separates "recent" from "old" -- which is exactly why the cap is a
+/// RENDERING budget with the total stated, and not a filter pretending to
+/// be a useful cutoff. Search is what narrows this list; the cap only
+/// decides how much is drawn before the reader asks for the rest.
+///
+/// 200 covers a full day's work several times over and the whole of
+/// yesterday, so the first screen is never missing something from this
+/// morning. It does NOT cover three days (276), and an earlier version of
+/// this comment claimed it did -- corrected by measurement rather than
+/// left as a plausible-sounding number, since a reader checking the claim
+/// is exactly who this paragraph is for.
 const RENDER_CAP = 200;
 
 /// Claude Code sessions on this machine, and how to get one back.
