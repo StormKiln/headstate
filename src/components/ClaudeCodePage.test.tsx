@@ -410,14 +410,31 @@ describe("the list at the real corpus size", () => {
     render(<ClaudeCodePage />);
     expect(screen.getByText(/showing the 200 most recent of 1,438/i)).toBeTruthy();
     expect(screen.getByText(/1,438 sessions/i)).toBeTruthy();
-    expect(screen.queryByRole("button", { name: /Session number 500/ })).toBeNull();
+    // `queryByText`, not `queryByRole(…, { name })` -- see the next test
+    // for the measurement. Row 500 is past the cap, so it must be absent.
+    expect(screen.queryByText("Session number 500")).toBeNull();
+    // ...and row 0 is present, so the absence above is the CAP rather
+    // than the list failing to render at all.
+    expect(screen.getByText("Session number 0")).toBeTruthy();
   });
 
+  /// The "show all" control genuinely renders the rest.
+  ///
+  /// Asserted with `getByText` rather than `getByRole(…, { name })`.
+  /// That is not cosmetic: `getByRole` with a name builds the
+  /// accessibility tree and computes an accessible name for every one of
+  /// 1,438 buttons, which measured **6.5s locally against 453ms** for the
+  /// capped case above -- and timed out at CI's 15s limit on a slower
+  /// runner, which is how this was found. `getByText` matches one text
+  /// node and costs milliseconds.
+  ///
+  /// The assertion is unchanged in meaning: row 500 exists only when the
+  /// cap is lifted, and it is absent in the capped test above.
   it("shows every row when asked to", () => {
     state.list = listOf(many(1438));
     render(<ClaudeCodePage />);
     fireEvent.click(screen.getByRole("button", { name: /show all 1,438/i }));
-    expect(screen.getByRole("button", { name: /Session number 500/ })).toBeTruthy();
+    expect(screen.getByText("Session number 500")).toBeTruthy();
     expect(screen.queryByText(/showing the 200 most recent/i)).toBeNull();
   });
 
