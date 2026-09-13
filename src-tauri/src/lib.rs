@@ -2,6 +2,7 @@ pub mod artifacts;
 pub mod auth;
 pub mod branches;
 pub mod caches;
+pub mod claude;
 pub mod claudemd;
 pub mod cleanup;
 pub mod commands;
