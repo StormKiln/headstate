@@ -190,8 +190,10 @@ That fires `.github/workflows/release.yml`, which:
    About box reading `0.1.0`.
 2. Builds a **universal** binary (Apple Silicon + Intel), so one download
    runs on both.
-3. Signs and notarizes it **if** the Apple secrets are present (see below).
-   They are not today, so this step is skipped.
+3. **Signs and notarizes it**, and verifies the result before uploading.
+   Guarded on the Apple secrets (see below), which are present, so this runs
+   on every release; a fork without them builds unsigned rather than
+   failing.
 4. Creates the GitHub Release with the `.dmg` and a `.app.tar.gz`, and
    generates release notes from the commits since the last tag.
 
@@ -199,12 +201,13 @@ The tag must be `vMAJOR.MINOR.PATCH`. Anything else (`v1.2`, `latest`,
 `vfoo`) fails the job early with a clear message rather than publishing a
 mislabelled build.
 
-**The release notes adapt to the signing state on their own.** While
-releases are unsigned, every release gets the `xattr -dr
-com.apple.quarantine` instruction prepended automatically. Once the signing
-secrets exist, that text is replaced with a note that the build is signed
-and notarized — no edit to the workflow, and no stale instruction left
-behind for users to follow unnecessarily.
+**The release notes adapt to the signing state on their own.** With the
+secrets in place the notes say the macOS build is signed and notarized;
+without them, every release instead gets the `xattr -dr
+com.apple.quarantine` instruction prepended automatically. No edit to the
+workflow either way, and no stale instruction left behind for users to
+follow unnecessarily. Windows is still unsigned and its SmartScreen note is
+generated the same way.
 
 To undo a bad tag before anyone downloads it, delete it locally and
 remotely (`git tag -d v0.2.0 && git push origin :v0.2.0`) and delete the
