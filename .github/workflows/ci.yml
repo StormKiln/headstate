@@ -118,6 +118,19 @@ jobs:
       # review. See the `mobile-changes` job.
       - name: Mobile path gate
         run: python3 scripts/check-mobile-gate.py
+      # The other way to produce a never-arriving required status, and the
+      # one the `platform` comment below could only ask for politely: a
+      # RENAME. The ruleset goes on requiring the old context, no job ever
+      # reports it, and every pull request waits forever -- with
+      # `bypass_actors: []` and `current_user_can_bypass: "never"`, so
+      # there is no override from a branch and the fix is an admin ruleset
+      # edit (#887). Asked here because `lint` always runs, and because
+      # the guard is a source read with no network: the committed list is
+      # the contract, deliberately not the live API.
+      - name: Required status contexts
+        run: |
+          python3 scripts/check-required-contexts.test.py
+          python3 scripts/check-required-contexts.py
       # `.github/mobile-build-high-water-mark` records the highest build
       # number that reached a store, and it went stale before six
       # consecutive releases (#714, #731, #740, #768, #786, #867) without
@@ -375,6 +388,16 @@ jobs:
   #   lint, test-frontend, test-rust, build, supply-chain,
   #   platform (ubuntu-latest), platform (windows-latest),
   #   mobile-android, mobile-ios
+  #
+  # THAT LIST IS NOW ASSERTED, not just recorded here. Until #887 it was
+  # this comment and nothing else, so a job rename left the comment
+  # wrong and the ruleset waiting on a context no job would ever report.
+  # `scripts/check-required-contexts.py` holds the same nine names as a
+  # committed contract and fails `lint` when the jobs stop reporting
+  # them -- including the matrix expansion below, which is the spelling
+  # that trips people up. Renaming a job here means editing that list
+  # AND the ruleset in the same pull request; the guard makes forgetting
+  # the first impossible and its floor makes forgetting the second loud.
   #
   # Why this matters beyond tidiness, and why it is worth the words: a
   # required check that does not RUN blocks a merge forever. So anyone

@@ -232,6 +232,14 @@ lint-deps:
 	# which is an uncomfortable gap for a guard whose failure mode is a
 	# silent pass.
 	python3 scripts/check-mobile-gate.test.py
+	# The rename half of the same problem. A required check that never
+	# reports blocks every merge forever, and the ruleset cannot be
+	# bypassed from a branch -- so the cheapest place to learn that a job
+	# rename was a lockout is before the push, not from nine PRs that
+	# will never go green (#887). A source read with no network, so it
+	# belongs in the target whose comment promises answers in a second.
+	python3 scripts/check-required-contexts.test.py
+	python3 scripts/check-required-contexts.py
 	# A `run:` step with no `shell:` runs under PowerShell on Windows,
 	# where bash syntax (a heredoc, `$(...)`) is a parse error. CI-only
 	# until now (ci.yml), so the author of such a step ran `make lint`
@@ -299,6 +307,19 @@ lint-deps:
 	# where a token exists and an unreachable API is worth seeing.
 	python3 scripts/check-mobile-build-mark.test.py
 	python3 scripts/check-mobile-build-mark.py
+	# The Actions cache budget (#901). Over GitHub's 10GB quota entries are
+	# evicted least-recently-used, so a measured cache HIT can become a miss
+	# on the same key minutes later -- which turned a 562s job into 1716s and
+	# means CI timings are not reproducible. This is the check to run when a
+	# timing looks wrong before concluding a change caused it.
+	#
+	# Needs the network, like the mark check above, and skips when it cannot
+	# look. NOT in ci.yml's `lint`, unlike its siblings: the cache is a
+	# shared, draining resource rather than a property of the branch under
+	# test, so a gate would fail pull requests for a state their authors
+	# cannot fix. See the script's docstring.
+	python3 scripts/check-cache-budget.test.py
+	python3 scripts/check-cache-budget.py
 	# The leak guard, LAST in this target: it is the only check here that
 	# scans commit messages, so it is the only one whose failure means an
 	# amend or an interactive rebase rather than an edit. Running it
