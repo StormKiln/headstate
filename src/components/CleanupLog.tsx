@@ -114,10 +114,16 @@ export function CleanupLog() {
       {isError ? (
         <div>
           <p className="text-sm text-[#f85149]">Could not read the cleanup ledger.</p>
+          {/* A bordered button rather than the bare underlined link this
+              was, for the reason #974 gives: at `text-sm` with no padding
+              it was a ~17px hit area against the 44px minimum
+              `index.css` establishes, and it looked like a different kind
+              of thing from the identical "Try again" four other surfaces
+              render as a button. */}
           <button
             type="button"
             onClick={() => void refetch()}
-            className="mt-1 text-sm text-[#58a6ff] hover:underline"
+            className="tap-target mt-1 rounded border border-[#30363d] px-2 py-0.5 text-sm text-[#e6edf3] hover:bg-[#161b22]"
           >
             Try again
           </button>

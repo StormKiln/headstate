@@ -4,6 +4,7 @@ import { FileText } from "lucide-react";
 import type { ClaudeFile, ImportNode } from "@/types/pr";
 import { useClaudeMd, useClaudeMdText } from "@/api/hooks";
 import { useActiveFilters } from "@/store/filters";
+import { current } from "@/lib/ariaCurrent";
 import { formatSize } from "@/lib/worktrees";
 import { Markdown } from "./Markdown";
 import { QueryError, errorMessage } from "./QueryError";
@@ -316,7 +317,12 @@ function FileEntry({
           e.preventDefault();
           setMenu({ x: e.clientX, y: e.clientY });
         }}
-        aria-pressed={active}
+        // `aria-current`, not `aria-pressed` (#977). This is a
+        // single-select row: a second click on the selected file is a
+        // no-op, so "pressed" announced a toggle that cannot be
+        // un-pressed. `"true"` rather than `"page"` because the row picks
+        // the pane's subject within this page -- the `RepoSidebar` case.
+        aria-current={current(active)}
         className={`flex w-full flex-col items-start gap-0.5 rounded px-2 py-1.5 text-left ${
           active ? "bg-[#1f6feb] text-white" : "text-[#e6edf3] hover:bg-[#161b22]"
         }`}

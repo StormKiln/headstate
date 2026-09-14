@@ -289,6 +289,37 @@ describe("WorktreeSidebar", () => {
       expect(refetchFn).toHaveBeenCalled();
     });
 
+    /// #974: a retry leaves `isLoading` and `isError` BOTH true for a
+    /// moment, and this column checked loading first -- so hitting "Try
+    /// again" flipped it to "Looking for repositories…" and the error read
+    /// as having resolved itself. A user who walked away came back to a
+    /// column saying nothing was wrong when nothing had been fixed.
+    ///
+    /// Both sibling consumers of this same `useWorktrees` hook name this
+    /// exact ordering as the thing to avoid; this was the third.
+    it("keeps saying the scan failed while a retry is in flight", () => {
+      scan.failed = true;
+      scan.loading = true;
+      repos.mockReturnValue(undefined);
+      render(<WorktreeSidebar />);
+      expect(screen.getByText(/could not scan for worktrees/i)).toBeTruthy();
+      expect(screen.queryByText(/looking for repositories/i)).toBeNull();
+      // And the way out of the failure is still there.
+      expect(screen.getByRole("button", { name: /try again/i })).toBeTruthy();
+    });
+
+    /// A failed scan's retry is the only route out of a failed scan, so it
+    /// carries the 44px `tap-target` the phone rule establishes -- the
+    /// thing the bare-link spellings of this same affordance did not.
+    it("gives the retry a full-size tap target", () => {
+      scan.failed = true;
+      repos.mockReturnValue(undefined);
+      render(<WorktreeSidebar />);
+      expect(
+        screen.getByRole("button", { name: /try again/i }).className,
+      ).toContain("tap-target");
+    });
+
     /// "No repositories found. Check the scanned directories in Settings"
     /// is a DIAGNOSIS -- it points at the user's configuration. On a
     /// failure it would send someone to fix something that is not broken,

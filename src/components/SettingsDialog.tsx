@@ -594,6 +594,36 @@ export function SettingsDialog({
               Sustained CPU use that no single process accounts for — usually
               several runaway or orphaned processes rather than one busy program.
             </p>
+            {/* #979. Its own category rather than folded into the two
+                above, on the same test `health_cpu` was split from
+                `health_battery` by: "a session I was relying on died" and
+                "the machine is unwell" are different questions, and
+                wanting one without the other is reasonable.
+
+                Defaults ON, which is new-field-defaults-OFF reversed and
+                is argued rather than copied -- see `poll.rs`'s field doc.
+                The short version is the sentence below: the sweep that
+                produces this signal does not run unless the Claude Code
+                integration is on, and that defaults off, so this cannot
+                interrupt anyone who did not ask for it. */}
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                disabled={!(prefs?.enabled ?? true)}
+                checked={prefs?.claude_crashed ?? true}
+                onChange={() =>
+                  prefs && void setPrefs({ ...prefs, claude_crashed: !prefs.claude_crashed })
+                }
+              />
+              A Claude Code session died
+            </label>
+            {/* Names the second gate, because a user who has this checked
+                and the integration off would otherwise wait for a
+                notification that cannot arrive. */}
+            <p className="text-xs text-[#8b949e]">
+              A session that stopped without ending cleanly — announced once, when it is first
+              noticed. Only while the Claude Code integration above is on.
+            </p>
           </div>
           {/* A number, not a checkbox, because the only question worth
               asking about LOW CHARGE is WHEN: everyone wants to know

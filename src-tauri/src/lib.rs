@@ -106,6 +106,61 @@ fn notify_runaway(app: &tauri::AppHandle, alert: &health::runaway::Alert) {
     }
 }
 
+/// Show one "a Claude Code session died" alert (#979).
+///
+/// A sibling of `notify_battery` and `notify_runaway` for the reason
+/// those are siblings of `poll::notify_breakage`: the four take four
+/// unrelated types, and one function widened to accept "a battery or a
+/// pull request or a process or a session" would describe nothing. What
+/// IS shared is the part that must not drift --
+/// `poll::notification_allowed`, the ask-once permission gate.
+///
+/// Failure is logged and swallowed, exactly as it is there: a
+/// notification is an affordance, and losing one must never take down the
+/// sweep that found the crash.
+///
+/// # The body carries the resume handle's directory, not the handle
+///
+/// A notification body cannot be copied from, so the session id would be
+/// a UUID the user has to retype. The DIRECTORY is what lets them find
+/// the row -- it is one of the four fields the session list searches --
+/// and the app already generates the `claude --resume` command on that
+/// row. The alert's job is to get the user to the app, not to be the app.
+fn notify_claude_crash(app: &tauri::AppHandle, crashed: &crate::claude::crash::Crashed) {
+    use tauri_plugin_notification::NotificationExt;
+
+    if !poll::notification_allowed(app) {
+        return;
+    }
+    // The registry's `name`, or the id. NOT a fabricated name: a
+    // generated title cannot be told from a real one, which is the rule
+    // `transcript.rs` states about the two titleless sessions, and a raw
+    // UUID at least reads as an identifier rather than as a description.
+    let title = crashed.name.clone().unwrap_or_else(|| {
+        format!(
+            "Claude session {}",
+            // The first segment of the UUID, which is what the session
+            // list's own rows show and what a user recognises. The whole
+            // thing would fill a notification title with hex.
+            crashed
+                .session_id
+                .split('-')
+                .next()
+                .unwrap_or(&crashed.session_id)
+        )
+    });
+    let body = match &crashed.cwd {
+        Some(cwd) => format!("Stopped without ending cleanly, in {cwd}"),
+        // "Where" is genuinely unknown rather than suppressed: a registry
+        // record without a cwd is a real case, and a body that simply
+        // omitted the clause would read as if there were nowhere to go.
+        None => "Stopped without ending cleanly. No directory was recorded for it.".to_owned(),
+    };
+    if let Err(e) = app.notification().builder().title(title).body(body).show() {
+        log::warn!("failed to show a Claude session notification: {e}");
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Before anything builds a TLS config. Two rustls providers are
@@ -206,6 +261,8 @@ pub fn run() {
             commands::claude_import_transcripts,
             commands::claude_sessions,
             commands::claude_reveal_path,
+            commands::claude_session_usage,
+            commands::claude_transcript_tail,
             commands::claude_poll_live,
             commands::claude_overview,
             commands::claude_hooks_status,
@@ -625,6 +682,46 @@ pub fn run() {
                         if commands::read_ui_prefs(&app_handle).claude_integrations_enabled {
                             match commands::claude_live_pass(&commands::db_path(&app_handle)) {
                                 Ok(state) => {
+                                    // ---- "your session died" (#979) ----
+                                    //
+                                    // `crashed_sessions` and NOT a query
+                                    // of the table: the list is built on
+                                    // the same arm that increments
+                                    // `crashed`, which is the
+                                    // FIRST-OBSERVATION count.
+                                    // `crashed_already_known` is its
+                                    // opposite and is deliberately not
+                                    // read here -- an orphan left on disk
+                                    // is re-swept every minute, and a
+                                    // notifier reading the wrong count
+                                    // would announce the same dead
+                                    // session forever. `crash.rs`'s
+                                    // COALESCE is what makes the split
+                                    // true and `record_crashed`'s doc
+                                    // records the four-sweeps-four-rows
+                                    // bug that found it.
+                                    //
+                                    // Read per tick, not once at startup,
+                                    // the same rule the health prefs
+                                    // above follow: a setting change
+                                    // lands on the next sample rather
+                                    // than the next relaunch.
+                                    //
+                                    // Already inside the
+                                    // `claude_integrations_enabled` gate,
+                                    // which is the second condition
+                                    // #979 requires -- a user who turned
+                                    // the feature off must not be
+                                    // interrupted by it.
+                                    if !state.sweep.crashed_sessions.is_empty() {
+                                        let prefs = commands::get_notify_prefs(app_handle.clone());
+                                        if prefs.enabled && prefs.claude_crashed {
+                                            for crashed in &state.sweep.crashed_sessions {
+                                                notify_claude_crash(&app_handle, crashed);
+                                            }
+                                        }
+                                    }
+
                                     // Logged only when it did something.
                                     // A quiet machine ticking every
                                     // minute would otherwise bury every

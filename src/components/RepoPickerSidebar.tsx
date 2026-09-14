@@ -1,5 +1,7 @@
 import { useWorktrees } from "@/api/hooks";
+import { current } from "@/lib/ariaCurrent";
 import { useActiveFilters, useFilters } from "@/store/filters";
+import { NarrowQueryError } from "./QueryError";
 import { PartialScanNotice } from "./PartialScanNotice";
 import { ViewSwitcher } from "./ViewSwitcher";
 
@@ -44,16 +46,10 @@ export function RepoPickerSidebar({ reviewingCount }: { reviewingCount: number }
       active ? "bg-[#1f6feb] text-white" : "text-[#e6edf3] hover:bg-[#161b22]"
     }`;
 
-  /// `aria-current` for the selected row (#852). The blue was carrying the
-  /// selection alone, against the rule `StatsSidebar` states: "the
-  /// selection is navigation state, and a screen reader reading a list of
-  /// repository names has no other way to know which one is open."
-  ///
-  /// `"true"` rather than `"page"`: these rows SCOPE the current page
-  /// rather than navigating to a different one. `undefined` on the
-  /// inactive rows, because absence is how "not current" is spelled and
-  /// `aria-current="false"` is announced by some readers.
-  const current = (active: boolean) => (active ? ("true" as const) : undefined);
+  // `current` from `@/lib/ariaCurrent` (#852, shared in #977). The blue was
+  // carrying the selection alone, against the rule `StatsSidebar` states:
+  // "the selection is navigation state, and a screen reader reading a list
+  // of repository names has no other way to know which one is open."
 
   return (
     <nav className="flex w-64 shrink-0 flex-col border-r border-[#30363d] p-3">
@@ -80,16 +76,10 @@ export function RepoPickerSidebar({ reviewingCount }: { reviewingCount: number }
             flipping back to "Looking…" reads as the error resolving
             itself. */}
         {isError ? (
-          <div className="px-3 py-2">
-            <p className="text-xs text-[#f85149]">Could not scan for repositories.</p>
-            <button
-              type="button"
-              onClick={() => void refetch()}
-              className="mt-1 text-xs text-[#58a6ff] hover:underline"
-            >
-              Try again
-            </button>
-          </div>
+          <NarrowQueryError
+            message="Could not scan for repositories."
+            onRetry={() => void refetch()}
+          />
         ) : isLoading ? (
           <p className="px-3 py-2 text-xs text-[#8b949e]">Looking for repositories…</p>
         ) : repos.length === 0 && unreadable.length > 0 ? (

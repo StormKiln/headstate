@@ -21,7 +21,9 @@ import type {
   ClaudeMdScan,
   ClaudeImported,
   ClaudeOverview,
+  ClaudePreview,
   ClaudeSessionList,
+  ClaudeUsage,
   ProjectReport,
   UpdateRequest,
   UpdateFilter,
@@ -153,6 +155,14 @@ export interface NotifyPrefs {
   /// Notify when this machine's CPU is busy with nothing in particular
   /// (#791).
   health_cpu: boolean;
+  /// Notify when a watched Claude Code session dies (#979).
+  ///
+  /// Gated TWICE on the desktop: by this and by
+  /// `claude_integrations_enabled`, which defaults off. That second gate
+  /// is why this one defaults ON despite being new -- nobody can be
+  /// interrupted by it without having first asked the app to watch their
+  /// Claude sessions. `poll.rs`'s field doc argues it.
+  claude_crashed: boolean;
 }
 
 export const getNotifyPrefs = () => call<NotifyPrefs>("get_notify_prefs");
@@ -738,6 +748,35 @@ export const claudeRevealPath = (path: string) =>
 /// Two SELECTs over the cache plus a stat per session and one directory
 /// listing; measured at 7ms for 1,461 sessions. Writes nothing.
 export const claudeOverview = () => call<ClaudeOverview>("claude_overview");
+
+/// How much work happened inside one session, from its own transcript
+/// (#959).
+///
+/// `Class::Read`, so the phone gets it: "was that the long session or the
+/// typo" is how a user picks which of 1,475 rows to resume, and nothing
+/// else on the row answers it.
+///
+/// On DEMAND, never on the import path -- the rollup is 11x the startup
+/// scan's head+tail read, which is why `claude::usage`'s budget exists and
+/// why this takes a path rather than being folded into `claude_sessions`.
+///
+/// Rejects when the transcript could not be read. A resolved `messages: 0`
+/// means it WAS read and carried no usage, which is a different fact.
+export const claudeSessionUsage = (path: string) =>
+  call<ClaudeUsage>("claude_session_usage", { path });
+
+/// The tail of one session's transcript, as conversation (#982).
+///
+/// `Class::Read`, and the one Claude action whose phone case is stronger
+/// than the desktop's: `claudeRevealPath` is `Class::Local`, so without
+/// this a companion user can see that a session died and not one word of
+/// what it was doing.
+///
+/// Bounded inside the command -- a 256 KB window, at most 200 messages,
+/// each block clamped -- so the 76 MB transcript on the development
+/// machine cannot be pulled over the pairing transport.
+export const claudeTranscriptTail = (path: string) =>
+  call<ClaudePreview>("claude_transcript_tail", { path });
 
 // ---------------------------------------------------------------------
 // The Claude Code hook installer (#915). Rust side:
