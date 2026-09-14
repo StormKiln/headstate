@@ -382,6 +382,95 @@ const MIGRATIONS: &[&str] = &[
      );
      CREATE INDEX IF NOT EXISTS claude_subagent_parent
         ON claude_subagent (parent_session_id);",
+    // Migration 13: per-pull-request accumulation for PR Stats (#1004).
+    //
+    // # Why this is not the `merge_history` migration 2 dropped
+    //
+    // Migration 10's note above explains that `merge_history` was wrong in
+    // SHAPE, not merely unused: it accumulated merges by DIFFING the open
+    // PR set, and a pull request leaving that set may have been closed
+    // unmerged, so it would have recorded abandonments as merges and
+    // contradicted the `is:merged` search that must stay authoritative.
+    //
+    // This table inverts that. Nothing is inferred from a disappearance:
+    // every row is written from a node GitHub returned for an explicit
+    // `is:merged` search, carrying the `mergedAt` GitHub itself reported.
+    // The search stays the only source of truth, and this is a record of
+    // what it has already said rather than a second opinion about it.
+    //
+    // # What it is for
+    //
+    // `stats_cache` memoises a whole ANSWER, keyed by the question. That
+    // is the right shape for an answer that arrives complete, and the
+    // wrong one for an account too large to retrieve in a single load: a
+    // partial board is stored partial, and the next load starts from
+    // nothing, so a user at 2,942 pull requests sees the same shortfall
+    // forever (#1004). This table is the layer beneath, so consecutive
+    // loads UNION instead of replacing each other.
+    //
+    // MEASURED against the live API, 2026-09-14. A detail document of 5
+    // aliases costs **1 point whatever it carries** -- 1 point for 75, 100
+    // and 125 nodes alike -- so the reporter's 2,942 pull requests are
+    // about 12 points of detail against a 4,500-point usable hourly
+    // budget. The budget was never what bound them; the ~11s server
+    // deadline and the 60s `LOAD_TIMEOUT` are, and those cap one LOAD
+    // rather than one hour. That is precisely why accumulating across
+    // loads converges: each load is separately bounded, and what it
+    // retrieved is kept.
+    //
+    // # Why `(repo, number)` and not a PR node id
+    //
+    // It is the key the boards already think in: `board::BoardPr` carries
+    // `repo` and `number`, `RepoCount` groups by `repo`, and the outlier
+    // lists tie-break on both. A `PR_kwDO...` node id would be stable too,
+    // but nothing that reads this table has one, so every read would need
+    // a second identifier to join on and the natural key would go
+    // unenforced.
+    //
+    // # Why the window columns are on the ROW
+    //
+    // Completeness is computed against the WINDOW, not the fetch, and the
+    // question "is every pull request in this window stored" needs the
+    // rows to be countable per window and per scope. `merged_at` alone
+    // could not answer it: the same pull request is legitimately in a
+    // 30-day window and a 90-day one, and a row is evidence about the
+    // question that retrieved it.
+    //
+    // `scope_key` is `StatsQuery::cache_key` with `@me` already RESOLVED,
+    // for the reason migration 10 gives: two accounts share this file and
+    // a row keyed on the literal `@me` would serve one user's rows to the
+    // other.
+    //
+    // # Growth
+    //
+    // MEASURED, 2026-09-14, over 50 real multi-repository pull requests:
+    // the stored fields mean **157 bytes** a row (median 155, p95 200).
+    // The reporter's 2,942 are therefore ~0.6 MiB including index
+    // overhead; 50,000 would be ~10 MiB. `pr_history::prune` bounds it
+    // regardless, because "a PR table stays small" is an assumption and
+    // not a bound.
+    "CREATE TABLE IF NOT EXISTS pr_history (
+        scope_key    TEXT NOT NULL,
+        window_start TEXT NOT NULL,
+        window_end   TEXT NOT NULL,
+        repo         TEXT NOT NULL,
+        number       INTEGER NOT NULL,
+        title        TEXT NOT NULL,
+        url          TEXT NOT NULL,
+        author       TEXT NOT NULL,
+        cycle_time_hours REAL NOT NULL,
+        size         INTEGER NOT NULL,
+        additions    INTEGER NOT NULL,
+        deletions    INTEGER NOT NULL,
+        changed_files INTEGER NOT NULL,
+        reviews_received INTEGER NOT NULL,
+        stored_at    TEXT NOT NULL,
+        PRIMARY KEY (scope_key, window_start, window_end, repo, number)
+     );
+     CREATE INDEX IF NOT EXISTS pr_history_window
+        ON pr_history (scope_key, window_start, window_end);
+     CREATE INDEX IF NOT EXISTS pr_history_stored
+        ON pr_history (stored_at);",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
@@ -454,6 +543,85 @@ mod tests {
             "dead table must be dropped"
         );
         assert!(has_table(&conn, "snapshot"), "the real cache must survive");
+    }
+
+    /// A v12 database gains the per-pull-request accumulation table (#1004).
+    ///
+    /// Migration-additive, like migration 12 before it: v12 is every
+    /// install that has the subagent attribution, so this is the upgrade
+    /// path the change actually ships into rather than a hypothetical one.
+    #[test]
+    fn migration_thirteen_adds_pr_history_to_a_v12_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        // A v12 database: `stats_cache` exists and holds an answer, and
+        // `pr_history` does not exist at all.
+        conn.execute_batch(
+            "CREATE TABLE snapshot (id INTEGER PRIMARY KEY, payload TEXT NOT NULL,
+                fetched_at TEXT NOT NULL);
+             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE stats_cache (
+                key TEXT NOT NULL, window_start TEXT NOT NULL,
+                window_end TEXT NOT NULL, total INTEGER NOT NULL,
+                complete INTEGER NOT NULL, payload TEXT NOT NULL,
+                fetched_at TEXT NOT NULL,
+                PRIMARY KEY (key, window_start, window_end));",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 12i64).unwrap();
+        // The answer cache an existing install already has must survive:
+        // #1004 adds a layer BENEATH `stats_cache`, it does not replace it.
+        conn.execute(
+            "INSERT INTO stats_cache
+               (key, window_start, window_end, total, complete, payload, fetched_at)
+             VALUES ('board|merged|*|org:X', '2026-01-01', '2026-01-31', 5, 1, '{}',
+                     '2026-02-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        assert!(has_table(&conn, "pr_history"));
+        assert!(
+            has_table(&conn, "stats_cache"),
+            "the assembled-answer cache stays; this adds a layer beneath it"
+        );
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+        let kept: i64 = conn
+            .query_row("SELECT COUNT(*) FROM stats_cache", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            kept, 1,
+            "an upgrade must not cost an existing cached answer"
+        );
+
+        // The natural key is `(scope_key, window, repo, number)`: one row per
+        // pull request per window, so a second load UNIONS rather than
+        // duplicating. A table without it would double-count every overlap
+        // and inflate every author aggregate.
+        conn.execute_batch(
+            "INSERT INTO pr_history
+               (scope_key, window_start, window_end, repo, number, title, url,
+                author, cycle_time_hours, size, additions, deletions,
+                changed_files, reviews_received, stored_at)
+             VALUES ('k','2026-01-01','2026-01-31','o/a',1,'t','u','a',1.0,1,1,0,1,0,'2026-02-01T00:00:00Z');
+             INSERT OR REPLACE INTO pr_history
+               (scope_key, window_start, window_end, repo, number, title, url,
+                author, cycle_time_hours, size, additions, deletions,
+                changed_files, reviews_received, stored_at)
+             VALUES ('k','2026-01-01','2026-01-31','o/a',1,'t2','u','a',1.0,1,1,0,1,0,'2026-02-02T00:00:00Z');",
+        )
+        .unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pr_history", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            rows, 1,
+            "one row per pull request per window, or an overlap double-counts"
+        );
     }
 
     /// Migration 6 adds `paired_devices` to a database that stopped at

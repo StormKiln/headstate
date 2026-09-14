@@ -706,10 +706,27 @@ export function partialityCaveat(board: {
   // absent from a structural duplicate.
   truncatedSlices: ShortSlice[];
   refusedFields: number;
+  /// #1004. Optional so a caller holding an older payload -- a `stats_cache`
+  /// row written before this shipped -- still type-checks and simply reads
+  /// as not accumulating, rather than rendering `undefined of 2,942`.
+  accumulated?: number;
+  accumulating?: boolean;
 }): string | undefined {
   if (board.complete) return undefined;
   const parts: string[] = [];
-  if (board.retrieved < board.total) {
+  // What is STORED, not what this one load fetched (#1004). The reporter's
+  // complaint is not the shortfall itself -- it is that "1523 of 2942 could
+  // not be retrieved" reads identically whether the next load will help or
+  // not. So the sentence says how many are held, how many remain, and that
+  // it improves.
+  const accumulated = board.accumulating ? (board.accumulated ?? 0) : undefined;
+  if (accumulated !== undefined && accumulated > 0 && accumulated < board.total) {
+    parts.push(
+      `${accumulated.toLocaleString()} of ${board.total.toLocaleString()} pull requests have been collected so far and ${(
+        board.total - accumulated
+      ).toLocaleString()} are still to come -- loading this scope again adds to them`,
+    );
+  } else if (board.retrieved < board.total) {
     // The SIZE of the gap, not just its existence. A reader deciding whether
     // a top-five is trustworthy needs to know whether four pull requests are
     // missing or four hundred.

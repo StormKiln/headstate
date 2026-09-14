@@ -66,7 +66,7 @@ pub mod slice;
 /// two requests, one point each, no statistics.
 pub mod tree;
 
-pub use board::{load_board, AuthorRow, Board, ShortSlice, TOP_N};
+pub use board::{load_board, AuthorRow, Board, BoardPr, ShortSlice, TOP_N};
 pub use budget::{Budget, Spend};
 pub use fetch::{
     load_count, load_detail, load_reviewers, load_series, Outcome, ReviewerRow, Reviewers,

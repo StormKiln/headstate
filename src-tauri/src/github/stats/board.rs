@@ -129,6 +129,7 @@ use super::budget::Budget;
 use super::query::Slice;
 use super::scope::{Scope, StatsQuery, Subject};
 use crate::github::client::{ClientError, GitHubClient};
+use crate::store::pr_history::StoredPr;
 
 /// Searches per detail document, for the BOARD's document specifically.
 ///
@@ -343,6 +344,28 @@ pub struct Board {
     /// repository scope this is one row, which is correct rather than
     /// useless: it confirms the scope.
     pub repo_counts: Vec<RepoCount>,
+    /// Pull requests held in `store::pr_history` for this window, across
+    /// every load (#1004).
+    ///
+    /// The fourth partiality channel, and the one that distinguishes
+    /// CONVERGING from STUCK. `retrieved` says what THIS load managed;
+    /// this says what the answer is assembled from. Today's caveat reads
+    /// identically whether the next load will help or not, and the
+    /// difference between "1,419 of 2,942" twice and "1,419 then 2,219"
+    /// is the whole of what the reporter asked for.
+    ///
+    /// Equal to `retrieved` on a board built from one fetch with nothing
+    /// stored, so a small account's numbers are unchanged.
+    pub accumulated: u64,
+    /// Whether accumulation is in play for this board at all.
+    ///
+    /// False for a board assembled from a single fetch with no storage
+    /// behind it -- a single-repo connection scope, or a load whose
+    /// database write failed. The UI must not promise "this improves on
+    /// the next load" when nothing is being written down, which would be
+    /// #841's fail-open in a new costume: a claim we cannot keep,
+    /// presented as a fact.
+    pub accumulating: bool,
 }
 
 /// How many outliers each list holds.
@@ -637,6 +660,166 @@ impl Board {
             slowest,
             largest,
             repo_counts,
+            // A board straight off one fetch has nothing stored behind it
+            // yet. `commands::stats_board` overwrites both once it has
+            // written the pages down and re-assembled -- and if that write
+            // fails, these stay honest rather than promising a convergence
+            // that is not happening.
+            accumulated: retrieved,
+            accumulating: false,
+        }
+    }
+
+    /// Every pull request this load retrieved, for accumulation.
+    ///
+    /// The outlier lists are TRUNCATED to [`OUTLIERS`], so they are not the
+    /// population -- writing them down would store five pull requests per
+    /// load and converge on nothing. This is the full retrieved set, which
+    /// is what `store::pr_history` needs.
+    ///
+    /// Returned from the alias map rather than kept on [`Board`] because a
+    /// `Board` is serialised into `stats_cache`'s payload, and carrying
+    /// every pull request there would put the whole corpus in the answer
+    /// cache as well as in the table beneath it.
+    pub fn retrieved_prs(map: &serde_json::Value, slices: &[Slice]) -> Vec<StoredPr> {
+        let mut out = Vec::new();
+        for (i, slice) in slices.iter().enumerate() {
+            let _ = slice;
+            let alias = super::query::slice_alias(i);
+            let entry = &map[&alias];
+            let nodes = entry["nodes"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+            for n in nodes {
+                let repo = n["repository"]["nameWithOwner"].as_str().unwrap_or("");
+                // A node with no repository cannot be keyed, and a row
+                // under an empty repo would collide with every other such
+                // node on `(repo, number)`. Skipped rather than stored
+                // under a placeholder: it stays absent from the table, so
+                // the window keeps reading as incomplete, which is the
+                // honest direction.
+                if repo.is_empty() {
+                    continue;
+                }
+                // Merged only, matching the population the outlier lists
+                // and `repo_counts` are drawn from. `cycle_hours` is what
+                // distinguishes a merged pull request from an open one.
+                let Some(hours) = cycle_hours(n) else {
+                    continue;
+                };
+                let additions = n["additions"].as_u64().unwrap_or(0);
+                let deletions = n["deletions"].as_u64().unwrap_or(0);
+                out.push(StoredPr {
+                    repo: repo.to_string(),
+                    number: n["number"].as_u64().unwrap_or(0),
+                    title: n["title"].as_str().unwrap_or("").to_string(),
+                    url: n["url"].as_str().unwrap_or("").to_string(),
+                    author: n["author"]["login"].as_str().unwrap_or(GHOST).to_string(),
+                    cycle_time_hours: hours,
+                    size: additions + deletions,
+                    additions,
+                    deletions,
+                    changed_files: n["changedFiles"].as_u64().unwrap_or(0),
+                    reviews_received: n["reviews"]["totalCount"].as_u64().unwrap_or(0),
+                });
+            }
+        }
+        out
+    }
+
+    /// Re-assemble a board from everything stored for a window (#1004).
+    ///
+    /// This is where accumulation becomes an ANSWER. `from_alias_map`
+    /// builds a board from one fetch; this builds one from the union of
+    /// every fetch, so two partial loads produce a board containing both
+    /// their pull requests rather than only the later one's.
+    ///
+    /// # Completeness is computed against the WINDOW, not the fetch
+    ///
+    /// `total` stays GitHub's `issueCount` for the window -- exact even
+    /// when retrieval is short, which is what makes the shortfall
+    /// detectable at all (`slice.rs:52`). `complete` becomes "every pull
+    /// request in this window is in the table", which is #1004's
+    /// definition and a STRICT EXTENSION of the existing flag rather than
+    /// a replacement: a single complete load still satisfies it, because
+    /// its rows are all stored.
+    ///
+    /// The refusal and truncation channels are kept from the fetch that
+    /// produced them. They do not become false merely because rows
+    /// accumulated -- a refused field is still refused, and #824's rule is
+    /// that partiality shrinks rather than becoming invisible.
+    pub fn from_stored(stored: &[StoredPr], fetched: &Board) -> Self {
+        let mut by_login: HashMap<String, AuthorRow> = HashMap::new();
+        let mut by_repo: HashMap<String, u64> = HashMap::new();
+        let mut prs: Vec<BoardPr> = Vec::with_capacity(stored.len());
+
+        for s in stored {
+            let row = by_login
+                .entry(s.author.clone())
+                .or_insert_with(|| AuthorRow::new(s.author.clone()));
+            row.prs = row.prs.saturating_add(1);
+            row.additions = row.additions.saturating_add(s.additions);
+            row.deletions = row.deletions.saturating_add(s.deletions);
+            row.changed_files = row.changed_files.saturating_add(s.changed_files);
+            row.reviews_received = row.reviews_received.saturating_add(s.reviews_received);
+            row.cycle_time_hours.push(s.cycle_time_hours);
+            *by_repo.entry(s.repo.clone()).or_insert(0) += 1;
+            prs.push(s.to_board_pr());
+        }
+
+        let mut rows: Vec<AuthorRow> = by_login.into_values().collect();
+        rows.sort_by(|a, b| a.login.cmp(&b.login));
+        for r in &mut rows {
+            r.cycle_time_hours.sort_by(f64::total_cmp);
+        }
+
+        // The same tie-breaks `from_alias_map` uses, for the same reason:
+        // without them the lists reshuffle between loads with no data
+        // change.
+        let mut slowest = prs.clone();
+        slowest.sort_by(|a, b| {
+            b.cycle_time_hours
+                .total_cmp(&a.cycle_time_hours)
+                .then_with(|| a.repo.cmp(&b.repo))
+                .then_with(|| a.number.cmp(&b.number))
+        });
+        slowest.truncate(OUTLIERS);
+        let mut largest = prs;
+        largest.sort_by(|a, b| {
+            b.size
+                .cmp(&a.size)
+                .then_with(|| a.repo.cmp(&b.repo))
+                .then_with(|| a.number.cmp(&b.number))
+        });
+        largest.truncate(OUTLIERS);
+
+        let mut repo_counts: Vec<RepoCount> = by_repo
+            .into_iter()
+            .map(|(repo, merged)| RepoCount { repo, merged })
+            .collect();
+        repo_counts.sort_by(|a, b| b.merged.cmp(&a.merged).then_with(|| a.repo.cmp(&b.repo)));
+
+        let accumulated = stored.len() as u64;
+        Self {
+            rows,
+            total: fetched.total,
+            // What THIS load retrieved is kept as it was. It is a fact
+            // about the fetch, and overwriting it with the accumulated
+            // figure would erase the distinction the caveat needs.
+            retrieved: fetched.retrieved,
+            // Computed against the WINDOW: every pull request GitHub says
+            // is here is in the table. The fetch's own refusal channel
+            // still counts -- a refused field is not cured by a row
+            // arriving from somewhere else.
+            complete: accumulated >= fetched.total && fetched.refused_fields == 0,
+            truncated_slices: fetched.truncated_slices.clone(),
+            refused_fields: fetched.refused_fields,
+            slices: fetched.slices,
+            rounds: fetched.rounds,
+            spend: fetched.spend.clone(),
+            slowest,
+            largest,
+            repo_counts,
+            accumulated,
+            accumulating: true,
         }
     }
 }
@@ -710,6 +893,33 @@ pub async fn load_board(
     // bounds are left in place: they are what the other callers of those
     // functions get, and the outer one is what makes this caller obey the same
     // contract as the count path.
+    load_board_accumulating(client, scope, measure, window, budget)
+        .await
+        .map(|loaded| loaded.board)
+}
+
+/// A board plus the pull requests it retrieved, for accumulation (#1004).
+///
+/// `load_board` returns only the board, which is all the single-repo and
+/// test callers want. `commands::stats_board` needs the retrieved set as
+/// well so it can write the pages down -- including from a load that
+/// later hits the cap, which is the entire point of #1004.
+#[derive(Debug, Clone)]
+pub struct LoadedBoard {
+    pub board: Board,
+    /// Every merged pull request this load retrieved, ready for
+    /// `store::pr_history::put_many`.
+    pub prs: Vec<StoredPr>,
+}
+
+/// [`load_board`], keeping the retrieved pull requests.
+pub async fn load_board_accumulating(
+    client: &GitHubClient,
+    scope: &Scope,
+    measure: super::scope::Measure,
+    window: Slice,
+    budget: &Budget,
+) -> Result<LoadedBoard, ClientError> {
     match tokio::time::timeout(
         super::fetch::LOAD_TIMEOUT,
         board_inner(client, scope, measure, window, budget),
@@ -727,7 +937,7 @@ async fn board_inner(
     measure: super::scope::Measure,
     window: Slice,
     budget: &Budget,
-) -> Result<Board, ClientError> {
+) -> Result<LoadedBoard, ClientError> {
     let q = StatsQuery::new(None, scope.clone(), measure);
     // Subdivided to the PAGE, not to the search cap. This is the line that
     // makes a board a ranking rather than a sample, and it was a real defect
@@ -761,7 +971,11 @@ async fn board_inner(
     if !plan.is_retrievable() {
         board.complete = false;
     }
-    Ok(board)
+    // Harvested from the SAME map the board was built from, so the rows
+    // written down and the board returned cannot describe different
+    // fetches.
+    let prs = Board::retrieved_prs(&map, &slices);
+    Ok(LoadedBoard { board, prs })
 }
 
 /// Whether a login is the ghost bucket rather than a person.
@@ -1540,5 +1754,302 @@ mod tests {
             !doc.contains("repository("),
             "a paged `repository` would be the priced shape"
         );
+    }
+
+    // ---- Accumulation across loads (#1004) ----------------------------
+
+    /// A stored pull request, for the accumulation tests.
+    fn stored(repo: &str, number: u64, author: &str, hours: f64, size: u64) -> StoredPr {
+        StoredPr {
+            repo: repo.into(),
+            number,
+            title: format!("pr {number}"),
+            url: format!("https://github.com/{repo}/pull/{number}"),
+            author: author.into(),
+            cycle_time_hours: hours,
+            size,
+            additions: size,
+            deletions: 0,
+            changed_files: 1,
+            reviews_received: 1,
+        }
+    }
+
+    /// A fetched board carrying only the facts `from_stored` reads off it.
+    fn fetched(total: u64, retrieved: u64, refused: usize) -> Board {
+        Board {
+            rows: Vec::new(),
+            total,
+            retrieved,
+            complete: retrieved == total && refused == 0,
+            truncated_slices: Vec::new(),
+            refused_fields: refused,
+            slices: 1,
+            rounds: 1,
+            spend: unmeasured(),
+            slowest: Vec::new(),
+            largest: Vec::new(),
+            repo_counts: Vec::new(),
+            accumulated: retrieved,
+            accumulating: false,
+        }
+    }
+
+    /// THE load-bearing property of #1004, at the board layer: a second
+    /// partial load's board contains pull requests only the FIRST load
+    /// retrieved.
+    ///
+    /// This is the union, asserted where a user would see it -- in the
+    /// rows and the outlier lists, not merely in a row count. Without
+    /// accumulation the second board holds only the second load's, which
+    /// is the reported defect: "1,419 retrieved then 800 more gives two
+    /// partial boards, never 2,219".
+    #[test]
+    fn a_second_load_assembles_a_board_over_both_loads_pull_requests() {
+        // Load one retrieved alice's two; load two retrieved carol's two.
+        // The table holds the union.
+        let union = vec![
+            stored("o/a", 1, "alice", 10.0, 100),
+            stored("o/a", 2, "alice", 20.0, 200),
+            stored("o/c", 4, "carol", 30.0, 300),
+            stored("o/c", 5, "carol", 40.0, 400),
+        ];
+        // The SECOND load itself fetched only carol's two, of four in window.
+        let board = Board::from_stored(&union, &fetched(4, 2, 0));
+
+        // Both authors are on the board, though this load fetched one of them.
+        let logins: Vec<&str> = board.rows.iter().map(|r| r.login.as_str()).collect();
+        assert_eq!(logins, vec!["alice", "carol"]);
+        assert_eq!(
+            board
+                .row_for("alice")
+                .expect("alice must survive load two")
+                .prs,
+            2,
+            "a pull request only the FIRST load retrieved must still be on the board"
+        );
+        assert_eq!(board.accumulated, 4);
+        assert!(board.accumulating);
+
+        // And specifically in the outlier lists, which are what the user reads.
+        assert!(
+            board
+                .largest
+                .iter()
+                .any(|p| p.number == 1 && p.repo == "o/a"),
+            "an outlier only the first load retrieved must be rankable"
+        );
+    }
+
+    /// Completeness is computed against the WINDOW, not the fetch.
+    ///
+    /// A load that fetched 2 of 4 is complete once the TABLE holds 4 --
+    /// that is #1004's definition, and it is what makes the caveat go away
+    /// for a user who loaded twice.
+    #[test]
+    fn complete_flips_only_when_the_window_is_genuinely_covered() {
+        let three = vec![
+            stored("o/a", 1, "alice", 1.0, 10),
+            stored("o/a", 2, "alice", 2.0, 20),
+            stored("o/a", 3, "bob", 3.0, 30),
+        ];
+        // Three of four stored: still incomplete, and visibly so.
+        let partial = Board::from_stored(&three, &fetched(4, 3, 0));
+        assert!(!partial.complete, "3 of 4 stored is not complete");
+        assert_eq!(partial.accumulated, 3);
+
+        // The fourth arrives -- from a load that fetched only IT.
+        let mut four = three.clone();
+        four.push(stored("o/b", 9, "carol", 4.0, 40));
+        let whole = Board::from_stored(&four, &fetched(4, 1, 0));
+        assert!(
+            whole.complete,
+            "every PR in the window is stored, so the answer is complete even \
+             though this load fetched one of them"
+        );
+        assert_eq!(whole.accumulated, 4);
+    }
+
+    /// Accumulation makes partiality SHRINK; it never makes it invisible
+    /// while incomplete (#824, and #1004's explicit non-goal).
+    ///
+    /// A refusal is not cured by rows arriving from another load: the data
+    /// GitHub declined to give is still missing, so `complete` stays false
+    /// even at full row coverage.
+    #[test]
+    fn a_refusal_keeps_the_board_incomplete_however_many_rows_accumulate() {
+        let all = vec![
+            stored("o/a", 1, "alice", 1.0, 10),
+            stored("o/a", 2, "bob", 2.0, 20),
+        ];
+        let board = Board::from_stored(&all, &fetched(2, 2, 3));
+        assert_eq!(board.accumulated, 2);
+        assert_eq!(board.total, 2);
+        assert!(
+            !board.complete,
+            "row coverage must not launder a refusal into a confident board"
+        );
+        assert_eq!(
+            board.refused_fields, 3,
+            "the refusal channel is carried through"
+        );
+    }
+
+    /// The truncation channel survives accumulation too, for the same
+    /// reason: it names WHICH range was short, and a later load that has
+    /// not re-covered it has not fixed it.
+    #[test]
+    fn truncated_slices_are_carried_through_accumulation() {
+        let mut f = fetched(10, 4, 0);
+        f.truncated_slices = vec![ShortSlice {
+            from: "2026-08-01".into(),
+            to: "2026-08-01".into(),
+            issue_count: 6,
+            retrieved: 0,
+        }];
+        let board = Board::from_stored(&[stored("o/a", 1, "alice", 1.0, 10)], &f);
+        assert_eq!(board.truncated_slices.len(), 1);
+        assert!(!board.complete);
+    }
+
+    /// `retrieved` keeps meaning "what THIS load fetched".
+    ///
+    /// Overwriting it with the accumulated figure would erase the very
+    /// distinction the caveat needs to tell converging from stuck.
+    #[test]
+    fn retrieved_still_describes_this_load_not_the_accumulation() {
+        let five: Vec<StoredPr> = (1..=5)
+            .map(|n| stored("o/a", n, "alice", n as f64, n * 10))
+            .collect();
+        let board = Board::from_stored(&five, &fetched(10, 2, 0));
+        assert_eq!(board.retrieved, 2, "this load fetched two");
+        assert_eq!(board.accumulated, 5, "five are stored");
+        assert_eq!(board.total, 10, "GitHub says the window holds ten");
+    }
+
+    /// A board built from one fetch reports no accumulation, so the UI
+    /// cannot promise convergence that is not happening.
+    ///
+    /// The #841 fail-open guard: a claim we cannot keep, presented as a
+    /// fact, is the failure mode this flag exists to prevent.
+    #[test]
+    fn a_single_fetch_board_does_not_claim_to_be_accumulating() {
+        let map = json!({ "s0": { "issueCount": 1, "nodes": [node("alice", 10, 5, 2, 1)] } });
+        let board = Board::from_alias_map(&map, &slices(1), 1, unmeasured());
+        assert!(!board.accumulating);
+        assert_eq!(
+            board.accumulated, board.retrieved,
+            "with nothing stored, the accumulated figure is simply what was fetched"
+        );
+    }
+
+    /// `retrieved_prs` harvests the whole retrieved set, not the truncated
+    /// outlier lists.
+    ///
+    /// Writing down `slowest` and `largest` would store five pull requests
+    /// per load and converge on nothing -- the bug that would make this
+    /// feature silently useless while every other test still passed.
+    #[test]
+    fn the_harvest_is_the_whole_page_not_the_five_outliers() {
+        let nodes: Vec<serde_json::Value> = (1..=12)
+            .map(|n| {
+                pr(
+                    "alice",
+                    n,
+                    "o/a",
+                    "2026-08-01T00:00:00Z",
+                    Some("2026-08-01T05:00:00Z"),
+                    n * 10,
+                    0,
+                )
+            })
+            .collect();
+        let map = json!({ "s0": { "issueCount": 12, "nodes": nodes } });
+        let harvested = Board::retrieved_prs(&map, &slices(1));
+        assert_eq!(
+            harvested.len(),
+            12,
+            "all twelve must be written down, not the {OUTLIERS} outliers"
+        );
+        assert!(harvested.len() > OUTLIERS);
+    }
+
+    /// An UNMERGED pull request is not accumulated.
+    ///
+    /// The stored population must match the one the outlier lists and
+    /// `repo_counts` are drawn from, or a board assembled from storage
+    /// would rank a different population than one assembled from a fetch.
+    #[test]
+    fn an_unmerged_pull_request_is_not_accumulated() {
+        let map = json!({
+            "s0": {
+                "issueCount": 2,
+                "nodes": [
+                    pr("alice", 1, "o/a", "2026-08-01T00:00:00Z", Some("2026-08-01T05:00:00Z"), 10, 0),
+                    pr("bob", 2, "o/a", "2026-08-01T00:00:00Z", None, 20, 0),
+                ]
+            }
+        });
+        let harvested = Board::retrieved_prs(&map, &slices(1));
+        assert_eq!(harvested.len(), 1);
+        assert_eq!(harvested[0].author, "alice");
+    }
+
+    /// A node with no repository is skipped rather than stored under an
+    /// empty key, where it would collide with every other such node on
+    /// `(repo, number)` and silently overwrite them.
+    #[test]
+    fn a_node_without_a_repository_is_not_accumulated() {
+        let map = json!({
+            "s0": {
+                "issueCount": 1,
+                "nodes": [{
+                    "number": 1,
+                    "title": "t",
+                    "url": "u",
+                    "repository": { "nameWithOwner": "" },
+                    "author": { "login": "alice" },
+                    "createdAt": "2026-08-01T00:00:00Z",
+                    "mergedAt": "2026-08-01T01:00:00Z",
+                    "additions": 1, "deletions": 0, "changedFiles": 1,
+                    "reviews": { "totalCount": 0 }
+                }]
+            }
+        });
+        assert!(Board::retrieved_prs(&map, &slices(1)).is_empty());
+    }
+
+    /// Assembling from storage produces the SAME author aggregates a
+    /// single complete fetch would.
+    ///
+    /// The regression guard for a small account: accumulation must not
+    /// change the numbers where nothing was ever partial.
+    #[test]
+    fn a_complete_load_assembles_identically_from_storage() {
+        let map = json!({
+            "s0": {
+                "issueCount": 2,
+                "nodes": [
+                    pr("alice", 1, "o/a", "2026-08-01T00:00:00Z", Some("2026-08-01T02:00:00Z"), 30, 10),
+                    pr("alice", 2, "o/a", "2026-08-01T00:00:00Z", Some("2026-08-01T04:00:00Z"), 5, 5),
+                ]
+            }
+        });
+        let direct = Board::from_alias_map(&map, &slices(1), 1, unmeasured());
+        let harvested = Board::retrieved_prs(&map, &slices(1));
+        let assembled = Board::from_stored(&harvested, &direct);
+
+        assert!(direct.complete && assembled.complete);
+        let a = direct.row_for("alice").unwrap();
+        let b = assembled.row_for("alice").unwrap();
+        assert_eq!(a.prs, b.prs);
+        assert_eq!(a.additions, b.additions);
+        assert_eq!(a.deletions, b.deletions);
+        assert_eq!(a.changed_files, b.changed_files);
+        assert_eq!(a.reviews_received, b.reviews_received);
+        assert_eq!(a.cycle_time_hours, b.cycle_time_hours);
+        assert_eq!(direct.repo_counts, assembled.repo_counts);
+        assert_eq!(direct.largest, assembled.largest);
+        assert_eq!(direct.slowest, assembled.slowest);
     }
 }

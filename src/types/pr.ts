@@ -2262,6 +2262,18 @@ export interface StatsBoard {
   /// Merged pull requests per repository, most first. The scoped
   /// counterpart to `MergedDetail.repo_counts`.
   repoCounts: { repo: string; merged: number }[];
+  /// Pull requests stored for this window across EVERY load (#1004).
+  ///
+  /// `retrieved` is what this one load managed; this is what the answer is
+  /// assembled from. The pair is what distinguishes a shortfall that is
+  /// CONVERGING from one that is STUCK -- today both read identically, and
+  /// the reporter's complaint is that repeated loads never improve.
+  accumulated: number;
+  /// Whether pull requests are being written down for this window.
+  ///
+  /// False when storage was unavailable, so the caveat does not promise
+  /// that another load will help when nothing is being kept.
+  accumulating: boolean;
 }
 
 /// One day of scoped pull-request activity.

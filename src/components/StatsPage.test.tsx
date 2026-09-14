@@ -81,6 +81,12 @@ const board = (over: Partial<StatsBoard> = {}): StatsBoard => ({
   slowest: [],
   largest: [],
   repoCounts: [{ repo: "acme/alpha", merged: 12 }],
+  // Not accumulating by DEFAULT, so a test that overrides `retrieved` alone
+  // keeps describing one fetch and renders the plain shortfall. #1004's
+  // converging wording is opted into by the tests that are about it, rather
+  // than leaking into every partiality case as an unrelated change of copy.
+  accumulated: 12,
+  accumulating: false,
   ...over,
 });
 
@@ -524,6 +530,27 @@ describe("StatsPage honesty", () => {
     expect(screen.getByText(/380 of 500/)).toBeTruthy();
   });
 
+  /// #1004 end to end: an accumulating board tells the reader the gap is
+  /// closing, on the page rather than only in the helper.
+  it("tells a reader a partial board is still filling in", () => {
+    vi.mocked(useStatsBoard).mockReturnValue(
+      settled(
+        board({
+          complete: false,
+          total: 500,
+          retrieved: 120,
+          accumulated: 400,
+          accumulating: true,
+        }),
+      ),
+    );
+    render(<StatsPage />);
+    fireEvent.click(screen.getByRole("tab", { name: /others/i }));
+    expect(screen.getByText(/rankings are incomplete/i)).toBeTruthy();
+    expect(screen.getByText(/400 of 500/)).toBeTruthy();
+    expect(screen.getByText(/loading this scope again adds to them/i)).toBeTruthy();
+  });
+
   /// Figures from a partial board read as floors, not totals.
   it("prefixes a partial person's figures with at least", () => {
     vi.mocked(useStatsBoard).mockReturnValue(
@@ -662,5 +689,68 @@ describe("partialityCaveat", () => {
     expect(partialityCaveat({ ...base, complete: false })).toMatch(
       /more pull requests than GitHub will return/i,
     );
+  });
+
+  /// #1004: a shortfall that is CONVERGING must not read like one that is
+  /// stuck. The reporter's complaint is not the gap itself -- it is that
+  /// "1523 of 2942 could not be retrieved" is the same sentence whether
+  /// another load will help or not.
+  it("says what is stored, what remains, and that it improves", () => {
+    const out = partialityCaveat({
+      complete: false,
+      total: 2942,
+      // This load fetched 800; 2,219 are held across every load so far.
+      retrieved: 800,
+      truncatedSlices: [],
+      refusedFields: 0,
+      accumulated: 2219,
+      accumulating: true,
+    })!;
+    expect(out).toContain("2,219 of 2,942");
+    expect(out).toContain("723");
+    expect(out).toMatch(/loading this scope again adds to them/i);
+    // And it must NOT fall back to the stuck-sounding sentence.
+    expect(out).not.toMatch(/could not be retrieved/);
+  });
+
+  /// The counterpart, and the one that keeps the promise honest: with
+  /// nothing being written down there is no convergence to promise, so the
+  /// original wording stands. #841's fail-open in a new costume would be a
+  /// claim we cannot keep, presented as a fact.
+  it("does not promise improvement when nothing is accumulating", () => {
+    const out = partialityCaveat({
+      complete: false,
+      total: 2942,
+      retrieved: 1419,
+      truncatedSlices: [],
+      refusedFields: 0,
+      accumulated: 1419,
+      accumulating: false,
+    })!;
+    expect(out).toContain("1,523 of 2,942 pull requests could not be retrieved");
+    expect(out).not.toMatch(/adds to them/i);
+  });
+
+  /// Pairs with the two above: a COMPLETE board gains no accumulation
+  /// noise. Partiality shrinking must not turn into a permanent progress
+  /// report on a board that has nothing left to say.
+  it("adds no accumulation noise when the board is complete", () => {
+    expect(
+      partialityCaveat({ ...base, accumulated: 100, accumulating: true }),
+    ).toBeUndefined();
+  });
+
+  /// A payload written before #1004 shipped -- a `stats_cache` row with no
+  /// accumulation fields -- must read as not accumulating rather than
+  /// rendering "undefined of 2,942".
+  it("tolerates a board stored before accumulation existed", () => {
+    const out = partialityCaveat({
+      complete: false,
+      total: 100,
+      retrieved: 60,
+      truncatedSlices: [],
+      refusedFields: 0,
+    })!;
+    expect(out).toContain("40 of 100 pull requests could not be retrieved");
   });
 });
