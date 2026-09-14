@@ -55,23 +55,23 @@ vi.mock("../api/tauri", () => ({ claudeRevealPath: vi.fn() }));
 
 import { ClaudeSessionColumn } from "./ClaudeCodePage";
 
+// Only the fields the LIST carries. #999 moved `claude_version`,
+// `transcript_path`, `first_seen_at`, `transcript_state`, `resume` and
+// `runs` onto `ClaudeSessionDetail`, fetched when a row is selected --
+// 65% of the payload was being sent for every row so one row's detail
+// pane could render. Adding them back here would typecheck only by
+// widening the type, which would put them back on the wire.
 const session = (n: number): ClaudeSession => ({
   session_id: `session-${String(n).padStart(4, "0")}`,
   name: `Session ${n}`,
   cwd: "/Users/acme/code/widget",
   git_branch: "feat/spoon",
-  claude_version: "2.1.270",
-  transcript_path: `/Users/acme/.claude/projects/slug/${n}.jsonl`,
-  first_seen_at: "2026-09-11T09:00:00Z",
   // DESCENDING, so the fixture's order is the order the column draws --
   // the list is sorted by last activity, and a fixture that ignored that
   // would let an index assertion pass against the wrong row.
   last_activity_at: new Date(Date.parse("2026-09-13T09:00:00Z") - n * 60_000).toISOString(),
   liveness: { state: "dead", why: "pid 14779 is no longer running" },
   cwd_state: { state: "exists" },
-  transcript_state: { state: "exists" },
-  resume: { command: "claude --resume", caveat: null, anchored: true },
-  runs: 1,
 });
 
 const listOf = (n: number): ClaudeSessionList => ({
