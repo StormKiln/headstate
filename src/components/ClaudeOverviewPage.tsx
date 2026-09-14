@@ -27,10 +27,11 @@ export const ACTIVITY_DAYS = 30;
 /// rather than as a dash or a zero. That is the page's central rule in
 /// component form: on a dashboard, zero is a MEASUREMENT and absence is
 /// not, and the two look identical unless something forces them apart.
+///
 /// # Clickable, as of #948, and only when there is something to open
 ///
-/// `Tile`'s own comment above marks `action` as "the one figure a user is
-/// meant to act on" -- and the tile was a `Card` wrapping three `div`s with
+/// The `tone` prop below marks `action` as "the one figure a user is meant
+/// to act on" -- and the tile was a `Card` wrapping three `div`s with
 /// no `onClick` and no `href`. On the measured corpus that meant the page
 /// coloured the number 179 to say "act on this" and dead-ended: the card
 /// below it lists the 12 most recent, so 167 resumable sessions had no path

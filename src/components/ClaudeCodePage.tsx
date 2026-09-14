@@ -235,20 +235,6 @@ export function ClaudeCodePage() {
   );
 }
 
-/// The sessions the current search matches, running ones first.
-///
-/// A hook rather than a prop, because the list and the detail render in
-/// two different columns since #939 -- `ClaudeSessionColumn` in the sidebar
-/// and `ClaudeCodePage` in the main panel -- with no ancestor between them
-/// to hold this. Both call `useClaudeSessions(true)`, which is one query
-/// and therefore one poll: react-query serves the second caller from the
-/// cache, so the split costs nothing on the wire.
-///
-/// Stating the matching ONCE is the point. The rule has three parts that
-/// must not drift -- which fields search covers, running-first ordering,
-/// and no `= []` default -- and two copies of it would be two chances for
-/// the list and the detail to disagree about which session the same id
-/// names.
 /// Whether one session belongs in the chip's subset (#949).
 ///
 /// A pure function over the two readings every row already carries, so it
@@ -308,6 +294,20 @@ export function matchesClaudeFilter(s: ClaudeSession, filter: ClaudeSessionFilte
   }
 }
 
+/// The sessions the current search and chip match, running ones first.
+///
+/// A hook rather than a prop, because the list and the detail render in
+/// two different columns since #939 -- `ClaudeSessionColumn` in the sidebar
+/// and `ClaudeCodePage` in the main panel -- with no ancestor between them
+/// to hold this. Both call `useClaudeSessions(true)`, which is one query
+/// and therefore one poll: react-query serves the second caller from the
+/// cache, so the split costs nothing on the wire.
+///
+/// Stating the matching ONCE is the point. The rule has four parts that
+/// must not drift -- which fields search covers, which subset the chip
+/// selects (#949), running-first ordering, and no `= []` default -- and two
+/// copies of it would be two chances for the list and the detail to
+/// disagree about which session the same id names.
 function useMatchedSessions() {
   const { list } = useClaudeSessions(true);
   const query = useFilters((f) => f.claudeQuery);
