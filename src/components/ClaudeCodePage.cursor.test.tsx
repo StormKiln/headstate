@@ -123,6 +123,21 @@ describe("the sessions list claims the keyboard cursor (#953)", () => {
     expect(activeRowCursor()?.toggle).toBeUndefined();
   });
 
+  /// The CONSEQUENCE of that, which is the half a user would notice.
+  ///
+  /// Before #953 the keys were wired to the PR list whatever view was on
+  /// screen, so `x` on the sessions page toggled a pull request checkbox
+  /// BEHIND it -- an invisible bulk selection accumulating while the user
+  /// pressed a key that appeared to do nothing. Asserting the absent
+  /// `toggle` alone would not catch a regression that re-pointed the key
+  /// at `useFilters`' `checked`, so the store is checked directly.
+  it("leaves the pull request bulk selection alone", () => {
+    useFilters.setState({ checked: [], cursor: 1 });
+    render(<ClaudeSessionColumn />);
+    activeRowCursor()?.toggle?.(1);
+    expect(useFilters.getState().checked).toEqual([]);
+  });
+
   /// The rows the cursor walks must be the rows on SCREEN.
   ///
   /// The column caps its rendering and offers "Show all"; below that cap
