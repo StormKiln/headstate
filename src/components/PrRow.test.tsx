@@ -10,6 +10,53 @@ function pr(over: Partial<PullRequest> = {}): PullRequest {
   return { ...PR_FIXTURES[0], ...over };
 }
 
+/// #977's third surface. The app's most-used list announced nothing at all
+/// about which row was open -- three list-selection surfaces, three
+/// different answers, and this was the "nothing" one.
+///
+/// The answer is `aria-current="true"`, matching the sidebars: opening a
+/// PR is not a toggle (so not `aria-pressed`), the container's
+/// `role="button"` with nested interactive controls forbids
+/// `aria-selected`, and the panel is part of this page rather than a
+/// different one (so `"true"`, not `"page"`).
+describe("PrRow open-row announcement", () => {
+  it("marks the open row as current", () => {
+    const { container } = render(
+      <PrRow pr={pr()} onOpen={() => {}} opened />,
+    );
+    expect(
+      container.querySelector('[role="button"]')?.getAttribute("aria-current"),
+    ).toBe("true");
+  });
+
+  /// Absence, not `"false"` -- `aria-current="false"` is announced by
+  /// some readers.
+  it("leaves the attribute off a row that is not open", () => {
+    const { container } = render(<PrRow pr={pr()} onOpen={() => {}} />);
+    const row = container.querySelector('[role="button"]');
+    expect(row?.hasAttribute("aria-current")).toBe(false);
+  });
+
+  /// Not `aria-pressed`: clicking the open row again does not close the
+  /// panel, so "pressed" would describe a toggle that cannot be
+  /// un-pressed -- the defect on the two Claude lists.
+  it("never announces pressed", () => {
+    const { container } = render(
+      <PrRow pr={pr()} onOpen={() => {}} opened />,
+    );
+    expect(
+      container.querySelector('[role="button"]')?.hasAttribute("aria-pressed"),
+    ).toBe(false);
+  });
+
+  /// A row that opens nothing cannot be the open one, and has no
+  /// `role="button"` to hang the attribute on either.
+  it("says nothing on a row that does not open anything", () => {
+    const { container } = render(<PrRow pr={pr()} opened />);
+    expect(container.querySelector("[aria-current]")).toBeNull();
+  });
+});
+
 describe("PrRow", () => {
   // The app fetched `review` for every PR and rendered it nowhere: ten
   // green PRs looked identical whether one was approved or none were.

@@ -26,14 +26,24 @@ import { RepoTable } from "./stats/RepoTable";
 import { GroupFigures, PersonFigures, ScopeCounts } from "./stats/ScopeSummary";
 import { SkeletonChart, SkeletonRow } from "./stats/Skeleton";
 
-/// The windows a scope page offers, in days.
+/// The windows a scope page offers are `ActivityChart`'s `RANGES`, and the
+/// chart's own buttons are the ONE control that sets them.
 ///
-/// The same three `ActivityChart` already offers, so the chart's own range
-/// buttons and the page's window are one control rather than two that can
-/// disagree about what "this period" means. 30 is the default because it is
-/// the shortest window in which a monthly cadence of work is visible at all,
-/// and it is what the unscoped page defaulted to.
-const RANGES = [7, 14, 30];
+/// This file used to declare the same three numbers and render a second,
+/// markup-identical group from them in the header row -- two groups on one
+/// screen, both `aria-pressed`, both calling this page's `setDays`, with
+/// nothing to tell a user or a screen reader which was which. The comment
+/// introducing that constant asked for "one control rather than two that
+/// can disagree about what 'this period' means"; the header group was
+/// removed to make that true, which also makes the scoped page agree with
+/// the unscoped one below it (#980).
+///
+/// `days` stays lifted here rather than moving into the chart: `ScopeCounts`
+/// takes it and the series query is keyed on it, so the counts and the chart
+/// would otherwise fall out of step -- exactly the disagreement above.
+/// 30 is the default because it is the shortest window in which a monthly
+/// cadence of work is visible at all, and it is what the unscoped page
+/// defaulted to.
 
 /// Which half of a scope the page is showing.
 ///
@@ -226,27 +236,14 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
 
   return (
     <div className="flex flex-col gap-3">
+      {/* The scope has to be named explicitly or a reader will mistake it
+          for the narrower one beside it. The range buttons that used to sit
+          opposite this label are gone -- the chart below owns them (#980) --
+          but the label and its help stay. */}
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-1 text-xs text-[#8b949e]">
           <span>{scopeLabel}</span>
           <HelpButton topic="stats-sample" />
-        </div>
-        <div className="flex gap-1">
-          {RANGES.map((r) => (
-            <button
-              key={r}
-              type="button"
-              aria-pressed={days === r}
-              onClick={() => setDays(r)}
-              className={`rounded px-2 py-1 text-xs ${
-                days === r
-                  ? "bg-[#1f6feb] text-white"
-                  : "text-[#8b949e] hover:bg-[#161b22]"
-              }`}
-            >
-              {r}d
-            </button>
-          ))}
         </div>
       </div>
 

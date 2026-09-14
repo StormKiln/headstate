@@ -36,11 +36,54 @@ export function QueryError({
         <button
           type="button"
           onClick={onRetry}
-          className="mt-4 rounded border border-[#30363d] px-3 py-1.5 text-sm text-[#e6edf3] hover:bg-[#161b22]"
+          className="tap-target mt-4 rounded border border-[#30363d] px-3 py-1.5 text-sm text-[#e6edf3] hover:bg-[#161b22]"
         >
           Try again
         </button>
       ) : null}
+    </div>
+  );
+}
+
+/// The same panel, sized for a 256px column.
+///
+/// `QueryError` is a full-width `px-4 py-8 text-center` block that does not
+/// fit a sidebar, which is why four sidebars hand-rolled their own failure
+/// arm instead -- and hand-rolled them differently: six "Try again"
+/// affordances across the app in three shapes, four bordered buttons at
+/// three sizes and two that were bare links with no padding at all (#974).
+/// That is a reason for a narrow variant, not for four spellings.
+///
+/// What it deliberately does NOT do is unify the copy or the handler. The
+/// per-surface wording is different CLAIMS about different scans -- "Could
+/// not scan for repositories." and "Could not scan for worktrees." and
+/// "build output or virtualenvs" are not interchangeable, and a user told
+/// only that a scan failed cannot tell whether a group is absent because it
+/// failed or because there are none. Likewise `onRetry` is a handler rather
+/// than one `refetch`, because `ArtifactSidebar` retries only what actually
+/// failed: re-running a 26-second virtualenv scan that succeeded would throw
+/// away a result the page is still rendering.
+///
+/// `tap-target` because a failed scan's retry is the only route out of a
+/// failed scan, and at `text-xs` with no padding the link form was roughly a
+/// 15px hit area against the 44px minimum `index.css` establishes.
+export function NarrowQueryError({
+  message,
+  onRetry,
+}: {
+  message: string;
+  onRetry: () => void;
+}) {
+  return (
+    <div role="alert" className="px-3 py-2">
+      <p className="text-xs text-[#f85149]">{message}</p>
+      <button
+        type="button"
+        onClick={onRetry}
+        className="tap-target mt-1 rounded border border-[#30363d] px-2 py-0.5 text-xs text-[#e6edf3] hover:bg-[#161b22]"
+      >
+        Try again
+      </button>
     </div>
   );
 }

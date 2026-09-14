@@ -3,6 +3,7 @@ import { screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { PR_FIXTURES } from "@/fixtures/prs";
 import { PrList } from "@/components/PrList";
+import { useFilters } from "@/store/filters";
 
 describe("PrList", () => {
   it("renders every PR with its number and title", () => {
@@ -10,6 +11,25 @@ describe("PrList", () => {
     expect(screen.getByText("Add retry to the fetch client")).toBeDefined();
     expect(screen.getByText(/#42/)).toBeDefined();
     expect(screen.getByText(/#43/)).toBeDefined();
+  });
+
+  /// #977: the list is the only thing that reads `selectedPr`, so it is
+  /// the list that tells each row whether it is the open one -- the same
+  /// division `cursored` and `stackedOn` already follow.
+  it("marks exactly the open row as current", () => {
+    const open = PR_FIXTURES[1];
+    useFilters.setState({ selectedPr: { repo: open.repo, number: open.number } });
+    const { container } = render(<PrList prs={PR_FIXTURES} onOpen={() => {}} />);
+    const rows = [...container.querySelectorAll('[role="button"][aria-current]')];
+    expect(rows).toHaveLength(1);
+    expect(rows[0].textContent).toContain(`#${open.number}`);
+    useFilters.setState({ selectedPr: null });
+  });
+
+  it("marks no row current when nothing is open", () => {
+    useFilters.setState({ selectedPr: null });
+    const { container } = render(<PrList prs={PR_FIXTURES} onOpen={() => {}} />);
+    expect(container.querySelectorAll("[aria-current]")).toHaveLength(0);
   });
 
   it("renders label pills", () => {

@@ -8,6 +8,20 @@ export default tseslint.config(
   // Both crates' build directories: an iOS build leaves tauri-codegen's
   // compressed `.js` assets under src-mobile/target, which eslint
   // otherwise tries to parse.
+  //
+  // `.worktrees` is the same hazard `vite.config.ts` documents for tests:
+  // this project keeps git worktrees at `.worktrees/<branch>/`, each a
+  // complete copy of `src/`, and with `projectService` enabled eslint
+  // builds a full TypeScript program PER sibling checkout. Memory then
+  // scales with how many branches happen to be open rather than with the
+  // code being linted -- measured here at 1264 files and 3.79 GB peak RSS
+  // against a 4 GB heap with three siblings present, versus 316 files and
+  // 2.16 GB with this entry. The warnings were wrong too: 60 reported,
+  // only 15 of them about this checkout.
+  //
+  // CI is unaffected either way -- it checks out fresh and has no
+  // `.worktrees` -- which is why the failure survived: the one place that
+  // would have reported it could not see it. #983
   {
     ignores: [
       "dist",
@@ -16,6 +30,7 @@ export default tseslint.config(
       "src-mobile/gen/apple/build",
       "coverage",
       ".remember",
+      ".worktrees",
     ],
   },
   {

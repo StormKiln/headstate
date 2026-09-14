@@ -1024,6 +1024,45 @@ describe("sessionWorktree", () => {
     }
   });
 
+  /// #969: the match RATE used to live in a comment on `ClaudeCodePage`
+  /// ("206 of 1,461 -- 14.1% of all sessions, 83.1% of those whose
+  /// directory still exists"). A number measured once is right on the day
+  /// it is written and decays from then on; it was four points out a day
+  /// later, and it is per-machine besides.
+  ///
+  /// The design does not rest on the rate, it rests on the RULE: a jump is
+  /// offered only where the recorded directory is still a registered
+  /// worktree, so the majority of a realistic corpus -- whose directories
+  /// are deleted when the work lands -- gets no button, and every session
+  /// that does get one has a live directory.
+  ///
+  /// This MEASURES that over a corpus instead of remembering a figure.
+  it("offers a jump only for directories that are still registered", () => {
+    const live = wt();
+    const repos = [repo([live])];
+    // A corpus in the shape a real one has: a few live worktrees, and a
+    // long tail of agent worktrees deleted when their work landed.
+    const cwds = [
+      live.path,
+      "/Users/acme/code/widget/.worktrees/gone-1",
+      "/Users/acme/code/widget/.worktrees/gone-2",
+      "/Users/acme/code/widget/.worktrees/gone-3",
+      "/Users/acme/code/widget/.worktrees/gone-4",
+    ];
+    const matched = cwds.filter((c) => sessionWorktree(c, "feat/spoon", repos) !== null);
+
+    // Exactly the registered one, and nothing else -- measured, not recalled.
+    expect(matched).toEqual([live.path]);
+    // The shape the design rests on: most rows get no button, which is why
+    // the section renders a REASON rather than leaving a dead control.
+    expect(matched.length).toBeLessThan(cwds.length / 2);
+    // And every match is a directory the listing still knows about, which
+    // is what makes the offered jump land on a row that exists.
+    for (const c of matched) {
+      expect(repos[0].worktrees.some((w) => w.path === c)).toBe(true);
+    }
+  });
+
   /// Case is PRESERVED, deliberately. Lowercasing would match more often
   /// on macOS and would be wrong on Linux, where these are two
   /// directories -- and a jump to the wrong tree is worse than a missing

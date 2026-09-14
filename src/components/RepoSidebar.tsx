@@ -1,6 +1,7 @@
 import type { PullRequest } from "@/types/pr";
 import { type View, useActiveFilters, useFilters } from "@/store/filters";
 import { ViewSwitcher } from "@/components/ViewSwitcher";
+import { current } from "@/lib/ariaCurrent";
 import { repoCounts } from "@/lib/repos";
 
 /// Repos where the user currently has open PRs, busiest first, plus an
@@ -40,25 +41,13 @@ export function RepoSidebar({
       active ? "bg-[#1f6feb] text-white" : "text-[#e6edf3] hover:bg-[#161b22]"
     }`;
 
-  /// `aria-current` for the selected row (#852).
-  ///
-  /// The blue was carrying the selection on its own, so a screen reader
-  /// reading a list of repository names had no way to know which one was
-  /// open. `StatsSidebar` already states the rule: "`aria-current` rather
-  /// than only a colour: the selection is navigation state, and a screen
-  /// reader reading a list of repository names has no other way to know
-  /// which one is open."
-  ///
-  /// `"true"` rather than `"page"`, matching `StatsSidebar` rather than
-  /// `SystemHealthSidebar`: these rows SCOPE the current page, they do not
-  /// navigate to a different one, and `aria-current="page"` would claim
-  /// each repository is its own page. `undefined` rather than `"false"` on
-  /// the inactive rows -- the attribute's absence is how "not current" is
-  /// spelled, and `aria-current="false"` is announced by some readers.
-  ///
-  /// A helper rather than an inline ternary at each call site, so the two
-  /// rows here cannot drift and a third cannot be added without it.
-  const current = (active: boolean) => (active ? ("true" as const) : undefined);
+  // `current` from `@/lib/ariaCurrent` (#852, shared in #977). The blue was
+  // carrying the selection on its own, so a screen reader reading a list of
+  // repository names had no way to know which one was open. The helper's
+  // own doc comment carries the `"true"`-not-`"page"` and
+  // `undefined`-not-`"false"` reasoning that used to live here; it was
+  // moved because four sidebars each had a private copy of it and the two
+  // newest lists reached for `aria-pressed` instead.
 
   // My PRs is the only view whose `filters.repo` this column both writes
   // and has read back. PR Stats was the other until #825 gave it
