@@ -16,6 +16,9 @@ import type {
   ClaudePreview,
   ClaudeUsage,
   ClaudeSessionList,
+  ClaudeSessionDetail,
+  WireClaudeSessionList,
+  Liveness,
   CleanupPrefs,
   DockerImage,
   Footprint,
@@ -94,6 +97,7 @@ import {
   claudeOverview,
   claudeSessionUsage,
   claudeSessions,
+  claudeSessionDetail,
   claudeTranscriptTail,
   claudeHooksStatus,
   claudeInstallHooks,
@@ -1159,10 +1163,96 @@ const CLAUDE_POLL_MS = 10_000;
 /// `HealthConditions` both state, and which `yarn lint` enforces. It
 /// advances once per poll, which is also the honest edge for "how old is
 /// this reading": the last moment we actually heard from the machine.
+/// Resolve each row's interned liveness reason back into its sentence
+/// (#985).
+///
+/// The inverse of the backend's `Reasons` table, and the ONE place the
+/// wire shape is known: every consumer below this sees `Liveness` with
+/// its `why`, unchanged from before the split.
+///
+/// # An index with no entry is `unknown`, and says so
+///
+/// It should be impossible -- the backend builds the table and the
+/// indices in one pass -- so this arm is about what happens if it ever is
+/// not. The alternatives were worse: `?? ""` would put an empty tooltip
+/// under a confident "Not running", and `?? "not running"` would invent
+/// grounds the app does not have. `unknown` with a reason naming the
+/// failure is the honest reading, and it is the state the app already
+/// renders as "Could not tell" (#846, #841 -- `unknown` must never be
+/// shown as a shade of `dead`, because "not running" is what offers
+/// Resume).
+///
+/// Exported for its test.
+export function hydrateClaudeSessions(wire: WireClaudeSessionList): ClaudeSessionList {
+  const why = (ix: number): string | null => wire.reasons[ix] ?? null;
+  return {
+    sessions: wire.sessions.map((s) => {
+      let liveness: Liveness;
+      if (s.liveness.state === "running") {
+        liveness = { state: "running", pid: s.liveness.pid, status: s.liveness.status };
+      } else {
+        const reason = why(s.liveness.why);
+        liveness =
+          reason === null
+            ? {
+                state: "unknown",
+                why: `the reason for this session's state did not arrive (index ${s.liveness.why} of ${wire.reasons.length})`,
+              }
+            : { state: s.liveness.state, why: reason };
+      }
+      return {
+        session_id: s.session_id,
+        name: s.name,
+        cwd: s.cwd,
+        git_branch: s.git_branch,
+        last_activity_at: s.last_activity_at,
+        liveness,
+        cwd_state: s.cwd_state,
+      };
+    }),
+    registry_failure: wire.registry_failure,
+    registry_unreadable: wire.registry_unreadable,
+  };
+}
+
+/// What one SELECTED session knows that the list does not carry (#985).
+///
+/// # Keyed by id, and polled with the list
+///
+/// `CLAUDE_POLL_MS`, the same tick as the list, because the detail pane
+/// shows a LIVENESS -- and liveness is derived per read, so a detail that
+/// did not poll would keep saying "running" under a list that had already
+/// stopped. That is the staleness the split had to avoid, moved from the
+/// rows to the pane.
+///
+/// It is one row, so this costs about what one row of the old list cost:
+/// the saving is that the other 1,473 no longer come with it.
+///
+/// `retry: false`, this feature's rule: a database that could not be read
+/// is a settled refusal, and three silent re-reads only delay saying so.
+///
+/// A resolved `null` means the store has no such id -- a session deleted
+/// between two polls -- which the caller renders differently from a
+/// rejection (#846).
+export function useClaudeSessionDetail(sessionId: string | null, enabled: boolean) {
+  return useQuery<ClaudeSessionDetail | null>({
+    queryKey: ["claude-session-detail", sessionId],
+    queryFn: () => claudeSessionDetail(sessionId as string),
+    enabled: enabled && sessionId !== null && sessionId !== "",
+    refetchInterval: enabled && sessionId ? CLAUDE_POLL_MS : false,
+    staleTime: CLAUDE_POLL_MS - 1_000,
+    retry: false,
+  });
+}
+
 export function useClaudeSessions(enabled: boolean) {
   const list = useQuery<ClaudeSessionList>({
     queryKey: ["claude-sessions"],
-    queryFn: claudeSessions,
+    // Hydrated HERE, in the `queryFn`, so the interning is a transport
+    // detail with one boundary. Everything downstream -- the search, the
+    // chips, the badges, the tests -- sees `Liveness` with its sentence,
+    // exactly as it did before #985.
+    queryFn: async () => hydrateClaudeSessions(await claudeSessions()),
     enabled,
     refetchInterval: enabled ? CLAUDE_POLL_MS : false,
     staleTime: CLAUDE_POLL_MS - 1_000,

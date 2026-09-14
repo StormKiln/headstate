@@ -1020,25 +1020,98 @@ export interface ClaudeImported {
   absent_root: string | null;
 }
 
-/// One row of the Claude Code session list (#917).
+/// A liveness exactly as it arrives on the wire, with its reason
+/// interned (#985).
+///
+/// The same three states as `Liveness`; the only difference is that
+/// `why` is an index into `ClaudeSessionList.reasons` rather than the
+/// sentence. `hydrateClaudeSessions` in `api/hooks.ts` resolves it, and
+/// the rest of the app only ever sees `Liveness`.
+///
+/// The reason is interned rather than dropped: the list RENDERS it, as
+/// each row's `title`, so "Not running" always carries its grounds on
+/// hover. It was 18.9% of the old payload and the same 150-character
+/// sentence on 1,474 of 1,474 real rows -- paid for once here, preserved
+/// exactly.
+export type WireLiveness =
+  | { state: "running"; pid: number; status: string | null }
+  | { state: "dead"; why: number }
+  | { state: "unknown"; why: number };
+
+/// One row exactly as `claude_sessions` sends it (#985).
+///
+/// Not what components consume -- see `ClaudeSession` below, which is
+/// this with `liveness` resolved. Separated so the interning is a
+/// transport detail that stops at the hook boundary.
+export interface WireClaudeSession {
+  session_id: string;
+  name: string | null;
+  cwd: string | null;
+  git_branch: string | null;
+  last_activity_at: string | null;
+  liveness: WireLiveness;
+  cwd_state: CwdState;
+}
+
+/// One row of the Claude Code session list, as the components see it
+/// (#917, #985).
+///
+/// # What is here, and what moved (#985)
+///
+/// Exactly what the list renders, searches, filters or counts on. The
+/// rest of what a session knows -- its resume command, transcript path
+/// and stat, version, start time and run count -- is
+/// `ClaudeSessionDetail`, fetched for the one selected row.
+///
+/// That split was measured rather than guessed. The old row was 990
+/// bytes and 65% of it was read only by the detail pane, for one session
+/// at a time, while the whole 1.35 MB crossed the pairing transport every
+/// ten seconds. Splitting by FIELD rather than by row is what makes it
+/// free: search still covers the whole corpus, the chip counts are still
+/// over every row, and the stated total is still just `sessions.length`.
 export interface ClaudeSession {
   /// The `claude --resume` handle, and the row's identity. Verified to
   /// survive `--resume` and `--continue` unchanged, so it never goes
-  /// stale.
+  /// stale. One of the four fields search covers.
   session_id: string;
   /// Claude's own `aiTitle`, present for 1,436 of 1,438 real sessions.
   /// `null` for the two that never got one -- never the UUID in
   /// disguise, because a fabricated name cannot be told from a real one.
+  /// One of the four fields search covers.
   name: string | null;
+  /// One of the four fields search covers, and what the row prints
+  /// beneath the title.
   cwd: string | null;
+  /// One of the four fields search covers.
   git_branch: string | null;
+  /// The newest record in the transcript, NOT when we scanned it.
+  last_activity_at: string | null;
+  /// Derived on every poll, for EVERY row -- which is why no approach
+  /// that dropped rows was acceptable. A session dies without any write
+  /// to its row, so a limit or an `updated_since` cursor would leave rows
+  /// outside its window claiming "running" indefinitely.
+  liveness: Liveness;
+  /// Stays on the row because the Resumable and Directory-gone chips
+  /// count it, and those counts are over the whole list.
+  cwd_state: CwdState;
+}
+
+/// What one SELECTED Claude Code session knows (#985).
+///
+/// The heavy half of the old row, fetched on selection instead of pushed
+/// for every session on every poll. `claude_session_detail` resolves to
+/// `null` when the store has no such id -- a session deleted between two
+/// polls -- which is a different answer from a rejected read and must not
+/// render as one (#846).
+export interface ClaudeSessionDetail {
+  session_id: string;
   claude_version: string | null;
   transcript_path: string | null;
   first_seen_at: string;
-  /// The newest record in the transcript, NOT when we scanned it.
-  last_activity_at: string | null;
+  /// Derived on THIS read, not copied from the list's. The detail pane is
+  /// where the reason is shown, so it states one as fresh as the verdict
+  /// it explains.
   liveness: Liveness;
-  cwd_state: CwdState;
   /// Whether the transcript file is still on disk (#919).
   ///
   /// A SEPARATE reading from `cwd_state`, never derived from it: 0% of
@@ -1050,6 +1123,11 @@ export interface ClaudeSession {
   /// the UI say "never observed" rather than implying we watched and
   /// lost it.
   runs: number;
+  /// Why the live registry could not be listed, for this read. Carried
+  /// for the reason the list carries it: a `liveness` that is `unknown`
+  /// because the registry was unreadable must be able to say so rather
+  /// than present a shrug as a finding.
+  registry_failure: string | null;
 }
 
 
@@ -1156,12 +1234,30 @@ export interface ClaudePreview {
 /// in which every liveness is `unknown`, and the view must say so rather
 /// than show rows that look like settled answers.
 export interface ClaudeSessionList {
+  /// EVERY stored session, always -- never a page or a window. The
+  /// stated total is `sessions.length`, so there is no separate count
+  /// that could drift from the rows beside it. `RENDER_CAP` bounds what
+  /// is DRAWN and says so; nothing bounds what arrives.
   sessions: ClaudeSession[];
   /// Why the live registry could not be listed. `null` means it was read
   /// -- so an absence of running sessions is a real answer.
   registry_failure: string | null;
   /// Registry files that could not be parsed. Each one hides a session
   /// whose liveness cannot be stated.
+  registry_unreadable: string[];
+}
+
+/// The session list exactly as it arrives, before the reasons are
+/// resolved (#985).
+///
+/// `hydrateClaudeSessions` turns this into `ClaudeSessionList` at the
+/// hook boundary, which is the only place either shape is known.
+export interface WireClaudeSessionList {
+  sessions: WireClaudeSession[];
+  /// Every distinct liveness reason, once. A `WireLiveness`'s `why` is
+  /// an index into this. ONE entry on the measured corpus of 1,474.
+  reasons: string[];
+  registry_failure: string | null;
   registry_unreadable: string[];
 }
 
