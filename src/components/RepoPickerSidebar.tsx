@@ -1,8 +1,10 @@
-import { useWorktrees } from "@/api/hooks";
+import { useState } from "react";
+import { useWorktreeDirs, useWorktrees } from "@/api/hooks";
 import { current } from "@/lib/ariaCurrent";
 import { useActiveFilters, useFilters } from "@/store/filters";
 import { NarrowQueryError } from "./QueryError";
 import { PartialScanNotice } from "./PartialScanNotice";
+import { SettingsDialog } from "./SettingsDialog";
 import { ViewSwitcher } from "./ViewSwitcher";
 
 /// A plain repository list, for views whose only axis is "which repo".
@@ -40,6 +42,18 @@ export function RepoPickerSidebar({ reviewingCount }: { reviewingCount: number }
     // only what it needs, and absent reads the same as empty here.
     unreadable = [],
   } = useWorktrees();
+  // The scan's INPUT, not its output (#952). Everything above says what
+  // the walk found; only this says whether the walk had anywhere to go.
+  //
+  // `default_worktree_dirs` returns an EMPTY vector when `~/code` is
+  // absent, and its comment is the reason -- "Returning a path that does
+  // not exist would make the worktrees view report 'no repos found' for
+  // a directory the user never chose". That is correct and stays; what
+  // was missing is a component that can tell the two apart. Costs one
+  // cache hit: `useWorktreeDirs` is `staleTime: Infinity` and Settings
+  // already holds the same query.
+  const { dirs } = useWorktreeDirs();
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   const rowClass = (active: boolean) =>
     `flex w-full items-center justify-between rounded px-3 py-2 text-sm ${
@@ -60,7 +74,7 @@ export function RepoPickerSidebar({ reviewingCount }: { reviewingCount: number }
             settings. Shown before the scan finishes it says the scan
             directories are wrong when they are fine, and sends someone
             to fix something that is not broken.
-            
+
             "We have not looked yet" and "we looked and there is
             nothing" are opposite answers, which is the same rule this
             codebase applies to a failed check anywhere else.
@@ -101,10 +115,69 @@ export function RepoPickerSidebar({ reviewingCount }: { reviewingCount: number }
             No repositories could be read. The paths below explain why — the
             scanned folders may well be correct.
           </p>
+        ) : repos.length === 0 && dirs.length === 0 ? (
+          /* The FIFTH answer, and the first one a new user actually gets
+             (#952): there is nowhere to look. Distinct from the empty arm
+             below in exactly the way the arms above are distinct from each
+             other -- "we looked and there is nothing" and "we had nowhere
+             to look" are opposite answers, and only one of them is a task.
+
+             AFTER the unreadable arm, not before: a scan that could not
+             read its folders had folders, so `dirs` is non-empty there and
+             the order is belt and braces rather than load-bearing. But it
+             must come after `isError` and `isLoading` for the reason the
+             block above gives at length -- `dirs` also defaults to `[]`
+             while its own query is in flight, so placed first this would
+             claim "no directories configured" during the very first
+             render of a machine that has three.
+
+             The button is the remedy the other two arms lack, and it is
+             reachable now: #945 fixed the field that rejected `~/code`,
+             so someone sent to Settings can actually type the path they
+             have. `initialSection` is `ConnectionBanner`'s pattern --
+             deep-linking to the section that is the only reason the
+             control was pressed. */
+          <div className="px-3 py-2">
+            <p className="text-xs text-[#8b949e]">
+              Headstate does not know where your repositories are yet. It has
+              no folders to scan.
+            </p>
+            <button
+              type="button"
+              onClick={() => setSettingsOpen(true)}
+              className="mt-2 rounded border border-[#30363d] px-2 py-1 text-xs text-[#58a6ff] hover:bg-[#161b22]"
+            >
+              Choose folders to scan…
+            </button>
+          </div>
         ) : repos.length === 0 ? (
-          <p className="px-3 py-2 text-xs text-[#8b949e]">
-            No repositories found in the scanned folders.
-          </p>
+          /* Directories ARE configured and the walk came back empty, so
+             this stays a diagnosis -- and now NAMES them (#952). The
+             paths are the difference between something the user can
+             check and something they have to guess at: "no git
+             repositories under /Users/x/src" is either obviously right
+             or obviously the wrong folder, and the old sentence was
+             neither. */
+          <div className="px-3 py-2">
+            <p className="text-xs text-[#8b949e]">
+              No git repositories found in the {dirs.length === 1 ? "folder" : "folders"}{" "}
+              being scanned.
+            </p>
+            <ul className="mt-1 space-y-0.5">
+              {dirs.map((d) => (
+                <li key={d} className="break-all font-mono text-[11px] text-[#8b949e]">
+                  {d}
+                </li>
+              ))}
+            </ul>
+            <button
+              type="button"
+              onClick={() => setSettingsOpen(true)}
+              className="mt-2 rounded border border-[#30363d] px-2 py-1 text-xs text-[#58a6ff] hover:bg-[#161b22]"
+            >
+              Change the folders scanned…
+            </button>
+          </div>
         ) : null}
         {/* Below whichever message above applies, and shown alongside a
             NON-empty list too: some repositories reading is not evidence
@@ -133,6 +206,17 @@ export function RepoPickerSidebar({ reviewingCount }: { reviewingCount: number }
           </button>
         ))}
       </div>
+      {/* Mounted only while open, `ConnectionBanner`'s shape: the dialog
+          subscribes to every settings query, and a permanently mounted
+          copy behind every repository sidebar would run them on views
+          that never open it. */}
+      {settingsOpen ? (
+        <SettingsDialog
+          open
+          onOpenChange={setSettingsOpen}
+          initialSection="repositories"
+        />
+      ) : null}
     </nav>
   );
 }

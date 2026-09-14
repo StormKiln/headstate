@@ -15,6 +15,13 @@ import { ACTIVITY_DAYS } from "@/components/ClaudeOverviewPage";
 import { TOP_N } from "@/components/stats/Leaderboard";
 import { ABSOLUTE_GAP_MS } from "./health";
 import { CANCELLED } from "./cancelled";
+import {
+  DEFAULT_STALE_DAYS,
+  MAX_STALE_DAYS,
+  MIN_STALE_DAYS,
+  STALE_DAY_CHOICES,
+  staleVenvDays,
+} from "./staleVenv";
 
 /// The constants that exist twice, once per language, and the assertion
 /// that they still agree.
@@ -251,6 +258,92 @@ describe("the Claude Code activity window", () => {
     // spans 41 days with any activity, of which the last 30 hold 1,375 of
     // 1,461 sessions.
     expect(ACTIVITY_DAYS).toBe(30);
+  });
+});
+
+/// 7. The virtualenv staleness threshold: 90 days, in three places (#957).
+///
+/// The pair this file was missing, and the one whose own comment said the
+/// duplication was safe: `VenvSection.tsx` carried
+/// `const STALE_SECS = 90 * 24 * 60 * 60` beside *"Duplicated rather than
+/// plumbed through because it is only used to LABEL rows here… and this
+/// never gates a removal."*
+///
+/// It gated one. `displayState` returned `"stale"` from that constant and
+/// `isRemovable` returns `true` for `"stale"`, so the frontend copy
+/// decided whether a row's CHECKBOX was enabled while `remove_venvs`
+/// decided whether the delete was permitted -- two numbers governing one
+/// action, invisible only because both were 90.
+///
+/// #957 removed the TypeScript literal entirely: `VenvSection` now
+/// resolves the user's `stale_venv_days` through `staleVenvDays`, which
+/// is the TypeScript twin of `poll::stale_venv_days`. What is left to
+/// assert is the DEFAULT, which is the number both languages fall back to
+/// when nothing is stored -- and `poll::stale_venv_days` writes it as a
+/// bare `0 => 90` rather than as a named constant, so the assertable Rust
+/// side is `caches/mod.rs`'s `STALE_SECS`.
+///
+/// What a mismatch would cost is the pair of failures #957 names: above
+/// the backend's threshold, a row reads Stale with an enabled checkbox
+/// and the delete is then REFUSED by `RemovalPolicy` -- a confirmed
+/// action that silently does nothing; below it, rows the backend would
+/// delete are never offered.
+describe("the virtualenv staleness default", () => {
+  it("is the same number of days the Rust default resolves to", async () => {
+    const cachesRs = (await import("../../src-tauri/src/caches/mod.rs?raw")).default;
+    const rustSecs = rustConst(cachesRs, "STALE_SECS", "caches/mod.rs");
+    expect(DEFAULT_STALE_DAYS * 24 * 60 * 60).toBe(rustSecs);
+    // And the literal, so a coordinated change to both sides still has to
+    // be deliberate. `caches/mod.rs` argues for 90 in prose: "a project
+    // worked on seasonally is normal… the cost of nagging about a live
+    // project is that the whole view stops being trusted."
+    expect(DEFAULT_STALE_DAYS).toBe(90);
+  });
+
+  /// The OTHER half of the agreement, and the half that is new: the
+  /// resolver, not just the constant. `poll::stale_venv_days` reads
+  /// `0 => 90` and otherwise `clamp(30, 3650)`, and the TypeScript side
+  /// has to read the same stored integer the same way or the two layers
+  /// resolve one preference to two thresholds -- which is the whole
+  /// defect, merely moved.
+  ///
+  /// Read out of Rust SOURCE rather than restated here, per this file's
+  /// rule: a test that spelled the bounds twice in TypeScript would pass
+  /// at any value Rust chose.
+  it("clamps to the same bounds the Rust resolver does", async () => {
+    const pollRs = (await import("../../src-tauri/src/poll.rs?raw")).default;
+    const fn = pollRs.slice(pollRs.indexOf("pub fn stale_venv_days"));
+    const body = fn.slice(0, fn.indexOf("\n}"));
+    // `0 => 90,` and `d.clamp(30, 3650)`, as the function spells them.
+    const zero = body.match(/0\s*=>\s*(\d+)\s*,/);
+    expect(zero, "poll.rs must resolve 0 to a default").toBeTruthy();
+    const clamp = body.match(/clamp\(\s*(\d+)\s*,\s*(\d+)\s*\)/);
+    expect(clamp, "poll.rs must clamp the stored value").toBeTruthy();
+
+    expect(DEFAULT_STALE_DAYS).toBe(Number(zero![1]));
+    expect(MIN_STALE_DAYS).toBe(Number(clamp![1]));
+    expect(MAX_STALE_DAYS).toBe(Number(clamp![2]));
+
+    // And the resolver itself, applied -- so this fails if a comparison
+    // is inverted as well as if a bound moves.
+    expect(staleVenvDays(0)).toBe(DEFAULT_STALE_DAYS);
+    expect(staleVenvDays(undefined)).toBe(DEFAULT_STALE_DAYS);
+    expect(staleVenvDays(1)).toBe(MIN_STALE_DAYS);
+    expect(staleVenvDays(999_999)).toBe(MAX_STALE_DAYS);
+    expect(staleVenvDays(180)).toBe(180);
+  });
+
+  /// Every choice Settings offers must survive the clamp untouched.
+  ///
+  /// A select exists so the user cannot enter a value the app will
+  /// silently rewrite. An option outside the bounds would reintroduce
+  /// exactly that: a user picks 7 days, the backend enforces 30, and the
+  /// two layers disagree again -- through the control added to stop them
+  /// disagreeing.
+  it("offers only choices the clamp leaves alone", () => {
+    for (const d of STALE_DAY_CHOICES) {
+      expect(staleVenvDays(d), `${d} is rewritten by the clamp`).toBe(d);
+    }
   });
 });
 

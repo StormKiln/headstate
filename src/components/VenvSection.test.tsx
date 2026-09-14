@@ -28,6 +28,14 @@ const state = vi.hoisted(() => ({
   // `isLoading` half was already fixed here for the adjacent bug and
   // `isError` was not -- so a rejection still removed the entire section.
   failed: false,
+  /// The stored `stale_venv_days` (#957). The threshold is no longer a
+  /// constant in this component: it is the user's setting, resolved the
+  /// same way `poll::stale_venv_days` resolves it.
+  ///
+  /// `0` by default, which is what every existing install actually
+  /// stores and what `staleVenvDays` reads as "use the default" -- so
+  /// the assertions written before #957 keep running against 90 days.
+  staleVenvDays: 0,
 }));
 
 // The explicit retry the `retry: false` on `useVenvs` is paired with. The
@@ -57,6 +65,14 @@ vi.mock("../api/hooks", () => ({
     failed: state.sizesFailed,
   }),
   useRemoveVenvs: () => removeFn,
+  // #957. Only `stale_venv_days` is read here; the rest of `UiPrefs` is
+  // absent deliberately, so a component that started reading another
+  // field without thinking about it fails loudly rather than seeing
+  // `undefined`.
+  useUiPrefs: () => ({
+    prefs: { stale_venv_days: state.staleVenvDays },
+    set: vi.fn(),
+  }),
 }));
 
 import { VenvSection } from "./VenvSection";
@@ -84,6 +100,9 @@ beforeEach(() => {
   // #956. Leaked, this suppresses every byte figure in the section and
   // adds an advisory that unrelated `role="status"` assertions would find.
   state.sizesFailed = 0;
+  // #957. Leaked, a non-default threshold relabels rows other tests
+  // assert the badge of, and rewrites the confirmation's sentence.
+  state.staleVenvDays = 0;
 });
 
 describe("VenvSection on a phone", () => {
@@ -707,5 +726,111 @@ describe("VenvSection's confirmation wording", () => {
     expect(within(dialog).getByText(/1 of these belong to a project that still exists/i)).toBeTruthy();
     // And never "every one", which is the word that made it a false claim.
     expect(within(dialog).queryByText(/every one of these/i)).toBeNull();
+  });
+
+  /// #957. The threshold is now the user's setting, and the two things it
+  /// governs -- the LABEL (and so the checkbox) and the SENTENCE the
+  /// confirmation asserts -- have to move with it together.
+  ///
+  /// They did not. `VenvSection` held its own `const STALE_SECS = 90 days`
+  /// while `remove_venvs` enforced `RemovalPolicy::stale_days` from
+  /// `stale_venv_days`, and the dialog said "90 days" as a string literal.
+  /// With the setting exposed, the two failures that produces are:
+  ///
+  /// 1. above 90, a row reads Stale with an enabled checkbox and the
+  ///    delete is REFUSED -- a confirmed action that silently does
+  ///    nothing;
+  /// 2. below 90, rows the backend would delete are never offered.
+  describe("the threshold is the user's setting (#957)", () => {
+    /// Idle for 120 days: stale at a 90-day threshold, live at 180. One
+    /// fixture, two verdicts, which is the disagreement itself.
+    const DAY = 24 * 60 * 60;
+    const ageDays = (days: number) => {
+      state.idle = new Map([["/cache/here-BBBB-py3.13", days * DAY]]);
+    };
+
+    it("labels a row against the configured threshold, not a constant 90", () => {
+      state.staleVenvDays = 180;
+      ageDays(120);
+      state.venvs = [stale()];
+      render(<VenvSection />);
+      // 120 days idle is inside a 180-day threshold, so this is LIVE --
+      // and under the old hardcoded 90 it read Stale.
+      expect(screen.getByText("live")).toBeTruthy();
+      expect(screen.queryByText("stale")).toBeNull();
+    });
+
+    /// The half that matters most, because it is the one that ends in a
+    /// refused delete: the checkbox must not offer what the backend will
+    /// not remove. `isRemovable` admits `stale` and nothing else among
+    /// live projects, so the label IS the gate.
+    it("does not offer a row the backend would refuse to remove", () => {
+      state.staleVenvDays = 180;
+      ageDays(120);
+      state.venvs = [stale()];
+      render(<VenvSection />);
+      // A non-removable row's checkbox names the REFUSAL rather than the
+      // selection -- the distinction the component draws deliberately, so
+      // a disabled control says why.
+      const box = screen.getByLabelText(/here virtualenv cannot be removed/) as HTMLInputElement;
+      expect(box.disabled).toBe(true);
+    });
+
+    /// And the other direction: lowering the threshold must OFFER rows the
+    /// backend would now delete, rather than leaving them unselectable.
+    it("offers a row the lowered threshold makes stale", () => {
+      state.staleVenvDays = 30;
+      ageDays(45);
+      state.venvs = [stale()];
+      render(<VenvSection />);
+      expect(screen.getByText("stale")).toBeTruthy();
+      const box = screen.getByLabelText(/Select here virtualenv/) as HTMLInputElement;
+      expect(box.disabled).toBe(false);
+    });
+
+    /// The confirmation sentence, which was a string literal. This is the
+    /// last place the figure is read before the click, so a dialog saying
+    /// 90 while the app deletes on 180 is the "rubber stamp with wrong
+    /// words on it" this component's own comment warns about.
+    it("states the configured threshold in the confirmation, not 90", () => {
+      state.staleVenvDays = 180;
+      ageDays(200);
+      const dialog = openWith([stale()]);
+      expect(within(dialog).getByText(/180 days/i)).toBeTruthy();
+      expect(within(dialog).queryByText(/90 days/i)).toBeNull();
+    });
+
+    /// A stored 0 is what EVERY existing install holds, because
+    /// `UiPrefs::stale_venv_days` defaults to it. Read as a threshold it
+    /// would mean "everything is stale" and reclassify every venv on every
+    /// machine -- the failure `poll::stale_venv_days`' comment forbids in
+    /// so many words: "a stored 0 from a bad write must not reclassify the
+    /// whole cache." It must resolve to 90.
+    it("reads a stored 0 as the default rather than as zero days", () => {
+      state.staleVenvDays = 0;
+      ageDays(45);
+      state.venvs = [stale()];
+      render(<VenvSection />);
+      // 45 days is short of 90, so a correct reading leaves this live. A
+      // literal 0 threshold would call it stale, and its checkbox would
+      // go live with it.
+      expect(screen.getByText("live")).toBeTruthy();
+      const box = screen.getByLabelText(/here virtualenv cannot be removed/) as HTMLInputElement;
+      expect(box.disabled).toBe(true);
+    });
+
+    /// And no noise on the happy path: the default threshold must keep
+    /// labelling exactly what it labelled before this change. A fix that
+    /// moved the 90-day boundary would be a silent reclassification of
+    /// every machine's cache.
+    it("still labels at 90 days when nothing is configured", () => {
+      state.staleVenvDays = 0;
+      ageDays(120);
+      state.venvs = [stale()];
+      render(<VenvSection />);
+      expect(screen.getByText("stale")).toBeTruthy();
+      const box = screen.getByLabelText(/Select here virtualenv/) as HTMLInputElement;
+      expect(box.disabled).toBe(false);
+    });
   });
 });

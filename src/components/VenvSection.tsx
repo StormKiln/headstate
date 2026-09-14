@@ -3,7 +3,8 @@ import { ActingOnDesktop } from "./ActingOnDesktop";
 import { useState } from "react";
 import { toast } from "sonner";
 import type { Venv, VenvState } from "@/types/pr";
-import { useRemoveVenvs, useVenvs, useVenvSizes } from "@/api/hooks";
+import { useRemoveVenvs, useUiPrefs, useVenvs, useVenvSizes } from "@/api/hooks";
+import { staleVenvDays, staleVenvSecs } from "@/lib/staleVenv";
 import { formatSize } from "@/lib/worktrees";
 import { relativeSeconds } from "@/lib/time";
 import { useIsMobile } from "@/lib/useIsMobile";
@@ -11,12 +12,24 @@ import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 import { HelpButton } from "./HelpButton";
 import { QueryError, errorMessage } from "./QueryError";
 
-/// How long idle counts as stale, mirroring `STALE_SECS` in Rust.
+/// The hardcoded `STALE_SECS` that used to live here is gone (#957).
 ///
-/// Duplicated rather than plumbed through because it is only used to
-/// LABEL rows here; the backend's value is the one that decides anything,
-/// and this never gates a removal.
-const STALE_SECS = 90 * 24 * 60 * 60;
+/// Its comment claimed the duplication was safe: *"Duplicated rather than
+/// plumbed through because it is only used to LABEL rows here; the
+/// backend's value is the one that decides anything, and this never gates
+/// a removal."*
+///
+/// The second half is right and the first half is not. `displayState`
+/// below returns `"stale"` from the threshold and `isRemovable` returns
+/// `true` for `"stale"`, so the threshold decides whether the CHECKBOX is
+/// enabled -- it gates what can be OFFERED, while the backend gates what
+/// is DELETED. Equal numbers made that invisible; `stale_venv_days` now
+/// has a control in Settings, so they need not be equal any more.
+///
+/// The threshold is therefore resolved from the same stored preference
+/// the delete path reads, through `staleVenvDays` -- the TypeScript twin
+/// of `poll::stale_venv_days`, with the same `0 ⇒ 90` and the same clamp.
+/// See `src/lib/staleVenv.ts`.
 
 /// Whether a venv is offered for removal at all.
 ///
@@ -53,13 +66,27 @@ function isRemovable(v: Venv, state: VenvState): boolean {
 ///
 /// An orphan stays an orphan however recently it was touched: its path
 /// is gone, so mtime says nothing about whether anyone wants it.
-function displayState(v: Venv, idleSecs: number | undefined): VenvState {
+///
+/// `staleSecs` is PASSED rather than read from a module constant (#957),
+/// because it is now the user's setting and the caller is the only thing
+/// that can resolve it.
+///
+/// NOT exported. Exporting it was the first spelling and it earns a
+/// `react-refresh/only-export-components` warning for a function nothing
+/// imports: the #957 tests drive this through a render, which is the
+/// stronger assertion anyway -- the defect was that a row's LABEL and its
+/// CHECKBOX disagreed with the backend, and only a render sees both.
+function displayState(
+  v: Venv,
+  idleSecs: number | undefined,
+  staleSecs: number,
+): VenvState {
   if (v.state === "orphaned") return "orphaned";
   // An idle time cannot complete an incomplete scan. Ageing `unknown`
   // into `stale` here would make it removable again, undoing the
   // suppression the backend applied for exactly that reason (#747).
   if (v.state === "unknown") return "unknown";
-  if (idleSecs !== undefined && idleSecs >= STALE_SECS) return "stale";
+  if (idleSecs !== undefined && idleSecs >= staleSecs) return "stale";
   return v.state;
 }
 
@@ -114,6 +141,21 @@ export function VenvSection() {
   /// paths. A failure does not clear on its own either (`retry: false`),
   /// so this is not a transient state that corrects itself.
   const sizesComplete = !measuring && failed === 0;
+  // The SAME stored preference the delete path reads (#957). `useUiPrefs`
+  // is `staleTime: Infinity` and `SettingsDialog` already holds it, so
+  // this is a cache hit rather than a second read.
+  //
+  // `prefs` is `undefined` until it arrives, and `staleVenvDays` resolves
+  // that to 90 -- the value the backend would use for an unset
+  // preference, so a row labelled during the first render is labelled
+  // with the threshold the delete would actually enforce if the stored
+  // value is the default. A stored non-default arrives a tick later and
+  // re-labels; the alternative, withholding the whole section behind one
+  // more query, would put a spinner over a list that is already correct
+  // for every machine that never changed the setting.
+  const { prefs: ui } = useUiPrefs();
+  const staleSecs = staleVenvSecs(ui?.stale_venv_days);
+  const staleDays = staleVenvDays(ui?.stale_venv_days);
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -164,7 +206,7 @@ export function VenvSection() {
   if (venvs.length === 0) return null;
 
   const rows = [...venvs]
-    .map((v) => ({ v, state: displayState(v, idle.get(v.path)) }))
+    .map((v) => ({ v, state: displayState(v, idle.get(v.path), staleSecs) }))
     .sort((a, b) => (sizes.get(b.v.path) ?? 0) - (sizes.get(a.v.path) ?? 0));
 
   const orphans = rows.filter((r) => r.state === "orphaned");
@@ -341,17 +383,25 @@ export function VenvSection() {
             {/* The amber of the `stale` badge, not the body grey: this is
                 the half of the selection the user is being asked to make a
                 JUDGEMENT about, and it has to read as a caveat rather than
-                as more reassurance. The 90 days and the `poetry install`
+                as more reassurance. The threshold and the `poetry install`
                 are both stated, so the judgement is reviewable -- "what
                 does this cost if I am wrong" is the question, and the
-                answer is what makes the gate meaningful. */}
+                answer is what makes the gate meaningful.
+
+                DERIVED, not the literal 90 it used to be (#957). This is
+                the last place the figure is read before the click, and a
+                sentence that says 90 while the app deletes on 180 is the
+                "rubber stamp with wrong words on it" the comment above
+                warns about -- in the one paragraph whose entire job is to
+                let the user check the threshold. */}
             {chosenStale > 0 ? (
               <p className="mt-2 text-sm text-[#d29922]">
                 {chosenStale === chosen.length
                   ? "Every one of these belongs"
                   : `${chosenStale} of these belong`}{" "}
                 to a project that still exists and{" "}
-                {chosenStale === 1 ? "has" : "have"} simply not been used for 90 days.
+                {chosenStale === 1 ? "has" : "have"} simply not been used for{" "}
+                {staleDays} days.
                 Removing {chosenStale === 1 ? "it" : "them"} costs a{" "}
                 <span className="font-mono">poetry install</span> if the project is picked
                 up again.

@@ -1186,28 +1186,30 @@ pub async fn check_packages(
 
 /// Push an update run's branch and open a pull request.
 ///
-/// PHASE 2, and the first command in this app that writes to a shared
+/// PHASE 2, and the first code in this app that writes to a shared
 /// remote. Everything before it was local: worktrees, removals and
 /// applies are all undoable by the user alone, and this is not.
 ///
-/// Takes a report from `apply_package_updates` rather than doing the
-/// work itself, so the user has seen what landed before anything is
-/// pushed. That separation is the point of the phasing.
-#[tauri::command]
-pub async fn open_update_pr(
-    client: State<'_, GhClient>,
-    repo_path: String,
-    report: crate::packages::apply::RunReport,
-) -> Result<String, String> {
-    open_update_pr_inner(client.inner(), &repo_path, report).await
-}
-
-/// The body of `open_update_pr`, callable without a `State`.
+/// # No longer a command (#964)
 ///
-/// Split out so the background run (`apply_updates_in_background`) can
-/// open the pull request with the SAME refusals -- nothing applied, and
-/// an ecosystem whose resolved constraint cannot be read back. A second
-/// implementation would be a second set of rules to keep in step.
+/// There was a `#[tauri::command] open_update_pr` wrapper over this,
+/// taking `State<GhClient>` and doing nothing else. #626 replaced the
+/// two-phase flow with `apply_updates_in_background`, which calls THIS
+/// function directly -- so the wrapper had no desktop caller while
+/// remaining dispatchable from a paired phone at `Class::Write`.
+///
+/// The wrapper is gone and this is not: it is the live code, with two
+/// callers before the removal and one after. The `_inner` suffix stays
+/// deliberately -- renaming it to `open_update_pr` would put a plain
+/// `fn open_update_pr` back in this module, which is exactly the name a
+/// future reader running #964's `generate_handler!`-versus-`tauri.ts`
+/// comparison would expect to find registered.
+///
+/// Still split from the background task rather than inlined there, for
+/// the reason the old doc gave: the refusals below -- nothing applied,
+/// and an ecosystem whose resolved constraint cannot be read back -- are
+/// rules, and a second implementation would be a second set of rules to
+/// keep in step.
 pub(crate) async fn open_update_pr_inner(
     client: &GhClient,
     repo_path: &str,
@@ -1284,42 +1286,31 @@ pub fn packages_markdown(
     crate::packages::markdown::render(&repo_path, &reports, filter)
 }
 
-/// Create a worktree and apply dependency updates in it.
-///
-/// Phase 1 of the update wizard: it does NOT push and does NOT open a
-/// pull request. The worktree is left in place and its path is returned,
-/// because what these package managers actually do to a checkout is the
-/// thing being found out.
-///
-/// The FIRST command in this app that runs a package manager in a mode
-/// that writes, which is why it carries the same care the destructive
-/// git paths do.
-#[tauri::command]
-pub async fn apply_package_updates(
-    repo_path: String,
-    requests: Vec<crate::packages::apply::UpdateRequest>,
-) -> Result<crate::packages::apply::RunReport, String> {
-    let repo = repo_path.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        crate::packages::apply::run(std::path::Path::new(&repo), &requests)
-    })
-    .await
-    .map_err(|e| e.to_string())?;
-
-    // Logged with the repository and branch, so "where did that
-    // worktree come from?" has an answer -- the same reason
-    // `remove_worktree` logs.
-    match &result {
-        Ok(r) => log::info!(
-            "applied {} update(s) in {} on branch {}",
-            r.results.len(),
-            r.worktree,
-            r.branch
-        ),
-        Err(e) => log::warn!("update run in {repo_path} refused: {e}"),
-    }
-    result
-}
+// `apply_package_updates` stood here and is gone (#964).
+//
+// It was phase 1 of the two-phase update wizard -- create a worktree,
+// apply the updates in it, push and open the pull request separately --
+// and its own comment made the strongest case for looking at it: "The
+// FIRST command in this app that runs a package manager in a mode that
+// WRITES, which is why it carries the same care the destructive git
+// paths do."
+//
+// #626 replaced the phasing with `apply_updates_in_background`, which
+// does both halves in one cancellable background task and reaches the
+// apply through `packages::apply::run_on_branch_cancellable` rather than
+// through this command. So from #626 onwards nothing on the desktop
+// could call it, while `remote/surface.rs` still classed it
+// `Destructive` and `dispatch` still routed to it: a paired phone could
+// invoke a package manager in write mode down a path the desktop UI had
+// no route to and no frontend test exercised.
+//
+// That is what made the care wrong rather than merely redundant. Care is
+// applied to a path somebody is looking at; this was care applied to a
+// path nobody could reach, which is how a path rots.
+//
+// The helpers it called are untouched -- `packages::apply::run` and its
+// cancellable sibling are the live code, exercised by the background
+// task and by `packages::apply`'s own tests.
 
 /// Reveal the diagnostic log in the file manager.
 ///

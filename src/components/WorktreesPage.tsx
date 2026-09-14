@@ -24,6 +24,7 @@ import {
   useUnlockWorktree,
   useUnlockWorktrees,
   usePruneWorktrees,
+  useWorktreeDirs,
 } from "../api/hooks";
 import {
   formatSize,
@@ -977,6 +978,10 @@ export function WorktreesPage() {
     unreadable = [],
   } = useWorktrees();
   const partial = unreadable.length > 0;
+  // The scan's INPUT (#952): whether there were any folders to walk at
+  // all, which nothing in the scan's OUTPUT can distinguish from a walk
+  // that found nothing. One cache hit -- `staleTime: Infinity`.
+  const { dirs } = useWorktreeDirs();
   const filters = useActiveFilters();
   const { setFilter } = useFilters();
   const isMobile = useIsMobile();
@@ -1614,11 +1619,33 @@ export function WorktreesPage() {
         </div>
       );
     }
+    // And the same split again (#952): with no directories configured,
+    // "No repositories found" is a claim about the user's disk that this
+    // scan never tested. It looked nowhere. That is a task to state, not
+    // a finding to report -- and the two want opposite words.
+    if (dirs.length === 0) {
+      return (
+        <div className="rounded-md border border-[#30363d] px-4 py-12 text-center">
+          <p className="text-sm font-semibold text-[#e6edf3]">
+            Headstate does not know where your repositories are
+          </p>
+          <p className="mx-auto mt-2 max-w-md text-sm text-[#8b949e]">
+            No folders are being scanned yet. Set the directories to scan in
+            Settings, at the bottom right.
+          </p>
+        </div>
+      );
+    }
     return (
       <div className="rounded-md border border-[#30363d] px-4 py-12 text-center">
         <p className="text-sm font-semibold text-[#e6edf3]">No repositories found</p>
+        {/* NAMES them (#952). "Set the directories to scan in Settings"
+            without saying which ones are set asks the user to go and
+            look up what the app already knows. */}
         <p className="mx-auto mt-2 max-w-md text-sm text-[#8b949e]">
-          Set the directories to scan in Settings, at the bottom right.
+          No git repositories under{" "}
+          <span className="font-mono">{dirs.join(", ")}</span>. Change the
+          directories to scan in Settings, at the bottom right.
         </p>
       </div>
     );

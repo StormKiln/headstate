@@ -251,8 +251,21 @@ pub fn run() {
             commands::cleanup_log,
             commands::get_cleanup_prefs,
             commands::set_cleanup_prefs,
-            commands::apply_package_updates,
-            commands::open_update_pr,
+            // apply_package_updates and open_update_pr were registered
+            // here and are gone (#964). #626 replaced the two-phase flow
+            // with apply_updates_in_background below, which does both
+            // halves in one background task and reaches the helpers
+            // directly, so the two command wrappers had no desktop caller
+            // while staying remotely dispatchable as Destructive and
+            // Write. The helpers themselves are untouched; see
+            // commands.rs where each wrapper stood.
+            //
+            // NOTE for whoever edits this comment: the parser behind
+            // every_registered_command_has_exactly_one_class reads this
+            // block by finding the first closing square bracket, so a
+            // comment in here must not contain one -- an attribute
+            // written out in backticks truncates the command list and
+            // fails that test with "the parser is broken".
             commands::apply_updates_in_background,
             commands::cancel_update_run,
             commands::update_run_state,

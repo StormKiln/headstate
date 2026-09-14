@@ -6,7 +6,17 @@ const setInterval_ = vi.hoisted(() => vi.fn((s: number) => Promise.resolve(s)));
 const dirs = vi.hoisted(() => ({ current: ["/Users/x/code"] as string[] }));
 
 const setCleanup = vi.hoisted(() => vi.fn(() => Promise.resolve()));
-const uiState = vi.hoisted(() => ({ diagnosticLogging: false }));
+/// `staleVenvDays` since #957: the setting that had no control at all,
+/// and the one whose stored value every install holds as 0. `setUi` is a
+/// spy so the write can be asserted -- a select that renders the right
+/// options and stores nothing is the failure mode a render-only test
+/// cannot see.
+const uiState = vi.hoisted(() => ({ diagnosticLogging: false, staleVenvDays: 0 }));
+// Typed so the written prefs can be asserted: the untyped form infers an
+// empty argument tuple, and indexing it is a compile error.
+const setUi = vi.hoisted(() =>
+  vi.fn<(prefs: { stale_venv_days: number }) => Promise<void>>(() => Promise.resolve()),
+);
 const revealFn = vi.hoisted(() => vi.fn(() => Promise.resolve("/Users/x/Library/Logs/app/headstate.log")));
 const cleanupPrefs = vi.hoisted(() => ({
   current: {
@@ -35,8 +45,9 @@ vi.mock("../api/hooks", () => ({
       hidden_views: [],
       close_hides_to_tray: true,
       diagnostic_logging: uiState.diagnosticLogging,
+      stale_venv_days: uiState.staleVenvDays,
     },
-    set: () => Promise.resolve(),
+    set: setUi,
   }),
   useCleanupPrefs: () => ({ prefs: cleanupPrefs.current, set: setCleanup }),
   useAutostart: () => ({ enabled: false, set: () => Promise.resolve() }),
@@ -230,6 +241,78 @@ describe("automatic cleanup settings", () => {
     expect(orphaned.closest("div")?.parentElement).toBe(
       stale.closest("div")?.parentElement,
     );
+  });
+});
+
+/// #957: `stale_venv_days` was the only `UiPrefs` field with no control.
+///
+/// Verified mechanically in the issue -- `grep -rl "stale_venv_days" src`
+/// returned only the type declaration in `tauri.ts` -- while every other
+/// field had a control here or a panel of its own. So it was always 0,
+/// which `poll::stale_venv_days` resolves to 90, which is what the
+/// frontend hardcoded: three numbers that agreed only because one of them
+/// could not be changed.
+describe("the virtualenv staleness threshold (#957)", () => {
+  const openDialog = () =>
+    render(<SettingsDialog open onOpenChange={() => {}} initialSection="cleanup" />);
+  const control = () =>
+    screen.getByLabelText(/Days idle before a virtualenv counts as stale/i);
+
+  it("offers a control for it at all", () => {
+    openDialog();
+    expect(control()).toBeTruthy();
+  });
+
+  /// A stored 0 means "use the default", never "zero days". Rendering the
+  /// raw 0 would show a threshold of zero on every existing install --
+  /// the reading `UiPrefs::stale_venv_days`' own doc forbids, since "a
+  /// stored 0 from a bad write must not reclassify the whole cache".
+  it("shows the resolved default rather than the stored 0", () => {
+    uiState.staleVenvDays = 0;
+    openDialog();
+    expect((control() as HTMLSelectElement).value).toBe("90");
+  });
+
+  it("shows a configured value as itself", () => {
+    uiState.staleVenvDays = 180;
+    openDialog();
+    expect((control() as HTMLSelectElement).value).toBe("180");
+    uiState.staleVenvDays = 0;
+  });
+
+  /// A select that renders correctly and writes nothing is the failure a
+  /// render-only test cannot see.
+  it("writes the chosen number", async () => {
+    setUi.mockClear();
+    openDialog();
+    fireEvent.change(control(), { target: { value: "180" } });
+    await waitFor(() => expect(setUi).toHaveBeenCalled());
+    expect(setUi.mock.calls[0][0].stale_venv_days).toBe(180);
+  });
+
+  /// Every option must survive `poll::stale_venv_days`' clamp untouched.
+  /// The whole reason this is a select rather than a number field is that
+  /// the clamp cannot then rewrite what the user picked -- an option
+  /// outside 30..3650 would reintroduce exactly the silent disagreement
+  /// the control exists to end.
+  it("offers only values the backend clamp leaves alone", () => {
+    openDialog();
+    const values = [...control().querySelectorAll("option")].map((o) => Number(o.value));
+    expect(values.length).toBeGreaterThan(1);
+    for (const v of values) {
+      expect(v).toBeGreaterThanOrEqual(30);
+      expect(v).toBeLessThanOrEqual(3650);
+    }
+  });
+
+  /// Outside the automatic-cleanup gate, deliberately: the threshold
+  /// labels rows and enables checkboxes on the Artifacts page whether or
+  /// not the unattended pass is on, so hiding it behind that switch would
+  /// hide the number a user is reading right now.
+  it("stays reachable with automatic cleanup switched off", () => {
+    cleanupPrefs.current = { ...cleanupPrefs.current, enabled: false };
+    openDialog();
+    expect(control()).toBeTruthy();
   });
 });
 

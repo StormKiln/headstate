@@ -15,6 +15,13 @@ const state = vi.hoisted(() => ({
   /// total. Defaults to empty, so tests that do not care keep the exact
   /// counts they already assert.
   unreadable: [] as string[],
+  /// The directories the scan was given (#952). A FIFTH state, and the
+  /// only one that is about the scan's INPUT: "we had nowhere to look"
+  /// is what a machine without `~/code` is in on first run, and it is a
+  /// task rather than a finding about the disk. Defaults to one
+  /// configured path so every existing assertion keeps reading the
+  /// "looked and found nothing" arm it was written for.
+  dirs: ["/code"] as string[],
   /// The scan's own `dataUpdatedAt`, epoch ms, which is the instant every
   /// ref age on the page is measured against (#788).
   ///
@@ -113,6 +120,9 @@ const removeImagesFn = vi.hoisted(() =>
 );
 
 vi.mock("../api/hooks", () => ({
+  // #952: the scan's input, so the empty arm can tell "nowhere to look"
+  // from "nothing there".
+  useWorktreeDirs: () => ({ dirs: state.dirs, set: vi.fn() }),
   // Idle: the progress line only appears mid-removal.
   useRemovalProgress: () => null,
   useUpdateProgress: () => null,
@@ -320,6 +330,9 @@ describe("WorktreesPage on a phone", () => {
       // #951. A leaked shortfall turns every count on the page into "at
       // least N" and puts a banner above the rows other tests assert on.
       unreadable: [],
+      // #952. Leaked empty, every "no repositories found" assertion would
+      // read the nowhere-to-look arm instead.
+      dirs: ["/code"],
       classified: [wt({ safety: { kind: "safe" } })],
       classifying: false,
       // #830. Leaked either way these are confusing: a stale
@@ -471,6 +484,9 @@ describe("WorktreesPage", () => {
       // #951. A leaked shortfall turns every count on the page into "at
       // least N" and puts a banner above the rows other tests assert on.
       unreadable: [],
+      // #952. Leaked empty, every "no repositories found" assertion would
+      // read the nowhere-to-look arm instead.
+      dirs: ["/code"],
       classified: undefined,
       classifying: false,
       // #830, and the same reasoning as `sizingFailed` below: a leaked

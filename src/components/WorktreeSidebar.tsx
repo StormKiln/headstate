@@ -1,4 +1,4 @@
-import { useWorktrees } from "../api/hooks";
+import { useWorktreeDirs, useWorktrees } from "../api/hooks";
 import { type View, useActiveFilters, useFilters } from "../store/filters";
 import { current } from "../lib/ariaCurrent";
 import { isOrphaned, ORPHAN_FILTER } from "../lib/worktrees";
@@ -43,6 +43,9 @@ export function WorktreeSidebar({
     unreadable = [],
   } = useWorktrees();
   const partial = unreadable.length > 0;
+  // The scan's INPUT (#952), so the empty arm below can tell "nowhere to
+  // look" from "nothing there". One cache hit: `staleTime: Infinity`.
+  const { dirs } = useWorktreeDirs();
   const filters = useActiveFilters();
   const { setFilter } = useFilters();
 
@@ -230,10 +233,19 @@ export function WorktreeSidebar({
 
             What was missing is the positive half: a silent column said
             nothing at all on a failure. The arm at the top of this list
-            is that half, and this stays exactly as it was. */}
+            is that half, and this stays exactly as it was.
+
+            #952 splits it in two. "Check the scanned directories" asks
+            the user to check a list that, on a machine without `~/code`,
+            is EMPTY -- so the instruction sends them to verify nothing.
+            The same distinction `RepoPickerSidebar` draws: having nowhere
+            to look is a task, and finding nothing in three real folders
+            is a finding. */}
         {repos?.length === 0 ? (
           <p className="px-3 py-2 text-xs text-[#8b949e]">
-            No repositories found. Check the scanned directories in Settings.
+            {dirs.length === 0
+              ? "Headstate does not know where your repositories are yet. Set the directories to scan in Settings."
+              : "No repositories found. Check the scanned directories in Settings."}
           </p>
         ) : null}
       </div>

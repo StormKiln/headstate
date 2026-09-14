@@ -167,3 +167,83 @@ describe("Escape and open dialogs", () => {
     expect(shortcutFor(key("Escape", {}, input))).toBeNull();
   });
 });
+
+/// #953 extended the row cursor to a second list -- the Claude Code
+/// sessions list -- whose PRIMARY control is a search box: 1,436 of the
+/// sessions have a title, and "the one about notarization" is how people
+/// find one.
+///
+/// That makes the typing guard load-bearing in a way it was not when the
+/// cursor only walked a list whose search box is one control among many.
+/// `shortcuts.ts` states the rule and the cost: bare letters "must never
+/// fire while typing -- otherwise searching for 'jack' moves the cursor
+/// four times". #953 lists it first among the things a fix must not
+/// break, and "a search box that swallows `j`" is the regression that
+/// would make the feature a net loss.
+///
+/// The guard is in `shortcutFor`, which the widened handler calls
+/// unchanged -- so this is the assertion that it still stands, spelled
+/// against the exact input the new list depends on.
+describe("bare letters never fire while typing (#953)", () => {
+  /// `input[type="search"]`, which is what the sessions list renders and
+  /// what the existing tests did not name. Its `tagName` is `INPUT` like
+  /// any other, so this passes today -- and that is the point: it is the
+  /// case a future change to `isTyping` would be most tempted to special
+  /// case.
+  it("leaves every cursor key to a search box", () => {
+    const box = document.createElement("input");
+    box.type = "search";
+    document.body.appendChild(box);
+    for (const k of ["j", "k", "x", "/"]) {
+      expect(shortcutFor(key(k, {}, box)), `"${k}" fired while typing`).toBeNull();
+    }
+  });
+
+  /// "jack", letter by letter, as the rule's own example. Four keystrokes
+  /// that must move nothing.
+  it("lets someone type the word the rule is named after", () => {
+    const box = document.createElement("input");
+    box.type = "search";
+    document.body.appendChild(box);
+    for (const k of [..."jack"]) {
+      expect(shortcutFor(key(k, {}, box))).toBeNull();
+    }
+  });
+
+  /// Textareas too, which `isTyping` covers by tag name.
+  it("leaves them to a textarea", () => {
+    const area = document.createElement("textarea");
+    document.body.appendChild(area);
+    expect(shortcutFor(key("j", {}, area))).toBeNull();
+  });
+
+  /// `isTyping`'s third branch is `target.isContentEditable`, and it is
+  /// asserted on a STUB rather than on a real element.
+  ///
+  /// Not a shortcut: jsdom does not implement `contentEditable` at all.
+  /// Verified rather than assumed -- setting the property leaves
+  /// `getAttribute("contenteditable")` null and `isContentEditable`
+  /// false -- so a test that built a real editable div would assert
+  /// jsdom's gap, watch `shortcutFor` return `onNext`, and read as a
+  /// product bug. The branch itself is a one-line property read, and
+  /// this is the input that actually reaches it in a browser.
+  it("leaves them to a contenteditable element", () => {
+    const editable = Object.assign(document.createElement("div"), {
+      isContentEditable: true,
+    });
+    expect(shortcutFor(key("j", {}, editable))).toBeNull();
+    expect(shortcutFor(key("x", {}, editable))).toBeNull();
+  });
+
+  /// And the pairing this repo asks for: the guard must not be so eager
+  /// that the keys never work. Outside a field they fire, which is the
+  /// whole feature.
+  it("still fires outside a text field", () => {
+    const div = document.createElement("div");
+    document.body.appendChild(div);
+    expect(shortcutFor(key("j", {}, div))).toBe("onNext");
+    expect(shortcutFor(key("k", {}, div))).toBe("onPrev");
+    expect(shortcutFor(key("Enter", {}, div))).toBe("onOpen");
+    expect(shortcutFor(key("x", {}, div))).toBe("onToggleSelect");
+  });
+});
