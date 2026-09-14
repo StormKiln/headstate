@@ -25,7 +25,11 @@ import type { Filters } from "@/lib/derive";
 /// `hasActiveFilters`. Listed explicitly rather than derived from the
 /// type so that adding a filter is a deliberate decision about whether a
 /// chip may coexist with it.
-export const OTHER_FILTERS = [
+/// Not exported: `chipPressed` is the whole interface, and an exported
+/// list invites a second reader to re-derive the predicate from it --
+/// which is how the two chip components came to disagree in the first
+/// place. `knip` flags it as an unused export, correctly.
+const OTHER_FILTERS = [
   "query",
   "unresolvedOnly",
   "needsMyReviewOnly",
