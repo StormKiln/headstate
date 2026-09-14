@@ -96,7 +96,7 @@ export function PackagesPage() {
         <button
           type="button"
           onClick={() => void refetch()}
-          className="mt-2 rounded border border-[#30363d] px-2 py-1 text-xs hover:bg-[#161b22]"
+          className="tap-target mt-2 rounded border border-[#30363d] px-2 py-1 text-xs text-[#e6edf3] hover:bg-[#161b22]"
         >
           Try again
         </button>

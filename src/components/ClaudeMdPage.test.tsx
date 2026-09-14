@@ -274,6 +274,47 @@ describe("ClaudeMdPage", () => {
     render(<ClaudeMdPage />);
     expect(screen.getByText("The rules")).toBeTruthy();
   });
+
+  /// #977: the row announced "pressed" -- a toggle the user had just
+  /// operated, inviting a second press to un-press it. This is a
+  /// single-select list, so that second click is a no-op: the
+  /// announcement described a control that does not exist, and left no
+  /// way to tell where in the list the user was.
+  ///
+  /// `"true"` rather than `"page"` because the row picks the detail
+  /// pane's subject within this page -- the `RepoSidebar` case, not the
+  /// `ClaudeCodeSidebar` one.
+  it("marks the selected file as current, not as pressed", () => {
+    state.files = [file({ path: "/code/app/CLAUDE.md" })];
+    render(<ClaudeMdPage />);
+    const row = screen.getByText("CLAUDE.md").closest("button");
+    expect(row?.getAttribute("aria-pressed")).toBeNull();
+    fireEvent.click(row as HTMLElement);
+    const after = screen.getByText("CLAUDE.md").closest("button");
+    expect(after?.getAttribute("aria-current")).toBe("true");
+    expect(after?.getAttribute("aria-pressed")).toBeNull();
+  });
+
+  /// `undefined`, never `"false"`, on the rows that are not current --
+  /// the attribute's absence is how "not current" is spelled, and
+  /// `aria-current="false"` is announced by some readers.
+  ///
+  /// Exactly one row is current: `active` falls back to `files[0]`, so the
+  /// first is current by default and the second must carry nothing at all.
+  it("leaves the attribute off the rows that are not current", () => {
+    state.files = [
+      file({ path: "/code/app/CLAUDE.md" }),
+      file({ path: "/code/app/docs/CLAUDE.md" }),
+    ];
+    render(<ClaudeMdPage />);
+    const rows = screen.getAllByText("CLAUDE.md").map((n) => n.closest("button"));
+    expect(rows).toHaveLength(2);
+    expect(rows.filter((r) => r?.getAttribute("aria-current") === "true")).toHaveLength(1);
+    // The other carries the attribute not at all, and neither carries
+    // `aria-pressed`.
+    expect(rows.filter((r) => r?.hasAttribute("aria-current"))).toHaveLength(1);
+    for (const r of rows) expect(r?.getAttribute("aria-pressed")).toBeNull();
+  });
 });
 
 describe("ClaudeMdPage browser", () => {

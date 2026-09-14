@@ -8,7 +8,21 @@ import {
 } from "@/components/ui/chart";
 import type { HistoryPoint } from "@/types/pr";
 
-const RANGES = [7, 14, 30];
+/// The windows a stats page offers, in days.
+///
+/// Exported and declared ONCE, here beside the buttons that render it, so
+/// no second renderer of the same list can drift into offering a different
+/// window -- the failure `VIEWS`, `HEALTH_PAGES` and `CLAUDE_PAGES` exist
+/// to prevent. `StatsPage` carried a hand-maintained copy of these three
+/// numbers and rendered a second, markup-identical group from it a few
+/// hundred pixels above this one, which is the disagreement the scope
+/// page's own comment warned about (#980).
+///
+/// 30 is the default because it is the shortest window in which a monthly
+/// cadence of work is visible at all, and it is what the unscoped page
+/// defaulted to. The default lives with `days` in `StatsPage`, which owns
+/// that state because `ScopeCounts` and the series query read it too.
+export const RANGES = [7, 14, 30];
 
 const config = {
   merged: { label: "Merged", color: "var(--chart-merged)" },

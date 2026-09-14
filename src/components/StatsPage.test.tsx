@@ -46,6 +46,7 @@ import {
 } from "../api/hooks";
 import { useActiveFilters } from "../store/filters";
 import { StatsPage, describeScope, partialityCaveat } from "./StatsPage";
+import { RANGES } from "./stats/ActivityChart";
 
 const row = (over: Partial<AuthorRow> = {}): AuthorRow => ({
   login: "octocat",
@@ -341,6 +342,51 @@ describe("StatsPage progressive rendering", () => {
     render(<StatsPage />);
     screen.getByRole("button", { name: /try again/i }).click();
     expect(q.refetch).toHaveBeenCalled();
+  });
+});
+
+/// #980: the scoped page rendered `7d 14d 30d` TWICE -- once in its header
+/// row and again inside the chart -- markup-identical, both `aria-pressed`,
+/// both wired to the same `setDays`, with nothing on screen to tell them
+/// apart. The constant introducing the header copy asked for "one control
+/// rather than two that can disagree about what 'this period' means".
+describe("StatsPage range control", () => {
+  beforeEach(() => {
+    vi.mocked(useScopedCounts).mockReturnValue(someCounts() as never);
+    vi.mocked(useStatsSeries).mockReturnValue(settled(series()));
+  });
+
+  it("offers each window exactly once on a scoped page", () => {
+    render(<StatsPage />);
+    for (const r of RANGES) {
+      expect(screen.getAllByRole("button", { name: `${r}d` })).toHaveLength(1);
+    }
+  });
+
+  /// The two pages in the same family must not disagree about how many
+  /// range controls a stats page has -- whichever one a user learns on
+  /// would teach the wrong thing about the other.
+  it("offers the same single group on the unscoped page", () => {
+    vi.mocked(useActiveFilters).mockReturnValue({} as never);
+    vi.mocked(useHistory).mockReturnValue(settled({ points: series().points }) as never);
+    render(<StatsPage />);
+    for (const r of RANGES) {
+      expect(screen.getAllByRole("button", { name: `${r}d` }).length).toBeLessThanOrEqual(1);
+    }
+  });
+
+  /// `days` stays lifted to `StatsPage`: `ScopeCounts` reads it and the
+  /// series query is keyed on it, so the surviving control must still drive
+  /// the page's state and not the chart's own.
+  it("still drives the page's window from the chart's buttons", () => {
+    render(<StatsPage />);
+    fireEvent.click(screen.getByRole("button", { name: "7d" }));
+    expect(
+      screen.getByRole("button", { name: "7d" }).getAttribute("aria-pressed"),
+    ).toBe("true");
+    // The counts read the same `days`, so they move with it -- the whole
+    // reason `days` stays lifted to the page rather than owned by the chart.
+    expect(vi.mocked(useScopedCounts).mock.calls.at(-1)?.[1]).toBe(7);
   });
 });
 

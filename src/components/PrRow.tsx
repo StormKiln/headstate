@@ -9,6 +9,7 @@ import {
   X,
 } from "lucide-react";
 import type { PullRequest } from "@/types/pr";
+import { current } from "@/lib/ariaCurrent";
 import { labelForeground } from "@/lib/labels";
 import { PrKebab } from "@/components/PrKebab";
 import { prKey } from "@/components/BulkBar";
@@ -206,6 +207,7 @@ export function PrRow({
   canWrite = true,
   onRange,
   cursored = false,
+  opened = false,
   selectable = false,
   stackedOn,
 }: {
@@ -220,6 +222,33 @@ export function PrRow({
   onRange?: (from: string, to: string) => void;
   /// Whether the keyboard cursor is on this row.
   cursored?: boolean;
+  /// Whether this row's PR is the one open in the detail panel.
+  ///
+  /// #977's third surface, and the one it asked for a decision on rather
+  /// than a copied answer. The answer is `aria-current="true"`, the same as
+  /// the sidebars -- but it is NOT the sidebars' situation, and the
+  /// differences are why it took checking:
+  ///
+  /// - This row is a composite with nested interactive controls (`PrKebab`,
+  ///   the checkbox, the title anchor) under a container `role="button"`.
+  ///   `aria-current` is safe there where `aria-selected` would not be:
+  ///   `aria-selected` requires a `listbox`/`grid` role the container does
+  ///   not have and the nested controls would forbid, and asserting it on a
+  ///   bare `button` is invalid ARIA.
+  /// - `aria-pressed` is wrong for the same reason it is wrong on the two
+  ///   Claude lists: opening a PR is not a toggle, and clicking the open
+  ///   row again does not close the panel.
+  /// - `"true"` rather than `"page"` because the panel is part of this
+  ///   page -- the row picks the detail view's subject, exactly the
+  ///   scoping case `RepoSidebar` names.
+  ///
+  /// Distinct from `cursored`, which is the roving KEYBOARD cursor and can
+  /// sit on a row that is not open. The two are separate states and a
+  /// reader needs both: "where my keys are" and "what is showing".
+  ///
+  /// Supplied by the list for the same reason `cursored` and `stackedOn`
+  /// are -- only the list reads `selectedPr` from the store.
+  opened?: boolean;
   /// Show the bulk-selection checkbox. Off on the review view for the
   /// same reason `canWrite` is: every bulk action is a write.
   selectable?: boolean;
@@ -247,6 +276,10 @@ export function PrRow({
     <div
       role={onOpen ? "button" : undefined}
       tabIndex={onOpen ? 0 : undefined}
+      // Only where the row actually opens something. A non-clickable row
+      // cannot be the open one, and claiming otherwise would be a location
+      // the user has no way to have reached.
+      aria-current={onOpen ? current(opened) : undefined}
       onClick={onOpen}
       onKeyDown={(e) => {
         if (onOpen && (e.key === "Enter" || e.key === " ")) {

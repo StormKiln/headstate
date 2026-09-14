@@ -2,6 +2,8 @@ import { HardDrive } from "lucide-react";
 import type { ArtifactKind } from "@/types/pr";
 import { useFilters, useActiveFilters } from "@/store/filters";
 import { useArtifacts, useArtifactSizes, useVenvs, useVenvSizes } from "@/api/hooks";
+import { current } from "@/lib/ariaCurrent";
+import { NarrowQueryError } from "./QueryError";
 import { ViewSwitcher } from "./ViewSwitcher";
 import { formatSize } from "@/lib/worktrees";
 
@@ -92,16 +94,8 @@ export function ArtifactSidebar({ reviewingCount }: { reviewingCount: number }) 
       active ? "bg-[#1f6feb] text-white" : "text-[#e6edf3] hover:bg-[#161b22]"
     }`;
 
-  /// `aria-current` for the selected row (#852). The blue was carrying the
-  /// selection alone, against the rule `StatsSidebar` states: "the
-  /// selection is navigation state, and a screen reader reading a list of
-  /// repository names has no other way to know which one is open."
-  ///
-  /// `"true"` rather than `"page"`: these rows SCOPE the artifacts view
-  /// rather than navigating to a different one. `undefined` on the
-  /// inactive rows, because absence is how "not current" is spelled and
-  /// `aria-current="false"` is announced by some readers.
-  const current = (active: boolean) => (active ? ("true" as const) : undefined);
+  // `current` from `@/lib/ariaCurrent` (#852, shared in #977): these rows
+  // SCOPE the artifacts view rather than navigating to a different page.
 
   return (
     <nav className="flex w-64 shrink-0 flex-col border-r border-[#30363d] p-3">
@@ -129,30 +123,24 @@ export function ArtifactSidebar({ reviewingCount }: { reviewingCount: number }) 
             for a moment, and flipping to "Looking…" mid-retry would read
             as the error having resolved itself. */}
         {artifactsFailed || venvsFailed ? (
-          <div className="px-3 py-2">
-            <p className="text-xs text-[#f85149]">
-              Could not scan for{" "}
-              {artifactsFailed && venvsFailed
+          // The message names WHICH scan failed, and the retry re-runs only
+          // what actually failed. `NarrowQueryError` takes both as props for
+          // exactly that reason -- re-running a scan that succeeded would
+          // throw away a result the page is still rendering, and the
+          // virtualenv scan is 26 seconds.
+          <NarrowQueryError
+            message={`Could not scan for ${
+              artifactsFailed && venvsFailed
                 ? "build output or virtualenvs"
                 : artifactsFailed
                   ? "build output"
-                  : "virtualenvs"}
-              .
-            </p>
-            {/* Retries only what actually failed. Re-running a scan that
-                succeeded would throw away a result the page is still
-                rendering -- and the virtualenv scan is 26 seconds. */}
-            <button
-              type="button"
-              onClick={() => {
-                if (artifactsFailed) void refetchArtifacts();
-                if (venvsFailed) void refetchVenvs();
-              }}
-              className="mt-1 rounded border border-[#30363d] px-2 py-0.5 text-xs text-[#e6edf3] hover:bg-[#161b22]"
-            >
-              Try again
-            </button>
-          </div>
+                  : "virtualenvs"
+            }.`}
+            onRetry={() => {
+              if (artifactsFailed) void refetchArtifacts();
+              if (venvsFailed) void refetchVenvs();
+            }}
+          />
         ) : artifactsLoading || venvsLoading ? (
           // A HOLDING message, not a diagnosis. An empty group list
           // before the scans answer is "we have not looked yet", and

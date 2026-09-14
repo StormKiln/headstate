@@ -263,8 +263,11 @@ describe("liveness renders as three states, not two", () => {
       }),
     ]);
     renderView();
-    const rows = screen.getAllByRole("button", { pressed: false });
-    const titles = rows.map((r) => r.textContent ?? "");
+    // Was `{ pressed: false }`, which selected these rows only because they
+    // carried `aria-pressed` -- the defect #977 removed. They are
+    // single-select list rows, not toggles, so the ORDER is read off the
+    // rows themselves.
+    const titles = screen.getAllByRole("button").map((r) => r.textContent ?? "");
     const live = titles.findIndex((t) => t.includes("Running but quiet"));
     const dead = titles.findIndex((t) => t.includes("Touched ten minutes ago"));
     expect(live).toBeGreaterThanOrEqual(0);
@@ -1307,5 +1310,52 @@ describe("purity", () => {
     // no argument is a clock read.
     expect(code).not.toMatch(/new Date\(\s*\)/);
     expect(code).not.toMatch(/eslint-disable.*purity/);
+  });
+});
+
+/// #977: the session row announced "pressed" -- a toggle the user had just
+/// operated, inviting a second press to un-press it. The list is
+/// single-select (`selectClaudeSession` into one slot), so that second
+/// click is a no-op: the announcement described a control that does not
+/// exist, and gave a screen-reader user nothing to locate themselves by.
+///
+/// `aria-current="true"` rather than `"page"`, matching `RepoSidebar`
+/// rather than `ClaudeCodeSidebar`: the row picks the detail pane's
+/// subject within this page rather than navigating to a different one.
+/// On a phone selecting a row IS navigation to a second screen, which
+/// makes "pressed" worse rather than better -- a toggle for an action
+/// that replaced the whole screen.
+describe("which session the list says you are on", () => {
+  /// The name also appears in the detail pane once a row is selected, so
+  /// every lookup here goes through the row BUTTON rather than the text.
+  const rowFor = (name: string) =>
+    screen
+      .getAllByRole("button")
+      .find((b) => b.textContent?.includes(name)) as HTMLElement;
+
+  it("marks the selected row as current, never as pressed", () => {
+    state.list = listOf([session({ session_id: "s-1", name: "Kestrel" })]);
+    renderView();
+
+    expect(rowFor("Kestrel").getAttribute("aria-pressed")).toBeNull();
+    fireEvent.click(rowFor("Kestrel"));
+    expect(rowFor("Kestrel").getAttribute("aria-current")).toBe("true");
+    expect(rowFor("Kestrel").getAttribute("aria-pressed")).toBeNull();
+  });
+
+  /// `undefined`, never `"false"` -- the attribute's absence is how "not
+  /// current" is spelled, and `aria-current="false"` is announced by some
+  /// readers. Exactly one row at a time, because the list is single-select.
+  it("leaves the attribute off every row that is not selected", () => {
+    state.list = listOf([
+      session({ session_id: "s-1", name: "Kestrel" }),
+      session({ session_id: "s-2", name: "Merlin" }),
+    ]);
+    renderView();
+
+    fireEvent.click(rowFor("Kestrel"));
+    const merlin = rowFor("Merlin");
+    expect(merlin.hasAttribute("aria-current")).toBe(false);
+    expect(merlin.getAttribute("aria-pressed")).toBeNull();
   });
 });
