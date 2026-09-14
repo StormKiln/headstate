@@ -122,6 +122,91 @@ describe("useFilters", () => {
   });
 });
 
+/// The Claude Code session filter, at the store level (#948, #949).
+///
+/// Tested here as well as through the components because these are the
+/// guarantees the components ASSUME. `showClaudeSessions` is one action
+/// precisely so no caller can order its writes wrongly, and that is a claim
+/// about the store rather than about any page -- a render test would pass just
+/// as well against two separate calls in the right order, which is the state
+/// #920's bug was in.
+describe("the Claude Code session filter", () => {
+  beforeEach(() =>
+    useFilters.setState({
+      view: "claude-code",
+      claudePage: "overview",
+      claudeFilter: "all",
+      claudeQuery: "",
+      claudeSelected: undefined,
+    }),
+  );
+
+  /// The jump lands the page and the filter TOGETHER.
+  ///
+  /// Both asserted, per #920: a jump that set the page and not the filter
+  /// opens an unfiltered list, which is the dead end with one more click in
+  /// front of it. A test asserting only the page would not have noticed.
+  it("opens the sessions page on the requested filter in one write", () => {
+    useFilters.getState().showClaudeSessions("resumable");
+
+    const s = useFilters.getState();
+    expect(s.claudePage).toBe("sessions");
+    expect(s.claudeFilter).toBe("resumable");
+  });
+
+  /// And clears the search and the selection.
+  ///
+  /// A chip and a leftover query intersect, so a tile reading 179 would land
+  /// on however many of those 179 also match yesterday's search -- a number
+  /// matching the tile only by luck. The selection goes because a detail pane
+  /// open for a session the chip just excluded describes a row that is not in
+  /// the list behind it.
+  it("clears the search text and the selection on the way", () => {
+    useFilters.setState({ claudeQuery: "notarization", claudeSelected: "abc-123" });
+
+    useFilters.getState().showClaudeSessions("gone");
+
+    expect(useFilters.getState().claudeQuery).toBe("");
+    expect(useFilters.getState().claudeSelected).toBeUndefined();
+  });
+
+  /// Leaving the view resets the chip, with the query and the selection.
+  ///
+  /// Same rule `claudeQuery` already followed: a filter narrowed on this
+  /// machine's sessions means nothing on the review list, and coming back to
+  /// 179 of 1,474 rows under a chip set last week is the
+  /// short-list-that-looks-empty failure with a control behind it instead of
+  /// a search box.
+  it("resets the chip when the view changes", () => {
+    useFilters.getState().showClaudeSessions("running");
+    expect(useFilters.getState().claudeFilter).toBe("running");
+
+    useFilters.getState().setView("worktrees");
+
+    const s = useFilters.getState();
+    expect(s.claudeFilter).toBe("all");
+    expect(s.claudePage).toBe("overview");
+    expect(s.claudeQuery).toBe("");
+    expect(s.claudeSelected).toBeUndefined();
+  });
+
+  /// Not persisted, like `claudeQuery`.
+  ///
+  /// `partialize` lists three keys and this is not one of them. Asserted
+  /// rather than assumed, because a restored chip is a short list that looks
+  /// like an empty one -- exactly what `partialize` already strips every
+  /// per-view `query` to avoid.
+  it("is not written to the persisted store", () => {
+    useFilters.getState().showClaudeSessions("ended");
+    const partialize = useFilters.persist.getOptions().partialize!;
+    const kept = partialize(useFilters.getState()) as Record<string, unknown>;
+
+    expect(kept).not.toHaveProperty("claudeFilter");
+    expect(kept).not.toHaveProperty("claudeQuery");
+    expect(kept).not.toHaveProperty("claudePage");
+  });
+});
+
 describe("persisted state migration", () => {
   // A store saved by v1 has a flat `filters` and a `view` enum that
   // conflated view with panel. Loading it into the new shape left
