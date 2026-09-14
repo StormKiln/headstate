@@ -53,8 +53,8 @@ serde = { version = "1", features = ["derive"] }
 # the webview byte for byte through `serde_json::value::RawValue`, so an
 # event is never parsed and re-serialised on the way through (events.rs).
 serde_json = { version = "1", features = ["raw_value"] }
-log = "0.4.33"
-tauri-plugin-log = "2.9.0"
+log = "0.4.34"
+tauri-plugin-log = "2.9.1"
 # HTTPS client for the paired desktop (#514 adds the pinned-fingerprint
 # verifier and the client identity). `rustls` here means rustls on the
 # aws-lc-rs provider -- reqwest 0.13 has no ring variant -- which is the

@@ -320,6 +320,8 @@ lint-deps:
 	# cannot fix. See the script's docstring.
 	python3 scripts/check-cache-budget.test.py
 	python3 scripts/check-cache-budget.py
+	python3 scripts/check-supply-chain-pins.test.py
+	python3 scripts/check-supply-chain-pins.py
 	# The leak guard, LAST in this target: it is the only check here that
 	# scans commit messages, so it is the only one whose failure means an
 	# amend or an interactive rebase rather than an edit. Running it

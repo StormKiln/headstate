@@ -132,7 +132,12 @@ yarn install --immutable
 
 Use `corepack enable` rather than `npm i -g yarn`. The global npm package
 installs Yarn 1.22, which refuses outright to run a project whose
-`package.json` pins `"packageManager": "yarn@4.5.1"`.
+`package.json` pins `"packageManager": "yarn@4.18.0+sha224.…"`. The
+`+sha224.` suffix is the hash of the Yarn bundle itself: corepack
+verifies what it downloads against it and refuses a mismatch, so the
+package manager is pinned to content, not just to a version number.
+`scripts/check-supply-chain-pins.py` keeps it that way, along with the
+other places CI fetches from outside the repository.
 
 Confirm the backend compiles before launching anything:
 

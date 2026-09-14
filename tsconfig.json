@@ -18,7 +18,10 @@
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
 
-    "baseUrl": ".",
+    // No `baseUrl`: TypeScript 6 deprecates it (TS5101) and 7 removes it.
+    // `paths` has resolved relative to this file's directory since 4.1,
+    // which is exactly what `.` said. Vite's `@/` alias is its own, in
+    // vite.config.ts.
     "paths": {
       "@/*": ["./src/*"]
     }
