@@ -1452,9 +1452,18 @@ function SessionUsage({ session: s }: { session: ClaudeSession }) {
       ) : data.messages === 0 ? (
         // 24 of 1,502 real transcripts. Four zeros here would be a
         // measurement that was never taken, with a credible shape.
+        /* The "that is unusual" clause originally named the measured
+           ratio, and #969's guard (`measuredFigures.test.ts`) caught it
+           on the merge: a corpus count rendered as a STRING is correct on
+           the day it is written and decays from then on, and on someone
+           else's machine it describes the author's. That this is the rare
+           case is what the reader needs; the figure behind it lives in
+           `claude/usage.rs`'s module docs, where it is a historical
+           observation about a design decision rather than a claim about
+           the machine it is printed on. */
         <p className="mt-2 text-xs text-[#8b949e]">
           Its transcript records no token usage, so there is nothing to total. That is unusual —
-          1,478 of 1,502 transcripts measured carry it.
+          nearly every transcript carries it.
         </p>
       ) : (
         <>
