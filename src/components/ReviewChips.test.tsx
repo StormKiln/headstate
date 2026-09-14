@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { PullRequest } from "@/types/pr";
 import { PR_FIXTURES } from "@/fixtures/prs";
@@ -64,6 +64,49 @@ describe("ReviewChips", () => {
       expect(applyFilters(PRS, s.filtersByView[s.view]).length).toBe(shown);
       useFilters.setState({ filtersByView: { ...EMPTY }, view: "to-review" });
     }
+  });
+
+  /// The assertion this file did not have, which is why #971 survived
+  /// here after `TriageChips` was fixed for exactly this.
+  ///
+  /// `applyPreset` replaces the filter set; `setFilter` merges into it.
+  /// So clicking a chip and then typing a search leaves the chip's own
+  /// keys set, and a subset test kept reading pressed while the list had
+  /// been narrowed by something else entirely. For a screen reader that
+  /// is a false statement about the current view, and clicking to
+  /// un-press silently discarded the search term.
+  it("is not pressed once another filter also narrows the list", () => {
+    render(<ReviewChips prs={PRS} />);
+    const name = /awaiting my review/i;
+    fireEvent.click(screen.getByRole("button", { name }));
+    expect(screen.getByRole("button", { name }).getAttribute("aria-pressed")).toBe("true");
+
+    // A search arrives from the filter bar, merged into the same set.
+    act(() => useFilters.getState().setFilter("query", "retry"));
+    expect(screen.getByRole("button", { name }).getAttribute("aria-pressed")).toBe("false");
+  });
+
+  /// The repo is navigation, not a filter -- the same rule
+  /// `hasActiveFilters` and the store's `reset` apply -- so being on a
+  /// repo page must not un-press the chip.
+  it("stays pressed while scoped to a repository", () => {
+    render(<ReviewChips prs={PRS} />);
+    const name = /awaiting my review/i;
+    fireEvent.click(screen.getByRole("button", { name }));
+    act(() => useFilters.getState().setFilter("repo", "octocat/hello-world"));
+    expect(screen.getByRole("button", { name }).getAttribute("aria-pressed")).toBe("true");
+  });
+
+  /// A chip for a DIFFERENT preset must not read as pressed either --
+  /// the two review chips are both members of `OTHER_FILTERS`, so each
+  /// sits in the other's blast radius.
+  it("un-presses when the sibling chip's filter is also set", () => {
+    render(<ReviewChips prs={PRS} />);
+    fireEvent.click(screen.getByRole("button", { name: /awaiting my review/i }));
+    act(() => useFilters.getState().setFilter("draftsOnly", true));
+    expect(
+      screen.getByRole("button", { name: /awaiting my review/i }).getAttribute("aria-pressed"),
+    ).toBe("false");
   });
 
   it("renders nothing when there is nothing to triage", () => {

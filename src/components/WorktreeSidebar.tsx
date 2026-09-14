@@ -1,6 +1,8 @@
 import { useWorktrees } from "../api/hooks";
 import { type View, useActiveFilters, useFilters } from "../store/filters";
+import { current } from "../lib/ariaCurrent";
 import { isOrphaned, ORPHAN_FILTER } from "../lib/worktrees";
+import { NarrowQueryError } from "./QueryError";
 import { PartialScanNotice } from "./PartialScanNotice";
 import { ViewSwitcher } from "./ViewSwitcher";
 
@@ -49,20 +51,10 @@ export function WorktreeSidebar({
       active ? "bg-[#1f6feb] text-white" : "text-[#e6edf3] hover:bg-[#161b22]"
     }`;
 
-  /// `aria-current` for the selected row (#852). The blue was carrying the
-  /// selection alone, against the rule `StatsSidebar` states: "the
-  /// selection is navigation state, and a screen reader reading a list of
-  /// repository names has no other way to know which one is open."
-  ///
-  /// `"true"` rather than `"page"`: these rows SCOPE the worktree view
-  /// rather than navigating to a different one. `undefined` on the
-  /// inactive rows, because absence is how "not current" is spelled and
-  /// `aria-current="false"` is announced by some readers.
-  ///
-  /// It covers the Orphaned row too, which is the one that most needs it:
-  /// its only other distinguishing mark is its amber text, so a reader who
-  /// cannot see colour had nothing at all.
-  const current = (active: boolean) => (active ? ("true" as const) : undefined);
+  // `current` from `@/lib/ariaCurrent` (#852, shared in #977). It covers the
+  // Orphaned row too, which is the one that most needs it: its only other
+  // distinguishing mark is its amber text, so a reader who cannot see colour
+  // had nothing at all.
 
   // Worktree count EXCLUDING the main checkout: it is not a worktree you
   // would ever remove, and counting it inflates every repo by one.
@@ -124,20 +116,23 @@ export function WorktreeSidebar({
             it would be two claims. The retry is here rather than only on
             the page body because this column is what a user stares at
             when the page looks empty -- and with no error and no retry,
-            the failure was not merely unreported but reassuring. */}
-        {isLoading ? (
+            the failure was not merely unreported but reassuring.
+
+            It took the wording and not the ORDERING, which was the bug
+            (#974): `isLoading` was checked first, so hitting "Try again"
+            after a failed scan flipped this column to "Looking for
+            repositories…" and the error read as having resolved itself. A
+            retry leaves both flags true for a moment. Both sibling
+            consumers of this same hook name that ordering as the thing to
+            avoid, and this was the third. The failure arm now comes
+            first, as it does there. */}
+        {isError ? (
+          <NarrowQueryError
+            message="Could not scan for worktrees."
+            onRetry={() => void refetch()}
+          />
+        ) : isLoading ? (
           <p className="px-3 py-2 text-xs text-[#8b949e]">Looking for repositories…</p>
-        ) : isError ? (
-          <div className="px-3 py-2">
-            <p className="text-xs text-[#f85149]">Could not scan for worktrees.</p>
-            <button
-              type="button"
-              onClick={() => void refetch()}
-              className="mt-1 rounded border border-[#30363d] px-2 py-0.5 text-xs text-[#e6edf3] hover:bg-[#161b22]"
-            >
-              Try again
-            </button>
-          </div>
         ) : null}
         {/* And the third answer, above the counts it qualifies (#951).
             Every number in this column -- the all-repositories total, the

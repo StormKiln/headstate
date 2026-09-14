@@ -54,7 +54,7 @@ export function PrList({
   /// the rejected-query and truncated-list cases already follow.
   unreachable?: boolean;
 }) {
-  const { checked, setChecked, cursor } = useFilters();
+  const { checked, setChecked, cursor, selectedPr } = useFilters();
 
   // What the poll got, not what survived the filters.
   const shown = fetched ?? prs.length;
@@ -180,6 +180,13 @@ export function PrList({
             selectable={selectable}
             onRange={selectRange}
             cursored={cursor === i}
+            // Which row the detail panel is showing (#977). Read here
+            // rather than in the row for the same reason `cursored` is:
+            // the store's selection is a property of the LIST's state,
+            // not of any one pull request.
+            opened={
+              selectedPr?.repo === pr.repo && selectedPr.number === pr.number
+            }
             stackedOn={stacked.get(pr.id)}
           />
         ))

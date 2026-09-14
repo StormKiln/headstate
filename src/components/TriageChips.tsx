@@ -2,6 +2,7 @@ import type { PullRequest } from "@/types/pr";
 import type { Filters } from "@/lib/derive";
 import { deriveStats, hasUnresolvedThreads, isStale } from "@/lib/derive";
 import { useActiveFilters, useFilters } from "@/store/filters";
+import { chipPressed } from "@/lib/chipPressed";
 import { HelpButton } from "./HelpButton";
 
 /// Clickable counters above the list.
@@ -16,32 +17,11 @@ import { HelpButton } from "./HelpButton";
 /// never inherits a filter the user forgot was active and lands on a list
 /// that contradicts the count they just clicked. `repo` is carried through
 /// because it is navigation, not a filter.
-/// Every filter key that narrows the list, excluding `repo` -- which is
-/// navigation, not a filter, per the store's `reset` and
-/// `hasActiveFilters`. Listed explicitly rather than derived from the
-/// type so that adding a filter is a deliberate decision about whether a
-/// chip may coexist with it.
-const OTHER_FILTERS = [
-  "query",
-  "unresolvedOnly",
-  "needsMyReviewOnly",
-  "readyOnly",
-  "draftsOnly",
-  "ci",
-  "review",
-  "includeLabels",
-  "excludeLabels",
-  "needsAttentionOnly",
-  "staleOnly",
-  "inMergeQueueOnly",
-  "awaitingReviewOnly",
-  "readyToQueueOnly",
-] as const satisfies readonly (keyof Filters)[];
-
-function isSet(v: Filters[keyof Filters]): boolean {
-  return Array.isArray(v) ? v.length > 0 : Boolean(v);
-}
-
+///
+/// The pressed-state predicate lives in `@/lib/chipPressed`, shared with
+/// `ReviewChips`: it was local and unexported here, so the sibling could
+/// not inherit it and shipped the very subset test this one documents
+/// fixing (#971).
 const CHIPS: {
   key: string;
   label: string;
@@ -101,24 +81,9 @@ export function TriageChips({ prs, now = new Date() }: { prs: PullRequest[]; now
           icon rather than a sentence taking permanent space. */}
       <HelpButton topic="triage-chips" />
       {active.map((chip) => {
-        // EQUALITY, not a subset test. `applyPreset` replaces the whole
-        // filter set while `setFilter` merges into it, so after clicking
-        // a chip and then typing a search the chip's own keys are still
-        // set -- and a subset test kept reading as pressed while the
-        // list beneath it had been narrowed by something else. The chip
-        // then announced itself as the active filter when it was not,
-        // and clicking it to un-press silently discarded the search.
-        //
-        // `repo` is excluded because it is navigation rather than a
-        // filter -- the same rule `hasActiveFilters` and the store's
-        // `reset` apply.
-        const onlyThisChip = !OTHER_FILTERS.some((k) =>
-          k in chip.preset ? false : isSet(filters[k]),
-        );
-        const isOn =
-          Object.keys(chip.preset).every(
-            (k) => filters[k as keyof Filters] === true,
-          ) && onlyThisChip;
+        // Equality, not a subset test, and `repo` excluded as
+        // navigation -- both stated once in `chipPressed`.
+        const isOn = chipPressed(chip.preset, filters);
         return (
           <button
             key={chip.key}

@@ -2,6 +2,7 @@ import type { PullRequest } from "@/types/pr";
 import type { Filters } from "@/lib/derive";
 import { needsMyReview } from "@/lib/derive";
 import { useActiveFilters, useFilters } from "@/store/filters";
+import { chipPressed } from "@/lib/chipPressed";
 
 /// Triage chips for the review queue.
 ///
@@ -9,6 +10,13 @@ import { useActiveFilters, useFilters } from "@/store/filters";
 /// are the AUTHOR's problem -- needs rebase, red CI, ready to queue -- and
 /// none of them is actionable when the PR is someone else's. What is
 /// actionable here is "have I reviewed this yet".
+///
+/// The pressed-state predicate is `TriageChips`'s, via
+/// `@/lib/chipPressed`. This file used the bare subset test that file's
+/// comment describes as the defect, so typing a search left a chip
+/// reading pressed over a list it no longer described, and clicking it to
+/// un-press discarded the search (#971). The chip SET stays separate --
+/// only the predicate is shared.
 const CHIPS: {
   key: string;
   label: string;
@@ -41,9 +49,7 @@ export function ReviewChips({ prs }: { prs: PullRequest[] }) {
   return (
     <div className="mb-3 flex flex-wrap gap-2">
       {active.map((chip) => {
-        const isOn = Object.keys(chip.preset).every(
-          (k) => filters[k as keyof Filters] === true,
-        );
+        const isOn = chipPressed(chip.preset, filters);
         return (
           <button
             key={chip.key}

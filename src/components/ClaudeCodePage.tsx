@@ -14,6 +14,7 @@ import {
   useWorktrees,
 } from "@/api/hooks";
 import { claudeRevealPath } from "@/api/tauri";
+import { current } from "@/lib/ariaCurrent";
 import { copyText } from "@/lib/clipboard";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { relativeTime } from "@/lib/time";
@@ -1023,7 +1024,7 @@ function SessionEntry({
     <button
       type="button"
       onClick={onSelect}
-      aria-pressed={active}
+      aria-current={current(active)}
       className={`mb-1 flex w-full flex-col items-start gap-0.5 rounded px-2 py-1.5 text-left ${
         active ? "bg-[#1f6feb] text-white" : "text-[#e6edf3] hover:bg-[#161b22]"
       }`}
@@ -1123,13 +1124,24 @@ function SessionDetail({
 ///
 /// # No jump is offered unless one actually matches
 ///
-/// Measured over 1,461 real sessions: 206 match a registered worktree --
-/// 14.1% of all sessions, but **83.1% of the 248 whose directory still
-/// exists**. The other 1,213 are overwhelmingly agent worktrees deleted
-/// when their work landed, and for those there is genuinely nothing to
-/// jump to. A button that navigated to a list where the row is absent
-/// would be worse than no button, so the section renders the reason
-/// instead.
+/// A minority of sessions match a registered worktree, and the ones that
+/// do are overwhelmingly the ones whose directory still exists. The rest
+/// are agent worktrees deleted when their work landed, and for those there
+/// is genuinely nothing to jump to. A button that navigated to a list where
+/// the row is absent would be worse than no button, so the section renders
+/// the reason instead.
+///
+/// The exact rates are deliberately NOT stated here. They were ("206 of
+/// 1,461 -- 14.1% of all sessions, 83.1% of the 248 whose directory still
+/// exists"), and they drifted: a figure measured once is correct on the day
+/// it is written and decays from then on (#969). The share is also
+/// per-machine -- a property of how the reader works, not of this code --
+/// so a number here describes the author's laptop rather than the reader's.
+///
+/// What the design rests on is the RULE, not the rate: a match requires the
+/// directory to still exist, so a session whose cwd is gone can never have
+/// one. That is a property of `sessionWorktree`, and `worktrees.test.ts`
+/// asserts it by measuring a corpus rather than by remembering a number.
 ///
 /// # Three absences, three renderings
 ///
@@ -1342,10 +1354,16 @@ function SessionBody({
               label="Reveal transcript"
               path={s.transcript_path}
               /* The TRANSCRIPT's own state, not the cwd's (#919). These
-                 were the same expression until the corpus was measured:
-                 1,213 of 1,461 rows (83.0%) have a dead cwd and a live
-                 transcript, so a shared reading disables the button that
-                 works on almost every row. */
+                 were the same expression until the corpus was measured
+                 and the overwhelming majority of rows turned out to have
+                 a dead cwd and a live transcript -- so a shared reading
+                 disables the button that works on almost every row.
+
+                 The count that was here (measured at the time: ~83%) is
+                 gone rather than updated. It is per-machine and it decays
+                 (#969), and the decision does not rest on its value: any
+                 material disagreement between the two states is enough,
+                 and re-measuring only ever strengthened it. */
               state={s.transcript_state}
               what="transcript"
               onReveal={reveal}
@@ -1700,9 +1718,10 @@ function PreviewBlock({ block: b }: { block: ClaudePreviewBlock }) {
 ///
 /// # Why not hide it
 ///
-/// 83.0% of recorded cwds no longer exist (1,213 of 1,461, measured), so
-/// a button that is simply absent on a gone path is absent on the common
-/// case -- and a reader cannot tell "this app has no such action" from
+/// Most recorded cwds no longer exist (measured at the time: ~83%, and
+/// higher when re-measured -- a historical observation, not a live fact
+/// (#969)), so a button that is simply absent on a gone path is absent on
+/// the common case -- and a reader cannot tell "this app has no such action" from
 /// "this particular path is gone". Worse is the version that renders
 /// enabled and does nothing: revealing a deleted directory on macOS
 /// silently opens the user's home folder, which looks like the app
