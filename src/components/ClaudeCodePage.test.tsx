@@ -7,6 +7,7 @@ import type {
   ClaudeSessionDetail,
   ClaudeSessionList,
   ClaudeUsage,
+  ClaudeSubagentRollup,
   Worktree,
   WorktreeRepo,
 } from "@/types/pr";
@@ -47,6 +48,14 @@ const state = vi.hoisted(() => ({
   /// 1,502 real transcripts.
   usage: undefined as ClaudeUsage | undefined,
   usageFailed: false,
+  /// What `useClaudeSubagentRollup` returns (#1002), on the same
+  /// three-way split as `usage` above: `undefined` with
+  /// `rollupFailed: false` is still-reading, with `rollupFailed: true` it
+  /// is the could-not-read case, and a `measured: 0` answer is a third
+  /// thing again -- we read the children and could total none of them.
+  /// Rendering any two of those alike is the #846 defect.
+  rollup: undefined as ClaudeSubagentRollup | undefined,
+  rollupFailed: false,
   /// What `useClaudeTranscriptTail` returns (#982), on the same
   /// three-way split and for the same reason.
   preview: undefined as ClaudePreview | undefined,
@@ -108,6 +117,16 @@ vi.mock("../api/hooks", () => ({
     isError: state.usageFailed,
     error: state.usageFailed ? "Permission denied" : undefined,
     isLoading: path !== null && !state.usageFailed && state.usage === undefined,
+  }),
+  // #1002, on the same three-way split as the usage mock above and for
+  // the same reason: still-reading, could-not-read and read-and-found-none
+  // are three different renderings and a mock that collapses them makes
+  // two of the three untestable.
+  useClaudeSubagentRollup: (sessionId: string | null) => ({
+    data: state.rollup,
+    isError: state.rollupFailed,
+    error: state.rollupFailed ? "Permission denied" : undefined,
+    isLoading: sessionId !== null && !state.rollupFailed && state.rollup === undefined,
   }),
   // #985. One row's detail, fetched on selection. Records the id so a
   // test can assert the list does not pull 1,474 of these.
@@ -174,7 +193,7 @@ function renderView() {
 /// will find it. Every test written before the split therefore still
 /// reads as a statement about a session rather than about a wire format.
 type WholeSession = ClaudeSession &
-  Omit<ClaudeSessionDetail, "registry_failure" | "liveness">;
+  Omit<ClaudeSessionDetail, "registry_failure" | "liveness" | "kind" | "subagents">;
 
 const whole = (over: Partial<WholeSession> = {}): WholeSession => ({
   session_id: "e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2",
@@ -202,6 +221,14 @@ const whole = (over: Partial<WholeSession> = {}): WholeSession => ({
     anchored: true,
   },
   runs: 1,
+  // Defaults to the user's OWN work, because that is the real default:
+  // 1,133 of 1,524 measured rows. A fixture defaulting to a subagent
+  // would make the common case the one no test exercised, and would hide
+  // every row from the list by default.
+  kind: { kind: "own" },
+  subagents: 0,
+  parent: null,
+  unattributed: null,
   ...over,
 });
 
@@ -226,6 +253,17 @@ const session = (over: Partial<WholeSession> = {}): ClaudeSession => {
     resume: w.resume,
     runs: w.runs,
     registry_failure: null,
+    kind: w.kind,
+    // The detail's `subagents` is the CHILD LIST, while the row's is a
+    // count -- two different shapes for the same fact, so the fixture
+    // derives the list from the count rather than letting them drift.
+    subagents: Array.from({ length: w.subagents }, (_, i) => ({
+      session_id: `child-${i}`,
+      name: `Child ${i}`,
+      agent_id: `a${i}`.padEnd(17, "0"),
+    })),
+    parent: w.parent,
+    unattributed: w.unattributed,
   });
   return {
     session_id: w.session_id,
@@ -235,6 +273,8 @@ const session = (over: Partial<WholeSession> = {}): ClaudeSession => {
     last_activity_at: w.last_activity_at,
     liveness: w.liveness,
     cwd_state: w.cwd_state,
+    kind: w.kind,
+    subagents: w.subagents,
   };
 };
 
@@ -345,7 +385,16 @@ beforeEach(() => {
   // `claudeFilter` too, as of #949, and for the same singleton reason: a
   // chip pressed by one test would silently shorten every list after it,
   // which is the failure mode where a suite goes green over an empty page.
-  useFilters.setState({ claudeQuery: "", claudeSelected: undefined, claudeFilter: "all" });
+  // `claudeShowSubagents` too, as of #1002, and for the same singleton
+  // reason with the opposite sign: a test that revealed subagents would
+  // leave 391 rows of machinery in every list after it, so a chip count
+  // asserted later would be right about a list nobody meant to draw.
+  useFilters.setState({
+    claudeQuery: "",
+    claudeSelected: undefined,
+    claudeFilter: "all",
+    claudeShowSubagents: false,
+  });
   copyFn.mockClear();
   revealFn.mockClear();
   toastError.mockClear();
@@ -1465,6 +1514,344 @@ describe("filtering the session list by state", () => {
       .filter((t) => /Peregrine|Hobby/.test(t));
     expect(titles[0]).toMatch(/Hobby/);
     expect(titles[1]).toMatch(/Peregrine/);
+  });
+});
+
+/// Subagent sessions are hidden, counted, and revealable (#1002).
+///
+/// 391 of 1,524 measured rows are sessions that ran inside an agent
+/// worktree -- 25.7% of the list. With one live session the rows
+/// immediately below it were that session's own machinery rather than the
+/// user's past work, which is what #1002 reports from use.
+///
+/// Three properties, and each has its own test because each fails
+/// independently:
+///
+/// 1. They are HIDDEN by default.
+/// 2. The count is STATED (#975: a hidden exclusion that does not say how
+///    many it hid leaves a user counting rows in disagreement with the app
+///    and no way to find out why).
+/// 3. They are REVEALABLE, and still real sessions when revealed.
+describe("subagent sessions are hidden by default and say how many", () => {
+  /// **The sabotage test.** Delete the `kind.kind !== "subagent"` filter
+  /// in `useMatchedSessions` and this fails: the subagent row renders in
+  /// the default list.
+  it("does not show a subagent session in the default list", () => {
+    state.list = listOf([
+      session({ session_id: "own-1", name: "My own work" }),
+      session({
+        session_id: "sub-1",
+        name: "VenvSection security review",
+        cwd: "/Users/acme/code/widget/.claude/worktrees/agent-ad12506fcee31848a",
+        kind: { kind: "subagent", agent_id: "ad12506fcee31848a" },
+      }),
+    ]);
+    renderView();
+
+    expect(screen.getByText("My own work")).toBeTruthy();
+    expect(screen.queryByText("VenvSection security review")).toBeFalsy();
+  });
+
+  /// The happy-path pair: hiding must not eat the user's OWN sessions.
+  /// A filter that hid everything would pass the test above.
+  it("still shows every session that is not a subagent", () => {
+    state.list = listOf([
+      session({ session_id: "own-1", name: "My own work" }),
+      session({ session_id: "own-2", name: "Another of mine" }),
+    ]);
+    renderView();
+
+    expect(screen.getByText("My own work")).toBeTruthy();
+    expect(screen.getByText("Another of mine")).toBeTruthy();
+    // And with none to hide, the toggle is not offered at all: a control
+    // promising to reveal nothing is noise.
+    expect(screen.queryByText(/subagent session/)).toBeFalsy();
+  });
+
+  /// **The sabotage test for #975's rule.** Delete the count from the
+  /// toggle's label and this fails. A hidden exclusion must state its
+  /// size, or the user counting rows cannot find out why the app
+  /// disagrees with them.
+  it("says how many it hid", () => {
+    state.list = listOf([
+      session({ session_id: "own-1", name: "My own work" }),
+      session({
+        session_id: "sub-1",
+        name: "Child one",
+        kind: { kind: "subagent", agent_id: "a1" },
+      }),
+      session({
+        session_id: "sub-2",
+        name: "Child two",
+        kind: { kind: "subagent", agent_id: "a2" },
+      }),
+    ]);
+    renderView();
+
+    expect(screen.getByText(/Show 2 subagent sessions/)).toBeTruthy();
+  });
+
+  it("reveals them when asked, and they are still real sessions", () => {
+    state.list = listOf([
+      session({ session_id: "own-1", name: "My own work" }),
+      session({
+        session_id: "sub-1",
+        name: "VenvSection security review",
+        kind: { kind: "subagent", agent_id: "ad12506fcee31848a" },
+      }),
+    ]);
+    useFilters.setState({ claudeShowSubagents: true });
+    renderView();
+
+    // Not deleted, not a placeholder -- the row is back with its own name
+    // and is selectable like any other. Several of these did substantial
+    // work and remain resumable by id.
+    expect(screen.getByText("VenvSection security review")).toBeTruthy();
+    expect(screen.getByText("My own work")).toBeTruthy();
+  });
+
+  /// The chip counts must describe the list the chips actually open.
+  ///
+  /// #949's rule -- a chip reading 179 that opens a list of 181 is a chip
+  /// that lied about where it went -- applied across the new axis. The
+  /// subagent count itself is the exception and is over the WHOLE list,
+  /// because it is the number the toggle offers to reveal.
+  it("counts the chips over the sessions the toggle admits", () => {
+    state.list = listOf([
+      session({ session_id: "own-1", name: "Mine", liveness: { state: "running", pid: 1, status: null } }),
+      session({
+        session_id: "sub-1",
+        name: "Machinery",
+        liveness: { state: "running", pid: 2, status: null },
+        kind: { kind: "subagent", agent_id: "a1" },
+      }),
+    ]);
+    renderView();
+
+    // One running session is VISIBLE, though two are running in all. The
+    // chip's own count is the claim under test: a Running chip reading 2
+    // that opens a list of 1 is a chip that lied about where it went.
+    expect(screen.getByRole("button", { name: "Running 1" })).toBeTruthy();
+    // And the toggle still offers the one it hid.
+    expect(screen.getByText(/Show 1 subagent session/)).toBeTruthy();
+  });
+});
+
+/// A parent's subagent tokens are a SEPARATE figure (#1002).
+///
+/// #959 kept four counters rather than one because cache reads run two to
+/// three orders of magnitude above fresh input. The same argument one
+/// level up: a parent's own tokens and its children's answer different
+/// questions, and one summed figure would answer neither.
+describe("the subagent rollup is beside the parent's own usage, never inside it", () => {
+  const parentWithChildren = () =>
+    session({
+      session_id: "parent-1",
+      name: "The parent",
+      subagents: 2,
+    });
+
+  /// **The sabotage test.** Add the rollup's tokens into the parent's own
+  /// figures in `SessionUsage` and this fails: the parent's own output
+  /// figure stops being its own.
+  it("shows the parent's own tokens and its subagents' tokens as two figures", async () => {
+    state.list = listOf([parentWithChildren()]);
+    state.usage = {
+      messages: 10,
+      input_tokens: 100,
+      output_tokens: 200,
+      cache_read_tokens: 300,
+      cache_creation_tokens: 400,
+      models: [],
+      truncated: false,
+      bytes_read: 10,
+      file_bytes: 10,
+    };
+    state.rollup = {
+      sessions: 2,
+      measured: 2,
+      without_usage: 0,
+      unreadable: [],
+      truncated: 0,
+      input_tokens: 1_000,
+      output_tokens: 2_000,
+      cache_read_tokens: 3_000,
+      cache_creation_tokens: 4_000,
+      messages: 20,
+    };
+    renderView();
+    open("The parent");
+
+    // Two headings, so the reader can tell which figure is which.
+    expect(screen.getByText("How much work it did")).toBeTruthy();
+    expect(screen.getByText("What its subagents did")).toBeTruthy();
+    // The parent's own output is 200 and NOT 2,200: the two are never
+    // added together.
+    expect(screen.getByText("200")).toBeTruthy();
+    expect(screen.getByText("2,000")).toBeTruthy();
+    expect(screen.queryByText("2,200")).toBeFalsy();
+  });
+
+  /// **The sabotage test for absent-is-not-zero.** Make the rollup
+  /// section render its four counters regardless of `measured` and this
+  /// fails: zeros appear for a rollup that was never totalled.
+  it("says it could not tell rather than showing zeros", () => {
+    state.list = listOf([parentWithChildren()]);
+    state.rollup = {
+      sessions: 2,
+      measured: 0,
+      without_usage: 0,
+      unreadable: ["/some/child.jsonl: could not open it"],
+      truncated: 0,
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_read_tokens: 0,
+      cache_creation_tokens: 0,
+      messages: 0,
+    };
+    renderView();
+    open("The parent");
+
+    expect(
+      screen.getByText(/None of their transcripts could be totalled/),
+    ).toBeTruthy();
+    // No figure at all for the rollup. "Cache read" cannot be the probe:
+    // the PARENT's own usage panel carries that label too, and asserting
+    // on it would pass for the wrong reason.
+    expect(screen.queryByText("What its subagents did")).toBeTruthy();
+    expect(screen.queryByText("20")).toBeFalsy();
+  });
+
+  /// The happy-path pair for the test above: a complete rollup must not
+  /// wear a caveat it has not earned.
+  it("does not add a caveat when every child was totalled", () => {
+    state.list = listOf([parentWithChildren()]);
+    state.rollup = {
+      sessions: 2,
+      measured: 2,
+      without_usage: 0,
+      unreadable: [],
+      truncated: 0,
+      input_tokens: 1,
+      output_tokens: 1,
+      cache_read_tokens: 1,
+      cache_creation_tokens: 1,
+      messages: 2,
+    };
+    renderView();
+    open("The parent");
+
+    expect(screen.queryByText(/floors rather than totals/)).toBeFalsy();
+    expect(screen.queryByText(/floors, not totals/)).toBeFalsy();
+  });
+
+  it("states the denominator when only some children could be totalled", () => {
+    state.list = listOf([parentWithChildren()]);
+    state.rollup = {
+      sessions: 2,
+      measured: 1,
+      without_usage: 0,
+      unreadable: ["/some/child.jsonl: could not open it"],
+      truncated: 0,
+      input_tokens: 5,
+      output_tokens: 5,
+      cache_read_tokens: 5,
+      cache_creation_tokens: 5,
+      messages: 5,
+    };
+    renderView();
+    open("The parent");
+
+    expect(screen.getByText(/These cover 1 of 2 subagent sessions/)).toBeTruthy();
+    expect(screen.getByText(/1 could not be read/)).toBeTruthy();
+  });
+
+  /// A rejected read must not render as a measurement (#846), and the
+  /// error arm is before the empty arm for the reason the page states at
+  /// length: `data` is undefined on a rejection exactly as it is before
+  /// the first read.
+  it("reports a failed rollup read rather than showing zeros", () => {
+    state.list = listOf([parentWithChildren()]);
+    state.rollupFailed = true;
+    renderView();
+    open("The parent");
+
+    expect(screen.getByText(/Could not total what they used/)).toBeTruthy();
+    // As above: the parent's own panel owns the "Cache read" label, so
+    // the absence under test is the rollup's own message being the only
+    // thing the section says.
+    expect(screen.queryByText(/These cover/)).toBeFalsy();
+  });
+
+  /// A session with no subagents must not carry the section at all.
+  it("adds no subagent section to an ordinary session", () => {
+    state.list = listOf([session({ session_id: "plain", name: "Just mine" })]);
+    renderView();
+    open("Just mine");
+
+    expect(screen.queryByText("What its subagents did")).toBeFalsy();
+    expect(screen.queryByText("What ran this")).toBeFalsy();
+  });
+});
+
+/// An unattributed subagent says so rather than being given a parent
+/// (#1002).
+///
+/// The rule the whole feature turns on: where earliest-mention cannot
+/// decide, the child stays unattributed. A wrong rollup is worse than no
+/// rollup.
+describe("a subagent whose parent could not be told says so", () => {
+  /// **The sabotage test.** Make the detail pane fall back to a probable
+  /// parent when `parent` is null and this fails: the pane names a
+  /// session instead of admitting it could not tell.
+  it("states that it could not tell, with the evidence", () => {
+    state.list = listOf([
+      session({
+        session_id: "sub-1",
+        name: "An orphan",
+        kind: { kind: "subagent", agent_id: "ad12506fcee31848a" },
+        parent: null,
+        unattributed:
+          "sess-a and sess-b both mention this agent first at 2026-09-14T02:23:29.713Z, " +
+          "so which one spawned it cannot be told apart",
+      }),
+    ]);
+    useFilters.setState({ claudeShowSubagents: true });
+    renderView();
+    open("An orphan");
+
+    expect(screen.getByText(/which session started it could not be told/)).toBeTruthy();
+    // The evidence, so the reader can see the app LOOKED rather than
+    // shrugged.
+    expect(screen.getByText(/cannot be told apart/)).toBeTruthy();
+    expect(screen.queryByText("Spawned by")).toBeFalsy();
+  });
+
+  /// The happy-path pair: an attributed child names its parent and adds
+  /// no "could not tell" noise.
+  it("names the parent when it is known", () => {
+    state.list = listOf([
+      session({
+        session_id: "sub-1",
+        name: "A child",
+        kind: { kind: "subagent", agent_id: "ad12506fcee31848a" },
+        parent: {
+          session_id: "e5dff3bd",
+          name: "The spawning session",
+          agent_id: "ad12506fcee31848a",
+        },
+        unattributed: null,
+      }),
+    ]);
+    useFilters.setState({ claudeShowSubagents: true });
+    renderView();
+    open("A child");
+
+    expect(screen.getByText("Spawned by")).toBeTruthy();
+    expect(screen.getByText("The spawning session")).toBeTruthy();
+    expect(
+      screen.queryByText(/which session started it could not be told/),
+    ).toBeFalsy();
   });
 });
 

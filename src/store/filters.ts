@@ -344,6 +344,33 @@ interface FilterStore {
   /// empty one. It also resets with the view, below.
   claudeFilter: ClaudeSessionFilter;
   setClaudeFilter: (filter: ClaudeSessionFilter) => void;
+  /// Whether subagent sessions are shown (#1002).
+  ///
+  /// # Why a toggle beside the chips rather than a sixth chip
+  ///
+  /// The five chips are ONE axis by construction -- the comment on
+  /// `ClaudeSessionFilter` sets out why: `cwd_state` is a tri-state and
+  /// `liveness` is a second, and crossing them would be a matrix of twenty
+  /// states nobody asks for. Subagent-ness is a THIRD axis and a genuinely
+  /// independent one: "the running subagents" and "the subagents whose
+  /// directory is gone" are both real questions, and folding this in as a
+  /// sixth mutually-exclusive chip would make them unaskable.
+  ///
+  /// So it is a boolean crossed with the chip, which is the one shape that
+  /// costs no new states: every chip means the same thing it did, over a
+  /// list that either includes the machinery or does not.
+  ///
+  /// Default `false`. 391 of 1,524 measured rows are subagents, and with
+  /// one live session the rows below it were that session's own machinery
+  /// rather than the user's past work -- which is what #1002 reports.
+  /// Hidden, never deleted: they stay searchable the moment this is on,
+  /// and they remain real, resumable sessions.
+  ///
+  /// Not persisted, like `claudeQuery` and `claudeFilter` above and for
+  /// the same reason: a list restored under yesterday's control is a short
+  /// list that looks like an empty one.
+  claudeShowSubagents: boolean;
+  setClaudeShowSubagents: (show: boolean) => void;
   /// Jump from the overview to the session list, filtered (#948).
   ///
   /// ONE action rather than a `setClaudePage` call followed by a
@@ -580,6 +607,11 @@ export const useFilters = create<FilterStore>()(
           // is the short-list-that-looks-empty failure with a control
           // instead of a search box behind it.
           claudeFilter: "all",
+          // And the subagent toggle (#1002), for the same reason: coming
+          // back to a list that silently includes 391 rows of machinery
+          // because it was switched on last week is the same
+          // stale-control failure in the other direction.
+          claudeShowSubagents: false,
           claudeSelected: undefined,
         }),
       healthPage: "overview",
@@ -594,6 +626,8 @@ export const useFilters = create<FilterStore>()(
       setClaudeQuery: (claudeQuery) => set({ claudeQuery }),
       claudeFilter: "all",
       setClaudeFilter: (claudeFilter) => set({ claudeFilter }),
+      claudeShowSubagents: false,
+      setClaudeShowSubagents: (claudeShowSubagents) => set({ claudeShowSubagents }),
       // Page, filter and query in one `set`, so the list cannot render for
       // a frame under the old chip and so no caller can order the three
       // wrongly. `claudeSelected` goes too: arriving on a filtered list
@@ -604,6 +638,11 @@ export const useFilters = create<FilterStore>()(
           claudePage: "sessions",
           claudeFilter,
           claudeQuery: "",
+          // The overview's tiles count the user's OWN sessions, so a tile
+          // that opened a list including subagents would show more rows
+          // than the figure the user just pressed. #948's rule: a tile's
+          // number is a promise about what the next screen shows.
+          claudeShowSubagents: false,
           claudeSelected: undefined,
         }),
       claudeSelected: undefined,

@@ -247,6 +247,10 @@ pub const SURFACE: &[(&str, Class)] = &[
     // call that lets it stop carrying the detail for 1,474 rows to render
     // one.
     ("claude_session_detail", Class::Read),
+    // #1002. Reads each attributed child transcript with #959's bounded
+    // summariser and the app's own database; writes nothing. The phone
+    // wants the rollup for the same reason the desktop does.
+    ("claude_subagent_rollup", Class::Read),
     // One pass over the two LIVE sources: the hook's handoff file and the
     // `~/.claude/sessions` registry (#913).
     //
@@ -783,6 +787,9 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "claude_sessions" => res(commands::claude_sessions(app.clone()).await),
         "claude_session_detail" => {
             res(commands::claude_session_detail(app.clone(), a.get("sessionId")?).await)
+        }
+        "claude_subagent_rollup" => {
+            res(commands::claude_subagent_rollup(app.clone(), a.get("sessionId")?).await)
         }
         "claude_poll_live" => res(commands::claude_poll_live(app.clone()).await),
         "claude_overview" => res(commands::claude_overview(app.clone()).await),

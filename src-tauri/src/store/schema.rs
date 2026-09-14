@@ -349,6 +349,39 @@ const MIGRATIONS: &[&str] = &[
      );
      CREATE INDEX IF NOT EXISTS claude_run_session
         ON claude_run (session_id, started_at DESC);",
+    // Migration 12: which subagent session belongs to which parent (#1002).
+    //
+    // # Why a table and not a column on `claude_session`
+    //
+    // The attribution is not a property of the session row -- it is the
+    // conclusion of a pass over EVERY transcript, and it can change for a
+    // session nothing about which has changed. A parent that was
+    // unattributed last scan can resolve on the next one because some
+    // OTHER session's transcript grew a mention. A column would invite a
+    // per-row upsert alongside the session's own fields and would blur
+    // that; a table written whole by one pass says plainly that the whole
+    // map is one derived artefact.
+    //
+    // # Why the parent is nullable and `why` is not dropped
+    //
+    // `parent_session_id IS NULL` means the map looked and could not
+    // decide, and `why` carries the sentence that says which of the two
+    // undecidable cases it was. Absent is not zero, and a null with no
+    // reason is a shrug the UI could only render as a blank.
+    //
+    // There is no foreign key to `claude_session`: the parent may be a
+    // session whose transcript was read but whose row failed to write, and
+    // an FK would then discard a correct attribution over an unrelated
+    // failure.
+    "CREATE TABLE IF NOT EXISTS claude_subagent (
+        session_id        TEXT PRIMARY KEY,
+        agent_id          TEXT NOT NULL,
+        parent_session_id TEXT,
+        why               TEXT,
+        resolved_at       TEXT NOT NULL
+     );
+     CREATE INDEX IF NOT EXISTS claude_subagent_parent
+        ON claude_subagent (parent_session_id);",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {

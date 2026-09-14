@@ -375,6 +375,28 @@ pub struct ListRow {
     /// the whole corpus is what ruled out every row-dropping approach.
     pub liveness: ListLiveness,
     pub cwd_state: CwdState,
+    /// Whether this session ran in an agent worktree (#1002).
+    ///
+    /// On the list row and not the detail, by the rule [`SessionList`]
+    /// states: this is a field the list FILTERS on, and the "show
+    /// subagents" chip's count is over the whole corpus. 391 of 1,524
+    /// measured rows are subagents, so a chip that could only count the
+    /// rows it had already drawn would be the confident-wrong-answer
+    /// failure with a number on it.
+    ///
+    /// Derived per read from the row's `cwd` rather than read back from
+    /// `claude_subagent`, because it is a pure function of a field the
+    /// row already carries -- and because the cwd the list uses is the
+    /// LIVE one when a session is running, which the stored map cannot
+    /// know. Cheap: a component walk, no I/O.
+    pub kind: super::subagent::Kind,
+    /// How many subagent sessions were traced to this one (#1002).
+    ///
+    /// `0` is a real answer here and not an absence: it is a count over
+    /// rows the app holds, so "no subagents were attributed to this
+    /// session" is something we genuinely know. Contrast the TOKENS
+    /// below, which are a measurement and therefore absent-or-known.
+    pub subagents: usize,
 }
 
 /// The session list, INCLUDING what could not be read.
@@ -487,6 +509,28 @@ pub struct SessionDetail {
     /// liveness is `Unknown` because the registry was unreadable must be
     /// able to say so rather than present a shrug as a finding.
     pub registry_failure: Option<String>,
+    /// Whether this session ran in an agent worktree (#1002).
+    pub kind: super::subagent::Kind,
+    /// The subagent sessions traced to this one, newest first.
+    ///
+    /// Empty for the overwhelming majority of sessions, which is why it
+    /// is on the DETAIL and not the list: 1,524 rows carrying a vector
+    /// each to serve the handful that have children is exactly the
+    /// per-row cost #985 measured and removed.
+    pub subagents: Vec<SubagentChild>,
+    /// Which session spawned THIS one, when it is an attributed subagent.
+    ///
+    /// `None` on an ordinary session and on an unattributed subagent --
+    /// [`SessionDetail::unattributed`] is what distinguishes those two,
+    /// because "not a subagent" and "a subagent whose parent we could not
+    /// tell" are different facts and only the second needs saying.
+    pub parent: Option<SubagentChild>,
+    /// Why this subagent could not be traced to a parent.
+    ///
+    /// `Some` ONLY for a subagent the map looked at and could not decide.
+    /// It carries the evidence -- which sessions tied, and when -- so the
+    /// reader can see that the app looked rather than that it shrugged.
+    pub unattributed: Option<String>,
 }
 
 /// Read every stored session, with liveness derived.
@@ -537,7 +581,256 @@ pub fn list(conn: &Connection) -> Result<SessionList, rusqlite::Error> {
     let probe = SysinfoProbe::for_pids(&pids);
 
     let rows = stored_rows(conn)?;
-    Ok(assemble(&probe, &registry, &runs, rows))
+    let children = children_by_parent(conn)?;
+    Ok(assemble(&probe, &registry, &runs, rows, &children))
+}
+
+/// What one session's subagents cost, as a figure of its own (#1002).
+///
+/// # Why this is never added to the parent's own usage
+///
+/// The same discipline #959 applied to its four counters, one level up. A
+/// parent's own tokens answer "how much work happened in this session";
+/// its subagents' tokens answer "how much work happened underneath it".
+/// Those are different questions, and a single summed figure would
+/// silently answer neither -- a parent that delegated everything would
+/// show a large number that describes work it did not do, and there would
+/// be no way to tell that from a parent that did the work itself.
+///
+/// So the parent's own [`crate::claude::usage::Usage`] and this travel
+/// separately and are rendered separately, exactly as the four counters
+/// are.
+///
+/// # Absent is not zero, per child
+///
+/// [`SubagentRollup::unreadable`] is the gate, and it is why this cannot
+/// be a bare four-tuple. A child whose transcript could not be read
+/// contributes NOTHING to the sums, and a sum missing an unknown amount
+/// is not a total. The UI renders "could not tell" for those rather than
+/// a number that is confidently short -- `caches/mod.rs:550`'s rule, and
+/// the reason [`crate::claude::usage::Usage::observed`] exists one level
+/// down.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentRollup {
+    /// Subagent sessions attributed to this parent.
+    pub sessions: usize,
+    /// Of those, how many yielded a usage sum. The denominator that makes
+    /// the totals below readable as a floor rather than a total.
+    pub measured: usize,
+    /// Children whose transcript carried no usage block at all.
+    ///
+    /// Distinct from `unreadable`: we read it and it had none (24 of
+    /// 1,502 real sessions are like this), which is a settled answer.
+    pub without_usage: usize,
+    /// Children whose transcript could not be read, with why.
+    ///
+    /// Non-empty means every total below is short by an unknown amount
+    /// and must be labelled so.
+    pub unreadable: Vec<String>,
+    /// Children whose usage sum stopped at the 8 MB budget.
+    ///
+    /// Carried up because #959's `truncated` means the same thing here
+    /// that it does there: the figures are a floor, and an unlabelled
+    /// floor is indistinguishable from a total.
+    pub truncated: usize,
+    /// The four counters, summed over the children that WERE read.
+    ///
+    /// Four and not one, for #959's reason: cache reads run two to three
+    /// orders of magnitude above fresh input, so a blended total would be
+    /// a cache-read count wearing the word "tokens".
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    /// Assistant messages across the children that were read.
+    pub messages: u64,
+}
+
+impl SubagentRollup {
+    /// Whether any child's usage was actually measured.
+    ///
+    /// The absent-is-not-zero gate, one level up from
+    /// [`crate::claude::usage::Usage::observed`]. `false` with
+    /// `sessions > 0` means "this session has subagents and we could not
+    /// total them", which must render as "could not tell" and never as
+    /// four zeros.
+    pub fn observed(&self) -> bool {
+        self.measured > 0
+    }
+
+    /// Whether the totals are short by an unknown amount.
+    pub fn partial(&self) -> bool {
+        !self.unreadable.is_empty() || self.truncated > 0
+    }
+}
+
+/// One subagent session, as the parent's detail lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentChild {
+    pub session_id: String,
+    pub name: Option<String>,
+    pub agent_id: String,
+}
+
+/// Sum one parent's subagents' usage, reading each child's transcript.
+///
+/// # Why this is on demand and not on the list
+///
+/// It costs one bounded transcript read PER CHILD. The measured corpus
+/// has parents with dozens, and the list has 1,524 rows -- so doing this
+/// for every row on every 10-second poll would be the whole-corpus read
+/// that `transcript.rs` and `usage.rs` both exist to avoid. The detail
+/// pane asks about ONE session, which is the same bargain
+/// `claude_session_usage` already strikes.
+///
+/// # Errors
+///
+/// Only when the database cannot be read. A child whose transcript
+/// cannot be read is recorded in [`SubagentRollup::unreadable`] and the
+/// other children are still summed: one unreadable transcript must not
+/// cost the parent every other figure.
+pub fn subagent_rollup(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<SubagentRollup, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        // Joined to `claude_session` for the transcript path: the map
+        // stores the attribution, and the session row stores where to
+        // read. A LEFT join would let a child with no session row through
+        // with no path to read, so this is an inner join and a child
+        // whose row is missing simply is not summed -- it is also not
+        // counted as measured, so the totals stay honest.
+        "SELECT s.transcript_path
+         FROM claude_subagent a
+         JOIN claude_session s ON s.session_id = a.session_id
+         WHERE a.parent_session_id = ?1",
+    )?;
+    let paths = stmt
+        .query_map([session_id], |r| r.get::<_, Option<String>>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut out = SubagentRollup {
+        sessions: paths.len(),
+        ..Default::default()
+    };
+    for path in paths.into_iter().flatten() {
+        match super::usage::summarise(std::path::Path::new(&path)) {
+            Ok(u) => {
+                if !u.observed() {
+                    // Read it, it carried none. A settled answer, and not
+                    // the same as a failure to read.
+                    out.without_usage += 1;
+                    continue;
+                }
+                out.measured += 1;
+                if u.truncated {
+                    out.truncated += 1;
+                }
+                // `saturating_add` for #959's reason: the largest real
+                // session alone sums to 405 million cache-read tokens, and
+                // a wrapped total would be a wildly wrong number with a
+                // credible shape.
+                out.messages = out.messages.saturating_add(u.messages);
+                out.input_tokens = out.input_tokens.saturating_add(u.input_tokens);
+                out.output_tokens = out.output_tokens.saturating_add(u.output_tokens);
+                out.cache_read_tokens = out.cache_read_tokens.saturating_add(u.cache_read_tokens);
+                out.cache_creation_tokens = out
+                    .cache_creation_tokens
+                    .saturating_add(u.cache_creation_tokens);
+            }
+            Err(e) => out.unreadable.push(e),
+        }
+    }
+    Ok(out)
+}
+
+/// The subagent sessions attributed to one parent, for its detail pane.
+pub fn subagent_children(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<SubagentChild>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT a.session_id, s.name, a.agent_id
+         FROM claude_subagent a
+         LEFT JOIN claude_session s ON s.session_id = a.session_id
+         WHERE a.parent_session_id = ?1
+         ORDER BY s.last_activity_at IS NULL, s.last_activity_at DESC",
+    )?;
+    let rows = stmt.query_map([session_id], |r| {
+        Ok(SubagentChild {
+            session_id: r.get(0)?,
+            name: r.get(1)?,
+            agent_id: r.get(2)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Why a subagent session could not be traced to a parent, if it could
+/// not (#1002).
+///
+/// `Ok(None)` means this session is not a subagent at all, or it WAS
+/// attributed -- both are "there is nothing to explain here". `Some` is
+/// the sentence the map recorded, which the child's own detail pane shows
+/// in place of a parent.
+pub fn unattributed_reason(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<String>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT why FROM claude_subagent
+         WHERE session_id = ?1 AND parent_session_id IS NULL",
+    )?;
+    let mut rows = stmt.query_map([session_id], |r| r.get::<_, Option<String>>(0))?;
+    Ok(rows.next().transpose()?.flatten())
+}
+
+/// Which session spawned this one, when it is an attributed subagent.
+pub fn parent_of(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<SubagentChild>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT a.parent_session_id, s.name, a.agent_id
+         FROM claude_subagent a
+         LEFT JOIN claude_session s ON s.session_id = a.parent_session_id
+         WHERE a.session_id = ?1 AND a.parent_session_id IS NOT NULL",
+    )?;
+    let mut rows = stmt.query_map([session_id], |r| {
+        Ok(SubagentChild {
+            session_id: r.get(0)?,
+            name: r.get(1)?,
+            agent_id: r.get(2)?,
+        })
+    })?;
+    rows.next().transpose()
+}
+
+/// How many subagent sessions each parent was credited with (#1002).
+///
+/// One grouped read of `claude_subagent`, whose rows the SCAN wrote --
+/// this is the poll's whole share of the parent map, and it is why the
+/// 969 ms corpus pass is not in the poll. Rows with a NULL parent are
+/// excluded by the `WHERE`: an unattributed child belongs to nobody and
+/// must not be added to any parent's count, which is the difference
+/// between a rollup and a guess.
+fn children_by_parent(
+    conn: &Connection,
+) -> Result<std::collections::HashMap<String, usize>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT parent_session_id, COUNT(*) FROM claude_subagent
+         WHERE parent_session_id IS NOT NULL
+         GROUP BY parent_session_id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+    })?;
+    let mut out = std::collections::HashMap::new();
+    for row in rows {
+        let (parent, n) = row?;
+        out.insert(parent, n);
+    }
+    Ok(out)
 }
 
 /// Everything ONE session knows that the list does not carry (#985).
@@ -595,6 +888,18 @@ pub fn detail(
         .or_else(|| stored.cwd.clone());
     let cwd_state = check_cwd(cwd.as_deref());
 
+    let kind = super::subagent::Kind::classify(cwd.as_deref());
+    let subagents = subagent_children(conn, session_id)?;
+    let parent = parent_of(conn, session_id)?;
+    // Only ASKED for a subagent: an ordinary session has no parent to be
+    // unable to find, and reporting "could not tell" for one would invent
+    // an uncertainty that does not exist.
+    let unattributed = if kind.is_subagent() {
+        unattributed_reason(conn, session_id)?
+    } else {
+        None
+    };
+
     Ok(Some(SessionDetail {
         resume: resume_command(&stored.session_id, cwd.as_deref(), &cwd_state),
         transcript_state: check_transcript(stored.transcript_path.as_deref()),
@@ -605,6 +910,10 @@ pub fn detail(
         liveness,
         runs: runs.len(),
         registry_failure: registry.failure,
+        kind,
+        subagents,
+        parent,
+        unattributed,
     }))
 }
 
@@ -745,6 +1054,7 @@ fn assemble<P: ProcessProbe>(
     registry: &Registry,
     runs: &std::collections::HashMap<String, Vec<Run>>,
     stored: Vec<Stored>,
+    children: &std::collections::HashMap<String, usize>,
 ) -> SessionList {
     let empty: Vec<Run> = Vec::new();
     let mut reasons = Reasons::default();
@@ -771,6 +1081,12 @@ fn assemble<P: ProcessProbe>(
             // chips switch on it, and those counts are over the whole
             // corpus.
             let cwd_state = check_cwd(cwd.as_deref());
+            // Derived from the cwd this read resolved, NOT from the
+            // stored map: a running session republishes its own cwd, and
+            // the classification must follow the directory the session is
+            // actually in.
+            let kind = super::subagent::Kind::classify(cwd.as_deref());
+            let subagents = children.get(&s.session_id).copied().unwrap_or(0);
             ListRow {
                 session_id: s.session_id,
                 name: s.name,
@@ -779,6 +1095,8 @@ fn assemble<P: ProcessProbe>(
                 last_activity_at: s.last_activity_at,
                 liveness: reasons.intern_liveness(liveness),
                 cwd_state,
+                kind,
+                subagents,
             }
         })
         .collect();
@@ -1243,6 +1561,7 @@ mod tests {
             &Registry::default(),
             &Default::default(),
             stored_rows(&conn).unwrap(),
+            &Default::default(),
         );
         assert_eq!(got.sessions[0].cwd_state, CwdState::Gone);
 
@@ -1297,6 +1616,7 @@ mod tests {
             &registry,
             &Default::default(),
             stored_rows(&conn).unwrap(),
+            &Default::default(),
         );
         assert_eq!(got.sessions.len(), 2, "the rows are still shown");
         assert_eq!(got.registry_failure.as_deref(), Some("Permission denied"));
@@ -1359,6 +1679,7 @@ mod tests {
             &registry,
             &Default::default(),
             stored_rows(&conn).unwrap(),
+            &Default::default(),
         );
         assert_eq!(
             resolved(&got, "s1"),
@@ -1403,6 +1724,7 @@ mod tests {
             &registry,
             &Default::default(),
             stored_rows(&conn).unwrap(),
+            &Default::default(),
         );
         assert_eq!(got.sessions[0].cwd.as_deref(), Some(real_dir().as_str()));
     }
@@ -1428,6 +1750,7 @@ mod tests {
             &Registry::default(),
             &Default::default(),
             stored_rows(&conn).unwrap(),
+            &Default::default(),
         );
         // `runs` is the detail's since #985 -- the list neither renders
         // nor counts it -- so the two facts are asserted from the two
@@ -1475,6 +1798,7 @@ mod tests {
             &Registry::default(),
             &runs,
             stored_rows(&conn).unwrap(),
+            &Default::default(),
         );
         match resolved(&got, "s1") {
             Liveness::Dead { why } => assert!(
@@ -1521,6 +1845,7 @@ mod tests {
             &Registry::default(),
             &runs,
             stored_rows(&conn).unwrap(),
+            &Default::default(),
         );
         match resolved(&got, "s1") {
             Liveness::Dead { why } => assert!(
@@ -1555,6 +1880,7 @@ mod tests {
             &Registry::default(),
             &Default::default(),
             Vec::new(),
+            &Default::default(),
         );
         assert!(got.sessions.is_empty());
         assert_eq!(
@@ -1665,6 +1991,7 @@ mod tests {
             &Registry::default(),
             &Default::default(),
             stored_rows(&conn).unwrap(),
+            &Default::default(),
         );
         assert_eq!(got.sessions.len(), 250);
         for s in &got.sessions {
@@ -1697,6 +2024,7 @@ mod tests {
             &Registry::default(),
             &Default::default(),
             stored_rows(&conn).unwrap(),
+            &Default::default(),
         );
         assert_eq!(
             got.reasons.len(),
@@ -1745,6 +2073,7 @@ mod tests {
             &Registry::default(),
             &runs_by_session(&conn).unwrap(),
             stored_rows(&conn).unwrap(),
+            &Default::default(),
         );
         assert_eq!(
             got.reasons.len(),
@@ -1823,6 +2152,7 @@ mod tests {
             &Registry::default(),
             &Default::default(),
             stored_rows(&conn).unwrap(),
+            &Default::default(),
         );
         let row = &got.sessions[0];
         assert_eq!(row.session_id, "s1");
@@ -1860,6 +2190,7 @@ mod tests {
             &Registry::default(),
             &Default::default(),
             stored_rows(&conn).unwrap(),
+            &Default::default(),
         );
         let row = &got.sessions[0];
         // Each one separately, so a failure names the field that went
