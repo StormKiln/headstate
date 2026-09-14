@@ -21,6 +21,7 @@
 mod cache;
 pub mod devices;
 pub mod health;
+pub mod pr_history;
 mod schema;
 pub mod settings;
 pub mod stats;

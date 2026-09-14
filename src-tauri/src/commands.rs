@@ -2695,7 +2695,20 @@ fn parse_scope_request(
 fn note_stats_viewer(conn: &rusqlite::Connection, viewer: &str) {
     match crate::store::stats::note_viewer(conn, viewer) {
         Ok(0) => {}
-        Ok(n) => log::info!("the stats cache dropped {n} rows for a previous identity"),
+        Ok(n) => {
+            log::info!("the stats cache dropped {n} rows for a previous identity");
+            // The accumulated pull requests go with it (#1004). They are
+            // keyed on `StatsQuery::cache_key` with `@me` already resolved,
+            // so a departed identity's rows can never be SERVED to the new
+            // one -- but leaving them would keep another user's corpus on
+            // disk indefinitely, and the event that clears one cache is
+            // exactly the event that should clear the layer beneath it.
+            match crate::store::pr_history::clear(conn) {
+                Ok(0) => {}
+                Ok(m) => log::info!("dropped {m} accumulated pull requests for that identity"),
+                Err(e) => log::warn!("could not clear accumulated pull requests: {e}"),
+            }
+        }
         Err(e) => log::warn!("could not record the stats viewer: {e}"),
     }
 }
@@ -2920,10 +2933,45 @@ pub async fn stats_board(
     // `days` there would be a second computation of the same dates that a
     // midnight boundary could make disagree with this one.
     let window = req.window.clone();
-    let out = crate::github::stats::load_board(&client, &req.scope, measure, window, &budget)
-        .await
-        .map(|board| StatsBoard { viewer, board })
-        .map_err(|e| e.to_string());
+    // ACCUMULATING (#1004). The board is assembled from every pull request
+    // stored for this window, not from this one fetch, so two partial loads
+    // union instead of the second replacing the first.
+    //
+    // The order is load-bearing and is the whole fix:
+    //
+    // 1. fetch what is affordable -- bounded by `LOAD_TIMEOUT` and the
+    //    ~11s server deadline, which is what actually caps a large account
+    //    (MEASURED: 2,942 PRs are ~12 points, 0.27% of the usable hourly
+    //    budget, so the budget was never the binding constraint);
+    // 2. WRITE IT DOWN, **including from a load that came back short** --
+    //    writing only on a complete load reproduces the defect exactly;
+    //    then
+    // 3. assemble from everything stored.
+    //
+    // A storage failure degrades to the single-fetch board rather than
+    // failing the load: the user gets today's behaviour, honestly labelled
+    // as not accumulating, instead of an error where they used to get a
+    // partial answer.
+    let scope_key = q.cache_key(&viewer);
+    let out = crate::github::stats::board::load_board_accumulating(
+        &client, &req.scope, measure, window, &budget,
+    )
+    .await
+    .map(|loaded| {
+        let board = accumulate_board(
+            &app,
+            &scope_key,
+            &req.window.from,
+            &req.window.to,
+            loaded,
+            now,
+        );
+        StatsBoard {
+            viewer: viewer.clone(),
+            board,
+        }
+    })
+    .map_err(|e| e.to_string());
     crate::diag!(
         "[diag] cmd stats_board end {}ms {}",
         started.elapsed().as_millis(),
@@ -2976,6 +3024,70 @@ pub async fn stats_board(
         }
     }
     out
+}
+
+/// Write a load's pull requests down and re-assemble the board from
+/// everything stored for the window (#1004).
+///
+/// The accumulation point. Returns the fetched board unchanged if storage
+/// is unavailable, which is the honest degradation: `Board::accumulating`
+/// is then false and the UI does not promise a convergence that is not
+/// happening.
+///
+/// # Why the write happens even when the load came back short
+///
+/// That is the entire fix. `store::stats` caches per whole window, so a
+/// load that hit the cap stored a partial board and the next load began
+/// from nothing -- 1,419 retrieved then 800 more gave two partial boards,
+/// never 2,219. Writing only on success would reproduce it precisely.
+///
+/// # Why a closed window converges rather than churns
+///
+/// MEASURED, live API, 2026-09-14: the same closed-window search twice
+/// returned an identical `issueCount` (208) and an identical
+/// `(repo, number, additions, deletions, mergedAt)` set for every node. So
+/// a stored row about a closed window never needs re-fetching, which is
+/// what makes repeated loads add rather than replace them.
+fn accumulate_board(
+    app: &AppHandle,
+    scope_key: &str,
+    window_start: &str,
+    window_end: &str,
+    loaded: crate::github::stats::board::LoadedBoard,
+    now: chrono::DateTime<chrono::Utc>,
+) -> crate::github::stats::Board {
+    use crate::store::pr_history;
+
+    let crate::github::stats::board::LoadedBoard { board, prs } = loaded;
+    let Ok(mut conn) = open_db(&db_path(app)) else {
+        log::warn!("could not open the database to accumulate PR stats");
+        return board;
+    };
+    // Written BEFORE the read, so this load's own pages are part of the
+    // answer it returns rather than only of the next one's.
+    if let Err(e) = pr_history::put_many(&mut conn, scope_key, window_start, window_end, &prs, now)
+    {
+        log::warn!("could not accumulate pull requests for PR stats: {e}");
+        return board;
+    }
+    // Bounded here rather than on a schedule: this is the only site that
+    // grows the table, so it is the only one that needs to bound it.
+    match pr_history::prune(&conn) {
+        Ok(0) => {}
+        Ok(n) => log::info!("pruned {n} accumulated pull requests past the bound"),
+        Err(e) => log::warn!("could not prune accumulated pull requests: {e}"),
+    }
+    let Ok(stored) = pr_history::load(&conn, scope_key, window_start, window_end) else {
+        log::warn!("could not read accumulated pull requests back");
+        return board;
+    };
+    crate::diag!(
+        "[diag] stats accumulate fetched={} stored={} total={}",
+        board.retrieved,
+        stored.len(),
+        board.total
+    );
+    crate::github::stats::Board::from_stored(&stored, &board)
 }
 
 /// A board plus the viewer's login, which is what splits it into Mine and
