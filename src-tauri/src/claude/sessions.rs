@@ -12,9 +12,10 @@
 //! A session records a `cwd` AND a `transcript_path`, and they are not
 //! interchangeable. Measured over 1,461 real session transcripts for
 //! #919: **83.0% of cwds are gone (1,213) and 0% of transcripts are.**
-//! So [`SessionRow`] carries [`SessionRow::cwd_state`] and
-//! [`SessionRow::transcript_state`] as independent tri-states, and
-//! neither is derived from the other. See [`check_transcript`].
+//! So the cwd's state travels as [`ListRow::cwd_state`] and the
+//! transcript's as [`SessionDetail::transcript_state`], as independent
+//! tri-states, and neither is derived from the other. See
+//! [`check_transcript`].
 //!
 //! # Why the cwd check is a tri-state and not a bool
 //!
@@ -287,48 +288,93 @@ fn shell_quote(path: &str) -> String {
     format!("'{}'", path.replace('\'', r"'\''"))
 }
 
-/// One row of the session list.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SessionRow {
-    /// The `claude --resume` handle, and the row's identity everywhere.
+/// A liveness as it travels in the LIST, with its reason interned.
+///
+/// The same three states as [`Liveness`] and the same information; the
+/// only difference is that `why` is an index into
+/// [`SessionList::reasons`] rather than the sentence itself. See
+/// [`SessionList`] for why.
+///
+/// # Why an index rather than dropping `why`
+///
+/// The list RENDERS the reason -- `LivenessBadge` puts it in the row's
+/// `title`, so "Not running" always carries its grounds on hover. #985
+/// measured it as 18.9% of the payload and it would have been the
+/// easiest thing to drop; dropping it would leave a verdict with no
+/// grounds, which is the defect class epic #941 exists to remove. An
+/// index preserves the sentence byte-for-byte and still pays for it
+/// once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum ListLiveness {
+    Running { pid: u32, status: Option<String> },
+    Dead { why: usize },
+    Unknown { why: usize },
+}
+
+/// Interns liveness reasons while a list is assembled.
+///
+/// Small and linear on purpose: the measured corpus has ONE distinct
+/// reason across 1,474 rows, and the ceiling is the handful of sentences
+/// `liveness::derive` can produce plus one per running pid. A `HashMap`
+/// here would be more machinery than the cardinality justifies.
+#[derive(Default)]
+struct Reasons {
+    seen: std::collections::HashMap<String, usize>,
+    list: Vec<String>,
+}
+
+impl Reasons {
+    fn intern(&mut self, why: String) -> usize {
+        if let Some(&ix) = self.seen.get(&why) {
+            return ix;
+        }
+        let ix = self.list.len();
+        self.seen.insert(why.clone(), ix);
+        self.list.push(why);
+        ix
+    }
+
+    /// Translate a derived [`Liveness`] into its list form.
+    fn intern_liveness(&mut self, liveness: Liveness) -> ListLiveness {
+        match liveness {
+            Liveness::Running { pid, status } => ListLiveness::Running { pid, status },
+            Liveness::Dead { why } => ListLiveness::Dead {
+                why: self.intern(why),
+            },
+            Liveness::Unknown { why } => ListLiveness::Unknown {
+                why: self.intern(why),
+            },
+        }
+    }
+}
+
+/// One row of the session list, carrying only what the LIST needs.
+///
+/// # What is here, and the rule that decides
+///
+/// Exactly the fields the list renders, searches, filters or counts on,
+/// and nothing else. Concretely: the four search fields (`name`, `cwd`,
+/// `git_branch`, `session_id`), the two the chips switch on (`liveness`,
+/// `cwd_state`), and the one the row prints (`last_activity_at`).
+///
+/// Everything else a session knows travels in [`SessionDetail`], fetched
+/// for the ONE row the user selected. See [`SessionList`] for the
+/// measurement that split them and for why this is not pagination.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListRow {
     pub session_id: String,
-    /// Claude's own `aiTitle`, when the transcript had one. `None` for
-    /// the two sessions in 1,438 that never got one -- never the UUID in
-    /// disguise, because a fabricated name is indistinguishable from a
-    /// real one. The UI decides what to show instead.
     pub name: Option<String>,
     pub cwd: Option<String>,
     pub git_branch: Option<String>,
-    pub claude_version: Option<String>,
-    pub transcript_path: Option<String>,
-    pub first_seen_at: String,
     /// The newest record in the transcript, NOT the time we scanned.
     /// `None` when nothing in the transcript carried a timestamp.
     pub last_activity_at: Option<String>,
-    /// Derived every read, never stored. Three states.
-    pub liveness: Liveness,
+    /// Derived every read, never stored -- for EVERY row, not just the
+    /// window a cap would draw. See [`SessionList`]: keeping this true of
+    /// the whole corpus is what ruled out every row-dropping approach.
+    pub liveness: ListLiveness,
     pub cwd_state: CwdState,
-    /// Whether the transcript file is still on disk (#919).
-    ///
-    /// A SEPARATE check from `cwd_state`, because the two paths survive
-    /// at opposite rates: 83% of cwds are gone and 0% of transcripts
-    /// are. Deriving one from the other -- or gating the transcript's
-    /// reveal on the cwd's state -- would suppress the button that works
-    /// on almost every row. See [`check_transcript`] for the numbers.
-    pub transcript_state: CwdState,
-    /// The command to copy, already resolved against `cwd_state`.
-    ///
-    /// Built on the backend rather than in the component because the
-    /// existence check is a filesystem read the frontend cannot do, and
-    /// splitting the check from the string it produces is how the two
-    /// drift into a command whose caveat no longer matches it.
-    pub resume: ResumeCommand,
-    /// How many runs of this session the hook recorded. `0` for every
-    /// transcript-imported session, which is the whole historical corpus
-    /// -- shown so a reader can tell "never observed" from "observed and
-    /// ended", which is also the difference between two `Liveness`
-    /// answers.
-    pub runs: usize,
 }
 
 /// The session list, INCLUDING what could not be read.
@@ -337,9 +383,71 @@ pub struct SessionRow {
 /// type. A list rendered from a registry we could not read is a list in
 /// which every liveness is `Unknown`, and the view has to say so rather
 /// than show 1,438 rows that look like settled answers.
+///
+/// # Every row, every poll -- and a third of the bytes (#985)
+///
+/// Measured on the real corpus of 1,474 sessions, serialising what this
+/// command actually returned:
+///
+/// ```text
+/// resume            25.6%   253.8 B/row   <- detail only
+/// liveness          18.9%   187.0 B/row   <- the same 150-char sentence, 1,474 times
+/// transcript_path   15.5%   153.3 B/row   <- detail only
+/// cwd                6.4%    63.3 B/row
+/// session_id         5.3%    52.0 B/row
+/// name               4.8%    47.1 B/row
+/// last_activity_at   4.6%    46.0 B/row
+/// first_seen_at      4.3%    43.0 B/row   <- detail only
+/// git_branch         4.0%    39.3 B/row
+/// transcript_state   3.8%    38.0 B/row   <- detail only
+/// cwd_state          3.0%    29.2 B/row
+/// claude_version     2.7%    27.0 B/row   <- detail only
+/// runs               0.9%     9.0 B/row   <- detail only
+///                          ------------
+///                          990.0 B/row    1.392 MB per poll, every 10s
+/// ```
+///
+/// The finding that settled the design: **the fields the list renders,
+/// searches, filters and counts on are the CHEAP ones.** Everything
+/// expensive is read by the detail pane, for the one row the user
+/// selected. So the split is by FIELD, not by row -- which is why it
+/// costs the feature nothing:
+///
+/// | invariant | why it survives |
+/// |---|---|
+/// | search covers the whole corpus | all four search fields are still on every row |
+/// | the stated total is the true total | every row still arrives; `sessions.len()` IS the total |
+/// | the chip counts are over everything | `liveness` and `cwd_state` are still on every row |
+/// | liveness is no staler for old rows | every row's liveness is still derived on every poll |
+/// | absent is not zero | the two registry fields are untouched |
+///
+/// Result: **990 -> 315 B/row, 1.392 MB -> 0.443 MB, 68.2% smaller**, and
+/// 37.8 MB -> 12.0 MB at 40,000 sessions.
+///
+/// # What was rejected, and why
+///
+/// - **A server-side `LIMIT`.** The obvious fix and the wrong one. Search
+///   is this list's primary navigation by explicit design, and it filters
+///   over the whole corpus on four fields; a limit silently turns it into
+///   "search the most recent 200" -- a worse feature that still looks like
+///   it works. It also makes the stated total a separate claim that can
+///   drift from the rows beside it. Splitting by field gives a bigger
+///   win with neither problem.
+/// - **Moving search into SQL.** Preserves the corpus but not the
+///   feature: the filtering is per-keystroke and a round-trip cannot be.
+/// - **An `updated_since` cursor.** Liveness is derived per read and
+///   changes with NO write to the row -- a session dies without touching
+///   `last_activity_at` -- so rows outside the window would keep claiming
+///   "running" until they happened to be written. That is precisely the
+///   staleness migration 11's missing `status` column exists to prevent.
+/// - **Lengthening the poll.** Does not reduce the payload, and the poll
+///   is the only thing that makes a session stop saying "running".
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionList {
-    pub sessions: Vec<SessionRow>,
+    pub sessions: Vec<ListRow>,
+    /// Every distinct liveness reason, once. `ListLiveness`'s `why` is an
+    /// index into this. One entry on the measured corpus.
+    pub reasons: Vec<String>,
     /// Why the live registry could not be listed. `None` with running
     /// sessions absent means "read it, nothing is running"; `Some` means
     /// "we do not know what is running".
@@ -349,17 +457,54 @@ pub struct SessionList {
     pub registry_unreadable: Vec<String>,
 }
 
-/// Read every stored session, with liveness and resume command derived.
+/// What one selected session knows that the list does not carry.
 ///
-/// # Why every row, and no pagination
+/// The heavy half of the old row (#985): 65% of the bytes, read by the
+/// detail pane for ONE session at a time. Fetched on selection rather
+/// than pushed for all 1,474 rows on every poll.
 ///
-/// The whole list is 1,438 rows of small strings -- measured, and the
-/// figure the truncation decision rests on. Paginating in SQL would
-/// force the sort and the search onto the backend, where neither can
-/// respond to a keystroke, and would make "showing 200 of 1,438" a
-/// server round-trip instead of a filter. The frontend caps what it
-/// RENDERS and says so; it never receives a silently short list, which
-/// is the house rule (#846).
+/// `liveness` is here in FULL -- the sentence, not an index -- because
+/// this answers about a single session and there is nothing to intern
+/// against. It is derived by the same `derive` the list uses, on this
+/// request, so the detail pane never shows a liveness older than the
+/// moment it was opened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDetail {
+    pub session_id: String,
+    pub claude_version: Option<String>,
+    pub transcript_path: Option<String>,
+    pub first_seen_at: String,
+    /// Derived NOW, for this one session.
+    pub liveness: Liveness,
+    /// Whether the transcript file is still on disk (#919).
+    pub transcript_state: CwdState,
+    /// The command to copy, already resolved against the cwd's state.
+    pub resume: ResumeCommand,
+    /// How many runs of this session the hook recorded.
+    pub runs: usize,
+    /// Why the live registry could not be listed, for THIS read. Carried
+    /// for the reason [`SessionList`] carries it: a detail pane whose
+    /// liveness is `Unknown` because the registry was unreadable must be
+    /// able to say so rather than present a shrug as a finding.
+    pub registry_failure: Option<String>,
+}
+
+/// Read every stored session, with liveness derived.
+///
+/// # Why every ROW, and no pagination
+///
+/// Still every row, and that is the decision #985 re-examined rather
+/// than reversed. Paginating in SQL would force the sort and the search
+/// onto the backend, where neither can respond to a keystroke, and would
+/// make "showing 200 of 1,474" a server round-trip instead of a filter.
+/// The frontend caps what it RENDERS and says so; it never receives a
+/// silently short list, which is the house rule (#846).
+///
+/// What #985 DID change is which FIELDS each row carries: the heavy ones
+/// are read by the detail pane for one session and now travel in
+/// [`detail`] instead. 990 -> 315 bytes per row, measured, with search,
+/// the chip counts, the ordering and the stated total all still over the
+/// whole corpus. [`SessionList`] carries the full breakdown.
 ///
 /// # Liveness is derived here, not stored
 ///
@@ -393,6 +538,74 @@ pub fn list(conn: &Connection) -> Result<SessionList, rusqlite::Error> {
 
     let rows = stored_rows(conn)?;
     Ok(assemble(&probe, &registry, &runs, rows))
+}
+
+/// Everything ONE session knows that the list does not carry (#985).
+///
+/// `Ok(None)` means the id is not in the store -- a real answer, and the
+/// one a session deleted between two polls produces. Distinct from an
+/// `Err`, which means the database could not be read: the caller renders
+/// "this session is gone" for the first and "we could not look" for the
+/// second, and collapsing them would put a confident wrong answer on the
+/// screen (#846).
+///
+/// # Why the liveness is derived again here
+///
+/// Rather than read back from the list's copy. Derivation is what makes a
+/// session stop saying "running" (migration 11 deliberately stores no
+/// `status`), and the detail pane is the surface that shows the REASON --
+/// so it states one derived at the moment it was asked, not one carried
+/// over from whenever the last poll happened to land.
+///
+/// The probe is scoped to this session's own candidate pids, so the cost
+/// is a registry read and at most a handful of process lookups.
+pub fn detail(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<SessionDetail>, rusqlite::Error> {
+    let Some(stored) = stored_row(conn, session_id)? else {
+        return Ok(None);
+    };
+
+    let registry = super::liveness::registry_dir()
+        .map(|d| super::liveness::read_registry(&d))
+        .unwrap_or_else(|| Registry {
+            failure: Some("no home directory, so the live session registry is unreachable".into()),
+            ..Default::default()
+        });
+    let runs = runs_for_session(conn, session_id)?;
+
+    let mut pids: Vec<u32> = registry.entries.values().map(|e| e.pid).collect();
+    for r in runs.iter().filter(|r| r.ended_at.is_none()) {
+        pids.push(r.pid);
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    let probe = SysinfoProbe::for_pids(&pids);
+
+    let liveness = derive(&probe, &registry, session_id, &runs);
+    // The same cwd precedence the list uses: a live session republishes
+    // its own, and the stored one is all a dead session has. Stated in
+    // both places rather than shared, because the two reads happen at
+    // different moments and each must be right about its own.
+    let cwd = registry
+        .entries
+        .get(session_id)
+        .and_then(|e| e.cwd.clone())
+        .or_else(|| stored.cwd.clone());
+    let cwd_state = check_cwd(cwd.as_deref());
+
+    Ok(Some(SessionDetail {
+        resume: resume_command(&stored.session_id, cwd.as_deref(), &cwd_state),
+        transcript_state: check_transcript(stored.transcript_path.as_deref()),
+        session_id: stored.session_id,
+        claude_version: stored.claude_version,
+        transcript_path: stored.transcript_path,
+        first_seen_at: stored.first_seen_at,
+        liveness,
+        runs: runs.len(),
+        registry_failure: registry.failure,
+    }))
 }
 
 /// A stored `claude_session` row, before liveness is attached.
@@ -435,6 +648,54 @@ fn stored_rows(conn: &Connection) -> Result<Vec<Stored>, rusqlite::Error> {
     rows.collect()
 }
 
+/// One stored row by id, or `None` when the store does not have it.
+///
+/// The same columns and the same shape as [`stored_rows`], so the detail
+/// read cannot disagree with the list about what a session recorded.
+fn stored_row(conn: &Connection, session_id: &str) -> Result<Option<Stored>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT session_id, name, cwd, git_branch, claude_version, transcript_path,
+                first_seen_at, last_activity_at
+         FROM claude_session WHERE session_id = ?1",
+    )?;
+    let mut rows = stmt.query_map([session_id], |r| {
+        Ok(Stored {
+            session_id: r.get(0)?,
+            name: r.get(1)?,
+            cwd: r.get(2)?,
+            git_branch: r.get(3)?,
+            claude_version: r.get(4)?,
+            transcript_path: r.get(5)?,
+            first_seen_at: r.get(6)?,
+            last_activity_at: r.get(7)?,
+        })
+    })?;
+    rows.next().transpose()
+}
+
+/// One session's recorded runs, newest first.
+///
+/// `ORDER BY started_at DESC` exactly as [`runs_by_session`] does, and
+/// that is load-bearing rather than tidiness: `derive` reads
+/// `runs.first()` to decide whether the newest run crashed (#965), so a
+/// different order here would give the detail pane a different verdict
+/// from the list for the same session.
+fn runs_for_session(conn: &Connection, session_id: &str) -> Result<Vec<Run>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT pid, pid_start_time, ended_at, end_reason
+         FROM claude_run WHERE session_id = ?1 ORDER BY started_at DESC",
+    )?;
+    let rows = stmt.query_map([session_id], |r| {
+        Ok(Run {
+            pid: r.get::<_, i64>(0)? as u32,
+            pid_start_time: r.get(1)?,
+            ended_at: r.get(2)?,
+            end_reason: r.get(3)?,
+        })
+    })?;
+    rows.collect()
+}
+
 /// Every recorded run, newest first, grouped by session.
 fn runs_by_session(
     conn: &Connection,
@@ -468,12 +729,17 @@ fn runs_by_session(
     Ok(out)
 }
 
-/// Attach liveness, the cwd check and the resume command to each stored
-/// row.
+/// Attach liveness and the cwd check to each stored row.
 ///
 /// Split from [`list`] so it can be tested against a fake probe: the
 /// `Unknown` states are the ones that matter most and a real process
 /// table cannot be made to fail on demand.
+///
+/// The resume command and the transcript's stat are NOT built here as of
+/// #985 -- they are the detail pane's, and building them for 1,474 rows
+/// to render one was 41% of the payload plus one `metadata` call per row
+/// on every 10-second poll. [`detail`] builds both, for the session that
+/// is actually open.
 fn assemble<P: ProcessProbe>(
     probe: &P,
     registry: &Registry,
@@ -481,10 +747,16 @@ fn assemble<P: ProcessProbe>(
     stored: Vec<Stored>,
 ) -> SessionList {
     let empty: Vec<Run> = Vec::new();
+    let mut reasons = Reasons::default();
     let sessions = stored
         .into_iter()
         .map(|s| {
             let session_runs = runs.get(&s.session_id).unwrap_or(&empty);
+            // Derived for EVERY row, still. The whole point of keeping
+            // every row in the response: a cap or a cursor would leave
+            // the rows outside its window claiming "running" until they
+            // happened to be rewritten, and this poll is the only thing
+            // that ever corrects that.
             let liveness = derive(probe, registry, &s.session_id, session_runs);
             // The registry's cwd wins when the session is running: the
             // transcript's cwd is where the session STARTED, and a live
@@ -495,32 +767,24 @@ fn assemble<P: ProcessProbe>(
                 .get(&s.session_id)
                 .and_then(|e| e.cwd.clone())
                 .or_else(|| s.cwd.clone());
+            // Stays on the list row: the Resumable and Directory-gone
+            // chips switch on it, and those counts are over the whole
+            // corpus.
             let cwd_state = check_cwd(cwd.as_deref());
-            let resume = resume_command(&s.session_id, cwd.as_deref(), &cwd_state);
-            // One `metadata` call per row, the same cost as the cwd
-            // check beside it. Measured: 1,461 transcripts stat in well
-            // under the poll tick, and unlike the cwds they are all on
-            // local disk under `~/.claude/projects`.
-            let transcript_state = check_transcript(s.transcript_path.as_deref());
-            SessionRow {
+            ListRow {
                 session_id: s.session_id,
                 name: s.name,
                 cwd,
                 git_branch: s.git_branch,
-                claude_version: s.claude_version,
-                transcript_path: s.transcript_path,
-                first_seen_at: s.first_seen_at,
                 last_activity_at: s.last_activity_at,
-                liveness,
+                liveness: reasons.intern_liveness(liveness),
                 cwd_state,
-                transcript_state,
-                resume,
-                runs: session_runs.len(),
             }
         })
         .collect();
     SessionList {
         sessions,
+        reasons: reasons.list,
         registry_failure: registry.failure.clone(),
         registry_unreadable: registry.unreadable.clone(),
     }
@@ -545,6 +809,41 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         crate::store::migrate(&conn).unwrap();
         conn
+    }
+
+    /// Resolve one list row's liveness back to the shape `derive`
+    /// produced, by looking its reason up in the list's own table.
+    ///
+    /// The inverse of `Reasons::intern_liveness`, and the assertions
+    /// below go through it so they keep testing the SENTENCE rather than
+    /// an index -- an index that happened to be 0 would satisfy a test
+    /// that only compared numbers no matter which reason it named.
+    fn resolved(list: &SessionList, session_id: &str) -> Liveness {
+        let row = list
+            .sessions
+            .iter()
+            .find(|s| s.session_id == session_id)
+            .unwrap_or_else(|| panic!("no row {session_id}"));
+        let why = |ix: usize| -> String {
+            list.reasons
+                .get(ix)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{session_id}: reason index {ix} is not in a table of {} -- an \
+                            out-of-range index is a row whose verdict has no grounds",
+                        list.reasons.len()
+                    )
+                })
+                .clone()
+        };
+        match &row.liveness {
+            ListLiveness::Running { pid, status } => Liveness::Running {
+                pid: *pid,
+                status: status.clone(),
+            },
+            ListLiveness::Dead { why: ix } => Liveness::Dead { why: why(*ix) },
+            ListLiveness::Unknown { why: ix } => Liveness::Unknown { why: why(*ix) },
+        }
     }
 
     /// A directory that really exists, on every platform.
@@ -908,13 +1207,20 @@ mod tests {
         assert!(why.contains("Permission denied"));
     }
 
-    /// The row carries BOTH states, and a dead cwd does not drag the
+    /// BOTH states are carried, and a dead cwd does not drag the
     /// transcript down with it.
     ///
     /// This is the 83%-vs-0% asymmetry as an assertion: the common real
     /// row has a deleted worktree and a perfectly readable transcript,
     /// and a UI that gated the transcript's reveal on `cwd_state` would
     /// hide the one button that works.
+    ///
+    /// Since #985 the two states live in two tiers -- the cwd's on the
+    /// list row, because the chips count it over the whole corpus, and
+    /// the transcript's on the detail, because only the reveal button
+    /// reads it. So this also asserts they still agree across the split:
+    /// the point was never which struct holds them, it is that neither is
+    /// derived from the other.
     #[test]
     fn a_gone_cwd_leaves_the_transcript_state_untouched() {
         let dir = std::env::temp_dir().join("headstate-919-both-states");
@@ -938,10 +1244,11 @@ mod tests {
             &Default::default(),
             stored_rows(&conn).unwrap(),
         );
-        let row = &got.sessions[0];
-        assert_eq!(row.cwd_state, CwdState::Gone);
+        assert_eq!(got.sessions[0].cwd_state, CwdState::Gone);
+
+        let d = detail(&conn, "s1").unwrap().expect("the session is stored");
         assert_eq!(
-            row.transcript_state,
+            d.transcript_state,
             CwdState::Exists,
             "the transcript survives the worktree, which is the whole point of \
              carrying two states"
@@ -994,31 +1301,39 @@ mod tests {
         assert_eq!(got.sessions.len(), 2, "the rows are still shown");
         assert_eq!(got.registry_failure.as_deref(), Some("Permission denied"));
         for s in &got.sessions {
+            let liveness = resolved(&got, &s.session_id);
             assert!(
-                matches!(s.liveness, Liveness::Unknown { .. }),
+                matches!(liveness, Liveness::Unknown { .. }),
                 "{}: {:?}",
                 s.session_id,
-                s.liveness
+                liveness
             );
         }
-        // The RESUME action survives the registry failure, and that
-        // matters: liveness and the resume command come from different
-        // sources, so a registry we could not read must not also cost the
-        // user the `cd` that the stored transcript cwd already provides.
-        // Rendering these rows with a bare command would be the failure
-        // of #918 caused by an unrelated failure of #917.
-        let s1 = got.sessions.iter().find(|s| s.session_id == "s2").unwrap();
-        assert!(!s1.resume.anchored, "s2 has no cwd at all");
         let s0 = got.sessions.iter().find(|s| s.session_id == "s1").unwrap();
         assert_eq!(
             s0.cwd.as_deref(),
             Some(real_dir().as_str()),
             "the stored cwd is the fallback"
         );
+
+        // The RESUME action survives the registry failure, and that
+        // matters: liveness and the resume command come from different
+        // sources, so a registry we could not read must not also cost the
+        // user the `cd` that the stored transcript cwd already provides.
+        // Rendering these rows with a bare command would be the failure
+        // of #918 caused by an unrelated failure of #917.
+        //
+        // Asserted through `detail` since #985, which is where the resume
+        // command is now built -- the real registry is readable here, so
+        // this proves the FALLBACK to the stored cwd rather than the
+        // registry's own, which is what the original test was about.
+        let d2 = detail(&conn, "s2").unwrap().expect("s2 is stored");
+        assert!(!d2.resume.anchored, "s2 has no cwd at all");
+        let d1 = detail(&conn, "s1").unwrap().expect("s1 is stored");
         assert!(
-            s0.resume.anchored,
-            "an unreadable registry must not cost the `cd`: {}",
-            s0.resume.command
+            d1.resume.anchored,
+            "the stored cwd must still carry the `cd`: {}",
+            d1.resume.command
         );
     }
 
@@ -1046,11 +1361,19 @@ mod tests {
             stored_rows(&conn).unwrap(),
         );
         assert_eq!(
-            got.sessions[0].liveness,
+            resolved(&got, "s1"),
             Liveness::Running {
                 pid: 14779,
                 status: Some("busy".into())
             }
+        );
+        // The pid and the status travel on the list row itself rather
+        // than through the reason table: a running row has no `why`, so
+        // interning must not have invented one for it.
+        assert!(
+            got.reasons.is_empty(),
+            "a running session has no reason to intern: {:?}",
+            got.reasons
         );
     }
 
@@ -1106,8 +1429,11 @@ mod tests {
             &Default::default(),
             stored_rows(&conn).unwrap(),
         );
-        assert_eq!(got.sessions[0].runs, 0);
-        match &got.sessions[0].liveness {
+        // `runs` is the detail's since #985 -- the list neither renders
+        // nor counts it -- so the two facts are asserted from the two
+        // tiers that now carry them.
+        assert_eq!(detail(&conn, "s1").unwrap().expect("stored").runs, 0);
+        match resolved(&got, "s1") {
             Liveness::Dead { why } => assert!(
                 why.contains("live session registry"),
                 "the verdict must state the absence it rests on: {why}"
@@ -1150,12 +1476,25 @@ mod tests {
             &runs,
             stored_rows(&conn).unwrap(),
         );
-        match &got.sessions[0].liveness {
+        match resolved(&got, "s1") {
             Liveness::Dead { why } => assert!(
                 why.contains("without shutting down"),
                 "a run the sweep recorded as crashed must not read as a clean exit: {why}"
             ),
             other => panic!("expected Dead, got {other:?}"),
+        }
+        // And the DETAIL pane -- the surface that actually prints this
+        // sentence -- reaches the same verdict from its own query. The
+        // two reads use different SQL since #985, and `derive` decides
+        // "crashed" from `runs.first()`, so a detail query that ordered
+        // its runs differently would report a crash as a clean exit on
+        // the one screen that shows the words.
+        match detail(&conn, "s1").unwrap().expect("stored").liveness {
+            Liveness::Dead { why } => assert!(
+                why.contains("without shutting down"),
+                "the detail must agree with the list about the crash: {why}"
+            ),
+            other => panic!("expected Dead from detail, got {other:?}"),
         }
     }
 
@@ -1183,12 +1522,19 @@ mod tests {
             &runs,
             stored_rows(&conn).unwrap(),
         );
-        match &got.sessions[0].liveness {
+        match resolved(&got, "s1") {
             Liveness::Dead { why } => assert!(
                 !why.contains("without shutting down"),
                 "`clear` is the hook's vocabulary and means a clean exit ran: {why}"
             ),
             other => panic!("expected Dead, got {other:?}"),
+        }
+        match detail(&conn, "s1").unwrap().expect("stored").liveness {
+            Liveness::Dead { why } => assert!(
+                !why.contains("without shutting down"),
+                "the detail must not turn a clean exit into a crash: {why}"
+            ),
+            other => panic!("expected Dead from detail, got {other:?}"),
         }
     }
 
@@ -1223,22 +1569,305 @@ mod tests {
     ///
     /// Proves the pieces compose -- the registry read, the pid probe, the
     /// cwd check and the command -- rather than asserting a count that
-    /// depends on what the developer is running.
+    /// depends on what the developer is running. Both tiers, since #985:
+    /// the command moved to `detail` and the same composition has to
+    /// hold there.
     #[test]
     fn list_composes_against_the_real_registry() {
         let conn = db();
         insert(&conn, "s1", Some(&real_dir()), Some("2026-09-01T00:00:00Z"));
         let got = list(&conn).unwrap();
         assert_eq!(got.sessions.len(), 1);
-        let row = &got.sessions[0];
         assert_eq!(
-            row.cwd_state,
+            got.sessions[0].cwd_state,
             CwdState::Exists,
             "the temp directory exists on every platform"
         );
-        assert!(row.resume.anchored);
-        assert!(row.resume.command.contains("claude --resume 's1'"));
-        eprintln!("liveness for an unobserved session: {:?}", row.liveness);
+
+        let d = detail(&conn, "s1").unwrap().expect("the session is stored");
+        assert!(d.resume.anchored);
+        assert!(d.resume.command.contains("claude --resume 's1'"));
+        eprintln!(
+            "liveness for an unobserved session: {:?}",
+            resolved(&got, "s1")
+        );
+    }
+
+    // ---- #985: the two tiers ----
+
+    /// The list carries every ROW, and the total is just how many there
+    /// are.
+    ///
+    /// The invariant the whole change rests on. #985's trap is a
+    /// server-side `LIMIT` that makes the stated total a separate claim
+    /// which can drift from the rows beside it; here there is nothing to
+    /// drift, because `sessions.len()` IS the total and the frontend
+    /// reads it from the array it is already rendering.
+    ///
+    /// Boundary-tested either side of `RENDER_CAP`, which is the only cap
+    /// in the feature and is a rendering budget in the client: 200 rows
+    /// exactly, and 201. Both must arrive whole.
+    #[test]
+    fn every_row_arrives_however_many_there_are() {
+        for n in [200usize, 201] {
+            let conn = db();
+            for i in 0..n {
+                // Zero-padded so the string ordering the SQL applies is
+                // the numeric one, making the assertion below about the
+                // ORDER as well as the count.
+                insert(
+                    &conn,
+                    &format!("s{i:04}"),
+                    None,
+                    Some(&format!("2026-09-01T00:00:{:02}Z", i % 60)),
+                );
+            }
+            // Through `list`, NOT `assemble`: the truncation this test
+            // exists to forbid would live in `list`, between the query
+            // and the assembly, and a test that called `assemble` with
+            // its own rows would step right over it. Proven by sabotage
+            // -- a `rows.truncate(200)` in `list` passed the
+            // `assemble` version of this test.
+            let got = list(&conn).unwrap();
+            assert_eq!(
+                got.sessions.len(),
+                n,
+                "{n} rows stored must be {n} rows returned -- a response that \
+                 dropped rows would make the frontend's stated total a lie"
+            );
+            let ids: std::collections::HashSet<&str> =
+                got.sessions.iter().map(|s| s.session_id.as_str()).collect();
+            assert_eq!(ids.len(), n, "every row is distinct");
+        }
+    }
+
+    /// Every row's liveness is still derived, whatever its position.
+    ///
+    /// The reason no row-dropping approach was acceptable (see
+    /// [`SessionList`]). Liveness changes with NO write to the row -- a
+    /// session dies without touching `last_activity_at` -- so a cap or an
+    /// `updated_since` cursor would leave rows outside its window
+    /// claiming "running" indefinitely. This asserts the property that
+    /// rules those out: the LAST row is as freshly derived as the first.
+    #[test]
+    fn the_last_row_is_as_freshly_derived_as_the_first() {
+        let conn = db();
+        for i in 0..250 {
+            insert(
+                &conn,
+                &format!("s{i:04}"),
+                None,
+                Some(&format!("2026-09-01T00:00:{:02}Z", i % 60)),
+            );
+        }
+        let got = assemble(
+            &Fake(Ok(None)),
+            &Registry::default(),
+            &Default::default(),
+            stored_rows(&conn).unwrap(),
+        );
+        assert_eq!(got.sessions.len(), 250);
+        for s in &got.sessions {
+            let liveness = resolved(&got, &s.session_id);
+            match liveness {
+                Liveness::Dead { why } => assert!(
+                    !why.is_empty(),
+                    "{}: a verdict with no grounds",
+                    s.session_id
+                ),
+                other => panic!("{}: expected a derived Dead, got {other:?}", s.session_id),
+            }
+        }
+    }
+
+    /// The interned reason is the SENTENCE, unchanged, once.
+    ///
+    /// The saving is only legitimate if nothing is lost: the list shows
+    /// this string in every row's `title`, so interning has to be a
+    /// transport encoding and not a truncation. Two sessions with the
+    /// same verdict share one entry; the sentence each resolves to is the
+    /// one `derive` produced.
+    #[test]
+    fn one_reason_is_carried_once_and_resolves_to_the_same_sentence() {
+        let conn = db();
+        insert(&conn, "s1", None, Some("2026-09-01T00:00:00Z"));
+        insert(&conn, "s2", None, Some("2026-09-02T00:00:00Z"));
+        let got = assemble(
+            &Fake(Ok(None)),
+            &Registry::default(),
+            &Default::default(),
+            stored_rows(&conn).unwrap(),
+        );
+        assert_eq!(
+            got.reasons.len(),
+            1,
+            "two identical verdicts must be carried once: {:?}",
+            got.reasons
+        );
+        let direct = derive(&Fake(Ok(None)), &Registry::default(), "s1", &[]);
+        let Liveness::Dead { why: expected } = direct else {
+            panic!("expected Dead");
+        };
+        for id in ["s1", "s2"] {
+            match resolved(&got, id) {
+                Liveness::Dead { why } => assert_eq!(
+                    why, expected,
+                    "{id}: interning must preserve the sentence exactly -- the list \
+                     renders it as the row's title"
+                ),
+                other => panic!("{id}: {other:?}"),
+            }
+        }
+    }
+
+    /// DIFFERENT verdicts get different entries, and nothing is merged.
+    ///
+    /// The failure interning could introduce: collapsing two distinct
+    /// reasons onto one index would put one session's grounds under
+    /// another session's verdict, which is worse than dropping `why`
+    /// altogether because it is confidently wrong.
+    #[test]
+    fn two_different_reasons_are_not_merged() {
+        let conn = db();
+        insert(&conn, "dead", None, Some("2026-09-01T00:00:00Z"));
+        insert(&conn, "unknown", None, Some("2026-09-02T00:00:00Z"));
+        // A run with no comparable start time is the `Unknown` arm, so
+        // this row's verdict differs from the other's by construction.
+        conn.execute(
+            "INSERT INTO claude_run
+               (session_id, pid, source, started_at)
+             VALUES ('unknown', 4242, 'hook', '2026-09-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let got = assemble(
+            &Fake(Ok(None)),
+            &Registry::default(),
+            &runs_by_session(&conn).unwrap(),
+            stored_rows(&conn).unwrap(),
+        );
+        assert_eq!(
+            got.reasons.len(),
+            2,
+            "two distinct verdicts need two entries: {:?}",
+            got.reasons
+        );
+        let dead = resolved(&got, "dead");
+        let unknown = resolved(&got, "unknown");
+        assert!(matches!(dead, Liveness::Dead { .. }), "{dead:?}");
+        assert!(matches!(unknown, Liveness::Unknown { .. }), "{unknown:?}");
+        let (Liveness::Dead { why: a }, Liveness::Unknown { why: b }) = (&dead, &unknown) else {
+            unreachable!()
+        };
+        assert_ne!(a, b, "each verdict keeps its own grounds");
+    }
+
+    /// An id the store does not have is `None`, not an error and not a
+    /// fabricated row.
+    ///
+    /// What a session deleted between two polls produces. `None` and
+    /// `Err` are different answers with different remedies -- "this
+    /// session is gone" versus "we could not look" -- and #846 is the
+    /// rule that they must not be collapsed.
+    #[test]
+    fn detail_for_an_unknown_id_is_none_rather_than_an_error() {
+        let conn = db();
+        insert(&conn, "s1", None, Some("2026-09-01T00:00:00Z"));
+        assert!(
+            detail(&conn, "never-stored").unwrap().is_none(),
+            "an absent id is an answer, not a failure"
+        );
+        assert!(detail(&conn, "s1").unwrap().is_some());
+    }
+
+    /// The detail carries the fields the list gave up, for the row the
+    /// list still names.
+    ///
+    /// The split's correctness condition: every field that left `ListRow`
+    /// has to be reachable for the selected session, or the detail pane
+    /// lost information rather than the transport did.
+    #[test]
+    fn the_detail_carries_what_the_list_no_longer_does() {
+        let dir = std::env::temp_dir().join("headstate-985-detail-fields");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("s1.jsonl");
+        std::fs::write(&file, b"{}\n").unwrap();
+
+        let conn = db();
+        conn.execute(
+            "INSERT INTO claude_session
+                (session_id, name, cwd, claude_version, transcript_path,
+                 first_seen_at, last_activity_at)
+             VALUES ('s1', 'about s1', ?1, '2.0.1', ?2,
+                     '2026-09-01T00:00:00Z', '2026-09-02T00:00:00Z')",
+            rusqlite::params![real_dir(), file.to_string_lossy()],
+        )
+        .unwrap();
+
+        let d = detail(&conn, "s1").unwrap().expect("stored");
+        assert_eq!(d.session_id, "s1");
+        assert_eq!(d.claude_version.as_deref(), Some("2.0.1"));
+        assert_eq!(d.first_seen_at, "2026-09-01T00:00:00Z");
+        assert_eq!(
+            d.transcript_path.as_deref(),
+            Some(file.to_string_lossy().as_ref())
+        );
+        assert_eq!(d.transcript_state, CwdState::Exists);
+        assert!(d.resume.anchored, "{}", d.resume.command);
+        assert!(d.resume.command.contains("claude --resume 's1'"));
+
+        // And the list still names the same session, with the fields it
+        // kept -- so the two halves describe one row rather than two.
+        let got = assemble(
+            &Fake(Ok(None)),
+            &Registry::default(),
+            &Default::default(),
+            stored_rows(&conn).unwrap(),
+        );
+        let row = &got.sessions[0];
+        assert_eq!(row.session_id, "s1");
+        assert_eq!(row.name.as_deref(), Some("about s1"));
+        assert_eq!(row.cwd.as_deref(), Some(real_dir().as_str()));
+        assert_eq!(
+            row.last_activity_at.as_deref(),
+            Some("2026-09-02T00:00:00Z")
+        );
+        assert_eq!(row.cwd_state, CwdState::Exists);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The four fields search covers are on EVERY list row.
+    ///
+    /// #985's stated trap: search is this list's primary navigation and
+    /// filters the whole corpus on `name`, `cwd`, `git_branch` and
+    /// `session_id`. Any of the four missing from the list tier would
+    /// silently narrow search to what happens to still carry it -- a
+    /// worse feature that still looks like it works.
+    #[test]
+    fn every_field_search_covers_survives_the_split() {
+        let conn = db();
+        conn.execute(
+            "INSERT INTO claude_session
+                (session_id, name, cwd, git_branch, first_seen_at, last_activity_at)
+             VALUES ('findable-id', 'findable name', '/findable/cwd', 'findable-branch',
+                     '2026-09-01T00:00:00Z', '2026-09-02T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let got = assemble(
+            &Fake(Ok(None)),
+            &Registry::default(),
+            &Default::default(),
+            stored_rows(&conn).unwrap(),
+        );
+        let row = &got.sessions[0];
+        // Each one separately, so a failure names the field that went
+        // missing rather than reporting "search broke".
+        assert_eq!(row.session_id, "findable-id");
+        assert_eq!(row.name.as_deref(), Some("findable name"));
+        assert_eq!(row.cwd.as_deref(), Some("/findable/cwd"));
+        assert_eq!(row.git_branch.as_deref(), Some("findable-branch"));
     }
 
     /// The WHOLE pipeline against the real corpus: import, then list.
@@ -1292,7 +1921,7 @@ mod tests {
         let mut t_unrecorded = 0;
         let mut dead_cwd_live_transcript = 0;
         for s in &got.sessions {
-            match &s.liveness {
+            match resolved(&got, &s.session_id) {
                 Liveness::Running { .. } => running += 1,
                 Liveness::Dead { why } => {
                     dead += 1;
@@ -1309,13 +1938,20 @@ mod tests {
                 CwdState::Unknown { .. } => uncheckable += 1,
                 CwdState::NotRecorded => {}
             }
-            match &s.transcript_state {
+            // The detail for EVERY row, which is not what the app does --
+            // it fetches one -- but is what proves the per-row invariants
+            // still hold across the whole corpus after #985 split them
+            // off the list.
+            let d = detail(&conn, &s.session_id)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{}: listed but has no detail", s.session_id));
+            match &d.transcript_state {
                 CwdState::Exists => t_exists += 1,
                 CwdState::Gone => t_gone += 1,
                 CwdState::Unknown { .. } => t_uncheckable += 1,
                 CwdState::NotRecorded => t_unrecorded += 1,
             }
-            if s.cwd_state == CwdState::Gone && s.transcript_state == CwdState::Exists {
+            if s.cwd_state == CwdState::Gone && d.transcript_state == CwdState::Exists {
                 dead_cwd_live_transcript += 1;
             }
             if s.name.is_none() {
@@ -1326,23 +1962,25 @@ mod tests {
             }
             // The invariants that hold at any corpus size.
             assert!(
-                s.resume.command.contains(&s.session_id),
+                d.resume.command.contains(&s.session_id),
                 "{}: the resume command must carry its own handle",
                 s.session_id
             );
             assert_eq!(
-                s.resume.anchored,
+                d.resume.anchored,
                 matches!(s.cwd_state, CwdState::Exists),
-                "{}: anchored must agree with the cwd check",
+                "{}: the detail's anchoring must agree with the LIST's cwd check -- \
+                 the two are read separately since #985 and a disagreement means one \
+                 of them is describing a different moment",
                 s.session_id
             );
             assert!(
-                s.resume.anchored || s.resume.caveat.is_some(),
+                d.resume.anchored || d.resume.caveat.is_some(),
                 "{}: a command with no `cd` MUST say why -- this is the whole of #918",
                 s.session_id
             );
             assert!(
-                !s.resume.anchored || s.resume.caveat.is_none(),
+                !d.resume.anchored || d.resume.caveat.is_none(),
                 "{}: an anchored command needs no caveat",
                 s.session_id
             );
@@ -1380,18 +2018,44 @@ mod tests {
         );
         eprintln!("no aiTitle name          {unnamed}");
         eprintln!("no recorded activity     {undated}");
+
+        // #985: the PAYLOAD, which is the cost this view actually pays.
+        // The server work above is 5ms; the response is what crosses the
+        // pairing transport every ten seconds, and it is what the split
+        // was for. Printed rather than asserted for the reason the rest
+        // of this test prints: the corpus grows.
+        let list_bytes = serde_json::to_vec(&got).unwrap().len();
+        let one_detail = serde_json::to_vec(&detail(&conn, &got.sessions[0].session_id).unwrap())
+            .unwrap()
+            .len();
+        eprintln!("--- #985: what the poll costs ---");
+        eprintln!(
+            "list payload             {list_bytes} bytes ({:.3} MB, {:.1} B/row)",
+            list_bytes as f64 / 1_048_576.0,
+            list_bytes as f64 / n as f64
+        );
+        eprintln!("distinct liveness reasons {}", got.reasons.len());
+        eprintln!("one session's detail     {one_detail} bytes, fetched on selection");
+        eprintln!(
+            "at 40,000 sessions       {:.1} MB per poll",
+            40_000.0 * (list_bytes as f64 / n as f64) / 1_048_576.0
+        );
         eprintln!("--- the first ten rows as the list orders them ---");
         for s in got.sessions.iter().take(10) {
             eprintln!(
                 "  {:<9} {:<52} {}",
                 match &s.liveness {
-                    Liveness::Running { status, .. } =>
+                    ListLiveness::Running { status, .. } =>
                         format!("live/{}", status.as_deref().unwrap_or("?")),
-                    Liveness::Dead { .. } => "dead".into(),
-                    Liveness::Unknown { .. } => "unknown".into(),
+                    ListLiveness::Dead { .. } => "dead".into(),
+                    ListLiveness::Unknown { .. } => "unknown".into(),
                 },
                 s.name.as_deref().unwrap_or("(no aiTitle)"),
-                s.resume.command
+                detail(&conn, &s.session_id)
+                    .unwrap()
+                    .unwrap()
+                    .resume
+                    .command
             );
         }
 

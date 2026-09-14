@@ -22,7 +22,8 @@ import type {
   ClaudeImported,
   ClaudeOverview,
   ClaudePreview,
-  ClaudeSessionList,
+  ClaudeSessionDetail,
+  WireClaudeSessionList,
   ClaudeUsage,
   ProjectReport,
   UpdateRequest,
@@ -733,7 +734,25 @@ export const claudeImportTranscripts = () => call<ClaudeImported>("claude_import
 /// `ClaudeSessionList`. Rejects when the DATABASE could not be read,
 /// which is different from an empty list and must never render as "you
 /// have no sessions".
-export const claudeSessions = () => call<ClaudeSessionList>("claude_sessions");
+///
+/// Returns the WIRE shape: every row, with each liveness reason interned
+/// against `reasons` (#985). `useClaudeSessions` hydrates it, and nothing
+/// below that hook sees an index.
+export const claudeSessions = () => call<WireClaudeSessionList>("claude_sessions");
+
+/// What ONE selected session knows that the list does not carry (#985).
+///
+/// `Class::Read`, so the phone gets it -- and the phone is who the split
+/// is for: the list crosses the pairing transport every ten seconds, and
+/// it was carrying every session's resume command and transcript path to
+/// render one.
+///
+/// Resolves to `null` when the store has no such id, which is what a
+/// session deleted between two polls produces. That is an ANSWER; a
+/// rejection means the database could not be read. The view words them
+/// differently and must never collapse them (#846).
+export const claudeSessionDetail = (sessionId: string) =>
+  call<ClaudeSessionDetail | null>("claude_session_detail", { sessionId });
 
 /// Reveal a session's directory or transcript in the file manager.
 /// Returns the path on success.

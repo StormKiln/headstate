@@ -124,6 +124,16 @@ pub const SURFACE: &[(&str, Class)] = &[
     // reasoning. The view must say these are the paired desktop's
     // sessions, not this phone's.
     ("claude_sessions", Class::Read),
+    // The DESKTOP's detail for ONE of those sessions (#985): its resume
+    // command, transcript path and stat, version, start time and run
+    // count. Read for the same reasons the list is -- the desktop's own
+    // cache plus two stats under the desktop's home, writing nothing.
+    //
+    // The split exists FOR this transport. The list crosses the pairing
+    // link every ten seconds and was carrying every session's detail to
+    // render one; it now carries what the list draws, and the phone asks
+    // for the rest only when the user opens a session.
+    ("claude_session_detail", Class::Read),
     // The two live sources on the DESKTOP: its hook handoff file and its
     // `~/.claude/sessions` registry (#913). The phone has neither of its
     // own -- it runs no Claude sessions -- which is exactly why it asks

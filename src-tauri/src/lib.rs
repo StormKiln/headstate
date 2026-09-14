@@ -260,6 +260,7 @@ pub fn run() {
             commands::read_claude_md,
             commands::claude_import_transcripts,
             commands::claude_sessions,
+            commands::claude_session_detail,
             commands::claude_reveal_path,
             commands::claude_session_usage,
             commands::claude_transcript_tail,

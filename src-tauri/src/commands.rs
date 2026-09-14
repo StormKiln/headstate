@@ -3392,14 +3392,24 @@ pub async fn claude_import_transcripts(
 /// three-state existence check -- see `claude::sessions` for why both are
 /// tri-state and what collapsing either one breaks.
 ///
-/// # Why the whole list, and no paging
+/// # Why every ROW, and no paging -- but not every FIELD (#985)
 ///
-/// 1,438 rows of short strings on the real corpus, which is what the
-/// decision rests on. Paging in SQL would move the sort and the search
-/// to a place that cannot answer a keystroke, and would turn "showing
-/// 200 of 1,438" into a round-trip. The frontend caps what it DRAWS and
-/// says the real total; it never receives a silently short list, which
-/// is the rule #846 exists for.
+/// Every row, still. Paging in SQL would move the sort and the search to
+/// a place that cannot answer a keystroke, and would turn "showing 200
+/// of 1,474" into a round-trip whose number could disagree with the rows
+/// beside it. The frontend caps what it DRAWS and says the real total; it
+/// never receives a silently short list, which is the rule #846 exists
+/// for.
+///
+/// What each row CARRIES is bounded instead. Measured on the real
+/// corpus, the fields the list renders, searches, filters and counts on
+/// are the cheap ones; 65% of the bytes were read only by the detail
+/// pane, for the one session the user selected. Those moved to
+/// [`claude_session_detail`]. 990 -> 315 bytes per row, 1.392 MB ->
+/// 0.443 MB per poll, with search still over the whole corpus, the chip
+/// counts still over every row, and the stated total still just
+/// `sessions.len()`. `claude::sessions::SessionList` carries the full
+/// per-field breakdown and what was rejected.
 ///
 /// # Absent is not zero
 ///
@@ -3423,6 +3433,40 @@ pub async fn claude_sessions(
     tauri::async_runtime::spawn_blocking(move || {
         let conn = open_db(&db).map_err(|e| e.to_string())?;
         crate::claude::sessions::list(&conn).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// What ONE Claude Code session knows that the list does not carry (#985).
+///
+/// The other half of the split above: the resume command, the transcript
+/// path and its stat, the Claude version, the start time and the run
+/// count -- 65% of the old payload, read only by the detail pane. Fetched
+/// for the session the user selected rather than pushed for all 1,474 on
+/// every 10-second poll.
+///
+/// # `Ok(None)` is an answer, and not the same as an error
+///
+/// `None` means the store does not have this id -- what a session
+/// deleted between two polls produces, and the view renders it by
+/// returning to the list. An `Err` means the DATABASE could not be read,
+/// which is a different sentence and a different remedy. Collapsing them
+/// would tell a user whose disk is unreadable that their session no
+/// longer exists (#846).
+///
+/// The liveness comes back derived on THIS read rather than copied from
+/// the list's, because the detail pane is where the reason is shown and
+/// a reason should be as fresh as the verdict it explains.
+#[tauri::command]
+pub async fn claude_session_detail(
+    app: tauri::AppHandle,
+    session_id: String,
+) -> Result<Option<crate::claude::sessions::SessionDetail>, String> {
+    let db = db_path(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&db).map_err(|e| e.to_string())?;
+        crate::claude::sessions::detail(&conn, &session_id).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
