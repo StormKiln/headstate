@@ -3363,6 +3363,13 @@ pub fn get_auth_state(state: State<'_, AuthState>) -> AuthState {
 /// must not render as "you have no sessions": the two have opposite
 /// remedies and the second is alarming when it is false.
 ///
+/// `absent_root` is the THIRD answer and it is not one of those (#970): a
+/// `~/.claude/projects` that does not exist is the honest empty answer for
+/// a machine that has never run Claude Code, so it travels in its own
+/// field and `is_partial()` stays false. Before that it arrived in
+/// `unreadable_dirs`, and a new user's first sentence about this feature
+/// was "0 sessions read, but 1 could not be".
+///
 /// [`Imported`]: crate::claude::store::Imported
 #[tauri::command]
 pub async fn claude_import_transcripts(

@@ -58,6 +58,50 @@
 //! because #913 will populate it from the hook and a run whose pid the
 //! registry has forgotten is still a run we once observed.
 //!
+//! # A complete registry listing that does not mention a session (#984)
+//!
+//! MEASURED on the real corpus, after #947 put `claude_poll_live` on the
+//! 60-second timer, by `sessions::tests::real_session_list`:
+//!
+//! ```text
+//! rows returned  1491
+//! liveness  running 1  dead 0  unknown 1490
+//! ```
+//!
+//! `Dead` matched **no row at all**, and structurally could not: every
+//! session here was imported from a transcript, migration 11's
+//! `claude_run.pid NOT NULL` forbids an import from fabricating a run,
+//! and a session that ran before the hook was installed can never
+//! acquire a pid retroactively. So the `runs.is_empty()` arm below WAS
+//! the whole list, and it returned `Unknown` -- "could not tell" on
+//! 1,490 of 1,491 rows, while `overview::aggregate` called 183 of the
+//! same rows resumable on the strength of the same registry read. Two
+//! pages, one database, contradictory answers.
+//!
+//! The overview's reading is the one consistent with this module's own
+//! evidence, and the fix is to adopt it here rather than add a third:
+//! **once `failure` is `None` and `unreadable` is empty, a registry
+//! listing that does not mention a session is positive evidence that it
+//! is not running.** `~/.claude/sessions/<pid>.json` exists for every
+//! running session and survives a SIGKILL (measured, epic #910), and
+//! `read_registry` already treats an absent directory as a settled empty
+//! answer rather than a failure -- `live.rs`'s
+//! `a_missing_registry_is_a_settled_empty_answer` is the same rule stated
+//! as a test, with the comment "absent is the answer, not an error".
+//!
+//! This does NOT weaken `Unknown`, and the ordering is what guarantees
+//! that: `registry.failure` and a non-empty `registry.unreadable` are
+//! still checked FIRST and still return `Unknown`, so the inference only
+//! ever applies to a listing we read completely. A registry we could not
+//! read still poisons every row, which is the direction that matters --
+//! a wrong `Dead` offers a confident Resume that starts a second copy.
+//!
+//! The `why` strings stay distinct, because the evidence is not equally
+//! strong. A `Dead` from probing a recorded pid is a fact about a
+//! process; a `Dead` from registry absence is an inference from one
+//! file's absence, and [`Liveness::Dead`] is rendered with its `why` for
+//! exactly that reason.
+//!
 //! # `(pid, pid_start_time)`, never a pid alone
 //!
 //! Pids are recycled. A bare "is 14779 alive" is true about whatever
@@ -411,6 +455,29 @@ pub struct Run {
     /// it is precisely the SIGKILL case -- so it only decides whether
     /// this run is worth probing at all.
     pub ended_at: Option<String>,
+    /// How the run ended, as whoever recorded the end wrote it (#965).
+    ///
+    /// Two disjoint vocabularies, deliberately: the hook writes
+    /// `clear|resume|logout|prompt_input_exit|other`, every one of which
+    /// means a clean exit RAN, and `crash::CRASHED` (`"crashed"`) is
+    /// written by the registry sweep only, for a run we found already
+    /// dead. `crash.rs:23-31` is explicit that the column exists to
+    /// distinguish "ended, and told us why" from "ended, and we found out
+    /// by looking".
+    ///
+    /// It is NOT a liveness column and this module must not shortcut the
+    /// probe with it -- migration 11's deliberate lack of a `status`
+    /// column is the epic's central correction, and a stored flag reads
+    /// "running" forever for exactly the sessions a user wants back.
+    /// What it is used for is WORDING the `Dead` arm: a crashed run did
+    /// not "report that it ended", and saying it did is factually wrong
+    /// about the one fact this feature exists to surface.
+    ///
+    /// A crashed run's `ended_at` is also not an end time we witnessed --
+    /// `crash.rs:32-46` records that the file's mtime was rejected as too
+    /// unreliable to store, so `ended_at` there is the moment we OBSERVED
+    /// the crash. Nothing here reinterprets it as anything else.
+    pub end_reason: Option<String>,
 }
 
 /// Derive one session's liveness from the registry and its runs.
@@ -422,13 +489,22 @@ pub struct Run {
 ///    source that can distinguish a crash from a clean exit.
 /// 2. **The newest un-ended run** -- what the hook saw, for a session
 ///    the registry no longer mentions.
-/// 3. **Neither** -- `Unknown`, because we never observed a process.
-///    Deliberately NOT `Dead`: the transcript importer creates exactly
-///    this state for all ~1,400 historical sessions, and claiming to
-///    have watched a process we never saw would be a fabricated
-///    reading. What the UI does with it is offer Resume with the
-///    caveat, which is the honest action for a session that is almost
-///    certainly over but was never observed.
+/// 3. **Neither, and the registry listing was COMPLETE** -- `Dead`, on
+///    the strength of the absence itself (#984). Every running session
+///    publishes a registry file and the file survives a SIGKILL, so a
+///    listing we read whole that does not name this session is positive
+///    evidence rather than a shrug. This is the ~1,400 transcript-imported
+///    historical sessions, i.e. the entire list on any machine that
+///    adopted Headstate after using Claude Code, and returning `Unknown`
+///    for it made the tri-state carry no information at all while the
+///    overview page called the same rows resumable. The `why` says the
+///    verdict rests on the absence, because that is weaker evidence than
+///    a probed pid and the detail pane renders it.
+///
+/// The case that is still `Unknown` is a listing we could NOT read
+/// completely, and it is checked before any of the three above -- see the
+/// module docs. The direction of the remaining error is the safe one: a
+/// registry we could not read still puts every row in `Unknown`.
 pub fn derive<P: ProcessProbe>(
     probe: &P,
     registry: &Registry,
@@ -531,14 +607,50 @@ pub fn derive<P: ProcessProbe>(
     // nothing to probe.
     let Some(run) = runs.iter().find(|r| r.ended_at.is_none()) else {
         if runs.is_empty() {
-            return Liveness::Unknown {
-                why: "this session's process was never observed, so whether it is running \
-                      cannot be told -- only that it is not in the live registry"
+            // #984. The registry listed completely -- both checks above
+            // passed -- and it does not name this session. A running
+            // session always has a `~/.claude/sessions/<pid>.json`, and
+            // that file outlives a SIGKILL, so the absence is the answer.
+            //
+            // The sentence says what it rests on, and says that nothing
+            // watched the process, because the two are different facts and
+            // the second is what "Observed runs: none" reports beside it.
+            // A reader who sees only "not running" would not know this was
+            // inferred from one directory listing rather than from probing
+            // a pid we recorded.
+            return Liveness::Dead {
+                why: "no process was ever recorded for this session, and it is not in the \
+                      live session registry -- which lists every running session -- so it \
+                      is not running"
                     .into(),
             };
         }
+        // Every recorded run ended. HOW it ended is what `end_reason`
+        // carries (#965), and the two answers are not interchangeable: a
+        // crash is the thing this feature exists to detect, and it was
+        // being reported as a self-reported clean exit.
+        //
+        // `crashed` is checked against the newest run rather than any run:
+        // a session that crashed in March and exited cleanly in July is
+        // over, cleanly, and the July record is the one that describes its
+        // ending. `runs` arrives newest-first from
+        // `sessions::runs_by_session` (`ORDER BY started_at DESC`).
+        let crashed = runs
+            .first()
+            .and_then(|r| r.end_reason.as_deref())
+            .is_some_and(|reason| reason == super::crash::CRASHED);
         return Liveness::Dead {
-            why: "every recorded run of this session reported that it ended".into(),
+            why: if crashed {
+                // Deliberately NOT a claim about when. `crash.rs:32-46`
+                // stores the moment we observed the orphan, not a
+                // witnessed end time, so the sentence says how we found
+                // out rather than putting a time on it.
+                "this session's process was found already gone, with nothing cleaned up \
+                 after it, so it ended without shutting down"
+                    .into()
+            } else {
+                "every recorded run of this session reported that it ended".into()
+            },
         };
     };
 
@@ -807,21 +919,107 @@ mod tests {
         }
     }
 
-    /// A session nobody ever watched is `Unknown`.
+    /// A session nobody ever watched, missing from a registry we read
+    /// WHOLE, is `Dead` (#984).
     ///
     /// This is all ~1,400 imported historical sessions, so it is the
-    /// COMMON case rather than an edge. `Dead` here would be a claim to
-    /// have observed a process we never saw.
+    /// COMMON case rather than an edge -- which is precisely why it could
+    /// not stay `Unknown`: 1,490 of 1,491 rows read "could not tell" while
+    /// the overview page called 183 of them resumable from the same
+    /// registry read.
+    ///
+    /// `Registry::default()` is a COMPLETE read here and not a stub:
+    /// `read_registry` returns exactly this for an absent
+    /// `~/.claude/sessions`, and `an_absent_registry_directory_is_not_a_failure`
+    /// pins that. So the listing succeeded and does not name this session,
+    /// and every running session publishes a file in it.
+    ///
+    /// The `why` must still say what the verdict RESTS on, because the
+    /// detail pane renders it and an inference from one directory listing
+    /// is weaker evidence than a probed pid.
     #[test]
-    fn a_session_with_no_registry_entry_and_no_runs_is_unknown() {
+    fn a_session_with_no_registry_entry_and_no_runs_is_dead_from_the_absence() {
         let got = derive(&gone(), &Registry::default(), "never-seen", &[]);
         match got {
-            Liveness::Unknown { why } => assert!(
-                why.contains("never observed"),
-                "the reason must say we never WATCHED a process, not that one is absent: {why}"
+            Liveness::Dead { why } => {
+                assert!(
+                    why.contains("live session registry"),
+                    "the reason must name the registry the verdict rests on: {why}"
+                );
+                assert!(
+                    why.contains("no process was ever recorded"),
+                    "and must not imply we watched a process and saw it go: {why}"
+                );
+            }
+            other => panic!(
+                "a complete registry listing that omits a session is positive evidence, \
+                 not a shrug: got {other:?}"
             ),
-            other => panic!("expected Unknown, got {other:?}"),
         }
+    }
+
+    /// The registry-absence `Dead` and the probed-pid `Dead` do not share
+    /// a sentence (#984).
+    ///
+    /// Both are `Dead`, and they rest on different evidence: one on a
+    /// directory listing that does not name the session, the other on
+    /// asking the process table about a pid we recorded. `SessionDetail`
+    /// renders `liveness.why` so the user has the grounds as well as the
+    /// verdict, and one shared string would leave the two
+    /// indistinguishable there.
+    #[test]
+    fn the_two_dead_paths_say_different_things() {
+        let from_absence = derive(&gone(), &Registry::default(), "never-seen", &[]);
+        let runs = [Run {
+            pid: 4242,
+            pid_start_time: Some(PROC_START.into()),
+            ended_at: None,
+            ..Default::default()
+        }];
+        let from_probe = derive(&gone(), &Registry::default(), "s1", &runs);
+        match (&from_absence, &from_probe) {
+            (Liveness::Dead { why: a }, Liveness::Dead { why: b }) => {
+                assert_ne!(a, b, "two kinds of evidence, one sentence");
+                assert!(
+                    !a.contains("4242") && b.contains("4242"),
+                    "only the probed one may name a pid: {a:?} / {b:?}"
+                );
+            }
+            other => panic!("both paths must be Dead: {other:?}"),
+        }
+    }
+
+    /// A registry we could NOT read still makes an unwatched session
+    /// `Unknown` (#984).
+    ///
+    /// The pair to `a_session_with_no_registry_entry_and_no_runs_is_dead_from_the_absence`,
+    /// and the half that must not regress: the new inference rests
+    /// entirely on the listing having been complete, so a failure has to
+    /// keep poisoning exactly the rows the inference now claims. This is
+    /// the direction where being wrong costs something -- a `Dead` on a
+    /// live session offers a confident Resume that starts a second copy.
+    #[test]
+    fn an_unwatched_session_is_unknown_when_the_registry_could_not_be_read() {
+        let listing_failed = Registry {
+            failure: Some("could not read /Users/acme/.claude/sessions: Permission denied".into()),
+            ..Default::default()
+        };
+        let got = derive(&gone(), &listing_failed, "never-seen", &[]);
+        assert!(
+            matches!(got, Liveness::Unknown { .. }),
+            "an absence in a listing we could not complete proves nothing: {got:?}"
+        );
+
+        let record_unreadable = Registry {
+            failure: None,
+            unreadable: vec!["/Users/acme/.claude/sessions/99.json: expected value".into()],
+            ..Default::default()
+        };
+        let got = derive(&gone(), &record_unreadable, "never-seen", &[]);
+        assert!(
+            matches!(got, Liveness::Unknown { .. }),
+            "the unreadable record might be the one naming this session: {got:?}"
+        );
     }
 
     /// **A registry record we could not PARSE is not an absent one.**
@@ -853,6 +1051,7 @@ mod tests {
             pid: 4242,
             pid_start_time: Some(PROC_START.into()),
             ended_at: Some("2026-09-11T12:00:00Z".into()),
+            ..Default::default()
         }];
         let got = derive(&gone(), &registry, "s1", &ended);
         match &got {
@@ -889,10 +1088,14 @@ mod tests {
         // by provoking a real `read_dir` entry error, which needs a race
         // that cannot be staged portably.
         let mut r = Registry::default();
-        assert!(matches!(
-            derive(&gone(), &r, "s1", &[]),
-            Liveness::Unknown { .. }
-        ));
+        // The clean listing is the CONTROL, and since #984 it is `Dead`
+        // rather than `Unknown`: this test is about what one unlistable
+        // entry changes, so the before state has to be the settled answer
+        // it changes away from.
+        assert!(
+            matches!(derive(&gone(), &r, "s1", &[]), Liveness::Dead { .. }),
+            "a complete listing that omits the session is a settled answer"
+        );
         r.unreadable
             .push("whatever: could not list an entry".into());
         let got = derive(&gone(), &r, "s1", &[]);
@@ -910,6 +1113,7 @@ mod tests {
             pid: 4242,
             pid_start_time: Some(PROC_START.into()),
             ended_at: None,
+            ..Default::default()
         }];
         assert!(derive(&alive(PROC_START_EPOCH), &Registry::default(), "s1", &runs).is_running());
         match derive(&gone(), &Registry::default(), "s1", &runs) {
@@ -930,6 +1134,7 @@ mod tests {
             pid: 4242,
             pid_start_time: None,
             ended_at: None,
+            ..Default::default()
         }];
         let got = derive(&alive(PROC_START_EPOCH), &Registry::default(), "s1", &runs);
         assert!(
@@ -945,9 +1150,148 @@ mod tests {
             pid: 4242,
             pid_start_time: Some(PROC_START.into()),
             ended_at: Some("2026-09-11T12:00:00Z".into()),
+            ..Default::default()
         }];
         match derive(&alive(PROC_START_EPOCH), &Registry::default(), "s1", &runs) {
             Liveness::Dead { why } => assert!(why.contains("ended"), "{why}"),
+            other => panic!("expected Dead, got {other:?}"),
+        }
+    }
+
+    /// A run recorded as CRASHED does not claim to have reported its own
+    /// end (#965).
+    ///
+    /// `crash.rs` writes `end_reason = "crashed"` for a registry orphan --
+    /// a pid we found already gone -- and nothing else writes that value.
+    /// The old fall-through arm said "every recorded run of this session
+    /// reported that it ended", which for such a run is the one thing that
+    /// is definitely false: the run reported nothing, we found out by
+    /// looking. Until this test the column had no production reader at
+    /// all, so ten tests in `crash.rs` asserted on a classification the
+    /// surface could never show.
+    ///
+    /// This does NOT shortcut the probe: the run is still only consulted
+    /// after the registry, and `end_reason` decides the WORDING of an
+    /// already-settled `Dead`. A fourth `Liveness` state would break the
+    /// tri-state the module argues for.
+    #[test]
+    fn a_crashed_run_says_it_crashed_rather_than_that_it_reported_ending() {
+        let runs = [Run {
+            pid: 4242,
+            pid_start_time: Some(PROC_START.into()),
+            // `crash.rs` sets this to the moment WE observed the orphan,
+            // not a witnessed end time, so nothing here may put a time on
+            // the ending.
+            ended_at: Some("2026-09-11T12:00:00Z".into()),
+            end_reason: Some(super::super::crash::CRASHED.into()),
+        }];
+        match derive(&alive(PROC_START_EPOCH), &Registry::default(), "s1", &runs) {
+            Liveness::Dead { why } => {
+                assert!(
+                    why.contains("without shutting down"),
+                    "a crash must read as a crash: {why}"
+                );
+                assert!(
+                    !why.contains("reported that it ended"),
+                    "the run reported nothing -- we found out by looking: {why}"
+                );
+                assert!(
+                    !why.contains("2026-09-11"),
+                    "`ended_at` on a crashed row is our observation time, not an end time: {why}"
+                );
+            }
+            other => panic!("a crashed run is Dead, not {other:?} -- the three states stay three"),
+        }
+    }
+
+    /// A CLEAN end is not relabelled as a crash (#965).
+    ///
+    /// The pair to the test above, and the one that keeps the new reader
+    /// from adding noise on the happy path. The hook's vocabulary is
+    /// `clear|resume|logout|prompt_input_exit|other` and every one of them
+    /// means a clean exit ran, so none may fold in with `crashed` --
+    /// `crash.rs` keeps the two vocabularies disjoint on purpose. A `NULL`
+    /// `end_reason` is the same: it is a run that ended without a recorded
+    /// reason, which is not evidence of a crash.
+    #[test]
+    fn a_clean_or_unlabelled_end_is_not_called_a_crash() {
+        for reason in [
+            None,
+            Some("clear"),
+            Some("resume"),
+            Some("logout"),
+            Some("prompt_input_exit"),
+            Some("other"),
+        ] {
+            let runs = [Run {
+                pid: 4242,
+                pid_start_time: Some(PROC_START.into()),
+                ended_at: Some("2026-09-11T12:00:00Z".into()),
+                end_reason: reason.map(str::to_string),
+            }];
+            match derive(&alive(PROC_START_EPOCH), &Registry::default(), "s1", &runs) {
+                Liveness::Dead { why } => assert!(
+                    !why.contains("without shutting down"),
+                    "end_reason {reason:?} means a clean exit ran: {why}"
+                ),
+                other => panic!("expected Dead for {reason:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// The NEWEST run decides, not any run (#965).
+    ///
+    /// A session that crashed in March and then exited cleanly in July is
+    /// over, cleanly, and the July record is the one describing its
+    /// ending. `runs` arrives newest-first (`ORDER BY started_at DESC` in
+    /// `sessions::runs_by_session`), so this pins that the reader takes
+    /// the first element rather than scanning for any `crashed` anywhere
+    /// in the history.
+    #[test]
+    fn the_newest_run_decides_how_the_session_ended() {
+        let newest_clean = [
+            Run {
+                pid: 5000,
+                pid_start_time: Some(PROC_START.into()),
+                ended_at: Some("2026-07-01T12:00:00Z".into()),
+                end_reason: Some("clear".into()),
+            },
+            Run {
+                pid: 4242,
+                pid_start_time: Some(PROC_START.into()),
+                ended_at: Some("2026-03-01T12:00:00Z".into()),
+                end_reason: Some(super::super::crash::CRASHED.into()),
+            },
+        ];
+        match derive(&gone(), &Registry::default(), "s1", &newest_clean) {
+            Liveness::Dead { why } => assert!(
+                !why.contains("without shutting down"),
+                "an older crash does not describe how this session ended: {why}"
+            ),
+            other => panic!("expected Dead, got {other:?}"),
+        }
+
+        // And the other order, so the assertion above is about ORDER
+        // rather than about the reader never firing.
+        let newest_crashed = [
+            Run {
+                pid: 5000,
+                pid_start_time: Some(PROC_START.into()),
+                ended_at: Some("2026-07-01T12:00:00Z".into()),
+                end_reason: Some(super::super::crash::CRASHED.into()),
+            },
+            Run {
+                pid: 4242,
+                pid_start_time: Some(PROC_START.into()),
+                ended_at: Some("2026-03-01T12:00:00Z".into()),
+                end_reason: Some("clear".into()),
+            },
+        ];
+        match derive(&gone(), &Registry::default(), "s1", &newest_crashed) {
+            Liveness::Dead { why } => assert!(
+                why.contains("without shutting down"),
+                "the newest run crashed: {why}"
+            ),
             other => panic!("expected Dead, got {other:?}"),
         }
     }

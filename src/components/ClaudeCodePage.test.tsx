@@ -135,6 +135,10 @@ const imported = (over: Partial<ClaudeImported> = {}): ClaudeImported => ({
   unreadable_files: [],
   metadata_beyond_first_record: 1438,
   elapsed_ms: 1374,
+  // `null` is the real default: the directory exists on any machine that
+  // has run Claude Code, which is every machine the other fixtures
+  // describe. The never-ran shape is opted into explicitly (#970).
+  absent_root: null,
   ...over,
 });
 
@@ -448,6 +452,65 @@ describe("absent is not zero", () => {
     expect(screen.getByText(/incomplete by an unknown amount/i)).toBeTruthy();
   });
 
+  /// A machine that has NEVER run Claude Code is not accused of a failed
+  /// read (#970).
+  ///
+  /// This is the shape no test covered from either side: `sessions: 0`
+  /// with the ROOT named. The neighbouring case above seeds a permission
+  /// error on a SUBdirectory with sessions present, and the default
+  /// fixture has `unreadable_dirs: []`, so a new user's first screen was
+  /// untested -- and it said "0 sessions read, but 1 could not be — this
+  /// list is incomplete by an unknown amount", which is false. Nothing
+  /// could not be read; there is nothing there.
+  it("does not call a never-run machine's empty list incomplete", () => {
+    state.list = listOf([]);
+    state.imported = imported({
+      sessions: 0,
+      absent_root: "/Users/acme/.claude/projects",
+      elapsed_ms: 4,
+    });
+    renderView();
+    expect(screen.queryByText(/incomplete by an unknown amount/i)).toBeNull();
+    expect(screen.queryByText(/could not be/i)).toBeNull();
+    // And it still NAMES the path, which is why #970 kept the information
+    // rather than dropping it.
+    expect(screen.getByText("/Users/acme/.claude/projects")).toBeTruthy();
+    expect(screen.getByText(/does not exist yet/i)).toBeTruthy();
+  });
+
+  /// A permission error on the root is STILL loud (#970).
+  ///
+  /// The pair to the test above, and the half that must not regress:
+  /// `ENOENT` and `EACCES` produce the same empty list and have opposite
+  /// remedies. A user whose history is behind a permission wall genuinely
+  /// has an incomplete list, and telling them "you have no sessions" is
+  /// #846 in the opposite direction.
+  it("still says the list is incomplete when the root itself was unreadable", () => {
+    state.list = listOf([]);
+    state.imported = imported({
+      sessions: 0,
+      absent_root: null,
+      unreadable_dirs: ["/Users/acme/.claude/projects: Permission denied"],
+    });
+    renderView();
+    expect(screen.getByText(/incomplete by an unknown amount/i)).toBeTruthy();
+    expect(screen.queryByText(/does not exist yet/i)).toBeNull();
+  });
+
+  /// A root that EXISTS and holds nothing gets its own sentence (#970).
+  ///
+  /// A user who ran `claude` once and cleared their history is not a user
+  /// who has never run it, so the page must not claim the directory is
+  /// missing. This is the third empty, and it keeps `absent_root` from
+  /// becoming a second way of saying "zero".
+  it("distinguishes a cleared history from a machine that never ran claude", () => {
+    state.list = listOf([]);
+    state.imported = imported({ sessions: 0, absent_root: null });
+    renderView();
+    expect(screen.getByText(/holds no session transcripts/i)).toBeTruthy();
+    expect(screen.queryByText(/does not exist yet/i)).toBeNull();
+  });
+
   /// The rescan's failure is separate from the list's: the list may still
   /// be perfectly readable, just stale.
   it("reports a failed rescan without hiding the stored sessions", () => {
@@ -601,6 +664,100 @@ describe("what the detail says about provenance", () => {
   it("shows how long the rescan took", () => {
     renderView();
     expect(screen.getByText(/1,438 read in 1374/)).toBeTruthy();
+  });
+
+  /// A FIRST scan does not say "Rescanning…" (#978).
+  ///
+  /// `isFetching` is true during the first fetch as well, so keying the
+  /// label only on it put a "Re-" prefix on a machine that had never
+  /// scanned -- asserting work that did not happen. `imported.data ===
+  /// undefined` is what separates the two.
+  it("says Scanning rather than Rescanning on the very first scan", () => {
+    state.imported = undefined;
+    state.importFetching = true;
+    renderView();
+    expect(screen.getByRole("button", { name: /^scanning/i })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /rescanning/i })).toBeNull();
+  });
+
+  /// A SECOND scan does say "Rescanning…" (#978).
+  ///
+  /// The pair, and the one that keeps the fix from silently deleting the
+  /// label: once a scan has returned, re-running it really is a rescan.
+  it("says Rescanning once a scan has already returned", () => {
+    state.importFetching = true;
+    renderView();
+    expect(screen.getByRole("button", { name: /rescanning/i })).toBeTruthy();
+  });
+
+  /// `0 read in 4ms` is suppressed, not qualified (#978).
+  ///
+  /// The figure exists to keep the "no incremental machinery" decision
+  /// checkable, and a scan that found nothing is no evidence of that -- it
+  /// is a developer-facing measurement shown to a first-run user as the
+  /// OUTCOME of their scan, which reads as a failed load. The house rule
+  /// (#976) is to qualify a figure a short read makes only LOW and to
+  /// suppress one it makes misleading; this is the second.
+  it("does not show a zero read count as the outcome of a first scan", () => {
+    state.list = listOf([]);
+    state.imported = imported({ sessions: 0, elapsed_ms: 4, absent_root: "/x/.claude/projects" });
+    renderView();
+    expect(screen.queryByText(/0 read in/i)).toBeNull();
+    expect(screen.queryByText(/read in 4/i)).toBeNull();
+  });
+
+  /// A MEASURED non-zero count stays silent about nothing (#978).
+  ///
+  /// The pair to the test above. Suppressing at zero must not suppress the
+  /// figure the line exists for -- `the_measurement_stays_on_a_real_scan`
+  /// in prose. One row read is still a real measurement.
+  it("still shows the measurement when the scan actually read something", () => {
+    state.imported = imported({ sessions: 1, elapsed_ms: 7 });
+    renderView();
+    expect(screen.getByText(/1 read in 7/)).toBeTruthy();
+  });
+
+  /// The empty list is told what would FILL it (#978).
+  ///
+  /// The epic's first bullet is "an empty state that explains nothing".
+  /// The zero is honest and stays; what was missing is the next step, and
+  /// the page's whole subject -- that sessions come from transcripts
+  /// Claude Code writes to disk when you run it -- was nowhere on screen.
+  it("says what produces a session rather than only that there are none", () => {
+    state.list = listOf([]);
+    state.imported = imported({ sessions: 0, absent_root: "/Users/acme/.claude/projects" });
+    renderView();
+    // `textContent` rather than `getByText`: the sentence is broken across
+    // `<span className="font-mono">` for the command name, so the accessible
+    // text spans several nodes.
+    const body = document.body.textContent ?? "";
+    expect(body).toMatch(/run claude in any directory and it will appear here/i);
+    expect(body).toMatch(/transcripts claude code writes to disk/i);
+  });
+
+  /// The detail pane does not tell the user to choose from nothing (#978).
+  ///
+  /// "Choose a session to see where it ran and how to resume it." printed
+  /// beside a list with no sessions is an instruction a reader cannot
+  /// follow, and one who tries reasonably concludes the list failed to
+  /// load -- which is the one thing the #846 error arm above exists to
+  /// distinguish an empty list from.
+  it("does not invite a choice from an empty list", () => {
+    state.list = listOf([]);
+    state.imported = imported({ sessions: 0, absent_root: "/Users/acme/.claude/projects" });
+    renderView();
+    expect(screen.queryByText(/choose a session/i)).toBeNull();
+    expect(screen.getByText(/nothing to show yet/i)).toBeTruthy();
+  });
+
+  /// And it DOES invite a choice when there is something to choose (#978).
+  ///
+  /// The pair: the prompt is right whenever the list has rows and none is
+  /// selected, and removing it outright would lose the one sentence that
+  /// tells a reader what the right-hand pane is for.
+  it("still invites a choice when the list has rows", () => {
+    renderView();
+    expect(screen.getByText(/choose a session/i)).toBeTruthy();
   });
 });
 
@@ -1055,7 +1212,26 @@ describe("filtering the session list by state", () => {
 
     fireEvent.click(chip("Running"));
     expect(screen.getByText(/no session is in this filter/i)).toBeTruthy();
+    // NOT `NoSessions`, which is a claim about the MACHINE: it names
+    // `~/.claude/projects` and offers a rescan. Reaching it under an active
+    // chip would tell a user with 1,474 sessions that they have none, and
+    // send them to a rescan that would change nothing. This is the arm
+    // ordering asserted, not just the wording (#949 over #970/#978).
     expect(screen.queryByText(/no claude code sessions on this machine/i)).toBeNull();
+    expect(screen.queryByText(/~\/\.claude\/projects/)).toBeNull();
+  });
+
+  /// And the machine-empty arm still reaches `NoSessions` under no chip.
+  ///
+  /// The guard on the guard above: an ordering that sent every empty list to
+  /// the filter sentence would satisfy it while hiding the one explanation a
+  /// first-run machine needs.
+  it("still explains an empty machine when no chip is active", () => {
+    state.list = listOf([]);
+    renderView();
+
+    expect(screen.getByText(/no claude code sessions on this machine/i)).toBeTruthy();
+    expect(screen.queryByText(/no session is in this filter/i)).toBeNull();
   });
 
   /// Which chip is on is available to a screen reader, not only as a

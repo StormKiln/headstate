@@ -440,7 +440,13 @@ fn runs_by_session(
     conn: &Connection,
 ) -> Result<std::collections::HashMap<String, Vec<Run>>, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT session_id, pid, pid_start_time, ended_at
+        // `end_reason` since #965: it was the column `crash.rs` exists to
+        // write and no production query selected it, so a run the sweep
+        // had recorded as crashed reached `derive` indistinguishable from
+        // one that reported a clean `SessionEnd` -- and `derive`'s
+        // fall-through arm then said it "reported that it ended", which
+        // for a crashed run is the one thing that is definitely false.
+        "SELECT session_id, pid, pid_start_time, ended_at, end_reason
          FROM claude_run ORDER BY started_at DESC",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -450,6 +456,7 @@ fn runs_by_session(
                 pid: r.get::<_, i64>(1)? as u32,
                 pid_start_time: r.get(2)?,
                 ended_at: r.get(3)?,
+                end_reason: r.get(4)?,
             },
         ))
     })?;
@@ -1077,14 +1084,20 @@ mod tests {
         assert_eq!(got.sessions[0].cwd.as_deref(), Some(real_dir().as_str()));
     }
 
-    /// A transcript-imported session -- zero runs, no registry entry --
-    /// is `Unknown` with `runs: 0`.
+    /// A transcript-imported session -- zero runs, no registry entry, and
+    /// a registry we read WHOLE -- is `Dead` with `runs: 0` (#984).
     ///
     /// This is the entire historical corpus (~1,400 rows), so it is the
-    /// common case. `runs: 0` is what lets the UI say "never observed"
-    /// rather than implying we watched and lost it.
+    /// common case, and it is why the old `Unknown` here made the
+    /// tri-state carry nothing: 1,490 of 1,491 rows read "could not tell"
+    /// while `overview::aggregate` called 183 of them resumable from the
+    /// same registry read.
+    ///
+    /// `runs: 0` stays alongside it and is a DIFFERENT fact: "not running"
+    /// is the verdict, "never observed" is how much was watched, and the
+    /// detail pane states both.
     #[test]
-    fn an_imported_session_reports_unknown_and_no_runs() {
+    fn an_imported_session_reports_dead_and_no_runs() {
         let conn = db();
         insert(&conn, "s1", None, Some("2026-09-01T00:00:00Z"));
         let got = assemble(
@@ -1094,7 +1107,89 @@ mod tests {
             stored_rows(&conn).unwrap(),
         );
         assert_eq!(got.sessions[0].runs, 0);
-        assert!(matches!(got.sessions[0].liveness, Liveness::Unknown { .. }));
+        match &got.sessions[0].liveness {
+            Liveness::Dead { why } => assert!(
+                why.contains("live session registry"),
+                "the verdict must state the absence it rests on: {why}"
+            ),
+            other => panic!("expected Dead from a complete registry listing, got {other:?}"),
+        }
+    }
+
+    /// `end_reason` reaches `derive` from the database (#965).
+    ///
+    /// The defect was in the SQL, not in the derivation: the production
+    /// query selected four columns and `end_reason` was not one of them,
+    /// so `crash.rs`'s classification could not reach `derive` at all and
+    /// a crashed run read as a self-reported clean exit. This asserts the
+    /// plumbing over a real `claude_run` row rather than over a
+    /// hand-built `Run`, because a hand-built one would pass with the old
+    /// `SELECT` still in place.
+    #[test]
+    fn a_crashed_run_in_the_database_reaches_the_liveness_reason() {
+        let conn = db();
+        insert(&conn, "s1", None, Some("2026-09-01T00:00:00Z"));
+        conn.execute(
+            "INSERT INTO claude_run
+               (session_id, pid, pid_start_time, source, end_reason, started_at, ended_at)
+             VALUES ('s1', 4242, ?1, 'sweep', ?2, '2026-09-01T00:00:00Z', '2026-09-01T01:00:00Z')",
+            rusqlite::params![PROC_START, crate::claude::crash::CRASHED],
+        )
+        .unwrap();
+
+        let runs = runs_by_session(&conn).unwrap();
+        assert_eq!(
+            runs["s1"][0].end_reason.as_deref(),
+            Some(crate::claude::crash::CRASHED),
+            "the query must select the column crash.rs exists to write"
+        );
+
+        let got = assemble(
+            &Fake(Ok(None)),
+            &Registry::default(),
+            &runs,
+            stored_rows(&conn).unwrap(),
+        );
+        match &got.sessions[0].liveness {
+            Liveness::Dead { why } => assert!(
+                why.contains("without shutting down"),
+                "a run the sweep recorded as crashed must not read as a clean exit: {why}"
+            ),
+            other => panic!("expected Dead, got {other:?}"),
+        }
+    }
+
+    /// A run that ended CLEANLY still reads as a clean exit (#965).
+    ///
+    /// The pair to the test above: the new reader must not turn every
+    /// ended run into a crash report. Same row shape, one column
+    /// different.
+    #[test]
+    fn a_cleanly_ended_run_in_the_database_still_reads_as_a_clean_exit() {
+        let conn = db();
+        insert(&conn, "s1", None, Some("2026-09-01T00:00:00Z"));
+        conn.execute(
+            "INSERT INTO claude_run
+               (session_id, pid, pid_start_time, source, end_reason, started_at, ended_at)
+             VALUES ('s1', 4242, ?1, 'hook', 'clear', '2026-09-01T00:00:00Z', '2026-09-01T01:00:00Z')",
+            rusqlite::params![PROC_START],
+        )
+        .unwrap();
+
+        let runs = runs_by_session(&conn).unwrap();
+        let got = assemble(
+            &Fake(Ok(None)),
+            &Registry::default(),
+            &runs,
+            stored_rows(&conn).unwrap(),
+        );
+        match &got.sessions[0].liveness {
+            Liveness::Dead { why } => assert!(
+                !why.contains("without shutting down"),
+                "`clear` is the hook's vocabulary and means a clean exit ran: {why}"
+            ),
+            other => panic!("expected Dead, got {other:?}"),
+        }
     }
 
     /// An empty database is an empty list, and the emptiness is NOT
