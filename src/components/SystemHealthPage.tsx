@@ -7,6 +7,7 @@ import {
   useSystemHealth,
   useHealthAlerts,
   useSystemHealthHistory,
+  useUiPrefs,
 } from "@/api/hooks";
 import { QueryError, errorMessage } from "./QueryError";
 import { formatSize } from "@/lib/worktrees";
@@ -44,9 +45,12 @@ import type {
   AlertReport,
   HealthSample,
 } from "@/types/pr";
+import { toast } from "sonner";
+import { revealLog } from "@/api/tauri";
+import { copyText } from "@/lib/clipboard";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { useConnectionState } from "@/api/connection";
-import { type HealthPage, useFilters } from "@/store/filters";
+import { type HealthPage, type View, useFilters } from "@/store/filters";
 import { healthPagesFor } from "./SystemHealthSidebar";
 import { useIsMobile } from "@/lib/useIsMobile";
 import { ChevronLeft } from "lucide-react";
@@ -381,8 +385,13 @@ function ProcessRow({ p, hint }: { p: FootprintProcess; hint?: string }) {
           cost: a user who wants to know what a 900%-CPU `git` is doing
           needs something to type into `ps`, and the name alone does not
           identify one of forty. */}
+      {/* And it is COPYABLE as of #943, because the sentence above says
+          the reader is going to type it into `ps` -- and a number that has
+          to be retyped is the workflow the comment describes rather than
+          the one it intends. `p.pid` is always present on a footprint row;
+          the absent case lives on the network table, which has one. */}
       <td className="py-1 pr-2 text-right text-xs tabular-nums text-[#8b949e]">
-        {p.pid}
+        <CopyPid pid={p.pid} />
       </td>
       <td className="py-1 pr-2 text-right tabular-nums text-[#e6edf3]">
         {p.cpu_percent.toFixed(0)}%
@@ -449,14 +458,159 @@ function ProcessRow({ p, hint }: { p: FootprintProcess; hint?: string }) {
 /// stopped.
 const SAMPLE_STALE_MS = 10 * 60 * 1000;
 
+/// A pid, and a button that puts it on the clipboard (#943).
+///
+/// # Why this exists
+///
+/// Three separate comments in this file already named copy-into-a-shell as
+/// the intended workflow -- the process table's PID column is "the column a
+/// reader copies into `ps`", the network table reasons about a reader
+/// pasting a pid "into `kill`", and the CPU watch notice ends "Worth a
+/// look" -- and none of the three provided a copy affordance. The number
+/// was bare text in a `<td>`, so the workflow the app expected was: read a
+/// number off the screen, retype it into a terminal.
+///
+/// `copyText` rather than `navigator.clipboard.writeText`, because the
+/// naive spelling has a failure mode that produces NO feedback at all: the
+/// property access throws synchronously in an insecure context, before
+/// either handler is attached, so the click does nothing visible. That is
+/// the bug that made an earlier copy button look inert.
+///
+/// # Surface class: none
+///
+/// No Tauri command is involved at all -- this is the browser clipboard --
+/// so it is not gated and works identically on the phone. Copying a pid
+/// there is genuinely useful: it is what a user forwards to themselves, or
+/// reads out, when the Mac holding the process is in another room.
+///
+/// # Never rendered for an absent pid
+///
+/// The caller decides. A network row whose label carried no parseable pid
+/// renders `NotMeasured` and no button, and a grouped process row has no
+/// PID column to attach one to; a collapsed health notice carries `null`
+/// and gets nothing. A disabled button offering to copy a dash would be a
+/// control whose only outcome is putting "—" on the clipboard.
+function CopyPid({ pid }: { pid: number }) {
+  const copy = async () => {
+    const failure = await copyText(String(pid));
+    if (failure) {
+      // The REASON. An insecure context is a configuration and retrying
+      // will not help; a rejected write usually means the window is not
+      // focused, which the user can fix. "Could not copy" covers both and
+      // helps with neither.
+      toast.error(`Could not copy the PID: ${failure}`);
+      return;
+    }
+    toast.success(`Copied PID ${pid}.`);
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={() => void copy()}
+      // The number is the label, so a screen reader hears the pid rather
+      // than "copy button" forty times down a table -- and `aria-label`
+      // says what pressing it does, which the digits alone do not.
+      aria-label={`Copy PID ${pid}`}
+      title={`Copy PID ${pid}`}
+      className="tap-target rounded px-1 tabular-nums text-[#58a6ff] hover:bg-[#21262d]"
+    >
+      {pid}
+    </button>
+  );
+}
+
+/// The retry on the two 24-hour-history failure states (#946).
+///
+/// One component for both because the two states say different sentences
+/// about the same rejected query -- "the charts above are empty" on the
+/// overview, "any chart here is empty" on a detail page -- and the CONTROL
+/// is the same control. Two copies of it would be two chances for one of
+/// them to be dropped, which is how there came to be four failure states
+/// with no retry while twenty `QueryError` sites all had one.
+///
+/// Deliberately not `QueryError`: these two states are a line of amber
+/// prose beside charts that are merely empty, not a panel replacing a
+/// failed read. `QueryError` is a full-width red alert and would make a
+/// missing chart look like a broken page -- the current readings above it
+/// are fine, which is the whole point of both sentences.
+///
+/// **Surface class: none.** `system_health_history` is `Read`, so the phone
+/// retries exactly as the desktop does.
+function HistoryRetry({ onRetry }: { onRetry: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onRetry}
+      className="tap-target ml-2 rounded border border-[#d29922]/40 px-2 py-0.5 text-xs text-[#d29922] hover:bg-[#d29922]/10"
+    >
+      Try again
+    </button>
+  );
+}
+
+/// The retry on the process-table and network-table failure lines (#946).
+///
+/// These three states are a bare `<p>` inside a panel whose heading has
+/// already said what the panel is for, so the retry is a text button on the
+/// same line rather than a bordered one: a panel-sized `QueryError` here
+/// would replace a heading that is still accurate.
+///
+/// # Why this is a retry and `PartialScanNotice` is not
+///
+/// A partial scan deliberately offers nothing to press, because a second
+/// identical walk will not read what the first could not -- the refusal is
+/// a fact about the filesystem, not about the attempt. These three are
+/// query REJECTIONS: `system_footprint` and `system_network_processes`
+/// either answered or did not, and asking again is the whole remedy. The
+/// distinction is why this component is separate from that one rather than
+/// a shared "something went wrong" affordance.
+///
+/// **Surface class: none.** Both commands are already `Read`.
+///
+/// The network one is the highest-value retry in the view and the one that
+/// was most conspicuously missing: that read costs ~5 seconds of `nettop`,
+/// which is why its poll cadence is deliberately slow -- and a slow
+/// cadence is exactly what makes a manual retry worth the most. It does NOT
+/// shorten that cadence; `surface.rs` is explicit that the phone must call
+/// it "on the Network page's slow cadence only, never beside the health
+/// poll", and a one-off re-issue at the user's request is not a cadence.
+function InlineRetry({ onRetry }: { onRetry: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onRetry}
+      className="tap-target ml-2 rounded px-1 text-sm text-[#58a6ff] hover:bg-[#161b22]"
+    >
+      Try again
+    </button>
+  );
+}
+
 function HealthConditions({
   alerts,
   failed,
+  error,
+  onRetry,
   sampledAt,
   now,
 }: {
   alerts: AlertReport[] | undefined;
   failed: boolean;
+  /// The rejection, for the failed arm (#946). Threaded down rather than
+  /// dropped: "the rules did not run" is the state where the app says its
+  /// own verdicts are untrustworthy, and it was the only one of the four
+  /// that did not even show what went wrong.
+  error: unknown;
+  /// The query's own `refetch`. In scope at the parent the whole time and
+  /// simply never wired to a control -- so the user's recourse was to wait
+  /// out the poll, leave the view and come back, or restart the app.
+  ///
+  /// A user-initiated one-off. It does NOT shorten `refetchInterval`, which
+  /// `useHealthAlerts` cadences to the history deliberately because "the
+  /// rules read history, so asking faster than the series grows re-derives
+  /// an identical answer".
+  onRetry: () => void;
   /// The live sample's own timestamp, epoch ms.
   sampledAt: number;
   /// The right-hand edge of "recent", epoch ms.
@@ -475,8 +629,60 @@ function HealthConditions({
         className="rounded-md border border-[#f85149]/40 bg-[#f85149]/5 px-3 py-2 text-xs text-[#f85149]"
         role="status"
       >
+        {/* VERBATIM (#946). "This is not a clean result — the rules did
+            not run" is load-bearing: it is the sentence that stops a
+            failed evaluation reading like a clean bill of health, and a
+            retry button is an addition beside it rather than a reason to
+            reword it. */}
         Could not check for health conditions. This is not a clean result — the rules did not
         run.
+        {/* The REASON, which this state alone was not showing -- the one
+            state where the app is telling the user its verdicts are
+            untrustworthy was also the one with the least to go on. */}
+        {errorMessage(error) ? (
+          <span className="mt-1 block text-[#8b949e]">{errorMessage(error)}</span>
+        ) : null}
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={onRetry}
+            className="tap-target rounded border border-[#30363d] px-2 py-0.5 text-[#e6edf3] hover:bg-[#21262d]"
+          >
+            Try again
+          </button>
+          {/* The log, on this state only (#946). This is precisely where
+              the cause would be written and the view has never offered
+              it: `reveal_log` has exactly one caller in the whole
+              frontend, behind Settings' "Show the log".
+
+              `reveal_log` is `Class::Local`, so this is gated on
+              `IS_MOBILE_BUILD` the way `ClaudeCodePage`'s reveal buttons
+              are -- and the sentence in its place says whose Finder it
+              would need, rather than leaving a reader unable to tell
+              "there is no log" from "not from here". */}
+          {IS_MOBILE_BUILD ? (
+            <span className="text-[#8b949e]">
+              The desktop&rsquo;s diagnostic log is opened at that Mac; there is no Finder
+              here to reveal it in.
+            </span>
+          ) : (
+            <button
+              type="button"
+              onClick={() => {
+                void revealLog().then(
+                  (path) => toast.success("Showed the log", { description: path }),
+                  (e: unknown) =>
+                    toast.error("Could not show the log", {
+                      description: typeof e === "string" ? e : undefined,
+                    }),
+                );
+              }}
+              className="tap-target rounded border border-[#30363d] px-2 py-0.5 text-[#e6edf3] hover:bg-[#21262d]"
+            >
+              Show the log
+            </button>
+          )}
+        </div>
       </div>
     );
   }
@@ -509,6 +715,13 @@ function HealthConditions({
         >
           <p className="text-sm font-semibold text-[#d29922]">{a.title}</p>
           <p className="mt-0.5 text-xs text-[#8b949e]">{a.body}</p>
+          {/* The pid the notice's own last sentence sends the reader
+              looking for (#943). Absent rather than fabricated where the
+              condition is about the machine, or about several processes of
+              one name -- so a notice with no button is one that genuinely
+              has no single process, not one whose button was forgotten.
+              `CopyPid` states that case at length. */}
+          {a.pid === null ? null : <CopyPid pid={a.pid} />}
         </div>
       ))}
     </div>
@@ -804,8 +1017,11 @@ export function SystemHealthPage() {
         samples={samples}
         sampledAt={sampledAt}
         historyFailed={history.isError}
+        onRetryHistory={() => void history.refetch()}
         alerts={alerts.data}
         alertsFailed={alerts.isError}
+        alertsError={alerts.error}
+        onRetryAlerts={() => void alerts.refetch()}
         renderedAt={renderedAt}
       />
     );
@@ -824,6 +1040,8 @@ export function SystemHealthPage() {
       <HealthConditions
         alerts={alerts.data}
         failed={alerts.isError}
+        error={alerts.error}
+        onRetry={() => void alerts.refetch()}
         sampledAt={sampledAt}
         now={renderedAt}
       />
@@ -1284,10 +1502,14 @@ export function SystemHealthPage() {
         // The live panels above are fine; only the charts are missing.
         // Said in place rather than replacing the page, because the
         // current numbers are the half of this view people open it for.
-        <p className="rounded-md border border-[#d29922]/40 bg-[#d29922]/5 px-4 py-2 text-xs text-[#d29922]">
+        <div className="rounded-md border border-[#d29922]/40 bg-[#d29922]/5 px-4 py-2 text-xs text-[#d29922]">
+          {/* Unchanged wording (#946): this sentence's job is to keep an
+              empty chart from reading as a flat one, and a retry beside
+              it does not change what it has to say. */}
           The 24-hour history could not be loaded, so the charts above are
           empty. The current readings are unaffected.
-        </p>
+          <HistoryRetry onRetry={() => void history.refetch()} />
+        </div>
       ) : null}
     </div>
   );
@@ -1396,8 +1618,11 @@ function DetailPage({
   samples,
   sampledAt,
   historyFailed,
+  onRetryHistory,
   alerts,
   alertsFailed,
+  alertsError,
+  onRetryAlerts,
   renderedAt,
 }: {
   page: Exclude<HealthPage, "overview">;
@@ -1408,6 +1633,12 @@ function DetailPage({
   /// navigated away from.
   alerts: AlertReport[] | undefined;
   alertsFailed: boolean;
+  /// The alerts rejection and its retry (#946). Forwarded from the
+  /// parent's single observer rather than re-queried here, exactly as
+  /// `alerts` itself is: a second observer on the same key would poll
+  /// twice and could show a different answer from the overview.
+  alertsError: unknown;
+  onRetryAlerts: () => void;
   /// "Now" for the staleness check, resolved once by the parent rather
   /// than read from the clock here -- same rule as `Sparkline`'s `now`.
   renderedAt: number;
@@ -1421,6 +1652,7 @@ function DetailPage({
   /// wall clock is not read during render.
   sampledAt: number;
   historyFailed: boolean;
+  onRetryHistory: () => void;
 }) {
   const isMobile = useIsMobile();
   const setHealthPage = useFilters((f) => f.setHealthPage);
@@ -1457,6 +1689,8 @@ function DetailPage({
         <HealthConditions
           alerts={alerts}
           failed={alertsFailed}
+          error={alertsError}
+          onRetry={onRetryAlerts}
           sampledAt={sampledAt}
           now={renderedAt}
         />
@@ -1480,10 +1714,14 @@ function DetailPage({
         // Said here as well as on the overview, for the same reason the
         // gap note is repeated beside each chart: an explanation on
         // another page is one nobody reads at the moment they need it.
-        <p className="rounded-md border border-[#d29922]/40 bg-[#d29922]/5 px-4 py-2 text-xs text-[#d29922]">
+        // And the RETRY is repeated for the same reason again (#946): a
+        // control on the page you navigated away from is one you do not
+        // have.
+        <div className="rounded-md border border-[#d29922]/40 bg-[#d29922]/5 px-4 py-2 text-xs text-[#d29922]">
           The 24-hour history could not be loaded, so any chart here is empty.
           The current readings are unaffected.
-        </p>
+          <HistoryRetry onRetry={onRetryHistory} />
+        </div>
       ) : null}
     </div>
   );
@@ -1852,7 +2090,10 @@ function CpuDetail({
       >
         {fp.isError && fp.data === undefined ? (
           <p className="text-sm text-[#8b949e]">
+            {/* Wording unchanged, retry added (#946). `fp.refetch` was in
+                scope here the whole time. */}
             Could not read the process list: {errorMessage(fp.error)}
+            <InlineRetry onRetry={() => void fp.refetch()} />
           </p>
         ) : fp.data === undefined ? (
           <p className="text-sm text-[#8b949e]">Reading…</p>
@@ -1996,7 +2237,11 @@ function MemoryDetail({
       >
         {fp.isError && fp.data === undefined ? (
           <p className="text-sm text-[#8b949e]">
+            {/* Same read, same remedy, same control as the CPU page's
+                (#946). One query serves both pages, so a retry on either
+                fixes both. */}
             Could not read the process list: {errorMessage(fp.error)}
+            <InlineRetry onRetry={() => void fp.refetch()} />
           </p>
         ) : fp.data === undefined ? (
           <p className="text-sm text-[#8b949e]">Reading…</p>
@@ -2119,6 +2364,42 @@ function MemoryDetail({
 /// ~13s call on a real 147-worktree machine (#661). Nothing on this
 /// page is slow now, which is why there is no Measure affordance left
 /// anywhere in this view.
+///
+/// # Why there IS a signpost, which is not the same thing (#955)
+///
+/// #796's argument above is sound and this is not a counter-argument to
+/// it. It rejects three specific things, and a LINK is none of the three:
+///
+/// 1. **Stale figures.** A link computes nothing, so there is nothing to go
+///    stale. This is the load-bearing distinction: the panel was worse than
+///    the three pages because it reported, and it reported numbers that
+///    aged the moment they were taken.
+/// 2. **A second implementation of removal that can disagree with the
+///    first.** A link is the opposite of that. It sends the reader TO the
+///    one implementation instead of restating it, which is why no figure,
+///    no size and no remove button appears below.
+/// 3. **A slow Measure affordance.** `size_worktrees` is the ~13s call and
+///    nothing here invokes it. "No Measure affordance left anywhere in this
+///    view" is preserved literally.
+///
+/// What #796 establishes is that this page must not REPORT Headstate's
+/// share of the disk. It does not establish that the page must not POINT AT
+/// the pages that can act -- and the comment's own closing paragraph is a
+/// list of exactly those three pointers, written where only a maintainer
+/// will ever read it. Measured on the development machine: the system
+/// volume at 73% (652 GB of 926 GB) and `docker system df` reporting
+/// 25.2 GB reclaimable by commands this app already ships. A first-time
+/// user reads the percentage and is on their own, because knowing that
+/// Worktrees, Artifacts and Docker are where space comes from is precisely
+/// the knowledge they do not have.
+///
+/// So: a signpost, with no numbers in it. It says where, never how much.
+///
+/// **Surface class: none.** `setView` against the Zustand store, no Tauri
+/// command and no IPC. It works on the phone, where all three target views
+/// are reachable (`MOBILE_HIDDEN_VIEWS` is empty). The removal commands
+/// behind those views stay exactly as classed -- `Destructive`, with their
+/// step-up -- and none of them is put on this page.
 function DiskDetail({ sample: s }: { sample: HealthSample }) {
   return (
     <div className="flex flex-col gap-4">
@@ -2182,8 +2463,92 @@ function DiskDetail({ sample: s }: { sample: HealthSample }) {
           different measurement, needs elevated privileges on macOS, and
           answers "who is writing" rather than "what is full". So the
           volumes above are the whole page: see the doc comment for why
-          "which of this is Headstate's" is not here either (#796). */}
+          "which of this is Headstate's" is not here either (#796) -- and
+          for why a signpost to the pages that CAN act is not that. */}
+      <ReclaimSignpost />
     </div>
+  );
+}
+
+/// Where Headstate can reclaim disk space, as links and nothing else (#955).
+///
+/// The doc comment on `DiskDetail` above carries the whole argument,
+/// including why this does not contradict #796's removal of the "which of
+/// this is ours" panel. The short version: that panel reported, this points.
+///
+/// # No figures, by construction and not by restraint
+///
+/// This component reads no size, calls no command, and takes no props. It
+/// therefore CANNOT show a stale number, which is the objection #796
+/// actually raises -- and the absence is structural rather than a rule
+/// someone has to keep remembering. Adding a size here would mean adding a
+/// query, which is a visible change rather than a quiet drift.
+///
+/// # It respects `hidden_views`
+///
+/// A user who hid the Docker view does not want to be sent to it. `hidden`
+/// means "I do not want to see this", and honouring it here is the same
+/// courtesy `ViewSwitcher` extends -- with the difference that a jump has no
+/// current-view escape hatch to fall back on, so a link to a hidden view
+/// would land the reader on a page their own switcher does not list. When
+/// every target is hidden the whole signpost goes, rather than leaving a
+/// sentence promising links that are not there.
+function ReclaimSignpost() {
+  const setView = useFilters((f) => f.setView);
+  const { prefs } = useUiPrefs();
+  const hidden = new Set(prefs?.hidden_views ?? []);
+
+  // Three views and not four: virtualenvs are a SECTION of the Artifacts
+  // page (`ArtifactsPage` renders `VenvSection`), not a view of their own,
+  // so a fourth link would be a second name for the same destination.
+  // Named in the Artifacts entry's own wording instead.
+  const targets: ReadonlyArray<{ view: View; label: string; what: string }> = [
+    { view: "worktrees", label: "Worktrees", what: "agent worktrees and their build output" },
+    { view: "artifacts", label: "Artifacts", what: "build directories and Poetry virtualenvs" },
+    { view: "docker", label: "Docker", what: "images, volumes and build cache" },
+  ];
+  const offered = targets.filter((t) => !hidden.has(t.view));
+  if (offered.length === 0) return null;
+
+  return (
+    <Panel
+      title="Where Headstate can reclaim space"
+      // Says what this is and what it is NOT, in the subtitle, because the
+      // reader's next question after a 73% bar is "how much of that is
+      // mine" and this panel deliberately does not answer it. Leaving that
+      // unsaid would make the panel look like a measurement that failed.
+      subtitle="The pages that can remove things. Nothing here is measured — each page reports its own sizes"
+    >
+      <div className="flex flex-wrap gap-2">
+        {offered.map((t) => (
+          <button
+            key={t.view}
+            type="button"
+            // Plain `setView`, with no `setFilter` after it -- which is why
+            // #920's ordering trap does not apply. That bug was `setFilter`
+            // writing into `filtersByView[state.view]`, the view being left;
+            // with no filter to write there is no order to get wrong. The
+            // three destinations are machine-wide lists and there is nothing
+            // on a disk volume to narrow them BY: a volume is not a
+            // repository, so inventing a filter here would be a jump that
+            // pre-narrowed the reader's view on no evidence.
+            onClick={() => setView(t.view)}
+            className="tap-target flex flex-col items-start rounded-md border border-[#30363d] bg-[#161b22] px-3 py-2 text-left hover:bg-[#21262d]"
+          >
+            <span className="text-sm text-[#58a6ff]">{t.label} →</span>
+            <span className="text-xs text-[#8b949e]">{t.what}</span>
+          </button>
+        ))}
+      </div>
+      {/* The honest caveat, and the reason there is no total. Without it a
+          reader could take three links as an implied claim that these are
+          where the 652 GB went -- which nothing here measured. */}
+      <p className="mt-3 text-xs leading-relaxed text-[#8b949e]">
+        Whether any of this accounts for the figures above is not something this page
+        measured. Each page counts and removes its own, which is why the sizes are there
+        rather than here.
+      </p>
+    </Panel>
   );
 }
 
@@ -2383,7 +2748,13 @@ function NetworkProcesses() {
   if (q.isError) {
     return (
       <p className="text-sm text-[#8b949e]">
+        {/* The highest-value retry in the view (#946). This read costs ~5
+            seconds of `nettop`, which is why its poll cadence is
+            deliberately slow -- so waiting out the poll is the most
+            expensive of the four "just wait" recourses and the manual
+            re-issue is worth the most. The cadence is untouched. */}
         Could not read the per-process network table: {errorMessage(q.error)}
+        <InlineRetry onRetry={() => void q.refetch()} />
       </p>
     );
   }
@@ -2472,8 +2843,14 @@ function NetworkProcesses() {
                 {/* Absent is not zero, and it is not a guess either. A
                     row whose label carried no parseable PID gets a dash
                     rather than a fabricated number a reader might paste
-                    into `kill`. */}
-                {r.pid === null ? <NotMeasured /> : r.pid}
+                    into `kill`.
+
+                    Which is also why the copy button is ABSENT there
+                    rather than disabled (#943): this comment is the one
+                    that names pasting into `kill` as the workflow, so a
+                    control offering to copy a dash into it would be the
+                    fabricated number arriving by another route. */}
+                {r.pid === null ? <NotMeasured /> : <CopyPid pid={r.pid} />}
               </td>
               <td className="text-right tabular-nums text-[#e6edf3]">
                 {r.in_rate === null ? formatSize(r.bytes_in) : formatRate(r.in_rate)}

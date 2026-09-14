@@ -8,6 +8,7 @@ import { pathBasename } from "../lib/worktrees";
 import { QueryError, errorMessage } from "./QueryError";
 import { SessionsChart } from "./stats/SessionsChart";
 import { Card } from "@/components/ui/card";
+import { useFilters } from "@/store/filters";
 import type { ClaudeResumable } from "@/types/pr";
 
 /// How many days the activity chart covers.
@@ -26,11 +27,49 @@ export const ACTIVITY_DAYS = 30;
 /// rather than as a dash or a zero. That is the page's central rule in
 /// component form: on a dashboard, zero is a MEASUREMENT and absence is
 /// not, and the two look identical unless something forces them apart.
+///
+/// # Clickable, as of #948, and only when there is something to open
+///
+/// The `tone` prop below marks `action` as "the one figure a user is meant
+/// to act on" -- and the tile was a `Card` wrapping three `div`s with
+/// no `onClick` and no `href`. On the measured corpus that meant the page
+/// coloured the number 179 to say "act on this" and dead-ended: the card
+/// below it lists the 12 most recent, so 167 resumable sessions had no path
+/// from this page at all.
+///
+/// The sessions list one click away can show every row, and the two
+/// surfaces did not cross-link in either direction. The asymmetry is the
+/// evidence this was an omission: `ClaudeCodePage` caps at 200 and renders
+/// "Show all 1,474" under a comment stating the house rule that a short
+/// list must both STATE the total and offer the rest. This page satisfied
+/// the first half and dropped the second.
+///
+/// `onClick` is OPTIONAL, and a tile without one renders exactly as before
+/// -- a `div`, not a dead button. That is what keeps the rule below
+/// enforceable by construction rather than by remembering to check.
+///
+/// ## A `null` tile is never clickable
+///
+/// `value === null` means the figure could not be established, and the
+/// caller must pass no `onClick` for it. A link from a tile reading "Could
+/// not tell" would open a filtered list whose emptiness the reader would
+/// take for an answer -- the confident-wrong-answer failure, arrived at
+/// through navigation instead of a zero. This is asserted here rather than
+/// only documented: the `onClick` is dropped when `value === null`, so a
+/// caller who forgets gets a plain tile rather than a broken jump.
+///
+/// ## Surface class: none
+///
+/// `setClaudePage` + `setClaudeFilter` against the Zustand store. No Tauri
+/// command, no IPC, so it works identically on the phone -- where it
+/// matters more, because there the tile is most of the screen and the
+/// sessions list is 1,474 rows with no other way to narrow them.
 function Tile({
   label,
   value,
   hint,
   tone = "plain",
+  onClick,
   Icon,
 }: {
   label: string;
@@ -40,10 +79,16 @@ function Tile({
   /// `action` is the one figure a user is meant to act on, and it is the
   /// only one that gets colour. Colour on every tile would rank nothing.
   tone?: "plain" | "action";
+  /// Where the figure leads, or `undefined` for a tile that leads nowhere.
+  ///
+  /// Ignored when `value === null`, deliberately and not defensively: a
+  /// figure that could not be established has nothing to drill into, and
+  /// the caller's own `null` is the same `null` the body renders in words.
+  onClick?: () => void;
   Icon: typeof Bot;
 }) {
-  return (
-    <Card className="px-4">
+  const figure = (
+    <>
       <div className="flex items-center gap-1.5 text-xs text-[#8b949e]">
         <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
         {label}
@@ -63,6 +108,33 @@ function Tile({
         )}
       </div>
       <div className="mt-1 text-xs text-[#8b949e]">{hint}</div>
+    </>
+  );
+
+  if (onClick === undefined || value === null) return <Card className="px-4">{figure}</Card>;
+
+  return (
+    <Card className="p-0">
+      <button
+        type="button"
+        onClick={onClick}
+        // "Show these" and not "Open" or an imperative: the tile's own
+        // wording is what ranks it, and "Directory gone" must stay worded
+        // as NORMAL rather than as damage -- 87.9% of the real corpus is
+        // in it. A label that read "Fix" or "Clean up" would turn a fact
+        // about how agent worktrees work into a problem to go looking for.
+        aria-label={`${label}: show these sessions`}
+        // `tap-target` keeps the 44px floor, and `text-left` because the
+        // content is a figure block rather than a caption -- a centred
+        // button would move every number on the page.
+        className="tap-target w-full rounded-md px-4 py-3 text-left hover:bg-[#161b22]"
+      >
+        {figure}
+        {/* The affordance, said in words. A whole card that is clickable
+            with nothing saying so is a control a reader finds by accident,
+            and on a phone there is no hover to reveal it. */}
+        <div className="mt-1.5 text-xs text-[#58a6ff]">Show these sessions →</div>
+      </button>
     </Card>
   );
 }
@@ -227,6 +299,12 @@ export function ClaudeOverviewPage() {
   const { query, now, rescan } = useClaudeOverview(true);
   const { data, isLoading, isError, error, refetch } = query;
   const [rescanning, setRescanning] = useState(false);
+  // The jump out of this page (#948). One store action rather than a
+  // `setClaudePage` followed by a `setClaudeFilter`, for the reason its own
+  // doc comment gives at length: #920's "Show in Worktrees" bug was
+  // precisely a pair of ordered writes where the natural reading order
+  // filed the filter under the page being left.
+  const showSessions = useFilters((f) => f.showClaudeSessions);
 
   const onRescan = async () => {
     setRescanning(true);
@@ -374,6 +452,12 @@ export function ClaudeOverviewPage() {
               ? "the live session registry could not be read"
               : "checked against the process table, not just the registry"
           }
+          // `running` is the ONE place a figure becomes null on this page,
+          // and `Tile` drops the jump when it is -- so a registry we could
+          // not read gives a tile that says "Could not tell" and leads
+          // nowhere, rather than to a Running filter that would be empty
+          // for the same unstated reason (#948).
+          onClick={() => showSessions("running")}
         />
         <Tile
           label="Resumable"
@@ -381,6 +465,7 @@ export function ClaudeOverviewPage() {
           Icon={RotateCw}
           tone="action"
           hint="not running, and the directory they ran in still exists"
+          onClick={() => showSessions("resumable")}
         />
         <Tile
           label="Directory gone"
@@ -390,6 +475,7 @@ export function ClaudeOverviewPage() {
           // reader who takes this for damage would go looking for a
           // problem that is just how agent worktrees work.
           hint="resumable by id, but they would land wherever you run the command"
+          onClick={() => showSessions("gone")}
         />
       </div>
 
@@ -452,6 +538,26 @@ export function ClaudeOverviewPage() {
             ))}
           </ul>
         )}
+        {/* The other half of the house rule (#948). The subtitle above
+            already STATES the total -- "the 12 most recent of 179" -- and
+            `ClaudeCodePage`'s cap comment names both halves of the rule:
+            state the total, and offer the rest. This card had the first and
+            not the second, so on the measured corpus 167 resumable sessions
+            had no path from this page.
+
+            Only when there IS a rest. A footer reading "show all 12" under
+            twelve rows is a control that changes nothing, and offering it
+            when `resumable.length === counts.resumable` would be a link
+            that leads back to what is already on screen. */}
+        {resumable.length > 0 && counts.resumable > resumable.length ? (
+          <button
+            type="button"
+            onClick={() => showSessions("resumable")}
+            className="tap-target mt-3 self-start rounded px-2 text-xs text-[#58a6ff] hover:bg-[#161b22]"
+          >
+            Show all {counts.resumable.toLocaleString()} resumable sessions →
+          </button>
+        ) : null}
       </Card>
 
       <SessionsChart points={activity} days={ACTIVITY_DAYS} />

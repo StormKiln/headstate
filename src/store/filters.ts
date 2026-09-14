@@ -157,6 +157,68 @@ export type HealthPage = (typeof ALL_HEALTH_PAGES)[number];
 /// knip` objects to and it is right.
 export type ClaudePage = "sessions" | "overview";
 
+/// Which subset of the Claude Code session list is showing (#949).
+///
+/// # Why these five and not a set of independent toggles
+///
+/// Because two of them are the same axis. `cwd_state` is a TRI-state --
+/// `exists` / `gone` / `unknown` -- so "resumable" and "gone" are two of its
+/// three values and cannot both be on. `liveness` is a second, genuinely
+/// independent axis (measured: all 1,474 transcripts exist while 1,295
+/// directories do not), and "running" and "crashed" are two of its values.
+/// Crossing them would be a matrix of twenty states, nineteen of which
+/// nobody asks for.
+///
+/// One of five, therefore, and `"all"` is the default rather than a sixth
+/// chip that means "no chip": a mode with a name is one the reader can see
+/// they are in.
+///
+/// # `unknown` is swept into neither
+///
+/// `"resumable"` and `"gone"` are the overview's own two predicates, which
+/// `matchesClaudeFilter` states and `overview.rs` owns the originals of: not
+/// running plus `cwd_state === "exists"`, and not running plus
+/// `cwd_state === "gone"`. So a session whose directory could not be checked
+/// appears under neither -- which is what the overview's tiles already do
+/// (it counts them "as neither"). Folding `unknown` in with `gone` would
+/// tell the user a directory is missing when the check itself is what
+/// failed, and `revealRefusal` gives the four states four different
+/// sentences precisely so that cannot happen.
+///
+/// Matching the tiles exactly is load-bearing as of #948, which makes those
+/// tiles navigate here: a tile reading 179 that opens a list of 181 rows is
+/// a tile that lied about where it went.
+///
+/// # Why `"ended"` and not `"crashed"`
+///
+/// #949 asks for a Crashed chip and calls a crash "the single most
+/// actionable state in the whole feature", which is right. It is not
+/// available as a client-side predicate, and the reason is worth stating
+/// rather than shipping the chip anyway.
+///
+/// A crash is one particular way of being `Liveness::Dead`: the live
+/// registry lists a pid that is no longer running, which means the process
+/// did not report its own `SessionEnd`. The registry file outlives a
+/// SIGKILL, which is what makes that inference sound -- and `liveness.rs`
+/// draws it. But the DISTINCTION crosses the wire only inside
+/// `liveness.why`, as the sentence "…so this session ended without shutting
+/// down". There is no flag.
+///
+/// So a Crashed chip would have to substring-match a sentence owned by
+/// Rust. That is a second description of a rule that already has one, in a
+/// language whose compiler cannot see the first -- and the failure is
+/// silent and total: a reworded sentence leaves the chip matching zero rows
+/// while every test that mocks its own fixtures stays green. `ClaudeCodePage`
+/// makes exactly this argument about stating the ordering rule once, and
+/// `notify.rs` makes it about thresholds.
+///
+/// `"ended"` is the honest structured neighbour: `liveness.state === "dead"`,
+/// which is every session that has finished, crash or clean. It is a real
+/// narrowing of 1,474 rows and it promises only what it can check. A
+/// crashed chip wants a structured field on `Liveness::Dead` -- see the PR
+/// body, which proposes one rather than smuggling it in here.
+export type ClaudeSessionFilter = "all" | "resumable" | "gone" | "running" | "ended";
+
 interface FilterStore {
   /// Filters are PER VIEW: a repo selected in My PRs must not leak into
   /// Worktrees, which has an entirely different repo list.
@@ -260,6 +322,53 @@ interface FilterStore {
   /// the same box over a longer list, so it gets the same treatment.
   claudeQuery: string;
   setClaudeQuery: (query: string) => void;
+  /// Which of the session list's five states is showing (#949).
+  ///
+  /// The two axes a user actually acts on -- whether the directory still
+  /// exists, and whether the session crashed -- were on every row and
+  /// readable only as prose. Search covered four TEXT fields, so on a
+  /// corpus where 87.9% of directories are gone the user paged through
+  /// 1,295 rows of archaeology to reach the 179 that can be resumed into
+  /// place.
+  ///
+  /// Beside `claudeQuery` rather than in `filtersByView` for exactly the
+  /// reason `claudeQuery` gives: the chips and the rows they filter both
+  /// live in `ClaudeSessionColumn`, which is a SIBLING of the page, and
+  /// `filtersByView` is keyed by `View` -- one bucket for the whole of
+  /// Claude Code, where the session list is only one of its pages. Putting
+  /// a session-list predicate there would file it under the same key the
+  /// PR filters use a different shape of.
+  ///
+  /// Not persisted, like `claudeQuery` and for the same reason: a list
+  /// restored under yesterday's chip is a short list that looks like an
+  /// empty one. It also resets with the view, below.
+  claudeFilter: ClaudeSessionFilter;
+  setClaudeFilter: (filter: ClaudeSessionFilter) => void;
+  /// Jump from the overview to the session list, filtered (#948).
+  ///
+  /// ONE action rather than a `setClaudePage` call followed by a
+  /// `setClaudeFilter` call, and the reason is #920's. That jump -- the
+  /// "Show in Worktrees" button -- had to call `setView` BEFORE `setFilter`
+  /// because `setFilter` writes into `filtersByView[state.view]`, the
+  /// CURRENT view, so the natural-reading order filed the value under the
+  /// page being left and the destination opened on its default. A test
+  /// asserting only the view would not have noticed; the one asserting both
+  /// caught it.
+  ///
+  /// `claudeFilter` is a flat field, so the same bug is not available here
+  /// -- which is exactly why this is one action. An invariant that holds
+  /// only because of how a field happens to be stored is one a later change
+  /// to the storage silently breaks, and the call sites would all still
+  /// compile. A single `set` makes the pairing structural: there is no
+  /// order for a caller to get wrong, and the two values land in one render
+  /// rather than two.
+  ///
+  /// Clears the search text. A chip and a leftover query intersect, so a
+  /// tile reading 179 would land on a list of however many of those 179
+  /// also match yesterday's search -- a number that matches the tile the
+  /// user just pressed only by luck. The tile's figure is a promise about
+  /// what the next screen shows.
+  showClaudeSessions: (filter: ClaudeSessionFilter) => void;
   /// The Claude Code session whose detail the main panel shows, or
   /// undefined for none (#939).
   ///
@@ -464,6 +573,13 @@ export const useFilters = create<FilterStore>()(
           // would restore a detail pane the user did not ask for.
           claudePage: "overview",
           claudeQuery: "",
+          // And the chip (#949), for the reason the sentence above gives
+          // about the query: a filter narrowed on this machine's sessions
+          // means nothing on the review list, and coming back to a list
+          // showing 179 of 1,474 rows under a chip the user set last week
+          // is the short-list-that-looks-empty failure with a control
+          // instead of a search box behind it.
+          claudeFilter: "all",
           claudeSelected: undefined,
         }),
       healthPage: "overview",
@@ -476,6 +592,20 @@ export const useFilters = create<FilterStore>()(
       setClaudePage: (claudePage) => set({ claudePage }),
       claudeQuery: "",
       setClaudeQuery: (claudeQuery) => set({ claudeQuery }),
+      claudeFilter: "all",
+      setClaudeFilter: (claudeFilter) => set({ claudeFilter }),
+      // Page, filter and query in one `set`, so the list cannot render for
+      // a frame under the old chip and so no caller can order the three
+      // wrongly. `claudeSelected` goes too: arriving on a filtered list
+      // with a detail pane already open for a session the chip may have
+      // just excluded would be a pane describing a row that is not there.
+      showClaudeSessions: (claudeFilter) =>
+        set({
+          claudePage: "sessions",
+          claudeFilter,
+          claudeQuery: "",
+          claudeSelected: undefined,
+        }),
       claudeSelected: undefined,
       selectClaudeSession: (claudeSelected) => set({ claudeSelected }),
       selectedPr: null,

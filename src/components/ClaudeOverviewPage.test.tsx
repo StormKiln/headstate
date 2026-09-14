@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import pageSource from "./ClaudeOverviewPage.tsx?raw";
 import type { ClaudeCounts, ClaudeDayCount, ClaudeOverview } from "@/types/pr";
+import { useFilters } from "@/store/filters";
 
 const copyFn = vi.hoisted(() => vi.fn(() => Promise.resolve(null as string | null)));
 const rescanFn = vi.hoisted(() => vi.fn(() => Promise.resolve()));
@@ -431,6 +432,135 @@ describe("ClaudeOverviewPage", () => {
 /// they are deterministic. A regression that started handing the chart
 /// 1,461 points would fail the second assertion even where the timing
 /// stayed under whatever ceiling a threshold had picked.
+/// #948: the tile marked "the one figure a user is meant to act on" leads
+/// somewhere.
+///
+/// On the measured corpus the Resumable tile read 179, was `tone="action"`,
+/// and was a `Card` wrapping three `div`s -- so the page coloured a number
+/// to say "act on this" and dead-ended. The card below lists the 12 most
+/// recent, leaving 167 resumable sessions with no path from this page.
+///
+/// The REAL store here, not a mock. The whole claim is that these controls
+/// write the page and the filter the way `ClaudeSessionColumn` reads them,
+/// and a mocked store would let the two drift apart while this file passed
+/// -- which is exactly how #920's `setView`-before-`setFilter` bug survived
+/// a test that asserted only one of the two values.
+describe("the overview's figures lead somewhere", () => {
+  beforeEach(() => {
+    // Not on the sessions page, and not filtered, so every assertion below
+    // is about what the click DID rather than about what was already true.
+    useFilters.setState({ view: "claude-code", claudePage: "overview", claudeFilter: "all" });
+  });
+
+  /// Each tile opens the sessions list on its own subset.
+  ///
+  /// Both values asserted, per #920: a jump that set the page and not the
+  /// filter would land on an unfiltered list of 1,474 rows, which is the
+  /// dead end with one more click in front of it.
+  it.each([
+    ["Resumable", "resumable"],
+    ["Directory gone", "gone"],
+    ["Running now", "running"],
+  ])("the %s tile opens the session list filtered to %s", (label, filter) => {
+    render(<ClaudeOverviewPage />);
+
+    fireEvent.click(screen.getByRole("button", { name: new RegExp(`^${label}:`, "i") }));
+
+    expect(useFilters.getState().claudePage).toBe("sessions");
+    expect(useFilters.getState().claudeFilter).toBe(filter);
+  });
+
+  /// The jump clears the search text.
+  ///
+  /// A chip and a leftover query intersect, so a tile reading 248 that
+  /// landed under yesterday's search would open a list of however many of
+  /// those 248 also match it -- a number matching the tile only by luck. The
+  /// tile's figure is a promise about the next screen.
+  it("clears the search text, so the tile's figure is what the list shows", () => {
+    useFilters.setState({ claudeQuery: "notarization" });
+    render(<ClaudeOverviewPage />);
+
+    fireEvent.click(screen.getByRole("button", { name: /^Resumable:/i }));
+
+    expect(useFilters.getState().claudeQuery).toBe("");
+  });
+
+  /// **The absent-is-not-zero guard, as navigation.** A tile whose figure
+  /// could not be established is not clickable.
+  ///
+  /// `running` is the one place a figure becomes `null` on this page: a live
+  /// registry that could not be listed gives no answer about what is
+  /// running. A link from a tile reading "Could not tell" would open a
+  /// Running filter that is empty for a reason the destination does not
+  /// state, and the reader would take the emptiness for the answer -- the
+  /// confident-wrong-answer failure arrived at by navigation instead of a 0.
+  ///
+  /// SABOTAGE: drop the `|| value === null` from `Tile`'s early return and
+  /// this fails, because the tile becomes a button.
+  it("does not make a tile clickable when its figure could not be established", () => {
+    state.data = overview({ live_failure: "could not list ~/.claude/sessions" });
+    render(<ClaudeOverviewPage />);
+
+    // The tile is there and says so, in words. `getAllBy`, because the
+    // scan-health banner above the tiles says "Could not tell which
+    // sessions are running" as well -- and BOTH must survive: the banner is
+    // the reason and the tile is the figure.
+    expect(screen.getAllByText(/could not tell/i).length).toBeGreaterThan(0);
+    // And is NOT a control.
+    expect(screen.queryByRole("button", { name: /^Running now:/i })).toBeNull();
+    // While the other two still are, which is what stops this test passing
+    // for the wrong reason -- a page that made nothing clickable would
+    // satisfy the assertion above.
+    expect(screen.getByRole("button", { name: /^Resumable:/i })).toBeTruthy();
+  });
+
+  /// The "Ready to resume" card offers the rest, which is the half of the
+  /// house rule it was missing.
+  ///
+  /// `ClaudeCodePage`'s cap comment states both halves: state the real
+  /// total, and offer the rest. The card's subtitle already said "the 12
+  /// most recent of 248" and stopped there.
+  it("offers the rest of the resumable sessions from the card", () => {
+    render(<ClaudeOverviewPage />);
+
+    const more = screen.getByRole("button", { name: /show all 248 resumable/i });
+    fireEvent.click(more);
+
+    expect(useFilters.getState().claudePage).toBe("sessions");
+    expect(useFilters.getState().claudeFilter).toBe("resumable");
+  });
+
+  /// And NOT when the card is already showing all of them.
+  ///
+  /// A footer reading "show all 1" under one row is a control that changes
+  /// nothing, and a link back to what is already on screen is worse than no
+  /// link: it teaches the reader that the affordance does not mean anything.
+  it("offers no footer link when the card already shows every resumable session", () => {
+    state.data = overview({ counts: counts({ resumable: 1 }) });
+    render(<ClaudeOverviewPage />);
+
+    expect(screen.queryByRole("button", { name: /show all .* resumable/i })).toBeNull();
+    // The tile still leads somewhere, though -- the card being complete
+    // says nothing about the tile.
+    expect(screen.getByRole("button", { name: /^Resumable:/i })).toBeTruthy();
+  });
+
+  /// "Directory gone" stays worded as NORMAL, not as damage.
+  ///
+  /// 87.9% of the real corpus is in it, and the page's own comment says a
+  /// reader who takes it for damage "would go looking for a problem that is
+  /// just how agent worktrees work". Making the tile clickable is exactly
+  /// the change that would tempt an imperative label, so the wording is
+  /// pinned here.
+  it("does not turn the Directory gone tile into an imperative", () => {
+    render(<ClaudeOverviewPage />);
+
+    const tile = screen.getByRole("button", { name: /^Directory gone:/i });
+    expect(tile.textContent).toMatch(/resumable by id/i);
+    expect(tile.textContent).not.toMatch(/clean|remove|delete|fix|reclaim/i);
+  });
+});
+
 describe("ClaudeOverviewPage at real scale", () => {
   it("renders a fixed number of nodes whatever the corpus size", () => {
     // The real machine's figures (measured by
@@ -463,10 +593,17 @@ describe("ClaudeOverviewPage at real scale", () => {
 
     // The structural claim: bounded by the CONSTANTS, not the corpus.
     expect(rows.length).toBe(12);
-    // One Rescan plus one Copy per row. Notably NOT 248, and not 1,461 --
-    // which is what makes `getByRole`-style accessible-name computation
+    // One Rescan, one Copy per row, three clickable tiles and one
+    // "show all resumable" footer (#948). Notably NOT 248, and not 1,461
+    // -- which is what makes `getByRole`-style accessible-name computation
     // affordable on this page where it was not on the list.
-    expect(buttons.length).toBe(13);
+    //
+    // The four navigation controls are a FIXED cost, which is the property
+    // this assertion is actually protecting: #948's fix had to end the dead
+    // end without making the page's node count depend on the corpus, and a
+    // per-row link into the session detail would have done exactly that on
+    // a page whose whole design is a bounded render over 1,461 sessions.
+    expect(buttons.length).toBe(13 + 3 + 1);
     // And the total DOM is small enough that no windowing is warranted.
     expect(container.querySelectorAll("*").length).toBeLessThan(200);
   });
