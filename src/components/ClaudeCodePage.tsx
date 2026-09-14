@@ -114,7 +114,7 @@ const RENDER_CAP = 200;
 /// anything at all would otherwise slide every relative time under
 /// unchanged data.
 ///
-/// # Absent is not zero: four failures, four renderings
+/// # Absent is not zero: seven conditions, seven renderings
 ///
 /// | condition | rendering |
 /// |---|---|
@@ -122,14 +122,28 @@ const RENDER_CAP = 200;
 /// | the live registry could not be read | a banner; every row's liveness becomes "could not tell" |
 /// | the transcript rescan partly failed | a line saying how many could not be read, above a list that still shows |
 /// | `~/.claude/projects` does not exist | `NoSessions` names the path and what creates it. NOT a partial read (#970). |
-/// | genuinely nothing | "No Claude Code sessions" -- only when the read SUCCEEDED |
+/// | the SEARCH matched nothing | "No session matches that search" -- about the query, not the machine |
+/// | the CHIP matched nothing | "No session is in this filter" (#949) -- about the control, not the machine |
+/// | genuinely nothing | `NoSessions` -- only when the read SUCCEEDED and nothing was narrowed |
 ///
-/// The fourth row is #970's correction, and it was the fifth failure
-/// hiding inside the third: the absent root travelled in `unreadable_dirs`,
-/// so a machine that had never run Claude Code was told "0 sessions read,
-/// but 1 could not be -- this list is incomplete by an unknown amount". It
-/// now arrives in `absent_root`, which `is_partial()` does not consult, and
-/// `NoSessions` renders it as the explanation it always was.
+/// The count was "four" until #970 and stayed there through the fifth row
+/// it added; it is corrected here rather than left, since a heading that
+/// undercounts its own table is the reader's first reason to stop trusting
+/// it.
+///
+/// The `~/.claude/projects` row is #970's correction, and it was a failure
+/// hiding inside the partial-read one: the absent root travelled in
+/// `unreadable_dirs`, so a machine that had never run Claude Code was told
+/// "0 sessions read, but 1 could not be -- this list is incomplete by an
+/// unknown amount". It now arrives in `absent_root`, which `is_partial()`
+/// does not consult, and `NoSessions` renders it as the explanation it
+/// always was.
+///
+/// The last three rows all render an EMPTY list and must not be confused,
+/// which is why `ClaudeSessionColumn` tests them in that order: `NoSessions`
+/// is a claim about the machine -- it names the path and offers a rescan --
+/// so it may only be reached when nothing was narrowed. Under an active chip
+/// it would tell a user with 1,474 sessions that they have none.
 ///
 /// The precedent is `ClaudeMdPage` (#846), one view over, where a `= []`
 /// default made a rejected scan read as "No CLAUDE.md files in this
