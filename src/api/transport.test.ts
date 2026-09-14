@@ -201,6 +201,11 @@ const ROWS: Row[] = [
   // and send it back".
   row(api.claudeImportTranscripts, [], "claude_import_transcripts"),
   row(api.claudeSessions, [], "claude_sessions"),
+  // #985. Takes a session ID rather than a path, and unlike the two path
+  // reads above it needs no resolution guard: the id is looked up in
+  // Headstate's OWN table, so an id the store does not have returns
+  // `null` rather than reaching the filesystem.
+  row(api.claudeSessionDetail, ["s1"], "claude_session_detail", { sessionId: "s1" }),
   row(api.claudeOverview, [], "claude_overview"),
   row(api.claudeSessionUsage, [path], "claude_session_usage", { path }),
   row(api.claudeTranscriptTail, [path], "claude_transcript_tail", { path }),

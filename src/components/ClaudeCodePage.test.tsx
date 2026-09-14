@@ -4,6 +4,7 @@ import type {
   ClaudeImported,
   ClaudePreview,
   ClaudeSession,
+  ClaudeSessionDetail,
   ClaudeSessionList,
   ClaudeUsage,
   Worktree,
@@ -55,6 +56,23 @@ const state = vi.hoisted(() => ({
   /// preview costs a 256 KB read over the pairing transport and must not
   /// happen on selection.
   previewEnabledFor: [] as (string | null)[],
+  /// What `useClaudeSessionDetail` returns (#985), keyed by session id.
+  ///
+  /// A MAP rather than one value, because the split made "the detail for
+  /// the row I selected" a real question: a detail served for the wrong
+  /// id is the failure this shape makes visible, and `fixtures` below
+  /// fills it from the same object the list row comes from.
+  details: new Map<string, ClaudeSessionDetail>(),
+  /// `true` makes the detail read REJECT, which the pane must render as
+  /// a reason with a retry rather than as an empty session.
+  detailFailed: false,
+  /// `true` makes it resolve `null` -- the store has no such id, a
+  /// session deleted between two polls. Distinct from the arm above, and
+  /// #846 is the rule that they must not render alike.
+  detailMissing: false,
+  /// Every session id the detail hook was asked for, so a test can
+  /// assert it is fetched for ONE row rather than for the list.
+  detailAskedFor: [] as (string | null)[],
 }));
 
 vi.mock("../api/hooks", () => ({
@@ -91,6 +109,22 @@ vi.mock("../api/hooks", () => ({
     error: state.usageFailed ? "Permission denied" : undefined,
     isLoading: path !== null && !state.usageFailed && state.usage === undefined,
   }),
+  // #985. One row's detail, fetched on selection. Records the id so a
+  // test can assert the list does not pull 1,474 of these.
+  useClaudeSessionDetail: (sessionId: string | null, enabled: boolean) => {
+    if (enabled && sessionId) state.detailAskedFor.push(sessionId);
+    const data = state.detailMissing
+      ? null
+      : sessionId
+        ? state.details.get(sessionId)
+        : undefined;
+    return {
+      data: state.detailFailed ? undefined : data,
+      isError: state.detailFailed,
+      error: state.detailFailed ? "database is locked" : undefined,
+      refetch: refetchFn,
+    };
+  },
   // #982. Records what it was asked for and whether the disclosure was
   // open, so a test can assert the read does not happen on selection.
   useClaudeTranscriptTail: (path: string | null, enabled: boolean) => {
@@ -132,7 +166,17 @@ function renderView() {
   );
 }
 
-const session = (over: Partial<ClaudeSession> = {}): ClaudeSession => ({
+/// One session, in the shape it had BEFORE the #985 split.
+///
+/// Kept whole deliberately. A session is one thing to a reader, and the
+/// list/detail split is a transport decision -- so the fixtures describe
+/// sessions and `session()` below files each half where the mocked hooks
+/// will find it. Every test written before the split therefore still
+/// reads as a statement about a session rather than about a wire format.
+type WholeSession = ClaudeSession &
+  Omit<ClaudeSessionDetail, "registry_failure" | "liveness">;
+
+const whole = (over: Partial<WholeSession> = {}): WholeSession => ({
   session_id: "e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2",
   name: "HeadState GitHub issues filing",
   cwd: "/Users/acme/code/widget",
@@ -148,13 +192,51 @@ const session = (over: Partial<ClaudeSession> = {}): ClaudeSession => ({
   // would make the common case the one no test exercised.
   transcript_state: { state: "exists" },
   resume: {
-    command: "cd '/Users/acme/code/widget' && claude --resume e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2",
+    // Built from the id the caller asked for, not a fixed one: several
+    // tests below render two sessions and assert the pane shows the
+    // SELECTED one's command, which a constant string cannot express.
+    command: `cd '/Users/acme/code/widget' && claude --resume ${
+      over.session_id ?? "e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2"
+    }`,
     caveat: null,
     anchored: true,
   },
   runs: 1,
   ...over,
 });
+
+/// The LIST row, with this session's detail filed under its id.
+///
+/// The registration is the point: `useClaudeSessionDetail`'s mock reads
+/// `state.details`, so a fixture built here is answerable by both hooks
+/// and a test never has to set up the two halves separately.
+const session = (over: Partial<WholeSession> = {}): ClaudeSession => {
+  const w = whole(over);
+  state.details.set(w.session_id, {
+    session_id: w.session_id,
+    claude_version: w.claude_version,
+    transcript_path: w.transcript_path,
+    first_seen_at: w.first_seen_at,
+    // The same liveness the list row carries. The real command derives
+    // it independently, and `sessions.rs` has the test that the two
+    // agree; here they are one value so that a UI test cannot
+    // accidentally depend on them differing.
+    liveness: w.liveness,
+    transcript_state: w.transcript_state,
+    resume: w.resume,
+    runs: w.runs,
+    registry_failure: null,
+  });
+  return {
+    session_id: w.session_id,
+    name: w.name,
+    cwd: w.cwd,
+    git_branch: w.git_branch,
+    last_activity_at: w.last_activity_at,
+    liveness: w.liveness,
+    cwd_state: w.cwd_state,
+  };
+};
 
 const listOf = (
   sessions: ClaudeSession[],
@@ -227,6 +309,13 @@ const preview = (over: Partial<ClaudePreview> = {}): ClaudePreview => ({
 });
 
 beforeEach(() => {
+  // BEFORE `session()` below, which repopulates it: a detail left over
+  // from a previous test would answer for an id this one never defined,
+  // which is exactly the cross-talk the map exists to make visible.
+  state.details.clear();
+  state.detailFailed = false;
+  state.detailMissing = false;
+  state.detailAskedFor = [];
   state.list = listOf([session()]);
   state.loading = false;
   state.failed = false;
@@ -1809,5 +1898,97 @@ describe("which session the list says you are on", () => {
     const merlin = rowFor("Merlin");
     expect(merlin.hasAttribute("aria-current")).toBe(false);
     expect(merlin.getAttribute("aria-pressed")).toBeNull();
+  });
+});
+
+
+/// The two-tier read, and what the pane says when the second half is not
+/// there (#985).
+///
+/// The list carries what it draws, searches, filters and counts on; the
+/// resume command, the transcript and the version are fetched for the one
+/// selected session. These are the properties that make that split
+/// invisible to a user and honest when it fails.
+describe("the detail is fetched for one session, not for the list", () => {
+  /// The whole point of the change, as a property rather than a byte
+  /// count: 1,474 rows on screen must not be 1,474 detail reads.
+  it("asks for no detail until a row is picked, then for exactly that one", () => {
+    state.list = listOf([
+      session({ session_id: "s-1", name: "Kestrel" }),
+      session({ session_id: "s-2", name: "Merlin" }),
+      session({ session_id: "s-3", name: "Hobby" }),
+    ]);
+    renderView();
+
+    // Three rows drawn, nothing selected: the detail is a read the list
+    // does not make.
+    expect(state.detailAskedFor).toEqual([]);
+
+    open("Merlin");
+    expect(state.detailAskedFor).toEqual(["s-2"]);
+  });
+
+  /// The resume command comes from the detail, and it must be the
+  /// SELECTED session's. A pane that served a cached detail for the
+  /// previously-open row would offer a command that resurrects the wrong
+  /// session -- which is the #918 failure with a new cause.
+  it("shows the picked session's own resume command", () => {
+    state.list = listOf([
+      session({ session_id: "s-1", name: "Kestrel" }),
+      session({ session_id: "s-2", name: "Merlin" }),
+    ]);
+    renderView();
+
+    open("Merlin");
+    expect(screen.getByText(/claude --resume s-2/)).toBeTruthy();
+    expect(screen.queryByText(/claude --resume s-1/)).toBeNull();
+  });
+
+  /// A rejected detail read is a REASON with a retry, never an empty
+  /// pane. #846's rule, applied to the half of the row that now arrives
+  /// separately: "we could not read this" and "there is nothing here"
+  /// have opposite remedies.
+  it("states the reason when the detail could not be read", () => {
+    state.list = listOf([session({ session_id: "s-1", name: "Kestrel" })]);
+    state.detailFailed = true;
+    renderView();
+
+    open("Kestrel");
+    expect(screen.getByText(/could not be read/i)).toBeTruthy();
+    // And NOT a resume command built from nothing.
+    expect(screen.queryByText(/claude --resume/)).toBeNull();
+  });
+
+  /// The list half still renders when the detail half fails. The title,
+  /// the liveness and its reason come from the row, so a failed second
+  /// read must not blank out the answer the user came for -- which on the
+  /// phone is "did the thing I left running die?".
+  it("still answers the liveness question when the detail read fails", () => {
+    state.list = listOf([
+      session({
+        session_id: "s-1",
+        name: "Kestrel",
+        liveness: { state: "dead", why: "pid 14779 is no longer running" },
+      }),
+    ]);
+    state.detailFailed = true;
+    renderView();
+
+    open("Kestrel");
+    expect(screen.getByText(/pid 14779 is no longer running/)).toBeTruthy();
+  });
+
+  /// A resolved `null` is a DIFFERENT sentence from a rejection: the
+  /// store does not have this id, which is what a session deleted between
+  /// two polls produces. Collapsing the two would tell a user whose disk
+  /// is unreadable that their session no longer exists.
+  it("says the session is gone when the detail resolves to nothing", () => {
+    state.list = listOf([session({ session_id: "s-1", name: "Kestrel" })]);
+    state.detailMissing = true;
+    renderView();
+
+    open("Kestrel");
+    expect(screen.getByText(/no longer in the store/i)).toBeTruthy();
+    expect(screen.queryByText(/could not be read/i)).toBeNull();
   });
 });

@@ -232,6 +232,21 @@ pub const SURFACE: &[(&str, Class)] = &[
     // reach a desktop shell -- the same reasoning that makes
     // `claudify_command` Read.
     ("claude_sessions", Class::Read),
+    // The other half of that row since #985: what ONE session knows that
+    // the list no longer carries -- its resume command, transcript path
+    // and stat, version, start time and run count.
+    //
+    // `Read` for exactly the reasons `claude_sessions` is, and the
+    // classing does not change by being split: it queries the desktop's
+    // own cache, stats two paths under the desktop's home, and writes
+    // nothing. The resume command still comes back as text the phone can
+    // read without being able to run it.
+    //
+    // It is the phone that gains most from the split -- the list is what
+    // crosses the pairing transport every ten seconds, and this is the
+    // call that lets it stop carrying the detail for 1,474 rows to render
+    // one.
+    ("claude_session_detail", Class::Read),
     // One pass over the two LIVE sources: the hook's handoff file and the
     // `~/.claude/sessions` registry (#913).
     //
@@ -766,6 +781,9 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "read_claude_md" => res(commands::read_claude_md(a.get("path")?)),
         "claude_import_transcripts" => res(commands::claude_import_transcripts(app.clone()).await),
         "claude_sessions" => res(commands::claude_sessions(app.clone()).await),
+        "claude_session_detail" => {
+            res(commands::claude_session_detail(app.clone(), a.get("sessionId")?).await)
+        }
         "claude_poll_live" => res(commands::claude_poll_live(app.clone()).await),
         "claude_overview" => res(commands::claude_overview(app.clone()).await),
         "claude_session_usage" => res(commands::claude_session_usage(a.get("path")?).await),

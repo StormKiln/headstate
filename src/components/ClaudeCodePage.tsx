@@ -4,10 +4,12 @@ import { toast } from "sonner";
 import type {
   ClaudePreviewBlock,
   ClaudeSession,
+  ClaudeSessionDetail,
   CwdState,
   Liveness,
 } from "@/types/pr";
 import {
+  useClaudeSessionDetail,
   useClaudeSessionUsage,
   useClaudeSessions,
   useClaudeTranscriptTail,
@@ -59,6 +61,22 @@ import { QueryError, errorMessage } from "./QueryError";
 /// this comment claimed it did -- corrected by measurement rather than
 /// left as a plausible-sounding number, since a reader checking the claim
 /// is exactly who this paragraph is for.
+///
+/// # It is still only a rendering budget, and #985 kept it that way
+///
+/// This cap says nothing about TRANSPORT, and never did -- the whole
+/// list arrives and this decides how much is painted. #985 found the
+/// transport cost that was never part of the design (1,474 rows, 1.35 MB,
+/// every ten seconds, over the pairing transport on the phone) and did
+/// NOT fix it by turning this into a server-side limit, which would have
+/// made the total a separate claim and quietly narrowed search to the
+/// first 200 rows.
+///
+/// It split the ROW instead: the list carries what it draws, searches,
+/// filters and counts on, and the rest is fetched for the one selected
+/// session. 990 -> 315 bytes per row, measured, with this cap, the
+/// stated total and the four search fields all unchanged.
+/// `claude::sessions::SessionList` carries the breakdown.
 const RENDER_CAP = 200;
 
 /// Claude Code sessions on this machine, and how to get one back.
@@ -1154,6 +1172,34 @@ function SessionEntry({
 
 /// One session: where it ran, whether it is alive, and how to get it
 /// back.
+///
+/// # Where the second read happens (#985)
+///
+/// The row arrives in the list; everything else about this session is
+/// fetched here, for this session only. The list used to carry the
+/// resume command, the transcript path and its stat, the version, the
+/// start time and the run count for all 1,474 rows on every ten-second
+/// poll, to render them for one -- 65% of a 1.35 MB payload, and the
+/// phone paid it over the pairing transport.
+///
+/// # Three arms, because a failed read is not an empty one
+///
+/// | condition | rendering |
+/// |---|---|
+/// | still reading | the fields the LIST already knows, and a note that the rest is coming |
+/// | the read was REJECTED | `QueryError` with the reason, and a retry |
+/// | resolved `null` | the session is gone from the store, and says so |
+///
+/// The first arm is why this does not render a spinner over the whole
+/// pane: the title, the liveness and the directory are already in hand
+/// from the list, and blanking them for a round-trip would make the
+/// pane flicker on every selection. It shows what it knows and says
+/// what it is waiting for.
+///
+/// The second and third must not be collapsed, which is #846's rule: a
+/// rejected read means the database could not be read, and `null` means
+/// this id is not in it. Opposite remedies, and only one of them is
+/// about the session.
 function SessionDetail({
   session: s,
   now,
@@ -1161,6 +1207,7 @@ function SessionDetail({
   session: ClaudeSession;
   now: number;
 }) {
+  const detail = useClaudeSessionDetail(s.session_id, true);
   const copy = (value: string, what: string) => {
     void copyText(value).then((failure) =>
       failure === null
@@ -1182,13 +1229,42 @@ function SessionDetail({
 
   return (
     <div className="flex flex-col gap-4">
-      <SessionBody session={s} now={now} copy={copy} reveal={reveal} />
-      {/* Both BELOW "Where it ran" and above the worktree jump, which is
-          the order the questions are asked in: what is this, how much was
-          it, what was it saying, and where do I go next. The preview is
-          last of the two because it is the one that costs a read. */}
-      <SessionUsage session={s} />
-      <TranscriptPreview session={s} />
+      {/* ONCE, here, with whatever the detail read has so far. Rendering
+          it again inside `SessionBody` would put two copies of the
+          liveness reason on screen -- caught by
+          `a crashed session states the crash`, which found two matches
+          for one sentence. */}
+      <SessionHeading session={s} now={now} detail={detail.data ?? undefined} />
+      {detail.isError ? (
+        <QueryError
+          title="No detail for this session"
+          message="The rest of this session's detail could not be read, so the resume command and the transcript are not shown."
+          onRetry={() => void detail.refetch()}
+        />
+      ) : detail.data === null ? (
+        // Resolved, and the store does not have it. A session deleted
+        // between two polls -- distinct from the arm above, which is the
+        // read itself failing.
+        <p className="text-xs text-[#8b949e]">
+          This session is no longer in the store, so there is nothing more to show about it.
+        </p>
+      ) : detail.data === undefined ? (
+        <p className="text-xs text-[#8b949e]">Reading the rest of this session…</p>
+      ) : (
+        <>
+          <SessionBody session={s} detail={detail.data} copy={copy} reveal={reveal} />
+          {/* Both BELOW "Where it ran" and above the worktree jump, which is
+              the order the questions are asked in: what is this, how much was
+              it, what was it saying, and where do I go next. The preview is
+              last of the two because it is the one that costs a read. */}
+          <SessionUsage detail={detail.data} />
+          <TranscriptPreview detail={detail.data} />
+        </>
+      )}
+      {/* OUTSIDE the detail gate: the jump is derived from `cwd` and
+          `git_branch`, both of which the list row already carries, so a
+          detail read that failed must not also cost the user the one
+          action that never depended on it. */}
       <WorktreeJump session={s} />
     </div>
   );
@@ -1340,17 +1416,68 @@ function WorktreeJump({ session: s }: { session: ClaudeSession }) {
   );
 }
 
+/// The heading: the title, the liveness and the two dates.
+///
+/// Split out of [`SessionBody`] for #985. Every field here comes from the
+/// LIST row, except `first_seen_at` -- so this renders immediately on
+/// selection rather than after the detail round-trip, which is what keeps
+/// the pane from flickering each time the user picks a row.
+///
+/// "Started" is therefore conditional: it is the detail's, and an absent
+/// detail must leave the line out rather than print a fabricated or
+/// zeroed date beside two real ones (#846).
+function SessionHeading({
+  session: s,
+  now,
+  detail,
+}: {
+  session: ClaudeSession;
+  now: number;
+  detail?: ClaudeSessionDetail;
+}) {
+  return (
+    <div>
+      <h2 className="text-sm font-semibold text-[#e6edf3]">{s.name ?? s.session_id}</h2>
+      <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[#8b949e]">
+        <LivenessBadge liveness={s.liveness} />
+        {s.last_activity_at ? (
+          <span>Last active {relativeTime(s.last_activity_at, new Date(now))}</span>
+        ) : (
+          <span>No recorded activity</span>
+        )}
+        {detail ? <span>Started {relativeTime(detail.first_seen_at, new Date(now))}</span> : null}
+      </div>
+      {/* The REASON, for the two states that have one. A "not running"
+          established by an orphaned registry entry is a crash and says
+          so; a "could not tell" says what stopped us. Hiding either
+          leaves the user with a verdict and no grounds.
+
+          From the LIST row, whose `why` is the interned sentence
+          resolved in `hydrateClaudeSessions` -- the same string, so this
+          reads exactly as it did before #985. */}
+      {s.liveness.state !== "running" ? (
+        <p className="mt-1.5 text-xs text-[#8b949e]">{s.liveness.why}</p>
+      ) : null}
+    </div>
+  );
+}
+
 /// The session detail's own fields, split from [`SessionDetail`] so the
 /// worktree section can sit beside them without this function growing a
 /// second concern.
+///
+/// Takes BOTH halves since #985: `session` is the list row and `detail`
+/// is what was fetched for it. Each field reads from whichever half
+/// actually carries it, so there is one place to check that the split
+/// lost nothing.
 function SessionBody({
   session: s,
-  now,
+  detail: d,
   copy,
   reveal,
 }: {
   session: ClaudeSession;
-  now: number;
+  detail: ClaudeSessionDetail;
   copy: (value: string, what: string) => void;
   reveal: (path: string, what: string) => void;
 }) {
@@ -1359,27 +1486,7 @@ function SessionBody({
   // they are spaced from each other.
   return (
     <>
-      <div>
-        <h2 className="text-sm font-semibold text-[#e6edf3]">{s.name ?? s.session_id}</h2>
-        <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[#8b949e]">
-          <LivenessBadge liveness={s.liveness} />
-          {s.last_activity_at ? (
-            <span>Last active {relativeTime(s.last_activity_at, new Date(now))}</span>
-          ) : (
-            <span>No recorded activity</span>
-          )}
-          <span>Started {relativeTime(s.first_seen_at, new Date(now))}</span>
-        </div>
-        {/* The REASON, for the two states that have one. A "not running"
-            established by an orphaned registry entry is a crash and says
-            so; a "could not tell" says what stopped us. Hiding either
-            leaves the user with a verdict and no grounds. */}
-        {s.liveness.state !== "running" ? (
-          <p className="mt-1.5 text-xs text-[#8b949e]">{s.liveness.why}</p>
-        ) : null}
-      </div>
-
-      <Resume session={s} onCopy={copy} />
+      <Resume session={s} detail={d} onCopy={copy} />
 
       <section className="rounded-md border border-[#30363d] bg-[#161b22] p-3">
         <h3 className="text-xs font-semibold text-[#e6edf3]">Where it ran</h3>
@@ -1397,7 +1504,7 @@ function SessionBody({
               <span className="break-all font-mono">{s.git_branch}</span>
             </Field>
           ) : null}
-          {s.claude_version ? <Field label="Claude">{s.claude_version}</Field> : null}
+          {d.claude_version ? <Field label="Claude">{d.claude_version}</Field> : null}
           <Field label="Session id">
             <span className="break-all font-mono">{s.session_id}</span>
           </Field>
@@ -1406,9 +1513,9 @@ function SessionBody({
               "we watched it and it ended" -- which is also the
               difference between two liveness answers. */}
           <Field label="Observed runs">
-            {s.runs === 0
+            {d.runs === 0
               ? "none — this session was read from its transcript, not watched while it ran"
-              : s.runs.toLocaleString()}
+              : d.runs.toLocaleString()}
           </Field>
         </dl>
         <div className="mt-3 flex flex-wrap gap-2">
@@ -1434,7 +1541,7 @@ function SessionBody({
           {!IS_MOBILE_BUILD ? (
             <RevealButton
               label="Reveal transcript"
-              path={s.transcript_path}
+              path={d.transcript_path}
               /* The TRANSCRIPT's own state, not the cwd's (#919). These
                  were the same expression until the corpus was measured
                  and the overwhelming majority of rows turned out to have
@@ -1446,7 +1553,7 @@ function SessionBody({
                  (#969), and the decision does not rest on its value: any
                  material disagreement between the two states is enough,
                  and re-measuring only ever strengthened it. */
-              state={s.transcript_state}
+              state={d.transcript_state}
               what="transcript"
               onReveal={reveal}
             />
@@ -1501,23 +1608,27 @@ function SessionBody({
 /// The error arm is BEFORE the empty arm, per #846: `data` is undefined on
 /// a rejection exactly as it is before the first read, so an error arm
 /// placed after would never render in the case it exists for.
-function SessionUsage({ session: s }: { session: ClaudeSession }) {
+function SessionUsage({ detail: d }: { detail: ClaudeSessionDetail }) {
   // The transcript's OWN state, never the cwd's (#919): 1,213 of 1,461
   // rows have a dead cwd and a live transcript, so a reading gated on the
   // cwd would be absent on almost every row.
-  const readable = s.transcript_path !== null && s.transcript_state.state !== "gone";
+  //
+  // Both readings come from the DETAIL since #985 -- the transcript path
+  // and its stat left the list row together, so there is no way for this
+  // to pair a path with someone else's state.
+  const readable = d.transcript_path !== null && d.transcript_state.state !== "gone";
   const { data, isError, error, isLoading } = useClaudeSessionUsage(
-    readable ? s.transcript_path : null,
+    readable ? d.transcript_path : null,
   );
 
   return (
     <section className="rounded-md border border-[#30363d] bg-[#161b22] p-3">
       <h3 className="text-xs font-semibold text-[#e6edf3]">How much work it did</h3>
-      {s.transcript_path === null ? (
+      {d.transcript_path === null ? (
         <p className="mt-2 text-xs text-[#8b949e]">
           No transcript was recorded for this session, so there is nothing to read this from.
         </p>
-      ) : s.transcript_state.state === "gone" ? (
+      ) : d.transcript_state.state === "gone" ? (
         <p className="mt-2 text-xs text-[#8b949e]">
           Its transcript is no longer on disk, so how much work it did cannot be read.
         </p>
@@ -1628,13 +1739,14 @@ function formatMb(bytes: number): string {
 /// The primary action stays the clipboard copy, for the reason
 /// `claudify_command` records: macOS has no default-terminal concept. This
 /// pane is for deciding, not for doing.
-function TranscriptPreview({ session: s }: { session: ClaudeSession }) {
+function TranscriptPreview({ detail: d }: { detail: ClaudeSessionDetail }) {
   const [open, setOpen] = useState(false);
-  // `transcript_state`, never `cwd_state` (#919, and `ClaudeSession`'s own
-  // doc): 0% of transcripts are gone against 83% of cwds.
-  const refusal = revealRefusal(s.transcript_path, s.transcript_state);
+  // `transcript_state`, never `cwd_state` (#919, and
+  // `ClaudeSessionDetail`'s own doc): 0% of transcripts are gone against
+  // 83% of cwds. Both live on the detail since #985.
+  const refusal = revealRefusal(d.transcript_path, d.transcript_state);
   const { data, isError, error, isLoading } = useClaudeTranscriptTail(
-    s.transcript_path,
+    d.transcript_path,
     open && refusal === null,
   );
 
@@ -1955,9 +2067,15 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 /// not establish it, so the label must not imply we did.
 function Resume({
   session: s,
+  detail: d,
   onCopy,
 }: {
   session: ClaudeSession;
+  /// The command itself, built on the backend against the cwd's state.
+  /// From the DETAIL since #985: it restated the `cwd` a second time on
+  /// every one of 1,474 rows to be read on one, which was 25.6% of the
+  /// payload -- the single largest field.
+  detail: ClaudeSessionDetail;
   onCopy: (value: string, what: string) => void;
 }) {
   if (s.liveness.state === "running") {
@@ -1979,7 +2097,7 @@ function Resume({
     );
   }
 
-  const anchored = s.resume.anchored;
+  const anchored = d.resume.anchored;
   return (
     <section
       className={`rounded-md border p-3 ${
@@ -2000,13 +2118,13 @@ function Resume({
           line before pasting it can see the `cd` -- or see that there
           is none, which is the whole point of the caveat below. */}
       <pre className="mt-2 overflow-x-auto rounded bg-[#0d1117] px-2 py-1.5 font-mono text-[11px] text-[#e6edf3]">
-        {s.resume.command}
+        {d.resume.command}
       </pre>
       {/* Never collapsed into the button's label, and never hidden
           behind a tooltip: this is the sentence that stops the command
           landing in the wrong tree. */}
-      {s.resume.caveat ? (
-        <p className="mt-2 text-xs text-[#d29922]">{s.resume.caveat}</p>
+      {d.resume.caveat ? (
+        <p className="mt-2 text-xs text-[#d29922]">{d.resume.caveat}</p>
       ) : null}
       {s.liveness.state === "unknown" ? (
         <p className="mt-1 text-xs text-[#8b949e]">
@@ -2017,7 +2135,7 @@ function Resume({
       <button
         type="button"
         onClick={() =>
-          onCopy(s.resume.command, anchored ? "Resume command" : "Resume command (no directory)")
+          onCopy(d.resume.command, anchored ? "Resume command" : "Resume command (no directory)")
         }
         className={`tap-target mt-2 rounded-md px-2 py-1 text-xs ${
           anchored

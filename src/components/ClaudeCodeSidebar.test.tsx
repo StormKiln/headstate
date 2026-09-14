@@ -42,24 +42,18 @@ vi.mock("../api/tauri", () => ({ claudeRevealPath: vi.fn() }));
 
 import { CLAUDE_PAGES, ClaudeCodeSidebar } from "./ClaudeCodeSidebar";
 
+/// One LIST row. The detail half is not built here: this file renders
+/// `ClaudeSessionColumn`, which since #985 receives only what the list
+/// carries -- so a fixture with a resume command in it would describe a
+/// payload this component never sees.
 const session = (over: Partial<ClaudeSession> = {}): ClaudeSession => ({
   session_id: "e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2",
   name: "HeadState GitHub issues filing",
   cwd: "/Users/acme/code/widget",
   git_branch: "feat/spoon",
-  claude_version: "2.1.270",
-  transcript_path: "/Users/acme/.claude/projects/slug/e5dff3bd.jsonl",
-  first_seen_at: "2026-09-11T09:00:00Z",
   last_activity_at: "2026-09-13T09:00:00Z",
   liveness: { state: "dead", why: "pid 14779 is no longer running" },
   cwd_state: { state: "exists" },
-  transcript_state: { state: "exists" },
-  resume: {
-    command: "cd '/Users/acme/code/widget' && claude --resume e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2",
-    caveat: null,
-    anchored: true,
-  },
-  runs: 1,
   ...over,
 });
 
