@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Bot, Circle, FolderOpen, GitBranch, RefreshCw, Search, Terminal } from "lucide-react";
 import { toast } from "sonner";
 import type {
@@ -19,6 +19,7 @@ import { copyText } from "@/lib/clipboard";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { relativeTime } from "@/lib/time";
 import { useIsMobile } from "@/lib/useIsMobile";
+import { useRowCursor } from "@/lib/useRowCursor";
 import { pathBasename, safetyReason, sessionWorktree } from "@/lib/worktrees";
 import { type ClaudeSessionFilter, useFilters } from "@/store/filters";
 import { QueryError, errorMessage } from "./QueryError";
@@ -500,10 +501,66 @@ export function ClaudeSessionColumn() {
   const setFilter = useFilters((f) => f.setClaudeFilter);
   const selected = useFilters((f) => f.claudeSelected);
   const selectSession = useFilters((f) => f.selectClaudeSession);
+  // The single app-wide keyboard cursor (#953). One cursor, owned by
+  // whichever view has claimed it -- `filters.ts` holds one value and
+  // #953 forbids a second, because two lists owning two cursors is the
+  // drift this repo refuses elsewhere.
+  const cursor = useFilters((f) => f.cursor);
+  const setCursor = useFilters((f) => f.setCursor);
   // Local, not in the store: unlike the query and the selection nothing
   // outside this component reads it, and it is a statement about how much
   // of ONE rendering of the list has been asked for.
   const [showAll, setShowAll] = useState(false);
+
+  // The rows `j`/`k`/`Enter` walk (#953). The longest list in the app --
+  // ~1,474 rows with "Show all" pressed, each one a focusable button with
+  // no roving tabindex -- and the one the issue measures as unusable by
+  // Tab.
+  //
+  // `capped`, not `matched.ordered`: the cursor must walk what is DRAWN.
+  // Below the "Show all" button the remaining rows are not in the DOM, so
+  // a cursor that could reach index 500 of 1,474 would highlight nothing
+  // and `Enter` would open a session the user cannot see.
+  //
+  // No `toggle`: sessions have no bulk action, so `x` does nothing here
+  // rather than inventing a selection with nothing to act on it. The
+  // shortcut help in Settings says "pull request" for that key, which
+  // stays accurate.
+  //
+  // Declared BEFORE the early returns below, as the Rules of Hooks
+  // require -- which is why the loading and failed cases are spelled out
+  // here rather than left to the fact that those branches return early.
+  //
+  // They are NOT the same absence. `useMatchedSessions` reads its own
+  // query and goes on returning the previous `ordered` while `list` is
+  // refetching or has rejected, so a target built from `matched` alone
+  // reported rows for a column that was drawing a spinner or a retry
+  // button. `j` would then move a cursor through rows that are not on
+  // screen and `Enter` would open one of them -- the exact stale-list
+  // hazard #953 forbids, arriving through the error path rather than
+  // through filtering.
+  //
+  // An empty array is the honest answer for both: there is no list to
+  // walk, so the keys do nothing.
+  const rowsDrawn = list.isLoading || list.isError ? [] : (matched?.ordered ?? []);
+  const visibleRows = showAll ? rowsDrawn : rowsDrawn.slice(0, RENDER_CAP);
+  useRowCursor({
+    rows: () => visibleRows.length,
+    open: (i) => {
+      const s = visibleRows[i];
+      if (s) selectSession(s.session_id);
+    },
+  });
+  // A cursor past the end of a newly-narrowed list points at nothing.
+  // Clamped here for the reason `App.tsx` gives about the PR list:
+  // clamping at render time keeps it correct for DRAWING -- the ring --
+  // and not only for the next key press. Typing into the search box is
+  // the common way this list shrinks under a cursor.
+  useEffect(() => {
+    if (cursor !== null && cursor >= visibleRows.length) {
+      setCursor(visibleRows.length > 0 ? visibleRows.length - 1 : null);
+    }
+  }, [cursor, visibleRows.length, setCursor]);
 
   if (list.isLoading) {
     return <p className="p-3 text-xs text-[#8b949e]">Reading Claude Code sessions…</p>;
@@ -525,7 +582,10 @@ export function ClaudeSessionColumn() {
     );
   }
 
-  const capped = showAll ? matched.ordered : matched.ordered.slice(0, RENDER_CAP);
+  // `visibleRows` above, narrowed: `matched` is non-null past the error
+  // arm. One list, so the rows the cursor walks and the rows drawn cannot
+  // drift apart -- which is the whole hazard a registered cursor has.
+  const capped = visibleRows;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -642,12 +702,22 @@ export function ClaudeSessionColumn() {
             <NoSessions imported={imported} />
           )
         ) : (
-          capped.map((s) => (
+          capped.map((s, i) => (
             <SessionEntry
               key={s.session_id}
               session={s}
               now={now}
               active={s.session_id === selected}
+              // The keyboard cursor, drawn as a ring (#953). `PrList`
+              // passes it the same way and for the same reason: only the
+              // list knows a row's index, and the cursor is an index.
+              //
+              // DISTINCT from `active`, which is the selection. Both can
+              // be on at once and they mean different things -- the
+              // cursor is where the next `Enter` lands, the selection is
+              // what the detail pane is showing -- so the ring is drawn
+              // over the blue rather than instead of it.
+              cursored={cursor === i}
               onSelect={() => selectSession(s.session_id)}
             />
           ))
@@ -1010,6 +1080,7 @@ function SessionEntry({
   session: s,
   now,
   active,
+  cursored = false,
   onSelect,
 }: {
   session: ClaudeSession;
@@ -1017,6 +1088,17 @@ function SessionEntry({
   /// `Date.now()`.
   now: number;
   active: boolean;
+  /// Whether the keyboard row cursor is on this row (#953).
+  ///
+  /// Distinct from `active`: `active` is the SELECTION, which the detail
+  /// pane is showing, and this is where the next `Enter` would land.
+  /// `PrRow` draws the same distinction with the same ring, and its
+  /// comment gives the reason the ring is not a background -- "a cursor
+  /// that looked like a hover" is not a cursor.
+  ///
+  /// Defaulted, so the phone's mount point and any future caller that
+  /// does not drive a cursor need not pass it.
+  cursored?: boolean;
   onSelect: () => void;
 }) {
   const note = cwdNote(s.cwd_state);
@@ -1027,7 +1109,7 @@ function SessionEntry({
       aria-current={current(active)}
       className={`mb-1 flex w-full flex-col items-start gap-0.5 rounded px-2 py-1.5 text-left ${
         active ? "bg-[#1f6feb] text-white" : "text-[#e6edf3] hover:bg-[#161b22]"
-      }`}
+      } ${cursored ? "ring-2 ring-inset ring-[#1f6feb]" : ""}`}
     >
       <span className="flex w-full items-center gap-1.5">
         <Bot className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />

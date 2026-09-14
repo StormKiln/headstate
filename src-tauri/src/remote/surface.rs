@@ -342,7 +342,13 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("clear_assessed", Class::Write),
     ("set_cleanup_prefs", Class::Write),
     ("set_poll_interval", Class::Write),
-    ("open_update_pr", Class::Write),
+    // `open_update_pr` was a `Write` row here and is gone (#964), with
+    // its `#[tauri::command]` wrapper and its `lib.rs` registration. #626
+    // superseded the two-phase flow, so nothing on the desktop called it
+    // and only a paired phone could reach it -- one fewer `Write` on the
+    // wire. `commands::open_update_pr_inner` is the live code and stays;
+    // `apply_updates_in_background`, still classed below, is how the
+    // phone drives an update now.
     // Driving the desktop IS the companion, so these are Write
     // rather than Local: pulling a checkout, starting the desktop's
     // Docker and restarting it are the things a person opens the
@@ -446,7 +452,12 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("docker_remove_images", Class::Destructive),
     ("docker_remove_volume", Class::Destructive),
     ("docker_prune_cache", Class::Destructive),
-    ("apply_package_updates", Class::Destructive),
+    // `apply_package_updates` was a `Destructive` row here and is gone
+    // (#964), the largest single reduction in this table's write surface:
+    // it ran package managers in write mode, in a worktree, from a phone,
+    // down a path #626 left with no desktop caller and no frontend test.
+    // The apply helpers stay -- `apply_updates_in_background` below is
+    // what actually runs an update, and it is classed and dispatched.
     // local: not exposed remotely.
     ("diag_log", Class::Local),
     ("reveal_log", Class::Local),
@@ -880,9 +891,12 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             app.state(),
             app.state(),
         )),
-        "open_update_pr" => {
-            res(commands::open_update_pr(app.state(), a.get("repoPath")?, a.get("report")?).await)
-        }
+        // `open_update_pr`'s arm went with its row in `SURFACE` (#964).
+        // `every_remote_command_has_a_dispatch_arm` reads that table, so
+        // the two must move together: a row with no arm fails it, and an
+        // arm with no row is dead but harmless -- `dispatch` is only ever
+        // reached through `admit`. Removed anyway, because an arm nothing
+        // can route to is the next reader's puzzle.
 
         // ---- destructive (signature already verified by the handler) ----
         "delete_head_branch" => res(commands::delete_head_branch(
@@ -947,9 +961,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             let until: Option<String> = a.get("until")?;
             res(blocking(move || commands::docker_prune_cache(until)).await?)
         }
-        "apply_package_updates" => {
-            res(commands::apply_package_updates(a.get("repoPath")?, a.get("requests")?).await)
-        }
+        // `apply_package_updates`' arm went with its row too (#964).
 
         // A classified, non-local command with no arm is a wiring bug
         // that the source test catches; at runtime it must still refuse
@@ -1261,5 +1273,71 @@ mod tests {
         let r: Result<(), String> = Err(commands::AUTH_ERR.to_string());
         assert_eq!(res(r), Err(RemoteError::Command(commands::AUTH_ERR.into())));
         assert_eq!(res(Ok(("a".to_string(), 1u64))), Ok(json!(["a", 1])));
+    }
+
+    /// The two superseded update commands are off the wire (#964).
+    ///
+    /// Named explicitly rather than left to
+    /// `every_registered_command_has_exactly_one_class`, which asserts
+    /// the two lists AGREE and is therefore satisfied by putting both
+    /// rows back alongside both registrations. This says which direction
+    /// the agreement must be reached in: these two are gone, and a
+    /// re-registration is a decision to make deliberately rather than by
+    /// restoring a line that looked missing.
+    ///
+    /// The evidence they are dead is in the issue: `apply_updates_in_
+    /// background` supersedes both, and it is asserted present below so
+    /// this cannot pass by the whole flow having been deleted.
+    #[test]
+    fn the_superseded_update_commands_are_not_on_the_remote_surface() {
+        for gone in ["apply_package_updates", "open_update_pr"] {
+            assert_eq!(
+                class_of(gone),
+                None,
+                "{gone} is classified again; #964 removed it because #626 \
+                 left it with no desktop caller while a paired phone could \
+                 still dispatch it. Re-adding it needs a desktop route first."
+            );
+        }
+        // The flow that replaced them, so this test fails if the removal
+        // is ever "fixed" by deleting the update feature instead.
+        assert_eq!(
+            class_of("apply_updates_in_background"),
+            Some(Class::Write),
+            "the flow that supersedes them must still be reachable"
+        );
+    }
+
+    /// And the wrapper functions themselves are gone from `commands.rs`,
+    /// not merely unregistered.
+    ///
+    /// A `#[tauri::command]` left in place with no entry in
+    /// `generate_handler!` is invisible to every guard in this file --
+    /// they all read the registration list -- and it is the shape the
+    /// next person re-registers by accident, because the function is
+    /// sitting there looking like a command. So the source is read
+    /// directly, the same technique `registered_commands` above uses.
+    ///
+    /// `open_update_pr_inner` must SURVIVE: it is the live code
+    /// `apply_updates_in_background` calls, and a fix that removed it
+    /// would take the pull-request half of the update flow with it.
+    #[test]
+    fn the_superseded_wrappers_are_gone_from_commands_rs_but_the_helper_is_not() {
+        let src = include_str!("../commands.rs");
+        for gone in ["apply_package_updates", "open_update_pr"] {
+            let sig = format!("pub async fn {gone}(");
+            assert!(
+                !src.contains(&sig),
+                "commands.rs still defines `{sig}`; an unregistered \
+                 command is invisible to every guard here and is how it \
+                 gets re-registered by accident"
+            );
+        }
+        assert!(
+            src.contains("pub(crate) async fn open_update_pr_inner("),
+            "open_update_pr_inner is the live code apply_updates_in_background \
+             calls; removing it would take the pull-request half of the \
+             update flow with it"
+        );
     }
 }

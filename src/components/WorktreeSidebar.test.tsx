@@ -11,14 +11,22 @@ const repos = vi.hoisted(() => vi.fn<() => unknown>(() => []));
 // rejecting, which is a FOURTH state -- "we looked, and could not read
 // all of where we looked" -- and every count in this column is then a
 // floor rather than a total.
+// `dirs` since #952: the scan's INPUT is a fifth state -- "we had
+// nowhere to look" -- and it is the one a first-run machine is in.
 const scan = vi.hoisted(() => ({
   loading: false,
   failed: false,
   unreadable: [] as string[],
+  dirs: ["/code"] as string[],
 }));
 const refetchFn = vi.hoisted(() => vi.fn());
 
 vi.mock("../api/hooks", () => ({
+  // #952. A CONFIGURED directory by default, so every pre-existing
+  // assertion below keeps reading the arm it was written for: with no
+  // directories the column now says "does not know where your
+  // repositories are" instead, which is the point of the split.
+  useWorktreeDirs: () => ({ dirs: scan.dirs, set: vi.fn() }),
   useWorktrees: () => ({
     data: repos(),
     isLoading: scan.loading,
@@ -126,6 +134,7 @@ beforeEach(() => {
   // turns every count in every other test into a floor and puts a banner
   // above the rows they assert on.
   scan.unreadable = [];
+  scan.dirs = ["/code"];
   refetchFn.mockClear();
   useFilters.setState({
     filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},

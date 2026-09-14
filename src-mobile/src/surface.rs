@@ -197,7 +197,17 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("clear_assessed", Class::Write),
     ("set_cleanup_prefs", Class::Write),
     ("set_poll_interval", Class::Write),
-    ("open_update_pr", Class::Write),
+    // `open_update_pr` was a `Write` row here, mirroring the desktop's,
+    // and both are gone (#964). Removed in the SAME change, which is
+    // what `table_is_identical_to_the_desktop_table` enforces: it parses
+    // the desktop's source at test time, so a row left here after the
+    // desktop dropped one fails the mobile tests until this copy catches
+    // up.
+    //
+    // What the phone loses is a command it could dispatch and the desktop
+    // could not: #626 superseded the two-phase flow. Updates are driven
+    // through `apply_updates_in_background`, which is still classed and
+    // still reachable from here.
     // Driving the desktop IS the companion, so these are Write
     // rather than Local: pulling a checkout, starting the desktop's
     // Docker and restarting it are the things a person opens the
@@ -263,7 +273,12 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("docker_remove_images", Class::Destructive),
     ("docker_remove_volume", Class::Destructive),
     ("docker_prune_cache", Class::Destructive),
-    ("apply_package_updates", Class::Destructive),
+    // `apply_package_updates` was the matching `Destructive` row and is
+    // gone with the desktop's (#964). It was the one entry in this table
+    // that let a phone run package managers in WRITE mode down a path no
+    // desktop control could reach, which is why it is worth naming here
+    // rather than merely deleting: the phone is now strictly narrower
+    // than the desktop on this flow, not wider.
     // local: not exposed remotely.
     ("diag_log", Class::Local),
     ("reveal_log", Class::Local),

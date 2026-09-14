@@ -54,6 +54,7 @@ import { PullIndicator } from "./components/PullIndicator";
 import { Sheet, SheetContent, SheetTitle } from "./components/ui/sheet";
 import { applyFilters, hasActiveFilters, sortPrs } from "./lib/derive";
 import { shortcutFor } from "./lib/shortcuts";
+import { activeRowCursor, nextCursor, type RowCursorTarget } from "./lib/rowCursor";
 import { useIsMobile } from "./lib/useIsMobile";
 import { relativeSeconds } from "./lib/time";
 import { MOBILE_HIDDEN_VIEWS, useActiveFilters, useFilters } from "./store/filters";
@@ -417,6 +418,13 @@ export default function App() {
   // rendering too, not just for the next key press.
   const { cursor, setCursor } = useFilters();
   useEffect(() => {
+    // Only while My PRs owns the cursor (#953). Another view's list is
+    // a different length, and clamping its cursor against `visible` --
+    // which is the PR list whatever view is on screen -- would drag a
+    // sessions cursor down to the number of pull requests, or to `null`
+    // when there are none. The owning view does its own clamping;
+    // `nextCursor` is the shared rule.
+    if (activeRowCursor() !== null) return;
     if (cursor !== null && cursor >= visible.length) {
       setCursor(visible.length > 0 ? visible.length - 1 : null);
     }
@@ -442,29 +450,72 @@ export default function App() {
         // that cannot work.
         if (IS_DESKTOP_BUILD) void getCurrentWindow().hide();
       } else if (action === "onFocusSearch") {
-        const el = document.querySelector<HTMLInputElement>('input[type="search"]');
+        // The VISIBLE search box, not the document's first (#953).
+        //
+        // This was a bare `querySelector('input[type="search"]')`, a
+        // global first-match. It worked on the sessions page only by
+        // coincidence -- that page happens to have exactly one -- and
+        // nothing asserted it, so a second search input anywhere would
+        // have silently stolen `/` from whichever page came later in the
+        // DOM.
+        //
+        // `offsetParent` is the test rather than a view lookup, because
+        // the hidden inputs here are hidden by CSS: the phone's two-pane
+        // views keep the list mounted under a `hidden` class so scrolling
+        // back keeps its position, and Settings' sections are all
+        // rendered with only one unhidden. An element inside any of those
+        // has a null `offsetParent`, which is exactly "not on screen".
+        //
+        // Falls back to the first match when nothing is visible, so the
+        // behaviour is never worse than it was.
+        const boxes = [...document.querySelectorAll<HTMLInputElement>('input[type="search"]')];
+        const el = boxes.find((b) => b.offsetParent !== null) ?? boxes[0];
         el?.focus();
         el?.select();
       } else {
-        // List navigation reads `visibleRef` rather than closing over
-        // `visible`: this effect mounts once, so a captured list would
-        // freeze at whatever was on screen at first render and the
-        // cursor would walk a stale list after any filter change.
-        const rows = visible;
-        if (rows.length === 0) return;
-        const { cursor, setCursor, toggleChecked } = useFilters.getState();
-        if (action === "onNext") {
+        // The list the cursor walks, decided HERE rather than baked in
+        // (#953).
+        //
+        // This branch used to read `visible` -- a `PullRequest[]` -- and
+        // index into it with `selectPr` and a `repo#number` key, which is
+        // why `j`/`k`/`Enter`/`x` worked on exactly one list of ten and
+        // silently moved a PR cursor behind the other nine.
+        //
+        // A view that has claimed the cursor answers first; My PRs is the
+        // fallback and is expressed in the same vocabulary, so there is
+        // one code path rather than a special case for the original list.
+        // `activeRowCursor()` is CALLED here, at keypress time, not
+        // captured at mount -- the constraint #953 states explicitly,
+        // and the same one the `visible` dependency below encodes.
+        const registered = activeRowCursor();
+        const target: RowCursorTarget = registered ?? {
+          rows: () => visible.length,
+          open: (i) => {
+            const pr = visible[i];
+            if (pr) selectPr({ repo: pr.repo, number: pr.number });
+          },
+          toggle: (i) => {
+            const pr = visible[i];
+            if (pr) useFilters.getState().toggleChecked(`${pr.repo}#${pr.number}`);
+          },
+        };
+        const rows = target.rows();
+        if (rows === 0) return;
+        const { cursor, setCursor } = useFilters.getState();
+        if (action === "onNext" || action === "onPrev") {
           // Clamped, not wrapped: wrapping from the bottom back to the
-          // top silently moves the eye across the whole screen.
-          setCursor(cursor === null ? 0 : Math.min(cursor + 1, rows.length - 1));
-        } else if (action === "onPrev") {
-          setCursor(cursor === null ? 0 : Math.max(cursor - 1, 0));
-        } else if (cursor !== null && rows[cursor]) {
-          const pr = rows[cursor];
+          // top silently moves the eye across the whole screen. The rule
+          // lives in `nextCursor` now, so it is stated once and tested
+          // without a DOM.
+          setCursor(nextCursor(cursor, rows, action === "onNext" ? "next" : "prev"));
+        } else if (cursor !== null && cursor < rows) {
           if (action === "onOpen") {
-            selectPr({ repo: pr.repo, number: pr.number });
+            target.open(cursor);
           } else if (action === "onToggleSelect") {
-            toggleChecked(`${pr.repo}#${pr.number}`);
+            // Optional by design: a list with no bulk action leaves
+            // `toggle` out and `x` does nothing there, rather than the
+            // view inventing a selection it cannot act on.
+            target.toggle?.(cursor);
           }
         }
       }

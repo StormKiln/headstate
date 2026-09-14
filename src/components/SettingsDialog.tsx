@@ -28,6 +28,7 @@ import {
   toggleChild,
   toggleParent,
 } from "@/lib/cleanupGroups";
+import { STALE_DAY_CHOICES, staleDaysLabel, staleVenvDays } from "@/lib/staleVenv";
 
 /// Matches the backend's own range: `clamp_interval` allows 60s..3600s
 /// (`poll.rs`), and the UI previously stopped at 900 -- so a user who
@@ -396,11 +397,23 @@ export function SettingsDialog({
         <div className="mt-5 flex flex-col gap-1">
           <span className="text-sm font-medium">Keyboard</span>
           <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-xs text-[#8b949e]">
+            {/* The grid said "pull request" twice, and #953 filed that as
+                missing functionality rather than wrong documentation
+                precisely because it was HONEST: the cursor really did
+                only walk the pull request list.
+
+                It now walks the Claude Code sessions list too, so the
+                wording follows -- "the highlighted row" for the two keys
+                that are no longer PR-only, and `x` stays specific because
+                it still is: sessions have no bulk action, so the key does
+                nothing there rather than inventing a selection. Saying
+                "row" for `x` would make this grid wrong in the direction
+                the issue was careful not to be. */}
             {[
               ["j / k", "Move down / up the list"],
-              ["Enter", "Open the highlighted pull request"],
-              ["x", "Select the highlighted pull request"],
-              ["/", "Search"],
+              ["Enter", "Open the highlighted row"],
+              ["x", "Select the highlighted pull request, for a bulk action"],
+              ["/", "Search the list on screen"],
               ["Esc", "Hide the window to the tray"],
             ].map(([keys, what]) => (
               <div key={keys} className="contents">
@@ -782,6 +795,72 @@ export function SettingsDialog({
               })}
             </>
           ) : null}
+        </div>
+
+        {/* `stale_venv_days`, which had no control at all (#957).
+
+            Here rather than under Repositories because it is about what
+            gets RECLAIMED, which is this section's subject -- and beside
+            the automatic-cleanup block above because both answer "what is
+            this app allowed to consider disposable".
+
+            Outside the `cleanup?.enabled` gate deliberately: the
+            threshold governs the Artifacts page's Stale badge and its
+            checkboxes whether or not the unattended pass is on, so hiding
+            it behind that switch would hide the number that labels rows a
+            user is looking at right now.
+
+            A SELECT, not a number field. `poll::stale_venv_days` clamps
+            to 30..3650 and its comment says why the floor matters --
+            "this number gates a delete once the opt-in above is on, so
+            the floor is what stops a typo in Settings from making live
+            work selectable". A free-text field would have to
+            re-implement that clamp on the way in, and a field that
+            silently rewrites 7 to 30 leaves the user believing a
+            threshold the app does not have. The poll interval's
+            `INTERVALS` is the same choice for the same reason. */}
+        <div className="mt-5 flex flex-col gap-1 border-t border-[#30363d] pt-4">
+          <h3 className="text-sm font-semibold text-[#e6edf3]">Virtualenvs</h3>
+          <label className="flex items-center gap-2 text-sm">
+            Call a virtualenv stale after
+            <select
+              className="rounded border border-[#30363d] bg-[#0d1117] px-2 py-1 text-sm"
+              // Resolved, never the raw stored value: `stale_venv_days`
+              // defaults to 0 and every existing install therefore holds
+              // one. Rendering that 0 would show a threshold of zero days
+              // -- "everything is stale" -- which is the exact misreading
+              // the field's own doc comment forbids. `staleVenvDays` is
+              // the same `0 ⇒ 90` the backend applies.
+              value={staleVenvDays(ui?.stale_venv_days)}
+              onChange={(e) => {
+                const next = Number(e.target.value);
+                // Writes the NUMBER, not 0-for-default. Picking 90 stores
+                // 90, so the value shown is the value stored and a later
+                // change to the default cannot silently move a threshold
+                // the user chose. 0 remains the "never set" reading for
+                // an install that has not touched this.
+                if (ui && Number.isInteger(next)) {
+                  void setUi({ ...ui, stale_venv_days: next });
+                }
+              }}
+              aria-label="Days idle before a virtualenv counts as stale"
+            >
+              {STALE_DAY_CHOICES.map((d) => (
+                <option key={d} value={d}>
+                  {staleDaysLabel(d)}
+                </option>
+              ))}
+            </select>
+          </label>
+          {/* Says what the number actually DOES, on both sides. Labelling
+              and deleting are two different consequences of one setting,
+              and a user moving it wants to know it widens what a click can
+              remove -- not only what a badge says. */}
+          <p className="text-xs text-[#8b949e]">
+            Sets the Stale badge on the Artifacts page, and the threshold the
+            removal re-checks before deleting anything. Orphaned virtualenvs —
+            ones whose project directory is gone — are unaffected.
+          </p>
         </div>
 
         {/* Every one of these already worked and none was mentioned

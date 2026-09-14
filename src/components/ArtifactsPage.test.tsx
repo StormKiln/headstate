@@ -50,6 +50,10 @@ vi.mock("../api/hooks", () => ({
   }),
   useVenvSizes: () => ({ sizes: new Map(), idle: new Map(), measuring: false }),
   useRemoveVenvs: () => vi.fn(),
+  // `VenvSection` reads the staleness threshold from here since #957. `0`
+  // is what every install stores and what `staleVenvDays` reads as "use
+  // the default", so this section behaves exactly as it did before.
+  useUiPrefs: () => ({ prefs: { stale_venv_days: 0 }, set: vi.fn() }),
   // The page renders CleanupLog on "Everything"; it has its own test
   // file, so this is stubbed empty rather than exercised here.
   useCleanupLog: () => ({ entries: [], isLoading: false, run: () => Promise.resolve([]) }),

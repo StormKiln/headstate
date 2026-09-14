@@ -1828,21 +1828,29 @@ mod tests {
             (!name.is_empty() && !name.contains(char::is_whitespace)).then(|| name.to_string())
         };
 
-        // Two commands are unreachable TODAY and tracked in #964:
-        // `apply_package_updates` and `open_update_pr` were superseded by
-        // the per-package flow and never unregistered, so they remain
-        // remotely dispatchable with nothing on the desktop calling them.
+        // EMPTY, and #964 is why.
         //
-        // Listed rather than silently tolerated, and deliberately not
-        // fixed here: unregistering a command changes what a paired phone
-        // can reach, which is a remote-surface decision with its own
-        // allowlist copies to update, and it does not belong inside the
-        // fix for a different defect. This guard found them
-        // independently, which is the evidence #964 wanted.
+        // This list held `apply_package_updates` and `open_update_pr`:
+        // superseded by #626's `apply_updates_in_background` and never
+        // unregistered, so they stayed remotely dispatchable at
+        // `Destructive` and `Write` with nothing on the desktop calling
+        // them. The entry's own comment said "when #964 lands, these
+        // lines come out with it", and the assertion below is what made
+        // that more than a note -- an exemption for a command that is no
+        // longer registered fails, so the fix could not land half-done.
         //
-        // Deleting an entry here must make the test FAIL, not pass -- so
-        // when #964 lands, these lines come out with it.
-        const KNOWN_UNREACHABLE: &[&str] = &["apply_package_updates", "open_update_pr"];
+        // #964 unregistered both and dropped their rows from
+        // `remote/surface.rs`, its `dispatch`, and
+        // `src-mobile/src/surface.rs`. The helpers they wrapped
+        // (`open_update_pr_inner`, `packages::apply::run`) are the live
+        // code and stay.
+        //
+        // Kept as an empty list rather than deleted along with the loop
+        // below: the next superseded command wants exactly this
+        // structure, and the pair of assertions -- one for unreachable
+        // commands, one for exemptions that have stopped being needed --
+        // is the mechanism, not the entries.
+        const KNOWN_UNREACHABLE: &[&str] = &[];
 
         let mut unreachable = Vec::new();
         let mut stale_exemptions = Vec::new();
