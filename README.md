@@ -304,6 +304,23 @@ command per repo.
 estimated token counts, so instruction files that have quietly grown past
 useful are visible. The counts are estimates and every label says so.
 
+**Claude Code.** Your Claude Code sessions, and the ones worth bringing
+back. Sessions are read from the transcripts Claude Code already writes, so
+the view opens with real history rather than waiting for something to
+happen. Each row carries a three-state liveness — running, not running, or
+could not tell — and the resumable ones offer the exact `claude --resume`
+command, prefixed with a `cd` to the directory the session ran in, because
+`--resume` adopts the directory it is invoked from. An overview page counts
+what is resurrectable and what is archived because its directory is gone.
+
+**This is off by default.** Turn it on in Settings, under Claude
+Integrations. It stays off until asked for because the optional session hook
+appends to `~/.claude/settings.json`, and a feature that edits another
+tool's configuration should be requested rather than assumed. Without the
+hook the view still lists every session from the transcripts; the hook adds
+the process id, which is what lets Headstate tell a session that is running
+from one that was killed.
+
 **System health.** CPU, memory, disk, network, GPU and battery for the
 machine itself, with drill-down pages that answer the "why" a summary can
 only raise — a panel says memory is at 88%, the Memory page says which
