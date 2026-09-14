@@ -301,7 +301,7 @@ pub fn tail(path: &Path) -> Result<Preview, String> {
 /// reader that assumed either one alone is wrong on the other.
 fn blocks_of(content: Option<&serde_json::Value>) -> Vec<Block> {
     match content {
-        Some(serde_json::Value::String(s)) => vec![text_block(s, false)],
+        Some(serde_json::Value::String(s)) => vec![text_block(s)],
         Some(serde_json::Value::Array(items)) => items.iter().map(block_of).collect(),
         // Neither shape, including absent. An empty block list renders as
         // a message with nothing in it, which is what it is.
@@ -314,7 +314,7 @@ fn block_of(v: &serde_json::Value) -> Block {
     let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
     let field = |key: &str| v.get(key).and_then(|s| s.as_str()).unwrap_or("");
     match kind {
-        "text" => text_block(field("text"), false),
+        "text" => text_block(field("text")),
         "thinking" => {
             let (text, truncated) = clamp(field("thinking"));
             Block::Thinking { text, truncated }
@@ -345,7 +345,7 @@ fn block_of(v: &serde_json::Value) -> Block {
     }
 }
 
-fn text_block(s: &str, _nested: bool) -> Block {
+fn text_block(s: &str) -> Block {
     let (text, truncated) = clamp(s);
     Block::Text { text, truncated }
 }

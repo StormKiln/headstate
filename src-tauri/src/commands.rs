@@ -3953,9 +3953,21 @@ mod tests {
             // and this test PASSED on the broken guard it exists to
             // catch. A guard test that passes on the sabotage is worse
             // than none.
+            //
+            // `join`, never a `format!` with `/` separators. Windows
+            // `canonicalize` returns a VERBATIM path (`\\?\C:\...`), and
+            // the verbatim namespace takes no forward slashes and does no
+            // `..` resolution -- so a string-built path failed to open at
+            // all and this test reported error 123 instead of the
+            // containment refusal. CI found it; the GUARD was right and
+            // the test was spelling its input in a Unix-only way.
             let resolved_root = root.canonicalize().unwrap();
-            let sneaky = format!("{}/slug/../../secret.jsonl", resolved_root.display());
-            let e = transcript_path_in(&root, &sneaky).unwrap_err();
+            let sneaky = resolved_root
+                .join("slug")
+                .join("..")
+                .join("..")
+                .join("secret.jsonl");
+            let e = transcript_path_in(&root, sneaky.to_str().unwrap()).unwrap_err();
             assert!(
                 e.contains("is not a Claude Code transcript under"),
                 "a path that resolves outside the root must be refused, and \
@@ -4048,8 +4060,13 @@ mod tests {
             // `/private/var` and pass on a guard that never followed the
             // link at all.
             let resolved_root = root.canonicalize().unwrap();
-            let through_root = format!("{}/slug/innocent.jsonl", resolved_root.display());
-            let e = transcript_path_in(&root, &through_root).unwrap_err();
+            // `join` rather than a `format!` with `/`, matching the
+            // traversal test above. This one is `cfg(unix)` so it cannot
+            // hit the verbatim-path problem that broke that one -- but a
+            // second spelling of the same construction is how the next
+            // reader learns the wrong habit.
+            let through_root = resolved_root.join("slug").join("innocent.jsonl");
+            let e = transcript_path_in(&root, through_root.to_str().unwrap()).unwrap_err();
             assert!(
                 e.contains("is not a Claude Code transcript under"),
                 "a symlink is followed BEFORE the containment test, or the \
