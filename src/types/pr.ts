@@ -1052,6 +1052,103 @@ export interface ClaudeSession {
   runs: number;
 }
 
+
+/// How much work happened inside one session (#959).
+///
+/// Summed from the session's own transcript, per message, on demand.
+/// Rust side: `src-tauri/src/claude/usage.rs`, which carries the
+/// measurement that reopened #910's "usage is not in the data" cut --
+/// 1,478 of 1,502 real transcripts carry it.
+///
+/// # Four counters, not one total
+///
+/// Cache reads run two to three orders of magnitude above fresh input on
+/// every real session measured, so a single summed "tokens" figure would
+/// be a cache-read count wearing a misleading name.
+///
+/// # Tokens, never dollars
+///
+/// A dollar figure needs per-model rates, those rates change, and this
+/// app cannot keep a hardcoded table true. A quietly wrong cost with a
+/// currency symbol in front of it is the confident-wrong-answer failure
+/// #941 is about.
+export interface ClaudeUsage {
+  /// Assistant messages carrying a usage block. `0` means NONE WAS FOUND
+  /// -- 24 of 1,502 real transcripts -- and must never render as four
+  /// measured zeros. It is the gate for the whole panel.
+  messages: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  /// Models seen, with how many messages each wrote, most first. `model`
+  /// is per-MESSAGE and the corpus is mixed, so "which model was this
+  /// session" has no single answer.
+  models: { model: string; messages: number }[];
+  /// Whether the read stopped at the byte budget before the end of the
+  /// file. `true` makes every figure above a FLOOR, and the UI must say
+  /// so -- an unlabelled partial sum cannot be told from a complete one.
+  truncated: boolean;
+  bytes_read: number;
+  file_bytes: number;
+}
+
+/// One content block of a previewed message (#982).
+///
+/// A tagged union rather than a flattened string, because the kinds
+/// answer different questions and render differently: text is what was
+/// said, a tool call is what was done, and a tool result is usually far
+/// too long to show whole.
+export type ClaudePreviewBlock =
+  | { kind: "text"; text: string; truncated: boolean }
+  | { kind: "thinking"; text: string; truncated: boolean }
+  | { kind: "tool_use"; name: string }
+  | { kind: "tool_result"; text: string; truncated: boolean }
+  /// A block kind this build does not know. Reported rather than
+  /// dropped: Claude Code owns this format, and a pane that silently
+  /// omitted a future kind would show an exchange with an invisible hole
+  /// in it.
+  | { kind: "other"; block_type: string };
+
+/// One previewed message.
+///
+/// Not exported: it is reached only through `ClaudePreview.messages`, and
+/// `yarn knip` is right that a second name for the same shape earns
+/// nothing. The same call `ResumeCommand` above makes, and exporting it
+/// the moment something else needs it is one word.
+interface ClaudePreviewMessage {
+  /// `"assistant"` or `"user"`.
+  role: string;
+  /// RFC 3339, or `null` for a record that carried none. Never
+  /// substituted: a fabricated time cannot be told from a real one.
+  timestamp: string | null;
+  model: string | null;
+  blocks: ClaudePreviewBlock[];
+}
+
+/// The tail of one transcript, as conversation (#982).
+///
+/// Rust side: `src-tauri/src/claude/preview.rs`, which argues the 256 KB
+/// window, the record-type allowlist, and why both are reported.
+export interface ClaudePreview {
+  /// Oldest first, so it reads as a conversation.
+  messages: ClaudePreviewMessage[];
+  /// Whether anything before these messages was NOT read. The pane must
+  /// say so: a reader who cannot tell a short conversation from a
+  /// truncated one has been told something false by omission (#846).
+  truncated: boolean;
+  bytes_read: number;
+  file_bytes: number;
+  /// Records in the window that were machinery rather than conversation.
+  /// 44.2% of real records are, so a pane showing six messages out of a
+  /// 300-record window has to say where the rest went.
+  non_conversation_records: number;
+  /// Lines in the window that would not parse at all. DISTINCT from the
+  /// count above: one is a record we understood and chose not to show,
+  /// the other is one we could not read.
+  unparseable_records: number;
+}
+
 /// The session list, INCLUDING what could not be read (#917).
 ///
 /// `registry_failure` is the reason this is a envelope rather than a

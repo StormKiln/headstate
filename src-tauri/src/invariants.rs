@@ -1614,6 +1614,106 @@ mod tests {
         );
     }
 
+    /// Every crash notifier is WIRED, and reads the right count (#979).
+    ///
+    /// This is `every_registered_command_is_reachable_from_the_desktop`
+    /// applied to a notification instead of a command, and it exists for
+    /// the same reason that one does: #947's defect was a complete,
+    /// correct, well-tested capability that nothing on the desktop
+    /// called, and every test passed the whole time. A `notify_*` function
+    /// with no caller in the poll loop is that failure exactly -- the
+    /// alert would be implemented, classified, preferenced and dead.
+    ///
+    /// It also pins the count the notifier reads, which is the one thing
+    /// a unit test of the notifier itself cannot see. `crash::Recorded`
+    /// splits `crashed` (first observations) from `crashed_already_known`
+    /// (the same orphans, still on disk), and `crash.rs` records that
+    /// without the split an orphan "would appear to have crashed a few
+    /// seconds ago, forever". A notifier reading the wrong one fires every
+    /// sixty seconds until the file is removed, and nothing about the
+    /// notifier in isolation says which it reads.
+    ///
+    /// Sabotage: delete the `notify_claude_crash` call from the poll loop
+    /// in `lib.rs`, or swap `crashed_sessions` for `crashed_already_known`
+    /// there, and this names the failure.
+    #[test]
+    fn the_claude_crash_notifier_is_wired_and_reads_first_observations() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let lib = std::fs::read_to_string(manifest.join("src/lib.rs")).expect("read lib.rs");
+        let body = production(&lib);
+
+        assert!(
+            body.contains("fn notify_claude_crash"),
+            "the notifier itself is gone; if #979 was reverted, remove this \
+             guard deliberately rather than leaving it asserting nothing"
+        );
+        // Called, not merely defined. Counted, because the definition
+        // line also matches the name.
+        assert!(
+            body.matches("notify_claude_crash").count() >= 2,
+            "`notify_claude_crash` is defined and never called -- which is \
+             #947's defect with a notification in place of a command: the \
+             alert is implemented, classified, preferenced and dead"
+        );
+
+        // The poll loop's Claude arm, which is where it must be called
+        // from: the sweep that produces the signal runs there, on the
+        // 60-second timer, and a notifier anywhere else would be reading
+        // a sweep somebody else ran.
+        //
+        // Split on the gate EXPRESSION, not on the bare field name. The
+        // field is also named in two comments above the arm, and
+        // `production()` strips test modules rather than comments -- so a
+        // bare-name split lands on prose and this guard reported a
+        // correctly-wired notifier as missing. Found by running it.
+        let arm = body
+            .split_once("if commands::read_ui_prefs(&app_handle).claude_integrations_enabled {")
+            .map(|(_, rest)| rest)
+            .expect(
+                "locate the Claude arm of the poll loop by its gate expression; \
+                 if that line was reworded, update this split rather than \
+                 deleting the guard",
+            );
+        let arm = &arm[..arm.len().min(3_000)];
+        // CODE only. The arm's own comments name `crashed_already_known`
+        // to explain why it is not read, and a scan that could not tell
+        // code from prose would report the explanation as the defect --
+        // which it did, on the first run of this guard. A guard that
+        // cannot distinguish the two is a guard that fails on being
+        // documented.
+        let code: String = arm
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let arm = code.as_str();
+        assert!(
+            arm.contains("notify_claude_crash"),
+            "the crash notifier must be called from the poll loop's Claude \
+             arm, inside the `claude_integrations_enabled` gate -- a user \
+             who turned the feature off must not be interrupted by it"
+        );
+        assert!(
+            arm.contains("crashed_sessions"),
+            "the notifier must read `crashed_sessions`, which is built on \
+             the same arm that increments `crashed` -- the FIRST-observation \
+             count"
+        );
+        assert!(
+            !arm.contains("crashed_already_known"),
+            "the notifier must not read `crashed_already_known`: an orphan \
+             left on disk is re-swept every minute, so that count would \
+             announce the same dead session forever (`crash.rs`'s COALESCE \
+             is what makes the split true)"
+        );
+        assert!(
+            arm.contains("claude_crashed"),
+            "the notification must be gated on its own preference as well \
+             as on the feature switch, or turning it off does nothing"
+        );
+    }
+
     /// Every registered command is REACHABLE from the desktop (#947).
     ///
     /// `claude_poll_live` shipped in #927 registered in `generate_handler!`,

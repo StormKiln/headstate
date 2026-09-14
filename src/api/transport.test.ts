@@ -184,15 +184,26 @@ const ROWS: Row[] = [
   row(api.revealLog, [], "reveal_log"),
   row(api.scanClaudeMd, [repoPath], "scan_claude_md", { repoPath }),
   // The Claude Code cache, its session list and its aggregates (#914,
-  // #917, #921). Three of the four are argument-free: they operate on
+  // #917, #921). Three of these are argument-free: they operate on
   // `~/.claude` and Headstate's own database, whose locations the Rust
   // side resolves, so there is nothing for a caller to scope -- and a
   // path supplied over the wire would be a way to make the desktop read
-  // somewhere else. `claudeRevealPath` is the exception and takes the
-  // path from a row the caller already holds.
+  // somewhere else.
+  //
+  // Three take a path, and they split two ways. `claudeRevealPath` is
+  // `Class::Local`, so its argument can only come from this machine's own
+  // frontend, which holds the row it came from. The two per-session reads
+  // (#959, #982) are `Class::Read` -- the phone is the case they exist
+  // for -- so their argument DOES arrive over the wire, and
+  // `claude_transcript_path` in `commands.rs` resolves it against
+  // `~/.claude/projects` before reading a byte. That guard, not the
+  // absence of a parameter, is what keeps them from being "read anything
+  // and send it back".
   row(api.claudeImportTranscripts, [], "claude_import_transcripts"),
   row(api.claudeSessions, [], "claude_sessions"),
   row(api.claudeOverview, [], "claude_overview"),
+  row(api.claudeSessionUsage, [path], "claude_session_usage", { path }),
+  row(api.claudeTranscriptTail, [path], "claude_transcript_tail", { path }),
   row(api.claudeRevealPath, [path], "claude_reveal_path", { path }),
   row(api.readClaudeMd, [path], "read_claude_md", { path }),
   // The Claude Code hook installer (#915). All four take no arguments: the

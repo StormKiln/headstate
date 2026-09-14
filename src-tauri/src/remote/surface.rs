@@ -264,6 +264,47 @@ pub const SURFACE: &[(&str, Class)] = &[
     // it leads to is a copy of `claude --resume <id>`, which
     // `claudify_command` is already `Read` for.
     ("claude_overview", Class::Read),
+    // How much work happened inside ONE session, summed from its own
+    // transcript (#959).
+    //
+    // `Read`: it reads one `.jsonl` under `~/.claude/projects` and writes
+    // nothing at all -- not even to Headstate's cache, since the figures
+    // are derived per read and a stored copy is exactly the kind of
+    // refreshed-into-a-lie state migration 11 deliberately lacks.
+    //
+    // Exposed on `Local`'s own test -- could the phone act on the answer?
+    // Yes: "was that session the long one or the typo" is how a user
+    // decides which of 1,475 rows is worth resuming, and 994 assistant
+    // messages against 4 is the distinction nothing else on the row
+    // makes.
+    //
+    // The response is a handful of integers, so the transport cost is
+    // nil. The READ is bounded inside the command at 8 MB
+    // (`usage::BUDGET_BYTES`) and says when it stopped, which is what
+    // keeps the 76.7 MB transcript on the development machine from
+    // hanging a phone's request -- the same "the limits live inside the
+    // command" rule `stats_board` above is classed by.
+    ("claude_session_usage", Class::Read),
+    // The tail of one session's transcript, as conversation (#982).
+    //
+    // `Read`, and the phone's case here is STRONGER than the desktop's.
+    // `claude_reveal_path` is `Class::Local`, so until now a companion
+    // user who could see that a session died could not see one word of
+    // what it was doing -- the desktop user can `cat` the file and the
+    // companion user cannot reach the machine at all.
+    //
+    // It reads one `.jsonl` under `~/.claude/projects` and writes
+    // nothing; `~/.claude` stays read-only, per `claude/mod.rs`'s two
+    // stated exceptions, neither of which this is.
+    //
+    // The response is bounded inside the command -- a 256 KB window, at
+    // most 200 messages, each block clamped -- so the phone cannot be
+    // handed a 76 MB file by asking for one. Both commands resolve their
+    // path argument against `~/.claude/projects` before reading, because
+    // unlike `claude_reveal_path` a `Read` command's argument arrives
+    // from a paired device rather than from this machine's own frontend;
+    // `claude_transcript_path` in `commands.rs` argues it.
+    ("claude_transcript_tail", Class::Read),
     // Whether the Claude Code hooks are in `~/.claude/settings.json`
     // (#915).
     //
@@ -716,6 +757,8 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "claude_sessions" => res(commands::claude_sessions(app.clone()).await),
         "claude_poll_live" => res(commands::claude_poll_live(app.clone()).await),
         "claude_overview" => res(commands::claude_overview(app.clone()).await),
+        "claude_session_usage" => res(commands::claude_session_usage(a.get("path")?).await),
+        "claude_transcript_tail" => res(commands::claude_transcript_tail(a.get("path")?).await),
         "claude_hooks_status" => res(commands::claude_hooks_status()),
         "get_poll_interval" => ok(commands::get_poll_interval(app.state())),
         "get_worktree_dirs" => ok(commands::get_worktree_dirs(app.clone())),
