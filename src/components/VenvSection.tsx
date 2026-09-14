@@ -69,10 +69,14 @@ function isRemovable(v: Venv, state: VenvState): boolean {
 ///
 /// `staleSecs` is PASSED rather than read from a module constant (#957),
 /// because it is now the user's setting and the caller is the only thing
-/// that can resolve it. Exported with it so a test can state the
-/// threshold as a fact rather than constructing an idle time against
-/// whatever 90 days happens to be.
-export function displayState(
+/// that can resolve it.
+///
+/// NOT exported. Exporting it was the first spelling and it earns a
+/// `react-refresh/only-export-components` warning for a function nothing
+/// imports: the #957 tests drive this through a render, which is the
+/// stronger assertion anyway -- the defect was that a row's LABEL and its
+/// CHECKBOX disagreed with the backend, and only a render sees both.
+function displayState(
   v: Venv,
   idleSecs: number | undefined,
   staleSecs: number,
