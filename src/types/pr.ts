@@ -1033,7 +1033,7 @@ export interface ClaudeImported {
 /// hover. It was 18.9% of the old payload and the same 150-character
 /// sentence on 1,474 of 1,474 real rows -- paid for once here, preserved
 /// exactly.
-export type WireLiveness =
+type WireLiveness =
   | { state: "running"; pid: number; status: string | null }
   | { state: "dead"; why: number }
   | { state: "unknown"; why: number };
@@ -1043,7 +1043,10 @@ export type WireLiveness =
 /// Not what components consume -- see `ClaudeSession` below, which is
 /// this with `liveness` resolved. Separated so the interning is a
 /// transport detail that stops at the hook boundary.
-export interface WireClaudeSession {
+///
+/// Not exported, for the reason `WireLiveness` above is not: it is
+/// reached only through `WireClaudeSessionList`.
+interface WireClaudeSession {
   session_id: string;
   name: string | null;
   cwd: string | null;
