@@ -1126,7 +1126,7 @@ export interface ClaudeSession {
 ///
 /// A subagent session is STILL A REAL SESSION: hidden by default, never
 /// deleted, still resumable by id. Several did substantial work.
-export type ClaudeSessionKind =
+type ClaudeSessionKind =
   | { kind: "own" }
   | { kind: "subagent"; agent_id: string };
 
@@ -1187,7 +1187,7 @@ export interface ClaudeSessionDetail {
 }
 
 /// One subagent session, as its parent's detail lists it (#1002).
-export interface ClaudeSubagentChild {
+interface ClaudeSubagentChild {
   session_id: string;
   name: string | null;
   agent_id: string;
