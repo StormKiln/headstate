@@ -1004,6 +1004,20 @@ export interface ClaudeImported {
   unreadable_files: string[];
   metadata_beyond_first_record: number;
   elapsed_ms: number;
+  /// `~/.claude/projects` itself, when it does not exist (#970).
+  ///
+  /// The THIRD answer, and not one of the two above: a root that is not
+  /// there is the honest empty result for a machine that has never run
+  /// Claude Code, so it must not be counted among the things that could
+  /// not be read. It used to arrive in `unreadable_dirs`, which is what
+  /// put "0 sessions read, but 1 could not be — this list is incomplete by
+  /// an unknown amount" above the empty list on a brand-new machine.
+  ///
+  /// `null` means the directory is there, whatever is in it. So a page
+  /// with zero sessions and `absent_root === null` is a user who cleared
+  /// their history, not one who has never run `claude`, and the two get
+  /// different copy.
+  absent_root: string | null;
 }
 
 /// One row of the Claude Code session list (#917).

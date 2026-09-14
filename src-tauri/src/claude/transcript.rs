@@ -267,6 +267,35 @@ pub struct Scan {
     /// decision stays checkable on someone else's machine instead of
     /// resting on this module's docs.
     pub elapsed_ms: u64,
+    /// The transcript root, when it does not exist at all (#970).
+    ///
+    /// # Why this is not `unreadable_dirs`
+    ///
+    /// It was, and that put an amber "0 sessions read, but 1 could not be
+    /// -- this list is incomplete by an unknown amount" above the empty
+    /// list on every machine that has never run Claude Code. Nothing
+    /// could not be read: there is nothing there. That is the app's first
+    /// statement to a new user about this feature, and it was false.
+    ///
+    /// `ENOENT` on the root and `EACCES` on the root are opposite facts
+    /// with opposite remedies, and one `Err` arm collapsed them. This is
+    /// the `NotFound` half, carried in a field [`Scan::is_partial`] does
+    /// not consult -- `live.rs`'s `read_registry` already draws exactly
+    /// this line for `~/.claude/sessions` and
+    /// `a_missing_registry_is_a_settled_empty_answer` is its test, with
+    /// the comment "absent is the answer, not an error". The two halves of
+    /// `~/.claude` now agree.
+    ///
+    /// **A permission error on the root is still `unreadable_dirs`**, and
+    /// still loud: that user's history genuinely IS hidden and the remedy
+    /// is theirs to apply. Collapsing both into "nothing here" would be
+    /// #846 in the opposite direction.
+    ///
+    /// The PATH is kept rather than a bare boolean, because
+    /// `scan_default`'s reason for reporting this at all was so the UI can
+    /// say which path it looked at -- a new user learning that Headstate
+    /// looked in `~/.claude/projects` learns where sessions come from.
+    pub absent_root: Option<String>,
 }
 
 impl Scan {
@@ -275,6 +304,12 @@ impl Scan {
     /// The UI's cue for "this list may be incomplete". Deliberately NOT a
     /// reason to discard the sessions that WERE read: a partial answer
     /// labelled partial beats both a silent truncation and an error page.
+    ///
+    /// [`Scan::absent_root`] is deliberately NOT consulted (#970): a root
+    /// that does not exist makes the list EMPTY, not short. A machine with
+    /// no Claude Code history has a complete list of nothing, and telling
+    /// its owner the list is "incomplete by an unknown amount" accuses the
+    /// app of a failure that did not happen.
     pub fn is_partial(&self) -> bool {
         !self.unreadable_dirs.is_empty() || !self.unreadable_files.is_empty()
     }
@@ -293,23 +328,31 @@ pub fn projects_dir() -> Option<PathBuf> {
 /// than by a path filter that a later refactor could drop -- which is
 /// what finding 1 in the module docs is about.
 ///
-/// Returns `(sessions, nested_skipped, unreadable_dirs)`. An unreadable
-/// project directory is reported, never silently treated as empty: it may
-/// hold any number of sessions.
-fn session_files(root: &Path) -> (Vec<PathBuf>, usize, Vec<String>) {
-    let mut files = Vec::new();
-    let mut nested = 0usize;
-    let mut unreadable = Vec::new();
+/// Returns [`Walk`]. An unreadable project directory is reported, never
+/// silently treated as empty: it may hold any number of sessions.
+fn session_files(root: &Path) -> Walk {
+    let mut out = Walk::default();
 
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
+        // The root does not exist: the honest answer for a machine that
+        // has never run Claude Code, and NOT a failure to read (#970). It
+        // travels in its own field so `is_partial()` stays false and the
+        // page says "no sessions" rather than "incomplete by an unknown
+        // amount". `read_registry` draws the same line for the other half
+        // of `~/.claude`.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            out.absent_root = Some(root.display().to_string());
+            return out;
+        }
         Err(e) => {
-            // The whole tree, not one slug. Reported to the caller as a
-            // failure to READ, which is a different statement from "you
-            // have no sessions" -- the distinction this module exists to
-            // keep.
-            unreadable.push(format!("{}: {e}", root.display()));
-            return (files, nested, unreadable);
+            // Any OTHER error on the whole tree -- a permission wall
+            // above all -- hides an unknown number of sessions and stays
+            // loud. Reported to the caller as a failure to READ, which is
+            // a different statement from "you have no sessions" -- the
+            // distinction this module exists to keep.
+            out.unreadable.push(format!("{}: {e}", root.display()));
+            return out;
         }
     };
 
@@ -323,7 +366,7 @@ fn session_files(root: &Path) -> (Vec<PathBuf>, usize, Vec<String>) {
         let inner = match std::fs::read_dir(&dir) {
             Ok(i) => i,
             Err(e) => {
-                unreadable.push(format!("{}: {e}", dir.display()));
+                out.unreadable.push(format!("{}: {e}", dir.display()));
                 continue;
             }
         };
@@ -335,15 +378,33 @@ fn session_files(root: &Path) -> (Vec<PathBuf>, usize, Vec<String>) {
                 // `subagents/`. Counting what is underneath is what makes
                 // the exclusion a number the tests can assert on, so it
                 // cannot regress into an invisible behaviour.
-                nested += count_jsonl(&p);
+                out.nested += count_jsonl(&p);
                 continue;
             }
             if p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                files.push(p);
+                out.files.push(p);
             }
         }
     }
-    (files, nested, unreadable)
+    out
+}
+
+/// What one walk of the transcript tree found.
+///
+/// A named struct since #970, because the walk now reports FOUR things and
+/// two of them are absences that must not be confused: `unreadable` is
+/// "we could not read this", `absent_root` is "there is nothing to read".
+/// A fourth positional element in a tuple is exactly how the two would get
+/// swapped at a call site.
+#[derive(Default)]
+struct Walk {
+    files: Vec<PathBuf>,
+    /// `.jsonl` files below `<slug>/<file>`, correctly excluded.
+    nested: usize,
+    /// Directories that could not be LISTED, with why.
+    unreadable: Vec<String>,
+    /// The root itself, when it does not exist. See [`Scan::absent_root`].
+    absent_root: Option<String>,
 }
 
 /// Every `.jsonl` at or below `dir`, for the skipped-file count.
@@ -561,15 +622,16 @@ fn newest_timestamp(file: &mut std::fs::File, size: u64, window: u64) -> Option<
 /// than presenting a short list as a complete one -- see the module docs.
 pub fn scan(root: &Path) -> Scan {
     let t0 = std::time::Instant::now();
-    let (files, subagent_files_skipped, unreadable_dirs) = session_files(root);
+    let walk = session_files(root);
 
     let mut out = Scan {
-        subagent_files_skipped,
-        unreadable_dirs,
+        subagent_files_skipped: walk.nested,
+        unreadable_dirs: walk.unreadable,
+        absent_root: walk.absent_root,
         ..Default::default()
     };
 
-    for f in files {
+    for f in walk.files {
         match extract(&f) {
             Ok(t) => {
                 if t.cwd_record.is_some_and(|r| r > 1) {
@@ -602,8 +664,14 @@ pub fn scan(root: &Path) -> Scan {
 /// Only when there is no home directory to look in. A MISSING
 /// `~/.claude/projects` is not an error here -- it is the honest answer
 /// for a machine that has never run Claude Code, and it arrives as an
-/// empty [`Scan`] with the directory named in `unreadable_dirs` so the UI
-/// can still say which path it looked at.
+/// empty [`Scan`] with the directory named in [`Scan::absent_root`] so
+/// the UI can still say which path it looked at.
+///
+/// It used to arrive in `unreadable_dirs`, which `is_partial()` reads, so
+/// the first thing a new user was told about this feature was "0 sessions
+/// read, but 1 could not be -- this list is incomplete by an unknown
+/// amount" (#970). The path is still named; the channel is one that does
+/// not claim a failure.
 pub fn scan_default() -> Result<Scan, String> {
     let root = projects_dir().ok_or("could not find your home directory")?;
     Ok(scan(&root))
@@ -800,21 +868,113 @@ mod tests {
         assert_eq!(got.sessions.len(), 1);
     }
 
-    /// A missing root is reported too, for the same reason.
+    /// A missing root is a SETTLED empty answer, and names the path (#970).
     ///
-    /// A machine that has never run Claude Code and a machine whose
-    /// `~/.claude` we cannot see produce the same empty list, so the
-    /// empty list alone cannot be trusted -- the named path is what makes
-    /// the difference legible.
+    /// This test previously asserted `is_partial()` and one
+    /// `unreadable_dirs` entry, which is what put "0 sessions read, but 1
+    /// could not be -- this list is incomplete by an unknown amount" above
+    /// the empty list on every machine that has never run Claude Code.
+    /// Nothing could not be read there; there is nothing to read.
+    ///
+    /// `live.rs`'s `a_missing_registry_is_a_settled_empty_answer` is the
+    /// same assertion about the other half of `~/.claude`, and the two
+    /// halves now agree -- which is the inconsistency #970 is about.
+    ///
+    /// The path is still named, because `scan_default`'s reason for
+    /// reporting this at all is that the UI can say where it looked.
     #[test]
-    fn a_missing_root_is_reported_not_silently_empty() {
+    fn a_missing_root_is_a_settled_empty_answer_that_still_names_the_path() {
         let t = Tmp::new("missing");
         let root = t.path().join("does-not-exist");
         let got = scan(&root);
         assert!(got.sessions.is_empty());
-        assert!(got.is_partial());
+        assert!(
+            !got.is_partial(),
+            "a machine with no history has a COMPLETE list of nothing, not a short one"
+        );
+        assert!(
+            got.unreadable_dirs.is_empty(),
+            "absent is the answer, not an error: {:?}",
+            got.unreadable_dirs
+        );
+        assert!(
+            got.absent_root
+                .as_deref()
+                .is_some_and(|p| p.contains("does-not-exist")),
+            "the path must still be named: {:?}",
+            got.absent_root
+        );
+    }
+
+    /// A root that EXISTS and holds nothing says nothing at all (#970).
+    ///
+    /// The pair to the test above, and the one that keeps `absent_root`
+    /// from becoming a second way of saying "empty". A user who ran
+    /// `claude` once and then cleared their history has a real
+    /// `~/.claude/projects`; the page has no path to explain to them and
+    /// must not claim the directory is missing.
+    #[test]
+    fn an_empty_but_present_root_reports_no_absent_root() {
+        let t = Tmp::new("present-empty");
+        std::fs::create_dir_all(t.path()).unwrap();
+        let got = scan(t.path());
+        assert!(got.sessions.is_empty());
+        assert!(!got.is_partial());
+        assert_eq!(
+            got.absent_root, None,
+            "the directory is there -- it is its contents that are empty"
+        );
+    }
+
+    /// A root we cannot READ is still loud (#970).
+    ///
+    /// The half that must not regress. `ENOENT` and `EACCES` on the root
+    /// produce the same empty list and have opposite remedies: one is "you
+    /// have no history", the other is "your history is behind a permission
+    /// wall and we cannot see it". Only the second means the list is short
+    /// by an unknown amount, so only the second may set `is_partial()`.
+    /// Collapsing both into "nothing here" is #846 in the opposite
+    /// direction, and #846 is the bug that cost a shipped release.
+    ///
+    /// `#[cfg(unix)]` because the gate is a Unix mode bit: on Windows a
+    /// directory at mode `0o000` is still listable, so the `read_dir`
+    /// would succeed and the assertion would fail for a reason that is
+    /// about the platform rather than about this code. Four Windows-only
+    /// failures in this epic were all a test encoding one platform's
+    /// behaviour as universal.
+    #[test]
+    #[cfg(unix)]
+    fn an_unreadable_root_is_still_partial_and_not_reported_as_absent() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = Tmp::new("root-denied");
+        let root = t.path().join("walled");
+        std::fs::create_dir_all(root.join("slug")).unwrap();
+        let original = std::fs::metadata(&root).unwrap().permissions();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let got = scan(&root);
+
+        // Restored BEFORE any assertion can panic, so a failure here does
+        // not leave an undeletable directory behind for `Tmp`'s drop.
+        std::fs::set_permissions(&root, original).unwrap();
+
+        // Running as root defeats the mode bit entirely, and a test that
+        // silently passes for the wrong reason is worse than one that
+        // skips. The listing succeeding is the signal.
+        if got.absent_root.is_none() && !got.is_partial() {
+            eprintln!("skipped: mode 0o000 did not block the listing (running as root?)");
+            return;
+        }
+        assert!(
+            got.is_partial(),
+            "a permission wall genuinely hides sessions: {got:?}"
+        );
+        assert_eq!(
+            got.absent_root, None,
+            "the directory exists -- we just cannot see into it"
+        );
         assert_eq!(got.unreadable_dirs.len(), 1);
-        assert!(got.unreadable_dirs[0].contains("does-not-exist"));
+        assert!(got.unreadable_dirs[0].contains("walled"));
     }
 
     /// Last activity comes from the END of the file, not the head.
