@@ -70,10 +70,14 @@ pub mod install;
 pub mod live;
 pub mod liveness;
 pub mod overview;
+/// The tail of one transcript, as conversation rather than JSONL (#982).
+pub mod preview;
 pub mod registry;
 pub mod sessions;
 pub mod store;
 pub mod transcript;
+/// Per-message token usage, summed per session (#959).
+pub mod usage;
 
 // Re-exported so `commands.rs` names the operation rather than the module it
 // happens to live in. Dropping these breaks the CALL SITE rather than the

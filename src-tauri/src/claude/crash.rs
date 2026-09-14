@@ -70,6 +70,21 @@ pub struct Recorded {
     /// can tell "three new crashes" from "the same three orphans are
     /// still on disk".
     pub crashed_already_known: usize,
+    /// WHICH sessions were recorded as crashed on this sweep (#979).
+    ///
+    /// `crashed` is the count and this is the identity, and a notifier
+    /// needs both: "1 crash" is a number, and "claude in ~/code/ghstat
+    /// died" is something a user can act on. One entry per increment of
+    /// `crashed`, so the two cannot disagree.
+    ///
+    /// Carried on `Recorded` rather than re-queried by the notifier
+    /// because the FIRST-observation property lives here: `record_crashed`
+    /// is what knows whether our observation is the one that stuck, and a
+    /// notifier that re-read the table afterwards could not tell a crash
+    /// found this tick from one found an hour ago. That is the
+    /// re-fires-every-minute bug `crashed_already_known` exists to
+    /// prevent.
+    pub crashed_sessions: Vec<Crashed>,
     /// Records whose liveness could not be determined -- the pid is in
     /// use but `procStart` would not confirm it is ours. Neither running
     /// nor crashed, per migration 11.
@@ -87,6 +102,27 @@ impl Recorded {
     pub fn is_partial(&self) -> bool {
         !self.write_failures.is_empty() || !self.unreadable.is_empty()
     }
+}
+
+/// One session this sweep newly recorded as crashed (#979).
+///
+/// Enough to NAME it in a notification and nothing more. No liveness, no
+/// stored status: liveness stays derived per read, which is migration
+/// 11's central correction, and a struct carrying a status field here
+/// would be the first place to store one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Crashed {
+    /// The `claude --resume` handle, and the only field guaranteed
+    /// present -- a record without one cannot key a row and never reaches
+    /// here (`without_session_id` counts those instead).
+    pub session_id: String,
+    /// The registry's own `name`, which exists in NO other source. `None`
+    /// for a record that carried none: a notification headed by a raw
+    /// UUID is still better than one headed by a fabricated name, and the
+    /// caller decides which to show.
+    pub name: Option<String>,
+    /// Where it was running. `None` when the record carried none.
+    pub cwd: Option<String>,
 }
 
 /// `pid_start_time` as it goes into the column: RFC 3339, or NULL.
@@ -307,7 +343,26 @@ pub fn record(conn: &mut Connection, sweep: &Sweep) -> Result<Recorded, String> 
                 record_running(&tx, rec)
             };
             match wrote {
-                Ok(true) => *counter += 1,
+                Ok(true) => {
+                    *counter += 1;
+                    // The identity, beside the count, for #979's
+                    // notifier. Recorded on the SAME arm that increments
+                    // `crashed`, so the list and the count cannot drift
+                    // -- a notifier reading a list assembled anywhere
+                    // else could fire for an orphan already announced,
+                    // which is the every-tick-forever bug
+                    // `crashed_already_known` exists to prevent.
+                    if crashed {
+                        out.crashed_sessions.push(Crashed {
+                            session_id: rec
+                                .session_id
+                                .clone()
+                                .expect("checked at the top of this loop"),
+                            name: rec.name.clone(),
+                            cwd: rec.cwd.clone(),
+                        });
+                    }
+                }
                 Ok(false) if crashed => out.crashed_already_known += 1,
                 Ok(false) => *counter += 1,
                 Err(e) => out
@@ -410,6 +465,140 @@ mod tests {
             .query_row("SELECT ended_at FROM claude_run", [], |r| r.get(0))
             .unwrap();
         assert!(ended.is_some(), "a crashed run is an ENDED run");
+    }
+
+    /// The identities beside the count, for #979's notifier.
+    ///
+    /// `crashed` is a number and a notification needs a name: "1 crash"
+    /// is not something a user can act on and "widget-80043 in
+    /// /Users/acme/code/widget died" is. The registry's `name` and `cwd`
+    /// exist in no other source, which is why they are carried rather
+    /// than re-queried.
+    ///
+    /// Sabotage: move the `crashed_sessions.push` out of the `Ok(true)`
+    /// arm -- to the top of the loop, say -- and
+    /// `only_a_new_crash_is_named` below fails.
+    #[test]
+    fn a_new_crash_is_named_as_well_as_counted() {
+        let mut conn = db();
+        let sweep = Sweep {
+            orphaned: vec![live(80043, Some("s-crashed"), Some(1_789_119_828))],
+            ..Default::default()
+        };
+
+        let got = record(&mut conn, &sweep).unwrap();
+        assert_eq!(got.crashed, 1);
+        assert_eq!(
+            got.crashed_sessions,
+            vec![Crashed {
+                session_id: "s-crashed".into(),
+                name: Some("widget-80043".into()),
+                cwd: Some("/Users/acme/code/widget".into()),
+            }],
+            "the count and the identity must describe the same crash"
+        );
+    }
+
+    /// **The notifier's whole correctness condition**: a second sweep of
+    /// the same orphan names nobody.
+    ///
+    /// A sweep runs every 60 seconds and an orphan left on disk is seen
+    /// on every one of them. A notifier reading a list that included
+    /// already-known orphans would announce the same dead session once a
+    /// minute, forever -- which is the failure `crashed_already_known`
+    /// was split out to prevent, and `record_crashed`'s doc records the
+    /// four-sweeps-four-rows bug that found it.
+    ///
+    /// Sabotage: push the identity before `record_crashed` decides, or on
+    /// the `Ok(false)` arm, and this fails on the second sweep.
+    #[test]
+    fn only_a_new_crash_is_named() {
+        let mut conn = db();
+        let sweep = Sweep {
+            orphaned: vec![live(80043, Some("s-crashed"), Some(1_789_119_828))],
+            ..Default::default()
+        };
+
+        let first = record(&mut conn, &sweep).unwrap();
+        assert_eq!(first.crashed_sessions.len(), 1);
+
+        let second = record(&mut conn, &sweep).unwrap();
+        assert_eq!(second.crashed, 0);
+        assert_eq!(second.crashed_already_known, 1, "still reported as known");
+        assert!(
+            second.crashed_sessions.is_empty(),
+            "a notifier reading this list must not announce the same dead \
+             session every minute forever"
+        );
+    }
+
+    /// A running session names nobody. The happy-path pair: the quiet
+    /// case must stay quiet, or a notifier wired to this list would fire
+    /// on every tick of a healthy machine.
+    #[test]
+    fn a_healthy_sweep_names_nobody() {
+        let mut conn = db();
+        let sweep = Sweep {
+            running: vec![live(80044, Some("s-running"), Some(1_789_119_828))],
+            ..Default::default()
+        };
+
+        let got = record(&mut conn, &sweep).unwrap();
+        assert_eq!(got.running, 1);
+        assert_eq!(got.crashed, 0);
+        assert!(got.crashed_sessions.is_empty());
+    }
+
+    /// A run the HOOK already closed is not a new crash and is not named.
+    ///
+    /// The hook's reason is a first-hand report and ours is an inference,
+    /// so a registry file left behind after a clean exit must not produce
+    /// a "your session died" notification about a session that ended on
+    /// purpose.
+    #[test]
+    fn a_cleanly_ended_run_is_not_named_as_a_crash() {
+        let mut conn = db();
+        conn.execute(
+            "INSERT INTO claude_session (session_id, first_seen_at)
+             VALUES ('s1', '2026-09-11T09:43:48+00:00')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO claude_run
+                (session_id, pid, started_at, end_reason, ended_at)
+             VALUES ('s1', 80043, '2026-09-11T09:43:48+00:00',
+                     'prompt_input_exit', '2026-09-11T10:00:00+00:00')",
+            [],
+        )
+        .unwrap();
+
+        let sweep = Sweep {
+            orphaned: vec![live(80043, Some("s1"), Some(1_789_119_828))],
+            ..Default::default()
+        };
+        let got = record(&mut conn, &sweep).unwrap();
+        assert!(
+            got.crashed_sessions.is_empty(),
+            "a session that ended on purpose must not be announced as dead"
+        );
+    }
+
+    /// A record with no `session_id` names nobody, because it cannot key
+    /// a row and never reaches the crash path at all. `Crashed` requires
+    /// a `session_id` for exactly this reason -- an `Option` there would
+    /// have made a notification headed by nothing representable.
+    #[test]
+    fn a_record_without_a_session_id_names_nobody() {
+        let mut conn = db();
+        let sweep = Sweep {
+            orphaned: vec![live(80043, None, Some(1_789_119_828))],
+            ..Default::default()
+        };
+        let got = record(&mut conn, &sweep).unwrap();
+        assert_eq!(got.without_session_id, 1);
+        assert_eq!(got.crashed, 0);
+        assert!(got.crashed_sessions.is_empty());
     }
 
     /// A SECOND sweep of the SAME orphan does not re-count it, and does

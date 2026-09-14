@@ -13,6 +13,8 @@ import type {
   BranchScanFrame,
   ClaudeImported,
   ClaudeOverview,
+  ClaudePreview,
+  ClaudeUsage,
   ClaudeSessionList,
   CleanupPrefs,
   DockerImage,
@@ -90,7 +92,9 @@ import {
   scanClaudeMd,
   claudeImportTranscripts,
   claudeOverview,
+  claudeSessionUsage,
   claudeSessions,
+  claudeTranscriptTail,
   claudeHooksStatus,
   claudeInstallHooks,
   claudeReinstallHooks,
@@ -1190,6 +1194,64 @@ export function useClaudeSessions(enabled: boolean) {
       await qc.invalidateQueries({ queryKey: ["claude-sessions"] });
     },
   };
+}
+
+
+/// How much work happened inside one session (#959).
+///
+/// # Not polled, and keyed by PATH
+///
+/// A session's usage never changes once the session is dead, which is
+/// 1,295 of 1,474 rows on the real corpus. A 10-second poll of a figure
+/// that cannot move would be the one expensive read on this page repeated
+/// forever -- the rollup is 11x the cost of the startup scan's head+tail.
+/// So `staleTime: Infinity`: it is read when a session is selected and
+/// cached under that transcript's path.
+///
+/// The PATH is the key rather than the session id, because the path is
+/// what the command takes and because a transcript that moved is a
+/// different file with a different answer.
+///
+/// `retry: false`, the rule this whole feature follows: a permission
+/// error on `~/.claude` is a settled refusal, not a flaky call, and three
+/// silent re-reads only delay saying so (#846).
+///
+/// # No `= {}` default
+///
+/// A rejected read must reach the caller's error arm. Four zeroes for a
+/// transcript that could not be read is a confident wrong answer with a
+/// credible shape, which is precisely what this feature is filed against.
+export function useClaudeSessionUsage(path: string | null) {
+  return useQuery<ClaudeUsage>({
+    queryKey: ["claude-usage", path],
+    queryFn: () => claudeSessionUsage(path as string),
+    // The path is required, so the query simply does not run without one
+    // -- a session with no transcript is a real row and must not produce
+    // a rejected query that reads as a failure.
+    enabled: path !== null && path !== "",
+    staleTime: Infinity,
+    retry: false,
+  });
+}
+
+/// The tail of one session's transcript, as conversation (#982).
+///
+/// Keyed by path and `staleTime: Infinity` for the same reasons
+/// `useClaudeSessionUsage` above is: a dead session's transcript does not
+/// change, and this is a 256 KB read that crosses the pairing transport
+/// on the phone.
+///
+/// `enabled` so the read is not merely cached but never STARTED until the
+/// user asks: the preview is behind a disclosure on the detail pane, so a
+/// user scrolling the list does not pull 256 KB per selection.
+export function useClaudeTranscriptTail(path: string | null, enabled: boolean) {
+  return useQuery<ClaudePreview>({
+    queryKey: ["claude-transcript-tail", path],
+    queryFn: () => claudeTranscriptTail(path as string),
+    enabled: enabled && path !== null && path !== "",
+    staleTime: Infinity,
+    retry: false,
+  });
 }
 
 /// How often the Claude Code overview re-reads.

@@ -1,6 +1,11 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ClaudeSession, ClaudeSessionList } from "@/types/pr";
+import type {
+  ClaudePreview,
+  ClaudeSession,
+  ClaudeSessionList,
+  ClaudeUsage,
+} from "@/types/pr";
 import { useFilters } from "@/store/filters";
 import { stubViewport } from "@/test-utils";
 
@@ -43,6 +48,14 @@ const rescanFn = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 const state = vi.hoisted(() => ({
   list: undefined as ClaudeSessionList | undefined,
   now: Date.parse("2026-09-13T12:00:00Z"),
+  /// #959 and #982. Both commands are `Class::Read`, so unlike the two
+  /// reveal buttons the phone DOES get them -- and the preview is the one
+  /// Claude action whose phone case is stronger than the desktop's, since
+  /// `claude_reveal_path` is `Local` and there is otherwise no path to a
+  /// transcript's content at all. Filled here so the tests below can
+  /// assert that, rather than only that the Local controls are gone.
+  usage: undefined as ClaudeUsage | undefined,
+  preview: undefined as ClaudePreview | undefined,
 }));
 
 vi.mock("../api/hooks", () => ({
@@ -59,6 +72,18 @@ vi.mock("../api/hooks", () => ({
     rescan: rescanFn,
   }),
   useWorktrees: () => ({ data: undefined, isError: false, error: undefined }),
+  useClaudeSessionUsage: (path: string | null) => ({
+    data: state.usage,
+    isError: false,
+    error: undefined,
+    isLoading: path !== null && state.usage === undefined,
+  }),
+  useClaudeTranscriptTail: (path: string | null, enabled: boolean) => ({
+    data: state.preview,
+    isError: false,
+    error: undefined,
+    isLoading: enabled && path !== null && state.preview === undefined,
+  }),
 }));
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 vi.mock("../lib/clipboard", () => ({ copyText: copyFn }));
@@ -95,6 +120,32 @@ const listOf = (sessions: ClaudeSession[]): ClaudeSessionList => ({
 
 beforeEach(() => {
   state.list = listOf([session()]);
+  state.usage = {
+    messages: 994,
+    input_tokens: 1_988,
+    output_tokens: 582_035,
+    cache_read_tokens: 405_086_242,
+    cache_creation_tokens: 4_971_059,
+    models: [{ model: "claude-opus-5", messages: 994 }],
+    truncated: false,
+    bytes_read: 183_237,
+    file_bytes: 183_237,
+  };
+  state.preview = {
+    messages: [
+      {
+        role: "assistant",
+        timestamp: "2026-09-13T11:00:05Z",
+        model: "claude-opus-5",
+        blocks: [{ kind: "text", text: "Running the tests now.", truncated: false }],
+      },
+    ],
+    truncated: false,
+    bytes_read: 183_237,
+    file_bytes: 183_237,
+    non_conversation_records: 0,
+    unparseable_records: 0,
+  };
   // 390px: an iPhone 15's CSS width, comfortably under `MOBILE_BREAKPOINT`.
   stubViewport(390);
   // The search text and the selection live in the store since #939, and it
@@ -228,5 +279,66 @@ describe("the companion offers the view and hides only the Local actions", () =>
 
     fireEvent.click(screen.getByRole("button", { name: /copy resume command/i }));
     expect(copyFn).toHaveBeenCalledOnce();
+  });
+
+  /// #959 on the phone. `claude_session_usage` is `Class::Read`, so
+  /// unlike the two reveal buttons this one is NOT behind
+  /// `IS_MOBILE_BUILD` -- and the assertion is the positive half, which
+  /// `surfaceGuard.test.ts` cannot make: that test checks the allowlist
+  /// and would stay green whether the page rendered this or not.
+  ///
+  /// The question it answers is the away-from-desk one: "was that the
+  /// long session or the typo" is how the row worth resuming is picked,
+  /// and the phone is where the picking happens.
+  it("shows how much work a session did, because claude_session_usage is Class::Read", () => {
+    render(<ClaudeCodePage />);
+    open("HeadState GitHub issues filing");
+
+    expect(screen.getByText(/how much work it did/i)).toBeTruthy();
+    expect(screen.getByText("994")).toBeTruthy();
+    expect(screen.getByText("582,035")).toBeTruthy();
+  });
+
+  /// #982 on the phone, and this is the strongest case in the set.
+  ///
+  /// `claude_reveal_path` is `Class::Local` and its buttons are asserted
+  /// absent above, so WITHOUT this a companion user could see that a
+  /// session died and not one word of what it was doing. The desktop user
+  /// can `cat` the file; the phone cannot reach the machine at all.
+  ///
+  /// **Sabotage:** wrap `<TranscriptPreview>` in `!IS_MOBILE_BUILD` in
+  /// `ClaudeCodePage` and this fails while every other test stays green.
+  it("lets the phone read a transcript, because claude_transcript_tail is Class::Read", () => {
+    render(<ClaudeCodePage />);
+    open("HeadState GitHub issues filing");
+
+    // Behind the disclosure on the phone as on the desktop: a 256 KB read
+    // over the pairing transport is exactly what must not happen on every
+    // selection.
+    expect(screen.getByRole("button", { name: /read the transcript/i })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    expect(screen.getByText("Running the tests now.")).toBeTruthy();
+  });
+
+  /// The viewport stub is load-bearing and is asserted rather than
+  /// trusted. A test that mocks `IS_MOBILE_BUILD` but not `matchMedia`
+  /// runs at DESKTOP width while claiming to be a phone -- and since #939
+  /// the two widths render different trees, so every assertion above
+  /// would be about the wrong one.
+  it("really is running at a phone viewport", () => {
+    // `matchMedia` is what `stubViewport(390)` replaces and what
+    // `useIsMobile()` reads, so it -- not `window.innerWidth`, which jsdom
+    // leaves at its own 1024 default -- is the thing that decides which
+    // tree renders. Asserting the stub actually bit, at the breakpoint the
+    // page uses and at one above it, is what stops this file silently
+    // becoming a second desktop suite.
+    expect(window.matchMedia("(max-width: 767px)").matches).toBe(true);
+    expect(window.matchMedia("(max-width: 389px)").matches).toBe(false);
+    // And the narrow tree is the one on screen: on the phone the list and
+    // the detail are two SCREENS, so opening a session hides the list.
+    render(<ClaudeCodePage />);
+    expect(screen.getByRole("button", { name: /HeadState GitHub issues filing/i })).toBeTruthy();
+    open("HeadState GitHub issues filing");
+    expect(screen.getByRole("button", { name: /all sessions/i })).toBeTruthy();
   });
 });

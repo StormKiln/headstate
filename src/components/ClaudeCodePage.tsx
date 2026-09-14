@@ -1,8 +1,18 @@
 import { useMemo, useState } from "react";
 import { Bot, Circle, FolderOpen, GitBranch, RefreshCw, Search, Terminal } from "lucide-react";
 import { toast } from "sonner";
-import type { ClaudeSession, CwdState, Liveness } from "@/types/pr";
-import { useClaudeSessions, useWorktrees } from "@/api/hooks";
+import type {
+  ClaudePreviewBlock,
+  ClaudeSession,
+  CwdState,
+  Liveness,
+} from "@/types/pr";
+import {
+  useClaudeSessionUsage,
+  useClaudeSessions,
+  useClaudeTranscriptTail,
+  useWorktrees,
+} from "@/api/hooks";
 import { claudeRevealPath } from "@/api/tauri";
 import { current } from "@/lib/ariaCurrent";
 import { copyText } from "@/lib/clipboard";
@@ -892,6 +902,45 @@ function Banners({
           <span className="text-[11px] text-[#8b949e]">
             {imported.data.sessions.toLocaleString()} read in {imported.data.elapsed_ms}
             ms
+            {/* The unstated denominator, stated (#975). `Scan` carries
+                `subagent_files_skipped` with the comment "counted so the
+                exclusion is visible and testable rather than invisible",
+                and it was rendered nowhere -- so a user who runs `find
+                ~/.claude/projects -name '*.jsonl' | wc -l` sees 2,904 and
+                the app says 1,502, with nothing on screen bridging the
+                two. Measured: every excluded file is under `subagents/`,
+                and the split is exactly 1,502 + 1,402.
+
+                GREY and factual, on the same line as `elapsed_ms`, NOT in
+                the amber partial-read banner. The field's own comment says
+                "Not failures -- correctly excluded work", and
+                `is_partial()` deliberately does not consult it. `NotMeasured`'s
+                rule is that an absent reading is not a warning; this is
+                not even absent, it is deliberately excluded, so it
+                warrants less emphasis than grey-for-unknown rather than
+                more.
+
+                The wording says these are NOT SESSIONS, which is the
+                point. #914's correction records that the naive glob
+                "would list ~2x the real sessions, and every phantom row
+                would offer a `--resume` handle for something that was
+                never a session" -- so this must not read as "sessions
+                Headstate declined to show".
+
+                Suppressed at zero, not qualified: zero subagent files is
+                the common case on a new machine and a clause reading "0
+                skipped" is noise about an exclusion that did not happen.
+                That is the same call the `sessions > 0` gate above makes,
+                and #976's rule -- qualify when a short read makes a figure
+                only LOW, suppress when it makes it misleading. */}
+            {imported.data.subagent_files_skipped > 0 ? (
+              <>
+                {" · "}
+                {imported.data.subagent_files_skipped.toLocaleString()} subagent transcript
+                {imported.data.subagent_files_skipped === 1 ? "" : "s"} skipped — they are not
+                sessions and cannot be resumed
+              </>
+            ) : null}
           </span>
         ) : null}
       </div>
@@ -1052,6 +1101,12 @@ function SessionDetail({
   return (
     <div className="flex flex-col gap-4">
       <SessionBody session={s} now={now} copy={copy} reveal={reveal} />
+      {/* Both BELOW "Where it ran" and above the worktree jump, which is
+          the order the questions are asked in: what is this, how much was
+          it, what was it saying, and where do I go next. The preview is
+          last of the two because it is the one that costs a read. */}
+      <SessionUsage session={s} />
+      <TranscriptPreview session={s} />
       <WorktreeJump session={s} />
     </div>
   );
@@ -1318,6 +1373,353 @@ function SessionBody({
       </section>
     </>
   );
+}
+
+
+/// How much work happened inside this session (#959).
+///
+/// # Why this section exists after #910 cut it
+///
+/// #910's UI design cut tokens on "not in the data I verified", which was
+/// correct on the evidence it had and false in fact: `usage` is on
+/// `assistant.message`, on 1,478 of 1,502 real transcripts (98.4%).
+/// `claude/usage.rs` carries the re-measurement.
+///
+/// It earns its space on #921's own test -- "does this help me see what is
+/// going on, or resurrect something?" -- because the spread is the useful
+/// part. Measured on four real sessions: 994 assistant messages against 4,
+/// and 405 million cache-read tokens against 111 thousand. Both render
+/// today as a title, a path and a relative time, and nothing distinguishes
+/// the session worth resuming from the typo.
+///
+/// # Tokens, never a dollar figure
+///
+/// A cost needs per-model rates, those rates change, and this app cannot
+/// keep a hardcoded table true. A quietly stale cost with a currency
+/// symbol in front of it is the confident-wrong-answer failure #941 is
+/// about, dressed to look authoritative. `cost-state` carries a real
+/// `totalCostUSD` -- and on 43 of 1,502 sessions (2.9%), so a panel built
+/// on it would appear on 43 rows and vanish on 1,459.
+///
+/// # Four absences, four renderings
+///
+/// | condition | rendering |
+/// |---|---|
+/// | no transcript path on the row | says so, and why: nothing to read |
+/// | the read failed | the reason. NOT zeros. |
+/// | it is still reading | says so |
+/// | read, and NO usage found | "this transcript records no token usage" -- not four zeros |
+///
+/// The last is the absent-is-not-zero rule with a number on it: 24 of
+/// 1,502 real transcripts carry no usage block, and rendering 0 for those
+/// states a measurement that was never taken. `Usage::observed()` is the
+/// gate, and `Tile`'s `value: number | null` one page over is the same
+/// pattern.
+///
+/// The error arm is BEFORE the empty arm, per #846: `data` is undefined on
+/// a rejection exactly as it is before the first read, so an error arm
+/// placed after would never render in the case it exists for.
+function SessionUsage({ session: s }: { session: ClaudeSession }) {
+  // The transcript's OWN state, never the cwd's (#919): 1,213 of 1,461
+  // rows have a dead cwd and a live transcript, so a reading gated on the
+  // cwd would be absent on almost every row.
+  const readable = s.transcript_path !== null && s.transcript_state.state !== "gone";
+  const { data, isError, error, isLoading } = useClaudeSessionUsage(
+    readable ? s.transcript_path : null,
+  );
+
+  return (
+    <section className="rounded-md border border-[#30363d] bg-[#161b22] p-3">
+      <h3 className="text-xs font-semibold text-[#e6edf3]">How much work it did</h3>
+      {s.transcript_path === null ? (
+        <p className="mt-2 text-xs text-[#8b949e]">
+          No transcript was recorded for this session, so there is nothing to read this from.
+        </p>
+      ) : s.transcript_state.state === "gone" ? (
+        <p className="mt-2 text-xs text-[#8b949e]">
+          Its transcript is no longer on disk, so how much work it did cannot be read.
+        </p>
+      ) : isError ? (
+        // NOT zeros (#846). A failed read and a session that used nothing
+        // have opposite remedies, and the second is a claim this cannot
+        // make.
+        <p className="mt-2 text-xs text-[#8b949e]">
+          Could not read its transcript, so how much work it did is unknown
+          {errorMessage(error) ? ` (${errorMessage(error)})` : ""}.
+        </p>
+      ) : isLoading || data === undefined ? (
+        <p className="mt-2 text-xs text-[#8b949e]">Reading its transcript…</p>
+      ) : data.messages === 0 ? (
+        // 24 of 1,502 real transcripts. Four zeros here would be a
+        // measurement that was never taken, with a credible shape.
+        /* The "that is unusual" clause originally named the measured
+           ratio, and #969's guard (`measuredFigures.test.ts`) caught it
+           on the merge: a corpus count rendered as a STRING is correct on
+           the day it is written and decays from then on, and on someone
+           else's machine it describes the author's. That this is the rare
+           case is what the reader needs; the figure behind it lives in
+           `claude/usage.rs`'s module docs, where it is a historical
+           observation about a design decision rather than a claim about
+           the machine it is printed on. */
+        <p className="mt-2 text-xs text-[#8b949e]">
+          Its transcript records no token usage, so there is nothing to total. That is unusual —
+          nearly every transcript carries it.
+        </p>
+      ) : (
+        <>
+          <dl className="mt-2 space-y-1.5 text-xs">
+            <Field label="Assistant messages">{data.messages.toLocaleString()}</Field>
+            {/* Four counters, never one total. Cache reads run two to
+                three orders of magnitude above fresh input on every real
+                session measured, so a single summed "tokens" figure would
+                be a cache-read count wearing a misleading name. */}
+            <Field label="Output tokens">{data.output_tokens.toLocaleString()}</Field>
+            <Field label="Input tokens">{data.input_tokens.toLocaleString()}</Field>
+            <Field label="Cache read">{data.cache_read_tokens.toLocaleString()}</Field>
+            <Field label="Cache written">{data.cache_creation_tokens.toLocaleString()}</Field>
+            {/* `model` is per-MESSAGE and the corpus is mixed -- 12,512
+                opus-5 against 912 opus-4-7 across 13,425 sampled messages
+                -- so "which model was this session" has no single answer
+                and this states the real one rather than picking. */}
+            {data.models.length > 0 ? (
+              <Field label={data.models.length === 1 ? "Model" : "Models"}>
+                {data.models
+                  .map((m) =>
+                    data.models.length === 1
+                      ? m.model
+                      : `${m.model} (${m.messages.toLocaleString()})`,
+                  )
+                  .join(", ")}
+              </Field>
+            ) : null}
+          </dl>
+          {/* The cap, STATED. Without this the reader cannot tell a
+              complete sum from one that stopped 8 MB in, which is the #846
+              defect with a number on it. It binds on the 16 real files over
+              10 MB and on nothing else, so this line is almost never
+              drawn -- which is exactly why it must be there when it is. */}
+          {data.truncated ? (
+            <p className="mt-2 text-xs text-[#d29922]">
+              These are floors, not totals: the transcript is{" "}
+              {formatMb(data.file_bytes)} and only its first {formatMb(data.bytes_read)} were
+              read. Reading it whole would hang this pane.
+            </p>
+          ) : null}
+        </>
+      )}
+    </section>
+  );
+}
+
+/// Bytes as MB, for the two truncation labels.
+///
+/// One decimal place, because the figures it renders are 8.0 and 76.7 and
+/// the difference between them is the whole point of the sentence.
+function formatMb(bytes: number): string {
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/// The last few exchanges of this session's transcript (#982).
+///
+/// # Why reading beats revealing, and why the phone is the stronger case
+///
+/// Until now the only action touching a transcript was Reveal in Finder,
+/// which is `Class::Local` and hands the user a 176 KB JSONL file --
+/// double-clicking which opens nothing useful on a default macOS install.
+/// And on a phone `claude_reveal_path` is unreachable by construction, so
+/// a companion user who could see that a session died could not see one
+/// word of what it was doing.
+///
+/// The question it answers is "is this the right session": 286 of 1,438
+/// sessions share a title with another, and 147 do inside the largest
+/// directory. The titles are not enough and the last exchange is.
+///
+/// # Behind a disclosure, not open by default
+///
+/// A 256 KB read per selection, over the pairing transport on the phone,
+/// for a pane the user may not want. `enabled` on the query is what makes
+/// the button an opt-in rather than a lazy render of something already
+/// fetched.
+///
+/// # It is NOT the resume path
+///
+/// The primary action stays the clipboard copy, for the reason
+/// `claudify_command` records: macOS has no default-terminal concept. This
+/// pane is for deciding, not for doing.
+function TranscriptPreview({ session: s }: { session: ClaudeSession }) {
+  const [open, setOpen] = useState(false);
+  // `transcript_state`, never `cwd_state` (#919, and `ClaudeSession`'s own
+  // doc): 0% of transcripts are gone against 83% of cwds.
+  const refusal = revealRefusal(s.transcript_path, s.transcript_state);
+  const { data, isError, error, isLoading } = useClaudeTranscriptTail(
+    s.transcript_path,
+    open && refusal === null,
+  );
+
+  return (
+    <section className="rounded-md border border-[#30363d] bg-[#161b22] p-3">
+      <h3 className="text-xs font-semibold text-[#e6edf3]">What it was doing</h3>
+      {/* The refusal is NAMED, with the tri-state's three distinct
+          wordings rather than one shared shrug -- `revealRefusal`'s doc
+          argues at length why collapsing `gone` and `unknown` destroys
+          the point of the third state. Reused rather than re-worded, so
+          this pane and the Reveal transcript button cannot come to
+          disagree about the same file.
+
+          Prefixed with what THIS control cannot do, because on the
+          desktop the disabled Reveal button states the same refusal a few
+          lines up, and two identical sentences side by side read as two
+          separate failures -- the rule `ClaudeCodePage`'s own error arm
+          and `WorktreeJump` both follow. The refusal clause itself stays
+          verbatim, so the distinction between `gone` and `unknown`
+          survives the prefix. */}
+      {refusal !== null ? (
+        <p className="mt-2 text-xs text-[#8b949e]">
+          There is nothing to read here: {refusal}.
+        </p>
+      ) : !open ? (
+        <>
+          <p className="mt-2 text-xs text-[#8b949e]">
+            The last few exchanges, to check this is the session you meant before resuming it.
+          </p>
+          <button
+            type="button"
+            onClick={() => setOpen(true)}
+            className="tap-target mt-3 flex items-center gap-1.5 rounded-md border border-[#30363d] bg-[#21262d] px-2 py-1 text-xs text-[#e6edf3] hover:bg-[#30363d]"
+          >
+            <Terminal className="h-3 w-3" aria-hidden="true" />
+            Read the transcript
+          </button>
+        </>
+      ) : isError ? (
+        // BEFORE the empty arm (#846): `data` is undefined on a rejection
+        // exactly as it is before the first read.
+        <p className="mt-2 text-xs text-[#8b949e]">
+          Could not read its transcript
+          {errorMessage(error) ? ` (${errorMessage(error)})` : ""}. This is not the same as the
+          session having said nothing.
+        </p>
+      ) : isLoading || data === undefined ? (
+        <p className="mt-2 text-xs text-[#8b949e]">Reading its transcript…</p>
+      ) : data.messages.length === 0 ? (
+        // Read, and there was no conversation in the window. The counts
+        // say which kind of nothing it was, because "300 machinery
+        // records" and "an empty file" are different facts.
+        <p className="mt-2 text-xs text-[#8b949e]">
+          {data.non_conversation_records > 0 || data.unparseable_records > 0
+            ? `No conversation in the last ${formatKb(data.bytes_read)} — ${data.non_conversation_records.toLocaleString()} bookkeeping record${data.non_conversation_records === 1 ? "" : "s"} and ${data.unparseable_records.toLocaleString()} that could not be read.`
+            : "Its transcript holds no conversation to show."}
+        </p>
+      ) : (
+        <>
+          {/* The cap, STATED, and this is where it matters most: a reader
+              who cannot tell a short conversation from a truncated one has
+              been told something false by omission. #910's own words asked
+              for "a 'showing the last N lines of a large file' label", and
+              the 39 real files over 1 MB are where it binds. */}
+          <p className="mt-2 text-xs text-[#8b949e]">
+            {data.truncated
+              ? `The last ${data.messages.length.toLocaleString()} message${data.messages.length === 1 ? "" : "s"}, from the final ${formatKb(data.bytes_read)} of a ${formatKb(data.file_bytes)} transcript. Earlier exchanges are not shown.`
+              : `All ${data.messages.length.toLocaleString()} message${data.messages.length === 1 ? "" : "s"} in this transcript.`}
+            {data.non_conversation_records > 0
+              ? ` ${data.non_conversation_records.toLocaleString()} bookkeeping record${data.non_conversation_records === 1 ? "" : "s"} in that window are not conversation and are not shown.`
+              : ""}
+          </p>
+          <ol className="mt-3 space-y-2">
+            {data.messages.map((m, i) => (
+              <li
+                // The index is the key on purpose: transcript records
+                // carry no stable id this reads, and two identical
+                // messages in a row are a real thing a session does. The
+                // list is never reordered or filtered, so the index IS the
+                // identity here.
+                key={i}
+                className="rounded border border-[#30363d] bg-[#0d1117] p-2"
+              >
+                <div className="flex flex-wrap items-center gap-x-2 text-[11px] text-[#8b949e]">
+                  <span className="font-semibold text-[#e6edf3]">
+                    {m.role === "assistant" ? "Claude" : "You"}
+                  </span>
+                  {m.model ? <span>{m.model}</span> : null}
+                </div>
+                <div className="mt-1 space-y-1">
+                  {m.blocks.length === 0 ? (
+                    <p className="text-xs text-[#6e7681]">(nothing in this message)</p>
+                  ) : (
+                    m.blocks.map((b, j) => <PreviewBlock key={j} block={b} />)
+                  )}
+                </div>
+              </li>
+            ))}
+          </ol>
+        </>
+      )}
+    </section>
+  );
+}
+
+/// Bytes as KB or MB, whichever reads better.
+///
+/// The figures here span 256 KB windows and 76 MB files, and "78,586 KB"
+/// is not a sentence anybody reads.
+function formatKb(bytes: number): string {
+  return bytes >= 1024 * 1024
+    ? `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+    : `${Math.round(bytes / 1024).toLocaleString()} KB`;
+}
+
+/// One content block of a previewed message.
+///
+/// Five kinds, five renderings, because they answer different questions:
+/// text is what was said, a tool call is what was DONE, and a tool result
+/// is usually far too long to show whole. Flattening them into prose is
+/// how 12,903 of 13,425 assistant messages would have rendered as nothing
+/// (they stop on `tool_use`).
+function PreviewBlock({ block: b }: { block: ClaudePreviewBlock }) {
+  switch (b.kind) {
+    case "text":
+      return (
+        <p className="whitespace-pre-wrap break-words text-xs text-[#e6edf3]">
+          {b.text}
+          {b.truncated ? <span className="text-[#8b949e]"> … (clipped)</span> : null}
+        </p>
+      );
+    case "thinking":
+      // Dimmed rather than hidden: 195 of 1,500 sampled blocks are
+      // thinking, and a reader scanning for "what was it doing" wants it
+      // out of the way but not gone.
+      return (
+        <p className="whitespace-pre-wrap break-words text-xs italic text-[#6e7681]">
+          {b.text}
+          {b.truncated ? " … (clipped)" : ""}
+        </p>
+      );
+    case "tool_use":
+      // The NAME, not the arguments: "Read" tells the reader what the
+      // session was doing and a 40 KB argument blob does not.
+      return (
+        <p className="text-xs text-[#8b949e]">
+          Ran <span className="font-mono text-[#e6edf3]">{b.name}</span>
+        </p>
+      );
+    case "tool_result":
+      return (
+        <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-[#161b22] p-1.5 text-[11px] text-[#8b949e]">
+          {b.text || "(no output)"}
+          {b.truncated ? "\n… (clipped)" : ""}
+        </pre>
+      );
+    case "other":
+      // NAMED, not dropped. Claude Code owns this format, and a pane that
+      // silently omitted a future block kind would show an exchange with
+      // an invisible hole in it.
+      return (
+        <p className="text-xs text-[#6e7681]">
+          A <span className="font-mono">{b.block_type}</span> block, which this version of
+          Headstate does not know how to show.
+        </p>
+      );
+  }
 }
 
 /// A reveal button that is DISABLED with a reason rather than absent

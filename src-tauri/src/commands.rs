@@ -3638,6 +3638,134 @@ pub fn claude_reveal_path(path: String) -> Result<String, String> {
     }
 }
 
+/// The transcript path a remote caller is allowed to read.
+///
+/// # Why this guard exists and `claude_reveal_path` has none
+///
+/// `claude_reveal_path` is `Class::Local`: only this machine's own
+/// frontend can reach it, so the path it is handed came from a row the
+/// frontend already holds. The two commands below are `Class::Read` --
+/// the whole point, since the phone is where the transcript is otherwise
+/// unreachable -- and a `Class::Read` command's argument arrives over the
+/// pairing transport from a paired device. A paired device is trusted to
+/// read Headstate's data; it is not a reason to turn a path parameter
+/// into "read any file on this machine and send it back".
+///
+/// So both commands resolve the path and require it to be a `.jsonl`
+/// under `~/.claude/projects`, which is the only place session
+/// transcripts live (`transcript.rs`'s walk is what defines that) and is
+/// exactly the set of files the session list already names.
+///
+/// `canonicalize` rather than a string prefix test, because
+/// `~/.claude/projects/../../.ssh/id_rsa` has the prefix and is not under
+/// the root. It also resolves symlinks, which is the same reason
+/// `session_files` uses `file_type` rather than `metadata` -- a symlinked
+/// project directory must not become a path into an arbitrary tree.
+///
+/// # Errors
+///
+/// Names which test failed, because the remedies differ: a path that is
+/// not there is a deleted transcript (`transcript_state` already says so
+/// on the row), and a path outside the root is a caller asking for
+/// something this command does not serve.
+fn claude_transcript_path(path: &str) -> Result<std::path::PathBuf, String> {
+    let root = crate::claude::transcript::projects_dir()
+        .ok_or_else(|| "could not find your home directory".to_string())?;
+    transcript_path_in(&root, path)
+}
+
+/// [`claude_transcript_path`] against a given root.
+///
+/// Split out so the tests cannot reach the developer's own
+/// `~/.claude/projects` -- the same rule `claude_settings_target` follows
+/// for the settings installer, and for the same reason: a guard tested
+/// against the real home directory is a guard tested on one machine's
+/// accidents.
+fn transcript_path_in(root: &std::path::Path, path: &str) -> Result<std::path::PathBuf, String> {
+    // The ROOT is canonicalized too: on macOS `/Users/...` resolves
+    // through `/System/Volumes/Data`, so comparing a resolved path
+    // against an unresolved root fails on every real machine.
+    let root = root
+        .canonicalize()
+        .map_err(|e| format!("{}: could not be read: {e}", root.display()))?;
+    let p = std::path::Path::new(path)
+        .canonicalize()
+        .map_err(|e| format!("{path}: could not be read: {e}"))?;
+    if !p.starts_with(&root) {
+        return Err(format!(
+            "{path} is not a Claude Code transcript under {}",
+            root.display()
+        ));
+    }
+    if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+        return Err(format!("{path} is not a transcript file"));
+    }
+    if !p.is_file() {
+        return Err(format!("{path} is not a file"));
+    }
+    Ok(p)
+}
+
+/// How much work happened inside one session (#959).
+///
+/// Summed from the session's OWN transcript, on demand, because the
+/// rollup is 11x the cost of the startup scan's head+tail read and must
+/// never join it -- `claude::usage`'s module docs carry the measurement.
+/// One session's detail pane costs one bounded read: ~1.2 ms for the
+/// 76.7 MB worst case on the development machine.
+///
+/// `Class::Read`. It reads one file under `~/.claude/projects` and writes
+/// nothing, and the phone wants this answer for the same reason the
+/// desktop does -- see `claude_transcript_tail` below, which argues the
+/// path guard both commands share.
+///
+/// # Absent is not zero
+///
+/// An `Err` means the transcript could not be READ. A `Usage` whose
+/// `messages` is 0 means it was read and carried no usage block, which is
+/// 24 of 1,502 real sessions. The UI must render those differently, and
+/// `Usage::observed()` is the gate.
+#[tauri::command]
+pub async fn claude_session_usage(path: String) -> Result<crate::claude::usage::Usage, String> {
+    let p = claude_transcript_path(&path)?;
+    // `spawn_blocking` because it reads up to 8 MB off disk, which does
+    // not belong on the async runtime -- the same reason
+    // `claude_sessions` wraps its query.
+    tauri::async_runtime::spawn_blocking(move || crate::claude::usage::summarise(&p))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// The tail of one session's transcript, as conversation (#982).
+///
+/// The only way to read a transcript's CONTENT. Until now the one action
+/// that touched a transcript was Reveal in Finder, which is `Class::Local`
+/// and hands the user a JSONL file -- so a companion user who could see
+/// that a session died could not see one word of what it was doing.
+///
+/// `Class::Read`, and this is the one Claude action where the phone's
+/// case is stronger than the desktop's: the desktop user can `cat` the
+/// file and the companion user cannot reach the machine. The response is
+/// bounded inside the command -- a 256 KB window, at most 200 messages,
+/// each block clamped -- which is the property that makes exposing it
+/// over the transport safe rather than a second set of limits to keep in
+/// sync, the same rule `stats_board` is classed by.
+///
+/// # Absent is not zero
+///
+/// An `Err` means the transcript could not be READ. A `Preview` with no
+/// messages means the window held no conversation, and its
+/// `non_conversation_records` and `unparseable_records` say which.
+#[tauri::command]
+pub async fn claude_transcript_tail(
+    path: String,
+) -> Result<crate::claude::preview::Preview, String> {
+    let p = claude_transcript_path(&path)?;
+    tauri::async_runtime::spawn_blocking(move || crate::claude::preview::tail(&p))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 // ---------------------------------------------------------------------
 // The Claude Code hook installer (#915). Rust side:
 // `claude/install.rs`, which is where every rule below is argued.
@@ -3743,6 +3871,210 @@ pub fn claude_uninstall_hooks() -> Result<crate::claude::install::Uninstalled, S
 
 #[cfg(test)]
 mod tests {
+
+    /// The path guard the two `Class::Read` transcript commands share
+    /// (#959, #982).
+    ///
+    /// `claude_reveal_path` needs no such guard because it is
+    /// `Class::Local`: its argument can only come from this machine's own
+    /// frontend. These two are `Class::Read` -- the phone is the case they
+    /// exist for -- so the argument arrives over the pairing transport,
+    /// and a paired device being trusted to read Headstate's data is not
+    /// a reason to turn a path parameter into "read any file on this
+    /// machine and send it back".
+    mod transcript_path {
+        use super::super::transcript_path_in;
+        use std::io::Write;
+        use std::path::{Path, PathBuf};
+
+        struct Tmp(PathBuf);
+        impl Tmp {
+            fn new(tag: &str) -> Self {
+                let p = std::env::temp_dir().join(format!(
+                    "headstate-tpath-{tag}-{}-{:?}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                std::fs::create_dir_all(&p).unwrap();
+                Tmp(p)
+            }
+            fn path(&self) -> &Path {
+                &self.0
+            }
+        }
+        impl Drop for Tmp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn touch(p: &Path) {
+            if let Some(d) = p.parent() {
+                std::fs::create_dir_all(d).unwrap();
+            }
+            let mut f = std::fs::File::create(p).unwrap();
+            writeln!(f, "{{}}").unwrap();
+        }
+
+        /// The happy path: a real transcript resolves.
+        #[test]
+        fn a_transcript_under_the_root_resolves() {
+            let tmp = Tmp::new("ok");
+            let root = tmp.path().join("projects");
+            let t = root.join("slug").join("e5dff3bd.jsonl");
+            touch(&t);
+            let got = transcript_path_in(&root, t.to_str().unwrap()).unwrap();
+            assert!(got.ends_with("e5dff3bd.jsonl"));
+        }
+
+        /// **The sabotage test.** Replace `canonicalize` with a string
+        /// `starts_with` on the raw argument and this passes a path that
+        /// escapes the root by traversal. That is the whole reason the
+        /// resolution happens before the containment test, and it is the
+        /// difference between a scoped reader and an arbitrary one.
+        #[test]
+        fn a_traversal_out_of_the_root_is_refused() {
+            let tmp = Tmp::new("traverse");
+            let root = tmp.path().join("projects");
+            std::fs::create_dir_all(root.join("slug")).unwrap();
+            let secret = tmp.path().join("secret.jsonl");
+            touch(&secret);
+
+            // The ROOT AS RESOLVED is the prefix, so the only thing
+            // standing between this and the secret is the resolution of
+            // `..`. Built this way deliberately, and by sabotage rather
+            // than by foresight: an earlier version of this test spelled
+            // the prefix as `root` unresolved, and on macOS
+            // `/var` resolves to `/private/var` -- so with `canonicalize`
+            // removed the refusal still happened, for the wrong reason,
+            // and this test PASSED on the broken guard it exists to
+            // catch. A guard test that passes on the sabotage is worse
+            // than none.
+            //
+            // `join`, never a `format!` with `/` separators. Windows
+            // `canonicalize` returns a VERBATIM path (`\\?\C:\...`), and
+            // the verbatim namespace takes no forward slashes and does no
+            // `..` resolution -- so a string-built path failed to open at
+            // all and this test reported error 123 instead of the
+            // containment refusal. CI found it; the GUARD was right and
+            // the test was spelling its input in a Unix-only way.
+            let resolved_root = root.canonicalize().unwrap();
+            let sneaky = resolved_root
+                .join("slug")
+                .join("..")
+                .join("..")
+                .join("secret.jsonl");
+            let e = transcript_path_in(&root, sneaky.to_str().unwrap()).unwrap_err();
+            assert!(
+                e.contains("is not a Claude Code transcript under"),
+                "a path that resolves outside the root must be refused, and \
+                 a raw string prefix test does not refuse it: {e}"
+            );
+        }
+
+        /// A file genuinely elsewhere, with no traversal trickery.
+        #[test]
+        fn a_path_outside_the_root_is_refused() {
+            let tmp = Tmp::new("outside");
+            let root = tmp.path().join("projects");
+            std::fs::create_dir_all(&root).unwrap();
+            let elsewhere = tmp.path().join("elsewhere.jsonl");
+            touch(&elsewhere);
+            let e = transcript_path_in(&root, elsewhere.to_str().unwrap()).unwrap_err();
+            assert!(e.contains("is not a Claude Code transcript under"), "{e}");
+        }
+
+        /// Inside the root but not a transcript. The extension test is a
+        /// second narrowing, not a substitute for the first: a settings
+        /// file that happened to live under the root is still not
+        /// something these commands serve.
+        #[test]
+        fn a_non_jsonl_file_inside_the_root_is_refused() {
+            let tmp = Tmp::new("ext");
+            let root = tmp.path().join("projects");
+            let f = root.join("slug").join("notes.txt");
+            touch(&f);
+            let e = transcript_path_in(&root, f.to_str().unwrap()).unwrap_err();
+            assert!(e.contains("is not a transcript file"), "{e}");
+        }
+
+        /// A directory named like a transcript. `is_file` is what stops a
+        /// read of a directory becoming an error from deep inside the
+        /// reader rather than a stated refusal here.
+        #[test]
+        fn a_directory_is_refused() {
+            let tmp = Tmp::new("dir");
+            let root = tmp.path().join("projects");
+            let d = root.join("slug").join("odd.jsonl");
+            std::fs::create_dir_all(&d).unwrap();
+            let e = transcript_path_in(&root, d.to_str().unwrap()).unwrap_err();
+            assert!(e.contains("is not a file"), "{e}");
+        }
+
+        /// A path that is not there NAMES that, rather than reading as a
+        /// containment refusal. The remedies differ: a deleted transcript
+        /// is a row whose `transcript_state` already says `gone`, and a
+        /// path outside the root is a caller asking for something else.
+        #[test]
+        fn a_missing_path_says_so_rather_than_claiming_it_is_out_of_bounds() {
+            let tmp = Tmp::new("missing");
+            let root = tmp.path().join("projects");
+            std::fs::create_dir_all(&root).unwrap();
+            let gone = root.join("slug").join("gone.jsonl");
+            let e = transcript_path_in(&root, gone.to_str().unwrap()).unwrap_err();
+            assert!(e.contains("could not be read"), "{e}");
+            assert!(
+                !e.contains("is not a Claude Code transcript"),
+                "a deleted transcript is not a caller reaching out of bounds: {e}"
+            );
+        }
+
+        /// A symlink out of the root is followed and then refused.
+        ///
+        /// `canonicalize` resolves symlinks, which is deliberate and is
+        /// the same reason `transcript.rs`'s walk uses `file_type` rather
+        /// than `metadata` -- a symlinked project directory must not
+        /// become a path into an arbitrary tree.
+        ///
+        /// `#[cfg(unix)]` because `std::os::unix::fs::symlink` is a Unix
+        /// API; Windows needs a different call and, without developer
+        /// mode, a privilege. Four Windows-only failures have already
+        /// cost this repository.
+        #[cfg(unix)]
+        #[test]
+        fn a_symlink_pointing_out_of_the_root_is_refused() {
+            let tmp = Tmp::new("symlink");
+            let root = tmp.path().join("projects");
+            std::fs::create_dir_all(root.join("slug")).unwrap();
+            let secret = tmp.path().join("secret.jsonl");
+            touch(&secret);
+            let link = root.join("slug").join("innocent.jsonl");
+            std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+            // Spelled through the RESOLVED root, for the reason
+            // `a_traversal_out_of_the_root_is_refused` records: an
+            // unresolved prefix would make this refuse on `/var` vs
+            // `/private/var` and pass on a guard that never followed the
+            // link at all.
+            let resolved_root = root.canonicalize().unwrap();
+            // `join` rather than a `format!` with `/`, matching the
+            // traversal test above. This one is `cfg(unix)` so it cannot
+            // hit the verbatim-path problem that broke that one -- but a
+            // second spelling of the same construction is how the next
+            // reader learns the wrong habit.
+            let through_root = resolved_root.join("slug").join("innocent.jsonl");
+            let e = transcript_path_in(&root, through_root.to_str().unwrap()).unwrap_err();
+            assert!(
+                e.contains("is not a Claude Code transcript under"),
+                "a symlink is followed BEFORE the containment test, or the \
+                 root is a suggestion: {e}"
+            );
+        }
+    }
+
     /// #336: `docker_builds` must actually ENRICH.
     ///
     /// `parse_history` hardcodes `context: None, revision: None`, and

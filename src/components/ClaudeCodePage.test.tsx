@@ -2,8 +2,10 @@ import { fireEvent, render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   ClaudeImported,
+  ClaudePreview,
   ClaudeSession,
   ClaudeSessionList,
+  ClaudeUsage,
   Worktree,
   WorktreeRepo,
 } from "@/types/pr";
@@ -36,6 +38,23 @@ const state = vi.hoisted(() => ({
   /// section must not render alike.
   worktrees: undefined as WorktreeRepo[] | undefined,
   worktreesFailed: false,
+  /// What `useClaudeSessionUsage` returns (#959). `undefined` with
+  /// `usageFailed: false` is still-reading; with `usageFailed: true` it is
+  /// the could-not-read case. The two must not render alike, and a
+  /// `messages: 0` answer must not render like either -- it is a
+  /// successful read of a transcript that carries no usage, which is 24 of
+  /// 1,502 real transcripts.
+  usage: undefined as ClaudeUsage | undefined,
+  usageFailed: false,
+  /// What `useClaudeTranscriptTail` returns (#982), on the same
+  /// three-way split and for the same reason.
+  preview: undefined as ClaudePreview | undefined,
+  previewFailed: false,
+  /// Every path `useClaudeTranscriptTail` was asked for while `enabled`
+  /// was false, so the "behind a disclosure" property is testable: the
+  /// preview costs a 256 KB read over the pairing transport and must not
+  /// happen on selection.
+  previewEnabledFor: [] as (string | null)[],
 }));
 
 vi.mock("../api/hooks", () => ({
@@ -63,6 +82,26 @@ vi.mock("../api/hooks", () => ({
     isError: state.worktreesFailed,
     error: state.worktreesFailed ? "could not list worktrees" : undefined,
   }),
+  // #959. `isLoading` is derived from the same absence the real hook
+  // derives it from, so the still-reading arm is reachable here exactly
+  // when it is reachable in the app.
+  useClaudeSessionUsage: (path: string | null) => ({
+    data: state.usage,
+    isError: state.usageFailed,
+    error: state.usageFailed ? "Permission denied" : undefined,
+    isLoading: path !== null && !state.usageFailed && state.usage === undefined,
+  }),
+  // #982. Records what it was asked for and whether the disclosure was
+  // open, so a test can assert the read does not happen on selection.
+  useClaudeTranscriptTail: (path: string | null, enabled: boolean) => {
+    if (enabled) state.previewEnabledFor.push(path);
+    return {
+      data: state.preview,
+      isError: state.previewFailed,
+      error: state.previewFailed ? "Permission denied" : undefined,
+      isLoading: enabled && !state.previewFailed && state.preview === undefined,
+    };
+  },
 }));
 vi.mock("sonner", () => ({ toast: { success: toastSuccess, error: toastError } }));
 vi.mock("../lib/clipboard", () => ({ copyText: copyFn }));
@@ -142,6 +181,51 @@ const imported = (over: Partial<ClaudeImported> = {}): ClaudeImported => ({
   ...over,
 });
 
+/// One session's token rollup (#959).
+///
+/// The defaults are the shape of a REAL session: cache reads two orders
+/// of magnitude above fresh input, which is what makes four separate
+/// counters the right rendering and one summed total the wrong one.
+const usage = (over: Partial<ClaudeUsage> = {}): ClaudeUsage => ({
+  messages: 994,
+  input_tokens: 1_988,
+  output_tokens: 582_035,
+  cache_read_tokens: 405_086_242,
+  cache_creation_tokens: 4_971_059,
+  models: [{ model: "claude-opus-5", messages: 994 }],
+  truncated: false,
+  bytes_read: 183_237,
+  file_bytes: 183_237,
+  ...over,
+});
+
+/// One transcript tail (#982).
+const preview = (over: Partial<ClaudePreview> = {}): ClaudePreview => ({
+  messages: [
+    {
+      role: "user",
+      timestamp: "2026-09-13T11:00:00Z",
+      model: null,
+      blocks: [{ kind: "text", text: "run the tests", truncated: false }],
+    },
+    {
+      role: "assistant",
+      timestamp: "2026-09-13T11:00:05Z",
+      model: "claude-opus-5",
+      blocks: [
+        { kind: "text", text: "Running them now.", truncated: false },
+        { kind: "tool_use", name: "Bash" },
+      ],
+    },
+  ],
+  truncated: false,
+  bytes_read: 183_237,
+  file_bytes: 183_237,
+  non_conversation_records: 0,
+  unparseable_records: 0,
+  ...over,
+});
+
 beforeEach(() => {
   state.list = listOf([session()]);
   state.loading = false;
@@ -149,6 +233,11 @@ beforeEach(() => {
   state.imported = imported();
   state.importFailed = false;
   state.importFetching = false;
+  state.usage = usage();
+  state.usageFailed = false;
+  state.preview = preview();
+  state.previewFailed = false;
+  state.previewEnabledFor = [];
   // A LOADED, empty listing by default -- not `undefined`. `undefined`
   // means "still loading or unreadable", and leaving it there would make
   // every unrelated test render the wrong one of the #920 section's three
@@ -1310,6 +1399,369 @@ describe("purity", () => {
     // no argument is a clock read.
     expect(code).not.toMatch(/new Date\(\s*\)/);
     expect(code).not.toMatch(/eslint-disable.*purity/);
+  });
+});
+
+/// #975. The exclusion the app computes and never said.
+///
+/// A user counting files sees 2,904 on disk and 1,502 in the app, and
+/// until now nothing on screen bridged the two -- so the obvious
+/// conclusion is that the scan is broken. `subagent_files_skipped` has
+/// crossed the IPC boundary since #914 with the comment "counted so the
+/// exclusion is visible and testable rather than invisible", and it was
+/// visible to a test and invisible to the person whose files they are.
+describe("the subagent exclusion is stated, not merely counted", () => {
+  /// **The sabotage test.** Delete the `subagent_files_skipped` clause
+  /// from `Banners` and this fails naming the number. Nothing else
+  /// catches it: the field is in the fixture and in the type, and every
+  /// other test passes with it rendered nowhere -- which is exactly the
+  /// state the issue reports.
+  it("names how many files were skipped, and that they are not sessions", () => {
+    state.imported = imported({ sessions: 1502, subagent_files_skipped: 1402 });
+    renderView();
+    expect(screen.getByText(/1,402 subagent transcripts skipped/i)).toBeTruthy();
+    // The WORDING matters as much as the number. #914's correction
+    // records that the naive glob "would list ~2x the real sessions, and
+    // every phantom row would offer a `--resume` handle for something
+    // that was never a session", so this must not read as "sessions
+    // Headstate declined to show".
+    expect(screen.getByText(/are not sessions and cannot be resumed/i)).toBeTruthy();
+  });
+
+  /// The happy-path pair: no noise when there is nothing to exclude.
+  ///
+  /// Zero subagent files is the common case on a new machine, and a
+  /// clause reading "0 skipped" is noise about an exclusion that did not
+  /// happen -- #976's rule, suppress rather than qualify when the figure
+  /// would mislead.
+  it("says nothing at all when no file was skipped", () => {
+    state.imported = imported({ sessions: 12, subagent_files_skipped: 0 });
+    renderView();
+    expect(screen.queryByText(/subagent/i)).toBeNull();
+    // The line it sits on is still there, so this is a suppressed clause
+    // and not a suppressed line.
+    expect(screen.getByText(/12 read in/i)).toBeTruthy();
+  });
+
+  /// It is GREY and factual, never the amber partial-read banner. The
+  /// field's own comment says "Not failures -- correctly excluded work",
+  /// and `is_partial()` deliberately does not consult it. Folding it in
+  /// would tell a user with a complete list that it is "incomplete by an
+  /// unknown amount".
+  it("does not make the list look incomplete", () => {
+    state.imported = imported({ sessions: 1502, subagent_files_skipped: 1402 });
+    renderView();
+    expect(screen.queryByText(/incomplete by an unknown amount/i)).toBeNull();
+  });
+
+  /// Singular reads as singular. A count of one rendering as "1 subagent
+  /// transcripts" is the kind of seam that makes a reader doubt the
+  /// number beside it.
+  it("agrees with itself about one file", () => {
+    state.imported = imported({ sessions: 3, subagent_files_skipped: 1 });
+    renderView();
+    expect(screen.getByText(/1 subagent transcript skipped/i)).toBeTruthy();
+    expect(screen.queryByText(/1 subagent transcripts/i)).toBeNull();
+  });
+});
+
+/// #959. How much work happened inside a session.
+///
+/// #910 cut this on "usage is not in the data I verified"; it is, on
+/// 1,478 of 1,502 real transcripts. `claude/usage.rs` carries the
+/// re-measurement and this is the rendering.
+describe("how much work a session did", () => {
+  /// **The sabotage test.** Fold the four counters into one total in
+  /// `SessionUsage` and this fails on the second assertion. The spread is
+  /// the whole point: cache reads run two to three orders of magnitude
+  /// above fresh input, so one summed figure is a cache-read count
+  /// wearing the word "tokens".
+  it("reports the four counters separately, never one total", () => {
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.getByText("994")).toBeTruthy();
+    expect(screen.getByText("582,035")).toBeTruthy();
+    expect(screen.getByText("1,988")).toBeTruthy();
+    expect(screen.getByText("405,086,242")).toBeTruthy();
+    expect(screen.getByText("4,971,059")).toBeTruthy();
+  });
+
+  /// **The sabotage test for absent-is-not-zero.** Remove the
+  /// `messages === 0` arm and this fails: the four `Field`s render with
+  /// zeros, which is a measurement that was never taken wearing the shape
+  /// of one that was. 24 of 1,502 real transcripts are exactly this.
+  it("says a transcript records no usage rather than showing four zeros", () => {
+    state.usage = usage({
+      messages: 0,
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_read_tokens: 0,
+      cache_creation_tokens: 0,
+      models: [],
+    });
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.getByText(/records no token usage/i)).toBeTruthy();
+    expect(screen.queryByText("Output tokens")).toBeNull();
+  });
+
+  /// A failed read and a session that used nothing have opposite
+  /// remedies, and only the second licenses a number. This is the #846
+  /// arm, ordered BEFORE the empty one for the reason that issue records.
+  it("names a failed read rather than reporting zeros", () => {
+    state.usageFailed = true;
+    state.usage = undefined;
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.getByText(/could not read its transcript/i)).toBeTruthy();
+    expect(screen.queryByText(/records no token usage/i)).toBeNull();
+    expect(screen.queryByText("0")).toBeNull();
+  });
+
+  /// The byte budget, STATED. Without this the reader cannot tell a
+  /// complete sum from one that stopped 8 MB into a 76.7 MB file, which
+  /// is #846 with a number on it.
+  it("says the figures are floors when the read stopped at the budget", () => {
+    state.usage = usage({ truncated: true, bytes_read: 8_388_608, file_bytes: 76_740_099 });
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.getByText(/floors, not totals/i)).toBeTruthy();
+    expect(screen.getByText(/73\.2 MB/)).toBeTruthy();
+    expect(screen.getByText(/8\.0 MB/)).toBeTruthy();
+  });
+
+  /// The happy-path pair for the test above: 97%+ of the corpus is read
+  /// whole, and the common case must not wear a label it has not earned.
+  it("claims no truncation on a transcript read whole", () => {
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.queryByText(/floors, not totals/i)).toBeNull();
+  });
+
+  /// `model` is per-MESSAGE and the corpus is mixed -- 12,512 opus-5
+  /// against 912 opus-4-7 across 13,425 sampled messages -- so a session
+  /// that used two gets both, with counts, rather than one picked.
+  it("names every model a session used, with how many messages each wrote", () => {
+    state.usage = usage({
+      models: [
+        { model: "claude-opus-5", messages: 900 },
+        { model: "claude-opus-4-7", messages: 94 },
+      ],
+    });
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.getByText(/claude-opus-5 \(900\), claude-opus-4-7 \(94\)/)).toBeTruthy();
+  });
+
+  /// No dollars anywhere, and this is asserted rather than left to
+  /// review. A cost needs per-model rates, those rates change, and a
+  /// quietly stale number with a currency symbol on it is the
+  /// confident-wrong-answer failure #941 exists for.
+  it("shows tokens and never a dollar figure", () => {
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.queryByText(/\$/)).toBeNull();
+    expect(screen.queryByText(/cost/i)).toBeNull();
+  });
+
+  /// A row with no transcript is a real row. It must say there is nothing
+  /// to read from, not fail and not report zeros.
+  it("says there is nothing to read when no transcript was recorded", () => {
+    state.list = listOf([
+      session({ transcript_path: null, transcript_state: { state: "not-recorded" } }),
+    ]);
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.getByText(/no transcript was recorded for this session/i)).toBeTruthy();
+  });
+
+  /// It reads the TRANSCRIPT's state, never the cwd's (#919): 1,213 of
+  /// 1,461 real rows have a dead cwd and a live transcript, so a reading
+  /// gated on the cwd would be absent on almost every row.
+  it("still reads usage for a session whose directory is gone", () => {
+    state.list = listOf([
+      session({ cwd_state: { state: "gone" }, transcript_state: { state: "exists" } }),
+    ]);
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.getByText("994")).toBeTruthy();
+  });
+});
+
+/// #982. Reading a transcript in the app.
+describe("reading a transcript rather than revealing it", () => {
+  /// Behind a disclosure, and the read does NOT start on selection: a
+  /// 256 KB read per row, over the pairing transport on the phone, for a
+  /// pane the user may not want.
+  ///
+  /// **The sabotage test for the gate.** Pass `true` instead of `open` to
+  /// `useClaudeTranscriptTail` and this fails on the first assertion.
+  it("does not read the transcript until asked", () => {
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(state.previewEnabledFor).toEqual([]);
+    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    expect(state.previewEnabledFor).toContain(
+      "/Users/acme/.claude/projects/slug/e5dff3bd.jsonl",
+    );
+  });
+
+  /// The four block kinds, four renderings. A renderer that assumed text
+  /// would show nothing for the 12,903 of 13,425 assistant messages that
+  /// stop on `tool_use`.
+  it("renders text, thinking, a tool call and a tool result each as itself", () => {
+    state.preview = preview({
+      messages: [
+        {
+          role: "assistant",
+          timestamp: "2026-09-13T11:00:05Z",
+          model: "claude-opus-5",
+          blocks: [
+            { kind: "text", text: "Looking now.", truncated: false },
+            { kind: "thinking", text: "weighing it up", truncated: false },
+            { kind: "tool_use", name: "Bash" },
+            { kind: "tool_result", text: "3 tests passed", truncated: false },
+          ],
+        },
+      ],
+    });
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    expect(screen.getByText("Looking now.")).toBeTruthy();
+    expect(screen.getByText("weighing it up")).toBeTruthy();
+    // The tool's NAME, not its arguments: "Bash" says what the session
+    // was doing and a 40 KB argument blob does not.
+    expect(screen.getByText("Bash")).toBeTruthy();
+    expect(screen.getByText(/3 tests passed/)).toBeTruthy();
+  });
+
+  /// **The sabotage test for the truncation label.** Delete the
+  /// `data.truncated` branch and this fails. A pane that silently showed
+  /// a tail is #846 in its purest form: the reader cannot tell a short
+  /// conversation from a truncated one, and #910's own design asked for
+  /// "a 'showing the last N lines of a large file' label".
+  it("says it is showing a tail, and of how large a file", () => {
+    state.preview = preview({
+      truncated: true,
+      bytes_read: 262_144,
+      file_bytes: 76_740_099,
+    });
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    expect(screen.getByText(/the last 2 messages/i)).toBeTruthy();
+    expect(screen.getByText(/final 256 KB of a 73\.2 MB transcript/i)).toBeTruthy();
+    expect(screen.getByText(/earlier exchanges are not shown/i)).toBeTruthy();
+  });
+
+  /// The happy-path pair: a transcript read whole says so, rather than
+  /// wearing a tail label it has not earned. 97.4% of the corpus is under
+  /// 1 MB, so this is the common case.
+  it("says it is showing everything when it read the whole file", () => {
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    expect(screen.getByText(/all 2 messages in this transcript/i)).toBeTruthy();
+    expect(screen.queryByText(/earlier exchanges are not shown/i)).toBeNull();
+  });
+
+  /// 44.2% of records are machinery. A pane showing two messages out of a
+  /// 300-record window has to say where the rest went, or the reader
+  /// concludes the reader is broken -- the same argument
+  /// `subagent_files_skipped` carries one banner up.
+  it("says how many records in the window were bookkeeping", () => {
+    state.preview = preview({ non_conversation_records: 298 });
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    expect(screen.getByText(/298 bookkeeping records in that window/i)).toBeTruthy();
+  });
+
+  /// A future block kind is NAMED, never dropped. Claude Code owns this
+  /// format, and a pane that silently omitted an unknown kind would show
+  /// an exchange with an invisible hole in it.
+  it("names a block kind it does not know rather than omitting it", () => {
+    state.preview = preview({
+      messages: [
+        {
+          role: "assistant",
+          timestamp: null,
+          model: null,
+          blocks: [{ kind: "other", block_type: "image" }],
+        },
+      ],
+    });
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    expect(screen.getByText("image")).toBeTruthy();
+    expect(screen.getByText(/does not know how to show/i)).toBeTruthy();
+  });
+
+  /// The #846 arm, and it is ordered before the empty one: `data` is
+  /// undefined on a rejection exactly as it is before the first read.
+  it("names a failed read rather than showing an empty conversation", () => {
+    state.previewFailed = true;
+    state.preview = undefined;
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    expect(screen.getByText(/could not read its transcript/i)).toBeTruthy();
+    expect(screen.getByText(/not the same as the session having said nothing/i)).toBeTruthy();
+  });
+
+  /// Read, and there genuinely was no conversation. Distinguished from
+  /// the failure above and from an empty file, because "300 machinery
+  /// records" and "an empty file" are different facts.
+  it("distinguishes a window with no conversation from a failed read", () => {
+    state.preview = preview({
+      messages: [],
+      non_conversation_records: 300,
+      unparseable_records: 2,
+    });
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    expect(screen.getByText(/no conversation in the last/i)).toBeTruthy();
+    expect(screen.getByText(/300 bookkeeping records and 2 that could not be read/i))
+      .toBeTruthy();
+    expect(screen.queryByText(/could not read its transcript/i)).toBeNull();
+  });
+
+  /// The tri-state's three wordings, not one shared shrug.
+  /// `revealRefusal`'s doc argues at length that collapsing `gone` and
+  /// `unknown` destroys the point of the third state, and this pane uses
+  /// the same function so the two controls cannot drift.
+  it("refuses a gone transcript differently from one it could not check", () => {
+    state.list = listOf([session({ transcript_state: { state: "gone" } })]);
+    renderView();
+    open("HeadState GitHub issues filing");
+    // Scoped to this section's own sentence, because the disabled Reveal
+    // transcript button is stating the same refusal clause a few lines
+    // up. Two identical sentences side by side read as two failures,
+    // which is why this one carries a prefix naming what IT cannot do.
+    expect(
+      screen.getByText(/there is nothing to read here: the path no longer exists/i),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /read the transcript/i })).toBeNull();
+  });
+
+  it("names the reason a transcript check failed", () => {
+    state.list = listOf([
+      session({ transcript_state: { state: "unknown", why: "Permission denied" } }),
+    ]);
+    renderView();
+    open("HeadState GitHub issues filing");
+    // `unknown` is worded DIFFERENTLY from `gone` above, which is the
+    // whole point of the tri-state: the path may well be there and the
+    // remedy is to fix whatever blocked the check.
+    expect(
+      screen.getByText(
+        /there is nothing to read here: could not check whether it exists \(Permission denied\)/i,
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText(/no longer exists/i)).toBeNull();
   });
 });
 

@@ -138,6 +138,29 @@ pub const SURFACE: &[(&str, Class)] = &[
     // "how much work is waiting for me back at the laptop". See the
     // desktop copy for the full argument.
     ("claude_overview", Class::Read),
+    // How much work happened inside one of the DESKTOP's sessions (#959).
+    // Read: one bounded read of one `.jsonl` under the desktop's
+    // `~/.claude/projects`, writing nothing.
+    //
+    // The phone gets this for the same reason the desktop does -- "was
+    // that the long session or the typo" is how the row worth resuming is
+    // picked -- and the response is a handful of integers, so it costs
+    // the transport nothing. See the desktop copy for the 8 MB read
+    // budget and why it is reported rather than silent.
+    ("claude_session_usage", Class::Read),
+    // The tail of one of the DESKTOP's transcripts, as conversation
+    // (#982). Read: one bounded tail read, writing nothing.
+    //
+    // The one Claude action where the phone's case is STRONGER than the
+    // desktop's. `claude_reveal_path` is `Local` and absent from this
+    // table, so until now a companion user could see that a session died
+    // and could not see a word of what it was doing -- the desktop user
+    // can `cat` the file, and the phone cannot reach the machine.
+    //
+    // Bounded inside the command (256 KB, 200 messages, clamped blocks)
+    // so asking for the desktop's 76 MB transcript cannot hand the phone
+    // 76 MB. See the desktop copy for the path guard both commands share.
+    ("claude_transcript_tail", Class::Read),
     // Whether the DESKTOP's hooks are installed (#915). Read: one file
     // read, no side effects, and "is that desktop recording?" is a real
     // away-from-desk question.

@@ -448,6 +448,37 @@ pub struct NotifyPrefs {
     /// one and not the other is making a reasonable choice.
     #[serde(default = "default_true")]
     pub health_cpu: bool,
+    /// Notify when a watched Claude Code session dies (#979).
+    ///
+    /// `#[serde(default)]` like every field above, and for the reason
+    /// `ready_to_review` states: without it a stored preference written
+    /// before this field existed would fail the WHOLE struct and silently
+    /// reset every other notification setting to its default.
+    ///
+    /// # Why this defaults ON, when "new field, default OFF" is the
+    /// # cautious reading
+    ///
+    /// Every field above defaults ON because those alerts predate their
+    /// own gate and an upgrade must not silence something a user relies
+    /// on. That argument does not apply here -- this alert is new and
+    /// nobody relies on it yet -- so the precedent is not a reason on its
+    /// own and #979 is right to ask for it to be argued.
+    ///
+    /// It is ON because it CANNOT fire unless the user has already opted
+    /// in to the thing it is about. `claude_integrations_enabled` defaults
+    /// `false` (`UiPrefs::default`) and the sweep that produces this
+    /// signal does not run without it, so nobody is interrupted about
+    /// something they never asked for -- which is the harm a default-OFF
+    /// would be protecting against. A user who turns the Claude Code
+    /// integration on is asking the app to watch their sessions, and
+    /// "the one you were relying on just died" is the whole of what
+    /// watching buys while you are away from the desk.
+    ///
+    /// Two gates rather than one, so turning the notification off does
+    /// not turn the feature off and vice versa: the master switch,
+    /// `enabled`, still covers it like everything else.
+    #[serde(default = "default_true")]
+    pub claude_crashed: bool,
 }
 
 impl Default for NotifyPrefs {
@@ -462,6 +493,11 @@ impl Default for NotifyPrefs {
             // upgrade must not silently mute an alert someone relies on.
             health_battery: true,
             health_cpu: true,
+            // ON, and NOT by copying the rows above -- see the field's
+            // own doc. It cannot fire unless the user has already turned
+            // the Claude Code integration on, which defaults off, so
+            // nobody is interrupted about something they never asked for.
+            claude_crashed: true,
         }
     }
 }
@@ -2257,6 +2293,60 @@ mod tests {
             assert!(p.health_battery);
             assert!(p.health_cpu);
             assert!(p.ready_to_review);
+        }
+
+        /// #979's field on the same upgrade path, asserted separately
+        /// because its default was ARGUED rather than copied.
+        ///
+        /// Every field above defaults ON because those alerts predate
+        /// their own gate and an upgrade must not silence something a
+        /// user relies on. That reasoning does not apply to a new alert
+        /// nobody relies on yet -- so this one is ON for a different
+        /// reason: it cannot fire unless `claude_integrations_enabled` is
+        /// on, and that defaults OFF, so nobody can be interrupted about
+        /// something they never asked for.
+        ///
+        /// Sabotage: drop `#[serde(default = "default_true")]` from
+        /// `claude_crashed` and this fails on the `from_str`, which is
+        /// the failure mode the attribute exists for -- a missing key
+        /// failing the WHOLE struct and silently resetting every other
+        /// setting.
+        #[test]
+        fn a_stored_preference_from_before_the_claude_field_still_decodes() {
+            let stored = r#"{"enabled":true,"ci_failed":false,"conflicted":true,
+                             "ready_to_review":false,"new_pr":true,
+                             "health_battery":false,"health_cpu":true}"#;
+            let p: NotifyPrefs = serde_json::from_str(stored).unwrap();
+            assert!(!p.ci_failed, "every stored choice survives");
+            assert!(!p.ready_to_review);
+            assert!(!p.health_battery);
+            assert!(
+                p.claude_crashed,
+                "and the new field defaults ON, because the feature it \
+                 reports on is itself opt-in and defaults off"
+            );
+        }
+
+        /// The gate is a real gate: turning it off is expressible and
+        /// leaves everything else alone. The pair to the test above --
+        /// a default that cannot be turned off is not a preference.
+        #[test]
+        fn the_claude_alert_can_be_turned_off_on_its_own() {
+            let off = NotifyPrefs {
+                claude_crashed: false,
+                ..Default::default()
+            };
+            assert!(!off.claude_crashed);
+            assert!(
+                off.health_battery && off.health_cpu && off.ci_failed,
+                "turning one category off must not touch the others"
+            );
+            let round: NotifyPrefs =
+                serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+            assert!(
+                !round.claude_crashed,
+                "and the choice survives a round trip"
+            );
         }
     }
 
