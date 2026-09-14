@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AlertReport, Footprint, HealthSample } from "@/types/pr";
 import { stubViewport } from "@/test-utils";
@@ -49,6 +49,10 @@ vi.mock("../api/hooks", () => ({
     }),
   useHealthAlerts: (enabled: boolean) =>
     useQuery({ queryKey: ["health-alerts"], queryFn: alertsFn, enabled, retry: false }),
+  // The Disk page's reclaim signpost reads `hidden_views` (#955): a user
+  // who hid the Docker view does not get sent to it. Empty here, so every
+  // link is offered and a test that finds none is finding a real absence.
+  useUiPrefs: () => ({ prefs: { hidden_views: [] } }),
 }));
 
 // The build target, as a mock: `IS_MOBILE_BUILD` is read at module
@@ -75,6 +79,19 @@ vi.mock("@/api/connection", () => ({
   isStale: () => false,
 }));
 
+/// The three modules #943 and #946 brought onto this page.
+///
+/// `copyText` is real in jsdom only as the insecure-context refusal, which
+/// would make every copy assertion below test the failure path; `revealLog`
+/// would reach a Tauri IPC that does not exist here. Mocked so the
+/// assertions are about the CONTROL rather than about jsdom.
+const copyFn = vi.hoisted(() => vi.fn(() => Promise.resolve(null as string | null)));
+const revealLogFn = vi.hoisted(() => vi.fn(() => Promise.resolve("/log/headstate.log")));
+const toastSuccess = vi.hoisted(() => vi.fn());
+const toastError = vi.hoisted(() => vi.fn());
+vi.mock("sonner", () => ({ toast: { success: toastSuccess, error: toastError } }));
+vi.mock("@/lib/clipboard", () => ({ copyText: copyFn }));
+vi.mock("@/api/tauri", () => ({ revealLog: revealLogFn }));
 import { SystemHealthPage } from "./SystemHealthPage";
 // The pure logic lives in `lib/health` rather than in the component, so
 // the gap detection -- the single most important piece of correctness
@@ -302,6 +319,11 @@ describe("SystemHealthPage", () => {
         key: "diffuse_cpu",
         title: "Several processes are using the CPU",
         body: "About 72% of the CPU has been in use for 31 minutes, and no single process accounts for it.",
+        // `null`, and this is the one alert where that is the POINT
+        // (#943): the whole content of this condition is that no single
+        // process accounts for the load, so a pid would contradict the
+        // sentence. A test below asserts no copy button appears here.
+        pid: null,
       },
     ]);
     show();
@@ -338,6 +360,151 @@ describe("SystemHealthPage", () => {
     show();
     expect(await screen.findByText(/Could not check for health conditions/)).toBeTruthy();
     expect(screen.getByText(/the rules did not run/)).toBeTruthy();
+  });
+
+  /// #946: the worst of the four failure states gets a retry, the reason,
+  /// and the log.
+  ///
+  /// "The rules did not run" is the state where the app tells the user its
+  /// health verdicts are untrustworthy -- and it was the state with the
+  /// LEAST recourse: no error message, no retry, and no pointer at the
+  /// diagnostic log where the cause would be. `alerts.refetch` was in scope
+  /// at the parent the whole time; only `alerts.data` and `alerts.isError`
+  /// were forwarded.
+  ///
+  /// SABOTAGE: drop `onRetry` from the `HealthConditions` call site and the
+  /// first assertion fails; drop the `errorMessage(error)` line and the
+  /// second does. Neither is caught by the test above, which asserts only
+  /// the sentence.
+  it("offers a retry, the reason and the log when the rules did not run", async () => {
+    alertsFn.mockRejectedValue("database is locked");
+    show();
+    await screen.findByText(/the rules did not run/);
+
+    // The REASON, which this state alone was not showing.
+    expect(screen.getByText(/database is locked/)).toBeTruthy();
+
+    // The retry re-issues the query. `health_alerts` is `Read`, so this
+    // works identically on the phone.
+    const before = alertsFn.mock.calls.length;
+    fireEvent.click(screen.getByRole("button", { name: /try again/i }));
+    await waitFor(() => expect(alertsFn.mock.calls.length).toBeGreaterThan(before));
+
+    // And the log, which this whole view has never offered: `reveal_log`
+    // has exactly one other caller in the frontend, in Settings.
+    fireEvent.click(screen.getByRole("button", { name: /show the log/i }));
+    await waitFor(() => expect(revealLogFn).toHaveBeenCalledOnce());
+  });
+
+  /// The wording survives VERBATIM.
+  ///
+  /// "This is not a clean result — the rules did not run" is load-bearing:
+  /// it is what stops a failed evaluation reading like a clean bill of
+  /// health. A retry is an addition beside it, never a reason to soften it,
+  /// and this pins the exact string rather than a loose pattern.
+  it("keeps the not-a-clean-result sentence exactly as it was", async () => {
+    alertsFn.mockRejectedValue(new Error("no"));
+    show();
+    const panel = await screen.findByText(/Could not check for health conditions/);
+    expect(panel.textContent).toContain(
+      "Could not check for health conditions. This is not a clean result — the rules did not run.",
+    );
+  });
+
+  /// The log button is `Class::Local` and is hidden on the phone, with a
+  /// sentence in its place.
+  ///
+  /// `reveal_log` is `Local` in both surface tables, so the companion would
+  /// render a button that can only be refused. `IS_MOBILE_BUILD` rather than
+  /// a width check, per this file's own rule: a desktop user who drags the
+  /// window narrow still has a Finder.
+  ///
+  /// The RETRY stays, because `health_alerts` is `Read` -- which is the half
+  /// that would be lost by hiding the whole block.
+  it("hides the log button on the phone and says why, while keeping the retry", async () => {
+    mobileBuild.current = true;
+    alertsFn.mockRejectedValue(new Error("no"));
+    show();
+    await screen.findByText(/the rules did not run/);
+
+    expect(screen.queryByRole("button", { name: /show the log/i })).toBeNull();
+    expect(screen.getByText(/no Finder here to reveal it in/i)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /try again/i })).toBeTruthy();
+  });
+
+  /// #946: the 24-hour history failure gets a retry, and keeps its wording.
+  ///
+  /// `history.refetch` was never read anywhere in this file -- grepped on
+  /// the issue. The sentence must not change: its job is to keep an empty
+  /// chart from reading as a flat one.
+  it("offers a retry when the 24-hour history could not be loaded", async () => {
+    historyFn.mockRejectedValue(new Error("nope"));
+    show();
+    await screen.findByText(/The 24-hour history could not be loaded/);
+    expect(screen.getByText(/The current readings are unaffected/)).toBeTruthy();
+
+    const before = historyFn.mock.calls.length;
+    fireEvent.click(screen.getByRole("button", { name: /try again/i }));
+    await waitFor(() => expect(historyFn.mock.calls.length).toBeGreaterThan(before));
+  });
+
+  /// #943: a notice about ONE process offers its pid, and one about the
+  /// machine does not.
+  ///
+  /// The notice's own last sentence is "Worth a look if you did not start
+  /// something long-running", and until `AlertReport` carried a pid there
+  /// was nothing on the page to look WITH -- the pid reached
+  /// `ProcessObservation` and was dropped when the notice was built.
+  ///
+  /// SABOTAGE: change `a.pid === null ? null : <CopyPid …>` to render
+  /// unconditionally and the second half fails, because the diffuse-CPU
+  /// alert -- whose whole content is that no single process explains the
+  /// load -- would sprout a button.
+  it("offers the pid on a single-process notice and none on a machine-wide one", async () => {
+    alertsFn.mockResolvedValue([
+      {
+        key: "cpu_watch:zsh",
+        title: "zsh has been busy for a while",
+        body: "zsh has held about 58% of one CPU core for 12 minutes. Worth a look.",
+        pid: 14779,
+      },
+      {
+        key: "diffuse_cpu",
+        title: "Several processes are using the CPU",
+        body: "About 72% of the CPU has been in use for 31 minutes, and no single process accounts for it.",
+        // No single process. No pid, and therefore no button.
+        pid: null,
+      },
+    ]);
+    show();
+    await screen.findByText("zsh has been busy for a while");
+
+    const copy = screen.getByRole("button", { name: /copy pid 14779/i });
+    fireEvent.click(copy);
+    await waitFor(() => expect(copyFn).toHaveBeenCalledWith("14779"));
+
+    // Exactly ONE copy control among the two notices.
+    expect(screen.getAllByRole("button", { name: /copy pid/i }).length).toBe(1);
+  });
+
+  /// A collapsed notice carries no pid, so it offers no button.
+  ///
+  /// "3 node processes have been busy" is about three pids and no single one
+  /// of them. Naming one would name a process the row is not about -- the
+  /// same mistake the grouped process table avoids by suppressing its PID
+  /// column, and the reason `Notice::pid` clears the field on collapse.
+  it("offers no pid on a notice that collapsed several processes", async () => {
+    alertsFn.mockResolvedValue([
+      {
+        key: "cpu_watch:node",
+        title: "3 node processes have been busy for a while",
+        body: "node has held about 91% of one CPU core for 40 minutes.",
+        pid: null,
+      },
+    ]);
+    show();
+    await screen.findByText("3 node processes have been busy for a while");
+    expect(screen.queryByRole("button", { name: /copy pid/i })).toBeNull();
   });
 
   it("shows the live readings once they arrive", async () => {

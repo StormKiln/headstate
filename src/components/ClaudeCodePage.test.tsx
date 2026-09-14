@@ -160,7 +160,10 @@ beforeEach(() => {
   // the store is a MODULE singleton -- so without this a query typed by
   // one test would still be filtering the list in the next one, and a
   // selected id would open a detail pane nobody clicked.
-  useFilters.setState({ claudeQuery: "", claudeSelected: undefined });
+  // `claudeFilter` too, as of #949, and for the same singleton reason: a
+  // chip pressed by one test would silently shorten every list after it,
+  // which is the failure mode where a suite goes green over an empty page.
+  useFilters.setState({ claudeQuery: "", claudeSelected: undefined, claudeFilter: "all" });
   copyFn.mockClear();
   revealFn.mockClear();
   toastError.mockClear();
@@ -824,6 +827,287 @@ describe("the jump to a session's worktree", () => {
     renderView();
     open("HeadState GitHub issues filing");
     expect(screen.getByText(/no directory was recorded/i)).toBeTruthy();
+  });
+});
+
+/// #949: the two axes a user acts on, as controls rather than prose.
+///
+/// 1,474 sessions were filterable only by four TEXT fields, while
+/// `cwd_state` and `liveness` -- both on every row, both read for display --
+/// were never read for filtering. On the measured corpus that meant paging
+/// through 1,295 rows whose directory was deleted to reach the 179 that can
+/// be resumed into place.
+describe("filtering the session list by state", () => {
+  /// A mixed list covering all four chips plus the states that belong to
+  /// NEITHER chip on their axis. Six rows, each one the only member of its
+  /// bucket, so an assertion naming a row is an assertion about a predicate.
+  ///
+  /// Every title is a bird, deliberately: the chip labels are
+  /// "Resumable"/"Running"/"Ended", and a fixture named "Resumable one"
+  /// makes `getByRole("button", { name: /Resumable/ })` ambiguous between
+  /// the chip and the row -- which is how the first draft of these tests
+  /// failed. Names with no overlap at all keep each assertion about one
+  /// thing. Synthetic per `CONTRIBUTING.md`.
+  function mixed() {
+    state.list = listOf([
+      session({
+        session_id: "r-1",
+        name: "Kestrel",
+        cwd_state: { state: "exists" },
+        liveness: { state: "dead", why: "pid 1 is no longer running" },
+      }),
+      session({
+        session_id: "g-1",
+        name: "Merlin",
+        cwd_state: { state: "gone" },
+        liveness: { state: "dead", why: "pid 2 is no longer running" },
+      }),
+      session({
+        session_id: "live-1",
+        name: "Goshawk",
+        cwd_state: { state: "exists" },
+        liveness: { state: "running", pid: 99, status: "busy" },
+      }),
+      session({
+        session_id: "unk-1",
+        name: "Buzzard",
+        // The directory check FAILED. Belongs to neither directory chip.
+        cwd_state: { state: "unknown", why: "Permission denied" },
+        liveness: { state: "dead", why: "pid 3 is no longer running" },
+      }),
+      session({
+        session_id: "nolive-1",
+        name: "Osprey",
+        cwd_state: { state: "gone" },
+        // Liveness could not be established. Belongs to neither liveness
+        // chip -- this is the entire imported history on a real machine.
+        liveness: { state: "unknown", why: "never observed" },
+      }),
+      session({
+        session_id: "norec-1",
+        name: "Harrier",
+        cwd: null,
+        cwd_state: { state: "not-recorded" },
+        liveness: { state: "dead", why: "pid 4 is no longer running" },
+      }),
+    ]);
+  }
+
+  /// Every title in `mixed`, so a row assertion can be written as a set
+  /// rather than a substring hunt. Alphabetical for readability only.
+  const BIRDS = ["Buzzard", "Goshawk", "Harrier", "Kestrel", "Merlin", "Osprey"] as const;
+
+  /// Scoped to the chip group, which is what makes this unambiguous even if
+  /// a future fixture does share a word with a chip label.
+  const chip = (name: string) =>
+    within(screen.getByRole("group", { name: /filter sessions by state/i })).getByRole(
+      "button",
+      { name: new RegExp(`^${name}`, "i") },
+    );
+
+  /// Which of `mixed`'s rows are currently drawn, by title. Not "every
+  /// button that looks like a row": an exact membership test over a known
+  /// set, so a predicate that admits one row too many fails by NAME rather
+  /// than by a count nobody can attribute.
+  const rowNames = () =>
+    BIRDS.filter((b) => screen.queryByRole("button", { name: new RegExp(b, "i") }) !== null);
+
+  /// The chips exist, are labelled, and carry their POPULATION.
+  ///
+  /// The count is not decoration: a chip reading "Resumable" with no number
+  /// tells the reader nothing about whether pressing it is worth it, and a
+  /// count computed over the CURRENT subset rather than the whole list would
+  /// read 0 on every chip but the active one.
+  it("offers a chip per state, each with its count over the whole list", () => {
+    mixed();
+    renderView();
+
+    const group = screen.getByRole("group", { name: /filter sessions by state/i });
+    // 6 rows in, and the counts must partition honestly: 1 resumable,
+    // 1 gone-and-not-running... except `nolive-1` is `gone` with UNKNOWN
+    // liveness, which `!== "running"` admits. So gone is 2.
+    expect(within(group).getByRole("button", { name: /^All 6/i })).toBeTruthy();
+    expect(within(group).getByRole("button", { name: /^Resumable 1/i })).toBeTruthy();
+    expect(within(group).getByRole("button", { name: /^Directory gone 2/i })).toBeTruthy();
+    expect(within(group).getByRole("button", { name: /^Running 1/i })).toBeTruthy();
+    expect(within(group).getByRole("button", { name: /^Ended 4/i })).toBeTruthy();
+  });
+
+  /// **The one that matters.** Each chip narrows the list to its own rows.
+  ///
+  /// SABOTAGE: make `matchesClaudeFilter` return `true` unconditionally and
+  /// every case below fails, naming the row that should have been filtered
+  /// out. A test that only asserted the chip renders would stay green.
+  it.each([
+    // Kestrel alone: `exists` AND not running. Goshawk's directory exists
+    // too and is excluded because it IS running -- which is the overview's
+    // own subtraction, and the reason the tile's 179 matches this list.
+    ["Resumable", ["Kestrel"]],
+    // Merlin (`gone` + dead) and Osprey (`gone` + liveness unknown). Osprey
+    // belongs here because this chip is about the DIRECTORY and "not
+    // running" admits a liveness we could not establish.
+    ["Directory gone", ["Merlin", "Osprey"]],
+    ["Running", ["Goshawk"]],
+    // Four of six: everything `dead`. Not Goshawk (running) and not Osprey
+    // (unknown).
+    ["Ended", ["Buzzard", "Harrier", "Kestrel", "Merlin"]],
+  ])("narrows the list to the %s rows", (label, expected) => {
+    mixed();
+    renderView();
+
+    fireEvent.click(chip(label));
+
+    // An EXACT set, not a superset. A predicate returning `true`
+    // unconditionally fails here by naming the extra rows.
+    expect(rowNames()).toEqual(expected);
+  });
+
+  /// **Absent is not zero, as a filter.** A directory whose check FAILED is
+  /// in neither directory chip.
+  ///
+  /// This is the guard the issue asks for by name. `cwd_state` is a
+  /// four-state and `revealRefusal` gives all four different wording
+  /// precisely because collapsing them is the shrug the tri-state exists to
+  /// prevent -- so a Resumable chip that swept `unknown` in with `exists`
+  /// would tell the user a resume will land in the right tree when the app
+  /// does not know whether the tree is there, and a Gone chip that swept it
+  /// in with `gone` would send them looking for work that was never lost.
+  ///
+  /// The consequence is that the two chips do not sum to the total, which is
+  /// asserted rather than glossed: 1 + 2 < 6 here, and the missing rows are
+  /// the unchecked and the unrecorded ones.
+  it("puts a session whose directory could not be checked in neither directory chip", () => {
+    mixed();
+    renderView();
+
+    // Buzzard's check failed (`unknown`); Harrier never had a path
+    // (`not-recorded`). Both are absent from BOTH directory chips.
+    fireEvent.click(chip("Resumable"));
+    expect(rowNames()).not.toContain("Buzzard");
+    expect(rowNames()).not.toContain("Harrier");
+
+    fireEvent.click(chip("Directory gone"));
+    expect(rowNames()).not.toContain("Buzzard");
+    expect(rowNames()).not.toContain("Harrier");
+
+    // And the arithmetic does not close, which is the honest consequence:
+    // 1 resumable + 2 gone < 6 sessions, with the shortfall being exactly
+    // the two rows above. Asserted so a later "tidy-up" that folds
+    // `unknown` into `gone` to make the numbers add up fails here.
+    fireEvent.click(chip("All"));
+    expect(rowNames().length).toBe(6);
+  });
+
+  /// And the same rule on the liveness axis: `unknown` is not `dead`.
+  ///
+  /// `Liveness`'s own doc calls rendering `unknown` as "not running" #841's
+  /// fail-open, because "not running" is what offers Resume and resuming a
+  /// live session starts a second copy. An Ended chip built on
+  /// `!== "running"` would be that mistake as a control -- and it would
+  /// sweep in the entire imported history, making the chip mean "all".
+  it("does not treat a liveness that could not be established as ended", () => {
+    mixed();
+    renderView();
+
+    fireEvent.click(chip("Ended"));
+    // Osprey's liveness could not be established. Not ended.
+    expect(rowNames()).not.toContain("Osprey");
+    // But the four genuinely dead ones ARE there, so this is a real
+    // narrowing and not an empty chip.
+    expect(rowNames().length).toBe(4);
+  });
+
+  /// The chip and the search box COMPOSE, and the count line says which
+  /// denominator it is reporting against.
+  ///
+  /// "Showing N of M" must stay exact in every mode. A chip narrows what the
+  /// search searches, so "1 of 2 match in this filter" is a different claim
+  /// from "1 of 6 match" -- and collapsing them would make the number on
+  /// screen unattributable to either control.
+  it("intersects with the search box and says which total it is counting against", () => {
+    mixed();
+    renderView();
+
+    fireEvent.click(chip("Directory gone"));
+    fireEvent.change(screen.getByLabelText(/search claude code sessions/i), {
+      target: { value: "osprey" },
+    });
+
+    // Merlin is in the filter and does not match the search; Kestrel
+    // matches neither. So one row from a filter holding two, out of six.
+    expect(rowNames()).toEqual(["Osprey"]);
+    expect(document.body.textContent).toMatch(/1 of 2 match in this filter/i);
+    expect(document.body.textContent).toMatch(/6 sessions in all/i);
+  });
+
+  /// A chip that matches nothing says THAT, not "no sessions on this
+  /// machine".
+  ///
+  /// The same distinction #846 draws between a failed read and an empty one,
+  /// one level in: a reader who cannot tell "this filter is empty" from
+  /// "this machine has never run Claude Code" will go looking for a rescan
+  /// they do not need.
+  it("distinguishes an empty filter from an empty machine", () => {
+    state.list = listOf([
+      session({ cwd_state: { state: "gone" }, liveness: { state: "dead", why: "gone" } }),
+    ]);
+    renderView();
+
+    fireEvent.click(chip("Running"));
+    expect(screen.getByText(/no session is in this filter/i)).toBeTruthy();
+    expect(screen.queryByText(/no claude code sessions on this machine/i)).toBeNull();
+  });
+
+  /// Which chip is on is available to a screen reader, not only as a
+  /// background colour.
+  ///
+  /// The same rule the pressure row states about never letting colour be
+  /// the only cue, applied to the one property of this control that matters
+  /// most: a reader who cannot see which chip is pressed cannot tell a
+  /// filtered list from a short one.
+  it("says which chip is pressed", () => {
+    mixed();
+    renderView();
+
+    fireEvent.click(chip("Resumable"));
+    expect(chip("Resumable").getAttribute("aria-pressed")).toBe("true");
+    expect(chip("All").getAttribute("aria-pressed")).toBe("false");
+  });
+
+  /// The running partition SURVIVES the chips.
+  ///
+  /// Running sessions are pinned above everything, and the chips filter the
+  /// INPUT to that partition rather than replacing it -- re-deriving the
+  /// ordering per chip would be a second description of a rule
+  /// `sessions.rs` owns.
+  it("keeps running sessions pinned to the top inside a filter", () => {
+    state.list = listOf([
+      // Dead FIRST in the data, so a partition that was dropped would show
+      // this order back unchanged and fail below.
+      session({
+        session_id: "d-1",
+        name: "Peregrine",
+        cwd_state: { state: "exists" },
+        liveness: { state: "dead", why: "pid 1 is no longer running" },
+      }),
+      session({
+        session_id: "l-1",
+        name: "Hobby",
+        cwd_state: { state: "exists" },
+        liveness: { state: "running", pid: 7, status: null },
+      }),
+    ]);
+    renderView();
+
+    // Both rows are in "All" and both have a live directory, so this is the
+    // base ordering the chips filter the INPUT to. `textContent` order over
+    // the rendered buttons, which is document order.
+    const titles = screen
+      .getAllByRole("button")
+      .map((b) => b.textContent ?? "")
+      .filter((t) => /Peregrine|Hobby/.test(t));
+    expect(titles[0]).toMatch(/Hobby/);
+    expect(titles[1]).toMatch(/Peregrine/);
   });
 });
 

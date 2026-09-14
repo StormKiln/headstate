@@ -1,7 +1,8 @@
 import { useState } from "react";
 import { toast } from "sonner";
 import { useClaudeHooks } from "@/api/hooks";
-import type { ClaudeHooksStatus, UiPrefs } from "@/api/tauri";
+import { claudeRevealPath, type ClaudeHooksStatus, type UiPrefs } from "@/api/tauri";
+import { copyText } from "@/lib/clipboard";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 
 /// One sentence saying what the file says, and what to do about it.
@@ -67,6 +68,22 @@ function refusalText(r: Extract<ClaudeHooksStatus, { state: "cannot_tell" }>): s
   }
 }
 
+/// The settings file the current status is ABOUT, or `null` (#961).
+///
+/// A function rather than an inline narrowing, because the four refusal
+/// kinds are a union and only the `cannot_tell` arm has a path at all: the
+/// `installed`, `not_installed` and `stale` states are answers about a file
+/// that was read successfully, so there is no path to offer and no reason
+/// to offer one -- the panel already says `~/.claude/settings.json` in
+/// prose there.
+///
+/// Kept as a pure function of the status, like `statusLine` above and for
+/// the same reason: it is the predicate that decides whether three controls
+/// render, so it should be testable without a DOM.
+export function refusalPath(status: ClaudeHooksStatus | undefined): string | null {
+  return status?.state === "cannot_tell" ? status.path : null;
+}
+
 /// Settings › Claude Code.
 ///
 /// Two controls with deliberately different meanings, and the distinction is
@@ -106,12 +123,15 @@ export function ClaudeIntegrationsPanel({
   prefs: UiPrefs | undefined;
   setPrefs: (prefs: UiPrefs) => Promise<void>;
 }) {
-  const { status, install, reinstall, uninstall } = useClaudeHooks();
+  const { status, install, reinstall, uninstall, reread } = useClaudeHooks();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const enabled = prefs?.claude_integrations_enabled ?? false;
   const line = statusLine(status);
+  // The file the refusal is about, and the gate on all three of #961's
+  // controls. `null` for every state that read the file successfully.
+  const brokenPath = refusalPath(status);
 
   // Every one of these edits a file outside this app and can genuinely
   // refuse, so the error is SHOWN. The same rule autostart and the phone
@@ -207,6 +227,33 @@ export function ClaudeIntegrationsPanel({
         >
           {line.text}
         </p>
+        {/* #961: the controls the refusal's own instruction requires.
+            "Fix the JSON by hand, then install" names a button that is
+            `disabled` in this state -- correctly, since a malformed file
+            must not offer the button whose whole job is to refuse -- so
+            after the hand-edit there was nothing on screen that re-read
+            the file. `refetchOnWindowFocus` is not an answer: it is
+            invisible, and it never fires for a user who does not leave
+            the window.
+
+            Rendered only for `cannot_tell`. In the other three states the
+            file was read, the prose below already names it, and a
+            re-check button beside a working status is furniture.
+
+            NOT inside the `IS_MOBILE_BUILD` branch below, and that is
+            deliberate: `claude_hooks_status` is `Class::Read` and
+            `copyText` is frontend-only, so both work on the phone. Only
+            the reveal is `Class::Local` and it is gated on its own. */}
+        {/* `void reread()`, not `reread` itself: `invalidateQueries` returns
+            a promise and `onReread` is a `() => void`, so passing it bare
+            hands a promise to a handler that will not await it. Nothing here
+            wants the result -- the re-read's outcome arrives as a new
+            `status`, which is the whole point of `invalidateQueries` over
+            `setQueryData` -- so discarding it explicitly is the honest
+            spelling rather than widening the prop's type to hide it. */}
+        {brokenPath !== null ? (
+          <RefusalActions path={brokenPath} onReread={() => void reread()} />
+        ) : null}
         {IS_MOBILE_BUILD ? (
           <p className="text-xs text-[#8b949e]">
             Installing and removing the hook edits a configuration file shared with other
@@ -236,6 +283,19 @@ export function ClaudeIntegrationsPanel({
                   // three-state status: a malformed file must not offer the
                   // button whose whole job is to refuse.
                   disabled={busy || !status || status.state === "cannot_tell"}
+                  // The reason on hover as well as beside the button, per
+                  // `RevealButton`'s argument (#919, #961): the visible
+                  // text is what a keyboard or screen-reader user gets,
+                  // the title is what a mouse user reaching for a greyed
+                  // control looks for. The disabled Install had neither,
+                  // so the amber paragraph above and the dead button
+                  // below were two things the reader had to connect
+                  // themselves.
+                  title={
+                    brokenPath !== null
+                      ? `Headstate cannot read ${brokenPath}, so it will not write to it.`
+                      : undefined
+                  }
                   onClick={() => run("install", install)}
                   className="rounded border border-[#30363d] px-2 py-0.5 text-xs text-[#e6edf3] hover:bg-[#21262d] disabled:opacity-50"
                 >
@@ -257,6 +317,20 @@ export function ClaudeIntegrationsPanel({
                 </button>
               ) : null}
             </div>
+            {/* The VISIBLE reason the button above is dead (#961). One
+                short line, not only a `title` -- the same case
+                `RevealButton` makes at length for the reveal buttons two
+                views over. Worded as a statement about the file rather
+                than a repeat of the amber paragraph's instruction: the
+                paragraph says what to do, this says why the control next
+                to it cannot. */}
+            {brokenPath !== null ? (
+              <p className="text-xs text-[#8b949e]">
+                Install is unavailable while that file cannot be read — Headstate refuses
+                to write to a settings file it could not parse, rather than overwriting
+                what another tool put there.
+              </p>
+            ) : null}
             <p className="text-xs text-[#8b949e]">
               Adds one entry to <code>~/.claude/settings.json</code>, beside whatever is
               already there. Anything another tool put in that file is left alone, and a
@@ -270,6 +344,128 @@ export function ClaudeIntegrationsPanel({
           </p>
         ) : null}
       </div>
+    </div>
+  );
+}
+
+/// The three things a user with a broken settings file needs (#961).
+///
+/// The panel's own message ends "Fix the JSON by hand, then install", and
+/// every one of those words named something the user could not do: the file
+/// was a path interpolated into a sentence, there was no re-check after the
+/// hand-edit, and Install was `disabled`. Two of the three gaps are closed
+/// here and the third -- the reason Install is dead -- is stated beside the
+/// button itself, where a reader looking at a greyed control will find it.
+///
+/// # Why "Check again" and not "enable Install"
+///
+/// Install stays disabled, which is the load-bearing half of the
+/// three-state status: a malformed file must not offer the button whose
+/// whole job is to refuse. "Check again" re-reads and lets the status
+/// decide -- so a fixed file turns into an enabled Install by the status
+/// changing, which is the only way that button should ever become live.
+///
+/// It is also not greyed by the integrations switch, deliberately. The
+/// panel already argues that greying the install controls "would imply the
+/// switch disables them", and a panel that cannot re-check while the view
+/// is off is the same dead end that argument names.
+///
+/// # Three controls, three surface classes
+///
+/// | control | class | phone |
+/// |---|---|---|
+/// | Check again | `claude_hooks_status` is `Read` | yes |
+/// | Copy path | no command at all -- `copyText` | yes |
+/// | Reveal | `claude_reveal_path` is `Class::Local` | NO |
+///
+/// So only the reveal is gated, and on `IS_MOBILE_BUILD` rather than
+/// `useIsMobile()`: a desktop user who drags the window narrow still has a
+/// Finder. The sentence in its place is not decoration -- an absent button
+/// with no explanation leaves the reader unable to tell "this app has no
+/// such action" from "not from here", which is the distinction
+/// `RevealButton` exists to preserve.
+///
+/// Copy is the one that matters most on the phone, and the reason it is
+/// rendered there rather than hidden with the reveal: a path the user can
+/// put in a message to themselves is the only one of the three that helps
+/// when the Mac with the broken file is in another room.
+function RefusalActions({
+  path,
+  onReread,
+}: {
+  /// The settings file the refusal names. Never `null` here -- the caller
+  /// gates on `refusalPath` -- so this component has no absent case and
+  /// does not invent wording for one.
+  path: string;
+  /// `useClaudeHooks`'s `reread`. The same invalidation the three writes
+  /// use in their `.finally`, so a hand-edit is judged by exactly the code
+  /// an install would have run.
+  onReread: () => void;
+}) {
+  const copy = async () => {
+    const failure = await copyText(path);
+    if (failure) {
+      // The REASON. `copyText` distinguishes an insecure context from a
+      // rejected write and the two have different remedies, so "could not
+      // copy" alone would leave the user with nothing to do -- which is
+      // the defect this whole component is fixing, reproduced one level
+      // down.
+      toast.error(`Could not copy the path: ${failure}`);
+      return;
+    }
+    toast.success("Copied the settings file path.");
+  };
+
+  const reveal = () => {
+    void claudeRevealPath(path).then(
+      () => {},
+      (e: unknown) => {
+        // Shown rather than swallowed, like every other refusal on this
+        // panel. `claude_reveal_path` falls back to returning the path
+        // where revealing is unsupported, so a rejection here is a real
+        // failure and not a platform gap.
+        toast.error(typeof e === "string" ? e : "Could not reveal the settings file");
+      },
+    );
+  };
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          onClick={onReread}
+          className="tap-target rounded border border-[#30363d] px-2 py-0.5 text-xs text-[#e6edf3] hover:bg-[#21262d]"
+        >
+          Check again
+        </button>
+        <button
+          type="button"
+          onClick={() => void copy()}
+          className="tap-target rounded border border-[#30363d] px-2 py-0.5 text-xs text-[#e6edf3] hover:bg-[#21262d]"
+        >
+          Copy path
+        </button>
+        {IS_MOBILE_BUILD ? null : (
+          <button
+            type="button"
+            onClick={reveal}
+            className="tap-target rounded border border-[#30363d] px-2 py-0.5 text-xs text-[#e6edf3] hover:bg-[#21262d]"
+          >
+            Reveal in Finder
+          </button>
+        )}
+      </div>
+      {IS_MOBILE_BUILD ? (
+        <p className="text-xs text-[#8b949e]">
+          Revealing the file needs a Finder this phone cannot see, so it is opened at that
+          Mac. The path above copies here.
+        </p>
+      ) : null}
+      <p className="text-xs text-[#8b949e]">
+        Check again re-reads the file without writing to it, so a hand-fix shows up here
+        as soon as it is saved.
+      </p>
     </div>
   );
 }

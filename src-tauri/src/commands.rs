@@ -4389,6 +4389,10 @@ pub async fn health_alerts(app: AppHandle) -> Result<Vec<crate::health::AlertRep
                     key: a.key().to_string(),
                     title: a.title(),
                     body: a.body(),
+                    // None for all five: battery, thermal and the rest are
+                    // conditions about the MACHINE, with no process to
+                    // point at (#943).
+                    pid: None,
                 })
                 .collect();
 
@@ -4415,6 +4419,11 @@ pub async fn health_alerts(app: AppHandle) -> Result<Vec<crate::health::AlertRep
                     key: a.key().to_string(),
                     title: a.title(),
                     body: a.body(),
+                    // The aggregate CPU alert is about the machine, and its
+                    // whole content is that NO single process explains the
+                    // load -- so a pid here would contradict the sentence
+                    // (#943).
+                    pid: None,
                 }),
         );
 
@@ -4438,6 +4447,11 @@ pub async fn health_alerts(app: AppHandle) -> Result<Vec<crate::health::AlertRep
                     key: n.key(),
                     title: n.title(),
                     body: n.body(),
+                    // `Notice::pid` answers `None` for the machine-wide
+                    // variant, which is what this is -- taken from the
+                    // accessor rather than hard-coded so the two cannot
+                    // disagree if a third variant ever lands (#943).
+                    pid: n.pid(),
                 }),
         );
 
@@ -4464,6 +4478,11 @@ pub async fn health_alerts(app: AppHandle) -> Result<Vec<crate::health::AlertRep
                 key: n.key(),
                 title: n.title(),
                 body: crate::health::runaway::with_age(&n.body(), age),
+                // THE one that matters (#943). These are #865's watch
+                // notices -- the ones whose body ends "Worth a look" -- and
+                // this is the pid the reader looks with. `Some` for a
+                // single process, `None` for a collapsed row.
+                pid: n.pid(),
             }));
         }
         Ok(out)

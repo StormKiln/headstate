@@ -2922,6 +2922,22 @@ export function useClaudeHooks() {
     install: () => claudeInstallHooks().finally(reread),
     reinstall: () => claudeReinstallHooks().finally(reread),
     uninstall: () => claudeUninstallHooks().finally(reread),
+    /// Re-read the file, with nothing written (#961).
+    ///
+    /// Exported because the `cannot_tell` arm's own message ends "Fix the
+    /// JSON by hand, then install" -- and Install is `disabled` in exactly
+    /// that state, deliberately and correctly. So the instruction named a
+    /// control that does not exist: every caller of `reread` was a
+    /// `.finally` on one of the three buttons that are disabled or hidden
+    /// there, leaving `refetchOnWindowFocus` as the only re-check. That is
+    /// invisible, undiscoverable, and will not fire at all for a user who
+    /// never leaves the window.
+    ///
+    /// The SAME function the three writes use, not a second read path: the
+    /// answer to "did my hand-edit take" must be the same answer an
+    /// install would have computed, or the button lies in a subtler way
+    /// than having no button did.
+    reread,
   };
 }
 

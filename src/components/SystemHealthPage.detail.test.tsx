@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   Footprint,
@@ -101,10 +101,18 @@ vi.mock("../api/hooks", () => ({
       retry: false,
     }),
   // The sidebar renders `ViewSwitcher`, which reads the hidden-views
-  // preference. Nothing hidden, so the switcher offers every view --
-  // this file's subject is the class list beneath it.
-  useUiPrefs: () => ({ prefs: { hidden_views: [] } }),
+  // preference. Nothing hidden by default, so the switcher offers every
+  // view -- this file's subject is the class list beneath it.
+  //
+  // Mutable as of #955, because the Disk page's reclaim signpost reads the
+  // same preference and must not send a user to a view they hid.
+  useUiPrefs: () => ({ prefs: { hidden_views: hiddenViews.current } }),
 }));
+
+/// Views the user has hidden. Empty for every test that does not opt in;
+/// reset in `beforeEach` so a test that hides one cannot shorten the next
+/// one's signpost (#955).
+const hiddenViews = vi.hoisted(() => ({ current: [] as string[] }));
 
 const mobileBuild = vi.hoisted(() => ({ current: false }));
 vi.mock("@/lib/target", () => ({
@@ -119,6 +127,24 @@ vi.mock("@/lib/target", () => ({
 vi.mock("@/api/connection", () => ({
   useConnectionState: () => ({ kind: "local" }),
   isStale: () => false,
+}));
+
+/// Mocked because the real ones are wrong here rather than merely
+/// inconvenient (#943, #946): `copyText` in jsdom only ever takes its
+/// insecure-context branch, so every copy assertion would test the refusal
+/// path, and `revealLog` would reach a Tauri IPC that does not exist.
+const copyFn = vi.hoisted(() => vi.fn(() => Promise.resolve(null as string | null)));
+const revealLogFn = vi.hoisted(() => vi.fn(() => Promise.resolve("/log/headstate.log")));
+vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+vi.mock("@/lib/clipboard", () => ({ copyText: copyFn }));
+// Spread the REAL module and override one export. A bare object would drop
+// every other wrapper in `tauri.ts`, and the sidebar's chain reaches several
+// -- which fails loudly at import time rather than at the assertion, so the
+// narrow version is not even a silent mistake. Spreading keeps this mock
+// about the one call the page under test makes.
+vi.mock("@/api/tauri", async (orig) => ({
+  ...((await orig()) as Record<string, unknown>),
+  revealLog: revealLogFn,
 }));
 
 import { SystemHealthPage } from "./SystemHealthPage";
@@ -271,6 +297,7 @@ beforeEach(() => {
   // macOS answer opt into it, exactly as `gpus` works above.
   netProcFn.mockResolvedValue([]);
   netProcPollMs.current = false;
+  hiddenViews.current = [];
   useFilters.setState({ healthPage: "overview" });
 });
 
@@ -337,6 +364,75 @@ describe("the CPU page names the processes responsible", () => {
     await screen.findByText(/other 1433 are not listed/i);
   });
 
+  /// #943: the PID in the table is copyable.
+  ///
+  /// The panel's own comment says the PID "is here because this panel's job
+  /// ends at naming the cost: a user who wants to know what a 900%-CPU `git`
+  /// is doing needs something to type into `ps`" -- and the number was bare
+  /// text in a `<td>`. So the workflow the app expected was: read a number
+  /// off the screen, retype it. Three separate comments in the file name
+  /// copy-into-a-shell as the intention and none provided a copy affordance;
+  /// `SystemHealthPage.tsx` contained zero occurrences of `copyText`.
+  ///
+  /// SABOTAGE: revert `<CopyPid pid={p.pid} />` to `{p.pid}` and this fails,
+  /// because there is no button to find.
+  it("copies a process PID rather than making it retyped", async () => {
+    renderPage();
+    // The TABLE, not the heading: the heading renders before the footprint
+    // query resolves, so waiting on it would look for a row that is not
+    // drawn yet. 701 is `acme-render`, the top row.
+    const copy = await screen.findByRole("button", { name: /copy pid 701/i });
+
+    fireEvent.click(copy);
+    await waitFor(() => expect(copyFn).toHaveBeenCalledWith("701"));
+  });
+
+  /// Grouped rows still have NO PID column, so there is nothing to copy
+  /// there either.
+  ///
+  /// The heading's own comment: "A group has no PID: printing one of the
+  /// twenty-six would name a process the row is not about, and it is the
+  /// column a reader copies into `ps`." Adding a copy button was the change
+  /// most likely to tempt someone into giving the grouped rows a PID column
+  /// to hang one on, so the absence is pinned.
+  it("adds no PID and no copy button to the grouped rows", async () => {
+    renderPage();
+    // Individual first, so the assertion after the switch is about the
+    // switch rather than about a table that never had a PID column.
+    expect(await screen.findByRole("button", { name: /copy pid 701/i })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Grouped" }));
+
+    await waitFor(() =>
+      expect(screen.queryByRole("columnheader", { name: "PID" })).toBeNull(),
+    );
+    expect(screen.queryByRole("button", { name: /copy pid/i })).toBeNull();
+  });
+
+  /// #946: the process-list failure offers a retry.
+  ///
+  /// `fp.refetch` was in scope at this call site the whole time, and the
+  /// state rendered as a bare `<p>`. Every one of the 20 other `QueryError`
+  /// sites in the codebase passes `onRetry`; only these four in-panel states
+  /// did not.
+  it("offers a retry when the process list could not be read", async () => {
+    footprintFn.mockRejectedValue("nettop refused");
+    renderPage();
+    const panel = (await screen.findByText("What is using the CPU")).closest(
+      "section",
+    ) as HTMLElement;
+
+    await waitFor(() =>
+      expect(within(panel).getByText(/Could not read the process list/)).toBeTruthy(),
+    );
+    // The reason, which this state already showed and must keep.
+    expect(within(panel).getByText(/nettop refused/)).toBeTruthy();
+
+    const before = footprintFn.mock.calls.length;
+    fireEvent.click(within(panel).getByRole("button", { name: /try again/i }));
+    await waitFor(() => expect(footprintFn.mock.calls.length).toBeGreaterThan(before));
+  });
+
   it("shows CPU above 100% without clamping it", async () => {
     // `cpu_percent` is a share of ONE core, so a process using four
     // legitimately reads 412%. Clamping would report a busy process as
@@ -395,6 +491,37 @@ describe("the CPU page names the processes responsible", () => {
 
 describe("the Memory page names what is holding it", () => {
   beforeEach(() => useFilters.setState({ healthPage: "memory" }));
+
+  /// #946: the fourth of the four states, and the second of the two that
+  /// read the same query.
+  ///
+  /// Asserted on this page as well as on the CPU page, not as padding: the
+  /// two are separate JSX sites rendering the same rejected read, and a fix
+  /// applied to one and not the other is the exact asymmetry that produced
+  /// four retry-less states beside twenty that had one.
+  it("offers a retry when the process list could not be read", async () => {
+    footprintFn.mockRejectedValue("could not read the process table");
+    renderPage();
+    const panel = (await screen.findByText("What is holding the memory")).closest(
+      "section",
+    ) as HTMLElement;
+
+    await waitFor(() =>
+      expect(within(panel).getByText(/Could not read the process list/)).toBeTruthy(),
+    );
+    const before = footprintFn.mock.calls.length;
+    fireEvent.click(within(panel).getByRole("button", { name: /try again/i }));
+    await waitFor(() => expect(footprintFn.mock.calls.length).toBeGreaterThan(before));
+  });
+
+  /// #943: the PIDs here are copyable too. Same table component, and the
+  /// assertion is here so a change that splits the two cannot pass.
+  it("copies a process PID", async () => {
+    renderPage();
+    const copy = await screen.findByRole("button", { name: /copy pid 703/i });
+    fireEvent.click(copy);
+    await waitFor(() => expect(copyFn).toHaveBeenCalledWith("703"));
+  });
 
   it("lists the biggest resident sets, in the order Rust chose", async () => {
     renderPage();
@@ -471,6 +598,109 @@ describe("the Disk page", () => {
     expect(
       screen.queryByRole("button", { name: /measure disk use/i }),
     ).toBeNull();
+  });
+
+  /// #955: a signpost to the three views that can reclaim space.
+  ///
+  /// The page reported a filling disk with ZERO cross-view navigation --
+  /// `setView` appeared nowhere in the file's 3,203 lines -- while the app
+  /// owns three views whose commands remove things. A first-time user reads
+  /// 73% and is on their own, which is the knowledge they most conspicuously
+  /// lack.
+  ///
+  /// This does not contradict #796's removal of the "which of this is ours"
+  /// panel, and the three tests below are one per thing #796 actually
+  /// rejects: stale figures, a second removal implementation, and a slow
+  /// Measure affordance.
+  it.each([
+    ["worktrees", "Worktrees"],
+    ["artifacts", "Artifacts"],
+    ["docker", "Docker"],
+  ])("navigates to the %s view", async (view, label) => {
+    useFilters.setState({ view: "system-health" });
+    renderPage();
+    await screen.findByText("Volumes");
+
+    fireEvent.click(screen.getByRole("button", { name: new RegExp(`^${label} →`) }));
+
+    expect(useFilters.getState().view).toBe(view);
+  });
+
+  /// **#796's first objection, answered structurally.** The signpost carries
+  /// no figure.
+  ///
+  /// "Figures stale the moment they were taken" is the load-bearing
+  /// objection, and a link computes nothing so there is nothing to go stale.
+  /// Asserted rather than trusted: this is the assertion that fails if
+  /// someone later adds "Docker · 25.2 GB reclaimable" to make the panel
+  /// more useful, which is precisely the change #796 removed.
+  it("carries no size, no total and no claim about Headstate's share", async () => {
+    renderPage();
+    // The signpost's own `<section>` and not the page: the Volumes panel
+    // above it is full of byte figures, and asserting over the whole page
+    // would be asserting about the wrong panel. `Panel` renders one
+    // `<section>` per heading, which is what makes this scope exact.
+    const panel = (
+      await screen.findByRole("heading", { name: /Where Headstate can reclaim space/ })
+    ).closest("section");
+    expect(panel).toBeTruthy();
+    const text = panel?.textContent ?? "";
+    // No byte figures at all, in any unit.
+    expect(text).not.toMatch(/\d+(\.\d+)?\s*(B|KB|MB|GB|TB)\b/);
+    // And it says so, so a reader does not take three links for an implied
+    // measurement.
+    expect(text).toMatch(/not something this page measured/i);
+  });
+
+  /// **#796's second and third objections.** No removal control, and no
+  /// Measure button.
+  ///
+  /// A link is the opposite of a second removal implementation: it sends the
+  /// reader TO the one implementation. And `size_worktrees` -- the ~13s call
+  /// on a 147-worktree machine -- is never invoked, so "no Measure
+  /// affordance left anywhere in this view" survives literally.
+  it("offers no removal and no measurement of its own", async () => {
+    renderPage();
+    await screen.findByText(/Where Headstate can reclaim space/);
+
+    for (const word of [/remove/i, /delete/i, /prune/i, /measure/i, /reclaim now/i]) {
+      expect(screen.queryByRole("button", { name: word })).toBeNull();
+    }
+  });
+
+  /// A view the user hid is not a place to send them.
+  ///
+  /// `hidden_views` means "I do not want to see this", and a jump has no
+  /// current-view escape hatch to fall back on the way `ViewSwitcher` does
+  /// -- so a link to a hidden view lands the reader on a page their own
+  /// switcher does not list.
+  ///
+  /// With every target hidden the whole panel goes, rather than leaving a
+  /// heading promising links that are not there.
+  it("omits a hidden view, and the whole panel when all three are hidden", async () => {
+    hiddenViews.current = ["docker"];
+    renderPage();
+    await screen.findByText(/Where Headstate can reclaim space/);
+    expect(screen.getByRole("button", { name: /^Worktrees →/ })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^Docker →/ })).toBeNull();
+
+    cleanup();
+    hiddenViews.current = ["worktrees", "artifacts", "docker"];
+    renderPage();
+    await screen.findByText("Volumes");
+    expect(screen.queryByText(/Where Headstate can reclaim space/)).toBeNull();
+  });
+
+  /// The two things #955 must not break, on the page it changes.
+  it("keeps the why-a-dozen-volumes paragraph and adds no process list", async () => {
+    renderPage();
+    await screen.findByText("Volumes");
+    // Without this a reader counts nine read-only mounts and concludes the
+    // page is broken.
+    expect(screen.getByText(/several read-only system volumes/i)).toBeTruthy();
+    // The kernel does not attribute disk USE to a process, so there is
+    // still no process table here.
+    expect(screen.queryByText(/what is using the disk/i)).toBeNull();
   });
 });
 
@@ -706,6 +936,59 @@ describe("the Network page", () => {
       expect(row).not.toBeNull();
       expect(within(row as HTMLElement).getByText("Not measured")).toBeTruthy();
       expect(within(row as HTMLElement).queryByText("0")).toBeNull();
+    });
+
+    /// #943: and it offers no copy button either, rather than a disabled
+    /// one.
+    ///
+    /// This is the row whose comment reasons explicitly about "a fabricated
+    /// number a reader might paste into `kill`". A control offering to copy
+    /// a dash would be that fabricated number arriving by another route --
+    /// and "—" on the clipboard is the one outcome a disabled-with-a-reason
+    /// button cannot improve on, because there is nothing to reveal.
+    ///
+    /// The row WITH a pid gets one, in the same test, so this cannot pass by
+    /// the page having no copy buttons at all.
+    it("offers a copy on a row with a pid and none on a row without", async () => {
+      netProcFn.mockResolvedValue([
+        netProc("acme-sync", 501, 9_000, 9_000),
+        netProc("acme-relay", null, 5_000, 5_000),
+      ]);
+      renderPage();
+      await screen.findByText("acme-relay");
+
+      fireEvent.click(screen.getByRole("button", { name: /copy pid 501/i }));
+      await waitFor(() => expect(copyFn).toHaveBeenCalledWith("501"));
+
+      // Exactly one, over two rows.
+      expect(screen.getAllByRole("button", { name: /copy pid/i }).length).toBe(1);
+    });
+
+    /// #946: the retry that was most conspicuously missing.
+    ///
+    /// This read costs ~5 seconds of `nettop`, which is why its poll cadence
+    /// is deliberately slow -- so waiting it out is the most expensive of the
+    /// four "just wait" recourses and a manual re-issue is worth the most.
+    /// `q.refetch` was in scope; the state rendered as a bare `<p>`.
+    ///
+    /// The cadence is untouched: `surface.rs` is explicit that the phone must
+    /// call this "on the Network page's slow cadence only, never beside the
+    /// health poll", and a one-off at the user's request is not a cadence.
+    it("offers a retry when the per-process network table could not be read", async () => {
+      netProcFn.mockRejectedValue("nettop is not available");
+      renderPage();
+      await screen.findByText(/Could not read the per-process network table/);
+      expect(screen.getByText(/nettop is not available/)).toBeTruthy();
+
+      const before = netProcFn.mock.calls.length;
+      fireEvent.click(screen.getByRole("button", { name: /try again/i }));
+      await waitFor(() => expect(netProcFn.mock.calls.length).toBeGreaterThan(before));
+
+      // And the poll is still OFF -- the retry is a one-off, not a new
+      // cadence. `netProcPollMs` stays false for this test, so any further
+      // calls after the click would be a second timer.
+      const after = netProcFn.mock.calls.length;
+      await waitFor(() => expect(netProcFn.mock.calls.length).toBe(after));
     });
 
     /// **The five-second reading must never reach the shared health

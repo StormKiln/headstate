@@ -9,7 +9,7 @@ import { IS_MOBILE_BUILD } from "@/lib/target";
 import { relativeTime } from "@/lib/time";
 import { useIsMobile } from "@/lib/useIsMobile";
 import { pathBasename, safetyReason, sessionWorktree } from "@/lib/worktrees";
-import { useFilters } from "@/store/filters";
+import { type ClaudeSessionFilter, useFilters } from "@/store/filters";
 import { QueryError, errorMessage } from "./QueryError";
 
 /// How many rows are drawn before the list stops and says so.
@@ -249,9 +249,69 @@ export function ClaudeCodePage() {
 /// and no `= []` default -- and two copies of it would be two chances for
 /// the list and the detail to disagree about which session the same id
 /// names.
+/// Whether one session belongs in the chip's subset (#949).
+///
+/// A pure function over the two readings every row already carries, so it
+/// can be tested without a DOM and so the five predicates are stated once.
+/// Exported for that test: these are the definitions the chip labels
+/// promise, and a chip whose label and predicate disagree is worse than no
+/// chip.
+///
+/// # `unknown` belongs to neither directory chip
+///
+/// `cwd_state` is a four-state, and only `exists` and `gone` are claims
+/// about the directory. `unknown` means the CHECK failed -- the tree may
+/// well be there and the `cd` would have worked -- and `not-recorded`
+/// means there was never a path to look for. Neither is "gone", and
+/// `revealRefusal` below gives all four different wording precisely so a
+/// single bucket cannot collapse them into a shrug. The overview counts
+/// them as neither too (`cwd_unknown`, "counted as neither"), so the chip
+/// and the tile agree.
+///
+/// Consequence, stated because it is a real one: Resumable and Directory
+/// gone do not sum to the total. On the measured corpus that is 179 + 1,295
+/// out of 1,474, and the missing rows are the ones whose directory could
+/// not be checked. The counts beside the chips are what makes that visible
+/// rather than a silent shortfall.
+export function matchesClaudeFilter(s: ClaudeSession, filter: ClaudeSessionFilter): boolean {
+  switch (filter) {
+    case "all":
+      return true;
+    case "resumable":
+      // "Not running, AND the directory still exists", which is the
+      // overview's own predicate verbatim (`overview.rs`: "not running +
+      // cwd exists"). Matching it is the point rather than an accident:
+      // #948 makes that tile navigate HERE, and a tile reading 179 that
+      // opens a list of 181 is a tile that lied about where it went. The
+      // difference is only the handful that can be live at once, which is
+      // exactly the size of gap nobody would notice and everybody would
+      // eventually trip over.
+      //
+      // It is also the right predicate on its own terms: resuming a
+      // session that is already alive starts a SECOND copy of it, which is
+      // the failure both banners on the overview are worded to prevent.
+      return s.liveness.state !== "running" && s.cwd_state.state === "exists";
+    case "gone":
+      // Same subtraction, same reason -- `overview.rs` counts `archived`
+      // as "not running + cwd gone", and the three cwd buckets plus
+      // running sum to the total so a reader can check the arithmetic.
+      return s.liveness.state !== "running" && s.cwd_state.state === "gone";
+    case "running":
+      return s.liveness.state === "running";
+    case "ended":
+      // `dead` and not `!== "running"`, which would sweep in `unknown`.
+      // `unknown` is the state where the check could not be completed, and
+      // it is the entire imported history on any machine that adopted
+      // Headstate after using Claude Code -- so folding it in here would
+      // make this chip mean "everything", which is what `all` is for.
+      return s.liveness.state === "dead";
+  }
+}
+
 function useMatchedSessions() {
   const { list } = useClaudeSessions(true);
   const query = useFilters((f) => f.claudeQuery);
+  const filter = useFilters((f) => f.claudeFilter);
 
   // NO `= []` default (#846). A rejected read must reach the caller's
   // error arm rather than arriving there as an empty list that reads as
@@ -261,25 +321,93 @@ function useMatchedSessions() {
   const matched = useMemo(() => {
     if (!all) return undefined;
     const q = query.trim().toLowerCase();
+    // The chip FIRST, then the text, and the order is only about reading
+    // clearly -- an `&&` of two predicates over one pass would be the same
+    // set. The counts below need the chip's subset independently of the
+    // query, which is the actual reason `chipped` is a named binding.
+    const chipped = all.filter((s) => matchesClaudeFilter(s, filter));
     const hits = q
-      ? all.filter((s) =>
+      ? chipped.filter((s) =>
           [s.name, s.cwd, s.git_branch, s.session_id].some((f) =>
             f?.toLowerCase().includes(q),
           ),
         )
-      : all;
+      : chipped;
     // Running first, then the backend's newest-activity-first order,
     // which `claude_session_activity` indexes and `sessions.rs` states.
     // A stable partition rather than a re-sort: re-deriving the date
     // ordering here would be a second description of the same rule, and
     // one that could disagree with the query's.
+    //
+    // The chips filter the INPUT to this partition rather than replacing
+    // it (#949): the running-first rule is about what a reader needs to see
+    // at the top and is true of any subset, so a chip that re-ordered would
+    // be a second ordering rule.
     const live = hits.filter((s) => s.liveness.state === "running");
     const rest = hits.filter((s) => s.liveness.state !== "running");
-    return { live, rest, ordered: [...live, ...rest] };
-  }, [all, query]);
+    return { live, rest, ordered: [...live, ...rest], chipped };
+  }, [all, query, filter]);
 
-  return { list, all, matched };
+  // Every chip's population, over the WHOLE list and not the current
+  // subset (#949). A count that shrank to zero on every chip but the
+  // active one would tell the reader nothing about where to go next, and a
+  // Resumable chip reading 0 while 179 sessions are resumable is the
+  // confident-wrong-answer failure with a number on it.
+  //
+  // Computed here rather than in the column so the counts and the rows come
+  // from one pass over one list; `all` is undefined on a rejected read and
+  // this stays undefined with it rather than reporting five zeros.
+  const counts = useMemo(() => {
+    if (!all) return undefined;
+    return {
+      all: all.length,
+      resumable: all.filter((s) => matchesClaudeFilter(s, "resumable")).length,
+      gone: all.filter((s) => matchesClaudeFilter(s, "gone")).length,
+      running: all.filter((s) => matchesClaudeFilter(s, "running")).length,
+      ended: all.filter((s) => matchesClaudeFilter(s, "ended")).length,
+    };
+  }, [all]);
+
+  return { list, all, matched, counts };
 }
+
+/// The chips, in the order they are offered (#949).
+///
+/// A table rather than five blocks of JSX, so the label, the predicate key
+/// and the count key cannot drift apart -- and so the order is a single
+/// declaration. `All` first because it is the default and the way back;
+/// then the two directory states, which is the split that decides whether a
+/// resume lands in the right tree; then the two liveness states.
+const CLAUDE_CHIPS: ReadonlyArray<{
+  filter: ClaudeSessionFilter;
+  label: string;
+  /// What the chip promises, in the `title` -- the predicate said in words,
+  /// because "Resumable" alone does not tell a reader that a directory
+  /// which could not be CHECKED is in neither of the two directory chips.
+  hint: string;
+}> = [
+  { filter: "all", label: "All", hint: "Every session Headstate has a row for" },
+  {
+    filter: "resumable",
+    label: "Resumable",
+    hint: "Not running, and the directory it ran in still exists — so a resume lands in the right tree. The same figure the overview's Resumable tile shows",
+  },
+  {
+    filter: "gone",
+    label: "Directory gone",
+    hint: "Not running, and the directory is definitely not there — normal for an agent worktree, and these are still resumable by id",
+  },
+  {
+    filter: "running",
+    label: "Running",
+    hint: "The process is alive and its start time matches what was recorded",
+  },
+  {
+    filter: "ended",
+    label: "Ended",
+    hint: "The process has finished. Whether it shut down cleanly or crashed is in the reason on each row, not in this filter",
+  },
+];
 
 /// The search box and the session rows, wherever they are mounted (#939).
 ///
@@ -308,10 +436,12 @@ function useMatchedSessions() {
 /// doc comment gives at length: the error arm BEFORE the empty arm, and no
 /// `= []` default, so a rejected read can never render as "no sessions".
 export function ClaudeSessionColumn() {
-  const { list, all, matched } = useMatchedSessions();
+  const { list, all, matched, counts } = useMatchedSessions();
   const { now } = useClaudeSessions(true);
   const query = useFilters((f) => f.claudeQuery);
   const setQuery = useFilters((f) => f.setClaudeQuery);
+  const filter = useFilters((f) => f.claudeFilter);
+  const setFilter = useFilters((f) => f.setClaudeFilter);
   const selected = useFilters((f) => f.claudeSelected);
   const selectSession = useFilters((f) => f.selectClaudeSession);
   // Local, not in the store: unlike the query and the selection nothing
@@ -355,14 +485,74 @@ export function ClaudeSessionColumn() {
             className="min-w-0 flex-1 bg-transparent py-1.5 text-xs text-[#e6edf3] outline-none placeholder:text-[#8b949e]"
           />
         </label>
+        {/* The chips (#949). Below the search box because search is still
+            the primary navigation -- 1,436 of 1,438 sessions have a title
+            and "the one about notarization" is how people find a session.
+            The chips are the second axis, for the two questions a title
+            cannot answer: can I resume this into place, and did it finish.
+
+            Not grouping, which stays rejected: these shorten the list
+            rather than nesting it, so the flat ordering below survives
+            intact. */}
+        <div
+          className="mt-2 flex flex-wrap gap-1"
+          role="group"
+          aria-label="Filter sessions by state"
+        >
+          {CLAUDE_CHIPS.map((c) => {
+            const active = filter === c.filter;
+            const n = counts?.[c.filter];
+            return (
+              <button
+                key={c.filter}
+                type="button"
+                // `aria-pressed` rather than colour alone: which chip is on
+                // is the single most important thing on this control, and a
+                // reader who cannot distinguish the two backgrounds would
+                // otherwise have no way to tell -- the same rule the
+                // pressure row states about never letting colour be the
+                // only cue.
+                aria-pressed={active}
+                title={c.hint}
+                onClick={() => setFilter(c.filter)}
+                className={`tap-target rounded-full border px-2 text-[11px] ${
+                  active
+                    ? "border-[#1f6feb] bg-[#1f6feb]/15 text-[#58a6ff]"
+                    : "border-[#30363d] text-[#8b949e] hover:bg-[#161b22]"
+                }`}
+              >
+                {c.label}
+                {/* The population, beside every chip and over the whole
+                    list. Absent rather than 0 when the count could not be
+                    established, which on a rejected read is the whole set
+                    -- though the error arm above has already returned by
+                    then, so this is the belt to that braces. */}
+                {n === undefined ? "" : ` ${n.toLocaleString()}`}
+              </button>
+            );
+          })}
+        </div>
         {/* The counts, always. With a cap in play the footer alone
             would not say how much the SEARCH removed, and "showing
             200 of 1,438" is a different fact from "12 of 1,438
-            match". */}
+            match".
+
+            THREE modes now rather than two (#949), and they stay exact
+            rather than collapsing: a chip narrows the denominator the
+            search reports against, so "12 of 179 match" is a different
+            claim from "12 of 1,474 match" and the chip's own count is
+            already on the chip. The rule the old comment states -- that
+            "how much the search removed" and "how much of what survived is
+            drawn" are two facts -- is unchanged; there is now a third,
+            which is which subset is being searched. */}
         <p className="mt-2 text-[11px] text-[#8b949e]">
           {query.trim()
-            ? `${matched.ordered.length.toLocaleString()} of ${all.length.toLocaleString()} match`
-            : `${all.length.toLocaleString()} sessions`}
+            ? filter === "all"
+              ? `${matched.ordered.length.toLocaleString()} of ${all.length.toLocaleString()} match`
+              : `${matched.ordered.length.toLocaleString()} of ${matched.chipped.length.toLocaleString()} match in this filter · ${all.length.toLocaleString()} sessions in all`
+            : filter === "all"
+              ? `${all.length.toLocaleString()} sessions`
+              : `${matched.ordered.length.toLocaleString()} of ${all.length.toLocaleString()} sessions`}
           {matched.live.length > 0 ? ` · ${matched.live.length} running now` : ""}
         </p>
       </div>
@@ -372,9 +562,19 @@ export function ClaudeSessionColumn() {
             Claude Code genuinely has none. */}
         {matched.ordered.length === 0 ? (
           <p className="p-2 text-sm text-[#8b949e]">
+            {/* Which of the three empties this is, said exactly (#949). A
+                chip that matches nothing is not "no sessions on this
+                machine", and a reader who cannot tell them apart will go
+                looking for a rescan they do not need -- the same
+                distinction the error arm above draws against the empty
+                one, one level in. */}
             {query.trim()
-              ? "No session matches that search."
-              : "No Claude Code sessions on this machine."}
+              ? filter === "all"
+                ? "No session matches that search."
+                : "No session in this filter matches that search."
+              : filter === "all"
+                ? "No Claude Code sessions on this machine."
+                : "No session is in this filter."}
           </p>
         ) : (
           capped.map((s) => (

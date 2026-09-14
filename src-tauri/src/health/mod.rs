@@ -263,4 +263,91 @@ pub struct AlertReport {
     pub key: String,
     pub title: String,
     pub body: String,
+    /// The process this condition is about, where it is about exactly one
+    /// (#943).
+    ///
+    /// # Why a structured field on a type that is otherwise prose
+    ///
+    /// Because the wording cannot carry it usefully. Every condition was
+    /// flattened into three strings, so the CPU watch notice's own closing
+    /// sentence -- "Worth a look" -- reached the UI with nothing the UI
+    /// could attach an action to: no targeted affordance was possible for
+    /// any of the six conditions, not just that one. A pid interpolated
+    /// into `body` would be text a reader retypes, which is the defect
+    /// rather than the fix.
+    ///
+    /// It does not weaken the "verdicts, not data" rule this type exists
+    /// for. The rules still run only on the desktop and the phone still
+    /// holds no threshold; this is one identifier the desktop already
+    /// computed, travelling beside the sentence that is about it.
+    ///
+    /// `None` for every condition that is not about a single process: the
+    /// five `alerts::Alert` variants, the machine-wide oversubscription
+    /// notice, and a watch notice that collapsed several processes of one
+    /// name. See `runaway::Notice::pid` on why a collapsed row must not
+    /// carry one of its members' pids.
+    ///
+    /// Serde gives `Option` no `skip_serializing_if`, so the key is always
+    /// present on the wire as `null` -- which is what the TypeScript
+    /// `number | null` says, and what stops "absent" reading as 0.
+    #[serde(default)]
+    pub pid: Option<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wire shape, pinned, because nothing generates the TypeScript
+    /// (#943).
+    ///
+    /// `AlertReport` is mirrored by hand at `src/types/pr.ts` as
+    /// `{ key, title, body, pid: number | null }`, and the phone mirrors it
+    /// again as `notify::HealthAlert`. Three hand-written copies of one
+    /// struct is exactly the drift `install::tests::the_wire_shape_matches_
+    /// the_typescript_type` exists to catch for the hooks status, and this is
+    /// the same guard for the same reason.
+    ///
+    /// The ABSENT case is the one worth pinning. A `skip_serializing_if`
+    /// would drop the key entirely, which arrives in TypeScript as
+    /// `undefined` rather than `null` -- and `a.pid === null` would then be
+    /// false for a machine-wide alert, putting a copy button on a condition
+    /// that is about no process. The key must be present and `null`.
+    #[test]
+    fn the_pid_is_always_on_the_wire_and_null_when_absent() {
+        let machine = AlertReport {
+            key: "diffuse_cpu".into(),
+            title: "Several processes are using the CPU".into(),
+            body: "no single process accounts for it".into(),
+            pid: None,
+        };
+        let json = serde_json::to_value(&machine).expect("serialises");
+        assert_eq!(
+            json.get("pid"),
+            Some(&serde_json::Value::Null),
+            "the key is present and null, never omitted: {json}"
+        );
+
+        let one = AlertReport {
+            pid: Some(14779),
+            ..machine
+        };
+        assert_eq!(
+            serde_json::to_value(&one).expect("serialises").get("pid"),
+            Some(&serde_json::json!(14779))
+        );
+    }
+
+    /// An older payload with no `pid` still decodes.
+    ///
+    /// `#[serde(default)]` is what makes that true, and it matters on the
+    /// wire between a phone and a desktop on independent tags: adding a field
+    /// to a response does not bump `PROTOCOL_VERSION`, so a newer phone
+    /// reading an older desktop's answer must not fail to parse it.
+    #[test]
+    fn a_payload_without_a_pid_still_decodes() {
+        let old = serde_json::json!({ "key": "battery_low", "title": "t", "body": "b" });
+        let parsed: AlertReport = serde_json::from_value(old).expect("decodes without pid");
+        assert_eq!(parsed.pid, None);
+    }
 }

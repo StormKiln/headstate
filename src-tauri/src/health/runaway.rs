@@ -838,6 +838,34 @@ pub enum Notice {
     /// One process worth a human glance (#865).
     Process {
         name: String,
+        /// The process id, for a notice about exactly ONE process (#943).
+        ///
+        /// `Some` when `count == 1`; `None` the moment two are collapsed.
+        /// The notice's own last sentence is "Worth a look", and the thing
+        /// a reader looks WITH is a pid to type into `ps` -- which this
+        /// module had in hand at the observation and dropped when building
+        /// the notice, leaving the sentence with nothing behind it.
+        ///
+        /// # Why `None` on a collapsed notice
+        ///
+        /// A "3 node processes have been busy" row is about three pids and
+        /// no single one of them. Naming one would name a process the row
+        /// is not about -- exactly the mistake the grouped process table
+        /// avoids by suppressing its PID column under grouping, and the
+        /// same reasoning [`Notice::name`] gives for returning `None` on
+        /// the machine-wide variant rather than inventing "system".
+        ///
+        /// # Why it is not in `key`
+        ///
+        /// [`key`] must stay keyed on the CONDITION: a process wandering
+        /// between 51% and 58% is one row, and #908's collapse-by-name
+        /// depends on two `zsh` notices sharing a key. A pid is stable for
+        /// the life of a process but not across a restart, so keying on it
+        /// would turn a standing condition into a new row every time the
+        /// thing restarted. It goes in the payload.
+        ///
+        /// [`key`]: Notice::key
+        pid: Option<u32>,
         /// How many processes of this name met the rule (#908).
         ///
         /// Collapsed into ONE notice rather than emitted per process,
@@ -988,6 +1016,24 @@ impl Notice {
     pub fn name(&self) -> Option<&str> {
         match self {
             Notice::Process { name, .. } => Some(name),
+            Notice::Oversubscribed { .. } => None,
+        }
+    }
+
+    /// The process id, or `None` where there is no single one (#943).
+    ///
+    /// Three ways to be `None` and all three are the same answer: the
+    /// machine-wide variant is about no process, a collapsed notice is
+    /// about several, and neither has a pid a reader could paste into `ps`
+    /// and get the row back. An accessor like [`name`], for the same
+    /// reason: inventing a number here would be worse than inventing
+    /// "system" as a name, because a pid that names the wrong process
+    /// looks exactly like one that names the right one.
+    ///
+    /// [`name`]: Notice::name
+    pub fn pid(&self) -> Option<u32> {
+        match self {
+            Notice::Process { pid, .. } => *pid,
             Notice::Oversubscribed { .. } => None,
         }
     }
@@ -1156,6 +1202,9 @@ pub fn watch(
         }
         out.push(Notice::Process {
             name: p.name.clone(),
+            // The pid was already in hand two lines up, for the duration
+            // lookup (#943). It used to stop there.
+            pid: Some(p.pid),
             count: 1,
             cpu_percent: p.cpu_percent,
             minutes,
@@ -1191,6 +1240,7 @@ pub fn watch(
             continue;
         };
         if let Some(Notice::Process {
+            pid: existing_pid,
             count: c,
             cpu_percent: cp,
             minutes: m,
@@ -1202,6 +1252,14 @@ pub fn watch(
             .iter_mut()
             .find(|e| matches!(e, Notice::Process { name: existing, .. } if existing == name))
         {
+            // The pid goes the moment there are two (#943). It is the ONE
+            // field that is not a worst-of or an OR, because it is not a
+            // figure about the group at all: "3 node processes" is about
+            // three pids, and keeping the first one would offer a reader a
+            // number that names one member of a row that is about all of
+            // them. Cleared rather than kept-as-first for the same reason
+            // the grouped process table suppresses its PID column.
+            *existing_pid = None;
             *c += 1;
             *cp = cp.max(*cpu_percent);
             *m = m.max(*minutes);
@@ -1939,6 +1997,69 @@ mod tests {
         // enough for the sentence to be worth saying.
         assert!(zsh.niced(), "one of the two is niced");
         assert!(zsh.orphaned(), "one of the two is orphaned");
+
+        // The pid is the ONE field that is not a worst-of or an OR (#943).
+        // "2 zsh processes have been busy" is about two pids and no single
+        // one of them, so keeping either would name a process the row is not
+        // about -- the same mistake the grouped process table avoids by
+        // suppressing its PID column.
+        assert_eq!(zsh.pid(), None, "a collapsed row names no single process");
+        // And the single-process row DOES carry one, in the same test, so
+        // this cannot pass by `pid()` always answering None.
+        let node = out
+            .iter()
+            .find(|n| n.title().contains("node"))
+            .expect("a node row");
+        assert_eq!(node.count(), 1);
+        assert_eq!(node.pid(), Some(922), "the one process it is about");
+    }
+
+    /// The pid a watch notice is about, and the three ways there isn't one
+    /// (#943).
+    ///
+    /// The notice's own body ends "Worth a look if you did not start
+    /// something long-running", and the thing a reader looks WITH is a pid to
+    /// type into `ps`. It was already in hand at the observation -- `watch`
+    /// reads `durations.get(&(p.pid, p.start_time))` two lines above the
+    /// `Notice::Process` it builds -- and stopped there.
+    #[test]
+    fn a_single_process_notice_carries_the_pid_it_is_about() {
+        let p = proc(4242, "acme-loop", 58.0, Some(1));
+        let out = watch(std::slice::from_ref(&p), &durations(&[(&p, 12.0)]));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].pid(), Some(4242));
+
+        // The machine-wide variant is about no process at all, and inventing
+        // a pid there would be worse than inventing "system" as a name: a
+        // pid that names the wrong process is indistinguishable from one that
+        // names the right one.
+        let machine = Notice::Oversubscribed {
+            load: 53.0,
+            cores: 12,
+            ratio: 4.4,
+            minutes: 510.0,
+        };
+        assert_eq!(machine.pid(), None);
+        assert_eq!(machine.name(), None, "for the same reason");
+    }
+
+    /// The pid must NOT reach `key` (#943).
+    ///
+    /// `key` is the condition's identity, and #908's collapse-by-name depends
+    /// on two `zsh` notices sharing one. A pid is stable for the life of a
+    /// process but not across a restart, so keying on it would turn a
+    /// standing condition into a new row every time the thing restarted --
+    /// and would break the collapse, since two processes of one name have
+    /// two pids.
+    #[test]
+    fn the_pid_stays_out_of_the_key() {
+        let a = proc(1, "zsh", 58.0, Some(1));
+        let b = proc(2, "zsh", 58.0, Some(1));
+        let one = watch(std::slice::from_ref(&a), &durations(&[(&a, 12.0)]));
+        let other = watch(std::slice::from_ref(&b), &durations(&[(&b, 12.0)]));
+
+        assert_eq!(one[0].key(), other[0].key(), "one condition, one key");
+        assert_ne!(one[0].pid(), other[0].pid(), "but different processes");
     }
 
     /// The age reaches the body, and reads as prose below a minute (#908).

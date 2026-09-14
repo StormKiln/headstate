@@ -1282,6 +1282,25 @@ export interface AlertReport {
   key: string;
   title: string;
   body: string;
+  /// The process this condition is about, or `null` where it is not about
+  /// exactly one (#943).
+  ///
+  /// The CPU watch notice's body ends "Worth a look if you did not start
+  /// something long-running", and until this field existed the page had
+  /// nothing to look WITH: the notice named a process by name, and a name
+  /// does not identify one of forty. The pid reached `ProcessObservation`
+  /// and was dropped when the notice was built.
+  ///
+  /// `null` for every machine-wide condition -- battery, thermal,
+  /// oversubscription, and the aggregate CPU alert whose whole content is
+  /// that no single process explains the load -- and also for a watch
+  /// notice that collapsed several processes of one name. That last case is
+  /// absent-is-not-zero in its sharpest form here: a "3 node processes"
+  /// row carries no pid rather than one of the three, because a pid that
+  /// names the wrong process is indistinguishable from one that names the
+  /// right one. Never coerced to 0: pid 0 is a real process on every
+  /// platform this app runs on.
+  pid: number | null;
 }
 
 export interface HealthSample {
