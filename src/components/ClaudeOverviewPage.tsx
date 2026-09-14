@@ -153,6 +153,26 @@ function Tile({
 /// `never_observed` is what lets a reader tell "nothing crashed" from
 /// "nothing was watched".
 ///
+/// # This page and the session list now answer the same question (#984)
+///
+/// They did not. `resumable` counts a session as not-running the moment it
+/// is absent from the running set -- 183 of 1,491 measured -- while
+/// `liveness::derive` returned `Unknown` for every session the hook had
+/// never observed, which was 1,490 of the same 1,491 rows. So this page
+/// said "183 of these are ready to resume" and the list beside it said it
+/// could not tell whether any of them was running, off one registry read.
+///
+/// `claude/mod.rs` states the rule that was being broken: this page
+/// "derives no liveness of its own -- #917's `liveness` module owns that,
+/// and two answers to one question disagree the first time either
+/// changes." The fix was in `liveness::derive` rather than here, because
+/// this page's reading was the one consistent with `live.rs`'s own
+/// `a_missing_registry_is_a_settled_empty_answer`: a registry listing we
+/// read WHOLE that does not name a session is positive evidence. Nothing
+/// on this page changed; the list stopped hedging. Measured after:
+/// `running 1  dead 1490  unknown 0`, and 183 of the 1,490 have a live
+/// directory -- which is `resumable` exactly.
+///
 /// # Absent is not zero, and a chart is the worst place to break it
 ///
 /// Four distinct failures, four renderings, none of them a zero:

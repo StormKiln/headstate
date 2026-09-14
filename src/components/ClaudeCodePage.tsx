@@ -121,7 +121,15 @@ const RENDER_CAP = 200;
 /// | the session list could not be read | `QueryError` with the reason. NOT "no sessions". |
 /// | the live registry could not be read | a banner; every row's liveness becomes "could not tell" |
 /// | the transcript rescan partly failed | a line saying how many could not be read, above a list that still shows |
+/// | `~/.claude/projects` does not exist | `NoSessions` names the path and what creates it. NOT a partial read (#970). |
 /// | genuinely nothing | "No Claude Code sessions" -- only when the read SUCCEEDED |
+///
+/// The fourth row is #970's correction, and it was the fifth failure
+/// hiding inside the third: the absent root travelled in `unreadable_dirs`,
+/// so a machine that had never run Claude Code was told "0 sessions read,
+/// but 1 could not be -- this list is incomplete by an unknown amount". It
+/// now arrives in `absent_root`, which `is_partial()` does not consult, and
+/// `NoSessions` renders it as the explanation it always was.
 ///
 /// The precedent is `ClaudeMdPage` (#846), one view over, where a `= []`
 /// default made a rejected scan read as "No CLAUDE.md files in this
@@ -135,6 +143,10 @@ export function ClaudeCodePage() {
   const { all, matched } = useMatchedSessions();
   const selected = useFilters((f) => f.claudeSelected);
   const selectSession = useFilters((f) => f.selectClaudeSession);
+  // Read here only to word the empty detail pane (#978): "no session
+  // matches that search" and "nothing has been read yet" are different
+  // emptinesses, and the pane must not offer "choose one" for either.
+  const query = useFilters((f) => f.claudeQuery);
   const isMobile = useIsMobile();
 
   // By LOOKUP against the current list, never a remembered session. The
@@ -224,6 +236,21 @@ export function ClaudeCodePage() {
           ) : null}
           {active ? (
             <SessionDetail session={active} now={now} />
+          ) : matched.ordered.length === 0 ? (
+            // NOT "choose a session" (#978). There is nothing to choose,
+            // and an instruction a reader cannot follow makes them
+            // conclude the list failed to load -- which is the one thing
+            // the #846 error arm above exists to distinguish this from.
+            //
+            // The column beside this one carries the explanation and the
+            // next step, so this pane points at it rather than repeating
+            // it: two copies of one sentence side by side read as two
+            // separate findings.
+            <p className="text-sm text-[#8b949e]">
+              {query.trim()
+                ? "Nothing to show — narrow or clear the search to pick a session."
+                : "Nothing to show yet — a session appears here once there is one to pick."}
+            </p>
           ) : (
             <p className="text-sm text-[#8b949e]">
               Choose a session to see where it ran and how to resume it.
@@ -309,7 +336,10 @@ function useMatchedSessions() {
 /// `= []` default, so a rejected read can never render as "no sessions".
 export function ClaudeSessionColumn() {
   const { list, all, matched } = useMatchedSessions();
-  const { now } = useClaudeSessions(true);
+  // `imported` as well as `now` since #970/#978: the empty state has to say
+  // WHY it is empty, and only the scan knows whether `~/.claude/projects`
+  // is there. Same query as the page's, so this costs a cache hit.
+  const { now, imported } = useClaudeSessions(true);
   const query = useFilters((f) => f.claudeQuery);
   const setQuery = useFilters((f) => f.setClaudeQuery);
   const selected = useFilters((f) => f.claudeSelected);
@@ -371,11 +401,11 @@ export function ClaudeSessionColumn() {
             has already established. A machine that has never run
             Claude Code genuinely has none. */}
         {matched.ordered.length === 0 ? (
-          <p className="p-2 text-sm text-[#8b949e]">
-            {query.trim()
-              ? "No session matches that search."
-              : "No Claude Code sessions on this machine."}
-          </p>
+          query.trim() ? (
+            <p className="p-2 text-sm text-[#8b949e]">No session matches that search.</p>
+          ) : (
+            <NoSessions imported={imported} />
+          )
         ) : (
           capped.map((s) => (
             <SessionEntry
@@ -411,6 +441,104 @@ export function ClaudeSessionColumn() {
           </div>
         ) : null}
       </div>
+    </div>
+  );
+}
+
+/// The empty list, with what would fill it (#978, #970).
+///
+/// # Why a statement of fact was not enough
+///
+/// "No Claude Code sessions on this machine." is TRUE, and that is the
+/// hard half -- it renders only after the error arm has established the
+/// read succeeded, which is the #846 ordering. What was missing is the
+/// easy half: a first-run user is told a fact with no next step, beside a
+/// right-hand pane inviting them to choose from the nothing. The epic's
+/// first bullet is exactly this: "an empty state that explains nothing".
+///
+/// So this says where sessions come from. The page's whole subject is
+/// transcripts under `~/.claude/projects`, and nothing on screen said that
+/// running `claude` in any directory is what populates the list, nor that
+/// the history is read off disk rather than out of an account.
+/// `WorktreeJump`'s "most agent worktrees are deleted once their work
+/// lands" is the page's own model for an empty state that explains.
+///
+/// # Three empties, not one
+///
+/// | condition | what the user is told |
+/// |---|---|
+/// | `absent_root` is set | the directory does not exist yet, named, and what makes it |
+/// | the scan has not returned | it is still looking, and nothing is stuck |
+/// | the root exists and is empty | there is no history here, and what makes some |
+///
+/// The first two are new. `absent_root` is #970's channel and exists
+/// because the path used to travel in `unreadable_dirs`, where
+/// `is_partial()` reads it and turned a brand-new machine into "0 sessions
+/// read, but 1 could not be — this list is incomplete by an unknown
+/// amount". The third is a user who HAS run Claude Code and has no
+/// transcripts left, which is a different sentence from never having run
+/// it, and `absent_root === null` is what distinguishes them.
+///
+/// The "nothing is stuck" line is copied in spirit from
+/// `SystemHealthPage`'s network panel, which is the house model for a
+/// first-run wait: it says how long, why it cannot be sooner, and that the
+/// app has not hung.
+function NoSessions({
+  imported,
+}: {
+  imported: ReturnType<typeof useClaudeSessions>["imported"];
+}) {
+  // The scan has not come back yet, so "there is nothing here" is not
+  // established. `imported.data === undefined` rather than `isFetching`:
+  // the question is whether an answer exists, not whether a request is in
+  // flight.
+  //
+  // NOT an error arm -- `Banners` above already renders `imported.isError`
+  // with the reason, and a second copy of one failure reads as two.
+  if (imported.data === undefined) {
+    return (
+      <div className="p-2 text-sm text-[#8b949e]">
+        <p>Looking for Claude Code transcripts on this machine…</p>
+        <p className="mt-1 text-xs">
+          The whole of <span className="font-mono">~/.claude/projects</span> is read on the
+          first open, which takes about a second for a large history. Nothing is stuck.
+        </p>
+      </div>
+    );
+  }
+
+  const absent = imported.data.absent_root;
+  return (
+    <div className="p-2 text-sm text-[#8b949e]">
+      <p className="text-[#e6edf3]">No Claude Code sessions on this machine.</p>
+      {absent !== null ? (
+        // The path is NAMED, which is why #970 kept it rather than
+        // dropping it: a reader who sees which directory was looked in
+        // learns where this history lives. It is stated as "not there
+        // yet", because that is the truth and it is also the reason
+        // there is nothing to show.
+        <p className="mt-1 text-xs">
+          <span className="break-all font-mono">{absent}</span> does not exist yet — Claude
+          Code creates it the first time it runs.
+        </p>
+      ) : (
+        // The directory IS there and holds no session transcripts. Not
+        // the same machine state, so not the same sentence: this user has
+        // run Claude Code and has no history left.
+        <p className="mt-1 text-xs">
+          <span className="break-all font-mono">~/.claude/projects</span> is there but holds no
+          session transcripts.
+        </p>
+      )}
+      {/* The NEXT STEP, which is the half that was missing. Read-only is
+          worth saying: it is why there is no "connect an account" button
+          to look for, and it is the app's own constraint against
+          `~/.claude`. */}
+      <p className="mt-2 text-xs">
+        Run <span className="font-mono">claude</span> in any directory and it will appear here.
+        Headstate reads these from the transcripts Claude Code writes to disk — it never signs
+        in on your behalf and never writes to <span className="font-mono">~/.claude</span>.
+      </p>
     </div>
   );
 }
@@ -509,13 +637,33 @@ function Banners({
             className={`h-3 w-3 ${imported.isFetching ? "animate-spin" : ""}`}
             aria-hidden="true"
           />
-          {imported.isFetching ? "Rescanning…" : "Rescan transcripts"}
+          {/* Three labels, not two (#978). `isFetching` is true during the
+              FIRST fetch as well, so keying only on it put "Rescanning…"
+              on a machine that had never scanned -- the "Re-" prefix
+              asserting work that did not happen. `imported.data ===
+              undefined` is what separates the two: no scan has returned
+              yet, so there is nothing to re-do. */}
+          {imported.isFetching
+            ? imported.data === undefined
+              ? "Scanning…"
+              : "Rescanning…"
+            : "Rescan transcripts"}
         </button>
         {/* The measurement, shown rather than only claimed -- the same
             reason `Scan` carries `elapsed_ms`: it keeps the "no
             incremental machinery" decision checkable on someone else's
-            machine. */}
-        {imported.data ? (
+            machine.
+
+            Suppressed at zero (#978), not qualified. The figure is a
+            developer-facing proof that a full rescan is affordable, and
+            "0 read in 4ms" is not evidence of that -- it is the outcome of
+            a scan that found nothing, offered to a first-run user as if it
+            were a result. A number that measures nothing is worse than no
+            number: it reads as a failed load. The house rule is qualify
+            when a short read makes a figure only LOW, suppress when it
+            makes it misleading (#976), and this is the second. The empty
+            state below says what happened instead, in words. */}
+        {imported.data && imported.data.sessions > 0 ? (
           <span className="text-[11px] text-[#8b949e]">
             {imported.data.sessions.toLocaleString()} read in {imported.data.elapsed_ms}
             ms

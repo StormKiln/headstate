@@ -69,10 +69,20 @@ pub struct Imported {
     pub unreadable_files: Vec<String>,
     pub metadata_beyond_first_record: usize,
     pub elapsed_ms: u64,
+    /// The transcript root, when it does not exist at all (#970).
+    ///
+    /// Carried through from [`Scan::absent_root`] and kept OUT of
+    /// [`Imported::is_partial`] for the reason that field's own doc gives:
+    /// a machine that has never run Claude Code has a complete list of
+    /// nothing, and the page's first sentence to its owner must not be
+    /// that the list is incomplete by an unknown amount.
+    pub absent_root: Option<String>,
 }
 
 impl Imported {
     /// Whether anything could not be read or written.
+    ///
+    /// `absent_root` is deliberately not consulted -- see its doc (#970).
     pub fn is_partial(&self) -> bool {
         !self.unreadable_dirs.is_empty()
             || !self.unreadable_files.is_empty()
@@ -157,6 +167,7 @@ pub fn import(conn: &mut Connection, scan: Scan) -> Result<Imported, rusqlite::E
         unreadable_files: scan.unreadable_files,
         metadata_beyond_first_record: scan.metadata_beyond_first_record,
         elapsed_ms: scan.elapsed_ms,
+        absent_root: scan.absent_root,
         ..Default::default()
     };
 
@@ -433,6 +444,7 @@ mod tests {
                 unreadable_files: vec!["/x/a.jsonl: Permission denied".into()],
                 metadata_beyond_first_record: 1,
                 elapsed_ms: 42,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -442,5 +454,33 @@ mod tests {
         assert_eq!(got.unreadable_files.len(), 1);
         assert_eq!(got.metadata_beyond_first_record, 1);
         assert_eq!(got.elapsed_ms, 42);
+    }
+
+    /// An absent root survives the storage boundary WITHOUT making the
+    /// import partial (#970).
+    ///
+    /// The path has to reach the frontend -- it is what lets the empty
+    /// state say where Headstate looked -- and it must not arrive as
+    /// evidence of a failed read, which is what `unreadable_dirs` was.
+    #[test]
+    fn an_absent_root_survives_the_boundary_without_claiming_a_failure() {
+        let mut conn = db();
+        let got = import(
+            &mut conn,
+            Scan {
+                absent_root: Some("/Users/acme/.claude/projects".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(got.sessions, 0);
+        assert_eq!(
+            got.absent_root.as_deref(),
+            Some("/Users/acme/.claude/projects")
+        );
+        assert!(
+            !got.is_partial(),
+            "a machine with no history has a complete list of nothing"
+        );
     }
 }
