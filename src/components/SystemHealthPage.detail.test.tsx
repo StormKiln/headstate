@@ -2050,9 +2050,26 @@ describe("the process table at phone width (#973)", () => {
     expect(within(table).getByText("CPU (of one core)")).toBeTruthy();
     expect(within(table).getByText("PID")).toBeTruthy();
     expect(within(table).getByText("Memory")).toBeTruthy();
-    // And the PID itself is still printed, not pushed off-screen.
+    // And the PID itself is still printed, not pushed off-screen. Inside
+    // the copy button as of #943, which is why this is a text query rather
+    // than a cell one: the number is the button's LABEL, so a screen reader
+    // hears the pid rather than "copy button" eight times down the table.
     expect(within(table).getByText("701")).toBeTruthy();
     expect(within(table).getByText("412%")).toBeTruthy();
+  });
+
+  /// The copy button clears the 44px floor `index.css` sets (#943).
+  ///
+  /// This is the one new control that lands inside a dense table, which is
+  /// exactly where the temptation to drop `tap-target` lives: it makes the
+  /// rows taller. The rule is not negotiable on a touch surface -- a
+  /// 16px-high tap target next to seven others is the control nobody can
+  /// hit -- so the class is asserted here, in the phone block, rather than
+  /// left to a reviewer to notice its absence.
+  it("gives the PID copy button a real tap target", async () => {
+    renderPage();
+    const copy = await screen.findByRole("button", { name: /copy pid 701/i });
+    expect(copy.className).toContain("tap-target");
   });
 
   /// The grouped table gets the same containment -- it was the other
