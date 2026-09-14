@@ -42,6 +42,12 @@ vi.mock("../api/hooks", () => ({
     error: undefined,
     isLoading: false,
   }),
+  useClaudeSubagentRollup: () => ({
+    data: undefined,
+    isError: false,
+    error: undefined,
+    isLoading: false,
+  }),
   useClaudeTranscriptTail: () => ({
     data: undefined,
     isError: false,
@@ -72,6 +78,8 @@ const session = (n: number): ClaudeSession => ({
   last_activity_at: new Date(Date.parse("2026-09-13T09:00:00Z") - n * 60_000).toISOString(),
   liveness: { state: "dead", why: "pid 14779 is no longer running" },
   cwd_state: { state: "exists" },
+  kind: { kind: "own" },
+  subagents: 0,
 });
 
 const listOf = (n: number): ClaudeSessionList => ({

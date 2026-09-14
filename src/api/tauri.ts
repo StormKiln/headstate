@@ -25,6 +25,7 @@ import type {
   ClaudeSessionDetail,
   WireClaudeSessionList,
   ClaudeUsage,
+  ClaudeSubagentRollup,
   ProjectReport,
   UpdateRequest,
   UpdateFilter,
@@ -783,6 +784,17 @@ export const claudeOverview = () => call<ClaudeOverview>("claude_overview");
 /// means it WAS read and carried no usage, which is a different fact.
 export const claudeSessionUsage = (path: string) =>
   call<ClaudeUsage>("claude_session_usage", { path });
+
+/// What one session's subagents cost, as a figure of its own (#1002).
+///
+/// ON DEMAND, for the selected session only. It reads one bounded
+/// transcript PER CHILD, and the measured corpus has parents with dozens
+/// -- so on the list's 10-second poll over 1,524 rows this would be the
+/// whole-corpus read `claudeSessionUsage` above already refuses.
+///
+/// Never added into the parent's own usage. See `ClaudeSubagentRollup`.
+export const claudeSubagentRollup = (sessionId: string) =>
+  call<ClaudeSubagentRollup>("claude_subagent_rollup", { sessionId });
 
 /// The tail of one session's transcript, as conversation (#982).
 ///

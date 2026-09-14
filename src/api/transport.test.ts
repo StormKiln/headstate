@@ -208,6 +208,7 @@ const ROWS: Row[] = [
   row(api.claudeSessionDetail, ["s1"], "claude_session_detail", { sessionId: "s1" }),
   row(api.claudeOverview, [], "claude_overview"),
   row(api.claudeSessionUsage, [path], "claude_session_usage", { path }),
+  row(api.claudeSubagentRollup, ["s1"], "claude_subagent_rollup", { sessionId: "s1" }),
   row(api.claudeTranscriptTail, [path], "claude_transcript_tail", { path }),
   row(api.claudeRevealPath, [path], "claude_reveal_path", { path }),
   row(api.readClaudeMd, [path], "read_claude_md", { path }),

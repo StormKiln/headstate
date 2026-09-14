@@ -15,6 +15,7 @@ import type {
   ClaudeOverview,
   ClaudePreview,
   ClaudeUsage,
+  ClaudeSubagentRollup,
   ClaudeSessionList,
   ClaudeSessionDetail,
   WireClaudeSessionList,
@@ -96,6 +97,7 @@ import {
   claudeImportTranscripts,
   claudeOverview,
   claudeSessionUsage,
+  claudeSubagentRollup,
   claudeSessions,
   claudeSessionDetail,
   claudeTranscriptTail,
@@ -1208,6 +1210,8 @@ export function hydrateClaudeSessions(wire: WireClaudeSessionList): ClaudeSessio
         last_activity_at: s.last_activity_at,
         liveness,
         cwd_state: s.cwd_state,
+        kind: s.kind,
+        subagents: s.subagents,
       };
     }),
     registry_failure: wire.registry_failure,
@@ -1319,6 +1323,38 @@ export function useClaudeSessionUsage(path: string | null) {
     // -- a session with no transcript is a real row and must not produce
     // a rejected query that reads as a failure.
     enabled: path !== null && path !== "",
+    staleTime: Infinity,
+    retry: false,
+  });
+}
+
+/// What one session's subagents cost, as a figure of its own (#1002).
+///
+/// # Keyed by session id, and not polled
+///
+/// The session id rather than a path, because the rollup is over the
+/// CHILDREN's transcripts and there is no single path to key on. Keyed by
+/// the parent whose figure it is.
+///
+/// `staleTime: Infinity` for `useClaudeSessionUsage`'s reason, doubled: a
+/// dead session's usage cannot move, and this reads one bounded
+/// transcript PER CHILD -- the measured corpus has parents with dozens.
+/// Polling it every ten seconds would be the whole-corpus read the
+/// bounded summariser exists to avoid, once per tick.
+///
+/// `enabled` on the caller's own test for whether there is anything to
+/// roll up: a session with no attributed subagents must not produce a
+/// query at all, rather than one that resolves to zeros.
+///
+/// `retry: false` and no `= {}` default, the rule this feature follows
+/// throughout: a rejected read must reach the caller's error arm, because
+/// zeros for a rollup that could not be read is a confident wrong answer
+/// with a credible shape.
+export function useClaudeSubagentRollup(sessionId: string | null) {
+  return useQuery<ClaudeSubagentRollup>({
+    queryKey: ["claude-subagent-rollup", sessionId],
+    queryFn: () => claudeSubagentRollup(sessionId as string),
+    enabled: sessionId !== null && sessionId !== "",
     staleTime: Infinity,
     retry: false,
   });

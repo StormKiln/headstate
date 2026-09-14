@@ -1054,6 +1054,8 @@ interface WireClaudeSession {
   last_activity_at: string | null;
   liveness: WireLiveness;
   cwd_state: CwdState;
+  kind: ClaudeSessionKind;
+  subagents: number;
 }
 
 /// One row of the Claude Code session list, as the components see it
@@ -1097,7 +1099,36 @@ export interface ClaudeSession {
   /// Stays on the row because the Resumable and Directory-gone chips
   /// count it, and those counts are over the whole list.
   cwd_state: CwdState;
+  /// Whether this session ran in an agent worktree (#1002).
+  ///
+  /// On the row rather than the detail because the list FILTERS on it and
+  /// the chip's count is over the whole corpus: 391 of 1,524 measured
+  /// rows are subagents, and a chip that could only count the rows it had
+  /// already drawn would be a number that lies.
+  kind: ClaudeSessionKind;
+  /// How many subagent sessions were traced to this one (#1002).
+  ///
+  /// `0` is a real answer: it is a count over rows the app holds, so "no
+  /// subagents were attributed to this session" is something we know.
+  /// Contrast the token rollup, which is a measurement and therefore
+  /// absent-or-known.
+  subagents: number;
 }
+
+/// Whether a session is the user's own work or an agent's (#1002).
+///
+/// Structural, from the session's `cwd`: a session whose directory is
+/// `<repo>/.claude/worktrees/agent-<id>` ran inside an agent worktree.
+/// Rust side: `src-tauri/src/claude/subagent.rs`, which carries the
+/// measurement -- 391 of 1,524 rows, across 107 agents, and the two
+/// markers it rejected (`git_branch` matches only 102 of the 391;
+/// `isSidechain` is false on all of them).
+///
+/// A subagent session is STILL A REAL SESSION: hidden by default, never
+/// deleted, still resumable by id. Several did substantial work.
+type ClaudeSessionKind =
+  | { kind: "own" }
+  | { kind: "subagent"; agent_id: string };
 
 /// What one SELECTED Claude Code session knows (#985).
 ///
@@ -1131,6 +1162,69 @@ export interface ClaudeSessionDetail {
   /// because the registry was unreadable must be able to say so rather
   /// than present a shrug as a finding.
   registry_failure: string | null;
+  /// Whether this session ran in an agent worktree (#1002).
+  kind: ClaudeSessionKind;
+  /// The subagent sessions traced to this one, newest first.
+  ///
+  /// On the detail and not the row: empty for the overwhelming majority
+  /// of sessions, and 1,524 rows carrying a vector each to serve the
+  /// handful with children is the per-row cost #985 measured and removed.
+  subagents: ClaudeSubagentChild[];
+  /// Which session spawned THIS one, when it is an attributed subagent.
+  ///
+  /// `null` on an ordinary session AND on an unattributed subagent.
+  /// `unattributed` below is what tells those two apart -- "not a
+  /// subagent" and "a subagent whose parent we could not tell" are
+  /// different facts, and only the second needs saying.
+  parent: ClaudeSubagentChild | null;
+  /// Why this subagent could not be traced to a parent (#1002).
+  ///
+  /// `Some` ONLY for a subagent the map looked at and could not decide,
+  /// and it carries the evidence -- which sessions tied, and when -- so
+  /// the reader can see the app looked rather than that it shrugged. A
+  /// wrong rollup is worse than no rollup.
+  unattributed: string | null;
+}
+
+/// One subagent session, as its parent's detail lists it (#1002).
+interface ClaudeSubagentChild {
+  session_id: string;
+  name: string | null;
+  agent_id: string;
+}
+
+/// What one session's subagents cost, as a figure of its own (#1002).
+///
+/// NEVER added into the parent's own `ClaudeUsage`. A parent's own tokens
+/// answer "how much work happened in this session"; these answer "how
+/// much happened underneath it". One summed figure would answer neither:
+/// a parent that delegated everything would show a large number
+/// describing work it did not do, indistinguishable from one that did the
+/// work itself. The same discipline that keeps `ClaudeUsage` at four
+/// counters rather than one.
+export interface ClaudeSubagentRollup {
+  /// Subagent sessions attributed to this parent.
+  sessions: number;
+  /// Of those, how many yielded a usage sum. The denominator that makes
+  /// the totals readable as a floor rather than a total. `0` with
+  /// `sessions > 0` means "it has subagents and we could not total them",
+  /// which must render as "could not tell" and never as zeros.
+  measured: number;
+  /// Children whose transcript carried no usage block at all. A settled
+  /// answer -- we read it and it had none -- and NOT the same as a
+  /// failure to read.
+  without_usage: number;
+  /// Children whose transcript could not be read, with why. Non-empty
+  /// means every total is short by an unknown amount.
+  unreadable: string[];
+  /// Children whose sum stopped at the 8 MB budget, so the figures are a
+  /// floor.
+  truncated: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  messages: number;
 }
 
 

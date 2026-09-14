@@ -11,6 +11,7 @@ import type {
 import {
   useClaudeSessionDetail,
   useClaudeSessionUsage,
+  useClaudeSubagentRollup,
   useClaudeSessions,
   useClaudeTranscriptTail,
   useWorktrees,
@@ -383,6 +384,7 @@ function useMatchedSessions() {
   const { list } = useClaudeSessions(true);
   const query = useFilters((f) => f.claudeQuery);
   const filter = useFilters((f) => f.claudeFilter);
+  const showSubagents = useFilters((f) => f.claudeShowSubagents);
 
   // NO `= []` default (#846). A rejected read must reach the caller's
   // error arm rather than arriving there as an empty list that reads as
@@ -396,7 +398,15 @@ function useMatchedSessions() {
     // clearly -- an `&&` of two predicates over one pass would be the same
     // set. The counts below need the chip's subset independently of the
     // query, which is the actual reason `chipped` is a named binding.
-    const chipped = all.filter((s) => matchesClaudeFilter(s, filter));
+    // Subagents FIRST, then the chip, then the text (#1002). The order
+    // is only about reading clearly -- an `&&` of the predicates over one
+    // pass would be the same set -- but the subsets below need each stage
+    // independently, which is why each is a named binding.
+    //
+    // Hidden by DEFAULT, never dropped from the payload: the count beside
+    // the toggle is over the whole list, and the rows are one click away.
+    const visible = showSubagents ? all : all.filter((s) => s.kind.kind !== "subagent");
+    const chipped = visible.filter((s) => matchesClaudeFilter(s, filter));
     const hits = q
       ? chipped.filter((s) =>
           [s.name, s.cwd, s.git_branch, s.session_id].some((f) =>
@@ -417,7 +427,7 @@ function useMatchedSessions() {
     const live = hits.filter((s) => s.liveness.state === "running");
     const rest = hits.filter((s) => s.liveness.state !== "running");
     return { live, rest, ordered: [...live, ...rest], chipped };
-  }, [all, query, filter]);
+  }, [all, query, filter, showSubagents]);
 
   // Every chip's population, over the WHOLE list and not the current
   // subset (#949). A count that shrank to zero on every chip but the
@@ -430,14 +440,27 @@ function useMatchedSessions() {
   // this stays undefined with it rather than reporting five zeros.
   const counts = useMemo(() => {
     if (!all) return undefined;
+    // The chips count over the set the toggle admits, not over `all`
+    // (#1002). A Running chip reading 12 while the list it opens holds 4
+    // is the confident-wrong-answer failure with a number on it -- the
+    // same argument #949 makes for counting over the whole list rather
+    // than the current chip's subset. The denominator that moves is the
+    // one the user is actually choosing among.
+    const visible = showSubagents ? all : all.filter((s) => s.kind.kind !== "subagent");
     return {
-      all: all.length,
-      resumable: all.filter((s) => matchesClaudeFilter(s, "resumable")).length,
-      gone: all.filter((s) => matchesClaudeFilter(s, "gone")).length,
-      running: all.filter((s) => matchesClaudeFilter(s, "running")).length,
-      ended: all.filter((s) => matchesClaudeFilter(s, "ended")).length,
+      all: visible.length,
+      resumable: visible.filter((s) => matchesClaudeFilter(s, "resumable")).length,
+      gone: visible.filter((s) => matchesClaudeFilter(s, "gone")).length,
+      running: visible.filter((s) => matchesClaudeFilter(s, "running")).length,
+      ended: visible.filter((s) => matchesClaudeFilter(s, "ended")).length,
+      // Over the WHOLE list, always: this is the number the toggle offers
+      // to reveal, so it must not be computed over a set that already
+      // excludes them. #975's rule -- a hidden exclusion states its size,
+      // or a user counting rows disagrees with the app and cannot find
+      // out why.
+      subagents: all.filter((s) => s.kind.kind === "subagent").length,
     };
-  }, [all]);
+  }, [all, showSubagents]);
 
   return { list, all, matched, counts };
 }
@@ -517,6 +540,8 @@ export function ClaudeSessionColumn() {
   const setQuery = useFilters((f) => f.setClaudeQuery);
   const filter = useFilters((f) => f.claudeFilter);
   const setFilter = useFilters((f) => f.setClaudeFilter);
+  const showSubagents = useFilters((f) => f.claudeShowSubagents);
+  const setShowSubagents = useFilters((f) => f.setClaudeShowSubagents);
   const selected = useFilters((f) => f.claudeSelected);
   const selectSession = useFilters((f) => f.selectClaudeSession);
   // The single app-wide keyboard cursor (#953). One cursor, owned by
@@ -666,6 +691,38 @@ export function ClaudeSessionColumn() {
             );
           })}
         </div>
+        {/* The subagent toggle (#1002).
+
+            A SEPARATE control from the chips above, not a sixth chip,
+            because it is a separate axis: the five chips are one axis by
+            construction (`ClaudeSessionFilter` sets out why), and "the
+            running subagents" is a question a mutually-exclusive sixth
+            chip would make unaskable. Crossed with the chip instead, which
+            costs no new states.
+
+            Rendered ONLY when there are some. A control offering to reveal
+            nothing is noise on a machine that has never used subagents,
+            and a zero beside it would invite the reader to wonder what
+            they are missing. Suppressed at zero, exactly as the subagent
+            file-skip notice above the list is.
+
+            The COUNT is the point (#975): a hidden exclusion that does not
+            say how many it hid leaves a user counting rows in disagreement
+            with the app and no way to find out why. */}
+        {counts !== undefined && counts.subagents > 0 ? (
+          <label className="mt-2 flex items-center gap-1.5 text-[11px] text-[#8b949e]">
+            <input
+              type="checkbox"
+              checked={showSubagents}
+              onChange={(e) => setShowSubagents(e.target.checked)}
+              className="tap-target h-3 w-3 accent-[#1f6feb]"
+            />
+            <span>
+              Show {counts.subagents.toLocaleString()} subagent session
+              {counts.subagents === 1 ? "" : "s"}
+            </span>
+          </label>
+        ) : null}
         {/* The counts, always. With a cap in play the footer alone
             would not say how much the SEARCH removed, and "showing
             200 of 1,438" is a different fact from "12 of 1,438
@@ -1258,6 +1315,12 @@ function SessionDetail({
               it, what was it saying, and where do I go next. The preview is
               last of the two because it is the one that costs a read. */}
           <SessionUsage detail={detail.data} />
+          {/* Directly after "how much work IT did", because the question
+              this answers is the same one one level down: how much work
+              happened UNDERNEATH it. Adjacent so the two figures can be
+              read against each other, and separate so neither is mistaken
+              for the other (#1002). */}
+          <SessionSubagents detail={detail.data} />
           <TranscriptPreview detail={detail.data} />
         </>
       )}
@@ -1696,6 +1759,149 @@ function SessionUsage({ detail: d }: { detail: ClaudeSessionDetail }) {
               These are floors, not totals: the transcript is{" "}
               {formatMb(data.file_bytes)} and only its first {formatMb(data.bytes_read)} were
               read. Reading it whole would hang this pane.
+            </p>
+          ) : null}
+        </>
+      )}
+    </section>
+  );
+}
+
+/// This session's subagents, and what they cost (#1002).
+///
+/// # Three audiences, one section
+///
+/// A session is in exactly one of three states here, and the section says
+/// which:
+///
+/// | state | what it shows |
+/// |---|---|
+/// | has attributed subagents | how many, and their tokens as a SEPARATE figure |
+/// | is a subagent with a known parent | which session spawned it |
+/// | is a subagent nobody could be traced for | that we looked, and why we could not tell |
+///
+/// A session that is neither renders nothing at all: the overwhelming
+/// majority of rows have no subagents and are not one, and a section
+/// saying "this has no subagents" on 1,100 rows is noise.
+///
+/// # The tokens are NEVER added to the parent's own
+///
+/// #959 kept four counters rather than one because cache reads run two to
+/// three orders of magnitude above fresh input. The same argument applies
+/// one level up: a parent's own tokens and its children's answer different
+/// questions, and one summed figure would answer neither -- a parent that
+/// delegated everything would show a large number describing work it did
+/// not do, indistinguishable from one that did the work itself. So this is
+/// its own section with its own heading, beside "How much work it did" and
+/// never inside it.
+///
+/// # Absent is not zero
+///
+/// `measured === 0` with subagents present means we could not total them,
+/// and it renders as "could not tell" rather than as four zeros. A child
+/// whose transcript could not be read contributes nothing to the sums, so
+/// a non-empty `unreadable` makes every figure a floor and the section
+/// says so. `caches/mod.rs:550`'s rule, one level up from
+/// `Usage::observed()`.
+///
+/// The error arm is BEFORE the loading/empty arms per #846: `data` is
+/// undefined on a rejection exactly as it is before the first read.
+function SessionSubagents({ detail: d }: { detail: ClaudeSessionDetail }) {
+  const isParent = d.subagents.length > 0;
+  // Only asked when there is something to roll up. A session with no
+  // attributed children must not issue a query that resolves to zeros --
+  // the zeros would be true and the section would still be noise.
+  const { data, isError, error, isLoading } = useClaudeSubagentRollup(
+    isParent ? d.session_id : null,
+  );
+
+  // A subagent's own view: who spawned it, or why that could not be told.
+  if (!isParent) {
+    if (d.kind.kind !== "subagent") return null;
+    return (
+      <section className="rounded-md border border-[#30363d] bg-[#161b22] p-3">
+        <h3 className="text-xs font-semibold text-[#e6edf3]">What ran this</h3>
+        {d.parent !== null ? (
+          <dl className="mt-2 space-y-1.5 text-xs">
+            <Field label="Spawned by">{d.parent.name ?? d.parent.session_id}</Field>
+            <Field label="Agent">{d.kind.agent_id}</Field>
+          </dl>
+        ) : (
+          /* Unattributed, and SAYING SO with the evidence. Never a
+             probable parent: a wrong rollup is worse than no rollup, and
+             the sentence carries which sessions tied and when so the
+             reader can see the app looked rather than shrugged. */
+          <>
+            <p className="mt-2 text-xs text-[#8b949e]">
+              This ran in an agent worktree, but which session started it could not be told.
+              {d.unattributed ? ` ${d.unattributed}.` : ""}
+            </p>
+            <dl className="mt-2 space-y-1.5 text-xs">
+              <Field label="Agent">{d.kind.agent_id}</Field>
+            </dl>
+          </>
+        )}
+      </section>
+    );
+  }
+
+  return (
+    <section className="rounded-md border border-[#30363d] bg-[#161b22] p-3">
+      <h3 className="text-xs font-semibold text-[#e6edf3]">What its subagents did</h3>
+      <p className="mt-2 text-xs text-[#8b949e]">
+        {d.subagents.length.toLocaleString()} subagent session
+        {d.subagents.length === 1 ? "" : "s"} ran under this one. They are hidden from the list
+        by default and are still resumable on their own.
+      </p>
+      {isError ? (
+        // NOT zeros (#846). A failed read and subagents that used nothing
+        // have opposite remedies, and the second is a claim this cannot
+        // make.
+        <p className="mt-2 text-xs text-[#8b949e]">
+          Could not total what they used
+          {errorMessage(error) ? ` (${errorMessage(error)})` : ""}.
+        </p>
+      ) : isLoading || data === undefined ? (
+        <p className="mt-2 text-xs text-[#8b949e]">Reading their transcripts…</p>
+      ) : !data.measured ? (
+        /* Has children, totalled none of them. Four zeros here would be a
+           measurement that was never taken. */
+        <p className="mt-2 text-xs text-[#8b949e]">
+          None of their transcripts could be totalled, so how much they used is unknown.
+        </p>
+      ) : (
+        <>
+          <dl className="mt-2 space-y-1.5 text-xs">
+            {/* Four counters, never one total, and never added into the
+                parent's own -- see this component's doc comment. */}
+            <Field label="Assistant messages">{data.messages.toLocaleString()}</Field>
+            <Field label="Output tokens">{data.output_tokens.toLocaleString()}</Field>
+            <Field label="Input tokens">{data.input_tokens.toLocaleString()}</Field>
+            <Field label="Cache read">{data.cache_read_tokens.toLocaleString()}</Field>
+            <Field label="Cache written">{data.cache_creation_tokens.toLocaleString()}</Field>
+          </dl>
+          {/* The denominator, whenever it is not the whole set. Without it
+              a sum over 3 of 12 children reads exactly like a sum over all
+              12 -- the #846 defect with a number on it. */}
+          {data.measured < data.sessions ? (
+            <p className="mt-2 text-xs text-[#d29922]">
+              These cover {data.measured.toLocaleString()} of{" "}
+              {data.sessions.toLocaleString()} subagent sessions
+              {data.without_usage > 0
+                ? `; ${data.without_usage.toLocaleString()} recorded no token usage`
+                : ""}
+              {data.unreadable.length > 0
+                ? `; ${data.unreadable.length.toLocaleString()} could not be read`
+                : ""}
+              , so they are floors rather than totals.
+            </p>
+          ) : data.truncated > 0 ? (
+            /* The 8 MB cap, stated. Binds on the handful of very large
+               transcripts and on nothing else, which is exactly why it
+               must be there when it does. */
+            <p className="mt-2 text-xs text-[#d29922]">
+              These are floors, not totals: {data.truncated.toLocaleString()} of their
+              transcripts were too large to read whole.
             </p>
           ) : null}
         </>

@@ -49,6 +49,7 @@
 
 use rusqlite::Connection;
 
+use super::subagent::{Kind, Parent};
 use super::transcript::{Scan, Transcript};
 
 /// What an import changed, and what it could not read.
@@ -69,6 +70,28 @@ pub struct Imported {
     pub unreadable_files: Vec<String>,
     pub metadata_beyond_first_record: usize,
     pub elapsed_ms: u64,
+    /// Sessions that ran inside an agent worktree (#1002).
+    ///
+    /// Hidden from the list by default. Counted so the exclusion can STATE
+    /// its size -- #975's rule, which `subagent_files_skipped` above
+    /// already follows for the other subagent shape: a hidden exclusion
+    /// that does not say how many it hid leaves a user counting rows in
+    /// disagreement with the app and no way to find out why.
+    pub subagents: usize,
+    /// How many of those were traced to the session that spawned them.
+    ///
+    /// The DIFFERENCE from `subagents` is the point: it is the number of
+    /// subagent sessions whose parent could not be told, and the UI says
+    /// so rather than rendering them as belonging to nobody.
+    pub subagents_attributed: usize,
+    /// Transcripts that could not be read while building the parent map.
+    ///
+    /// Carried separately from `unreadable_files` because they are a
+    /// different failure with a different consequence: an unreadable
+    /// transcript here does not cost a SESSION, it costs an attribution --
+    /// the file that could not be read may be the one that would have
+    /// named a parent.
+    pub subagent_map_unreadable: Vec<String>,
     /// The transcript root, when it does not exist at all (#970).
     ///
     /// Carried through from [`Scan::absent_root`] and kept OUT of
@@ -83,6 +106,15 @@ impl Imported {
     /// Whether anything could not be read or written.
     ///
     /// `absent_root` is deliberately not consulted -- see its doc (#970).
+    ///
+    /// Neither is `subagent_map_unreadable` (#1002), and for the same
+    /// kind of reason. This flag drives "this LIST may be incomplete". A
+    /// transcript that could not be read while building the parent map
+    /// costs an ATTRIBUTION, not a session: every row is still present and
+    /// the list is still the whole list. The affected children say "could
+    /// not tell" on their own rows, which is where that uncertainty
+    /// belongs. Raising the list-level banner for it would tell the user
+    /// their session list is short when it is complete.
     pub fn is_partial(&self) -> bool {
         !self.unreadable_dirs.is_empty()
             || !self.unreadable_files.is_empty()
@@ -168,8 +200,19 @@ pub fn import(conn: &mut Connection, scan: Scan) -> Result<Imported, rusqlite::E
         metadata_beyond_first_record: scan.metadata_beyond_first_record,
         elapsed_ms: scan.elapsed_ms,
         absent_root: scan.absent_root,
+        subagent_map_unreadable: scan.subagents.unreadable.clone(),
         ..Default::default()
     };
+
+    // Which sessions belong to each agent worktree. Needed before the
+    // attribution because a child must never be its own parent, and only
+    // this grouping knows which sessions are the agent's own.
+    let mut own: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for t in &scan.sessions {
+        if let Kind::Subagent { agent_id } = Kind::classify(t.cwd.as_deref()) {
+            own.entry(agent_id).or_default().push(t.session_id.clone());
+        }
+    }
 
     let tx = conn.transaction()?;
     for t in &scan.sessions {
@@ -178,6 +221,44 @@ pub fn import(conn: &mut Connection, scan: Scan) -> Result<Imported, rusqlite::E
             Err(e) => out
                 .write_failures
                 .push(format!("{}: could not store it: {e}", t.session_id)),
+        }
+    }
+
+    // The attribution, rewritten WHOLE rather than upserted (#1002).
+    //
+    // The map is one derived artefact over the whole corpus: a session
+    // that was unattributed last scan can resolve on this one because
+    // some OTHER transcript grew a mention, and one that was attributed
+    // can stop being so if its parent's transcript is deleted. An upsert
+    // would leave the stale conclusion in place with nothing to remove
+    // it, so the table is cleared and re-stated by the pass that owns it.
+    //
+    // Inside the same transaction as the sessions, so a reader never sees
+    // a list whose rows and whose attributions came from different scans.
+    tx.execute("DELETE FROM claude_subagent", [])?;
+    for t in &scan.sessions {
+        let Kind::Subagent { agent_id } = Kind::classify(t.cwd.as_deref()) else {
+            continue;
+        };
+        let siblings = own.get(&agent_id).cloned().unwrap_or_default();
+        let (parent, why) = match scan.subagents.parent_of(&agent_id, &siblings) {
+            Parent::Session { session_id } => (Some(session_id), None),
+            Parent::Unattributed { why } => (None, Some(why)),
+        };
+        out.subagents += 1;
+        if parent.is_some() {
+            out.subagents_attributed += 1;
+        }
+        if let Err(e) = tx.execute(
+            "INSERT INTO claude_subagent
+                (session_id, agent_id, parent_session_id, why, resolved_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![t.session_id, agent_id, parent, why, now],
+        ) {
+            out.write_failures.push(format!(
+                "{}: could not store which session spawned it: {e}",
+                t.session_id
+            ));
         }
     }
     tx.commit()?;
@@ -381,6 +462,258 @@ mod tests {
         let (_, _, first, last) = one(&conn, "s1");
         assert_eq!(first, "2026-01-01T00:00:00Z", "earliest wins");
         assert_eq!(last.as_deref(), Some("2026-06-02T00:00:00Z"), "latest wins");
+    }
+
+    /// A subagent session is recorded as one, with its parent (#1002).
+    ///
+    /// The end-to-end shape: a child whose `cwd` is an agent worktree, a
+    /// parent transcript that mentions the agent id, and a
+    /// `claude_subagent` row joining them.
+    #[test]
+    fn a_subagent_is_stored_with_the_session_that_spawned_it() {
+        let mut conn = db();
+        let mut child = t("child-1");
+        child.cwd = Some(agent_cwd("aaaaaaaa1111"));
+        let parent = t("parent-1");
+
+        let mut map = crate::claude::subagent::Map::default();
+        map_note(&mut map, "aaaaaaaa1111", "parent-1", "2026-09-14T01:00:00Z");
+
+        let out = import(
+            &mut conn,
+            Scan {
+                sessions: vec![parent, child],
+                subagents: map,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(out.subagents, 1, "one session ran in an agent worktree");
+        assert_eq!(out.subagents_attributed, 1);
+        let (agent, parent_id, why): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT agent_id, parent_session_id, why FROM claude_subagent
+                 WHERE session_id = 'child-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(agent, "aaaaaaaa1111");
+        assert_eq!(parent_id.as_deref(), Some("parent-1"));
+        assert!(why.is_none(), "an attributed child needs no excuse");
+    }
+
+    /// The happy-path pair: an ordinary session gets no subagent row.
+    ///
+    /// Without this the test above passes for a build that files EVERY
+    /// session as a subagent, which would hide the entire list.
+    #[test]
+    fn an_ordinary_session_is_not_recorded_as_a_subagent() {
+        let mut conn = db();
+        let out = import(
+            &mut conn,
+            Scan {
+                sessions: vec![t("s1")],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(out.subagents, 0);
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM claude_subagent", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    /// An ambiguous child is stored UNATTRIBUTED, with the reason.
+    ///
+    /// #1002's central rule: where earliest-mention cannot decide, the
+    /// child stays unattributed rather than being assigned a probable
+    /// parent. A wrong rollup is worse than no rollup.
+    #[test]
+    fn an_ambiguous_child_is_stored_unattributed_with_its_reason() {
+        let mut conn = db();
+        let mut child = t("child-1");
+        child.cwd = Some(agent_cwd("bbbbbbbb2222"));
+
+        // Two candidate parents naming the agent at the SAME instant.
+        let mut map = crate::claude::subagent::Map::default();
+        map_note(&mut map, "bbbbbbbb2222", "cand-a", "2026-09-14T01:00:00Z");
+        map_note(&mut map, "bbbbbbbb2222", "cand-b", "2026-09-14T01:00:00Z");
+
+        let out = import(
+            &mut conn,
+            Scan {
+                sessions: vec![t("cand-a"), t("cand-b"), child],
+                subagents: map,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(out.subagents, 1);
+        assert_eq!(
+            out.subagents_attributed, 0,
+            "a tie must not be resolved to a probable parent"
+        );
+        let (parent_id, why): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT parent_session_id, why FROM claude_subagent
+                 WHERE session_id = 'child-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(parent_id.is_none(), "got {parent_id:?}");
+        let why = why.expect("an unattributed child must say why");
+        assert!(why.contains("cannot be told apart"), "{why}");
+    }
+
+    /// The map is rewritten WHOLE, so a stale attribution cannot survive.
+    ///
+    /// The conclusion is over the whole corpus and can change for a
+    /// session nothing about which changed -- a parent's transcript being
+    /// deleted, say. An upsert would leave yesterday's answer in place
+    /// with nothing to remove it.
+    #[test]
+    fn a_rescan_replaces_the_attribution_rather_than_adding_to_it() {
+        let mut conn = db();
+        let mut child = t("child-1");
+        child.cwd = Some(agent_cwd("cccccccc3333"));
+
+        let mut first = crate::claude::subagent::Map::default();
+        map_note(
+            &mut first,
+            "cccccccc3333",
+            "parent-old",
+            "2026-09-14T01:00:00Z",
+        );
+        import(
+            &mut conn,
+            Scan {
+                sessions: vec![t("parent-old"), child.clone()],
+                subagents: first,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // A second scan in which the old parent is gone and a new one
+        // names the agent.
+        let mut second = crate::claude::subagent::Map::default();
+        map_note(
+            &mut second,
+            "cccccccc3333",
+            "parent-new",
+            "2026-09-14T02:00:00Z",
+        );
+        import(
+            &mut conn,
+            Scan {
+                sessions: vec![t("parent-new"), child],
+                subagents: second,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM claude_subagent", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "the table is restated, never appended to");
+        let parent_id: Option<String> = conn
+            .query_row(
+                "SELECT parent_session_id FROM claude_subagent WHERE session_id = 'child-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent_id.as_deref(), Some("parent-new"));
+    }
+
+    /// A child never adopts itself.
+    ///
+    /// A child's own transcript carries its own agent id and is always the
+    /// earliest mention of it, so without the exclusion every subagent
+    /// would be filed as its own parent.
+    #[test]
+    fn a_child_is_not_filed_as_its_own_parent() {
+        let mut conn = db();
+        let mut child = t("child-1");
+        child.cwd = Some(agent_cwd("dddddddd4444"));
+
+        let mut map = crate::claude::subagent::Map::default();
+        // The child mentions it FIRST, the real parent later.
+        map_note(&mut map, "dddddddd4444", "child-1", "2026-09-14T01:00:00Z");
+        map_note(&mut map, "dddddddd4444", "parent-1", "2026-09-14T02:00:00Z");
+
+        import(
+            &mut conn,
+            Scan {
+                sessions: vec![t("parent-1"), child],
+                subagents: map,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let parent_id: Option<String> = conn
+            .query_row(
+                "SELECT parent_session_id FROM claude_subagent WHERE session_id = 'child-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            parent_id.as_deref(),
+            Some("parent-1"),
+            "the child's own mention must not win"
+        );
+    }
+
+    /// An unreadable transcript costs an ATTRIBUTION, not a session.
+    ///
+    /// So it travels in its own field and is deliberately kept out of
+    /// `is_partial`, which drives "this LIST may be incomplete". Every row
+    /// is still present; only the rollup is short.
+    #[test]
+    fn a_map_read_failure_does_not_claim_the_list_is_short() {
+        let mut conn = db();
+        let mut map = crate::claude::subagent::Map::default();
+        map.unreadable.push("/x/y.jsonl: could not open it".into());
+        let out = import(
+            &mut conn,
+            Scan {
+                sessions: vec![t("s1")],
+                subagents: map,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(out.subagent_map_unreadable.len(), 1);
+        assert!(
+            !out.is_partial(),
+            "an unreadable transcript costs an attribution, not a row"
+        );
+    }
+
+    /// An agent worktree cwd, built with `join` so this is right on
+    /// Windows -- `format!("{}/…")` has cost this repo six Windows-only
+    /// failures.
+    fn agent_cwd(agent: &str) -> String {
+        std::path::Path::new("/Users/x/code/widget")
+            .join(".claude")
+            .join("worktrees")
+            .join(format!("agent-{agent}"))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Record one mention in a map, through the module's own builder so
+    /// the tests exercise the real note/resolve path.
+    fn map_note(map: &mut crate::claude::subagent::Map, agent: &str, session: &str, at: &str) {
+        map.note_for_test(agent, session, at);
     }
 
     /// An import writes no runs, because it observed no process.

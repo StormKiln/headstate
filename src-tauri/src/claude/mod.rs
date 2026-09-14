@@ -75,6 +75,8 @@ pub mod preview;
 pub mod registry;
 pub mod sessions;
 pub mod store;
+/// Which sessions are subagents, and which session spawned each (#1002).
+pub mod subagent;
 pub mod transcript;
 /// Per-message token usage, summed per session (#959).
 pub mod usage;

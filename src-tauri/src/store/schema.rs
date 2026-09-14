@@ -349,6 +349,39 @@ const MIGRATIONS: &[&str] = &[
      );
      CREATE INDEX IF NOT EXISTS claude_run_session
         ON claude_run (session_id, started_at DESC);",
+    // Migration 12: which subagent session belongs to which parent (#1002).
+    //
+    // # Why a table and not a column on `claude_session`
+    //
+    // The attribution is not a property of the session row -- it is the
+    // conclusion of a pass over EVERY transcript, and it can change for a
+    // session nothing about which has changed. A parent that was
+    // unattributed last scan can resolve on the next one because some
+    // OTHER session's transcript grew a mention. A column would invite a
+    // per-row upsert alongside the session's own fields and would blur
+    // that; a table written whole by one pass says plainly that the whole
+    // map is one derived artefact.
+    //
+    // # Why the parent is nullable and `why` is not dropped
+    //
+    // `parent_session_id IS NULL` means the map looked and could not
+    // decide, and `why` carries the sentence that says which of the two
+    // undecidable cases it was. Absent is not zero, and a null with no
+    // reason is a shrug the UI could only render as a blank.
+    //
+    // There is no foreign key to `claude_session`: the parent may be a
+    // session whose transcript was read but whose row failed to write, and
+    // an FK would then discard a correct attribution over an unrelated
+    // failure.
+    "CREATE TABLE IF NOT EXISTS claude_subagent (
+        session_id        TEXT PRIMARY KEY,
+        agent_id          TEXT NOT NULL,
+        parent_session_id TEXT,
+        why               TEXT,
+        resolved_at       TEXT NOT NULL
+     );
+     CREATE INDEX IF NOT EXISTS claude_subagent_parent
+        ON claude_subagent (parent_session_id);",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
@@ -429,6 +462,78 @@ mod tests {
     /// database, so a migration that only works when it runs first in
     /// A v10 database gains the Claude session tables (#911).
     ///
+    /// Migration 12 upgrades a v11 database rather than needing it
+    /// deleted (#1002).
+    ///
+    /// v11 is EVERY install that has the Claude Code feature at all --
+    /// the version the development machine's own database sits at -- so
+    /// this is the upgrade path the change actually ships into, not a
+    /// hypothetical one.
+    #[test]
+    fn migration_twelve_adds_the_subagent_table_to_a_v11_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        // A v11 database: the Claude tables exist, the subagent one does
+        // not.
+        conn.execute_batch(
+            "CREATE TABLE snapshot (id INTEGER PRIMARY KEY, payload TEXT NOT NULL,
+                fetched_at TEXT NOT NULL);
+             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE claude_session (
+                session_id TEXT PRIMARY KEY, name TEXT, cwd TEXT, git_branch TEXT,
+                claude_version TEXT, transcript_path TEXT,
+                first_seen_at TEXT NOT NULL, last_activity_at TEXT);",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 11i64).unwrap();
+        // The rows an existing install already has must survive.
+        conn.execute(
+            "INSERT INTO claude_session (session_id, first_seen_at)
+             VALUES ('kept', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        assert!(has_table(&conn, "claude_subagent"));
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+        let kept: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claude_session WHERE session_id = 'kept'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1, "an upgrade must not cost an existing row");
+
+        // One attribution per SESSION: a session ran in exactly one
+        // directory, so two rows for one id would make "which agent was
+        // this" ambiguous.
+        let insert = "INSERT INTO claude_subagent
+            (session_id, agent_id, resolved_at)
+            VALUES (?1, 'a1', '2026-01-01T00:00:00Z')";
+        conn.execute(insert, ["child"]).unwrap();
+        assert!(
+            conn.execute(insert, ["child"]).is_err(),
+            "session_id must be unique in claude_subagent"
+        );
+
+        // A NULL parent is legal and is the unattributed case -- the
+        // column must not be NOT NULL, or an ambiguous child could only
+        // be stored by inventing a parent for it.
+        conn.execute(
+            "INSERT INTO claude_subagent
+                (session_id, agent_id, parent_session_id, why, resolved_at)
+             VALUES ('orphan', 'a2', NULL, 'two candidates tied',
+                     '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+    }
+
     /// The same shape as the v5 case below, and for the same reason: an
     /// existing install must upgrade rather than need its database deleted.
     #[test]

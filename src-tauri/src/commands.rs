@@ -3463,6 +3463,48 @@ pub async fn claude_session_detail(
     .map_err(|e| e.to_string())?
 }
 
+/// What one session's subagents cost, as a figure of its own (#1002).
+///
+/// Reads each attributed child's transcript with #959's bounded summariser
+/// and sums the four counters SEPARATELY -- never into the parent's own,
+/// and never into one blended total. `claude::sessions::SubagentRollup`
+/// carries both arguments at length.
+///
+/// # Why on demand rather than on the list row
+///
+/// It costs one bounded transcript read per child, and the measured
+/// corpus has parents with dozens. Doing it for all 1,524 rows on every
+/// 10-second poll is the whole-corpus read that `transcript.rs` and
+/// `usage.rs` both exist to avoid. The detail pane asks about one
+/// session, which is the bargain `claude_session_usage` already strikes.
+///
+/// `Class::Read`: it reads files under `~/.claude/projects` and the app's
+/// own database, and writes nothing. The phone wants this answer for the
+/// same reason the desktop does.
+///
+/// # Absent is not zero
+///
+/// A child whose transcript could not be read lands in
+/// `SubagentRollup::unreadable` and contributes nothing to the sums, so
+/// the totals are a floor the UI must label. `SubagentRollup::observed()`
+/// is the gate that stops four zeros rendering as a measurement.
+#[tauri::command]
+pub async fn claude_subagent_rollup(
+    app: tauri::AppHandle,
+    session_id: String,
+) -> Result<crate::claude::sessions::SubagentRollup, String> {
+    let db = db_path(&app);
+    // `spawn_blocking` because it reads up to 8 MB per child off disk,
+    // which does not belong on the async runtime -- the same reason
+    // `claude_session_usage` wraps its own read.
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&db).map_err(|e| e.to_string())?;
+        crate::claude::sessions::subagent_rollup(&conn, &session_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// What one pass over both live sources found (#913, epic #910).
 ///
 /// The two halves are returned together because they are ONE answer to

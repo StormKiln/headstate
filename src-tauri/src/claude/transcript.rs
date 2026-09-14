@@ -267,6 +267,13 @@ pub struct Scan {
     /// decision stays checkable on someone else's machine instead of
     /// resting on this module's docs.
     pub elapsed_ms: u64,
+    /// Which session spawned each agent worktree (#1002).
+    ///
+    /// Built during this same walk, because it needs an unbounded read of
+    /// every transcript and this is the only pass that already opens them
+    /// all. See [`super::subagent`] for the measurement that rules out
+    /// doing it in the session list's poll.
+    pub subagents: super::subagent::Map,
     /// The transcript root, when it does not exist at all (#970).
     ///
     /// # Why this is not `unreadable_dirs`
@@ -631,8 +638,8 @@ pub fn scan(root: &Path) -> Scan {
         ..Default::default()
     };
 
-    for f in walk.files {
-        match extract(&f) {
+    for f in &walk.files {
+        match extract(f) {
             Ok(t) => {
                 if t.cwd_record.is_some_and(|r| r > 1) {
                     out.metadata_beyond_first_record += 1;
@@ -642,6 +649,22 @@ pub fn scan(root: &Path) -> Scan {
             Err(e) => out.unreadable_files.push(e),
         }
     }
+
+    // The parent map (#1002), built HERE and nowhere else.
+    //
+    // This is the one place in the app that already reads every
+    // transcript, and the map needs an UNBOUNDED read of each -- measured,
+    // #959's 8 MB budget finds only 15 of 52 agent ids on the largest real
+    // parent, because a spawn happens once at whatever moment the parent
+    // delegated rather than on every assistant record. `subagent.rs`
+    // carries the offset table.
+    //
+    // Measured cost on the real corpus, release build: 969 ms over 1,523
+    // transcripts / 0.86 GB. That is affordable once, at startup and
+    // behind the rescan button, and would be ruinous in the session
+    // list's 10-second poll -- which is exactly why the poll reads the
+    // stored answer instead of deriving one.
+    out.subagents = super::subagent::build(&walk.files);
 
     // Newest first: the session someone wants is almost always the one
     // they were just in. A session with no timestamp sorts last rather

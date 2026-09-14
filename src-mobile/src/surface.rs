@@ -134,6 +134,7 @@ pub const SURFACE: &[(&str, Class)] = &[
     // render one; it now carries what the list draws, and the phone asks
     // for the rest only when the user opens a session.
     ("claude_session_detail", Class::Read),
+    ("claude_subagent_rollup", Class::Read),
     // The two live sources on the DESKTOP: its hook handoff file and its
     // `~/.claude/sessions` registry (#913). The phone has neither of its
     // own -- it runs no Claude sessions -- which is exactly why it asks

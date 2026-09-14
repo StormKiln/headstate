@@ -54,6 +54,8 @@ const session = (over: Partial<ClaudeSession> = {}): ClaudeSession => ({
   last_activity_at: "2026-09-13T09:00:00Z",
   liveness: { state: "dead", why: "pid 14779 is no longer running" },
   cwd_state: { state: "exists" },
+  kind: { kind: "own" },
+  subagents: 0,
   ...over,
 });
 

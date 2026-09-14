@@ -6,6 +6,7 @@ import type {
   ClaudeSessionDetail,
   ClaudeSessionList,
   ClaudeUsage,
+  ClaudeSubagentRollup,
 } from "@/types/pr";
 import { useFilters } from "@/store/filters";
 import { stubViewport } from "@/test-utils";
@@ -56,6 +57,7 @@ const state = vi.hoisted(() => ({
   /// transcript's content at all. Filled here so the tests below can
   /// assert that, rather than only that the Local controls are gone.
   usage: undefined as ClaudeUsage | undefined,
+  rollup: undefined as ClaudeSubagentRollup | undefined,
   preview: undefined as ClaudePreview | undefined,
   /// One session's detail, keyed by id (#985). `Class::Read`, so the
   /// phone gets this too -- and the phone is who the split is for: the
@@ -87,6 +89,12 @@ vi.mock("../api/hooks", () => ({
     error: undefined,
     isLoading: path !== null && state.usage === undefined,
   }),
+  useClaudeSubagentRollup: (sessionId: string | null) => ({
+    data: state.rollup,
+    isError: false,
+    error: undefined,
+    isLoading: sessionId !== null && state.rollup === undefined,
+  }),
   useClaudeSessionDetail: (sessionId: string | null, enabled: boolean) => {
     if (enabled && sessionId) state.detailAskedFor.push(sessionId);
     return {
@@ -114,7 +122,9 @@ const { ClaudeCodePage } = await import("./ClaudeCodePage");
 /// Returns the LIST row and files the detail under the same id, so the
 /// phone's two reads answer for one session and these tests keep reading
 /// as statements about a session rather than about a wire format.
-const session = (over: Partial<ClaudeSession & ClaudeSessionDetail> = {}): ClaudeSession => {
+const session = (
+  over: Partial<Omit<ClaudeSession, "subagents"> & ClaudeSessionDetail> = {},
+): ClaudeSession => {
   const id = over.session_id ?? "e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2";
   const liveness = over.liveness ?? {
     state: "dead" as const,
@@ -134,6 +144,13 @@ const session = (over: Partial<ClaudeSession & ClaudeSessionDetail> = {}): Claud
     },
     runs: 1,
     registry_failure: null,
+    // The user's own work by default -- 1,133 of 1,524 measured rows.
+    // A fixture defaulting to a subagent would hide every row from the
+    // list, which is the one thing these tests must not do silently.
+    kind: { kind: "own" as const },
+    subagents: [],
+    parent: null,
+    unattributed: null,
     ...over,
   });
   return {
@@ -145,6 +162,13 @@ const session = (over: Partial<ClaudeSession & ClaudeSessionDetail> = {}): Claud
     liveness,
     cwd_state: { state: "exists" },
     ...over,
+    kind: over.kind ?? { kind: "own" as const },
+    // AFTER the spread, and that ordering is load-bearing: `over` carries
+    // the DETAIL's `subagents`, which is a list of children, while the row
+    // wants a count. Spreading it onto the row unchanged would put an
+    // array where a number belongs. Deriving the count here means the two
+    // shapes of the same fact cannot drift.
+    subagents: Array.isArray(over.subagents) ? over.subagents.length : 0,
   };
 };
 
@@ -334,6 +358,48 @@ describe("the companion offers the view and hides only the Local actions", () =>
 
     expect(screen.getByText(/how much work it did/i)).toBeTruthy();
     expect(screen.getByText("994")).toBeTruthy();
+    expect(screen.getByText("582,035")).toBeTruthy();
+  });
+
+  /// #1002 on the phone. `claude_subagent_rollup` is `Class::Read`, so
+  /// like the usage panel above and unlike the two reveal buttons it is
+  /// NOT behind `IS_MOBILE_BUILD`.
+  ///
+  /// This is the positive half `surfaceGuard.test.ts` cannot make: that
+  /// test checks the CLASSIFICATION and would stay green whether this
+  /// page rendered the section or not. A `Read` command with no render
+  /// test is a command the phone is allowed to call and never does.
+  ///
+  /// **Sabotage:** wrap `<SessionSubagents>` in `!IS_MOBILE_BUILD` in
+  /// `ClaudeCodePage` and this fails while every other test stays green.
+  it("shows the subagent rollup, because claude_subagent_rollup is Class::Read", () => {
+    state.rollup = {
+      sessions: 2,
+      measured: 2,
+      without_usage: 0,
+      unreadable: [],
+      truncated: 0,
+      input_tokens: 11,
+      output_tokens: 22,
+      cache_read_tokens: 33,
+      cache_creation_tokens: 44,
+      messages: 55,
+    };
+    state.list = listOf([
+      session({
+        subagents: [
+          { session_id: "c1", name: "Child one", agent_id: "a1" },
+          { session_id: "c2", name: "Child two", agent_id: "a2" },
+        ],
+      }),
+    ]);
+    render(<ClaudeCodePage />);
+    open("HeadState GitHub issues filing");
+
+    expect(screen.getByText(/what its subagents did/i)).toBeTruthy();
+    // The children's own figure, and NOT folded into the parent's: the
+    // parent's own output is 582,035 and stays that.
+    expect(screen.getByText("22")).toBeTruthy();
     expect(screen.getByText("582,035")).toBeTruthy();
   });
 
