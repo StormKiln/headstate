@@ -22,6 +22,16 @@
     // `paths` has resolved relative to this file's directory since 4.1,
     // which is exactly what `.` said. Vite's `@/` alias is its own, in
     // vite.config.ts.
+    //
+    // Two TypeScripts are installed, and this file is checked by the
+    // NEWER one. `yarn tsc` is TypeScript 7, the native compiler, via the
+    // `typescript-7` alias in package.json (~2.5s for `tsc -b --force`
+    // here, against ~14s on 6). The `typescript` package itself is
+    // Microsoft's `@typescript/typescript6` compatibility build, because
+    // 7.0 ships no JavaScript compiler API and typescript-eslint's typed
+    // rules and knip both need one; its binary is `tsc6`, so the two
+    // never collide on `tsc`. The alias goes away once typescript-eslint
+    // supports the 7.1 API (typescript-eslint/typescript-eslint#10940).
     "paths": {
       "@/*": ["./src/*"]
     }

@@ -53,7 +53,7 @@ set -euo pipefail
 # case this list exists for -- and a comment that cites a measured
 # constraint without saying where the constraint came from is the kind
 # of unsourced claim this codebase's comments are written to avoid.
-ALLOWED='octocat|pktstorm|tauri-apps|shadcn-ui|rust-lang|actions|dtolnay|Swatinem|org|owner|acme|anthropics'
+ALLOWED='octocat|pktstorm|tauri-apps|shadcn-ui|rust-lang|actions|dtolnay|Swatinem|typescript-eslint|org|owner|acme|anthropics'
 
 # Ticket-ID-shaped tokens (PREFIX-NUMBER) that are legitimate public
 # identifiers, not internal tracker references.
