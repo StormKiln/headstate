@@ -1,3 +1,4 @@
+import type { Unmeasured } from "../types/pr";
 /// Percent change between two periods.
 ///
 /// Returns `Infinity` when `previous` is 0 but `current` is not -- there is
@@ -94,4 +95,78 @@ export function namedDaysText(named: string[], rest: number): string {
   const list = named.join(", ");
   if (rest <= 0) return list;
   return `${list}, and ${rest} other${rest === 1 ? "" : "s"}`;
+}
+
+/// The sentence a total failure gets, and whether a retry can help (#1050).
+///
+/// Three states, because the page previously had two and a budget-exhausted
+/// load matched the wrong one:
+///
+/// - `budgetExhausted` -- THIS PROCESS declined to issue the request, because
+///   the rate-limit budget was under its reserve. GitHub was never asked. A
+///   retry cannot succeed until the hourly window rolls over, so it is not
+///   offered: a button that cannot work invites exactly the loop the user is
+///   already stuck in.
+/// - refused fields -- GitHub answered and refused fields, which is usually a
+///   SAML authorization. A retry will not fix it either, but the action is
+///   clear and belongs in the message.
+/// - otherwise -- GitHub did not answer the documents. This is the one that
+///   usually does clear on its own, and the only one that earns a retry.
+export function unmeasuredMessage(
+  count: number,
+  refusedFields: number,
+  unmeasured: Unmeasured | undefined,
+  now: Date = new Date(),
+): { message: string; canRetry: boolean } {
+  if (unmeasured?.kind === "budgetExhausted") {
+    const left =
+      unmeasured.remaining === null
+        ? "The remaining budget was not reported"
+        : `${unmeasured.remaining.toLocaleString()} points remained`;
+    return {
+      message:
+        `None of the ${count} days in this window could be measured: GitHub's hourly API ` +
+        `budget is exhausted, so the requests were never issued. ${left}, under the ` +
+        `${unmeasured.reserve.toLocaleString()}-point reserve kept for background refresh. ` +
+        `${resumesAt(unmeasured.resetAt, now)}`,
+      canRetry: false,
+    };
+  }
+  if (refusedFields > 0) {
+    return {
+      message:
+        `None of the ${count} days in this window could be measured, and GitHub refused ` +
+        `${refusedFields} field${refusedFields === 1 ? "" : "s"} on the responses -- ` +
+        `usually a SAML authorization this organization needs.`,
+      canRetry: false,
+    };
+  }
+  return {
+    message:
+      `None of the ${count} days in this window could be measured. GitHub did not answer ` +
+      `the daily documents, which usually clears on its own.`,
+    canRetry: true,
+  };
+}
+
+/// When measuring resumes, in the reader's own timezone.
+///
+/// The reset instant is what makes the budget message ACTIONABLE rather than
+/// merely accurate: "exhausted" tells a user to stop retrying, and a time
+/// tells them when to come back. An absent or unparseable instant says so
+/// instead of inventing one -- absent is not a time, the same rule the rest
+/// of this codebase states as absent-is-not-zero.
+function resumesAt(resetAt: string | null, now: Date): string {
+  if (!resetAt) return "Measuring resumes when the hourly window resets.";
+  const t = new Date(resetAt);
+  if (Number.isNaN(t.getTime())) {
+    return "Measuring resumes when the hourly window resets.";
+  }
+  const mins = Math.max(0, Math.ceil((t.getTime() - now.getTime()) / 60000));
+  const clock = t.toLocaleTimeString(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+  });
+  if (mins === 0) return `Measuring resumes now (${clock}) -- reload to try again.`;
+  return `Measuring resumes at ${clock}, in ${mins} minute${mins === 1 ? "" : "s"}.`;
 }

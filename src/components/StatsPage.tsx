@@ -12,9 +12,9 @@ import {
   useStatsSeries,
   useStatsTree,
 } from "../api/hooks";
-import { classifyFailedDays, namedDaysText } from "../lib/stats";
+import { classifyFailedDays, namedDaysText, unmeasuredMessage } from "../lib/stats";
 import { useActiveFilters } from "../store/filters";
-import type { ShortSlice } from "../types/pr";
+import type { ShortSlice, Unmeasured } from "../types/pr";
 import { QueryError, errorMessage } from "./QueryError";
 import { ActivityChart } from "./stats/ActivityChart";
 import { CycleTime } from "./stats/CycleTime";
@@ -282,15 +282,10 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
            distinguishes a SAML refusal (which a retry will not fix) from
            an unanswered document (which it usually will), and that is the
            difference between advice a user can act on and a shrug. */
-        <QueryError
-          title="Could not measure activity for this scope"
-          message={
-            series.refusedFields > 0
-              ? `None of the ${failedDays.count} days in this window could be measured, and GitHub refused ${series.refusedFields} field${
-                  series.refusedFields === 1 ? "" : "s"
-                } on the responses -- usually a SAML authorization this organization needs.`
-              : `None of the ${failedDays.count} days in this window could be measured. GitHub did not answer the daily documents, which usually clears on its own.`
-          }
+        <BudgetAwareError
+          count={failedDays.count}
+          refusedFields={series.refusedFields}
+          unmeasured={series.unmeasured}
           onRetry={() => void seriesQ.refetch()}
         />
       ) : series ? (
@@ -797,4 +792,32 @@ export function partialityCaveat(board: {
     parts.push("part of this window holds more pull requests than GitHub will return");
   }
   return `${parts.join("; ")}.`;
+}
+
+/// The total-failure panel, which must not offer a retry that cannot work.
+///
+/// Split out of `StatsPage` because the decision is a real one -- three causes
+/// with different advice, only one of which a retry helps -- and an inline
+/// ternary is where the previous version quietly said the wrong thing to the
+/// user reporting #1050: a budget-exhausted load matched the "GitHub did not
+/// answer" branch and was handed a button that could not succeed.
+function BudgetAwareError({
+  count,
+  refusedFields,
+  unmeasured,
+  onRetry,
+}: {
+  count: number;
+  refusedFields: number;
+  unmeasured: Unmeasured | undefined;
+  onRetry: () => void;
+}) {
+  const { message, canRetry } = unmeasuredMessage(count, refusedFields, unmeasured);
+  return (
+    <QueryError
+      title="Could not measure activity for this scope"
+      message={message}
+      onRetry={canRetry ? onRetry : undefined}
+    />
+  );
 }

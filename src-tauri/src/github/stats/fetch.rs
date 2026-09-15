@@ -1145,6 +1145,43 @@ pub struct Series {
     /// Fields GitHub refused across the series responses.
     pub refused_fields: usize,
     pub spend: super::budget::Spend,
+    /// Why days are missing, when the reason is not GitHub's (#1050).
+    ///
+    /// `None` means the days that failed did so at GitHub: a document went
+    /// unanswered, or a field was refused. `Some` means this process
+    /// declined to issue the request at all, which is a DIFFERENT fact and
+    /// the one the UI previously could not tell.
+    ///
+    /// Without this field `Series` carried no way to say "we never asked".
+    /// `StatsPage` had two explanations available -- a SAML refusal when
+    /// `refused_fields > 0`, and "GitHub did not answer ... usually clears
+    /// on its own" otherwise -- and a budget-exhausted load matched the
+    /// second while being wrong in both halves: GitHub was never asked, and
+    /// it clears when the hourly window resets rather than on its own.
+    ///
+    /// Deliberately NOT folded into `refused_fields`. That field means
+    /// GitHub refused a field and is load-bearing for the SAML message;
+    /// overloading it would trade one confidently wrong sentence for
+    /// another.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unmeasured: Option<Unmeasured>,
+}
+
+/// Why a load stopped short for a reason that is not GitHub's (#1050).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum Unmeasured {
+    /// The rate-limit budget was under [`super::budget::RESERVE`], so the
+    /// request was never issued.
+    ///
+    /// Carries the figures the message needs, rather than leaving the UI to
+    /// restate a constant it would then have to keep in step: `remaining`
+    /// and `reset_at` are read off the budget at the moment of the refusal.
+    BudgetExhausted {
+        remaining: Option<u64>,
+        reserve: u64,
+        reset_at: Option<chrono::DateTime<chrono::Utc>>,
+    },
 }
 
 impl Series {
@@ -1193,6 +1230,7 @@ async fn series_inner(
     let mut merged = vec![None::<u64>; days.len()];
     let mut opened = vec![None::<u64>; days.len()];
     let mut refused = 0usize;
+    let mut unmeasured: Option<Unmeasured> = None;
     let per_wave = ALIAS_CHUNK * READ_CONCURRENCY;
 
     for (w, wave) in days.chunks(per_wave).enumerate() {
@@ -1211,6 +1249,16 @@ async fn series_inner(
                 super::budget::RESERVE,
                 days.len().saturating_sub(base)
             );
+            // Recorded, not merely logged (#1050). A log line cannot reach
+            // the UI, and this is the difference between "GitHub did not
+            // answer" and "we did not ask" -- which on wave 0 is the whole
+            // of what the user sees.
+            let snap = budget.snapshot();
+            unmeasured = Some(Unmeasured::BudgetExhausted {
+                remaining: snap.remaining,
+                reserve: super::budget::RESERVE,
+                reset_at: snap.reset_at,
+            });
             break;
         }
         let mut set = tokio::task::JoinSet::new();
@@ -1281,6 +1329,7 @@ async fn series_inner(
         failed_days,
         refused_fields: refused,
         spend: budget.snapshot(),
+        unmeasured,
     })
 }
 
@@ -1983,6 +2032,94 @@ mod tests {
     /// read: `board.rs:480-493` for a missing detail alias, and
     /// `series_inner`/`reviewers_inner`'s own `None`-not-zero handling for
     /// the other two.
+    /// THE regression test for #1050.
+    ///
+    /// A drained account refuses on WAVE ZERO: the loop breaks before issuing
+    /// a single request, every day stays `None` and becomes a named failed
+    /// day, and the function returns `Ok`. That is the state a large account
+    /// is in on every page load, and the page told the user "GitHub did not
+    /// answer the daily documents, which usually clears on its own" -- wrong
+    /// in both halves, because GitHub was never asked and it clears when the
+    /// hourly window resets.
+    ///
+    /// The existing `a_wave_is_refused_once_the_budget_is_under_the_reserve`
+    /// covers the PREDICATE, and a mid-load refusal leaves some days measured.
+    /// Nothing covered wave zero, which is why this shipped.
+    ///
+    /// No mock server on purpose: the client points at an unroutable port, so
+    /// the test proves NO request is issued rather than asserting on a
+    /// response. If the break on wave 0 ever stops happening, this fails
+    /// instead of quietly passing.
+    ///
+    /// Asserts on the REASON, not merely on emptiness -- a `Series` that is
+    /// empty for an unexplained reason IS the defect, and an assertion that
+    /// only counted failed days would pass over it.
+    #[tokio::test]
+    async fn a_budget_exhausted_series_names_the_budget_rather_than_blaming_github() {
+        use crate::github::stats::budget::RESERVE;
+        use crate::github::stats::scope::{Measure, Scope, StatsQuery};
+
+        // The budget is seeded on THIS load's own accumulator, not on the
+        // process-wide figure, deliberately (#1048). `observed_test_lock`
+        // returns a `std::sync::MutexGuard` and clippy's
+        // `await_holding_lock` under `-D warnings` refuses to let one be
+        // held across an `.await`, so an async test cannot serialise on it
+        // -- and writing the shared static WITHOUT the lock is exactly the
+        // race that burned the v5.20.0 tag.
+        //
+        // `Budget::permits` takes the LOWER of this accumulator and the
+        // process figure, so a local reading under the reserve refuses the
+        // wave whatever the process figure happens to be. The test needs no
+        // shared state at all, which is why it can be async safely.
+        let oc = octocrab::Octocrab::builder()
+            .base_uri("http://127.0.0.1:1")
+            .unwrap()
+            .personal_token("test-token".to_string())
+            .build()
+            .unwrap();
+        let client = GitHubClient::new(oc);
+        // Seeded locally -- no write to the process-wide figure, so this
+        // async test needs no lock and cannot starve another test's gate.
+        let budget = Budget::seeded_for_test(RESERVE - 1, 1_789_412_400);
+        let q = StatsQuery {
+            subject: None,
+            scope: Scope::Org("example".into()),
+            measure: Measure::Merged,
+        };
+        let days: Vec<String> = (1..=30).map(|d| format!("2026-09-{d:02}")).collect();
+
+        let series = series_inner(&client, &q, &days, &budget)
+            .await
+            .expect("a budget refusal is a successful call reporting nothing measured");
+
+        assert!(series.points.is_empty(), "no day can have been measured");
+        assert_eq!(
+            series.failed_days.len(),
+            days.len(),
+            "every day in the window is unmeasured"
+        );
+        // One request accounted for: the seeding `record` above, which is
+        // this test's own setup rather than a load. What matters is that the
+        // LOAD issued none -- the client points at an unroutable port, so any
+        // real request would have produced an error rather than an `Ok`, and
+        // `failed_days` covering the whole window with `points` empty is what
+        // "never asked" looks like from the outside.
+        assert_eq!(
+            series.spend.points, 0,
+            "the signature of never asking: not one point spent"
+        );
+        assert_eq!(series.spend.requests, 0, "not one request issued");
+        match series.unmeasured {
+            Some(Unmeasured::BudgetExhausted { reserve, .. }) => {
+                assert_eq!(reserve, RESERVE);
+            }
+            ref other => panic!(
+                "#1050: a budget-exhausted load must NAME the budget, not leave \
+                 the UI to guess that GitHub did not answer; got {other:?}"
+            ),
+        }
+    }
+
     #[test]
     fn a_wave_is_refused_once_the_budget_is_under_the_reserve() {
         use crate::github::stats::budget::RESERVE;

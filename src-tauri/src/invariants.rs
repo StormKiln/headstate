@@ -1984,36 +1984,41 @@ mod tests {
                 let Some((_, tests)) = src.split_once("\nmod tests {") else {
                     continue;
                 };
-                // Only files whose test module is ASYNC. A sync test can
-                // take `observed_test_lock()` and several correctly do --
-                // `fetch.rs`'s `a_wave_is_refused_once_the_budget_is_under_the_reserve`
-                // supplies `rateLimit.remaining` three times and is safe,
-                // because it holds the lock and restores the static. The
-                // hazard is specifically a mock reachable from a test that
-                // CANNOT hold the lock across its `.await`.
-                if !tests.contains("#[tokio::test]") {
-                    continue;
-                }
                 let lines: Vec<&str> = tests.lines().collect();
-                for (n, line) in lines.iter().enumerate() {
-                    let t = line.trim_start();
-                    if t.starts_with("///") || t.starts_with("//") {
+                let _ = &lines;
+                // Scoped to the TEST FUNCTION, not the file (#1050).
+                //
+                // A file-level "does this module contain `#[tokio::test]`"
+                // check was the first shape of this guard, and it is too
+                // coarse the moment one file holds both kinds: adding an
+                // async test to `fetch.rs` made its three SAFE sync mocks --
+                // which hold `observed_test_lock` and restore the static --
+                // look like offenders. The hazard belongs to the individual
+                // test that cannot take the lock, so that is what is asked
+                // about.
+                for t in test_fns(&format!("src-tauri/{rel}"), &src) {
+                    if !t.is_async {
                         continue;
                     }
-                    // `remaining` is the load-bearing field: it is what
-                    // `map_rate_limit` needs to return `Some`. A mock may
-                    // carry `cost` or `resetAt` without arming anything.
-                    if !(line.contains("remaining") && line.contains(':')) {
-                        continue;
-                    }
-                    // Only inside a rateLimit-shaped fixture, which is how
-                    // the field reaches `map_rate_limit`.
-                    let lo = n.saturating_sub(4);
-                    if lines[lo..(n + 2).min(lines.len())]
-                        .iter()
-                        .any(|l| l.contains("rateLimit"))
-                    {
-                        offenders.push(format!("{rel}: {}", line.trim()));
+                    let body: Vec<&str> = t.body.lines().collect();
+                    for (n, line) in body.iter().enumerate() {
+                        let trimmed = line.trim_start();
+                        if trimmed.starts_with("///") || trimmed.starts_with("//") {
+                            continue;
+                        }
+                        // `remaining` is the load-bearing field: it is what
+                        // `map_rate_limit` needs to return `Some`. A mock may
+                        // carry `cost` or `resetAt` without arming anything.
+                        if !(line.contains("remaining") && line.contains(':')) {
+                            continue;
+                        }
+                        let lo = n.saturating_sub(4);
+                        if body[lo..(n + 2).min(body.len())]
+                            .iter()
+                            .any(|l| l.contains("rateLimit"))
+                        {
+                            offenders.push(format!("{rel}: {}", line.trim()));
+                        }
                     }
                 }
             }
