@@ -105,6 +105,14 @@ export function AllRepositoriesTable() {
         unreadable={unreadable}
         consequence="this table is a floor rather than a complete census"
       />
+      {/* A VISIBLE heading, not only the caption below (#1015).
+          The caption is `sr-only` and names the table for a screen
+          reader; a sighted user landing on this view sees a bare table
+          with no statement of what it covers. "All Repositories" is the
+          name the view was asked for, and it is also what makes the
+          table addressable -- a test, or a person, can ask for it by
+          name rather than by its first row. */}
+      <h2 className="text-sm font-semibold text-[#e6edf3]">All Repositories</h2>
       <RepoCurrencySummary currency={currency} />
       <table className="w-full border-collapse text-sm">
         <caption className="sr-only">

@@ -4,6 +4,7 @@ import { useActiveFilters, useFilters } from "@/store/filters";
 import { formatSize } from "@/lib/worktrees";
 import type { RepoEntry } from "@/types/pr";
 import { QueryError, errorMessage } from "./QueryError";
+import { AllRepositoriesTable } from "./AllRepositoriesTable";
 
 /// Browse one repository's files, the way GitHub's code view does
 /// (#1031, #1033, #1036, epic #1011).
@@ -62,11 +63,26 @@ export function RepositoriesPage() {
   // from a list that itself failed to load.
   const { data: repos, isError: scanFailed } = useWorktrees();
 
+  // No repository picked: the ALL REPOSITORIES overview (#1015, #1021).
+  //
+  // This is the landing state of the view rather than a prompt, because
+  // "which of my repositories is behind its remote" is a question worth
+  // answering before any repository is chosen -- and the table is the one
+  // place it is answered. The sentence stays underneath it: the table
+  // says what is stale, the sentence says what to do next, and a table
+  // with no instruction reads as a dead end.
+  //
+  // The table qualifies every verdict by fetch age (#1021) and never
+  // fetches, so landing here costs the scan that has already run rather
+  // than a network call to every remote.
   if (!repo) {
     return (
-      <p className="text-sm text-[#8b949e]">
-        Choose a repository on the left to browse its files.
-      </p>
+      <div className="space-y-3">
+        <AllRepositoriesTable />
+        <p className="text-sm text-[#8b949e]">
+          Choose a repository on the left to browse its files.
+        </p>
+      </div>
     );
   }
 

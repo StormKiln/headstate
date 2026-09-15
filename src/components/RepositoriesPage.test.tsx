@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { RepoFile, RepoTree } from "@/types/pr";
+import type { WorktreeRepo } from "@/types/pr";
 
 /// The repository browser's four outcomes, each asserted as its OWN
 /// rendering (#1036).
@@ -12,13 +13,47 @@ import type { RepoFile, RepoTree } from "@/types/pr";
 /// screen" would pass against precisely that defect, so each arm asserts
 /// the copy that distinguishes it AND asserts the others are absent.
 
+/// One repository, shaped as the scan really returns it.
+///
+/// A factory rather than a literal at each site: the browser reads only
+/// `path` and `name`, so a two-field subset satisfied a narrowed local
+/// type for as long as nothing else mounted here. `AllRepositoriesTable`
+/// (#1015) reads `worktrees`, and the subset then failed at runtime with
+/// `Cannot read properties of undefined (reading 'find')`. Four sites set
+/// this fixture; one definition is what stops three of them drifting back.
+const appRepo = (): WorktreeRepo =>
+  ({
+    identity: null,
+    name: "app",
+    path: "/code/app",
+    fetched_at: null,
+    default_ref: "origin/main",
+    worktrees: [
+      {
+        path: "/code/app",
+        branch: "main",
+        head: "abc1234",
+        size_bytes: null,
+        safety: { kind: "main-checkout" },
+        is_main: true,
+        merged_at: null,
+        upstream: null,
+      },
+    ],
+  }) as unknown as WorktreeRepo;
+
 const state = vi.hoisted(() => ({
   repo: "/code/app" as string | undefined,
   // The scan the page consults to notice a stale selection. `undefined`
   // is the pending-or-rejected state, which must NOT read as "gone".
-  repos: [{ path: "/code/app", name: "app" }] as
-    | { path: string; name: string }[]
-    | undefined,
+  // A REAL `WorktreeRepo`, not a two-field subset cast to a local shape.
+  // The browser only ever reads `path` and `name`, so the narrow fixture
+  // was sufficient until `AllRepositoriesTable` mounted here (#1015) and
+  // read `worktrees`. A structural subset silently satisfies a narrowed
+  // local type and then fails at runtime in the component that needs the
+  // rest -- which is what it did: `Cannot read properties of undefined
+  // (reading 'find')` in `mainCheckout`.
+  repos: undefined as WorktreeRepo[] | undefined,
   scanFailed: false,
   // The two queries fail INDEPENDENTLY, as they do on the wire: the
   // listing failing means the directory is unknown, and the file failing
@@ -56,6 +91,14 @@ vi.mock("../api/hooks", () => ({
   useWorktrees: () => ({
     data: state.repos,
     isError: state.scanFailed,
+    // `AllRepositoriesTable` renders in the no-repository state and reads
+    // the same hook, so the mock has to answer what it asks for. Absent
+    // fields would render the table's pending arm forever and make the
+    // assertion below pass or fail for the wrong reason.
+    unreadable: [],
+    isLoading: false,
+    error: undefined,
+    refetch: vi.fn(),
   }),
   useRepoTree: () => ({
     data: state.treeFailed ? undefined : state.tree,
@@ -88,7 +131,7 @@ const { RepositoriesPage } = await import("./RepositoriesPage");
 
 beforeEach(() => {
   state.repo = "/code/app";
-  state.repos = [{ path: "/code/app", name: "app" }];
+  state.repos = [appRepo()];
   state.scanFailed = false;
   state.tree = {
     path: "",
@@ -117,6 +160,31 @@ beforeEach(() => {
 });
 
 describe("the repository browser's listing", () => {
+  /// #1015 lands in the state where no repository is picked.
+  ///
+  /// The table and the browser were built in separate pull requests
+  /// (#1038 and #1039), so nothing rendered the table until they met.
+  /// Both suites were green throughout with the table mounted nowhere --
+  /// which is exactly the shape of gap a cross-PR seam produces, and why
+  /// this asserts the two are joined rather than that each works.
+  it("shows the All Repositories overview when no repository is picked", () => {
+    state.repo = undefined;
+    render(<RepositoriesPage />);
+    // The table's own heading, not a string this page owns, so the
+    // assertion fails if the table stops rendering rather than if
+    // somebody rewords a prompt.
+    expect(screen.getByText(/all repositories/i)).toBeTruthy();
+  });
+
+  /// And the instruction survives beside it. A table with no next step
+  /// reads as a dead end; the prompt is what says the left column does
+  /// something.
+  it("keeps the choose-a-repository prompt under the overview", () => {
+    state.repo = undefined;
+    render(<RepositoriesPage />);
+    expect(screen.getByText(/choose a repository on the left/i)).toBeTruthy();
+  });
+
   it("lists directories and files, and descends on a click", () => {
     render(<RepositoriesPage />);
     expect(screen.getByText("src")).toBeTruthy();
@@ -386,7 +454,7 @@ describe("the repository browser's selection", () => {
   /// scan rather than trusted, per `caches/mod.rs` step 4.
   it("says the repository is no longer scanned when the scan no longer has it", () => {
     state.repo = "/code/gone";
-    state.repos = [{ path: "/code/app", name: "app" }];
+    state.repos = [appRepo()];
     render(<RepositoriesPage />);
     expect(screen.getByText(/no longer in the scanned folders/i)).toBeTruthy();
   });
