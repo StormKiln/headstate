@@ -7,7 +7,7 @@ import { useFilters } from "@/store/filters";
 import { ReviewChips } from "./ReviewChips";
 
 const EMPTY = { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, "system-health": {} } as const;
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, repositories: {}, "system-health": {} } as const;
 const pr = (over: Partial<PullRequest>): PullRequest => ({ ...PR_FIXTURES[0], ...over });
 
 const PRS: PullRequest[] = [

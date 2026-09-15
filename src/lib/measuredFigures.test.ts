@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 import claudeCodePage from "@/components/ClaudeCodePage.tsx?raw";
 import claudeMdPage from "@/components/ClaudeMdPage.tsx?raw";
 import claudeOverviewPage from "@/components/ClaudeOverviewPage.tsx?raw";
+import repositoriesPage from "@/components/RepositoriesPage.tsx?raw";
 import statsPage from "@/components/StatsPage.tsx?raw";
 
 /// A measured figure must never be rendered to a user.
@@ -37,6 +38,12 @@ const PAGES: [string, string][] = [
   ["ClaudeMdPage.tsx", claudeMdPage],
   ["ClaudeOverviewPage.tsx", claudeOverviewPage],
   ["StatsPage.tsx", statsPage],
+  // The repository browser (#1011). Added because its whole subject is a
+  // corpus measurement -- 672 tracked files against 623,488 on disk, a
+  // 256 KB bound clearing a 199 KB p99 -- and the figures belong in the
+  // comments arguing the design, never in the panel. The truncation
+  // notice states LIVE sizes from the response instead.
+  ["RepositoriesPage.tsx", repositoriesPage],
 ];
 
 /// Strip every comment, so only code and rendered text remain.

@@ -58,6 +58,8 @@ import type {
   StatsTree,
   Worktree,
   WorktreeScan,
+  RepoTree,
+  RepoFile,
 } from "../types/pr";
 
 export interface AuthState {
@@ -370,6 +372,35 @@ export const statsReviewers = (
 /// second command would mean a second full walk -- which `useWorktrees`'
 /// own comment and #846's `retry: false` reasoning both forbid.
 export const listWorktrees = () => call<WorktreeScan>("list_worktrees");
+
+/// One directory level of a repository, from the git INDEX (#1031).
+///
+/// Not from `readdir`, and the measurement is what decides it: 672
+/// tracked files against 623,488 on disk in this repository's own
+/// checkout, a 928x amplification that is almost entirely
+/// `src-tauri/target/` and `node_modules`. `git ls-files` answers in
+/// 0.01s where a `scandir`+`stat` of one build directory takes 0.718s.
+///
+/// `repoPath` is the repository ROOT, and the command re-derives it
+/// against the live `list_worktrees` scan before touching a path -- so a
+/// selection the sidebar made five minutes ago cannot authorise a read
+/// (#1036). `path` is repository-relative, `""` for the root.
+///
+/// REJECTS rather than returning an empty listing when git fails, which
+/// is #846's exact shape and the one thing this must not blur.
+export const repoTree = (repoPath: string, path: string) =>
+  call<RepoTree>("repo_tree", { repoPath, path });
+
+/// One file's bounded contents (#1033).
+///
+/// Bounded INSIDE the command -- a 256 KB window from the head, a binary
+/// refusal by NUL byte rather than by extension, and the same containment
+/// guard `repoTree` uses -- which is the property that makes the
+/// `Class::Read` row safe rather than a second set of limits to keep in
+/// sync. The phone inherits all three; the 275 MB tracked zip measured in
+/// the corpus is never read, let alone sent.
+export const repoFile = (repoPath: string, path: string) =>
+  call<RepoFile>("repo_file", { repoPath, path });
 
 /// Classify one repo's worktrees. Per repo, and STREAMING: each verdict
 /// is also emitted on `worktree-safety` as it is reached.

@@ -288,6 +288,17 @@ in words rather than a boolean — merged upstream, unmerged, or checked out
 somewhere. Deletions are batched and confirmed, because no reflog undoes a
 remote branch deletion.
 
+**Repositories.** Browse the files of any repository in your scanned
+folders, the way GitHub's code view does: a directory listing, click to
+descend, click a file to read it. The listing comes from the index
+rather than from the filesystem, so what you see is the repository and
+not its build output -- in Headstate's own checkout that is the
+difference between a few hundred entries and several hundred thousand.
+Files are read up to a fixed limit and the truncation is stated rather
+than silent; binaries are named rather than rendered; and symbolic links
+are shown but not followed. Available on the phone companion too, where
+the files are otherwise unreachable.
+
 **Docker.** What Docker is costing you in disk: images, containers,
 volumes and build cache, with the dangling and reclaimable portions
 separated from what is actually in use. Build images accumulate silently

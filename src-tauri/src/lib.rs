@@ -18,6 +18,7 @@ mod invariants;
 pub mod packages;
 pub mod poll;
 pub mod remote;
+pub mod repos;
 pub mod store;
 pub mod tray;
 mod worktrees;
@@ -302,6 +303,8 @@ pub fn run() {
             commands::get_worktree_dirs,
             commands::set_worktree_dirs,
             commands::list_worktrees,
+            commands::repo_tree,
+            commands::repo_file,
             commands::classify_worktrees,
             commands::list_branches,
             commands::system_health,

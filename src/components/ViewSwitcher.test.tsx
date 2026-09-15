@@ -2,11 +2,30 @@ import { fireEvent, screen } from "@testing-library/react";
 // ViewSwitcher reads `useUiPrefs`, so it needs a QueryClient.
 import { renderWithQuery as render } from "@/test-utils";
 import { beforeEach, describe, expect, it } from "vitest";
-import { useFilters } from "../store/filters";
+import { ALL_VIEWS, useFilters, type View } from "../store/filters";
+import type { Filters } from "../lib/derive";
 import { VIEWS, ViewSwitcher } from "./ViewSwitcher";
 
-const EMPTY = { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, "system-health": {} } as const;
+/// An empty filter bucket per view, TYPED rather than cast (#1023).
+///
+/// This was a hand-maintained object literal whose two uses were cast
+/// `as never`, which is a cast that silences exactly the error this
+/// fixture should raise: a view added to `ALL_VIEWS` and forgotten here
+/// left the record short, and `as never` accepted it without a word. The
+/// store's own `useActiveFilters` guards against a missing key at
+/// RUNTIME because `persist` replaces rather than merges -- but a test
+/// fixture is not a persisted store, and a silently incomplete one tests
+/// a `filtersByView` the app never has.
+///
+/// Derived from `ALL_VIEWS` rather than written out, for the reason
+/// `readme.views.test.ts` gives about its own map: a property about a SET
+/// cannot be pinned by naming the members, and a hand-written second list
+/// is one that gets edited to match whatever the code does and stops
+/// checking anything. A new view is covered here without anyone adding a
+/// line.
+const EMPTY: Record<View, Filters> = Object.fromEntries(
+  ALL_VIEWS.map((v) => [v, {}]),
+) as Record<View, Filters>;
 
 describe("ViewSwitcher", () => {
   /// PR Stats leads the menu (#823).
@@ -36,7 +55,7 @@ describe("ViewSwitcher", () => {
   /// elsewhere would pass against a gate placed after the hatch, which is
   /// the bug this is written to catch.
   it("does not offer the Claude Code view while the capability is off", () => {
-    useFilters.setState({ filtersByView: EMPTY, view: "claude-code" } as never);
+    useFilters.setState({ filtersByView: EMPTY, view: "claude-code" });
     render(<ViewSwitcher counts={{ "to-review": 0 }} />);
     fireEvent.click(screen.getByRole("button", { name: /claude code|my pull requests/i }));
     // Absent from the MENU, not merely from a collapsed control.
@@ -53,7 +72,7 @@ describe("ViewSwitcher", () => {
   /// a view the user has not enabled. Absent is not enabled -- the same
   /// direction every other unknown in this codebase fails in.
   it("treats unknown prefs as the capability being off", () => {
-    useFilters.setState({ filtersByView: EMPTY, view: "my-prs" } as never);
+    useFilters.setState({ filtersByView: EMPTY, view: "my-prs" });
     render(<ViewSwitcher counts={{ "to-review": 0 }} />);
     fireEvent.click(screen.getByRole("button", { name: /my pull requests/i }));
     expect(screen.queryByRole("menuitem", { name: /claude code/i })).toBeNull();
@@ -131,7 +150,7 @@ describe("ViewSwitcher", () => {
   it("does not leak filters between views", () => {
     useFilters.setState({
       filtersByView: { "my-prs": { repo: "octocat/hello-world" }, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, "system-health": {} },
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, repositories: {}, "system-health": {} },
       view: "my-prs",
     });
     render(<ViewSwitcher />);

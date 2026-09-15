@@ -125,6 +125,12 @@ const ROWS: Row[] = [
   row(api.replyToThread, [threadId, repo, number, body], "reply_to_thread", { threadId, repo, number, body }),
   row(api.getStats, [], "get_stats"),
   row(api.listWorktrees, [], "list_worktrees"),
+  // The repository browser (#1031, #1033). Both take the repository ROOT
+  // and a repository-relative path, in that order -- the root is what the
+  // command re-derives against the live scan, and the path is what the
+  // containment guard resolves inside it.
+  row(api.repoTree, [repoPath, "src"], "repo_tree", { repoPath, path: "src" }),
+  row(api.repoFile, [repoPath, "src/main.rs"], "repo_file", { repoPath, path: "src/main.rs" }),
   row(api.classifyWorktrees, [repoPath], "classify_worktrees", { repoPath }),
   row(api.actOnPr, [id, repo, number, action], "act_on_pr", { id, repo, number, action }),
   row(api.removeWorktrees, [repoPath, worktreePaths], "remove_worktrees", { repoPath, worktreePaths }),

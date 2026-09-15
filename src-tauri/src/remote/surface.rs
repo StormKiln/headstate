@@ -125,6 +125,45 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("build_target", Class::Read),
     ("latest_release", Class::Read),
     ("list_worktrees", Class::Read),
+    // The repository browser's two commands (#1035, epic #1011). Both
+    // `Class::Read`: one lists a directory level from the git index and
+    // the other reads at most 256 KB of one file, and neither writes
+    // anything -- on GitHub or on disk.
+    //
+    // Exposed rather than `Local`, and this is the sharpest case of the
+    // companion's whole purpose yet. Apply `Class::Local`'s stated test --
+    // could the phone act on the answer? -- and it is plainly yes; a
+    // listing and a file are exactly what a person away from their desk
+    // wants. `claude_transcript_tail` makes the stronger form of the
+    // argument and it transfers verbatim: "the desktop user can `cat` the
+    // file and the companion user cannot reach the machine." A repository
+    // browser is that argument repeated for every file in 38
+    // repositories.
+    //
+    // What makes `Read` safe here is that ALL THREE limits live inside
+    // the commands, so a phone's `remote_call` inherits every one of them
+    // rather than keeping a second copy in sync -- the rule `stats_board`
+    // is classed by:
+    //
+    //   1. `repo_path_in` refuses a path outside the repository root, a
+    //      symlink, and an absolute path. A `Class::Read` command's path
+    //      argument arrives over the pairing transport, and a paired
+    //      device being trusted to read Headstate's data is not a reason
+    //      to turn a path parameter into "read any file on this machine".
+    //   2. The root is RE-DERIVED against `list_worktrees` at the moment
+    //      of the call, never trusted from the UI's selection. The
+    //      browser has no extension check to lean on, so this is what
+    //      stops a caller-chosen root from meaning "anywhere".
+    //   3. A 256 KB window on the file read, with the truncation stated.
+    //      So the 275 MB tracked zip measured in that corpus cannot be
+    //      pulled over the transport: the command never reads it.
+    //
+    // Is a 275 MB file a problem? No -- because the command never sends
+    // one, and that is an answer only because the bound is server-side.
+    // Never widen it for the desktop alone: one limit, inside the
+    // command, for both callers.
+    ("repo_tree", Class::Read),
+    ("repo_file", Class::Read),
     ("classify_worktrees", Class::Read),
     ("size_worktrees", Class::Read),
     ("list_branches", Class::Read),
@@ -731,6 +770,17 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "build_target" => ok(commands::build_target()),
         "latest_release" => ok(commands::latest_release(app.clone()).await),
         "list_worktrees" => res(commands::list_worktrees(app.clone()).await),
+        // The repository browser (#1031, #1033). `app.clone()` because
+        // both commands re-derive the repository root against
+        // `list_worktrees` before touching a path -- the phone's caller
+        // does not get to name a root the desktop's current scan does not
+        // hold.
+        "repo_tree" => {
+            res(commands::repo_tree(app.clone(), a.get("repoPath")?, a.get("path")?).await)
+        }
+        "repo_file" => {
+            res(commands::repo_file(app.clone(), a.get("repoPath")?, a.get("path")?).await)
+        }
         // `app.clone()` since #830, exactly as `size_worktrees` below:
         // the command now emits `worktree-safety` per worktree, and the
         // handle is what carries those events to this phone through the

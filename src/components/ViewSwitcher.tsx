@@ -1,4 +1,4 @@
-import { Activity, BarChart3, Bot, ChevronDown, Container, Eye, FileText, FolderGit2, GitBranch, GitPullRequest, HardDrive, Package } from "lucide-react";
+import { Activity, BarChart3, Bot, ChevronDown, Container, Eye, FileText, FolderGit2, FolderTree, GitBranch, GitPullRequest, HardDrive, Package } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { MOBILE_HIDDEN_VIEWS, type View, useFilters } from "../store/filters";
 import { useUiPrefs } from "../api/hooks";
@@ -27,6 +27,12 @@ export const VIEWS: { id: View; label: string; Icon: typeof GitPullRequest }[] =
   { id: "to-review", label: "To review", Icon: Eye },
   { id: "worktrees", label: "Worktrees", Icon: FolderGit2 },
   { id: "branches", label: "Branches", Icon: GitBranch },
+  // Beside Worktrees and Branches, the three views over the same
+  // checkouts -- the grouped menu files all three under "Repos" (#1011).
+  // `ALL_VIEWS` in `store/filters.ts` carries the same position, so a
+  // reader comparing the two lists does not have to wonder which one the
+  // user sees.
+  { id: "repositories", label: "Repositories", Icon: FolderTree },
   { id: "docker", label: "Docker", Icon: Container },
   { id: "artifacts", label: "Artifacts", Icon: HardDrive },
   { id: "packages", label: "Package updates", Icon: Package },
