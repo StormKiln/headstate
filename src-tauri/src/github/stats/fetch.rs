@@ -813,9 +813,10 @@ impl PartialDetail {
     /// load dies", which is the opposite of this type's purpose; the
     /// inner map is a plain accumulator with no invariant a panic
     /// mid-insert could break.
+    ///
     /// `pub(super)` rather than private: `board.rs` seeds a sink in its
-    /// tests to exercise the timeout branch's mapping directly, and the
-    /// two modules are the only pair that ever touch one.
+    /// own tests to exercise the timeout branch's mapping directly, and
+    /// those two modules are the only pair that ever touch one.
     pub(super) fn record(
         &self,
         aliases: &serde_json::Map<String, serde_json::Value>,

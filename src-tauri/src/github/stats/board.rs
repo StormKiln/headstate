@@ -989,10 +989,6 @@ struct BoardProgress(std::sync::Arc<std::sync::Mutex<Option<PlannedSlices>>>);
 struct PlannedSlices {
     slices: Vec<Slice>,
     rounds: u32,
-    /// `Plan::is_retrievable` for the plan these slices came from. An
-    /// irreducible slice makes the board a sample before a single detail
-    /// request is issued, so it has to survive into the partial as well.
-    retrievable: bool,
 }
 
 impl BoardProgress {
@@ -1083,14 +1079,12 @@ fn partial_on_timeout(
     let mut board = Board::from_alias_map(&map, &planned.slices, planned.rounds, budget.snapshot());
     // Unconditional, and NOT `&&`-ed with anything. A load that ran out of
     // wall clock is incomplete even if every alias it did reach came back
-    // whole, because the aliases it never reached are the ones missing.
+    // whole, because the aliases it never reached are the ones missing --
+    // and `plan.is_retrievable()`, which the success path checks
+    // separately, can only ever push the same way. One assignment rather
+    // than two, so there is no reading of this function under which the
+    // flag comes back true.
     board.complete = false;
-    // An irreducible slice is a sample by construction, exactly as on the
-    // success path -- folded in here too so a partial board cannot come
-    // back claiming a completeness the plan had already ruled out.
-    if !planned.retrievable {
-        board.complete = false;
-    }
     crate::diag!(
         "[diag] stats board TIMEOUT after {:?} (ceiling {}s): \
          {} slices planned, {} covered by {} completed waves, {} outstanding, \
@@ -1137,7 +1131,6 @@ async fn board_inner(
     progress.publish(PlannedSlices {
         slices: slices.clone(),
         rounds: plan.rounds,
-        retrievable: plan.is_retrievable(),
     });
     let map = super::fetch::load_detail_into(client, &q, &slices, budget, BOARD_ALIAS_CHUNK, sink)
         .await?;
@@ -2350,7 +2343,6 @@ mod tests {
         progress.publish(PlannedSlices {
             slices: planned.clone(),
             rounds: 1,
-            retrievable: true,
         });
 
         let sink = super::super::fetch::PartialDetail::new();
@@ -2401,7 +2393,6 @@ mod tests {
         progress.publish(PlannedSlices {
             slices: planned.clone(),
             rounds: 1,
-            retrievable: true,
         });
 
         let sink = super::super::fetch::PartialDetail::new();
