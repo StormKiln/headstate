@@ -3,6 +3,7 @@ import {
   NAMED_DAYS,
   classifyFailedDays,
   formatPct,
+  unmeasuredMessage,
   namedDaysText,
   pctChange,
   percentile,
@@ -133,5 +134,69 @@ describe("namedDaysText", () => {
 
   it("says one other in the singular", () => {
     expect(namedDaysText(["2026-08-17"], 1)).toBe("2026-08-17, and 1 other");
+  });
+});
+
+describe("unmeasuredMessage (#1050)", () => {
+  const NOW = new Date("2026-09-15T16:20:00Z");
+
+  /// THE regression test for #1050.
+  ///
+  /// The reported symptom was a stats page that said "GitHub did not answer
+  /// the daily documents, which usually clears on its own" when GitHub had
+  /// never been asked -- the process refused the load because its rate-limit
+  /// budget was under the reserve. Both halves of that sentence were wrong.
+  it("names the budget rather than blaming GitHub, and offers no retry", () => {
+    const { message, canRetry } = unmeasuredMessage(
+      30,
+      0,
+      {
+        kind: "budgetExhausted",
+        remaining: 499,
+        reserve: 500,
+        resetAt: "2026-09-15T17:00:00Z",
+      },
+      NOW,
+    );
+    expect(message).toContain("budget is exhausted");
+    expect(message).toContain("never issued");
+    expect(message).toContain("499");
+    // The actionable half: a time to come back, not merely a diagnosis.
+    expect(message).toContain("40 minutes");
+    expect(message).not.toContain("did not answer");
+    expect(message).not.toContain("clears on its own");
+    // A retry cannot succeed until the window rolls over, and offering one
+    // invites exactly the loop the user was stuck in.
+    expect(canRetry).toBe(false);
+  });
+
+  it("still blames SAML when GitHub refused fields", () => {
+    const { message, canRetry } = unmeasuredMessage(30, 4, undefined, NOW);
+    expect(message).toContain("SAML");
+    expect(message).toContain("4 fields");
+    expect(canRetry).toBe(false);
+  });
+
+  /// The one case a retry genuinely helps, and the only one that keeps the
+  /// original wording -- which was correct for it all along.
+  it("keeps the retryable message when GitHub simply did not answer", () => {
+    const { message, canRetry } = unmeasuredMessage(30, 0, undefined, NOW);
+    expect(message).toContain("did not answer");
+    expect(message).toContain("clears on its own");
+    expect(canRetry).toBe(true);
+  });
+
+  /// Absent is not a time. An unknown reset says so rather than inventing
+  /// one, the same rule this codebase states as absent-is-not-zero.
+  it("says the window resets without naming a time it does not know", () => {
+    const { message } = unmeasuredMessage(
+      30,
+      0,
+      { kind: "budgetExhausted", remaining: null, reserve: 500, resetAt: null },
+      NOW,
+    );
+    expect(message).toContain("when the hourly window resets");
+    expect(message).toContain("not reported");
+    expect(message).not.toMatch(/\bin \d+ minute/);
   });
 });

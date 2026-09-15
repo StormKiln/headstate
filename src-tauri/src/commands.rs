@@ -3298,6 +3298,27 @@ pub async fn stats_series(
         "[diag] cmd stats_series end {}ms {}",
         started.elapsed().as_millis(),
         match &out {
+            // A load that measured NOTHING is not an "ok" worth the same
+            // word as a full success (#1050). The user reported logs that
+            // "all appear to indicate success" while the page showed a
+            // total failure, and this line is why: `points_spent=0` with
+            // `failed=30` was rendered in the same shape as a good load.
+            Ok(s) if s.points.is_empty() && !s.failed_days.is_empty() => format!(
+                "MEASURED NOTHING failed={} refused={} points_spent={} reason={}",
+                s.failed_days.len(),
+                s.refused_fields,
+                s.spend.points,
+                match &s.unmeasured {
+                    Some(crate::github::stats::fetch::Unmeasured::BudgetExhausted {
+                        remaining,
+                        reserve,
+                        ..
+                    }) => format!(
+                        "budget exhausted (remaining={remaining:?} under the {reserve}-point reserve; no request was issued)"
+                    ),
+                    None => "GitHub did not answer".to_string(),
+                }
+            ),
             Ok(s) => format!(
                 "ok points={} failed={} refused={} complete={} points_spent={}",
                 s.points.len(),

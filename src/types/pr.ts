@@ -2395,7 +2395,30 @@ export interface StatsSeries {
   failedDays: string[];
   refusedFields: number;
   spend: Spend;
+  /// Why days are missing, when the reason is not GitHub's (#1050).
+  ///
+  /// Absent means the days that failed did so AT GitHub -- a document went
+  /// unanswered, or a field was refused. Present means this process declined
+  /// to issue the request at all, which is a different fact and the one the
+  /// page previously could not tell: a budget-exhausted load matched the
+  /// "GitHub did not answer ... usually clears on its own" branch while being
+  /// wrong in both halves.
+  unmeasured?: Unmeasured;
 }
+
+/// Why a load stopped short for a reason that is not GitHub's (#1050).
+///
+/// Mirrors the Rust `github::stats::fetch::Unmeasured`. A tagged union rather
+/// than a boolean, so a second non-GitHub reason adds a variant instead of a
+/// parallel flag nothing forces anyone to read.
+export type Unmeasured = {
+  kind: "budgetExhausted";
+  /// The lowest remaining budget GitHub reported. `null` means nothing
+  /// reported one, which is NOT the same as zero.
+  remaining: number | null;
+  reserve: number;
+  resetAt: string | null;
+};
 
 /// One person's reviews GIVEN in a scope and window.
 ///

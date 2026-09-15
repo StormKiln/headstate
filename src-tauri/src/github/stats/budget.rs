@@ -503,6 +503,31 @@ impl Budget {
     }
 
     /// A snapshot for the UI and the logs.
+    /// A budget seeded with a remaining figure, for tests, touching NOTHING
+    /// shared (#1050).
+    ///
+    /// `record` is the production way to get a remaining figure into an
+    /// accumulator, but it also calls `note_remaining`, which writes the
+    /// process-wide `OBSERVED_REMAINING`. A test that seeds via `record`
+    /// therefore mutates state every other test's gate reads -- and an
+    /// ASYNC test cannot serialise on `observed_test_lock`, because clippy's
+    /// `await_holding_lock` under `-D warnings` refuses a `std::sync` guard
+    /// held across an `.await`.
+    ///
+    /// That combination is exactly the race that burned the v5.20.0 tag
+    /// (#1048): a mock supplying `rateLimit.remaining` from an async test.
+    /// Seeding the local accumulator alone keeps `permits` -- which takes the
+    /// LOWER of this figure and the process one -- refusing as intended,
+    /// while leaving the static untouched, so the test needs no lock and
+    /// starves nobody.
+    #[cfg(test)]
+    pub fn seeded_for_test(remaining: u64, reset_at_epoch: u64) -> Self {
+        let b = Self::new();
+        b.lowest_remaining.store(remaining, Ordering::Relaxed);
+        b.reset_at.store(reset_at_epoch, Ordering::Relaxed);
+        b
+    }
+
     pub fn snapshot(&self) -> Spend {
         Spend {
             points: self.spent(),
