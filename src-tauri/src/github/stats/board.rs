@@ -2494,7 +2494,7 @@ mod tests {
         // ABSENCE of the node selection -- and answered generously enough
         // that every slice subdivides until it is a single day.
         //
-        // One body for every probe round: `probe_counts` fills in whatever
+        // One body for every probe round: `probe_body` fills in whatever
         // aliases the round asked for, so the same mock serves rounds of
         // 1, 10 and 40 slices without three separate mocks that could
         // disagree about the counts.
