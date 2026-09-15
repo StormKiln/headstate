@@ -4084,6 +4084,162 @@ pub async fn repo_file(
         .map_err(|e| e.to_string())?
 }
 
+/// Bring every repository level with its remote default branch (#1012).
+///
+/// The per-repository refusal set is unchanged: this is **N safe
+/// fast-forwards, not one bulk update**, exactly as `remove_worktrees`
+/// beside it is "N safe deletions, not one bulk deletion". Each
+/// repository's preconditions are re-derived at the moment it is acted
+/// on, so a repository that went dirty since the table was drawn is
+/// skipped mid-run while the rest proceed.
+///
+/// # It scans, and it does not take a list from the caller
+///
+/// The paths come from `list_worktrees`' own scan, run HERE, rather than
+/// arriving as an argument from whatever the table was showing. Two
+/// reasons, and the second is the one that matters:
+///
+/// - The table's list may be minutes old, and `caches/mod.rs`'s rule is
+///   that the set a bulk action rests on is re-derived at the moment of
+///   acting, not trusted from the UI.
+/// - A caller-supplied list would make this command a way to pull
+///   arbitrary paths. Deriving the set from the configured scan roots
+///   keeps the blast radius exactly what the button's label claims, which
+///   is the property that makes the `Write` surface row safe for a phone
+///   (#1019).
+///
+/// # The shortfall travels with the result (#1025)
+///
+/// `scan_dirs_fast_reporting` returns `RepoScan { repos, unreadable }`,
+/// and `unreadable` is carried into the report rather than dropped. The
+/// run is NOT refused over a partial scan -- unlike `remove_venv`, whose
+/// verdict is unsound over an incomplete set, this command's
+/// per-repository decision is correct regardless of what the walk missed.
+/// What a partial scan invalidates is the word "all", so the report says
+/// the census was short and the button names the number it can see.
+///
+/// Returns immediately? **No** -- unlike `apply_updates_in_background`
+/// this awaits, because it returns the whole report and the caller wants
+/// it. Progress arrives on `update-all-progress` meanwhile, and the
+/// registry holds the outcome for a client that was asleep.
+#[tauri::command]
+pub async fn update_all_repositories(
+    app: AppHandle,
+) -> Result<crate::worktrees::UpdateAllReport, String> {
+    let dirs = get_worktree_dirs(app.clone());
+
+    // The scan first, and on the blocking pool: it walks the scan roots
+    // and spawns a `git worktree list` per repository.
+    let scan = tauri::async_runtime::spawn_blocking(move || {
+        crate::worktrees::scan_dirs_fast_reporting(&dirs)
+    })
+    .await
+    .map_err(|e| format!("could not scan for repositories: {e}"))?;
+
+    // The MAIN CHECKOUT of each repository, which is what the button is
+    // about. A repository's other worktrees are branches the user is
+    // working on, and pulling them is a different promise entirely.
+    let paths: Vec<String> = scan.repos.iter().map(|r| r.path.clone()).collect();
+    let unreadable = scan.unreadable;
+
+    // Claimed BEFORE anything is spawned, and the claim is what refuses a
+    // second run: two runs pulling the same 45 repositories would put two
+    // `git pull` invocations in one repository, contending on
+    // `index.lock`. It also returns the flag the run reads to stop, so
+    // the registry owns both halves -- `apply_updates_in_background`'s
+    // shape exactly.
+    let stop = app
+        .state::<crate::repos::runs::UpdateAllRuns>()
+        .start(paths.len())?;
+
+    let progress_app = app.clone();
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        crate::worktrees::update_all_with(&paths, unreadable, &stop, |done, total| {
+            // Counts only -- never paths. The same rule the two progress
+            // emitters beside this one state in identical terms: a
+            // progress event is not a place to leak what the user is
+            // working on. The repository paths are in the RESULT, where
+            // the user needs them to know where to go.
+            let _ = progress_app.emit("update-all-progress", (done, total));
+            // And into the registry, so a client that was asleep for the
+            // whole run can still ask how far it got.
+            progress_app
+                .state::<crate::repos::runs::UpdateAllRuns>()
+                .progress(done, total);
+        })
+    })
+    .await
+    .map_err(|e| format!("the update run failed to finish: {e}"))?;
+
+    let updated = report
+        .outcomes
+        .iter()
+        .filter(|o| matches!(o.result, crate::worktrees::UpdateResult::Updated { .. }))
+        .count();
+    let failed = report
+        .outcomes
+        .iter()
+        .filter(|o| matches!(o.result, crate::worktrees::UpdateResult::Failed { .. }))
+        .count();
+    // The log line distinguishes could-not from did-not, for the same
+    // reason the UI's summary must: "12 of 45" would say nothing.
+    log::info!(
+        "update all: {updated} updated, {failed} could not be reached, of {} repositories{}",
+        report.outcomes.len(),
+        if report.is_partial() {
+            format!(
+                " ({} directories could not be read)",
+                report.unreadable.len()
+            )
+        } else {
+            String::new()
+        }
+    );
+
+    // Recorded BEFORE returning, so a phone that slept through the run
+    // can read the outcome even though it held no event stream.
+    app.state::<crate::repos::runs::UpdateAllRuns>()
+        .finished(report.clone());
+    Ok(report)
+}
+
+/// Ask the Update All run to stop.
+///
+/// It stops after the repository it is on, never during one: a `git pull`
+/// killed mid-write leaves a repository in a state this app has no story
+/// for, and the whole safety argument for `--ff-only` rests on a
+/// repository being either fast-forwarded or untouched.
+///
+/// Stopping between repositories is clean by construction, and the
+/// repositories already fast-forwarded stay fast-forwarded -- the report
+/// says how far it got rather than discarding the work.
+///
+/// Errors when nothing is running, rather than succeeding quietly: a
+/// Cancel that appears to work on a run that already finished is its own
+/// small lie.
+#[tauri::command]
+pub fn cancel_update_all(runs: State<'_, crate::repos::runs::UpdateAllRuns>) -> Result<(), String> {
+    runs.cancel()
+}
+
+/// How the Update All run is going, or how it ended.
+///
+/// The read a client uses when it was not listening. Progress and the
+/// result are events and a return value, and a suspended phone holds
+/// neither (`src-mobile/src/background.rs`), so a phone that started a
+/// run and went to sleep would otherwise never learn how it ended --
+/// which is precisely what `apply_updates_in_background`'s surface row
+/// refuses: *starting something you cannot stop or see the end of is not
+/// a feature*.
+///
+/// `None` when this process has never run one.
+#[tauri::command]
+pub fn update_all_state(
+    runs: State<'_, crate::repos::runs::UpdateAllRuns>,
+) -> Option<crate::repos::runs::UpdateAllState> {
+    runs.state()
+}
+
 // ---------------------------------------------------------------------
 // The Claude Code hook installer (#915). Rust side:
 // `claude/install.rs`, which is where every rule below is argued.

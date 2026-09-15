@@ -208,6 +208,10 @@ pub const SURFACE: &[(&str, Class)] = &[
     // How a run is going, or how it ended. The resume path: a
     // suspended phone holds no event stream, so it asks instead.
     ("update_run_state", Class::Read),
+    // How the Update All run is going, or how it ended (#1016). The same
+    // resume path, and Read for the same reason: one in-memory registry,
+    // read, nothing written.
+    ("update_all_state", Class::Read),
     // write: changes GitHub state through the existing write module, or
     // a desktop setting.
     ("act_on_pr", Class::Write),
@@ -241,6 +245,21 @@ pub const SURFACE: &[(&str, Class)] = &[
     // phone to do. They change the desktop but delete nothing, so
     // they do not carry the step-up signature.
     ("pull_checkout", Class::Write),
+    // Fast-forward every repository in the scan roots (#1019). Write, and
+    // the line is the one this table draws everywhere: a `--ff-only` pull
+    // DELETES nothing -- no merge commit created, no commit discarded,
+    // and on refusal the working tree is byte-identical -- so it carries
+    // no step-up signature. Not Local either: the refusal set is
+    // identical whatever the caller, because a phone's `remote_call`
+    // routes through the same code and inherits every per-repository
+    // refusal. See the desktop table for the full argument.
+    //
+    // Exposed only BECAUSE the two rows around it exist: the run can be
+    // stopped and its outcome read back after a suspension, which is
+    // `apply_updates_in_background`'s own stated condition. MEASURED
+    // worst case 22 minutes, and a suspended phone holds no event stream.
+    ("update_all_repositories", Class::Write),
+    ("cancel_update_all", Class::Write),
     // Refreshing one repository's remote refs (#788). Write, not Read:
     // `git fetch` mutates nothing on GitHub but it writes `origin/*`,
     // `FETCH_HEAD` and new objects to disk, and Read here means neither.

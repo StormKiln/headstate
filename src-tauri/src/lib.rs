@@ -305,6 +305,9 @@ pub fn run() {
             commands::list_worktrees,
             commands::repo_tree,
             commands::repo_file,
+            commands::update_all_repositories,
+            commands::cancel_update_all,
+            commands::update_all_state,
             commands::classify_worktrees,
             commands::list_branches,
             commands::system_health,
@@ -443,6 +446,12 @@ pub fn run() {
             // and how the last one ended. Default-constructed: it is
             // empty until someone starts a run.
             app.manage(packages::runs::UpdateRuns::default());
+            // Whether an Update All run is going, how far it has got, and
+            // how the last one ended (#1016). ONE slot, not a map: the
+            // run covers the whole scan root, so a per-repository claim
+            // would let two runs interleave across 45 repositories and
+            // make both reports wrong.
+            app.manage(repos::runs::UpdateAllRuns::default());
 
             // The system-health reader, and the sampler that fills the
             // 24-hour series behind the System Health view (#663).
