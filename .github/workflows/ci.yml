@@ -168,6 +168,17 @@ jobs:
           python3 scripts/check-tauri-versions.test.py
           python3 scripts/check-tauri-versions.py
           python3 scripts/android-release-signing.test.py
+      # Every fetch from outside the repository -- action SHAs, the Yarn
+      # bundle corepack downloads, `cargo install` in a job, the Python
+      # requirements -- is pinned to a hash or a locked version, and the
+      # npm age gate in .yarnrc.yml is matched by Dependabot's cooldown.
+      # Asked here, in the job that always runs, so the next unpinned
+      # `uses:` or `cargo install` fails review rather than a future
+      # incident.
+      - name: Supply-chain pins
+        run: |
+          python3 scripts/check-supply-chain-pins.test.py
+          python3 scripts/check-supply-chain-pins.py
       # Both crates. `crates/headstate-stepup` is a PATH DEPENDENCY of
       # src-tauri rather than a workspace member, so a run from src-tauri
       # never looks at it -- and it is the one place the step-up
@@ -329,7 +340,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
+        run: cargo install cargo-deny --locked --version 0.20.2
       - name: cargo-deny
         working-directory: src-tauri
         run: cargo deny check
@@ -902,7 +913,7 @@ jobs:
 
       - name: Install cargo-deny
         if: needs.mobile-changes.outputs.run == 'true'
-        run: cargo install cargo-deny --locked
+        run: cargo install cargo-deny --locked --version 0.20.2
 
       - name: cargo-deny
         if: needs.mobile-changes.outputs.run == 'true'

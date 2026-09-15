@@ -746,7 +746,7 @@ jobs:
       - name: Check the Android target
         run: make check-mobile-android
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
+        run: cargo install cargo-deny --locked --version 0.20.2
       - name: cargo-deny
         run: make deny-mobile
 

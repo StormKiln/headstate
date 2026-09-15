@@ -4,26 +4,59 @@ updates:
   # `# vX.Y.Z` comment for readability. Dependabot updates the SHA and
   # rewrites that comment to match the new release -- that's the intended
   # behaviour, not a diff to second-guess in review.
+  #
+  # Two directories, because `directory: "/"` covers only
+  # `.github/workflows/`. The composite action under `.github/actions/setup`
+  # holds three more pinned SHAs (setup-node, rust-toolchain, rust-cache)
+  # that were otherwise invisible to Dependabot -- setup-node sat two
+  # majors behind for that reason.
   - package-ecosystem: github-actions
-    directory: "/"
+    directories: ["/", "/.github/actions/setup"]
     schedule:
       interval: weekly
     groups:
       actions:
         patterns: ["*"]
 
+  # `cooldown` is the Dependabot half of `.yarnrc.yml`'s `npmMinimalAgeGate`
+  # and it must be at least as long: a bump to a version younger than the
+  # gate would fail its own `yarn install` here. The same week applies to
+  # Cargo, where nothing enforces it at install time and the reasoning is
+  # the same -- a poisoned release is usually pulled within days, and a
+  # pull request that waits a week never proposes it.
   - package-ecosystem: npm
     directory: "/"
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     groups:
       minor-and-patch:
         update-types: ["minor", "patch"]
 
+  # Three Cargo roots, one entry each: `src-tauri` and `src-mobile` are
+  # separate crates with separate lockfiles (see src-mobile/Cargo.toml),
+  # and `crates/headstate-stepup` is a path dependency of both with a
+  # lockfile of its own. A bump in one lockfile does not reach the others,
+  # and the mobile lock was two crates behind on rustls for exactly that
+  # reason (#1007). `check-tauri-versions.py` in the lint job catches a
+  # Tauri crate moving in one lock but not the other.
   - package-ecosystem: cargo
-    directory: "/src-tauri"
+    directories: ["/src-tauri", "/src-mobile", "/crates/headstate-stepup"]
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     groups:
       minor-and-patch:
         update-types: ["minor", "patch"]
+
+  # `scripts/requirements.txt` pins Pillow by version and hash; Dependabot
+  # rewrites both when it bumps it, which is the only way that file
+  # moves without someone regenerating 87 hashes by hand.
+  - package-ecosystem: pip
+    directory: "/scripts"
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7

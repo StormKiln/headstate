@@ -28,7 +28,7 @@ tauri-plugin = { version = "2.6", features = ["build"] }
 tauri = { version = "2.11", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-log = "0.4.33"
+log = "0.4.34"
 # One error enum with Display, same as the keys plugin's `error.rs`.
 thiserror = "2"
 

@@ -216,7 +216,7 @@ socket2 = "0.6"
 # token is read from `gh`. See `remote/identity.rs` for the Linux
 # fallback when no Secret Service daemon is running.
 keyring = "4.2"
-tauri-plugin-log = "2.9.0"
+tauri-plugin-log = "2.9.1"
 # Auto-update. Verifies an Ed25519 signature over each bundle with the
 # public key in `tauri.conf.json` -- separate from Apple code signing
 # (#23) and not a substitute for it: this proves the archive came from
@@ -224,8 +224,8 @@ tauri-plugin-log = "2.9.0"
 tauri-plugin-updater = "2"
 # The updater needs to restart the app to apply an update.
 tauri-plugin-process = "2"
-log = "0.4.33"
-tauri-plugin-notification = "2.3.3"
+log = "0.4.34"
+tauri-plugin-notification = "2.4.0"
 # Start at login. A tray app whose value is a live badge while hidden is
 # weakened by requiring a manual launch every boot.
 tauri-plugin-autostart = "2.5.1"
