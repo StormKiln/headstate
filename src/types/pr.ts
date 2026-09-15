@@ -346,6 +346,24 @@ export interface WorktreeRepo {
   /// age is unknown, which is what the UI must say. The Rust side
   /// always sends the key.
   fetched_at?: string | null;
+  /// The ref this repository's verdicts are measured against --
+  /// `origin/main`, `origin/master`, or a bare local branch name where
+  /// no remote-tracking ref resolves (#757, #1026).
+  ///
+  /// Mirrors `Repo::default_ref`. Carried rather than re-derived: a
+  /// hardcoded `origin/main` is wrong for over 10% of the repositories
+  /// on the reporting machine, and a fifth `default_branch` is exactly
+  /// what `invariants.rs` guards against.
+  ///
+  /// `null` means the resolution did not happen -- an orphaned worktree
+  /// has no repository to ask. Render that as unknown; substituting
+  /// `main` would be a confident answer about which branch was compared,
+  /// which is the one thing this field exists to stop.
+  ///
+  /// Optional in the TYPE so the existing fixtures need not enumerate
+  /// it, and `undefined` reads the same as `null` at every use. The Rust
+  /// side always sends the key.
+  default_ref?: string | null;
 }
 
 /// What a worktree scan found, INCLUDING what it could not read (#951).

@@ -2646,6 +2646,13 @@ fn collect_inner(dir: &Path, depth: usize, out: &mut RepoScan, with_safety: bool
                 path: dir.to_string_lossy().into_owned(),
                 identity: None,
                 fetched_at: fetched_at(dir),
+                // `None`, not `"main"`, for the reason the safety verdict
+                // beside it is `Orphaned`: resolving a default branch
+                // means running git in the parent repository, and there
+                // is no parent repository to run it in. A plausible
+                // guess here would be a confident answer to a question
+                // nothing asked (#1026).
+                default_ref: None,
                 worktrees: vec![Worktree {
                     path: dir.to_string_lossy().into_owned(),
                     branch: String::new(),
@@ -2717,6 +2724,13 @@ fn collect_inner(dir: &Path, depth: usize, out: &mut RepoScan, with_safety: bool
                         .unwrap_or_default(),
                     path: dir.to_string_lossy().into_owned(),
                     worktrees,
+                    // The SAME string `classify` was just fed, not a
+                    // second resolution of it (#1026). Carrying what is
+                    // already in hand is what keeps the table's "up to
+                    // date with X" and the merge verdicts on the same
+                    // row from naming different refs -- the disagreement
+                    // #757 measured at nine rows in 34.
+                    default_ref: Some(branch),
                 });
             }
             Err(e) => out
@@ -3078,6 +3092,95 @@ prunable gitdir file points to non-existent location
         assert!(
             !names.contains(&"proj-feature"),
             "a worktree must not be listed as its own repository: {names:?}"
+        );
+    }
+
+    /// #1026: the scan carries the ref its verdicts are measured
+    /// against, and it is the repository's OWN.
+    ///
+    /// A hardcoded `origin/main` is wrong for over 10% of the
+    /// repositories on the reporting machine -- one resolves
+    /// `origin/master`, one a long feature branch because `origin/HEAD`
+    /// points at it, and two fall back to a LOCAL `main` because no
+    /// remote-tracking ref resolves.
+    ///
+    /// The string must be the one `classify` was fed, not a second
+    /// resolution -- #757 measured a nine-row verdict swing in 34 from
+    /// one ref being resolved differently.
+    ///
+    /// The fixture is a repository whose `origin/HEAD` points at a
+    /// branch that is not `main`, which is the `osiris` and `claude-mkt`
+    /// case on the reporting machine. A repository with no remote would
+    /// prove nothing here: `default_branch` falls back to the LITERAL
+    /// `"main"` when `origin/HEAD` does not resolve -- it never consults
+    /// the checked-out branch -- so such a fixture returns `main`
+    /// whatever its trunk is called, and a carried value would be
+    /// indistinguishable from the hardcode this test exists to catch.
+    /// (Verified by writing that test first and watching it report
+    /// `Some("main")` for a repository whose only branch was `trunk`.)
+    #[test]
+    fn the_scan_carries_the_repositorys_own_default_ref() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+        let ident = [
+            ("GIT_AUTHOR_NAME", "octocat"),
+            ("GIT_COMMITTER_NAME", "octocat"),
+            ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+            ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+        ];
+        let run = |dir: &Path, args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .envs(ident)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?} failed");
+        };
+
+        // The "remote": a real repository on disk whose default branch
+        // is `master`, so cloning it gives an `origin/HEAD` pointing
+        // somewhere other than `main`. `PathBuf::join`, never a
+        // formatted path.
+        let origin = base.join("origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        run(&origin, &["init", "-q", "-b", "master"]);
+        run(&origin, &["commit", "-q", "--allow-empty", "-m", "init"]);
+
+        // Cloned into the scan root, so the walk finds it as a
+        // repository with a remote whose HEAD is `master`.
+        let repo = base.join("proj");
+        let ok = Command::new("git")
+            .args(["clone", "-q"])
+            .arg(&origin)
+            .arg(&repo)
+            .envs(ident)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(ok, "git clone failed");
+        assert_eq!(
+            default_branch(&repo),
+            "origin/master",
+            "the fixture must resolve a non-main remote ref, or this test proves nothing"
+        );
+
+        let found = scan_dirs_fast(&[base.to_string_lossy().into_owned()]);
+        let proj = found
+            .iter()
+            .find(|r| r.name == "proj")
+            .expect("the repository must be found");
+        assert_eq!(
+            proj.default_ref.as_deref(),
+            Some("origin/master"),
+            "the scan must carry what `default_branch` resolved, not a guess"
+        );
+        assert_ne!(
+            proj.default_ref.as_deref(),
+            Some("origin/main"),
+            "a hardcoded origin/main is the defect #1026 exists to prevent"
         );
     }
 
@@ -4938,6 +5041,12 @@ prunable gitdir file points to non-existent location
             name: name.into(),
             path: format!("/tmp/{name}"),
             worktrees: vec![Worktree::default(); n],
+            // These three fixtures exercise `sort_for_sidebar`, which
+            // reads only the name and the worktree count. `default_ref`
+            // is irrelevant to the ordering, so it takes the derived
+            // default rather than a value that would imply the sort
+            // consults it.
+            ..Default::default()
         };
         // "zed" has the most but sorts last alphabetically -- the whole
         // point. "alpha" has the fewest but would sort first by name.
@@ -4957,6 +5066,12 @@ prunable gitdir file points to non-existent location
             name: name.into(),
             path: format!("/tmp/{name}"),
             worktrees: vec![Worktree::default(); n],
+            // These three fixtures exercise `sort_for_sidebar`, which
+            // reads only the name and the worktree count. `default_ref`
+            // is irrelevant to the ordering, so it takes the derived
+            // default rather than a value that would imply the sort
+            // consults it.
+            ..Default::default()
         };
         let mut repos = vec![mk("charlie", 4), mk("alpha", 4), mk("bravo", 4)];
         sort_for_sidebar(&mut repos);
@@ -4975,6 +5090,12 @@ prunable gitdir file points to non-existent location
             name: name.into(),
             path: format!("/tmp/{name}"),
             worktrees: vec![Worktree::default(); n],
+            // These three fixtures exercise `sort_for_sidebar`, which
+            // reads only the name and the worktree count. `default_ref`
+            // is irrelevant to the ordering, so it takes the derived
+            // default rather than a value that would imply the sort
+            // consults it.
+            ..Default::default()
         };
         // A repo with only its main checkout displays 0 and must sort
         // below one displaying 1.
@@ -8640,6 +8761,33 @@ mod live {
                 .collect();
             assert_eq!(found.len(), 1, "the orphan must be reported at all");
             assert_eq!(found[0].path, wt.to_string_lossy());
+        }
+
+        /// #1026: an orphan reports NO default ref, rather than a
+        /// plausible one.
+        ///
+        /// The same rule that makes its safety verdict `Orphaned`:
+        /// resolving a default branch means running git in the parent
+        /// repository, and the parent repository is exactly what is
+        /// gone. Sending the word `main` here would be a confident
+        /// answer about which ref a verdict was measured against, for a
+        /// checkout where no verdict was measured at all -- this
+        /// codebase's absent-read-as-success bug (#967, #769, #841)
+        /// applied to the one field that says what was compared.
+        #[test]
+        fn an_orphan_reports_no_default_ref() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            orphaned_worktree(tmp.path());
+            let repos = scan_dirs_fast(&[tmp.path().to_string_lossy().into_owned()]);
+            let orphans: Vec<_> = repos
+                .iter()
+                .filter(|r| r.worktrees.iter().any(|w| w.safety == Safety::Orphaned))
+                .collect();
+            assert_eq!(orphans.len(), 1, "the orphan must be reported at all");
+            assert_eq!(
+                orphans[0].default_ref, None,
+                "an orphan has no repository to resolve a default ref from"
+            );
         }
 
         /// The safety rule that matters: an orphan can never be
