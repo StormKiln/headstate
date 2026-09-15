@@ -12,6 +12,7 @@ import {
   useStatsSeries,
   useStatsTree,
 } from "../api/hooks";
+import { classifyFailedDays, namedDaysText } from "../lib/stats";
 import { useActiveFilters } from "../store/filters";
 import type { ShortSlice } from "../types/pr";
 import { QueryError, errorMessage } from "./QueryError";
@@ -234,6 +235,12 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
   // reader deciding whether to trust a ranking needs to know which.
   const caveat = board ? partialityCaveat(board) : undefined;
 
+  // Some days missing, or none measured at all (#1045). Classified against
+  // `days` -- the window the chart ASKED for -- rather than against
+  // `points.length`, which a total failure would leave at zero and make the
+  // two agree on "nothing is missing".
+  const failedDays = classifyFailedDays(series?.failedDays ?? [], days);
+
   return (
     <div className="flex flex-col gap-3">
       {/* The scope has to be named explicitly or a reader will mistake it
@@ -261,7 +268,32 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
         <SkeletonRow count={2} cols="sm:grid-cols-2" />
       )}
 
-      {series ? (
+      {series && failedDays.kind === "total" ? (
+        /* NO day was measured, so there is no chart to annotate (#1045).
+           The old branch fell through to the warning below and enumerated
+           all 30 dates -- which told a reader nothing they could not see
+           from the empty chart, while burying the fact that actually
+           matters: the measurement did not complete. A total failure is an
+           error state and gets the error panel, including the retry that a
+           chart-shaped warning has nowhere to put.
+
+           The series resolved, so `seriesQ.error` is empty and the cause
+           has to come from the query's own channels. `refusedFields`
+           distinguishes a SAML refusal (which a retry will not fix) from
+           an unanswered document (which it usually will), and that is the
+           difference between advice a user can act on and a shrug. */
+        <QueryError
+          title="Could not measure activity for this scope"
+          message={
+            series.refusedFields > 0
+              ? `None of the ${failedDays.count} days in this window could be measured, and GitHub refused ${series.refusedFields} field${
+                  series.refusedFields === 1 ? "" : "s"
+                } on the responses -- usually a SAML authorization this organization needs.`
+              : `None of the ${failedDays.count} days in this window could be measured. GitHub did not answer the daily documents, which usually clears on its own.`
+          }
+          onRetry={() => void seriesQ.refetch()}
+        />
+      ) : series ? (
         <>
           <ActivityChart
             // The scoped series carries the same three fields
@@ -275,14 +307,18 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
           {/* Named days, not a count. A chart of 30 days missing 2 is still
               the most informative thing available, provided it says which 2
               -- and a missing day rendered as zero would draw a trough that
-              reads as a quiet Tuesday. */}
-          {series.failedDays.length > 0 && (
+              reads as a quiet Tuesday.
+
+              BOUNDED as of #1045. That reasoning holds for a handful and
+              stops holding for a wall: past `NAMED_DAYS` the rest are
+              counted, so the sentence still says how much is missing
+              without becoming a paragraph nobody reads. */}
+          {failedDays.kind === "partial" && (
             <p className="text-xs text-[#d29922]">
-              {series.failedDays.length} day
-              {series.failedDays.length === 1 ? "" : "s"} could not be measured
-              and {series.failedDays.length === 1 ? "is" : "are"} absent from
-              the chart rather than drawn as zero:{" "}
-              {series.failedDays.join(", ")}.
+              {failedDays.count} day{failedDays.count === 1 ? "" : "s"} could
+              not be measured and {failedDays.count === 1 ? "is" : "are"}{" "}
+              absent from the chart rather than drawn as zero:{" "}
+              {namedDaysText(failedDays.named, failedDays.rest)}.
             </p>
           )}
         </>

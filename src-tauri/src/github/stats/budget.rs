@@ -249,6 +249,50 @@ pub fn observed_test_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Serialises tests that hold `fetch::READ_PERMITS`, for the same reason
+/// [`observed_test_lock`] exists (#1044).
+///
+/// `fetch::READ_PERMITS` is a process-wide semaphore of six by design --
+/// that is what makes `READ_CONCURRENCY` true of the app rather than of one
+/// command -- and process-wide makes it shared state between TESTS as
+/// surely as between commands. Two hazards, both observed while building
+/// #1044's tests:
+///
+/// - two tests that stall a request on purpose starve each other, and
+///   whichever loses the race for the six permits fails intermittently;
+/// - `fetch`'s own `every_stats_read_goes_through_the_process_wide_permit`
+///   asserts `available_permits() == READ_CONCURRENCY`, which is false for
+///   as long as any other test has a load in flight.
+///
+/// So every test that takes a permit, and every test that counts them,
+/// takes this lock.
+///
+/// # Why here and not in `fetch.rs`
+///
+/// `fetch.rs`, `board.rs`, `tree.rs` and `slice.rs` are SCANNED by source
+/// tests that split on the first `\n#[cfg(test)]` to find where production
+/// ends. A gated helper near the top of one of them silently truncates
+/// what those tests scan -- which is exactly what happened when this was
+/// first written into `fetch.rs`, and both scans caught it. This file is
+/// not scanned, and it already owns the sibling convention.
+///
+/// # Why a `tokio::sync::Mutex` where [`observed_test_lock`] uses a
+/// `std` one
+///
+/// Because the tests that need THIS one are async, and `std`'s guard
+/// cannot be held across an `.await`: clippy's `await_holding_lock` is an
+/// error under CI's `cargo clippy -- -D warnings`. `invariants.rs` records
+/// that limitation as the reason its own scan skips async tests, and calls
+/// giving the lock an async form "a change to `budget.rs`'s public test
+/// surface" -- so it is made here, on a new lock, rather than by changing
+/// the existing one under the fourteen tests that depend on it.
+///
+/// The one SYNCHRONOUS caller (`fetch`'s permit-count assertion) is a
+/// plain `#[test]` with no runtime of its own, so `blocking_lock` is
+/// correct there rather than a panic waiting to happen.
+#[cfg(test)]
+pub static READ_PERMIT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Restores [`OBSERVED_REMAINING`] on drop, so a test that seeds it cannot
 /// leak a figure into whatever runs next.
 ///

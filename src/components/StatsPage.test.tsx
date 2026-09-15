@@ -444,6 +444,60 @@ describe("StatsPage honesty", () => {
     expect(screen.getByText(/rather than drawn as zero/i)).toBeTruthy();
   });
 
+
+  /// #1045: 30 of 30 is not an annotation, it is a failure.
+  ///
+  /// The old branch enumerated every date in the window, which told a reader
+  /// nothing they could not see from the empty chart while burying the fact
+  /// that mattered -- the measurement did not complete. The dates are gone
+  /// and an error panel with a retry takes their place.
+  it("reports a failure rather than 30 dates when no day was measured", () => {
+    const all = Array.from({ length: 30 }, (_, i) => `2026-08-${i + 1}`);
+    vi.mocked(useStatsSeries).mockReturnValue(
+      settled(series({ points: [], failedDays: all })),
+    );
+    render(<StatsPage />);
+    expect(screen.getByText(/could not measure activity/i)).toBeTruthy();
+    expect(screen.getByText(/none of the 30 days/i)).toBeTruthy();
+    // The wall of dates is the defect. Not one of them may appear.
+    expect(screen.queryByText(/2026-08-17/)).toBeNull();
+    expect(screen.queryByText(/rather than drawn as zero/i)).toBeNull();
+    // An error state offers a way out of itself.
+    expect(screen.getByRole("button", { name: /try again/i })).toBeTruthy();
+  });
+
+  /// A total failure with a REFUSAL says so, because the two want opposite
+  /// responses: a refused field is usually a SAML authorization to fix,
+  /// where an unanswered document usually clears on a retry. Telling a user
+  /// to retry a refusal is advice that cannot work.
+  it("names a refusal rather than suggesting a retry will fix it", () => {
+    const all = Array.from({ length: 30 }, (_, i) => `2026-08-${i + 1}`);
+    vi.mocked(useStatsSeries).mockReturnValue(
+      settled(series({ points: [], failedDays: all, refusedFields: 4 })),
+    );
+    render(<StatsPage />);
+    expect(screen.getByText(/refused 4 fields/i)).toBeTruthy();
+    expect(screen.getByText(/SAML/i)).toBeTruthy();
+  });
+
+  /// #1045 keeps the named-days behaviour for genuine partials, but BOUNDS
+  /// it. Past a handful the list is a paragraph rather than a set of days to
+  /// go and check -- and the remainder is counted, so the sentence still
+  /// says how much is missing.
+  it("caps a long partial at a few named days and a count", () => {
+    const twelve = Array.from({ length: 12 }, (_, i) => `2026-08-${i + 1}`);
+    vi.mocked(useStatsSeries).mockReturnValue(
+      settled(series({ failedDays: twelve })),
+    );
+    render(<StatsPage />);
+    expect(screen.getByText(/12 days could not be measured/i)).toBeTruthy();
+    expect(screen.getByText(/and 9 others/i)).toBeTruthy();
+    // The chart still exists, so this is an annotation and not an error.
+    expect(screen.queryByText(/could not measure activity/i)).toBeNull();
+    // ...and the twelfth date is not printed.
+    expect(screen.queryByText(/2026-08-12/)).toBeNull();
+  });
+
   /// A person with no row reads as "no activity", not four zeroes. #826's
   /// empty-means-empty rule, which is only expressible because the Rust
   /// `Board::row_for` returns `None` rather than a zero row.

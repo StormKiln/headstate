@@ -759,6 +759,104 @@ pub async fn load_detail(
     load_detail_chunked(client, q, slices, budget, ALIAS_CHUNK).await
 }
 
+/// Where a detail fetch writes each wave down AS IT COMPLETES, so a
+/// dropped future does not take the data with it (#1044).
+///
+/// # Why this exists rather than a plain return value
+///
+/// `tokio::time::timeout` DROPS the future it is racing. Everything that
+/// future owns -- including every alias a completed wave had already
+/// merged -- is destroyed at the moment the ceiling expires. Those waves
+/// were real POSTs, paid for against the rate limit, and #1004 built the
+/// accumulation table precisely so they would survive; the timeout branch
+/// was the one path that threw them away, which is why the scopes that
+/// need eventual consistency most were the exact scopes it never reached.
+///
+/// So the accumulator is owned by the CALLER, OUTSIDE the future, and the
+/// future only appends to it. A timeout can then read what was retrieved
+/// out of a future that no longer exists.
+///
+/// # Why a mutex rather than a channel
+///
+/// The reader wants the WHOLE set at one instant (the moment the ceiling
+/// expires), not a stream; a channel would make the reader drain an
+/// unknown number of messages under the same deadline that just expired.
+/// Contention is nil: one lock per completed wave, held for the length of
+/// a map extend.
+#[derive(Debug, Clone, Default)]
+pub struct PartialDetail(std::sync::Arc<std::sync::Mutex<PartialDetailInner>>);
+
+/// [`PartialDetail`]'s contents, behind its lock.
+#[derive(Debug, Default)]
+struct PartialDetailInner {
+    /// Aliases merged so far, keyed exactly as the completed map keys
+    /// them -- `query::slice_alias`'s ABSOLUTE index, so a partial map is
+    /// read by the same `Board::from_alias_map` as a whole one.
+    merged: serde_json::Map<String, serde_json::Value>,
+    /// Refused fields summed across every response so far.
+    refused: usize,
+    /// Waves that finished before the ceiling expired.
+    waves: usize,
+    /// Slices whose aliases a completed wave covered.
+    slices_done: usize,
+}
+
+impl PartialDetail {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one completed wave.
+    ///
+    /// A POISONED lock is recovered from rather than panicked on. A panic
+    /// here would convert "a wave's data is questionable" into "the whole
+    /// load dies", which is the opposite of this type's purpose; the
+    /// inner map is a plain accumulator with no invariant a panic
+    /// mid-insert could break.
+    ///
+    /// `pub(super)` rather than private: `board.rs` seeds a sink in its
+    /// own tests to exercise the timeout branch's mapping directly, and
+    /// those two modules are the only pair that ever touch one.
+    pub(super) fn record(
+        &self,
+        aliases: &serde_json::Map<String, serde_json::Value>,
+        refused: usize,
+        slices_done: usize,
+    ) {
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        for (k, v) in aliases {
+            g.merged.insert(k.clone(), v.clone());
+        }
+        g.refused += refused;
+        g.waves += 1;
+        g.slices_done = g.slices_done.max(slices_done);
+    }
+
+    /// What has been retrieved so far, in the shape `load_detail_chunked`
+    /// returns on success.
+    ///
+    /// Identical shape on purpose: the partial path must not need a
+    /// second mapper, or the two would drift and the partial one would be
+    /// the untested of the pair.
+    pub fn snapshot(&self) -> serde_json::Value {
+        let g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = g.merged.clone();
+        // Non-zero only, matching `graphql_partial_ok`'s rule that the
+        // key's ABSENCE means no refusal and a written 0 would be a
+        // second way of saying that.
+        if g.refused > 0 {
+            map.insert("__refused".into(), g.refused.into());
+        }
+        serde_json::Value::Object(map)
+    }
+
+    /// How many waves completed, and how many slices they covered.
+    pub fn progress(&self) -> (usize, usize) {
+        let g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        (g.waves, g.slices_done)
+    }
+}
+
 /// [`load_detail`] with the caller's chunk size rather than
 /// [`ALIAS_CHUNK`].
 ///
@@ -790,6 +888,25 @@ pub async fn load_detail_chunked(
     budget: &Budget,
     chunk: usize,
 ) -> Result<serde_json::Value, ClientError> {
+    load_detail_into(client, q, slices, budget, chunk, &PartialDetail::new()).await
+}
+
+/// [`load_detail_chunked`], writing each completed wave into the caller's
+/// [`PartialDetail`] as it goes (#1044).
+///
+/// The caller owns the sink, so a ceiling that drops THIS future still
+/// leaves the caller holding every wave that finished before it expired.
+/// `load_detail_chunked` is this function with a sink nobody reads, which
+/// is the honest way to express "this caller does not want the partial"
+/// rather than duplicating the body.
+pub async fn load_detail_into(
+    client: &GitHubClient,
+    q: &StatsQuery,
+    slices: &[Slice],
+    budget: &Budget,
+    chunk: usize,
+    sink: &PartialDetail,
+) -> Result<serde_json::Value, ClientError> {
     // Clamped rather than trusted. The chunk reaches here from a caller's
     // constant today, but a 0 would make `slices.chunks(0)` panic and a
     // value over the ceiling would build a document the deadline refuses
@@ -799,7 +916,7 @@ pub async fn load_detail_chunked(
     let started = std::time::Instant::now();
     match tokio::time::timeout(
         LOAD_TIMEOUT,
-        detail_with_ladder(client, q, slices, budget, chunk, SLICE_PAGE_FULL),
+        detail_with_ladder(client, q, slices, budget, chunk, SLICE_PAGE_FULL, sink),
     )
     .await
     {
@@ -821,13 +938,23 @@ pub async fn load_detail_chunked(
             // The chunk logged is the one this call STARTED at;
             // `detail_with_ladder` already logs each degradation step at
             // `warn!`, so the pair reconstructs the descent.
+            // #1044 added the two figures that say whether the ceiling
+            // expired on a load that had done nothing or on one that was
+            // nearly finished: waves completed, and slices they covered.
+            // Without them a 59-seconds-of-useful-work failure reads
+            // identically to an instant one.
+            let (waves, slices_done) = sink.progress();
             crate::diag!(
                 "[diag] stats load_detail_chunked TIMEOUT after {:?} (ceiling {}s): \
-                 {} slices planned, start chunk {}, {} requests completed, \
+                 {} slices planned, {} covered by {} completed waves, \
+                 {} outstanding, start chunk {}, {} requests completed, \
                  {} points spent, {} unmetered",
                 started.elapsed(),
                 LOAD_TIMEOUT.as_secs(),
                 slices.len(),
+                slices_done,
+                waves,
+                slices.len().saturating_sub(slices_done),
                 chunk,
                 budget.requests(),
                 budget.spent(),
@@ -845,8 +972,9 @@ async fn detail_with_ladder(
     budget: &Budget,
     chunk: usize,
     page: u32,
+    sink: &PartialDetail,
 ) -> Result<serde_json::Value, ClientError> {
-    match detail_round(client, q, slices, budget, chunk, page).await {
+    match detail_round(client, q, slices, budget, chunk, page, sink).await {
         Ok(v) => Ok(v),
         Err(e) if crate::github::client::server_gave_up_on(&e) => {
             let Some((next_chunk, next_page)) = degrade(chunk, page) else {
@@ -860,7 +988,7 @@ async fn detail_with_ladder(
                  retrying at {next_chunk}/{next_page} -- the load will take longer"
             );
             Box::pin(detail_with_ladder(
-                client, q, slices, budget, next_chunk, next_page,
+                client, q, slices, budget, next_chunk, next_page, sink,
             ))
             .await
         }
@@ -891,6 +1019,7 @@ async fn detail_round(
     budget: &Budget,
     chunk: usize,
     page: u32,
+    sink: &PartialDetail,
 ) -> Result<serde_json::Value, ClientError> {
     let mut merged = serde_json::Map::new();
     let mut refused = 0usize;
@@ -920,6 +1049,12 @@ async fn detail_round(
             let budget = budget.clone();
             set.spawn(async move { metered_read(&client, &budget, json!({ "query": doc })).await });
         }
+        // This wave's own aliases, kept separately from `merged` so the
+        // sink is handed exactly what THIS wave added (#1044). Merging
+        // into `merged` and re-sending the whole map each time would be
+        // quadratic in waves for no gain.
+        let mut wave_aliases = serde_json::Map::new();
+        let mut wave_refused = 0usize;
         while let Some(joined) = set.join_next().await {
             let v = joined.map_err(|e| ClientError::Join(e.to_string()))??;
             if let Some(obj) = v.as_object() {
@@ -928,6 +1063,7 @@ async fn detail_round(
                 // `query.rs:667-678`'s rule.
                 for (k, val) in obj {
                     merged.insert(k.clone(), val.clone());
+                    wave_aliases.insert(k.clone(), val.clone());
                 }
             }
             // `__refused` is a TOP-LEVEL key on each response, not an alias,
@@ -945,8 +1081,20 @@ async fn detail_round(
             //
             // `series_inner` below already accumulates per chunk, which is
             // what the two paths now have in common.
-            refused += crate::github::client::refused_fields_of(&v);
+            let r = crate::github::client::refused_fields_of(&v);
+            refused += r;
+            wave_refused += r;
         }
+        // Written down BEFORE the next wave starts, which is the whole of
+        // #1044: the ceiling can expire at any await point after this, and
+        // whatever is in the sink at that instant survives the drop of
+        // this future.
+        //
+        // `__refused` is a top-level key rather than an alias and rides
+        // along in `wave_aliases`; `PartialDetail::snapshot` rewrites it
+        // from its own running sum, so the sink's figure is authoritative
+        // and the stray copy is overwritten rather than double-counted.
+        sink.record(&wave_aliases, wave_refused, base + wave.len());
     }
     // Written back as the merged map's own key, so `Board::from_alias_map`
     // keeps reading the count through `client::refused_fields_of` -- one
@@ -1406,6 +1554,14 @@ mod tests {
     /// #844.
     #[test]
     fn every_stats_read_goes_through_the_process_wide_permit() {
+        // The permit COUNT asserted at the end of this test reads
+        // process-wide state, so it is false for as long as any other test
+        // has a load in flight -- which #1044's timeout tests deliberately
+        // do. Serialised against them rather than weakened: the assertion
+        // that the cap is the documented number is worth keeping exact.
+        // `blocking_lock` because this is a plain `#[test]` with no
+        // runtime of its own; inside one it would panic rather than wait.
+        let _permits = crate::github::stats::budget::READ_PERMIT_TEST_LOCK.blocking_lock();
         for (file, src) in [
             ("fetch.rs", include_str!("fetch.rs")),
             ("tree.rs", include_str!("tree.rs")),

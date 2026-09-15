@@ -920,15 +920,186 @@ pub async fn load_board_accumulating(
     window: Slice,
     budget: &Budget,
 ) -> Result<LoadedBoard, ClientError> {
-    match tokio::time::timeout(
+    load_board_within(
+        client,
+        scope,
+        measure,
+        window,
+        budget,
         super::fetch::LOAD_TIMEOUT,
-        board_inner(client, scope, measure, window, budget),
+    )
+    .await
+}
+
+/// [`load_board_accumulating`] against a caller-supplied ceiling.
+///
+/// # Why the ceiling is a parameter
+///
+/// So the RETENTION can be tested (#1044). The behaviour under test is
+/// "the ceiling expired part-way through a fetch and the pull requests
+/// already retrieved survived", and the shipped ceiling is 60 seconds --
+/// a test that waited for it would take a minute, and one that faked the
+/// clock would exercise a timer rather than the drop. With the ceiling as
+/// an argument the test drives THIS function, the one that ships, against
+/// a stalling server and a ceiling short enough to expire between two
+/// waves.
+///
+/// `LOAD_TIMEOUT` itself is unchanged and is not raised: #1044 is
+/// explicit that the defect is discarding the work, not the size of the
+/// budget, and `fetch.rs`'s own doc derives the 60s from measurement.
+/// There is exactly one production caller and it passes `LOAD_TIMEOUT`.
+async fn load_board_within(
+    client: &GitHubClient,
+    scope: &Scope,
+    measure: super::scope::Measure,
+    window: Slice,
+    budget: &Budget,
+    ceiling: std::time::Duration,
+) -> Result<LoadedBoard, ClientError> {
+    // Both owned HERE, outside the future the ceiling may drop (#1044).
+    // That placement is the fix: `tokio::time::timeout` destroys the
+    // future and everything it owns, so anything the partial answer is
+    // built from has to live on this side of the race.
+    let progress = BoardProgress::default();
+    let sink = super::fetch::PartialDetail::new();
+    let started = std::time::Instant::now();
+    match tokio::time::timeout(
+        ceiling,
+        board_inner(client, scope, measure, window, budget, &progress, &sink),
     )
     .await
     {
         Ok(r) => r,
-        Err(_) => Err(ClientError::Timeout(super::fetch::LOAD_TIMEOUT.as_secs())),
+        Err(_) => partial_on_timeout(&progress, &sink, budget, started.elapsed(), ceiling),
     }
+}
+
+/// What the dropped future had got as far as, for the timeout branch.
+///
+/// Only the plan: the retrieved nodes live in `fetch::PartialDetail`,
+/// which the fetch layer already owns for the same reason. This carries
+/// what the MAPPER needs and the fetch layer does not know -- the slice
+/// list the aliases are indexed against, and the probe rounds the plan
+/// took.
+#[derive(Debug, Clone, Default)]
+struct BoardProgress(std::sync::Arc<std::sync::Mutex<Option<PlannedSlices>>>);
+
+/// The plan a partial board is mapped against.
+#[derive(Debug, Clone)]
+struct PlannedSlices {
+    slices: Vec<Slice>,
+    rounds: u32,
+}
+
+impl BoardProgress {
+    fn publish(&self, planned: PlannedSlices) {
+        // Poisoning recovered from rather than panicked on, for
+        // `PartialDetail::record`'s reason: this is an accumulator with no
+        // invariant a mid-write panic could break, and dying here would
+        // convert a partial answer into no answer.
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(planned);
+    }
+
+    fn get(&self) -> Option<PlannedSlices> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+/// Build a board out of what a timed-out load had already retrieved.
+///
+/// # Partial is not nothing
+///
+/// The load that expires here has typically issued dozens of successful
+/// POSTs, each paid for against the rate limit. #1004 built
+/// `LoadedBoard::prs` so those would be written down "including from a
+/// load that later hits the cap, which is the entire point of #1004", and
+/// the timeout branch was the single path that dropped them instead. The
+/// user-visible consequence was that eventual consistency never advanced
+/// on exactly the scopes slow enough to need it: a fast scope did not need
+/// accumulation and a slow one saved nothing, so no number of retries
+/// converged.
+///
+/// # Why the board is still marked incomplete
+///
+/// `complete` is forced false whatever the numbers say. This codebase's
+/// rule is only-low -> qualify, possibly-wrong -> suppress, and a board
+/// assembled from an unknown fraction of its slices is only-low on the
+/// per-author figures (every row is a floor) but possibly-WRONG on the
+/// ranking between them. `complete = false` is what the UI branches on to
+/// qualify the first and withhold the second, so it is set at the source
+/// rather than left to a caller to infer.
+///
+/// # Why this is still an error when nothing was retrieved
+///
+/// A plan that never published, or one whose every slice is still
+/// outstanding, has nothing to qualify. Returning an empty board would
+/// present "we measured nobody" as a measurement, which is the
+/// zero-for-absent confusion this module's header exists to forbid. So the
+/// timeout error survives for exactly that case.
+fn partial_on_timeout(
+    progress: &BoardProgress,
+    sink: &super::fetch::PartialDetail,
+    budget: &Budget,
+    elapsed: std::time::Duration,
+    ceiling: std::time::Duration,
+) -> Result<LoadedBoard, ClientError> {
+    let secs = ceiling.as_secs();
+    let (waves, slices_done) = sink.progress();
+    let Some(planned) = progress.get() else {
+        // The ceiling expired during PLANNING, so there are no slices to
+        // index the aliases against and no detail request was ever issued.
+        crate::diag!(
+            "[diag] stats board TIMEOUT after {:?} (ceiling {}s): \
+             expired while planning, nothing retrieved",
+            elapsed,
+            secs
+        );
+        return Err(ClientError::Timeout(secs));
+    };
+    let outstanding = planned.slices.len().saturating_sub(slices_done);
+    let map = sink.snapshot();
+    let prs = Board::retrieved_prs(&map, &planned.slices);
+    if slices_done == 0 {
+        crate::diag!(
+            "[diag] stats board TIMEOUT after {:?} (ceiling {}s): \
+             {} slices planned, 0 covered, {} outstanding, 0 pull requests kept",
+            elapsed,
+            secs,
+            planned.slices.len(),
+            outstanding
+        );
+        return Err(ClientError::Timeout(secs));
+    }
+    // The SAME mapper as the success path. An alias no wave reached is
+    // simply absent from the snapshot, and `from_alias_map` already reads
+    // an absent alias as a named short slice of unknown size -- the shape
+    // #843 built for a refused wave. So a partial board arrives already
+    // naming the ranges it did not read, and there is no second mapper to
+    // keep in step with the first.
+    let mut board = Board::from_alias_map(&map, &planned.slices, planned.rounds, budget.snapshot());
+    // Unconditional, and NOT `&&`-ed with anything. A load that ran out of
+    // wall clock is incomplete even if every alias it did reach came back
+    // whole, because the aliases it never reached are the ones missing --
+    // and `plan.is_retrievable()`, which the success path checks
+    // separately, can only ever push the same way. One assignment rather
+    // than two, so there is no reading of this function under which the
+    // flag comes back true.
+    board.complete = false;
+    crate::diag!(
+        "[diag] stats board TIMEOUT after {:?} (ceiling {}s): \
+         {} slices planned, {} covered by {} completed waves, {} outstanding, \
+         {} pull requests kept, {} short slices, {} points spent",
+        elapsed,
+        secs,
+        planned.slices.len(),
+        slices_done,
+        waves,
+        outstanding,
+        prs.len(),
+        board.truncated_slices.len(),
+        budget.spent()
+    );
+    Ok(LoadedBoard { board, prs })
 }
 
 async fn board_inner(
@@ -937,6 +1108,8 @@ async fn board_inner(
     measure: super::scope::Measure,
     window: Slice,
     budget: &Budget,
+    progress: &BoardProgress,
+    sink: &super::fetch::PartialDetail,
 ) -> Result<LoadedBoard, ClientError> {
     let q = StatsQuery::new(None, scope.clone(), measure);
     // Subdivided to the PAGE, not to the search cap. This is the line that
@@ -953,8 +1126,14 @@ async fn board_inner(
     )
     .await?;
     let slices: Vec<Slice> = plan.slices.iter().map(|s| s.slice.clone()).collect();
-    let map =
-        super::fetch::load_detail_chunked(client, &q, &slices, budget, BOARD_ALIAS_CHUNK).await?;
+    // Published BEFORE the fetch, so a ceiling expiring mid-fetch can
+    // still index the sink's aliases against the slices they name (#1044).
+    progress.publish(PlannedSlices {
+        slices: slices.clone(),
+        rounds: plan.rounds,
+    });
+    let map = super::fetch::load_detail_into(client, &q, &slices, budget, BOARD_ALIAS_CHUNK, sink)
+        .await?;
     let mut board = Board::from_alias_map(&map, &slices, plan.rounds, budget.snapshot());
     // An irreducible slice cannot be divided further, so its nodes are a
     // sample BY CONSTRUCTION -- before any request was made. Folded in here
@@ -1017,6 +1196,89 @@ mod tests {
             remaining: None,
             reset_at: None,
         }
+    }
+
+    /// A client pointed at a mock server, matching `client.rs`'s own
+    /// test helper rather than a second way of building one.
+    async fn mock_client(server: &wiremock::MockServer) -> GitHubClient {
+        let oc = octocrab::Octocrab::builder()
+            .base_uri(server.uri())
+            .unwrap()
+            .personal_token("test-token".to_string())
+            .build()
+            .unwrap();
+        GitHubClient::new(oc)
+    }
+
+    /// Every slice alias a request's document actually selects.
+    ///
+    /// Read off the DOCUMENT rather than assumed from the call, because
+    /// the point of these tests is that the layer under test decides how
+    /// to chunk -- a fixture that hard-coded the aliases would keep
+    /// passing if the chunking changed underneath it.
+    fn aliases_in(doc: &str) -> Vec<String> {
+        doc.lines()
+            .filter_map(|l| {
+                l.trim()
+                    .split(": search(")
+                    .next()
+                    .filter(|_| l.contains(": search("))
+            })
+            .map(|a| a.trim().to_string())
+            .collect()
+    }
+
+    /// A probe answer: a count over the subdivision threshold for every
+    /// alias asked for, so the planner keeps cutting until it reaches
+    /// single days it cannot cut.
+    fn probe_body(aliases: &[String]) -> serde_json::Value {
+        let mut data = serde_json::Map::new();
+        data.insert(
+            "rateLimit".into(),
+            json!({ "cost": 1, "remaining": 4000, "resetAt": "2026-09-15T17:00:00Z" }),
+        );
+        for a in aliases {
+            data.insert(a.clone(), json!({ "issueCount": 5000 }));
+        }
+        json!({ "data": data })
+    }
+
+    /// A detail answer: ONE merged pull request per alias, numbered by the
+    /// alias so the retained set can be told apart from a duplicate.
+    ///
+    /// `issueCount` matches the node count, so a slice that answers is not
+    /// ALSO reported short -- the assertion about `truncated_slices` in the
+    /// timeout test would otherwise pass on the answered slices and say
+    /// nothing about the stalled ones.
+    fn detail_body(aliases: &[String]) -> serde_json::Value {
+        let mut data = serde_json::Map::new();
+        data.insert(
+            "rateLimit".into(),
+            json!({ "cost": 1, "remaining": 4000, "resetAt": "2026-09-15T17:00:00Z" }),
+        );
+        for a in aliases {
+            let n: u64 = a.trim_start_matches('s').parse().unwrap_or(0);
+            data.insert(
+                a.clone(),
+                json!({
+                    "issueCount": 1,
+                    "nodes": [{
+                        "number": n + 1,
+                        "title": format!("pull request {n}"),
+                        "url": format!("https://github.com/acme/repo/pull/{}", n + 1),
+                        "repository": { "nameWithOwner": "acme/repo" },
+                        "author": { "login": "alice" },
+                        "createdAt": "2026-07-01T00:00:00Z",
+                        "mergedAt": "2026-07-01T01:00:00Z",
+                        "additions": 10,
+                        "deletions": 2,
+                        "changedFiles": 1,
+                        "reviews": { "totalCount": 1 },
+                    }]
+                }),
+            );
+        }
+        json!({ "data": data })
     }
 
     fn slices(n: usize) -> Vec<Slice> {
@@ -2051,5 +2313,382 @@ mod tests {
         assert_eq!(direct.repo_counts, assembled.repo_counts);
         assert_eq!(direct.largest, assembled.largest);
         assert_eq!(direct.slowest, assembled.slowest);
+    }
+
+    /// A board whose every alias DID answer is still incomplete if the
+    /// ceiling expired (#1044).
+    ///
+    /// The case the unconditional `complete = false` guards, and the only
+    /// one that isolates it. Everywhere else the missing aliases do the
+    /// work: a wave that never ran leaves its slices absent, and
+    /// `from_alias_map` already reports an absent alias as a short slice,
+    /// which clears the flag on its own. Here every slice answered and the
+    /// load ran out of wall clock anyway -- the mapper sees a whole board
+    /// and would call it complete.
+    ///
+    /// Reachable: the ceiling is on the WHOLE of `board_inner`, so it can
+    /// expire after the last wave merged and before the future returned.
+    /// A board presented as complete after a load that timed out is a
+    /// confident claim made by a load that did not finish, which is the one
+    /// thing #1044's rule forbids.
+    #[test]
+    fn a_timed_out_board_is_incomplete_even_when_every_alias_answered() {
+        // `Budget::new()` reads the process-wide OBSERVED_REMAINING, which
+        // `invariants.rs` requires every synchronous test touching it to
+        // serialise against -- #868's race.
+        let _g = super::super::budget::observed_test_lock();
+        let _restore = super::super::budget::RestoreObserved::capture();
+        let planned = slices(2);
+        let progress = BoardProgress::default();
+        progress.publish(PlannedSlices {
+            slices: planned.clone(),
+            rounds: 1,
+        });
+
+        let sink = super::super::fetch::PartialDetail::new();
+        let whole = json!({
+            "s0": { "issueCount": 1, "nodes": [node("alice", 10, 5, 2, 1)] },
+            "s1": { "issueCount": 1, "nodes": [node("bob", 1, 1, 1, 0)] },
+        });
+        sink.record(whole.as_object().unwrap(), 0, planned.len());
+
+        let loaded = partial_on_timeout(
+            &progress,
+            &sink,
+            &Budget::new(),
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+        )
+        .expect("every alias answered, so there is a board to render");
+
+        assert_eq!(loaded.prs.len(), 2, "both pull requests are kept");
+        assert!(
+            loaded.board.truncated_slices.is_empty(),
+            "nothing was short -- which is exactly why the flag needs forcing"
+        );
+        assert!(
+            !loaded.board.complete,
+            "a load that ran out of wall clock must not present itself as \
+             complete, however whole the aliases it did reach look"
+        );
+    }
+
+    /// The partial board names the ranges it never read.
+    ///
+    /// Asserted on the SHAPE rather than only on the flag, because
+    /// "incomplete" is a boolean a user cannot act on: #826's rule is that
+    /// a short board says WHICH part is short, so a reader can ask GitHub
+    /// the same question for that range. This is the timeout path
+    /// inheriting that property from `from_alias_map` rather than
+    /// re-deriving it.
+    #[test]
+    fn a_timed_out_board_names_the_slices_it_never_reached() {
+        // `Budget::new()` reads the process-wide OBSERVED_REMAINING, which
+        // `invariants.rs` requires every synchronous test touching it to
+        // serialise against -- #868's race.
+        let _g = super::super::budget::observed_test_lock();
+        let _restore = super::super::budget::RestoreObserved::capture();
+        let planned = slices(3);
+        let progress = BoardProgress::default();
+        progress.publish(PlannedSlices {
+            slices: planned.clone(),
+            rounds: 1,
+        });
+
+        let sink = super::super::fetch::PartialDetail::new();
+        // Only the FIRST slice answered.
+        let first = json!({ "s0": { "issueCount": 1, "nodes": [node("alice", 10, 5, 2, 1)] } });
+        sink.record(first.as_object().unwrap(), 0, 1);
+
+        let loaded = partial_on_timeout(
+            &progress,
+            &sink,
+            &Budget::new(),
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+        )
+        .expect("one slice answered, so there is something to render");
+
+        assert_eq!(loaded.prs.len(), 1);
+        assert!(!loaded.board.complete);
+        let named: Vec<&str> = loaded
+            .board
+            .truncated_slices
+            .iter()
+            .map(|s| s.from.as_str())
+            .collect();
+        assert_eq!(
+            named,
+            vec![planned[1].from.as_str(), planned[2].from.as_str()],
+            "the two slices the ceiling swallowed must be named by their own \
+             date ranges, not merely counted"
+        );
+        // Unknown size, not zero. The only figure that could have said how
+        // big those slices were is the `issueCount` that never arrived.
+        assert!(loaded
+            .board
+            .truncated_slices
+            .iter()
+            .all(|s| s.issue_count == 0 && s.retrieved == 0));
+    }
+
+    /// A ceiling that expires while PLANNING is an error, not an empty board.
+    ///
+    /// The plan never published, so there are no slices to index aliases
+    /// against and nothing was fetched. An empty board here would say "we
+    /// measured this scope and found nobody", which is the zero-for-absent
+    /// confusion this module's header forbids -- so the timeout survives.
+    #[test]
+    fn a_ceiling_that_expires_while_planning_is_still_an_error() {
+        let _g = super::super::budget::observed_test_lock();
+        let _restore = super::super::budget::RestoreObserved::capture();
+        let e = partial_on_timeout(
+            &BoardProgress::default(),
+            &super::super::fetch::PartialDetail::new(),
+            &Budget::new(),
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+        )
+        .expect_err("nothing was planned and nothing was fetched");
+        assert!(matches!(e, ClientError::Timeout(60)));
+    }
+
+    /// A board that runs out of wall clock KEEPS the pull requests it
+    /// already retrieved, and says it is incomplete (#1044).
+    ///
+    /// # Why this test is end-to-end rather than a unit test on the mapper
+    ///
+    /// The bug was not in any mapper. Every piece of #1004's accumulation
+    /// was correct; `tokio::time::timeout` DROPPED the future holding the
+    /// result, and no unit test can see a drop. The existing tests covered
+    /// the success path and the error TYPE, so nothing asserted that a
+    /// timed-out load leaves the store better off than before -- which is
+    /// precisely the gap that let this ship.
+    ///
+    /// So this drives the shipped `load_board_within` against a server
+    /// that answers the plan and the FIRST detail wave and then stalls,
+    /// with a ceiling short enough to expire in the stall. It asserts the
+    /// first wave's pull requests come back rather than an error.
+    ///
+    /// # How the plan is forced into two waves
+    ///
+    /// A wave is `BOARD_ALIAS_CHUNK * READ_CONCURRENCY` = 30 slices, so
+    /// the window has to plan into more than 30. Three probe rounds do it:
+    /// a 40-day window over the subdivision threshold cuts into 10 pieces
+    /// of 4 days, each still over cuts into 4 single days, and 40 single
+    /// days are irreducible. 40 slices is two waves, with the second one
+    /// the stall.
+    #[tokio::test]
+    async fn a_timed_out_board_keeps_the_pull_requests_it_retrieved() {
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // The read semaphore is process-wide and these tests stall
+        // requests on purpose -- see `budget::READ_PERMIT_TEST_LOCK`.
+        let _permits = crate::github::stats::budget::READ_PERMIT_TEST_LOCK
+            .lock()
+            .await;
+        let server = MockServer::start().await;
+
+        // The probe. `issueCount` without `nodes`, so it is matched by the
+        // ABSENCE of the node selection -- and answered generously enough
+        // that every slice subdivides until it is a single day.
+        //
+        // One body for every probe round: `probe_body` fills in whatever
+        // aliases the round asked for, so the same mock serves rounds of
+        // 1, 10 and 40 slices without three separate mocks that could
+        // disagree about the counts.
+        Mock::given(method("POST"))
+            .and(body_string_contains("issueCount"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                let doc = body["query"].as_str().unwrap_or("");
+                if doc.contains("nodes {") {
+                    // A DETAIL document. The aliases it asks for say which
+                    // wave this is: the first wave's are s0..s29, so any
+                    // request mentioning an alias at or past s30 is the
+                    // second wave and is the one that stalls.
+                    let second_wave =
+                        (BOARD_ALIAS_CHUNK * super::super::fetch::READ_CONCURRENCY..40).any(|i| {
+                            doc.contains(&format!(
+                                "  {}: search",
+                                super::super::query::slice_alias(i)
+                            ))
+                        });
+                    if second_wave {
+                        // Long enough to outlast the ceiling by two orders
+                        // of magnitude, and BOUNDED rather than infinite:
+                        // `fetch::READ_PERMITS` is process-wide, so a
+                        // request that never returns would hold a permit
+                        // against every other test in the binary.
+                        return ResponseTemplate::new(200)
+                            .set_body_json(detail_body(&[]))
+                            .set_delay(std::time::Duration::from_secs(5));
+                    }
+                    let aliases = aliases_in(doc);
+                    return ResponseTemplate::new(200).set_body_json(detail_body(&aliases));
+                }
+                let aliases = aliases_in(doc);
+                ResponseTemplate::new(200).set_body_json(probe_body(&aliases))
+            })
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let budget = Budget::new();
+        let loaded = super::load_board_within(
+            &client,
+            &Scope::Org("acme".into()),
+            super::super::scope::Measure::Merged,
+            Slice::new("2026-07-01".to_string(), "2026-08-09".to_string()),
+            &budget,
+            // Well past the first wave's answers and far inside the
+            // second's 5-second stall, so the ceiling lands exactly where
+            // the bug lived: between two waves.
+            std::time::Duration::from_millis(1500),
+        )
+        .await
+        .expect("a timed-out load must return what it retrieved, not an error");
+
+        // THE ASSERTION #1044 IS ABOUT. The first wave answered 30 slices
+        // with one merged pull request each; every one of them was paid
+        // for and every one of them must survive the drop.
+        assert!(
+            !loaded.prs.is_empty(),
+            "a load that retrieved pull requests before the ceiling expired \
+             must hand them to the caller for `pr_history::put_many`; \
+             got none"
+        );
+        assert!(
+            loaded.prs.len() >= 20,
+            "the whole first wave's pull requests should survive, not a \
+             fragment of it: got {}",
+            loaded.prs.len()
+        );
+        // Qualified, never confident. The slices the second wave never
+        // reached are absent, so the ranking between authors could be
+        // wrong even though each author's own figures are a floor.
+        assert!(
+            !loaded.board.complete,
+            "a board assembled from part of its slices must say so"
+        );
+        // And it names WHICH ranges it is missing, through the same
+        // `from_alias_map` channel a refused wave uses -- so the partial
+        // path needs no second mapper.
+        assert!(
+            !loaded.board.truncated_slices.is_empty(),
+            "the slices the stall swallowed must be named, not merely counted away"
+        );
+        assert!(
+            loaded.board.retrieved > 0,
+            "the rows must be built from the kept nodes"
+        );
+    }
+
+    /// The same load, given time to finish, returns everything.
+    ///
+    /// The control for the test above: without it, a `load_board_within`
+    /// that had simply stopped fetching after one wave would pass the
+    /// retention assertion while being badly broken.
+    #[tokio::test]
+    async fn the_same_load_is_complete_when_it_is_given_time() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // The read semaphore is process-wide and these tests stall
+        // requests on purpose -- see `budget::READ_PERMIT_TEST_LOCK`.
+        let _permits = crate::github::stats::budget::READ_PERMIT_TEST_LOCK
+            .lock()
+            .await;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                let doc = body["query"].as_str().unwrap_or("");
+                let aliases = aliases_in(doc);
+                if doc.contains("nodes {") {
+                    return ResponseTemplate::new(200).set_body_json(detail_body(&aliases));
+                }
+                ResponseTemplate::new(200).set_body_json(probe_body(&aliases))
+            })
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let budget = Budget::new();
+        let loaded = super::load_board_within(
+            &client,
+            &Scope::Org("acme".into()),
+            super::super::scope::Measure::Merged,
+            Slice::new("2026-07-01".to_string(), "2026-08-09".to_string()),
+            &budget,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("an unstalled load must succeed");
+
+        assert_eq!(
+            loaded.prs.len(),
+            40,
+            "every slice answered, so every slice's pull request is kept"
+        );
+        assert!(
+            loaded.board.truncated_slices.is_empty(),
+            "nothing was short: {:?}",
+            loaded.board.truncated_slices
+        );
+    }
+
+    /// A ceiling that expires before ANY slice was covered is still an error.
+    ///
+    /// The other half of the rule. "Partial is not nothing" is not "nothing
+    /// is partial": a board with no retrieved pull requests would render as
+    /// "we measured nobody", which is the zero-for-absent confusion this
+    /// module's header forbids. So the timeout error survives for exactly
+    /// the case where there is nothing to qualify.
+    #[tokio::test]
+    async fn a_board_that_retrieved_nothing_is_still_an_error() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // The read semaphore is process-wide and these tests stall
+        // requests on purpose -- see `budget::READ_PERMIT_TEST_LOCK`.
+        let _permits = crate::github::stats::budget::READ_PERMIT_TEST_LOCK
+            .lock()
+            .await;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                let doc = body["query"].as_str().unwrap_or("");
+                let aliases = aliases_in(doc);
+                if doc.contains("nodes {") {
+                    // EVERY detail request stalls, so the plan completes
+                    // and not one wave does.
+                    return ResponseTemplate::new(200)
+                        .set_body_json(detail_body(&[]))
+                        .set_delay(std::time::Duration::from_secs(5));
+                }
+                ResponseTemplate::new(200).set_body_json(probe_body(&aliases))
+            })
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let budget = Budget::new();
+        let e = super::load_board_within(
+            &client,
+            &Scope::Org("acme".into()),
+            super::super::scope::Measure::Merged,
+            Slice::new("2026-07-01".to_string(), "2026-08-09".to_string()),
+            &budget,
+            std::time::Duration::from_millis(1500),
+        )
+        .await
+        .expect_err("a load that retrieved nothing has nothing to render");
+        assert!(
+            matches!(e, ClientError::Timeout(_)),
+            "and it is still the timeout, not some other error: {e:?}"
+        );
     }
 }
