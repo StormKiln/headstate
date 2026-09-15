@@ -227,12 +227,27 @@ function Listing({
         <li key={e.path}>
           <button
             type="button"
-            // A symlink is SHOWN and not followed, which is what the
-            // GitHub code view does and what the containment guard
-            // requires -- so its row is not a control at all. Disabled
-            // rather than absent: hiding it would make 22 tracked entries
-            // silently missing from their listings.
-            disabled={e.symlink}
+            // A symlinked DIRECTORY is not a control; a symlinked FILE
+            // is. The 22 tracked symlinks across 38 repositories split 14
+            // files / 6 directories / 2 broken, and that split decides
+            // this.
+            //
+            // A directory link has no panel to explain itself in, so a
+            // single "symlinks are not followed" treatment would leave it
+            // looking descendable and doing nothing when clicked -- and a
+            // row that silently ignores a click reads as broken. It is
+            // disabled, and the row itself carries the reason.
+            //
+            // A file link stays clickable precisely so it CAN explain
+            // itself, in the panel. `repo_file` refuses it with "is a
+            // symbolic link, which is shown but not followed" -- the
+            // guard's own message, which the panel's failure arm renders
+            // verbatim. The refusal is the explanation, so there is no
+            // second copy of that sentence here to drift from it.
+            //
+            // Disabled rather than hidden: hiding a link would make
+            // tracked entries silently missing from their listings.
+            disabled={e.symlink && e.symlink_to_dir === true}
             onClick={() => (e.dir ? onDescend(e.path) : onOpen(e.path))}
             className="tap-target flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-[#e6edf3] enabled:hover:bg-[#161b22] disabled:cursor-default disabled:text-[#8b949e]"
           >
@@ -244,9 +259,22 @@ function Listing({
               <File aria-hidden className="h-4 w-4 shrink-0 text-[#8b949e]" />
             )}
             <span className="truncate font-mono">{e.name}</span>
+            {/* The target, on EVERY link row. 14 of the 22 are shared
+                Terraform module files, where what the link points at is
+                exactly the thing the user opened the row to learn -- a
+                link shown without one tells them less than the filename
+                already did.
+
+                The arrow is the spelling `ls -l` and the GitHub code view
+                both use, so it needs no explaining. A link whose target
+                could not be read shows the label alone rather than a
+                dangling arrow. */}
             {e.symlink ? (
-              <span className="ml-auto shrink-0 text-xs text-[#8b949e]">
-                symbolic link — shown, not followed
+              <span className="ml-auto shrink-0 truncate pl-2 text-xs text-[#8b949e]">
+                {e.symlink_to_dir === true ? "linked folder" : "link"}
+                {e.target !== undefined ? (
+                  <span className="font-mono"> → {e.target}</span>
+                ) : null}
               </span>
             ) : null}
           </button>

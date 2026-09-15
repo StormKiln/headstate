@@ -163,20 +163,122 @@ describe("the repository browser's listing", () => {
     expect(refetchTree).toHaveBeenCalled();
   });
 
-  /// A symlink is SHOWN and not followed, which is what the containment
-  /// guard requires and what the GitHub code view does anyway. Hiding it
-  /// would make 22 tracked entries silently missing from their listings.
-  it("shows a symlink as a link and does not let it be descended into", () => {
+  /// The symlink split, which is the one part of this listing that is not
+  /// a single treatment.
+  ///
+  /// Measured: 22 tracked symlinks across 38 repositories -- the entire
+  /// population an index-based browser can display -- splitting 14 files
+  /// / 6 directories / 2 broken. A single "symlinks are not followed"
+  /// rule gives the DIRECTORY case a row that looks descendable and does
+  /// nothing when clicked, which reads as broken. So the two are tested
+  /// as two.
+  it("disables a symlinked DIRECTORY row and says so on the row", () => {
     state.tree = {
       path: "",
-      entries: [{ name: "link", path: "link", dir: false, symlink: true }],
+      entries: [
+        {
+          name: "alias",
+          path: "alias",
+          dir: false,
+          symlink: true,
+          symlink_to_dir: true,
+          target: "../shared",
+        },
+      ],
     };
     render(<RepositoriesPage />);
-    expect(screen.getByText(/shown, not followed/i)).toBeTruthy();
-    const row = screen.getByRole("button", { name: /link/i });
-    fireEvent.click(row);
-    expect(setRepoFile).not.toHaveBeenCalled();
+    // Said BEFORE the click, because there is no panel to say it after.
+    expect(screen.getByText(/linked folder/i)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /alias/i }));
     expect(setRepoPath).not.toHaveBeenCalled();
+    expect(setRepoFile).not.toHaveBeenCalled();
+  });
+
+  /// A symlinked FILE stays clickable precisely so it can explain itself
+  /// in the panel, where `repo_file`'s own refusal is the explanation.
+  it("leaves a symlinked FILE clickable so the panel can explain it", () => {
+    state.tree = {
+      path: "",
+      entries: [
+        {
+          name: "vpc.tf",
+          path: "vpc.tf",
+          dir: false,
+          symlink: true,
+          symlink_to_dir: false,
+          target: "../modules/vpc.tf",
+        },
+      ],
+    };
+    render(<RepositoriesPage />);
+    fireEvent.click(screen.getByRole("button", { name: /vpc\.tf/i }));
+    expect(setRepoFile).toHaveBeenCalledWith("vpc.tf");
+  });
+
+  /// Both kinds name the target. 14 of the 22 are shared Terraform
+  /// module files, where what the link points at is exactly the thing the
+  /// user opened the row to learn.
+  it("names the target on both kinds of link", () => {
+    state.tree = {
+      path: "",
+      entries: [
+        {
+          name: "alias",
+          path: "alias",
+          dir: false,
+          symlink: true,
+          symlink_to_dir: true,
+          target: "../shared",
+        },
+        {
+          name: "vpc.tf",
+          path: "vpc.tf",
+          dir: false,
+          symlink: true,
+          symlink_to_dir: false,
+          target: "../modules/vpc.tf",
+        },
+      ],
+    };
+    render(<RepositoriesPage />);
+    expect(screen.getByText(/→ \.\.\/shared/)).toBeTruthy();
+    expect(screen.getByText(/→ \.\.\/modules\/vpc\.tf/)).toBeTruthy();
+  });
+
+  /// A broken link -- 2 of the 22 today -- is still shown, still labelled,
+  /// and still names where it was pointing. That is what tells the user
+  /// it is broken rather than missing.
+  it("shows a broken link with its target, as a file rather than a folder", () => {
+    state.tree = {
+      path: "",
+      entries: [
+        {
+          name: "dangling",
+          path: "dangling",
+          dir: false,
+          symlink: true,
+          symlink_to_dir: false,
+          target: "nowhere/at/all",
+        },
+      ],
+    };
+    render(<RepositoriesPage />);
+    expect(screen.getByText(/→ nowhere\/at\/all/)).toBeTruthy();
+    expect(screen.queryByText(/linked folder/i)).toBeNull();
+  });
+
+  /// A link whose target could not be read still renders, with the label
+  /// alone rather than a dangling arrow.
+  it("renders a link with no readable target without a dangling arrow", () => {
+    state.tree = {
+      path: "",
+      entries: [
+        { name: "odd", path: "odd", dir: false, symlink: true, symlink_to_dir: false },
+      ],
+    };
+    render(<RepositoriesPage />);
+    expect(screen.getByText("link")).toBeTruthy();
+    expect(screen.queryByText(/→/)).toBeNull();
   });
 });
 

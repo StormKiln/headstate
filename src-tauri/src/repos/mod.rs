@@ -33,6 +33,28 @@
 //! already the authority for "what is in this repository" and it answers
 //! in 10ms.
 //!
+//! # And a second, independent argument: the index is a narrower surface
+//!
+//! The performance case above is not the only one, and the other half is
+//! about safety. Measured under the same scan root: **21 symlinks escape
+//! their repository root, and every one of them is untracked** --
+//! `.venv/bin/python*` shims pointing into `~/.pyenv` and
+//! `~/.local/share/uv`. Because they live in `.venv/`, `git ls-files`
+//! cannot see them, so under index-based listing they are never
+//! enumerated and **never reach [`repo_path_in`] at all**.
+//!
+//! A filesystem walk would hand that guard 21 separate chances to be
+//! wrong about a path resolving into `~/.pyenv`. Listing from the index
+//! means the guard's symlink refusal is defence in depth rather than the
+//! sole barrier -- and the tracked population it does face is 22 links
+//! across 38 repositories, 0 of which escape.
+//!
+//! So a future change that wants the filesystem walk after all (to show
+//! untracked files, say) does not merely owe an answer about 623,478
+//! entries. It also moves the containment guard from second line of
+//! defence to first, against a population three times the size and
+//! measurably hostile.
+//!
 //! One directory LEVEL per call, not the whole tree. 30,349 files is
 //! small in total, but the code view descends one level at a time and the
 //! response should be the level being shown -- and `git ls-files --
@@ -118,11 +140,46 @@ pub struct Entry {
     /// Whether git has this tracked as a symlink (mode `120000`).
     ///
     /// Shown rather than descended into. Measured across the 38
-    /// repositories: 22 tracked symlinks, 2 of them already broken, and 0
+    /// repositories: **22 tracked symlinks is the entire population this
+    /// browser can ever display**, 2 of them already broken, and 0
     /// resolving outside their own repository root -- so following them
     /// buys 20 working links and costs the guard its containment
     /// property. The GitHub code view shows them as links too.
     pub symlink: bool,
+    /// Where a symlink points, verbatim, or `None` for anything else.
+    ///
+    /// The link's own text -- `readlink`, not a resolved path -- because
+    /// that is the fact the row exists to convey and the only one that is
+    /// true whether or not the target exists. 14 of the 22 are shared
+    /// Terraform module files under
+    /// `environments/{elevate,tenant-one}/*.tf`, where the target is
+    /// exactly the thing a user opened the row to learn; showing a link
+    /// with no target tells them less than the filename already did.
+    ///
+    /// `None` on a read failure rather than an error: a link whose target
+    /// cannot be read is still a link, and refusing to list the directory
+    /// over it would be the shortfall-discards-everything failure
+    /// `RepoScan::is_partial` refuses.
+    pub target: Option<String>,
+    /// Whether a symlink points at a DIRECTORY, so the row can say so
+    /// before it is clicked.
+    ///
+    /// The 22 split 14 files / 6 directories / 2 broken, and the split
+    /// has a UI consequence: a symlinked directory row looks descendable
+    /// and does nothing when clicked, and a row that silently ignores a
+    /// click reads as broken. A symlinked FILE can explain itself in the
+    /// panel on click, in the same slot the binary refusal uses; a
+    /// symlinked DIRECTORY has no panel to explain itself in, so the row
+    /// has to carry it.
+    ///
+    /// A single "symlinks are not followed" treatment for both kinds is
+    /// what gives the directory case that silent click, which is why this
+    /// is a separate field rather than something the UI infers.
+    ///
+    /// `false` for a broken link, which is correct rather than a
+    /// fallback: the 2 broken ones point at nothing, so they are not
+    /// directories, and the row says only that it is a link.
+    pub symlink_to_dir: bool,
 }
 
 /// One directory level of a repository, from the git index.
@@ -321,14 +378,37 @@ pub fn tree(repo_root: &Path, rel: &str) -> Result<Tree, String> {
         if segments.next().is_some() {
             dirs.insert(name.to_string(), ());
         } else {
+            // Mode `120000` is git's symlink. Read from the index rather
+            // than from a `lstat` per entry: 651 entries would be 651
+            // syscalls to learn something git already knows.
+            let symlink = mode == "120000";
+            // The target and its kind cost two syscalls, and ONLY on a
+            // link. Across 38 repositories that is 22 calls in total --
+            // concentrated in 3 of those repositories -- against the 651
+            // an unconditional `lstat` per entry would cost in this one
+            // repository alone, so the measurement is what makes this
+            // affordable rather than a per-row cost.
+            let (target, symlink_to_dir) = if symlink {
+                let p = dir.join(name);
+                let t = std::fs::read_link(&p)
+                    .ok()
+                    .map(|t| t.to_string_lossy().into_owned());
+                // `metadata` FOLLOWS the link, which is what decides
+                // whether it points at a directory. A broken link makes
+                // this `Err`, and `false` is then the right answer rather
+                // than a fallback: it points at nothing, so it is not a
+                // directory.
+                (t, std::fs::metadata(&p).is_ok_and(|m| m.is_dir()))
+            } else {
+                (None, false)
+            };
             files.push(Entry {
                 name: name.to_string(),
                 path: child_path(&rel, name),
                 dir: false,
-                // Mode `120000` is git's symlink. Read from the index
-                // rather than from a `lstat` per entry: 651 entries would
-                // be 651 syscalls to learn something git already knows.
-                symlink: mode == "120000",
+                symlink,
+                target,
+                symlink_to_dir,
             });
         }
     }
@@ -342,7 +422,12 @@ pub fn tree(repo_root: &Path, rel: &str) -> Result<Tree, String> {
             path: child_path(&rel, &name),
             name,
             dir: true,
+            // A directory collapsed out of the index is a real directory
+            // by construction: git records a symlink as one entry with
+            // mode `120000`, never as a prefix of deeper paths.
             symlink: false,
+            target: None,
+            symlink_to_dir: false,
         })
         .collect();
     entries.extend(files);
@@ -811,6 +896,114 @@ mod tests {
         // And reading it is still refused, which is the pair this
         // behaviour comes in: shown in the listing, not followed.
         assert!(file(&f.dir, "link.txt").is_err());
+    }
+
+    /// A symlinked FILE names its target, so the panel can explain
+    /// itself in the slot the binary refusal uses.
+    ///
+    /// The target is the link's own TEXT rather than a resolved path: 14
+    /// of the 22 tracked links in that corpus are shared Terraform module
+    /// files, where what the link points at is exactly the thing the user
+    /// opened the row to learn.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_file_names_its_target() {
+        let f = Fixture::new("linkfile");
+        f.init();
+        f.write("modules/vpc.tf", b"# shared");
+        std::os::unix::fs::symlink("../modules/vpc.tf", f.dir.join("vpc.tf")).expect("symlink");
+        f.add_all();
+        let t = tree(&f.dir, "").expect("listing");
+        let link = t
+            .entries
+            .iter()
+            .find(|e| e.name == "vpc.tf")
+            .expect("the link is shown");
+        assert!(link.symlink);
+        assert_eq!(link.target.as_deref(), Some("../modules/vpc.tf"));
+        // A FILE link, so the row stays clickable and the panel does the
+        // explaining.
+        assert!(!link.symlink_to_dir);
+    }
+
+    /// A symlinked DIRECTORY says so on the entry, because it has no
+    /// panel to explain itself in.
+    ///
+    /// 6 of the 22 are directory links. A single "symlinks are not
+    /// followed" treatment would leave these rows looking descendable and
+    /// doing nothing when clicked, and a row that silently ignores a
+    /// click reads as broken -- which is the whole reason this is a
+    /// separate field rather than something the UI infers.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_directory_is_marked_as_one_so_the_row_can_say_so() {
+        let f = Fixture::new("linkdir");
+        f.init();
+        f.write("real/inner.txt", b"x");
+        std::os::unix::fs::symlink("real", f.dir.join("alias")).expect("dir symlink");
+        f.add_all();
+        let t = tree(&f.dir, "").expect("listing");
+        let link = t
+            .entries
+            .iter()
+            .find(|e| e.name == "alias")
+            .expect("the directory link is shown");
+        assert!(link.symlink);
+        assert!(
+            link.symlink_to_dir,
+            "a directory link must be distinguishable BEFORE it is clicked"
+        );
+        assert_eq!(link.target.as_deref(), Some("real"));
+        // It is not a real directory either: `dir` stays false, so it is
+        // sorted and rendered as the link it is rather than as something
+        // to descend into.
+        assert!(!link.dir);
+    }
+
+    /// A broken link is still a link, and is not a directory.
+    ///
+    /// Two of the 22 are broken today -- the index and the filesystem
+    /// already disagree -- so this is measured behaviour rather than a
+    /// hypothetical. It must not take the listing down with it.
+    #[cfg(unix)]
+    #[test]
+    fn a_broken_symlink_is_listed_as_a_link_and_not_as_a_directory() {
+        let f = Fixture::new("brokenlink");
+        f.init();
+        f.write("keep.txt", b"in");
+        std::os::unix::fs::symlink("nowhere/at/all", f.dir.join("dangling")).expect("symlink");
+        f.add_all();
+        let t = tree(&f.dir, "").expect("a broken link must not fail the whole listing");
+        let link = t
+            .entries
+            .iter()
+            .find(|e| e.name == "dangling")
+            .expect("the broken link is still shown");
+        assert!(link.symlink);
+        assert!(
+            !link.symlink_to_dir,
+            "it points at nothing, so it is not a directory"
+        );
+        assert_eq!(link.target.as_deref(), Some("nowhere/at/all"));
+        // And the rest of the listing is intact: one bad entry is not
+        // evidence the others are wrong.
+        assert!(t.entries.iter().any(|e| e.name == "keep.txt"));
+    }
+
+    /// An ordinary entry carries no link fields at all, so a UI keyed on
+    /// `target` cannot mistake a plain file for a link.
+    #[test]
+    fn an_ordinary_entry_has_no_link_target() {
+        let f = Fixture::new("plainentry");
+        f.init();
+        f.write("src/main.rs", b"fn main() {}");
+        f.add_all();
+        let t = tree(&f.dir, "").expect("listing");
+        for e in &t.entries {
+            assert!(!e.symlink);
+            assert!(e.target.is_none());
+            assert!(!e.symlink_to_dir);
+        }
     }
 
     #[test]

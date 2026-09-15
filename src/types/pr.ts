@@ -389,10 +389,29 @@ export interface RepoEntry {
   ///
   /// SHOWN rather than followed, which is what the GitHub code view does
   /// too. Measured across the 38 repositories on the development
-  /// machine: 22 tracked symlinks, 2 already broken, and 0 resolving
-  /// outside their own repository -- so following them would buy 20
-  /// working links and cost the containment guard its whole property.
+  /// machine: 22 tracked symlinks is the ENTIRE population a browser
+  /// listing from the index can ever display, 2 already broken, and 0
+  /// resolving outside their own repository -- so following them would
+  /// buy 20 working links and cost the containment guard its whole
+  /// property.
   symlink: boolean;
+  /// Where the link points, verbatim, or absent for anything else.
+  ///
+  /// The link's own text rather than a resolved path, because that is
+  /// the fact the row exists to convey. 14 of the 22 are shared
+  /// Terraform module files, where the target is exactly the thing the
+  /// user opened the row to learn -- a link shown without one tells them
+  /// less than the filename already did.
+  target?: string;
+  /// Whether the link points at a DIRECTORY.
+  ///
+  /// The 22 split 14 files / 6 directories / 2 broken, and the split has
+  /// a UI consequence. A symlinked file can explain itself in the panel
+  /// on click, in the slot the binary refusal uses; a symlinked
+  /// DIRECTORY has no panel to explain itself in, so the row must carry
+  /// it -- otherwise the row looks descendable and does nothing when
+  /// clicked, which reads as broken.
+  symlink_to_dir?: boolean;
 }
 
 /// One directory level of a repository, from the git index (#1031).

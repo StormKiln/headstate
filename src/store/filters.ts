@@ -30,10 +30,22 @@ export const ALL_VIEWS = [
   // TO SEE, so it leads rather than sitting ninth of ten.
   //
   // This list's order is only cosmetic -- `View` is derived from it and
-  // nothing else reads the sequence. `ViewSwitcher`'s own `VIEWS` array
-  // is what the menu renders, so the two are kept in the same order
-  // deliberately: a reader comparing them should not have to wonder which
-  // one the user sees.
+  // nothing else reads the sequence.
+  //
+  // It used to say the two lists were kept in the same order deliberately,
+  // "so a reader comparing them should not have to wonder which one the
+  // user sees". That stopped being true in #1017: `ViewSwitcher`'s `VIEWS`
+  // is grouped now, and the menu renders group by group, so the order a
+  // user sees is `GROUPS` first and position within a group second. The
+  // two lists still happen to read alike, but only by coincidence, and a
+  // comment claiming otherwise is one a reader would rely on.
+  //
+  // What IS still true, and is the part worth keeping: `VIEWS` is what
+  // the menu renders and this list only derives the type. When they
+  // disagree about membership that is a bug -- `readme.views.test.ts` and
+  // `ViewSwitcher.test.tsx` both assert every `ALL_VIEWS` id reaches
+  // `VIEWS` exactly once. When they disagree about ORDER, that is now
+  // expected.
   "pr-stats",
   "my-prs",
   "to-review",
