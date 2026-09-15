@@ -61,6 +61,18 @@ export const ALL_VIEWS = [
   // existed only while enabled would make a persisted `view` unparseable the
   // moment someone switched the integrations off.
   "claude-code",
+  // The repository browser (#1023, epic #1011). Beside `worktrees` and
+  // `branches` because it is the third view over the same checkouts --
+  // the grouped menu files all three under "Repos" -- and it is the only
+  // one of the three that answers "what is IN this repository" rather
+  // than "what state is it in".
+  //
+  // Registered here unconditionally, like every other view: `View` is
+  // the type every route and preference is keyed on, and `filtersByView`
+  // is TOTAL over it. A view added to `ViewSwitcher`'s array and not to
+  // this one would be a menu entry with no bucket for its repo selection
+  // -- the undefined-crash `EMPTY_FILTERS` exists to prevent.
+  "repositories",
   // Last, deliberately: the only entry that is not about pull requests.
   "system-health",
 ] as const;
@@ -427,6 +439,64 @@ interface FilterStore {
   /// which is the reason `selectedPr` gives for the same choice.
   claudeSelected: string | undefined;
   selectClaudeSession: (id: string | undefined) => void;
+  /// Where inside the selected repository the browser is (#1034).
+  ///
+  /// Repository-relative, `""` for the root, and it names a DIRECTORY --
+  /// `repoFile` below is the file being read within it, so "which folder
+  /// am I in" and "which file am I reading" stay two questions rather
+  /// than one string the reader has to disambiguate.
+  ///
+  /// # In the store rather than `useState`
+  ///
+  /// `claudeQuery`'s reason exactly: `RepoPickerSidebar` and the file
+  /// panel are SIBLINGS under `App` with no common ancestor below it, and
+  /// the sidebar's selection has to reset the panel's path. This is where
+  /// cross-component view state already lives, beside `claudePage`.
+  ///
+  /// # NOT in `filtersByView`
+  ///
+  /// `claudeFilter`'s reason, and it is the same shape: `filtersByView`
+  /// is keyed by `View` and holds `Filters`, whose keys narrow a list.
+  /// A path is not a filter; it is navigation. Filing it there would put
+  /// it under the same key the repo selection uses a different shape of,
+  /// and `activeFilterCount` would have to learn to exclude it the way it
+  /// already excludes `repo`.
+  ///
+  /// # NOT persisted
+  ///
+  /// Absent from `partialize`, and no migration is needed -- worth
+  /// stating rather than assuming, per `claudePage`'s comment about a key
+  /// `partialize` has never listed: no install has one on disk.
+  ///
+  /// The `query` argument, applied to a path, and it lands harder. A
+  /// search box restored with yesterday's text "renders a filtered list
+  /// that looks like an empty one"; a PATH restored from yesterday can
+  /// point at a directory that no longer exists -- on this machine ~100
+  /// sibling agent worktrees are created and destroyed continuously -- and
+  /// the user did not ask to go there, so the empty listing reads as a
+  /// broken repository rather than as a stale restore.
+  ///
+  /// The repository SELECTION stays persisted, because it already is and
+  /// it is a genuine preference. The position inside it is not.
+  ///
+  /// Do not add this to `partialize` later without deciding what a
+  /// vanished path renders as.
+  repoPath: string;
+  setRepoPath: (path: string) => void;
+  /// The file the browser is reading, repository-relative, or undefined
+  /// for "showing the directory listing" (#1034).
+  ///
+  /// A second field rather than a mode flag on `repoPath`, so descending
+  /// and reading cannot contradict each other: opening a file keeps the
+  /// directory it was opened from, which is what "back to the listing"
+  /// needs and what the GitHub code view shows in its breadcrumb.
+  ///
+  /// Not persisted, for `repoPath`'s reason and one more of its own,
+  /// which `selectedPr` already states about itself: relaunching onto the
+  /// detail of something that has since been deleted is worse than
+  /// landing on the list.
+  repoFile: string | undefined;
+  setRepoFile: (path: string | undefined) => void;
   /// How tightly PR rows pack.
   ///
   /// A global preference rather than per-view: it is about the user's
@@ -480,6 +550,11 @@ const EMPTY_FILTERS: Record<View, Filters> = {
   packages: {},
   "claude-md": {},
   "claude-code": {},
+  // Repositories holds a `repo`, written by the SAME `RepoPickerSidebar`
+  // that Packages and CLAUDE.md use (#1030). The position INSIDE the
+  // repository is `repoPath` below, which is deliberately not here --
+  // see its comment for why a path is navigation rather than a filter.
+  repositories: {},
   // PR Stats holds its own scope selection (#825): `statsScopeKind`,
   // `statsScopeValue` and `statsSubject`, written by `StatsSidebar`
   // through `setStatsScope`. Empty here like every other view -- the entry
@@ -540,7 +615,21 @@ export const useFilters = create<FilterStore>()(
           // Only `repo`. The other keys narrow the list you are looking
           // at, and closing the detail view on a label filter would
           // throw away what the user is reading.
-          ...(key === "repo" ? { selectedPr: null } : {}),
+          //
+          // The browser's position goes with it (#1034), and for the
+          // same reason at one more remove: selecting a DIFFERENT
+          // repository while three directories deep must not carry
+          // `src/components/` into a repository that has no such path,
+          // and the file being read certainly does not survive it.
+          //
+          // Reset INSIDE the setter, not at each caller. `filters.ts:378`
+          // records a bug of exactly this shape -- "Show in Worktrees"
+          // had to call `setView` BEFORE `setFilter` because `setFilter`
+          // writes into `filtersByView[state.view]` -- and every caller
+          // doing its own reset is how that ordering hazard spreads.
+          // There is no order for a caller to get wrong if there is
+          // nothing for a caller to do.
+          ...(key === "repo" ? { selectedPr: null, repoPath: "", repoFile: undefined } : {}),
         })),
       setStatsScope: (kind, value, subject) =>
         set((s) => ({
@@ -625,6 +714,13 @@ export const useFilters = create<FilterStore>()(
           // stale-control failure in the other direction.
           claudeShowSubagents: false,
           claudeSelected: undefined,
+          // And the browser's position (#1034), for the reason this
+          // block gives throughout: a position inside one view means
+          // nothing on another, and coming back to a file panel opened
+          // last week is the stale-restore failure the non-persistence
+          // above is about, arriving by a different route.
+          repoPath: "",
+          repoFile: undefined,
         }),
       healthPage: "overview",
       setHealthPage: (healthPage) => set({ healthPage }),
@@ -659,6 +755,19 @@ export const useFilters = create<FilterStore>()(
         }),
       claudeSelected: undefined,
       selectClaudeSession: (claudeSelected) => set({ claudeSelected }),
+      repoPath: "",
+      // Descending or going up CLEARS the file being read, in one `set`
+      // rather than two calls a caller has to order (#1034). The pairing
+      // is structural for the reason `showClaudeSessions` gives about its
+      // own: an invariant that holds only because callers remember is one
+      // a later call site silently breaks, and every call site would
+      // still compile.
+      setRepoPath: (repoPath) => set({ repoPath, repoFile: undefined }),
+      repoFile: undefined,
+      // Opening a file does NOT move `repoPath`: the directory it was
+      // opened from is what "back to the listing" returns to, and what a
+      // breadcrumb names.
+      setRepoFile: (repoFile) => set({ repoFile }),
       selectedPr: null,
       selectPr: (selectedPr) => set({ selectedPr }),
       checked: [],
@@ -824,6 +933,15 @@ export const useFilters = create<FilterStore>()(
           Object.entries(s.filtersByView).map(([k, f]) => [k, { ...f, query: undefined }]),
         ) as Record<View, Filters>,
         view: s.view,
+        // `repoPath` and `repoFile` are DELIBERATELY absent (#1034), and
+        // the absence is the decision rather than an omission. A path
+        // restored from yesterday can point at a directory that no longer
+        // exists, and the user did not ask to go there -- so the empty
+        // listing reads as a broken repository rather than as a stale
+        // restore. The repository SELECTION is still persisted, inside
+        // `filtersByView`, because that is a preference and this is a
+        // position. No migration is needed: `partialize` has never listed
+        // either key, so no install has one on disk.
         // `panel` is gone (#852). Left here it would re-persist the field
         // the v4 migration drops, so the next launch would read it back
         // and the axis would survive its own removal.

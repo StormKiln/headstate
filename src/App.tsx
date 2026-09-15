@@ -37,6 +37,7 @@ import { ClaudeMdPage } from "./components/ClaudeMdPage";
 import { ClaudeCodePage } from "./components/ClaudeCodePage";
 import { ClaudeCodeSidebar } from "./components/ClaudeCodeSidebar";
 import { RepoPickerSidebar } from "./components/RepoPickerSidebar";
+import { RepositoriesPage } from "./components/RepositoriesPage";
 import { DockerPage } from "./components/DockerPage";
 import { DockerSidebar } from "./components/DockerSidebar";
 import { BranchesPage } from "./components/BranchesPage";
@@ -584,7 +585,20 @@ export default function App() {
       // What it holds instead is the view's own two pages, exactly as
       // `SystemHealthSidebar` holds the machine's classes.
       <ClaudeCodeSidebar viewCounts={{ "to-review": reviewingCount }} />
-    ) : view === "packages" || view === "claude-md" ? (
+    ) : view === "packages" || view === "claude-md" || view === "repositories" ? (
+      // The SAME list, not a second one (#1030). `RepoPickerSidebar` is
+      // already "a plain repository list, for views whose only axis is
+      // 'which repo'", and the browser's only axis is which repo -- the
+      // position INSIDE it is store state (#1034), not a second sidebar
+      // concern.
+      //
+      // A copy would be a second set of the five empty arms, and #854 is
+      // the shipped evidence that a second consumer of this data gets
+      // them wrong: `RepoPickerSidebar` ITSELF was the missed consumer
+      // when #846 fixed this defect on four surfaces. Copying it to bolt
+      // a file tree on would recreate that bug with the new copy as the
+      // one that drifts -- and it would re-ship #846 with a component
+      // whose empty copy is a diagnosis naming the user's settings.
       <RepoPickerSidebar reviewingCount={reviewingCount} />
     ) : view === "artifacts" ? (
       <ArtifactSidebar reviewingCount={reviewingCount} />
@@ -704,6 +718,12 @@ export default function App() {
                   ? "Worktrees"
                 : view === "branches"
                   ? "Branches"
+                // Matching the switcher entry exactly, per #794's
+                // finding: a header naming the page something other than
+                // the menu item that opened it is how a user doubts they
+                // are where they meant to be.
+                : view === "repositories"
+                  ? "Repositories"
                   // "PR Stats", matching the switcher entry exactly
                   // (#794). The header naming the page something other
                   // than the menu item that opened it is how a user
@@ -829,6 +849,20 @@ export default function App() {
         ) : view === "branches" ? (
           <div className="p-4">
             <BranchesPage />
+          </div>
+        ) : view === "repositories" ? (
+          // A real route rather than the documented fall-through at the
+          // end of this chain (#1023). #916's lesson, stated on the
+          // `claude-code` branch above: a registered view id with no arm
+          // here is a switcher entry that silently renders the pull
+          // request list.
+          //
+          // NOT lazy. #838's boundary is for the views that pull in a
+          // charting library; this page imports nothing heavier than
+          // `lucide-react` icons the launch chunk already has, so a lazy
+          // boundary would split a chunk for no weight.
+          <div className="p-4">
+            <RepositoriesPage />
           </div>
         ) : view === "system-health" ? (
           // No `FilterBar` and no strips, deliberately. Every control in

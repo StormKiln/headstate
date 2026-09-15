@@ -3956,6 +3956,135 @@ pub async fn claude_transcript_tail(
 }
 
 // ---------------------------------------------------------------------
+// The repository browser (#1030-#1036, epic #1011). Rust side:
+// `repos/mod.rs`, where the git-index listing, the 256 KB bound and the
+// containment guard are each argued at length.
+// ---------------------------------------------------------------------
+
+/// The repository root the browser was pointed at, RE-DERIVED against the
+/// live scan (#1036).
+///
+/// `caches/mod.rs:520-565` states the rule and its numbered step 4 is the
+/// pattern: *"Still not owned by a live project. **Re-derived NOW**: if
+/// the project directory came back since the scan, this is no longer an
+/// orphan and must not be removed on the strength of a stale verdict."*
+///
+/// The browser's version of a stale verdict is the sidebar's selection: a
+/// path the UI held five minutes ago, over a machine where ~100 sibling
+/// worktrees are created and destroyed by agents continuously, so a
+/// repository directory vanishing mid-browse is the normal case rather
+/// than the edge one.
+///
+/// It is also what replaces the extension check the transcript guard
+/// leans on. `transcript_path_in` has one fixed root, one extension and
+/// one file type; this has a caller-chosen root and no extension to
+/// check, so WITHOUT this step "browse this repository" is "read any file
+/// on this machine", because the caller picks the root. The containment
+/// guard is only as strong as the root it contains against.
+///
+/// A repository in the scan's `unreadable` set is still browsable, and
+/// that is deliberate: `RepoScan::is_partial`'s comment says a shortfall
+/// is "DELIBERATELY not a reason to discard the repositories that WERE
+/// read".
+///
+/// # Errors
+///
+/// Its own message, distinct from every path refusal below, because the
+/// remedy is different: this one means the SELECTION is stale and the
+/// sidebar should clear it, not that the path was wrong.
+async fn scanned_repo_root(app: AppHandle, repo_path: &str) -> Result<std::path::PathBuf, String> {
+    let scan = list_worktrees(app).await?;
+    // Compared on the CANONICAL path, not on the string. The scan reports
+    // `/Users/...` and a caller may send the same directory through
+    // `/System/Volumes/Data/Users/...` on macOS; two spellings of one
+    // directory must not read as two repositories.
+    let want = std::path::Path::new(repo_path)
+        .canonicalize()
+        .map_err(|e| format!("{repo_path}: could not be read: {e}"))?;
+    for repo in &scan.repos {
+        if std::path::Path::new(&repo.path)
+            .canonicalize()
+            .is_ok_and(|p| p == want)
+        {
+            return Ok(want);
+        }
+    }
+    Err(format!(
+        "{repo_path} is no longer one of the scanned repositories"
+    ))
+}
+
+/// One directory level of a repository, from the git index (#1031).
+///
+/// `Class::Read`. It lists one directory level and writes nothing -- the
+/// same classification `list_worktrees`, `scan_artifacts` and
+/// `read_claude_md` already carry -- and the browser is exactly the case
+/// where the phone's need is strongest, because the phone cannot reach
+/// the machine at all.
+///
+/// The listing comes from the INDEX rather than from `readdir`, measured
+/// at 928x fewer entries and fifty times faster; `repos`' module docs
+/// carry the figures. Both limits that make the `Read` row safe -- the
+/// containment guard and the re-derived root -- live inside this command,
+/// so a phone's `remote_call` inherits them rather than reimplementing
+/// them.
+///
+/// # Absent is not zero
+///
+/// An `Err` means the directory could not be LISTED: git failed, the path
+/// was refused, or the repository is no longer scanned. A `Tree` with no
+/// entries means git listed it and it holds no tracked files. Those are
+/// different answers with different remedies and the UI must render them
+/// differently (#1036).
+#[tauri::command]
+pub async fn repo_tree(
+    app: AppHandle,
+    repo_path: String,
+    path: String,
+) -> Result<crate::repos::Tree, String> {
+    let root = scanned_repo_root(app, &repo_path).await?;
+    // `spawn_blocking` because it spawns git and stats the directory,
+    // which does not belong on the async runtime -- the same reason
+    // `list_worktrees` wraps its walk.
+    tauri::async_runtime::spawn_blocking(move || crate::repos::tree(&root, &path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// One file's bounded contents (#1033).
+///
+/// `Class::Read`. It reads at most 256 KB of one file and writes nothing.
+///
+/// Every limit lives HERE rather than in the frontend or the phone -- the
+/// 256 KB window, the binary refusal and the containment guard -- which
+/// is the property that makes the `Read` row safe rather than a second
+/// set of limits to keep in sync, the rule `stats_board` is classed by
+/// and `claude_transcript_tail` restates. A phone that asks for the
+/// 275 MB tracked zip is handed 256 KB with the truncation stated,
+/// because this command never reads more.
+///
+/// # Absent is not zero
+///
+/// Three outcomes, three renderings: an `Err` means the file could not be
+/// READ; a response with `binary: true` means it was read and is not
+/// text; a response with empty content and `binary: false` means the file
+/// is genuinely empty, of which this corpus has real ones (`.gitkeep`).
+#[tauri::command]
+pub async fn repo_file(
+    app: AppHandle,
+    repo_path: String,
+    path: String,
+) -> Result<crate::repos::FileRead, String> {
+    let root = scanned_repo_root(app, &repo_path).await?;
+    // `spawn_blocking` for the reason `claude_session_usage` gives about
+    // its own read: this reads up to 256 KB off disk plus a `stat`, and
+    // that does not belong on the async runtime.
+    tauri::async_runtime::spawn_blocking(move || crate::repos::file(&root, &path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+// ---------------------------------------------------------------------
 // The Claude Code hook installer (#915). Rust side:
 // `claude/install.rs`, which is where every rule below is argued.
 // ---------------------------------------------------------------------

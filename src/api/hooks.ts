@@ -115,6 +115,8 @@ import {
   scanArtifacts,
   sizeArtifacts,
   sizeWorktrees,
+  repoTree,
+  repoFile,
   getReviewing,
   getCachedReviewing,
   countReviewing,
@@ -1119,6 +1121,58 @@ export function useClaudeMdText(path: string | undefined) {
     queryKey: ["claude-md-text", path],
     queryFn: () => readClaudeMd(path as string),
     enabled: Boolean(path),
+    staleTime: 30_000,
+    retry: false,
+  });
+}
+
+/// One directory level of a repository, from the git index (#1031).
+///
+/// Keyed on BOTH the repository and the path, so descending is a cache
+/// miss for the new level rather than a refetch of the old one, and two
+/// repositories that both have a `src/` never share an entry.
+///
+/// `retry: false`, and `useClaudeMdText`'s reason applies unchanged: a
+/// directory removed between the scan and the click is a real possibility
+/// -- ~100 sibling agent worktrees are created and destroyed continuously
+/// on this machine -- and a settled refusal is not a flaky call, so three
+/// silent re-reads only delay saying so. The page offers an explicit
+/// retry instead, which is honest about being a second attempt (#1036).
+///
+/// A rejection is NOT an empty listing. `data` is left `undefined` on a
+/// failure rather than defaulted to a tree with no entries, which is
+/// #846 exactly: the four outcomes the page renders are distinguishable
+/// only if this hook keeps them distinguishable.
+export function useRepoTree(repoPath: string | undefined, path: string) {
+  return useQuery({
+    queryKey: ["repo-tree", repoPath, path],
+    queryFn: () => repoTree(repoPath as string, path),
+    enabled: Boolean(repoPath),
+    staleTime: 30_000,
+    retry: false,
+  });
+}
+
+/// One file's bounded contents (#1033).
+///
+/// Fetched only when a file is selected, for `useClaudeMdText`'s reason:
+/// holding every file's contents to display one is a lot of bytes across
+/// the bridge for nothing -- and here the bridge may be the pairing
+/// transport to a phone.
+///
+/// `retry: false` for the same reason as the listing above, and one more
+/// of its own that is measured: the git index and the filesystem already
+/// disagree today. Two tracked files in that corpus do not exist on disk,
+/// both indexed symlinks whose targets are gone. A file in the listing
+/// that cannot be read is a settled answer about that file, not a
+/// transient one -- and it does NOT invalidate the listing, which is the
+/// `PartialScanNotice` trade: one unreadable entry is not evidence the
+/// other 650 are wrong.
+export function useRepoFile(repoPath: string | undefined, path: string | undefined) {
+  return useQuery({
+    queryKey: ["repo-file", repoPath, path],
+    queryFn: () => repoFile(repoPath as string, path as string),
+    enabled: Boolean(repoPath) && Boolean(path),
     staleTime: 30_000,
     retry: false,
   });

@@ -238,15 +238,31 @@ describe("ViewSwitcher grouping", () => {
   /// produces in three clicks in Settings, and it must render NOTHING
   /// rather than a heading over empty space.
   it("renders no heading for a group whose every member is hidden", () => {
-    uiPrefs = { hidden_views: ["worktrees", "branches"], claude_integrations_enabled: true };
+    // EVERY member, which is three since #1023 added Repositories to this
+    // group. Hiding two of the three would leave the heading standing
+    // correctly, so a list that fell behind the group's membership would
+    // make this test assert the opposite of its own name -- which is why
+    // it is spelled out rather than kept at the two it used to be.
+    uiPrefs = {
+      hidden_views: ["worktrees", "branches", "repositories"],
+      claude_integrations_enabled: true,
+    };
     render(<ViewSwitcher />);
     fireEvent.click(screen.getByRole("button", { name: /my pull requests/i }));
     // The group is gone, not merely empty.
-    expect(screen.queryByRole("group", { name: /^repositories$/i })).toBeNull();
-    expect(screen.queryByText(/^repositories$/i)).toBeNull();
+    //
+    // `^repos$` rather than `^repositories$`: the group is labelled
+    // "Repos" as of #1023, because it now CONTAINS a view called
+    // Repositories and a heading indistinguishable by name from one of
+    // its own children is unresolvable to a screen reader querying by
+    // accessible name. The epic's grouping spells it that way for the
+    // same reason.
+    expect(screen.queryByRole("group", { name: /^repos$/i })).toBeNull();
+    expect(screen.queryByText(/^repos$/i)).toBeNull();
     // Its members are gone too, and an unaffected group still renders --
     // so this is not passing because the menu failed to open.
     expect(screen.queryByRole("menuitem", { name: /worktrees/i })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: /^repositories$/i })).toBeNull();
     expect(screen.getByRole("group", { name: /^builds$/i })).toBeTruthy();
   });
 
@@ -267,15 +283,59 @@ describe("ViewSwitcher grouping", () => {
   /// otherwise fully hidden group, which is the only configuration where
   /// the rules could disagree.
   it("never drops the group holding the current view, even when it is hidden", () => {
-    uiPrefs = { hidden_views: ["worktrees", "branches"], claude_integrations_enabled: true };
+    // All three members hidden since #1023, so the group survives ONLY
+    // through the current-view hatch. With a member left visible it would
+    // survive for an ordinary reason and this would stop testing the
+    // hatch at all.
+    uiPrefs = {
+      hidden_views: ["worktrees", "branches", "repositories"],
+      claude_integrations_enabled: true,
+    };
     useFilters.setState({ filtersByView: { ...EMPTY }, view: "worktrees" });
     render(<ViewSwitcher />);
     fireEvent.click(screen.getByRole("button", { name: /worktrees/i }));
-    const repos = screen.getByRole("group", { name: /^repositories$/i });
+    // "Repos" -- see the rename's reasoning above.
+    const repos = screen.getByRole("group", { name: /^repos$/i });
     expect(within(repos).getByRole("menuitem", { name: /worktrees/i })).toBeTruthy();
-    // The hidden sibling stays hidden -- the hatch is for the current
+    // The hidden siblings stay hidden -- the hatch is for the current
     // view only, not for its whole group.
     expect(screen.queryByRole("menuitem", { name: /branches/i })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: /^repositories$/i })).toBeNull();
+  });
+
+  /// No group may share a label with a view (#1023).
+  ///
+  /// The collision this pins is not hypothetical: #1017 labelled the
+  /// repos group "Repositories" while it held two views neither of which
+  /// was called that, and #1023's third member IS called that -- so the
+  /// menu rendered a "Repositories" heading with a "Repositories" item
+  /// beneath it. A reader cannot tell which is which, and a screen reader
+  /// querying by accessible name genuinely cannot resolve it: the group
+  /// and one of its own children answer to the same string.
+  ///
+  /// Asserted over both SETS rather than on the one pair that collided,
+  /// for the reason this codebase states about every such guard: a
+  /// property about a set cannot be pinned by naming the members, and the
+  /// next label added is the one nobody checks.
+  ///
+  /// Case-insensitive, because the ambiguity is about what a person reads
+  /// and hears rather than about bytes.
+  it("gives no group the same label as a view", () => {
+    const groupLabels = GROUPS.map((g) => g.label.toLowerCase());
+    for (const v of VIEWS) {
+      expect(
+        groupLabels,
+        `The view "${v.label}" shares its label with a group heading. A heading ` +
+          `indistinguishable by name from one of its own children is ambiguous to ` +
+          `a reader and unresolvable to a screen reader querying by accessible ` +
+          `name (#1023). Rename the GROUP: a view's name is user-facing and has to ` +
+          `agree with its header, its README section and its Settings checkbox.`,
+      ).not.toContain(v.label.toLowerCase());
+    }
+    // Guards the guard: both lists are non-empty, or the assertion above
+    // is vacuously true.
+    expect(groupLabels.length).toBeGreaterThan(1);
+    expect(VIEWS.length).toBeGreaterThan(1);
   });
 
   /// #1022: the attribute's ABSENCE is how "not current" is spelled.

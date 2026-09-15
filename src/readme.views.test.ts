@@ -59,6 +59,7 @@ describe("the README documents every view", () => {
     packages: "Package updates",
     "claude-md": "CLAUDE.md",
     "claude-code": "Claude Code",
+    repositories: "Repositories",
     "system-health": "System health",
   };
 

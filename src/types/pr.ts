@@ -388,6 +388,84 @@ export interface WorktreeScan {
   unreadable?: string[];
 }
 
+/// One entry in a repository directory listing (#1031).
+///
+/// Mirrors `Entry` in `src-tauri/src/repos/mod.rs`. The listing comes
+/// from the git INDEX rather than from `readdir`, measured at 928x fewer
+/// entries in this repository's own checkout -- 672 tracked against
+/// 623,488 on disk -- so what arrives here is the repository rather than
+/// the build directory.
+export interface RepoEntry {
+  /// The entry's own name, with no path in it.
+  name: string;
+  /// The repository-relative path, which is what goes back to the
+  /// commands to descend or to read.
+  path: string;
+  /// A directory to descend into.
+  dir: boolean;
+  /// Tracked by git as a symbolic link (mode `120000`).
+  ///
+  /// SHOWN rather than followed, which is what the GitHub code view does
+  /// too. Measured across the 38 repositories on the development
+  /// machine: 22 tracked symlinks is the ENTIRE population a browser
+  /// listing from the index can ever display, 2 already broken, and 0
+  /// resolving outside their own repository -- so following them would
+  /// buy 20 working links and cost the containment guard its whole
+  /// property.
+  symlink: boolean;
+  /// Where the link points, verbatim, or absent for anything else.
+  ///
+  /// The link's own text rather than a resolved path, because that is
+  /// the fact the row exists to convey. 14 of the 22 are shared
+  /// Terraform module files, where the target is exactly the thing the
+  /// user opened the row to learn -- a link shown without one tells them
+  /// less than the filename already did.
+  target?: string;
+  /// Whether the link points at a DIRECTORY.
+  ///
+  /// The 22 split 14 files / 6 directories / 2 broken, and the split has
+  /// a UI consequence. A symlinked file can explain itself in the panel
+  /// on click, in the slot the binary refusal uses; a symlinked
+  /// DIRECTORY has no panel to explain itself in, so the row must carry
+  /// it -- otherwise the row looks descendable and does nothing when
+  /// clicked, which reads as broken.
+  symlink_to_dir?: boolean;
+}
+
+/// One directory level of a repository, from the git index (#1031).
+///
+/// `entries` being empty means git listed the directory and it holds no
+/// tracked files -- a real answer. A directory that could not be LISTED
+/// rejects instead, and the two must render differently (#1036, #846).
+export interface RepoTree {
+  /// The repository-relative path listed, `""` for the root. Echoed back
+  /// so a response cannot be rendered against the wrong request.
+  path: string;
+  entries: RepoEntry[];
+}
+
+/// One file's bounded contents (#1033).
+///
+/// Mirrors `FileRead` in `src-tauri/src/repos/mod.rs`. Three outcomes to
+/// render distinctly, and a rejection is a fourth: an `Err` means the
+/// file could not be READ; `binary` means it was read and is not text;
+/// and empty `content` with `binary` false means the file is genuinely
+/// empty, of which there are real ones (`.gitkeep`).
+export interface RepoFile {
+  path: string;
+  /// The file's REAL size, not the window's. Read by `stat` before the
+  /// file is, so the bound is a bound rather than a discard.
+  size: number;
+  /// The text, or empty when `binary`.
+  content: string;
+  /// Whether the 256 KB bound cut it short. Stated, never silent -- a
+  /// window shown as if it were the whole file is worse than a refusal.
+  truncated: boolean;
+  /// Whether a NUL byte in the head makes this not text. Not an error;
+  /// the GitHub code view says exactly this about a binary.
+  binary: boolean;
+}
+
 /// Everything the detail view renders.
 ///
 /// Separate from `PullRequest`, which is a list row fetched 100 at a time

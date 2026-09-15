@@ -59,6 +59,22 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("build_target", Class::Read),
     ("latest_release", Class::Read),
     ("list_worktrees", Class::Read),
+    // The repository browser (#1035, epic #1011). Both Read: one lists a
+    // directory level from the DESKTOP's git index, the other reads at
+    // most 256 KB of one of its files, and neither writes anything.
+    //
+    // The sharpest case of the companion's purpose yet, and the same
+    // argument `claude_transcript_tail` below makes about itself: the
+    // desktop user can `cat` the file and the phone cannot reach the
+    // machine at all.
+    //
+    // Every limit is on the DESKTOP side, inside the command, so this
+    // build inherits all three rather than holding a second copy -- the
+    // containment guard on the path, the repository root re-derived
+    // against the live scan, and the 256 KB window with its truncation
+    // stated. See the desktop table for the full argument.
+    ("repo_tree", Class::Read),
+    ("repo_file", Class::Read),
     ("classify_worktrees", Class::Read),
     ("size_worktrees", Class::Read),
     ("list_branches", Class::Read),

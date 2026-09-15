@@ -1,4 +1,4 @@
-import { Activity, BarChart3, Bot, ChevronDown, Container, Eye, FileText, FolderGit2, GitBranch, GitPullRequest, HardDrive, Package } from "lucide-react";
+import { Activity, BarChart3, Bot, ChevronDown, Container, Eye, FileText, FolderGit2, FolderTree, GitBranch, GitPullRequest, HardDrive, Package } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { MOBILE_HIDDEN_VIEWS, type View, useFilters } from "../store/filters";
 import { useUiPrefs } from "../api/hooks";
@@ -20,7 +20,26 @@ export const GROUPS = [
   // app's premise, and because #823's PR Stats-first rule is a statement
   // about this group's contents leading the menu.
   { id: "pull-requests", label: "Pull requests" },
-  { id: "repos", label: "Repositories" },
+  // "Repos", not "Repositories", and #1023 is what forced the choice.
+  //
+  // #1017 labelled this group "Repositories" while it held two views
+  // neither of which was called that. The third one IS (#1011's grouping
+  // names it), so the menu would render a "Repositories" heading with a
+  // "Repositories" item beneath it -- a heading and one of its own
+  // children indistinguishable by name, which is ambiguous to a reader
+  // and genuinely unresolvable to a screen reader querying by
+  // accessible name.
+  //
+  // The epic's own grouping spells it "Repos" for exactly this reason:
+  //
+  //     Repos    Worktrees . Branches . Repositories (NEW)
+  //
+  // The group renamed rather than the view, because the view's name is
+  // the user-facing feature and matches its header, its README section
+  // and `SettingsDialog`'s checkbox -- three places #794's rule says must
+  // agree. A group label is internal navigation furniture with one call
+  // site, so it is the cheaper of the two to move.
+  { id: "repos", label: "Repos" },
   { id: "builds", label: "Builds" },
   { id: "ai", label: "AI" },
   // Last, for the reason `system-health` was already last: it is the
@@ -68,6 +87,15 @@ export const VIEWS: { id: View; label: string; Icon: typeof GitPullRequest; grou
   { id: "to-review", label: "To review", Icon: Eye, group: "pull-requests" },
   { id: "worktrees", label: "Worktrees", Icon: FolderGit2, group: "repos" },
   { id: "branches", label: "Branches", Icon: GitBranch, group: "repos" },
+  // Third in the Repos group, after the two views about a checkout's
+  // STATE (#1023, epic #1011). This one answers "what is in it", which is
+  // why it sits with them rather than anywhere else -- the group is the
+  // set of views over the same checkouts.
+  //
+  // `group` is required as of #1024, and that requirement is what makes
+  // this entry safe to add: a new view whose group was forgotten does not
+  // silently vanish from a grouped menu, the compiler demands it.
+  { id: "repositories", label: "Repositories", Icon: FolderTree, group: "repos" },
   { id: "docker", label: "Docker", Icon: Container, group: "builds" },
   { id: "artifacts", label: "Artifacts", Icon: HardDrive, group: "builds" },
   { id: "packages", label: "Package updates", Icon: Package, group: "builds" },
