@@ -2107,7 +2107,6 @@ export function useAllWorktreeSizes(repoPaths: string[], enabled: boolean) {
   };
 }
 
-
 /// The upstream verdict for every repository's MAIN CHECKOUT, one
 /// repository at a time (#1042).
 ///
@@ -2250,6 +2249,12 @@ export function usePullCheckout() {
       // so the button looked like it had done nothing, which is exactly
       // what #346 reported.
       void qc.invalidateQueries({ queryKey: ["worktree-safety"] });
+      // AND the overview's verdicts (#1042), which are a THIRD cache
+      // holding the same ahead/behind fact for the All Repositories
+      // table. It has a five-minute `staleTime`, so without this a
+      // successful pull would leave that table saying "40 behind" for
+      // five minutes -- #346's report, in the new place.
+      void qc.invalidateQueries({ queryKey: ["repo-upstream"] });
       return out;
     });
 }
@@ -2277,6 +2282,13 @@ export function useFetchRefs() {
     fetchRefs(path).then((out) => {
       void qc.invalidateQueries({ queryKey: ["worktrees"] });
       void qc.invalidateQueries({ queryKey: ["worktree-safety"] });
+      // And the overview's verdicts (#1042). Sharpest here of the three:
+      // this feature exists to make a stale verdict fresh, and the All
+      // Repositories table is the surface that most loudly qualifies its
+      // verdicts by ref age. A refresh that updated the age note and not
+      // the verdict beside it would be the exact half-updated row this
+      // hook's own comment refuses.
+      void qc.invalidateQueries({ queryKey: ["repo-upstream"] });
       return out;
     });
 }
@@ -2300,6 +2312,12 @@ export function useUpdateAllRepositories() {
     updateAllRepositories().then((report) => {
       void qc.invalidateQueries({ queryKey: ["worktrees"] });
       void qc.invalidateQueries({ queryKey: ["worktree-safety"] });
+      // And the overview's verdicts (#1042). This button lives ON the
+      // All Repositories table, so its own rows are the ones that would
+      // otherwise sit stale for five minutes -- a run that moved 30
+      // repositories, reporting so, above a table still saying they are
+      // behind.
+      void qc.invalidateQueries({ queryKey: ["repo-upstream"] });
       return report;
     });
 }
