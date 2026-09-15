@@ -34,6 +34,42 @@ pub struct Repo {
     /// tell are both "we do not know", and neither is "just now".
     #[serde(default)]
     pub fetched_at: Option<String>,
+    /// What [`crate::worktrees::scan::default_branch`] resolved for this
+    /// repository -- the REMOTE-TRACKING ref where one exists
+    /// (`origin/main`, `origin/master`), the bare local short name where
+    /// it does not (#757, #1026).
+    ///
+    /// # Why this is on the wire rather than re-derived
+    ///
+    /// The All Repositories table names the branch its verdict is about,
+    /// and a hardcoded `origin/main` is the wrong answer for over 10% of
+    /// the repositories on the reporting machine: `osiris` resolves to
+    /// `origin/master`, `claude-mkt` to a long feature branch because
+    /// `origin/HEAD` points at one, and two fall back to a LOCAL `main`
+    /// because no `origin/main` ref resolves.
+    ///
+    /// Re-deriving it in a fifth place was the other option and is
+    /// refused: `invariants.rs` already guards four functions named
+    /// `default_branch` against drifting apart, and #757 measured what
+    /// disagreement costs -- a nine-row verdict swing in 34, every
+    /// affected row carrying a confident, false reason.
+    ///
+    /// # It costs nothing
+    ///
+    /// `collect_inner` ALREADY calls `default_branch` to classify the
+    /// worktrees; this carries the string it already has instead of
+    /// discarding it. No extra git invocation, on a scan whose per-repo
+    /// cost is the thing every other decision here is budgeted against.
+    ///
+    /// # `None` is "not resolved", never a default
+    ///
+    /// The orphan branch has no repository to ask, so it sends `None`
+    /// rather than the word `main`. A consumer must render that as "we
+    /// could not tell" -- substituting a plausible ref would be this
+    /// codebase's characteristic absent-read-as-success bug (#967,
+    /// #769, #841) applied to the one field that says what was compared.
+    #[serde(default)]
+    pub default_ref: Option<String>,
 }
 
 /// Why a worktree can or cannot be removed.
