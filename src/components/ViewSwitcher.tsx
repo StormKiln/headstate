@@ -3,8 +3,34 @@ import { useEffect, useRef, useState } from "react";
 import { MOBILE_HIDDEN_VIEWS, type View, useFilters } from "../store/filters";
 import { useUiPrefs } from "../api/hooks";
 import { IS_MOBILE_BUILD } from "../lib/target";
+import { current } from "../lib/ariaCurrent";
+import { useIsMobile } from "../lib/useIsMobile";
 
-/// Every view, in sidebar order, with the label and icon each needs.
+/// The menu's groups, in the order their headings appear (#1017).
+///
+/// Declared as a const tuple so `Group` derives from it, the same way
+/// `View` derives from `ALL_VIEWS`: one list, and a type that cannot
+/// name a group the menu does not render.
+///
+/// The order is the menu's order. `VIEWS` is grouped by it at render
+/// time rather than being stored pre-sorted, so the two cannot disagree
+/// about where a heading goes.
+export const GROUPS = [
+  // "Pull requests" leads because `my-prs` is the default view and the
+  // app's premise, and because #823's PR Stats-first rule is a statement
+  // about this group's contents leading the menu.
+  { id: "pull-requests", label: "Pull requests" },
+  { id: "repos", label: "Repositories" },
+  { id: "builds", label: "Builds" },
+  { id: "ai", label: "AI" },
+  // Last, for the reason `system-health` was already last: it is the
+  // only entry that is not about the user's code.
+  { id: "system", label: "System" },
+] as const;
+
+export type Group = (typeof GROUPS)[number]["id"];
+
+/// Every view, in sidebar order, with the label, icon and GROUP each needs.
 ///
 /// Exported because `SettingsDialog` offers these as hide/show
 /// checkboxes and previously kept its OWN hand-written list. That list
@@ -12,32 +38,50 @@ import { IS_MOBILE_BUILD } from "../lib/target";
 /// hidden at all and nothing said so -- the section simply looked
 /// complete (#675). One array, one order, one set of labels, which is why
 /// #794's tenth view needed no edit there.
-export const VIEWS: { id: View; label: string; Icon: typeof GitPullRequest }[] = [
-  // FIRST in the menu, per #823 -- the order here is what the user sees,
-  // and `ALL_VIEWS` in `store/filters.ts` is kept in step so the two read
-  // alike. See that list for why this leads.
+///
+/// `group` is REQUIRED rather than optional, and that is the whole guard
+/// (#1024). Until #1017 the render was `offered.map(...)`, so every view
+/// that survived the filter reached the menu by construction. Grouping
+/// removes that property: the loop is now over groups, so a view in no
+/// group is a view in no menu, and a partial list looks exactly like a
+/// complete one -- which is #675 again, one structure further in. A
+/// required field makes the omission a compile error instead of a
+/// silently absent entry.
+///
+/// `SettingsDialog.tsx` still maps this flat array for its checkboxes:
+/// the grouping is applied at render, so the array stays one list rather
+/// than becoming a nested structure every consumer has to walk.
+export const VIEWS: { id: View; label: string; Icon: typeof GitPullRequest; group: Group }[] = [
+  // FIRST in the menu, per #823 -- and still first once grouped, because
+  // it leads the group that leads `GROUPS`. See `ALL_VIEWS` in
+  // `store/filters.ts` for why this leads; note that since #1017 the two
+  // lists are no longer kept in a shared order, so what a user sees is
+  // this array read group by group rather than top to bottom.
   //
   // "PR Stats", not "Stats" (#794). The bare word had the sidebar's
   // context to lean on -- it sat under a list of repositories with open
   // pull requests in them. In a flat menu beside "System health" it
   // would read as stats about the machine, which is the one thing it is
   // not about.
-  { id: "pr-stats", label: "PR Stats", Icon: BarChart3 },
-  { id: "my-prs", label: "My pull requests", Icon: GitPullRequest },
-  { id: "to-review", label: "To review", Icon: Eye },
-  { id: "worktrees", label: "Worktrees", Icon: FolderGit2 },
-  { id: "branches", label: "Branches", Icon: GitBranch },
-  { id: "docker", label: "Docker", Icon: Container },
-  { id: "artifacts", label: "Artifacts", Icon: HardDrive },
-  { id: "packages", label: "Package updates", Icon: Package },
-  { id: "claude-md", label: "CLAUDE.md", Icon: FileText },
+  { id: "pr-stats", label: "PR Stats", Icon: BarChart3, group: "pull-requests" },
+  { id: "my-prs", label: "My pull requests", Icon: GitPullRequest, group: "pull-requests" },
+  { id: "to-review", label: "To review", Icon: Eye, group: "pull-requests" },
+  { id: "worktrees", label: "Worktrees", Icon: FolderGit2, group: "repos" },
+  { id: "branches", label: "Branches", Icon: GitBranch, group: "repos" },
+  { id: "docker", label: "Docker", Icon: Container, group: "builds" },
+  { id: "artifacts", label: "Artifacts", Icon: HardDrive, group: "builds" },
+  { id: "packages", label: "Package updates", Icon: Package, group: "builds" },
+  { id: "claude-md", label: "CLAUDE.md", Icon: FileText, group: "ai" },
   // Offered only while `claude_integrations_enabled` is on -- see the
   // `capabilityOff` check below for why that is not a `hidden_views` entry.
-  { id: "claude-code", label: "Claude Code", Icon: Bot },
+  // With grouping this is also what can empty the "AI" group, which is
+  // why the render drops a group with no visible members (#1018).
+  { id: "claude-code", label: "Claude Code", Icon: Bot, group: "ai" },
   // Last, and deliberately so: it is the only entry that is not about
   // the user's code at all. Grouping it with the repo-scoped views
-  // would imply it takes a repository, which it does not.
-  { id: "system-health", label: "System health", Icon: Activity },
+  // would imply it takes a repository, which it does not -- and now that
+  // the menu has headings, its own group says that outright.
+  { id: "system-health", label: "System health", Icon: Activity, group: "system" },
 ];
 
 /// Views that are offered whatever `hidden_views` says.
@@ -113,7 +157,9 @@ export function ViewSwitcher({ counts }: { counts?: Partial<Record<View, number>
     IS_MOBILE_BUILD && MOBILE_HIDDEN_VIEWS.has(storedView) ? "my-prs" : storedView;
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
-  const current = VIEWS.find((v) => v.id === view) ?? VIEWS[0];
+  const currentView = VIEWS.find((v) => v.id === view) ?? VIEWS[0];
+  // A LAYOUT question, so the hook rather than `IS_MOBILE_BUILD` (#1020).
+  const isMobile = useIsMobile();
   const { prefs } = useUiPrefs();
   // Two views are never hidden, whatever is stored:
   //
@@ -151,6 +197,35 @@ export function ViewSwitcher({ counts }: { counts?: Partial<Record<View, number>
       : ALWAYS_OFFERED.has(id) || id === view || !hidden.has(id),
   );
 
+  // Group AFTER filtering, and drop a group with no surviving members
+  // (#1018).
+  //
+  // The order matters and is the whole of the issue. The natural refactor
+  // -- iterate the groups, collect each one's views, filter inside the
+  // loop -- renders the heading before it knows whether anything is left
+  // under it, and an "AI" heading with nothing beneath it is a menu
+  // telling the user about a feature they cannot reach. Filtering first
+  // and keeping only non-empty groups makes that state unrepresentable
+  // rather than merely unlikely.
+  //
+  // This is reachable without any capability. `hidden_views` can empty
+  // Repositories, Builds and System outright -- none of their members is
+  // in `ALWAYS_OFFERED`. Only Pull requests is protected, and only
+  // because `my-prs` is. The Claude capability is the second route to
+  // the same state, not the only one.
+  //
+  // The saving property is that the CURRENT view is always offered, so
+  // the group the user is standing in can never be the empty one. That
+  // is what makes "render nothing" safe: dropping a group can never drop
+  // the way back to where you are.
+  //
+  // A view whose `group` is not in `GROUPS` cannot exist -- `Group` is
+  // derived from `GROUPS` -- so this loses nothing the type permits.
+  const visibleGroups = GROUPS.map((g) => ({
+    ...g,
+    members: offered.filter((v) => v.group === g.id),
+  })).filter(({ members }) => members.length > 0);
+
   // Dismiss on Escape and on a click elsewhere. Without both, the menu
   // stays open behind whatever the user does next.
   useEffect(() => {
@@ -178,8 +253,8 @@ export function ViewSwitcher({ counts }: { counts?: Partial<Record<View, number>
         aria-haspopup="menu"
         className="flex w-full items-center gap-2 rounded px-3 py-2 text-sm font-semibold text-[#e6edf3] hover:bg-[#161b22]"
       >
-        <current.Icon className="h-4 w-4 shrink-0" aria-hidden="true" />
-        <span className="truncate">{current.label}</span>
+        <currentView.Icon className="h-4 w-4 shrink-0" aria-hidden="true" />
+        <span className="truncate">{currentView.label}</span>
         <ChevronDown
           className={`ml-auto h-3.5 w-3.5 shrink-0 transition-transform ${
             open ? "rotate-180" : ""
@@ -193,27 +268,75 @@ export function ViewSwitcher({ counts }: { counts?: Partial<Record<View, number>
           role="menu"
           className="absolute left-0 right-0 top-full z-20 mt-1 rounded border border-[#30363d] bg-[#161b22] p-1 shadow-lg"
         >
-          {offered.map(({ id, label, Icon }) => (
-            <button
-              key={id}
-              type="button"
-              role="menuitem"
-              aria-current={id === view}
-              onClick={() => {
-                setView(id);
-                setOpen(false);
-              }}
-              className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-sm ${
-                id === view ? "bg-[#1f6feb] text-white" : "text-[#e6edf3] hover:bg-[#21262d]"
-              }`}
-            >
-              <Icon className="h-4 w-4 shrink-0" aria-hidden="true" />
-              <span className="truncate">{label}</span>
-              {counts?.[id] ? (
-                <span className="ml-auto text-xs tabular-nums">{counts[id]}</span>
-              ) : null}
-            </button>
-          ))}
+          {visibleGroups.map(({ id: groupId, label: groupLabel, members }) => {
+            const headingId = `view-group-${groupId}`;
+            return (
+              <div
+                key={groupId}
+                // `role="group"` with `aria-labelledby`, NOT a bare `<h3>`
+                // (#1022). `role="menu"`'s content model admits `menuitem`,
+                // `menuitemradio`, `menuitemcheckbox`, `group` and
+                // `separator` -- a heading element is not among them, so an
+                // `<h3>` dropped straight into the menu is a child a screen
+                // reader is entitled to ignore, taking the label with it.
+                // Wrapping the members in a `group` and pointing it at the
+                // heading keeps the label attached to the items it names.
+                role="group"
+                aria-labelledby={headingId}
+              >
+                {/* Rendered only on the wide layout (#1020). Five headings
+                    cost five rows of vertical space, and the phone's sheet
+                    has 288px of it -- the labels are worth less there than
+                    the entries they would push off-screen. The heading id
+                    stays on the element either way: `aria-labelledby`
+                    pointing at a `hidden` element still resolves, so the
+                    group keeps its accessible name on the phone even
+                    though the text is not painted.
+
+                    `useIsMobile()` rather than `IS_MOBILE_BUILD`, per the
+                    rule of thumb in `lib/target.ts`: the answer changes
+                    when a desktop user drags the window narrower, so this
+                    is a layout question and not a capability one. */}
+                <h3
+                  id={headingId}
+                  hidden={isMobile}
+                  className="px-2 pb-0.5 pt-1.5 text-xs font-semibold uppercase tracking-wide text-[#8b949e]"
+                >
+                  {groupLabel}
+                </h3>
+                {members.map(({ id, label, Icon }) => (
+                  <button
+                    key={id}
+                    type="button"
+                    role="menuitem"
+                    // `current(...)` from `@/lib/ariaCurrent` (#977, adopted
+                    // here in #1022). This was `aria-current={id === view}`,
+                    // which React serialises to the literal string "false"
+                    // on every non-current item -- announced by some
+                    // readers, where the attribute's ABSENCE is how "not
+                    // current" is spelled. `ViewSwitcher` was the one
+                    // navigation list that never adopted the shared helper,
+                    // because it already had the attribute and so did not
+                    // look broken.
+                    aria-current={current(id === view)}
+                    onClick={() => {
+                      setView(id);
+                      setOpen(false);
+                    }}
+                    className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-sm ${
+                      id === view ? "bg-[#1f6feb] text-white" : "text-[#e6edf3] hover:bg-[#21262d]"
+                    }`}
+                  >
+                    <Icon className="h-4 w-4 shrink-0" aria-hidden="true" />
+                    <span className="truncate">{label}</span>
+                    {counts?.[id] ? (
+                      <span className="ml-auto text-xs tabular-nums">{counts[id]}</span>
+                    ) : null}
+                  </button>
+                ))}
+              </div>
+            );
+          })}
         </div>
       ) : null}
     </div>
