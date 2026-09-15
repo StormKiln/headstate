@@ -736,12 +736,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(&outside);
     }
 
+    /// A path that escapes the repository is refused whatever SHAPE the
+    /// escape takes -- and the shapes differ by platform.
+    ///
+    /// This asserts the REFUSAL rather than one particular sentence,
+    /// which is the lesson Windows CI taught: `/etc/passwd` is
+    /// `is_absolute()` on unix and is NOT on Windows, where a path with
+    /// no drive letter is root-relative. So it took the `RootDir`
+    /// component arm there and was refused with the other message --
+    /// correctly, and by a test that failed anyway because it had pinned
+    /// the wrong one of two right answers.
+    ///
+    /// Six Windows-only failures have cost this repository, and this
+    /// would have been the seventh. The guard was never wrong; the
+    /// assertion was over-specific about a message whose wording is
+    /// platform-dependent by construction.
+    ///
+    /// The per-platform spellings below then pin the SPECIFIC message
+    /// each shape earns, because "names which test failed" is a real
+    /// requirement -- the four remedies differ -- and an assertion that
+    /// accepted any refusal would not be checking it.
     #[test]
-    fn an_absolute_path_is_refused() {
+    fn a_path_that_escapes_the_repository_is_refused_whatever_shape_it_takes() {
         let f = Fixture::new("absolute");
         f.write("keep.txt", b"in");
-        let err = repo_path_in(&f.dir, "/etc/passwd").expect_err("must refuse an absolute path");
+        for rel in ["/etc/passwd", "../../etc/passwd", "/", "//server/share/x"] {
+            assert!(
+                repo_path_in(&f.dir, rel).is_err(),
+                "{rel} must not resolve inside the repository"
+            );
+        }
+        // And the guard has not become "refuse everything", which is the
+        // failure mode a containment test passes for the wrong reason on.
+        repo_path_in(&f.dir, "keep.txt").expect("an ordinary path still resolves");
+    }
+
+    /// A genuinely ABSOLUTE path names the absolute test, per platform.
+    ///
+    /// Spelled with a drive letter on Windows and a leading slash on
+    /// unix, because those are what `Path::is_absolute` actually answers
+    /// true for -- see the test above for what happens when one spelling
+    /// is assumed to be absolute everywhere.
+    #[test]
+    fn an_absolute_path_says_it_is_absolute() {
+        let f = Fixture::new("absolutemsg");
+        f.write("keep.txt", b"in");
+        #[cfg(windows)]
+        let rel = "C:\\Windows\\System32\\config\\SAM";
+        #[cfg(not(windows))]
+        let rel = "/etc/passwd";
+        assert!(
+            std::path::Path::new(rel).is_absolute(),
+            "the fixture must actually be absolute on this platform, or the \
+             assertion below tests the wrong arm"
+        );
+        let err = repo_path_in(&f.dir, rel).expect_err("must refuse an absolute path");
         assert!(err.contains("absolute"), "got: {err}");
+    }
+
+    /// A `..` names the traversal test, on every platform.
+    ///
+    /// `..` is `Component::ParentDir` everywhere, so unlike the absolute
+    /// case there is one spelling and one message.
+    #[test]
+    fn a_parent_component_says_it_leaves_the_repository() {
+        let f = Fixture::new("parentmsg");
+        f.write("keep.txt", b"in");
+        let err = repo_path_in(&f.dir, "../outside.txt")
+            .expect_err("must refuse a path with a parent component");
+        assert!(err.contains("leaves the repository"), "got: {err}");
     }
 
     /// A symlink is refused BEFORE canonicalising, which is the only
