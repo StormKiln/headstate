@@ -599,7 +599,22 @@ export default function App() {
       // a file tree on would recreate that bug with the new copy as the
       // one that drifts -- and it would re-ship #846 with a component
       // whose empty copy is a diagnosis naming the user's settings.
-      <RepoPickerSidebar reviewingCount={reviewingCount} />
+      //
+      // `allLabel` for the Repositories view ALONE (#1043). All three
+      // views render something when no repository is selected, but only
+      // this one renders a page there -- the All Repositories overview,
+      // which answers "which of my repositories is behind its remote"
+      // before any repository is chosen. Packages and CLAUDE.md render a
+      // one-line prompt, and a permanently selected row leading to a
+      // prompt would announce an empty view as somewhere the user is.
+      //
+      // The label matches the overview's own visible heading exactly.
+      // Two spellings of one destination is how a sidebar and the page it
+      // leads to start disagreeing.
+      <RepoPickerSidebar
+        reviewingCount={reviewingCount}
+        allLabel={view === "repositories" ? "All Repositories" : undefined}
+      />
     ) : view === "artifacts" ? (
       <ArtifactSidebar reviewingCount={reviewingCount} />
     ) : view === "docker" ? (

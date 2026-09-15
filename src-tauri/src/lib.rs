@@ -309,6 +309,7 @@ pub fn run() {
             commands::cancel_update_all,
             commands::update_all_state,
             commands::classify_worktrees,
+            commands::classify_repo_upstream,
             commands::list_branches,
             commands::system_health,
             commands::system_health_history,

@@ -746,6 +746,67 @@ pub async fn classify_worktrees(
     .map_err(|e| e.to_string())?
 }
 
+/// One repository's main checkout, classified. See `classify_worktrees`.
+///
+/// The All Repositories table's Status column (#1042). That column was an
+/// indefinite skeleton and nothing appeared in the logs, because there
+/// was no failing call -- there was NO CALL. `Worktree::upstream` is
+/// written in exactly one place, `classify`, which the walk runs only
+/// behind `with_safety`, and `list_worktrees` above reaches the walk
+/// through `scan_dirs_fast_reporting`, which passes `false`. So the
+/// field the table reads was `None` for every row by construction.
+///
+/// # Why a second command rather than `with_safety: true`
+///
+/// Because the landing page would become the slowest screen in the app.
+/// The fast scan is fast deliberately: classification spends an UNBOUNDED
+/// number of git calls per worktree (`content_landed` spends up to four
+/// per CHANGED FILE), bounded only by a 45s `CLASSIFY_TIMEOUT` each, and
+/// the overview covers every repository in the scan roots -- ~38 on the
+/// reporting machine, one of them with 145 worktrees. Flipping the flag
+/// would classify all ~295 of them inline, to render 38 rows.
+///
+/// # Why not `classify_worktrees`
+///
+/// Same reason at one remove: that command classifies every worktree of
+/// the repository, and this table renders one row per repository. Calling
+/// it once per repository would do the same ~295-worktree pass, merely
+/// spread across 38 promises. `classify_main_checkout` does exactly the
+/// one worktree the row is about.
+///
+/// # Per repository, so rows resolve independently
+///
+/// One call per repository rather than one call for all of them, which is
+/// `useAllWorktreeSizes`' granularity and for its reason: a repository
+/// whose git is slow must not hold the other 37 on skeletons. There is no
+/// streaming event here and none is needed -- the unit of work IS one
+/// row, so the promise settling is the row filling.
+///
+/// # A failure is an answer, never a skeleton
+///
+/// The `Err` arm is what the frontend renders as a failed row.
+/// `classify_main_checkout` itself never returns a `Worktree` whose
+/// `upstream` is `None`: an abandoned classification comes back as
+/// `Upstream::Unknown` carrying why. Between the two, every row leaves
+/// Pending -- which is the whole of #1042, since Pending and Unknown are
+/// deliberately distinct states and the bug was that nothing moved a row
+/// out of the first one at all.
+///
+/// No fetch, deliberately and measurably (#1026). See
+/// `classify_main_checkout`.
+#[tauri::command]
+pub async fn classify_repo_upstream(
+    repo_path: String,
+) -> Result<crate::worktrees::Worktree, String> {
+    // Blocking git work: off the async runtime's worker threads, the
+    // same treatment `list_worktrees` above gives the walk.
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::worktrees::classify_main_checkout(&repo_path)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Disk sizes for one repo's worktrees, as `(path, bytes)` pairs.
 ///
 /// Separate from classification because it is a full tree walk, and the

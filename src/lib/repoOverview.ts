@@ -5,22 +5,30 @@ import type { Upstream, WorktreeRepo } from "@/types/pr";
 ///
 /// # Why this is a projection and not a scan
 ///
-/// Every field here is already on the wire. `useWorktrees` delivers
-/// `WorktreeRepo[]` under `queryKey: ["worktrees"]`, each repo already
-/// carrying `fetched_at`, `default_ref`, and a `worktrees` array whose
-/// `is_main` entry already has `upstream` populated -- `Worktree::upstream`
-/// is "computed for EVERY worktree, not just the main checkout".
-///
-/// So the table adds no command, no query and no git invocation (#1029).
-/// MEASURED on the reporting machine, the local reads behind this are 73ms
+/// `useWorktrees` delivers `WorktreeRepo[]` under `queryKey: ["worktrees"]`,
+/// each repo already carrying `fetched_at`, `default_ref`, and a
+/// `worktrees` array whose `is_main` entry is the row this summarises. So
+/// the LISTING adds no command, no query and no git invocation (#1029).
+/// MEASURED on the reporting machine, the local reads behind it are 73ms
 /// mean per repository and 2.77s serial for the whole scan root; the table
-/// inherits that cost rather than paying it a second time. A second
-/// `scan_repos_overview` computing upstream independently would be a
-/// second source for one fact, which is what `default_branch`'s nine-row
-/// swing and `invariants.rs`'s four-way guard are both about.
+/// inherits that cost rather than paying it a second time.
 ///
-/// It is also what keeps this table and the Worktrees first row it
-/// summarises from disagreeing: same value, not a second computation of it.
+/// # `upstream` is the exception, and assuming otherwise was #1042
+///
+/// This block used to claim that the `is_main` entry "already has
+/// `upstream` populated", quoting `Worktree::upstream`'s own doc about
+/// being "computed for EVERY worktree". That doc describes `classify`,
+/// and the walk behind `useWorktrees` does not run it: `collect_inner`
+/// calls `classify` only when `with_safety` is true, and the only
+/// production entry point, `scan_dirs_fast_reporting`, passes `false`.
+/// The deep path that would have populated it is `#[cfg(test)]`.
+///
+/// So `main.upstream` below is `null` on every row that comes out of the
+/// scan, permanently, and the Status column was an indefinite skeleton
+/// for it. The verdicts now come from `useRepoUpstreams`, which
+/// classifies the main checkout per repository and lays its answer over
+/// this projection. The rest of the row is still projected, and still
+/// cannot drift from the Worktrees first row it summarises.
 export interface RepoOverviewRow {
   /// Directory name, the table's leftmost cell and its sort key.
   name: string;

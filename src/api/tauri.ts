@@ -420,6 +420,34 @@ export const repoFile = (repoPath: string, path: string) =>
 export const classifyWorktrees = (repoPath: string) =>
   call<Worktree[]>("classify_worktrees", { repoPath });
 
+/// One repository's MAIN CHECKOUT, classified (#1042).
+///
+/// The All Repositories table's Status column. It had no source at all
+/// before this: `upstream` is written only by the Rust `classify`, which
+/// the walk runs behind a flag every production caller passes `false`
+/// for, so the column was a skeleton by construction rather than by
+/// race -- a stuck request would at least have appeared in the logs, and
+/// nothing did, because there was no request.
+///
+/// One repository per call, and ONE worktree per repository. Not
+/// `classifyWorktrees`, which classifies every worktree of the
+/// repository: the overview renders one row per repository, so on a
+/// 145-worktree repository that would be 144 verdicts thrown away. The
+/// main checkout is also the cheapest worktree there is -- the Rust side
+/// decides its safety without a single git call -- so what this actually
+/// costs is reading the refs already on disk.
+///
+/// It does NOT fetch, and the column depends on that (#1026): on the
+/// reporting machine only one of 38 repositories is fresh, and 4 of 8
+/// sampled would print a green "up to date" while behind. The verdict is
+/// qualified by ref age instead, through `upstreamReasonAged`.
+///
+/// No streaming counterpart, unlike `classifyWorktrees`. The unit of work
+/// IS one row, so the promise settling is the row filling; an event would
+/// be a second delivery of the same single answer.
+export const classifyRepoUpstream = (repoPath: string) =>
+  call<Worktree>("classify_repo_upstream", { repoPath });
+
 /// Apply an action to a pull request.
 ///
 /// Rejects with GitHub's own message on refusal -- "base branch was

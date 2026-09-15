@@ -114,6 +114,17 @@ vi.mock("../api/hooks", () => ({
     error: state.fileFailed ? new Error("No such file or directory") : undefined,
     refetch: refetchFile,
   }),
+  // The Status column's source (#1042), stubbed for the same reason as
+  // the three below: an absent hook throws and the no-repository arm
+  // never renders. No verdicts, which is the state a freshly-mounted
+  // table is genuinely in -- what it does with them is
+  // `AllRepositoriesTable.test.tsx`'s subject.
+  useRepoUpstreams: () => ({
+    upstreams: new Map(),
+    pending: 0,
+    failed: 0,
+    total: 0,
+  }),
   // `UpdateAllButton` mounts inside `AllRepositoriesTable` (#1012) and
   // reads three more hooks from this module. Stubbed for the same reason
   // `unreadable` above is answered: an absent hook throws and the
