@@ -165,6 +165,17 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("repo_tree", Class::Read),
     ("repo_file", Class::Read),
     ("classify_worktrees", Class::Read),
+    // The All Repositories table's Status column, one repository at a
+    // time (#1042). A Read: it lists one repository's worktrees and
+    // inspects the refs already on disk for the main checkout. It does
+    // NOT fetch -- that property is measured (#1026) and is the reason
+    // the column qualifies every verdict by ref age instead.
+    //
+    // Exposed for `classify_worktrees`' reason, one row down: the phone
+    // asks the same question the desktop's overview does, and the bound
+    // that matters (`CLASSIFY_TIMEOUT`) lives inside the command, so a
+    // `remote_call` inherits it rather than needing a second copy.
+    ("classify_repo_upstream", Class::Read),
     ("size_worktrees", Class::Read),
     ("list_branches", Class::Read),
     ("scan_artifacts", Class::Read),
@@ -858,6 +869,11 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "classify_worktrees" => {
             res(commands::classify_worktrees(app.clone(), a.get("repoPath")?).await)
         }
+        // No `app` handle, unlike the arm above: this command emits no
+        // events. Its unit of work is ONE worktree, so the promise
+        // settling is the answer arriving -- there is nothing partial to
+        // stream (#1042).
+        "classify_repo_upstream" => res(commands::classify_repo_upstream(a.get("repoPath")?).await),
         "size_worktrees" => res(commands::size_worktrees(app.clone(), a.get("repoPath")?).await),
         "list_branches" => res(commands::list_branches(app.clone(), a.get("repoPath")?).await),
         "scan_artifacts" => res(commands::scan_artifacts(app.clone()).await),

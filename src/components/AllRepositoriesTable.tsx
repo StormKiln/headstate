@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { useWorktrees } from "@/api/hooks";
+import { useRepoUpstreams, useWorktrees } from "@/api/hooks";
 import { PartialScanNotice } from "@/components/PartialScanNotice";
 import { QueryError, errorMessage } from "@/components/QueryError";
 import { repoCurrency, repoOverviewRows } from "@/lib/repoOverview";
@@ -43,12 +43,30 @@ import { UpdateAllButton } from "@/components/UpdateAllButton";
 /// regression. Per-repository `fetch_refs` is already the remedy, and a
 /// row refreshes its own verdict the moment its refs are.
 ///
-/// # It adds no scan (#1029)
+/// # It adds no scan (#1029), and one cheap query per row (#1042)
 ///
 /// `useWorktrees` is the same query the Worktrees view and both sidebars
-/// read, under the same `queryKey`. This is a projection over it, so the
-/// table costs nothing additional when it and the sidebar are both on
-/// screen, and cannot drift from the row it summarises.
+/// read, under the same `queryKey`. The rows are a projection over it, so
+/// the LISTING costs nothing additional when the table and the sidebar
+/// are both on screen, and cannot drift from the row it summarises.
+///
+/// The VERDICTS are not a projection, and the claim that they were is
+/// what #1042 is. This file used to say the table "adds no command, no
+/// query and no git invocation" because `upstream` was supposedly
+/// "already on the wire". It never was: that field is written in exactly
+/// one place on the Rust side, inside `classify`, which the walk runs
+/// only behind a `with_safety` flag that every production caller passes
+/// `false` for -- the deep path that would have set it is `#[cfg(test)]`.
+/// So the Status column was a permanent skeleton, and nothing appeared in
+/// the logs because there was no failing call; there was no call.
+///
+/// `useRepoUpstreams` is the correction, and it keeps the property the
+/// old claim was actually protecting. It classifies the MAIN CHECKOUT
+/// ONLY -- the one worktree this table has a row for -- rather than every
+/// worktree of every repository, which would be ~295 of them on the
+/// reporting machine to render 38 rows, and it is one query PER
+/// REPOSITORY so a slow repository cannot hold the others on skeletons.
+/// It still does not fetch.
 ///
 /// Not polled, deliberately. The two pollers in this app read cheap local
 /// state answering questions that change on their own; this data changes
@@ -62,8 +80,49 @@ export function AllRepositoriesTable() {
   // reporting form exists.
   const { data, unreadable, isLoading, isError, error, refetch } = useWorktrees();
 
-  const rows = useMemo(() => repoOverviewRows(data ?? []), [data]);
-  const currency = useMemo(() => repoCurrency(rows), [rows]);
+  const scanned = useMemo(() => repoOverviewRows(data ?? []), [data]);
+
+  // The verdicts, which the scan does NOT carry (#1042).
+  //
+  // This component's own doc used to say the table "adds no command, no
+  // query and no git invocation", on the reading that `upstream` was
+  // already on the wire from the scan. It was not, and the Status column
+  // was an indefinite skeleton for it: `Worktree::upstream` is written
+  // only inside the Rust `classify`, which the walk runs behind a flag
+  // every production caller passes `false` for, and the path that would
+  // have set it is test-only. So the field was `None` for every row,
+  // always, and no amount of waiting was ever going to change it.
+  //
+  // What the claim was RIGHT about is the cost, and that is preserved:
+  // this classifies the MAIN CHECKOUT only, one query per repository, and
+  // it does not fetch. Not `useWorktreeSafety`, which would classify
+  // every worktree of every repository -- ~295 of them on the reporting
+  // machine, to render 38 rows.
+  //
+  // Keyed by repository PATH, which is the row's identity and unique
+  // across scan roots where `name` is not.
+  const paths = useMemo(() => scanned.map((r) => r.path), [scanned]);
+  const { upstreams } = useRepoUpstreams(paths);
+
+  // The resolved verdict laid over the row, and `?? row.upstream`
+  // underneath it rather than `?? null`: the scan's own value is what
+  // this falls back to, so if a future change ever does populate it the
+  // table reads it rather than ignoring it. An absent entry stays
+  // whatever the scan said, which today is `null` -- the PENDING
+  // skeleton, correct for exactly as long as the query is in flight and
+  // no longer, which is the whole of #1042.
+  //
+  // NOT memoised, deliberately. `upstreams` is rebuilt on every render by
+  // design (the hook says why), so a `useMemo` over it would recompute
+  // every render anyway while adding a dependency array to get wrong --
+  // and the work is one spread per repository over the scan root, 38 on
+  // the reporting machine. `repoCurrency` below follows for the same
+  // reason: it is one pass over those same rows.
+  const rows = scanned.map((row) => ({
+    ...row,
+    upstream: upstreams.get(row.path) ?? row.upstream,
+  }));
+  const currency = repoCurrency(rows);
 
   // The error arm FIRST, before the empty arm (#846). With `data`
   // undefined on a rejection `rows` is `[]`, so an empty-state check

@@ -29,9 +29,10 @@ pub use model::{Repo, Worktree};
 // too.
 pub(crate) use scan::git;
 pub use scan::{
-    classify_repo_streaming, fetch_refs, head_oid, prune_worktrees, pull_checkout, remove_orphan,
-    remove_worktree, remove_worktree_forced, remove_worktrees_with_progress, repo_identity,
-    scan_dirs_fast_reporting, size_repo_streaming, unlock_worktree, RemovalOutcome, RepoScan,
+    classify_main_checkout, classify_repo_streaming, fetch_refs, head_oid, prune_worktrees,
+    pull_checkout, remove_orphan, remove_worktree, remove_worktree_forced,
+    remove_worktrees_with_progress, repo_identity, scan_dirs_fast_reporting, size_repo_streaming,
+    unlock_worktree, RemovalOutcome, RepoScan,
 };
 // Update All (#1012). A loop over `pull_checkout` above, deliberately in
 // its own module: the refusal set is the feature, and it is long enough

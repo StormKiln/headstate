@@ -132,6 +132,10 @@ const ROWS: Row[] = [
   row(api.repoTree, [repoPath, "src"], "repo_tree", { repoPath, path: "src" }),
   row(api.repoFile, [repoPath, "src/main.rs"], "repo_file", { repoPath, path: "src/main.rs" }),
   row(api.classifyWorktrees, [repoPath], "classify_worktrees", { repoPath }),
+  // The All Repositories Status column (#1042). Same argument shape as
+  // the row above and a deliberately different command: this classifies
+  // the MAIN CHECKOUT only, where that one classifies every worktree.
+  row(api.classifyRepoUpstream, [repoPath], "classify_repo_upstream", { repoPath }),
   row(api.actOnPr, [id, repo, number, action], "act_on_pr", { id, repo, number, action }),
   row(api.removeWorktrees, [repoPath, worktreePaths], "remove_worktrees", { repoPath, worktreePaths }),
   row(api.latestRelease, [], "latest_release"),

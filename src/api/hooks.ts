@@ -27,6 +27,7 @@ import type {
   NetProcess,
   PrDetail,
   PullRequest,
+  Upstream,
   Venv,
   Worktree,
   WorktreeScan,
@@ -60,6 +61,7 @@ import {
   actOnPr,
   getPrDetail,
   getWorktreeDirs,
+  classifyRepoUpstream,
   classifyWorktrees,
   listBranches,
   systemHealth,
@@ -2105,6 +2107,122 @@ export function useAllWorktreeSizes(repoPaths: string[], enabled: boolean) {
   };
 }
 
+/// The upstream verdict for every repository's MAIN CHECKOUT, one
+/// repository at a time (#1042).
+///
+/// # What was wrong, and why nothing was in the logs
+///
+/// The All Repositories table reads `upstream` off the main checkout the
+/// scan already lists, on the reasoning that the field is "already on the
+/// wire". It is not, and never was: `Worktree::upstream` is written in
+/// exactly one place on the Rust side, inside `classify`, which the walk
+/// runs only behind a `with_safety` flag that every production caller
+/// passes `false` for. The path that would have set it is `#[cfg(test)]`.
+/// So the column was an indefinite skeleton BY CONSTRUCTION -- not a
+/// stuck request, which would have left a trace, but no request at all.
+///
+/// # One query per repository, which is the whole shape
+///
+/// `useAllWorktreeSizes`' granularity, for its reason: a repository whose
+/// git is slow must not hold the other 37 rows on skeletons. Each row
+/// resolves, or fails, entirely on its own.
+///
+/// There is deliberately no streaming event underneath, unlike the size
+/// and safety passes. Those stream because one call covers many rows and
+/// the rows must not wait for each other; here the unit of work IS one
+/// row, so the promise settling is the row filling and an event would be
+/// a second delivery of the same single answer.
+///
+/// # A failed repository is an ANSWER, not a longer wait
+///
+/// The map carries `Upstream` values only. A repository whose
+/// classification rejected is recorded as `Upstream::Unknown` carrying
+/// the refusal, because the caller renders an absent entry as a PENDING
+/// skeleton -- "not computed yet" -- and a row that can never be computed
+/// must stop making that promise. This is the `Safety::Pending` versus
+/// `Safety::Unknown` distinction the Worktrees page already draws,
+/// applied to the field this table actually reads. #1042's requirement in
+/// one line: nothing may skeleton forever.
+///
+/// # No fetch
+///
+/// The command reads refs already on disk and this adds nothing. The
+/// table's no-fetch property is measured (#1026) and the verdicts are
+/// qualified by ref age rather than made fresh by a network call to every
+/// remote in the scan root -- 13 of which have never been contacted from
+/// the reporting machine at all.
+///
+/// `staleTime` is long for `useWorktreeSizes`' reason at a different
+/// scale: a repository's position against its upstream changes when the
+/// user acts or when its refs are fetched, and both of those invalidate
+/// this key explicitly rather than being waited for.
+///
+/// NOT the default `retry: 3`, the same refusal every pass in this file
+/// makes: a rejection here is git declining, not a flaky network call,
+/// and three silent re-runs would put the cell back on a skeleton for
+/// four times as long before saying anything.
+export function useRepoUpstreams(repoPaths: readonly string[], enabled = true) {
+  const results = useQueries({
+    queries: repoPaths.map((path) => ({
+      queryKey: ["repo-upstream", path],
+      queryFn: () => classifyRepoUpstream(path),
+      enabled,
+      staleTime: 5 * 60 * 1000,
+      retry: false,
+    })),
+  });
+
+  // Built inline rather than in a memo, exactly as `useAllWorktreeSizes`
+  // builds its size map: `useQueries` returns a fresh results array on
+  // every render anyway, so a memo over it would recompute regardless
+  // while adding a dependency array to get wrong. The loop is over the
+  // repositories in the scan root -- 38 on the reporting machine.
+  const upstreams = new Map<string, Upstream>();
+  repoPaths.forEach((path, i) => {
+    const r = results[i];
+    if (r?.data?.upstream) {
+      upstreams.set(path, r.data.upstream);
+      return;
+    }
+    // The rejection arm, and it must produce a VALUE. `r.error` is the
+    // Rust refusal, which already says what failed -- "could not list
+    // worktrees: ..." -- so it is carried through rather than replaced
+    // with a sentence of this layer's own.
+    if (r?.isError) {
+      upstreams.set(path, { kind: "unknown", n: errorText(r.error) });
+    }
+    // Anything else is genuinely still in flight, and an absent key is
+    // how the caller spells that. It renders as a skeleton, which is
+    // honest for exactly as long as the query is running -- and only
+    // then, which is the whole of #1042.
+  });
+
+  return {
+    upstreams,
+    /// Repositories with no answer of any kind yet. Falls to zero when
+    /// every row has heard something, success or failure.
+    pending: results.filter((r) => r.isPending).length,
+    /// Repositories whose classification REJECTED, counted separately
+    /// from `pending` for `useAllWorktreeSizes`' reason: a caller
+    /// watching only `pending` sees it reach zero and concludes
+    /// everything was measured. #769 is the shape of that mistake.
+    failed: results.filter((r) => r.isError).length,
+    total: results.length,
+  };
+}
+
+/// A query rejection as the string the cell will show.
+///
+/// Tauri rejects with the command's own `Err` string, which is already
+/// display-ready and names what failed. An `Error` instance is unwrapped
+/// to its message; anything else is stringified rather than dropped,
+/// because a cell that says a failure happened without saying what is
+/// still better than a cell that keeps promising an answer.
+function errorText(e: unknown): string {
+  if (typeof e === "string") return e;
+  if (e instanceof Error) return e.message;
+  return String(e);
+}
 /// Remove a worktree, then refresh both queries.
 ///
 /// Deliberately NOT optimistic. Every other mutation in this app updates
@@ -2131,6 +2249,12 @@ export function usePullCheckout() {
       // so the button looked like it had done nothing, which is exactly
       // what #346 reported.
       void qc.invalidateQueries({ queryKey: ["worktree-safety"] });
+      // AND the overview's verdicts (#1042), which are a THIRD cache
+      // holding the same ahead/behind fact for the All Repositories
+      // table. It has a five-minute `staleTime`, so without this a
+      // successful pull would leave that table saying "40 behind" for
+      // five minutes -- #346's report, in the new place.
+      void qc.invalidateQueries({ queryKey: ["repo-upstream"] });
       return out;
     });
 }
@@ -2158,6 +2282,13 @@ export function useFetchRefs() {
     fetchRefs(path).then((out) => {
       void qc.invalidateQueries({ queryKey: ["worktrees"] });
       void qc.invalidateQueries({ queryKey: ["worktree-safety"] });
+      // And the overview's verdicts (#1042). Sharpest here of the three:
+      // this feature exists to make a stale verdict fresh, and the All
+      // Repositories table is the surface that most loudly qualifies its
+      // verdicts by ref age. A refresh that updated the age note and not
+      // the verdict beside it would be the exact half-updated row this
+      // hook's own comment refuses.
+      void qc.invalidateQueries({ queryKey: ["repo-upstream"] });
       return out;
     });
 }
@@ -2181,6 +2312,12 @@ export function useUpdateAllRepositories() {
     updateAllRepositories().then((report) => {
       void qc.invalidateQueries({ queryKey: ["worktrees"] });
       void qc.invalidateQueries({ queryKey: ["worktree-safety"] });
+      // And the overview's verdicts (#1042). This button lives ON the
+      // All Repositories table, so its own rows are the ones that would
+      // otherwise sit stale for five minutes -- a run that moved 30
+      // repositories, reporting so, above a table still saying they are
+      // behind.
+      void qc.invalidateQueries({ queryKey: ["repo-upstream"] });
       return report;
     });
 }

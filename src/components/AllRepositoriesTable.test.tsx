@@ -6,6 +6,14 @@ import type { Upstream, Worktree, WorktreeRepo } from "@/types/pr";
 /// property under test is what the TABLE does with a scan -- including
 /// the `unreadable` half, which only the hook's wrapper shape carries.
 const useWorktrees = vi.hoisted(() => vi.fn());
+/// The verdicts, which the SCAN does not carry (#1042). Mocked
+/// separately from `useWorktrees` because they arrive separately: the
+/// walk lists repositories and never classifies them, and this hook is
+/// the second pass that fills the Status column one repository at a
+/// time. Keeping them as two mocks is what lets a test put a row in the
+/// scan and leave its verdict outstanding, which is the state the whole
+/// column was stuck in.
+const useRepoUpstreams = vi.hoisted(() => vi.fn());
 /// `UpdateAllButton` mounts inside this table (#1012) and reads three
 /// more hooks from the same module, so the mock must carry them or the
 /// whole table fails to render. Stubbed rather than given behaviour: the
@@ -13,6 +21,7 @@ const useWorktrees = vi.hoisted(() => vi.fn());
 /// these tests are about what the TABLE does with a scan.
 vi.mock("@/api/hooks", () => ({
   useWorktrees,
+  useRepoUpstreams,
   useUpdateAllRepositories: () => vi.fn(),
   useCancelUpdateAll: () => vi.fn(),
   useUpdateAllProgress: () => null,
@@ -58,7 +67,22 @@ const scan = (over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
-beforeEach(() => useWorktrees.mockReset());
+/// What `useRepoUpstreams` returns for a given path-to-verdict map.
+const verdicts = (entries: Record<string, Upstream> = {}) => ({
+  upstreams: new Map<string, Upstream>(Object.entries(entries)),
+  pending: 0,
+  failed: 0,
+  total: Object.keys(entries).length,
+});
+
+beforeEach(() => {
+  useWorktrees.mockReset();
+  // No verdicts unless a test supplies them, so a test that does not
+  // care about the Status column gets the honest default: the scan
+  // listed the repository and its verdict has not landed.
+  useRepoUpstreams.mockReset();
+  useRepoUpstreams.mockReturnValue(verdicts());
+});
 
 describe("AllRepositoriesTable", () => {
   /// #1015: the safety verdict on the main checkout is a CONSTANT --
@@ -208,5 +232,154 @@ describe("AllRepositoriesTable", () => {
     useWorktrees.mockReturnValue(scan({ data: [] }));
     render(<AllRepositoriesTable />);
     expect(screen.getByText(/No repositories found in the scanned folders/)).toBeTruthy();
+  });
+
+  /// #1042: the Status column, against the data production actually
+  /// delivers.
+  ///
+  /// The tests above drive the column from `Worktree.upstream` on the
+  /// scanned row, which is what this table was written believing it
+  /// would get. It never did: that field is written only by the Rust
+  /// `classify`, which the walk runs behind a flag every production
+  /// caller passes `false` for. Those tests still earn their place --
+  /// they pin what each VERDICT renders as -- but none of them could
+  /// fail while the column was permanently blank, because all of them
+  /// hand it a verdict the scan does not carry.
+  ///
+  /// So these start from the honest scan: `upstream: null` on every row,
+  /// exactly as `list_worktrees` returns it, and the verdicts arriving
+  /// separately through `useRepoUpstreams`.
+  describe("the Status column, from the production shape", () => {
+    /// A repository as the production scan really hands it over: listed,
+    /// unclassified.
+    const unclassified = (over: Partial<WorktreeRepo> = {}) =>
+      repo({ worktrees: [wt({ upstream: null })], ...over });
+
+    /// THE regression test. With a real scan and a landed verdict, the
+    /// cell must show the verdict -- not the skeleton it showed forever.
+    it("renders the verdict that arrives after the scan, not a skeleton", () => {
+      useWorktrees.mockReturnValue(scan({ data: [unclassified()] }));
+      useRepoUpstreams.mockReturnValue(
+        verdicts({ "/code/a": { kind: "current" } as Upstream }),
+      );
+      render(<AllRepositoriesTable />);
+      expect(screen.getByText(/up to date with upstream/)).toBeTruthy();
+      expect(screen.queryByText("Checking")).toBeNull();
+    });
+
+    /// The skeleton is still correct while the verdict is genuinely
+    /// outstanding -- for exactly that long, and no longer. Without this
+    /// the fix could be "render something, anything", which is the
+    /// inverse defect: a claim made before anything was measured.
+    it("still shows a skeleton while a verdict is genuinely outstanding", () => {
+      useWorktrees.mockReturnValue(scan({ data: [unclassified()] }));
+      useRepoUpstreams.mockReturnValue(verdicts());
+      render(<AllRepositoriesTable />);
+      expect(screen.getByText("Checking")).toBeTruthy();
+      expect(screen.queryByText(/up to date with upstream/)).toBeNull();
+    });
+
+    /// #1042's hard requirement: a repository whose classification FAILED
+    /// must render its failure, never keep promising. `Upstream::Unknown`
+    /// is the state for "we asked and could not answer", and the hook
+    /// carries the refusal's own words into it.
+    it("renders a failed classification as a failure, not as a pending row", () => {
+      useWorktrees.mockReturnValue(scan({ data: [unclassified()] }));
+      useRepoUpstreams.mockReturnValue(
+        verdicts({
+          "/code/a": { kind: "unknown", n: "could not list worktrees: git exploded" } as Upstream,
+        }),
+      );
+      render(<AllRepositoriesTable />);
+      expect(screen.queryByText("Checking")).toBeNull();
+      // The refusal's OWN words, carried through rather than replaced
+      // with a sentence of the UI's: "could not list worktrees" is what
+      // the user needs in order to know which half failed.
+      expect(screen.getByText(/upstream unknown: could not list worktrees/)).toBeTruthy();
+    });
+
+    /// Rows resolve INDEPENDENTLY. One repository whose verdict has not
+    /// landed must not hold back a sibling whose has -- which is the
+    /// per-repository granularity the hook exists for, observable from
+    /// the outside only here.
+    it("fills a resolved row while a sibling is still outstanding", () => {
+      useWorktrees.mockReturnValue(
+        scan({
+          data: [
+            unclassified({ name: "a", path: "/a" }),
+            unclassified({ name: "b", path: "/b" }),
+          ],
+        }),
+      );
+      useRepoUpstreams.mockReturnValue(
+        verdicts({ "/a": { kind: "behind", n: 3 } as Upstream }),
+      );
+      render(<AllRepositoriesTable />);
+      expect(screen.getByText(/3 commits behind/)).toBeTruthy();
+      // And exactly one row is still waiting, not both and not none.
+      expect(screen.getAllByText("Checking")).toHaveLength(1);
+    });
+
+    /// The verdicts are keyed by PATH, which is the row's identity.
+    /// `name` is not unique across scan roots -- two roots may each hold
+    /// an `api` -- so a verdict keyed by name would land on the wrong
+    /// row, which is the most damaging thing this column could do.
+    it("matches verdicts to rows by path, not by name", () => {
+      useWorktrees.mockReturnValue(
+        scan({
+          data: [
+            unclassified({ name: "api", path: "/one/api" }),
+            unclassified({ name: "api", path: "/two/api" }),
+          ],
+        }),
+      );
+      useRepoUpstreams.mockReturnValue(
+        verdicts({ "/two/api": { kind: "untracked" } as Upstream }),
+      );
+      render(<AllRepositoriesTable />);
+      expect(screen.getByText(/no upstream — local only/)).toBeTruthy();
+      expect(screen.getAllByText("Checking")).toHaveLength(1);
+    });
+
+    /// The summary counts the LANDED verdicts, not the scan's blanks.
+    /// Before the fix this read "0 of 0", a ratio over a population that
+    /// had never been measured, and it would stay there forever.
+    it("counts the landed verdicts in the currency summary", () => {
+      useWorktrees.mockReturnValue(
+        scan({
+          data: [
+            unclassified({ name: "a", path: "/a" }),
+            unclassified({ name: "b", path: "/b" }),
+          ],
+        }),
+      );
+      useRepoUpstreams.mockReturnValue(
+        verdicts({
+          "/a": { kind: "current" } as Upstream,
+          "/b": { kind: "untracked" } as Upstream,
+        }),
+      );
+      render(<AllRepositoriesTable />);
+      expect(
+        screen.getByText(/1 of 1 repositories with an upstream are up to date/),
+      ).toBeTruthy();
+      expect(screen.getByText(/1 repository has no upstream to compare against/)).toBeTruthy();
+    });
+
+    /// The verdicts are asked for BY PATH, one query per repository. Not
+    /// a single call for everything, which is what would let one slow
+    /// repository hold the whole table.
+    it("asks for a verdict for every scanned repository, by path", () => {
+      useWorktrees.mockReturnValue(
+        scan({
+          data: [
+            unclassified({ name: "a", path: "/a" }),
+            unclassified({ name: "b", path: "/b" }),
+          ],
+        }),
+      );
+      render(<AllRepositoriesTable />);
+      expect(useRepoUpstreams).toHaveBeenCalledWith(["/a", "/b"]);
+    });
   });
 });

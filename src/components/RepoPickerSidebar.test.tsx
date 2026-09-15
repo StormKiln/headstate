@@ -42,9 +42,13 @@ vi.mock("./SettingsDialog", () => ({
     <div role="dialog">Settings: {initialSection}</div>
   ),
 }));
+/// A STABLE spy, not a fresh `vi.fn()` per render: #1043's requirement
+/// is about what clicking the All Repositories row DOES, and a mock
+/// recreated on every render has no call to assert on afterwards.
+const setFilter = vi.hoisted(() => vi.fn());
 vi.mock("@/store/filters", () => ({
   useActiveFilters: () => ({ repo: selected.repo }),
-  useFilters: () => ({ setFilter: vi.fn() }),
+  useFilters: () => ({ setFilter }),
 }));
 
 import { RepoPickerSidebar } from "./RepoPickerSidebar";
@@ -66,6 +70,7 @@ beforeEach(() => {
   scan.unreadable = [];
   scan.dirs = ["/code"];
   selected.repo = undefined;
+  setFilter.mockReset();
 });
 
 describe("RepoPickerSidebar", () => {
@@ -262,9 +267,102 @@ describe("RepoPickerSidebar", () => {
       render(<RepoPickerSidebar reviewingCount={0} />);
       const rows = screen.getAllByRole("button");
       expect(rows.some((r) => r.getAttribute("aria-current") === "false")).toBe(false);
-      // With nothing scoped, no row claims to be the current one -- this
-      // column has no "All repositories" entry to fall back to.
+      // With nothing scoped AND no `allLabel`, no row claims to be the
+      // current one -- this column has no entry to fall back to. That is
+      // still true for Packages and CLAUDE.md, which pass no label; the
+      // Repositories view's row is covered below.
       expect(rows.some((r) => r.getAttribute("aria-current") !== null)).toBe(false);
+    });
+  });
+
+  /// #1043: the Repositories view lands on All Repositories, and the
+  /// sidebar had no item for it. The overview was a STATE (no repository
+  /// selected) rather than a destination, so there was nothing to click
+  /// -- and once a repository was picked, no way back except deselecting,
+  /// which nothing on screen offered.
+  describe("the All Repositories item", () => {
+    const allRow = () => screen.getByText("All Repositories").closest("button");
+
+    it("is absent for the views that pass no label", () => {
+      repos.mockReturnValue([repo("alpha")]);
+      render(<RepoPickerSidebar reviewingCount={0} />);
+      expect(screen.queryByText("All Repositories")).toBeNull();
+    });
+
+    it("is pinned above the repository list when a label is given", () => {
+      repos.mockReturnValue([repo("alpha"), repo("beta")]);
+      render(<RepoPickerSidebar reviewingCount={0} allLabel="All Repositories" />);
+      const labels = screen.getAllByRole("button").map((b) => b.textContent);
+      // FIRST, above the list -- the position `WorktreeSidebar` and
+      // `RepoSidebar` both put theirs in. A row below the repositories
+      // would be a different affordance, found only by scrolling past
+      // however many repositories the machine has.
+      expect(labels[0]).toBe("All Repositories");
+      expect(labels.slice(1)).toEqual(["alpha", "beta"]);
+    });
+
+    /// The landing state must be visibly current, not merely implicit.
+    it("is the current item when no repository is chosen", () => {
+      repos.mockReturnValue([repo("alpha")]);
+      selected.repo = undefined;
+      render(<RepoPickerSidebar reviewingCount={0} allLabel="All Repositories" />);
+      expect(allRow()?.getAttribute("aria-current")).toBe("true");
+      expect(
+        screen.getByText("alpha").closest("button")?.getAttribute("aria-current"),
+      ).toBeNull();
+    });
+
+    /// And it yields the claim the moment a repository is picked. Two
+    /// `aria-current` rows would announce two locations at once.
+    it("yields to the repository row once one is chosen", () => {
+      repos.mockReturnValue([repo("alpha")]);
+      selected.repo = "/code/alpha";
+      render(<RepoPickerSidebar reviewingCount={0} allLabel="All Repositories" />);
+      expect(allRow()?.getAttribute("aria-current")).toBeNull();
+      expect(
+        screen.getByText("alpha").closest("button")?.getAttribute("aria-current"),
+      ).toBe("true");
+    });
+
+    /// #1043's named requirement, and the defect it names: `current()`
+    /// from `@/lib/ariaCurrent`, never a bare boolean. A boolean
+    /// serialises `false` to the literal string "false", which some
+    /// screen readers announce as current -- so an unselected row would
+    /// say out loud that it is the one you are on. That shipped in #1037
+    /// and was fixed in #1039; this pins that it cannot come back HERE.
+    it("never serialises aria-current as the string false", () => {
+      repos.mockReturnValue([repo("alpha"), repo("beta")]);
+      selected.repo = "/code/alpha";
+      render(<RepoPickerSidebar reviewingCount={0} allLabel="All Repositories" />);
+      const rows = screen.getAllByRole("button");
+      expect(rows.some((r) => r.getAttribute("aria-current") === "false")).toBe(false);
+      // Exactly one current row, which is the other half of the same
+      // property: absence is how "not current" is spelled.
+      expect(rows.filter((r) => r.getAttribute("aria-current") !== null)).toHaveLength(1);
+    });
+
+    /// Clicking it returns to the overview. `setFilter("repo",
+    /// undefined)` is the whole of it -- the store clears `repoPath` and
+    /// `repoFile` for the `repo` key itself, so a click three directories
+    /// into a file tree cannot carry that position anywhere.
+    it("clears the selected repository when clicked", () => {
+      repos.mockReturnValue([repo("alpha")]);
+      selected.repo = "/code/alpha";
+      render(<RepoPickerSidebar reviewingCount={0} allLabel="All Repositories" />);
+      fireEvent.click(allRow() as HTMLElement);
+      expect(setFilter).toHaveBeenCalledWith("repo", undefined);
+    });
+
+    /// It does not depend on the scan, unlike every arm above it. A view
+    /// whose own landing page becomes unreachable because the repository
+    /// walk failed is the failure this row exists to remove -- and the
+    /// failure arm is exactly when a user most wants to get back to the
+    /// overview, which says what went wrong.
+    it("is still reachable when the scan found nothing", () => {
+      repos.mockReturnValue([]);
+      render(<RepoPickerSidebar reviewingCount={0} allLabel="All Repositories" />);
+      expect(allRow()).toBeTruthy();
+      expect(allRow()?.getAttribute("aria-current")).toBe("true");
     });
   });
 });

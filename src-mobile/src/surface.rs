@@ -76,6 +76,17 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("repo_tree", Class::Read),
     ("repo_file", Class::Read),
     ("classify_worktrees", Class::Read),
+    // The All Repositories table's Status column, one repository at a
+    // time (#1042). A Read: it lists one repository's worktrees and
+    // inspects the refs already on disk for the main checkout. It does
+    // NOT fetch -- that property is measured (#1026) and is the reason
+    // the column qualifies every verdict by ref age instead.
+    //
+    // Exposed for `classify_worktrees`' reason, one row down: the phone
+    // asks the same question the desktop's overview does, and the bound
+    // that matters (`CLASSIFY_TIMEOUT`) lives inside the command, so a
+    // `remote_call` inherits it rather than needing a second copy.
+    ("classify_repo_upstream", Class::Read),
     ("size_worktrees", Class::Read),
     ("list_branches", Class::Read),
     ("scan_artifacts", Class::Read),
