@@ -79,6 +79,14 @@
 //! message beats a boolean: they send the user to three different places,
 //! and only the message distinguishes them.
 
+/// What an Update All run is doing, and how the last one ended (#1016).
+///
+/// Beside the browser rather than inside `worktrees`, because it is a
+/// registry of RUNS and not git plumbing: `worktrees::update` has no
+/// AppHandle and no state by design, which is what keeps it testable
+/// without a running app.
+pub mod runs;
+
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 

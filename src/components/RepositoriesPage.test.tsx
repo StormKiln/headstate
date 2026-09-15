@@ -114,6 +114,15 @@ vi.mock("../api/hooks", () => ({
     error: state.fileFailed ? new Error("No such file or directory") : undefined,
     refetch: refetchFile,
   }),
+  // `UpdateAllButton` mounts inside `AllRepositoriesTable` (#1012) and
+  // reads three more hooks from this module. Stubbed for the same reason
+  // `unreadable` above is answered: an absent hook throws and the
+  // no-repository arm never renders, which would make the assertions
+  // below fail for a reason that has nothing to do with the browser.
+  // The button's own conduct is `UpdateAllButton.test.tsx`'s subject.
+  useUpdateAllRepositories: () => vi.fn(),
+  useCancelUpdateAll: () => vi.fn(),
+  useUpdateAllProgress: () => null,
 }));
 
 vi.mock("@/store/filters", async (orig) => ({
@@ -170,10 +179,16 @@ describe("the repository browser's listing", () => {
   it("shows the All Repositories overview when no repository is picked", () => {
     state.repo = undefined;
     render(<RepositoriesPage />);
-    // The table's own heading, not a string this page owns, so the
+    // The table's own HEADING, not a string this page owns, so the
     // assertion fails if the table stops rendering rather than if
     // somebody rewords a prompt.
-    expect(screen.getByText(/all repositories/i)).toBeTruthy();
+    //
+    // By ROLE rather than by text: "Update All Repositories" is the
+    // button the table now carries (#1012), so a bare text match finds
+    // two elements and fails for a reason that has nothing to do with
+    // the seam this test guards. The heading is the thing meant all
+    // along -- the comment above said so before the button existed.
+    expect(screen.getByRole("heading", { name: /all repositories/i })).toBeTruthy();
   });
 
   /// And the instruction survives beside it. A table with no next step

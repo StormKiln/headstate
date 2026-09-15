@@ -384,6 +384,10 @@ pub const SURFACE: &[(&str, Class)] = &[
     // How a run is going, or how it ended. The resume path: a
     // suspended phone holds no event stream, so it asks instead.
     ("update_run_state", Class::Read),
+    // How the Update All run is going, or how it ended (#1016). The same
+    // resume path as `update_run_state` above and `Read` for the same
+    // reason: it reads one in-memory registry and writes nothing.
+    ("update_all_state", Class::Read),
     // write: changes GitHub state through the existing write module, or
     // a desktop setting.
     ("act_on_pr", Class::Write),
@@ -413,6 +417,70 @@ pub const SURFACE: &[(&str, Class)] = &[
     // phone to do. They change the desktop but delete nothing, so
     // they do not carry the step-up signature.
     ("pull_checkout", Class::Write),
+    // Fast-forward every repository in the scan roots (#1019, #1012).
+    //
+    // WRITE, and the argument has three halves.
+    //
+    // **Not `Read`.** This table's `Read` means "no side effects on
+    // GitHub OR DISK" -- `fetch_refs` below refuses `Read` for a far
+    // smaller write. This moves branch refs and rewrites working tree
+    // files. Not close.
+    //
+    // **Not `Local`.** `Local`'s own test is "whether the phone could act
+    // on the answer, not whether the command touches the desktop --
+    // driving the desktop is what the companion is for", and
+    // `pull_checkout` directly above settles the single-repository case
+    // deliberately in favour of exposure. On "a phone triggering a bulk
+    // mutation of a desktop's working trees": the phone is not the risk.
+    // The REFUSAL SET is the safety property, and it is identical
+    // whatever the caller -- a phone's `remote_call` routes through the
+    // same `worktrees::update`, inheriting its fresh per-repository dirty
+    // check, its `--ff-only`, and every refusal in it. There is no code
+    // path by which a phone can fast-forward a repository the desktop
+    // would not. That is the property `stats_board`'s row relies on: the
+    // limits live INSIDE the command, so exposure costs no second set to
+    // keep in sync. Classing it `Local` would also class by WHICH SCREEN
+    // calls it rather than by what it does, which `stats_tree`'s row
+    // rejects explicitly.
+    //
+    // **Not `Destructive`.** This table draws that line at DELETION, and
+    // says so four times -- unlock ("nothing is deleted"), `fetch_refs`
+    // ("passes no `--prune`, precisely so that it cannot delete"),
+    // `apply_updates_in_background` ("deleting nothing"). A `--ff-only`
+    // pull deletes nothing: it creates no merge commit, discards no
+    // commit, and on refusal leaves the working tree byte-identical.
+    // Dirty trees are refused outright, so there is no uncommitted work
+    // for it to touch. The closest precedent is
+    // `apply_updates_in_background` below -- already a bulk,
+    // long-running, cancellable working-tree mutation started from a
+    // phone -- and this has the smaller blast radius per unit: it writes
+    // no file contents of its own, only moving a branch to a commit that
+    // already exists on the remote.
+    //
+    // The counter-argument, stated because it deserves to be: Destructive
+    // is the only class carrying a step-up signature, and a bulk action
+    // across 45 repositories is where a mis-tap costs most. But step-up
+    // is not a general "are you sure" -- it is this table's marker for
+    // deletion, and stretching it to mean "large" would make the class
+    // mean two things and leave the next author unable to tell which.
+    // Confirmation for a bulk action belongs in the UI, where it can name
+    // the count and say what will be skipped; step-up can say neither.
+    //
+    // Exposed only because it can be STOPPED and its outcome read back
+    // after a suspension -- `cancel_update_all` and `update_all_state`
+    // ship in the same change, borrowing `apply_updates_in_background`'s
+    // own condition verbatim: *starting something you cannot stop or see
+    // the end of is not a feature*. That is a hard dependency, not a
+    // nicety: MEASURED, the worst case is 45 x `GIT_TIMEOUT` ~= 22
+    // minutes, and a phone holds no event stream while suspended.
+    //
+    // `pull_checkout` is NOT reclassified. Its row is load-bearing for
+    // the single-repository case, and this row does not change what one
+    // pull does. Nor is this a way to reach a laxer pull: the refusal set
+    // is inherited from `pull_checkout`, and if that ever stops being
+    // true this class argument collapses with it.
+    ("update_all_repositories", Class::Write),
+    ("cancel_update_all", Class::Write),
     // Refreshing one repository's remote refs (#788). WRITE, not Read.
     //
     // It mutates nothing on GitHub, which is what makes the Read
@@ -850,6 +918,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "get_worktree_dirs" => ok(commands::get_worktree_dirs(app.clone())),
         "get_ui_prefs" => ok(commands::get_ui_prefs(app.clone())),
         "update_run_state" => ok(commands::update_run_state(app.state(), a.get("repoPath")?)),
+        "update_all_state" => ok(commands::update_all_state(app.state())),
 
         // ---- write ------------------------------------------------------
         "act_on_pr" => res(commands::act_on_pr(
@@ -951,6 +1020,12 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         .await),
         "cancel_update_run" => res(commands::cancel_update_run(app.state(), a.get("repoPath")?)),
         "pull_checkout" => res(commands::pull_checkout(a.get("path")?).await),
+        // No arguments: the set comes from the desktop's own scan roots,
+        // re-derived inside the command, never from the caller. See the
+        // command's doc -- a caller-supplied path list would make this a
+        // way to pull arbitrary directories.
+        "update_all_repositories" => res(commands::update_all_repositories(app.clone()).await),
+        "cancel_update_all" => res(commands::cancel_update_all(app.state())),
         "fetch_refs" => res(commands::fetch_refs(a.get("path")?).await),
         // Shell out like the other sync Docker commands, so a slow
         // engine start does not stall the listener for everyone else.
@@ -1178,11 +1253,45 @@ mod tests {
             ("set_view_needs_github", Class::Write),
             ("apply_updates_in_background", Class::Write),
             ("cancel_update_run", Class::Write),
+            // Update All (#1019). Listed here with its two companions
+            // because the three are inseparable: the `Write` row was
+            // argued on the condition that the run can be STOPPED and its
+            // outcome read back after a suspension, so moving either of
+            // the other two to `Local` would silently withdraw the
+            // premise this row rests on.
+            ("update_all_repositories", Class::Write),
+            ("cancel_update_all", Class::Write),
+            ("update_all_state", Class::Read),
         ] {
             assert_eq!(
                 admit(name),
                 Ok(class),
                 "{name} must be drivable from a phone"
+            );
+        }
+    }
+
+    /// Update All is exposed ONLY because it can be stopped and read back
+    /// (#1019), borrowing `apply_updates_in_background`'s own condition:
+    /// *starting something you cannot stop or see the end of is not a
+    /// feature*.
+    ///
+    /// MEASURED, the worst case is 45 x `GIT_TIMEOUT` ~= 22 minutes, and
+    /// a suspended phone holds no event stream at all -- so a phone that
+    /// could start the run but neither stop it nor learn how it ended is
+    /// exactly what that sentence refuses. This test is the gate: remove
+    /// either companion from the surface and the bulk row must go with
+    /// it.
+    #[test]
+    fn update_all_is_exposed_only_alongside_its_stop_and_its_readback() {
+        if admit("update_all_repositories").is_ok() {
+            assert!(
+                admit("cancel_update_all").is_ok(),
+                "a run a phone cannot stop must not be exposed to a phone"
+            );
+            assert!(
+                admit("update_all_state").is_ok(),
+                "a run whose end a phone cannot read must not be exposed to a phone"
             );
         }
     }

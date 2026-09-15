@@ -14,6 +14,7 @@
 mod assess;
 mod model;
 pub(crate) mod scan;
+mod update;
 
 pub use assess::{assess, Assessment};
 // `Repo` is still the payload `RepoScan` carries, so it stays exported
@@ -32,3 +33,13 @@ pub use scan::{
     remove_worktree, remove_worktree_forced, remove_worktrees_with_progress, repo_identity,
     scan_dirs_fast_reporting, size_repo_streaming, unlock_worktree, RemovalOutcome, RepoScan,
 };
+// Update All (#1012). A loop over `pull_checkout` above, deliberately in
+// its own module: the refusal set is the feature, and it is long enough
+// to argue in one place rather than as a wing of the scan.
+//
+// `RepoUpdateOutcome` is the payload `UpdateAllReport` carries, so it
+// stays exported even though production code only ever names the report
+// -- the same reason `Repo` above carries the allow. A caller that wants
+// to destructure an outcome must be able to name its type.
+#[allow(unused_imports)]
+pub use update::{update_all_with, RepoUpdateOutcome, UpdateAllReport, UpdateResult};

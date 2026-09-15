@@ -72,6 +72,8 @@ import {
   removeWorktree,
   pullCheckout,
   fetchRefs,
+  updateAllRepositories,
+  cancelUpdateAll,
   removeOrphan,
   assessedWorktrees,
   dockerBuilds,
@@ -2158,6 +2160,78 @@ export function useFetchRefs() {
       void qc.invalidateQueries({ queryKey: ["worktree-safety"] });
       return out;
     });
+}
+
+/// Fast-forward every repository in the scan roots (#1012).
+///
+/// Invalidates exactly what `usePullCheckout` does, and for the same
+/// reason: `fetched_at` lives on the worktree LIST while the ahead/behind
+/// counts come from the CLASSIFICATION pass, so refreshing one without
+/// the other leaves the page half-updated -- a row whose age note says
+/// "just now" beside an ahead/behind from before the pull.
+///
+/// Invalidated even when the run reports failures or was cancelled, and
+/// that is deliberate: a partial run really did move some repositories,
+/// and leaving those rows saying "40 behind" would make a run that
+/// half-worked look like one that did nothing -- which is #346's exact
+/// report about the single-repository button.
+export function useUpdateAllRepositories() {
+  const qc = useQueryClient();
+  return () =>
+    updateAllRepositories().then((report) => {
+      void qc.invalidateQueries({ queryKey: ["worktrees"] });
+      void qc.invalidateQueries({ queryKey: ["worktree-safety"] });
+      return report;
+    });
+}
+
+/// Ask the Update All run to stop.
+///
+/// Rejects when nothing is running, which the caller must surface rather
+/// than swallow: a Cancel that appears to work on a run that already
+/// finished is its own small lie.
+export function useCancelUpdateAll() {
+  return () => cancelUpdateAll();
+}
+
+/// How far the Update All run has got, or null when idle.
+///
+/// The same shape as `useRemovalProgress` and `useUpdateProgress` beside
+/// it, and for a reason those two make with room to spare: removal was
+/// judged to warrant progress at ~30 seconds, and this run's BEST case is
+/// 40 seconds while its worst is 22 minutes. MEASURED -- 45 repositories,
+/// `git fetch --dry-run` at 25ms-1055ms each, and every call bounded by
+/// `GIT_TIMEOUT` at 30s when a remote is unreachable.
+///
+/// Counts only. The event carries no paths, which is the rule all three
+/// emitters state in identical terms: a progress event is not a place to
+/// leak what the user is working on. The paths are in the RESULT, where
+/// the user needs them.
+export function useUpdateAllProgress(): { done: number; total: number } | null {
+  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
+
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    listen<[number, number]>("update-all-progress", (e) => {
+      const [done, total] = e.payload;
+      // Cleared on the last one rather than leaving "45 of 45" on screen
+      // after the work is over; the returned report carries the outcome.
+      setProgress(done >= total ? null : { done, total });
+    }).then(
+      (fn) => {
+        if (cancelled) safeUnlisten(fn);
+        else unlisten = fn;
+      },
+      () => {},
+    );
+    return () => {
+      cancelled = true;
+      safeUnlisten(unlisten);
+    };
+  }, []);
+
+  return progress;
 }
 
 /// How big ONE orphaned directory is, measured when asked (#845).

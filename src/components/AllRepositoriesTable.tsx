@@ -5,6 +5,7 @@ import { QueryError, errorMessage } from "@/components/QueryError";
 import { repoCurrency, repoOverviewRows } from "@/lib/repoOverview";
 import type { RepoOverviewRow } from "@/lib/repoOverview";
 import { upstreamReasonAged, upstreamToneAged } from "@/lib/worktrees";
+import { UpdateAllButton } from "@/components/UpdateAllButton";
 
 /// The All Repositories overview: one row per repository, each saying how
 /// its main checkout stands against the ref it tracks (#1011).
@@ -114,6 +115,19 @@ export function AllRepositoriesTable() {
           name rather than by its first row. */}
       <h2 className="text-sm font-semibold text-[#e6edf3]">All Repositories</h2>
       <RepoCurrencySummary currency={currency} />
+      {/* The button belongs HERE, above the rows it acts on, and it is
+          handed the same `unreadable` the notice above renders (#1025).
+          `rows.length` rather than a literal: the label names the number
+          it can actually see when the scan fell short, and a measured
+          figure rendered as a string is correct on the day it is written
+          and describes someone else's machine from then on (#969).
+
+          What it is NOT handed is the table's verdicts. Every precondition
+          is re-derived inside the command at the moment of acting, per
+          repository -- this table's currency column is minutes old by the
+          time the button is pressed, and it is a reason to OFFER the
+          action, never the basis for performing it. */}
+      <UpdateAllButton count={rows.length} unreadable={unreadable} />
       <table className="w-full border-collapse text-sm">
         <caption className="sr-only">
           Every repository found in the scanned folders, and how its main checkout stands against

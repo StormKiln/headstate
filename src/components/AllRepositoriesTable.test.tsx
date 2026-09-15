@@ -6,7 +6,17 @@ import type { Upstream, Worktree, WorktreeRepo } from "@/types/pr";
 /// property under test is what the TABLE does with a scan -- including
 /// the `unreadable` half, which only the hook's wrapper shape carries.
 const useWorktrees = vi.hoisted(() => vi.fn());
-vi.mock("@/api/hooks", () => ({ useWorktrees }));
+/// `UpdateAllButton` mounts inside this table (#1012) and reads three
+/// more hooks from the same module, so the mock must carry them or the
+/// whole table fails to render. Stubbed rather than given behaviour: the
+/// button's own conduct is `UpdateAllButton.test.tsx`'s subject, and
+/// these tests are about what the TABLE does with a scan.
+vi.mock("@/api/hooks", () => ({
+  useWorktrees,
+  useUpdateAllRepositories: () => vi.fn(),
+  useCancelUpdateAll: () => vi.fn(),
+  useUpdateAllProgress: () => null,
+}));
 
 import { AllRepositoriesTable } from "./AllRepositoriesTable";
 

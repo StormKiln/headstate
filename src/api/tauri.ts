@@ -998,6 +998,95 @@ export type UpdateRunState =
 export const updateRunState = (repoPath: string) =>
   call<UpdateRunState | null>("update_run_state", { repoPath });
 
+/// --- Update All Repositories (#1012, epic #1011) ---------------------
+
+/// What happened to ONE repository in an Update All run (#1014).
+///
+/// Mirrors `UpdateResult` in `src-tauri/src/worktrees/update.rs`. Five
+/// states rather than an error-or-not, because an aggregate hides the
+/// only distinction that matters -- could-not versus did-not:
+///
+/// - `updated` — fast-forwarded, carrying git's own output.
+/// - `alreadyLevel` — nothing to do. A SUCCESS; never a failure row.
+/// - `skipped` — a deliberate non-action with a named reason (on a
+///   feature branch, dirty, detached, ahead, diverged). On a working
+///   machine this is the expected MAJORITY, and rendering these as errors
+///   would make the report unreadable.
+/// - `failed` — could not be read or reached. **These are the rows that
+///   need attention.**
+/// - `notAttempted` — the run stopped before reaching it. Distinct from
+///   both: nothing was decided about it at all.
+///
+/// Git's own message survives in every variant that has one. The
+/// categorisation is additional, never a replacement: "could not update"
+/// says nothing where git's refusal usually names the problem exactly.
+export type UpdateResult =
+  | { state: "updated"; message: string }
+  | { state: "alreadyLevel" }
+  | { state: "skipped"; reason: string }
+  | { state: "failed"; error: string }
+  | { state: "notAttempted" };
+
+/// One repository's outcome. The path is here — and deliberately NOT in
+/// the progress event — because the user needs to know which repository
+/// to go to, while a progress event is not a place to leak what they are
+/// working on. `remove_worktrees` draws exactly this line.
+export interface RepoUpdateOutcome {
+  path: string;
+  result: UpdateResult;
+}
+
+/// What an Update All run did.
+///
+/// Mirrors `UpdateAllReport`. `outcomes` holds exactly one entry per
+/// repository in the scan, in the scan's order — never an aggregate, and
+/// a caller wanting "12 of 45" derives it from this.
+export interface UpdateAllReport {
+  outcomes: RepoUpdateOutcome[];
+  /// The user stopped it. Not a failure: the repositories fast-forwarded
+  /// before the stop really were.
+  cancelled: boolean;
+  /// The run's wall-clock ceiling fired. Also not a failure: it ran out
+  /// of the time it was given.
+  timedOut: boolean;
+  /// Paths the SCAN could not read (#1025).
+  ///
+  /// Carried so a user reading only the result still learns the set was
+  /// short. These are NOT repositories and must never be counted as
+  /// skipped or failed ones — they are a hole in the list, and summing
+  /// them into a per-repository outcome would invent rows for things that
+  /// were never enumerated.
+  unreadable: string[];
+}
+
+/// Fast-forward every repository in the configured scan roots.
+///
+/// Takes NO path list: the set is re-derived from the scan roots inside
+/// the command, because the table's verdict is minutes old by the time
+/// the button is pressed and may decide what to OFFER, never what to DO.
+///
+/// Resolves with an outcome per repository rather than throwing on the
+/// first refusal. Partial completion is the design, not the exception.
+export const updateAllRepositories = () =>
+  call<UpdateAllReport>("update_all_repositories");
+
+/// Ask the Update All run to stop.
+///
+/// It stops after the repository it is on, never during one — a `git
+/// pull` killed mid-write leaves a repository this app has no story for.
+/// Rejects when nothing is running.
+export const cancelUpdateAll = () => call<void>("cancel_update_all");
+
+/// How the Update All run is going, or how it ended.
+///
+/// The read for a client that was not listening. Null when this desktop
+/// has run none.
+export type UpdateAllState =
+  | { state: "running"; done: number; total: number }
+  | { state: "done"; report: UpdateAllReport };
+
+export const updateAllState = () => call<UpdateAllState | null>("update_all_state");
+
 // ---------------------------------------------------------------------
 // Phone pairing (mobile companion). Rust side: src-tauri/src/remote/pairing.rs
 // Callers: the pairing hooks in hooks.ts, behind Settings > Phone.

@@ -289,6 +289,14 @@ const ROWS: Row[] = [
   // (or, over the wire, the paired desktop). The ~5s it costs is a
   // property of `nettop`, not of anything a caller could narrow.
   row(api.systemNetworkProcesses, [], "system_network_processes"),
+  // Update All (#1012). ARGUMENT-FREE, and that is the property worth
+  // pinning here: the set comes from the desktop's own scan roots,
+  // re-derived inside the command, never from a path list the caller
+  // supplies. A row that grew an argument would be a way to pull
+  // arbitrary directories, and this test is where that would show up.
+  row(api.updateAllRepositories, [], "update_all_repositories"),
+  row(api.cancelUpdateAll, [], "cancel_update_all"),
+  row(api.updateAllState, [], "update_all_state"),
 ];
 
 describe("tauri.ts wrappers through the transport", () => {
