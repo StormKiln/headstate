@@ -1233,10 +1233,6 @@ mod tests {
     /// single days it cannot cut.
     fn probe_body(aliases: &[String]) -> serde_json::Value {
         let mut data = serde_json::Map::new();
-        data.insert(
-            "rateLimit".into(),
-            json!({ "cost": 1, "remaining": 4000, "resetAt": "2026-09-15T17:00:00Z" }),
-        );
         for a in aliases {
             data.insert(a.clone(), json!({ "issueCount": 5000 }));
         }
@@ -1252,10 +1248,6 @@ mod tests {
     /// nothing about the stalled ones.
     fn detail_body(aliases: &[String]) -> serde_json::Value {
         let mut data = serde_json::Map::new();
-        data.insert(
-            "rateLimit".into(),
-            json!({ "cost": 1, "remaining": 4000, "resetAt": "2026-09-15T17:00:00Z" }),
-        );
         for a in aliases {
             let n: u64 = a.trim_start_matches('s').parse().unwrap_or(0);
             data.insert(

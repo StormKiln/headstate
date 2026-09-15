@@ -1915,4 +1915,118 @@ mod tests {
             unreachable.join("\n  ")
         );
     }
+
+    /// No test mock anywhere may supply `rateLimit.remaining` (#1048).
+    ///
+    /// # The defect this is the generalisation of
+    ///
+    /// `client.rs` already carries this rule, as
+    /// `no_mock_here_arms_the_process_wide_budget_race` (#875), and its
+    /// doc comment states the hazard exactly: a mock response carrying
+    /// `rateLimit.remaining` makes `map_rate_limit` return `Some`, which
+    /// calls `budget::note_remaining`, which stores to the PROCESS-WIDE
+    /// `OBSERVED_REMAINING`. Async tests structurally cannot take
+    /// `observed_test_lock()` -- it returns a `std::sync::MutexGuard` and
+    /// clippy's `await_holding_lock` under `-D warnings` refuses to let
+    /// one be held across an `.await` -- so such a mock arms a race that
+    /// surfaces as a flake in `budget.rs`, in another file entirely.
+    ///
+    /// That guard scanned ONE file: `include_str!("client.rs")`. #1044
+    /// then added async mock-server tests to `board.rs`, whose two fixture
+    /// bodies each supplied `"remaining": 4000` -- the precise arming
+    /// condition, in the one file the guard could not see.
+    ///
+    /// It was not hypothetical. It failed `platform (windows-latest)` on
+    /// the v5.20.0 tag with
+    /// `the_observed_figure_recovers_after_the_window_rolls_over` panicking
+    /// at its FIRST assertion ("under the reserve, so refused"), which
+    /// reads the figure right after writing 80. The release gate refused
+    /// the tag and published nothing. Measured directly, by probing the
+    /// static at the end of the board load: `Some(4000)`.
+    ///
+    /// # Why a tree-wide scan rather than a second copy
+    ///
+    /// A per-file guard protects the file it names and nothing else, and
+    /// the next mock-server test in a third file would re-arm this in
+    /// exactly the same way. This walks every Rust file in both crates, so
+    /// a new file is covered without anyone remembering to add it -- the
+    /// property this module's own header argues for.
+    #[test]
+    fn no_test_mock_arms_the_process_wide_budget_race() {
+        let mut offenders: Vec<String> = Vec::new();
+        for (_, root) in crate_roots() {
+            for file in rust_files(&root) {
+                let Ok(src) = std::fs::read_to_string(&file) else {
+                    continue;
+                };
+                let rel = file
+                    .strip_prefix(&root)
+                    .unwrap_or(&file)
+                    .display()
+                    .to_string();
+                // This file states the rule in prose and in its own
+                // assertion message; a guard that reports itself reports
+                // nothing useful. Skipped by PATH, never by comment
+                // matching, for the reason #874's sabotage proof found:
+                // accepting a comment in place of code is the trap these
+                // source-reading guards fall into.
+                if rel.contains("invariants.rs") {
+                    continue;
+                }
+                // Line endings normalised before any byte pattern runs:
+                // a Windows checkout with `core.autocrlf` has CRLF, and a
+                // `\n`-anchored split would find no test module and scan
+                // nothing -- a silent pass on the one platform where this
+                // defect actually fired.
+                let src = src.replace("\r\n", "\n");
+                // The TEST module only. A `rateLimit` selection in a real
+                // document is the feature working as intended.
+                let Some((_, tests)) = src.split_once("\nmod tests {") else {
+                    continue;
+                };
+                // Only files whose test module is ASYNC. A sync test can
+                // take `observed_test_lock()` and several correctly do --
+                // `fetch.rs`'s `a_wave_is_refused_once_the_budget_is_under_the_reserve`
+                // supplies `rateLimit.remaining` three times and is safe,
+                // because it holds the lock and restores the static. The
+                // hazard is specifically a mock reachable from a test that
+                // CANNOT hold the lock across its `.await`.
+                if !tests.contains("#[tokio::test]") {
+                    continue;
+                }
+                let lines: Vec<&str> = tests.lines().collect();
+                for (n, line) in lines.iter().enumerate() {
+                    let t = line.trim_start();
+                    if t.starts_with("///") || t.starts_with("//") {
+                        continue;
+                    }
+                    // `remaining` is the load-bearing field: it is what
+                    // `map_rate_limit` needs to return `Some`. A mock may
+                    // carry `cost` or `resetAt` without arming anything.
+                    if !(line.contains("remaining") && line.contains(':')) {
+                        continue;
+                    }
+                    // Only inside a rateLimit-shaped fixture, which is how
+                    // the field reaches `map_rate_limit`.
+                    let lo = n.saturating_sub(4);
+                    if lines[lo..(n + 2).min(lines.len())]
+                        .iter()
+                        .any(|l| l.contains("rateLimit"))
+                    {
+                        offenders.push(format!("{rel}: {}", line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a test mock supplies `rateLimit.remaining`, which writes the \
+             process-wide OBSERVED_REMAINING and arms the cross-test race \
+             that async tests cannot lock against (#1048, and #875 before \
+             it). Drop the field from the mock -- no test needs it -- or \
+             adopt an async form of `observed_test_lock` and delete this \
+             guard deliberately. Offending lines:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
 }
