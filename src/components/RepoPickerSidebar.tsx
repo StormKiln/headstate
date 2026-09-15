@@ -14,7 +14,33 @@ import { ViewSwitcher } from "./ViewSwitcher";
 /// `ArtifactSidebar`, which groups by artifact kind. Those carry
 /// information this does not have, and bending either into a shared
 /// component would mean passing empty decorations through it.
-export function RepoPickerSidebar({ reviewingCount }: { reviewingCount: number }) {
+///
+/// # `allLabel`, and why it is opt-in (#1043)
+///
+/// Three views share this list -- Packages, CLAUDE.md and Repositories --
+/// and only one of them has a landing state worth a row. The Repositories
+/// view renders the All Repositories overview when no repository is
+/// chosen, so that state is a DESTINATION and needs an entry to click;
+/// Packages and CLAUDE.md render a one-line prompt there ("Choose a
+/// repository to see what is out of date"), which is a prompt rather than
+/// a page, and giving it a permanent selected row would announce an
+/// empty view as somewhere you are.
+///
+/// So the row is passed in by the view that has something behind it,
+/// rather than being unconditional here or being a fourth copy of this
+/// component. `WorktreeSidebar` and `RepoSidebar` both carry their own
+/// "All repositories" row already; this is the same affordance in the
+/// same position, and the label is a prop only because the overview it
+/// leads to is named "All Repositories" on screen and the two must match.
+export function RepoPickerSidebar({
+  reviewingCount,
+  allLabel,
+}: {
+  reviewingCount: number;
+  /// The label for a pinned row above the repository list that clears
+  /// the selection, or `undefined` for no such row. See above.
+  allLabel?: string;
+}) {
   const filters = useActiveFilters();
   const { setFilter } = useFilters();
   // The SAME repository list the worktree view uses -- one scan, one
@@ -193,6 +219,46 @@ export function RepoPickerSidebar({ reviewingCount }: { reviewingCount: number }
                   "may not be all of them."
             }
           />
+        ) : null}
+        {/* The landing state, as a DESTINATION (#1043).
+
+            Pinned above the list and outside it, the position
+            `WorktreeSidebar` and `RepoSidebar` both put theirs in. Before
+            this, the Repositories view rendered its overview in the
+            `!repo` branch and the sidebar listed only repositories, so the
+            overview was a state with no entry to click -- and once a
+            repository was picked there was no way back to it except
+            deselecting, which nothing on screen offered.
+
+            It is rendered even while the scan is loading, failing or
+            empty, which is the opposite of the arms above: those describe
+            what the scan FOUND, and this does not depend on the scan at
+            all. A view whose landing page is unreachable during a failed
+            scan is the failure mode this row exists to remove.
+
+            `current()` from `@/lib/ariaCurrent`, never a bare boolean. A
+            boolean serialises `false` to the literal string "false",
+            which some screen readers announce as current -- so every
+            inactive row would claim to be the one you are on. That exact
+            defect shipped in #1037 and was fixed in #1039; this is the
+            helper that exists so it cannot come back.
+
+            `setFilter("repo", undefined)` clears `repoPath` and
+            `repoFile` as well, and does so INSIDE the store rather than
+            here: `filters.ts` resets them for the `repo` key precisely so
+            that no caller has an ordering to get wrong. Clicking this
+            while three directories into a file tree returns to the
+            overview, not to a stale position in a repository that is no
+            longer selected. */}
+        {allLabel !== undefined ? (
+          <button
+            type="button"
+            onClick={() => setFilter("repo", undefined)}
+            aria-current={current(!filters.repo)}
+            className={rowClass(!filters.repo)}
+          >
+            <span className="truncate">{allLabel}</span>
+          </button>
         ) : null}
         {repos.map((r) => (
           <button

@@ -2575,6 +2575,106 @@ pub fn classify_repo_streaming(
     Ok(())
 }
 
+/// The MAIN CHECKOUT of one repository, classified (#1042).
+///
+/// The All Repositories table summarises one row per repository, and the
+/// only field on that row that carries information is `upstream`. Until
+/// this existed, nothing in the shipped binary ever populated it: the
+/// sole writer is `classify`, which `collect_inner` calls only behind
+/// `with_safety`, and every production caller reaches the scan through
+/// `scan_dirs_fast_reporting`, which passes `false`. The deep path that
+/// would have set it, `scan_dirs_reporting`, is `#[cfg(test)]`. So the
+/// table's Status column was a skeleton BY CONSTRUCTION rather than by
+/// race -- `upstream` was `None` for every row, always.
+///
+/// # Why one worktree and not the repository
+///
+/// `classify_repo_streaming` beside this classifies EVERY worktree, and
+/// that is the right shape for the Worktrees page, which renders every
+/// worktree. The overview renders exactly one row per repository and that
+/// row is the main checkout, so classifying the other 144 worktrees of a
+/// 145-worktree repository would be work whose entire output is
+/// discarded. The porcelain listing already says which record is the main
+/// one (`parse_porcelain` marks the first), so this picks it and stops.
+///
+/// # Why it is cheap, and bounded anyway
+///
+/// The main checkout is the cheapest worktree there is: `worktree_safety`
+/// returns `Safety::MainCheckout` on `is_main` before running a single
+/// git command, which is `classify_within`'s stated reason for not
+/// spending a thread on it. What remains is `upstream_state`, one
+/// `log -1`, and no merge date (a main checkout is never `is_safe`).
+///
+/// It is still routed through `classify_within` with `CLASSIFY_TIMEOUT`,
+/// so a repository whose git hangs becomes a verdict rather than an
+/// unbounded wait. That is #830's guarantee restated for this table: a
+/// row must hear SOMETHING, because a skeleton is a promise that a value
+/// is coming and #830 is what that promise looks like when it is never
+/// kept.
+///
+/// # It does not fetch, deliberately
+///
+/// `upstream_state` reads refs already on disk and nothing here adds a
+/// fetch. That property is measured (#1026): of the 38 repositories in
+/// the reporting machine's scan root exactly one was fresh, and of 8
+/// sampled against `git ls-remote`, 4 would have printed a green "up to
+/// date" while actually behind. The table QUALIFIES every verdict by the
+/// age of the refs behind it instead, through `upstreamReasonAged`.
+/// Fetching on behalf of a landing page would be a network call to every
+/// remote in the scan root because somebody opened a view -- 13 of which
+/// have never been contacted from that machine at all.
+///
+/// # Errors
+///
+/// `Err` only when the repository could not be LISTED -- the same refusal
+/// `classify_repo_streaming` makes, and for the same reason: an empty
+/// answer resolved as success is what leaves a row on a skeleton forever.
+/// A repository that lists but carries no main record is also an `Err`,
+/// not a silent absence: the caller has a row on screen for it already
+/// and needs something to render in the cell.
+pub fn classify_main_checkout(repo_path: &str) -> Result<Worktree, String> {
+    let dir = Path::new(repo_path);
+    let list = git(dir, &["worktree", "list", "--porcelain"])
+        .map_err(|e| format!("could not list worktrees: {e}"))?;
+    let branch = default_branch(dir);
+    let mut w = parse_porcelain(&list)
+        .into_iter()
+        .find(|w| w.is_main)
+        .ok_or_else(|| format!("{repo_path} has no main checkout"))?;
+
+    // DIAGNOSTIC LOGGING (Settings > diagnostic log), the shape
+    // `classify_repo_streaming` logs in: the total says a view was slow,
+    // this says WHICH repository made it slow.
+    let started = std::time::Instant::now();
+    let ok = classify_within(&mut w, dir, &branch, CLASSIFY_TIMEOUT);
+    crate::diag!(
+        "[diag] repo-upstream {} {}ms {}",
+        w.path,
+        started.elapsed().as_millis(),
+        if ok {
+            safety_label(&w.safety).to_string()
+        } else {
+            format!("ABANDONED after {}s", CLASSIFY_TIMEOUT.as_secs())
+        }
+    );
+
+    // An abandoned classification leaves `safety` as `Unknown` and
+    // `upstream` UNTOUCHED -- which is `None`, the very skeleton this
+    // function exists to end. So it is filled here with the verdict that
+    // says so. `Upstream::Unknown` is the arm for "we asked and could not
+    // answer", distinct from `None`'s "we have not asked yet", and the
+    // frontend renders it as a failure rather than as a promise. The same
+    // distinction `Safety::Pending` and `Safety::Unknown` already draw,
+    // on the field this table actually reads.
+    if w.upstream.is_none() {
+        w.upstream = Some(Upstream::Unknown(format!(
+            "classification did not finish within {}s",
+            CLASSIFY_TIMEOUT.as_secs()
+        )));
+    }
+    Ok(w)
+}
+
 /// Every repo with its worktrees fully classified, in one pass.
 ///
 /// Only the live test uses this: production lists first and classifies
@@ -3670,6 +3770,174 @@ prunable gitdir file points to non-existent location
         run_in(&repo, &["commit", "-q", "--allow-empty", "-m", "two"]);
         run_in(&repo, &["push", "-q", "origin", "main"]);
         (tmp, repo, wt)
+    }
+
+    /// The All Repositories overview, end to end through the SHIPPED
+    /// configuration (#1042).
+    ///
+    /// # Why the existing coverage missed this
+    ///
+    /// `classify` populates `upstream`, and it was thoroughly tested --
+    /// but every one of those tests either calls `classify` /
+    /// `classify_within` directly, or goes through `scan_dirs_reporting`,
+    /// which is `#[cfg(test)]` and passes `with_safety: true`. Production
+    /// reaches the walk only through `scan_dirs_fast_reporting`, which
+    /// passes `false`, so `collect_inner` never called `classify` in the
+    /// shipped binary at all. The one configuration that actually ships
+    /// was precisely the one nothing exercised, and the result was a
+    /// Status column that skeletoned forever with nothing in the logs --
+    /// because there was no failing call, there was no call.
+    ///
+    /// So these tests start from `scan_dirs_fast_reporting`, the function
+    /// `list_worktrees` calls, and assert on what the table can actually
+    /// render from the production pipeline.
+    mod repo_overview {
+        use super::super::{classify_main_checkout, scan_dirs_fast_reporting, Upstream};
+        use super::merged_worktree_fixture;
+
+        /// THE regression test for #1042.
+        ///
+        /// The fast scan is the production entry point and it deliberately
+        /// leaves `upstream` unset -- that half is asserted here too, so
+        /// that a future change flipping `with_safety` to `true` (the fix
+        /// #1042 explicitly refuses, because it would classify ~295
+        /// worktrees to render 38 rows) fails loudly rather than passing
+        /// this test for the wrong reason.
+        ///
+        /// What must be true is that the PIPELINE resolves it: scan, then
+        /// `classify_main_checkout` per repository, and the row the table
+        /// renders has a real verdict rather than a skeleton.
+        #[test]
+        fn the_production_pipeline_resolves_a_repository_upstream() {
+            let (_tmp, repo, _wt) = merged_worktree_fixture();
+            let base = repo.parent().unwrap();
+
+            let scan = scan_dirs_fast_reporting(&[base.to_string_lossy().into_owned()]);
+            let listed = scan
+                .repos
+                .iter()
+                .find(|r| r.path == repo.to_string_lossy())
+                .expect("the fixture repository must be scanned");
+
+            // The scan itself does no classification, and that is the
+            // deliberate property this fix had to preserve.
+            let main = listed
+                .worktrees
+                .iter()
+                .find(|w| w.is_main)
+                .expect("the scan must list a main checkout");
+            assert!(
+                main.upstream.is_none(),
+                "the fast scan must stay fast: it classifies nothing"
+            );
+
+            // And the second pass is what fills the cell.
+            let classified = classify_main_checkout(&listed.path)
+                .expect("the main checkout of a healthy repository must classify");
+            assert!(
+                classified.is_main,
+                "the row the overview renders is the MAIN checkout, not some other worktree"
+            );
+            let upstream = classified.upstream.expect(
+                "#1042: the production path must yield a resolved upstream, not a skeleton",
+            );
+            // The fixture pushed `main` to its origin and then pushed
+            // again, so the checkout is level with the ref it tracks.
+            // Asserted by VALUE rather than merely `is_some`, so a stub
+            // returning a placeholder cannot satisfy this.
+            assert_eq!(
+                upstream,
+                Upstream::Current,
+                "a checkout level with its pushed upstream reads as current"
+            );
+        }
+
+        /// Every repository in the scan gets a cell, not just the lucky
+        /// ones: the table renders one row per repository and each must
+        /// leave Pending on its own.
+        ///
+        /// The second repository here has no remote at all, which is the
+        /// ordinary case on a real machine -- six of the 38 repositories
+        /// in the reporting scan root are local-only. `Untracked` is a
+        /// real answer and is not a failure, so the row must land on it
+        /// rather than waiting for a comparison that will never happen.
+        #[test]
+        fn every_scanned_repository_reaches_a_verdict() {
+            let (_tmp, repo, _wt) = merged_worktree_fixture();
+            let base = repo.parent().unwrap();
+            // `PathBuf::join`, never `format!("{}/...")`: `canonicalize`
+            // returns verbatim `\\?\C:\` paths on Windows and string
+            // concatenation onto one does not survive.
+            let local_only = base.join("localonly");
+            std::fs::create_dir_all(&local_only).unwrap();
+            for args in [
+                &["init", "-q", "-b", "main"][..],
+                &["commit", "-q", "--allow-empty", "-m", "one"][..],
+            ] {
+                let out = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&local_only)
+                    .args(args)
+                    .envs([
+                        ("GIT_AUTHOR_NAME", "octocat"),
+                        ("GIT_COMMITTER_NAME", "octocat"),
+                        ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+                        ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "git {args:?} failed");
+            }
+
+            let scan = scan_dirs_fast_reporting(&[base.to_string_lossy().into_owned()]);
+            assert!(
+                scan.repos.len() >= 2,
+                "both fixtures must be scanned: {:?}",
+                scan.repos.iter().map(|r| &r.name).collect::<Vec<_>>()
+            );
+
+            for r in &scan.repos {
+                let w = classify_main_checkout(&r.path)
+                    .unwrap_or_else(|e| panic!("{} must reach a verdict: {e}", r.name));
+                assert!(
+                    w.upstream.is_some(),
+                    "{} left its cell on a skeleton",
+                    r.name
+                );
+            }
+
+            let local = scan
+                .repos
+                .iter()
+                .find(|r| r.name == "localonly")
+                .expect("the local-only repository must be scanned");
+            assert_eq!(
+                classify_main_checkout(&local.path).unwrap().upstream,
+                Some(Upstream::Untracked),
+                "a repository with no remote has no upstream, which is an ANSWER"
+            );
+        }
+
+        /// A repository that cannot be classified must produce something
+        /// the row can render -- never silence.
+        ///
+        /// #1042's requirement, and the reason `Upstream::Unknown` exists
+        /// separately from `None`: `None` means "not computed yet" and is
+        /// a promise that a value is coming. A row that can never be
+        /// classified must not keep making that promise.
+        #[test]
+        fn a_repository_that_cannot_be_listed_fails_loudly() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let not_a_repo = tmp.path().join("nothing");
+            std::fs::create_dir_all(&not_a_repo).unwrap();
+
+            let err = classify_main_checkout(not_a_repo.to_str().unwrap())
+                .expect_err("a directory that is not a repository must not resolve as an answer");
+            assert!(
+                err.contains("could not list worktrees"),
+                "the refusal must say what failed: {err}"
+            );
+        }
     }
 
     /// A branch whose work landed on `main` as a SQUASH commit.
