@@ -2559,6 +2559,20 @@ mod tests {
             .await;
 
         let client = mock_client(&server).await;
+        // The observed figure, scoped to THIS TEST's thread (#1079).
+        //
+        // `Budget::permits` takes the LOWER of this load's own figure and
+        // the process-wide one, so a test that inherits a starved global
+        // is refused by the PLANNER before any wave runs -- and fails with
+        // a message about a budget it never set. That is how the v5.22.0
+        // tag was lost.
+        //
+        // `scoped::enter` rather than `observed_test_lock`: the lock is a
+        // `std::sync::MutexGuard` and clippy's `await_holding_lock` under
+        // `-D warnings` refuses to let one be held across an `.await`.
+        // This guard is a thread-local write, safe to hold here, and it
+        // restores on drop including on panic.
+        let _observed = crate::github::stats::budget::scoped::enter(50_000);
         let budget = Budget::new();
         let scope = Scope::Org("acme".into());
 
@@ -2664,6 +2678,20 @@ mod tests {
             .await;
 
         let client = mock_client(&server).await;
+        // The observed figure, scoped to THIS TEST's thread (#1079).
+        //
+        // `Budget::permits` takes the LOWER of this load's own figure and
+        // the process-wide one, so a test that inherits a starved global
+        // is refused by the PLANNER before any wave runs -- and fails with
+        // a message about a budget it never set. That is how the v5.22.0
+        // tag was lost.
+        //
+        // `scoped::enter` rather than `observed_test_lock`: the lock is a
+        // `std::sync::MutexGuard` and clippy's `await_holding_lock` under
+        // `-D warnings` refuses to let one be held across an `.await`.
+        // This guard is a thread-local write, safe to hold here, and it
+        // restores on drop including on panic.
+        let _observed = crate::github::stats::budget::scoped::enter(50_000);
         let budget = Budget::new();
         let loaded = super::load_board_within(
             &client,
@@ -2724,6 +2752,20 @@ mod tests {
             .await;
 
         let client = mock_client(&server).await;
+        // The observed figure, scoped to THIS TEST's thread (#1079).
+        //
+        // `Budget::permits` takes the LOWER of this load's own figure and
+        // the process-wide one, so a test that inherits a starved global
+        // is refused by the PLANNER before any wave runs -- and fails with
+        // a message about a budget it never set. That is how the v5.22.0
+        // tag was lost.
+        //
+        // `scoped::enter` rather than `observed_test_lock`: the lock is a
+        // `std::sync::MutexGuard` and clippy's `await_holding_lock` under
+        // `-D warnings` refuses to let one be held across an `.await`.
+        // This guard is a thread-local write, safe to hold here, and it
+        // restores on drop including on panic.
+        let _observed = crate::github::stats::budget::scoped::enter(50_000);
         let budget = Budget::new();
         let e = super::load_board_within(
             &client,

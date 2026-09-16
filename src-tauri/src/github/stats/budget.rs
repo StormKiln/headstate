@@ -192,6 +192,10 @@ static OBSERVED_REMAINING: AtomicU64 = AtomicU64::new(u64::MAX);
 /// (`client.rs:908`) -- so the figure is never stale for long, and the
 /// window itself is an hour.
 pub fn note_remaining(remaining: u64) {
+    #[cfg(test)]
+    if scoped::intercept(remaining) {
+        return;
+    }
     OBSERVED_REMAINING.store(remaining, Ordering::Relaxed);
 }
 
@@ -201,9 +205,111 @@ pub fn note_remaining(remaining: u64) {
 /// cold start and not the same as zero -- the NULL-not-0 rule
 /// [`Budget::remaining`] states.
 pub fn observed_remaining() -> Option<u64> {
+    #[cfg(test)]
+    if let Some(scoped) = scoped::get() {
+        return match scoped {
+            u64::MAX => None,
+            n => Some(n),
+        };
+    }
     match OBSERVED_REMAINING.load(Ordering::Relaxed) {
         u64::MAX => None,
         n => Some(n),
+    }
+}
+
+/// A per-test view of the observed figure, so the process-wide static stops
+/// being shared state between tests (#1079).
+///
+/// # Why this exists rather than another guard
+///
+/// Three separate defects traced to one root: `OBSERVED_REMAINING` is
+/// process-wide and mutable, and a test that writes it changes what every
+/// other test reads. #1048 was a mock fixture supplying
+/// `rateLimit.remaining`; #1050 was seeding through `record`; #1079 was an
+/// async test inheriting a starved figure and failing with a message about
+/// a budget it never set. Each was fixed where it appeared, and the next
+/// one would have been found the same way -- by a red CI run on a tag.
+///
+/// [`observed_test_lock`] serialises SYNC tests, and that still works. It
+/// cannot help an async one: it returns a `std::sync::MutexGuard` and
+/// clippy's `await_holding_lock` under `-D warnings` refuses to let one be
+/// held across an `.await`.
+///
+/// # Why a thread-local is sound here
+///
+/// `cargo test` runs each test on its own thread, and every `#[tokio::test]`
+/// in this crate uses the DEFAULT `current_thread` runtime -- no
+/// `flavor = "multi_thread"` appears anywhere -- so an async test and its
+/// `.await`s stay on the one thread that entered it. A thread-local is
+/// therefore scoped to exactly one test, which a `Mutex` cannot be and a
+/// static is not.
+///
+/// Verified rather than assumed: `grep -rn 'tokio::test(flavor' src` matches
+/// nothing.
+///
+/// # What it does NOT change
+///
+/// Production is untouched. Both hooks are `#[cfg(test)]`, so a release
+/// build has the same static, the same two accessors, and no thread-local
+/// at all. A test that never calls [`scoped::with`] also behaves exactly as
+/// before, which is why this can land without rewriting the existing tests
+/// that take the lock.
+#[cfg(test)]
+pub mod scoped {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// `None` means "this thread has no opinion", and the process-wide
+        /// static answers -- the pre-#1079 behaviour, kept so the change is
+        /// additive.
+        static OVERRIDE: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    /// Whether a write should stay on this thread instead of reaching the
+    /// static.
+    pub(super) fn intercept(remaining: u64) -> bool {
+        OVERRIDE.with(|o| {
+            if o.get().is_some() {
+                o.set(Some(remaining));
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    pub(super) fn get() -> Option<u64> {
+        OVERRIDE.with(Cell::get)
+    }
+
+    /// Run `f` with the observed figure scoped to this thread.
+    ///
+    /// Restores the previous value on the way out, including on panic --
+    /// the guard's `Drop` runs during unwinding, so one failing test cannot
+    /// leak its figure into the next test on the same thread.
+    ///
+    /// `u64::MAX` is the cold-start sentinel, so `with(u64::MAX, ..)` is how
+    /// a test asks for "nothing has reported a figure".
+    pub fn with<T>(remaining: u64, f: impl FnOnce() -> T) -> T {
+        let _guard = Guard(OVERRIDE.with(|o| o.replace(Some(remaining))));
+        f()
+    }
+
+    /// Enter a scope without a closure, for `async` tests.
+    ///
+    /// A closure cannot wrap an `.await`, so an async test binds this to a
+    /// local and lets it drop at the end of the test body.
+    pub fn enter(remaining: u64) -> Guard {
+        Guard(OVERRIDE.with(|o| o.replace(Some(remaining))))
+    }
+
+    pub struct Guard(Option<u64>);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            OVERRIDE.with(|o| o.set(self.0));
+        }
     }
 }
 
@@ -1127,5 +1233,66 @@ pub(crate) mod tests {
             region.matches("fetch_viewer_metered(&budget)").count() >= 2,
             "both stats commands that resolve the viewer must meter it"
         );
+    }
+}
+
+#[cfg(test)]
+mod scoped_tests {
+    use super::*;
+
+    /// A scoped write must not reach the process-wide static (#1079).
+    ///
+    /// This is the property the whole module exists for: before it, a test
+    /// that set the figure changed what every other test read, and three
+    /// separate defects came from that.
+    #[test]
+    fn a_scoped_write_does_not_escape_to_the_process() {
+        let _g = observed_test_lock();
+        let restore = RestoreObserved::capture();
+        note_remaining(4_242);
+
+        scoped::with(77, || {
+            assert_eq!(observed_remaining(), Some(77), "the scope answers inside");
+            note_remaining(88);
+            assert_eq!(observed_remaining(), Some(88), "and takes writes");
+        });
+
+        assert_eq!(
+            observed_remaining(),
+            Some(4_242),
+            "#1079: a scoped write must not leak into the process-wide figure"
+        );
+        drop(restore);
+    }
+
+    /// The scope restores even when the body panics, so one failing test
+    /// cannot poison the next test on the same thread.
+    #[test]
+    fn a_panicking_scope_still_restores() {
+        let _g = observed_test_lock();
+        let restore = RestoreObserved::capture();
+        note_remaining(555);
+
+        let caught = std::panic::catch_unwind(|| {
+            scoped::with(11, || panic!("boom"));
+        });
+        assert!(caught.is_err(), "the panic must propagate");
+        assert_eq!(
+            observed_remaining(),
+            Some(555),
+            "#1079: Drop runs during unwinding, so the figure is restored"
+        );
+        drop(restore);
+    }
+
+    /// Without a scope, nothing changes -- which is why this is additive
+    /// and the existing lock-taking tests did not need rewriting.
+    #[test]
+    fn no_scope_means_the_process_figure_answers() {
+        let _g = observed_test_lock();
+        let restore = RestoreObserved::capture();
+        note_remaining(909);
+        assert_eq!(observed_remaining(), Some(909));
+        drop(restore);
     }
 }
