@@ -2482,6 +2482,30 @@ mod tests {
             .await;
         let server = MockServer::start().await;
 
+        // How many first-wave detail RESPONSES the mock has served (#1073).
+        //
+        // # Why this exists: the ceiling used to race a real clock
+        //
+        // The pairing was a 1500ms ceiling against a 5s stall, and the
+        // test asserted the whole first wave had landed inside that
+        // 1500ms. On a loaded runner it had not -- the observed panic was
+        // `!loaded.prs.is_empty()`, meaning not one first-wave response
+        // had arrived. It fired twice on two different commits, once on
+        // `main` itself. A failed attempt is PERMANENT to the release gate
+        // (`wait-for-duplicates: true`), so a flake here can burn a tag,
+        // which is how v5.20.0 was lost (#1048).
+        //
+        // The property under test was never about speed: it is "what
+        // arrived is kept, and what did not is named". So the margins are
+        // now two orders of magnitude apart in both directions, and this
+        // counter lets the test CHECK that its own premise held rather
+        // than assume it.
+        let first_wave_done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served = first_wave_done.clone();
+        // Two orders of magnitude above what an undelayed first wave
+        // needs, and a tenth of the second wave's stall.
+        const CEILING: std::time::Duration = std::time::Duration::from_secs(3);
+
         // The probe. `issueCount` without `nodes`, so it is matched by the
         // ABSENCE of the node selection -- and answered generously enough
         // that every slice subdivides until it is a single day.
@@ -2513,12 +2537,20 @@ mod tests {
                         // `fetch::READ_PERMITS` is process-wide, so a
                         // request that never returns would hold a permit
                         // against every other test in the binary.
+                        // Ten times the ceiling (#1073). Bounded rather
+                        // than infinite: `fetch::READ_PERMITS` is
+                        // process-wide, so a request that never returns
+                        // would hold a permit against every other test.
                         return ResponseTemplate::new(200)
                             .set_body_json(detail_body(&[]))
-                            .set_delay(std::time::Duration::from_secs(5));
+                            .set_delay(std::time::Duration::from_secs(30));
                     }
                     let aliases = aliases_in(doc);
-                    return ResponseTemplate::new(200).set_body_json(detail_body(&aliases));
+                    // Counted AFTER the body is built, so it rises only
+                    // for a response this mock really is returning (#1073).
+                    let r = ResponseTemplate::new(200).set_body_json(detail_body(&aliases));
+                    served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return r;
                 }
                 let aliases = aliases_in(doc);
                 ResponseTemplate::new(200).set_body_json(probe_body(&aliases))
@@ -2528,19 +2560,38 @@ mod tests {
 
         let client = mock_client(&server).await;
         let budget = Budget::new();
+        let scope = Scope::Org("acme".into());
+
+        // Two different units, and conflating them is a mistake made while
+        // fixing this (#1073): the first wave is `READ_CONCURRENCY`
+        // REQUESTS of `BOARD_ALIAS_CHUNK` aliases each -- 6 responses
+        // carrying 30 slices, one merged pull request per slice.
+        const FIRST_WAVE_REQUESTS: usize = super::super::fetch::READ_CONCURRENCY;
+        const FIRST_WAVE_SLICES: usize = BOARD_ALIAS_CHUNK * FIRST_WAVE_REQUESTS;
+
         let loaded = super::load_board_within(
             &client,
-            &Scope::Org("acme".into()),
+            &scope,
             super::super::scope::Measure::Merged,
             Slice::new("2026-07-01".to_string(), "2026-08-09".to_string()),
             &budget,
-            // Well past the first wave's answers and far inside the
-            // second's 5-second stall, so the ceiling lands exactly where
-            // the bug lived: between two waves.
-            std::time::Duration::from_millis(1500),
+            CEILING,
         )
         .await
         .expect("a timed-out load must return what it retrieved, not an error");
+
+        // The GUARD on this test's own premise. If a runner is ever slow
+        // enough to reorder a 3-second ceiling against an undelayed first
+        // wave, this fails FIRST and says so -- rather than a retention
+        // assertion failing and looking like a defect in the code under
+        // test. That misattribution is what made the old flake expensive.
+        assert_eq!(
+            first_wave_done.load(std::sync::atomic::Ordering::SeqCst),
+            FIRST_WAVE_REQUESTS,
+            "the first wave must be served in full before the ceiling lands, \
+             or this test measures the runner rather than the retention it \
+             exists to prove"
+        );
 
         // THE ASSERTION #1044 IS ABOUT. The first wave answered 30 slices
         // with one merged pull request each; every one of them was paid
@@ -2551,10 +2602,16 @@ mod tests {
              must hand them to the caller for `pr_history::put_many`; \
              got none"
         );
-        assert!(
-            loaded.prs.len() >= 20,
-            "the whole first wave's pull requests should survive, not a \
-             fragment of it: got {}",
+        // EXACT, not a threshold (#1073). `>= 20` was a proxy for "most
+        // of the first wave arrived", and it was the assertion that raced.
+        // With the premise guarded above, the number that survives is not
+        // a matter of timing -- it is the whole wave, and anything less is
+        // a real retention bug.
+        assert_eq!(
+            loaded.prs.len(),
+            FIRST_WAVE_SLICES,
+            "every first-wave pull request was paid for and must survive the \
+             drop: got {} of {FIRST_WAVE_SLICES}",
             loaded.prs.len()
         );
         // Qualified, never confident. The slices the second wave never
