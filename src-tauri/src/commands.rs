@@ -3699,6 +3699,65 @@ pub async fn claude_subagent_rollup(
     .map_err(|e| e.to_string())?
 }
 
+/// What the hook recorded about ONE session's failures and denials
+/// (#1062, #1063, #1064).
+///
+/// # Why this is its own command and not a field on `claude_session_detail`
+///
+/// It needs the install status, which `claude_session_detail` does not
+/// read -- and reading it there would put a settings-file parse on the
+/// path of every detail open. More importantly the two FAIL separately:
+/// a detail read that failed must not also cost the user the failure
+/// profile, and a failure profile that could not be read must not blank
+/// the resume command. `SessionDetail` already carries `registry_failure`
+/// for exactly this reason.
+///
+/// # Cost
+///
+/// Two indexed queries and one settings parse. No transcript is read: the
+/// hook recorded all of this in O(1) as it happened, which is the entire
+/// argument for the events existing.
+#[tauri::command]
+pub async fn claude_session_events(
+    app: tauri::AppHandle,
+    session_id: String,
+) -> Result<crate::claude::events::Observation, String> {
+    let db = db_path(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let installed = crate::claude::install::recording_events(&claude_hooks_status()?);
+        let conn = open_db(&db).map_err(|e| e.to_string())?;
+        crate::claude::events::for_session(&conn, &session_id, &installed)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The failure and denial profile ACROSS every stored session (#1062,
+/// #1063, #1064).
+///
+/// The more informative of the two views, and #1064 says why: one denial
+/// is noise, the same denial forty times is a finding, and only the
+/// cross-session view can tell them apart.
+///
+/// Carries its own denominators -- see [`crate::claude::events::Corpus`].
+/// A profile over 3 observed sessions out of 1,461 stored is a very
+/// different statement from the same profile over all of them, and
+/// without the denominator the two render identically.
+#[tauri::command]
+pub async fn claude_event_profile(
+    app: tauri::AppHandle,
+) -> Result<crate::claude::events::Corpus, String> {
+    let db = db_path(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let installed = crate::claude::install::recording_events(&claude_hooks_status()?);
+        let conn = open_db(&db).map_err(|e| e.to_string())?;
+        crate::claude::events::across_sessions(&conn, &installed).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// What one pass over both live sources found (#913, epic #910).
 ///
 /// The two halves are returned together because they are ONE answer to

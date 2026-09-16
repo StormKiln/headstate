@@ -16,6 +16,8 @@ import type {
   ClaudePreview,
   ClaudeUsage,
   ClaudeSubagentRollup,
+  ClaudeObservation,
+  ClaudeCorpus,
   ClaudeSessionList,
   ClaudeSessionDetail,
   WireClaudeSessionList,
@@ -102,6 +104,8 @@ import {
   claudeOverview,
   claudeSessionUsage,
   claudeSubagentRollup,
+  claudeSessionEvents,
+  claudeEventProfile,
   claudeSessions,
   claudeSessionDetail,
   claudeTranscriptTail,
@@ -1422,6 +1426,44 @@ export function useClaudeSubagentRollup(sessionId: string | null) {
     queryKey: ["claude-subagent-rollup", sessionId],
     queryFn: () => claudeSubagentRollup(sessionId as string),
     enabled: sessionId !== null && sessionId !== "",
+    staleTime: Infinity,
+    retry: false,
+  });
+}
+
+/// What the hook recorded about one session's failures and denials
+/// (#1062, #1063, #1064).
+///
+/// `staleTime: Infinity` because the handoff file is consumed by the live
+/// poll rather than by this query: a session's stored events change only
+/// when `claude_poll_live` commits new ones, and re-asking on a timer
+/// would be a settings parse plus two queries per tick for an answer that
+/// almost never moves.
+///
+/// `retry: false` and no `= {}` default, the rule this feature follows
+/// throughout. A rejected read must reach the caller's error arm --
+/// rendering "0 failures" for a read that failed is the same confident
+/// wrong answer with the same credible shape (#846), and here it is worse
+/// than usual because zero is also a perfectly ordinary real value.
+export function useClaudeSessionEvents(sessionId: string | null) {
+  return useQuery<ClaudeObservation>({
+    queryKey: ["claude-session-events", sessionId],
+    queryFn: () => claudeSessionEvents(sessionId as string),
+    enabled: sessionId !== null && sessionId !== "",
+    staleTime: Infinity,
+    retry: false,
+  });
+}
+
+/// The failure and denial profile across every stored session.
+///
+/// `enabled` on the caller, because the overview page asks for it only
+/// when it is actually showing that section.
+export function useClaudeEventProfile(enabled = true) {
+  return useQuery<ClaudeCorpus>({
+    queryKey: ["claude-event-profile"],
+    queryFn: () => claudeEventProfile(),
+    enabled,
     staleTime: Infinity,
     retry: false,
   });

@@ -301,6 +301,13 @@ pub const SURFACE: &[(&str, Class)] = &[
     // summariser and the app's own database; writes nothing. The phone
     // wants the rollup for the same reason the desktop does.
     ("claude_subagent_rollup", Class::Read),
+    // #1062, #1063, #1064. Two indexed reads over the app's own
+    // database plus a parse of `~/.claude/settings.json`; writes
+    // nothing. The phone wants both for the same reason the desktop
+    // does -- "which of my sessions was fighting something" is a
+    // question you ask while away from the machine.
+    ("claude_session_events", Class::Read),
+    ("claude_event_profile", Class::Read),
     // One pass over the two LIVE sources: the hook's handoff file and the
     // `~/.claude/sessions` registry (#913).
     //
@@ -925,6 +932,10 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "claude_subagent_rollup" => {
             res(commands::claude_subagent_rollup(app.clone(), a.get("sessionId")?).await)
         }
+        "claude_session_events" => {
+            res(commands::claude_session_events(app.clone(), a.get("sessionId")?).await)
+        }
+        "claude_event_profile" => res(commands::claude_event_profile(app.clone()).await),
         "claude_poll_live" => res(commands::claude_poll_live(app.clone()).await),
         "claude_overview" => res(commands::claude_overview(app.clone()).await),
         "claude_session_usage" => res(commands::claude_session_usage(a.get("path")?).await),

@@ -26,6 +26,8 @@ import type {
   WireClaudeSessionList,
   ClaudeUsage,
   ClaudeSubagentRollup,
+  ClaudeObservation,
+  ClaudeCorpus,
   ProjectReport,
   UpdateRequest,
   UpdateFilter,
@@ -854,6 +856,23 @@ export const claudeSessionUsage = (path: string) =>
 /// Never added into the parent's own usage. See `ClaudeSubagentRollup`.
 export const claudeSubagentRollup = (sessionId: string) =>
   call<ClaudeSubagentRollup>("claude_subagent_rollup", { sessionId });
+
+/// What the hook recorded about one session's failures and denials
+/// (#1062, #1063, #1064).
+///
+/// Returns a THREE-state answer, not a count. `unobserved` means no hook
+/// ever watched this session, which is the normal state for history that
+/// predates the install -- it must render as "not recorded" and never as
+/// zero. See `ClaudeObservation`.
+export const claudeSessionEvents = (sessionId: string) =>
+  call<ClaudeObservation>("claude_session_events", { sessionId });
+
+/// The failure and denial profile across every stored session.
+///
+/// The more informative view for denials: one denial is noise, the same
+/// denial forty times is a finding (#1064). Carries its own
+/// denominators, without which the profile reads as covering everything.
+export const claudeEventProfile = () => call<ClaudeCorpus>("claude_event_profile");
 
 /// The tail of one session's transcript, as conversation (#982).
 ///

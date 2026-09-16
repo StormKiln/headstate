@@ -54,6 +54,25 @@
 //! crash from a missing `SessionEnd`, since absence is also what a
 //! still-running session looks like.
 //!
+//! # The failure events are NOT a source here, and must not become one
+//!
+//! Epic #1060 added three events (#1062, #1063, #1064) recording why a
+//! turn died, which tools failed and what auto mode denied. None of them
+//! belongs in this derivation, and the temptation is real: a turn that
+//! died of a rate limit reads like evidence the session is over.
+//!
+//! It is not. `StopFailure` does not fire on SIGKILL -- the founding
+//! measurement of this whole epic -- and a rate-limited session is very
+//! much still running, so consulting it would report a live session as
+//! dead. A denial is further still from an ending: it is a guardrail
+//! doing its job while the session carries on.
+//!
+//! The separation is structural rather than remembered. Those events live
+//! in `claude_hook_event`, this derivation is handed only `&[Run]` rows,
+//! and
+//! `invariants.rs`'s `liveness_never_reads_the_failure_events` fails on
+//! any code in this file that reaches for them.
+//!
 //! `claude_run` is consulted for sessions the registry does not mention,
 //! because #913 will populate it from the hook and a run whose pid the
 //! registry has forgotten is still a run we once observed.

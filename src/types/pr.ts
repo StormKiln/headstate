@@ -1519,6 +1519,89 @@ interface ClaudeSubagentChild {
   agent_id: string;
 }
 
+/// One named thing that went wrong, with how often (#1062, #1063, #1064).
+///
+/// `name` is carried VERBATIM from the hook payload and is never mapped to
+/// a known set: an `error_type` or `tool_name` this app has never seen
+/// renders as itself. Folding an unrecognised value into "other" would
+/// destroy the one thing the record carries, and a new Claude Code release
+/// would silently start hiding its own new failure modes.
+export interface ClaudeTally {
+  /// The `error_type` or `tool_name`, exactly as recorded. `null` when the
+  /// payload carried none -- render that as "not recorded", never as a
+  /// blank row.
+  name: string | null;
+  /// How many records carried it.
+  count: number;
+  /// One example of the free-text detail, capped by the writer at 160
+  /// bytes. `null` when none was recorded, which #1064 requires be said
+  /// rather than filled in with an invented sentence.
+  ///
+  /// UNTRUSTED vendor text. Display only: never log it, never put it
+  /// anywhere a committed file could pick it up.
+  detail: string | null;
+}
+
+/// What went wrong in a session, or across all of them.
+///
+/// Failures and denials are counted APART and must never be summed. A
+/// denial is a guardrail working; a failure is something that broke. One
+/// number covering both would answer neither question and would present
+/// the guardrail as damage (#1064).
+export interface ClaudeProfile {
+  /// `StopFailure` by `error_type` -- why turns died. Commonest first.
+  turn_failures: ClaudeTally[];
+  /// `PostToolUseFailure` by `tool_name`. Commonest first.
+  tool_failures: ClaudeTally[];
+  /// `PermissionDenied` by `tool_name`. Commonest first. NOT a failure
+  /// list -- see above.
+  denials: ClaudeTally[];
+}
+
+/// How much of a session's failure history the app can state (#1062).
+///
+/// THREE states, because two would lie, and the discriminated union is the
+/// mechanism: there is no `profile` to read on `unobserved`, so a zero
+/// cannot be rendered for a session nobody watched.
+///
+/// | state | meaning | rendering |
+/// |---|---|---|
+/// | `unobserved` | no hook ever saw this session | "not recorded" — NEVER 0 |
+/// | `partial` | some events were not installed | a FLOOR, naming what is missing |
+/// | `observed` | every event was recording | a total; a 0 here is real |
+///
+/// `unobserved` is the normal state for history that predates the install,
+/// which on a machine that adopted Headstate after using Claude Code is
+/// almost all of it. Rendering it as "0 failures" is the absent-is-not-zero
+/// defect (#846) in its most convincing form: the session looks clean when
+/// the truth is nobody was watching.
+export type ClaudeObservation =
+  | { state: "unobserved" }
+  | { state: "partial"; missing: string[]; profile: ClaudeProfile }
+  | { state: "observed"; profile: ClaudeProfile };
+
+/// The cross-session failure and denial profile, with its denominators
+/// (#1062, #1063, #1064).
+///
+/// The denominators are not decoration. A profile over 3 observed sessions
+/// out of 1,461 stored is a very different statement from the same profile
+/// over all of them, and without them the two render identically.
+export interface ClaudeCorpus {
+  /// What was recorded, and whether it is a total or a floor.
+  observation: ClaudeObservation;
+  /// Every stored session, as the denominator.
+  sessions: number;
+  /// Of those, how many a hook ever observed. The rest predate the install
+  /// and can contribute nothing.
+  sessions_observed: number;
+  /// Of the observed, how many recorded at least one of these events.
+  ///
+  /// A SMALL number here is the GOOD news -- most observed sessions had
+  /// nothing go wrong -- and the UI must frame it that way. Presented bare
+  /// it reads as a coverage problem.
+  sessions_with_events: number;
+}
+
 /// What one session's subagents cost, as a figure of its own (#1002).
 ///
 /// NEVER added into the parent's own `ClaudeUsage`. A parent's own tokens

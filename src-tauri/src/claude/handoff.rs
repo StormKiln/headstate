@@ -164,6 +164,11 @@ pub struct Record {
     /// `PermissionDenied`'s `denial_reason` (#1060 sub-issue 3).
     #[serde(default)]
     pub denial_reason: Option<String>,
+    /// The tool call a `PostToolUseFailure` or `PermissionDenied` is
+    /// about, for deduplication only (#1063). See the writer's field of
+    /// the same name.
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
     /// `PreCompact`/`PostCompact`'s `trigger`: `manual|auto` (#1060
     /// sub-issue 4).
     #[serde(default)]
@@ -213,12 +218,89 @@ impl Record {
     /// an event this app has never seen keeps degrading the way it
     /// already did rather than being silently discarded by a negative
     /// match nobody revisited.
+    ///
+    /// # The failure and denial events (#1062, #1063, #1064)
+    ///
+    /// Added to the same named list rather than given a predicate of
+    /// their own. They are point events by exactly the definition above
+    /// -- no duration, no pid semantics -- and for `StopFailure` the
+    /// separation is a requirement rather than a convenience: #1062 is
+    /// explicit that it must not inform liveness, because it does not
+    /// fire on SIGKILL and a session that hit a rate limit is still very
+    /// much running. Diverting here is what keeps it out of `claude_run`,
+    /// which is the table `liveness::derive` reads.
     fn point_event(&self) -> Option<&str> {
         match self.event.as_str() {
-            e @ ("PreCompact" | "SubagentStart" | "Notification") => Some(e),
+            e @ ("PreCompact" | "SubagentStart" | "Notification" | "StopFailure"
+            | "PostToolUseFailure" | "PermissionDenied") => Some(e),
             _ => None,
         }
     }
+
+    /// The two columns a failure or denial record fills, beyond the ones
+    /// every point event shares (#1062, #1063, #1064).
+    ///
+    /// `subject` is the thing the event is ABOUT and `detail` is the free
+    /// text explaining it. Which payload field plays which role differs
+    /// per event, and that mapping lives here rather than in SQL so there
+    /// is one place to read it:
+    ///
+    /// | event | subject -> column | detail -> `failure_detail` |
+    /// |---|---|---|
+    /// | `StopFailure` | `error_type` | `error_message` |
+    /// | `PostToolUseFailure` | `tool_name` | `error_message` |
+    /// | `PermissionDenied` | `tool_name` | `denial_reason` |
+    ///
+    /// The two subjects go to DIFFERENT columns -- `error_type` is not a
+    /// tool name and storing them together would make "which tool failed"
+    /// unanswerable without also knowing the event. The two details share
+    /// one column because no event carries both, which is the same
+    /// partition `hook.rs`'s byte budget measures.
+    ///
+    /// `tool_input` is deliberately absent from every column and from the
+    /// table, per #1063 and #1064: it carries file contents, command lines
+    /// and credentials-adjacent strings, and the question is already
+    /// answered without it. This is migration 14's rule about
+    /// `last_assistant_message`, one event over.
+    ///
+    /// Any of them may be `None`, and that survives to the database as
+    /// NULL rather than being defaulted to a string. #1064 requires that a
+    /// denial with an empty `denial_reason` SAY so rather than have one
+    /// invented, so the absence has to be storable as an absence.
+    fn failure_fields(&self) -> FailureFields<'_> {
+        match self.event.as_str() {
+            "StopFailure" => FailureFields {
+                error_type: self.error_type.as_deref(),
+                tool_name: None,
+                detail: self.error_message.as_deref(),
+            },
+            "PostToolUseFailure" => FailureFields {
+                error_type: None,
+                tool_name: self.tool_name.as_deref(),
+                detail: self.error_message.as_deref(),
+            },
+            "PermissionDenied" => FailureFields {
+                error_type: None,
+                tool_name: self.tool_name.as_deref(),
+                detail: self.denial_reason.as_deref(),
+            },
+            _ => FailureFields::default(),
+        }
+    }
+}
+
+/// What a failure or denial record contributes to `claude_hook_event`.
+///
+/// A struct rather than a tuple because three `Option<&str>` in a row is
+/// exactly the shape a caller silently transposes, and the columns are
+/// not interchangeable: swapping `error_type` and `tool_name` would put a
+/// tool name in the column the turn-failure breakdown groups by, and
+/// nothing would fail loudly.
+#[derive(Default)]
+struct FailureFields<'a> {
+    error_type: Option<&'a str>,
+    tool_name: Option<&'a str>,
+    detail: Option<&'a str>,
 }
 
 /// Where the handoff file lives, given a home directory.
@@ -516,23 +598,38 @@ fn write_record(conn: &Connection, rec: &Record, start_time: Option<i64>) -> Res
     )
     .map_err(|e| format!("{session_id}: could not store the session: {e}"))?;
 
-    // A point event (#1065/#1066/#1067) before any run handling, because
-    // it is not a run and must not fall through into one.
+    // A point event (#1062-#1067) before any run handling, because it is
+    // not a run and must not fall through into one.
     //
     // The session upsert above still happened, and deliberately: a
     // `Notification` for a session we have no row for is still evidence
     // that the session exists, and its `last_activity_at` widening is
     // what makes #1067's staleness rule work -- see `signals::Waiting`.
+    //
+    // For #1062 the early return is a REQUIREMENT rather than a tidiness:
+    // `StopFailure` does not fire on SIGKILL, so it says nothing about
+    // whether a session is alive. Falling through would open a spurious
+    // run or -- far worse -- close a real one, and a session that hit a
+    // rate limit and kept going would be reported as ended.
     if let Some(event) = rec.point_event() {
+        let f = rec.failure_fields();
         conn.execute(
             // OR IGNORE against (session_id, event, at) for the reason
             // the start-record insert below uses it: `consume` can
             // re-read records after a rotation-then-crash, and a
             // re-read must be a no-op rather than a doubled count.
+            //
+            // Migration 15's partial unique index on
+            // (session_id, event, tool_use_id) does the OTHER half for
+            // the two tool events, and it is a different question: this
+            // key collapses a re-read of one record, that one collapses
+            // RETRIES of one tool call, which arrive as separate records
+            // at separate instants carrying the same id (#1063).
             "INSERT OR IGNORE INTO claude_hook_event
                 (session_id, event, at, trigger_kind, agent_id, agent_type,
-                 notification_type)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 notification_type, error_type, tool_name, failure_detail,
+                 tool_use_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 session_id,
                 event,
@@ -548,6 +645,18 @@ fn write_record(conn: &Connection, rec: &Record, start_time: Option<i64>) -> Res
                 // the "not recorded" arm that already exists.
                 rec.agent_type.as_deref().filter(|t| !t.is_empty()),
                 rec.notification_type,
+                f.error_type,
+                f.tool_name,
+                // Same empty-is-absent rule as `agent_type` above, and
+                // #1064 needs it by name: a denial whose `denial_reason`
+                // arrived as "" must reach the "not recorded" arm rather
+                // than render as a blank reason that looks recorded.
+                f.detail.filter(|d| !d.is_empty()),
+                // NULL rather than "" when there is no tool call, because
+                // migration 15's unique index is PARTIAL on
+                // `tool_use_id IS NOT NULL`: two distinct `StopFailure`
+                // records must not collide on a shared sentinel.
+                rec.tool_use_id.as_deref().filter(|t| !t.is_empty()),
             ],
         )
         .map_err(|e| format!("{session_id}: could not store the {event}: {e}"))?;
@@ -1745,10 +1854,16 @@ mod tests {
     /// [`parse_line`], which reads `v` off a `Value` before the struct is
     /// ever built.
     ///
-    /// The event here is deliberately one that is NOT installed, which is
-    /// the state #1061 ships in: the format accepts it before any hook
-    /// writes it. It is stored as a run with no `ended_at`, per
-    /// `an_unrecognised_event_is_not_an_ending`.
+    /// The event here is a `PostToolUseFailure`. When #1061 wrote this
+    /// test that event was not installed and the record was stored as a
+    /// RUN, which is what the format-only change could do with it. #1063
+    /// installs it and teaches this side to read it, so the same line now
+    /// lands in `claude_event` -- and that is the behaviour change, not an
+    /// incidental one.
+    ///
+    /// What is unchanged, and is what the test is actually for: the line
+    /// still passes the version gate at `v: 1`. `RECORD_VERSION` was NOT
+    /// bumped by any of #1062-#1064.
     #[test]
     fn the_gate_lets_a_new_format_record_through() {
         let t = tempfile::TempDir::new().unwrap();
@@ -1766,8 +1881,29 @@ mod tests {
              fields"
         );
         assert!(got.unparseable.is_empty(), "got {:?}", got.unparseable);
-        assert_eq!(got.runs, 1);
         assert_eq!(got.sessions, 1);
+
+        // `Consumed::runs` is "how much did this pass store" and counts
+        // point events too, so the record IS counted there -- see that
+        // field's docs for why it was not split.
+        assert_eq!(got.runs, 1);
+
+        // The assertion that matters: it was stored as a point event and
+        // NOT as a run. `claude_run` is the table `liveness::derive`
+        // reads, and a tool failure says nothing about whether the
+        // session is alive (#1062's constraint, #1063's record).
+        let runs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM claude_run", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(runs, 0, "nothing of this record belongs in `claude_run`");
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claude_hook_event WHERE event = 'PostToolUseFailure'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1, "it belongs in `claude_hook_event`");
     }
 
     /// The new fields are accepted by the live [`Record`] too, so a later

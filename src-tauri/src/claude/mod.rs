@@ -64,6 +64,7 @@
 
 pub mod cli;
 pub mod crash;
+pub mod events;
 pub mod handoff;
 pub mod hook;
 pub mod install;

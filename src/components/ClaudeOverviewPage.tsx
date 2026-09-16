@@ -1,7 +1,7 @@
 import { AlertTriangle, Bot, FolderX, Play, RotateCw } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
-import { useClaudeOverview } from "../api/hooks";
+import { useClaudeEventProfile, useClaudeOverview } from "../api/hooks";
 import { copyText } from "../lib/clipboard";
 import { relativeTime } from "../lib/time";
 import { pathBasename } from "../lib/worktrees";
@@ -9,7 +9,12 @@ import { QueryError, errorMessage } from "./QueryError";
 import { SessionsChart } from "./stats/SessionsChart";
 import { Card } from "@/components/ui/card";
 import { useFilters } from "@/store/filters";
-import type { ClaudeResumable } from "@/types/pr";
+import type {
+  ClaudeCorpus,
+  ClaudeProfile,
+  ClaudeResumable,
+  ClaudeTally,
+} from "@/types/pr";
 
 /// How many days the activity chart covers.
 ///
@@ -561,6 +566,170 @@ export function ClaudeOverviewPage() {
       </Card>
 
       <SessionsChart points={activity} days={ACTIVITY_DAYS} />
+
+      {/* BELOW the chart, because this is context rather than the thing a
+          user came to do. The page's own rule, stated at the resumable
+          card: actionable above, context below. */}
+      <TroubleProfileCard />
+    </div>
+  );
+}
+
+/// The failure and denial profile across every session (#1062, #1063,
+/// #1064).
+///
+/// # Why the cross-session view is the informative one
+///
+/// #1064 puts it plainly: one denial is noise, the same denial forty
+/// times is a finding. A per-session view cannot tell those apart, and
+/// this is the only place the difference is visible.
+///
+/// # The denominators are not decoration
+///
+/// A profile over 3 observed sessions out of 1,461 stored is a very
+/// different statement from the same profile over all of them, and
+/// without the denominator the two render identically. `sessions_observed`
+/// is therefore shown whenever it is short of `sessions`, rather than only
+/// when someone thinks to look.
+///
+/// The error arm precedes the loading arm per #846, and the `unobserved`
+/// arm never renders as zeros — on a machine whose history predates the
+/// hooks that is the state of the entire corpus, so a grid of zeros here
+/// would be the original defect at full scale.
+function TroubleProfileCard() {
+  const { data, isError, error, isLoading } = useClaudeEventProfile();
+
+  return (
+    <Card className="px-4">
+      <div className="text-sm font-semibold">Failures and denials</div>
+      <div className="text-xs text-[#8b949e]">
+        what the hooks recorded across every session
+      </div>
+      {isError ? (
+        <div className="py-6 text-center text-sm text-[#8b949e]">
+          Could not read what the hooks recorded, so failures and denials are unknown
+          {errorMessage(error) ? ` (${errorMessage(error)})` : ""}.
+        </div>
+      ) : isLoading || data === undefined ? (
+        <div className="py-6 text-center text-sm text-[#8b949e]" aria-busy="true">
+          Reading what the hooks recorded…
+        </div>
+      ) : data.observation.state === "unobserved" ? (
+        /* Absent is not zero, at corpus scale. `overview.rs` measured
+           1,461 of 1,461 sessions in exactly this state on the development
+           machine, so this arm is the NORMAL one before the hooks go in
+           and a page of zeros here would be #846 at its most convincing. */
+        <div className="py-6 text-center text-sm text-[#8b949e]">
+          Not recorded. No hook has observed any of your{" "}
+          {data.sessions.toLocaleString()} sessions yet, so there is nothing to report — install
+          the Claude Code hooks to start recording this.
+        </div>
+      ) : (
+        <CorpusProfile corpus={data} />
+      )}
+    </Card>
+  );
+}
+
+/// The measured half of [`TroubleProfileCard`].
+function CorpusProfile({ corpus }: { corpus: ClaudeCorpus }) {
+  if (corpus.observation.state === "unobserved") return null;
+  const p: ClaudeProfile = corpus.observation.profile;
+  const floor = corpus.observation.state === "partial";
+  const empty =
+    p.turn_failures.length === 0 && p.tool_failures.length === 0 && p.denials.length === 0;
+
+  return (
+    <>
+      {/* The denominator, always, whenever it is short of the whole. A
+          reader who cannot see that 1,458 sessions predate the hooks will
+          read the profile as covering everything. */}
+      {corpus.sessions_observed < corpus.sessions ? (
+        <p className="mt-2 text-xs text-[#8b949e]">
+          Over the {corpus.sessions_observed.toLocaleString()} of{" "}
+          {corpus.sessions.toLocaleString()} sessions a hook has observed. The rest ran before
+          the hooks were installed and cannot be reported on.
+        </p>
+      ) : null}
+      {floor ? (
+        <p className="mt-2 text-xs text-[#d29922]">
+          At least these — {corpus.observation.state === "partial"
+            ? corpus.observation.missing.join(" and ")
+            : ""}{" "}
+          not installed, so anything they would have recorded is missing.
+        </p>
+      ) : null}
+
+      {empty ? (
+        /* A measured zero, and good news. Reachable only when something
+           WAS observed, so it is allowed to say nothing went wrong. */
+        <div className="py-6 text-center text-sm text-[#8b949e]">
+          Nothing failed and nothing was declined across the{" "}
+          {corpus.sessions_observed.toLocaleString()} observed{" "}
+          {corpus.sessions_observed === 1 ? "session" : "sessions"}.
+        </div>
+      ) : (
+        <p className="mt-2 text-xs text-[#8b949e]">
+          {corpus.sessions_with_events.toLocaleString()} of{" "}
+          {corpus.sessions_observed.toLocaleString()} observed{" "}
+          {corpus.sessions_observed === 1 ? "session" : "sessions"} recorded something.
+        </p>
+      )}
+
+      {p.turn_failures.length > 0 ? (
+        <CorpusTallies label="Turns that died" tallies={p.turn_failures} />
+      ) : null}
+      {p.tool_failures.length > 0 ? (
+        <CorpusTallies label="Tool failures" tallies={p.tool_failures} />
+      ) : null}
+      {p.denials.length > 0 ? (
+        /* Guardrail, not damage (#1064). The heading and the sentence both
+           carry that: the same denial forty times is worth a look, and it
+           is worth a look because it may be a workflow being blocked, not
+           because something broke. */
+        <CorpusTallies
+          label="Declined by auto mode"
+          note="Auto mode refused these. A denial repeated many times is either a guardrail earning its keep or a workflow being quietly blocked."
+          tallies={p.denials}
+        />
+      ) : null}
+    </>
+  );
+}
+
+/// One named breakdown on the overview.
+///
+/// Names render VERBATIM, never bucketed into "other": an error type or
+/// an MCP tool name this build has never seen is exactly the case the
+/// record exists to surface (#1062, #1063).
+function CorpusTallies({
+  label,
+  note,
+  tallies,
+}: {
+  label: string;
+  note?: string;
+  tallies: ClaudeTally[];
+}) {
+  return (
+    <div className="mt-3">
+      <div className="text-xs font-semibold text-[#e6edf3]">{label}</div>
+      {note !== undefined ? <p className="mt-0.5 text-xs text-[#8b949e]">{note}</p> : null}
+      <ul className="mt-1.5 flex flex-col divide-y divide-[#30363d]">
+        {tallies.map((t) => (
+          <li
+            key={`${label}:${t.name ?? "\u0000"}`}
+            className="flex flex-wrap items-baseline justify-between gap-x-3 py-1.5 text-xs"
+          >
+            <span className="min-w-0 break-all text-[#e6edf3]">
+              {t.name ?? "Not recorded"}
+            </span>
+            <span className="shrink-0 tabular-nums text-[#8b949e]">
+              {t.count.toLocaleString()}
+            </span>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }

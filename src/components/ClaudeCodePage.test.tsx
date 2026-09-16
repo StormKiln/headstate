@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   ClaudeImported,
@@ -7,6 +7,7 @@ import type {
   ClaudeSessionDetail,
   ClaudeSessionList,
   ClaudeUsage,
+  ClaudeObservation,
   ClaudeSubagentRollup,
   Worktree,
   WorktreeRepo,
@@ -56,6 +57,12 @@ const state = vi.hoisted(() => ({
   /// Rendering any two of those alike is the #846 defect.
   rollup: undefined as ClaudeSubagentRollup | undefined,
   rollupFailed: false,
+  /// #1062-#1064. `undefined` is STILL READING; a resolved
+  /// `{ state: "unobserved" }` is "no hook was watching". Those are
+  /// different renderings and the distinction is the whole feature, so
+  /// the fixture keeps them apart rather than using one value for both.
+  events: undefined as ClaudeObservation | undefined,
+  eventsFailed: false,
   /// What `useClaudeTranscriptTail` returns (#982), on the same
   /// three-way split and for the same reason.
   preview: undefined as ClaudePreview | undefined,
@@ -127,6 +134,18 @@ vi.mock("../api/hooks", () => ({
     isError: state.rollupFailed,
     error: state.rollupFailed ? "Permission denied" : undefined,
     isLoading: sessionId !== null && !state.rollupFailed && state.rollup === undefined,
+  }),
+  // #1062, #1063, #1064. The same three-way split, plus a fourth state
+  // this feature adds and the others do not have: `unobserved`, which is
+  // a RESOLVED answer meaning "no hook was watching". It is data rather
+  // than a flag precisely so a test can tell it from `undefined`, which
+  // is the still-reading state -- collapsing those two is the defect the
+  // whole feature is about.
+  useClaudeSessionEvents: (sessionId: string | null) => ({
+    data: state.events,
+    isError: state.eventsFailed,
+    error: state.eventsFailed ? "Permission denied" : undefined,
+    isLoading: sessionId !== null && !state.eventsFailed && state.events === undefined,
   }),
   // #985. One row's detail, fetched on selection. Records the id so a
   // test can assert the list does not pull 1,474 of these.
@@ -390,6 +409,13 @@ beforeEach(() => {
   state.importFetching = false;
   state.usage = usage();
   state.usageFailed = false;
+  // #1062-#1064. A RESOLVED "nobody was watching" by default, matching
+  // the fixture corpus: these hooks are new, so the honest default for a
+  // session the other tests describe is that no failure record exists.
+  // Reset here like every other field, because a leftover
+  // `eventsFailed` would silently put unrelated tests in the error arm.
+  state.events = { state: "unobserved" };
+  state.eventsFailed = false;
   state.preview = preview();
   state.previewFailed = false;
   state.previewEnabledFor = [];
@@ -432,6 +458,226 @@ beforeEach(() => {
 function open(name: string) {
   fireEvent.click(screen.getByRole("button", { name: new RegExp(name, "i") }));
 }
+
+/// #1062, #1063, #1064: the per-session failure and denial profile.
+///
+/// The single rule these share is the one the root `CLAUDE.md` records as
+/// having shipped as a real defect: **absent is not zero**. A session with
+/// no failure records may have had none, or may have run before the hooks
+/// existed, and rendering the second as "0 failures" is the most legible
+/// possible lie.
+describe("what went wrong in a session", () => {
+  const tally = (name: string | null, count: number, detail: string | null = null) => ({
+    name,
+    count,
+    detail,
+  });
+
+  /// **The sabotage test of this feature.** A session no hook watched must
+  /// say "not recorded" and must never show a zero.
+  ///
+  /// On a machine that adopted Headstate after using Claude Code, this is
+  /// EVERY historical session -- `overview.rs` measured 1,461 of 1,461 in
+  /// exactly this state -- so a zero here is not an edge case, it is the
+  /// whole corpus reporting that it was clean when nobody was watching.
+  ///
+  /// Sabotage: replacing the `unobserved` arm with `<TroubleProfile>` over
+  /// an empty profile renders "Nothing failed and nothing was declined",
+  /// and this test fails on both assertions below.
+  it("says a session from before the hooks was not recorded, never zero", () => {
+    state.list = listOf([session({ name: "Ancient session" })]);
+    state.events = { state: "unobserved" };
+    renderView();
+    open("Ancient session");
+
+    expect(screen.getByText(/Not recorded\./)).toBeTruthy();
+    expect(screen.getByText(/No hook was watching this session/)).toBeTruthy();
+    // And NOT the measured-zero sentence, which is the claim this state
+    // is not entitled to make.
+    expect(screen.queryByText(/Nothing failed and nothing was declined/)).toBeNull();
+  });
+
+  /// The other half: a session that WAS watched and was clean says so.
+  ///
+  /// Without this the feature could never deliver good news, and a user
+  /// whose sessions are genuinely fine would be told forever that nothing
+  /// was measured.
+  it("reports a watched session with no failures as a measured zero", () => {
+    state.list = listOf([session({ name: "Clean session" })]);
+    state.events = {
+      state: "observed",
+      profile: { turn_failures: [], tool_failures: [], denials: [] },
+    };
+    renderView();
+    open("Clean session");
+
+    expect(screen.getByText(/Nothing failed and nothing was declined/)).toBeTruthy();
+    expect(screen.queryByText(/Not recorded\./)).toBeNull();
+  });
+
+  /// A failed read is not a clean session (#846).
+  ///
+  /// The error arm sits before the loading arm because `data` is
+  /// undefined on a rejection exactly as it is before the first read.
+  it("reports a failed read rather than showing zeros", () => {
+    state.list = listOf([session({ name: "Unreadable session" })]);
+    state.eventsFailed = true;
+    renderView();
+    open("Unreadable session");
+
+    expect(screen.getByText(/Could not read what the hook recorded/)).toBeTruthy();
+    expect(screen.queryByText(/Nothing failed and nothing was declined/)).toBeNull();
+    expect(screen.queryByText(/Not recorded\./)).toBeNull();
+  });
+
+  /// An `error_type` this build has never seen renders as ITSELF (#1062).
+  ///
+  /// A newer Claude Code can add an error type at any time. Bucketing the
+  /// unrecognised ones into "other" would mean the first user to hit a new
+  /// failure mode sees the least about it, which inverts the point.
+  it("renders an unknown error type verbatim rather than as other", () => {
+    state.list = listOf([session({ name: "Odd session" })]);
+    state.events = {
+      state: "observed",
+      profile: {
+        turn_failures: [tally("quantum_decoherence", 3, "the turn collapsed")],
+        tool_failures: [],
+        denials: [],
+      },
+    };
+    renderView();
+    open("Odd session");
+
+    expect(screen.getByText("quantum_decoherence")).toBeTruthy();
+    expect(screen.queryByText(/^other$/i)).toBeNull();
+  });
+
+  /// A tool name this build has never seen renders as itself (#1063).
+  ///
+  /// MCP servers define arbitrary tool names, so the unknown case is the
+  /// COMMON one rather than an edge.
+  it("renders an unknown tool name verbatim", () => {
+    state.list = listOf([session({ name: "MCP session" })]);
+    state.events = {
+      state: "observed",
+      profile: {
+        turn_failures: [],
+        tool_failures: [tally("mcp__acme_widgets__reticulate", 2, "connection refused")],
+        denials: [],
+      },
+    };
+    renderView();
+    open("MCP session");
+
+    expect(screen.getByText("mcp__acme_widgets__reticulate")).toBeTruthy();
+  });
+
+  /// A denial is presented as a GUARDRAIL, not as an error (#1064).
+  ///
+  /// The wording rule as an assertion. Presenting auto mode's refusals as
+  /// damage teaches the user to switch the guardrail off, which is the
+  /// opposite of what the record is for.
+  it("presents a denial as the guardrail working rather than as a failure", () => {
+    state.list = listOf([session({ name: "Guarded session" })]);
+    state.events = {
+      state: "observed",
+      profile: {
+        turn_failures: [],
+        tool_failures: [],
+        denials: [tally("Write", 4, "auto mode refuses writes outside the worktree")],
+      },
+    };
+    renderView();
+    open("Guarded session");
+
+    expect(screen.getByText(/Declined by auto mode/)).toBeTruthy();
+    expect(screen.getByText(/That is the guardrail working/)).toBeTruthy();
+    // A denial-only session must not be described as having failures.
+    expect(screen.queryByText(/^Tool failures$/)).toBeNull();
+    expect(screen.queryByText(/^Turns that died$/)).toBeNull();
+  });
+
+  /// A denial with no recorded reason SAYS so (#1064's own test).
+  ///
+  /// Inventing a plausible reason would be worse than showing none: the
+  /// user would act on a sentence Headstate made up.
+  it("says a denial had no recorded reason rather than inventing one", () => {
+    state.list = listOf([session({ name: "Reasonless session" })]);
+    state.events = {
+      state: "observed",
+      profile: {
+        turn_failures: [],
+        tool_failures: [],
+        denials: [tally("Bash", 1, null)],
+      },
+    };
+    renderView();
+    open("Reasonless session");
+
+    expect(screen.getByText("Bash")).toBeTruthy();
+    // The count is there and no sentence has been conjured beside it.
+    expect(screen.getByText(/Auto mode refused these tool calls/)).toBeTruthy();
+  });
+
+  /// A half install renders the counts as a FLOOR and names what is
+  /// missing.
+  ///
+  /// "At least" is the qualify half of the house rule: only-low qualifies,
+  /// possibly-wrong suppresses. The counts here are only-low.
+  it("reports a half install as a floor and names the missing event", () => {
+    state.list = listOf([session({ name: "Half-watched session" })]);
+    state.events = {
+      state: "partial",
+      missing: ["PermissionDenied"],
+      profile: {
+        turn_failures: [],
+        tool_failures: [tally("Bash", 2, "exited 1")],
+        denials: [],
+      },
+    };
+    renderView();
+    open("Half-watched session");
+
+    expect(screen.getByText(/At least these/)).toBeTruthy();
+    expect(screen.getByText(/PermissionDenied/)).toBeTruthy();
+    // Partial is not nothing: what WAS recorded is still shown.
+    expect(screen.getByText("Bash")).toBeTruthy();
+  });
+
+  /// Failures concentrated in one tool are called out; spread ones are
+  /// not (#1063).
+  ///
+  /// Both directions in one test, because a signal that always fires is
+  /// not a signal and only the negative case proves it does not.
+  it("flags failures concentrated in one tool and stays quiet when they are spread", () => {
+    state.list = listOf([session({ name: "Fighting session" })]);
+    state.events = {
+      state: "observed",
+      profile: {
+        turn_failures: [],
+        tool_failures: [tally("Bash", 14, "exited 1"), tally("Read", 1, "no such file")],
+        denials: [],
+      },
+    };
+    renderView();
+    open("Fighting session");
+    expect(screen.getByText(/Concentrated in Bash/)).toBeTruthy();
+
+    cleanup();
+    state.list = listOf([session({ name: "Spread session" })]);
+    state.events = {
+      state: "observed",
+      profile: {
+        turn_failures: [],
+        tool_failures: [tally("Bash", 1), tally("Read", 1), tally("Edit", 1)],
+        denials: [],
+      },
+    };
+    renderView();
+    open("Spread session");
+    expect(screen.queryByText(/Concentrated in/)).toBeNull();
+  });
+});
 
 describe("liveness renders as three states, not two", () => {
   /// **The sabotage test.** `unknown` must NOT render as "Not running".

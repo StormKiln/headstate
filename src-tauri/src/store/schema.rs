@@ -527,6 +527,88 @@ const MIGRATIONS: &[&str] = &[
      );
      CREATE INDEX IF NOT EXISTS claude_hook_event_session
         ON claude_hook_event (session_id, at DESC);",
+    // Migration 15: the failure and denial events (#1062, #1063, #1064,
+    // epic #1060).
+    //
+    // # Why this ALTERs migration 14's table rather than adding one
+    //
+    // Migration 14 (#1065/#1066/#1067) built `claude_hook_event` for
+    // exactly this class of record -- a point event with a session, a
+    // moment, an event name and a few small payload values -- and its own
+    // note says how it expects to grow: "a fourth event that needs a
+    // fourth [column] is one `ALTER TABLE ADD COLUMN`, which SQLite does
+    // cheaply and which is additive by construction." This is that.
+    //
+    // A second table would have been the wrong answer twice over: it
+    // would split one question ("what did the hooks record about this
+    // session") across two reads, and it would leave the next event's
+    // author guessing which table is theirs.
+    //
+    // # The four columns, and why none of them is a blob
+    //
+    // Migration 14's rule again: a `detail TEXT` holding JSON makes every
+    // read a parse and every query a `LIKE`. These are the whole of what
+    // the three events carry that is worth recording.
+    //
+    // | column | written by | payload field |
+    // |---|---|---|
+    // | `error_type` | `StopFailure` | `error_type` |
+    // | `tool_name` | `PostToolUseFailure`, `PermissionDenied` | `tool_name` |
+    // | `failure_detail` | all three | `error_message` or `denial_reason` |
+    // | `tool_use_id` | the two tool events | `tool_use_id` |
+    //
+    // `failure_detail` is ONE column for two payload fields because no
+    // event carries both: `error_message` belongs to the two failure
+    // events and `denial_reason` to the denial, and `hook.rs`'s byte
+    // budget records that partition. Two columns would be two NULLs on
+    // every row to express one value.
+    //
+    // NULLABLE, all four, and that is load-bearing rather than lax: #1064
+    // requires that a denial with an EMPTY `denial_reason` say so rather
+    // than have one invented, so the absence has to survive storage AS an
+    // absence.
+    //
+    // `tool_input` is NOT here and must never be, for the reason
+    // migration 14 excludes `last_assistant_message`: #1063 and #1064 are
+    // explicit that it carries file contents, command lines and
+    // credentials-adjacent strings, and this table is read on every poll.
+    //
+    // # Why `tool_use_id` earns a UNIQUE INDEX of its own
+    //
+    // This is the one place where migration 14's key is not sufficient,
+    // and it is a difference in the EVENTS rather than a disagreement
+    // about design.
+    //
+    // Migration 14's `(session_id, event, at)` makes a re-read after a
+    // rotation a no-op, which this needs too and inherits unchanged. What
+    // it cannot do is collapse a RETRY. #1063 requires that "failure
+    // counts do not double-count retries of the same `tool_use_id`", and
+    // a retried tool call is a genuinely different moment: Claude Code
+    // re-runs the failing call, each attempt fires its own hook process
+    // at its own nanosecond-precision instant, and all of them carry the
+    // SAME `tool_use_id`.
+    //
+    // MEASURED against migration 14's key alone: three retries of one
+    // `Bash` call store as three rows and count as three failures, which
+    // is precisely the figure #1063 says must not be produced. Migration
+    // 14's events cannot hit this -- a `PreCompact` is not retried -- so
+    // its key is right for them and simply does not reach this case.
+    //
+    // A PARTIAL index, so it constrains only the rows that have an id:
+    // `StopFailure` has no tool call, and SQLite treats NULLs as distinct
+    // in a unique index, which would otherwise be the doubling this
+    // exists to prevent. `WHERE tool_use_id IS NOT NULL` says that
+    // explicitly rather than relying on the NULL semantics to be
+    // remembered.
+    "ALTER TABLE claude_hook_event ADD COLUMN error_type TEXT;
+     ALTER TABLE claude_hook_event ADD COLUMN tool_name TEXT;
+     ALTER TABLE claude_hook_event ADD COLUMN failure_detail TEXT;
+     ALTER TABLE claude_hook_event ADD COLUMN tool_use_id TEXT;
+     CREATE UNIQUE INDEX IF NOT EXISTS claude_hook_event_tool_call
+        ON claude_hook_event (session_id, event, tool_use_id)
+      WHERE tool_use_id IS NOT NULL;
+     CREATE INDEX IF NOT EXISTS claude_hook_event_kind
+        ON claude_hook_event (event, at DESC);",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
@@ -599,6 +681,200 @@ mod tests {
             "dead table must be dropped"
         );
         assert!(has_table(&conn, "snapshot"), "the real cache must survive");
+    }
+
+    /// A v14 database gains the failure and denial columns (#1062, #1063,
+    /// #1064).
+    ///
+    /// Additive by `ALTER TABLE`, which is the growth path migration 14
+    /// names for itself: "a fourth event that needs a fourth [column] is
+    /// one `ALTER TABLE ADD COLUMN`". v14 is every install that has
+    /// #1065-#1067's point events, which is the upgrade path this ships
+    /// into.
+    ///
+    /// The second assertion is the one worth having. `claude_run` is the
+    /// table `liveness::derive` reads, and #1062 requires that
+    /// `StopFailure` never inform liveness -- so these columns must land
+    /// on `claude_hook_event` and `claude_run` must be untouched. A
+    /// migration that grew `claude_run` instead would satisfy the first
+    /// assertion and break the constraint silently.
+    #[test]
+    fn migration_fifteen_adds_the_failure_columns_without_touching_claude_run() {
+        let conn = Connection::open_in_memory().unwrap();
+        // A v14 database: migration 11's claude tables and migration 14's
+        // point-event table, holding a run and a compaction record.
+        conn.execute_batch(
+            "CREATE TABLE snapshot (id INTEGER PRIMARY KEY, payload TEXT NOT NULL,
+                fetched_at TEXT NOT NULL);
+             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE claude_run (
+                session_id TEXT NOT NULL, pid INTEGER NOT NULL,
+                pid_start_time TEXT, source TEXT, end_reason TEXT,
+                started_at TEXT NOT NULL, ended_at TEXT,
+                PRIMARY KEY (session_id, pid, started_at));
+             CREATE TABLE claude_hook_event (
+                session_id TEXT NOT NULL, event TEXT NOT NULL, at TEXT NOT NULL,
+                trigger_kind TEXT, agent_id TEXT, agent_type TEXT,
+                notification_type TEXT,
+                PRIMARY KEY (session_id, event, at));",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 14i64).unwrap();
+        conn.execute(
+            "INSERT INTO claude_run (session_id, pid, started_at)
+             VALUES ('s1', 4242, '2026-09-15T12:00:00Z')",
+            [],
+        )
+        .unwrap();
+        // A #1065 record an existing install already has. It must survive:
+        // this ALTERs their table, it does not replace it.
+        conn.execute(
+            "INSERT INTO claude_hook_event (session_id, event, at, trigger_kind)
+             VALUES ('s1', 'PreCompact', '2026-09-15T12:00:01Z', 'auto')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let cols = |table: &str| -> Vec<String> {
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap();
+            let names = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            names
+        };
+
+        for added in ["error_type", "tool_name", "failure_detail", "tool_use_id"] {
+            assert!(
+                cols("claude_hook_event").contains(&added.to_string()),
+                "{added} is missing from claude_hook_event"
+            );
+        }
+
+        // `claude_run`'s columns are UNCHANGED. #1062 is explicit that
+        // StopFailure must not reach liveness, and liveness reads this
+        // table -- a failure column here would be one join away from
+        // reporting a rate-limited but very much alive session as dead.
+        assert_eq!(
+            cols("claude_run"),
+            vec![
+                "session_id",
+                "pid",
+                "pid_start_time",
+                "source",
+                "end_reason",
+                "started_at",
+                "ended_at"
+            ],
+            "the failure columns belong on `claude_hook_event`: `claude_run` \
+             is what liveness reads, and #1062 requires StopFailure never \
+             inform it"
+        );
+
+        let kept: i64 = conn
+            .query_row("SELECT COUNT(*) FROM claude_run", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 1, "an upgrade must not cost an observed run");
+        let compaction: i64 = conn
+            .query_row("SELECT COUNT(*) FROM claude_hook_event", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            compaction, 1,
+            "an upgrade must not cost a point event #1065-#1067 recorded"
+        );
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+    }
+
+    /// A RETRIED tool call counts once; a distinct one counts again.
+    ///
+    /// #1063 requires that "failure counts do not double-count retries of
+    /// the same `tool_use_id`", and this is that rule at the storage
+    /// layer. It is migration 15's partial unique index that enforces it,
+    /// NOT migration 14's `(session_id, event, at)` key: a retry is a
+    /// genuinely different moment -- Claude Code re-runs the failing call
+    /// and each attempt fires its own hook process at its own instant --
+    /// so the timestamps differ and that key cannot collapse them.
+    ///
+    /// PROVEN BY SABOTAGE: dropping the unique index makes the two retries
+    /// below store as two rows and this fails at 3 instead of 2.
+    ///
+    /// The third insert is the other direction, and it is what stops the
+    /// index from being too greedy: a genuinely different tool call must
+    /// still count. The fourth and fifth are `StopFailure` records, which
+    /// carry NO tool id -- the index is PARTIAL precisely so two of those
+    /// are not collapsed onto a shared NULL.
+    #[test]
+    fn a_retried_tool_call_is_stored_once_but_a_distinct_one_is_not() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+
+        let ins = |event: &str, at: &str, tool: Option<&str>, id: Option<&str>| {
+            conn.execute(
+                "INSERT OR IGNORE INTO claude_hook_event
+                    (session_id, event, at, tool_name, tool_use_id)
+                 VALUES ('s1', ?1, ?2, ?3, ?4)",
+                rusqlite::params![event, at, tool, id],
+            )
+            .unwrap();
+        };
+
+        // One tool call, failing twice at different instants: a RETRY.
+        ins(
+            "PostToolUseFailure",
+            "2026-09-15T12:00:00Z",
+            Some("Bash"),
+            Some("toolu_01"),
+        );
+        ins(
+            "PostToolUseFailure",
+            "2026-09-15T12:00:05Z",
+            Some("Bash"),
+            Some("toolu_01"),
+        );
+        assert_eq!(
+            count(&conn),
+            1,
+            "two failures of ONE tool call are one failure (#1063)"
+        );
+
+        // A genuinely different call still counts.
+        ins(
+            "PostToolUseFailure",
+            "2026-09-15T12:00:06Z",
+            Some("Bash"),
+            Some("toolu_02"),
+        );
+        assert_eq!(
+            count(&conn),
+            2,
+            "a distinct tool call is a distinct failure"
+        );
+
+        // Two StopFailures, neither carrying a tool id. The index is
+        // partial, so a shared NULL must not collapse them.
+        ins("StopFailure", "2026-09-15T12:01:00Z", None, None);
+        ins("StopFailure", "2026-09-15T12:01:01Z", None, None);
+        assert_eq!(
+            count(&conn),
+            4,
+            "two turn failures have no tool call to be the same; a partial \
+             index is what keeps them apart"
+        );
+    }
+
+    /// Rows in `claude_hook_event`, for the test above.
+    fn count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM claude_hook_event", [], |r| r.get(0))
+            .unwrap()
     }
 
     /// A v12 database gains the per-pull-request accumulation table (#1004).

@@ -111,19 +111,50 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
-/// The hook events Headstate installs, and only these two.
+/// The hook events Headstate installs.
 ///
 /// `SessionStart` and `SessionEnd` bound a session, which is the whole
-/// question #910 asks. Every other hook is per-turn or per-tool-call
-/// (`Stop`, `UserPromptSubmit`, `PostToolUse`, `Notification`) and the
-/// transcript already carries that detail at a cost measured in
-/// milliseconds, so installing them would add volume without adding an
-/// answer.
+/// question #910 asks. The bulk hooks are still rejected for the reason
+/// they always were: `Stop`, `UserPromptSubmit` and `PostToolUse` are
+/// per-turn or per-tool-call, and the transcript already carries that
+/// detail at a cost measured in milliseconds, so installing them would add
+/// volume without adding an answer.
 ///
-/// `StopFailure` is the one genuine candidate and is deliberately NOT here:
-/// it fires on the failure path this feature is about, but it does not fire
-/// on SIGKILL either, so it adds error context rather than liveness. It
-/// belongs to its own issue, additive to the same handoff file.
+/// # The three FAILURE events, and why they pass the same test (#1062-#1064)
+///
+/// `StopFailure`, `PostToolUseFailure` and `PermissionDenied` are here
+/// because they pass that test rather than because they are cheap to add.
+/// Each answers something a windowed transcript reader cannot: the reader
+/// is 40 head records plus a 16 KB tail (`transcript.rs:151,163`), so a
+/// failure scattered through the body of a 73 MB transcript is outside the
+/// window, and the alternative is a full-body scan of a 1.8 GB corpus that
+/// grows without bound.
+///
+/// - **`StopFailure`** (#1062) carries `error_type` -- `rate_limit`,
+///   `overloaded`, `authentication_failed` -- and says why a turn died.
+///   The paragraph this replaces called it "the one genuine candidate" and
+///   excluded it, and the EXCLUSION REASONING STILL BINDS: it does not
+///   fire on SIGKILL, so it adds error context and **not liveness**.
+///   Nothing deciding "is this session running" may consult it. That is
+///   enforced structurally rather than remembered -- these events are
+///   stored in `claude_event`, and `liveness::derive` reads `claude_run`,
+///   which has no column for them. `invariants.rs`'s
+///   `liveness_never_reads_the_failure_events` guards the boundary.
+/// - **`PostToolUseFailure`** (#1063) is the narrow slice of `PostToolUse`
+///   that carries information. The volume argument does not transfer
+///   because failures are the small fraction: successes dominate, and a
+///   session where `Bash` failed 14 times is a session that was fighting
+///   something.
+/// - **`PermissionDenied`** (#1064) is the clearest case in the epic. A
+///   denial is a thing that DID NOT HAPPEN: there is no tool result to
+///   parse and no durable record a reader could find at any price. It is
+///   also not an error -- it is a guardrail working -- and the UI is
+///   required to word it that way.
+///
+/// None of the three records `tool_input`. It carries file contents,
+/// command lines and credentials-adjacent strings, and `tool_name` plus
+/// the reason already answers the question; storing it would create a
+/// privacy surface in a file this app reads on every scan.
 ///
 /// # This list is ADDITIVE, and that is a tested property (#1061)
 ///
@@ -154,6 +185,9 @@ use serde_json::{Map, Value};
 /// What adding an event does NOT need is a record-format change: #1061
 /// already carries every event-specific field the epic names, optional at
 /// `v: 1`. See [`super::hook::RECORD_VERSION`] for why that is not a bump.
+/// The three events above were added without touching it, which is the
+/// property #1061 was built to provide -- `RECORD_VERSION` is still `1`
+/// and an old reader still accepts every line.
 ///
 /// The one thing an addition still owes is the argument in the paragraphs
 /// above: a new event must answer something the transcript cannot, or
@@ -161,6 +195,16 @@ use serde_json::{Map, Value};
 pub const EVENTS: &[&str] = &[
     "SessionStart",
     "SessionEnd",
+    // #1062: why the turn died -- `rate_limit`, `overloaded`,
+    // `authentication_failed`. Error context ONLY: it does not fire on
+    // SIGKILL, so nothing deciding liveness may consult it.
+    "StopFailure",
+    // #1063: which tools fail, and how. The narrow slice of `PostToolUse`
+    // that carries information, because failures are the rare fraction.
+    "PostToolUseFailure",
+    // #1064: what auto mode declined. A guardrail working, not an error,
+    // and the only record of a thing that did not happen.
+    "PermissionDenied",
     // #1065: context pressure. `PreCompact` and NOT `PostCompact` --
     // see `hook::compaction` for the argument and the measurement.
     "PreCompact",
@@ -351,6 +395,45 @@ pub struct Uninstalled {
     /// True when there was nothing of ours to remove. Not an error: an
     /// uninstall of something already absent has achieved what was asked.
     pub was_absent: bool,
+}
+
+/// Which events are actually being recorded right now.
+///
+/// The question [`super::events`] needs in order to tell a total from a
+/// floor: a count of denials is complete only if `PermissionDenied` was
+/// installed for the whole period, and a bare count cannot say which.
+///
+/// # Why this reads a [`Status`] rather than the file
+///
+/// The caller has already read the file once for the page's install
+/// banner. Reading it again -- per session, on a list of 1,474 rows --
+/// would be one settings parse per row for an answer that cannot change
+/// between them.
+///
+/// # The three states, and why `CannotTell` is empty
+///
+/// | status | answer | why |
+/// |---|---|---|
+/// | `Installed` | every event in [`EVENTS`] | they are all there and current |
+/// | `Stale` | none | we cannot tell WHICH are intact from the sentence |
+/// | `NotInstalled` | none | nothing is recording |
+/// | `CannotTell` | none | the file could not be read |
+///
+/// `Stale` returning NOTHING is the conservative direction and it is
+/// chosen deliberately. A stale install may be missing an event, may have
+/// a duplicate, or may point at a moved binary that is not running at all
+/// -- and `Status::Stale` carries a human sentence rather than a list, so
+/// there is nothing to parse. Claiming completeness on the strength of a
+/// state that means "something is wrong with this install" would be
+/// exactly the confidently-wrong number the house rule forbids. The cost
+/// is that a stale install renders as a floor, which is true.
+pub fn recording_events(status: &Status) -> Vec<String> {
+    match status {
+        Status::Installed { .. } => EVENTS.iter().map(|e| (*e).to_string()).collect(),
+        // Qualify, or suppress. None of these three can say WHICH events
+        // are intact, so none of them may claim any are.
+        Status::Stale { .. } | Status::NotInstalled | Status::CannotTell(_) => Vec::new(),
+    }
 }
 
 /// `~/.claude/settings.json` under a given home directory.
@@ -970,11 +1053,19 @@ mod tests {
     /// The foreign hook that is really on the development machine, and the
     /// reason this module appends rather than assigns.
     ///
-    /// Measured today from `~/.claude/settings.json`: ten hook events
-    /// pointing at this binary, plus `codegraph prompt-hook` under
-    /// `UserPromptSubmit`. This fixture is that file's SHAPE with its
-    /// personal content removed -- the same matcher structure, the same
-    /// two-entry `UserPromptSubmit`, the same sibling top-level keys.
+    /// Measured from `~/.claude/settings.json`: ten hook events pointing at
+    /// this binary, plus `codegraph prompt-hook` under `UserPromptSubmit`.
+    /// This fixture is that file's SHAPE with its personal content removed
+    /// -- the same matcher structure, the same two-entry
+    /// `UserPromptSubmit`, the same sibling top-level keys.
+    ///
+    /// It carries a foreign hook under EVERY event in [`EVENTS`], which is
+    /// a property the tests below depend on rather than an accident: the
+    /// claim they make is that installing APPENDS to somebody else's
+    /// array instead of assigning over it, and an event where the fixture
+    /// had no foreign hook could not distinguish the two. #1062-#1064
+    /// added three events and two of them (`PostToolUseFailure`,
+    /// `PermissionDenied`) had to be added here for that reason.
     const CC_STATUS: &str = "/Users/acme/.config/iterm2/cc-status";
 
     /// A fixture whose hooks are all somebody else's.
@@ -987,8 +1078,10 @@ mod tests {
         let mut hooks = serde_json::Map::new();
         for event in [
             "Notification",
+            "PermissionDenied",
             "PermissionRequest",
             "PostToolUse",
+            "PostToolUseFailure",
             "PreToolUse",
             "SessionEnd",
             "SessionStart",
@@ -2014,6 +2107,42 @@ mod tests {
         );
     }
 
+    /// A healthy install reports every event as recording; every other
+    /// status reports none.
+    ///
+    /// Both directions, because the failure mode is asymmetric. Claiming
+    /// too MANY would let a half-installed machine present a floor as a
+    /// total, which is the confidently-wrong number the house rule
+    /// forbids; claiming too FEW only costs a "could not tell" on a
+    /// machine that is fine.
+    #[test]
+    fn only_a_healthy_install_is_reported_as_recording() {
+        assert_eq!(
+            recording_events(&Status::Installed {
+                command: "x".into()
+            }),
+            EVENTS.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+
+        for status in [
+            Status::NotInstalled,
+            Status::Stale {
+                detail: "no hook is installed for PermissionDenied".into(),
+            },
+            Status::CannotTell(Refusal::Io {
+                path: "p".into(),
+                detail: "boom".into(),
+            }),
+        ] {
+            assert!(
+                recording_events(&status).is_empty(),
+                "{status:?} cannot say which events are intact, so it must \
+                 not claim any are -- a floor presented as a total is the \
+                 confidently-wrong number the house rule forbids"
+            );
+        }
+    }
+
     /// The installed events are exactly the ones with an issue behind
     /// them.
     ///
@@ -2041,10 +2170,31 @@ mod tests {
             &[
                 "SessionStart",
                 "SessionEnd",
+                "StopFailure",
+                "PostToolUseFailure",
+                "PermissionDenied",
                 "PreCompact",
                 "SubagentStart",
                 "Notification",
             ]
+        );
+
+        // The bulk per-tool-call hook stays rejected. #1063 admits the
+        // FAILURE slice precisely because failures are rare; admitting the
+        // whole event would be the "volume without an answer" this module
+        // has argued against since #910.
+        assert!(
+            !EVENTS.contains(&"PostToolUse"),
+            "the bulk per-tool-call hook is one record per tool call, which \
+             is the volume #1063's rarity argument exists to avoid"
+        );
+        // Headstate is an OBSERVER. A `PreToolUse` hook can deny a tool
+        // call, which would turn a read-only dashboard into something that
+        // can break the user's session -- epic #1060 rules it out
+        // explicitly and this is that rule as a test.
+        assert!(
+            !EVENTS.contains(&"PreToolUse"),
+            "a hook that can block a tool call is not an observer"
         );
     }
 

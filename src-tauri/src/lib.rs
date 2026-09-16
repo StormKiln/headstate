@@ -276,6 +276,8 @@ pub fn run() {
             commands::claude_sessions,
             commands::claude_session_detail,
             commands::claude_subagent_rollup,
+            commands::claude_session_events,
+            commands::claude_event_profile,
             commands::claude_reveal_path,
             commands::claude_session_usage,
             commands::claude_transcript_tail,
