@@ -104,6 +104,22 @@
 //!    is derivable from `session_id`. That is why the omissions listed on
 //!    [`Record`] are argued rather than assumed.
 //!
+//!    #1061 spent some of that margin and found the floor. The eight
+//!    event-specific fields epic #1060 needs are additive and cost
+//!    nothing when absent -- but a record carrying ALL of them at once,
+//!    with both free-text fields capped at 160 bytes, measures **818
+//!    bytes**, and **497** with those two fields empty. That is outside
+//!    the regime, and the answer is not a smaller cap: no event carries
+//!    all eight. The fields partition by event, so the ceiling that
+//!    matters is the largest single partition (the subagent pair, 316
+//!    bytes before text), and
+//!    [`tests::every_events_worst_case_record_stays_small`] measures each
+//!    event's own worst case rather than a shape nothing emits.
+//!
+//!    The consequence for a future field: there is room for one more
+//!    event's worth, not for another eight. A field that has to coexist
+//!    with a capped free-text one needs its own row in that test.
+//!
 //! If a future change cannot keep to one call, the honest move is to say so
 //! and add a lock -- not to keep the comment and lose the property.
 //!
@@ -135,6 +151,50 @@ use std::path::{Path, PathBuf};
 /// skipped it, rather than guessing at fields. `v` is the first field in
 /// the serialised order for exactly that reason: it can be read without
 /// committing to the rest of the shape.
+///
+/// # The version rule (#1061), and why adding a field does NOT bump it
+///
+/// Epic #1060 adds six hook events, each carrying its own payload fields.
+/// The obvious move -- bump `v` when the format grows -- is the wrong one
+/// here, and the reason is mechanical rather than a matter of taste.
+///
+/// [`super::handoff::parse_line`] gates on **strict equality**: a record
+/// whose `v` is anything but the reader's own `RECORD_VERSION` is counted
+/// as `unknown_version` and stored nowhere. So bumping this constant does
+/// not make old readers read new records *slightly worse* -- it makes them
+/// reject **every** record, including the `SessionStart`/`SessionEnd` ones
+/// they have always understood. And old readers are the normal case, not
+/// an edge one: the installed hook command line keeps running whatever
+/// binary is at that path across an app upgrade, so a new hook writing for
+/// an old app is exactly what a mid-upgrade machine looks like.
+///
+/// Adding an **optional** field is forward-compatible without a bump.
+/// [`Record`] on this side skips absent fields when serialising, and the
+/// reader's `Record` carries no `#[serde(deny_unknown_fields)]`, so a
+/// field an old reader has never heard of is silently ignored and the
+/// fields it does know still arrive. That is the `source`/`reason`
+/// precedent, applied to every event-specific field #1060 adds.
+///
+/// So, stated as the rule the next person needs:
+///
+/// - **Adding a new optional field** -- `#[serde(default)]` on the reader,
+///   `skip_serializing_if` on the writer, absent meaning "this event does
+///   not carry it": **does not bump.** An old reader degrades by ignoring
+///   it, which is the outcome we want.
+/// - **Adding a new event name** to `event`, or a new value to an existing
+///   field: **does not bump.** `event` is a string the reader already
+///   matches rather than exhaustively parses, and an event it does not
+///   recognise is not an ending -- which
+///   `handoff::tests::an_unrecognised_event_is_not_an_ending` already pins.
+/// - **Changing the MEANING of an existing field**, removing one, making
+///   an optional field required, or changing a field's type: **bumps.**
+///   An old reader would read these and be confidently wrong, which is the
+///   one failure mode a version number exists to prevent. Reading nothing
+///   beats reading a wrong answer.
+///
+/// A bump is therefore a rare, deliberate act that requires updating the
+/// reader in the same change and accepting that every record written by an
+/// older hook stops being read.
 pub const RECORD_VERSION: u32 = 1;
 
 /// Everything that goes on one line of `sessions.jsonl`.
@@ -158,6 +218,43 @@ pub const RECORD_VERSION: u32 = 1;
 ///   why a session started or how it ended, so losing them here loses them
 ///   permanently. That is the main thing the hooks contribute over the two
 ///   sources that need no install at all.
+/// - `error_type`, `tool_name`, `error_message`, `denial_reason`,
+///   `trigger`, `agent_id`, `agent_type`, `notification_type` -- the same
+///   shape, for the events epic #1060 adds. See "Event-specific fields"
+///   below.
+///
+/// # Event-specific fields are FLAT and OPTIONAL, not a nested payload
+///
+/// #1061 settles the shape all of #1060's events use, because six events
+/// each inventing their own would make this file six formats.
+///
+/// Every event-specific field is a **flat `Option<String>`**, absent when
+/// the event does not carry it -- exactly what `source` and `reason`
+/// already are. The flatness is the load-bearing part, not a style
+/// preference:
+///
+/// - A **nested blob** (`"payload": { ... }`) would make an old reader
+///   choose between deserialising a shape it has never seen and refusing
+///   the record. Flat optional fields it has never heard of are simply
+///   ignored by serde, so the fields it DOES understand -- the session id,
+///   the pid, the timestamp -- still arrive. Degrading beats crashing.
+/// - It keeps [`RECORD_VERSION`]'s rule true: a new field is additive at
+///   `v: 1`, so no bump, so no old reader is cut off. See that constant's
+///   docs for why a bump would reject every record rather than just the
+///   new fields.
+/// - It costs nothing when absent. `skip_serializing_if` means a
+///   `SessionStart` record carries none of these keys at all, so the
+///   512-byte single-write budget is unaffected for the two events that
+///   ship today. [`tests::the_new_event_fields_cost_nothing_when_absent`]
+///   pins that, and
+///   [`tests::every_events_worst_case_record_stays_small`] pins that
+///   even a record carrying every one of them at once stays inside it.
+///
+/// These fields are a FORMAT, not an install: #1061 adds no event to
+/// `install::EVENTS`. Each of #1060's six sub-issues adds its own event
+/// and gives its own field meaning; until then these are written only when
+/// a payload happens to carry them, which for the two installed events is
+/// never.
 ///
 /// # What is deliberately omitted
 ///
@@ -231,6 +328,95 @@ pub struct Record {
     /// `SessionEnd`'s `reason`: `clear|resume|logout|prompt_input_exit|other`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// `StopFailure`'s `error_type`: `rate_limit|overloaded|
+    /// authentication_failed|…`. Why the turn died, which the transcript
+    /// does not record (#1060 sub-issue 1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_type: Option<String>,
+    /// `PostToolUseFailure`'s `tool_name`: which tool failed (#1060
+    /// sub-issue 2). Shared with any other event naming a tool rather than
+    /// given a per-event name, because the field means the same thing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// `PostToolUseFailure`'s `error_message`.
+    ///
+    /// The one field here that is NOT bounded by a small vocabulary: it is
+    /// free text from a failing tool, and a long one would push the line
+    /// past the 512-byte single-write regime. [`TEXT_FIELD_CAP`] truncates
+    /// it for that reason -- see there for why truncating beats dropping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    /// `PermissionDenied`'s `denial_reason` (#1060 sub-issue 3). Free text
+    /// like `error_message`, and capped the same way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub denial_reason: Option<String>,
+    /// `PreCompact`/`PostCompact`'s `trigger`: `manual|auto` (#1060
+    /// sub-issue 4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
+    /// `SubagentStart`/`SubagentStop`'s `agent_id` (#1060 sub-issue 5) --
+    /// the subagent's identity **at the source**, rather than #914's
+    /// structural inference over paths and cwds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// `SubagentStart`/`SubagentStop`'s `agent_type`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    /// `Notification`'s `notification_type`, of which `idle_prompt` is the
+    /// "waiting for you" state the session list cannot show today (#1060
+    /// sub-issue 6).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notification_type: Option<String>,
+}
+
+/// The longest a free-text field may be on a line, in bytes.
+///
+/// Every other field here comes from a small documented vocabulary
+/// (`rate_limit`, `manual`, `idle_prompt`) or is a UUID, so its length is
+/// bounded by the payload's own schema. `error_message` and
+/// `denial_reason` are not: they are prose from a failing tool, and
+/// nothing stops one being a multi-kilobyte stack trace.
+///
+/// That matters because the no-lock concurrency claim in this module's
+/// docs rests on ONE small `write(2)` to an `O_APPEND` descriptor, and the
+/// records it was measured against were sub-512 bytes. An uncapped field
+/// would let a single unlucky tool failure move the whole design outside
+/// the regime it was measured in -- and the symptom would be a torn line
+/// in someone else's file, not a test failure here.
+///
+/// 160 bytes: enough for a first line of a real error message, and small
+/// enough that both capped fields at once still leave the worst-case
+/// record comfortably inside 512 (measured by
+/// [`tests::every_events_worst_case_record_stays_small`]).
+///
+/// # Truncated, not dropped
+///
+/// Absent is not zero, and a dropped message would say "this failure had
+/// no message" when the truth is "it had a long one". A truncated one says
+/// what it can and marks that it was cut, with the ellipsis INSIDE the
+/// cap so the cap is a real ceiling on the bytes written.
+pub const TEXT_FIELD_CAP: usize = 160;
+
+/// A free-text payload field, capped at [`TEXT_FIELD_CAP`] bytes.
+///
+/// Truncation is on a **char boundary**, because `String` is UTF-8 and
+/// slicing mid-codepoint panics -- a panic inside a hook is the worst
+/// available outcome, since it would take the record with it and exit
+/// non-zero into the user's session.
+fn capped_str_field(payload: &serde_json::Value, key: &str) -> Option<String> {
+    let s = str_field(payload, key)?;
+    if s.len() <= TEXT_FIELD_CAP {
+        return Some(s);
+    }
+    const ELLIPSIS: &str = "…";
+    // The ellipsis is 3 bytes in UTF-8 and lives INSIDE the cap, so the
+    // result is never longer than the cap however long the input was.
+    let room = TEXT_FIELD_CAP - ELLIPSIS.len();
+    let mut end = room;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(format!("{}{ELLIPSIS}", &s[..end]))
 }
 
 /// A string field of the payload, when it is present AND a string.
@@ -272,6 +458,22 @@ pub fn record_from(payload: &serde_json::Value, ppid: u32, now: &str) -> Record 
         cwd: str_field(payload, "cwd"),
         source: str_field(payload, "source"),
         reason: str_field(payload, "reason"),
+        // Read unconditionally rather than switched on `event`. A payload
+        // that does not carry a key yields `None` and costs no bytes, and
+        // switching would mean this function knowing every event name --
+        // which is exactly the coupling #1061 exists to avoid, since each
+        // of #1060's six sub-issues would then have to edit this match.
+        //
+        // It also keeps the hook O(1): this is eight `get` calls on an
+        // already-parsed `Value`, with no disk touched.
+        error_type: str_field(payload, "error_type"),
+        tool_name: str_field(payload, "tool_name"),
+        error_message: capped_str_field(payload, "error_message"),
+        denial_reason: capped_str_field(payload, "denial_reason"),
+        trigger: str_field(payload, "trigger"),
+        agent_id: str_field(payload, "agent_id"),
+        agent_type: str_field(payload, "agent_type"),
+        notification_type: str_field(payload, "notification_type"),
     }
 }
 
@@ -495,6 +697,290 @@ mod tests {
         let json = serde_json::to_string(&record_from(&start_payload(), 1, TS)).unwrap();
         assert!(!json.contains("reason"), "got {json}");
         assert!(!json.contains("null"), "got {json}");
+    }
+
+    // -----------------------------------------------------------------
+    // #1061: the event-specific fields the epic's six events will use.
+    // -----------------------------------------------------------------
+
+    /// A payload carrying every event-specific field #1061 adds, for the
+    /// tests that need a worst case.
+    ///
+    /// Not realistic as a single payload -- no event carries all of them
+    /// at once -- and deliberately so. The byte assertion below has to
+    /// hold for the worst line the format can produce, not the likely one.
+    fn every_field_payload() -> serde_json::Value {
+        serde_json::json!({
+            "session_id": "e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2",
+            "cwd": "/Users/someone/code/acme/acme-monorepo/packages/some-workspace/src",
+            "hook_event_name": "PostToolUseFailure",
+            "source": "compact",
+            "reason": "prompt_input_exit",
+            "error_type": "authentication_failed",
+            "tool_name": "Bash",
+            "error_message": "the tool exited 1",
+            "denial_reason": "the write is outside the allowed directory",
+            "trigger": "manual",
+            "agent_id": "f1e2d3c4-b5a6-4798-8a9b-0c1d2e3f4a5b",
+            "agent_type": "general-purpose",
+            "notification_type": "idle_prompt",
+        })
+    }
+
+    /// Every field the epic's six events carry is mapped, and mapped from
+    /// the payload key the event documents.
+    ///
+    /// A field declared on [`Record`] but never read from the payload
+    /// would serialise as absent forever, and the sub-issue that came to
+    /// use it would find an always-empty column with nothing to say why.
+    #[test]
+    fn every_event_field_is_read_from_the_payload() {
+        let r = record_from(&every_field_payload(), 1, TS);
+
+        assert_eq!(r.error_type.as_deref(), Some("authentication_failed"));
+        assert_eq!(r.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(r.error_message.as_deref(), Some("the tool exited 1"));
+        assert_eq!(
+            r.denial_reason.as_deref(),
+            Some("the write is outside the allowed directory")
+        );
+        assert_eq!(r.trigger.as_deref(), Some("manual"));
+        assert_eq!(
+            r.agent_id.as_deref(),
+            Some("f1e2d3c4-b5a6-4798-8a9b-0c1d2e3f4a5b")
+        );
+        assert_eq!(r.agent_type.as_deref(), Some("general-purpose"));
+        assert_eq!(r.notification_type.as_deref(), Some("idle_prompt"));
+    }
+
+    /// The new fields cost ZERO bytes on the two events shipping today.
+    ///
+    /// This is what makes the format additive rather than expensive: a
+    /// `SessionStart` line after #1061 is byte-identical to one before it,
+    /// because `skip_serializing_if` omits a field the payload did not
+    /// carry. A `null` for each of the eight would be ~140 wasted bytes on
+    /// every line of a file that grows without bound.
+    ///
+    /// PROVEN BY SABOTAGE: removing `skip_serializing_if` from
+    /// `error_type` fails here with `"error_type":null` on the line.
+    #[test]
+    fn the_new_event_fields_cost_nothing_when_absent() {
+        for payload in [start_payload(), end_payload()] {
+            let json = serde_json::to_string(&record_from(&payload, 1, TS)).unwrap();
+            for field in [
+                "error_type",
+                "tool_name",
+                "error_message",
+                "denial_reason",
+                "trigger",
+                "agent_id",
+                "agent_type",
+                "notification_type",
+            ] {
+                assert!(
+                    !json.contains(field),
+                    "an event that does not carry {field} must not write the \
+                     key at all: {json}"
+                );
+            }
+            assert!(!json.contains("null"), "got {json}");
+        }
+    }
+
+    /// Every event's own worst-case record stays inside the 512-byte
+    /// single-write regime.
+    ///
+    /// `a_realistic_record_stays_small` guards the worst case of the two
+    /// events installed today. This guards the worst case for each event
+    /// #1060 adds, which is the number that matters once they are
+    /// installed.
+    ///
+    /// # Why this is PER EVENT and not one all-fields-at-once record
+    ///
+    /// MEASURED while writing this test, and it changed the design: a
+    /// record carrying all eight new fields at once, with both free-text
+    /// fields at a 160-byte cap, is **818 bytes** -- outside the regime.
+    /// Even with both text fields EMPTY it is 497, leaving 14 bytes.
+    ///
+    /// The honest response is not to shrink the cap until that number
+    /// fits, because that would be tuning a guard to pass on a shape
+    /// nothing produces. No event carries all eight: `error_type` is
+    /// `StopFailure`'s, `agent_id`/`agent_type` are the subagent events',
+    /// `trigger` is the compaction events'. The fields PARTITION by event,
+    /// and the worst line the writer can actually emit is the largest
+    /// single partition.
+    ///
+    /// So each event's real field set is measured, with the free-text
+    /// fields at their cap. The widest is the subagent pair at 316 bytes
+    /// before any text, and `PostToolUseFailure` at 273 plus a capped
+    /// message. That is the ceiling [`TEXT_FIELD_CAP`] is sized against.
+    ///
+    /// The cost of this choice is stated rather than hidden: if a future
+    /// event carries BOTH a subagent identity and a capped message, this
+    /// test will not have covered it -- so that event must add its own row
+    /// to the table below, which is why the table is a table.
+    ///
+    /// PROVEN BY SABOTAGE: raising `TEXT_FIELD_CAP` to 400 fails here at
+    /// `PostToolUseFailure` (673 bytes), and removing the cap entirely
+    /// fails at 4000-odd.
+    #[test]
+    fn every_events_worst_case_record_stays_small() {
+        // The fields each of #1060's events actually carries. A deep cwd
+        // and a UUID session id in every row, because those are the
+        // bytes that are always there.
+        let cwd =
+            "/Users/someone/code/acme/acme-monorepo/packages/some-deeply-nested-workspace/src";
+        let long = "x".repeat(4000);
+        let cases: &[(&str, serde_json::Value)] = &[
+            ("SessionStart", serde_json::json!({ "source": "compact" })),
+            (
+                "SessionEnd",
+                serde_json::json!({ "reason": "prompt_input_exit" }),
+            ),
+            (
+                "StopFailure",
+                serde_json::json!({ "error_type": "authentication_failed" }),
+            ),
+            (
+                "PostToolUseFailure",
+                serde_json::json!({ "tool_name": "Bash", "error_message": long }),
+            ),
+            (
+                "PermissionDenied",
+                serde_json::json!({ "tool_name": "Bash", "denial_reason": long }),
+            ),
+            ("PreCompact", serde_json::json!({ "trigger": "manual" })),
+            (
+                "SubagentStop",
+                serde_json::json!({
+                    "agent_id": "f1e2d3c4-b5a6-4798-8a9b-0c1d2e3f4a5b",
+                    "agent_type": "general-purpose",
+                }),
+            ),
+            (
+                "Notification",
+                serde_json::json!({ "notification_type": "idle_prompt" }),
+            ),
+        ];
+
+        for (event, extra) in cases {
+            let mut payload = serde_json::json!({
+                "hook_event_name": event,
+                "session_id": "e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2",
+                "cwd": cwd,
+            });
+            for (k, v) in extra.as_object().unwrap() {
+                payload[k] = v.clone();
+            }
+            let line = serde_json::to_string(&record_from(&payload, u32::MAX, TS)).unwrap();
+
+            assert!(
+                line.len() + 1 < 512,
+                "a worst-case {event} record is {} bytes, which is outside \
+                 the single-write regime the no-lock design was measured in \
+                 -- see TEXT_FIELD_CAP",
+                line.len() + 1
+            );
+        }
+    }
+
+    /// A free-text field longer than the cap is TRUNCATED, not dropped and
+    /// not written whole.
+    ///
+    /// All three outcomes are asserted because each of the other two is a
+    /// real failure: writing it whole moves the line outside the
+    /// single-write regime, and dropping it says "this failure had no
+    /// message" when the truth is "it had a long one".
+    ///
+    /// PROVEN BY SABOTAGE: making `capped_str_field` delegate to
+    /// `str_field` fails here at the length assertion (4000 > 160), and
+    /// fails `every_events_worst_case_record_stays_small` at 8000-odd
+    /// bytes -- which is the failure that matters, since that is a torn
+    /// line in a user's file.
+    #[test]
+    fn a_long_free_text_field_is_truncated_rather_than_dropped() {
+        let payload = serde_json::json!({
+            "hook_event_name": "PostToolUseFailure",
+            "error_message": format!("the tool failed: {}", "x".repeat(4000)),
+        });
+
+        let r = record_from(&payload, 1, TS);
+
+        let msg = r.error_message.expect(
+            "a long message must be truncated, not dropped -- absent \
+                     would say the failure had no message",
+        );
+        assert!(
+            msg.len() <= TEXT_FIELD_CAP,
+            "the cap must be a real ceiling on the BYTES written, ellipsis \
+             included: {} bytes",
+            msg.len()
+        );
+        assert!(
+            msg.starts_with("the tool failed: xxx"),
+            "truncation must keep the START of the message, which is where a \
+             tool puts what went wrong: {msg}"
+        );
+        assert!(
+            msg.ends_with('…'),
+            "a cut message must say it was cut: {msg}"
+        );
+    }
+
+    /// A message exactly at the cap is left alone -- the boundary is
+    /// `<=`, not `<`.
+    ///
+    /// Without this the test above passes for a cap that truncates
+    /// everything, including messages that fit.
+    #[test]
+    fn a_message_that_fits_is_not_truncated() {
+        let exact = "x".repeat(TEXT_FIELD_CAP);
+        let payload = serde_json::json!({
+            "hook_event_name": "PostToolUseFailure",
+            "error_message": exact.clone(),
+        });
+
+        assert_eq!(record_from(&payload, 1, TS).error_message, Some(exact));
+    }
+
+    /// Truncation lands on a char boundary rather than mid-codepoint.
+    ///
+    /// `String` is UTF-8 and slicing mid-codepoint PANICS. A panic inside
+    /// a hook is the worst outcome available: it takes the record with it
+    /// and exits non-zero into the user's session, which is the one thing
+    /// this module promises never to do.
+    ///
+    /// The fixture is multi-byte characters only, so the naive cut lands
+    /// inside one -- `TEXT_FIELD_CAP - 3` is not a multiple of 3.
+    #[test]
+    fn truncation_does_not_split_a_multi_byte_character() {
+        let payload = serde_json::json!({
+            "hook_event_name": "PostToolUseFailure",
+            // 3 bytes each, so the byte cap falls inside a character.
+            "denial_reason": "→".repeat(500),
+        });
+
+        let r = record_from(&payload, 1, TS);
+
+        let msg = r.denial_reason.unwrap();
+        assert!(msg.len() <= TEXT_FIELD_CAP, "{} bytes", msg.len());
+        assert!(
+            msg.trim_end_matches('…').chars().all(|c| c == '→'),
+            "got {msg}"
+        );
+    }
+
+    /// The record still serialises `v` first with the new fields present.
+    ///
+    /// `the_version_is_the_first_field_on_the_line` covers today's two
+    /// events; this covers the shape #1060 will write. Serde emits fields
+    /// in declaration order, so a new field declared above `v` would move
+    /// it -- and a reader that cannot find `v` without parsing the whole
+    /// line loses the cheap dispatch the version exists for.
+    #[test]
+    fn the_version_is_still_first_with_every_field_present() {
+        let json = serde_json::to_string(&record_from(&every_field_payload(), 1, TS)).unwrap();
+        assert!(json.starts_with("{\"v\":1,"), "got {json}");
     }
 
     /// A payload that is not JSON at all still produces a line. The pid

@@ -75,6 +75,26 @@ use rusqlite::Connection;
 /// guessed at. The hook and the reader are separate binaries on disk and
 /// can be different versions at the same time, because #915 installs a
 /// command line once and it keeps running whatever lives at that path.
+///
+/// # The version rule (#1061): a new optional field does NOT bump this
+///
+/// The gate in [`parse_line`] is **strict equality**, and that is what
+/// decides the rule. A bump does not make old readers read new records a
+/// little worse; it makes them count **every** record as
+/// `unknown_version` and store none of it, including the
+/// `SessionStart`/`SessionEnd` records they have always understood.
+///
+/// So epic #1060's six new events ride at `v: 1` as **optional** fields,
+/// following the `source`/`reason` precedent. This struct has no
+/// `#[serde(deny_unknown_fields)]`, so a field written by a newer hook
+/// that this reader has never heard of is ignored and the fields it does
+/// know still arrive -- the degrade-don't-crash path, pinned by
+/// [`tests::a_reader_without_the_new_fields_still_reads_a_new_record`].
+///
+/// Bump only when an existing field changes MEANING, is removed, changes
+/// type, or becomes required -- the cases where an old reader would be
+/// confidently wrong rather than merely incomplete. See
+/// [`super::hook::RECORD_VERSION`] for the writer's half of the same rule.
 pub const RECORD_VERSION: u32 = 1;
 
 /// One line of the handoff file, as the hook wrote it (#912).
@@ -121,6 +141,42 @@ pub struct Record {
     /// `SessionEnd`'s `reason`: `clear|resume|logout|prompt_input_exit|other`.
     #[serde(default)]
     pub reason: Option<String>,
+    /// `StopFailure`'s `error_type` (#1060 sub-issue 1).
+    ///
+    /// This and the seven below are the event-specific fields #1061
+    /// settles the shape of: flat, `#[serde(default)]`, absent meaning
+    /// "this event does not carry it". They are ACCEPTED here before any
+    /// event that writes them is installed, which is the point -- a reader
+    /// that already understands the shape is what lets each of #1060's
+    /// sub-issues add its event without a format change.
+    ///
+    /// Nothing in this module gives them meaning yet; `store` reads
+    /// `source` and `reason` and no more. That belongs to the sub-issues.
+    #[serde(default)]
+    pub error_type: Option<String>,
+    /// `PostToolUseFailure`'s `tool_name` (#1060 sub-issue 2).
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    /// `PostToolUseFailure`'s `error_message`, capped by the writer at
+    /// [`super::hook::TEXT_FIELD_CAP`] bytes.
+    #[serde(default)]
+    pub error_message: Option<String>,
+    /// `PermissionDenied`'s `denial_reason` (#1060 sub-issue 3).
+    #[serde(default)]
+    pub denial_reason: Option<String>,
+    /// `PreCompact`/`PostCompact`'s `trigger`: `manual|auto` (#1060
+    /// sub-issue 4).
+    #[serde(default)]
+    pub trigger: Option<String>,
+    /// `SubagentStart`/`SubagentStop`'s `agent_id` (#1060 sub-issue 5).
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// `SubagentStart`/`SubagentStop`'s `agent_type`.
+    #[serde(default)]
+    pub agent_type: Option<String>,
+    /// `Notification`'s `notification_type` (#1060 sub-issue 6).
+    #[serde(default)]
+    pub notification_type: Option<String>,
 }
 
 impl Record {
@@ -1478,5 +1534,214 @@ mod tests {
             "an event we cannot name must not be read as an ending -- \
              that would mark a live session finished"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // #1061: the version rule, proven rather than asserted.
+    // -----------------------------------------------------------------
+
+    /// [`Record`] exactly as it was BEFORE #1061 added the event fields.
+    ///
+    /// A frozen copy, not a reference to the live type -- that is the
+    /// whole point. An assertion about "an old reader" written against
+    /// today's struct tests nothing, because today's struct has the new
+    /// fields and would go on having them as more are added. This one
+    /// cannot: it is a snapshot of the shape a Headstate shipped before
+    /// this change has compiled into it, and it stays that shape forever.
+    ///
+    /// It carries the same `#[serde(default)]` attributes and, crucially,
+    /// the same ABSENCE of `#[serde(deny_unknown_fields)]` -- which is the
+    /// property the test below is really about.
+    #[derive(Debug, serde::Deserialize)]
+    struct OldRecord {
+        v: u32,
+        event: String,
+        #[serde(default)]
+        session_id: Option<String>,
+        ppid: u32,
+        #[serde(default)]
+        ts: Option<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        source: Option<String>,
+        #[serde(default)]
+        reason: Option<String>,
+    }
+
+    /// One line as a NEW hook writes it: every event-specific field #1061
+    /// adds, present at once, at `v: 1`.
+    ///
+    /// Produced by the real writer rather than hand-written, so it cannot
+    /// drift from what a hook actually emits.
+    fn a_new_format_line() -> String {
+        let payload = serde_json::json!({
+            "hook_event_name": "PostToolUseFailure",
+            "session_id": "s-new",
+            "cwd": "/Users/someone/code/proj",
+            "source": "startup",
+            "reason": "other",
+            "error_type": "rate_limit",
+            "tool_name": "Bash",
+            "error_message": "the command exited 1",
+            "denial_reason": "auto mode refuses writes outside the worktree",
+            "trigger": "auto",
+            "agent_id": "a-1",
+            "agent_type": "Explore",
+            "notification_type": "idle_prompt",
+        });
+        serde_json::to_string(&super::super::hook::record_from(&payload, 4242, TS_NEW)).unwrap()
+    }
+
+    const TS_NEW: &str = "2026-09-15T10:00:00+00:00";
+
+    /// **An old reader meets a new record: it degrades, it does not
+    /// crash.** The headline test of #1061.
+    ///
+    /// Proven against [`OldRecord`], a struct that genuinely does not have
+    /// the new fields, rather than asserted about one. Three things are
+    /// checked, and only the three together mean anything:
+    ///
+    /// 1. The parse SUCCEEDS. Serde ignores unknown fields by default, and
+    ///    this is the test that keeps that true -- adding
+    ///    `#[serde(deny_unknown_fields)]` to the live `Record` would be a
+    ///    one-word change that silently made every new record unreadable
+    ///    to every old Headstate.
+    /// 2. The fields the old reader DOES know still arrive, with the right
+    ///    values. A parse that succeeded but zeroed the session id would
+    ///    be a crash by another name.
+    /// 3. The version is still `1`, so the old reader's strict-equality
+    ///    gate in [`parse_line`] lets the line through at all. This is the
+    ///    assertion that would fail if someone bumped [`RECORD_VERSION`]
+    ///    to carry the new fields -- which is the mistake the constant's
+    ///    docs exist to prevent.
+    ///
+    /// PROVEN BY SABOTAGE, three ways, because the three assertions guard
+    /// different mistakes:
+    ///
+    /// - Adding `#[serde(deny_unknown_fields)]` to `OldRecord` (standing
+    ///   in for a live `Record` that had it) fails (1):
+    ///   `unknown field 'error_type', expected one of 'v', 'event', ...`.
+    /// - Changing `hook::record_from` to drop `session_id` fails (2).
+    /// - Bumping `hook::RECORD_VERSION` to 2 fails (3) -- and, tellingly,
+    ///   fails `the_gate_lets_a_new_format_record_through` below with
+    ///   `unknown_version: 1`, which is the whole record rejected rather
+    ///   than just its new fields.
+    #[test]
+    fn a_reader_without_the_new_fields_still_reads_a_new_record() {
+        let line = a_new_format_line();
+        // The fixture is really a new-format line, or this test is a
+        // round trip of the old format against itself.
+        assert!(
+            line.contains("\"error_type\":\"rate_limit\""),
+            "the fixture must carry a field the old reader has never heard \
+             of, or it proves nothing: {line}"
+        );
+
+        let old: OldRecord = serde_json::from_str(&line).unwrap_or_else(|e| {
+            panic!(
+                "an old reader must DEGRADE on a new record, not fail to \
+                 parse it: {e}\nline: {line}"
+            )
+        });
+
+        assert_eq!(old.v, 1, "a new optional field must not bump the version");
+        assert_eq!(old.event, "PostToolUseFailure");
+        assert_eq!(old.session_id.as_deref(), Some("s-new"));
+        assert_eq!(old.ppid, 4242);
+        assert_eq!(old.ts.as_deref(), Some(TS_NEW));
+        assert_eq!(old.cwd.as_deref(), Some("/Users/someone/code/proj"));
+        assert_eq!(old.source.as_deref(), Some("startup"));
+        assert_eq!(old.reason.as_deref(), Some("other"));
+    }
+
+    /// The same new-format line, through the REAL gate and all the way
+    /// into the database.
+    ///
+    /// The test above proves the struct shape degrades; this proves the
+    /// pipeline does. They are different failures: a record that
+    /// deserialises fine can still be counted as `unknown_version` by
+    /// [`parse_line`], which reads `v` off a `Value` before the struct is
+    /// ever built.
+    ///
+    /// The event here is deliberately one that is NOT installed, which is
+    /// the state #1061 ships in: the format accepts it before any hook
+    /// writes it. It is stored as a run with no `ended_at`, per
+    /// `an_unrecognised_event_is_not_an_ending`.
+    #[test]
+    fn the_gate_lets_a_new_format_record_through() {
+        let t = tempfile::TempDir::new().unwrap();
+        let p = path_in(t.path());
+        write_file(&p, &[a_new_format_line()]);
+
+        let mut conn = db();
+        let got = consume(&mut conn, &p, Offset(0), &no_registry()).unwrap();
+
+        assert_eq!(
+            got.unknown_version, 0,
+            "a record carrying new optional fields at v:1 must NOT be \
+             counted as a newer version -- the gate is strict equality, so \
+             a bump would reject the whole record rather than just the \
+             fields"
+        );
+        assert!(got.unparseable.is_empty(), "got {:?}", got.unparseable);
+        assert_eq!(got.runs, 1);
+        assert_eq!(got.sessions, 1);
+    }
+
+    /// The new fields are accepted by the live [`Record`] too, so a later
+    /// sub-issue has somewhere to read them from.
+    ///
+    /// Without this, `Record` could quietly drop the fields it declares
+    /// and both tests above would still pass -- they are about what an
+    /// OLD reader does. This is the other direction: a current reader
+    /// really receives what a current writer sends.
+    #[test]
+    fn the_current_reader_receives_every_new_field() {
+        let rec: Record = serde_json::from_str(&a_new_format_line()).unwrap();
+
+        assert_eq!(rec.error_type.as_deref(), Some("rate_limit"));
+        assert_eq!(rec.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(rec.error_message.as_deref(), Some("the command exited 1"));
+        assert_eq!(
+            rec.denial_reason.as_deref(),
+            Some("auto mode refuses writes outside the worktree")
+        );
+        assert_eq!(rec.trigger.as_deref(), Some("auto"));
+        assert_eq!(rec.agent_id.as_deref(), Some("a-1"));
+        assert_eq!(rec.agent_type.as_deref(), Some("Explore"));
+        assert_eq!(rec.notification_type.as_deref(), Some("idle_prompt"));
+    }
+
+    /// A record from a genuinely NEWER format version is still rejected.
+    ///
+    /// The three tests above are all about what must keep working; this is
+    /// the one about what must still be refused. If the rule "new optional
+    /// fields do not bump" were implemented by loosening the gate instead,
+    /// every test above would pass and the version number would mean
+    /// nothing -- a `v: 2` record whose fields had CHANGED MEANING would
+    /// be read and believed.
+    ///
+    /// `a_newer_record_version_is_its_own_count` above covers the bare
+    /// case; this covers it with the new fields present, which is the
+    /// shape someone would actually produce while making this mistake.
+    #[test]
+    fn a_newer_version_carrying_the_new_fields_is_still_refused() {
+        let mut v: serde_json::Value = serde_json::from_str(&a_new_format_line()).unwrap();
+        v["v"] = serde_json::json!(2);
+        let t = tempfile::TempDir::new().unwrap();
+        let p = path_in(t.path());
+        write_file(&p, &[v.to_string()]);
+
+        let mut conn = db();
+        let got = consume(&mut conn, &p, Offset(0), &no_registry()).unwrap();
+
+        assert_eq!(
+            got.unknown_version, 1,
+            "the version gate must still refuse a record from a format this \
+             reader does not understand -- the additive rule is about not \
+             BUMPING, not about ignoring a bump"
+        );
+        assert_eq!(got.runs, 0);
     }
 }
