@@ -124,6 +124,40 @@ use serde_json::{Map, Value};
 /// it fires on the failure path this feature is about, but it does not fire
 /// on SIGKILL either, so it adds error context rather than liveness. It
 /// belongs to its own issue, additive to the same handoff file.
+///
+/// # This list is ADDITIVE, and that is a tested property (#1061)
+///
+/// Epic #1060 adds six events, one sub-issue each. #1061 makes adding one
+/// a single-line change here by pinning what "additive" has to mean, so
+/// that the seventh person to add an event does not have to re-derive it:
+///
+/// - **Adding an event does not disturb the existing ones.** [`install`]
+///   iterates this list and appends one matcher per event, touching no
+///   other key -- so the two events installed today are written exactly as
+///   they were before the list grew.
+///   [`tests::adding_an_event_leaves_the_existing_two_untouched`] proves it
+///   against an expanded list rather than asserting it.
+/// - **Uninstall removes every key it added, and nothing it did not.**
+///   [`uninstall`] deliberately sweeps **every** key under `hooks` rather
+///   than this list (see its docs), so an event removed from this list in a
+///   later version is still cleaned up. That is what makes the round trip
+///   byte-identical for any list, not just this one.
+/// - **A PARTIAL install is a real state, not a bug to assume away.** A
+///   user can be mid-upgrade, or have hand-deleted one matcher; [`status`]
+///   models it as [`Status::Stale`] naming the missing event, and
+///   `install` repairs it by dropping and rewriting every event in the
+///   list. An uninstall from a partial install must still leave the file
+///   byte-identical --
+///   [`tests::uninstall_from_a_partial_install_of_an_expanded_set_is_byte_identical`]
+///   pins that.
+///
+/// What adding an event does NOT need is a record-format change: #1061
+/// already carries every event-specific field the epic names, optional at
+/// `v: 1`. See [`super::hook::RECORD_VERSION`] for why that is not a bump.
+///
+/// The one thing an addition still owes is the argument in the paragraphs
+/// above: a new event must answer something the transcript cannot, or
+/// cannot afford to. Being cheap to add is not a reason to add one.
 pub const EVENTS: &[&str] = &["SessionStart", "SessionEnd"];
 
 /// The subcommand the installed command line invokes.
@@ -662,6 +696,23 @@ fn write_atomically(path: &Path, root: &Value) -> Result<(), Refusal> {
 /// belonging to other tools. See the module docs for why that is the
 /// property this module exists to have.
 pub fn install(path: &Path, exe: &Path) -> Result<Installed, Refusal> {
+    install_events(path, exe, EVENTS)
+}
+
+/// [`install`], with the event list as a parameter.
+///
+/// The parameter exists for ONE reason, and it is the reason #1061 asks
+/// for: "adding an event is additive" is a claim about a list that is
+/// longer than today's, and the only honest way to test it is to install a
+/// longer one. Doing that by adding a real event to [`EVENTS`] would ship
+/// an event whose semantics belong to a sub-issue that has not been
+/// written yet -- so the mechanism is demonstrated against a test fixture
+/// instead, which is what the issue asks for.
+///
+/// Not `pub`: nothing outside this module may choose its own event list.
+/// The events Headstate installs are [`EVENTS`] and the argument for each
+/// of them lives there.
+fn install_events(path: &Path, exe: &Path, events: &[&str]) -> Result<Installed, Refusal> {
     let command = hook_command(exe);
     let existing = read_settings(path)?;
     let created_file = existing.is_none();
@@ -674,7 +725,7 @@ pub fn install(path: &Path, exe: &Path) -> Result<Installed, Refusal> {
     };
     {
         let hooks = hooks_mut(&mut root, path)?;
-        for event in EVENTS {
+        for event in events {
             // Drop first, then append. A matcher of ours that is already
             // correct is still rewritten -- which costs nothing and means
             // there is exactly one code path, so a "already fine" branch
@@ -1912,8 +1963,268 @@ mod tests {
     /// multiply the handoff file's volume by the number of tool calls in a
     /// session, and the transcript already carries that detail. A change to
     /// this list should be a deliberate one with an issue behind it.
+    ///
+    /// #1061 makes the list additive but deliberately does NOT add to it:
+    /// the format has to land before the events that use it, and each of
+    /// #1060's six events owes its own argument in its own sub-issue. The
+    /// tests below prove the mechanism against a fixture list instead, so
+    /// this assertion can stay exact.
     #[test]
     fn only_the_two_session_bounding_events_are_installed() {
         assert_eq!(EVENTS, &["SessionStart", "SessionEnd"]);
+    }
+
+    // -----------------------------------------------------------------
+    // #1061: the install surface is additive.
+    //
+    // Each of these installs an EXPANDED list through `install_events`
+    // rather than through `EVENTS`, because the claim is about a list
+    // longer than today's and no assertion over today's list can test it.
+    // The fixture events are the ones epic #1060 names, so the shape is
+    // the real one -- but nothing here installs them for real.
+    // -----------------------------------------------------------------
+
+    /// The event list a later sub-issue would produce: today's two, plus
+    /// the six #1060 proposes. Order matters -- the existing two stay
+    /// FIRST, because an addition appends rather than reorders.
+    const EXPANDED: &[&str] = &[
+        "SessionStart",
+        "SessionEnd",
+        "StopFailure",
+        "PostToolUseFailure",
+        "PermissionDenied",
+        "PreCompact",
+        "SubagentStop",
+        "Notification",
+    ];
+
+    /// Adding an event does not disturb the two already installed.
+    ///
+    /// The comparison is between two real installs into two copies of the
+    /// SAME starting document -- one with today's list, one with the
+    /// expanded one -- and the assertion is that the existing two events'
+    /// arrays come out byte-identical in both. That is stronger than
+    /// asserting the new keys appeared: an installer that rewrote,
+    /// reordered or re-quoted the existing matchers while adding a new one
+    /// would pass "the new key is there" and fail here.
+    ///
+    /// PROVEN BY SABOTAGE, and the first attempt did NOT fail -- which is
+    /// the more useful half of the result, so both are recorded.
+    ///
+    /// **The sabotage that did not fail.** Clearing the event's array
+    /// before appending (`hooks.insert((*event).to_string(),
+    /// Value::Array(Vec::new()));`) destroys the foreign hook and left this
+    /// test GREEN. It is a DIFFERENTIAL test: both installs were sabotaged
+    /// identically, so both lost the foreign matcher and the two documents
+    /// still agreed. That defect is real, and it is caught by
+    /// [`tests::a_foreign_hook_under_a_new_event_survives_install_and_uninstall`]
+    /// and by the headline round trip -- which both failed on it. This
+    /// test is not the one that carries that rule.
+    ///
+    /// **The sabotage it does catch**, and the reason it exists: a defect
+    /// whose effect SCALES WITH THE LIST LENGTH, which no assertion over
+    /// today's two events can see. Making the append push one matcher per
+    /// event in the list (`.extend(repeat_n(our_matcher(&command),
+    /// events.len() - 1).chain(once(...)))`) fails here, with `SessionStart`
+    /// carrying **eight** of our matchers under the expanded list against
+    /// two under today's:
+    ///
+    /// ```text
+    /// adding an event must leave the existing ones exactly as they were
+    ///   left: [cc-status, ours, ours, ours, ours, ours, ours, ours, ours]
+    ///  right: [cc-status, ours, ours]
+    /// ```
+    ///
+    /// That is precisely the class of bug "additive" is a claim about, and
+    /// it is invisible to every other test in this module.
+    #[test]
+    fn adding_an_event_leaves_the_existing_two_untouched() {
+        let exe = Path::new(EXE);
+        let (_home_a, today) = scratch(Some(&foreign_fixture()));
+        let (_home_b, expanded) = scratch(Some(&foreign_fixture()));
+
+        install(&today, exe).unwrap();
+        let grown = install_events(&expanded, exe, EXPANDED).unwrap();
+
+        // The expanded install really did add the new events, or the
+        // comparison below is between two identical runs and proves
+        // nothing.
+        for event in EXPANDED.iter().skip(EVENTS.len()) {
+            assert!(
+                commands_under(&expanded, event).contains(&hook_command(exe)),
+                "the expanded install must really have installed {event}"
+            );
+        }
+        assert_eq!(grown.added.len() + grown.replaced.len(), EXPANDED.len());
+
+        // And the two events that existed before are bit-for-bit what the
+        // unexpanded install produced.
+        let a: Value = serde_json::from_str(&std::fs::read_to_string(&today).unwrap()).unwrap();
+        let b: Value = serde_json::from_str(&std::fs::read_to_string(&expanded).unwrap()).unwrap();
+        for event in EVENTS {
+            assert_eq!(
+                b["hooks"][event], a["hooks"][event],
+                "adding an event must leave the existing ones exactly as \
+                 they were"
+            );
+        }
+    }
+
+    /// Install then uninstall with the EXPANDED set restores the document
+    /// byte for byte.
+    ///
+    /// The headline round-trip, re-run against a list longer than today's.
+    /// It is the property that makes `EVENTS` safe to grow: uninstall
+    /// sweeps every key under `hooks` rather than today's list, so the six
+    /// keys the expanded install added are removed along with the two, and
+    /// no `"StopFailure": []` is left behind.
+    ///
+    /// PROVEN BY SABOTAGE. Narrowing `uninstall`'s sweep from every key to
+    /// `EVENTS` (`let events: Vec<String> = EVENTS.iter().map(|e|
+    /// (*e).to_string()).collect();`) fails here with the six extra keys
+    /// still carrying our matcher:
+    ///
+    /// ```text
+    /// install then uninstall with an expanded event set must restore the
+    ///   document BYTE for byte
+    ///   left: ... "PermissionDenied": [ { "_headstate": 1, ... } ], ...
+    ///  right: ... (no such key)
+    /// ```
+    #[test]
+    fn uninstall_after_an_expanded_install_is_byte_identical() {
+        let before = foreign_fixture();
+        let (_home, path) = scratch(Some(&before));
+        let exe = Path::new(EXE);
+
+        let installed = install_events(&path, exe, EXPANDED).unwrap();
+        assert_eq!(
+            installed.added.len() + installed.replaced.len(),
+            EXPANDED.len()
+        );
+        // The middle of the test: the install really happened. Without
+        // this, an `install_events` that did nothing would pass the byte
+        // comparison below.
+        for event in EXPANDED {
+            assert!(
+                commands_under(&path, event).contains(&hook_command(exe)),
+                "{event} must carry our hook after the install"
+            );
+        }
+
+        uninstall(&path).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "install then uninstall with an expanded event set must restore \
+             the document BYTE for byte -- including removing the KEY of an \
+             event the fixture never had, not leaving an empty array behind"
+        );
+    }
+
+    /// A PARTIAL install of an expanded set still uninstalls cleanly.
+    ///
+    /// `install.rs` already models a partial install as a real state
+    /// (`Status::Stale` names the missing event), so uninstall has to
+    /// handle one: a user can be interrupted mid-write, or hand-delete one
+    /// matcher, or be running a version whose `EVENTS` is shorter than the
+    /// one that wrote the file.
+    ///
+    /// The fixture here is the one a shorter-list version produces: three
+    /// of the expanded events are installed, five are not. Uninstall must
+    /// remove exactly those three keys, leave the foreign hooks alone, and
+    /// restore the document byte for byte.
+    #[test]
+    fn uninstall_from_a_partial_install_of_an_expanded_set_is_byte_identical() {
+        let before = foreign_fixture();
+        let (_home, path) = scratch(Some(&before));
+        let exe = Path::new(EXE);
+        let partial: &[&str] = &["SessionStart", "StopFailure", "Notification"];
+
+        install_events(&path, exe, partial).unwrap();
+
+        // Exactly the partial set carries our hook, and the five events we
+        // did not install do not -- a partial install is partial.
+        for event in EXPANDED {
+            let has_ours = commands_under(&path, event).contains(&hook_command(exe));
+            assert_eq!(
+                has_ours,
+                partial.contains(event),
+                "{event} should{} carry our hook after a partial install",
+                if partial.contains(event) { "" } else { " not" }
+            );
+        }
+
+        let removed = uninstall(&path).unwrap();
+        assert!(!removed.was_absent);
+        let mut got = removed.removed.clone();
+        got.sort();
+        let mut want: Vec<String> = partial.iter().map(|e| (*e).to_string()).collect();
+        want.sort();
+        assert_eq!(
+            got, want,
+            "uninstall must report exactly the events it removed ours from, \
+             not every event in the file"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "an uninstall from a PARTIAL install must still restore the \
+             document byte for byte"
+        );
+    }
+
+    /// A foreign hook under an event of the expanded set survives both
+    /// halves of the round trip.
+    ///
+    /// This is the failure the module exists to prevent, restated for the
+    /// events #1060 adds: `StopFailure`, `Notification` and `SubagentStop`
+    /// all carry a foreign `cc-status` matcher on the development machine
+    /// TODAY, before Headstate installs anything under them. So the first
+    /// sub-issue that adds one of those events is installing beside
+    /// somebody else's tool from its very first run -- and an uninstall
+    /// that took the key with it would silently disable that tool.
+    ///
+    /// PROVEN BY SABOTAGE, twice, because the two halves fail differently:
+    ///
+    /// - Replacing the append in `install_events` with an assignment
+    ///   (`hooks.insert((*event).to_string(),
+    ///   Value::Array(vec![our_matcher(&command)]))`) fails at the install
+    ///   assertion, with `cc-status` gone from `StopFailure`.
+    /// - Weakening `is_ours` to `true` fails at the uninstall assertion,
+    ///   with the foreign matcher removed and the key gone entirely.
+    #[test]
+    fn a_foreign_hook_under_a_new_event_survives_install_and_uninstall() {
+        let before = foreign_fixture();
+        let (_home, path) = scratch(Some(&before));
+        let exe = Path::new(EXE);
+        // These three are in `foreign_fixture` already -- the same shape
+        // the real development machine has.
+        let shared = ["StopFailure", "Notification", "SubagentStop"];
+
+        install_events(&path, exe, EXPANDED).unwrap();
+
+        for event in shared {
+            assert_eq!(
+                commands_under(&path, event),
+                vec![CC_STATUS.to_string(), hook_command(exe)],
+                "installing into {event} must APPEND beside the foreign hook \
+                 already there, not replace the array"
+            );
+        }
+
+        uninstall(&path).unwrap();
+
+        for event in shared {
+            assert_eq!(
+                commands_under(&path, event),
+                vec![CC_STATUS.to_string()],
+                "uninstalling from {event} must leave the foreign hook -- \
+                 removing someone else's tool is the worst failure this \
+                 module can have"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 }
