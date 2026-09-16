@@ -609,6 +609,68 @@ const MIGRATIONS: &[&str] = &[
       WHERE tool_use_id IS NOT NULL;
      CREATE INDEX IF NOT EXISTS claude_hook_event_kind
         ON claude_hook_event (event, at DESC);",
+    // Migration 16: per-transcript plugin usage, incrementally (#1075).
+    //
+    // # Why a cache at all, when `transcript.rs` argues against one
+    //
+    // `transcript.rs` states the case for no incremental machinery, and
+    // it is right FOR ITSELF: its reader is bounded at 40 head records
+    // and a 16 KB tail, so a full rescan is 200-250 ms and a cache would
+    // cost more than it saves.
+    //
+    // This scan cannot be bounded that way. A plugin call can appear at
+    // any point in a transcript, so answering "how often was this
+    // plugin called" needs the whole body of every file. MEASURED on the
+    // real corpus: 2,474 files, 1.7 GB, **26 s** cold. That is not a page
+    // load, and it is two orders of magnitude away from the read the
+    // no-cache argument was made about. `usage.rs` draws the same line
+    // for the same reason -- "affordable per session detail and still
+    // must never join the startup scan".
+    //
+    // So the file-level result is cached and keyed on what makes it
+    // stale.
+    //
+    // # Why mtime and size, and what they are NOT
+    //
+    // `crash.rs` rejects mtime as a claim about when something happened,
+    // and that rejection stands: nothing here stores mtime as a time. It
+    // is a CHANGE KEY -- "is this file the one we read?" -- and `size`
+    // rides with it because a transcript is append-only in practice, so
+    // a changed size is the cheap positive signal and mtime catches a
+    // rewrite that happened to land on the same length.
+    //
+    // A false HIT would silently freeze a plugin's count. A false MISS
+    // costs one re-read of one file. The pair is chosen so the cheap
+    // error is the one we make.
+    //
+    // # Why per file and not per plugin
+    //
+    // The unit of invalidation is the file: it is what changes, and what
+    // we can tell has changed without reading it. Summing to per-plugin
+    // totals is a GROUP BY over a few thousand rows, which is free, and
+    // storing the totals instead would mean re-deriving them from
+    // scratch on any single file's change -- the thing this exists to
+    // avoid.
+    //
+    // `path` is the primary key rather than a session id because a
+    // subagent transcript has no session row (migration 11 never sees
+    // one) and, as `plugins::usage_files` measures, most plugin calls
+    // happen inside one. Keying on `session_id` would drop 80% of
+    // `playwright`'s calls on the floor.
+    //
+    // `calls` is a JSON object of `{plugin: {kind: n}}` plus the
+    // failures and last-called stamp, because the alternative -- a row
+    // per (file, plugin, kind) -- is a schema that has to be re-derived
+    // and re-inserted wholesale whenever one file changes, for a value
+    // nothing ever queries except by summing all of it. The blob is read
+    // back and summed in Rust, never queried into.
+    "CREATE TABLE IF NOT EXISTS claude_plugin_scan (
+        path        TEXT PRIMARY KEY,
+        mtime_ms    INTEGER NOT NULL,
+        size_bytes  INTEGER NOT NULL,
+        calls       TEXT NOT NULL,
+        scanned_at  TEXT NOT NULL
+     );",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
@@ -792,6 +854,67 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, MIGRATIONS.len() as i64);
+    }
+
+    /// Migration 16 adds the plugin scan cache without costing history.
+    ///
+    /// An install sitting at 15 gains `claude_plugin_scan` and keeps
+    /// every row it had. The cache is Headstate's own derived data --
+    /// losing it would cost one 26-second rescan, not a fact -- but the
+    /// tables beside it hold observations that cannot be recovered.
+    #[test]
+    fn migration_16_adds_the_plugin_scan_cache() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE claude_session (
+                session_id TEXT PRIMARY KEY, name TEXT, cwd TEXT, git_branch TEXT,
+                claude_version TEXT, transcript_path TEXT,
+                first_seen_at TEXT NOT NULL, last_activity_at TEXT);",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 15i64).unwrap();
+        conn.execute(
+            "INSERT INTO claude_session (session_id, first_seen_at)
+             VALUES ('s1', '2026-09-15T12:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        // The new table exists and takes a row.
+        conn.execute(
+            "INSERT INTO claude_plugin_scan (path, mtime_ms, size_bytes, calls, scanned_at)
+             VALUES ('/p/a.jsonl', 1, 2, '{}', '2026-09-16T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        // `path` is the primary key: re-scanning one file replaces its
+        // row rather than appending a second reading of the same file,
+        // which would double every count it carries.
+        conn.execute(
+            "INSERT INTO claude_plugin_scan (path, mtime_ms, size_bytes, calls, scanned_at)
+             VALUES ('/p/a.jsonl', 9, 9, '{}', '2026-09-16T00:01:00Z')
+             ON CONFLICT(path) DO UPDATE SET mtime_ms = excluded.mtime_ms",
+            [],
+        )
+        .unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM claude_plugin_scan", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "one row per file, keyed on path");
+
+        let kept: i64 = conn
+            .query_row("SELECT COUNT(*) FROM claude_session", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 1, "an upgrade must not cost a stored session");
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+        assert_eq!(version, 16, "this is migration 16");
     }
 
     /// A RETRIED tool call counts once; a distinct one counts again.

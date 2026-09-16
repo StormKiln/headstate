@@ -340,6 +340,19 @@ pub const SURFACE: &[(&str, Class)] = &[
     // it leads to is a copy of `claude --resume <id>`, which
     // `claudify_command` is already `Read` for.
     ("claude_overview", Class::Read),
+    // Installed plugins and their measured usage (#1075).
+    //
+    // `Read`: it lists `~/.claude/plugins/installed_plugins.json`, reads
+    // transcript bodies, and writes only to Headstate's OWN cache
+    // (migration 16's per-file scan table) -- the same thing
+    // `claude_import_transcripts` above is `Read` for. It installs
+    // nothing, enables nothing and removes nothing; every plugin
+    // management action stays in Claude Code's own hands.
+    //
+    // The classification is about what the command DOES, and this one
+    // counts. That its answer might persuade someone to uninstall a
+    // plugin is a property of the information, not of the command.
+    ("claude_plugins", Class::Read),
     // The restart list: every running session's resume command (#1071).
     //
     // `Read`, on the same grounds as `claude_sessions`, which it is a
@@ -957,6 +970,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "claude_event_profile" => res(commands::claude_event_profile(app.clone()).await),
         "claude_poll_live" => res(commands::claude_poll_live(app.clone()).await),
         "claude_overview" => res(commands::claude_overview(app.clone()).await),
+        "claude_plugins" => res(commands::claude_plugins(app.clone()).await),
         "claude_restart_list" => res(commands::claude_restart_list(app.clone()).await),
         "claude_session_usage" => res(commands::claude_session_usage(a.get("path")?).await),
         "claude_transcript_tail" => res(commands::claude_transcript_tail(a.get("path")?).await),

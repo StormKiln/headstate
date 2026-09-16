@@ -222,6 +222,18 @@ const ClaudeOverviewPage = lazy(() =>
     default: m.ClaudeOverviewPage,
   })),
 );
+/// The FOURTH chart-carrying route (#1075).
+///
+/// `ClaudePluginsPage` reaches `recharts` through `stats/PluginCallsChart`
+/// -> `ui/chart`, the same path the three above reach it by, so it belongs
+/// behind the same boundary for the same reason. Its entry in
+/// `App.lazy.test.tsx`'s `LAZY_ROUTES` was added in the same change as this
+/// line -- that table is the only gate, for the reason stated above.
+const ClaudePluginsPage = lazy(() =>
+  import("./components/ClaudePluginsPage").then((m) => ({
+    default: m.ClaudePluginsPage,
+  })),
+);
 
 /// What fills a lazy view's frame while its chunk arrives.
 ///
@@ -834,6 +846,21 @@ export default function App() {
           // split a chunk the sidebar has already fetched.
           claudePage === "sessions" ? (
             <ClaudeCodePage />
+          ) : claudePage === "plugins" ? (
+            // Its own arm rather than a second fall-through. The overview
+            // is the `else`, so a page added to `ClaudePage` and to
+            // `CLAUDE_PAGES` but not here compiles cleanly, highlights
+            // its own sidebar row, and renders the overview -- a
+            // navigation that silently goes nowhere. #1038 is the same
+            // defect one layer up: a component and its host landed in
+            // different PRs and nothing rendered the component.
+            //
+            // The page owns its own padding, so no wrapper here.
+            // `Suspense` because it reaches `recharts` through
+            // `stats/PluginCallsChart`.
+            <Suspense fallback={<ViewLoading />}>
+              <ClaudePluginsPage />
+            </Suspense>
           ) : (
             <div className="p-4">
               {/* Suspense because the page is a lazy chunk: it reaches

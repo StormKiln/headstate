@@ -21,6 +21,7 @@ import type {
   ClaudeMdScan,
   ClaudeImported,
   ClaudeOverview,
+  PluginsReport,
   ClaudeRestartList,
   ClaudePreview,
   ClaudeSessionDetail,
@@ -830,6 +831,15 @@ export const claudeRevealPath = (path: string) =>
 /// Two SELECTs over the cache plus a stat per session and one directory
 /// listing; measured at 7ms for 1,461 sessions. Writes nothing.
 export const claudeOverview = () => call<ClaudeOverview>("claude_overview");
+
+/// Installed plugins and what they were actually used for (#1075).
+///
+/// Unlike every other Claude command this reads transcript BODIES, which
+/// is 26 seconds cold over the real corpus. Migration 16's per-file cache
+/// makes every later call read only what changed, so this is a normal
+/// query after the first one -- but it is not a poll target, and no hook
+/// here gives it a `refetchInterval`.
+export const claudePlugins = () => call<PluginsReport>("claude_plugins");
 
 /// Every running session's resume command, for a restart (#1071).
 ///

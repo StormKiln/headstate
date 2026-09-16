@@ -51,6 +51,9 @@ const LAZY_ROUTES: [name: string, specifier: string][] = [
   // `ClaudeOverviewPage` reaches `recharts` through `stats/SessionsChart`
   // -> `ui/chart`, which is the same path `StatsPage` reaches it by.
   ["ClaudeOverviewPage", "./components/ClaudeOverviewPage"],
+  // #1075. Reaches `recharts` through `stats/PluginCallsChart` ->
+  // `ui/chart`, the same path as the three above.
+  ["ClaudePluginsPage", "./components/ClaudePluginsPage"],
 ];
 
 describe("the launch chunk", () => {

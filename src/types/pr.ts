@@ -2848,3 +2848,80 @@ export interface StatsReviewers {
   refusedFields: number;
   spend: Spend;
 }
+
+/// What a plugin is CAPABLE of contributing (#1075).
+///
+/// Read from the install path, never from usage. `read: false` means the
+/// flags are absences of KNOWLEDGE, not absences of features, so the UI
+/// must not turn them into a claim.
+export interface PluginContribution {
+  mcp: boolean;
+  skills: boolean;
+  agents: boolean;
+  commands: boolean;
+  /// Whether the install path could be read at all.
+  read: boolean;
+}
+
+/// One installed plugin, from `installed_plugins.json` (#1075).
+export interface InstalledPlugin {
+  name: string;
+  /// Where it came from. The source is the `@<marketplace>` half of the
+  /// inventory key, not a field of the entry.
+  marketplace: string;
+  scope: string | null;
+  version: string | null;
+  install_path: string | null;
+  installed_at: string | null;
+  last_updated: string | null;
+  contribution: PluginContribution;
+}
+
+/// One plugin's counted usage (#1075).
+///
+/// Every count here is of `tool_use` records ONLY. A plugin's tool names
+/// also appear in every session's availability list, and counting those
+/// reports unused plugins as the busiest -- see `claude/plugins.rs`.
+export interface PluginUsage {
+  name: string;
+  mcp_calls: number;
+  skill_calls: number;
+  agent_calls: number;
+  command_calls: number;
+  failures: number;
+  last_called_at: string | null;
+  /// Whether a scan covered this plugin at all.
+  ///
+  /// `false` is "we have no reading", NOT "zero calls". The page renders
+  /// the two differently, because a false zero here argues for
+  /// uninstalling something the user relies on.
+  measured: boolean;
+}
+
+/// One day of the plugin activity chart (#1075).
+export interface PluginDayCount {
+  /// `YYYY-MM-DD`, UTC.
+  day: string;
+  calls: number;
+}
+
+/// Installed plugins and what they were actually used for (#1075).
+export interface PluginsReport {
+  installed: InstalledPlugin[];
+  usage: PluginUsage[];
+  activity: PluginDayCount[];
+  /// Transcripts that could not be read, `<path>: <why>`. While this is
+  /// non-empty every count above is a FLOOR, and the page says
+  /// "at least N".
+  unreadable: string[];
+  /// The inventory file could not be read, with why. Distinct from an
+  /// empty inventory.
+  inventory_failure: string | null;
+  /// There is no inventory file: nothing is installed. A settled empty
+  /// answer, not a failure.
+  inventory_absent: boolean;
+  /// How many transcripts were read this time; the rest were unchanged
+  /// and came from the cache.
+  scanned: number;
+  elapsed_ms: number;
+}

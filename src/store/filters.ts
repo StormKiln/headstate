@@ -173,13 +173,13 @@ export type HealthPage = (typeof ALL_HEALTH_PAGES)[number];
 /// A plain union, not an `as const` array like `ALL_HEALTH_PAGES`.
 ///
 /// That one is an array because `healthPagesFor` FILTERS it at runtime --
-/// a machine with no discoverable GPU is offered no GPU page. Both Claude
-/// Code pages are offered unconditionally, so nothing ever iterates the
-/// set: the sidebar's own `CLAUDE_PAGES` carries the labels and icons and
-/// is the only list there is. An array here would be a second declaration
-/// of the same two names with nothing reading it, which is what `yarn
-/// knip` objects to and it is right.
-export type ClaudePage = "sessions" | "overview";
+/// a machine with no discoverable GPU is offered no GPU page. Every
+/// Claude Code page is offered unconditionally, so nothing ever iterates
+/// the set: the sidebar's own `CLAUDE_PAGES` carries the labels and icons
+/// and is the only list there is. An array here would be a second
+/// declaration of the same names with nothing reading it, which is what
+/// `yarn knip` objects to and it is right.
+export type ClaudePage = "sessions" | "overview" | "plugins";
 
 /// Which subset of the Claude Code session list is showing (#949).
 ///

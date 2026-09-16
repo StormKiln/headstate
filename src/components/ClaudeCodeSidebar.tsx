@@ -1,4 +1,4 @@
-import { Bot, Gauge, ListTree } from "lucide-react";
+import { Blocks, Bot, Gauge, ListTree } from "lucide-react";
 import { useIsMobile } from "../lib/useIsMobile";
 import { type ClaudePage, type View, useFilters } from "../store/filters";
 import { ClaudeSessionColumn } from "./ClaudeCodePage";
@@ -10,7 +10,7 @@ import { ViewSwitcher } from "./ViewSwitcher";
 /// drift into offering different pages -- the failure `HEALTH_PAGES` exists
 /// to prevent, and #675 fixed for `VIEWS`.
 ///
-/// Two entries, and `"overview"` is first because it is the landing page
+/// `"overview"` is first because it is the landing page
 /// (#939). #921 put `"sessions"` first and argued for it: "the view is
 /// opened to get a crashed session back, and the overview answers a second
 /// question rather than the first." Using the view disproved both halves.
@@ -36,6 +36,12 @@ export const CLAUDE_PAGES: {
 }[] = [
   { id: "overview", label: "Overview", Icon: Gauge },
   { id: "sessions", label: "Sessions", Icon: ListTree },
+  // Last: it answers a question asked occasionally ("am I getting value
+  // out of what I installed?") rather than the one the view is opened
+  // for. Its scan is also the most expensive thing behind any of these
+  // pages, and putting it above Sessions would make arriving here cost a
+  // corpus read nobody asked for.
+  { id: "plugins", label: "Plugins", Icon: Blocks },
 ];
 
 /// The Claude Code view's own sidebar (#917, #921, #939).
