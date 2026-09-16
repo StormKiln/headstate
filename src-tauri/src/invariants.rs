@@ -1149,6 +1149,31 @@ mod tests {
     /// `async` and need a live client; the guard covers them so the first
     /// one that appears fails here rather than in a release.
     ///
+    /// # The async gap this guard cannot close, and what does
+    ///
+    /// This rule is enforceable only for SYNC tests. `observed_test_lock`
+    /// returns a `std::sync::MutexGuard`, and clippy's
+    /// `await_holding_lock` under `-D warnings` refuses to let one be held
+    /// across an `.await` -- so an async test structurally cannot comply,
+    /// and this guard cannot demand it.
+    ///
+    /// That gap produced three defects: #1048 (a mock fixture supplying
+    /// `rateLimit.remaining`), #1050 (seeding through `record`), and #1079
+    /// (an async test inheriting a STARVED figure and failing with a
+    /// message about a budget it never set, which burned the v5.22.0 tag).
+    ///
+    /// `budget::scoped` (#1079) is the async-safe form: a thread-local
+    /// override, sound because `cargo test` gives each test its own thread
+    /// and every `#[tokio::test]` here uses the default `current_thread`
+    /// runtime. An async test calls `scoped::enter` and is then immune to
+    /// what any other test wrote -- and its own writes cannot escape.
+    ///
+    /// So the two mechanisms divide the space rather than compete: this
+    /// guard keeps sync tests serialised, and `scoped` isolates async ones.
+    /// A NEW async test needs `scoped::enter`, and nothing here can make it
+    /// -- which is why the mechanism is the fix and this comment is the
+    /// pointer to it.
+    ///
     /// One hop, not a full closure, and the limit is stated because it is
     /// real: the hop is resolved inside the test's OWN file via
     /// [`fn_bodies`], so a test calling a helper in a sibling module that
