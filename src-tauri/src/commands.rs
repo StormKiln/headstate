@@ -3968,6 +3968,38 @@ pub async fn claude_restart_list(
     .map_err(|e| e.to_string())?
 }
 
+/// Installed plugins and what they were actually used for (#1075).
+///
+/// # Why this one is allowed to read the corpus body
+///
+/// Every other Claude command is bounded precisely so nothing touches
+/// the 1.7 GB of transcript bodies on a normal path. This one must: a
+/// plugin call can appear anywhere in a file, so the question cannot be
+/// answered from a 40-record head and a 16 KB tail.
+///
+/// It pays for that with migration 16's per-file cache, so the
+/// 26-second cold read happens ONCE and every later call reads only
+/// transcripts whose mtime or size moved. `claude/plugins.rs` argues the
+/// whole design, including why this does not contradict
+/// `transcript.rs`'s no-incremental-machinery rule.
+///
+/// A database that could not be read is an `Err`, for the reason
+/// `claude_overview` gives: a struct of zeros would draw a chart and a
+/// "0 calls" column that look exactly like a measured absence, and on
+/// THIS page that argues for uninstalling a plugin the user relies on.
+#[tauri::command]
+pub async fn claude_plugins(
+    app: tauri::AppHandle,
+) -> Result<crate::claude::plugins::PluginsReport, String> {
+    let db = db_path(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&db).map_err(|e| e.to_string())?;
+        crate::claude::plugins::report(&conn, chrono::Utc::now()).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Reveal a session's working directory or its transcript in the file
 /// manager (#917).
 ///

@@ -118,7 +118,9 @@ describe("the page order, which #939 reversed", () => {
   /// array is exported precisely so there is one order, so the order in the
   /// array is a claim in its own right.
   it("lists overview first in CLAUDE_PAGES itself", () => {
-    expect(CLAUDE_PAGES.map((p) => p.id)).toEqual(["overview", "sessions"]);
+    // Plugins last (#1075): it answers an occasional question, and its
+    // scan is the most expensive thing behind any of these pages.
+    expect(CLAUDE_PAGES.map((p) => p.id)).toEqual(["overview", "sessions", "plugins"]);
   });
 
   /// The store has to agree with the column, or where you land depends on
@@ -147,6 +149,21 @@ describe("the page order, which #939 reversed", () => {
     ).toBeNull();
     // No toggle semantics anywhere in the column.
     expect(document.querySelector("[aria-pressed]")).toBeNull();
+  });
+
+  /// The Plugins row navigates (#1075).
+  ///
+  /// `src/CLAUDE.md`'s rule that a component and its host can land in
+  /// different PRs, applied to a page: a sidebar row that sets a
+  /// `claudePage` nothing routes on highlights itself and renders the
+  /// overview, which looks like a broken page rather than a missing one.
+  it("navigates to the plugins page", () => {
+    render(<ClaudeCodeSidebar />);
+    fireEvent.click(screen.getByRole("button", { name: /plugins/i }));
+    expect(useFilters.getState().claudePage).toBe("plugins");
+    expect(
+      screen.getByRole("button", { name: /plugins/i }).getAttribute("aria-current"),
+    ).toBe("page");
   });
 });
 

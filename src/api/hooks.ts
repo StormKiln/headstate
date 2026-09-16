@@ -13,6 +13,7 @@ import type {
   BranchScanFrame,
   ClaudeImported,
   ClaudeOverview,
+  PluginsReport,
   ClaudePreview,
   ClaudeUsage,
   ClaudeSubagentRollup,
@@ -102,6 +103,7 @@ import {
   scanClaudeMd,
   claudeImportTranscripts,
   claudeOverview,
+  claudePlugins,
   claudeSessionUsage,
   claudeSubagentRollup,
   claudeSessionEvents,
@@ -1463,6 +1465,31 @@ export function useClaudeEventProfile(enabled = true) {
   return useQuery<ClaudeCorpus>({
     queryKey: ["claude-event-profile"],
     queryFn: () => claudeEventProfile(),
+    enabled,
+    staleTime: Infinity,
+    retry: false,
+  });
+}
+
+/// Installed plugins and their measured usage (#1075).
+///
+/// # Why this never polls
+///
+/// The first call reads every transcript body -- 26 seconds over the
+/// real corpus -- and later calls read only what changed. A
+/// `refetchInterval` would be a background full-corpus read on a timer,
+/// which is exactly what `transcript.rs`'s bounded window exists to
+/// prevent. `staleTime: Infinity` because the answer changes only when
+/// the user runs Claude Code, and a manual refetch is the honest way to
+/// ask again.
+///
+/// `retry: false` on the same grounds as the hooks above: the failures
+/// this can have -- no home directory, an unreadable database -- are
+/// settled refusals that a second identical call cannot fix.
+export function useClaudePlugins(enabled = true) {
+  return useQuery<PluginsReport>({
+    queryKey: ["claude-plugins"],
+    queryFn: () => claudePlugins(),
     enabled,
     staleTime: Infinity,
     retry: false,

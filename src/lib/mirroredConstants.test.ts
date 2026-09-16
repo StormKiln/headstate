@@ -12,6 +12,7 @@ import companionRs from "../../src-mobile/src/companion.rs?raw";
 import eventsRs from "../../src-tauri/src/remote/events.rs?raw";
 import { ACTIVE_SECS } from "@/components/ArtifactsPage";
 import { ACTIVITY_DAYS } from "@/components/ClaudeOverviewPage";
+import { PLUGIN_ACTIVITY_DAYS } from "@/components/ClaudePluginsPage";
 import { TOP_N } from "@/components/stats/Leaderboard";
 import { ABSOLUTE_GAP_MS } from "./health";
 import { AUTO_COMPACT_PRESSURE } from "./subagentDisagreement";
@@ -259,6 +260,28 @@ describe("the Claude Code activity window", () => {
     // spans 41 days with any activity, of which the last 30 hold 1,375 of
     // 1,461 sessions.
     expect(ACTIVITY_DAYS).toBe(30);
+  });
+});
+
+/// 7. The plugin activity window: 30 days, in the Rust bucketing and in
+/// the sentence the chart prints under itself (#1075).
+///
+/// The same shape and the same failure mode as the case above, on a
+/// second chart. `plugins::fill_window` is what cuts the window;
+/// `PLUGIN_ACTIVITY_DAYS` is only what the subtitle quotes, so the two
+/// can disagree with every other test still passing and the page will
+/// say "the last 14 days" over 30 bars.
+///
+/// A separate constant from `ACTIVITY_DAYS` rather than a shared one:
+/// they are windows over different measures and either could move
+/// without the other. What must not happen is one HALF of either moving,
+/// which is what this asserts.
+describe("the plugin activity window", () => {
+  it("is the same number of days the Rust side buckets", async () => {
+    const pluginsRs = (await import("../../src-tauri/src/claude/plugins.rs?raw")).default;
+    const rustDays = rustConst(pluginsRs, "ACTIVITY_DAYS", "claude/plugins.rs");
+    expect(PLUGIN_ACTIVITY_DAYS).toBe(rustDays);
+    expect(PLUGIN_ACTIVITY_DAYS).toBe(30);
   });
 });
 

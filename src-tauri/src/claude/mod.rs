@@ -74,6 +74,8 @@ pub mod install;
 pub mod live;
 pub mod liveness;
 pub mod overview;
+/// Installed plugins, and what they were actually used for (#1075).
+pub mod plugins;
 /// The tail of one transcript, as conversation rather than JSONL (#982).
 pub mod preview;
 pub mod registry;
