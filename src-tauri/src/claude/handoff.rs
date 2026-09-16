@@ -189,6 +189,36 @@ impl Record {
     fn is_end(&self) -> bool {
         self.event == "SessionEnd"
     }
+
+    /// Whether this record is a POINT event rather than a run boundary.
+    ///
+    /// `SessionStart` and `SessionEnd` open and close a `claude_run` row.
+    /// The events epic #1060 adds have no pid semantics and no duration,
+    /// so they are stored in `claude_hook_event` and must not reach the
+    /// run path -- a `Notification` inserted as a run would be a second
+    /// run of a session that never restarted, and every liveness read
+    /// downstream would then have an extra open run to reason about.
+    ///
+    /// # Why a NAMED list and not "anything that is not the two"
+    ///
+    /// Because "not a boundary" is also what an event we have never
+    /// heard of looks like, and those two cases need opposite handling.
+    /// `an_unrecognised_event_is_not_an_ending` pins the existing rule:
+    /// the hook's literal `"unknown"` (a payload with no
+    /// `hook_event_name`) still records a run, because a session that
+    /// really did start must not be lost over one unreadable field.
+    ///
+    /// That rule survives here unchanged. Only the events Headstate
+    /// INSTALLS and has given meaning to divert, so a newer hook writing
+    /// an event this app has never seen keeps degrading the way it
+    /// already did rather than being silently discarded by a negative
+    /// match nobody revisited.
+    fn point_event(&self) -> Option<&str> {
+        match self.event.as_str() {
+            e @ ("PreCompact" | "SubagentStart" | "Notification") => Some(e),
+            _ => None,
+        }
+    }
 }
 
 /// Where the handoff file lives, given a home directory.
@@ -206,7 +236,20 @@ pub fn path_in(home: &Path) -> PathBuf {
 /// What one pass read, and what it could not.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Consumed {
-    /// Records that reached the database as runs.
+    /// Records that reached the database.
+    ///
+    /// Named `runs` from when `SessionStart`/`SessionEnd` were the only
+    /// events: since #1065/#1066/#1067 it also counts the point events
+    /// that land in `claude_hook_event` rather than in `claude_run`. It
+    /// is a diagnostic "how much did this pass store", not a count of
+    /// processes -- `claude_run` is what answers that, and
+    /// `overview::Counts::orphaned_runs` reads the table rather than
+    /// this field.
+    ///
+    /// The name is kept rather than changed because this struct is
+    /// serialised whole onto `ClaudeLiveState::handoff` by
+    /// `claude_poll_live`, so a rename is a wire break -- for a field
+    /// whose meaning only widened.
     pub runs: usize,
     /// Sessions inserted or touched.
     pub sessions: usize,
@@ -472,6 +515,44 @@ fn write_record(conn: &Connection, rec: &Record, start_time: Option<i64>) -> Res
         rusqlite::params![session_id, rec.cwd, ts],
     )
     .map_err(|e| format!("{session_id}: could not store the session: {e}"))?;
+
+    // A point event (#1065/#1066/#1067) before any run handling, because
+    // it is not a run and must not fall through into one.
+    //
+    // The session upsert above still happened, and deliberately: a
+    // `Notification` for a session we have no row for is still evidence
+    // that the session exists, and its `last_activity_at` widening is
+    // what makes #1067's staleness rule work -- see `signals::Waiting`.
+    if let Some(event) = rec.point_event() {
+        conn.execute(
+            // OR IGNORE against (session_id, event, at) for the reason
+            // the start-record insert below uses it: `consume` can
+            // re-read records after a rotation-then-crash, and a
+            // re-read must be a no-op rather than a doubled count.
+            "INSERT OR IGNORE INTO claude_hook_event
+                (session_id, event, at, trigger_kind, agent_id, agent_type,
+                 notification_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                session_id,
+                event,
+                ts,
+                rec.trigger,
+                rec.agent_id,
+                // An EMPTY agent_type is stored as NULL, not as "". The
+                // hook passes the payload through verbatim and
+                // `SubagentStop` writes `agent_type: b ?? ""` -- so an
+                // empty string is Claude Code's way of saying it did not
+                // have one. Storing it as a value would render a blank
+                // chip that looks like a real agent type; NULL reaches
+                // the "not recorded" arm that already exists.
+                rec.agent_type.as_deref().filter(|t| !t.is_empty()),
+                rec.notification_type,
+            ],
+        )
+        .map_err(|e| format!("{session_id}: could not store the {event}: {e}"))?;
+        return Ok(());
+    }
 
     // `pid_start_time` is written as RFC 3339 to match every other
     // timestamp in the schema, and is NULL when the registry could not

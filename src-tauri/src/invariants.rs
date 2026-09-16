@@ -2034,4 +2034,116 @@ mod tests {
             offenders.join("\n  ")
         );
     }
+
+    /// Every INSTALLED hook event has a row in the record-size table.
+    ///
+    /// # The rule, and why prose could not carry it
+    ///
+    /// `hook.rs`'s no-lock concurrency claim rests on each record fitting
+    /// one small `write(2)`, and
+    /// `hook::tests::every_events_worst_case_record_stays_small` is what
+    /// holds the line -- but only for the events it lists. Its own doc
+    /// says so out loud: *"if a future event carries BOTH a subagent
+    /// identity and a capped message, this test will not have covered it
+    /// -- so that event must add its own row to the table below."*
+    ///
+    /// That is a rule stated in prose, next to a table, asking the next
+    /// person to remember. Epic #1060 has six sub-issues each adding an
+    /// event, written by different people at different times; the
+    /// `guard` skill's whole argument is that this is the shape that
+    /// gets missed. So it is checked instead.
+    ///
+    /// The failure it prevents is not a test failure. An event installed
+    /// with no measured worst case can emit a line over 512 bytes, and
+    /// the symptom is a TORN LINE in a user's handoff file -- a record
+    /// that parses as nothing, in a file nobody looks at, on somebody
+    /// else's machine.
+    ///
+    /// # Derived, not enumerated
+    ///
+    /// Both sides are read out of the source at runtime: the installed
+    /// list from `install.rs`'s `EVENTS`, the measured list from the
+    /// case table in `hook.rs`. Neither is restated here, so adding an
+    /// event to either file is covered without anyone editing this
+    /// guard. `EVENTS` is parsed from the production half only --
+    /// `install.rs`'s test module also contains an `EXPANDED` fixture
+    /// naming events that are deliberately NOT installed, and a scan
+    /// that read both would demand rows for events nothing emits.
+    ///
+    /// PROVEN BY SABOTAGE, both directions. Adding `"PostCompact"` to
+    /// `EVENTS` without a table row fails here naming `PostCompact`;
+    /// removing the `SubagentStart` row from the table fails naming
+    /// `SubagentStart`. With the tree as it stands it is silent, which is
+    /// the other half of the proof.
+    #[test]
+    fn every_installed_hook_event_has_a_measured_worst_case_record() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let install = std::fs::read_to_string(manifest.join("src/claude/install.rs"))
+            .expect("read claude/install.rs");
+        let hook = std::fs::read_to_string(manifest.join("src/claude/hook.rs"))
+            .expect("read claude/hook.rs");
+
+        // Production only: the test module's `EXPANDED` fixture names
+        // events the epic proposes but does not install, and they have no
+        // business being required here.
+        let installed_src = production(&install);
+        let decl = installed_src
+            .split_once("pub const EVENTS: &[&str] = &[")
+            .map(|(_, rest)| rest)
+            .expect(
+                "locate `EVENTS` in claude/install.rs; if it was reshaped, \
+                 update this guard rather than deleting it",
+            );
+        let decl = decl
+            .split_once("];")
+            .map(|(head, _)| head)
+            .expect("`EVENTS` has no closing bracket");
+        let installed: Vec<String> = decl
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with("//"))
+            .flat_map(|l| l.split(','))
+            .filter_map(|t| {
+                let t = t.trim().trim_end_matches(',').trim();
+                t.strip_prefix('"')?.strip_suffix('"').map(str::to_owned)
+            })
+            .collect();
+        assert!(
+            installed.len() >= 2,
+            "parsed {installed:?} out of `EVENTS`, which cannot be right -- \
+             the declaration's shape changed and this guard is now reading \
+             nothing"
+        );
+
+        // The measured set: the `(event, payload)` rows of the size
+        // table. Matched on the row shape rather than on a list, so a row
+        // added in any order is seen.
+        let table = hook
+            .split_once("fn every_events_worst_case_record_stays_small()")
+            .map(|(_, rest)| rest)
+            .expect(
+                "locate the record-size table in claude/hook.rs; if it was \
+                 renamed, update this guard rather than deleting it",
+            );
+        let table = &table[..table.len().min(4_000)];
+
+        let missing: Vec<&String> = installed
+            .iter()
+            .filter(|e| {
+                !table.contains(&format!("(\n                \"{e}\","))
+                    && !table.contains(&format!("(\"{e}\","))
+            })
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "these hook events are INSTALLED but have no row in \
+             `every_events_worst_case_record_stays_small`, so nothing \
+             measures whether the line they write fits the single-write \
+             regime the no-lock append design was measured in. The symptom \
+             of getting this wrong is a torn line in a user's handoff file, \
+             not a test failure. Add a row carrying the event's real \
+             payload fields at their worst case: {missing:?}"
+        );
+    }
 }

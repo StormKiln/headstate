@@ -14,6 +14,7 @@ import { ACTIVE_SECS } from "@/components/ArtifactsPage";
 import { ACTIVITY_DAYS } from "@/components/ClaudeOverviewPage";
 import { TOP_N } from "@/components/stats/Leaderboard";
 import { ABSOLUTE_GAP_MS } from "./health";
+import { AUTO_COMPACT_PRESSURE } from "./subagentDisagreement";
 import { CANCELLED } from "./cancelled";
 import {
   DEFAULT_STALE_DAYS,
@@ -258,6 +259,34 @@ describe("the Claude Code activity window", () => {
     // spans 41 days with any activity, of which the last 30 hold 1,375 of
     // 1,461 sessions.
     expect(ACTIVITY_DAYS).toBe(30);
+  });
+});
+
+/// 8. The auto-compaction pressure threshold: two, in the Rust flag and
+/// in the sentence the UI puts under it (#1065).
+///
+/// Exactly the `ACTIVITY_DAYS` shape. `Compactions::under_pressure` is
+/// what actually sets `ClaudeSession.context_pressure`, and the frontend
+/// copy is what the row and the detail pane WORD the marker against. The
+/// two must agree or the UI explains a flag raised on a different rule --
+/// "compacted automatically several times" over a badge the backend put
+/// there at one, or a pane that describes two as the threshold while the
+/// backend flags at four.
+///
+/// Neither side's own tests can catch that: the Rust test asserts against
+/// `AUTO_COMPACT_PRESSURE` symbolically and so does every TS test, which
+/// is self-consistent at any value.
+describe("the auto-compaction pressure threshold", () => {
+  it("is the same count the Rust side flags at", async () => {
+    const signalsRs = (await import("../../src-tauri/src/claude/signals.rs?raw")).default;
+    const rustThreshold = rustConst(signalsRs, "AUTO_COMPACT_PRESSURE", "claude/signals.rs");
+    expect(AUTO_COMPACT_PRESSURE).toBe(rustThreshold);
+    // And the literal, so a coordinated change to both sides still has to
+    // be deliberate. `signals.rs` argues for two in prose: "a single
+    // auto-compaction is an ordinary long session and flagging it would
+    // put a badge on a large share of real work; the signal #1065 wants
+    // is the REPEATED case."
+    expect(AUTO_COMPACT_PRESSURE).toBe(2);
   });
 });
 

@@ -56,6 +56,11 @@ const session = (over: Partial<ClaudeSession> = {}): ClaudeSession => ({
   cwd_state: { state: "exists" },
   kind: { kind: "own" },
   subagents: 0,
+  // The pre-hook default (#1067, #1065): no notification record has ever
+  // arrived, and no compaction was ever recorded. Both render nothing, so
+  // the rows these tests count and order are unchanged.
+  waiting: { state: "no", reason: "never-observed" },
+  context_pressure: null,
   ...over,
 });
 

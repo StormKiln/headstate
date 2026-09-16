@@ -229,6 +229,22 @@ const whole = (over: Partial<WholeSession> = {}): WholeSession => ({
   subagents: 0,
   parent: null,
   unattributed: null,
+  // #1067. Defaults to `never-observed`, which is the real default and
+  // not a convenient one: no session that ran before the hook was
+  // installed has a notification record, so this is what the entire
+  // corpus sends. A fixture defaulting to `now` would put a waiting
+  // indicator on every existing test's row and make the silent case the
+  // one nothing exercised.
+  waiting: { state: "no", reason: "never-observed" },
+  // #1065, and `null` rather than `false` for the same reason: absent is
+  // the pre-hook default. `false` would mean "we watched and it did not",
+  // which is a measurement no fixture should claim by accident.
+  context_pressure: null,
+  // #1065 and #1066. `null` on both, again the pre-hook state: no
+  // compaction was ever recorded and neither source has anything to say
+  // about agent types.
+  compactions: null,
+  agent_types: null,
   ...over,
 });
 
@@ -264,6 +280,14 @@ const session = (over: Partial<WholeSession> = {}): ClaudeSession => {
     })),
     parent: w.parent,
     unattributed: w.unattributed,
+    compactions: w.compactions,
+    agent_types: w.agent_types,
+    // ONE `waiting` across both halves, exactly as `liveness` above is
+    // one value. The real backend derives it twice -- once per read --
+    // and `signals.rs` has the test that the two agree; keeping them a
+    // single value here means a UI test cannot accidentally depend on the
+    // row and the pane disagreeing.
+    waiting: w.waiting,
   });
   return {
     session_id: w.session_id,
@@ -275,6 +299,8 @@ const session = (over: Partial<WholeSession> = {}): ClaudeSession => {
     cwd_state: w.cwd_state,
     kind: w.kind,
     subagents: w.subagents,
+    waiting: w.waiting,
+    context_pressure: w.context_pressure,
   };
 };
 
@@ -2377,5 +2403,397 @@ describe("the detail is fetched for one session, not for the list", () => {
     open("Kestrel");
     expect(screen.getByText(/no longer in the store/i)).toBeTruthy();
     expect(screen.queryByText(/could not be read/i)).toBeNull();
+  });
+});
+
+/// The waiting indicator, and the tense it is allowed to use (#1067).
+///
+/// The issue's own constraint is that a STALE indicator is worse than no
+/// indicator, because it sends the user to a session that does not need
+/// them. `ClaudeWaiting` makes the present-tense claim unconstructible
+/// without a live process on the Rust side; these are the rendering half
+/// of the same rule, and the dead-session case below is the one that
+/// actually fails if the component ever treats the two arms alike.
+describe("the waiting indicator", () => {
+  it("says a live session at an idle prompt is waiting, in the present tense", () => {
+    state.list = listOf([
+      session({
+        name: "Kestrel",
+        liveness: { state: "running", pid: 14779, status: null },
+        waiting: { state: "now", kind: "idle_prompt", at: "2026-09-13T11:45:00Z" },
+      }),
+    ]);
+    renderView();
+
+    expect(screen.getAllByText(/waiting for you/i).length).toBeGreaterThan(0);
+    // And NOT the past-tense wording, which is the other arm's.
+    expect(screen.queryByText(/last seen waiting/i)).toBeNull();
+  });
+
+  /// The two #1067 names are DIFFERENT stories -- one session idling and
+  /// one blocked on a decision -- so they do not share a sentence.
+  it("says a permission prompt is asking permission, not merely waiting", () => {
+    state.list = listOf([
+      session({
+        name: "Kestrel",
+        liveness: { state: "running", pid: 14779, status: null },
+        waiting: { state: "now", kind: "permission_prompt", at: "2026-09-13T11:45:00Z" },
+      }),
+    ]);
+    renderView();
+
+    expect(screen.getAllByText(/asking permission/i).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/waiting for you/i)).toBeNull();
+  });
+
+  /// **The sabotage test, and the load-bearing one.**
+  ///
+  /// A dead session with a waiting record must say it was LAST SEEN
+  /// waiting and must never say it is waiting now. The present-tense
+  /// absence is asserted explicitly rather than left implied: a component
+  /// that rendered both arms through one sentence would still pass the
+  /// "last seen" half, and the failure #1067 is about is precisely the
+  /// present tense surviving the process.
+  it("says a dead session was LAST SEEN waiting, never that it is waiting now", () => {
+    state.list = listOf([
+      session({
+        name: "Kestrel",
+        liveness: { state: "dead", why: "pid 14779 is no longer running" },
+        waiting: {
+          state: "last-seen",
+          kind: "idle_prompt",
+          at: "2026-09-13T09:05:00Z",
+          why: "pid 14779 is no longer running",
+        },
+      }),
+    ]);
+    renderView();
+
+    expect(screen.getAllByText(/last seen waiting at \d\d:\d\d/i).length).toBeGreaterThan(0);
+    // THE assertion. Neither wording of the present tense may appear
+    // anywhere on the page for a session whose process is gone.
+    expect(screen.queryByText(/waiting for you/i)).toBeNull();
+    expect(screen.queryByText(/asking permission/i)).toBeNull();
+  });
+
+  /// `why` is the liveness reason, carried so the past tense has visible
+  /// grounds rather than looking like an arbitrary hedge.
+  it("puts the reason the present tense was refused in the title", () => {
+    state.list = listOf([
+      session({
+        name: "Kestrel",
+        liveness: { state: "dead", why: "pid 14779 is no longer running" },
+        waiting: {
+          state: "last-seen",
+          kind: "idle_prompt",
+          at: "2026-09-13T09:05:00Z",
+          why: "the process could not be checked: Operation not permitted",
+        },
+      }),
+    ]);
+    renderView();
+
+    const badge = screen.getAllByText(/last seen waiting at/i)[0];
+    expect(badge.getAttribute("title")).toMatch(/Operation not permitted/);
+  });
+
+  /// Every `no` reason renders nothing. `never-observed` is the whole
+  /// pre-hook corpus, and an indicator saying "we were not watching this
+  /// one either" on 1,500 rows is the noise that gets a feature ignored.
+  it("renders no indicator at all when the session is not waiting", () => {
+    for (const reason of ["never-observed", "superseded", "not-a-prompt"] as const) {
+      state.list = listOf([session({ name: "Kestrel", waiting: { state: "no", reason } })]);
+      const view = renderView();
+      expect(screen.queryByText(/waiting/i), `reason ${reason}`).toBeNull();
+      expect(screen.queryByText(/asking permission/i), `reason ${reason}`).toBeNull();
+      view.unmount();
+    }
+  });
+
+  /// Unknown enum values render as THEMSELVES. There is no "other"
+  /// bucket anywhere in this epic: a notification kind Claude Code grows
+  /// tomorrow must show up under its own name, so the reader sees what
+  /// was actually sent rather than a relabelling that hides it.
+  it("renders an unknown notification kind verbatim", () => {
+    state.list = listOf([
+      session({
+        name: "Kestrel",
+        liveness: { state: "running", pid: 14779, status: null },
+        waiting: { state: "now", kind: "elicitation_requested", at: "2026-09-13T11:45:00Z" },
+      }),
+    ]);
+    renderView();
+
+    expect(screen.getAllByText(/elicitation_requested/).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/\bother\b/i)).toBeNull();
+  });
+
+  /// The detail pane states it too, on the DETAIL's own `waiting` --
+  /// derived against the same liveness read the pane's badge shows, so
+  /// the pane cannot disagree with itself.
+  it("states it in the detail pane as well as on the row", () => {
+    state.list = listOf([
+      session({
+        name: "Kestrel",
+        liveness: { state: "running", pid: 14779, status: null },
+        waiting: { state: "now", kind: "idle_prompt", at: "2026-09-13T11:45:00Z" },
+      }),
+    ]);
+    renderView();
+
+    open("Kestrel");
+    // Two: the row and the heading.
+    expect(screen.getAllByText(/waiting for you/i).length).toBe(2);
+  });
+});
+
+/// The context-pressure marker, and its three states (#1065).
+///
+/// `null` and `false` both render nothing, and that is deliberate rather
+/// than a collapse: neither is a finding. What the absent-is-not-zero
+/// rule forbids is rendering `null` as a MEASURED answer, and "no
+/// compactions" on the entire pre-hook corpus would be exactly that.
+describe("the context-pressure marker", () => {
+  it("marks a session that compacted automatically several times", () => {
+    state.list = listOf([session({ name: "Kestrel", context_pressure: true })]);
+    renderView();
+
+    expect(screen.getByText(/compacted repeatedly/i)).toBeTruthy();
+  });
+
+  /// **The absent-is-not-zero assertion.** An unmeasured session must not
+  /// acquire a claim about compactions on the row -- and above all must
+  /// not be told it had none, which is a measurement nobody took.
+  it("renders nothing when no compaction was ever recorded", () => {
+    state.list = listOf([session({ name: "Kestrel", context_pressure: null })]);
+    renderView();
+
+    expect(screen.queryByText(/compacted/i)).toBeNull();
+    expect(screen.queryByText(/no compactions/i)).toBeNull();
+  });
+
+  it("renders nothing when it was measured and there was no pressure", () => {
+    state.list = listOf([session({ name: "Kestrel", context_pressure: false })]);
+    renderView();
+
+    expect(screen.queryByText(/compacted/i)).toBeNull();
+  });
+});
+
+/// The compactions panel, and its five renderings (#1065).
+///
+/// `SessionUsage`'s shape one field along. The arm that matters is the
+/// first: `null` is the state of EVERY session that predates the hook,
+/// so drawing it as zeros would put a measured-looking figure on the
+/// whole corpus.
+describe("the compactions panel", () => {
+  it("says no compaction was recorded, and that the hook may not have been installed", () => {
+    state.list = listOf([session({ name: "Kestrel", compactions: null })]);
+    renderView();
+
+    open("Kestrel");
+    expect(screen.getByText(/no compaction has been recorded for this session/i)).toBeTruthy();
+    // The second sentence is load-bearing: without it this reads as "it
+    // never compacted", which is a measurement nobody took.
+    expect(screen.getByText(/may not have been installed/i)).toBeTruthy();
+    // And NOT the measured-zero wording, which is a different claim.
+    expect(screen.queryByText(/never compacted/i)).toBeNull();
+  });
+
+  /// A measured zero is a real answer and gets its own sentence. This is
+  /// the distinction the arm above exists to protect: we were watching,
+  /// and nothing happened.
+  it("says a measured zero differently from an absent one", () => {
+    state.list = listOf([
+      session({
+        name: "Kestrel",
+        compactions: { manual: 0, auto: 0, unknown: [], untriggered: 0 },
+      }),
+    ]);
+    renderView();
+
+    open("Kestrel");
+    expect(screen.getByText(/never compacted/i)).toBeTruthy();
+    expect(screen.queryByText(/no compaction has been recorded/i)).toBeNull();
+    expect(screen.queryByText(/may not have been installed/i)).toBeNull();
+  });
+
+  /// Split, never summed: a user who compacts by hand has made a choice,
+  /// and a session that compacts automatically has hit a wall.
+  it("splits manual from automatic", () => {
+    state.list = listOf([
+      session({
+        name: "Kestrel",
+        compactions: { manual: 1, auto: 3, unknown: [], untriggered: 0 },
+      }),
+    ]);
+    renderView();
+
+    open("Kestrel");
+    const panel = screen.getByText(/how often it compacted/i).closest("section")!;
+    expect(within(panel).getByText("Automatic").nextSibling?.textContent).toBe("3");
+    expect(within(panel).getByText("Manual").nextSibling?.textContent).toBe("1");
+  });
+
+  /// **Unknown enum values render as themselves.** A trigger this app has
+  /// never heard of must appear under its own name -- never folded into
+  /// `auto`, which would overstate the pressure figure, and never
+  /// relabelled "other", which would hide from the reader that the
+  /// vocabulary has grown.
+  it("renders an unknown trigger as itself, not as 'other'", () => {
+    state.list = listOf([
+      session({
+        name: "Kestrel",
+        compactions: { manual: 0, auto: 1, unknown: [["emergency", 2]], untriggered: 0 },
+      }),
+    ]);
+    renderView();
+
+    open("Kestrel");
+    const panel = screen.getByText(/how often it compacted/i).closest("section")!;
+    expect(within(panel).getByText("emergency")).toBeTruthy();
+    expect(within(panel).queryByText(/\bother\b/i)).toBeNull();
+    // And it did NOT quietly increment `auto`.
+    expect(within(panel).getByText("Automatic").nextSibling?.textContent).toBe("1");
+  });
+
+  /// A record whose `trigger` field was absent says the payload SHAPE
+  /// moved, which is a different problem from the vocabulary growing --
+  /// so it is counted apart rather than summed into one bucket.
+  it("counts a record with no trigger apart from an unrecognised one", () => {
+    state.list = listOf([
+      session({
+        name: "Kestrel",
+        compactions: { manual: 0, auto: 0, unknown: [], untriggered: 2 },
+      }),
+    ]);
+    renderView();
+
+    open("Kestrel");
+    // It is a real compaction, so the panel must NOT say the session
+    // never compacted.
+    expect(screen.queryByText(/never compacted/i)).toBeNull();
+    expect(screen.getByText(/no trigger recorded/i)).toBeTruthy();
+  });
+});
+
+/// What the hook says the subagents WERE, and the one case in which it
+/// contradicts the directory rule (#1066).
+describe("the subagent agent types", () => {
+  it("names the stated types beside the inferred count", () => {
+    state.list = listOf([
+      session({
+        name: "Kestrel",
+        subagents: 3,
+        agent_types: {
+          stated: [
+            ["general-purpose", 2],
+            ["code-reviewer", 1],
+          ],
+          untyped: 0,
+          inferred_children: 3,
+        },
+      }),
+    ]);
+    renderView();
+
+    open("Kestrel");
+    expect(screen.getByText(/2 general-purpose, 1 code-reviewer/)).toBeTruthy();
+    // The directory rule's own count is still there: the hook is an
+    // additional source, never a replacement.
+    expect(screen.getByText(/3 subagent sessions ran under this one/i)).toBeTruthy();
+  });
+
+  /// A type this app has never heard of renders as itself.
+  it("renders an unknown agent type verbatim", () => {
+    state.list = listOf([
+      session({
+        name: "Kestrel",
+        subagents: 1,
+        agent_types: { stated: [["flux-capacitor", 1]], untyped: 0, inferred_children: 1 },
+      }),
+    ]);
+    renderView();
+
+    open("Kestrel");
+    expect(screen.getByText(/1 flux-capacitor/)).toBeTruthy();
+    expect(screen.queryByText(/\bother\b/i)).toBeNull();
+  });
+
+  /// **The pre-hook case, and it must not read as an error.** Every
+  /// session that already exists looks like this: children found by their
+  /// working directories, and no hook record to name them. Saying which
+  /// source the grouping came from is what stops it reading as a gap.
+  it("says the grouping came from the directory layout when the hook said nothing", () => {
+    state.list = listOf([
+      session({
+        name: "Kestrel",
+        subagents: 4,
+        agent_types: { stated: [], untyped: 0, inferred_children: 4 },
+      }),
+    ]);
+    renderView();
+
+    open("Kestrel");
+    expect(screen.getByText(/grouped by their working directories/i)).toBeTruthy();
+    // NOT the disagreement note. This direction is the normal state of
+    // the entire corpus and flagging it would fire everywhere.
+    expect(screen.queryByText(/directory rule does not recognise/i)).toBeNull();
+  });
+
+  /// **The disagreement, in the one direction that is one.** The hook
+  /// recorded spawns and the cwd rule attributed no children, which means
+  /// subagents are running somewhere the rule does not look.
+  it("reports the disagreement when the hook saw spawns the directory rule did not", () => {
+    state.list = listOf([
+      session({
+        name: "Kestrel",
+        subagents: 0,
+        agent_types: {
+          stated: [["general-purpose", 2]],
+          untyped: 0,
+          inferred_children: 0,
+        },
+      }),
+    ]);
+    renderView();
+
+    open("Kestrel");
+    expect(screen.getByText(/2 subagent starts/)).toBeTruthy();
+    expect(screen.getByText(/directory rule does not recognise/i)).toBeTruthy();
+  });
+
+  /// The same finding on a session that DOES have attributed children is
+  /// not a finding, and the asymmetry is asserted from the component as
+  /// well as from `subagentDisagreement`'s own unit test -- the note is
+  /// rendered on two different code paths here, and only one of them is
+  /// covered by the case above.
+  it("does not report a disagreement when both sources found subagents", () => {
+    state.list = listOf([
+      session({
+        name: "Kestrel",
+        subagents: 2,
+        agent_types: {
+          stated: [["general-purpose", 2]],
+          untyped: 0,
+          inferred_children: 2,
+        },
+      }),
+    ]);
+    renderView();
+
+    open("Kestrel");
+    expect(screen.queryByText(/directory rule does not recognise/i)).toBeNull();
+  });
+
+  /// A session with no children and no hook record renders no section at
+  /// all -- the majority of rows, and a section saying "this has no
+  /// subagents" on all of them is noise.
+  it("renders no subagent section for an ordinary session", () => {
+    state.list = listOf([session({ name: "Kestrel", subagents: 0, agent_types: null })]);
+    renderView();
+
+    open("Kestrel");
+    expect(screen.queryByText(/what its subagents did/i)).toBeNull();
   });
 });

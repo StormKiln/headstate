@@ -2,9 +2,12 @@ import { useEffect, useMemo, useState } from "react";
 import { Bot, Circle, FolderOpen, GitBranch, RefreshCw, Search, Terminal } from "lucide-react";
 import { toast } from "sonner";
 import type {
+  ClaudeAgentTypes,
+  ClaudeCompactions,
   ClaudePreviewBlock,
   ClaudeSession,
   ClaudeSessionDetail,
+  ClaudeWaiting,
   CwdState,
   Liveness,
 } from "@/types/pr";
@@ -20,6 +23,7 @@ import { claudeRevealPath } from "@/api/tauri";
 import { current } from "@/lib/ariaCurrent";
 import { copyText } from "@/lib/clipboard";
 import { IS_MOBILE_BUILD } from "@/lib/target";
+import { AUTO_COMPACT_PRESSURE, subagentDisagreement } from "@/lib/subagentDisagreement";
 import { relativeTime } from "@/lib/time";
 import { useIsMobile } from "@/lib/useIsMobile";
 import { useRowCursor } from "@/lib/useRowCursor";
@@ -1137,6 +1141,142 @@ function LivenessBadge({ liveness }: { liveness: Liveness }) {
   );
 }
 
+/// The wall-clock time a notification was recorded, as `HH:MM`.
+///
+/// #1067 asks for "last seen waiting at HH:MM" in so many words, and a
+/// relative time cannot carry it: `relativeTime` floors at "just now"
+/// under a minute and rounds to months past thirty days, so two sessions
+/// that stopped four hours apart yesterday both read "1 day ago". The
+/// question the past-tense arm answers is WHEN, precisely enough to match
+/// against what the reader was doing.
+///
+/// Local time, because the reader's own day is the frame: a UTC clock
+/// would make "09:00" mean nothing to anyone west of Greenwich.
+///
+/// No clock read anywhere in here -- the timestamp is the argument. See
+/// the page's doc comment on why that rule is absolute in this file.
+function clockTime(iso: string): string {
+  const at = new Date(iso);
+  // An unparseable timestamp must not render as `NaN:NaN`. Returning the
+  // raw string is the honest fallback: it is what we were sent, and a
+  // reader can see that it is not a time rather than read a broken one as
+  // one.
+  if (Number.isNaN(at.getTime())) return iso;
+  return `${String(at.getHours()).padStart(2, "0")}:${String(at.getMinutes()).padStart(2, "0")}`;
+}
+
+/// How to word ONE notification kind, in the present tense.
+///
+/// The two #1067 names are different stories and get different sentences:
+/// a session sitting at an idle prompt is waiting for instructions, and a
+/// session at a permission prompt is blocked on a decision about
+/// something it has already decided to do. A single "Waiting" for both
+/// would lose the distinction the epic exists to draw.
+///
+/// Anything else renders VERBATIM. There is no "other" bucket in this
+/// epic: a kind Claude Code grows tomorrow shows up as its own name, so
+/// the reader sees what was actually sent rather than a relabelling that
+/// hides it.
+function waitingPhrase(kind: string): string {
+  if (kind === "permission_prompt") return "Asking permission";
+  if (kind === "idle_prompt") return "Waiting for you";
+  return kind;
+}
+
+/// Whether this session is waiting on the user, in the tense the evidence
+/// supports (#1067).
+///
+/// # The staleness rule, as rendering
+///
+/// `ClaudeWaiting` makes the present-tense claim unconstructible without
+/// a live process, and this is the other half of that: `last-seen` must
+/// never be worded as though it were `now`. A dead session that stopped
+/// to ask a question is worth seeing -- it is a reason to resume it --
+/// but "Waiting for you" on a process that no longer exists sends the
+/// user somewhere nothing is happening, which #1067 calls worse than
+/// showing nothing at all.
+///
+/// So the two arms do not share a sentence, a tense or a colour:
+///
+/// | state | rendering |
+/// |---|---|
+/// | `now` | amber, present tense, a filled dot -- act on this |
+/// | `last-seen` | muted, past tense with the clock time, `why` in the title |
+/// | `no` | nothing |
+///
+/// Amber is the file's existing qualified/partial colour and is the
+/// strongest thing here on purpose: #1067 asks for no notification, no
+/// sound and no badge. This is a word on a row the user is already
+/// looking at.
+///
+/// # Why `no` renders nothing
+///
+/// All three of its reasons are absences from the reader's point of view,
+/// and the commonest -- `never-observed` -- is every session that ran
+/// before the hook existed. An indicator that said "we were not watching
+/// this one" on 1,500 rows is the noise that gets a feature ignored. The
+/// reason is not discarded, it is simply not the row's business; the
+/// detail pane is where a session's own silence can be explained.
+function WaitingBadge({ waiting, muted = false }: { waiting: ClaudeWaiting; muted?: boolean }) {
+  if (waiting.state === "no") return null;
+  if (waiting.state === "now") {
+    return (
+      <span
+        className={`flex items-center gap-1 ${muted ? "" : "text-[#d29922]"}`}
+        title={`${waiting.kind} at ${clockTime(waiting.at)}`}
+      >
+        <Circle className="h-2.5 w-2.5 fill-current" aria-hidden="true" />
+        {waitingPhrase(waiting.kind)}
+      </span>
+    );
+  }
+  // PAST TENSE, always, and muted rather than amber: this is a fact about
+  // a moment that has gone, not a call to act. `why` -- the liveness
+  // reason -- goes in the title so the hedge has visible grounds rather
+  // than looking arbitrary.
+  return (
+    <span
+      className={`flex items-center gap-1 ${muted ? "" : "text-[#8b949e]"}`}
+      title={`${waiting.kind}: ${waiting.why}`}
+    >
+      <Circle className="h-2.5 w-2.5" aria-hidden="true" />
+      Last seen waiting at {clockTime(waiting.at)}
+    </span>
+  );
+}
+
+/// The context-pressure marker, when there is one to draw (#1065).
+///
+/// Three states, and only one of them draws anything:
+///
+/// | value | rendering |
+/// |---|---|
+/// | `true` | "compacted repeatedly" -- muted, one word's worth of space |
+/// | `false` | nothing. We watched and it did not. |
+/// | `null` | nothing. No compaction was ever RECORDED for this session. |
+///
+/// The last two render alike here and are NOT the same thing -- which is
+/// the one place this file deliberately draws two states the same way, so
+/// it is worth saying why. Neither is a finding: one is "no" and the
+/// other is "we were not watching", and a row is not where the difference
+/// between them can be explained. What the absent-is-not-zero rule
+/// forbids is rendering `null` as a MEASURED answer, and printing "no
+/// compactions" on the entire pre-hook corpus would be exactly that.
+/// `SessionCompactions` in the detail pane is where the distinction is
+/// drawn, because there is room there to say which silence it is.
+///
+/// Muted, not amber. A session that compacted twice is not in trouble; it
+/// is a long session, and the flag is context for a reader deciding which
+/// of several sessions to open.
+function ContextPressure({ pressure }: { pressure: boolean | null }) {
+  if (pressure !== true) return null;
+  return (
+    <span className="truncate" title={`compacted automatically at least ${AUTO_COMPACT_PRESSURE} times`}>
+      compacted repeatedly
+    </span>
+  );
+}
+
 /// What to say about the recorded directory, in one short phrase.
 function cwdNote(state: CwdState): string | null {
   switch (state.state) {
@@ -1215,6 +1355,31 @@ function SessionEntry({
           <span className="truncate">· no recorded activity</span>
         )}
       </span>
+      {/* #1067 and #1065, on their OWN line rather than appended to the
+          liveness row above. Both are conditional and usually absent, so
+          sharing a line would make the row's height jump between
+          neighbouring sessions -- and the waiting indicator is the one
+          thing here a user scans a column of rows FOR, which a badge
+          wedged after a truncating date would defeat.
+
+          No notification, no sound, no badge that interrupts: this is a
+          word on a row the user is already reading, which is exactly what
+          #1067 asks for.
+
+          `muted` on the selected row for `LivenessBadge`'s own reason,
+          measured on the same blue: at 11px the amber and the grey both
+          fall under 4.5:1 against #1f6feb, and the row is already
+          distinguished. */}
+      {s.waiting.state !== "no" || s.context_pressure === true ? (
+        <span
+          className={`flex w-full items-center gap-1.5 text-[11px] ${
+            active ? "text-white" : "text-[#8b949e]"
+          }`}
+        >
+          <WaitingBadge waiting={s.waiting} muted={active} />
+          <ContextPressure pressure={s.context_pressure} />
+        </span>
+      ) : null}
       <span
         className={`w-full truncate font-mono text-[11px] ${
           active ? "text-white" : "text-[#8b949e]"
@@ -1315,6 +1480,11 @@ function SessionDetail({
               it, what was it saying, and where do I go next. The preview is
               last of the two because it is the one that costs a read. */}
           <SessionUsage detail={detail.data} />
+          {/* Right after the token figures, because it answers the same
+              question from the other side: the tokens say how much work
+              happened, and this says what that volume cost the session in
+              context (#1065). */}
+          <SessionCompactions detail={detail.data} />
           {/* Directly after "how much work IT did", because the question
               this answers is the same one one level down: how much work
               happened UNDERNEATH it. Adjacent so the two figures can be
@@ -1509,6 +1679,15 @@ function SessionHeading({
           <span>No recorded activity</span>
         )}
         {detail ? <span>Started {relativeTime(detail.first_seen_at, new Date(now))}</span> : null}
+        {/* From the DETAIL, not the row (#1067). Both halves carry a
+            `waiting`, and the detail's is derived against the same
+            liveness read this heading's own badge is showing -- so the
+            pane cannot say "waiting for you" beside a "Not running" it
+            derived a moment later. Absent until the detail arrives, which
+            is the same rule "Started" follows one line up: a tense
+            asserted from a stale half is the exact staleness #1067 is
+            about. */}
+        {detail ? <WaitingBadge waiting={detail.waiting} /> : null}
       </div>
       {/* The REASON, for the two states that have one. A "not running"
           established by an orphaned registry entry is a crash and says
@@ -1767,6 +1946,197 @@ function SessionUsage({ detail: d }: { detail: ClaudeSessionDetail }) {
   );
 }
 
+/// How often this session compacted, and on whose initiative (#1065).
+///
+/// # Five absences, five renderings
+///
+/// `SessionUsage` above is the pattern this follows, one field along:
+///
+/// | condition | rendering |
+/// |---|---|
+/// | no compaction was ever RECORDED | says so, AND that the hook may not have been installed |
+/// | recorded, and the total is zero | "it never compacted" -- a measured answer |
+/// | manual and auto, split | the two counts, apart |
+/// | a trigger we do not recognise | its own name, verbatim |
+/// | a record with no trigger at all | counted separately from an unknown value |
+///
+/// The first row is the one that matters, and it is the state of EVERY
+/// session that already exists: the hook writes `claude_hook_event` rows
+/// from the moment it is installed and nothing backfills the sessions
+/// that ran before it. So `null` is the overwhelming default, and drawing
+/// it as "0 compactions" would put a measured-looking zero on the entire
+/// corpus. That is the root `CLAUDE.md` rule with a number on it, and
+/// #846 is the same defect one view over.
+///
+/// It is also not enough to say "none recorded" and stop: a reader who
+/// does not know a hook is involved reads that as "this session never
+/// compacted", which is the confident wrong answer in a quieter voice.
+/// So the sentence names the reason it might be silent.
+///
+/// The second row is the distinction the first exists to protect. Once
+/// the hook IS installed, `total === 0` is a real measurement -- we were
+/// watching and nothing happened -- and it gets its own, differently
+/// worded, sentence.
+///
+/// # Unknown triggers render as themselves
+///
+/// `manual` and `auto` are the two documented values. Anything else is
+/// kept verbatim in `unknown` and printed under its own name: a future
+/// trigger called `emergency` appears as `emergency`. It is never folded
+/// into `auto` -- which would overstate the pressure figure -- and never
+/// relabelled "other", which would hide from the reader that the
+/// vocabulary has grown. `untriggered` is counted apart again, because a
+/// record whose `trigger` field is missing says the payload SHAPE moved,
+/// which is a different problem with a different fix.
+function SessionCompactions({ detail: d }: { detail: ClaudeSessionDetail }) {
+  const c = d.compactions;
+  return (
+    <section className="rounded-md border border-[#30363d] bg-[#161b22] p-3">
+      <h3 className="text-xs font-semibold text-[#e6edf3]">How often it compacted</h3>
+      {c === null ? (
+        // ABSENT, not zero. The second sentence is load-bearing: without
+        // it this reads as "it never compacted", which is a measurement
+        // nobody took.
+        <p className="mt-2 text-xs text-[#8b949e]">
+          No compaction has been recorded for this session, so how often it compacted is unknown.
+          The hook that records them may not have been installed when this session ran, which is
+          the case for every session that predates it.
+        </p>
+      ) : compactionTotal(c) === 0 ? (
+        // MEASURED zero, and worded so it cannot be mistaken for the arm
+        // above. We were watching; nothing happened.
+        <p className="mt-2 text-xs text-[#8b949e]">
+          This session never compacted: compactions were recorded for it and there were none.
+        </p>
+      ) : (
+        <>
+          <dl className="mt-2 space-y-1.5 text-xs">
+            {/* Split, never summed. A user who compacts by hand has made
+                a choice; a session that compacts automatically has hit a
+                wall. One total would answer neither question. */}
+            <Field label="Automatic">{c.auto.toLocaleString()}</Field>
+            <Field label="Manual">{c.manual.toLocaleString()}</Field>
+            {/* Verbatim, under the trigger's own name. Never "other". */}
+            {c.unknown.map(([trigger, n]) => (
+              <Field key={trigger} label={trigger}>
+                {n.toLocaleString()}
+              </Field>
+            ))}
+            {c.untriggered > 0 ? (
+              // A record we READ whose `trigger` was absent -- the
+              // payload shape moved, rather than the vocabulary growing.
+              // Counted apart from an unknown value for that reason.
+              <Field label="No trigger recorded">{c.untriggered.toLocaleString()}</Field>
+            ) : null}
+          </dl>
+          {c.auto >= AUTO_COMPACT_PRESSURE ? (
+            /* The same threshold the row's marker uses, from the same
+               constant -- `mirroredConstants.test.ts` pins it to the Rust
+               side that actually sets `context_pressure`, so the badge and
+               this sentence cannot describe different rules.
+
+               Amber and a sentence, not a warning: a session that
+               compacted automatically several times was working against
+               its context window, which is context for a reader, not a
+               fault to fix. */
+            <p className="mt-2 text-xs text-[#d29922]">
+              It compacted automatically {c.auto.toLocaleString()} times, so it was working
+              against its context window rather than simply being long.
+            </p>
+          ) : null}
+        </>
+      )}
+    </section>
+  );
+}
+
+/// Every compaction counted, whatever its trigger.
+///
+/// The TypeScript twin of `Compactions::total`, and it sums the unknown
+/// and untriggered ones too: they ARE compactions, and a total that
+/// quietly omitted them would be short by an amount the reader cannot
+/// see. That matters most for the gate above -- a session whose only
+/// compactions had an unrecognised trigger would otherwise render as
+/// "this session never compacted" while holding records that say
+/// otherwise.
+function compactionTotal(c: ClaudeCompactions): number {
+  return (
+    c.manual + c.auto + c.untriggered + c.unknown.reduce((sum, [, n]) => sum + n, 0)
+  );
+}
+
+/// What the hook says this session's subagents WERE (#1066).
+///
+/// "2 general-purpose, 1 code-reviewer" is the whole point of the field:
+/// the directory rule can count children and cannot name them, and this
+/// is the sentence that turns "3 subagents" into three identifiable ones.
+///
+/// # Three silences, and only one of them is a finding
+///
+/// Renders nothing when `types` is `null` -- neither source has anything
+/// to say -- and nothing when `stated` is empty and the hook saw no
+/// untyped spawns either. That second case is the ordinary pre-hook
+/// session, and the section's existing count is already the right answer
+/// for it; a line reading "no types recorded" would turn the normal case
+/// into a reported deficiency. What it DOES say, when the hook observed
+/// spawns it could not name, is how many were untyped -- the hook fired
+/// and named nothing, which is a fact about the payload and not a
+/// guessable type.
+///
+/// Type names are printed VERBATIM. A type this app has never heard of
+/// renders as itself; there is no "other" bucket.
+function AgentTypeBreakdown({ types }: { types: ClaudeAgentTypes | null }) {
+  if (types === null) return null;
+  if (types.stated.length === 0 && types.untyped === 0) {
+    // The pre-hook session: children found by their directories, and no
+    // hook record to name them. Stated as the ordinary thing it is --
+    // the grouping HAS a source, and saying which one is what stops this
+    // reading as a gap.
+    if (types.inferred_children === 0) return null;
+    return (
+      <p className="mt-2 text-xs text-[#8b949e]">
+        They were grouped by their working directories rather than by the hook, so what kind of
+        agent each one was is not recorded.
+      </p>
+    );
+  }
+  return (
+    <p className="mt-2 text-xs text-[#8b949e]">
+      The hook recorded{" "}
+      {types.stated
+        .map(([type, n]) => `${n.toLocaleString()} ${type}`)
+        .concat(
+          // Counted, never guessed at, and never folded into a named
+          // bucket: a blank rendered as a type would be a fabricated
+          // answer.
+          types.untyped > 0
+            ? [`${types.untyped.toLocaleString()} with no type recorded`]
+            : [],
+        )
+        .join(", ")}
+      .
+    </p>
+  );
+}
+
+/// #1066's disagreement, when there is one.
+///
+/// Prominent but NOT alarming, which is the balance the issue asks for.
+/// Amber -- this file's qualified/partial colour, the same one
+/// `WorktreeJump` uses for "the branch moved on" -- rather than a red
+/// error panel, because nothing is broken: a session reported spawning
+/// subagents and the directory rule did not find them, which is a finding
+/// about the INFERENCE, not a failure of this session.
+///
+/// The sentence itself carries both numbers -- how many starts the hook
+/// recorded, and that the rule found none of them -- so this renders it
+/// and adds nothing. Restating them here would be a second copy of a
+/// claim that has to agree with the Rust one word for word.
+function SubagentDisagreement({ note }: { note: string | null }) {
+  if (note === null) return null;
+  return <p className="mt-2 text-xs text-[#d29922]">{note}</p>;
+}
+
 /// This session's subagents, and what they cost (#1002).
 ///
 /// # Three audiences, one section
@@ -1806,7 +2176,44 @@ function SessionUsage({ detail: d }: { detail: ClaudeSessionDetail }) {
 ///
 /// The error arm is BEFORE the loading/empty arms per #846: `data` is
 /// undefined on a rejection exactly as it is before the first read.
+///
+/// # What the hook adds, and the one case where it contradicts (#1066)
+///
+/// `d.subagents` is what the DIRECTORY RULE found, and it stays the
+/// section's spine: it is the only source for every session that exists
+/// today. `d.agent_types` is the hook's account of the same session, and
+/// it answers a question the directory rule cannot -- an `agent-<hex>`
+/// cwd yields an opaque id, never "this was a code-reviewer". So the two
+/// are laid out as ONE section rather than two: same subagents, two
+/// things known about them.
+///
+/// Three combinations, and none of them is an error:
+///
+/// | `stated` | `inferred_children` | rendering |
+/// |---|---|---|
+/// | empty | > 0 | the normal pre-hook session -- say the grouping came from the layout |
+/// | non-empty | > 0 | the breakdown, beside the inferred count |
+/// | non-empty | 0 | `subagentDisagreement`'s note, prominent but not alarming |
+///
+/// The first must not read as a failure. It is what every session that
+/// predates the install looks like, and it is the case in which the hook
+/// simply has nothing to say -- so the copy names the directory layout as
+/// the source rather than reporting a missing type.
+///
+/// The third is #1066's finding, and the rule that only ONE direction is
+/// a disagreement lives in `src/lib/subagentDisagreement.ts` with its
+/// argument. It is computed there rather than inline here for the reason
+/// the file gives: Rust has the same logic as a METHOD, which is never
+/// serialised, so this is a re-derivation that has to be testable against
+/// the Rust one rather than a second rule hidden in JSX.
 function SessionSubagents({ detail: d }: { detail: ClaudeSessionDetail }) {
+  // #1066's finding. Computed before the branch below, because a session
+  // the hook saw spawns for but the directory rule attributed no children
+  // to has `d.subagents.length === 0` -- it takes the non-parent path,
+  // and that path is precisely where this must be said. Rendering it only
+  // under `isParent` would hide the note in exactly the case it exists
+  // for.
+  const disagreement = subagentDisagreement(d.agent_types);
   const isParent = d.subagents.length > 0;
   // Only asked when there is something to roll up. A session with no
   // attributed children must not issue a query that resolves to zeros --
@@ -1817,7 +2224,22 @@ function SessionSubagents({ detail: d }: { detail: ClaudeSessionDetail }) {
 
   // A subagent's own view: who spawned it, or why that could not be told.
   if (!isParent) {
-    if (d.kind.kind !== "subagent") return null;
+    if (d.kind.kind !== "subagent") {
+      // Not a subagent and no attributed children -- so ordinarily
+      // nothing to say, which is the majority of rows. The exception is
+      // #1066's disagreement: the hook watched this session START
+      // subagents and the directory rule found none of them, and that is
+      // a finding about a session with no children rather than about a
+      // parent. Silence here would drop the note on the one shape it
+      // exists to report.
+      if (disagreement === null) return null;
+      return (
+        <section className="rounded-md border border-[#30363d] bg-[#161b22] p-3">
+          <h3 className="text-xs font-semibold text-[#e6edf3]">What its subagents did</h3>
+          <SubagentDisagreement note={disagreement} />
+        </section>
+      );
+    }
     return (
       <section className="rounded-md border border-[#30363d] bg-[#161b22] p-3">
         <h3 className="text-xs font-semibold text-[#e6edf3]">What ran this</h3>
@@ -1853,6 +2275,12 @@ function SessionSubagents({ detail: d }: { detail: ClaudeSessionDetail }) {
         {d.subagents.length === 1 ? "" : "s"} ran under this one. They are hidden from the list
         by default and are still resumable on their own.
       </p>
+      {/* What the hook knows about those same subagents (#1066). BESIDE
+          the count above rather than replacing it: the count is the
+          directory rule's, which is the only source for every session
+          that predates the install, and nothing here overrides it. */}
+      <AgentTypeBreakdown types={d.agent_types} />
+      <SubagentDisagreement note={disagreement} />
       {isError ? (
         // NOT zeros (#846). A failed read and subagents that used nothing
         // have opposite remedies, and the second is a claim this cannot

@@ -471,6 +471,62 @@ const MIGRATIONS: &[&str] = &[
         ON pr_history (scope_key, window_start, window_end);
      CREATE INDEX IF NOT EXISTS pr_history_stored
         ON pr_history (stored_at);",
+    // Migration 14: the hook events that are not session boundaries
+    // (#1065, #1066, #1067, epic #1060).
+    //
+    // # Why ONE table and not three
+    //
+    // `PreCompact`, `SubagentStart` and `Notification` are three
+    // questions, but they are the SAME SHAPE: a session id, a moment, an
+    // event name, and one or two small vocabulary values off the payload.
+    // Three tables would be three migrations, three inserts in
+    // `handoff::write_record`, and three places for the next event to be
+    // forgotten. One table makes a fourth event a row rather than a
+    // schema change, which is the property epic #1060 asks each
+    // sub-issue to preserve.
+    //
+    // It is deliberately NOT `claude_run`. A run is a process with a
+    // start and possibly an end, and liveness is derived from it; these
+    // are point events with no duration and no pid semantics. Folding
+    // them in would mean every liveness query learning to ignore rows
+    // that are not runs, which is exactly the kind of overloading that
+    // makes a later reader confidently wrong.
+    //
+    // # Why the columns are the payload's and not a generic blob
+    //
+    // A `detail TEXT` holding JSON would make every read a parse and
+    // every query a `LIKE`. These three columns are the whole of what
+    // the three events carry that we record, they are small vocabularies
+    // (`manual`/`auto`, an agent name, `idle_prompt`), and a fourth
+    // event that needs a fourth is one `ALTER TABLE ADD COLUMN` -- which
+    // SQLite does cheaply and which is additive by construction.
+    //
+    // `last_assistant_message` is NOT here and must never be: #1066 is
+    // explicit that it is unbounded model output, and this table is read
+    // on every poll.
+    //
+    // # Why the primary key is what it is
+    //
+    // (session_id, event, at) -- the same re-read-is-a-no-op property
+    // `claude_run` relies on. `handoff::consume` can re-read records
+    // after a rotation-then-crash, and `INSERT OR IGNORE` against this
+    // key makes that a no-op rather than a doubled count. Two genuinely
+    // distinct events of the same kind in the same session at the same
+    // RFC 3339 instant would collide and the second be dropped; the
+    // timestamp carries sub-second precision, so that is a narrower
+    // window than the double-counting it prevents.
+    "CREATE TABLE IF NOT EXISTS claude_hook_event (
+        session_id        TEXT NOT NULL,
+        event             TEXT NOT NULL,
+        at                TEXT NOT NULL,
+        trigger_kind      TEXT,
+        agent_id          TEXT,
+        agent_type        TEXT,
+        notification_type TEXT,
+        PRIMARY KEY (session_id, event, at)
+     );
+     CREATE INDEX IF NOT EXISTS claude_hook_event_session
+        ON claude_hook_event (session_id, at DESC);",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
@@ -1015,5 +1071,61 @@ mod tests {
             [],
         )
         .expect("a second cached list must now be allowed");
+    }
+
+    /// Migration 14 adds the hook-event table without disturbing the
+    /// session history an existing install already has.
+    ///
+    /// The upgrade path is the one that actually happens: every user has
+    /// a populated `claude_session`/`claude_run` pair from the transcript
+    /// importer, and #1065/#1066/#1067 must add a table beside them
+    /// rather than rebuild anything. A migration that dropped or rebuilt
+    /// either would cost a user their whole Claude Code history for a
+    /// feature that only adds to it.
+    #[test]
+    fn migration_14_adds_hook_events_without_touching_session_history() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO claude_session (session_id, cwd, first_seen_at)
+             VALUES ('s1', '/Users/acme/code/widget', '2026-09-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO claude_run (session_id, pid, started_at)
+             VALUES ('s1', 4242, '2026-09-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        // Re-running is a no-op, which is what an already-upgraded
+        // install does on every launch.
+        migrate(&conn).unwrap();
+
+        assert!(has_table(&conn, "claude_hook_event"));
+        let sessions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM claude_session", [], |r| r.get(0))
+            .unwrap();
+        let runs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM claude_run", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            (sessions, runs),
+            (1, 1),
+            "adding a table must not cost an install its session history"
+        );
+
+        // The key is what makes `handoff::consume`'s re-read a no-op
+        // rather than a doubled count -- see migration 14's own comment.
+        let insert = "INSERT OR IGNORE INTO claude_hook_event
+                        (session_id, event, at, trigger_kind)
+                      VALUES ('s1', 'PreCompact', '2026-09-01T01:00:00Z', 'auto')";
+        conn.execute(insert, []).unwrap();
+        conn.execute(insert, []).unwrap();
+        let events: i64 = conn
+            .query_row("SELECT COUNT(*) FROM claude_hook_event", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(events, 1, "the same event read twice is one event");
     }
 }
