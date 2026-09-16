@@ -6,6 +6,7 @@ import type {
   ClaudeSessionDetail,
   ClaudeSessionList,
   ClaudeUsage,
+  ClaudeObservation,
   ClaudeSubagentRollup,
 } from "@/types/pr";
 import { useFilters } from "@/store/filters";
@@ -58,6 +59,7 @@ const state = vi.hoisted(() => ({
   /// assert that, rather than only that the Local controls are gone.
   usage: undefined as ClaudeUsage | undefined,
   rollup: undefined as ClaudeSubagentRollup | undefined,
+  events: undefined as ClaudeObservation | undefined,
   preview: undefined as ClaudePreview | undefined,
   /// One session's detail, keyed by id (#985). `Class::Read`, so the
   /// phone gets this too -- and the phone is who the split is for: the
@@ -94,6 +96,14 @@ vi.mock("../api/hooks", () => ({
     isError: false,
     error: undefined,
     isLoading: sessionId !== null && state.rollup === undefined,
+  }),
+  // #1062-#1064. `src/` is rendered by the iOS companion too, so the
+  // failure section reaches the phone and needs a mock here as well.
+  useClaudeSessionEvents: (sessionId: string | null) => ({
+    data: state.events,
+    isError: false,
+    error: undefined,
+    isLoading: sessionId !== null && state.events === undefined,
   }),
   useClaudeSessionDetail: (sessionId: string | null, enabled: boolean) => {
     if (enabled && sessionId) state.detailAskedFor.push(sessionId);

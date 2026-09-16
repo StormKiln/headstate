@@ -350,6 +350,24 @@ pub struct Record {
     /// like `error_message`, and capped the same way.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub denial_reason: Option<String>,
+    /// The tool call a `PostToolUseFailure` or `PermissionDenied` is about
+    /// (#1063, #1064).
+    ///
+    /// Recorded for DEDUPLICATION, which is the one job it has. #1063
+    /// requires that a per-tool failure count not double-count retries of
+    /// the same tool call, and the reader keys `claude_event` on this so
+    /// that a redelivered record addresses the row it already wrote --
+    /// the same no-op the rotation re-read depends on everywhere else.
+    ///
+    /// Not free text and not capped: it is an opaque vendor id of bounded
+    /// length (`toolu_` plus a base62 body), so its size is fixed by the
+    /// payload's own schema the way `session_id`'s is. It costs 47 bytes
+    /// on the two events that carry it, which
+    /// [`tests::every_events_worst_case_record_stays_small`] measures.
+    ///
+    /// It is NOT an identity worth displaying, and nothing renders it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_use_id: Option<String>,
     /// `PreCompact`/`PostCompact`'s `trigger`: `manual|auto` (#1060
     /// sub-issue 4).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -585,6 +603,7 @@ pub fn record_from(payload: &serde_json::Value, ppid: u32, now: &str) -> Record 
         tool_name: str_field(payload, "tool_name"),
         error_message: capped_str_field(payload, "error_message"),
         denial_reason: capped_str_field(payload, "denial_reason"),
+        tool_use_id: str_field(payload, "tool_use_id"),
         trigger: str_field(payload, "trigger"),
         agent_id: str_field(payload, "agent_id"),
         agent_type: str_field(payload, "agent_type"),
@@ -835,6 +854,7 @@ mod tests {
             "tool_name": "Bash",
             "error_message": "the tool exited 1",
             "denial_reason": "the write is outside the allowed directory",
+            "tool_use_id": "toolu_01A09q90qw90lq917835lq9k",
             "trigger": "manual",
             "agent_id": "f1e2d3c4-b5a6-4798-8a9b-0c1d2e3f4a5b",
             "agent_type": "general-purpose",
@@ -858,6 +878,10 @@ mod tests {
         assert_eq!(
             r.denial_reason.as_deref(),
             Some("the write is outside the allowed directory")
+        );
+        assert_eq!(
+            r.tool_use_id.as_deref(),
+            Some("toolu_01A09q90qw90lq917835lq9k")
         );
         assert_eq!(r.trigger.as_deref(), Some("manual"));
         assert_eq!(
@@ -887,6 +911,7 @@ mod tests {
                 "tool_name",
                 "error_message",
                 "denial_reason",
+                "tool_use_id",
                 "trigger",
                 "agent_id",
                 "agent_type",
@@ -930,6 +955,39 @@ mod tests {
     /// before any text, and `PostToolUseFailure` at 273 plus a capped
     /// message. That is the ceiling [`TEXT_FIELD_CAP`] is sized against.
     ///
+    /// # Every installed event, MEASURED
+    ///
+    /// All eight of epic #1060's events are installed as of #1062-#1067,
+    /// so none of these rows is hypothetical any more -- each measures a
+    /// line the writer really emits. Re-measured together after
+    /// #1062-#1064 rebased onto #1065-#1067:
+    ///
+    /// ```text
+    /// SessionStart          249 bytes   headroom 263
+    /// SessionEnd            257 bytes   headroom 255
+    /// PreCompact            247 bytes   headroom 265
+    /// Notification          264 bytes   headroom 248
+    /// SubagentStop          311 bytes   headroom 201
+    /// SubagentStart         355 bytes   headroom 157
+    /// StopFailure           445 bytes   headroom  67
+    /// PermissionDenied      479 bytes   headroom  33
+    /// PostToolUseFailure    481 bytes   headroom  31   <- tightest
+    /// ```
+    ///
+    /// **Every one is inside the regime, so no cap needed raising** --
+    /// which is the answer #1062-#1064 owed and not a foregone one.
+    ///
+    /// The two tool events are the tightest, because each carries a capped
+    /// free-text field, a tool name AND a 47-byte `tool_use_id`.
+    /// `StopFailure` is looser only because it has no tool call to
+    /// identify, and the subagent and compaction events looser still
+    /// because they carry no capped text at all.
+    ///
+    /// 31 bytes of headroom is thin, and that is stated rather than
+    /// smoothed over: a FOURTH field on either tool event, or a cap above
+    /// ~190, puts the line outside the single-write regime. The next event
+    /// to add one must re-measure rather than assume.
+    ///
     /// The cost of this choice is stated rather than hidden: if a future
     /// event carries BOTH a subagent identity and a capped message, this
     /// test will not have covered it -- so that event must add its own row
@@ -954,10 +1012,12 @@ mod tests {
     /// "yes, but only just, and nothing further" -- recorded here rather
     /// than left for the next person to re-derive.
     ///
-    /// None of the three events installed by #1065/#1066/#1067 is that
-    /// shape. `SubagentStart` carries no free-text field at all (see
-    /// [`super::subagents`] for why the pair's other half, which does,
-    /// is not installed), so the worst line these three can emit is 358.
+    /// None of the eight events installed is that shape, and that still
+    /// holds after #1062-#1064. `SubagentStart` carries no free-text field
+    /// at all (see [`super::subagents`] for why the pair's other half,
+    /// which does, is not installed), and the three failure events carry
+    /// no subagent identity -- so no installed line combines the two. The
+    /// worst any of them emits is `PostToolUseFailure` at 481.
     ///
     /// PROVEN BY SABOTAGE: raising `TEXT_FIELD_CAP` to 400 fails here at
     /// `PostToolUseFailure` (673 bytes), and removing the cap entirely
@@ -976,17 +1036,40 @@ mod tests {
                 "SessionEnd",
                 serde_json::json!({ "reason": "prompt_input_exit" }),
             ),
+            // Both fields, because #1062 records both. The row #1061 left
+            // here carried only `error_type`, which was right for a format
+            // nothing emitted yet and became an UNDER-measurement the
+            // moment the event was installed: a real `StopFailure` payload
+            // carries an `error_message` alongside the type, and that is
+            // the capped field the budget turns on. Measured at 448 bytes
+            // with the message at its cap -- the tightest of the five
+            // installed events, with 64 bytes to spare.
             (
                 "StopFailure",
-                serde_json::json!({ "error_type": "authentication_failed" }),
+                serde_json::json!({
+                    "error_type": "authentication_failed",
+                    "error_message": long,
+                }),
             ),
+            // `tool_use_id` on both, because #1063 and #1064 record it for
+            // deduplication and a row without it would under-measure the
+            // line the writer really emits. It is the widest single
+            // addition either event has: 47 bytes, leaving 28.
             (
                 "PostToolUseFailure",
-                serde_json::json!({ "tool_name": "Bash", "error_message": long }),
+                serde_json::json!({
+                    "tool_name": "Bash",
+                    "error_message": long,
+                    "tool_use_id": "toolu_01A09q90qw90lq917835lq9k",
+                }),
             ),
             (
                 "PermissionDenied",
-                serde_json::json!({ "tool_name": "Bash", "denial_reason": long }),
+                serde_json::json!({
+                    "tool_name": "Bash",
+                    "denial_reason": long,
+                    "tool_use_id": "toolu_01A09q90qw90lq917835lq9k",
+                }),
             ),
             ("PreCompact", serde_json::json!({ "trigger": "manual" })),
             (

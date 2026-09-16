@@ -1,7 +1,12 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import pageSource from "./ClaudeOverviewPage.tsx?raw";
-import type { ClaudeCounts, ClaudeDayCount, ClaudeOverview } from "@/types/pr";
+import type {
+  ClaudeCorpus,
+  ClaudeCounts,
+  ClaudeDayCount,
+  ClaudeOverview,
+} from "@/types/pr";
 import { useFilters } from "@/store/filters";
 
 const copyFn = vi.hoisted(() => vi.fn(() => Promise.resolve(null as string | null)));
@@ -17,9 +22,29 @@ const state = vi.hoisted(() => ({
   // A fixed `now`, because the page must not read the clock. If it did,
   // these assertions would drift with wall time.
   now: new Date("2026-09-13T12:00:00Z").getTime(),
+  /// #1062-#1064. Defaults to a RESOLVED `unobserved` rather than to
+  /// `undefined`, so the profile card settles instead of sitting in its
+  /// loading arm through every unrelated assertion in this file.
+  profile: {
+    observation: { state: "unobserved" },
+    sessions: 0,
+    sessions_observed: 0,
+    sessions_with_events: 0,
+  } as ClaudeCorpus | undefined,
+  profileFailed: false,
 }));
 
 vi.mock("../api/hooks", () => ({
+  // #1062-#1064, the cross-session profile card. Defaults to a resolved
+  // `unobserved`, which is the state of a machine before the hooks go in
+  // -- and therefore the state every existing assertion in this file was
+  // written against.
+  useClaudeEventProfile: () => ({
+    data: state.profile,
+    isError: state.profileFailed,
+    error: state.profileFailed ? "permission denied reading ~/.claude" : undefined,
+    isLoading: !state.profileFailed && state.profile === undefined,
+  }),
   useClaudeOverview: () => ({
     query: {
       data: state.data,
@@ -88,6 +113,136 @@ beforeEach(() => {
   state.data = overview();
   state.loading = false;
   state.failed = false;
+  state.profile = {
+    observation: { state: "unobserved" },
+    sessions: 0,
+    sessions_observed: 0,
+    sessions_with_events: 0,
+  };
+  state.profileFailed = false;
+});
+
+/// #1062, #1063, #1064: the cross-session failure and denial profile.
+///
+/// The cross-session view is the informative one, and #1064 says why: one
+/// denial is noise, the same denial forty times is a finding. A per-session
+/// view cannot tell those apart.
+describe("the failures and denials card", () => {
+  const tally = (name: string | null, count: number) => ({ name, count, detail: null });
+
+  const corpus = (over: Partial<ClaudeCorpus> = {}): ClaudeCorpus => ({
+    observation: {
+      state: "observed",
+      profile: { turn_failures: [], tool_failures: [], denials: [] },
+    },
+    sessions: 1461,
+    sessions_observed: 1461,
+    sessions_with_events: 0,
+    ...over,
+  });
+
+  /// **The test this card exists to pass.** A corpus no hook has observed
+  /// says so, and shows no figures at all.
+  ///
+  /// `overview.rs` measured 1,461 of 1,461 sessions in exactly this state
+  /// on the development machine, so this is the NORMAL rendering before
+  /// the hooks are installed. A grid of zeros here would be #846 at full
+  /// scale -- and worse than the original, because a chart of zeros at
+  /// least looks like data while "0 failures across 1,461 sessions" reads
+  /// as an achievement.
+  it("renders an unobserved corpus as not-recorded, never as zeros", () => {
+    state.profile = corpus({ observation: { state: "unobserved" }, sessions_observed: 0 });
+    render(<ClaudeOverviewPage />);
+
+    expect(screen.getByText(/Not recorded\./)).toBeTruthy();
+    expect(screen.getByText(/install the Claude Code hooks/i)).toBeTruthy();
+    expect(screen.queryByText(/Nothing failed and nothing was declined/)).toBeNull();
+  });
+
+  /// A failed read is not a clean corpus.
+  it("reports a failed read rather than showing zeros", () => {
+    state.profileFailed = true;
+    state.profile = undefined;
+    render(<ClaudeOverviewPage />);
+
+    expect(screen.getByText(/Could not read what the hooks recorded/)).toBeTruthy();
+    expect(screen.queryByText(/Nothing failed and nothing was declined/)).toBeNull();
+  });
+
+  /// The DENOMINATOR is shown whenever the observed set is short of the
+  /// whole.
+  ///
+  /// Without it a profile over 3 of 1,461 sessions renders identically to
+  /// one over all of them, and the reader has no way to know which they
+  /// are looking at.
+  it("names how many sessions it can speak for when some predate the hooks", () => {
+    state.profile = corpus({
+      sessions: 1461,
+      sessions_observed: 3,
+      sessions_with_events: 2,
+      observation: {
+        state: "observed",
+        profile: {
+          turn_failures: [tally("rate_limit", 7)],
+          tool_failures: [],
+          denials: [],
+        },
+      },
+    });
+    render(<ClaudeOverviewPage />);
+
+    expect(screen.getByText(/Over the 3 of 1,461 sessions a hook has observed/)).toBeTruthy();
+    expect(screen.getByText(/ran before the hooks were installed/)).toBeTruthy();
+  });
+
+  /// An observed corpus with nothing recorded is a measured zero, and is
+  /// allowed to read as good news.
+  it("reports an observed corpus with nothing recorded as a measured zero", () => {
+    state.profile = corpus({ sessions: 4, sessions_observed: 4 });
+    render(<ClaudeOverviewPage />);
+
+    expect(screen.getByText(/Nothing failed and nothing was declined/)).toBeTruthy();
+    expect(screen.queryByText(/Not recorded\./)).toBeNull();
+  });
+
+  /// Denials are presented as a guardrail, not as damage (#1064).
+  it("presents denials as the guardrail working rather than as failures", () => {
+    state.profile = corpus({
+      sessions_with_events: 12,
+      observation: {
+        state: "observed",
+        profile: {
+          turn_failures: [],
+          tool_failures: [],
+          denials: [tally("Write", 40)],
+        },
+      },
+    });
+    render(<ClaudeOverviewPage />);
+
+    expect(screen.getByText(/Declined by auto mode/)).toBeTruthy();
+    expect(screen.getByText(/guardrail earning its keep/)).toBeTruthy();
+    expect(screen.getByText("Write")).toBeTruthy();
+    expect(screen.getByText("40")).toBeTruthy();
+  });
+
+  /// An unknown name renders verbatim here too (#1062, #1063).
+  it("renders an unknown error type verbatim", () => {
+    state.profile = corpus({
+      sessions_with_events: 1,
+      observation: {
+        state: "observed",
+        profile: {
+          turn_failures: [tally("some_new_failure_mode", 2)],
+          tool_failures: [],
+          denials: [],
+        },
+      },
+    });
+    render(<ClaudeOverviewPage />);
+
+    expect(screen.getByText("some_new_failure_mode")).toBeTruthy();
+  });
 });
 
 describe("ClaudeOverviewPage", () => {

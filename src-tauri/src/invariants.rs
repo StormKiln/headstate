@@ -1613,6 +1613,122 @@ mod tests {
             contradicted.join("\n  ")
         );
     }
+    /// Liveness never reads the failure and denial events (#1062).
+    ///
+    /// `install.rs` has recorded since #910 that `StopFailure` "does not
+    /// fire on SIGKILL, so it adds error context rather than liveness",
+    /// and #1062 installs the event while carrying that constraint
+    /// forward. The defect it forbids is specific and tempting: a turn
+    /// that died of a rate limit looks like evidence a session is over,
+    /// and it is not -- the session is very much still running, and a
+    /// liveness that consulted this would report every rate-limited
+    /// session as dead.
+    ///
+    /// The separation is structural: these events live in `claude_hook_event`
+    /// and liveness reads `claude_run`. This guard is what stops a later
+    /// well-meaning join from erasing that, because nothing about
+    /// `liveness.rs` in isolation says which table it may not touch.
+    ///
+    /// # Scoped to the FILE, not to a function
+    ///
+    /// The `guard` skill's third recorded mistake is scoping too coarsely,
+    /// and this looks like a case for scoping to `derive`. It is not: the
+    /// hazard is not one function reading the table, it is the DEPENDENCY
+    /// existing at all -- a private helper, a new `runs_with_failures`
+    /// query, or a `use super::events` at the top of the file are each the
+    /// same defect arriving by another route, and a function-scoped guard
+    /// would see none of them. The file is the unit that owns the
+    /// constraint.
+    ///
+    /// PROVEN BY SABOTAGE, both directions, and the second one FOUND A
+    /// DEFECT IN THIS GUARD:
+    ///   - adding `let _ = "SELECT 1 FROM claude_hook_event";` to
+    ///     `liveness::derive` fails this, naming the file and the rule.
+    ///   - adding a module-doc paragraph to `liveness.rs` explaining why
+    ///     it must never read `claude_hook_event` ALSO failed it, at first. The
+    ///     guard had been written assuming `production` strips comments;
+    ///     it does not, it strips `#[cfg(test)]` blocks. That is exactly
+    ///     #874's recorded mistake -- a guard matching its pattern inside
+    ///     a doc comment -- and it would have made this file undocumentable
+    ///     on its own most important constraint. Fixed by filtering
+    ///     `is_comment` lines here, after which the same prose passes and
+    ///     the code sabotage still fails.
+    ///   - `sessions.rs` legitimately reads BOTH tables (it assembles the
+    ///     detail pane) and is not flagged, because the guard names
+    ///     `liveness.rs` alone rather than sweeping the module.
+    #[test]
+    fn liveness_never_reads_the_failure_events() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let path = manifest.join("src/claude/liveness.rs");
+        let src = std::fs::read_to_string(&path).expect("read claude/liveness.rs");
+
+        // Comments stripped, and `production` does NOT do it -- it removes
+        // `#[cfg(test)]` blocks only. That distinction is #874's recorded
+        // mistake and it was caught here by sabotage rather than by
+        // foresight: an earlier version of this guard claimed `production`
+        // stripped comments, and adding a module-doc paragraph to
+        // liveness.rs explaining why it must not read `claude_hook_event` made
+        // the guard fail on the documentation of the rule it enforces.
+        //
+        // This codebase documents rules directly above the code they
+        // govern, so these needles appear in prose far more often than in
+        // a call. `is_comment` covers `//`, `///` and `//!` alike.
+        //
+        // CRLF is normalised first: on a Windows checkout every line would
+        // otherwise carry a trailing `\r`, which changes nothing for
+        // `contains` here but is the house rule for any line-oriented scan
+        // and costs nothing to keep.
+        let body: String = production(&src.replace("\r\n", "\n"))
+            .lines()
+            .filter(|l| !is_comment(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for needle in [
+            "claude_hook_event",
+            "events::",
+            "StopFailure",
+            "PermissionDenied",
+        ] {
+            assert!(
+                !body.contains(needle),
+                "claude/liveness.rs mentions `{needle}` in code. #1062 is \
+                 explicit that the failure events must not inform whether a \
+                 session is running: StopFailure does not fire on SIGKILL, \
+                 so a session that hit a rate limit and is still alive \
+                 would be reported as dead. Liveness reads `claude_run`; \
+                 these events live in `claude_hook_event`, and the two must stay \
+                 apart."
+            );
+        }
+
+        // The negative direction, per the `guard` skill: prove this is not
+        // merely passing because the file is empty or because the scan
+        // reads nothing.
+        //
+        // The anchor is `fn derive` and its `runs` parameter, NOT the
+        // string `claude_run` -- and that correction was itself found by
+        // running this. `liveness.rs` never names the table in code at
+        // all: it is handed a `&[Run]` by `sessions.rs`, which owns the
+        // SQL. Asserting on the table name would have been asserting on a
+        // string that only ever appears in this file's comments, which is
+        // the same doc-comment confusion the needles above guard against,
+        // one direction over.
+        //
+        // That indirection is also WHY the constraint holds so cheaply:
+        // liveness cannot read a table it is never given a connection to.
+        assert!(
+            body.contains("fn derive"),
+            "liveness.rs no longer defines `derive`, so the needles above \
+             are scanning a file that no longer decides liveness -- they \
+             would stay silent however the decision was made instead"
+        );
+        assert!(
+            body.contains("runs"),
+            "liveness.rs no longer takes the runs it derives from, so this \
+             guard is passing for the wrong reason"
+        );
+    }
 
     /// Every crash notifier is WIRED, and reads the right count (#979).
     ///

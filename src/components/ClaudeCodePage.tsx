@@ -6,13 +6,17 @@ import type {
   ClaudeCompactions,
   ClaudePreviewBlock,
   ClaudeSession,
+  ClaudeObservation,
+  ClaudeProfile,
   ClaudeSessionDetail,
+  ClaudeTally,
   ClaudeWaiting,
   CwdState,
   Liveness,
 } from "@/types/pr";
 import {
   useClaudeSessionDetail,
+  useClaudeSessionEvents,
   useClaudeSessionUsage,
   useClaudeSubagentRollup,
   useClaudeSessions,
@@ -1491,6 +1495,12 @@ function SessionDetail({
               read against each other, and separate so neither is mistaken
               for the other (#1002). */}
           <SessionSubagents detail={detail.data} />
+          {/* After the two "how much" sections and before the transcript:
+              the questions run what is this, how much was it, what went
+              WRONG in it, and what was it saying. The failure profile is
+              the one a user acts on, so it sits above the preview rather
+              than below it. */}
+          <SessionTrouble sessionId={s.session_id} />
           <TranscriptPreview detail={detail.data} />
         </>
       )}
@@ -2373,6 +2383,194 @@ function formatMb(bytes: number): string {
 /// The primary action stays the clipboard copy, for the reason
 /// `claudify_command` records: macOS has no default-terminal concept. This
 /// pane is for deciding, not for doing.
+/// What the hook recorded about this session's failures and denials
+/// (#1062, #1063, #1064).
+///
+/// # The four conditions, and why none may render as another
+///
+/// | condition | rendering |
+/// |---|---|
+/// | the read failed | the reason. NOT zeros. |
+/// | still reading | says so |
+/// | `unobserved` | "not recorded", and why — NEVER "0 failures" |
+/// | observed | the counts, a zero among them being a real zero |
+///
+/// The third row is the one this section exists to get right, and it is
+/// the house rule (#846) in its most convincing disguise. A session that
+/// ran before the hooks were installed has no records, and "0 failures"
+/// for it is a sentence that looks like good news and is actually a
+/// measurement nobody took. On a machine that adopted Headstate after
+/// using Claude Code that is EVERY historical session.
+///
+/// The error arm is before the loading arm, per #846: `data` is undefined
+/// on a rejection exactly as it is before the first read, so an error arm
+/// placed after would never render in the case it exists for.
+///
+/// # Denials are not failures
+///
+/// #1064 is explicit that a denial is a guardrail working rather than
+/// something going wrong, and the wording here must not imply otherwise.
+/// They get their own heading, their own count and neutral verbs — "auto
+/// mode declined", never "blocked" or "failed".
+function SessionTrouble({ sessionId }: { sessionId: string }) {
+  const { data, isError, error, isLoading } = useClaudeSessionEvents(sessionId);
+
+  return (
+    <section className="rounded-md border border-[#30363d] bg-[#161b22] p-3">
+      <h3 className="text-xs font-semibold text-[#e6edf3]">What went wrong in it</h3>
+      {isError ? (
+        // NOT zeros. A failed read and a clean session have opposite
+        // remedies, and the second is a claim this cannot make.
+        <p className="mt-2 text-xs text-[#8b949e]">
+          Could not read what the hook recorded, so failures and denials for this session are
+          unknown
+          {errorMessage(error) ? ` (${errorMessage(error)})` : ""}.
+        </p>
+      ) : isLoading || data === undefined ? (
+        <p className="mt-2 text-xs text-[#8b949e]">Reading what the hook recorded…</p>
+      ) : data.state === "unobserved" ? (
+        // The absent-is-not-zero arm. It says what is true — nobody was
+        // watching — and names the remedy, rather than showing a zero
+        // that would read as "this session was clean".
+        <p className="mt-2 text-xs text-[#8b949e]">
+          Not recorded. No hook was watching this session, so whether anything failed or was
+          declined is unknown — this is normal for sessions that ran before the hooks were
+          installed.
+        </p>
+      ) : (
+        <TroubleProfile observation={data} />
+      )}
+    </section>
+  );
+}
+
+/// The measured half of [`SessionTrouble`]: a profile that really was
+/// recorded.
+///
+/// Split out so the caller's guard chain stays readable, and so the
+/// partial-install banner has one place to live.
+function TroubleProfile({ observation }: { observation: ClaudeObservation }) {
+  if (observation.state === "unobserved") return null;
+  const p: ClaudeProfile = observation.profile;
+  const floor = observation.state === "partial";
+  const concentrated = concentratedTool(p.tool_failures);
+
+  return (
+    <>
+      {floor ? (
+        /* A half install. The counts below are a FLOOR and saying so is
+           the difference between a number and a wrong number. `missing`
+           names the event, because "reinstall the hooks" is only
+           actionable if the reader knows what is not being recorded —
+           the same reason `install::Status::Stale` carries a sentence. */
+        <p className="mt-2 text-xs text-[#d29922]">
+          At least these — {observation.missing.join(" and ")} {observation.missing.length === 1
+            ? "is"
+            : "are"}{" "}
+          not installed, so anything it would have recorded is missing. Reinstall the hooks to
+          record all of it.
+        </p>
+      ) : null}
+      {p.turn_failures.length === 0 && p.tool_failures.length === 0 && p.denials.length === 0 ? (
+        /* A real, MEASURED zero, and it is allowed to read as good news
+           precisely because the unobserved case above never reaches
+           here. */
+        <p className="mt-2 text-xs text-[#8b949e]">
+          {floor
+            ? "Nothing was recorded by the hooks that are installed."
+            : "Nothing failed and nothing was declined while this session was being watched."}
+        </p>
+      ) : null}
+
+      {p.turn_failures.length > 0 ? (
+        <TallyList
+          label="Turns that died"
+          hint="Why the turn ended. A recurring rate limit is a different problem from a recurring overload, and only the first is one you can pace around."
+          tallies={p.turn_failures}
+        />
+      ) : null}
+
+      {p.tool_failures.length > 0 ? (
+        <TallyList
+          label="Tool failures"
+          hint={
+            concentrated !== null
+              ? `Concentrated in ${concentrated}, which is the shape worth looking at.`
+              : undefined
+          }
+          tallies={p.tool_failures}
+        />
+      ) : null}
+
+      {p.denials.length > 0 ? (
+        /* NOT an error, and the wording carries that (#1064). A denial is
+           auto mode doing the job it was asked to do; presenting it as
+           damage would teach the user to switch the guardrail off. */
+        <TallyList
+          label="Declined by auto mode"
+          hint="Auto mode refused these tool calls. That is the guardrail working — worth a look only if something you meant to allow is on the list."
+          tallies={p.denials}
+        />
+      ) : null}
+    </>
+  );
+}
+
+/// One breakdown: a label, an optional sentence, and the named tallies.
+///
+/// `name` is rendered VERBATIM and is never mapped to a friendlier label.
+/// An `error_type` or tool name this build has never seen — an MCP
+/// server's tool, or an error type a newer Claude Code added — must render
+/// as itself, because it is the only thing the record carries (#1062,
+/// #1063).
+function TallyList({
+  label,
+  hint,
+  tallies,
+}: {
+  label: string;
+  hint?: string;
+  tallies: ClaudeTally[];
+}) {
+  return (
+    <div className="mt-3">
+      <h4 className="text-xs font-semibold text-[#e6edf3]">{label}</h4>
+      {hint !== undefined ? <p className="mt-0.5 text-xs text-[#8b949e]">{hint}</p> : null}
+      <dl className="mt-1.5 space-y-1.5 text-xs">
+        {tallies.map((t) => (
+          <Field key={`${label}:${t.name ?? "\u0000"}`} label={t.name ?? "Not recorded"}>
+            <span>{t.count.toLocaleString()}</span>
+            {/* Untrusted vendor text, rendered as text by React and never
+                interpolated into anything else. One example rather than
+                every message: the question is what KIND of thing is going
+                wrong. */}
+            {t.detail !== null ? (
+              <span className="ml-2 break-all text-[#8b949e]">{t.detail}</span>
+            ) : null}
+          </Field>
+        ))}
+      </dl>
+    </div>
+  );
+}
+
+/// The tool holding a strict majority of the failures, when there is one.
+///
+/// Mirrors `Profile::concentrated_tool` on the Rust side, and the
+/// thresholds are the same for the same reasons: a STRICT majority
+/// because a 2/2/1 split has no story, and more than one failure because
+/// a single failure is trivially 100% concentrated and pointing at it
+/// would make the signal constant.
+///
+/// Computed here rather than sent, because it is a presentation choice
+/// over data the client already holds.
+function concentratedTool(tallies: ClaudeTally[]): string | null {
+  const total = tallies.reduce((n, t) => n + t.count, 0);
+  if (total < 2) return null;
+  const top = tallies.find((t) => t.count * 2 > total && t.name !== null);
+  return top?.name ?? null;
+}
+
 function TranscriptPreview({ detail: d }: { detail: ClaudeSessionDetail }) {
   const [open, setOpen] = useState(false);
   // `transcript_state`, never `cwd_state` (#919, and

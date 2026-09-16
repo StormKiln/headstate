@@ -162,6 +162,10 @@ pub const SURFACE: &[(&str, Class)] = &[
     // for the rest only when the user opens a session.
     ("claude_session_detail", Class::Read),
     ("claude_subagent_rollup", Class::Read),
+    // The hook's failure and denial profile for one session, and
+    // across all of them (#1062, #1063, #1064). Reads only.
+    ("claude_session_events", Class::Read),
+    ("claude_event_profile", Class::Read),
     // The two live sources on the DESKTOP: its hook handoff file and its
     // `~/.claude/sessions` registry (#913). The phone has neither of its
     // own -- it runs no Claude sessions -- which is exactly why it asks
