@@ -2072,9 +2072,32 @@ mod tests {
     ///
     /// PROVEN BY SABOTAGE, both directions. Adding `"PostCompact"` to
     /// `EVENTS` without a table row fails here naming `PostCompact`;
-    /// removing the `SubagentStart` row from the table fails naming
+    /// renaming the `SubagentStart` row out of the table fails naming
     /// `SubagentStart`. With the tree as it stands it is silent, which is
     /// the other half of the proof.
+    ///
+    /// # It shipped broken once, on Windows only
+    ///
+    /// Recorded because the lesson is worth more than the fix. The first
+    /// version matched rustfmt's literal indentation for a multi-line
+    /// row, `(\n                "Name",`. Every sabotage passed, the
+    /// negative direction was silent, and the guard was green on macOS --
+    /// then `platform (windows-latest)` failed it naming three events
+    /// that were plainly in the table, because a CRLF checkout makes
+    /// every `\n` a `\r\n` and the pattern matched nothing.
+    ///
+    /// `src-tauri/CLAUDE.md` states that rule in so many words, and it
+    /// was still missed, because sabotaging a guard proves it reacts to
+    /// the DEFECT and says nothing about the platform it runs on. The
+    /// failure was reproduced locally by converting `hook.rs` to CRLF,
+    /// which fails the old matcher with the same three event names and
+    /// passes the current one -- so the fix is tested rather than
+    /// assumed.
+    ///
+    /// Hence stripping ALL whitespace rather than normalising `\r\n`:
+    /// it removes the line-ending dependency and the dependency on
+    /// rustfmt's one-line-versus-four choice at the same time, so a later
+    /// `cargo fmt` cannot resurrect this in a new costume.
     #[test]
     fn every_installed_hook_event_has_a_measured_worst_case_record() {
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -2127,12 +2150,29 @@ mod tests {
             );
         let table = &table[..table.len().min(4_000)];
 
+        // WHITESPACE-INSENSITIVE, and that is the fix for a real
+        // Windows-only failure rather than tidiness.
+        //
+        // The first version matched the literal `(\n                "Name",`
+        // -- rustfmt's own indentation for a multi-line row. It passed on
+        // macOS and failed on windows-latest naming three events, because
+        // a CRLF checkout makes every `\n` a `\r\n` and the pattern
+        // matched nothing. Exactly the trap `src-tauri/CLAUDE.md` states:
+        // "Normalise \r\n before any \n-anchored byte pattern, or it
+        // matches nothing on a CRLF checkout and passes silently on
+        // Windows only." Here it did not pass silently -- it failed
+        // loudly, on the opposite platform -- which is the better of the
+        // two outcomes and still a defect.
+        //
+        // Stripping ALL whitespace removes the dependency on line endings
+        // AND on rustfmt's choice of one line versus four, so a row
+        // reformatted by a later `cargo fmt` cannot make this guard report
+        // a missing measurement that is right there.
+        let squashed: String = table.chars().filter(|c| !c.is_whitespace()).collect();
+
         let missing: Vec<&String> = installed
             .iter()
-            .filter(|e| {
-                !table.contains(&format!("(\n                \"{e}\","))
-                    && !table.contains(&format!("(\"{e}\","))
-            })
+            .filter(|e| !squashed.contains(&format!("(\"{e}\",")))
             .collect();
 
         assert!(
