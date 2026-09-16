@@ -397,6 +397,37 @@ pub struct ListRow {
     /// session" is something we genuinely know. Contrast the TOKENS
     /// below, which are a measurement and therefore absent-or-known.
     pub subagents: usize,
+    /// Whether this session is waiting on the user (#1067).
+    ///
+    /// On the LIST and not the detail, against #985's rule, because this
+    /// is the one fact in the epic that is about **now**: a user with
+    /// several sessions open wants to see which is blocked from the row,
+    /// and a field only the open detail pane carries would answer the
+    /// question for the session they already chose.
+    ///
+    /// Cheap enough to justify it. The serialised form is
+    /// `{"state":"no","reason":"never-observed"}` -- 41 bytes -- for
+    /// every session on a machine without the hook, which is the whole
+    /// corpus today and the only case that multiplies by 1,500.
+    ///
+    /// It is a [`super::signals::Waiting`] and not a `bool` for the
+    /// reason that type documents at length: a boolean would have to be
+    /// computed somewhere, and the only safe place to compute it is
+    /// against a liveness verdict that this function has and the view
+    /// does not.
+    pub waiting: super::signals::Waiting,
+    /// Whether this session repeatedly hit its context limit (#1065).
+    ///
+    /// `None` means no compaction was ever RECORDED for it -- absent, not
+    /// zero, and the state every pre-hook session is in. `Some(false)`
+    /// means we watched and it did not. The row renders the two
+    /// differently or it is claiming a measurement it does not have.
+    ///
+    /// A `bool` rather than the full [`super::signals::Compactions`]
+    /// because the row shows a flag and the breakdown belongs to the
+    /// detail pane -- #985's split by field, applied to a new field
+    /// rather than discovered later.
+    pub context_pressure: Option<bool>,
 }
 
 /// The session list, INCLUDING what could not be read.
@@ -531,6 +562,26 @@ pub struct SessionDetail {
     /// It carries the evidence -- which sessions tied, and when -- so the
     /// reader can see that the app looked rather than that it shrugged.
     pub unattributed: Option<String>,
+    /// How often this session compacted, split by trigger (#1065).
+    ///
+    /// `None` is "no compaction was ever recorded for this session",
+    /// which is not the same as none happening -- see
+    /// [`super::signals::Observed`]. The detail pane renders the two
+    /// differently.
+    pub compactions: Option<super::signals::Compactions>,
+    /// What this session STATED it spawned, against what we infer (#1066).
+    ///
+    /// `None` when neither source has anything to say. `Some` with an
+    /// empty `stated` and a non-zero `inferred_children` is the normal
+    /// pre-hook session, and it is why the hook is an additional source
+    /// rather than a replacement.
+    pub agent_types: Option<super::signals::AgentTypes>,
+    /// Whether this session is waiting on the user (#1067).
+    ///
+    /// Derived from the same liveness the pane's own badge shows, on
+    /// this request -- so the detail pane can never disagree with itself
+    /// about whether the process is there.
+    pub waiting: super::signals::Waiting,
 }
 
 /// Read every stored session, with liveness derived.
@@ -582,7 +633,32 @@ pub fn list(conn: &Connection) -> Result<SessionList, rusqlite::Error> {
 
     let rows = stored_rows(conn)?;
     let children = children_by_parent(conn)?;
-    Ok(assemble(&probe, &registry, &runs, rows, &children))
+    Ok(assemble(
+        &probe,
+        &registry,
+        &runs,
+        rows,
+        &children,
+        &hook_events(conn)?,
+    ))
+}
+
+/// Every session's hook events, with the run table's activity folded in.
+///
+/// Two queries for the whole list rather than two per row. The fold is
+/// what makes #1067's expiry work across tables: a `SessionEnd` lives in
+/// `claude_run`, and a waiting indicator that could not see it would
+/// outlive the session it points at.
+fn hook_events(
+    conn: &Connection,
+) -> Result<std::collections::HashMap<String, super::signals::Events>, rusqlite::Error> {
+    let mut events = super::signals::events_by_session(conn)?;
+    for (session_id, at) in super::signals::newest_run_activity(conn)? {
+        if let Some(e) = events.get_mut(&session_id) {
+            e.observe_activity(&at);
+        }
+    }
+    Ok(events)
 }
 
 /// What one session's subagents cost, as a figure of its own (#1002).
@@ -900,6 +976,27 @@ pub fn detail(
         None
     };
 
+    // #1065/#1066/#1067, for this one session. Read through the same
+    // fold the list uses, so the two views cannot disagree about whether
+    // a session is waiting -- `hook_events` is the single place the
+    // cross-table expiry is applied.
+    let events = hook_events(conn)?;
+    let session_events = events.get(session_id);
+    let compactions = session_events.and_then(super::signals::Events::compactions);
+    // The inference's count is passed in, which is what makes the
+    // disagreement check a comparison of two sources rather than one
+    // source and an assumption. `subagents` is already the inference's
+    // answer for this session.
+    let agent_types = session_events
+        .map(|e| e.agent_types(subagents.len()))
+        .unwrap_or_else(|| super::signals::Events::default().agent_types(subagents.len()));
+    let waiting =
+        session_events
+            .map(|e| e.waiting(&liveness))
+            .unwrap_or(super::signals::Waiting::No {
+                why: super::signals::NotWaiting::NeverObserved,
+            });
+
     Ok(Some(SessionDetail {
         resume: resume_command(&stored.session_id, cwd.as_deref(), &cwd_state),
         transcript_state: check_transcript(stored.transcript_path.as_deref()),
@@ -914,6 +1011,9 @@ pub fn detail(
         subagents,
         parent,
         unattributed,
+        compactions,
+        agent_types,
+        waiting,
     }))
 }
 
@@ -1055,6 +1155,7 @@ fn assemble<P: ProcessProbe>(
     runs: &std::collections::HashMap<String, Vec<Run>>,
     stored: Vec<Stored>,
     children: &std::collections::HashMap<String, usize>,
+    events: &std::collections::HashMap<String, super::signals::Events>,
 ) -> SessionList {
     let empty: Vec<Run> = Vec::new();
     let mut reasons = Reasons::default();
@@ -1087,6 +1188,20 @@ fn assemble<P: ProcessProbe>(
             // actually in.
             let kind = super::subagent::Kind::classify(cwd.as_deref());
             let subagents = children.get(&s.session_id).copied().unwrap_or(0);
+            // #1065/#1067. Both read the SAME `liveness` the badge beside
+            // them is rendered from, deliberately: a waiting indicator
+            // derived from a second liveness read could contradict the
+            // badge on its own row, and the two would be right about
+            // different moments with nothing to say which.
+            let session_events = events.get(&s.session_id);
+            let waiting = session_events.map(|e| e.waiting(&liveness)).unwrap_or(
+                super::signals::Waiting::No {
+                    why: super::signals::NotWaiting::NeverObserved,
+                },
+            );
+            let context_pressure = session_events
+                .and_then(super::signals::Events::compactions)
+                .map(|c| c.under_pressure());
             ListRow {
                 session_id: s.session_id,
                 name: s.name,
@@ -1097,6 +1212,8 @@ fn assemble<P: ProcessProbe>(
                 cwd_state,
                 kind,
                 subagents,
+                waiting,
+                context_pressure,
             }
         })
         .collect();
@@ -1562,6 +1679,7 @@ mod tests {
             &Default::default(),
             stored_rows(&conn).unwrap(),
             &Default::default(),
+            &Default::default(),
         );
         assert_eq!(got.sessions[0].cwd_state, CwdState::Gone);
 
@@ -1616,6 +1734,7 @@ mod tests {
             &registry,
             &Default::default(),
             stored_rows(&conn).unwrap(),
+            &Default::default(),
             &Default::default(),
         );
         assert_eq!(got.sessions.len(), 2, "the rows are still shown");
@@ -1680,6 +1799,7 @@ mod tests {
             &Default::default(),
             stored_rows(&conn).unwrap(),
             &Default::default(),
+            &Default::default(),
         );
         assert_eq!(
             resolved(&got, "s1"),
@@ -1725,6 +1845,7 @@ mod tests {
             &Default::default(),
             stored_rows(&conn).unwrap(),
             &Default::default(),
+            &Default::default(),
         );
         assert_eq!(got.sessions[0].cwd.as_deref(), Some(real_dir().as_str()));
     }
@@ -1750,6 +1871,7 @@ mod tests {
             &Registry::default(),
             &Default::default(),
             stored_rows(&conn).unwrap(),
+            &Default::default(),
             &Default::default(),
         );
         // `runs` is the detail's since #985 -- the list neither renders
@@ -1799,6 +1921,7 @@ mod tests {
             &runs,
             stored_rows(&conn).unwrap(),
             &Default::default(),
+            &Default::default(),
         );
         match resolved(&got, "s1") {
             Liveness::Dead { why } => assert!(
@@ -1846,6 +1969,7 @@ mod tests {
             &runs,
             stored_rows(&conn).unwrap(),
             &Default::default(),
+            &Default::default(),
         );
         match resolved(&got, "s1") {
             Liveness::Dead { why } => assert!(
@@ -1880,6 +2004,7 @@ mod tests {
             &Registry::default(),
             &Default::default(),
             Vec::new(),
+            &Default::default(),
             &Default::default(),
         );
         assert!(got.sessions.is_empty());
@@ -1992,6 +2117,7 @@ mod tests {
             &Default::default(),
             stored_rows(&conn).unwrap(),
             &Default::default(),
+            &Default::default(),
         );
         assert_eq!(got.sessions.len(), 250);
         for s in &got.sessions {
@@ -2024,6 +2150,7 @@ mod tests {
             &Registry::default(),
             &Default::default(),
             stored_rows(&conn).unwrap(),
+            &Default::default(),
             &Default::default(),
         );
         assert_eq!(
@@ -2073,6 +2200,7 @@ mod tests {
             &Registry::default(),
             &runs_by_session(&conn).unwrap(),
             stored_rows(&conn).unwrap(),
+            &Default::default(),
             &Default::default(),
         );
         assert_eq!(
@@ -2153,6 +2281,7 @@ mod tests {
             &Default::default(),
             stored_rows(&conn).unwrap(),
             &Default::default(),
+            &Default::default(),
         );
         let row = &got.sessions[0];
         assert_eq!(row.session_id, "s1");
@@ -2190,6 +2319,7 @@ mod tests {
             &Registry::default(),
             &Default::default(),
             stored_rows(&conn).unwrap(),
+            &Default::default(),
             &Default::default(),
         );
         let row = &got.sessions[0];
@@ -2394,6 +2524,275 @@ mod tests {
             got.sessions.len(),
             imported.sessions,
             "every stored session must reach the list"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // #1065/#1066/#1067: the hook signals reach the row and the pane.
+    //
+    // `signals.rs` owns the rules and proves them against its own
+    // fixtures. These are WIRING tests: they exist because a correct
+    // module reached by nobody renders nothing, and because the list and
+    // the detail must not disagree about the same session.
+    // -----------------------------------------------------------------
+
+    /// Seed one session with a run and an arbitrary hook event.
+    fn seed_event(
+        conn: &Connection,
+        session_id: &str,
+        event: &str,
+        at: &str,
+        extra: &[(&str, &str)],
+    ) {
+        conn.execute(
+            "INSERT OR IGNORE INTO claude_session (session_id, first_seen_at)
+             VALUES (?1, '2026-09-01T00:00:00+00:00')",
+            [session_id],
+        )
+        .unwrap();
+        let mut cols = String::from("session_id, event, at");
+        let mut vals = String::from("?1, ?2, ?3");
+        let mut params: Vec<String> = vec![session_id.to_owned(), event.to_owned(), at.to_owned()];
+        for (i, (col, val)) in extra.iter().enumerate() {
+            cols.push_str(&format!(", {col}"));
+            vals.push_str(&format!(", ?{}", i + 4));
+            params.push((*val).to_owned());
+        }
+        conn.execute(
+            &format!("INSERT OR IGNORE INTO claude_hook_event ({cols}) VALUES ({vals})"),
+            rusqlite::params_from_iter(params.iter()),
+        )
+        .unwrap();
+    }
+
+    /// A waiting session reaches the ROW, not only the detail pane.
+    ///
+    /// #1067's whole value is answering "which of my open sessions is
+    /// blocked on me" without opening each one, so a field that only the
+    /// detail carried would answer the question for the session the user
+    /// already picked. This is the wiring that makes the list useful.
+    #[test]
+    fn a_waiting_session_reaches_the_list_row() {
+        let conn = db();
+        seed_event(
+            &conn,
+            "s1",
+            "Notification",
+            "2026-09-13T10:00:00+00:00",
+            &[("notification_type", "idle_prompt")],
+        );
+
+        let mut registry = Registry::default();
+        registry.entries.insert(
+            "s1".to_owned(),
+            RegistryEntry {
+                pid: 4242,
+                session_id: "s1".to_owned(),
+                proc_start: Some(PROC_START.to_owned()),
+                ..Default::default()
+            },
+        );
+
+        let got = assemble(
+            &Fake(Ok(Some(PROC_START_EPOCH))),
+            &registry,
+            &Default::default(),
+            stored_rows(&conn).unwrap(),
+            &Default::default(),
+            &hook_events(&conn).unwrap(),
+        );
+
+        assert!(
+            matches!(
+                got.sessions[0].waiting,
+                crate::claude::signals::Waiting::Now { ref kind, .. } if kind == "idle_prompt"
+            ),
+            "a live session at an idle prompt must say so ON THE ROW, got {:?}",
+            got.sessions[0].waiting
+        );
+    }
+
+    /// The row and the detail pane never disagree about waiting.
+    ///
+    /// They derive it separately -- the list from its batch liveness
+    /// pass, the pane from its own read -- which is the arrangement
+    /// #984 records as having already produced two pages contradicting
+    /// each other about the same rows. So the agreement is pinned rather
+    /// than left to two functions being written the same way.
+    ///
+    /// Asserted with the process ABSENT, which is the case that matters:
+    /// both must refuse the present tense, and a `LastSeen` from one
+    /// beside a `Now` from the other would be the stale indicator #1067
+    /// exists to prevent, visible in two places at once.
+    #[test]
+    fn the_row_and_the_pane_agree_about_waiting() {
+        let conn = db();
+        seed_event(
+            &conn,
+            "s1",
+            "Notification",
+            "2026-09-13T10:00:00+00:00",
+            &[("notification_type", "idle_prompt")],
+        );
+
+        let got = assemble(
+            &Fake(Ok(None)),
+            &Registry::default(),
+            &Default::default(),
+            stored_rows(&conn).unwrap(),
+            &Default::default(),
+            &hook_events(&conn).unwrap(),
+        );
+        let d = detail(&conn, "s1").unwrap().expect("the session is stored");
+
+        assert_eq!(
+            got.sessions[0].waiting, d.waiting,
+            "the row and the pane must not disagree about whether a session \
+             is waiting"
+        );
+        assert!(
+            !matches!(d.waiting, crate::claude::signals::Waiting::Now { .. }),
+            "with no live process neither may claim the present tense, got {:?}",
+            d.waiting
+        );
+    }
+
+    /// Context pressure is absent-or-known on the row, never a bare
+    /// `false`.
+    ///
+    /// A session with no compaction record is the whole corpus today.
+    /// `Some(false)` there would be a measurement nobody took.
+    #[test]
+    fn context_pressure_is_absent_rather_than_false_when_unrecorded() {
+        let conn = db();
+        conn.execute(
+            "INSERT INTO claude_session (session_id, first_seen_at)
+             VALUES ('quiet', '2026-09-01T00:00:00+00:00')",
+            [],
+        )
+        .unwrap();
+        seed_event(
+            &conn,
+            "pressed",
+            "PreCompact",
+            "2026-09-13T10:00:00+00:00",
+            &[("trigger_kind", "auto")],
+        );
+        seed_event(
+            &conn,
+            "pressed",
+            "PreCompact",
+            "2026-09-13T10:01:00+00:00",
+            &[("trigger_kind", "auto")],
+        );
+        seed_event(
+            &conn,
+            "once",
+            "PreCompact",
+            "2026-09-13T10:00:00+00:00",
+            &[("trigger_kind", "manual")],
+        );
+
+        let got = assemble(
+            &Fake(Ok(None)),
+            &Registry::default(),
+            &Default::default(),
+            stored_rows(&conn).unwrap(),
+            &Default::default(),
+            &hook_events(&conn).unwrap(),
+        );
+        let by_id: std::collections::HashMap<&str, &ListRow> = got
+            .sessions
+            .iter()
+            .map(|s| (s.session_id.as_str(), s))
+            .collect();
+
+        assert_eq!(
+            by_id["quiet"].context_pressure, None,
+            "a session with no compaction RECORD was never measured -- \
+             absent, not false"
+        );
+        assert_eq!(
+            by_id["once"].context_pressure,
+            Some(false),
+            "one manual compaction was measured and is not pressure"
+        );
+        assert_eq!(
+            by_id["pressed"].context_pressure,
+            Some(true),
+            "repeated auto-compaction is the case #1065 asks to flag"
+        );
+    }
+
+    /// The detail pane carries the breakdowns the row does not.
+    ///
+    /// #985's split by field, applied deliberately rather than
+    /// discovered: the row gets one flag, the pane gets the numbers.
+    #[test]
+    fn the_detail_pane_carries_the_compaction_breakdown() {
+        let conn = db();
+        seed_event(
+            &conn,
+            "s1",
+            "PreCompact",
+            "2026-09-13T10:00:00+00:00",
+            &[("trigger_kind", "auto")],
+        );
+        seed_event(
+            &conn,
+            "s1",
+            "PreCompact",
+            "2026-09-13T10:01:00+00:00",
+            &[("trigger_kind", "manual")],
+        );
+
+        let d = detail(&conn, "s1").unwrap().expect("the session is stored");
+        let c = d.compactions.expect("compactions were recorded");
+        assert_eq!((c.auto, c.manual), (1, 1));
+        assert_eq!(c.total(), 2);
+    }
+
+    /// A pre-hook session's rollup still works, and reports no
+    /// disagreement.
+    ///
+    /// #1066's central rule as wiring: the inference is the fallback,
+    /// not a casualty. Every session on the machine today is this case,
+    /// so a disagreement here would flag the whole corpus.
+    #[test]
+    fn a_pre_hook_parent_keeps_its_rollup_and_reports_no_disagreement() {
+        let conn = db();
+        conn.execute(
+            "INSERT INTO claude_session (session_id, first_seen_at)
+             VALUES ('parent', '2026-09-01T00:00:00+00:00')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO claude_session (session_id, first_seen_at)
+             VALUES ('child', '2026-09-01T00:00:00+00:00')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO claude_subagent
+                (session_id, agent_id, parent_session_id, resolved_at)
+             VALUES ('child', 'abc123', 'parent', '2026-09-01T00:00:00+00:00')",
+            [],
+        )
+        .unwrap();
+
+        let d = detail(&conn, "parent")
+            .unwrap()
+            .expect("the session is stored");
+        let a = d
+            .agent_types
+            .expect("a parent with inferred children still has a rollup");
+        assert_eq!(a.inferred_children, 1);
+        assert!(a.stated.is_empty(), "the hook observed nothing");
+        assert_eq!(
+            a.disagreement(),
+            None,
+            "inference-only is the normal pre-hook state, not a contradiction"
         );
     }
 }

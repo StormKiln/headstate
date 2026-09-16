@@ -1134,6 +1134,183 @@ type WireLiveness =
   | { state: "dead"; why: number }
   | { state: "unknown"; why: number };
 
+/// Whether a session is waiting on the user, and how sure we are (#1067).
+///
+/// Rust side: `claude/signals.rs`, whose `Waiting` enum this mirrors
+/// exactly, tag and kebab-case variant names included.
+///
+/// # Why this is three states and not a boolean
+///
+/// A notification is a POINT IN TIME. Between the record being written
+/// and this row being drawn, the session may have been answered, exited,
+/// or SIGKILLed -- and a SIGKILL leaves no record at all, so nothing ever
+/// arrives to correct the file. A `waiting: boolean` on the wire would be
+/// a value nobody can refresh, presented as a fact about now. That is
+/// #841's fail-open shape, and #1067 states the consequence plainly: a
+/// stale waiting indicator is WORSE than no indicator, because it sends
+/// the user to a session that does not need them.
+///
+/// So the present-tense variant is not something the view decides. Rust's
+/// `waiting()` is the only constructor and it can only produce `now`
+/// against a `Liveness::Running`. The view's whole job is to render each
+/// arm in its own tense:
+///
+/// | state | tense | why |
+/// |---|---|---|
+/// | `now` | present -- "Waiting for you" | a live process backs the claim |
+/// | `last-seen` | past -- "Last seen waiting at 09:00" | it DID ask; we cannot say it still is |
+/// | `no` | nothing at all | see `ClaudeNotWaitingReason` |
+///
+/// `last-seen` is a real answer and not an absence: a dead session that
+/// stopped to ask a question is worth seeing on a row you are deciding
+/// whether to resume. It just may never be stated in the present tense.
+export type ClaudeWaiting =
+  /// Waiting on the user right now, with a live process behind it.
+  | {
+      state: "now";
+      /// The notification type as Claude Code sent it, VERBATIM.
+      ///
+      /// `idle_prompt` and `permission_prompt` are #1067's two names and
+      /// they are different stories -- one session idling and one
+      /// repeatedly asking permission -- which is why this is the value
+      /// and not a boolean. Any other value renders as ITSELF: there is
+      /// no "other" bucket anywhere in this epic.
+      kind: string;
+      /// When the notification was recorded, as an ISO timestamp.
+      at: string;
+    }
+  /// It asked for input at `at`, and we cannot say whether it still
+  /// needs it. Never rendered in the present tense.
+  | {
+      state: "last-seen";
+      kind: string;
+      at: string;
+      /// Why the present tense could not be claimed -- the liveness
+      /// reason, carried through so the indicator's `title` says which of
+      /// "the process is gone" and "we could not tell" applies. Without
+      /// it the past tense looks like an arbitrary hedge.
+      why: string;
+    }
+  /// Not waiting, for one of three genuinely different reasons.
+  | { state: "no"; reason: ClaudeNotWaitingReason };
+
+/// The ways a session can fail to be waiting, which are not one way.
+///
+/// Serialised flattened into the `no` arm above, so the wire shape is
+/// `{"state":"no","reason":"never-observed"}`.
+///
+/// - `never-observed` -- no notification record has EVER arrived for this
+///   session. Absent, not zero: it is the answer for every session that
+///   predates the hook install, and it means "we were not watching",
+///   never "it never waited".
+/// - `superseded` -- something newer happened after the notification, so
+///   the session moved on and the earlier waiting is spent. This is the
+///   expiry rule that makes the indicator clear itself.
+/// - `not-a-prompt` -- the newest notification reported an event rather
+///   than requesting an answer (`auth_success` and friends).
+///
+/// All three render nothing on the row, which is deliberate rather than
+/// lazy: an indicator that appeared on 1,500 rows saying "we were not
+/// watching this one either" would be the noise that gets the whole
+/// feature ignored. The distinction is kept in the type because the
+/// detail pane's copy can use it and because collapsing it into a
+/// boolean is how "we did not ask" becomes "they did not answer" (#1050).
+///
+/// Not exported, for the reason `ResumeCommand` and `WireLiveness` above
+/// are not: it is reached only through `ClaudeWaiting`, and `yarn knip`
+/// is right that a second name nothing imports earns nothing. Exporting
+/// it the moment something else needs it is one word.
+type ClaudeNotWaitingReason = "never-observed" | "superseded" | "not-a-prompt";
+
+/// How hard a session pushed against its context window (#1065).
+///
+/// Counted from `PreCompact` records. Rust side: `claude/signals.rs`.
+///
+/// # `manual` and `auto` are counted apart, and unknown is neither
+///
+/// `manual` is a user CHOICE and `auto` is the session hitting a wall, so
+/// one summed total would answer neither question -- the same discipline
+/// that keeps `ClaudeUsage` at four counters rather than one.
+///
+/// The whole object being absent (`ClaudeSessionDetail.compactions ===
+/// null`) is a THIRD thing again, and the one that matters most on the
+/// corpus this ships onto: it means no compaction was ever recorded for
+/// this session, which is true of every session that ran before the hook
+/// existed. Rendering that as zeros would be 1,500 confident wrong
+/// answers with a credible shape.
+export interface ClaudeCompactions {
+  /// Compactions the user asked for.
+  manual: number;
+  /// Compactions the session ran into.
+  auto: number;
+  /// Triggers that are neither, VERBATIM and counted.
+  ///
+  /// A list of `[trigger, count]` pairs rather than a map, so the
+  /// serialised shape is stable and an unknown value can never collide
+  /// with a field name. A future trigger named `emergency` appears here
+  /// as `emergency` and is rendered as `emergency` -- never folded into
+  /// `auto` and never relabelled "other", which is this epic's rule about
+  /// enum values.
+  unknown: [string, number][];
+  /// Compactions whose record carried no `trigger` field at all.
+  ///
+  /// Distinct from an unknown VALUE: this one says the payload SHAPE
+  /// moved, not that the vocabulary grew. Different causes, so they are
+  /// counted apart rather than summed into one "we did not understand it"
+  /// bucket.
+  untriggered: number;
+}
+
+/// What a session STATED it spawned, against what we INFER it spawned
+/// (#1066).
+///
+/// Rust side: `claude/signals.rs`.
+///
+/// # Two sources, and the hook is the ADDITIONAL one
+///
+/// `subagent.rs` classifies a session as a subagent from its `cwd`, and
+/// that inference is the only source for every session that already
+/// exists. Nothing here replaces it. What the hook ADDS is the agent's
+/// TYPE, which the directory rule cannot produce at all: a cwd of
+/// `.claude/worktrees/agent-<hex>` yields an opaque id and no hint of
+/// whether that was an `Explore` or a `code-reviewer`. So in the normal
+/// case the two are not rivals -- the hook answers a question the
+/// inference never could.
+///
+/// # Where they overlap, and why the view surfaces it
+///
+/// They make one claim in common: whether this session spawned subagents
+/// at all. When `stated` totals more than zero and `inferred_children` is
+/// zero, the layout assumption has moved -- subagents are running
+/// somewhere the cwd rule does not look. Rust computes that sentence in
+/// `AgentTypes::disagreement`, but it is a METHOD and not a field, so it
+/// never crosses the wire; `subagentDisagreement` in
+/// `src/lib/subagentDisagreement.ts` is the TypeScript twin, with the
+/// asymmetry argued there.
+export interface ClaudeAgentTypes {
+  /// Each stated `agent_type` and how many were spawned, commonest
+  /// first then alphabetically, so the order is total and the pane does
+  /// not reshuffle between polls.
+  ///
+  /// This is what turns "3 subagents" into "2 general-purpose, 1
+  /// code-reviewer".
+  stated: [string, number][];
+  /// Spawns whose record carried no usable `agent_type`.
+  ///
+  /// The hook fired and named no type. Counted, never guessed at, and
+  /// never folded into a named bucket -- a blank rendered as a type would
+  /// be a fabricated answer.
+  untyped: number;
+  /// Subagent sessions the INFERENCE attributed to this one.
+  ///
+  /// Carried alongside `stated` rather than merged, because the two count
+  /// different things: this counts child SESSIONS that exist, `stated`
+  /// counts spawn EVENTS that were observed. The disagreement check needs
+  /// both numbers, and merging them would destroy the only signal that
+  /// says the directory rule has stopped finding things.
+  inferred_children: number;
+}
+
 /// One row exactly as `claude_sessions` sends it (#985).
 ///
 /// Not what components consume -- see `ClaudeSession` below, which is
@@ -1152,6 +1329,12 @@ interface WireClaudeSession {
   cwd_state: CwdState;
   kind: ClaudeSessionKind;
   subagents: number;
+  /// Not interned, unlike `liveness`. The `no` arm -- 41 bytes, and the
+  /// answer for the whole corpus on a machine without the hook -- carries
+  /// no free-text sentence, so there is nothing here for an intern table
+  /// to deduplicate.
+  waiting: ClaudeWaiting;
+  context_pressure: boolean | null;
 }
 
 /// One row of the Claude Code session list, as the components see it
@@ -1209,6 +1392,30 @@ export interface ClaudeSession {
   /// Contrast the token rollup, which is a measurement and therefore
   /// absent-or-known.
   subagents: number;
+  /// Whether this session is waiting on the user (#1067).
+  ///
+  /// On the LIST and not the detail, against #985's split, because this
+  /// is the one fact in epic #1060 that is about NOW: a user with several
+  /// sessions open wants to see which of them is blocked from the row
+  /// itself, and a field only the open detail pane carried would answer
+  /// the question for the one session they had already chosen.
+  ///
+  /// Cheap enough to justify the exception. The serialised `no` arm is 41
+  /// bytes, and it is what every session on a machine without the hook
+  /// sends -- the only case that multiplies by 1,500.
+  waiting: ClaudeWaiting;
+  /// Whether this session repeatedly hit its context limit (#1065).
+  ///
+  /// Three renderings, not two. `null` means no compaction was ever
+  /// RECORDED for this session -- absent, not zero, and the state every
+  /// pre-hook session is in. `false` means we watched and it did not.
+  /// `true` is the flag. A row that drew `null` and `false` alike would
+  /// be claiming a measurement it never took, on the whole corpus.
+  ///
+  /// A boolean rather than the full `ClaudeCompactions` because the row
+  /// shows a FLAG and the breakdown belongs to the detail pane -- #985's
+  /// split by field, applied to a new field rather than discovered later.
+  context_pressure: boolean | null;
 }
 
 /// Whether a session is the user's own work or an agent's (#1002).
@@ -1280,6 +1487,29 @@ export interface ClaudeSessionDetail {
   /// the reader can see the app looked rather than that it shrugged. A
   /// wrong rollup is worse than no rollup.
   unattributed: string | null;
+  /// How often this session compacted, split by trigger (#1065).
+  ///
+  /// `null` is "no compaction was ever recorded for this session", which
+  /// is NOT the same claim as "none happened" -- and it is the state of
+  /// every session that ran before the hook was installed, which is all
+  /// of them on the day this ships. The pane renders the two differently
+  /// or it is inventing a measurement.
+  compactions: ClaudeCompactions | null;
+  /// What this session STATED it spawned, against what we infer (#1066).
+  ///
+  /// `null` when neither source has anything to say. A value with an
+  /// EMPTY `stated` and a non-zero `inferred_children` is the normal
+  /// pre-hook session and must not read as an error -- it is the ordinary
+  /// case in which the directory rule is the only source there has ever
+  /// been.
+  agent_types: ClaudeAgentTypes | null;
+  /// Whether this session is waiting on the user (#1067).
+  ///
+  /// Derived from the same liveness this pane's own badge shows, on this
+  /// read -- so the detail can never disagree with itself about whether
+  /// the process is there. Carried on both halves for that reason rather
+  /// than reused from the row: the row's was derived on the list's poll.
+  waiting: ClaudeWaiting;
 }
 
 /// One subagent session, as its parent's detail lists it (#1002).

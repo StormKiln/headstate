@@ -158,7 +158,20 @@ use serde_json::{Map, Value};
 /// The one thing an addition still owes is the argument in the paragraphs
 /// above: a new event must answer something the transcript cannot, or
 /// cannot afford to. Being cheap to add is not a reason to add one.
-pub const EVENTS: &[&str] = &["SessionStart", "SessionEnd"];
+pub const EVENTS: &[&str] = &[
+    "SessionStart",
+    "SessionEnd",
+    // #1065: context pressure. `PreCompact` and NOT `PostCompact` --
+    // see `hook::compaction` for the argument and the measurement.
+    "PreCompact",
+    // #1066: the subagent's `agent_type` stated rather than inferred.
+    // `SubagentStart` and NOT `SubagentStop`: the pair would double the
+    // volume for the same two fields, and only the start is guaranteed
+    // to fire -- see `hook::subagents`.
+    "SubagentStart",
+    // #1067: which session is waiting on the user.
+    "Notification",
+];
 
 /// The subcommand the installed command line invokes.
 ///
@@ -1020,6 +1033,27 @@ mod tests {
         (home, path)
     }
 
+    /// What [`foreign_fixture`] should look like under one of OUR events
+    /// after an install: the foreign matcher first where the fixture had
+    /// one, then ours.
+    ///
+    /// A helper rather than a literal in each test because the two sets
+    /// stopped coinciding at #1065/#1066. The fixture mirrors the real
+    /// development machine, which runs `cc-status` under nine events;
+    /// `EVENTS` now includes `PreCompact` and `SubagentStart`, which no
+    /// tool on that machine hooks. Hard-coding `[cc-status, ours]` for
+    /// every event would assert a neighbour the real file does not have,
+    /// and relaxing to "ours is in there somewhere" would stop testing
+    /// the clobber this module exists to prevent. So the expectation is
+    /// derived from the fixture itself.
+    fn expected_after_install(event: &str, ours: &str) -> Vec<String> {
+        if foreign_fixture().contains(&format!("\"{event}\"")) {
+            vec![CC_STATUS.to_string(), ours.to_string()]
+        } else {
+            vec![ours.to_string()]
+        }
+    }
+
     fn commands_under(path: &Path, event: &str) -> Vec<String> {
         let root: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         root["hooks"][event]
@@ -1067,17 +1101,27 @@ mod tests {
         let exe = Path::new(EXE);
 
         let installed = install(&path, exe).unwrap();
-        assert_eq!(installed.added, vec!["SessionStart", "SessionEnd"]);
+        assert_eq!(installed.added, EVENTS.to_vec());
 
-        // The foreign entry is STILL THERE, beside ours, under both of the
-        // events we installed into.
+        // The foreign entry is STILL THERE, beside ours, under every event
+        // we installed into that HAD one.
+        //
+        // Split on whether the fixture carried a foreign matcher rather
+        // than asserting one shape for all of `EVENTS`: the fixture is a
+        // copy of the real development machine, which has `cc-status`
+        // under nine events, and #1065/#1066 install two (`PreCompact`,
+        // `SubagentStart`) that no tool on that machine uses. Asserting
+        // `[cc-status, ours]` everywhere would demand a foreign hook the
+        // real file does not have; asserting only `contains(ours)` would
+        // stop testing the clobber. So each event is checked against what
+        // was actually there before.
         for event in EVENTS {
             assert_eq!(
                 commands_under(&path, event),
-                vec![CC_STATUS.to_string(), hook_command(exe)],
+                expected_after_install(event, &hook_command(exe)),
                 "replacing the array rather than appending to it destroys \
                  another tool's hook -- the development machine really has \
-                 cc-status under all ten events"
+                 cc-status under nine events"
             );
         }
         // And every event we did NOT install into is exactly as it was,
@@ -1086,12 +1130,25 @@ mod tests {
             commands_under(&path, "UserPromptSubmit"),
             vec!["codegraph prompt-hook".to_string(), CC_STATUS.to_string()]
         );
-        for event in ["Notification", "PreToolUse", "Stop", "SubagentStop"] {
+        // `Notification` is NOT in this list any more: #1067 installs it,
+        // so it is covered by the loop above instead. `SubagentStop` still
+        // is, and deliberately -- #1066 installs `SubagentStart` and not
+        // its pair (see `hook::subagents`), so a foreign hook on the stop
+        // event is exactly the kind of neighbour this test protects.
+        for event in ["PreToolUse", "Stop", "SubagentStop"] {
             assert_eq!(commands_under(&path, event), vec![CC_STATUS.to_string()]);
         }
 
         let removed = uninstall(&path).unwrap();
-        assert_eq!(removed.removed, vec!["SessionEnd", "SessionStart"]);
+        // Compared as a SET: `uninstall` sweeps the document's own `hooks`
+        // keys (see its docs for why it does not iterate `EVENTS`), so the
+        // order it reports follows the file rather than this list.
+        let got: BTreeSet<&str> = removed.removed.iter().map(String::as_str).collect();
+        assert_eq!(
+            got,
+            EVENTS.iter().copied().collect::<BTreeSet<_>>(),
+            "uninstall reports every event it took a matcher out of"
+        );
 
         let after = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
@@ -1582,7 +1639,7 @@ mod tests {
 
         assert_eq!(
             second.replaced,
-            vec!["SessionStart", "SessionEnd"],
+            EVENTS.to_vec(),
             "a second install must REPORT that it replaced ours -- silently \
              reverting a hand-edit is its own defect (§5.4)"
         );
@@ -1590,7 +1647,7 @@ mod tests {
         for event in EVENTS {
             assert_eq!(
                 commands_under(&path, event),
-                vec![CC_STATUS.to_string(), hook_command(exe)],
+                expected_after_install(event, &hook_command(exe)),
                 "an install must be idempotent: twice means one matcher, not two"
             );
         }
@@ -1619,7 +1676,7 @@ mod tests {
         for event in EVENTS {
             assert_eq!(
                 commands_under(&path, event),
-                vec![CC_STATUS.to_string(), hook_command(new)],
+                expected_after_install(event, &hook_command(new)),
                 "the stale matcher must be gone, not sitting beside the new one"
             );
         }
@@ -1661,7 +1718,7 @@ mod tests {
         let out = install(&path, Path::new(EXE)).unwrap();
 
         assert!(out.created_file);
-        assert_eq!(out.added, vec!["SessionStart", "SessionEnd"]);
+        assert_eq!(out.added, EVENTS.to_vec());
         assert_eq!(
             status(&path, Path::new(EXE)),
             Status::Installed {
@@ -1685,7 +1742,7 @@ mod tests {
 
         let out = install(&path, Path::new(EXE)).unwrap();
 
-        assert_eq!(out.added, vec!["SessionStart", "SessionEnd"]);
+        assert_eq!(out.added, EVENTS.to_vec());
         assert!(matches!(
             status(&path, Path::new(EXE)),
             Status::Installed { .. }
@@ -1957,21 +2014,38 @@ mod tests {
         );
     }
 
-    /// The events installed are exactly the two that bound a session.
+    /// The installed events are exactly the ones with an issue behind
+    /// them.
     ///
     /// A guard rather than a tautology: adding a per-turn hook here would
     /// multiply the handoff file's volume by the number of tool calls in a
     /// session, and the transcript already carries that detail. A change to
     /// this list should be a deliberate one with an issue behind it.
     ///
-    /// #1061 makes the list additive but deliberately does NOT add to it:
-    /// the format has to land before the events that use it, and each of
-    /// #1060's six events owes its own argument in its own sub-issue. The
-    /// tests below prove the mechanism against a fixture list instead, so
-    /// this assertion can stay exact.
+    /// #1061 made the list additive without adding to it. #1065, #1066 and
+    /// #1067 are the first additions, and each installs ONE event where the
+    /// docs offer a pair -- `PreCompact` not `PostCompact`, `SubagentStart`
+    /// not `SubagentStop` -- because the epic's rule rejects the second of
+    /// a pair that answers the same question at twice the volume. Those
+    /// arguments live on [`super::super::hook::compaction`] and
+    /// [`super::super::hook::subagents`], next to the measurements that
+    /// settle them.
+    ///
+    /// Asserted as a literal list rather than against a length or a
+    /// `contains`, so that installing a further event is a change someone
+    /// has to make here on purpose.
     #[test]
-    fn only_the_two_session_bounding_events_are_installed() {
-        assert_eq!(EVENTS, &["SessionStart", "SessionEnd"]);
+    fn only_the_events_with_an_issue_behind_them_are_installed() {
+        assert_eq!(
+            EVENTS,
+            &[
+                "SessionStart",
+                "SessionEnd",
+                "PreCompact",
+                "SubagentStart",
+                "Notification",
+            ]
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1984,9 +2058,19 @@ mod tests {
     // the real one -- but nothing here installs them for real.
     // -----------------------------------------------------------------
 
-    /// The event list a later sub-issue would produce: today's two, plus
-    /// the six #1060 proposes. Order matters -- the existing two stay
-    /// FIRST, because an addition appends rather than reorders.
+    /// The event list a fully-landed epic #1060 would produce: everything
+    /// installed today plus every event the epic still proposes.
+    ///
+    /// It must stay a SUPERSET of [`EVENTS`], which
+    /// [`tests::the_expanded_fixture_is_a_superset_of_the_real_list`]
+    /// pins. The differential test below installs both lists into copies
+    /// of one document and asserts the shared events come out identical;
+    /// if `EVENTS` ever held an event `EXPANDED` did not, that comparison
+    /// would fail on a key that exists in one document and not the other,
+    /// reporting a clobber that never happened.
+    ///
+    /// Order matters -- the events installed today stay FIRST, because an
+    /// addition appends rather than reorders.
     const EXPANDED: &[&str] = &[
         "SessionStart",
         "SessionEnd",
@@ -1994,9 +2078,28 @@ mod tests {
         "PostToolUseFailure",
         "PermissionDenied",
         "PreCompact",
+        "SubagentStart",
         "SubagentStop",
         "Notification",
     ];
+
+    /// The fixture list covers everything really installed.
+    ///
+    /// Guards the assumption the differential test rests on. Without it,
+    /// a later sub-issue installing an event nobody added to `EXPANDED`
+    /// would make that test compare a key present in one document against
+    /// a missing key in the other -- which fails, but names a clobber
+    /// rather than the stale fixture that actually caused it. Two hours
+    /// were spent on exactly that shape while writing #1065/#1066/#1067.
+    #[test]
+    fn the_expanded_fixture_is_a_superset_of_the_real_list() {
+        let missing: Vec<&&str> = EVENTS.iter().filter(|e| !EXPANDED.contains(e)).collect();
+        assert!(
+            missing.is_empty(),
+            "EXPANDED is the differential test's fixture and must contain \
+             every event EVENTS installs; missing {missing:?}"
+        );
+    }
 
     /// Adding an event does not disturb the two already installed.
     ///
@@ -2046,10 +2149,23 @@ mod tests {
         install(&today, exe).unwrap();
         let grown = install_events(&expanded, exe, EXPANDED).unwrap();
 
-        // The expanded install really did add the new events, or the
-        // comparison below is between two identical runs and proves
-        // nothing.
-        for event in EXPANDED.iter().skip(EVENTS.len()) {
+        // The expanded install really did add events the plain one did
+        // not, or the comparison below is between two identical runs and
+        // proves nothing.
+        //
+        // Selected by DIFFERENCE rather than by `skip(EVENTS.len())`:
+        // that index trick was only correct while `EXPANDED` began with
+        // exactly today's list, and #1065/#1066/#1067 moved three of its
+        // entries into `EVENTS`. A positional assumption that silently
+        // stops selecting the right events would leave this test passing
+        // while checking nothing.
+        let extra: Vec<&&str> = EXPANDED.iter().filter(|e| !EVENTS.contains(e)).collect();
+        assert!(
+            !extra.is_empty(),
+            "EXPANDED must contain events EVENTS does not, or this test is \
+             comparing a list against itself"
+        );
+        for event in extra {
             assert!(
                 commands_under(&expanded, event).contains(&hook_command(exe)),
                 "the expanded install must really have installed {event}"

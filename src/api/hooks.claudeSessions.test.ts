@@ -39,6 +39,12 @@ const wire = (over: Partial<WireClaudeSessionList> = {}): WireClaudeSessionList 
       cwd_state: { state: "exists" },
       kind: { kind: "own" },
       subagents: 0,
+      // The pre-hook default (#1067, #1065): every session that already
+      // exists sends exactly this. `hydrateClaudeSessions` must carry both
+      // through untouched -- a field-by-field mapper is where a new list
+      // field silently disappears.
+      waiting: { state: "no", reason: "never-observed" },
+      context_pressure: null,
     },
   ],
   reasons: [DEAD],
@@ -71,6 +77,12 @@ describe("hydrateClaudeSessions", () => {
             cwd_state: { state: "not-recorded" },
             kind: { kind: "own" as const },
             subagents: 0,
+            // The pre-hook default (#1067, #1065): every session that already
+            // exists sends exactly this. `hydrateClaudeSessions` must carry both
+            // through untouched -- a field-by-field mapper is where a new list
+            // field silently disappears.
+            waiting: { state: "no", reason: "never-observed" },
+            context_pressure: null,
           },
           {
             session_id: "s2",
@@ -82,6 +94,12 @@ describe("hydrateClaudeSessions", () => {
             cwd_state: { state: "not-recorded" },
             kind: { kind: "own" as const },
             subagents: 0,
+            // The pre-hook default (#1067, #1065): every session that already
+            // exists sends exactly this. `hydrateClaudeSessions` must carry both
+            // through untouched -- a field-by-field mapper is where a new list
+            // field silently disappears.
+            waiting: { state: "no", reason: "never-observed" },
+            context_pressure: null,
           },
         ],
         reasons: [DEAD],
@@ -111,6 +129,12 @@ describe("hydrateClaudeSessions", () => {
             cwd_state: { state: "not-recorded" },
             kind: { kind: "own" as const },
             subagents: 0,
+            // The pre-hook default (#1067, #1065): every session that already
+            // exists sends exactly this. `hydrateClaudeSessions` must carry both
+            // through untouched -- a field-by-field mapper is where a new list
+            // field silently disappears.
+            waiting: { state: "no", reason: "never-observed" },
+            context_pressure: null,
           },
           {
             session_id: "unknown",
@@ -122,6 +146,12 @@ describe("hydrateClaudeSessions", () => {
             cwd_state: { state: "not-recorded" },
             kind: { kind: "own" as const },
             subagents: 0,
+            // The pre-hook default (#1067, #1065): every session that already
+            // exists sends exactly this. `hydrateClaudeSessions` must carry both
+            // through untouched -- a field-by-field mapper is where a new list
+            // field silently disappears.
+            waiting: { state: "no", reason: "never-observed" },
+            context_pressure: null,
           },
         ],
         reasons: [DEAD, UNKNOWN],
@@ -148,6 +178,12 @@ describe("hydrateClaudeSessions", () => {
             cwd_state: { state: "exists" },
             kind: { kind: "own" as const },
             subagents: 0,
+            // The pre-hook default (#1067, #1065): every session that already
+            // exists sends exactly this. `hydrateClaudeSessions` must carry both
+            // through untouched -- a field-by-field mapper is where a new list
+            // field silently disappears.
+            waiting: { state: "no", reason: "never-observed" },
+            context_pressure: null,
           },
         ],
         reasons: [],
@@ -184,6 +220,12 @@ describe("hydrateClaudeSessions", () => {
             cwd_state: { state: "not-recorded" },
             kind: { kind: "own" as const },
             subagents: 0,
+            // The pre-hook default (#1067, #1065): every session that already
+            // exists sends exactly this. `hydrateClaudeSessions` must carry both
+            // through untouched -- a field-by-field mapper is where a new list
+            // field silently disappears.
+            waiting: { state: "no", reason: "never-observed" },
+            context_pressure: null,
           },
         ],
         reasons: [DEAD],
@@ -225,6 +267,12 @@ describe("hydrateClaudeSessions", () => {
       cwd_state: { state: "not-recorded" as const },
       kind: { kind: "own" as const },
       subagents: 0,
+      // The pre-hook default (#1067, #1065): every session that already
+      // exists sends exactly this. `hydrateClaudeSessions` must carry both
+      // through untouched -- a field-by-field mapper is where a new list
+      // field silently disappears.
+      waiting: { state: "no" as const, reason: "never-observed" as const },
+      context_pressure: null,
     }));
     const got = hydrateClaudeSessions(wire({ sessions, reasons: [DEAD] }));
     expect(got.sessions).toHaveLength(n);

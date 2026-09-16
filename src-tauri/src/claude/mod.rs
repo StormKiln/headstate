@@ -74,6 +74,9 @@ pub mod overview;
 pub mod preview;
 pub mod registry;
 pub mod sessions;
+/// Compaction pressure, stated agent types, and who is waiting on you
+/// (#1065, #1066, #1067).
+pub mod signals;
 pub mod store;
 /// Which sessions are subagents, and which session spawned each (#1002).
 pub mod subagent;

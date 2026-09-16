@@ -151,6 +151,11 @@ const session = (
     subagents: [],
     parent: null,
     unattributed: null,
+    // The pre-hook default on all four (#1065, #1066, #1067): nothing was
+    // ever recorded, which is what every existing session sends.
+    compactions: null,
+    agent_types: null,
+    waiting: { state: "no" as const, reason: "never-observed" as const },
     ...over,
   });
   return {
@@ -161,6 +166,8 @@ const session = (
     last_activity_at: "2026-09-13T09:00:00Z",
     liveness,
     cwd_state: { state: "exists" },
+    waiting: over.waiting ?? { state: "no" as const, reason: "never-observed" as const },
+    context_pressure: null,
     ...over,
     kind: over.kind ?? { kind: "own" as const },
     // AFTER the spread, and that ordering is load-bearing: `over` carries

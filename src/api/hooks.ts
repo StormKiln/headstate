@@ -1270,6 +1270,15 @@ export function hydrateClaudeSessions(wire: WireClaudeSessionList): ClaudeSessio
         cwd_state: s.cwd_state,
         kind: s.kind,
         subagents: s.subagents,
+        // Carried through UNCHANGED, like every field but `liveness`.
+        // This mapper is the one place a list field can silently vanish:
+        // it is a field-by-field copy, so a new field that is not
+        // mentioned here arrives on the wire, typechecks on both sides
+        // and reaches no component. The row would then render no waiting
+        // indicator on every session forever, which looks exactly like
+        // "nothing is waiting" (#1067's own failure mode).
+        waiting: s.waiting,
+        context_pressure: s.context_pressure,
       };
     }),
     registry_failure: wire.registry_failure,

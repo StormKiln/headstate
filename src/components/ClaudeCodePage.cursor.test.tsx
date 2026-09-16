@@ -80,6 +80,11 @@ const session = (n: number): ClaudeSession => ({
   cwd_state: { state: "exists" },
   kind: { kind: "own" },
   subagents: 0,
+  // The pre-hook default (#1067, #1065). Both render nothing, so every
+  // row here stays the same height -- which matters for a file about a
+  // keyboard cursor walking a list.
+  waiting: { state: "no", reason: "never-observed" },
+  context_pressure: null,
 });
 
 const listOf = (n: number): ClaudeSessionList => ({

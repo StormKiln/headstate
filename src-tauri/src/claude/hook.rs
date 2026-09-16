@@ -397,6 +397,121 @@ pub struct Record {
 /// cap so the cap is a real ceiling on the bytes written.
 pub const TEXT_FIELD_CAP: usize = 160;
 
+/// Why `PreCompact` is installed and `PostCompact` is not (#1065).
+///
+/// The docs offer both, and #1065 asks for the choice to be settled here
+/// rather than taken for completeness -- epic #1060's own rule rejects
+/// the second event of a pair that answers the same question at twice
+/// the volume.
+///
+/// # What each one would carry, MEASURED
+///
+/// Read out of the shipped Claude Code binary (2.1.273) rather than from
+/// the docs, which describe the matcher but print no payload for either
+/// event:
+///
+/// ```text
+/// PreCompact   { ..common, hook_event_name, trigger, custom_instructions }
+/// PostCompact  { ..common, hook_event_name, trigger, compact_summary }
+/// ```
+///
+/// Two findings came out of that read, and both point the same way.
+///
+/// **The field is `trigger`, not `compact_trigger`.** #1065's text says
+/// `compact_trigger`; the binary says `trigger`, on both events. #1061
+/// named the [`Record`] field `trigger`, so it happens to be right --
+/// but it was right by luck until this was measured, and a field read
+/// from the wrong key is a column that is empty forever with nothing to
+/// say why. That is the reason this is checked against the binary rather
+/// than believed from an issue.
+///
+/// **`PostCompact` does not fire inside a subagent.** Its first
+/// statement is `if (Us(r.agentContext)) return {}` -- an early return on
+/// the agent context that `PreCompact` does not have. So the two events
+/// do not even cover the same population: a subagent that compacts emits
+/// a `PreCompact` and no `PostCompact` at all. Installing `PostCompact`
+/// as the "completed compactions" counter would silently undercount
+/// exactly the sessions #1002 says are a quarter of the corpus.
+///
+/// # The choice
+///
+/// `PreCompact`, alone.
+///
+/// - It fires on **every** compaction, including a subagent's and
+///   including one that starts and does not finish. `PostCompact` fires
+///   on a strict subset, and the subset is not the interesting one.
+/// - Both carry the same `trigger`, which is the whole of what #1065
+///   records. A second event would add volume and no field.
+/// - The question is "how hard is this session pushing context", and a
+///   compaction that *began* is evidence of pressure whether or not it
+///   completed. Counting only completions would report a session that
+///   died mid-compaction as having compacted less than it did.
+///
+/// The cost is stated rather than hidden: a `PreCompact` count is
+/// compactions ATTEMPTED, not compactions completed, and a compaction
+/// blocked by another tool's `PreCompact` hook (the binary has
+/// "Compaction blocked by PreCompact hook" as a real path) still counts
+/// here. Nothing in Headstate renders it as "completed", and
+/// [`super::store`] names it "compactions" for that reason.
+pub mod compaction {}
+
+/// Why `SubagentStart` is installed and `SubagentStop` is not (#1066).
+///
+/// The same one-of-a-pair question as [`compaction`], with a different
+/// answer available and the same rule deciding it. MEASURED out of the
+/// same binary:
+///
+/// ```text
+/// SubagentStart { ..common, hook_event_name, agent_id, agent_type }
+/// SubagentStop  { ..common, hook_event_name, stop_hook_active, agent_id,
+///                 agent_transcript_path, agent_type, last_assistant_message,
+///                 background_tasks, session_crons }
+/// ```
+///
+/// # The choice
+///
+/// `SubagentStart`, alone.
+///
+/// - **It carries exactly the two fields #1066 wants and nothing else.**
+///   `SubagentStop`'s payload is six fields wider, and one of them is
+///   `last_assistant_message` -- unbounded model output, which #1066
+///   explicitly forbids recording. [`record_from`] does not read it, so
+///   installing `SubagentStop` would not put it in the file; but the
+///   safest place for a field we must never write is an event we never
+///   install.
+/// - **Start is the one that always fires.** A subagent killed with
+///   SIGKILL, or one whose parent dies under it, emits no `SubagentStop`
+///   -- the same asymmetry `install.rs` records for `SessionEnd`. An
+///   inventory keyed on stop would miss precisely the subagents that
+///   went wrong.
+/// - **`SubagentStop` writes `agent_type` as `b ?? ""`** -- an empty
+///   string rather than an absent field when the type is unknown. An
+///   empty string is a value, and a value is what
+///   [`super::signals`] would have to special-case to avoid rendering
+///   a blank agent type as a real one. `SubagentStart` passes the type
+///   through as given.
+///
+/// The cost: Headstate learns that a subagent STARTED and never that it
+/// finished. That is acceptable because nothing here counts durations --
+/// #1066 is about `agent_type` being stated rather than inferred, and
+/// the type is known at the start.
+///
+/// # `session_id` on these payloads is the PARENT's
+///
+/// The common fields are built as `{ session_id: e.id, ..., agent_id }`
+/// from the session the hook fires for, and `SubagentStart` passes the
+/// *parent* session. So a `SubagentStart` row is keyed on the session
+/// that SPAWNED the subagent, and `agent_id` names the subagent within
+/// it.
+///
+/// That is why [`super::signals::Events::agent_types`] reads these rows as "what
+/// this session spawned" and never as "what this session IS", and why
+/// the disagreement check in [`super::signals::AgentTypes`] compares a
+/// parent's stated spawns against the inference over its children rather
+/// than against the row's own id. Getting this backwards would attribute
+/// every subagent's type to its parent.
+pub mod subagents {}
+
 /// A free-text payload field, capped at [`TEXT_FIELD_CAP`] bytes.
 ///
 /// Truncation is on a **char boundary**, because `String` is UTF-8 and
@@ -820,6 +935,30 @@ mod tests {
     /// test will not have covered it -- so that event must add its own row
     /// to the table below, which is why the table is a table.
     ///
+    /// # That combination, MEASURED (#1066)
+    ///
+    /// #1065/#1066/#1067 took #1061 up on that and measured it, because
+    /// #1066 installs a subagent event and the question is whether the
+    /// next one has room:
+    ///
+    /// ```text
+    /// PreCompact                                 250 bytes
+    /// Notification (longest documented value)    282
+    /// SubagentStart (plugin-scoped agent_type)   358
+    /// subagent identity + a capped free text     496   <- the uncovered shape
+    /// ```
+    ///
+    /// **It fits, with 16 bytes to spare.** That is a pass and it is not
+    /// a margin anyone should spend: one more field of any kind on such
+    /// an event puts it over. So the answer to #1061's open question is
+    /// "yes, but only just, and nothing further" -- recorded here rather
+    /// than left for the next person to re-derive.
+    ///
+    /// None of the three events installed by #1065/#1066/#1067 is that
+    /// shape. `SubagentStart` carries no free-text field at all (see
+    /// [`super::subagents`] for why the pair's other half, which does,
+    /// is not installed), so the worst line these three can emit is 358.
+    ///
     /// PROVEN BY SABOTAGE: raising `TEXT_FIELD_CAP` to 400 fails here at
     /// `PostToolUseFailure` (673 bytes), and removing the cap entirely
     /// fails at 4000-odd.
@@ -855,6 +994,22 @@ mod tests {
                 serde_json::json!({
                     "agent_id": "f1e2d3c4-b5a6-4798-8a9b-0c1d2e3f4a5b",
                     "agent_type": "general-purpose",
+                }),
+            ),
+            // #1066 installs `SubagentStart`, so its own worst case is
+            // measured rather than assumed to match `SubagentStop`'s.
+            // The agent TYPE is the free-ish part: it is a user-chosen
+            // agent name, and a plugin-scoped one is the longest shape
+            // the docs describe. It is NOT capped -- it comes from a
+            // vocabulary the user controls rather than from model output
+            // -- so this row is what establishes that an uncapped
+            // agent_type still fits.
+            (
+                "SubagentStart",
+                serde_json::json!({
+                    "agent_id": "f1e2d3c4-b5a6-4798-8a9b-0c1d2e3f4a5b",
+                    "agent_type":
+                        "some-long-plugin-name:some-long-custom-agent-reviewer-name",
                 }),
             ),
             (
