@@ -2559,6 +2559,46 @@ mod tests {
             .await;
 
         let client = mock_client(&server).await;
+        // Seeded LOCALLY, never `Budget::new()` (#1079).
+        //
+        // `Budget::permits` takes the lower of this accumulator and the
+        // process-wide `OBSERVED_REMAINING`, so a bare `Budget::new()`
+        // inherits whatever figure another test last wrote. When that
+        // figure is under `RESERVE`, the PLANNER refuses before any wave
+        // runs and this test fails with "GitHub budget fell below the
+        // 500-point reserve while planning this scope" -- a message about
+        // a test that is not this one.
+        //
+        // Observed on the v5.22.0 tag: `test-rust` failed exactly this way
+        // on the tag's own CI run, after `main` had been verified clean,
+        // and the failed attempt made the commit permanently untaggable
+        // (#1048). The sync tests in this module already take
+        // `observed_test_lock`; an async test cannot, because clippy's
+        // `await_holding_lock` forbids a `std::sync` guard across an
+        // `.await`. `seeded_for_test` (#1050) is the async-safe form: it
+        // writes nothing shared, so it can neither be starved nor starve
+        // anyone else.
+        // The PROCESS-WIDE figure, not just a local one (#1079).
+        //
+        // `Budget::permits` takes the LOWER of this load's accumulator and
+        // the process-wide `OBSERVED_REMAINING`, so seeding only locally
+        // does not help: a concurrent test that wrote a figure under
+        // `RESERVE` still wins the `min` and the PLANNER refuses before any
+        // wave runs. Measured -- with a local seed of 50,000 and a shared
+        // figure of 100, this test still failed with "GitHub budget fell
+        // below the 500-point reserve while planning this scope".
+        //
+        // So the shared figure is set high and RESTORED on drop.
+        // `RestoreObserved` is a bare `u64` with no lock, so unlike
+        // `observed_test_lock` it is safe to hold across an `.await`,
+        // which is what makes this usable from an async test at all.
+        //
+        // Observed on the v5.22.0 tag: `test-rust` failed exactly this way
+        // on the tag's own CI run, after `main` had been verified clean,
+        // and that failed attempt made the commit permanently untaggable
+        // (#1048).
+        let _restore = crate::github::stats::budget::RestoreObserved::capture();
+        crate::github::stats::budget::note_remaining(50_000);
         let budget = Budget::new();
         let scope = Scope::Org("acme".into());
 
@@ -2664,6 +2704,46 @@ mod tests {
             .await;
 
         let client = mock_client(&server).await;
+        // Seeded LOCALLY, never `Budget::new()` (#1079).
+        //
+        // `Budget::permits` takes the lower of this accumulator and the
+        // process-wide `OBSERVED_REMAINING`, so a bare `Budget::new()`
+        // inherits whatever figure another test last wrote. When that
+        // figure is under `RESERVE`, the PLANNER refuses before any wave
+        // runs and this test fails with "GitHub budget fell below the
+        // 500-point reserve while planning this scope" -- a message about
+        // a test that is not this one.
+        //
+        // Observed on the v5.22.0 tag: `test-rust` failed exactly this way
+        // on the tag's own CI run, after `main` had been verified clean,
+        // and the failed attempt made the commit permanently untaggable
+        // (#1048). The sync tests in this module already take
+        // `observed_test_lock`; an async test cannot, because clippy's
+        // `await_holding_lock` forbids a `std::sync` guard across an
+        // `.await`. `seeded_for_test` (#1050) is the async-safe form: it
+        // writes nothing shared, so it can neither be starved nor starve
+        // anyone else.
+        // The PROCESS-WIDE figure, not just a local one (#1079).
+        //
+        // `Budget::permits` takes the LOWER of this load's accumulator and
+        // the process-wide `OBSERVED_REMAINING`, so seeding only locally
+        // does not help: a concurrent test that wrote a figure under
+        // `RESERVE` still wins the `min` and the PLANNER refuses before any
+        // wave runs. Measured -- with a local seed of 50,000 and a shared
+        // figure of 100, this test still failed with "GitHub budget fell
+        // below the 500-point reserve while planning this scope".
+        //
+        // So the shared figure is set high and RESTORED on drop.
+        // `RestoreObserved` is a bare `u64` with no lock, so unlike
+        // `observed_test_lock` it is safe to hold across an `.await`,
+        // which is what makes this usable from an async test at all.
+        //
+        // Observed on the v5.22.0 tag: `test-rust` failed exactly this way
+        // on the tag's own CI run, after `main` had been verified clean,
+        // and that failed attempt made the commit permanently untaggable
+        // (#1048).
+        let _restore = crate::github::stats::budget::RestoreObserved::capture();
+        crate::github::stats::budget::note_remaining(50_000);
         let budget = Budget::new();
         let loaded = super::load_board_within(
             &client,
@@ -2724,6 +2804,46 @@ mod tests {
             .await;
 
         let client = mock_client(&server).await;
+        // Seeded LOCALLY, never `Budget::new()` (#1079).
+        //
+        // `Budget::permits` takes the lower of this accumulator and the
+        // process-wide `OBSERVED_REMAINING`, so a bare `Budget::new()`
+        // inherits whatever figure another test last wrote. When that
+        // figure is under `RESERVE`, the PLANNER refuses before any wave
+        // runs and this test fails with "GitHub budget fell below the
+        // 500-point reserve while planning this scope" -- a message about
+        // a test that is not this one.
+        //
+        // Observed on the v5.22.0 tag: `test-rust` failed exactly this way
+        // on the tag's own CI run, after `main` had been verified clean,
+        // and the failed attempt made the commit permanently untaggable
+        // (#1048). The sync tests in this module already take
+        // `observed_test_lock`; an async test cannot, because clippy's
+        // `await_holding_lock` forbids a `std::sync` guard across an
+        // `.await`. `seeded_for_test` (#1050) is the async-safe form: it
+        // writes nothing shared, so it can neither be starved nor starve
+        // anyone else.
+        // The PROCESS-WIDE figure, not just a local one (#1079).
+        //
+        // `Budget::permits` takes the LOWER of this load's accumulator and
+        // the process-wide `OBSERVED_REMAINING`, so seeding only locally
+        // does not help: a concurrent test that wrote a figure under
+        // `RESERVE` still wins the `min` and the PLANNER refuses before any
+        // wave runs. Measured -- with a local seed of 50,000 and a shared
+        // figure of 100, this test still failed with "GitHub budget fell
+        // below the 500-point reserve while planning this scope".
+        //
+        // So the shared figure is set high and RESTORED on drop.
+        // `RestoreObserved` is a bare `u64` with no lock, so unlike
+        // `observed_test_lock` it is safe to hold across an `.await`,
+        // which is what makes this usable from an async test at all.
+        //
+        // Observed on the v5.22.0 tag: `test-rust` failed exactly this way
+        // on the tag's own CI run, after `main` had been verified clean,
+        // and that failed attempt made the commit permanently untaggable
+        // (#1048).
+        let _restore = crate::github::stats::budget::RestoreObserved::capture();
+        crate::github::stats::budget::note_remaining(50_000);
         let budget = Budget::new();
         let e = super::load_board_within(
             &client,
