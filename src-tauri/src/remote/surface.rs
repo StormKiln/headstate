@@ -340,6 +340,25 @@ pub const SURFACE: &[(&str, Class)] = &[
     // it leads to is a copy of `claude --resume <id>`, which
     // `claudify_command` is already `Read` for.
     ("claude_overview", Class::Read),
+    // The restart list: every running session's resume command (#1071).
+    //
+    // `Read`, on the same grounds as `claude_sessions`, which it is a
+    // fold of: one registry listing, one process probe, two SELECTs over
+    // Headstate's own cache. It writes nothing anywhere, spawns nothing,
+    // and touches no terminal -- the answer is text.
+    //
+    // Exposed rather than `Local`, and the phone's case is weaker than
+    // for anything else in this group but it is not zero. The stated test
+    // is whether the phone could act on the answer, and "which sessions
+    // are alive on my laptop right now, and what would bring each back"
+    // is readable away from the desk even where pasting is not: it is the
+    // away-from-desk inventory, and the companion already shows the same
+    // fact per row through `claude_session_detail`. The frontend decides
+    // whether to OFFER the button on a phone; the class only decides
+    // whether the command can be reached at all, and refusing it here
+    // would make a command the companion's own session pane already
+    // exposes piecemeal unreachable in aggregate.
+    ("claude_restart_list", Class::Read),
     // How much work happened inside ONE session, summed from its own
     // transcript (#959).
     //
@@ -938,6 +957,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "claude_event_profile" => res(commands::claude_event_profile(app.clone()).await),
         "claude_poll_live" => res(commands::claude_poll_live(app.clone()).await),
         "claude_overview" => res(commands::claude_overview(app.clone()).await),
+        "claude_restart_list" => res(commands::claude_restart_list(app.clone()).await),
         "claude_session_usage" => res(commands::claude_session_usage(a.get("path")?).await),
         "claude_transcript_tail" => res(commands::claude_transcript_tail(a.get("path")?).await),
         "claude_hooks_status" => res(commands::claude_hooks_status()),

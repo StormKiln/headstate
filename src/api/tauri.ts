@@ -21,6 +21,7 @@ import type {
   ClaudeMdScan,
   ClaudeImported,
   ClaudeOverview,
+  ClaudeRestartList,
   ClaudePreview,
   ClaudeSessionDetail,
   WireClaudeSessionList,
@@ -829,6 +830,18 @@ export const claudeRevealPath = (path: string) =>
 /// Two SELECTs over the cache plus a stat per session and one directory
 /// listing; measured at 7ms for 1,461 sessions. Writes nothing.
 export const claudeOverview = () => call<ClaudeOverview>("claude_overview");
+
+/// Every running session's resume command, for a restart (#1071).
+///
+/// A fold of `claude_sessions`: one registry read and one process probe
+/// already establish every row's liveness, so this derives none of its
+/// own. `claudeOverview` cannot answer it -- `ClaudeResumable` carries
+/// the id and the cwd but not the built command.
+///
+/// Fetched ON DEMAND, never polled. It is the same work the session list
+/// already does every ten seconds, and a second timer would double it to
+/// answer a question the user asks once before a reboot.
+export const claudeRestartList = () => call<ClaudeRestartList>("claude_restart_list");
 
 /// How much work happened inside one session, from its own transcript
 /// (#959).

@@ -3928,6 +3928,46 @@ pub async fn claude_overview(
     .map_err(|e| e.to_string())?
 }
 
+/// Every running session's resume command, for a restart (#1071).
+///
+/// The user is about to reboot and wants the lines that bring their
+/// sessions back. `claude_overview` cannot answer this: `ClaudeResumable`
+/// carries the id and the cwd but not the BUILT command, and rebuilding
+/// it on the frontend would reproduce the quoting the review of #918
+/// caught -- the id is `path.file_stem()` of an arbitrary `*.jsonl`, not
+/// a validated UUID.
+///
+/// # Why this shares `claude_sessions`' derivation
+///
+/// It calls `claude::sessions::list` and folds the result, rather than
+/// reading the registry a second time. One registry read and one process
+/// probe already establish every row's liveness, and a second derivation
+/// on the same machine at the same moment is two answers to one question
+/// -- #984, where the overview and the session list disagreed about the
+/// same rows off the same read.
+///
+/// The fold is `claude::export::restart_list`, which is where the
+/// inclusive-on-uncertainty argument lives: `Running` and `Unknown` are
+/// both exported, in separate halves, and only `Dead` is dropped. A
+/// session wrongly omitted is work the user rebooted away.
+///
+/// `spawn_blocking` for the reason `claude_sessions` is: a directory
+/// read, a process probe and a SQLite query, none of which belongs on the
+/// async runtime.
+#[tauri::command]
+pub async fn claude_restart_list(
+    app: tauri::AppHandle,
+) -> Result<crate::claude::export::RestartList, String> {
+    let db = db_path(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&db).map_err(|e| e.to_string())?;
+        let list = crate::claude::sessions::list(&conn).map_err(|e| e.to_string())?;
+        Ok(crate::claude::export::restart_list(&list))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Reveal a session's working directory or its transcript in the file
 /// manager (#917).
 ///

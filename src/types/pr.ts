@@ -1833,6 +1833,78 @@ export interface ClaudeResumable {
   last_activity_at: string | null;
 }
 
+/// The resume command and what to say before pasting it, as the restart
+/// export carries it (#1071).
+///
+/// Structurally identical to `ResumeCommand` above -- both are the same
+/// Rust type -- and not exported, for the same reason that one is not:
+/// it is reached only through `ClaudeRestartEntry.resume`, and `yarn
+/// knip` is right that a second exported name for the same shape earns
+/// nothing. Two declarations rather than one shared alias because the two
+/// travel in different payloads and each documents its own; exporting
+/// either the moment something else needs it is one word.
+interface ClaudeResumeCommand {
+  /// The text to paste. Always correct to run: `claude --resume <id>`
+  /// resolves by id and works after the recorded directory is deleted.
+  command: string;
+  /// `null` only when the command carries its own `cd`. Every unanchored
+  /// line has one, and the export renders it as a `#` comment ABOVE the
+  /// line: a bare `claude --resume` pasted blind resumes in whatever
+  /// directory the user happens to be in.
+  caveat: string | null;
+  anchored: boolean;
+}
+
+/// One line of the restart list (#1071).
+///
+/// Carries the BUILT command rather than the parts. A frontend that
+/// rebuilt `cd <dir> && claude --resume <id>` from `cwd` and `session_id`
+/// would have to redo the quoting and the four-way cwd treatment, and the
+/// id is `path.file_stem()` of an arbitrary `*.jsonl` with no format check
+/// -- exactly the case a review of #918 caught.
+export interface ClaudeRestartEntry {
+  session_id: string;
+  /// Claude's own `aiTitle`, or `null`. Never the UUID dressed up as a
+  /// name.
+  name: string | null;
+  cwd: string | null;
+  resume: ClaudeResumeCommand;
+}
+
+/// A session whose liveness could not be decided, with the grounds.
+///
+/// INCLUDED in the export rather than dropped. `Unknown` is not a shade
+/// of `Dead` -- #984 misclassified 183 of 1,491 sessions by treating it
+/// as one -- and in a restart list that mistake is work the user rebooted
+/// away.
+export interface ClaudeUncertainEntry extends ClaudeRestartEntry {
+  /// `liveness::derive`'s own sentence. A "could not tell" heading with
+  /// no grounds is the shrug the reason field exists to prevent.
+  why: string;
+}
+
+/// Every session to restart after a reboot, and what qualifies the list
+/// (#1071).
+///
+/// Two lists rather than one with a flag: "this is running" and "we could
+/// not tell" are different claims rendered under different headings, and a
+/// single list would let a reader paste past the boundary without seeing
+/// it.
+export interface ClaudeRestartList {
+  /// Positively established as running: the process is there and its
+  /// start time matches what was recorded.
+  running: ClaudeRestartEntry[];
+  /// Could not be decided. Included on purpose.
+  uncertain: ClaudeUncertainEntry[];
+  /// Why the live registry could not be listed. Non-null means nothing
+  /// could be positively established as running, so an empty `running` is
+  /// NOT "nothing is running".
+  registry_failure: string | null;
+  /// Records present but unusable. Each hides a session that may be
+  /// running, so the list is a floor.
+  registry_unreadable: string[];
+}
+
 /// Everything the Claude Code overview draws, plus what it could not
 /// establish (#921).
 ///
