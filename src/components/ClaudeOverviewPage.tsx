@@ -1,8 +1,11 @@
-import { AlertTriangle, Bot, FolderX, Play, RotateCw } from "lucide-react";
+import { AlertTriangle, Bot, ClipboardList, FolderX, Play, RotateCw } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
 import { useClaudeEventProfile, useClaudeOverview } from "../api/hooks";
+import { claudeRestartList } from "../api/tauri";
 import { copyText } from "../lib/clipboard";
+import { restartExportText } from "../lib/restartExport";
+import { IS_DESKTOP_BUILD } from "../lib/target";
 import { relativeTime } from "../lib/time";
 import { pathBasename } from "../lib/worktrees";
 import { QueryError, errorMessage } from "./QueryError";
@@ -565,6 +568,8 @@ export function ClaudeOverviewPage() {
         ) : null}
       </Card>
 
+      <RestartExportCard />
+
       <SessionsChart points={activity} days={ACTIVITY_DAYS} />
 
       {/* BELOW the chart, because this is context rather than the thing a
@@ -572,6 +577,131 @@ export function ClaudeOverviewPage() {
           card: actionable above, context below. */}
       <TroubleProfileCard />
     </div>
+  );
+}
+
+/// Export the commands to restart every running session, for a reboot
+/// (#1071).
+///
+/// # Why this is not on the resumable card above
+///
+/// That card is about sessions that are already STOPPED and whose
+/// directory survived. This is the opposite population: the ones that are
+/// running right now and are about to be stopped by the user, on purpose.
+/// The two want opposite treatment of an uncertain row -- see
+/// `claude/export.rs`, which argues it at length -- so putting the button
+/// on the resumable card would attach it to the wrong list.
+///
+/// # Desktop only, and it is a capability question
+///
+/// `IS_DESKTOP_BUILD`, not `useIsMobile()`. The output is text to paste
+/// into a terminal, and an iPhone has no terminal -- the answer does not
+/// change when a desktop window is dragged narrower, which is exactly the
+/// test `target.ts` states.
+///
+/// The COMMAND stays `Class::Read` and reachable from the phone all the
+/// same: the class decides whether the companion can call it, and a
+/// companion user reading "three sessions alive on my laptop, here is
+/// what each was doing" is a real away-from-desk answer. What is hidden
+/// here is the action, not the fact.
+///
+/// # On demand, never polled
+///
+/// The user asks this once, before a reboot. It is the same registry read
+/// and process probe the session list already does every ten seconds, and
+/// a second timer would double that work to answer a question nobody is
+/// asking for most of the session's life.
+function RestartExportCard() {
+  // Both hooks run before the build check, unconditionally. An early
+  // `return` above a `useState` changes the hook order between builds,
+  // which React forbids -- and `IS_DESKTOP_BUILD` is a build-time
+  // literal, so the whole body folds away on the phone regardless of
+  // where the check sits.
+  const [text, setText] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const onExport = async () => {
+    setBusy(true);
+    try {
+      const list = await claudeRestartList();
+      const built = restartExportText(list);
+      setText(built);
+      const failure = await copyText(built);
+      if (failure) {
+        // NOT a failure of the export. The text is on screen and the
+        // user can select it, so this says what did not happen rather
+        // than implying the whole thing failed -- `copyText`
+        // distinguishes an insecure context from a rejected write, and
+        // the two have different remedies.
+        toast.error(`The list is below, but the clipboard refused it: ${failure}`);
+        return;
+      }
+      const total = list.running.length + list.uncertain.length;
+      toast.success(
+        total === 0
+          ? "Nothing is running — the note below says so."
+          : `Copied ${total} restart command${total === 1 ? "" : "s"}.`,
+      );
+    } catch (e: unknown) {
+      // The reason, and NO stale text left on screen. A previous
+      // export still showing under a failed refresh is a list the user
+      // would save believing it was current.
+      setText(null);
+      toast.error(`Could not read which sessions are running: ${errorMessage(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!IS_DESKTOP_BUILD) return null;
+
+  return (
+    <Card className="px-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <div className="text-sm font-semibold">Before you restart</div>
+          <div className="text-xs text-[#8b949e]">
+            The command to bring back each session that is running now, one per
+            line. Save it, reboot, then paste the lines into a terminal.
+          </div>
+        </div>
+        <button
+          type="button"
+          // `void`-wrapped: an async handler returns a promise into an
+          // attribute that expects `void`, which
+          // `@typescript-eslint/no-misused-promises` rejects. `onExport`
+          // reports its own failures as a toast, so there is nothing left
+          // to await.
+          onClick={() => void onExport()}
+          disabled={busy}
+          className="flex shrink-0 items-center gap-1.5 rounded border border-[#30363d] px-3 py-1.5 text-sm text-[#e6edf3] hover:bg-[#161b22] disabled:opacity-50"
+        >
+          <ClipboardList className="h-3.5 w-3.5" aria-hidden="true" />
+          {busy ? "Reading…" : "Export restart commands"}
+        </button>
+      </div>
+
+      {text !== null ? (
+        <>
+          {/* Shown as well as copied, and this is the half that makes
+              "save it somewhere" possible without the app picking a
+              path. The user selects it and puts it where THEY want --
+              a file we wrote to a directory of our choosing is a
+              restart list they might never find. */}
+          <textarea
+            readOnly
+            value={text}
+            aria-label="Commands to restart the running Claude Code sessions"
+            rows={Math.min(20, text.split("\n").length)}
+            className="mt-3 w-full resize-y rounded border border-[#30363d] bg-[#0d1117] p-2 font-mono text-xs text-[#e6edf3]"
+          />
+          <p className="mt-1.5 text-xs text-[#8b949e]">
+            Every line that is not a command starts with <code>#</code>, so you
+            can paste the whole thing.
+          </p>
+        </>
+      ) : null}
+    </Card>
   );
 }
 

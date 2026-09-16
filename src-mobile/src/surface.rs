@@ -180,6 +180,18 @@ pub const SURFACE: &[(&str, Class)] = &[
     // "how much work is waiting for me back at the laptop". See the
     // desktop copy for the full argument.
     ("claude_overview", Class::Read),
+    // The DESKTOP's restart list (#1071): every session running there,
+    // with the line that would bring each one back. Read -- a fold of
+    // `claude_sessions`, writing nothing and spawning nothing.
+    //
+    // Present because the class decides REACHABILITY, not whether a
+    // button is drawn. The companion renders the same `src/` frontend,
+    // and that frontend hides the export control on a phone (there is no
+    // terminal to paste into), so this is the inventory a companion user
+    // can read rather than an action they can take. Refusing it here
+    // would make the aggregate unreachable while `claude_session_detail`
+    // already hands over the same command one row at a time.
+    ("claude_restart_list", Class::Read),
     // How much work happened inside one of the DESKTOP's sessions (#959).
     // Read: one bounded read of one `.jsonl` under the desktop's
     // `~/.claude/projects`, writing nothing.

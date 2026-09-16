@@ -65,6 +65,9 @@
 pub mod cli;
 pub mod crash;
 pub mod events;
+/// The restart list: every running session's resume command, as text to
+/// save before a reboot (#1071).
+pub mod export;
 pub mod handoff;
 pub mod hook;
 pub mod install;

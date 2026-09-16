@@ -9,11 +9,36 @@ import type {
 } from "@/types/pr";
 import { useFilters } from "@/store/filters";
 
-const copyFn = vi.hoisted(() => vi.fn(() => Promise.resolve(null as string | null)));
+// Typed with the argument the real `copyText` takes, so `mock.calls`
+// carries it. Without the parameter the mock's call tuple is empty and
+// asserting on WHAT was copied does not typecheck -- which matters for
+// #1071, where the copied text is the whole deliverable.
+const copyFn = vi.hoisted(() =>
+  // The parameter is READ (returned through a void expression) rather
+  // than named `_text` and ignored: eslint's `no-unused-vars` rejects an
+  // unused argument here regardless of the underscore.
+  vi.fn((text: string) => {
+    void text;
+    return Promise.resolve(null as string | null);
+  }),
+);
 const rescanFn = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 const refetchFn = vi.hoisted(() => vi.fn());
 const toastError = vi.hoisted(() => vi.fn());
 const toastSuccess = vi.hoisted(() => vi.fn());
+/// #1071's command. Resolves an empty, fully-readable list by default, so
+/// every test in this file that does not care about the export renders a
+/// settled card rather than one stuck mid-request.
+const restartFn = vi.hoisted(() =>
+  vi.fn(() =>
+    Promise.resolve({
+      running: [],
+      uncertain: [],
+      registry_failure: null,
+      registry_unreadable: [],
+    } as unknown),
+  ),
+);
 
 const state = vi.hoisted(() => ({
   data: undefined as unknown,
@@ -59,6 +84,9 @@ vi.mock("../api/hooks", () => ({
 }));
 vi.mock("sonner", () => ({ toast: { success: toastSuccess, error: toastError } }));
 vi.mock("../lib/clipboard", () => ({ copyText: copyFn }));
+// #1071. Only the one command the page calls directly; everything else
+// it reaches goes through `../api/hooks`, already mocked above.
+vi.mock("../api/tauri", () => ({ claudeRestartList: restartFn }));
 
 // `recharts` needs a measured container to draw into and jsdom gives it
 // none, so the real chart renders an empty box and its own tests cover it
@@ -748,19 +776,137 @@ describe("ClaudeOverviewPage at real scale", () => {
 
     // The structural claim: bounded by the CONSTANTS, not the corpus.
     expect(rows.length).toBe(12);
-    // One Rescan, one Copy per row, three clickable tiles and one
-    // "show all resumable" footer (#948). Notably NOT 248, and not 1,461
-    // -- which is what makes `getByRole`-style accessible-name computation
-    // affordable on this page where it was not on the list.
+    // One Rescan, one Copy per row, three clickable tiles, one
+    // "show all resumable" footer (#948) and one restart export (#1071).
+    // Notably NOT 248, and not 1,461 -- which is what makes
+    // `getByRole`-style accessible-name computation affordable on this
+    // page where it was not on the list.
     //
-    // The four navigation controls are a FIXED cost, which is the property
+    // The five non-row controls are a FIXED cost, which is the property
     // this assertion is actually protecting: #948's fix had to end the dead
     // end without making the page's node count depend on the corpus, and a
     // per-row link into the session detail would have done exactly that on
     // a page whose whole design is a bounded render over 1,461 sessions.
-    expect(buttons.length).toBe(13 + 3 + 1);
+    // #1071 adds ONE button for the whole page for the same reason: the
+    // export is one action over every running session, not a control per
+    // row.
+    expect(buttons.length).toBe(13 + 3 + 1 + 1);
     // And the total DOM is small enough that no windowing is warranted.
     expect(container.querySelectorAll("*").length).toBeLessThan(200);
+  });
+});
+
+/// #1071: exporting the commands to restart every running session.
+///
+/// The card's own job is narrow -- fetch, render, copy, and say what
+/// failed. The TEXT it copies is `restartExport.test.ts`'s subject, which
+/// is where the four properties the issue names are pinned; duplicating
+/// them here would test the same function through two layers.
+describe("the restart export card", () => {
+  const restartList = (over: Record<string, unknown> = {}) => ({
+    running: [],
+    uncertain: [],
+    registry_failure: null,
+    registry_unreadable: [],
+    ...over,
+  });
+
+  const anchored = (id: string, cwd: string) => ({
+    session_id: id,
+    name: null,
+    cwd,
+    resume: {
+      command: `cd '${cwd}' && claude --resume '${id}'`,
+      caveat: null,
+      anchored: true,
+    },
+  });
+
+  it("copies the commands and shows them", async () => {
+    restartFn.mockResolvedValueOnce(
+      restartList({ running: [anchored("s1", "/tmp/a"), anchored("s2", "/tmp/b")] }),
+    );
+    render(<ClaudeOverviewPage />);
+
+    fireEvent.click(screen.getByRole("button", { name: /export restart commands/i }));
+
+    await waitFor(() => expect(copyFn).toHaveBeenCalledTimes(1));
+    const copied = copyFn.mock.calls[0][0];
+    expect(copied).toContain("cd '/tmp/a' && claude --resume 's1'");
+    expect(copied).toContain("cd '/tmp/b' && claude --resume 's2'");
+    expect(toastSuccess).toHaveBeenCalledWith("Copied 2 restart commands.");
+
+    // Shown as well as copied. This is what makes "save it where you
+    // want" possible without the app choosing a path -- and it is the
+    // fallback that keeps the feature usable when the clipboard refuses.
+    const shown = await screen.findByLabelText(
+      /commands to restart the running claude code sessions/i,
+    );
+    expect((shown as HTMLTextAreaElement).value).toBe(copied);
+  });
+
+  /// A clipboard that refused still leaves the text on screen, and the
+  /// message says which half failed.
+  ///
+  /// "Could not copy" alone would read as "the export failed", and the
+  /// user would click again instead of selecting the text that is
+  /// already there.
+  it("keeps the text visible when the clipboard refuses", async () => {
+    restartFn.mockResolvedValueOnce(restartList({ running: [anchored("s1", "/tmp/a")] }));
+    copyFn.mockResolvedValueOnce("This window has no clipboard access.");
+    render(<ClaudeOverviewPage />);
+
+    fireEvent.click(screen.getByRole("button", { name: /export restart commands/i }));
+
+    await waitFor(() => expect(toastError).toHaveBeenCalled());
+    expect(toastError.mock.calls[0][0]).toContain("The list is below");
+    expect(toastError.mock.calls[0][0]).toContain("no clipboard access");
+    const shown = await screen.findByLabelText(
+      /commands to restart the running claude code sessions/i,
+    );
+    expect((shown as HTMLTextAreaElement).value).toContain("claude --resume 's1'");
+  });
+
+  /// A failed read shows NO text and says why.
+  ///
+  /// The dangerous version is the one that leaves a previous export on
+  /// screen under a failed refresh: the user saves it believing it is
+  /// current, reboots, and restores the wrong set.
+  it("clears any previous list when the read fails", async () => {
+    restartFn.mockResolvedValueOnce(restartList({ running: [anchored("s1", "/tmp/a")] }));
+    render(<ClaudeOverviewPage />);
+    const button = screen.getByRole("button", { name: /export restart commands/i });
+
+    fireEvent.click(button);
+    await screen.findByLabelText(/commands to restart the running claude code sessions/i);
+
+    restartFn.mockRejectedValueOnce(new Error("permission denied reading ~/.claude"));
+    fireEvent.click(button);
+
+    await waitFor(() =>
+      expect(
+        screen.queryByLabelText(/commands to restart the running claude code sessions/i),
+      ).toBeNull(),
+    );
+    expect(toastError.mock.calls.at(-1)?.[0]).toContain("permission denied");
+  });
+
+  /// Nothing running is reported as an answer, not as a failure.
+  ///
+  /// The registry WAS read, so "nothing is running" is something the app
+  /// genuinely knows -- and the note it copies says so rather than
+  /// leaving the user wondering whether the button worked.
+  it("states a measured zero rather than an empty copy", async () => {
+    restartFn.mockResolvedValueOnce(restartList());
+    render(<ClaudeOverviewPage />);
+
+    fireEvent.click(screen.getByRole("button", { name: /export restart commands/i }));
+
+    await waitFor(() => expect(copyFn).toHaveBeenCalledTimes(1));
+    expect(copyFn.mock.calls[0][0]).toContain(
+      "No Claude Code session is running",
+    );
+    expect(toastSuccess).toHaveBeenCalledWith("Nothing is running — the note below says so.");
   });
 });
 
