@@ -501,6 +501,20 @@ pub fn count_file(path: &Path) -> Result<SessionCounts, String> {
 ///
 /// `failed_ids` is matched against the calls' own ids, so a failing
 /// `Bash` in the same session is not charged to a plugin.
+///
+/// # Why matching within one file is the right scope
+///
+/// A `tool_result` names only the `tool_use_id` it answers, so the id is
+/// the only thing tying a failure back to a plugin -- and the result is
+/// a LATER record than the call it answers, never the same one. That is
+/// why [`SessionCounts`] accumulates both across the whole file before
+/// this runs: a rollup per record could never see the pair.
+///
+/// One file is also sufficient: a tool call and its result belong to the
+/// same conversation and are appended to the same transcript, so a pair
+/// never spans two files. Matching across files would only create the
+/// chance of charging a failure to a same-id call in an unrelated
+/// session, which is a way to be wrong with no way to be more right.
 pub fn rollup(counts: &SessionCounts, into: &mut BTreeMap<String, PluginUsage>) {
     for call in &counts.calls {
         let e = into
