@@ -877,6 +877,40 @@ pub fn fill_window(
 /// checks the two agree.
 pub const ACTIVITY_DAYS: i64 = 30;
 
+/// Give every installed plugin a row, and decide what its absence means.
+///
+/// Split out of [`report`] so this rule is testable without a home
+/// directory: it is the one place the difference between "measured, and
+/// it was zero" and "we have no reading" is DECIDED, and the whole page
+/// is built on getting it right.
+///
+/// A plugin the scan never saw is `measured` iff the scan was COMPLETE.
+/// A complete pass over every transcript that did not find a plugin is a
+/// real measurement of zero -- that is the page's central finding, 7 of
+/// 22. But if any transcript could not be read, the plugin might be in
+/// the part we could not see, so the same empty row is `measured: false`
+/// and renders as "no calls recorded" rather than as a zero.
+///
+/// A plugin WITH calls is always `measured`: we have its calls.
+fn merge_rows(
+    mut totals: BTreeMap<String, PluginUsage>,
+    installed: &[String],
+    complete: bool,
+) -> Vec<PluginUsage> {
+    for name in installed {
+        totals.entry(name.clone()).or_insert_with(|| PluginUsage {
+            name: name.clone(),
+            measured: complete,
+            ..Default::default()
+        });
+    }
+    let mut rows: Vec<PluginUsage> = totals.into_values().collect();
+    // Busiest first, then by name so equal rows have a stable order
+    // rather than one that shuffles between reads.
+    rows.sort_by(|a, b| b.total().cmp(&a.total()).then(a.name.cmp(&b.name)));
+    rows
+}
+
 /// Build the whole report: inventory, usage, chart.
 ///
 /// The two halves fail independently, on purpose. An unreadable
@@ -931,20 +965,8 @@ pub fn report(
     // there. The exception is a corpus we could not fully read, where
     // every absence is a maybe -- which is what `unreadable` says, and
     // why those counts are floors.
-    let complete = out.unreadable.is_empty();
-    let mut usage = scan.totals;
-    for p in &out.installed {
-        usage.entry(p.name.clone()).or_insert_with(|| PluginUsage {
-            name: p.name.clone(),
-            measured: complete,
-            ..Default::default()
-        });
-    }
-    let mut usage: Vec<PluginUsage> = usage.into_values().collect();
-    // Busiest first, then by name so equal rows have a stable order
-    // rather than one that shuffles between reads.
-    usage.sort_by(|a, b| b.total().cmp(&a.total()).then(a.name.cmp(&b.name)));
-    out.usage = usage;
+    let names: Vec<String> = out.installed.iter().map(|p| p.name.clone()).collect();
+    out.usage = merge_rows(scan.totals, &names, out.unreadable.is_empty());
     out.elapsed_ms = t0.elapsed().as_millis() as u64;
     Ok(out)
 }
@@ -1397,6 +1419,50 @@ mod tests {
             got[0].calls, 0,
             "a covered day with no calls is a real zero"
         );
+    }
+
+    /// A complete scan makes an uncalled plugin a MEASURED zero; a short
+    /// one does not.
+    ///
+    /// The rule the whole page rests on. Both directions asserted,
+    /// because a version that always says `measured` loses the "absent"
+    /// state and a version that never does loses the page's headline
+    /// finding -- that 7 of 22 plugins are genuinely unused.
+    #[test]
+    fn an_uncalled_plugin_is_measured_only_when_the_scan_was_complete() {
+        let installed = vec!["playwright".to_string(), "clangd-lsp".to_string()];
+
+        let mut totals = BTreeMap::new();
+        totals.insert(
+            "playwright".to_string(),
+            PluginUsage {
+                name: "playwright".into(),
+                mcp_calls: 44,
+                measured: true,
+                ..Default::default()
+            },
+        );
+
+        // Complete scan: the uncalled plugin was genuinely looked for.
+        let rows = merge_rows(totals.clone(), &installed, true);
+        let lsp = rows.iter().find(|r| r.name == "clangd-lsp").unwrap();
+        assert!(lsp.measured, "a complete scan measures an absence");
+        assert_eq!(lsp.total(), 0);
+
+        // Short scan: the same absence is now unknown, not zero.
+        let rows = merge_rows(totals, &installed, false);
+        let lsp = rows.iter().find(|r| r.name == "clangd-lsp").unwrap();
+        assert!(
+            !lsp.measured,
+            "a short scan cannot prove a plugin was never called"
+        );
+        // And a plugin we DID see stays measured either way -- we have
+        // its calls regardless of what else we could not read.
+        let pw = rows.iter().find(|r| r.name == "playwright").unwrap();
+        assert!(pw.measured);
+        assert_eq!(pw.total(), 44);
+        // Busiest first.
+        assert_eq!(rows[0].name, "playwright");
     }
 
     /// A test database with the schema applied.
