@@ -1003,6 +1003,26 @@ fn should_surface(e: &ClientError, consecutive: u32) -> bool {
     !e.is_transient() || consecutive >= FAILURES_BEFORE_BANNER
 }
 
+/// The `poll-state` a finished tick leaves behind.
+///
+/// The loop emits this ONCE, at the end of every tick, after the request is
+/// no longer in flight. It carries the tick's outcome rather than a fixed
+/// `"idle"` because a suppressed transient failure has nothing else to
+/// announce it: no `poll-error`, no `prs-updated`. Emitting `"idle"`
+/// unconditionally told the bar the data was current when the fetch had just
+/// failed, so it showed a green "Up to date" over stale rows for up to ten
+/// minutes (#1104).
+///
+/// `None` is a success. `Some(surfaced)` is a failure, where `surfaced` says
+/// whether a `poll-error` banner was already emitted for it -- in that case
+/// the banner is the signal and the bar has no further work to do.
+fn tick_state(failure: Option<bool>) -> &'static str {
+    match failure {
+        Some(false) => "retrying",
+        Some(true) | None => "idle",
+    }
+}
+
 pub fn spawn(
     app: AppHandle,
     client: Arc<GitHubClient>,
@@ -1039,6 +1059,10 @@ pub fn spawn(
             // handles, so a wedged request costs one tick instead of the
             // rest of the session.
             let _ = app.emit("poll-state", "fetching");
+            // What this tick leaves behind, emitted once at the end. A
+            // suppressed failure sets "retrying"; everything else is
+            // genuinely idle. Reset per tick so a recovery clears it.
+            let mut ending_state = tick_state(None);
             // DIAGNOSTIC LOGGING (Settings > diagnostic log). The background loop
             // shares one client -- and one connection pool -- with
             // whatever the user just clicked, so a tick that overlaps a
@@ -1223,7 +1247,14 @@ pub fn spawn(
                         // poll-error and no prs-updated on a suppressed
                         // failure, so it would otherwise show a green
                         // "Up to date" while the data is stale.
-                        let _ = app.emit("poll-state", "retrying");
+                        //
+                        // Recorded rather than emitted here: the terminal
+                        // emit below runs on EVERY tick, so emitting
+                        // "retrying" at this point would be overwritten by
+                        // it microseconds later and the bar would settle on
+                        // green anyway -- the exact bug this branch exists
+                        // to prevent (#1104).
+                        ending_state = tick_state(Some(false));
                     }
                 }
             }
@@ -1231,7 +1262,11 @@ pub fn spawn(
             // flight. Inferring it from `isFetching` would miss the tray
             // path, which bypasses the queryFn -- so the loop that knows
             // says so directly.
-            let _ = app.emit("poll-state", "idle");
+            //
+            // Carries the tick's OUTCOME, not a fixed "idle": a suppressed
+            // failure leaves the data stale, and the bar has no other way to
+            // learn that. See `tick_state`.
+            let _ = app.emit("poll-state", ending_state);
 
             // Whichever comes first: the cadence elapsing, or someone
             // asking for a refresh. `Notify` stores one permit, so a
@@ -1730,6 +1765,35 @@ mod tests {
         let e = ClientError::Timeout(90);
         assert!(e.is_transient());
         assert!(!should_surface(&e, 1), "one blip must stay quiet");
+    }
+
+    /// A suppressed transient failure must NOT end the tick as "idle".
+    ///
+    /// The bar reads `poll-state` as the whole truth when no `poll-error` and
+    /// no `prs-updated` accompany it, so an "idle" here renders a green
+    /// "Up to date" dot over rows that failed to refresh (#1104).
+    ///
+    /// Asserted against the tick's own decision function, not a mocked hook:
+    /// `StatusBar.test.tsx` sets `state.current = "retrying"` directly and so
+    /// passed against the broken code for the whole time it was broken.
+    #[test]
+    fn a_suppressed_failure_does_not_end_the_tick_idle() {
+        assert_eq!(tick_state(Some(false)), "retrying");
+    }
+
+    /// A surfaced failure DOES end the tick idle: `poll-error` is already on
+    /// screen, and a second simultaneous signal would have the bar competing
+    /// with its own banner.
+    #[test]
+    fn a_surfaced_failure_leaves_the_banner_to_speak() {
+        assert_eq!(tick_state(Some(true)), "idle");
+    }
+
+    /// A successful tick is genuinely idle -- the guard above must not be so
+    /// broad that the bar can never return to green.
+    #[test]
+    fn a_successful_tick_is_idle() {
+        assert_eq!(tick_state(None), "idle");
     }
 
     /// But a real outage must not be hidden. Two in a row stops being
