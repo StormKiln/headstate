@@ -3369,15 +3369,30 @@ fn accumulate_board_blocking(
 ) -> crate::github::stats::Board {
     use crate::store::pr_history;
 
-    let crate::github::stats::board::LoadedBoard { board, prs } = loaded;
+    let crate::github::stats::board::LoadedBoard { board, prs, slices } = loaded;
     let Ok(mut conn) = open_db(db) else {
         log::warn!("could not open the database to accumulate PR stats");
         return board;
     };
     // Written BEFORE the read, so this load's own pages are part of the
-    // answer it returns rather than only of the next one's.
-    if let Err(e) = pr_history::put_many(&mut conn, scope_key, window_start, window_end, &prs, now)
-    {
+    // answer it returns rather than only of the next one's -- and, since
+    // #1103, so are its CLAIMS about the days those pages came from. The
+    // numerator was already live here; the denominator was not, because
+    // only the background worker wrote the ledger and `coverage` below
+    // therefore read zero days covered no matter how many loads ran.
+    //
+    // One transaction over both, for the reason `record_all_with_rows`
+    // gives: a ledger row without its evidence is a claim nothing
+    // revisits.
+    if let Err(e) = crate::store::pr_slice::record_all_with_rows(
+        &mut conn,
+        scope_key,
+        window_start,
+        window_end,
+        &slices,
+        &prs,
+        now,
+    ) {
         log::warn!("could not accumulate pull requests for PR stats: {e}");
         return board;
     }
@@ -3412,9 +3427,10 @@ fn accumulate_board_blocking(
     let coverage = crate::store::pr_slice::coverage(&conn, scope_key, window_start, window_end)
         .unwrap_or_default();
     crate::diag!(
-        "[diag] stats accumulate fetched={} stored={} days={}/{} ledger_total={:?}",
+        "[diag] stats accumulate fetched={} stored={} claimed={} days={}/{} ledger_total={:?}",
         board.retrieved,
         stored.len(),
+        slices.len(),
         coverage.days_covered(),
         crate::github::stats::backfill::days_between(window_start, window_end),
         coverage.total
@@ -6134,13 +6150,16 @@ pub struct StatsBackfillFrame {
     pub days_total: usize,
     pub collected: u64,
     pub total: Option<u64>,
-    /// Whether the worker is still walking this scope.
+    /// What the worker is doing about this scope right now.
     ///
     /// The page must distinguish "backfill is running" from "backfill has
     /// stopped": a caveat identical in both cases is #1042's indefinite
     /// skeleton at page level, where a reader cannot tell waiting from
-    /// broken.
-    pub running: bool,
+    /// broken. A `bool` could not say WHY (#1103).
+    pub phase: crate::github::stats::backfill::BackfillPhase,
+    /// When the next tick is due, as Unix milliseconds. From the backend
+    /// because the worker rotates across scopes.
+    pub next_tick_at_ms: Option<i64>,
 }
 
 /// Emit one backfill progress frame.
@@ -6158,7 +6177,8 @@ pub fn emit_stats_backfill(app: &AppHandle, report: &crate::github::stats::backf
             days_total: report.days_total,
             collected: report.collected,
             total: report.total,
-            running: report.running,
+            phase: report.phase.clone(),
+            next_tick_at_ms: report.next_tick_at_ms,
         },
     );
 }

@@ -50,7 +50,7 @@ import {
   useStatsTree,
 } from "../api/hooks";
 import { useActiveFilters } from "../store/filters";
-import { StatsPage, describeScope, partialityCaveat } from "./StatsPage";
+import { StatsPage, backfillActivity, describeScope, partialityCaveat } from "./StatsPage";
 import { RANGES } from "./stats/ActivityChart";
 
 const row = (over: Partial<AuthorRow> = {}): AuthorRow => ({
@@ -652,7 +652,8 @@ describe("StatsPage honesty", () => {
       daysTotal: 30,
       collected: 400,
       total: 500,
-      running: true,
+      phase: { kind: "working" },
+      nextTickAtMs: null,
     });
     render(<StatsPage />);
     fireEvent.click(screen.getByRole("tab", { name: /others/i }));
@@ -678,7 +679,8 @@ describe("StatsPage honesty", () => {
       daysTotal: 30,
       collected: 400,
       total: null,
-      running: true,
+      phase: { kind: "working" },
+      nextTickAtMs: null,
     });
     render(<StatsPage />);
     fireEvent.click(screen.getByRole("tab", { name: /others/i }));
@@ -781,6 +783,56 @@ describe("describeScope", () => {
     expect(describeScope({ kind: "org", value: "acme", subject: "hubber" })).toBe(
       "hubber, in everything in acme",
     );
+  });
+});
+
+describe("backfillActivity", () => {
+  /// **The state the page had no way to express.**
+  ///
+  /// #1103: a board sat at "0 of 30 days measured" for ten minutes while
+  /// the worker was alive, solvent and deliberately waiting. `running:
+  /// true` said something was happening and nothing visible ever
+  /// happened, which reads as broken.
+  it("says when the next batch is due while waiting", () => {
+    expect(backfillActivity({ kind: "waiting" }, 161)).toBe("Next batch in 2:41.");
+  });
+
+  /// A pause names the rate limit, because that is an external condition
+  /// with a known end -- it tells the reader nothing is broken and that
+  /// waiting is correct. Distinct from the implementation detail #1088
+  /// removed, which described the app's own conduct.
+  it("says why it is paused and when it resumes", () => {
+    const s = backfillActivity({ kind: "paused", remaining: 900 }, 125);
+    expect(s).toContain("GitHub request budget");
+    expect(s).toContain("in 2:05");
+  });
+
+  /// The remaining-requests figure is never printed: on a cold start
+  /// nothing has measured it, and a 0 would be a number nobody took.
+  it("never prints a remaining-request count", () => {
+    expect(backfillActivity({ kind: "paused", remaining: null }, 60)).not.toMatch(/\d+ requests?/);
+    expect(backfillActivity({ kind: "paused", remaining: 900 }, 60)).not.toContain("900");
+  });
+
+  /// A pause and a stall must not read identically: one lifts on its own
+  /// at a known time, the other may not.
+  it("distinguishes a stall from a pause", () => {
+    const paused = backfillActivity({ kind: "paused", remaining: 900 }, 60);
+    const stalled = backfillActivity({ kind: "stalled" }, 60);
+    expect(stalled).not.toBe(paused);
+    expect(stalled).toContain("tried again");
+  });
+
+  /// A converged board says NOTHING. The absence of the caveat is the
+  /// signal, and a "finished" banner on a complete board is noise.
+  it("says nothing once collection has converged", () => {
+    expect(backfillActivity({ kind: "converged" }, 0)).toBeUndefined();
+  });
+
+  /// A countdown already at zero is not rendered: the batch is due and
+  /// has not reported, and a frozen 0:00 reads worse than no countdown.
+  it("does not render a countdown that has run out", () => {
+    expect(backfillActivity({ kind: "waiting" }, 0)).toBe("Waiting for the next batch.");
   });
 });
 

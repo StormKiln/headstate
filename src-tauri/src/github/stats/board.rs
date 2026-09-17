@@ -801,6 +801,69 @@ impl Board {
         out
     }
 
+    /// What this load can honestly claim about the days it fetched.
+    ///
+    /// The foreground writes pull requests but, until #1103, wrote no
+    /// ledger row for them -- so `pr_slice::coverage` reported zero days
+    /// covered no matter how many loads ran, and the board said "0 of 30
+    /// days measured" forever. The rows are the evidence; these are the
+    /// claims they are evidence for.
+    ///
+    /// # Only single-day slices earn a row
+    ///
+    /// The background worker always slices to exactly one day
+    /// (`backfill::day_slices`), while the foreground plans ADAPTIVELY and
+    /// leaves a sparse scope as one 30-day slice. Both writers' rows are
+    /// keyed `(scope_key, slice_from, slice_to)`, so identically-shaped
+    /// rows SUPERSEDE each other -- but a 30-day row merely OVERLAPS the
+    /// worker's day rows, and `coverage_from` sums `issue_count` over
+    /// every overlapping settled row. A wide row beside the worker's
+    /// narrow ones would double the denominator and put the board
+    /// permanently out of reach of completeness.
+    ///
+    /// Restricting to `from == to` removes that class entirely rather
+    /// than detecting it. The cost is that a sparse scope writes no
+    /// foreground row and converges via the worker, which is today's
+    /// behaviour rather than a regression.
+    ///
+    /// # Counted from the STORED rows, not the raw nodes
+    ///
+    /// `retrieved_prs` drops unmerged nodes and nodes with no repository,
+    /// so a slice's node count exceeds what lands in `pr_history`.
+    /// Classifying on the node count would mark a slice `Complete` with a
+    /// `retrieved` larger than the rows behind it -- the lying ledger this
+    /// module exists to prevent. `prs` is the same set the caller writes.
+    pub fn slice_ledger(
+        map: &serde_json::Value,
+        slices: &[Slice],
+        prs: &[StoredPr],
+    ) -> Vec<crate::store::pr_slice::SliceRow> {
+        let refused = crate::github::client::refused_fields_of(map);
+        let mut out = Vec::new();
+        for (i, slice) in slices.iter().enumerate() {
+            // A wider slice cannot be recorded without double-counting.
+            if slice.from != slice.to {
+                continue;
+            }
+            let alias = super::query::slice_alias(i);
+            // No `issueCount` means this alias did not answer at all. A
+            // slice nobody measured gets NO row: absent is not zero, and a
+            // `Refused` row carrying `issue_count: 0` would be a
+            // measurement claim about a question never asked.
+            let Some(issue_count) = map[&alias]["issueCount"].as_u64() else {
+                continue;
+            };
+            let mine = prs.iter().filter(|p| p.merged_at == slice.from).count();
+            out.push(super::backfill::classify(
+                slice,
+                issue_count,
+                mine as u64,
+                refused as u64,
+            ));
+        }
+        out
+    }
+
     /// Re-assemble a board from everything stored for a window (#1004).
     ///
     /// This is where accumulation becomes an ANSWER. `from_alias_map`
@@ -898,6 +961,24 @@ impl Board {
         // can be `None`, and a `None` survives to the UI rather than being
         // filled in here.
         let total = coverage.total.or(fetched.total);
+        // The ledger is authoritative where it HAS rows. Where it has
+        // none, its silence is not a measurement of zero
+        // (`caches/mod.rs:550`), and this fetch's own planned span is a
+        // day it genuinely measured.
+        //
+        // Taking the ledger's figure unconditionally is what made a
+        // foreground load report "0 of 30 days measured" forever (#1103):
+        // only the background worker writes the ledger, so a board
+        // assembled from a foreground fetch arrived knowing it had covered
+        // the window and was then told by an empty ledger that it had
+        // covered nothing.
+        //
+        // A FLOOR on the union rather than the union itself: the two can
+        // cover different days, and `Coverage` carries its date list while
+        // a `Board` carries only a count, so the exact union is not
+        // available here. Under-reporting is the safe direction and is
+        // what every other figure on this board already does.
+        let days_covered = coverage.days_covered().max(fetched.days_covered);
         Self {
             rows,
             total,
@@ -920,7 +1001,7 @@ impl Board {
             // days we measured can be present while whole days remain
             // unasked, and that board is not complete.
             complete: total.is_some_and(|t| accumulated >= t)
-                && coverage.days_covered() >= days_total
+                && days_covered >= days_total
                 && !coverage.partial
                 && fetched.refused_fields == 0,
             truncated_slices: fetched.truncated_slices.clone(),
@@ -933,7 +1014,7 @@ impl Board {
             repo_counts,
             accumulated,
             accumulating: true,
-            days_covered: coverage.days_covered(),
+            days_covered,
             days_total,
         }
     }
@@ -1070,8 +1151,15 @@ pub async fn load_board(
 pub struct LoadedBoard {
     pub board: Board,
     /// Every merged pull request this load retrieved, ready for
-    /// `store::pr_history::put_many`.
+    /// `store::pr_slice::record_all_with_rows`.
     pub prs: Vec<StoredPr>,
+    /// What this load can claim about the days behind those rows.
+    ///
+    /// The rows are evidence; these are the claims they are evidence for,
+    /// and they must be written in the SAME transaction -- see
+    /// `store::pr_slice::record_with_rows`. Empty when nothing was
+    /// retrievable at a single-day granularity (`Board::slice_ledger`).
+    pub slices: Vec<crate::store::pr_slice::SliceRow>,
 }
 
 /// [`load_board`], keeping the retrieved pull requests.
@@ -1221,6 +1309,12 @@ fn partial_on_timeout(
     let outstanding = planned.slices.len().saturating_sub(slices_done);
     let map = sink.snapshot();
     let prs = Board::retrieved_prs(&map, &planned.slices);
+    // A load that ran out of wall clock still MEASURED the days its
+    // completed waves covered. Discarding those claims would make a
+    // timed-out load contribute nothing to convergence, which is the
+    // failure "partial is not nothing" names -- and it is exactly how
+    // #1044 lost every PR a timed-out board had fetched.
+    let ledger = Board::slice_ledger(&map, &planned.slices, &prs);
     if slices_done == 0 {
         crate::diag!(
             "[diag] stats board TIMEOUT after {:?} (ceiling {}s): \
@@ -1261,7 +1355,11 @@ fn partial_on_timeout(
         board.truncated_slices.len(),
         budget.spent()
     );
-    Ok(LoadedBoard { board, prs })
+    Ok(LoadedBoard {
+        board,
+        prs,
+        slices: ledger,
+    })
 }
 
 async fn board_inner(
@@ -1316,7 +1414,14 @@ async fn board_inner(
     // written down and the board returned cannot describe different
     // fetches.
     let prs = Board::retrieved_prs(&map, &slices);
-    Ok(LoadedBoard { board, prs })
+    // From the same map and the same rows, so the claims and the evidence
+    // cannot describe different fetches.
+    let ledger = Board::slice_ledger(&map, &slices, &prs);
+    Ok(LoadedBoard {
+        board,
+        prs,
+        slices: ledger,
+    })
 }
 
 /// Whether a login is the ghost bucket rather than a person.
@@ -2194,6 +2299,14 @@ mod tests {
         }
     }
 
+    /// Four accumulated pull requests, for the `from_stored` day-count
+    /// tests -- which care about the DAY figures, not about who wrote what.
+    fn four_stored() -> Vec<StoredPr> {
+        (1..=4)
+            .map(|n| stored("o/a", n, "alice", 1.0, 10))
+            .collect()
+    }
+
     /// The ledger's verdict on a window, for the `from_stored` tests.
     ///
     /// `whole` means every day measured with nothing outstanding, which is
@@ -2228,6 +2341,249 @@ mod tests {
             days_covered: 1,
             days_total: 1,
         }
+    }
+
+    /// A node as GitHub returns it, for the `slice_ledger` tests.
+    ///
+    /// Distinct from `node` above, which fixes the number and repository
+    /// because its tests are about authorship rather than about which day
+    /// a pull request lands on.
+    fn day_node(number: u64, repo: &str, merged: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "number": number,
+            "title": format!("pr {number}"),
+            "url": format!("https://github.com/{repo}/pull/{number}"),
+            "author": { "login": "alice" },
+            "repository": { "nameWithOwner": repo },
+            "createdAt": "2026-08-01T00:00:00Z",
+            "mergedAt": merged,
+            "additions": 1,
+            "deletions": 0,
+            "changedFiles": 1,
+            "reviews": { "totalCount": 0 },
+        })
+    }
+
+    /// An alias map over day-slices, each with its own `issueCount`.
+    fn day_map(days: &[(&str, u64, Vec<serde_json::Value>)]) -> serde_json::Value {
+        let mut m = serde_json::Map::new();
+        for (i, (_, count, nodes)) in days.iter().enumerate() {
+            m.insert(
+                super::super::query::slice_alias(i),
+                serde_json::json!({ "issueCount": count, "nodes": nodes }),
+            );
+        }
+        serde_json::Value::Object(m)
+    }
+
+    /// A foreground load writes a ledger row for every day it fully
+    /// retrieved -- which is what makes its coverage converge (#1103).
+    #[test]
+    fn a_fully_retrieved_day_earns_a_complete_ledger_row() {
+        let days = vec![
+            (
+                "2026-08-01",
+                1u64,
+                vec![day_node(1, "o/a", Some("2026-08-01T01:00:00Z"))],
+            ),
+            (
+                "2026-08-02",
+                1u64,
+                vec![day_node(2, "o/a", Some("2026-08-02T01:00:00Z"))],
+            ),
+        ];
+        let slices: Vec<Slice> = days.iter().map(|(d, _, _)| Slice::new(*d, *d)).collect();
+        let map = day_map(&days);
+        let prs = Board::retrieved_prs(&map, &slices);
+        let ledger = Board::slice_ledger(&map, &slices, &prs);
+
+        assert_eq!(ledger.len(), 2, "each fully retrieved day earns a row");
+        assert!(
+            ledger
+                .iter()
+                .all(|r| r.state == crate::store::pr_slice::SliceState::Complete),
+            "a day whose every pull request was retrieved is Complete"
+        );
+
+        // The point of the whole exercise: these rows make the ledger
+        // report the days as covered.
+        let cov = crate::store::pr_slice::coverage_from(&ledger, "2026-08-01", "2026-08-02");
+        assert_eq!(
+            cov.days_covered(),
+            2,
+            "the rows a foreground load writes must count as covered days"
+        );
+    }
+
+    /// THE trap in counting from the alias map instead of the stored rows.
+    ///
+    /// `retrieved_prs` drops unmerged nodes and nodes with no repository,
+    /// so a slice's NODE count exceeds what reaches `pr_history`.
+    /// Classifying on the node count would call this day `Complete` while
+    /// the table holds fewer rows than the claim -- the lying ledger
+    /// `pr_slice` exists to prevent.
+    #[test]
+    fn a_day_whose_nodes_were_dropped_is_not_complete() {
+        // GitHub counted two; one is unmerged, so only one is stored.
+        let days = vec![(
+            "2026-08-01",
+            2u64,
+            vec![
+                day_node(1, "o/a", Some("2026-08-01T01:00:00Z")),
+                day_node(2, "o/a", None),
+            ],
+        )];
+        let slices = vec![Slice::new("2026-08-01", "2026-08-01")];
+        let map = day_map(&days);
+        let prs = Board::retrieved_prs(&map, &slices);
+        assert_eq!(prs.len(), 1, "the unmerged node is not stored");
+
+        let ledger = Board::slice_ledger(&map, &slices, &prs);
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(
+            ledger[0].retrieved, 1,
+            "the claim must count STORED rows, not returned nodes"
+        );
+        assert_ne!(
+            ledger[0].state,
+            crate::store::pr_slice::SliceState::Complete,
+            "a day holding fewer rows than GitHub counted is not Complete"
+        );
+    }
+
+    /// A slice wider than a day earns NO row.
+    ///
+    /// The worker always slices to one day, and `coverage_from` sums
+    /// `issue_count` over every OVERLAPPING settled row -- so a wide
+    /// foreground row beside the worker's narrow ones would double the
+    /// denominator and put completeness permanently out of reach.
+    #[test]
+    fn a_multi_day_slice_earns_no_ledger_row() {
+        let slices = vec![Slice::new("2026-08-01", "2026-08-30")];
+        let map = serde_json::json!({
+            super::super::query::slice_alias(0): {
+                "issueCount": 1,
+                "nodes": [day_node(1, "o/a", Some("2026-08-01T01:00:00Z"))],
+            }
+        });
+        let prs = Board::retrieved_prs(&map, &slices);
+        assert_eq!(prs.len(), 1, "its pull requests are still stored");
+
+        let ledger = Board::slice_ledger(&map, &slices, &prs);
+        assert!(
+            ledger.is_empty(),
+            "a wide slice must not claim days the worker also claims"
+        );
+    }
+
+    /// An alias that never answered earns NO row.
+    ///
+    /// Absent is not zero: a range nobody measured must stay uncovered so
+    /// it is asked again, not recorded as a measurement of nothing.
+    #[test]
+    fn an_alias_that_never_answered_earns_no_ledger_row() {
+        let slices = vec![
+            Slice::new("2026-08-01", "2026-08-01"),
+            Slice::new("2026-08-02", "2026-08-02"),
+        ];
+        // Only the first alias is present in the snapshot.
+        let map = serde_json::json!({
+            super::super::query::slice_alias(0): {
+                "issueCount": 1,
+                "nodes": [day_node(1, "o/a", Some("2026-08-01T01:00:00Z"))],
+            }
+        });
+        let prs = Board::retrieved_prs(&map, &slices);
+        let ledger = Board::slice_ledger(&map, &slices, &prs);
+
+        assert_eq!(ledger.len(), 1, "only the day that answered earns a row");
+        assert_eq!(ledger[0].from, "2026-08-01");
+    }
+
+    /// An empty ledger must not erase what the fetch itself measured.
+    ///
+    /// The reported defect (#1103): only the background worker writes the
+    /// `pr_slice` ledger, so a board assembled from a FOREGROUND load met
+    /// a ledger with no rows for its window. `days_covered` was taken from
+    /// that empty ledger, and a board that had just measured all 30 days
+    /// reported "0 of 30 days measured" -- forever, because every
+    /// subsequent load did the same thing.
+    ///
+    /// Absent is not zero (`caches/mod.rs:550`). A ledger with no row for
+    /// a day is a reading nobody took, not a reading of zero.
+    #[test]
+    fn an_empty_ledger_does_not_erase_the_fetchs_own_measured_days() {
+        let mut fetched = fetched(4, 4, 0);
+        // What a foreground load of a 30-day window knows about itself:
+        // it planned 30 days and covered them.
+        fetched.days_covered = 30;
+        fetched.days_total = 30;
+        // The worker has never walked this scope, so the ledger is empty.
+        let empty = crate::store::pr_slice::Coverage {
+            days: Vec::new(),
+            total: None,
+            retrieved: 0,
+            partial: false,
+        };
+
+        let board = Board::from_stored(&four_stored(), &fetched, &empty, 30);
+
+        assert_eq!(
+            board.days_covered, 30,
+            "a fetch that measured 30 days must not report 0 because the ledger is silent"
+        );
+    }
+
+    /// The ledger still WINS where it knows more.
+    ///
+    /// The guard above must be a floor on the union, not a reason to
+    /// ignore the ledger: a scope the worker has been walking for days
+    /// holds coverage this single fetch never had.
+    #[test]
+    fn the_ledger_still_wins_where_it_has_covered_more_than_this_fetch() {
+        let mut fetched = fetched(4, 4, 0);
+        // This load covered a single day...
+        fetched.days_covered = 1;
+        fetched.days_total = 30;
+        // ...but the worker has already walked ten.
+        let mut ledger = whole_coverage(4, 4);
+        ledger.days = (1..=10).map(|d| format!("2026-08-{d:02}")).collect();
+
+        let board = Board::from_stored(&four_stored(), &fetched, &ledger, 30);
+
+        assert_eq!(
+            board.days_covered, 10,
+            "the ledger's ten days must not be reduced to this fetch's one"
+        );
+    }
+
+    /// Completeness reads the SAME figure the caveat does.
+    ///
+    /// `from_stored` uses the day count twice -- once for `complete` and
+    /// once for `days_covered`. Correcting only the second would print
+    /// "30 of 30 days measured" above a banner still calling the board
+    /// incomplete, which is a worse bug than the one being fixed because
+    /// the page then contradicts itself.
+    #[test]
+    fn a_fully_measured_fetch_is_complete_even_with_a_silent_ledger() {
+        let mut fetched = fetched(4, 4, 0);
+        fetched.days_covered = 30;
+        fetched.days_total = 30;
+        let empty = crate::store::pr_slice::Coverage {
+            days: Vec::new(),
+            // The fetch's own total carries when the ledger has none.
+            total: None,
+            retrieved: 0,
+            partial: false,
+        };
+
+        let board = Board::from_stored(&four_stored(), &fetched, &empty, 30);
+
+        assert_eq!(board.days_covered, 30);
+        assert!(
+            board.complete,
+            "the same day figure must satisfy `complete`, or the board argues with itself"
+        );
     }
 
     /// THE load-bearing property of #1004, at the board layer: a second
