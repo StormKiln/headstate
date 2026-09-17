@@ -2988,6 +2988,37 @@ fn board_projection(days: i64) -> u64 {
 /// window. 4 is that measured figure plus one.
 const MAX_PROBE_ROUNDS: u64 = 4;
 
+/// Register a scope for backfill, off the runtime.
+///
+/// SQLite on a runtime worker is the rule `persist_and_emit` states; this
+/// is a single tiny upsert but it is still a blocking file write.
+///
+/// A failure costs the backfill, never the board: the user's answer does
+/// not depend on a bookkeeping write, and the next load registers again.
+async fn note_scope_seen(
+    db: std::path::PathBuf,
+    registration: crate::store::pr_backfill_scope::BackfillScope,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        let Ok(conn) = open_db(&db) else {
+            log::warn!("could not open the database to register this scope for backfill");
+            return;
+        };
+        if let Err(e) = crate::store::pr_backfill_scope::note_seen(&conn, &registration, now) {
+            log::warn!("could not register this scope for backfill: {e}");
+        } else {
+            crate::diag!(
+                "[diag] backfill scope registered key={} kind={} horizon={}",
+                registration.scope_key,
+                registration.scope_kind,
+                registration.horizon_days
+            );
+        }
+    })
+    .await;
+}
+
 /// Per-author aggregates for one scope: #826's Mine and Others views and
 /// the three leaderboards, in ONE load.
 ///
@@ -3130,6 +3161,30 @@ pub async fn stats_board(
     let key = crate::store::stats::key(crate::store::stats::Kind::Board, &q.cache_key(&viewer));
     // Off the runtime since #1090; see `stats_cache_read`.
     let db = db_path(&app);
+    // REGISTERED BEFORE THE CACHE IS READ, not after the fetch (#1109).
+    //
+    // This used to live on the accumulate path, which a cache hit returns
+    // before reaching -- so the scope a user had already opened once was
+    // never registered, `next_to_work` found nothing, and the backfill
+    // never ran for the one scope the user was actually looking at. The
+    // page then sat on a warning that could not change, which is exactly
+    // what #1103 set out to fix and did not.
+    //
+    // Registration is a statement about DEMAND -- this scope was asked
+    // for -- and demand is demonstrated by the request, not by whether
+    // the answer happened to be cached.
+    let registration = crate::store::pr_backfill_scope::BackfillScope {
+        scope_key: q.cache_key(&viewer),
+        scope_kind: scope_kind.clone(),
+        // The value the user's click carried. `Scope::All` has none, and
+        // an empty string is what the parser round trips back to
+        // `Scope::All` -- so the worker reconstructs the same question
+        // rather than a guess at it.
+        scope_value: scope_value_for_backfill.clone(),
+        measure: measure_name.to_string(),
+        horizon_days: crate::github::stats::backfill::HORIZON_DAYS.max(clamp_days(days) as u32),
+    };
+    note_scope_seen(db.clone(), registration.clone(), now).await;
     let hit = stats_cache_read(
         db.clone(),
         viewer.clone(),
@@ -3211,19 +3266,7 @@ pub async fn stats_board(
                 req.window.to.clone(),
                 loaded,
                 now,
-                crate::store::pr_backfill_scope::BackfillScope {
-                    scope_key: scope_key.clone(),
-                    scope_kind: scope_kind.clone(),
-                    // The value the user's click carried. `Scope::All` has
-                    // none, and an empty string is what the parser round
-                    // trips back to `Scope::All` -- so the worker
-                    // reconstructs the same question rather than a guess
-                    // at it.
-                    scope_value: scope_value_for_backfill.clone(),
-                    measure: measure_name.to_string(),
-                    horizon_days: crate::github::stats::backfill::HORIZON_DAYS
-                        .max(clamp_days(days) as u32),
-                },
+                registration.clone(),
             )
             .await;
             Ok(StatsBoard {

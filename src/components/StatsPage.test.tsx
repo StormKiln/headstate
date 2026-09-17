@@ -797,6 +797,50 @@ describe("backfillActivity", () => {
     expect(backfillActivity({ kind: "waiting" }, 161)).toBe("Next batch in 2:41.");
   });
 
+  /// **The percentage the user asked for**, floored so it cannot claim
+  /// 100% beside a caveat saying the board is incomplete.
+  it("states progress as a percentage", () => {
+    const s = backfillActivity({ kind: "waiting" }, 60, { daysCovered: 10, daysTotal: 30 });
+    expect(s).toContain("33% collected");
+  });
+
+  it("never rounds a partial window up to 100%", () => {
+    const s = backfillActivity({ kind: "waiting" }, 60, { daysCovered: 29, daysTotal: 30 });
+    expect(s).toContain("96%");
+    expect(s).not.toContain("100%");
+  });
+
+  /// **The estimate the user asked for.** 20 days left at 5 days a tick,
+  /// one tick a minute, is about 4 minutes.
+  it("estimates how long the rest will take", () => {
+    const s = backfillActivity({ kind: "waiting" }, 60, { daysCovered: 10, daysTotal: 30 });
+    expect(s).toContain("About 4 minutes of collecting left");
+  });
+
+  /// An estimate of zero is not an estimate.
+  it("gives no estimate once nothing is outstanding", () => {
+    const s = backfillActivity({ kind: "waiting" }, 60, { daysCovered: 30, daysTotal: 30 });
+    expect(s).not.toContain("left");
+  });
+
+  /// Absent is not zero: an unknown denominator has no percentage, and
+  /// 0% would be a measurement nobody took.
+  it("states no percentage when the window has no day total", () => {
+    const s = backfillActivity({ kind: "waiting" }, 60, { daysCovered: 0, daysTotal: 0 });
+    expect(s).not.toContain("%");
+  });
+
+  /// A paused collection still reports how far it got. The progress is a
+  /// fact about the data and does not stop being true while waiting.
+  it("reports progress even while paused", () => {
+    const s = backfillActivity({ kind: "paused", remaining: null }, 60, {
+      daysCovered: 12,
+      daysTotal: 30,
+    });
+    expect(s).toContain("40% collected");
+    expect(s).toContain("GitHub request budget");
+  });
+
   /// A pause names the rate limit, because that is an external condition
   /// with a known end -- it tells the reader nothing is broken and that
   /// waiting is correct. Distinct from the implementation detail #1088

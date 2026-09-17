@@ -2617,6 +2617,39 @@ mod tests {
     /// `is_comment` gives: this codebase argues its rules directly above
     /// the code that implements them, so every name below appears in prose
     /// in this very file.
+    /// A scope is registered for backfill BEFORE the cache can return.
+    ///
+    /// `stats_board` returns a cached board early. Registration used to
+    /// live on the accumulate path, far below that return -- so a scope
+    /// the user had already opened once was never registered, the worker
+    /// found nothing to walk, and the page sat on a warning that could
+    /// not change (#1109). The whole of #1103 shipped without reaching a
+    /// single user for this reason.
+    ///
+    /// Asserted as an ORDERING because that is what was wrong. Both calls
+    /// existed; the registration was simply unreachable on the path the
+    /// user takes every time after the first.
+    #[test]
+    fn a_stats_board_registers_its_scope_before_returning_a_cached_one() {
+        let src = include_str!("commands.rs");
+        let body = src
+            .split_once("pub async fn stats_board(")
+            .expect("stats_board must exist")
+            .1;
+        let register = body
+            .find("note_scope_seen(")
+            .expect("stats_board must register its scope for backfill");
+        let cache_return = body
+            .find("return Ok(cached)")
+            .expect("stats_board must have a cache-hit return");
+        assert!(
+            register < cache_return,
+            "stats_board registers its scope at byte {register} but returns a cached board at \
+             {cache_return}: a scope the user has already opened would never be registered, so \
+             the backfill would never walk the one scope they are looking at (#1109)"
+        );
+    }
+
     #[test]
     fn the_identity_change_clears_every_backfill_table() {
         let src = include_str!("commands.rs");

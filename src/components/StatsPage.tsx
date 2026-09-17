@@ -264,7 +264,10 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
   // live frame: a board with no frame has nothing to say about activity,
   // and inventing a phase for it would be a claim nobody measured.
   const activity = backfill
-    ? backfillActivity(backfill.phase, secsToNextTick)
+    ? backfillActivity(backfill.phase, secsToNextTick, {
+        daysCovered: backfill.daysCovered,
+        daysTotal: backfill.daysTotal,
+      })
     : undefined;
   const caveat = board
     ? partialityCaveat(
@@ -788,6 +791,44 @@ export function describeScope(scope: StatsScope): string {
   return scope.subject ? `${scope.subject}, in ${where}` : String(where);
 }
 
+/// "62%", or `undefined` when there is no denominator to divide by.
+///
+/// Absent is not zero: a window whose day total is unknown has no
+/// percentage, and 0% would be a measurement nobody took.
+function progressWords(p?: { daysCovered: number; daysTotal: number }): string | undefined {
+  if (!p || p.daysTotal <= 0) return undefined;
+  // FLOORED, never rounded up. 29 of 30 days must not read as 100% --
+  // this figure sits beside a caveat saying the board is incomplete, and
+  // the two must not contradict each other.
+  return `${Math.floor((Math.min(p.daysCovered, p.daysTotal) / p.daysTotal) * 100)}%`;
+}
+
+/// Roughly how long the rest will take, in words.
+///
+/// The worker walks up to `GROUP_SLICES` (5) days per tick at one tick
+/// per `BACKFILL_INTERVAL` (60s), so the remaining days give a bounded
+/// figure. Stated as "about", because it is a FLOOR: the worker rotates
+/// across every registered scope, so a scope sharing the rotation waits
+/// longer, and a paused budget stops the clock entirely.
+///
+/// `undefined` once nothing is outstanding -- an estimate of zero is not
+/// an estimate.
+function etaWords(p?: { daysCovered: number; daysTotal: number }): string | undefined {
+  if (!p || p.daysTotal <= 0) return undefined;
+  const left = p.daysTotal - Math.min(p.daysCovered, p.daysTotal);
+  if (left <= 0) return undefined;
+  const mins = Math.ceil(left / 5);
+  if (mins <= 1) return "About a minute of collecting left.";
+  if (mins < 60) return `About ${mins} minutes of collecting left.`;
+  const hrs = Math.round(mins / 60);
+  return `About ${hrs} hour${hrs === 1 ? "" : "s"} of collecting left.`;
+}
+
+/// Joins the parts that exist, dropping the ones that do not.
+function join(parts: (string | undefined | false)[]): string {
+  return parts.filter(Boolean).join(" ");
+}
+
 /// What the collection is DOING, in one sentence.
 ///
 /// The counterpart to `partialityCaveat`, which says what is missing. A
@@ -805,31 +846,43 @@ export function describeScope(scope: StatsScope): string {
 export function backfillActivity(
   phase: BackfillPhase,
   secsToNextTick: number,
+  progress?: { daysCovered: number; daysTotal: number },
 ): string | undefined {
+  const pct = progressWords(progress);
+  const eta = etaWords(progress);
   switch (phase.kind) {
     // Nothing to say: the absence of a caveat IS the signal.
     case "converged":
       return undefined;
     case "working":
-      return "Collecting now.";
+      return join([pct && `${pct} collected`, "Collecting now.", eta]);
     case "paused": {
       // The remaining-requests figure is deliberately NOT printed. It is
       // a number the reader cannot act on, and on a cold start there is
       // no measurement to print -- which would invite a 0 that nobody
       // measured.
-      return secsToNextTick > 0
-        ? `Paused: the GitHub request budget for this hour is used up. Next batch in ${mmss(secsToNextTick)}.`
-        : "Paused: the GitHub request budget for this hour is used up.";
+      return join([
+        pct && `${pct} collected.`,
+        "Paused: the GitHub request budget for this hour is used up.",
+        secsToNextTick > 0 ? `Next batch in ${mmss(secsToNextTick)}.` : undefined,
+      ]);
     }
     case "stalled":
-      return "The last batch did not complete. It will be tried again.";
+      return join([
+        pct && `${pct} collected.`,
+        "The last batch did not complete. It will be tried again.",
+      ]);
     case "waiting":
       // A countdown already at zero says nothing: the batch is due and
       // has not reported yet, and a frozen 0:00 reads worse than no
       // countdown at all.
-      return secsToNextTick > 0
-        ? `Next batch in ${mmss(secsToNextTick)}.`
-        : "Waiting for the next batch.";
+      return join([
+        pct && `${pct} collected.`,
+        secsToNextTick > 0
+          ? `Next batch in ${mmss(secsToNextTick)}.`
+          : "Waiting for the next batch.",
+        eta,
+      ]);
   }
 }
 
