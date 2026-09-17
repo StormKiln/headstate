@@ -2035,6 +2035,42 @@ export type BranchScanFrame =
   | { kind: "listed"; repo: string; total: number; branches: Branch[] }
   | { kind: "classified"; repo: string; verdicts: [string, Deletable][] };
 
+/// One frame of PR Stats backfill progress, mirroring the Rust
+/// `StatsBackfillFrame` in `src-tauri/src/commands.rs` (#1093).
+///
+/// ONE shape, unlike `BranchScanFrame`'s two, because this stream has one
+/// kind of news: the coverage moved. Every frame carries the whole state
+/// rather than a delta, so a listener that joined late -- or missed a
+/// frame while the page was closed -- renders correctly from the next one
+/// instead of accumulating from a start it never saw.
+export interface StatsBackfillFrame {
+  /// The scope this describes, as the Rust side keys it. Compared before
+  /// anything is rendered: the event is app-global while the work is
+  /// per-scope, so a page that changed scope mid-walk would otherwise
+  /// show another scope's coverage under its own heading.
+  scopeKey: string;
+  /// Days of the window that have actually been retrieved.
+  daysCovered: number;
+  /// Days in the window.
+  daysTotal: number;
+  /// Pull requests held for those days.
+  collected: number;
+  /// GitHub's exact total, or `null` when nothing has measured it.
+  ///
+  /// **Never treat `null` as 0.** "400 of 0" is nonsense and "400 of 400,
+  /// complete" is worse, because it reads as reassuring. `null` means the
+  /// denominator is unknown, and the only honest render of it says so.
+  /// The same discipline `Branch.ahead`/`behind` keep (#967).
+  total: number | null;
+  /// Whether the worker is still walking this scope.
+  ///
+  /// The page must distinguish "still collecting" from "stopped": a
+  /// caveat that reads identically in both cases is an indefinite
+  /// skeleton at page level, where the reader cannot tell waiting from
+  /// broken (#1042).
+  running: boolean;
+}
+
 /// One frame of a running branch DELETION, mirroring the Rust
 /// `BranchDeleteFrame` in `src-tauri/src/commands.rs`.
 ///
@@ -2727,12 +2763,27 @@ export interface ShortSlice {
 export interface StatsBoard {
   /// The authenticated login. What splits the board into Mine and Others.
   viewer: string;
+  /// The key this board's stored rows are filed under (#1093).
+  ///
+  /// Travels with the board for `viewer`'s reason: backfill progress
+  /// events are app-global while the work is per-scope, so the page needs
+  /// this scope's own key to tell its frames from another scope's.
+  /// Re-deriving it here would be a second spelling of a key the Rust side
+  /// already computes, and a disagreement would silently show no progress.
+  scopeKey: string;
   /// One row per author who appears, in no ranking order -- the UI ranks by
   /// whichever measure its chart is about.
   rows: AuthorRow[];
   /// Pull requests GitHub says the window holds. Exact even when the rows
   /// are short: the 1,000-result cap limits retrieval, not counting.
-  total: number;
+  ///
+  /// `null` means NOBODY HAS MEASURED IT (#1092) -- a board assembled from
+  /// stored rows over a window the ledger has never probed. Never render it
+  /// as 0: "400 of 0" is nonsense, and "400 of 400, complete" is worse
+  /// because it reads as reassuring. The same discipline `Branch.ahead`
+  /// keeps (#967), on the one field where the lie is invisible, since every
+  /// ratio built from a wrong denominator still looks plausible.
+  total: number | null;
   /// Pull requests actually aggregated into the rows.
   retrieved: number;
   /// Whether every pull request in the window made it into a row.
@@ -2772,6 +2823,15 @@ export interface StatsBoard {
   /// False when storage was unavailable, so the caveat does not promise
   /// that another load will help when nothing is being kept.
   accumulating: boolean;
+  /// Days of the window that have actually been retrieved (#1092).
+  ///
+  /// The figure a pull request count cannot give. "40% of the pull
+  /// requests" is equally consistent with 40% of every day and with 100% of
+  /// 40% of the days, and only the second tells a reader WHICH PART of the
+  /// chart to trust -- usually the part they are looking at.
+  daysCovered: number;
+  /// Days in the window, the denominator of "34 of 90 days measured".
+  daysTotal: number;
 }
 
 /// One day of scoped pull-request activity.

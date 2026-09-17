@@ -21,7 +21,14 @@
 mod cache;
 pub mod devices;
 pub mod health;
+/// Which scopes the background backfill is allowed to walk, and how far
+/// (#1092). Written when a user opens a scope, so background spend
+/// follows demonstrated interest rather than everything a token can see.
+pub mod pr_backfill_scope;
 pub mod pr_history;
+/// The ledger saying which date ranges have been retrieved -- and, by the
+/// ABSENCE of a row, which have never been asked for (#1092).
+pub mod pr_slice;
 mod schema;
 pub mod settings;
 pub mod stats;

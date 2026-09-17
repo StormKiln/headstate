@@ -815,6 +815,16 @@ pub fn run() {
                         }
                     });
                 }
+                // The PR Stats backfill (#1092, #1093), BESIDE the poll
+                // loop rather than inside its tick.
+                //
+                // `poll::TICK_TIMEOUT`'s margin under `MIN_FOCUSED_SECS`
+                // is load-bearing, and `budget::RESERVE` exists to protect
+                // the poll loop -- so a consumer placed inside that loop
+                // would both spend the margin and make the protection
+                // self-referential. `spawn_backfill`'s own docs carry the
+                // argument in full.
+                poll::spawn_backfill(handle.clone(), client.clone());
                 let focused = Arc::new(AtomicBool::new(true));
                 app.manage(Focused(focused.clone()));
                 poll::spawn(handle, client, focused, waker, interval, needs_gh);

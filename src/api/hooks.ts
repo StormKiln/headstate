@@ -11,6 +11,7 @@ import type {
   Branch,
   BranchDeleteFrame,
   BranchScanFrame,
+  StatsBackfillFrame,
   ClaudeImported,
   ClaudeOverview,
   PluginsReport,
@@ -4026,6 +4027,65 @@ export function useBranchScan(repoPath: string | undefined): BranchScanState {
     }),
     [state.branches, state.total, state.classified],
   );
+}
+
+/// What the PR Stats backfill has collected for one scope so far (#1093).
+///
+/// `null` until a frame arrives, which is the honest starting state: the
+/// worker ticks on its own cadence and a page opened between ticks knows
+/// nothing yet. A zeroed object would be indistinguishable from a scope
+/// the worker has measured and found empty.
+export type StatsBackfillState = StatsBackfillFrame | null;
+
+/// Subscribe to backfill progress for one scope.
+///
+/// Modelled on `useBranchScan`, and for the same reasons: the event is
+/// app-global while the work is per-scope, so frames for another scope are
+/// dropped, and the scope is held IN the state rather than only in the
+/// effect's dependency list -- a scope change must start from nothing, and
+/// resetting inside the effect would paint the previous scope's numbers
+/// for a frame first.
+///
+/// The whole frame is kept rather than merged into a running tally. Each
+/// frame is a complete statement of what the ledger holds, so a listener
+/// that joined late or missed one is correct from the next frame instead
+/// of accumulating from a start it never saw.
+///
+/// `listen` comes from the transport seam, never from `@tauri-apps/api`.
+/// A direct import works on the desktop and silently never fires on the
+/// phone, which is the failure `POLL_EVENTS` in `transport.test.ts` exists
+/// to make impossible.
+export function useStatsBackfill(scopeKey: string | undefined): StatsBackfillState {
+  const [held, setState] = useState<{ scopeKey?: string; frame: StatsBackfillFrame | null }>({
+    frame: null,
+  });
+  const state = held.scopeKey === scopeKey ? held.frame : null;
+
+  useEffect(() => {
+    if (!scopeKey) return;
+
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    listen<StatsBackfillFrame>("stats-backfill-progress", (e) => {
+      const f = e.payload;
+      // Another scope's progress is not this page's news.
+      if (f.scopeKey !== scopeKey) return;
+      setState({ scopeKey, frame: f });
+    }).then(
+      (fn) => {
+        if (cancelled) safeUnlisten(fn);
+        else unlisten = fn;
+      },
+      () => {},
+    );
+    return () => {
+      cancelled = true;
+      safeUnlisten(unlisten);
+      unlisten = undefined;
+    };
+  }, [scopeKey]);
+
+  return state;
 }
 
 /// What a running branch deletion has reported so far, or `null` when

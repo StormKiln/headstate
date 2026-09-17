@@ -141,6 +141,23 @@ pub const EVENT_NAMES: &[&str] = &[
     // done. A phone feels that hardest: it cannot leave a window open,
     // so what it can show is what arrives while it is in the foreground.
     "worktree-safety",
+    // The PR Stats backfill's coverage (#1093). Counts and one scope key,
+    // which is the `org:X` or `owner/repo` string the phone just ASKED
+    // about -- no repository list, no logins, no titles, no paths.
+    //
+    // Weighed on the same test as the entries above and it passes more
+    // easily than most: `stats_board` is already an allowlisted Read that
+    // returns a whole leaderboard for this scope to this phone over this
+    // transport, so a day count about that same scope opens nothing the
+    // command has not.
+    //
+    // It has to be here because the work is unbounded in TIME by design.
+    // A backfill deliberately spends minutes to hours walking a horizon a
+    // point at a time, and a phone feels that hardest -- it cannot leave a
+    // window open, so what it can show is what arrives while it is in the
+    // foreground. Without this the phone shows a caveat that never moves,
+    // which is indistinguishable from one that is broken.
+    "stats-backfill-progress",
 ];
 
 /// The event name the opening snapshot frame is sent under, so the
