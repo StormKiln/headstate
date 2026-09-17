@@ -66,6 +66,14 @@ import type { MemberRow, OrgTree, RepoRow } from "@/types/pr";
 /// is only meaningful somewhere. Every other row clears the subject, so
 /// clicking a repository after clicking a colleague is a question about the
 /// repository rather than about that colleague inside it.
+/// How many organisations one "Everything" search may name.
+///
+/// Mirrors `ORG_UNION_CAP` in `src-tauri/src/github/stats/scope.rs`. The
+/// Rust side trims to this too, so a mismatch makes the sidebar's claim
+/// wrong rather than the search -- which is why the number is stated in
+/// both places and named the same in both.
+const ACCOUNT_ORG_CAP = 20;
+
 export function StatsSidebar({
   viewCounts,
 }: {
@@ -80,6 +88,21 @@ export function StatsSidebar({
   // spending two points on a view that does not use the tree.
   const enabled = view === "pr-stats";
   const { data, isPending, error } = useStatsTree(enabled);
+  // `login,orgA,orgB` for the account-wide row. Empty-safe: a viewer in no
+  // organisations yields their login alone, which is a narrow but VALID
+  // qualifier -- the failure mode is a board that is too small, never one
+  // that searches every repository on GitHub (#1114).
+  const accountScope = data
+    ? [data.viewer, ...data.orgs.map((o) => o.login)].join(",")
+    : undefined;
+  // How many organisations "Everything" actually spans, against how many
+  // the viewer has. The union is capped (`ORG_UNION_CAP`, 20) BELOW the
+  // sidebar's own list cap (50), so a viewer in 30 organisations would see
+  // all 30 listed while the account row silently covered 20. Said out
+  // loud, for the same reason every other count in this sidebar is: a
+  // figure drawn from a sample must not look like a total.
+  const accountOrgs = data ? Math.min(data.orgs.length, ACCOUNT_ORG_CAP) : 0;
+  const accountShort = data ? data.orgsTotal - accountOrgs : 0;
 
   // Which org sections are open. Collapsed by DEFAULT, and that is the
   // list-length decision -- see `OrgSection`.
@@ -110,6 +133,18 @@ export function StatsSidebar({
           </p>
         ) : !data ? null : (
           <>
+            {/* The union "Everything" spans, spelled `login,orgA,orgB` and
+                carried in the `scope_value` this kind leaves unused.
+
+                Sent EXPLICITLY because GitHub will not infer it. An absent
+                repository qualifier does not mean "everywhere this token
+                can see" -- it means the whole of GitHub, which returned
+                606,016 pull requests for a single day and made the
+                backfill's five-slice document 502 every tick (#1114).
+
+                Derived from the same tree the rows below are drawn from,
+                so the account page and the organisations under it cannot
+                disagree about which organisations exist. */}
             {/* The account-wide page, FIRST and outside every heading
                 (#826's reopening).
 
@@ -141,9 +176,13 @@ export function StatsSidebar({
             <Row
               depth={0}
               label="Everything"
-              detail="your account"
-              active={selected("all", undefined, undefined)}
-              onClick={() => setStatsScope("all", undefined, undefined)}
+              detail={
+                accountShort > 0
+                  ? `${accountOrgs} of ${accountOrgs + accountShort} organizations`
+                  : "your account"
+              }
+              active={selected("all", accountScope, undefined)}
+              onClick={() => setStatsScope("all", accountScope, undefined)}
             />
 
             {/* The heading is conditional on there BEING organisations
