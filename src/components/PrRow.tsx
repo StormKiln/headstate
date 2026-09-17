@@ -14,7 +14,7 @@ import { labelForeground } from "@/lib/labels";
 import { PrKebab } from "@/components/PrKebab";
 import { prKey } from "@/components/BulkBar";
 import { useFilters } from "@/store/filters";
-import { needsAttention, pendingReviewers } from "@/lib/derive";
+import { needsAttention, pendingReview } from "@/lib/derive";
 import { relativeTime } from "@/lib/time";
 import { useIsMobile } from "@/lib/useIsMobile";
 
@@ -262,9 +262,19 @@ export function PrRow({
   stackedOn?: number;
 }) {
   const state = prState(pr);
-  const pending = pendingReviewers(pr);
+  const pending = pendingReview(pr);
   const { checked, toggleChecked, anchor, setAnchor, density } = useFilters();
   const dense = density === "dense";
+  // What the row is NOT showing, against GitHub's own count rather than
+  // against the length of a list the query already capped.
+  //
+  // Clamped at 0 rather than a bare subtraction: the total and the nodes
+  // can come from slightly different moments, so a total smaller than
+  // the list is legitimate and is not a shortfall. Absent is not zero --
+  // a snapshot cached before `labels_total` existed falls back to the
+  // list's own length, which hides nothing.
+  const labelsShown = dense ? Math.min(pr.labels.length, DENSE_LABELS) : pr.labels.length;
+  const labelsHidden = Math.max(0, (pr.labels_total ?? pr.labels.length) - labelsShown);
   const key = prKey(pr);
   // On a phone the repo moves from its own column on the right to a
   // line above the title. A trailing column is what stops a title from
@@ -397,11 +407,22 @@ export function PrRow({
               {label.name}
             </span>
           ))}
-          {dense && pr.labels.length > DENSE_LABELS ? (
+          {labelsHidden > 0 ? (
             // The count is not decoration: without it a capped list
             // looks like the whole list, and a label the user filters on
             // would appear simply absent.
-            <span className="text-xs text-[#8b949e]">+{pr.labels.length - DENSE_LABELS}</span>
+            //
+            // Counted against `labels_total`, GitHub's own figure, NOT
+            // against `pr.labels.length` -- that list is itself capped at
+            // 20 by the query, so the old subtraction was a precise
+            // number computed from truncated input (#1089). MEASURED
+            // live: open kubernetes/kubernetes pull requests carry up to
+            // 28 labels, so the window is reached in practice.
+            //
+            // Shown in BOTH densities now. Comfortable mode renders every
+            // label it HAS, which is exactly when a reader has no other
+            // clue that more exist.
+            <span className="text-xs text-[#8b949e]">+{labelsHidden}</span>
           ) : null}
         </div>
         {/* Dense drops the PROSE line only. Every decisive signal --
@@ -443,15 +464,44 @@ export function PrRow({
               Only the still-outstanding reviewers. Someone who has
               already approved is not who you chase, and listing them
               here would make the row longer while making it less
-              useful. */}
-          {pending.length > 0 ? (
-            <span
-              className="ml-2 text-[#8b949e]"
-              title={`Waiting on ${pending.join(", ")}`}
-            >
-              • waiting on {pending.slice(0, 2).join(", ")}
-              {pending.length > 2 ? ` +${pending.length - 2}` : ""}
-            </span>
+              useful.
+
+              SUPPRESSED, not qualified, when the verdict list was cut
+              (#1089). Every other truncation on this row is an
+              undercount, which a count can qualify; this one can name
+              the WRONG PERSON, because a reviewer beyond the window
+              never enters the answered set and so survives as "pending"
+              after approving. "Qualify, or suppress" -- possibly-wrong
+              suppresses. The row still says a review is outstanding, so
+              nothing is hidden except the names that might be wrong. */}
+          {/* `atLeast`, not `names.length`: when the verdicts were cut
+              the names are suppressed and the array is empty, but a
+              review IS still outstanding and the row must say so. */}
+          {pending.atLeast > 0 ? (
+            pending.certain ? (
+              <span
+                className="ml-2 text-[#8b949e]"
+                title={`Waiting on ${pending.names.join(", ")}`}
+              >
+                {/* `atLeast`, not `names.length`: the requested-reviewer
+                    list is itself paged, so subtracting from what
+                    arrived prints an exact-looking "+3" derived from a
+                    cut list. "at least" marks the figure as a floor when
+                    the source was truncated, which is the same wording
+                    the repo's qualify-or-suppress rule asks for. */}
+                • waiting on {pending.names.slice(0, 2).join(", ")}
+                {pending.atLeast > 2
+                  ? ` ${pending.exact ? "+" : "+ at least "}${pending.atLeast - 2}`
+                  : ""}
+              </span>
+            ) : (
+              <span
+                className="ml-2 text-[#8b949e]"
+                title="GitHub returned more review verdicts than fit in one page, so a reviewer who has already answered could still appear outstanding. Open the pull request to see who is left."
+              >
+                • waiting on a review — open to see who
+              </span>
+            )
           ) : null}
           {/* Open review conversations on the current code. Deliberately
               worded as a count, not "blocked": whether a repo requires

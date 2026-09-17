@@ -31,6 +31,14 @@ export const PR_FIXTURES: PullRequest[] = [
     requested_reviewers: [],
     assignees: [],
     latest_reviews: [],
+    // Totals equal to the lists above: these fixtures are COMPLETE, and
+    // a fixture that silently looked truncated would make every test
+    // using it assert against a truncation notice nobody asked for. The
+    // truncated cases are built explicitly where they are tested.
+    requested_reviewers_total: 0,
+    assignees_total: 0,
+    latest_reviews_total: 0,
+    labels_total: 1,
   },
   {
     id: "PR_fixture1",
@@ -57,6 +65,14 @@ export const PR_FIXTURES: PullRequest[] = [
     requested_reviewers: [],
     assignees: [],
     latest_reviews: [],
+    // Totals equal to the lists above: these fixtures are COMPLETE, and
+    // a fixture that silently looked truncated would make every test
+    // using it assert against a truncation notice nobody asked for. The
+    // truncated cases are built explicitly where they are tested.
+    requested_reviewers_total: 0,
+    assignees_total: 0,
+    latest_reviews_total: 0,
+    labels_total: 1,
   },
   {
     id: "PR_fixture2",
@@ -83,6 +99,14 @@ export const PR_FIXTURES: PullRequest[] = [
     requested_reviewers: [],
     assignees: [],
     latest_reviews: [],
+    // Totals equal to the lists above: these fixtures are COMPLETE, and
+    // a fixture that silently looked truncated would make every test
+    // using it assert against a truncation notice nobody asked for. The
+    // truncated cases are built explicitly where they are tested.
+    requested_reviewers_total: 0,
+    assignees_total: 0,
+    latest_reviews_total: 0,
+    labels_total: 1,
   },
 ];
 

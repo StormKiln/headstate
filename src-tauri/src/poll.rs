@@ -1719,6 +1719,11 @@ mod tests {
             requested_reviewers: Vec::new(),
             assignees: Vec::new(),
             latest_reviews: Vec::new(),
+            // Zero totals against empty lists: nothing was cut.
+            requested_reviewers_total: 0,
+            assignees_total: 0,
+            latest_reviews_total: 0,
+            labels_total: 0,
         }
     }
 
@@ -1954,6 +1959,21 @@ mod tests {
         /// MEASURED live 2026-09-11, `gh api graphql -F first=25`, the
         /// document extracted verbatim from `PRS_QUERY` with `#` comment
         /// lines stripped: **cost 2**, 3 runs (2.31s, 2.32s, 2.56s).
+        ///
+        /// RE-MEASURED 2026-09-16 for #1089, same method, after adding
+        /// `totalCount` to `assignees`, `reviewRequests`, `latestReviews`
+        /// and `labels` and raising `latestReviews` from 5 to 20: still
+        /// **cost 2**, 3 runs (2.47s, 2.63s, 2.68s), and 2 again against
+        /// `repo:kubernetes/kubernetes` before and after. So this figure
+        /// stands rather than being carried forward on faith.
+        ///
+        /// Why it did not move, which is the reusable part: GitHub prices
+        /// the `first:` ARGUMENT, not the field or the page size
+        /// (`stats/query.rs:694-720` measured `reviews { totalCount }` at
+        /// 1 point and `reviews(first: 1) { totalCount }` at 2). All four
+        /// connections were paged already, so `totalCount` rides along on
+        /// something being paid for either way, and widening a window
+        /// that already exists changes nothing.
         ///
         /// Not a count of anything. The previous guard's number was a count
         /// of connection appearances asserted to be 7, which had drifted
@@ -2424,6 +2444,11 @@ mod tests {
             requested_reviewers: Vec::new(),
             assignees: Vec::new(),
             latest_reviews: Vec::new(),
+            // Zero totals against empty lists: nothing was cut.
+            requested_reviewers_total: 0,
+            assignees_total: 0,
+            latest_reviews_total: 0,
+            labels_total: 0,
         }
     }
 

@@ -106,6 +106,74 @@ export function needsAttention(pr: PullRequest): boolean {
 /// something without blocking; chasing them is not what the row should
 /// suggest.
 export function pendingReviewers(pr: PullRequest): string[] {
+  return pendingReview(pr).names;
+}
+
+/// Whether a pull request's verdict list arrived whole.
+///
+/// `latest_reviews` is paged. When GitHub reports more verdicts than
+/// arrived, the answered set is INCOMPLETE -- and every name this
+/// function would otherwise subtract from could belong to someone who
+/// has already approved.
+///
+/// `>` rather than a subtraction, the same care `ReviewThreads` takes:
+/// the count and the nodes can come from slightly different moments, so
+/// a total smaller than the list is legitimate and is not a shortfall.
+function verdictsTruncated(pr: PullRequest): boolean {
+  const fetched = pr.latest_reviews?.length ?? 0;
+  // Absent falls back to `fetched`, which reads as "nothing missing" --
+  // a snapshot cached before #1089 added the field must not be declared
+  // truncated forever.
+  //
+  // Honest note, because a comment claiming more than it does is how a
+  // guard rots: under this `>` the fallback is not what SAVES the case.
+  // `?? 0` would answer identically, since `0 > fetched` is false for
+  // any non-negative `fetched`. The comparison is the real protection;
+  // the fallback states the intent. Sabotage-proved during #1089 --
+  // swapping it for `?? 0` failed nothing, which is why this says so
+  // rather than pretending the line is load-bearing.
+  return (pr.latest_reviews_total ?? fetched) > fetched;
+}
+
+/// Who you are waiting on, and whether that is the whole answer.
+///
+/// # Why this is not just a list
+///
+/// `pendingReviewers` subtracts the answered from the asked. The
+/// answered set is built from `latest_reviews`, which is PAGED -- so on
+/// a pull request with more verdicts than the window, a reviewer who has
+/// already APPROVED never enters the set and is named as someone you are
+/// still waiting on (#1089).
+///
+/// That is a wrong answer, not a short list: the row names a person and
+/// tells you to chase them, when they are done. It is strictly worse
+/// than saying nothing.
+///
+/// # What each field means
+///
+/// - `names` -- who to chase, and EMPTY when they cannot be vouched for.
+///   The repo's rule is "qualify, or suppress": only-low qualifies,
+///   possibly-wrong suppresses. Every name is possibly-wrong once the
+///   verdicts were cut, so the list is emptied rather than printed with
+///   a caveat. Suppressing in the data rather than in the renderer is
+///   deliberate -- a correctness rule enforced at one call site is
+///   enforced nowhere.
+/// - `certain` -- whether `names` is the whole answer. False means the
+///   verdict list was cut and the names were withheld, so a caller can
+///   say a review is outstanding without saying whose.
+/// - `atLeast` -- how many reviewers are outstanding, as a FLOOR.
+///   `requested_reviewers` and `assignees` are paged too, so counting
+///   the names that arrived gives a precise-looking number computed from
+///   truncated input: `slice(0, 2)` was honest about its own cut and
+///   silently inherited a dishonest one (#1089). Reviewers beyond the
+///   window cannot have answered either, so they are counted here.
+/// - `exact` -- whether `atLeast` is the true total rather than a floor.
+export function pendingReview(pr: PullRequest): {
+  names: string[];
+  certain: boolean;
+  atLeast: number;
+  exact: boolean;
+} {
   const answered = new Set(pr.latest_reviews?.map((r) => r.author) ?? []);
   // Assignees are a FALLBACK, not an addition. Some repositories assign
   // the reviewer rather than requesting a review -- measured: 25 of 25
@@ -117,8 +185,45 @@ export function pendingReviewers(pr: PullRequest): string[] {
   // pull request, and listing them as someone you are waiting on would
   // be worse than saying nothing.
   const requested = pr.requested_reviewers ?? [];
-  const source = requested.length > 0 ? requested : (pr.assignees ?? []);
-  return source.filter((login) => !answered.has(login) && login !== pr.author);
+  const usingRequests = requested.length > 0;
+  const source = usingRequests ? requested : (pr.assignees ?? []);
+  const outstanding = source.filter((login) => !answered.has(login) && login !== pr.author);
+
+  // How many the SOURCE list claims, so a "+N" is not computed from a
+  // list that was cut. Absent is not zero: a snapshot cached before
+  // these totals existed falls back to the list's own length.
+  const sourceTotal =
+    (usingRequests ? pr.requested_reviewers_total : pr.assignees_total) ?? source.length;
+  // Everyone the window did not show is unaccounted for, so count them
+  // as still outstanding: they are by definition not in `answered`
+  // either. This makes `atLeast` a floor rather than a guess.
+  const unseen = Math.max(0, sourceTotal - source.length);
+
+  // Truncated verdicts only matter when a name SURVIVED the subtraction.
+  // With nobody left to chase there is nothing that could be wrong, and
+  // warning about an empty list would put a caveat on every quiet row.
+  const certain = outstanding.length === 0 || !verdictsTruncated(pr);
+
+  return {
+    // EMPTIED, not merely flagged, when the verdicts were cut.
+    //
+    // The flag alone would fix only the one caller that reads it. Every
+    // other consumer of `pendingReviewers` -- and the next one somebody
+    // writes -- would keep the wrong name, which is the shape of defect
+    // this repo keeps re-learning: a correctness rule enforced in the
+    // renderer is enforced nowhere. So the suppression lives in the
+    // DATA. A name that might belong to someone who has already approved
+    // is not a worse version of the answer, it is a different and wrong
+    // one, and the honest value for it is nothing.
+    //
+    // Nothing is lost: `atLeast` still says how many are outstanding, so
+    // the caller can report that a review IS pending without naming the
+    // person it cannot vouch for.
+    names: certain ? outstanding : [],
+    certain,
+    atLeast: outstanding.length + unseen,
+    exact: unseen === 0,
+  };
 }
 
 /// Waiting on a reviewer and nobody else.

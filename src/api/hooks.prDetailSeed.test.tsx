@@ -39,6 +39,10 @@ const ROW: PullRequest = {
   requested_reviewers: [],
   assignees: [],
   latest_reviews: [{ author: "hubot", state: "CHANGES_REQUESTED" }],
+  requested_reviewers_total: 0,
+  assignees_total: 0,
+  latest_reviews_total: 1,
+  labels_total: 0,
 };
 
 /// What the command eventually answers with.

@@ -2884,11 +2884,15 @@ function NetworkProcesses() {
           outranks one saturating the link right now.
         </p>
       )}
+      {/* The cadence, and nothing defending it (#1088). What followed
+          the colon argued the sampling cost to a developer and named
+          "the poll driving the rest of this view" -- an internal the
+          reader cannot see, act on, or check. The cadence itself is the
+          fact: it tells the reader how fresh these numbers are and that
+          they stop when the page closes. */}
       <p className="mt-2 text-xs leading-relaxed text-[#8b949e]">
         Re-read every {NET_PROCESSES_POLL_MS / 1000} seconds, and only while
-        this page is open: each reading costs about{" "}
-        {NET_PROCESSES_SAMPLE_MS / 1000} seconds of sampling, which is far too
-        expensive for the poll driving the rest of this view.
+        this page is open.
       </p>
     </div>
   );
@@ -3139,12 +3143,17 @@ function GpuDetail({
           privilege wall that keeps degrees off the Power page keeps
           these off this one. Saying so is better than the reader
           concluding the panel failed to load. */}
+      {/* TRIMMED, not cut (#1088). The privilege constraint STAYS: it
+          is a true fact about the reader's machine, and it is what stops
+          them concluding the panel broke. Only the trailing "so
+          Headstate reports..." went -- that half was the app explaining
+          its own conduct, which the reader neither asked for nor can act
+          on. */}
       <p className="text-xs leading-relaxed text-[#8b949e]">
         There is no list of what is using the GPU. Unlike CPU and memory, the
         system does not attribute graphics work to individual processes without
         elevated privileges — the same wall that keeps temperatures off the
-        Power page — so Headstate reports the device totals it can read rather
-        than a per-process breakdown it would have to guess at.
+        Power page.
       </p>
     </div>
   );
