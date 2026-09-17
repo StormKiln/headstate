@@ -2433,6 +2433,19 @@ mod tests {
     /// silence is about what they DO and not about which file they live
     /// in or what they are called -- which is the failure mode the guard
     /// skill records as "passing for the wrong reason".
+    ///
+    /// **And it was proven on a CRLF checkout**, which sabotage alone does
+    /// not cover: sabotaging a guard shows it reacts to the defect and
+    /// says nothing about the platform it runs on. `every_installed_hook_
+    /// event_has_a_measured_worst_case_record` records this repository
+    /// shipping exactly that -- every sabotage passing, the negative
+    /// direction silent, green on macOS, and `platform (windows-latest)`
+    /// failing because a CRLF checkout made every `\n` a `\r\n`.
+    ///
+    /// So it was reproduced rather than assumed: converting `commands.rs`
+    /// to CRLF and injecting a sync `Command::new` command fails here
+    /// naming it, with no new false positive. The `replace("\r\n", "\n")`
+    /// below is what makes that true, and it is tested.
     #[test]
     fn no_sync_command_reaches_a_subprocess_or_a_whole_file() {
         /// The spellings that mean "another program" or "a file of
