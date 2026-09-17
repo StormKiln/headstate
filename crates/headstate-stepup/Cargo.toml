@@ -3,7 +3,7 @@ name = "headstate-stepup"
 version = "0.1.0"
 license = "Apache-2.0"
 description = "The step-up signature protocol shared by the Headstate desktop and its phone companion: canonical bytes, header grammar, and verification."
-repository = "https://github.com/pktstorm/headstate"
+repository = "https://github.com/StormKiln/headstate"
 edition = "2021"
 # Never published. It exists so the desktop and the phone compile ONE
 # implementation of the signature contract rather than two that happen to

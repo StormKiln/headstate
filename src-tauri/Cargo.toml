@@ -3,7 +3,7 @@ name = "headstate"
 version = "0.1.0"
 license = "Apache-2.0"
 description = "Your work. Your pull requests. One clear status."
-repository = "https://github.com/pktstorm/headstate"
+repository = "https://github.com/StormKiln/headstate"
 edition = "2021"
 
 [lib]

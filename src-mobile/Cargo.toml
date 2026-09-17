@@ -3,7 +3,7 @@ name = "headstate-companion"
 version = "0.1.0"
 license = "Apache-2.0"
 description = "Drive a paired desktop Headstate from your phone."
-repository = "https://github.com/pktstorm/headstate"
+repository = "https://github.com/StormKiln/headstate"
 edition = "2021"
 
 # A SEPARATE crate with its own lockfile, not a member of a workspace with
