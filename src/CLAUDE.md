@@ -51,3 +51,32 @@ as it shows up in the UI.
 
 When a load fails, say **why** in terms the reader can act on, and do not offer
 a retry that cannot succeed (#1050).
+
+## A warning states a fact, not an excuse
+
+A warning says **what is true** and **what the reader can do about it**. It does
+not explain the implementation, name an internal, or defend the app's conduct.
+
+> These are floors, not totals: the transcript is 76.7 MB and only its first
+> 8 MB were read.
+
+That is the whole message. What followed it — *"Reading it whole would hang this
+pane"* — was the defect #1088 is about: it justified a decision the reader did
+not make, and carried a performance claim the code's own measurements did not
+support (`usage.rs` records that transcript rolled up in **0.024 s**).
+
+- **Cut the `so that…` / `which is…` tail.** "Files are read up to a fixed
+  limit" is a fact. "…so that a large one cannot be pulled over the connection
+  whole" is a design note wearing a warning's clothes.
+- **Never name an internal.** "the poll driving the rest of this view" is not
+  something the reader can see, check, or act on.
+- **Keep a constraint that changes what the reader concludes.** "the system does
+  not attribute GPU work per process without elevated privileges" STAYS — it
+  stops them thinking the panel broke. "…so Headstate reports the totals it can
+  read" goes; that half is the app talking about itself.
+- **The rationale belongs in the module docs**, where it is developer-facing and
+  correct. #1088 was one sentence that leaked out of `usage.rs` onto a screen.
+
+Measured claims decay. If a warning states a figure, it must come from the
+response — `measuredFigures.test.ts` enforces this — and never from a constant
+that was true the day it was typed.

@@ -67,6 +67,21 @@ export interface PullRequest {
   assignees: string[];
   /// Who has already reviewed, and what they said.
   latest_reviews: { author: string; state: string }[];
+  /// GitHub's own counts for the four lists above, which those lists can
+  /// be short of (#1089).
+  ///
+  /// Each is the length of its own list when GitHub did not say, never 0
+  /// -- see `connection_total` in `map.rs`. A 0 against a non-empty list
+  /// would render "3 of 0"; absent is not zero.
+  ///
+  /// `latest_reviews_total` is the one that changes an ANSWER rather
+  /// than a count: `pendingReviewers` subtracts the answered from the
+  /// asked, so a reviewer beyond the window is named as still pending
+  /// when they have already approved.
+  requested_reviewers_total: number;
+  assignees_total: number;
+  latest_reviews_total: number;
+  labels_total: number;
 }
 
 /// `merged_week`/`merged_month` are real. The other five derived fields

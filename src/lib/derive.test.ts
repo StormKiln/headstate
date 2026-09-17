@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { PR_FIXTURES, prWithState } from "../fixtures/prs";
 import {
   applyFilters, awaitingReview, changesRequested, deriveStacked, deriveStats,
-  isStale, needsAttention, pendingReviewers, readyToQueue, sortPrs, STALE_DAYS,
+  isStale, needsAttention, pendingReview, pendingReviewers, readyToQueue, sortPrs, STALE_DAYS,
 } from "./derive";
 
 const [approved, broken, checking] = PR_FIXTURES;
@@ -274,10 +274,20 @@ describe("the triage chips reconcile with the repo count", () => {
 /// you can act on. `reviewDecision` cannot say the second -- it
 /// collapses every reviewer into one verdict and names nobody.
 describe("pendingReviewers", () => {
+  /// Totals track the lists by default, so every test below describes a
+  /// COMPLETE pull request unless it says otherwise. A helper that left
+  /// them at 0 would make each of these rows silently truncated and the
+  /// assertions would pass or fail for a reason nobody wrote down.
   const withReviewers = (
     requested: string[],
     reviews: { author: string; state: string }[] = [],
-  ) => ({ ...PR_FIXTURES[0], requested_reviewers: requested, latest_reviews: reviews });
+  ) => ({
+    ...PR_FIXTURES[0],
+    requested_reviewers: requested,
+    latest_reviews: reviews,
+    requested_reviewers_total: requested.length,
+    latest_reviews_total: reviews.length,
+  });
 
   it("names everyone still asked and not yet answered", () => {
     expect(pendingReviewers(withReviewers(["reviewer-one", "hubot"]))).toEqual([
@@ -359,6 +369,197 @@ describe("pendingReviewers", () => {
     delete old.latest_reviews;
     expect(() => pendingReviewers(old as never)).not.toThrow();
     expect(pendingReviewers(old as never)).toEqual([]);
+  });
+});
+
+/// #1089: the verdict list is PAGED, so the answered set can be short --
+/// and every name subtracted against a short set is possibly wrong.
+///
+/// This is not an undercount like the others on the row. It names a
+/// person and tells the reader to chase them, when that person has
+/// already approved. The repo's rule is "qualify, or suppress":
+/// possibly-wrong suppresses.
+describe("pendingReview with a truncated verdict list", () => {
+  /// The exact shape the issue describes: six reviewers were asked, the
+  /// query's window returned five verdicts, and the SIXTH -- the one
+  /// outside the window -- has approved.
+  ///
+  /// Every reviewer here has in fact answered, so the truthful roster is
+  /// empty. The old code could only see five of the six verdicts, so
+  /// `reviewer-six` survived the subtraction and was named as pending.
+  const sixth = () => {
+    const asked = [
+      "reviewer-one",
+      "reviewer-two",
+      "reviewer-three",
+      "reviewer-four",
+      "reviewer-five",
+      "reviewer-six",
+    ];
+    return {
+      ...PR_FIXTURES[0],
+      requested_reviewers: asked,
+      requested_reviewers_total: asked.length,
+      // What a `first: 5` window returns: the first five verdicts.
+      latest_reviews: asked.slice(0, 5).map((author) => ({ author, state: "APPROVED" })),
+      // What GitHub SAYS exists. `reviewer-six`'s approval is in the gap
+      // between this number and the list above.
+      latest_reviews_total: 6,
+    };
+  };
+
+  /// THE test this issue exists for. A person who has approved must not
+  /// be reported as someone you are waiting on.
+  it("does not name a reviewer who approved outside the window as pending", () => {
+    const { names, certain, atLeast } = pendingReview(sixth());
+    expect(names).not.toContain("reviewer-six");
+    // Pinned exactly, not just "does not contain": an empty array
+    // satisfies `not.toContain` whatever the reason, so the assertion
+    // above would pass on a function that returned nothing at all. This
+    // says the suppression is total and deliberate.
+    expect(names).toEqual([]);
+    expect(certain).toBe(false);
+    // And the row is not silenced: a review IS outstanding as far as
+    // this data can tell, so the reader is still told to look -- just
+    // not told WHO, which is the part that could be wrong.
+    expect(atLeast).toBeGreaterThan(0);
+  });
+
+  /// `pendingReviewers`, the older list-only entry point, must get the
+  /// same answer. Fixing this in the renderer alone would leave every
+  /// other caller -- and the next one somebody writes -- with the wrong
+  /// name, which is why the suppression lives in the data.
+  it("suppresses the name through the list-only entry point too", () => {
+    expect(pendingReviewers(sixth())).toEqual([]);
+  });
+
+  /// `certain: false` is what the row reads to suppress the names. If it
+  /// were true, the caller would print `reviewer-six` in full confidence
+  /// -- which is the defect, not the fix.
+  it("reports the roster as unsettled rather than printing a name that may be wrong", () => {
+    expect(pendingReview(sixth()).certain).toBe(false);
+  });
+
+  /// The counterpart, and what stops this from being a warning on every
+  /// row: when the window covered every verdict, the names are exact and
+  /// the caller prints them as before.
+  it("stays certain when every verdict arrived", () => {
+    const pr = {
+      ...PR_FIXTURES[0],
+      requested_reviewers: ["reviewer-one", "hubot"],
+      requested_reviewers_total: 2,
+      latest_reviews: [{ author: "reviewer-one", state: "APPROVED" }],
+      latest_reviews_total: 1,
+    };
+    const { names, certain } = pendingReview(pr);
+    expect(certain).toBe(true);
+    expect(names).toEqual(["hubot"]);
+  });
+
+  /// Truncation only matters when a name survived. With nobody left to
+  /// chase there is nothing that could be wrong, and warning about an
+  /// empty list would put a caveat on every quiet row.
+  it("stays certain when the subtraction left nobody, however truncated", () => {
+    const pr = {
+      ...PR_FIXTURES[0],
+      requested_reviewers: ["reviewer-one"],
+      requested_reviewers_total: 1,
+      latest_reviews: [{ author: "reviewer-one", state: "APPROVED" }],
+      latest_reviews_total: 40,
+    };
+    const { names, certain } = pendingReview(pr);
+    expect(names).toEqual([]);
+    expect(certain).toBe(true);
+  });
+
+  /// A snapshot cached before these totals existed must behave exactly
+  /// as it did before them: names printed, nothing suppressed, no
+  /// caveat. The upgrade path is the whole reason the fields are
+  /// optional.
+  ///
+  /// Scoped honestly. The obvious framing is "absent is not zero", but
+  /// sabotage says otherwise: swapping the `?? fetched` fallback for
+  /// `?? 0` fails NOTHING, because `0 > fetched` is false anyway and
+  /// `unseen` is clamped at 0. So this does not claim to guard that
+  /// fallback -- it guards the BEHAVIOUR an upgrading user sees, which
+  /// is what would actually be noticed if it broke.
+  it("does not call a pull request cached before these totals truncated", () => {
+    const old = {
+      ...PR_FIXTURES[0],
+      requested_reviewers: ["hubot"],
+      latest_reviews: [{ author: "reviewer-one", state: "APPROVED" }],
+    } as Record<string, unknown>;
+    delete old.requested_reviewers_total;
+    delete old.latest_reviews_total;
+    const { names, certain } = pendingReview(old as never);
+    expect(certain).toBe(true);
+    expect(names).toEqual(["hubot"]);
+  });
+
+  /// The `+N` was a precise-looking number computed from a cut list:
+  /// `requested_reviewers` is paged too, so `names.length` is a FLOOR.
+  it("reports the outstanding count as a floor when the asked list was cut", () => {
+    const pr = {
+      ...PR_FIXTURES[0],
+      // Seven were asked; the window returned five.
+      requested_reviewers: ["a", "b", "c", "d", "e"],
+      requested_reviewers_total: 7,
+      latest_reviews: [],
+      latest_reviews_total: 0,
+    };
+    const { names, atLeast, exact } = pendingReview(pr);
+    expect(names).toHaveLength(5);
+    expect(exact).toBe(false);
+    // Five named plus two unseen, not the five the old row would divide.
+    expect(atLeast).toBe(7);
+  });
+
+  it("reports an exact count when the asked list arrived whole", () => {
+    const pr = {
+      ...PR_FIXTURES[0],
+      requested_reviewers: ["a", "b", "c"],
+      requested_reviewers_total: 3,
+      latest_reviews: [],
+      latest_reviews_total: 0,
+    };
+    const { atLeast, exact } = pendingReview(pr);
+    expect(exact).toBe(true);
+    expect(atLeast).toBe(3);
+  });
+
+  /// The assignee fallback is paged too, and its total is a different
+  /// field -- so a floor computed from the wrong one would be silently
+  /// wrong on exactly the repositories the fallback exists for.
+  it("counts the assignee fallback against the assignee total", () => {
+    const pr = {
+      ...PR_FIXTURES[0],
+      requested_reviewers: [],
+      requested_reviewers_total: 0,
+      assignees: ["jieyouxu", "wesleywiser"],
+      assignees_total: 6,
+      latest_reviews: [],
+      latest_reviews_total: 0,
+    };
+    const { names, atLeast, exact } = pendingReview(pr);
+    expect(names).toEqual(["jieyouxu", "wesleywiser"]);
+    expect(exact).toBe(false);
+    expect(atLeast).toBe(6);
+  });
+
+  /// A total smaller than the list is LEGITIMATE, not a negative
+  /// shortfall: the count and the nodes can come from slightly different
+  /// moments. `ReviewThreads` takes the same care.
+  it("does not invent a shortfall when the total lags the list", () => {
+    const pr = {
+      ...PR_FIXTURES[0],
+      requested_reviewers: ["a", "b"],
+      requested_reviewers_total: 1,
+      latest_reviews: [],
+      latest_reviews_total: 0,
+    };
+    const { atLeast, exact } = pendingReview(pr);
+    expect(exact).toBe(true);
+    expect(atLeast).toBe(2);
   });
 });
 

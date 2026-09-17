@@ -383,3 +383,93 @@ describe("PrRow click-through", () => {
     expect(container.querySelector('[role="button"]')).toBeNull();
   });
 });
+
+/// #1089: the row named a person and told the reader to chase them,
+/// when that person had already approved.
+///
+/// `latest_reviews` is paged. A reviewer beyond the window never enters
+/// the answered set, so the subtraction leaves them looking outstanding.
+/// This is the one truncation on the row that produces a WRONG answer
+/// rather than a low one, which is why the names are suppressed rather
+/// than qualified.
+describe("PrRow waiting-on line", () => {
+  /// Six asked, five verdicts returned, and the sixth has approved. The
+  /// truthful roster is empty; the old row printed `r-six`.
+  const sixReviewers = () => {
+    const asked = ["r-one", "r-two", "r-three", "r-four", "r-five", "r-six"];
+    return pr({
+      requested_reviewers: asked,
+      requested_reviewers_total: asked.length,
+      latest_reviews: asked.slice(0, 5).map((author) => ({ author, state: "APPROVED" })),
+      latest_reviews_total: 6,
+    });
+  };
+
+  /// Asserted over the whole rendered row, including the `title`
+  /// attribute the old markup put the full roster in -- `queryByText`
+  /// walks text nodes and would miss a name reachable only through a
+  /// tooltip.
+  ///
+  /// And asserted over EVERY reviewer, not just the sixth. Restoring the
+  /// defect makes the row print "waiting on r-one, r-two +4": `r-six` is
+  /// beyond the `slice(0, 2)`, so a check for that one name passes while
+  /// the row is busily naming four other people it cannot vouch for.
+  /// Sabotage-proved during #1089 -- the single-name version did not
+  /// fail, which is how this loop got written.
+  it("does not name any reviewer it cannot vouch for", () => {
+    const row = sixReviewers();
+    const { container } = render(<PrRow pr={row} />);
+    for (const login of row.requested_reviewers) {
+      expect(container.innerHTML).not.toContain(login);
+    }
+  });
+
+  /// Suppressed, NOT silenced. As far as this data can tell a review is
+  /// still outstanding, so the row must still send the reader to look --
+  /// it just must not say who.
+  it("still says a review is outstanding", () => {
+    render(<PrRow pr={sixReviewers()} />);
+    expect(screen.getByText(/waiting on a review/i)).toBeTruthy();
+  });
+
+  /// The ordinary case must be untouched: when every verdict arrived,
+  /// the names are exact and are printed as before. Without this the
+  /// suppression could swallow every row and the suite would not notice.
+  it("names them plainly when every verdict arrived", () => {
+    const row = pr({
+      requested_reviewers: ["octocat", "hubot"],
+      requested_reviewers_total: 2,
+      latest_reviews: [{ author: "octocat", state: "APPROVED" }],
+      latest_reviews_total: 1,
+    });
+    render(<PrRow pr={row} />);
+    expect(screen.getByText(/waiting on hubot/)).toBeTruthy();
+  });
+
+  /// The "+N" was computed from `requested_reviewers`, which is paged
+  /// too -- so seven asked with a five-item window rendered "+3" from a
+  /// list of five. It is a floor, and says so.
+  it("marks the outstanding count as a floor when the asked list was cut", () => {
+    const row = pr({
+      requested_reviewers: ["a", "b", "c", "d", "e"],
+      requested_reviewers_total: 7,
+      latest_reviews: [],
+      latest_reviews_total: 0,
+    });
+    render(<PrRow pr={row} />);
+    // Seven outstanding, two named: five more, and the figure is a floor.
+    expect(screen.getByText(/at least 5/)).toBeTruthy();
+  });
+
+  it("gives an exact count when the asked list arrived whole", () => {
+    const row = pr({
+      requested_reviewers: ["a", "b", "c", "d"],
+      requested_reviewers_total: 4,
+      latest_reviews: [],
+      latest_reviews_total: 0,
+    });
+    render(<PrRow pr={row} />);
+    expect(screen.getByText(/\+2/)).toBeTruthy();
+    expect(screen.queryByText(/at least/)).toBeNull();
+  });
+});

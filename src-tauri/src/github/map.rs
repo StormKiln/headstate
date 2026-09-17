@@ -215,6 +215,23 @@ fn requested_reviewers(node: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// GitHub's own count for a connection, defaulting to what arrived.
+///
+/// `fetched` is the length of the mapped list, NOT of the raw nodes: the
+/// mappers drop entries they cannot name (a review with no author, a
+/// `requestedReviewer` that is a Team rather than a User), and defaulting
+/// to the raw length would claim we have more than we can show.
+///
+/// The default is the length and NEVER 0. An absent `totalCount` -- a
+/// snapshot cached before #1089 added the field, a partial response that
+/// dropped it -- must read as "nothing missing". A 0 against a non-empty
+/// list renders "3 of 0", which is the absent-is-not-zero defect (#846)
+/// wearing a truncation notice. `review_threads_total` and `checks_total`
+/// state the same rule for the same reason.
+fn connection_total(conn: &Value, fetched: usize) -> u64 {
+    conn["totalCount"].as_u64().unwrap_or(fetched as u64)
+}
+
 /// The logins in a `{ nodes: [{ login }] }` connection.
 fn logins(conn: &Value) -> Vec<String> {
     conn["nodes"]
@@ -423,6 +440,14 @@ fn labels(node: &Value) -> Vec<Label> {
 }
 
 fn map_node(node: &Value) -> Option<PullRequest> {
+    // Bound ahead of the struct literal so each total can default to the
+    // length of the list it describes without mapping anything twice --
+    // the shape `map_detail` already uses for `review_threads_total`.
+    let requested_reviewers = requested_reviewers(node);
+    let assignees = logins(&node["assignees"]);
+    let latest_reviews = latest_reviews(node);
+    let labels = labels(node);
+
     Some(PullRequest {
         id: node["id"].as_str().unwrap_or_default().to_string(),
         number: node["number"].as_u64()?,
@@ -454,10 +479,17 @@ fn map_node(node: &Value) -> Option<PullRequest> {
         // null on repositories without a merge queue, where
         // `isInMergeQueue` is false anyway.
         in_merge_queue: in_merge_queue(node),
-        requested_reviewers: requested_reviewers(node),
-        assignees: logins(&node["assignees"]),
-        latest_reviews: latest_reviews(node),
-        labels: labels(node),
+        requested_reviewers_total: connection_total(
+            &node["reviewRequests"],
+            requested_reviewers.len(),
+        ),
+        assignees_total: connection_total(&node["assignees"], assignees.len()),
+        latest_reviews_total: connection_total(&node["latestReviews"], latest_reviews.len()),
+        labels_total: connection_total(&node["labels"], labels.len()),
+        requested_reviewers,
+        assignees,
+        latest_reviews,
+        labels,
         comment_count: node["totalCommentsCount"].as_u64().unwrap_or(0),
         unresolved_threads: unresolved_threads(node),
     })
@@ -1218,6 +1250,111 @@ mod tests {
         assert_eq!(prs[0].requested_reviewers, vec!["octocat", "hubot"]);
         assert_eq!(prs[0].latest_reviews.len(), 1);
         assert_eq!(prs[0].latest_reviews[0].author, "ghost-reviewer");
+    }
+
+    /// GitHub's own counts are carried, so a truncated list can say so.
+    ///
+    /// The four connections page their results. Without the total, a
+    /// list cut at the window is indistinguishable from a complete one
+    /// (#1089) -- and for `latestReviews` that is not an undercount but
+    /// a wrong ANSWER, since `pendingReviewers` subtracts this list from
+    /// the requested ones.
+    #[test]
+    fn carries_githubs_own_count_for_each_paged_connection() {
+        let v = json!({"search": {"nodes": [{
+            "number": 1, "title": "t", "url": "u",
+            "createdAt": "2026-08-20T10:00:00Z", "updatedAt": "2026-08-20T10:00:00Z",
+            "repository": {"nameWithOwner": "o/r"},
+            "reviewRequests": {"totalCount": 9, "nodes": [
+                {"requestedReviewer": {"login": "octocat"}}
+            ]},
+            "assignees": {"totalCount": 7, "nodes": [{"login": "hubot"}]},
+            "latestReviews": {"totalCount": 23, "nodes": [
+                {"state": "APPROVED", "author": {"login": "octocat"}}
+            ]},
+            // MEASURED live on open kubernetes/kubernetes pull requests:
+            // 28 labels against this query's window of 20. The cut is
+            // real, not hypothetical.
+            "labels": {"totalCount": 28, "nodes": [{"name": "bug", "color": "d73a4a"}]}
+        }]}});
+        let pr = &map_list(&v, "search")[0];
+        assert_eq!(pr.requested_reviewers_total, 9);
+        assert_eq!(pr.assignees_total, 7);
+        assert_eq!(pr.latest_reviews_total, 23);
+        assert_eq!(pr.labels_total, 28);
+    }
+
+    /// ABSENT IS NOT ZERO -- the rule #846 shipped as a defect.
+    ///
+    /// A snapshot cached before #1089 added these fields has no
+    /// `totalCount`. Defaulting to 0 would make every such row claim a
+    /// truncation against a list that is complete, rendering the nonsense
+    /// "1 of 0". The default is the length of the list instead, which
+    /// reads as "nothing missing".
+    #[test]
+    fn an_absent_total_defaults_to_the_list_rather_than_to_zero() {
+        let v = json!({"search": {"nodes": [{
+            "number": 1, "title": "t", "url": "u",
+            "createdAt": "2026-08-20T10:00:00Z", "updatedAt": "2026-08-20T10:00:00Z",
+            "repository": {"nameWithOwner": "o/r"},
+            // Every connection present, none of them counted.
+            "reviewRequests": {"nodes": [{"requestedReviewer": {"login": "octocat"}}]},
+            "assignees": {"nodes": [{"login": "hubot"}, {"login": "ghost"}]},
+            "latestReviews": {"nodes": [
+                {"state": "APPROVED", "author": {"login": "octocat"}}
+            ]},
+            "labels": {"nodes": [{"name": "bug", "color": "d73a4a"}]}
+        }]}});
+        let pr = &map_list(&v, "search")[0];
+        assert_eq!(pr.requested_reviewers_total, 1);
+        assert_eq!(pr.assignees_total, 2);
+        assert_eq!(pr.latest_reviews_total, 1);
+        assert_eq!(pr.labels_total, 1);
+        // Not merely non-zero: each must equal ITS OWN list, or the UI
+        // would compute a shortfall out of a mismatch.
+        assert_eq!(
+            pr.requested_reviewers_total,
+            pr.requested_reviewers.len() as u64
+        );
+        assert_eq!(pr.assignees_total, pr.assignees.len() as u64);
+        assert_eq!(pr.latest_reviews_total, pr.latest_reviews.len() as u64);
+        assert_eq!(pr.labels_total, pr.labels.len() as u64);
+    }
+
+    /// The default is the MAPPED length, not the raw node count.
+    ///
+    /// The mappers drop what they cannot name -- a Team in
+    /// `requestedReviewer`, a review with no author. Defaulting to the
+    /// raw length would claim more than the row can show, which is the
+    /// same "N of M" nonsense in the other direction.
+    #[test]
+    fn an_absent_total_counts_what_survived_mapping_not_what_arrived() {
+        let v = json!({"search": {"nodes": [{
+            "number": 1, "title": "t", "url": "u",
+            "createdAt": "2026-08-20T10:00:00Z", "updatedAt": "2026-08-20T10:00:00Z",
+            "repository": {"nameWithOwner": "o/r"},
+            "reviewRequests": {"nodes": [
+                {"requestedReviewer": {"login": "octocat"}},
+                // A Team: no login, dropped by the mapper.
+                {"requestedReviewer": {}}
+            ]},
+            "latestReviews": {"nodes": [
+                {"state": "APPROVED", "author": {"login": "octocat"}},
+                // No author: dropped.
+                {"state": "COMMENTED", "author": null}
+            ]}
+        }]}});
+        let pr = &map_list(&v, "search")[0];
+        assert_eq!(pr.requested_reviewers.len(), 1);
+        assert_eq!(
+            pr.requested_reviewers_total, 1,
+            "two arrived, one is nameable"
+        );
+        assert_eq!(pr.latest_reviews.len(), 1);
+        assert_eq!(
+            pr.latest_reviews_total, 1,
+            "two arrived, one is attributable"
+        );
     }
 
     /// Empty is ORDINARY. Repositories that assign reviewers through a

@@ -157,6 +157,28 @@ pub struct PullRequest {
     /// reviewer into one verdict and names nobody.
     #[serde(default)]
     pub latest_reviews: Vec<ReviewerVerdict>,
+    /// GitHub's own counts for the four connections above, which the
+    /// lists beside them can be short of (#1089).
+    ///
+    /// Each defaults to the LENGTH OF ITS LIST, never to 0 -- the same
+    /// rule `review_threads_total` and `checks_total` state on
+    /// `PrDetail`. A payload written before this field existed, or a
+    /// partial response that dropped it, must read as "nothing missing";
+    /// a 0 against a non-empty list would render the nonsense "3 of 0"
+    /// and is the absent-is-not-zero defect from #846 all over again.
+    ///
+    /// `latest_reviews_total` is the load-bearing one. `pendingReviewers`
+    /// subtracts the answered from the asked, so a reviewer outside the
+    /// window is reported as still pending when they have approved --
+    /// a wrong answer, not merely a short list.
+    #[serde(default)]
+    pub requested_reviewers_total: u64,
+    #[serde(default)]
+    pub assignees_total: u64,
+    #[serde(default)]
+    pub latest_reviews_total: u64,
+    #[serde(default)]
+    pub labels_total: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -508,6 +530,11 @@ mod attention_tests {
             requested_reviewers: Vec::new(),
             assignees: Vec::new(),
             latest_reviews: Vec::new(),
+            // Zero totals against empty lists: nothing was cut.
+            requested_reviewers_total: 0,
+            assignees_total: 0,
+            latest_reviews_total: 0,
+            labels_total: 0,
         }
     }
 

@@ -1942,12 +1942,23 @@ function SessionUsage({ detail: d }: { detail: ClaudeSessionDetail }) {
               complete sum from one that stopped 8 MB in, which is the #846
               defect with a number on it. It binds on the 16 real files over
               10 MB and on nothing else, so this line is almost never
-              drawn -- which is exactly why it must be there when it is. */}
+              drawn -- which is exactly why it must be there when it is.
+
+              The justification that used to tail this sentence is gone
+              (#1088). "Reading it whole would hang this pane" explained
+              a decision the reader did not make and cannot act on, and
+              put a performance claim on screen that the module's own
+              measurements do not support as written: `usage.rs` records
+              the 76.7 MB transcript rolled up in 0.024 s. The reasoning
+              for the cap belongs in that module's docs, where it is, and
+              not on a warning. What is left is the two facts the reader
+              can use: how big the file is, and how much of it this
+              number covers. */}
           {data.truncated ? (
             <p className="mt-2 text-xs text-[#d29922]">
               These are floors, not totals: the transcript is{" "}
               {formatMb(data.file_bytes)} and only its first {formatMb(data.bytes_read)} were
-              read. Reading it whole would hang this pane.
+              read.
             </p>
           ) : null}
         </>

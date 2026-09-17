@@ -395,9 +395,13 @@ function FilePanel({
           role="status"
           className="rounded border border-[#30363d] bg-[#161b22] px-3 py-2 text-xs text-[#8b949e]"
         >
+          {/* The "so that a large one cannot be pulled over the
+              connection whole" clause is gone (#1088): it explained a
+              developer's choice, named an internal the reader cannot
+              see, and asserted a constraint nothing in this repo
+              measures. The two sizes are the whole actionable fact. */}
           Showing the first {formatSize(data.content.length)} of{" "}
-          {formatSize(data.size)}. Files are read up to a fixed limit so that
-          a large one cannot be pulled over the connection whole.
+          {formatSize(data.size)}. Files are read up to a fixed limit.
         </p>
       ) : null}
       <pre className="overflow-x-auto rounded-md border border-[#30363d] bg-[#0d1117] p-3 text-xs leading-relaxed text-[#e6edf3]">

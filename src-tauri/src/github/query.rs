@@ -114,15 +114,55 @@ query($q: String!, $first: Int!, $after: String) {
         # feature shows nothing at all on whole repositories.
         #
         # Costs nothing: the live query still measures 3 points.
-        assignees(first: 5) { nodes { login } }
+        #
+        # `totalCount` on all four connections below, and the raise from
+        # 5 to 20 on `latestReviews`, are FREE. MEASURED live 2026-09-16,
+        # the same method `poll.rs`'s cost guard records -- this document
+        # extracted verbatim with its `#` comment lines stripped, `gh api
+        # graphql -F first=25` (which is `client.rs`'s real PAGE_SIZE),
+        # three runs each:
+        #
+        # | Document                          | Cost | Wall clock |
+        # |-----------------------------------|------|------------|
+        # | before, `author:@me`              | 2    | 2.23-3.08s |
+        # | after, `author:@me`               | 2    | 2.59-3.18s |
+        # | before, `repo:kubernetes/kubernetes` | 2 | 5.73-5.82s |
+        # | after, `repo:kubernetes/kubernetes`  | 2 | 5.88-6.40s |
+        #
+        # Cost is unchanged at 2, so `MEASURED_COST` in `poll.rs` stands.
+        # That matches what `stats/query.rs:694-720` measured: GitHub
+        # prices the `first:` ARGUMENT, and all four of these were paged
+        # already -- `totalCount` rides along on a connection that is
+        # being paid for either way, and the page SIZE is not the price.
+        #
+        # The truncation is not theoretical. On the same live run,
+        # `labels.totalCount` reached **28** against this `first: 20`
+        # window on open kubernetes/kubernetes pull requests -- a label
+        # the user filters on could simply be absent from a row that
+        # looked complete.
+        assignees(first: 5) { totalCount nodes { login } }
         reviewRequests(first: 5) {
+          totalCount
           nodes { requestedReviewer { ... on User { login } } }
         }
         # Who has already reviewed, and what they said. A different
         # question from `reviewDecision`, which collapses everyone into
         # one verdict and names nobody.
-        latestReviews(first: 5) { nodes { state author { login } } }
-        labels(first: 20) { nodes { name color } }
+        #
+        # 20, NOT 5, to match the detail query (`:529`). `map.rs`'s
+        # `latest_reviews` is shared "so the row and the view it opens
+        # cannot disagree about who reviewed" -- but the MAPPER being
+        # shared does nothing if the page size is not, and at 5 the row
+        # and its detail view could name different reviewers for the
+        # same pull request.
+        #
+        # The cap here is worse than an undercount: `pendingReviewers`
+        # (`derive.ts`) builds its answered set from this list, so a
+        # reviewer who fell outside the window never enters it and is
+        # reported as still pending when they have already APPROVED.
+        # That names a person and tells you to chase someone who is done.
+        latestReviews(first: 20) { totalCount nodes { state author { login } } }
+        labels(first: 20) { totalCount nodes { name color } }
         # 100, the connection maximum, so the badge is an exact count
         # rather than a cap (#810). It was `first: 20`, and the mapper
         # counts the unresolved, un-outdated threads in the window -- so a
@@ -867,6 +907,136 @@ mod tests {
         assert!(
             before_nodes.contains("totalCount"),
             "the thread connection must select totalCount, or truncation is silent again"
+        );
+    }
+
+    /// Every PAGED connection in the list query's node selection must
+    /// select `totalCount`, or its truncation is silent again (#1089).
+    ///
+    /// # Derived, not a list
+    ///
+    /// The obvious guard names the four connections #1089 fixed, and has
+    /// the failure mode `poll.rs`'s cost guard documents as its third
+    /// occurrence: a hand-written list cannot cover the connection nobody
+    /// remembered to add. So this scans for the SHAPE instead -- any
+    /// `name(` taking an argument in the node selection -- exactly as the
+    /// cost guard's deny-list does, and for the same reason. A fifth
+    /// paged connection added tomorrow is covered without anyone editing
+    /// this test.
+    ///
+    /// `reviewThreads` is the one deliberate exemption, and it is
+    /// EXEMPTED BY NAME with its reason recorded beside it: its badge
+    /// counts unresolved, un-outdated threads, while `totalCount`
+    /// includes the resolved and outdated ones. Reading it would
+    /// OVERSTATE the badge, which #808 and #810 both recorded as the
+    /// opposite error. Its own guard above pins its window at 100
+    /// instead, so it is not unguarded -- it is guarded differently.
+    #[test]
+    fn every_paged_connection_in_the_list_query_reports_its_true_total() {
+        // Comment lines first. This repo documents rules directly above
+        // the code they govern, so `latestReviews(` appears in prose here
+        // far more often than in the document -- matching a comment
+        // instead of code is #874's mistake, and these `#` lines are
+        // stripped before the server ever sees them anyway.
+        let doc: String = PRS_QUERY
+            .replace("\r\n", "\n")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let nodes = doc
+            .split_once("... on PullRequest {")
+            .expect("the node selection")
+            .1;
+
+        // `reviewThreads` is exempt for the reason in this test's docs;
+        // `commits`/`contexts` carry no count the UI renders, and the
+        // check list's own total is selected in the DETAIL query where it
+        // is shown.
+        const EXEMPT: [&str; 3] = ["reviewThreads", "commits", "contexts"];
+
+        let mut rest = nodes;
+        let mut checked = 0;
+        while let Some(i) = rest.find('(') {
+            let head = &rest[..i];
+            let start = head
+                .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .map_or(0, |p| p + 1);
+            let name = head[start..].to_string();
+            rest = &rest[i + 1..];
+            if name.is_empty() || EXEMPT.contains(&name.as_str()) {
+                continue;
+            }
+            // The connection's own selection set, up to its `nodes` --
+            // so a sibling connection's `totalCount` further down cannot
+            // satisfy this one. That is the containment mistake the
+            // detail-query guard above already had to avoid.
+            let body = rest.split_once("nodes").map_or(rest, |(b, _)| b);
+            assert!(
+                body.contains("totalCount"),
+                "`{name}(` is a paged connection in PRS_QUERY's node selection \
+                 and does not select `totalCount`, so a truncated list is \
+                 indistinguishable from a complete one (#1089). Add it -- \
+                 measured free, since GitHub prices the `first:` argument and \
+                 this connection is paying for it already."
+            );
+            checked += 1;
+        }
+        // The scan must actually have found something. A refactor that
+        // renamed the split marker would leave `nodes` empty and this
+        // test passing over nothing -- which is a guard reporting safety
+        // it is not checking.
+        assert!(
+            checked >= 4,
+            "expected at least the four connections #1089 fixed, scanned {checked}"
+        );
+    }
+
+    /// `latestReviews` must ask for the same page in BOTH documents.
+    ///
+    /// `map.rs`'s `latest_reviews` is shared between the list and detail
+    /// mappers "so the row and the view it opens cannot disagree about
+    /// who reviewed". Sharing the MAPPER does nothing if the page sizes
+    /// differ: at `first: 5` on the list and `first: 20` on the detail, a
+    /// row and the view it opens could name different reviewers for the
+    /// same pull request, which is precisely what that comment claims the
+    /// design prevents (#1089).
+    ///
+    /// Derived from the two documents rather than asserted against a
+    /// literal, so raising one without the other fails here instead of
+    /// shipping a disagreement no mapper test can see.
+    #[test]
+    fn the_row_and_its_detail_view_ask_for_the_same_reviewers() {
+        fn window(doc: &str) -> String {
+            // Comment lines stripped first: #874's sabotage proof caught a
+            // guard matching its own pattern inside a doc comment, and
+            // both documents discuss `latestReviews` in prose directly
+            // above the field.
+            let code: String = doc
+                .replace("\r\n", "\n")
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let after = code
+                .split_once("latestReviews(")
+                .expect("latestReviews is asked for")
+                .1;
+            after
+                .split_once(')')
+                .expect("the connection closes")
+                .0
+                .trim()
+                .to_string()
+        }
+        let list = window(PRS_QUERY);
+        let detail = window(PR_DETAIL_QUERY);
+        assert_eq!(
+            list, detail,
+            "the list asks for `latestReviews({list})` and the detail view for \
+             `latestReviews({detail})`. A shared mapper cannot reconcile \
+             different page sizes: the row and the view it opens would \
+             disagree about who reviewed (#1089)."
         );
     }
 

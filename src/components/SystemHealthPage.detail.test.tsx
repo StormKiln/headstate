@@ -999,15 +999,25 @@ describe("the Network page", () => {
     /// Asserted as "the page states its own cadence", which is the
     /// user-visible consequence: a panel driven by the health poll
     /// could not truthfully say it re-reads every fifteen seconds.
-    it("states its own slower cadence and why", async () => {
+    ///
+    /// It used to assert the JUSTIFICATION too ("too expensive for the
+    /// poll driving the rest"). #1088 removed that sentence from the
+    /// screen -- a warning states what is true and actionable, not why
+    /// the implementation is the way it is -- so the assertion moved
+    /// with it. The cadence is the fact worth pinning; the excuse was
+    /// the defect.
+    it("states its own slower cadence without defending it", async () => {
       netProcFn.mockResolvedValue([netProc("acme-sync", 501, 1_000, 500)]);
       renderPage();
       await screen.findByText("acme-sync");
-      await screen.findByText(
+      const cadence = await screen.findByText(
         new RegExp(`re-read every ${MOCK_POLL_MS / 1000} seconds`, "i"),
       );
       await screen.findByText(/only while this page is open/i);
-      await screen.findByText(/too expensive for the poll driving the rest/i);
+      // The excuse is GONE, and asserted gone rather than merely
+      // unasserted: dropping the old line would otherwise let the
+      // sentence creep back with nothing to notice.
+      expect(cadence.textContent).not.toMatch(/expensive|sampling|poll driving/i);
     });
 
     /// And it must not run on any OTHER page. The containment is that

@@ -76,6 +76,11 @@ mod tests {
             requested_reviewers: Vec::new(),
             assignees: Vec::new(),
             latest_reviews: Vec::new(),
+            // Zero totals against empty lists: nothing was cut.
+            requested_reviewers_total: 0,
+            assignees_total: 0,
+            latest_reviews_total: 0,
+            labels_total: 0,
         }
     }
 
