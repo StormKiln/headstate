@@ -830,17 +830,67 @@ jobs:
           VALIDATE_MANIFEST
           ASSETS+=("release-assets/latest.json")
 
-          # Idempotent: a rerun after a partial failure -- exactly what
-          # happened on the first v2.0.1 attempt, where all three platforms
-          # built and only this job died -- must upload to the existing
-          # release rather than failing on "already exists".
+          # The release is created EMPTY, then assets are uploaded one at a
+          # time with a retry. Three reasons, and the ordering is the point:
+          #
+          # 1. `gh release create` with assets is ATOMIC. v5.23.2 died on
+          #    `HTTP 500: Error saving asset` partway through the DMG, and
+          #    the whole release rolled back -- `gh release view` returned
+          #    "release not found" with all eight artifacts built, signed
+          #    and notarized on disk.
+          # 2. A failed `publish` is a failed CHECK-RUN, and the gate reads
+          #    every attempt (`allowed-conclusions: success`,
+          #    `wait-for-duplicates: true`). So one transient 500 from
+          #    GitHub's upload endpoint BURNS THE TAG permanently -- the
+          #    job cannot simply be re-run. v5.23.2 was spent this way.
+          # 3. Creating first means a retry has something to upload INTO,
+          #    which is what makes the `view || create` branch below
+          #    genuinely reachable rather than only reachable by a re-run
+          #    the gate forbids.
+          #
+          # Retrying is safe here and repeats no work: every artifact has
+          # already been built, verified and notarized by the time this
+          # step runs. The only thing being retried is an HTTP PUT.
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             echo "Release exists; uploading assets to it."
-            gh release upload "$GITHUB_REF_NAME" "${ASSETS[@]}" --clobber
           else
             gh release create "$GITHUB_REF_NAME" \
               --title "Headstate ${GITHUB_REF_NAME}" \
               --notes "$NOTES" \
-              --generate-notes \
-              "${ASSETS[@]}"
+              --generate-notes
           fi
+
+          # Per asset, so one flaky upload costs one retry rather than the
+          # whole set. `--clobber` makes each attempt idempotent: a retry
+          # after a partial write replaces the asset rather than failing on
+          # "already exists".
+          for asset in "${ASSETS[@]}"; do
+            uploaded=false
+            for attempt in 1 2 3; do
+              if gh release upload "$GITHUB_REF_NAME" "$asset" --clobber; then
+                uploaded=true
+                break
+              fi
+              echo "upload of $asset failed (attempt $attempt/3)" >&2
+              # 15s, then 30s. Long enough for a transient server fault to
+              # pass, short enough that three attempts cannot outlast the
+              # job.
+              [ "$attempt" -lt 3 ] && sleep $((attempt * 15))
+            done
+            if [ "$uploaded" != "true" ]; then
+              echo "::error::could not upload $asset after 3 attempts" >&2
+              exit 1
+            fi
+          done
+
+          # Every asset present, or this job has published a release that
+          # LOOKS complete and is not -- which the updater would then serve.
+          for asset in "${ASSETS[@]}"; do
+            name=$(basename "$asset")
+            gh release view "$GITHUB_REF_NAME" --json assets \
+              --jq '.assets[].name' | grep -qx "$name" || {
+                echo "::error::$name is missing from the published release" >&2
+                exit 1
+              }
+          done
+          echo "published ${#ASSETS[@]} assets"
