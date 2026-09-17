@@ -3,7 +3,7 @@ name = "tauri-plugin-headstate-notify"
 version = "0.1.0"
 license = "Apache-2.0"
 description = "Local user notifications for Headstate Companion: UNUserNotificationCenter on iOS."
-repository = "https://github.com/pktstorm/headstate"
+repository = "https://github.com/StormKiln/headstate"
 edition = "2021"
 # Required by `tauri_plugin::Builder`: the build script publishes the
 # plugin's permission set under this name.

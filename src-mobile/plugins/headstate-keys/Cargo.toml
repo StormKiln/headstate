@@ -3,7 +3,7 @@ name = "tauri-plugin-headstate-keys"
 version = "0.1.0"
 license = "Apache-2.0"
 description = "Hardware-backed step-up signing keys and the TLS session identity for Headstate Companion."
-repository = "https://github.com/pktstorm/headstate"
+repository = "https://github.com/StormKiln/headstate"
 edition = "2021"
 # Required by `tauri_plugin::Builder`: the build script publishes the
 # plugin's permission set under this name.

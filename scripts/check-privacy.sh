@@ -53,7 +53,12 @@ set -euo pipefail
 # case this list exists for -- and a comment that cites a measured
 # constraint without saying where the constraint came from is the kind
 # of unsourced claim this codebase's comments are written to avoid.
-ALLOWED='octocat|pktstorm|tauri-apps|shadcn-ui|rust-lang|actions|dtolnay|Swatinem|typescript-eslint|org|owner|acme|anthropics'
+# `StormKiln` is this repository's owner; `pktstorm` is kept beside it because
+# the repo moved there from a personal account on 2026-09-16 and the old name
+# is still correct in two places that must not be rewritten: the macOS and iOS
+# bundle identifiers (`com.pktstorm.headstate`), which are an APPLE identity
+# rather than a GitHub one and cannot change without a new App Store record.
+ALLOWED='octocat|StormKiln|pktstorm|tauri-apps|shadcn-ui|rust-lang|actions|dtolnay|Swatinem|typescript-eslint|org|owner|acme|anthropics'
 
 # Ticket-ID-shaped tokens (PREFIX-NUMBER) that are legitimate public
 # identifiers, not internal tracker references.

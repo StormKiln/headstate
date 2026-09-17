@@ -44,7 +44,7 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/pktstorm/headstate/releases/latest/download/latest.json"
+        "https://github.com/StormKiln/headstate/releases/latest/download/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDJERUNDQzAzOTlGMjExQzAKUldUQUVmS1pBOHpzTFlCRnlSSnNvdnN6WStjaVZLSWZqMkdKOVVtUG5qeUxJckY1WjAzMU1mbUEK",
       "windows": {
