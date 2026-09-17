@@ -2266,10 +2266,17 @@ describe("how much work a session did", () => {
     expect(screen.queryByText("0")).toBeNull();
   });
 
-  /// The byte budget, STATED. Without this the reader cannot tell a
-  /// complete sum from one that stopped 8 MB into a 76.7 MB file, which
-  /// is #846 with a number on it.
-  it("says the figures are floors when the read stopped at the budget", () => {
+  /// A short read, STATED. Without this the reader cannot tell a complete
+  /// sum from one that stopped part-way, which is #846 with a number on
+  /// it.
+  ///
+  /// Since #1086 the 8 MB budget can no longer cause this on a SELECTED
+  /// session -- that path reads whole -- so what it now guards is the
+  /// backend's remaining `bytes_read < file_bytes` case: a transcript
+  /// that shrank between being sized and being read. The rendering is
+  /// unchanged, and deliberately: the rule is that a partial sum says so,
+  /// whatever made it partial.
+  it("says the figures are floors when the read came back short", () => {
     state.usage = usage({ truncated: true, bytes_read: 8_388_608, file_bytes: 76_740_099 });
     renderView();
     open("HeadState GitHub issues filing");
@@ -2278,8 +2285,10 @@ describe("how much work a session did", () => {
     expect(screen.getByText(/8\.0 MB/)).toBeTruthy();
   });
 
-  /// The happy-path pair for the test above: 97%+ of the corpus is read
-  /// whole, and the common case must not wear a label it has not earned.
+  /// The happy-path pair for the test above, and since #1086 the case
+  /// for EVERY selected session rather than only the 97%+ of the corpus
+  /// under the old cap. A complete sum must not wear a label it has not
+  /// earned.
   it("claims no truncation on a transcript read whole", () => {
     renderView();
     open("HeadState GitHub issues filing");

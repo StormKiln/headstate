@@ -1427,13 +1427,26 @@ pub async fn scan_claude_md(repo_path: String) -> Result<crate::claudemd::Scan, 
 /// Read fresh rather than carried in the scan: the scan holds every file
 /// in a repository, and shipping all of their contents to the frontend
 /// to display one is a lot of bytes crossing the bridge for nothing.
+///
+/// # Why `spawn_blocking` (#1090)
+///
+/// `read_to_string` of an arbitrary path is an UNBOUNDED read: nothing
+/// here caps the file, and `remote/surface.rs` dispatched this inline, so
+/// a large CLAUDE.md held the phone's listener as well as the desktop's
+/// runtime. A `stat` is one syscall and stays inline elsewhere in this
+/// file; reading a whole file is not, and that is the line
+/// `no_sync_command_reaches_a_subprocess_or_a_whole_file` draws.
 #[tauri::command]
-pub fn read_claude_md(path: String) -> Result<String, String> {
+pub async fn read_claude_md(path: String) -> Result<String, String> {
     // No containment check because there is no write here and no
     // deletion -- this reads a path the user picked from a list the app
     // produced. The risk a containment check guards against elsewhere
     // (`remove_dir_all` on an arbitrary path) does not exist for a read.
-    std::fs::read_to_string(&path).map_err(|e| format!("could not read {path}: {e}"))
+    tauri::async_runtime::spawn_blocking(move || {
+        std::fs::read_to_string(&path).map_err(|e| format!("could not read {path}: {e}"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Remove a worktree, refusing anything not provably safe.
@@ -1738,8 +1751,20 @@ pub fn docker_remove_images(ids: Vec<String>) -> Vec<crate::docker::RemovalOutco
 
 #[tauri::command]
 /// Volumes attached to nothing.
-pub fn docker_dangling_volumes() -> Result<Vec<crate::docker::DanglingVolume>, String> {
-    crate::docker::dangling_volumes()
+///
+/// `spawn_blocking` for the reason `docker_builds` gives (#496, #1090):
+/// this runs two `docker` subprocesses, and `docker/reclaim.rs` measures
+/// `system df -v` at 1.94 s cold. Inline that is a worker held for two
+/// seconds -- or for the full 20 s `CALL_TIMEOUT` with the daemon
+/// mid-restart -- and the whole UI freezes, not just the Docker page.
+///
+/// `remote/surface.rs` already wrapped this arm for the phone, citing
+/// #496 in as many words. The desktop path did not, and that asymmetry is
+/// what proved this was a live defect rather than a theoretical one.
+pub async fn docker_dangling_volumes() -> Result<Vec<crate::docker::DanglingVolume>, String> {
+    tauri::async_runtime::spawn_blocking(crate::docker::dangling_volumes)
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1760,8 +1785,16 @@ pub fn docker_prune_cache(until: Option<String>) -> Result<u64, String> {
 
 #[tauri::command]
 /// Containers a restart would stop, so the confirmation can name them.
-pub fn docker_running_containers() -> Result<Vec<String>, String> {
-    crate::docker::running_containers()
+///
+/// `spawn_blocking` for the same reason as `docker_dangling_volumes`
+/// above (#1090): it shells out to the daemon, and a daemon that is not
+/// answering holds the caller for `CALL_TIMEOUT`. This one fires behind a
+/// confirmation dialog, which is precisely when a frozen UI is least
+/// explicable.
+pub async fn docker_running_containers() -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(crate::docker::running_containers)
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1988,20 +2021,47 @@ pub fn claudify_command(
 /// A branch that has moved since is dropped: the assessment described a
 /// different state, and offering an override on a stale verdict is
 /// exactly the mistake this feature could otherwise introduce.
-pub fn assessed_worktrees(app: AppHandle) -> Vec<String> {
-    let Ok(conn) = open_db(&db_path(&app)) else {
-        return Vec::new();
-    };
-    let seen: std::collections::BTreeMap<String, String> =
-        settings::get(&conn, settings::keys::ASSESSED_WORKTREES)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+///
+/// # Why `spawn_blocking` (#1090)
+///
+/// This opens SQLite and then runs `git rev-parse HEAD` -- a real
+/// subprocess with a three-attempt spawn retry -- ONCE PER assessed
+/// worktree, sequentially. The reporting machine carries ~295 worktrees
+/// across 38 repositories, and `useAssessed`'s `staleTime: 5_000` re-runs
+/// this on a five-second cadence for as long as the Worktrees page is
+/// open. As a plain `fn` that is N subprocesses on an async runtime
+/// worker every five seconds, which is the freeze
+/// `docker_commands_never_block_the_async_runtime` was written about --
+/// and `remote/surface.rs` dispatched it inline, so it stalled the
+/// phone's HTTP listener as well.
+///
+/// The payload is a list of strings, so there is nothing to stream: the
+/// whole fix is getting the work off the runtime.
+pub async fn assessed_worktrees(app: AppHandle) -> Vec<String> {
+    let db = db_path(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let Ok(conn) = open_db(&db) else {
+            return Vec::new();
+        };
+        let seen: std::collections::BTreeMap<String, String> =
+            settings::get(&conn, settings::keys::ASSESSED_WORKTREES)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
 
-    seen.into_iter()
-        .filter(|(path, oid)| crate::worktrees::head_oid(path).is_ok_and(|current| &current == oid))
-        .map(|(path, _)| path)
-        .collect()
+        seen.into_iter()
+            .filter(|(path, oid)| {
+                crate::worktrees::head_oid(path).is_ok_and(|current| &current == oid)
+            })
+            .map(|(path, _)| path)
+            .collect()
+    })
+    .await
+    // A join failure is a panic in the closure above, and this command
+    // returns no error channel. Empty is what every other failure path
+    // here already returns -- an unreadable database, an unparseable
+    // setting -- so the badge is simply absent rather than wrong.
+    .unwrap_or_default()
 }
 
 /// The clipboard payload, plus whether Claude Code was actually found.
@@ -2511,17 +2571,22 @@ pub async fn stats_count(
     // its key would otherwise be byte-identical to a whole-scope count's.
     let key = crate::store::stats::key(crate::store::stats::Kind::Count, &q.cache_key(&viewer));
 
-    let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
-    // Before any read: if the token now belongs to someone else, the rows
-    // in this table are the previous user's (#840). Non-fatal -- the
-    // answer below is correct either way, and failing a stats load
-    // because a cache could not be tidied would be the tail wagging the
-    // dog.
-    note_stats_viewer(&conn, &viewer);
-    if let Ok(Some(hit)) = crate::store::stats::get(&conn, &key, &window.from, &window.to, now) {
-        if let Ok(mut cached) = serde_json::from_str::<crate::github::stats::Outcome>(&hit.payload)
-        {
-            crate::diag!("[diag] cmd stats_count cache hit total={}", hit.total);
+    // `stats_cache_read` rather than an inline `open_db`, since #1090: the
+    // viewer note and the cache query are SQLite on an async runtime
+    // worker, and this command's `async fn` signature hid that.
+    let db = db_path(&app);
+    let hit = stats_cache_read(
+        db.clone(),
+        viewer.clone(),
+        key.clone(),
+        window.from.clone(),
+        window.to.clone(),
+        now,
+    )
+    .await?;
+    if let Some(payload) = hit {
+        if let Ok(mut cached) = serde_json::from_str::<crate::github::stats::Outcome>(&payload) {
+            crate::diag!("[diag] cmd stats_count cache hit total={}", cached.total);
             // A cache HIT still cost the viewer lookup, so it reports that
             // rather than the spend of the load that originally filled the
             // row. Stating a stale figure would be worse than either: a user
@@ -2583,21 +2648,21 @@ pub async fn stats_count(
         // remembering, and a partial one is stored WITH its partiality
         // (`complete`) so it cannot be read back as a confident number.
         if let Ok(payload) = serde_json::to_string(o) {
-            if let Err(e) = crate::store::stats::put(
-                &conn,
-                &key,
-                &window.from,
-                &window.to,
+            // Non-fatal, and off the runtime (#1090): `put` serialises and
+            // COMMITS, which is an `fsync`. `stats_cache_put` carries the
+            // "never fail the command over a cache" reasoning that used to
+            // live inline here.
+            stats_cache_put(
+                db,
+                key,
+                window.from.clone(),
+                window.to.clone(),
                 o.total,
                 o.is_complete(),
-                &payload,
+                payload,
                 now,
-            ) {
-                // Non-fatal: the answer is already correct, and failing
-                // the command because the cache could not be written
-                // would turn an optimisation into a liability.
-                log::warn!("could not cache the stats answer: {e}");
-            }
+            )
+            .await;
         }
     }
     out
@@ -2771,6 +2836,80 @@ fn note_stats_viewer(conn: &rusqlite::Connection, viewer: &str) {
             }
         }
         Err(e) => log::warn!("could not record the stats viewer: {e}"),
+    }
+}
+
+/// Note the viewer and read the cached row, off the async runtime (#1090).
+///
+/// # Why this exists rather than an inline `open_db`
+///
+/// All three stats commands are `async fn` and correctly `await` their
+/// GitHub work -- and then opened SQLite, ran `note_viewer` (which can
+/// DELETE rows), and queried `stats_cache` directly in the async body.
+/// That looks async and blocks anyway: a file open, a schema check, a
+/// delete and a query on a runtime worker, three call sites deep in the
+/// one place a reviewer would assume was already safe because the
+/// signature says `async`.
+///
+/// Both halves of the cache are wrapped -- this and [`stats_cache_put`]
+/// -- so the `Connection` never crosses an `.await` at all. That also
+/// keeps clippy quiet: a `rusqlite::Connection` held across an await in a
+/// `Send` future is exactly the shape the runtime cannot move.
+///
+/// Returns the payload TEXT rather than a parsed value, because the three
+/// commands deserialise into three different types and the parse is
+/// microseconds of CPU with no I/O in it.
+async fn stats_cache_read(
+    db: std::path::PathBuf,
+    viewer: String,
+    key: String,
+    from: String,
+    to: String,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&db).map_err(|e| e.to_string())?;
+        // Before any read: if the token now belongs to someone else, the
+        // rows in this table are the previous user's (#840).
+        note_stats_viewer(&conn, &viewer);
+        Ok(crate::store::stats::get(&conn, &key, &from, &to, now)
+            .ok()
+            .flatten()
+            .map(|hit| hit.payload))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Write one answer to `stats_cache`, off the async runtime (#1090).
+///
+/// Failure is LOGGED, never returned, for the reason each call site
+/// already gave in its own words: the answer is correct whether or not it
+/// was cached, and failing a stats load because a cache could not be
+/// written would turn an optimisation into a liability. A panicked join
+/// is folded into the same outcome, since it means the same thing to the
+/// caller -- the row is not there.
+#[allow(clippy::too_many_arguments)]
+async fn stats_cache_put(
+    db: std::path::PathBuf,
+    key: String,
+    from: String,
+    to: String,
+    total: u64,
+    complete: bool,
+    payload: String,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let wrote = tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&db).map_err(|e| e.to_string())?;
+        crate::store::stats::put(&conn, &key, &from, &to, total, complete, &payload, now)
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    match wrote {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log::warn!("could not cache the stats answer: {e}"),
+        Err(e) => log::warn!("the stats cache write task failed: {e}"),
     }
 }
 
@@ -2957,12 +3096,19 @@ pub async fn stats_board(
     // leaderboard already on disk.
     let q = crate::github::stats::StatsQuery::new(None, req.scope.clone(), measure);
     let key = crate::store::stats::key(crate::store::stats::Kind::Board, &q.cache_key(&viewer));
-    let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
-    note_stats_viewer(&conn, &viewer);
-    if let Ok(Some(hit)) =
-        crate::store::stats::get(&conn, &key, &req.window.from, &req.window.to, now)
-    {
-        if let Ok(cached) = serde_json::from_str::<StatsBoard>(&hit.payload) {
+    // Off the runtime since #1090; see `stats_cache_read`.
+    let db = db_path(&app);
+    let hit = stats_cache_read(
+        db.clone(),
+        viewer.clone(),
+        key.clone(),
+        req.window.from.clone(),
+        req.window.to.clone(),
+        now,
+    )
+    .await?;
+    if let Some(payload) = hit {
+        if let Ok(cached) = serde_json::from_str::<StatsBoard>(&payload) {
             crate::diag!(
                 "[diag] cmd stats_board cache hit authors={} complete={}",
                 cached.board.rows.len(),
@@ -3018,21 +3164,30 @@ pub async fn stats_board(
         &client, &req.scope, measure, window, &budget,
     )
     .await
-    .map(|loaded| {
-        let board = accumulate_board(
-            &app,
-            &scope_key,
-            &req.window.from,
-            &req.window.to,
-            loaded,
-            now,
-        );
-        StatsBoard {
-            viewer: viewer.clone(),
-            board,
-        }
-    })
     .map_err(|e| e.to_string());
+    // `accumulate_board` is `await`ed rather than folded into a `.map()`
+    // since #1090: it does the heaviest database work in this command --
+    // `put_many`, `prune` and `load` over the accumulated corpus -- and
+    // inside a synchronous `.map()` on an async chain every byte of that
+    // ran on a runtime worker.
+    let out = match out {
+        Ok(loaded) => {
+            let board = accumulate_board(
+                db.clone(),
+                scope_key.clone(),
+                req.window.from.clone(),
+                req.window.to.clone(),
+                loaded,
+                now,
+            )
+            .await;
+            Ok(StatsBoard {
+                viewer: viewer.clone(),
+                board,
+            })
+        }
+        Err(e) => Err(e),
+    };
     crate::diag!(
         "[diag] cmd stats_board end {}ms {}",
         started.elapsed().as_millis(),
@@ -3070,18 +3225,18 @@ pub async fn stats_board(
         // because the split has to travel with the board it was made
         // against (see `StatsBoard`).
         if let Ok(payload) = serde_json::to_string(b) {
-            if let Err(e) = crate::store::stats::put(
-                &conn,
-                &key,
-                &req.window.from,
-                &req.window.to,
+            // Off the runtime since #1090; see `stats_cache_put`.
+            stats_cache_put(
+                db,
+                key,
+                req.window.from.clone(),
+                req.window.to.clone(),
                 b.board.total,
                 b.board.complete,
-                &payload,
+                payload,
                 now,
-            ) {
-                log::warn!("could not cache the stats board: {e}");
-            }
+            )
+            .await;
         }
     }
     out
@@ -3109,8 +3264,39 @@ pub async fn stats_board(
 /// `(repo, number, additions, deletions, mergedAt)` set for every node. So
 /// a stored row about a closed window never needs re-fetching, which is
 /// what makes repeated loads add rather than replace them.
-fn accumulate_board(
-    app: &AppHandle,
+///
+/// # Why `spawn_blocking` (#1090)
+///
+/// This is the heaviest database work in the stats path -- a bulk
+/// `put_many`, a `prune` over the whole table, and a `load` back -- and it
+/// used to run inside a synchronous `.map()` on `stats_board`'s async
+/// chain, which put all of it on a runtime worker. Taking the database
+/// PATH rather than an `AppHandle` is what lets the whole body move: the
+/// `Connection` then never has to be `Send` across an `.await`, because it
+/// is created and dropped inside the closure.
+async fn accumulate_board(
+    db: std::path::PathBuf,
+    scope_key: String,
+    window_start: String,
+    window_end: String,
+    loaded: crate::github::stats::board::LoadedBoard,
+    now: chrono::DateTime<chrono::Utc>,
+) -> crate::github::stats::Board {
+    let fallback = loaded.board.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        accumulate_board_blocking(&db, &scope_key, &window_start, &window_end, loaded, now)
+    })
+    .await
+    // A panicked join means the accumulation did not happen. The
+    // single-fetch board is what every other failure path in the blocking
+    // half already degrades to, and it is an honest answer -- today's
+    // behaviour, not a wrong number.
+    .unwrap_or(fallback)
+}
+
+/// The blocking half of [`accumulate_board`].
+fn accumulate_board_blocking(
+    db: &std::path::Path,
     scope_key: &str,
     window_start: &str,
     window_end: &str,
@@ -3120,7 +3306,7 @@ fn accumulate_board(
     use crate::store::pr_history;
 
     let crate::github::stats::board::LoadedBoard { board, prs } = loaded;
-    let Ok(mut conn) = open_db(&db_path(app)) else {
+    let Ok(mut conn) = open_db(db) else {
         log::warn!("could not open the database to accumulate PR stats");
         return board;
     };
@@ -3274,12 +3460,19 @@ pub async fn stats_series(
         .await
         .map_err(|e| e.to_string())?;
     let key = crate::store::stats::key(crate::store::stats::Kind::Series, &q.cache_key(&viewer));
-    let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
-    note_stats_viewer(&conn, &viewer);
-    if let Ok(Some(hit)) =
-        crate::store::stats::get(&conn, &key, &req.window.from, &req.window.to, now)
-    {
-        if let Ok(cached) = serde_json::from_str::<crate::github::stats::Series>(&hit.payload) {
+    // Off the runtime since #1090; see `stats_cache_read`.
+    let db = db_path(&app);
+    let hit = stats_cache_read(
+        db.clone(),
+        viewer.clone(),
+        key.clone(),
+        req.window.from.clone(),
+        req.window.to.clone(),
+        now,
+    )
+    .await?;
+    if let Some(payload) = hit {
+        if let Ok(cached) = serde_json::from_str::<crate::github::stats::Series>(&payload) {
             crate::diag!(
                 "[diag] cmd stats_series cache hit points={}",
                 cached.points.len()
@@ -3335,18 +3528,18 @@ pub async fn stats_series(
         if let Ok(payload) = serde_json::to_string(series) {
             // See the doc above for why `total` is the merged sum.
             let total = series.points.iter().map(|p| p.merged).sum();
-            if let Err(e) = crate::store::stats::put(
-                &conn,
-                &key,
-                &req.window.from,
-                &req.window.to,
+            // Off the runtime since #1090; see `stats_cache_put`.
+            stats_cache_put(
+                db,
+                key,
+                req.window.from.clone(),
+                req.window.to.clone(),
                 total,
                 series.is_complete(),
-                &payload,
+                payload,
                 now,
-            ) {
-                log::warn!("could not cache the stats series: {e}");
-            }
+            )
+            .await;
         }
     }
     out
@@ -4113,8 +4306,24 @@ fn transcript_path_in(root: &std::path::Path, path: &str) -> Result<std::path::P
 /// Summed from the session's OWN transcript, on demand, because the
 /// rollup is 11x the cost of the startup scan's head+tail read and must
 /// never join it -- `claude::usage`'s module docs carry the measurement.
-/// One session's detail pane costs one bounded read: ~1.2 ms for the
-/// 76.7 MB worst case on the development machine.
+///
+/// # Whole, not bounded (#1086)
+///
+/// `summarise_whole`, not `summarise`. A SELECTED session is one file the
+/// user explicitly asked about, read once, off the runtime. The cap this
+/// used to inherit made every figure a floor for exactly the long
+/// sessions where the question is real, and the UI then had to say so:
+/// the largest transcript in the measured corpus holds 16,748 messages
+/// and the capped read reported 1,250 of them.
+///
+/// MEASURED at 160 ms release for that 76.7 MB file, not the 24 ms #1086
+/// predicted -- see `usage::summarise_whole`, which records the
+/// disagreement rather than quietly adopting the better number.
+///
+/// `BUDGET_BYTES` is untouched and still bounds the bulk path -- the
+/// 3.8 s figure it defends against is a whole-CORPUS read over 1,502
+/// files, which is a different question from this one. See that
+/// constant's docs.
 ///
 /// `Class::Read`. It reads one file under `~/.claude/projects` and writes
 /// nothing, and the phone wants this answer for the same reason the
@@ -4130,10 +4339,12 @@ fn transcript_path_in(root: &std::path::Path, path: &str) -> Result<std::path::P
 #[tauri::command]
 pub async fn claude_session_usage(path: String) -> Result<crate::claude::usage::Usage, String> {
     let p = claude_transcript_path(&path)?;
-    // `spawn_blocking` because it reads up to 8 MB off disk, which does
-    // not belong on the async runtime -- the same reason
-    // `claude_sessions` wraps its query.
-    tauri::async_runtime::spawn_blocking(move || crate::claude::usage::summarise(&p))
+    // `spawn_blocking` because it reads a whole transcript off disk --
+    // 76.7 MB for the largest in the measured corpus -- which does not
+    // belong on the async runtime, the same reason `claude_sessions`
+    // wraps its query. Removing the byte cap (#1086) makes this MORE
+    // load-bearing, not less.
+    tauri::async_runtime::spawn_blocking(move || crate::claude::usage::summarise_whole(&p))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -4801,6 +5012,26 @@ mod tests {
     /// Asserted on the source for the same reason as the enrichment
     /// check above: the behaviour needs a Docker daemon, and this bug
     /// survived precisely because nothing looked.
+    ///
+    /// # Why this list is now SIX names and not four, and why it stays
+    ///
+    /// The general rule moved to
+    /// `invariants::no_sync_command_reaches_a_subprocess_or_a_whole_file`,
+    /// which covers every `#[tauri::command]` in all three crates rather
+    /// than a list anyone has to remember to extend. #1090's finding was
+    /// exactly that gap: `docker_dangling_volumes` and
+    /// `docker_running_containers` shell out too, were both plain `fn`,
+    /// and sat one name away from a rule that already covered them in
+    /// spirit.
+    ///
+    /// This is kept, extended to those two, because it asserts something
+    /// the general guard deliberately cannot see. The general guard reads
+    /// a command's OWN body and does not follow calls -- see its doc on
+    /// why one hop of name-matching produced four false positives out of
+    /// six flags. Every command below delegates to `crate::docker`, so
+    /// none of them names `Command::new` itself, and reverting any one to
+    /// `pub fn` would be invisible to a body scan. The signature check
+    /// here is what catches that, for the six commands measured to hurt.
     #[test]
     fn docker_commands_never_block_the_async_runtime() {
         let src = include_str!("commands.rs");
@@ -4809,6 +5040,10 @@ mod tests {
             "docker_state",
             "docker_images",
             "docker_disk_usage",
+            // Added by #1090. `docker/reclaim.rs` measures `system df -v`
+            // at 1.94 s cold, and `CALL_TIMEOUT` is 20 s.
+            "docker_dangling_volumes",
+            "docker_running_containers",
         ] {
             assert!(
                 src.contains(&format!("pub async fn {name}")),
@@ -4821,6 +5056,55 @@ mod tests {
                 "{name} still has a blocking signature"
             );
         }
+    }
+
+    /// `assessed_worktrees` does not hold a runtime worker while
+    /// spawning git (#1090).
+    ///
+    /// # Why a source check rather than a behavioural one
+    ///
+    /// The same trade the Docker checks above make, and for a sharper
+    /// reason: the defect is not in what this command RETURNS, which is
+    /// correct and was never in doubt. It is in which thread the
+    /// `git rev-parse HEAD` subprocesses run on -- once per assessed
+    /// worktree, ~295 of them on the reporting machine, on `useAssessed`'s
+    /// five-second cadence. A behavioural test would need a runtime, a
+    /// database, and a few hundred real worktrees to observe anything at
+    /// all, and would still be asserting on wall-clock time.
+    ///
+    /// The general guard in `invariants.rs` cannot see this one either:
+    /// the subprocess is inside `worktrees::head_oid`, one call away.
+    #[test]
+    fn assessed_worktrees_spawns_its_git_off_the_runtime() {
+        let src = include_str!("commands.rs");
+        assert!(
+            src.contains("pub async fn assessed_worktrees"),
+            "assessed_worktrees must be `pub async fn`: it runs \
+             `git rev-parse HEAD` once per assessed worktree, and as a \
+             plain `fn` those subprocesses ran on the async runtime's \
+             worker every five seconds"
+        );
+        let start = src
+            .find("pub async fn assessed_worktrees")
+            .expect("assessed_worktrees not found");
+        let rest = &src[start + 1..];
+        let end = rest
+            .find("\n#[tauri::command]")
+            .map(|i| start + 1 + i)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        assert!(
+            body.contains("spawn_blocking"),
+            "assessed_worktrees is async but does its git work on the \
+             runtime anyway -- an `async fn` that never yields blocks \
+             exactly as hard as a plain one"
+        );
+        assert!(
+            body.contains("head_oid"),
+            "assessed_worktrees must still expire an assessment whose \
+             branch has moved; without the head check it would offer an \
+             override on a stale verdict"
+        );
     }
 
     /// Every stats command must WRITE its answer to `stats_cache`.
@@ -4847,6 +5131,76 @@ mod tests {
     /// matter: the `put` has to be inside THAT command's body, and the
     /// `Kind` has to be the right one -- so deleting one command's caching
     /// or copy-pasting another's discriminator both fail here.
+    /// One stats command's body, PLUS the two cache helpers it delegates
+    /// to.
+    ///
+    /// # Why the helpers are concatenated rather than followed by name
+    ///
+    /// #1090 moved the cache read and the cache write out of each
+    /// command's async body and into `stats_cache_read` and
+    /// `stats_cache_put`, because `open_db`, `note_viewer`, `get` and a
+    /// committing `put` were all running on the async runtime inside three
+    /// functions whose `async fn` signature implied otherwise.
+    ///
+    /// The three guards below assert about `store::stats::get`,
+    /// `store::stats::put` and `note_stats_viewer`, all of which now live
+    /// one hop away. Weakening them to a whole-file grep would destroy the
+    /// property their docs name -- *"the `put` has to be inside THAT
+    /// command's body"* -- so instead the hop is followed EXPLICITLY, to
+    /// two helpers named here by hand.
+    ///
+    /// Named by hand, and not by matching call names generally, for the
+    /// reason `invariants::no_sync_command_reaches_a_subprocess_or_a_whole_file`
+    /// records at length: following bare names one level reported four
+    /// false positives out of six flags, because short names collide
+    /// across a crate this size. Two names, spelled out, cannot collide.
+    ///
+    /// The cost is that a THIRD helper would have to be added here. That
+    /// is a real gap and it is the reason `checked_helpers` below asserts
+    /// both helpers were actually found: if one is renamed, these guards
+    /// fail loudly rather than silently scanning a body that no longer
+    /// contains what they are looking for.
+    fn stats_command_body(src: &str, name: &str) -> String {
+        let one = |needle: &str| -> String {
+            let start = src
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} not found in commands.rs"));
+            // To the start of the NEXT item, so the window is this
+            // function's body and not its neighbour's.
+            let rest = &src[start + 1..];
+            let end = rest
+                .find("\n#[tauri::command]")
+                .map(|i| start + 1 + i)
+                .unwrap_or(src.len());
+            let end = rest
+                .find("\n/// ")
+                .map(|i| (start + 1 + i).min(end))
+                .unwrap_or(end);
+            src[start..end].to_string()
+        };
+        let body = one(&format!("pub async fn {name}("));
+        // The delegation has to be REAL. Asserting the command actually
+        // calls each helper is what stops this from quietly turning into
+        // the whole-file grep it exists to avoid: a command that stopped
+        // caching altogether would otherwise still pass, because the
+        // helper it no longer calls still contains the `put`.
+        for helper in ["stats_cache_read(", "stats_cache_put("] {
+            assert!(
+                body.contains(helper),
+                "{name} no longer calls `{helper}`. Either its caching was \
+                 removed -- which is the defect #836 and #840's guards \
+                 exist to catch -- or the helper was renamed, in which \
+                 case update `stats_command_body` rather than deleting \
+                 the assertion it feeds"
+            );
+        }
+        format!(
+            "{body}\n{}\n{}",
+            one("async fn stats_cache_read("),
+            one("async fn stats_cache_put(")
+        )
+    }
+
     #[test]
     fn every_stats_command_writes_its_answer_to_the_cache() {
         let src = include_str!("commands.rs");
@@ -4855,19 +5209,10 @@ mod tests {
             ("stats_board", "Kind::Board"),
             ("stats_series", "Kind::Series"),
         ] {
-            let start = src
-                .find(&format!("pub async fn {name}("))
-                .unwrap_or_else(|| panic!("{name} not found"));
-            // To the start of the NEXT command, so the window is this
-            // function's body and not its neighbour's. Every stats
-            // command is followed by another `#[tauri::command]` or by the
-            // test module, so the fallback is the end of the file.
-            let rest = &src[start + 1..];
-            let end = rest
-                .find("#[tauri::command]")
-                .map(|i| start + 1 + i)
-                .unwrap_or(src.len());
-            let body = &src[start..end];
+            // The command's body plus the two cache helpers it delegates
+            // to since #1090. See `stats_command_body` on why the hop is
+            // followed explicitly rather than by relaxing the scope.
+            let body = stats_command_body(src, name);
             assert!(
                 body.contains("store::stats::put("),
                 "{name} must cache its answer (#836); without it a closed \
@@ -4912,29 +5257,65 @@ mod tests {
     /// give: these commands need an authenticated client and live requests.
     /// A position check is weak, but it is the property itself, and the
     /// alternative was nothing.
+    ///
+    /// # Where the ordering lives since #1090
+    ///
+    /// All three commands now reach both calls through `stats_cache_read`,
+    /// which does the note and the read inside ONE function body. That
+    /// makes the ordering structural rather than repeated: there is one
+    /// place it can be got wrong, instead of three.
+    ///
+    /// So the check is in two halves, and both are needed. The ordering is
+    /// asserted in the helper, where the two calls actually sit. Each
+    /// command is then asserted to REACH the helper -- because a command
+    /// that stopped calling it would satisfy an ordering check on a body
+    /// it no longer executes, which is precisely the "passing for the
+    /// wrong reason" failure the `guard` skill warns about.
     #[test]
     fn the_identity_check_precedes_every_cache_read() {
         let src = include_str!("commands.rs");
+
+        // Half one: the ordering, in the single body that owns it.
+        let helper_at = src.find("async fn stats_cache_read(").expect(
+            "stats_cache_read not found; if the cache read moved, \
+                     move this assertion with it rather than deleting it",
+        );
+        let helper = &src[helper_at..];
+        let helper = &helper[..helper
+            .find("\nasync fn stats_cache_put(")
+            .unwrap_or(helper.len())];
+        let note = helper
+            .find("note_stats_viewer(")
+            .expect("stats_cache_read must note the viewer (#840)");
+        let read = helper
+            .find("store::stats::get(")
+            .expect("stats_cache_read must read the cache");
+        assert!(
+            note < read,
+            "stats_cache_read reads the cache before checking whether the \
+             token still belongs to the same person; on a board -- whose \
+             key carries no login -- that serves another account's rows \
+             and splits Mine/Others against the wrong viewer"
+        );
+
+        // Half two: every command actually goes through it. Without this
+        // the assertion above would hold over code nothing calls.
         for name in ["stats_count", "stats_board", "stats_series"] {
-            let start = src.find(&format!("pub async fn {name}(")).unwrap();
+            let start = src
+                .find(&format!("pub async fn {name}("))
+                .unwrap_or_else(|| panic!("{name} not found"));
             let rest = &src[start + 1..];
             let end = rest
-                .find("#[tauri::command]")
+                .find("\n#[tauri::command]")
                 .map(|i| start + 1 + i)
                 .unwrap_or(src.len());
-            let body = &src[start..end];
-            let note = body
-                .find("note_stats_viewer(")
-                .unwrap_or_else(|| panic!("{name} must call note_stats_viewer"));
-            let read = body
-                .find("store::stats::get(")
-                .unwrap_or_else(|| panic!("{name} must read the cache"));
             assert!(
-                note < read,
-                "{name} reads the cache before checking whether the token \
-                 still belongs to the same person; on a board -- whose key \
-                 carries no login -- that serves another account's rows and \
-                 splits Mine/Others against the wrong viewer"
+                src[start..end].contains("stats_cache_read("),
+                "{name} does not reach `stats_cache_read`, so the \
+                 note-before-read ordering proven above says nothing \
+                 about it. Either it reads the cache another way -- in \
+                 which case that path needs the same ordering -- or its \
+                 caching was removed"
             );
         }
     }
@@ -4947,26 +5328,44 @@ mod tests {
     /// days is cached forever as though it were whole. `store::stats`
     /// cannot catch that: by the time the flag reaches it, it is just a
     /// bool.
+    ///
+    /// # Where the decision is made since #1090
+    ///
+    /// At each command's call to `stats_cache_put`, not at `store::stats::
+    /// put` itself. That is the same place it was before -- the flag was
+    /// always computed in the command and passed down -- and the helper
+    /// merely added one hop between the two. Scanning the helper's own
+    /// `put` call would be the weaker check, because there the flag is a
+    /// parameter called `complete` and has already stopped being a
+    /// decision. So this reads each COMMAND's argument list, which is
+    /// where a literal `true` would have to be written.
     #[test]
     fn no_stats_command_caches_a_partial_answer_as_complete() {
         let src = include_str!("commands.rs");
         for name in ["stats_count", "stats_board", "stats_series"] {
-            let start = src.find(&format!("pub async fn {name}(")).unwrap();
+            let start = src
+                .find(&format!("pub async fn {name}("))
+                .unwrap_or_else(|| panic!("{name} not found"));
             let rest = &src[start + 1..];
             let end = rest
-                .find("#[tauri::command]")
+                .find("\n#[tauri::command]")
                 .map(|i| start + 1 + i)
                 .unwrap_or(src.len());
             let body = &src[start..end];
-            let put = body.find("store::stats::put(").unwrap();
+            let put = body.find("stats_cache_put(").unwrap_or_else(|| {
+                panic!(
+                    "{name} does not call `stats_cache_put`, so nothing \
+                     here can check what completeness flag it stores"
+                )
+            });
             // The argument list, generously bounded -- the call spans
             // several lines and the flag is the sixth argument.
             let call = &body[put..(put + 600).min(body.len())];
             assert!(
                 call.contains("is_complete()") || call.contains(".complete"),
-                "{name} must pass the answer's own completeness flag to \
-                 `put`, not a literal: a partial result cached as complete \
-                 launders a sample into a fact"
+                "{name} must pass the answer's own completeness flag when \
+                 it caches, not a literal: a partial result cached as \
+                 complete launders a sample into a fact"
             );
             assert!(
                 !call.contains("\n                true,"),

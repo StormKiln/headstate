@@ -2327,4 +2327,252 @@ mod tests {
              payload fields at their worst case: {missing:?}"
         );
     }
+
+    // ---- Invariant 9: a sync command that blocks the runtime ---------------
+
+    /// No synchronous `#[tauri::command]` shells out or reads a whole
+    /// file.
+    ///
+    /// # What it enforces
+    ///
+    /// A `#[tauri::command]` that is not `async fn`, and whose body names
+    /// a subprocess spawn or a whole-file read, must hand that work to
+    /// `spawn_blocking`. A plain `fn` command runs ON the async runtime's
+    /// worker and blocks it, so the whole UI freezes -- not just the view
+    /// that asked -- and on the remote surface it stalls the phone's HTTP
+    /// listener for every other request.
+    ///
+    /// # What it replaces
+    ///
+    /// `commands::tests::docker_commands_never_block_the_async_runtime`,
+    /// which asserted the same rule -- in the same words, *"a plain `fn`
+    /// stalls the runtime and freezes the entire UI"* -- over an allowlist
+    /// of FOUR hardcoded names. #1090's finding is that the siblings of
+    /// those four were among the offenders: `docker_dangling_volumes` and
+    /// `docker_running_containers` shell out and were both plain `fn`,
+    /// one name away from a rule that already covered them in spirit.
+    ///
+    /// The proof that this was live rather than theoretical is an
+    /// asymmetry: `remote/surface.rs` wrapped those two in `blocking()`
+    /// for the phone, citing #496 as *"this bug in the webview"*, while
+    /// the desktop called the same two functions synchronously. One path
+    /// knew; the other did not; nothing checked.
+    ///
+    /// # Why subprocesses and whole-file reads, and NOT SQLite
+    ///
+    /// This is the part that decides whether the guard survives. A rule
+    /// of "reaches the filesystem or SQLite" flags 18 commands here, 15
+    /// of which are single-row settings reads -- `get_notify_prefs`,
+    /// `get_ui_prefs`, `get_cleanup_prefs`, `get_poll_interval` and their
+    /// setters. Those are one indexed lookup against a local database
+    /// file, they are what the app does on every window focus, and a
+    /// guard demanding `spawn_blocking` around each of them would be
+    /// weakened or deleted within a week -- which is the outcome
+    /// `check-privacy.sh:120` records ~40 false positives buying.
+    ///
+    /// So the trigger is the UNBOUNDED work, which is what actually
+    /// froze the UI in every incident this rule has a number for:
+    ///
+    /// - **a subprocess**, because its cost is another program's. #496
+    ///   was five seconds of `docker`; `assessed_worktrees` was `git
+    ///   rev-parse HEAD` once per worktree over ~295 of them, on a
+    ///   five-second refresh cadence.
+    /// - **a whole-file read**, because nothing bounds the file.
+    ///   `read_claude_md` was `read_to_string` of an arbitrary path,
+    ///   dispatched inline on the remote surface.
+    ///
+    /// `std::fs::metadata` is deliberately NOT in the list.
+    /// `claude_reveal_path` stats one path to tell "deleted" from "cannot
+    /// tell", which is a single syscall, and flagging it would be the
+    /// false positive that costs this guard its credibility for no defect
+    /// caught.
+    ///
+    /// # What it cannot see
+    ///
+    /// **One hop.** The scan reads the command's OWN body and does not
+    /// follow calls. That is a measured choice, not laziness: following
+    /// bare names one level -- the technique `fn_bodies` uses for
+    /// invariant 7, whose doc already warns it "is not a call graph" --
+    /// reports `list_paired_devices` as an offender, because its
+    /// `devices::list(&conn)` (a SQL query) matches some other `list` in
+    /// the tree that reads a file. Six flags, of which two were real and
+    /// four were name collisions. A guard that is right one time in three
+    /// does not survive contact with anyone in a hurry, so this checks
+    /// what it can check exactly.
+    ///
+    /// The cost is real and worth stating: a command that moves its
+    /// `Command::new` into a private helper passes this. What catches
+    /// that is the same thing that caught these -- somebody noticing the
+    /// UI freeze -- and the guard at least ensures the direct spelling,
+    /// which is what every offender in #1090 actually used, cannot come
+    /// back.
+    ///
+    /// **A command in another crate.** `src-mobile` and the stepup crate
+    /// register no `#[tauri::command]`, so walking all three roots costs
+    /// nothing and covers them the moment one does.
+    ///
+    /// # Proven by sabotage, both directions
+    ///
+    /// **It fires on the real defect.** Reverting `read_claude_md` to a
+    /// `pub fn` with its bare `read_to_string` -- the shape it shipped in
+    /// -- fails here naming the file, the command and the pattern. Adding
+    /// a brand-new `pub fn` command that runs `std::process::Command`
+    /// fails the same way, which is the case the four-name allowlist
+    /// could not see at all.
+    ///
+    /// **It stays silent on the trivial one.** With the tree as it
+    /// stands, all 15 single-row settings commands -- `get_notify_prefs`,
+    /// `get_ui_prefs`, `get_cleanup_prefs`, `get_poll_interval`,
+    /// `get_worktree_dirs`, `get_cached`, `get_cached_reviewing`,
+    /// `cleanup_log`, five setters, `mark_assessed` and `clear_assessed`
+    /// -- pass, and that was checked rather than assumed.
+    ///
+    /// The two halves were then checked against each other, one command
+    /// at a time: giving each of those 15 a real `read_to_string` in its
+    /// body makes this fail naming that command, all 15 of 15. So the
+    /// silence is about what they DO and not about which file they live
+    /// in or what they are called -- which is the failure mode the guard
+    /// skill records as "passing for the wrong reason".
+    #[test]
+    fn no_sync_command_reaches_a_subprocess_or_a_whole_file() {
+        /// The spellings that mean "another program" or "a file of
+        /// unknown size".
+        ///
+        /// Every entry is a shape that appears in this tree, not a
+        /// speculative list. `fs::read(` carries its paren so it cannot
+        /// match `fs::read_dir` or `fs::read_link` by prefix -- those are
+        /// listed separately and on purpose, because a directory listing
+        /// over a large tree is the same unbounded shape.
+        const UNBOUNDED: &[&str] = &[
+            "Command::new",
+            "read_to_string",
+            "read_to_end",
+            "File::open",
+            "fs::read(",
+            "fs::read_dir",
+            "read_dir(",
+        ];
+
+        let mut checked = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for (crate_name, root) in crate_roots() {
+            for file in rust_files(&root) {
+                let Ok(src) = std::fs::read_to_string(&file) else {
+                    continue;
+                };
+                // This file's own prose names every pattern above. Skipped
+                // BY PATH rather than by comment-matching, which is the
+                // rule the module header states and #874 paid for.
+                if file.ends_with("invariants.rs") {
+                    continue;
+                }
+                let rel = file.strip_prefix(&root).unwrap_or(&file).display();
+                let where_ = format!("{crate_name}/{rel}");
+                // Normalised before any `\n`-anchored split: a CRLF
+                // checkout makes `lines()` keep a trailing `\r`, and the
+                // attribute comparison below would then match nothing and
+                // pass silently on Windows only. Invariant 5 records this
+                // being OBSERVED rather than feared.
+                let src = src.replace("\r\n", "\n");
+                let lines: Vec<&str> = src.lines().collect();
+                for (i, line) in lines.iter().enumerate() {
+                    if line.trim() != "#[tauri::command]" {
+                        continue;
+                    }
+                    // The `fn` line: the next declaration, so an
+                    // intervening attribute or doc comment is skipped.
+                    // `#[tauri::command]` sits both above and below the
+                    // doc comment in this file, which is why the search
+                    // runs forward from the attribute rather than
+                    // assuming adjacency.
+                    let Some(fn_at) = (i + 1..lines.len().min(i + 12)).find(|j| {
+                        let t = lines[*j].trim_start();
+                        t.starts_with("fn ")
+                            || t.starts_with("async fn ")
+                            || t.starts_with("pub fn ")
+                            || t.starts_with("pub async fn ")
+                            || t.starts_with("pub(crate) fn ")
+                            || t.starts_with("pub(crate) async fn ")
+                    }) else {
+                        continue;
+                    };
+                    let fn_line = lines[fn_at];
+                    checked += 1;
+                    if fn_line.contains("async fn ") {
+                        continue;
+                    }
+                    let indent = fn_line.len() - fn_line.trim_start().len();
+                    let end = item_end(&lines, fn_at, indent);
+                    // Comments dropped, for the reason the module header
+                    // gives at length: this codebase states its rules in
+                    // prose directly above the code they govern, so every
+                    // pattern above appears far more often in a doc
+                    // comment than in a call. Without this the guard would
+                    // fire on the very sentences that explain it.
+                    let code: String = lines[fn_at..end]
+                        .iter()
+                        .filter(|l| !is_comment(l))
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    // Already on the blocking pool: a sync command MAY do
+                    // this work, it just may not do it on the runtime.
+                    // That is the whole remedy the rule asks for, so
+                    // naming it is compliance rather than an exemption.
+                    if code.contains("spawn_blocking") {
+                        continue;
+                    }
+                    let name = fn_line
+                        .trim_start()
+                        .trim_start_matches("pub(crate) ")
+                        .trim_start_matches("pub ")
+                        .trim_start_matches("fn ")
+                        .split(['(', '<'])
+                        .next()
+                        .unwrap_or("<unknown>");
+                    for pat in UNBOUNDED {
+                        if code.contains(pat) {
+                            offenders.push(format!("{where_}: {name} reaches `{pat}`"));
+                        }
+                    }
+                }
+            }
+        }
+
+        // The self-guard every scan here carries. If the attribute
+        // spelling or the `fn` shapes above ever stop matching, this test
+        // goes green while seeing nothing -- which is worse than no guard,
+        // because it reports safety it is not checking.
+        //
+        // 126 is what it sees today: the 116 registered in `lib.rs` plus
+        // the `#[tauri::command]`s in test fixtures, which are scanned
+        // too. That is deliberate rather than an oversight -- a fixture
+        // command that blocks is not a shipped defect, but it is also not
+        // worth an exception that could hide a real one, and none of them
+        // does. The floor is set well below the figure so a handful of
+        // commands being deleted does not fail this, while the shape of
+        // the scan breaking still does.
+        assert!(
+            checked >= 90,
+            "found only {checked} `#[tauri::command]` functions, which \
+             cannot be right -- the scan's shape no longer matches the \
+             source and this guard is now reading nothing"
+        );
+
+        assert!(
+            offenders.is_empty(),
+            "these `#[tauri::command]` functions are a plain `fn` and \
+             reach a subprocess or an unbounded file read directly in \
+             their own body. A sync command runs ON the async runtime's \
+             worker and blocks it, so the whole UI freezes -- not just \
+             the view that asked -- and on the remote surface it stalls \
+             the phone's listener for every other request (#496, #1090). \
+             Make it `pub async fn` and move the work into \
+             `tauri::async_runtime::spawn_blocking`, the way \
+             `docker_builds` and `assessed_worktrees` do. A single-row \
+             settings read is deliberately NOT in scope here; if this \
+             fired on one, the pattern list is wrong rather than the \
+             command: {offenders:#?}"
+        );
+    }
 }
