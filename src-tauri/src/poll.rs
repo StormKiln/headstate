@@ -717,33 +717,78 @@ fn emit_store_error(app: &AppHandle, msg: String) {
 /// database problem silently mutes an interruption channel the user is
 /// relying on, and they would have no way to tell that from "nothing
 /// broke". A notification too many is recoverable; a missed one is not.
-fn read_notify_prefs(app: &AppHandle) -> NotifyPrefs {
+///
+/// # Why `spawn_blocking` (#1090)
+///
+/// This runs inside `tauri::async_runtime::spawn`, twice per tick, and it
+/// opens SQLite -- a file open, a schema check and a query. That is disk
+/// work on an async runtime worker, and this loop is the one thing in the
+/// app that does it forever on a timer. `poll.rs`'s own diagnostic
+/// comment one screen up already worries that "a foreground query can be
+/// what makes the foreground query look slow"; this is the half of that
+/// which was measurable and unnecessary.
+async fn read_notify_prefs(app: &AppHandle) -> NotifyPrefs {
     let Ok(dir) = app.path().app_data_dir() else {
         return NotifyPrefs::default();
     };
-    let Ok(conn) = open_db(&dir.join("headstate.db")) else {
-        return NotifyPrefs::default();
-    };
-    crate::store::settings::get(&conn, crate::store::settings::keys::NOTIFY_PREFS)
-        .ok()
-        .flatten()
-        .unwrap_or_default()
+    tauri::async_runtime::spawn_blocking(move || {
+        let Ok(conn) = open_db(&dir.join("headstate.db")) else {
+            return NotifyPrefs::default();
+        };
+        crate::store::settings::get(&conn, crate::store::settings::keys::NOTIFY_PREFS)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    })
+    .await
+    // Every other failure path here falls back to the default -- see the
+    // doc above on why that direction is deliberate -- and a panicked
+    // join is not the one case to start muting notifications on.
+    .unwrap_or_default()
 }
 
-fn persist_and_emit(app: &AppHandle, prs: &[PullRequest]) {
+/// Write the snapshot and tell the UI.
+///
+/// # Why the WRITE is `spawn_blocking` and the emits are not (#1090)
+///
+/// `save_snapshot` serialises the list and COMMITS, which is an `fsync` --
+/// the unbounded-latency case, on a runtime worker, on a timer, forever.
+/// `app.emit` is a channel send and `set_badge` is a platform call; both
+/// are cheap and neither touches the disk, so only the database half moves
+/// off the runtime. Splitting it this way also keeps the ordering the UI
+/// depends on: the snapshot is on disk before `prs-updated` says so.
+async fn persist_and_emit(app: &AppHandle, prs: &[PullRequest]) {
     match app.path().app_data_dir() {
-        Ok(dir) => match open_db(&dir.join("headstate.db")) {
-            Ok(conn) => {
-                if let Err(e) = save_snapshot(&conn, CachedList::Authored, prs) {
+        Ok(dir) => {
+            let owned: Vec<PullRequest> = prs.to_vec();
+            let written = tauri::async_runtime::spawn_blocking(move || {
+                let conn =
+                    open_db(&dir.join("headstate.db")).map_err(|e| (true, format!("{e}")))?;
+                save_snapshot(&conn, CachedList::Authored, &owned)
+                    .map_err(|e| (false, format!("{e}")))
+            })
+            .await;
+            match written {
+                Ok(Ok(())) => {}
+                Ok(Err((opening, e))) if opening => {
+                    log::error!("failed to open db: {e}");
+                    emit_store_error(app, format!("could not open the local database: {e}"));
+                }
+                Ok(Err((_, e))) => {
                     log::error!("failed to save snapshot: {e}");
                     emit_store_error(app, format!("could not save local snapshot: {e}"));
                 }
+                // A panic in the closure. Reported rather than swallowed:
+                // the snapshot not landing is exactly what `store-error`
+                // exists to say, and silence here would be the "offline
+                // readability is gone and nothing told you" failure the
+                // banner was added for.
+                Err(e) => {
+                    log::error!("the snapshot write task failed: {e}");
+                    emit_store_error(app, format!("could not save local snapshot: {e}"));
+                }
             }
-            Err(e) => {
-                log::error!("failed to open db: {e}");
-                emit_store_error(app, format!("could not open the local database: {e}"));
-            }
-        },
+        }
         Err(e) => {
             log::error!("failed to resolve app data dir: {e}");
             emit_store_error(app, format!("could not find the app data directory: {e}"));
@@ -781,7 +826,7 @@ fn spawn_recheck(app: AppHandle, client: Arc<GitHubClient>, last_known: Vec<Pull
         match client.fetch_prs().await {
             Ok(fresh) => {
                 let merged = merge_by_identity(&last_known, &fresh);
-                persist_and_emit(&app, &merged);
+                persist_and_emit(&app, &merged).await;
             }
             Err(e) => {
                 // No retry: the regular 60s/300s cadence picks this back up
@@ -1028,7 +1073,7 @@ pub fn spawn(
             // must not cost the poll. That is also what makes it the right
             // half to squeeze when the shared deadline is nearly spent.
             let remaining = remaining_tick_budget(tick_started.elapsed());
-            let reviewing_now = if read_notify_prefs(&app).ready_to_review {
+            let reviewing_now = if read_notify_prefs(&app).await.ready_to_review {
                 if remaining.is_zero() {
                     // The authored fetch used the whole tick. Skipped rather
                     // than issued with no time to answer: a request that
@@ -1075,7 +1120,7 @@ pub fn spawn(
                     // instead of at the next relaunch. A failed read
                     // falls back to the default (everything on), which
                     // is what the app did before the setting existed.
-                    let prefs = read_notify_prefs(&app);
+                    let prefs = read_notify_prefs(&app).await;
                     for b in newly_broken(&previous, &prs) {
                         if prefs.wants(b.kind) {
                             notify_breakage(&app, &b);
@@ -1155,7 +1200,7 @@ pub fn spawn(
                     }
 
                     consecutive_failures = 0;
-                    persist_and_emit(&app, &prs);
+                    persist_and_emit(&app, &prs).await;
                     if has_checking(&prs) {
                         spawn_recheck(app.clone(), client.clone(), prs);
                     }

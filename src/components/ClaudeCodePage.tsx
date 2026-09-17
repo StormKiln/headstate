@@ -1938,16 +1938,26 @@ function SessionUsage({ detail: d }: { detail: ClaudeSessionDetail }) {
               </Field>
             ) : null}
           </dl>
-          {/* The cap, STATED. Without this the reader cannot tell a
-              complete sum from one that stopped 8 MB in, which is the #846
-              defect with a number on it. It binds on the 16 real files over
-              10 MB and on nothing else, so this line is almost never
-              drawn -- which is exactly why it must be there when it is. */}
+          {/* A short read, STATED. Without this the reader cannot tell a
+              complete sum from one that stopped early, which is the #846
+              defect with a number on it.
+
+              Since #1086 a SELECTED session reads whole, so the 8 MB cap
+              can no longer draw this line -- `BUDGET_BYTES` still bounds
+              the bulk paths, but not this one. What remains is the one
+              case that survives an uncapped read: a transcript that
+              SHRANK between being sized and being read. Rare, and the
+              reason this stays rather than being deleted with the cap --
+              a partial sum has to say so however it came to be partial.
+
+              The old sentence "Reading it whole would hang this pane" is
+              gone with the cap: it was never true (160 ms measured for the
+              largest transcript in the corpus) and it now describes
+              something the code does not do. */}
           {data.truncated ? (
             <p className="mt-2 text-xs text-[#d29922]">
-              These are floors, not totals: the transcript is{" "}
-              {formatMb(data.file_bytes)} and only its first {formatMb(data.bytes_read)} were
-              read. Reading it whole would hang this pane.
+              These are floors, not totals: the transcript measured{" "}
+              {formatMb(data.file_bytes)} and only {formatMb(data.bytes_read)} could be read.
             </p>
           ) : null}
         </>
