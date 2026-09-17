@@ -173,6 +173,41 @@ pub fn record_with_rows(
     Ok(n)
 }
 
+/// Record a whole load: its rows, and the claims about the days they
+/// came from, atomically.
+///
+/// The foreground counterpart to [`record_with_rows`], which records ONE
+/// range. A foreground load fetches many ranges at once and must write
+/// them under a single commit for the same reason: the ledger claims a
+/// range is retrieved and the rows are the evidence, and a reader landing
+/// between two commits gets a permanently wrong answer rather than a
+/// temporarily incomplete one.
+///
+/// Rows are written once for the whole window rather than per range, so
+/// a pull request whose range earned no ledger row -- a wide slice, or an
+/// alias that never answered -- is still stored. Dropping those would
+/// lose pull requests that were already paid for, which is the failure
+/// #1004 exists to prevent.
+///
+/// Returns how many pull request rows were written.
+pub fn record_all_with_rows(
+    conn: &mut Connection,
+    scope_key: &str,
+    window_from: &str,
+    window_to: &str,
+    rows: &[SliceRow],
+    prs: &[StoredPr],
+    measured_at: DateTime<Utc>,
+) -> Result<usize, StoreError> {
+    let tx = conn.transaction()?;
+    let n = super::pr_history::put_many_in(&tx, scope_key, window_from, window_to, prs, measured_at)?;
+    for row in rows {
+        put_in(&tx, scope_key, row, measured_at)?;
+    }
+    tx.commit()?;
+    Ok(n)
+}
+
 /// Record a completed attempt at one range, with no rows.
 ///
 /// For the probe pass, which learns a range's `issue_count` before
