@@ -55,6 +55,11 @@
 //! contradicting it -- every connection on its cost list is a paged one.
 //! `board.rs`'s module docs carry the table.
 
+/// The background worker that fills the ledger in small groups over time
+/// (#1092, #1093). Spawned beside `poll::spawn` rather than inside the
+/// poll tick -- see its module docs for why that placement is the design
+/// rather than a convenience.
+pub mod backfill;
 pub mod board;
 pub mod budget;
 pub mod fetch;

@@ -306,7 +306,23 @@ pub struct Board {
     /// retrieval, not counting (`slice.rs:52`). So this is the number a
     /// "based on N of M" label quotes, and comparing it against
     /// [`Board::retrieved`] is how the UI knows to draw that label at all.
-    pub total: u64,
+    ///
+    /// # Why it is `Option` (#1092)
+    ///
+    /// `None` means NOBODY HAS MEASURED IT. A board assembled from stored
+    /// rows whose window has no ledger coverage holds pull requests and
+    /// has no denominator for them, and a 0 there would render as "400 of
+    /// 0" or -- worse, because it reads as reassuring -- "400 of 400,
+    /// complete". Absent is not zero, and a denominator is the one field
+    /// where the lie is invisible: every ratio built from it looks
+    /// plausible.
+    ///
+    /// The window in which this is `None` is short by design: the
+    /// backfill's first tick probes the whole horizon for ~1 point and
+    /// makes it `Some`. That is exactly why defaulting it would be
+    /// dangerous rather than harmless -- the shortest window would be the
+    /// most confidently wrong one.
+    pub total: Option<u64>,
     /// Pull requests actually aggregated into the rows.
     pub retrieved: u64,
     /// Whether every PR in the window made it into a row.
@@ -366,6 +382,22 @@ pub struct Board {
     /// #841's fail-open in a new costume: a claim we cannot keep,
     /// presented as a fact.
     pub accumulating: bool,
+    /// Days of the window the ledger has actually retrieved (#1092).
+    ///
+    /// The figure a pull request count cannot give. "40% of the pull
+    /// requests" is compatible with 40% of every day and with 100% of 40%
+    /// of the days, and only the second tells a reader WHICH PART of the
+    /// chart to trust -- the part they are usually looking at.
+    ///
+    /// A day is counted here because a settled ledger row covers it, never
+    /// because it held no pull requests. An uncovered day is uncovered.
+    pub days_covered: usize,
+    /// Days in the window.
+    ///
+    /// The denominator of "34 of 90 days measured". 0 when the window's
+    /// bounds could not be read, which renders as visibly wrong rather
+    /// than invisibly wrong.
+    pub days_total: usize,
 }
 
 /// How many outliers each list holds.
@@ -404,9 +436,18 @@ pub struct RepoCount {
 }
 
 impl Board {
-    /// How many PRs are missing from the rows.
-    pub fn missing(&self) -> u64 {
-        self.total.saturating_sub(self.retrieved)
+    /// How many PRs are missing from the rows, or `None` when the total
+    /// has not been measured.
+    ///
+    /// `None` rather than 0, because the two mean opposite things and 0 is
+    /// the reassuring one: "nothing is missing" is exactly what a reader
+    /// would conclude, and it is the one conclusion an unmeasured
+    /// denominator cannot support. A caller that wants a number must
+    /// decide what to say about the unknown case rather than being handed
+    /// a plausible default -- which is the whole reason [`Board::total`]
+    /// is an `Option`.
+    pub fn missing(&self) -> Option<u64> {
+        self.total.map(|t| t.saturating_sub(self.retrieved))
     }
 
     /// Whether the board was assembled from more than one request.
@@ -645,7 +686,11 @@ impl Board {
 
         Self {
             rows,
-            total,
+            // `Some`, and measured: this board came from a fetch, so
+            // GitHub's own `issueCount` for every slice is in hand. The
+            // `None` case belongs to a board assembled from storage whose
+            // window nothing has probed -- see `from_stored`.
+            total: Some(total),
             retrieved,
             // All three channels, not just the node count. A refusal can
             // leave the node list the right LENGTH while blanking fields
@@ -667,6 +712,11 @@ impl Board {
             // that is not happening.
             accumulated: retrieved,
             accumulating: false,
+            // A board from one fetch knows the slices it planned, and a
+            // planned slice IS a measured day. The ledger figure replaces
+            // this the moment storage is consulted (`from_stored`).
+            days_covered: day_span(slices),
+            days_total: day_span(slices),
         }
     }
 
@@ -762,7 +812,26 @@ impl Board {
     /// produced them. They do not become false merely because rows
     /// accumulated -- a refused field is still refused, and #824's rule is
     /// that partiality shrinks rather than becoming invisible.
-    pub fn from_stored(stored: &[StoredPr], fetched: &Board) -> Self {
+    /// # The denominator comes from the LEDGER (#1092)
+    ///
+    /// `coverage` is what the `pr_slice` ledger says about this window:
+    /// which days were retrieved, and GitHub's exact total across them.
+    /// It is the only honest source for a board assembled from storage,
+    /// because the fetch this board is paired with may have covered a
+    /// fraction of the window -- or, for a board served entirely from
+    /// accumulated rows, none of it.
+    ///
+    /// A `Coverage::total` of `None` passes straight through to
+    /// `Board::total`. That is the case the whole `Option` exists for:
+    /// rows on disk and nothing that ever measured how many there should
+    /// be. Defaulting it to the fetched total would look right and be
+    /// wrong whenever the fetch covered less than the window.
+    pub fn from_stored(
+        stored: &[StoredPr],
+        fetched: &Board,
+        coverage: &crate::store::pr_slice::Coverage,
+        days_total: usize,
+    ) -> Self {
         let mut by_login: HashMap<String, AuthorRow> = HashMap::new();
         let mut by_repo: HashMap<String, u64> = HashMap::new();
         let mut prs: Vec<BoardPr> = Vec::with_capacity(stored.len());
@@ -814,9 +883,14 @@ impl Board {
         repo_counts.sort_by(|a, b| b.merged.cmp(&a.merged).then_with(|| a.repo.cmp(&b.repo)));
 
         let accumulated = stored.len() as u64;
+        // The ledger's figure when it has one; otherwise the fetch's,
+        // which is exact for the window the fetch actually planned. Both
+        // can be `None`, and a `None` survives to the UI rather than being
+        // filled in here.
+        let total = coverage.total.or(fetched.total);
         Self {
             rows,
-            total: fetched.total,
+            total,
             // What THIS load retrieved is kept as it was. It is a fact
             // about the fetch, and overwriting it with the accumulated
             // figure would erase the distinction the caveat needs.
@@ -825,7 +899,20 @@ impl Board {
             // is here is in the table. The fetch's own refusal channel
             // still counts -- a refused field is not cured by a row
             // arriving from somewhere else.
-            complete: accumulated >= fetched.total && fetched.refused_fields == 0,
+            // Completeness needs a denominator, a full day list, and no
+            // refusals. An UNKNOWN total can never satisfy it: `None`
+            // makes this false, which is the honest direction -- a board
+            // that does not know how many pull requests it is missing is
+            // not a board that can claim to be missing none.
+            //
+            // The day check is what makes this true to the window rather
+            // than to the fetch: every pull request GitHub counted for the
+            // days we measured can be present while whole days remain
+            // unasked, and that board is not complete.
+            complete: total.is_some_and(|t| accumulated >= t)
+                && coverage.days_covered() >= days_total
+                && !coverage.partial
+                && fetched.refused_fields == 0,
             truncated_slices: fetched.truncated_slices.clone(),
             refused_fields: fetched.refused_fields,
             slices: fetched.slices,
@@ -836,6 +923,8 @@ impl Board {
             repo_counts,
             accumulated,
             accumulating: true,
+            days_covered: coverage.days_covered(),
+            days_total,
         }
     }
 }
@@ -863,6 +952,36 @@ fn cycle_hours(node: &serde_json::Value) -> Option<f64> {
     let m = chrono::DateTime::parse_from_rfc3339(merged).ok()?;
     let hours = (m - c).num_seconds() as f64 / 3600.0;
     (hours >= 0.0).then_some(hours)
+}
+
+/// How many distinct days a slice list spans.
+///
+/// The day figure for a board built from one fetch, where every planned
+/// slice was fetched and is therefore measured. Deduplicated across slices
+/// so an overlap cannot report more days than the calendar holds -- the
+/// planner tiles without overlap, but a figure that could exceed its own
+/// denominator is one a reader cannot act on, so it is made impossible
+/// here rather than assumed upstream.
+///
+/// An unparseable bound contributes nothing, matching
+/// `pr_slice::clamped_days`: a range this cannot read must not claim days
+/// it cannot verify.
+fn day_span(slices: &[Slice]) -> usize {
+    let mut days = std::collections::BTreeSet::new();
+    for s in slices {
+        let (Some(from), Some(to)) = (
+            chrono::NaiveDate::parse_from_str(&s.from, "%Y-%m-%d").ok(),
+            chrono::NaiveDate::parse_from_str(&s.to, "%Y-%m-%d").ok(),
+        ) else {
+            continue;
+        };
+        let mut d = from;
+        while d <= to {
+            days.insert(d);
+            d += chrono::Duration::days(1);
+        }
+    }
+    days.len()
 }
 
 /// The `YYYY-MM-DD` day a node belongs to, for the slice ledger (#1092).
@@ -1383,7 +1502,7 @@ mod tests {
         });
         let b = Board::from_alias_map(&map, &slices(2), 1, unmeasured());
         assert!(b.complete, "nothing was short: {:?}", b.truncated_slices);
-        assert_eq!(b.total, 4);
+        assert_eq!(b.total, Some(4));
         assert_eq!(b.retrieved, 4);
         assert_eq!(
             b.row_for("alice"),
@@ -1417,9 +1536,9 @@ mod tests {
         });
         let b = Board::from_alias_map(&map, &slices(1), 1, unmeasured());
         assert!(!b.complete, "a short slice must not read as complete");
-        assert_eq!(b.total, 50);
+        assert_eq!(b.total, Some(50));
         assert_eq!(b.retrieved, 1);
-        assert_eq!(b.missing(), 49);
+        assert_eq!(b.missing(), Some(49));
         assert_eq!(
             b.truncated_slices,
             vec![ShortSlice {
@@ -1482,7 +1601,7 @@ mod tests {
             "__refused": 3,
         });
         let b = Board::from_alias_map(&map, &slices(1), 1, unmeasured());
-        assert_eq!(b.retrieved, b.total, "the node count itself matched");
+        assert_eq!(Some(b.retrieved), b.total, "the node count itself matched");
         assert_eq!(
             b.refused_fields, 3,
             "the refusal count must be carried, not dropped"
@@ -2063,11 +2182,25 @@ mod tests {
         }
     }
 
+    /// The ledger's verdict on a window, for the `from_stored` tests.
+    ///
+    /// `whole` means every day measured with nothing outstanding, which is
+    /// what a complete board needs; the tests that care about partiality
+    /// build their own.
+    fn whole_coverage(total: u64, retrieved: u64) -> crate::store::pr_slice::Coverage {
+        crate::store::pr_slice::Coverage {
+            days: vec!["2026-08-01".to_string()],
+            total: Some(total),
+            retrieved,
+            partial: false,
+        }
+    }
+
     /// A fetched board carrying only the facts `from_stored` reads off it.
     fn fetched(total: u64, retrieved: u64, refused: usize) -> Board {
         Board {
             rows: Vec::new(),
-            total,
+            total: Some(total),
             retrieved,
             complete: retrieved == total && refused == 0,
             truncated_slices: Vec::new(),
@@ -2080,6 +2213,8 @@ mod tests {
             repo_counts: Vec::new(),
             accumulated: retrieved,
             accumulating: false,
+            days_covered: 1,
+            days_total: 1,
         }
     }
 
@@ -2103,7 +2238,7 @@ mod tests {
             stored("o/c", 5, "carol", 40.0, 400),
         ];
         // The SECOND load itself fetched only carol's two, of four in window.
-        let board = Board::from_stored(&union, &fetched(4, 2, 0));
+        let board = Board::from_stored(&union, &fetched(4, 2, 0), &whole_coverage(4, 4), 1);
 
         // Both authors are on the board, though this load fetched one of them.
         let logins: Vec<&str> = board.rows.iter().map(|r| r.login.as_str()).collect();
@@ -2142,14 +2277,14 @@ mod tests {
             stored("o/a", 3, "bob", 3.0, 30),
         ];
         // Three of four stored: still incomplete, and visibly so.
-        let partial = Board::from_stored(&three, &fetched(4, 3, 0));
+        let partial = Board::from_stored(&three, &fetched(4, 3, 0), &whole_coverage(4, 3), 1);
         assert!(!partial.complete, "3 of 4 stored is not complete");
         assert_eq!(partial.accumulated, 3);
 
         // The fourth arrives -- from a load that fetched only IT.
         let mut four = three.clone();
         four.push(stored("o/b", 9, "carol", 4.0, 40));
-        let whole = Board::from_stored(&four, &fetched(4, 1, 0));
+        let whole = Board::from_stored(&four, &fetched(4, 1, 0), &whole_coverage(4, 4), 1);
         assert!(
             whole.complete,
             "every PR in the window is stored, so the answer is complete even \
@@ -2170,9 +2305,9 @@ mod tests {
             stored("o/a", 1, "alice", 1.0, 10),
             stored("o/a", 2, "bob", 2.0, 20),
         ];
-        let board = Board::from_stored(&all, &fetched(2, 2, 3));
+        let board = Board::from_stored(&all, &fetched(2, 2, 3), &whole_coverage(2, 2), 1);
         assert_eq!(board.accumulated, 2);
-        assert_eq!(board.total, 2);
+        assert_eq!(board.total, Some(2));
         assert!(
             !board.complete,
             "row coverage must not launder a refusal into a confident board"
@@ -2195,7 +2330,12 @@ mod tests {
             issue_count: 6,
             retrieved: 0,
         }];
-        let board = Board::from_stored(&[stored("o/a", 1, "alice", 1.0, 10)], &f);
+        let board = Board::from_stored(
+            &[stored("o/a", 1, "alice", 1.0, 10)],
+            &f,
+            &whole_coverage(10, 4),
+            1,
+        );
         assert_eq!(board.truncated_slices.len(), 1);
         assert!(!board.complete);
     }
@@ -2209,10 +2349,10 @@ mod tests {
         let five: Vec<StoredPr> = (1..=5)
             .map(|n| stored("o/a", n, "alice", n as f64, n * 10))
             .collect();
-        let board = Board::from_stored(&five, &fetched(10, 2, 0));
+        let board = Board::from_stored(&five, &fetched(10, 2, 0), &whole_coverage(10, 5), 1);
         assert_eq!(board.retrieved, 2, "this load fetched two");
         assert_eq!(board.accumulated, 5, "five are stored");
-        assert_eq!(board.total, 10, "GitHub says the window holds ten");
+        assert_eq!(board.total, Some(10), "GitHub says the window holds ten");
     }
 
     /// A board built from one fetch reports no accumulation, so the UI
@@ -2325,7 +2465,7 @@ mod tests {
         });
         let direct = Board::from_alias_map(&map, &slices(1), 1, unmeasured());
         let harvested = Board::retrieved_prs(&map, &slices(1));
-        let assembled = Board::from_stored(&harvested, &direct);
+        let assembled = Board::from_stored(&harvested, &direct, &whole_coverage(2, 2), 1);
 
         assert!(direct.complete && assembled.complete);
         let a = direct.row_for("alice").unwrap();

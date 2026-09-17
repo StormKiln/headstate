@@ -2588,4 +2588,81 @@ mod tests {
              command: {offenders:#?}"
         );
     }
+
+    /// **Every table keyed on the resolved viewer is cleared when the
+    /// identity changes (#1092).**
+    ///
+    /// `note_stats_viewer` is the one place that learns the token now
+    /// belongs to somebody else, and the tables it clears are the tables
+    /// keyed on `StatsQuery::cache_key` with `@me` already RESOLVED. Miss
+    /// one and it survives the identity change holding the previous
+    /// account's answers.
+    ///
+    /// # Why this is a guard and not a comment
+    ///
+    /// Because the failure is silent and permanent in one direction.
+    /// `pr_slice` is a LEDGER: a row saying a range is retrieved makes the
+    /// worker skip that range forever. Clear `pr_history` without it and
+    /// the ledger claims days whose pull requests were just deleted --
+    /// days nothing will ever fetch again, because the ledger says they
+    /// are done. #1094 states the rule directly: a ledger that lies is
+    /// worse than no ledger.
+    ///
+    /// The shape this catches is adding a fourth viewer-keyed table and
+    /// clearing only the three that were there when it was written --
+    /// which is what nearly happened when `pr_history` was added beside
+    /// `stats_cache`, and was avoided only because #1004 thought of it.
+    ///
+    /// Comment lines are stripped before matching, for the reason
+    /// `is_comment` gives: this codebase argues its rules directly above
+    /// the code that implements them, so every name below appears in prose
+    /// in this very file.
+    #[test]
+    fn the_identity_change_clears_every_backfill_table() {
+        let src = include_str!("commands.rs");
+        // The function that owns the decision, not the file: a `clear`
+        // call anywhere else in `commands.rs` would satisfy a file-wide
+        // scan while leaving this path broken. The `guard` skill names
+        // scoping too coarsely as one of the three ways this repo has
+        // already got a guard wrong.
+        // Offset INTO the signature rather than at its first byte:
+        // `enclosing_fn` searches backwards for the nearest preceding
+        // `fn `, so anchoring on the `f` of the definition finds the
+        // function BEFORE this one. The guard caught that on its own
+        // first run, which is the cheapest place to catch it.
+        let at = src.find("fn note_stats_viewer(").expect(
+            "note_stats_viewer not found; if the identity check moved, \
+             move this guard with it rather than deleting it",
+        ) + "fn note_stats_viewer(".len();
+        let (name, body) = enclosing_fn(src, at);
+        assert_eq!(name, "note_stats_viewer");
+        let code: String = body
+            .lines()
+            .filter(|l| !is_comment(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for table in ["pr_history", "pr_slice", "pr_backfill_scope"] {
+            assert!(
+                code.contains(&format!("{table}::clear(")),
+                "`note_stats_viewer` does not clear `{table}`. Every table \
+                 keyed on the RESOLVED viewer must be cleared when the \
+                 identity behind `@me` changes, in this one place. Leaving \
+                 `pr_slice` in particular is worse than leaving rows: it is \
+                 a ledger, so a stale row makes the backfill worker skip \
+                 those days forever -- a ledger that lies is worse than no \
+                 ledger (#1092, #1094)."
+            );
+        }
+
+        // And the clears are reached only on a real identity change rather
+        // than on every read: `note_viewer` returning 0 means the same
+        // account, and that arm must stay empty.
+        assert!(
+            code.contains("Ok(0) => {}"),
+            "the clears must sit under the arm that fires on a CHANGED \
+             identity; clearing on every read would drop the accumulated \
+             corpus on each page load"
+        );
+    }
 }

@@ -2834,6 +2834,26 @@ fn note_stats_viewer(conn: &rusqlite::Connection, viewer: &str) {
                 Ok(m) => log::info!("dropped {m} accumulated pull requests for that identity"),
                 Err(e) => log::warn!("could not clear accumulated pull requests: {e}"),
             }
+            // The LEDGER goes with the rows (#1092), and this is the half
+            // it would be easiest to forget. Clearing `pr_history` alone
+            // leaves `pr_slice` claiming ranges are retrieved whose pull
+            // requests are gone -- and because the worker skips a range the
+            // ledger calls settled, those days would never be re-fetched.
+            // A ledger that lies is worse than no ledger, so the guard
+            // `the_identity_change_clears_every_backfill_table` checks
+            // this rather than a comment asking someone to remember.
+            match crate::store::pr_slice::clear(conn) {
+                Ok(0) => {}
+                Ok(m) => log::info!("dropped {m} slice ledger rows for that identity"),
+                Err(e) => log::warn!("could not clear the slice ledger: {e}"),
+            }
+            // And the scopes the worker walks, whose keys were resolved
+            // against a login that is no longer signed in.
+            match crate::store::pr_backfill_scope::clear(conn) {
+                Ok(0) => {}
+                Ok(m) => log::info!("dropped {m} backfill scopes for that identity"),
+                Err(e) => log::warn!("could not clear the backfill scopes: {e}"),
+            }
         }
         Err(e) => log::warn!("could not record the stats viewer: {e}"),
     }
@@ -3051,6 +3071,18 @@ pub async fn stats_board(
         "opened" => Measure::Opened,
         other => return Err(format!("unknown measure: {other}")),
     };
+    // The measure's stored spelling, kept BEFORE `measure` shadows the
+    // string: the backfill registration stores exactly the scalars this
+    // command received, so the worker reconstructs the same question
+    // rather than re-deriving it from an enum by a second route that
+    // could disagree.
+    let measure_name = match measure {
+        Measure::Merged => "merged",
+        Measure::Opened => "opened",
+    };
+    // Captured before `parse_scope_request` consumes it. `Scope::All`
+    // carries no value and round trips through the empty string.
+    let scope_value_for_backfill = scope_value.clone().unwrap_or_default();
     let now = chrono::Utc::now();
     let req = parse_scope_request(&scope_kind, scope_value, days, now)?;
 
@@ -3179,10 +3211,24 @@ pub async fn stats_board(
                 req.window.to.clone(),
                 loaded,
                 now,
+                crate::store::pr_backfill_scope::BackfillScope {
+                    scope_key: scope_key.clone(),
+                    scope_kind: scope_kind.clone(),
+                    // The value the user's click carried. `Scope::All` has
+                    // none, and an empty string is what the parser round
+                    // trips back to `Scope::All` -- so the worker
+                    // reconstructs the same question rather than a guess
+                    // at it.
+                    scope_value: scope_value_for_backfill.clone(),
+                    measure: measure_name.to_string(),
+                    horizon_days: crate::github::stats::backfill::HORIZON_DAYS
+                        .max(clamp_days(days) as u32),
+                },
             )
             .await;
             Ok(StatsBoard {
                 viewer: viewer.clone(),
+                scope_key: scope_key.clone(),
                 board,
             })
         }
@@ -3198,9 +3244,13 @@ pub async fn stats_board(
             // naming colleagues in it would be the one place this feature
             // could leak a roster.
             Ok(b) => format!(
-                "ok authors={} total={} retrieved={} complete={} short={} refused={} \
+                "ok authors={} total={:?} retrieved={} complete={} short={} refused={} \
                  slices={} rounds={} points={}",
                 b.board.rows.len(),
+                // `{:?}` rather than `{}`: the total is an Option, and a
+                // log printing `0` for an unmeasured one would be as
+                // misleading as the UI would have been. The `{:?}` is in
+                // the template string above, on this argument's slot.
                 b.board.total,
                 b.board.retrieved,
                 b.board.complete,
@@ -3231,7 +3281,11 @@ pub async fn stats_board(
                 key,
                 req.window.from.clone(),
                 req.window.to.clone(),
-                b.board.total,
+                // 0 for an unmeasured total. Safe ONLY because nothing
+                // reads this column as a denominator -- a board's own
+                // figures come back from the serialised payload, where
+                // the `None` survives intact. See `stats_cache_put`.
+                b.board.total.unwrap_or(0),
                 b.board.complete,
                 payload,
                 now,
@@ -3281,10 +3335,19 @@ async fn accumulate_board(
     window_end: String,
     loaded: crate::github::stats::board::LoadedBoard,
     now: chrono::DateTime<chrono::Utc>,
+    registration: crate::store::pr_backfill_scope::BackfillScope,
 ) -> crate::github::stats::Board {
     let fallback = loaded.board.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        accumulate_board_blocking(&db, &scope_key, &window_start, &window_end, loaded, now)
+        accumulate_board_blocking(
+            &db,
+            &scope_key,
+            &window_start,
+            &window_end,
+            loaded,
+            now,
+            &registration,
+        )
     })
     .await
     // A panicked join means the accumulation did not happen. The
@@ -3302,6 +3365,7 @@ fn accumulate_board_blocking(
     window_end: &str,
     loaded: crate::github::stats::board::LoadedBoard,
     now: chrono::DateTime<chrono::Utc>,
+    registration: &crate::store::pr_backfill_scope::BackfillScope,
 ) -> crate::github::stats::Board {
     use crate::store::pr_history;
 
@@ -3324,17 +3388,43 @@ fn accumulate_board_blocking(
         Ok(n) => log::info!("pruned {n} accumulated pull requests past the bound"),
         Err(e) => log::warn!("could not prune accumulated pull requests: {e}"),
     }
+    // Register the scope so the background worker can advance it (#1092).
+    // A scope is walked because a user OPENED it -- background spend
+    // follows demonstrated interest rather than everything a token can
+    // see, which is what keeps `Scope::All` from becoming an unbounded
+    // walk nobody asked for.
+    //
+    // A failure here costs the backfill, never the board: the user's
+    // answer is already assembled and must not depend on a bookkeeping
+    // write.
+    if let Err(e) = crate::store::pr_backfill_scope::note_seen(&conn, registration, now) {
+        log::warn!("could not register this scope for backfill: {e}");
+    }
     let Ok(stored) = pr_history::load(&conn, scope_key, window_start, window_end) else {
         log::warn!("could not read accumulated pull requests back");
         return board;
     };
+    // What the LEDGER says about this window, which is what distinguishes
+    // "we hold 400 of 2,942" from "we hold 400 and have never asked about
+    // the rest". A window with no ledger rows reports `None` for its
+    // total, and the board carries that through as a `None` rather than
+    // defaulting it -- see `Board::from_stored`.
+    let coverage = crate::store::pr_slice::coverage(&conn, scope_key, window_start, window_end)
+        .unwrap_or_default();
     crate::diag!(
-        "[diag] stats accumulate fetched={} stored={} total={}",
+        "[diag] stats accumulate fetched={} stored={} days={}/{} ledger_total={:?}",
         board.retrieved,
         stored.len(),
-        board.total
+        coverage.days_covered(),
+        crate::github::stats::backfill::days_between(window_start, window_end),
+        coverage.total
     );
-    crate::github::stats::Board::from_stored(&stored, &board)
+    crate::github::stats::Board::from_stored(
+        &stored,
+        &board,
+        &coverage,
+        crate::github::stats::backfill::days_between(window_start, window_end),
+    )
 }
 
 /// A board plus the viewer's login, which is what splits it into Mine and
@@ -3350,6 +3440,16 @@ fn accumulate_board_blocking(
 #[serde(rename_all = "camelCase")]
 pub struct StatsBoard {
     pub viewer: String,
+    /// The key this board's stored rows and ledger entries are filed
+    /// under (#1093).
+    ///
+    /// Travels with the board for `viewer`'s reason: the backfill's
+    /// progress events are app-global while the work is per-scope, so the
+    /// page needs the scope's own key to tell its own frames from another
+    /// scope's. Deriving it in TypeScript would be a second spelling of a
+    /// key the Rust side already computes, and the two could disagree --
+    /// at which point the page would silently show no progress at all.
+    pub scope_key: String,
     #[serde(flatten)]
     pub board: crate::github::stats::Board,
 }
@@ -5996,6 +6096,71 @@ pub async fn system_network_processes() -> Result<Vec<crate::health::NetProcess>
     tauri::async_runtime::spawn_blocking(crate::health::netproc::read)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// The event name the PR Stats backfill reports its progress under
+/// (#1093).
+///
+/// One frame shape, unlike `BRANCH_SCAN_PROGRESS`'s two, because this
+/// stream has one kind of news: the coverage moved. Every frame carries
+/// the whole state rather than a delta, so a listener that joined late --
+/// or missed a frame -- renders correctly from the next one instead of
+/// accumulating from a start it never saw.
+///
+/// On the allowlists in `remote/events.rs` and `src-mobile/src/events.rs`,
+/// so the phone receives it too. It carries counts and a scope key the
+/// viewer has already asked about; no repository names, no logins, no
+/// paths.
+pub const STATS_BACKFILL_PROGRESS: &str = "stats-backfill-progress";
+
+/// One frame of backfill progress.
+///
+/// `scopeKey` is on every frame for `BranchScanFrame`'s reason, and it is
+/// load-bearing rather than informational: the events are app-global while
+/// the work is per-scope, so a page that changed scope mid-walk would
+/// otherwise render another scope's coverage under its own heading.
+///
+/// `total` is `Option` and stays `Option` -- serialised as `null`, never
+/// as 0. A board with 400 collected and an unmeasured denominator must not
+/// render "400 of 0", and must never render "400 of 400, complete". The
+/// probe pass makes this `Some` after one request, so the window in which
+/// it is `null` is short -- but it exists, and a default of 0 would make
+/// the shortest window the most confidently wrong one.
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct StatsBackfillFrame {
+    pub scope_key: String,
+    pub days_covered: usize,
+    pub days_total: usize,
+    pub collected: u64,
+    pub total: Option<u64>,
+    /// Whether the worker is still walking this scope.
+    ///
+    /// The page must distinguish "backfill is running" from "backfill has
+    /// stopped": a caveat identical in both cases is #1042's indefinite
+    /// skeleton at page level, where a reader cannot tell waiting from
+    /// broken.
+    pub running: bool,
+}
+
+/// Emit one backfill progress frame.
+///
+/// Failures are discarded the way every other emitter here discards them:
+/// there is no window to receive it when the app is headless or shutting
+/// down, and a background walk must not fail because nothing was
+/// listening.
+pub fn emit_stats_backfill(app: &AppHandle, report: &crate::github::stats::backfill::Report) {
+    let _ = app.emit(
+        STATS_BACKFILL_PROGRESS,
+        StatsBackfillFrame {
+            scope_key: report.scope_key.clone(),
+            days_covered: report.days_covered,
+            days_total: report.days_total,
+            collected: report.collected,
+            total: report.total,
+            running: report.running,
+        },
+    );
 }
 
 /// The event name a branch scan reports its progress under.

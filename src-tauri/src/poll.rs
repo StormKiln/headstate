@@ -1285,6 +1285,281 @@ fn truncation_payload(fetched: u64, total: u64) -> u64 {
     }
 }
 
+/// Spawn the PR Stats backfill worker (#1092, #1093).
+///
+/// # Why this is a SIBLING of [`spawn`] and not part of its tick
+///
+/// Two reasons, and `stats::backfill`'s module docs carry them in full.
+/// [`TICK_TIMEOUT`]'s margin under [`MIN_FOCUSED_SECS`] is load-bearing --
+/// a tick that overruns overlaps its successor and two hung fetches both
+/// spend budget -- so adding a consumer inside the tick spends exactly the
+/// margin that margin exists to protect. And `budget::RESERVE` exists to
+/// protect THIS loop; putting the backfill inside the loop `RESERVE`
+/// protects would make the protection self-referential.
+///
+/// The worker therefore has its own cadence, its own floor above
+/// `RESERVE`, and no ability to delay a poll tick.
+///
+/// # What one tick does
+///
+/// Picks the least recently advanced scope a user has opened, reads the
+/// ledger for the days it has never retrieved, and asks for up to
+/// [`stats::backfill::GROUP_SLICES`] of them -- one document, MEASURED at
+/// 1 point. The rows and the ledger entry claiming them land in ONE
+/// transaction, so a crash can lose the work but can never leave the
+/// ledger claiming work that is not there.
+///
+/// Nothing is written before the fetch, which is what makes a crash
+/// mid-tick leave no stuck row: there is no `pending` state to be stuck
+/// in.
+pub fn spawn_backfill(app: AppHandle, client: Arc<GitHubClient>) {
+    tauri::async_runtime::spawn(async move {
+        // The first tick waits a full interval rather than firing at
+        // launch. Startup is the busiest moment the app has -- the poll
+        // loop's first tick, the window's first render and whatever the
+        // user clicks are all competing -- and a backfill is the one
+        // consumer that can always wait.
+        loop {
+            tokio::time::sleep(crate::github::stats::backfill::BACKFILL_INTERVAL).await;
+            let outcome = backfill_tick(&app, &client).await;
+            match &outcome {
+                crate::github::stats::backfill::TickOutcome::Advanced { days, prs } => {
+                    crate::diag!("[diag] stats backfill advanced {days} days, {prs} pull requests");
+                }
+                crate::github::stats::backfill::TickOutcome::Failed(e) => {
+                    // `warn`, never a user-facing error. Nobody asked for
+                    // this work, so a failure is not an event the user
+                    // must act on -- and the days stay uncovered, so the
+                    // next tick simply tries them again.
+                    log::warn!("stats backfill tick failed: {e}");
+                }
+                other => crate::diag!("[diag] stats backfill {other:?}"),
+            }
+        }
+    });
+}
+
+/// One backfill tick: pick a scope, fetch a group of uncovered days, write
+/// them down.
+///
+/// Separated from the loop so the sequencing is readable and so the loop
+/// itself holds no state that a failure could corrupt.
+async fn backfill_tick(
+    app: &AppHandle,
+    client: &Arc<GitHubClient>,
+) -> crate::github::stats::backfill::TickOutcome {
+    use crate::github::stats::backfill::{self as bf, TickOutcome};
+
+    // The gate, BEFORE any request. `None` means skip -- deliberately the
+    // opposite of `Budget::permits`' arm, because nobody is waiting for
+    // this and an unknown budget costs one minute rather than a user's
+    // first click.
+    let observed = crate::github::stats::budget::observed_remaining();
+    if !bf::affordable(observed, bf::TICK_PROJECTION) {
+        return TickOutcome::Skipped {
+            remaining: observed,
+        };
+    }
+
+    let db = crate::commands::db_path(app);
+    let now = chrono::Utc::now();
+
+    // Which scope, and what it still owes -- off the runtime, because this
+    // is SQLite (`persist_and_emit` states the rule).
+    let picked = {
+        let db = db.clone();
+        tauri::async_runtime::spawn_blocking(move || -> Result<Option<_>, String> {
+            let conn = open_db(&db).map_err(|e| e.to_string())?;
+            let Some(scope) =
+                crate::store::pr_backfill_scope::next_to_work(&conn).map_err(|e| e.to_string())?
+            else {
+                return Ok(None);
+            };
+            let Some((from, to)) = bf::horizon_window(now, scope.horizon_days) else {
+                return Ok(None);
+            };
+            let uncovered =
+                crate::store::pr_slice::uncovered_days(&conn, &scope.scope_key, &from, &to)
+                    .map_err(|e| e.to_string())?;
+            Ok(Some((scope, from, to, uncovered)))
+        })
+        .await
+    };
+    let picked = match picked {
+        Ok(Ok(Some(v))) => v,
+        Ok(Ok(None)) => return TickOutcome::NoScope,
+        Ok(Err(e)) => return TickOutcome::Failed(e),
+        Err(e) => return TickOutcome::Failed(e.to_string()),
+    };
+    let (scope, from, to, uncovered) = picked;
+
+    if uncovered.is_empty() {
+        // Every day in the horizon is covered. The scope is still marked
+        // worked, so the rotation moves on rather than re-deciding this
+        // same scope every minute.
+        mark_worked(&db, &scope.scope_key, now).await;
+        emit_backfill(app, &db, &scope.scope_key, &from, &to, false).await;
+        return TickOutcome::Complete;
+    }
+
+    let Some(q) = bf::query_for(&scope.scope_kind, &scope.scope_value, &scope.measure) else {
+        // A row this build cannot interpret. Marked worked so it cannot
+        // hold the rotation, and left alone otherwise.
+        mark_worked(&db, &scope.scope_key, now).await;
+        return TickOutcome::Failed(format!("unreadable scope kind {}", scope.scope_kind));
+    };
+
+    let group: Vec<String> = uncovered.iter().take(bf::GROUP_SLICES).cloned().collect();
+    let slices = bf::day_slices(&group);
+    let budget = bf::tick_budget();
+
+    // One document for the whole group, MEASURED at 1 point.
+    let fetched = crate::github::stats::fetch::load_detail_chunked(
+        client,
+        &q,
+        &slices,
+        &budget,
+        bf::GROUP_SLICES,
+    )
+    .await;
+    let map = match fetched {
+        Ok(v) => v,
+        Err(e) => {
+            // The days stay uncovered, so the next tick retries them.
+            // Nothing was written, so there is no row to get stuck.
+            mark_worked(&db, &scope.scope_key, now).await;
+            return TickOutcome::Failed(e.to_string());
+        }
+    };
+
+    // Map the response the SAME way a foreground board does -- one mapper,
+    // so a backfilled row and a clicked one cannot differ.
+    let prs = crate::github::stats::Board::retrieved_prs(&map, &slices);
+    let refused = map["__refused"].as_u64().unwrap_or(0);
+    let counts: Vec<u64> = slices
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            map[crate::github::stats::query::slice_alias(i)]["issueCount"]
+                .as_u64()
+                .unwrap_or(0)
+        })
+        .collect();
+
+    let scope_key = scope.scope_key.clone();
+    let written = {
+        let db = db.clone();
+        let slices = slices.clone();
+        let key = scope_key.clone();
+        tauri::async_runtime::spawn_blocking(move || -> Result<(usize, usize), String> {
+            let mut conn = open_db(&db).map_err(|e| e.to_string())?;
+            let mut days = 0;
+            let mut rows = 0;
+            for (i, slice) in slices.iter().enumerate() {
+                // Rows belonging to THIS slice only. A day's rows and the
+                // claim about that day land together, so a partially
+                // written group leaves whole days rather than partial ones.
+                let mine: Vec<_> = prs
+                    .iter()
+                    .filter(|p| p.merged_at == slice.from)
+                    .cloned()
+                    .collect();
+                let count = counts.get(i).copied().unwrap_or(0);
+                // Refusals are attributed to the whole document rather
+                // than to one alias -- `Outcome::refused_fields` records
+                // that the sliced path cannot attribute them -- so a
+                // refusal marks every slice in the group as refused. That
+                // is the conservative direction: the days are re-asked.
+                let row = crate::github::stats::backfill::classify(
+                    slice,
+                    count,
+                    mine.len() as u64,
+                    refused,
+                );
+                if row.state.settled() {
+                    days += 1;
+                }
+                rows += crate::store::pr_slice::record_with_rows(&mut conn, &key, &row, &mine, now)
+                    .map_err(|e| e.to_string())?;
+            }
+            let _ = crate::store::pr_history::prune(&conn);
+            Ok((days, rows))
+        })
+        .await
+    };
+    mark_worked(&db, &scope_key, now).await;
+    let (days, rows) = match written {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return TickOutcome::Failed(e),
+        Err(e) => return TickOutcome::Failed(e.to_string()),
+    };
+
+    // Running while there is still work left in the horizon, so the page
+    // can distinguish "still walking" from "stopped" -- a caveat identical
+    // in both cases is #1042's indefinite skeleton at page level.
+    let more = uncovered.len() > group.len();
+    emit_backfill(app, &db, &scope_key, &from, &to, more).await;
+    TickOutcome::Advanced { days, prs: rows }
+}
+
+/// Note that a scope was advanced, so the rotation moves on.
+///
+/// Called on EVERY outcome including failure: a scope whose tick failed
+/// must still yield, or one persistently failing scope holds the worker
+/// forever and starves every other one.
+async fn mark_worked(db: &std::path::Path, scope_key: &str, now: chrono::DateTime<chrono::Utc>) {
+    let db = db.to_path_buf();
+    let key = scope_key.to_string();
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        if let Ok(conn) = open_db(&db) {
+            if let Err(e) = crate::store::pr_backfill_scope::note_worked(&conn, &key, now) {
+                log::warn!("could not record backfill progress: {e}");
+            }
+        }
+    })
+    .await;
+}
+
+/// Read the ledger and emit what the page should show.
+///
+/// The coverage is re-read from the database rather than accumulated in
+/// memory, so the figure the user sees is the figure that is stored -- a
+/// counter kept alongside could drift from it, and the drift would be
+/// invisible.
+async fn emit_backfill(
+    app: &AppHandle,
+    db: &std::path::Path,
+    scope_key: &str,
+    from: &str,
+    to: &str,
+    running: bool,
+) {
+    let db = db.to_path_buf();
+    let key = scope_key.to_string();
+    let (from, to) = (from.to_string(), to.to_string());
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&db).ok()?;
+        let cov = crate::store::pr_slice::coverage(&conn, &key, &from, &to).ok()?;
+        let held = crate::store::pr_history::count(&conn, &key, &from, &to).unwrap_or(0);
+        let days_total = crate::github::stats::backfill::days_between(&from, &to);
+        Some(crate::github::stats::backfill::Report {
+            scope_key: key,
+            days_covered: cov.days_covered(),
+            days_total,
+            collected: held,
+            // Straight through, `None` and all. Defaulting it here would
+            // be the "400 of 0" the design forbids, introduced at the one
+            // layer nobody would look at.
+            total: cov.total,
+            running,
+        })
+    })
+    .await;
+    if let Ok(Some(report)) = report {
+        crate::commands::emit_stats_backfill(app, &report);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// The worst case in the six-day log: 8 fetched of 29 open (#745).

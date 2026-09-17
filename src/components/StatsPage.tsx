@@ -8,6 +8,7 @@ import {
   usePeriods,
   useScopedCounts,
   useStatsBoard,
+  useStatsBackfill,
   useStatsReviewers,
   useStatsSeries,
   useStatsTree,
@@ -141,6 +142,17 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
   // opened count still appears in the headline figures, where it is the
   // intake half of the pair.
   const boardQ = useStatsBoard(scope, "merged", days, loadable);
+  // What the background worker has collected since that board was built
+  // (#1093). The board is a snapshot from load time; this is the live
+  // figure, and without it the caveat would state numbers that stop moving
+  // while collection continues -- a warning that never changes reads as
+  // broken rather than as progressing.
+  //
+  // Called HERE with the other hooks rather than beside the caveat that
+  // uses it: two early returns sit between, and a hook after one of them
+  // runs in a different order on the renders that take it. React's own
+  // lint caught this; the caveat reads the value a hundred lines below.
+  const backfill = useStatsBackfill(boardQ.data?.scopeKey);
 
   // The roster for the reviews-GIVEN board, read off the tree the sidebar
   // already loaded rather than fetched again. `useStatsTree` is keyed
@@ -233,7 +245,31 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
   // Why the board is partial, assembled from whichever channels applied.
   // All three are reported, because they fail for different reasons and a
   // reader deciding whether to trust a ranking needs to know which.
-  const caveat = board ? partialityCaveat(board) : undefined;
+  //
+  // The live frame WINS where there is one: it is strictly newer than the
+  // board's own figures, and it is the only source that can say whether
+  // the collection is still running. Every field comes from the SAME
+  // source rather than being mixed, so the sentence cannot pair a fresh
+  // numerator with a stale denominator.
+  const caveat = board
+    ? partialityCaveat(
+        backfill
+          ? {
+              ...board,
+              total: backfill.total,
+              accumulated: backfill.collected,
+              accumulating: true,
+              daysCovered: backfill.daysCovered,
+              daysTotal: backfill.daysTotal,
+              // A window the worker has now covered end to end is complete
+              // only if nothing else on the board is short. The other
+              // partiality channels are the board's own and are carried
+              // through untouched.
+              complete: board.complete && backfill.daysCovered >= backfill.daysTotal,
+            }
+          : board,
+      )
+    : undefined;
 
   // Some days missing, or none measured at all (#1045). Classified against
   // `days` -- the window the chart ASKED for -- rather than against
@@ -422,10 +458,20 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
                     // component's default wording would understate a
                     // complete measurement -- and when it is not complete
                     // the caveat above the leaderboards says why.
+                    // An unmeasured total (#1092) drops the denominator
+                    // from the sentence rather than printing `null` or a
+                    // zero. "the 120 merged that could be measured" is
+                    // true and useful on its own; "120 of 0" is not, and
+                    // "120 of 120" would claim a completeness nobody
+                    // measured. `board.complete` cannot be true with an
+                    // unmeasured total -- the Rust side requires a
+                    // denominator for it -- so the first arm is safe.
                     hint={
-                      board.complete
+                      board.complete && board.total !== null
                         ? `share of all ${board.total.toLocaleString()} merged in this window`
-                        : `share of the ${board.retrieved.toLocaleString()} of ${board.total.toLocaleString()} merged that could be measured`
+                        : board.total !== null
+                          ? `share of the ${board.retrieved.toLocaleString()} of ${board.total.toLocaleString()} merged that could be measured`
+                          : `share of the ${board.retrieved.toLocaleString()} merged that could be measured`
                     }
                   />
                 </>
@@ -730,7 +776,10 @@ export function describeScope(scope: StatsScope): string {
 /// so the caller has nothing to render.
 export function partialityCaveat(board: {
   complete: boolean;
-  total: number;
+  /// `null` when nothing has measured the window (#1092). Never defaulted
+  /// to 0 here or anywhere below: a denominator of 0 renders every ratio as
+  /// either nonsense or false reassurance.
+  total: number | null;
   retrieved: number;
   // The named type rather than an inline shape, so a field added to it on
   // the Rust side reaches this function's reader rather than being silently
@@ -742,27 +791,52 @@ export function partialityCaveat(board: {
   /// as not accumulating, rather than rendering `undefined of 2,942`.
   accumulated?: number;
   accumulating?: boolean;
+  /// #1092. Optional for the same reason: a payload cached before the
+  /// ledger existed carries no day figures, and must read as "not stated"
+  /// rather than as zero days measured.
+  daysCovered?: number;
+  daysTotal?: number;
 }): string | undefined {
   if (board.complete) return undefined;
   const parts: string[] = [];
-  // What is STORED, not what this one load fetched (#1004). The reporter's
-  // complaint is not the shortfall itself -- it is that "1523 of 2942 could
-  // not be retrieved" reads identically whether the next load will help or
-  // not. So the sentence says how many are held, how many remain, and that
-  // it improves.
+  // A WARNING STATES A FACT (#1088). The previous version ended this
+  // sentence with "loading this scope again adds to them" -- an instruction,
+  // and one that stopped being true the moment a background worker existed:
+  // the collection continues whether or not the reader does anything. What
+  // replaces it is what is true, and nothing about the app's conduct.
   const accumulated = board.accumulating ? (board.accumulated ?? 0) : undefined;
-  if (accumulated !== undefined && accumulated > 0 && accumulated < board.total) {
+  const total = board.total;
+  if (accumulated !== undefined && accumulated > 0 && total !== null && accumulated < total) {
     parts.push(
-      `${accumulated.toLocaleString()} of ${board.total.toLocaleString()} pull requests have been collected so far and ${(
-        board.total - accumulated
-      ).toLocaleString()} are still to come -- loading this scope again adds to them`,
+      `${accumulated.toLocaleString()} of ${total.toLocaleString()} pull requests collected`,
     );
-  } else if (board.retrieved < board.total) {
+  } else if (accumulated !== undefined && accumulated > 0 && total === null) {
+    // Collected rows with no measured denominator. Stated as a floor rather
+    // than as a ratio -- "at least N" is the repo's only-low form, and the
+    // one thing that must never appear here is a total nobody measured.
+    parts.push(`at least ${accumulated.toLocaleString()} pull requests collected so far`);
+  } else if (total !== null && board.retrieved < total) {
     // The SIZE of the gap, not just its existence. A reader deciding whether
     // a top-five is trustworthy needs to know whether four pull requests are
     // missing or four hundred.
     parts.push(
-      `${(board.total - board.retrieved).toLocaleString()} of ${board.total.toLocaleString()} pull requests could not be retrieved`,
+      `${(total - board.retrieved).toLocaleString()} of ${total.toLocaleString()} pull requests could not be retrieved`,
+    );
+  }
+  // DAYS, not just pull requests (#1092). A pull request count cannot
+  // distinguish "40% of every day" from "100% of 40% of the days", and the
+  // second tells the reader which part of the chart to trust. Stated only
+  // when the window is genuinely short of days, so a complete-but-refused
+  // board does not gain a line saying every day is measured.
+  const { daysCovered, daysTotal } = board;
+  if (
+    daysCovered !== undefined &&
+    daysTotal !== undefined &&
+    daysTotal > 0 &&
+    daysCovered < daysTotal
+  ) {
+    parts.push(
+      `${daysCovered.toLocaleString()} of ${daysTotal.toLocaleString()} days measured`,
     );
   }
   if (board.truncatedSlices.length > 0) {

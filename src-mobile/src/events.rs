@@ -102,6 +102,20 @@ pub const EVENT_NAMES: &[&str] = &[
     // number of individually-bounded calls. #830 is a 111-worktree
     // repository whose safety column never resolved at all.
     "worktree-safety",
+    // The fourteenth: how much of a stats window has been collected so far
+    // (#1093). Counts, a day tally, and the scope key this phone just
+    // asked about -- no repository names, no logins, no titles.
+    //
+    // Same test as the entries above, same answer: `stats_board` is
+    // already an allowlisted Read returning a whole leaderboard for this
+    // scope over this transport, so counts about that scope widen nothing.
+    //
+    // Needed because a backfill is unbounded in time BY DESIGN -- it walks
+    // a horizon a point at a time over minutes or hours -- and a phone
+    // cannot leave a window open to wait it out. Without this the caveat
+    // on the page never changes, and a number that never moves reads as
+    // broken rather than as progressing.
+    "stats-backfill-progress",
 ];
 
 /// The event whose payload is the PR list, cached as the snapshot.

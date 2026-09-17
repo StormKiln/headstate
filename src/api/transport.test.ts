@@ -378,6 +378,12 @@ const POLL_EVENTS: [string, () => unknown][] = [
   // that imported Tauri's `listen` directly would work on the desktop
   // and silently never fire on the phone.
   ["worktree-safety", () => hooks.useWorktreeSafety("/code/app")],
+  // The fourteenth (#1093). PR Stats collects a window a group of days at
+  // a time over minutes, so what the page can show is what arrives while
+  // it is open — and a hook that imported Tauri's `listen` directly would
+  // work on the desktop and silently never fire on the phone, which is
+  // the client with no window to leave open and wait in.
+  ["stats-backfill-progress", () => hooks.useStatsBackfill("board|merged|*|org:X")],
 ];
 
 function wrapper({ children }: { children: ReactNode }) {

@@ -13,6 +13,10 @@ vi.mock("../api/hooks", async () => {
     useScopedCounts: vi.fn(),
     useStatsSeries: vi.fn(),
     useStatsBoard: vi.fn(),
+    // The backfill's live progress (#1093). Defaults to `null` -- no frame
+    // has arrived -- so every test that does not care keeps reading the
+    // board's own figures rather than a live frame it never set up.
+    useStatsBackfill: vi.fn(() => null),
     // The reviews-GIVEN board and the roster it reads (#826's reopening).
     useStatsReviewers: vi.fn(),
     useStatsTree: vi.fn(),
@@ -39,6 +43,7 @@ import {
   useMergedDetail,
   usePeriods,
   useScopedCounts,
+  useStatsBackfill,
   useStatsBoard,
   useStatsReviewers,
   useStatsSeries,
@@ -69,6 +74,7 @@ const spend = {
 
 const board = (over: Partial<StatsBoard> = {}): StatsBoard => ({
   viewer: "octocat",
+  scopeKey: "board|merged|*|org:acme",
   rows: [row()],
   total: 12,
   retrieved: 12,
@@ -87,6 +93,11 @@ const board = (over: Partial<StatsBoard> = {}): StatsBoard => ({
   // than leaking into every partiality case as an unrelated change of copy.
   accumulated: 12,
   accumulating: false,
+  // A fully measured window by default, matching `complete: true` above --
+  // so a test that overrides only the pull request figures does not also
+  // acquire a day shortfall it never asked about.
+  daysCovered: 30,
+  daysTotal: 30,
   ...over,
 });
 
@@ -584,8 +595,13 @@ describe("StatsPage honesty", () => {
     expect(screen.getByText(/380 of 500/)).toBeTruthy();
   });
 
-  /// #1004 end to end: an accumulating board tells the reader the gap is
-  /// closing, on the page rather than only in the helper.
+  /// #1004 end to end, as #1088 and #1092 left it: the page states what
+  /// has been collected and how much of the window was measured, and does
+  /// NOT tell the reader to load it again.
+  ///
+  /// The removed clause was both an instruction and, once a background
+  /// worker exists, false -- collection continues whether or not the
+  /// reader does anything.
   it("tells a reader a partial board is still filling in", () => {
     vi.mocked(useStatsBoard).mockReturnValue(
       settled(
@@ -595,14 +611,81 @@ describe("StatsPage honesty", () => {
           retrieved: 120,
           accumulated: 400,
           accumulating: true,
+          daysCovered: 12,
+          daysTotal: 30,
         }),
       ),
     );
     render(<StatsPage />);
     fireEvent.click(screen.getByRole("tab", { name: /others/i }));
     expect(screen.getByText(/rankings are incomplete/i)).toBeTruthy();
-    expect(screen.getByText(/400 of 500/)).toBeTruthy();
-    expect(screen.getByText(/loading this scope again adds to them/i)).toBeTruthy();
+    expect(screen.getByText(/400 of 500 pull requests collected/)).toBeTruthy();
+    // Days, which is what says WHICH PART of the chart to trust.
+    expect(screen.getByText(/12 of 30 days measured/)).toBeTruthy();
+    expect(screen.queryByText(/adds to them/i)).toBeNull();
+  });
+
+  /// **The streaming property, end to end (#1093).**
+  ///
+  /// A board loaded at 120 of 500 with the worker still walking must show
+  /// the LIVE figure, not the one frozen at load time. Without this the
+  /// page states a number that never moves while collection continues,
+  /// which is indistinguishable from a collection that has stopped.
+  it("shows the backfill's live figures rather than the board's snapshot", () => {
+    vi.mocked(useStatsBoard).mockReturnValue(
+      settled(
+        board({
+          complete: false,
+          total: 500,
+          retrieved: 120,
+          accumulated: 120,
+          accumulating: true,
+          daysCovered: 6,
+          daysTotal: 30,
+        }),
+      ),
+    );
+    // The worker has advanced since that board was assembled.
+    vi.mocked(useStatsBackfill).mockReturnValue({
+      scopeKey: "board|merged|*|org:acme",
+      daysCovered: 18,
+      daysTotal: 30,
+      collected: 400,
+      total: 500,
+      running: true,
+    });
+    render(<StatsPage />);
+    fireEvent.click(screen.getByRole("tab", { name: /others/i }));
+    expect(screen.getByText(/400 of 500 pull requests collected/)).toBeTruthy();
+    expect(screen.getByText(/18 of 30 days measured/)).toBeTruthy();
+    // The stale snapshot figures are gone, not merely supplemented.
+    expect(screen.queryByText(/120 of 500/)).toBeNull();
+    expect(screen.queryByText(/6 of 30 days/)).toBeNull();
+  });
+
+  /// **An unmeasured denominator never becomes a zero on the page.**
+  ///
+  /// The end-to-end counterpart of the helper's own test: a live frame
+  /// whose total is `null` must not render "400 of 0" -- and must not
+  /// render "400 of 400, complete", which is the reassuring failure.
+  it("never renders an unmeasured total as a zero or as complete", () => {
+    vi.mocked(useStatsBoard).mockReturnValue(
+      settled(board({ complete: false, total: null, retrieved: 0, accumulating: true })),
+    );
+    vi.mocked(useStatsBackfill).mockReturnValue({
+      scopeKey: "board|merged|*|org:acme",
+      daysCovered: 4,
+      daysTotal: 30,
+      collected: 400,
+      total: null,
+      running: true,
+    });
+    render(<StatsPage />);
+    fireEvent.click(screen.getByRole("tab", { name: /others/i }));
+    expect(screen.getByText(/at least 400 pull requests collected/)).toBeTruthy();
+    expect(screen.getByText(/4 of 30 days measured/)).toBeTruthy();
+    expect(screen.queryByText(/of 0/)).toBeNull();
+    expect(screen.queryByText(/400 of 400/)).toBeNull();
   });
 
   /// Figures from a partial board read as floors, not totals.
@@ -746,10 +829,15 @@ describe("partialityCaveat", () => {
   });
 
   /// #1004: a shortfall that is CONVERGING must not read like one that is
-  /// stuck. The reporter's complaint is not the gap itself -- it is that
-  /// "1523 of 2942 could not be retrieved" is the same sentence whether
-  /// another load will help or not.
-  it("says what is stored, what remains, and that it improves", () => {
+  /// stuck. #1088 then removed the half that told the reader what to do
+  /// about it: "loading this scope again adds to them" was an instruction,
+  /// and once a background worker exists it is also FALSE -- the collection
+  /// continues whether or not the reader loads anything.
+  ///
+  /// What is left is a statement of fact, in two figures, and the second is
+  /// the one #1092 added: days. A pull request count cannot distinguish
+  /// "40% of every day" from "100% of 40% of the days".
+  it("states what is collected and how much of the window was measured", () => {
     const out = partialityCaveat({
       complete: false,
       total: 2942,
@@ -759,12 +847,61 @@ describe("partialityCaveat", () => {
       refusedFields: 0,
       accumulated: 2219,
       accumulating: true,
+      daysCovered: 34,
+      daysTotal: 90,
     })!;
-    expect(out).toContain("2,219 of 2,942");
-    expect(out).toContain("723");
-    expect(out).toMatch(/loading this scope again adds to them/i);
+    expect(out).toContain("2,219 of 2,942 pull requests collected");
+    expect(out).toContain("34 of 90 days measured");
+    // The excuse is gone, and stays gone: it told the reader to do
+    // something that is neither necessary nor sufficient.
+    expect(out).not.toMatch(/adds to them/i);
+    expect(out).not.toMatch(/loading this scope again/i);
     // And it must NOT fall back to the stuck-sounding sentence.
     expect(out).not.toMatch(/could not be retrieved/);
+  });
+
+  /// **A denominator nobody measured is never rendered (#1092).**
+  ///
+  /// The case the `Option` exists for: rows on disk over a window the
+  /// ledger has never probed. "400 of 0" is nonsense and "400 of 400,
+  /// complete" is worse, because it reads as reassuring -- so the figure
+  /// is stated as a FLOOR instead, which is the repo's only-low form.
+  it("states a floor rather than a ratio when the total is unmeasured", () => {
+    const out = partialityCaveat({
+      complete: false,
+      total: null,
+      retrieved: 0,
+      truncatedSlices: [],
+      refusedFields: 0,
+      accumulated: 400,
+      accumulating: true,
+      daysCovered: 4,
+      daysTotal: 30,
+    })!;
+    expect(out).toContain("at least 400 pull requests collected");
+    expect(out).toContain("4 of 30 days measured");
+    // The two forbidden renderings of an unmeasured denominator.
+    expect(out).not.toContain("of 0");
+    expect(out).not.toMatch(/400 of 400/);
+    expect(out).not.toMatch(/complete/i);
+  });
+
+  /// A payload cached before the ledger existed carries no day figures,
+  /// and must read as "not stated" rather than as zero days measured --
+  /// which would be the absent-is-not-zero defect in the warning itself.
+  it("omits the day figure rather than inventing one for an older payload", () => {
+    const out = partialityCaveat({
+      complete: false,
+      total: 2942,
+      retrieved: 800,
+      truncatedSlices: [],
+      refusedFields: 0,
+      accumulated: 2219,
+      accumulating: true,
+    })!;
+    expect(out).toContain("2,219 of 2,942 pull requests collected");
+    expect(out).not.toMatch(/days measured/i);
+    expect(out).not.toMatch(/0 of 0/);
   });
 
   /// The counterpart, and the one that keeps the promise honest: with
