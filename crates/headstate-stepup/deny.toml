@@ -1,0 +1,52 @@
+# The step-up crate's supply-chain gate (#1008).
+#
+# A separate file from the other two for the same reason they are separate
+# from each other: three crates, three dependency graphs, resolved
+# independently. MEASURED at the time of writing: 25 packages shared between
+# the desktop and mobile lockfiles are legitimately at different versions, so
+# a shared configuration would have to describe a graph that does not exist.
+#
+# # Why this file did not exist until now
+#
+# It was not a decision. `crates/headstate-stepup` has a lockfile and 60
+# packages, and the Makefile already ran `fmt`, `clippy` and `test` against
+# it -- but never `cargo deny`. So its dependencies could have carried a
+# known vulnerability indefinitely and no job would have said so.
+#
+# That is the same shape as the failure #1008 was filed for: an advisory
+# handled in one crate and believed handled repo-wide.
+# `scripts/check-lockfile-agreement.py` now fails when a crate with a
+# lockfile has no advisory check, so the next crate cannot be added silently.
+[graph]
+# The desktop scopes to macOS and the mobile crate to the two phone targets.
+# This crate builds wherever the desktop does, so it takes the same scope --
+# a finding in a Windows- or Linux-only dependency is still reported, because
+# the desktop ships on all three.
+all-features = true
+
+[advisories]
+version = 2
+
+# The allow-list is exactly what this graph uses, not a copy of the
+# desktop's. `cargo deny` warns on an allowance it never encounters, and an
+# allowance for a license no dependency carries is a claim about nothing --
+# it would also quietly pre-approve that license for a future dependency.
+#
+# No `ignore` list, deliberately. The other two crates carry acceptances for
+# unmaintained transitive dependencies they cannot currently move off
+# (unic-*, bincode, paste). This crate's graph is 60 packages rather than
+# ~600 and has none of them, so an empty list is the honest state rather
+# than a copied one. An entry here should name the finding and the reason,
+# the way the sibling files do.
+
+[bans]
+multiple-versions = "allow"
+
+[licenses]
+version = 2
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "BSD-3-Clause",
+  "Unicode-3.0",
+]

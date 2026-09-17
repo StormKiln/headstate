@@ -344,6 +344,12 @@ jobs:
       - name: cargo-deny
         working-directory: src-tauri
         run: cargo deny check
+      # The step-up crate had a lockfile and no advisory check at all
+      # (#1008). Here rather than in `deny-mobile`'s job because this is
+      # the supply-chain job and the crate ships with the desktop.
+      - name: cargo-deny (step-up)
+        working-directory: crates/headstate-stepup
+        run: cargo deny check
       # A REAL advisory fails. An unreachable service does not.
       #
       # npm's advisories endpoint went down for hours and took every

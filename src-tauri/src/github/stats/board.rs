@@ -283,13 +283,6 @@ pub struct ShortSlice {
     pub retrieved: u64,
 }
 
-impl ShortSlice {
-    /// PRs this slice is missing from the board.
-    pub fn missing(&self) -> u64 {
-        self.issue_count.saturating_sub(self.retrieved)
-    }
-}
-
 /// Per-author aggregates for one scope and window, with every way they
 /// could be wrong stated alongside them.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -446,6 +439,23 @@ impl Board {
     /// decide what to say about the unknown case rather than being handed
     /// a plausible default -- which is the whole reason [`Board::total`]
     /// is an `Option`.
+    ///
+    /// # `#[cfg(test)]`, and why it is not deleted (#1101)
+    ///
+    /// Nothing in production calls this. The page reports the COUNT of
+    /// short slices (`StatsPage.tsx:842`) and never computes a per-slice
+    /// or whole-board shortfall, so there is no caller to give it.
+    ///
+    /// It is kept, gated, rather than removed because the `Option` is the
+    /// absent-is-not-zero rule stated in one line: the moment a caller
+    /// does want this number, the shape it gets should already refuse to
+    /// answer 0 for an unmeasured denominator. Deleting it would mean the
+    /// next person writes `total - retrieved` and ships the 0.
+    ///
+    /// `pub` without a caller reads as an API something depends on, which
+    /// is the misreading #1101 was filed about. The gate says what is
+    /// true: this is for tests until something needs it.
+    #[cfg(test)]
     pub fn missing(&self) -> Option<u64> {
         self.total.map(|t| t.saturating_sub(self.retrieved))
     }
@@ -1548,7 +1558,9 @@ mod tests {
                 retrieved: 1,
             }]
         );
-        assert_eq!(b.truncated_slices[0].missing(), 49);
+        // The shortfall is `issue_count - retrieved`, both asserted above.
+        // `ShortSlice::missing()` used to restate it here and had no other
+        // caller in the tree (#1101); the fields are the fact.
     }
 
     /// An alias MISSING from the map is reported, not treated as an empty
