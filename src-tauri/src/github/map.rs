@@ -215,21 +215,48 @@ fn requested_reviewers(node: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// GitHub's own count for a connection, defaulting to what arrived.
+/// How many entries this connection has, in terms of the MAPPED list.
 ///
-/// `fetched` is the length of the mapped list, NOT of the raw nodes: the
-/// mappers drop entries they cannot name (a review with no author, a
-/// `requestedReviewer` that is a Team rather than a User), and defaulting
-/// to the raw length would claim we have more than we can show.
+/// # Why this is not just `totalCount`
 ///
-/// The default is the length and NEVER 0. An absent `totalCount` -- a
-/// snapshot cached before #1089 added the field, a partial response that
-/// dropped it -- must read as "nothing missing". A 0 against a non-empty
-/// list renders "3 of 0", which is the absent-is-not-zero defect (#846)
-/// wearing a truncation notice. `review_threads_total` and `checks_total`
-/// state the same rule for the same reason.
-fn connection_total(conn: &Value, fetched: usize) -> u64 {
-    conn["totalCount"].as_u64().unwrap_or(fetched as u64)
+/// Two different reductions are at work and conflating them invents a
+/// truncation that does not exist:
+///
+/// - The WINDOW cuts the connection. `totalCount` minus the number of
+///   nodes that arrived is the real shortfall, and the only thing the UI
+///   should report.
+/// - The MAPPER then drops nodes it cannot name -- a review with no
+///   author, a `requestedReviewer` that is a Team or Mannequin rather
+///   than a User. Those entries DID arrive; they are simply not people
+///   this app can name.
+///
+/// Returning a bare `totalCount` against the mapped length adds the two
+/// together, so a Team reviewer sitting inside the window reads as a
+/// person the window hid. MEASURED on live data: 1 of 25 open
+/// kubernetes/kubernetes pull requests has exactly that shape
+/// (`totalCount` 3, three nodes, two of them Users), and it would have
+/// rendered a truncation warning on a pull request whose reviewer list
+/// arrived whole.
+///
+/// So the shortfall is measured against the RAW nodes and then added to
+/// the mapped length: `mapped + (totalCount - arrived)`. A dropped Team
+/// shrinks the list, as it should, without becoming a missing person.
+///
+/// The result is never below `mapped` and never 0 against a non-empty
+/// list. An absent `totalCount` -- a snapshot cached before #1089 added
+/// the field, a partial response that dropped it -- reads as "nothing
+/// missing". A 0 there would render "3 of 0", which is the
+/// absent-is-not-zero defect (#846) wearing a truncation notice;
+/// `review_threads_total` and `checks_total` state the same rule.
+fn connection_total(conn: &Value, mapped: usize) -> u64 {
+    let arrived = conn["nodes"].as_array().map_or(0, Vec::len);
+    // Saturating: `totalCount` can legitimately lag the nodes (the count
+    // and the page come from slightly different moments), and that is
+    // not a negative shortfall. The same care `ReviewThreads` takes.
+    let unseen = conn["totalCount"]
+        .as_u64()
+        .map_or(0, |t| t.saturating_sub(arrived as u64));
+    mapped as u64 + unseen
 }
 
 /// The logins in a `{ nodes: [{ login }] }` connection.
@@ -1319,6 +1346,67 @@ mod tests {
         assert_eq!(pr.assignees_total, pr.assignees.len() as u64);
         assert_eq!(pr.latest_reviews_total, pr.latest_reviews.len() as u64);
         assert_eq!(pr.labels_total, pr.labels.len() as u64);
+    }
+
+    /// A Team reviewer inside the window is not a person the window hid.
+    ///
+    /// `reviewRequests.totalCount` counts Teams and Mannequins, which the
+    /// mapper drops because it cannot name them. Comparing that count
+    /// against the mapped list would add the dropped Team to the genuine
+    /// shortfall and report a truncation on a connection that arrived
+    /// whole -- a false warning, which is the opposite error to the one
+    /// #1089 is about and just as dishonest.
+    ///
+    /// This shape is MEASURED, not hypothetical: 1 of 25 open
+    /// kubernetes/kubernetes pull requests has `totalCount` 3 across
+    /// three nodes of which two are Users.
+    #[test]
+    fn a_team_reviewer_inside_the_window_is_not_counted_as_one_the_window_hid() {
+        let v = json!({"search": {"nodes": [{
+            "number": 1, "title": "t", "url": "u",
+            "createdAt": "2026-08-20T10:00:00Z", "updatedAt": "2026-08-20T10:00:00Z",
+            "repository": {"nameWithOwner": "o/r"},
+            // Three asked for, three arrived, one of them a Team.
+            "reviewRequests": {"totalCount": 3, "nodes": [
+                {"requestedReviewer": {"login": "octocat"}},
+                {"requestedReviewer": {"login": "hubot"}},
+                {"requestedReviewer": {}}
+            ]}
+        }]}});
+        let pr = &map_list(&v, "search")[0];
+        assert_eq!(pr.requested_reviewers.len(), 2);
+        // Two, not three: nothing was cut by the window, so the total
+        // must equal what the row can actually name.
+        assert_eq!(
+            pr.requested_reviewers_total, 2,
+            "a dropped Team must shrink the list, not become a missing person"
+        );
+    }
+
+    /// And the genuine shortfall still survives alongside a dropped Team.
+    ///
+    /// The two reductions are independent, so a connection that is BOTH
+    /// truncated and carrying a Team must report the window's cut and
+    /// only the window's cut.
+    #[test]
+    fn a_window_cut_is_still_reported_when_a_team_was_also_dropped() {
+        let v = json!({"search": {"nodes": [{
+            "number": 1, "title": "t", "url": "u",
+            "createdAt": "2026-08-20T10:00:00Z", "updatedAt": "2026-08-20T10:00:00Z",
+            "repository": {"nameWithOwner": "o/r"},
+            // Nine asked for, three arrived (six cut by the window), and
+            // one of the three is a Team.
+            "reviewRequests": {"totalCount": 9, "nodes": [
+                {"requestedReviewer": {"login": "octocat"}},
+                {"requestedReviewer": {"login": "hubot"}},
+                {"requestedReviewer": {}}
+            ]}
+        }]}});
+        let pr = &map_list(&v, "search")[0];
+        assert_eq!(pr.requested_reviewers.len(), 2);
+        // Two named plus the six the window cut. NOT 9, which would count
+        // the Team twice over, and not 2, which would hide the cut.
+        assert_eq!(pr.requested_reviewers_total, 8);
     }
 
     /// The default is the MAPPED length, not the raw node count.

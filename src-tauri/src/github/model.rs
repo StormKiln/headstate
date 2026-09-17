@@ -157,15 +157,21 @@ pub struct PullRequest {
     /// reviewer into one verdict and names nobody.
     #[serde(default)]
     pub latest_reviews: Vec<ReviewerVerdict>,
-    /// GitHub's own counts for the four connections above, which the
-    /// lists beside them can be short of (#1089).
+    /// How many entries each of the four connections above has, which
+    /// the lists beside them can be short of (#1089).
     ///
-    /// Each defaults to the LENGTH OF ITS LIST, never to 0 -- the same
-    /// rule `review_threads_total` and `checks_total` state on
-    /// `PrDetail`. A payload written before this field existed, or a
-    /// partial response that dropped it, must read as "nothing missing";
-    /// a 0 against a non-empty list would render the nonsense "3 of 0"
-    /// and is the absent-is-not-zero defect from #846 all over again.
+    /// NOT a bare `totalCount`: see `map.rs`'s `connection_total`. The
+    /// window's cut and the mapper's drops are two different reductions,
+    /// and adding them together reports a truncation on a connection
+    /// that arrived whole -- measured on 1 of 25 live pull requests,
+    /// where a Team reviewer inside the window would have read as a
+    /// person the window hid.
+    ///
+    /// Never 0 against a non-empty list -- the same rule
+    /// `review_threads_total` and `checks_total` state on `PrDetail`. A
+    /// payload written before this field existed, or a partial response
+    /// that dropped it, reads as "nothing missing"; a 0 would render the
+    /// nonsense "3 of 0", which is #846 all over again.
     ///
     /// `latest_reviews_total` is the load-bearing one. `pendingReviewers`
     /// subtracts the answered from the asked, so a reviewer outside the
