@@ -671,6 +671,23 @@ const MIGRATIONS: &[&str] = &[
         calls       TEXT NOT NULL,
         scanned_at  TEXT NOT NULL
      );",
+    // 17: re-scan the corpus for the engagement signal (#1082).
+    //
+    // `claude_plugin_scan.calls` gained `touches` and `install_reads`,
+    // which a row written by migration 16 does not carry. `serde`
+    // fills a missing field as empty, and an empty footprint is
+    // indistinguishable from a measured zero -- so an unmigrated cache
+    // would report `remember` with no footprint at all, which is the
+    // exact false zero #1082 exists to remove, served from cache and
+    // never corrected because the files have not changed.
+    //
+    // DELETE rather than a column default: the fix is to re-read the
+    // transcripts, and emptying the cache is what makes the next scan
+    // do that. The cost is one 26-second rescan of derived data, and
+    // nothing observed is lost -- the transcripts are the source and
+    // they are untouched. Migration 16's own test makes the same
+    // argument for the same table.
+    "DELETE FROM claude_plugin_scan;",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
@@ -914,7 +931,76 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, MIGRATIONS.len() as i64);
-        assert_eq!(version, 16, "this is migration 16");
+        assert!(
+            version >= 16,
+            "migration 16 is the one that adds this table, and later \
+             migrations may follow it"
+        );
+    }
+
+    /// Migration 17 drops the stale plugin cache, and costs nothing else.
+    ///
+    /// A row written by migration 16 has no engagement figures in its
+    /// `calls` blob, and `serde` fills the missing fields as empty --
+    /// which is indistinguishable from a measured zero. Left in place,
+    /// an install upgrading to #1082 would report `remember` as having
+    /// no footprint, served from cache and never corrected because the
+    /// transcripts themselves have not changed. That is exactly the
+    /// false zero the feature exists to remove.
+    ///
+    /// The cache is Headstate's own derived data, so clearing it costs
+    /// one rescan and no observation. The tables beside it hold readings
+    /// that cannot be recovered, and they must survive.
+    #[test]
+    fn migration_17_clears_the_stale_plugin_cache() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE claude_session (
+                session_id TEXT PRIMARY KEY, name TEXT, cwd TEXT, git_branch TEXT,
+                claude_version TEXT, transcript_path TEXT,
+                first_seen_at TEXT NOT NULL, last_activity_at TEXT);
+             CREATE TABLE claude_plugin_scan (
+                path TEXT PRIMARY KEY, mtime_ms INTEGER NOT NULL,
+                size_bytes INTEGER NOT NULL, calls TEXT NOT NULL,
+                scanned_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        // A session observation, and a cache row written before #1082.
+        conn.execute(
+            "INSERT INTO claude_session (session_id, first_seen_at) VALUES ('s1','2026-09-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO claude_plugin_scan (path, mtime_ms, size_bytes, calls, scanned_at)
+             VALUES ('/p/a.jsonl', 1, 2, '{\"per_plugin\":{}}', '2026-09-16T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 16i64).unwrap();
+
+        migrate(&conn).unwrap();
+
+        // The stale cache row is gone, so the next scan re-reads and
+        // gathers the engagement figures.
+        let cached: i64 = conn
+            .query_row("SELECT COUNT(*) FROM claude_plugin_scan", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cached, 0, "a pre-#1082 cache row must not be trusted");
+
+        // And nothing observed was lost to get there.
+        let kept: i64 = conn
+            .query_row("SELECT COUNT(*) FROM claude_session", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 1, "clearing a cache must not cost an observation");
+
+        // The table still works afterwards.
+        conn.execute(
+            "INSERT INTO claude_plugin_scan (path, mtime_ms, size_bytes, calls, scanned_at)
+             VALUES ('/p/b.jsonl', 3, 4, '{}', '2026-09-16T00:01:00Z')",
+            [],
+        )
+        .unwrap();
     }
 
     /// A RETRIED tool call counts once; a distinct one counts again.

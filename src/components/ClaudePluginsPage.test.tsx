@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   InstalledPlugin,
   PluginDayCount,
+  PluginFootprint,
   PluginUsage,
   PluginsReport,
 } from "../types/pr";
@@ -59,8 +60,32 @@ function usage(over: Partial<PluginUsage> = {}): PluginUsage {
     failures: 0,
     last_called_at: null,
     measured: true,
+    // Untraceable by default, which is the common case: most plugins
+    // own no directory we can follow, and their engagement is unknown
+    // rather than zero.
+    footprint: { calls: 0, by_tool: {}, install_reads: 0, owned_known: false },
     ...over,
   };
+}
+
+/// A footprint, for the plugins whose engagement IS traceable.
+function footprint(over: Partial<PluginFootprint> = {}): PluginFootprint {
+  return { calls: 0, by_tool: {}, install_reads: 0, owned_known: true, ...over };
+}
+
+/// The plugin's row in the "All plugins" TABLE.
+///
+/// A plugin with calls is named twice on the page -- once in the ranked
+/// bar and once in the table -- so a bare `getByText(name)` is ambiguous
+/// and throws. The table row is the one carrying the per-plugin cells
+/// these tests are about.
+function tableRow(name: string): HTMLTableRowElement {
+  const row = screen
+    .getAllByText(name)
+    .map((el) => el.closest("tr"))
+    .find((tr): tr is HTMLTableRowElement => tr !== null);
+  if (row === undefined) throw new Error(`no table row for ${name}`);
+  return row;
 }
 
 function window30(): PluginDayCount[] {
@@ -282,6 +307,212 @@ describe("ClaudePluginsPage", () => {
     expect(screen.getAllByText("44").length).toBeGreaterThan(0);
     const alerts = screen.getAllByRole("alert").map((a) => a.textContent ?? "");
     expect(alerts.some((t) => /installed-plugin list could not be read/i.test(t))).toBe(true);
+  });
+
+  /// Invocations and engagement are shown as TWO figures, never blended.
+  ///
+  /// #1082's first required test, at the UI. A plugin invoked once whose
+  /// files are touched 100 times must show both: "1" and "100" each
+  /// legible, and the blend (101) nowhere on the page. A single number
+  /// would be a new confident-wrong answer, which is the defect this
+  /// feature exists to avoid.
+  it("shows invocations and engagement as two distinct figures", () => {
+    state.data = report({
+      installed: [plugin({ name: "superpowers" })],
+      usage: [
+        usage({
+          name: "superpowers",
+          skill_calls: 1,
+          measured: true,
+          footprint: footprint({ calls: 100, by_tool: { Bash: 70, Read: 30 } }),
+        }),
+      ],
+    });
+    render(<ClaudePluginsPage />);
+
+    const row = tableRow("superpowers");
+    const cells = Array.from(row.querySelectorAll("td")).map((c) => (c.textContent ?? "").trim());
+
+    // The two readings live in DIFFERENT cells, each exact. Asserting
+    // per cell rather than over the row's concatenated text, which runs
+    // the figures together ("1" then "100" reads as "1100") and would
+    // let a blended rendering pass.
+    const callsCell = cells.find((t) => t === "1");
+    const engagementCell = cells.find((t) => t.startsWith("100"));
+    expect(callsCell).toBeTruthy();
+    expect(engagementCell).toBeTruthy();
+    expect(callsCell).not.toBe(engagementCell);
+
+    // The tool that did the work is named, because the shape is the
+    // argument.
+    expect(engagementCell).toMatch(/Bash/);
+
+    // And the blend appears in no cell -- the specific lie prevented.
+    expect(cells.some((t) => t.startsWith("101"))).toBe(false);
+  });
+
+  /// `remember` -- 0 invocations, files written -- is not "unused".
+  ///
+  /// #1082's second required test, and the disproof the whole feature
+  /// rests on. Its entire contribution is instructions the model then
+  /// follows, so it scores zero invocations forever; a page that showed
+  /// only that would argue for uninstalling it.
+  it("does not present a plugin with engagement and no calls as unused", () => {
+    state.data = report({
+      installed: [
+        plugin({
+          name: "remember",
+          contribution: {
+            mcp: false,
+            skills: true,
+            agents: false,
+            commands: true,
+            read: true,
+          },
+        }),
+      ],
+      usage: [
+        usage({
+          name: "remember",
+          measured: true,
+          footprint: footprint({ calls: 16, by_tool: { Write: 16 } }),
+        }),
+      ],
+    });
+    render(<ClaudePluginsPage />);
+
+    const row = screen.getByText("remember").closest("tr");
+    const text = row?.textContent ?? "";
+
+    // Its work is visible.
+    expect(text).toMatch(/\b16\b/);
+    expect(text).toMatch(/Write/);
+    // And it is never called unused, nor is its engagement a zero.
+    expect(text).not.toMatch(/\bunused\b/i);
+    expect(text).not.toMatch(/none recorded/i);
+
+    // It counts toward the activity tally, rather than being filtered
+    // out as "never called" -- which is the defect at the summary level.
+    //
+    // Asserted against the tally element itself. Matching "1" anywhere
+    // in the tile passes on the "of 1 installed" denominator even when
+    // the tally reads 0, which is exactly how this assertion first
+    // passed against a calls-only tally.
+    expect(screen.getByTestId("activity-tally").textContent).toBe("1");
+  });
+
+  /// An untraceable footprint renders words, never a bare 0.
+  ///
+  /// #1082's third required test. Most plugins own no directory we can
+  /// follow, so their engagement is UNKNOWN. A "0" there would say "this
+  /// plugin did nothing" when what we mean is "we cannot see what it
+  /// did" -- absent is not zero, in the new column.
+  it("says the engagement was not traced rather than printing a bare 0", () => {
+    state.data = report({
+      installed: [plugin({ name: "playwright" })],
+      usage: [
+        usage({
+          name: "playwright",
+          mcp_calls: 44,
+          measured: true,
+          // No owned directory declared: untraceable.
+          footprint: { calls: 0, by_tool: {}, install_reads: 0, owned_known: false },
+        }),
+      ],
+    });
+    render(<ClaudePluginsPage />);
+
+    const row = tableRow("playwright");
+    const text = row.textContent ?? "";
+    expect(text).toMatch(/not traced/i);
+
+    // The ENGAGEMENT cell specifically is words, not a zero. (A bare
+    // "0" elsewhere in the row is fine and correct: this plugin was
+    // called 44 times and none of them failed, which is a measured
+    // zero in the failures column.)
+    const engagementCell = Array.from(row.querySelectorAll("td")).find((c) =>
+      /not traced/i.test(c.textContent ?? ""),
+    );
+    expect(engagementCell).toBeTruthy();
+    expect((engagementCell?.textContent ?? "").trim()).not.toBe("0");
+  });
+
+  /// A traceable plugin with nothing found IS a measured zero.
+  ///
+  /// The other direction, so the page does not become so cautious it
+  /// refuses to report a real finding. "Traceable, and we found nothing"
+  /// is a fact worth stating.
+  it("says 'none recorded' when a traceable plugin really had no engagement", () => {
+    state.data = report({
+      installed: [plugin({ name: "superpowers" })],
+      usage: [usage({ name: "superpowers", measured: true, footprint: footprint() })],
+    });
+    render(<ClaudePluginsPage />);
+    const row = screen.getByText("superpowers").closest("tr");
+    const text = row?.textContent ?? "";
+    expect(text).toMatch(/none recorded/i);
+    expect(text).not.toMatch(/not traced/i);
+  });
+
+  /// The page states the limit on what calls measure.
+  ///
+  /// #1082's third requirement. Without it the calls column implies
+  /// "value", and a reader acts on that.
+  it("says a plugin can contribute without ever being called", () => {
+    state.data = report({ installed: [plugin()], usage: [usage()] });
+    render(<ClaudePluginsPage />);
+    expect(screen.getByText(/contribute without ever being called/i)).toBeTruthy();
+  });
+
+  /// What a plugin ships is named, so a zero reads correctly.
+  ///
+  /// #1082's second requirement: a skills-only plugin and a 31-tool MCP
+  /// server cannot be judged by the same number.
+  it("names what each plugin contributes", () => {
+    state.data = report({
+      installed: [
+        plugin({
+          name: "frontend-design",
+          contribution: {
+            mcp: false,
+            skills: true,
+            agents: false,
+            commands: false,
+            read: true,
+          },
+        }),
+      ],
+      usage: [usage({ name: "frontend-design", measured: true })],
+    });
+    render(<ClaudePluginsPage />);
+    const row = screen.getByText("frontend-design").closest("tr");
+    expect(row?.textContent ?? "").toMatch(/skills/i);
+  });
+
+  /// An install path we could not read says so, rather than guessing.
+  it("does not claim what a plugin ships when the path was unreadable", () => {
+    state.data = report({
+      installed: [
+        plugin({
+          name: "mystery",
+          contribution: {
+            mcp: false,
+            skills: false,
+            agents: false,
+            commands: false,
+            read: false,
+          },
+        }),
+      ],
+      usage: [usage({ name: "mystery", measured: true })],
+    });
+    render(<ClaudePluginsPage />);
+    const row = screen.getByText("mystery").closest("tr");
+    const text = row?.textContent ?? "";
+    expect(text).toMatch(/not known/i);
+    // And it must not be described as shipping nothing, which is a
+    // different claim we cannot support.
+    expect(text).not.toMatch(/background behaviour only/i);
   });
 
   /// The chart gets the whole window.
