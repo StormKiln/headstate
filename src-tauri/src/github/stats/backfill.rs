@@ -62,6 +62,40 @@
 //! complete", and it is why `Coverage::total` can be `Some` long before
 //! the rows arrive.
 
+//! # Two of #1094's four open questions are NOT settled here
+//!
+//! Both need the live API against a real busy organisation, and this
+//! change was built without one. Saying so is the point: an unmeasured
+//! number presented as a finding is the defect #969 shipped, and #1094
+//! asks specifically for measurements rather than guesses.
+//!
+//! **(3) Does a closed DAY re-fetch identically?** `pr_history`'s module
+//! docs record the byte-identical result for a closed 30-day WINDOW --
+//! same `issueCount`, same `(repo, number, additions, deletions,
+//! mergedAt)` set. It was never taken at day granularity, and the two are
+//! not the same claim: a window's total can be stable while a day inside
+//! it moves, if GitHub's search index backfills. If a closed day CAN
+//! change, then `SliceState::Complete` is not permanent and this design
+//! needs a revisit policy.
+//!
+//! Nothing here depends on the stronger claim being true. A wrong
+//! `Complete` costs a stale day, not a corrupt one, and re-fetching a day
+//! is ~1 point for five of them -- so the safe response, if it is ever
+//! measured and comes back negative, is a re-probe cadence rather than a
+//! redesign.
+//!
+//! **(4) Does backfill traffic slow the foreground?** Unmeasured. The
+//! instrumentation to settle it already exists -- the `[diag] cmd
+//! stats_board` brackets against these ticks' own `[diag]` lines -- and it
+//! needs a session on a real account, not a unit test.
+//!
+//! So the yield mechanism #1094 sketches in its §3.4(c) is deliberately
+//! NOT shipped. Building it would be adding complexity against a cost
+//! nobody has observed, and #1094 says to measure before shipping it. What
+//! IS shipped is the cheap structural protection: one document per minute,
+//! a floor above `RESERVE`, and a task that shares the client's six read
+//! permits like any other caller rather than reserving its own.
+
 use super::budget::{self, Budget};
 use super::query::Slice;
 use super::scope::{Measure, Scope, StatsQuery};
@@ -602,6 +636,134 @@ mod tests {
             "clamp_days caps a board at 90 days; a wider horizon spends \
              the budget on days nothing can display"
         );
+    }
+
+    /// **A group of days is fetched, stored, and never asked for again.**
+    ///
+    /// The user's fourth requirement -- "it shouldn't be requerying for
+    /// data each time" -- asserted end to end against a real mock server
+    /// and a real database, through the same `load_detail_chunked` and
+    /// `record_with_rows` the worker calls.
+    ///
+    /// Asserted on REQUESTS ISSUED, which is what #1092 asks for by name:
+    /// the answer already converged before this change, the cost did not.
+    #[tokio::test]
+    async fn a_second_pass_does_not_re_request_a_day_already_stored() {
+        use crate::store::pr_slice;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let days: Vec<String> = (1..=5).map(|d| format!("2026-08-{d:02}")).collect();
+        let slices = day_slices(&days);
+
+        Mock::given(method("POST"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                let doc = body["query"].as_str().unwrap_or("").to_string();
+                let mut data = serde_json::Map::new();
+                for (i, _) in (0..16).enumerate() {
+                    let alias = format!("s{i}");
+                    if !doc.contains(&format!("{alias}: search(")) {
+                        continue;
+                    }
+                    data.insert(
+                        alias,
+                        serde_json::json!({
+                            "issueCount": 1,
+                            "nodes": [{
+                                "number": 100 + i,
+                                "title": "t",
+                                "url": "https://github.com/acme/repo/pull/1",
+                                "repository": { "nameWithOwner": "acme/repo" },
+                                "author": { "login": "alice" },
+                                "createdAt": "2026-08-01T00:00:00Z",
+                                // The day the row is filed under, and the
+                                // reason a second pass can skip it.
+                                "mergedAt": format!("2026-08-0{}T01:00:00Z", i + 1),
+                                "additions": 10,
+                                "deletions": 2,
+                                "changedFiles": 1,
+                                "reviews": { "totalCount": 1 },
+                            }]
+                        }),
+                    );
+                }
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": data,
+                    // `cost` only, NO `remaining`. A mock supplying
+                    // `remaining` writes the process-wide
+                    // OBSERVED_REMAINING and arms the cross-test race an
+                    // async test cannot lock against -- the race that
+                    // burned the v5.20.0 tag (#1048). This test does not
+                    // need the figure: it drives the fetch and the store,
+                    // never the gate, and `affordable` is asserted
+                    // directly in its own sync tests above.
+                    "extensions": { "rateLimit": { "cost": 1 } }
+                }))
+            })
+            .mount(&server)
+            .await;
+
+        let oc = octocrab::Octocrab::builder()
+            .base_uri(server.uri())
+            .unwrap()
+            .personal_token("test-token".to_string())
+            .build()
+            .unwrap();
+        let client = crate::github::client::GitHubClient::new(oc);
+        let q = query_for("org", "acme", "merged").unwrap();
+        let key = q.cache_key("octocat");
+
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::migrate(&conn).unwrap();
+
+        // Pass one: every day is uncovered, so every day is asked for.
+        let first = pr_slice::uncovered_days(&conn, &key, &days[0], &days[4]).unwrap();
+        assert_eq!(first.len(), 5, "nothing stored means nothing covered");
+
+        let budget = Budget::new();
+        let map =
+            super::super::fetch::load_detail_chunked(&client, &q, &slices, &budget, GROUP_SLICES)
+                .await
+                .unwrap();
+        let prs = super::super::Board::retrieved_prs(&map, &slices);
+        for (i, slice) in slices.iter().enumerate() {
+            let mine: Vec<_> = prs
+                .iter()
+                .filter(|p| p.merged_at == slice.from)
+                .cloned()
+                .collect();
+            let count = map[super::super::query::slice_alias(i)]["issueCount"]
+                .as_u64()
+                .unwrap_or(0);
+            let row = classify(slice, count, mine.len() as u64, 0);
+            pr_slice::record_with_rows(&mut conn, &key, &row, &mine, Utc::now()).unwrap();
+        }
+        let issued = server.received_requests().await.unwrap().len();
+        assert!(issued >= 1, "pass one must actually fetch");
+
+        // Pass two: the SAME question, now that the days are stored.
+        let second = pr_slice::uncovered_days(&conn, &key, &days[0], &days[4]).unwrap();
+        assert!(
+            second.is_empty(),
+            "every day was retrieved and stored, so a second pass must ask \
+             for NONE of them -- this is the cost convergence #1092 is \
+             about, and it is asserted on what would be requested rather \
+             than on the answer, which already converged before this change"
+        );
+
+        // And the rows really are readable by a window nobody loaded.
+        let held =
+            crate::store::pr_history::count(&conn, &key, "2026-07-01", "2026-09-30").unwrap();
+        assert_eq!(
+            held, 5,
+            "a WIDER window reads the narrow pass's rows, because the key \
+             is the day and not the question"
+        );
+        let cov = pr_slice::coverage(&conn, &key, &days[0], &days[4]).unwrap();
+        assert_eq!(cov.days_covered(), 5);
+        assert_eq!(cov.total, Some(5), "an exact denominator, from the ledger");
     }
 
     /// An unknown scope kind or measure is skipped rather than guessed.
