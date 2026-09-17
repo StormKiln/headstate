@@ -1379,6 +1379,19 @@ pub fn spawn_backfill(app: AppHandle, client: Arc<GitHubClient>) {
             // Placed in the LOOP rather than inside `backfill_tick` so a
             // future early return cannot silently reintroduce the silence:
             // there is one path out of the tick and it runs through here.
+            // A tick that never chose a scope has no window to report and
+            // no `scopeKey` for the page to match a frame against
+            // (`useStatsBackfill` filters on it), so there is nothing
+            // honest to emit. It is logged instead, because a worker that
+            // finds no registered scope while a user is watching a stats
+            // page is a REGISTRATION failure (#1109) and the log is the
+            // only place that distinction can surface.
+            if tick.scope.is_none() {
+                crate::diag!(
+                    "[diag] stats backfill tick chose no scope ({:?}) -- nothing registered to walk",
+                    tick.outcome
+                );
+            }
             if let Some(scope) = &tick.scope {
                 let next = chrono::Utc::now()
                     + chrono::Duration::from_std(crate::github::stats::backfill::BACKFILL_INTERVAL)
@@ -1447,6 +1460,16 @@ async fn backfill_tick(app: &AppHandle, client: &Arc<GitHubClient>) -> Tick {
     // first click.
     let observed = crate::github::stats::budget::observed_remaining();
     if !bf::affordable(observed, bf::TICK_PROJECTION) {
+        // Logged, not just returned: this gate fires BEFORE any request,
+        // so nothing else in the log would show that a tick happened at
+        // all. `None` is a cold start, which reads very differently from
+        // a genuinely exhausted budget.
+        crate::diag!(
+            "[diag] stats backfill skipped: remaining={:?} floor={} projection={}",
+            observed,
+            bf::BACKFILL_FLOOR,
+            bf::TICK_PROJECTION
+        );
         return TickOutcome::Skipped {
             remaining: observed,
         }
@@ -1671,8 +1694,24 @@ async fn emit_backfill(
         })
     })
     .await;
-    if let Ok(Some(report)) = report {
-        crate::commands::emit_stats_backfill(app, &report);
+    match report {
+        Ok(Some(report)) => {
+            // The frame AS THE PAGE WILL SEE IT. A user reporting "the
+            // numbers never change" needs the log to distinguish a frame
+            // that never left from one that left carrying zeros (#1109).
+            crate::diag!(
+                "[diag] stats backfill frame key={} days={}/{} collected={} total={:?} phase={:?}",
+                report.scope_key,
+                report.days_covered,
+                report.days_total,
+                report.collected,
+                report.total,
+                report.phase
+            );
+            crate::commands::emit_stats_backfill(app, &report);
+        }
+        Ok(None) => log::warn!("stats backfill could not read coverage back to report progress"),
+        Err(e) => log::warn!("stats backfill progress task failed: {e}"),
     }
 }
 
