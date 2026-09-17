@@ -3369,11 +3369,7 @@ fn accumulate_board_blocking(
 ) -> crate::github::stats::Board {
     use crate::store::pr_history;
 
-    let crate::github::stats::board::LoadedBoard {
-        board,
-        prs,
-        slices,
-    } = loaded;
+    let crate::github::stats::board::LoadedBoard { board, prs, slices } = loaded;
     let Ok(mut conn) = open_db(db) else {
         log::warn!("could not open the database to accumulate PR stats");
         return board;
@@ -6154,13 +6150,16 @@ pub struct StatsBackfillFrame {
     pub days_total: usize,
     pub collected: u64,
     pub total: Option<u64>,
-    /// Whether the worker is still walking this scope.
+    /// What the worker is doing about this scope right now.
     ///
     /// The page must distinguish "backfill is running" from "backfill has
     /// stopped": a caveat identical in both cases is #1042's indefinite
     /// skeleton at page level, where a reader cannot tell waiting from
-    /// broken.
-    pub running: bool,
+    /// broken. A `bool` could not say WHY (#1103).
+    pub phase: crate::github::stats::backfill::BackfillPhase,
+    /// When the next tick is due, as Unix milliseconds. From the backend
+    /// because the worker rotates across scopes.
+    pub next_tick_at_ms: Option<i64>,
 }
 
 /// Emit one backfill progress frame.
@@ -6178,7 +6177,8 @@ pub fn emit_stats_backfill(app: &AppHandle, report: &crate::github::stats::backf
             days_total: report.days_total,
             collected: report.collected,
             total: report.total,
-            running: report.running,
+            phase: report.phase.clone(),
+            next_tick_at_ms: report.next_tick_at_ms,
         },
     );
 }

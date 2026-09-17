@@ -1321,8 +1321,8 @@ pub fn spawn_backfill(app: AppHandle, client: Arc<GitHubClient>) {
         // consumer that can always wait.
         loop {
             tokio::time::sleep(crate::github::stats::backfill::BACKFILL_INTERVAL).await;
-            let outcome = backfill_tick(&app, &client).await;
-            match &outcome {
+            let tick = backfill_tick(&app, &client).await;
+            match &tick.outcome {
                 crate::github::stats::backfill::TickOutcome::Advanced { days, prs } => {
                     crate::diag!("[diag] stats backfill advanced {days} days, {prs} pull requests");
                 }
@@ -1335,8 +1335,67 @@ pub fn spawn_backfill(app: AppHandle, client: Arc<GitHubClient>) {
                 }
                 other => crate::diag!("[diag] stats backfill {other:?}"),
             }
+            // THE emit, and the only one. Every tick reports, whatever it
+            // decided -- including the budget gate, which returns before
+            // issuing a request and used to report nothing at all. A page
+            // that is told nothing cannot distinguish a worker that is
+            // waiting from one that has died (#1103).
+            //
+            // Placed in the LOOP rather than inside `backfill_tick` so a
+            // future early return cannot silently reintroduce the silence:
+            // there is one path out of the tick and it runs through here.
+            if let Some(scope) = &tick.scope {
+                let next = chrono::Utc::now()
+                    + chrono::Duration::from_std(crate::github::stats::backfill::BACKFILL_INTERVAL)
+                        .unwrap_or_else(|_| chrono::Duration::seconds(60));
+                emit_backfill(
+                    &app,
+                    &crate::commands::db_path(&app),
+                    &scope.key,
+                    &scope.from,
+                    &scope.to,
+                    tick.outcome.phase(),
+                    Some(next.timestamp_millis()),
+                )
+                .await;
+            }
         }
     });
+}
+
+/// A tick's outcome, plus the scope window it applies to.
+///
+/// The window travels back to the LOOP so the loop can emit exactly one
+/// frame per tick, whatever the tick decided. Previously the two emits
+/// lived inside `backfill_tick` and five of its ten exits reached neither
+/// -- including the budget gate, which returns before any request and was
+/// therefore the silent path a user on a large account sat behind
+/// indefinitely (#1103).
+///
+/// `scope` is `None` when the tick never got as far as choosing one;
+/// there is then no scope to report about, and the page keeps its last
+/// frame.
+struct Tick {
+    outcome: crate::github::stats::backfill::TickOutcome,
+    scope: Option<TickScope>,
+}
+
+/// The scope a tick touched, and the window it was walking.
+struct TickScope {
+    key: String,
+    from: String,
+    to: String,
+}
+
+impl From<crate::github::stats::backfill::TickOutcome> for Tick {
+    /// An outcome that never reached a scope. Spelled as a conversion so
+    /// the early returns stay one-liners.
+    fn from(outcome: crate::github::stats::backfill::TickOutcome) -> Self {
+        Self {
+            outcome,
+            scope: None,
+        }
+    }
 }
 
 /// One backfill tick: pick a scope, fetch a group of uncovered days, write
@@ -1344,10 +1403,7 @@ pub fn spawn_backfill(app: AppHandle, client: Arc<GitHubClient>) {
 ///
 /// Separated from the loop so the sequencing is readable and so the loop
 /// itself holds no state that a failure could corrupt.
-async fn backfill_tick(
-    app: &AppHandle,
-    client: &Arc<GitHubClient>,
-) -> crate::github::stats::backfill::TickOutcome {
+async fn backfill_tick(app: &AppHandle, client: &Arc<GitHubClient>) -> Tick {
     use crate::github::stats::backfill::{self as bf, TickOutcome};
 
     // The gate, BEFORE any request. `None` means skip -- deliberately the
@@ -1358,7 +1414,8 @@ async fn backfill_tick(
     if !bf::affordable(observed, bf::TICK_PROJECTION) {
         return TickOutcome::Skipped {
             remaining: observed,
-        };
+        }
+        .into();
     }
 
     let db = crate::commands::db_path(app);
@@ -1387,19 +1444,28 @@ async fn backfill_tick(
     };
     let picked = match picked {
         Ok(Ok(Some(v))) => v,
-        Ok(Ok(None)) => return TickOutcome::NoScope,
-        Ok(Err(e)) => return TickOutcome::Failed(e),
-        Err(e) => return TickOutcome::Failed(e.to_string()),
+        Ok(Ok(None)) => return TickOutcome::NoScope.into(),
+        Ok(Err(e)) => return TickOutcome::Failed(e).into(),
+        Err(e) => return TickOutcome::Failed(e.to_string()).into(),
     };
     let (scope, from, to, uncovered) = picked;
+    // Everything past this point knows its scope, so every exit can report
+    // one.
+    let here = |outcome| Tick {
+        outcome,
+        scope: Some(TickScope {
+            key: scope.scope_key.clone(),
+            from: from.clone(),
+            to: to.clone(),
+        }),
+    };
 
     if uncovered.is_empty() {
         // Every day in the horizon is covered. The scope is still marked
         // worked, so the rotation moves on rather than re-deciding this
         // same scope every minute.
         mark_worked(&db, &scope.scope_key, now).await;
-        emit_backfill(app, &db, &scope.scope_key, &from, &to, false).await;
-        return TickOutcome::Complete;
+        return here(TickOutcome::Complete);
     }
 
     // A measure whose days could never settle is not walked at all --
@@ -1407,13 +1473,16 @@ async fn backfill_tick(
     // rotation, and left alone otherwise.
     if !bf::walkable(&scope.measure) {
         mark_worked(&db, &scope.scope_key, now).await;
-        return TickOutcome::Complete;
+        return here(TickOutcome::Complete);
     }
     let Some(q) = bf::query_for(&scope.scope_kind, &scope.scope_value, &scope.measure) else {
         // A row this build cannot interpret. Marked worked so it cannot
         // hold the rotation, and left alone otherwise.
         mark_worked(&db, &scope.scope_key, now).await;
-        return TickOutcome::Failed(format!("unreadable scope kind {}", scope.scope_kind));
+        return here(TickOutcome::Failed(format!(
+            "unreadable scope kind {}",
+            scope.scope_kind
+        )));
     };
 
     let group: Vec<String> = uncovered.iter().take(bf::GROUP_SLICES).cloned().collect();
@@ -1435,7 +1504,7 @@ async fn backfill_tick(
             // The days stay uncovered, so the next tick retries them.
             // Nothing was written, so there is no row to get stuck.
             mark_worked(&db, &scope.scope_key, now).await;
-            return TickOutcome::Failed(e.to_string());
+            return here(TickOutcome::Failed(e.to_string()));
         }
     };
 
@@ -1497,16 +1566,19 @@ async fn backfill_tick(
     mark_worked(&db, &scope_key, now).await;
     let (days, rows) = match written {
         Ok(Ok(v)) => v,
-        Ok(Err(e)) => return TickOutcome::Failed(e),
-        Err(e) => return TickOutcome::Failed(e.to_string()),
+        Ok(Err(e)) => return here(TickOutcome::Failed(e)),
+        Err(e) => return here(TickOutcome::Failed(e.to_string())),
     };
 
-    // Running while there is still work left in the horizon, so the page
-    // can distinguish "still walking" from "stopped" -- a caveat identical
-    // in both cases is #1042's indefinite skeleton at page level.
-    let more = uncovered.len() > group.len();
-    emit_backfill(app, &db, &scope_key, &from, &to, more).await;
-    TickOutcome::Advanced { days, prs: rows }
+    // Whether there is still work left in the horizon. A tick that
+    // advanced and emptied the horizon has CONVERGED, and saying
+    // "Working" about it would leave the page promising a next batch that
+    // will never come.
+    if uncovered.len() > group.len() {
+        here(TickOutcome::Advanced { days, prs: rows })
+    } else {
+        here(TickOutcome::Complete)
+    }
 }
 
 /// Note that a scope was advanced, so the rotation moves on.
@@ -1539,7 +1611,8 @@ async fn emit_backfill(
     scope_key: &str,
     from: &str,
     to: &str,
-    running: bool,
+    phase: crate::github::stats::backfill::BackfillPhase,
+    next_tick_at_ms: Option<i64>,
 ) {
     let db = db.to_path_buf();
     let key = scope_key.to_string();
@@ -1558,7 +1631,8 @@ async fn emit_backfill(
             // be the "400 of 0" the design forbids, introduced at the one
             // layer nobody would look at.
             total: cov.total,
-            running,
+            phase,
+            next_tick_at_ms,
         })
     })
     .await;

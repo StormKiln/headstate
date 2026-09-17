@@ -200,7 +200,8 @@ pub fn record_all_with_rows(
     measured_at: DateTime<Utc>,
 ) -> Result<usize, StoreError> {
     let tx = conn.transaction()?;
-    let n = super::pr_history::put_many_in(&tx, scope_key, window_from, window_to, prs, measured_at)?;
+    let n =
+        super::pr_history::put_many_in(&tx, scope_key, window_from, window_to, prs, measured_at)?;
     for row in rows {
         put_in(&tx, scope_key, row, measured_at)?;
     }

@@ -184,6 +184,57 @@ pub const BACKFILL_INTERVAL: Duration = Duration::from_secs(60);
 /// made, and a horizon above it could never be rendered.
 pub const HORIZON_DAYS: u32 = 30;
 
+/// What the backfill is DOING for a scope, as the page must render it.
+///
+/// `bool` was not enough states. A page that knows only "running" or
+/// "not running" cannot tell a user why nothing is changing, and the
+/// reported failure (#1103) was exactly that: a board sat at "0 of 30
+/// days measured" for ten minutes while the worker was alive, solvent and
+/// deliberately waiting -- indistinguishable, to the reader, from broken.
+///
+/// Derived from [`TickOutcome`], which already carried every distinction
+/// the page needs; it simply never reached the page.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum BackfillPhase {
+    /// A request is in flight, or one just advanced the coverage.
+    Working,
+    /// Solvent and scheduled. The common steady state, and the one the
+    /// page had no way to express.
+    Waiting,
+    /// The rate budget is too low to spend. Carries the remaining figure
+    /// when one has been observed; `None` is a cold start, where nothing
+    /// has reported a budget yet.
+    Paused { remaining: Option<u64> },
+    /// Every day in the horizon is covered. Nothing further to do until
+    /// the horizon moves.
+    Converged,
+    /// The last attempt failed. The days stay uncovered and are retried,
+    /// so this is distinct from `Paused` -- the wait is not deliberate.
+    Stalled,
+}
+
+impl TickOutcome {
+    /// How this outcome reads to a user.
+    ///
+    /// The mapping lives here rather than in the emitter so that adding a
+    /// `TickOutcome` variant is a compile error until someone decides
+    /// what the page should say about it.
+    pub fn phase(&self) -> BackfillPhase {
+        match self {
+            // Nothing has been opened, so nothing is owed an explanation
+            // yet -- but the page is still waiting rather than stopped.
+            TickOutcome::NoScope => BackfillPhase::Waiting,
+            TickOutcome::Skipped { remaining } => BackfillPhase::Paused {
+                remaining: *remaining,
+            },
+            TickOutcome::Complete => BackfillPhase::Converged,
+            TickOutcome::Advanced { .. } => BackfillPhase::Working,
+            TickOutcome::Failed(_) => BackfillPhase::Stalled,
+        }
+    }
+}
+
 /// What a tick did, for the log and the progress stream.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TickOutcome {
@@ -269,13 +320,24 @@ pub struct Report {
     ///
     /// **Never defaulted to 0.** See [`Progress::tick`].
     pub total: Option<u64>,
-    /// Whether the worker is still walking, or has stopped.
+    /// What the worker is doing about this scope right now.
     ///
     /// The page must distinguish "backfill is running" from "backfill has
     /// stopped": a caveat identical in both cases is #1042's indefinite
     /// skeleton at page level, where the reader cannot tell waiting from
-    /// broken.
-    pub running: bool,
+    /// broken. A `bool` could not say WHY the wait was happening, which
+    /// #1103 showed is the distinction that matters.
+    pub phase: BackfillPhase,
+    /// When the next tick is due, as a Unix millisecond timestamp.
+    ///
+    /// From the BACKEND, never computed as `now + BACKFILL_INTERVAL` on
+    /// the page: the worker rotates across registered scopes, so any one
+    /// scope's next tick is N intervals away. A frontend countdown would
+    /// hit zero, nothing would happen, and the page would look broken in
+    /// a new way -- with a timer to make it look deliberate.
+    ///
+    /// `None` when no further tick is scheduled for this scope.
+    pub next_tick_at_ms: Option<i64>,
 }
 
 /// The days of a horizon ending yesterday, oldest first.
@@ -558,6 +620,64 @@ mod tests {
         let w = horizon_window(now(), 30).unwrap();
         assert_eq!(w.0, "2026-08-17");
         assert_eq!(w.1, "2026-09-15");
+    }
+
+    /// The budget gate is a PAUSE, and it says so.
+    ///
+    /// This is the path the reported failure sat behind (#1103): on a
+    /// large account `affordable` returns false, the tick returns before
+    /// issuing any request, and the page was told nothing at all -- so a
+    /// worker that was alive, solvent and deliberately waiting looked
+    /// identical to one that had died.
+    #[test]
+    fn a_budget_skip_reads_as_paused_and_carries_its_figure() {
+        let outcome = TickOutcome::Skipped {
+            remaining: Some(1_200),
+        };
+        assert_eq!(
+            outcome.phase(),
+            BackfillPhase::Paused {
+                remaining: Some(1_200)
+            },
+            "a skipped tick must say it is paused, and say how much is left"
+        );
+    }
+
+    /// A cold start is still a pause, with an unknown figure rather than a
+    /// zero. Absent is not zero.
+    #[test]
+    fn a_cold_start_is_paused_with_an_unknown_figure() {
+        assert_eq!(
+            TickOutcome::Skipped { remaining: None }.phase(),
+            BackfillPhase::Paused { remaining: None }
+        );
+    }
+
+    /// The remaining outcomes each map to their own state.
+    ///
+    /// Asserted together because the POINT is that they stay distinct: a
+    /// mapping that collapsed any two would put the page back to being
+    /// unable to say why nothing is changing.
+    #[test]
+    fn every_outcome_reads_as_its_own_state() {
+        assert_eq!(
+            TickOutcome::Advanced { days: 5, prs: 40 }.phase(),
+            BackfillPhase::Working
+        );
+        assert_eq!(TickOutcome::Complete.phase(), BackfillPhase::Converged);
+        assert_eq!(
+            TickOutcome::Failed("boom".into()).phase(),
+            BackfillPhase::Stalled
+        );
+        assert_eq!(TickOutcome::NoScope.phase(), BackfillPhase::Waiting);
+
+        // And specifically: a failure is NOT a pause. One is deliberate
+        // and will lift on its own; the other is not and may not.
+        assert_ne!(
+            TickOutcome::Failed("boom".into()).phase(),
+            TickOutcome::Skipped { remaining: None }.phase(),
+            "a stall and a pause must not render identically"
+        );
     }
 
     /// A day is only `Complete` when everything GitHub counted arrived.

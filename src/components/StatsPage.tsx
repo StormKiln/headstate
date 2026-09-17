@@ -13,9 +13,10 @@ import {
   useStatsSeries,
   useStatsTree,
 } from "../api/hooks";
+import { mmss, useCountdown } from "../lib/countdown";
 import { classifyFailedDays, namedDaysText, unmeasuredMessage } from "../lib/stats";
 import { useActiveFilters } from "../store/filters";
-import type { ShortSlice, Unmeasured } from "../types/pr";
+import type { BackfillPhase, ShortSlice, Unmeasured } from "../types/pr";
 import { QueryError, errorMessage } from "./QueryError";
 import { ActivityChart } from "./stats/ActivityChart";
 import { CycleTime } from "./stats/CycleTime";
@@ -153,6 +154,14 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
   // runs in a different order on the renders that take it. React's own
   // lint caught this; the caveat reads the value a hundred lines below.
   const backfill = useStatsBackfill(boardQ.data?.scopeKey);
+  // Ticks once a second toward the backend's own next-tick time, so the
+  // caveat visibly moves between frames rather than only when one lands.
+  // Wall-clock driven (`useCountdown`), so a webview throttled in the
+  // background comes back showing the true remaining time.
+  //
+  // Called HERE for the same reason as the hook above: the early returns
+  // below would otherwise change hook order on the renders that take them.
+  const secsToNextTick = useCountdown(backfill?.nextTickAtMs ?? null);
 
   // The roster for the reviews-GIVEN board, read off the tree the sidebar
   // already loaded rather than fetched again. `useStatsTree` is keyed
@@ -251,6 +260,12 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
   // the collection is still running. Every field comes from the SAME
   // source rather than being mixed, so the sentence cannot pair a fresh
   // numerator with a stale denominator.
+  // What the collection is DOING, beside what it is missing. Only from a
+  // live frame: a board with no frame has nothing to say about activity,
+  // and inventing a phase for it would be a claim nobody measured.
+  const activity = backfill
+    ? backfillActivity(backfill.phase, secsToNextTick)
+    : undefined;
   const caveat = board
     ? partialityCaveat(
         backfill
@@ -411,6 +426,12 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
             <div className="rounded-md border border-[#d29922]/40 bg-[#d29922]/10 px-3 py-2 text-xs text-[#d29922]">
               This board is incomplete, so every figure below is a floor rather
               than a total. {caveat}
+              {/* A SEPARATE sentence, not folded into the semicolon list
+                  above: those are facts about the data, this is what is
+                  being done about it. A reader told only what is missing,
+                  and told it unchanged for ten minutes, concludes the page
+                  is broken (#1103). */}
+              {activity ? <span className="ml-1 opacity-80">{activity}</span> : null}
             </div>
           ) : null}
           {half === "mine" ? (
@@ -765,6 +786,51 @@ export function describeScope(scope: StatsScope): string {
   // The subject, when there is one, KEEPS the scope -- "this person, in this
   // org" is the question a Members row asks, so both halves are named.
   return scope.subject ? `${scope.subject}, in ${where}` : String(where);
+}
+
+/// What the collection is DOING, in one sentence.
+///
+/// The counterpart to `partialityCaveat`, which says what is missing. A
+/// reader told only what is missing, and told the same thing for ten
+/// minutes, concludes the page is broken -- which is exactly what was
+/// reported in #1103. This says whether anything is still happening, and
+/// when the next change is due.
+///
+/// A WARNING STATES A FACT (#1088). "Paused" names the rate limit because
+/// that is an external condition with a known end time: it tells the
+/// reader nothing is broken and that waiting is the correct response.
+/// That is different in kind from the implementation detail #1088
+/// removed, which described the app's own conduct and gave the reader
+/// nothing to act on.
+export function backfillActivity(
+  phase: BackfillPhase,
+  secsToNextTick: number,
+): string | undefined {
+  switch (phase.kind) {
+    // Nothing to say: the absence of a caveat IS the signal.
+    case "converged":
+      return undefined;
+    case "working":
+      return "Collecting now.";
+    case "paused": {
+      // The remaining-requests figure is deliberately NOT printed. It is
+      // a number the reader cannot act on, and on a cold start there is
+      // no measurement to print -- which would invite a 0 that nobody
+      // measured.
+      return secsToNextTick > 0
+        ? `Paused: the GitHub request budget for this hour is used up. Next batch in ${mmss(secsToNextTick)}.`
+        : "Paused: the GitHub request budget for this hour is used up.";
+    }
+    case "stalled":
+      return "The last batch did not complete. It will be tried again.";
+    case "waiting":
+      // A countdown already at zero says nothing: the batch is due and
+      // has not reported yet, and a frozen 0:00 reads worse than no
+      // countdown at all.
+      return secsToNextTick > 0
+        ? `Next batch in ${mmss(secsToNextTick)}.`
+        : "Waiting for the next batch.";
+  }
 }
 
 /// Why a board is partial, in words a reader can act on.

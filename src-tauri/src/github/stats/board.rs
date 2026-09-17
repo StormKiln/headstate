@@ -2381,13 +2381,18 @@ mod tests {
     #[test]
     fn a_fully_retrieved_day_earns_a_complete_ledger_row() {
         let days = vec![
-            ("2026-08-01", 1u64, vec![day_node(1, "o/a", Some("2026-08-01T01:00:00Z"))]),
-            ("2026-08-02", 1u64, vec![day_node(2, "o/a", Some("2026-08-02T01:00:00Z"))]),
+            (
+                "2026-08-01",
+                1u64,
+                vec![day_node(1, "o/a", Some("2026-08-01T01:00:00Z"))],
+            ),
+            (
+                "2026-08-02",
+                1u64,
+                vec![day_node(2, "o/a", Some("2026-08-02T01:00:00Z"))],
+            ),
         ];
-        let slices: Vec<Slice> = days
-            .iter()
-            .map(|(d, _, _)| Slice::new(*d, *d))
-            .collect();
+        let slices: Vec<Slice> = days.iter().map(|(d, _, _)| Slice::new(*d, *d)).collect();
         let map = day_map(&days);
         let prs = Board::retrieved_prs(&map, &slices);
         let ledger = Board::slice_ledger(&map, &slices, &prs);

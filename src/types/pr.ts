@@ -2062,14 +2062,44 @@ export interface StatsBackfillFrame {
   /// denominator is unknown, and the only honest render of it says so.
   /// The same discipline `Branch.ahead`/`behind` keep (#967).
   total: number | null;
-  /// Whether the worker is still walking this scope.
+  /// What the worker is doing about this scope right now.
   ///
   /// The page must distinguish "still collecting" from "stopped": a
   /// caveat that reads identically in both cases is an indefinite
   /// skeleton at page level, where the reader cannot tell waiting from
   /// broken (#1042).
-  running: boolean;
+  ///
+  /// A `boolean` could not say WHY the wait was happening, and #1103 is
+  /// what that costs: a board sat at "0 of 30 days measured" for ten
+  /// minutes while the worker was alive, solvent and deliberately
+  /// waiting, and the page had no way to say so.
+  phase: BackfillPhase;
+  /// When the next batch is due, as Unix milliseconds, or `null` when
+  /// none is scheduled.
+  ///
+  /// From the BACKEND. Never computed as `now + 60s` on the page: the
+  /// worker rotates across registered scopes, so one scope's next tick is
+  /// N intervals away. A page-computed countdown would reach zero,
+  /// nothing would happen, and the page would look broken in a new way --
+  /// with a timer to make it look deliberate.
+  nextTickAtMs: number | null;
 }
+
+/// What the PR Stats backfill is doing for a scope, mirroring the Rust
+/// `BackfillPhase` in `src-tauri/src/github/stats/backfill.rs` (#1103).
+///
+/// Five states rather than a boolean, because "nothing is changing" has
+/// five different meanings and only one of them is a bug. `Paused` and
+/// `Stalled` are deliberately distinct: one lifts on its own at a known
+/// time, the other may not.
+export type BackfillPhase =
+  | { kind: "working" }
+  | { kind: "waiting" }
+  /// `remaining` is `null` on a cold start -- nothing has reported a
+  /// budget yet. Never render that as 0.
+  | { kind: "paused"; remaining: number | null }
+  | { kind: "converged" }
+  | { kind: "stalled" };
 
 /// One frame of a running branch DELETION, mirroring the Rust
 /// `BranchDeleteFrame` in `src-tauri/src/commands.rs`.
