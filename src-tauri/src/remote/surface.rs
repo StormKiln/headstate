@@ -928,15 +928,21 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "system_footprint" => res(commands::system_footprint(app.state()).await),
         "system_network_processes" => res(commands::system_network_processes().await),
         "docker_disk_usage" => res(commands::docker_disk_usage().await),
-        // The sync Docker commands shell out. Inline they would stall the
-        // listener's worker for every other request (#496 was this bug
-        // in the webview); the blocking pool is where they belong.
-        "docker_dangling_volumes" => res(blocking(commands::docker_dangling_volumes).await?),
-        "docker_running_containers" => res(blocking(commands::docker_running_containers).await?),
+        // These two shell out and would stall the listener's worker for
+        // every other request (#496 was this bug in the webview). The
+        // `blocking()` wrapper that used to live here is gone because
+        // #1090 moved the `spawn_blocking` INTO the commands themselves:
+        // the desktop called the same two functions synchronously and
+        // froze its own UI, so wrapping only the phone's arm fixed half
+        // the defect. Both callers now get the same treatment.
+        "docker_dangling_volumes" => res(commands::docker_dangling_volumes().await),
+        "docker_running_containers" => res(commands::docker_running_containers().await),
         "preview_cleanup" => res(commands::preview_cleanup(app.clone()).await),
         "cleanup_log" => res(commands::cleanup_log(app.clone())),
         "get_cleanup_prefs" => ok(commands::get_cleanup_prefs(app.clone())),
-        "assessed_worktrees" => ok(commands::assessed_worktrees(app.clone())),
+        // `async` since #1090: it ran `git rev-parse HEAD` once per
+        // assessed worktree inline on this listener's worker.
+        "assessed_worktrees" => ok(commands::assessed_worktrees(app.clone()).await),
         "assess_worktree" => res(commands::assess_worktree(
             a.get("repoPath")?,
             a.get("worktreePath")?,
@@ -955,7 +961,9 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             a.get("filter")?,
         )),
         "scan_claude_md" => res(commands::scan_claude_md(a.get("repoPath")?).await),
-        "read_claude_md" => res(commands::read_claude_md(a.get("path")?)),
+        // `async` since #1090: an unbounded `read_to_string` dispatched
+        // inline held this listener for the length of the file.
+        "read_claude_md" => res(commands::read_claude_md(a.get("path")?).await),
         "claude_import_transcripts" => res(commands::claude_import_transcripts(app.clone()).await),
         "claude_sessions" => res(commands::claude_sessions(app.clone()).await),
         "claude_session_detail" => {

@@ -83,6 +83,29 @@
 //! scan -- 1,502 of them would be the 3.8 s whole-corpus read
 //! `transcript.rs` exists to avoid.
 //!
+//! # The selected session reads whole (#1086)
+//!
+//! The paragraph above draws the right distinction and the code then
+//! applied the bound to both halves of it. A user who SELECTS a session
+//! was shown "these are floors, not totals: the transcript is 40.4 MB and
+//! only its first 8.0 MB were read" -- a partial answer, concentrated
+//! exactly on the long sessions where "what did this cost" is a real
+//! question.
+//!
+//! So there are two entry points, and the difference between them is the
+//! bound and nothing else:
+//!
+//! - [`summarise`] -- the BULK path. Capped at [`BUDGET_BYTES`], used by
+//!   `sessions::subagent_rollup`, which reads one transcript per
+//!   attributed child. The 3.8 s whole-corpus figure is why this stays.
+//! - [`summarise_whole`] -- ONE file, on demand, behind an explicit user
+//!   selection. No cap, `truncated` false by construction, so the notice
+//!   disappears rather than being suppressed.
+//!
+//! `Usage::observed` is unchanged and still load-bearing on both: 24 of
+//! 1,502 sessions carry no usage block at all, and reading whole must not
+//! turn "we found none" into a measured zero.
+//!
 //! # Absent is not zero
 //!
 //! 24 of 1,502 sessions carry no usage block at all. `messages == 0` is
@@ -111,6 +134,19 @@ use serde::{Deserialize, Serialize};
 /// [`Usage::truncated`] -- because unlike a missing timestamp, a sum that
 /// stopped early is indistinguishable from a complete one unless it says
 /// so.
+///
+/// # What this bounds, since #1086
+///
+/// The BULK paths only -- [`summarise`], and through it
+/// `sessions::subagent_rollup`, which reads one transcript per attributed
+/// child and has parents with dozens. It does NOT bound a selected
+/// session: [`summarise_whole`] reads that one file to its end, because
+/// the 3.8 s figure this constant defends against is a whole-CORPUS read
+/// over 1,502 files and says nothing about one file a user opened.
+///
+/// Do not delete it on the strength of the selected-session measurement.
+/// The two paths need opposite treatments, and conflating them is how a
+/// 1,502-file scan becomes 1.7 GB of I/O.
 pub const BUDGET_BYTES: u64 = 8 * 1024 * 1024;
 
 /// What one session's transcript says it spent.
@@ -206,6 +242,59 @@ pub struct ModelCount {
 /// unreadable case ("we could not read it") -- the same split
 /// [`crate::claude::transcript::extract`] draws and for the same reason.
 pub fn summarise(path: &Path) -> Result<Usage, String> {
+    read_and_sum(path, Some(BUDGET_BYTES))
+}
+
+/// Sum one transcript's per-message usage, reading the WHOLE file (#1086).
+///
+/// # Why a selected session is not a scan
+///
+/// Everything [`summarise`] says about the substring pre-filter, the
+/// `cost-state` exclusion and absent-is-not-zero applies here unchanged.
+/// The one difference is the bound, and the module docs already carry the
+/// measurement that settles it: *"the 76.7 MB monster in 0.024 s ...
+/// affordable per session detail and still must never join the startup
+/// scan -- 1,502 of them would be the 3.8 s whole-corpus read"*.
+///
+/// That is one distinction, drawn two ways. **One file, on demand**, once,
+/// on `spawn_blocking`, because a user who selected a session asked for
+/// the answer about that session. **The corpus on every scan** is 3.8 s
+/// and 1.7 GB of I/O, which is what [`BUDGET_BYTES`] exists to bound and
+/// why it is not removed.
+///
+/// # The re-measurement, which did not agree with the issue
+///
+/// #1086 asks for the number in Rust rather than the argument, and says
+/// to speak up if it exceeds ~50 ms. It does.
+/// `selected_session_reads_the_largest_real_transcript_whole` measures
+/// **160 ms release, warm** for the 76.7 MB largest transcript in the
+/// corpus -- not the 24 ms the module doc above records, which was the
+/// CAPPED read of the same file. A debug build is 1.4 s.
+///
+/// It is still the right trade, and the same run says why: the capped
+/// read of that session reported 1,250 messages where the file holds
+/// 16,748. 160 ms once, off the runtime, behind an explicit click, to
+/// stop reporting 7.5% of a session's work as the answer.
+///
+/// A `Usage` returned from here has `truncated == false` by construction,
+/// so the "these are floors, not totals" notice disappears on its own
+/// rather than needing a second flag to suppress it.
+///
+/// # Errors
+///
+/// Identical to [`summarise`]: only when the file cannot be opened or
+/// sized. See its docs on why an unparseable record is not a failure.
+pub fn summarise_whole(path: &Path) -> Result<Usage, String> {
+    read_and_sum(path, None)
+}
+
+/// The shared reader. `budget` of `None` reads to the end of the file.
+///
+/// One body rather than two, because every rule this module enforces --
+/// the pre-filter, `assistant`-only, the four counters kept separate, the
+/// saturating adds -- has to hold identically on both paths, and two
+/// copies is how one of them quietly stops holding.
+fn read_and_sum(path: &Path, budget: Option<u64>) -> Result<Usage, String> {
     let mut file = std::fs::File::open(path)
         .map_err(|e| format!("{}: could not open it: {e}", path.display()))?;
     let file_bytes = file
@@ -214,10 +303,20 @@ pub fn summarise(path: &Path) -> Result<Usage, String> {
         .len();
 
     let mut buf = Vec::new();
-    (&mut file)
-        .take(BUDGET_BYTES)
-        .read_to_end(&mut buf)
-        .map_err(|e| format!("{}: could not read it: {e}", path.display()))?;
+    match budget {
+        Some(limit) => (&mut file)
+            .take(limit)
+            .read_to_end(&mut buf)
+            .map_err(|e| format!("{}: could not read it: {e}", path.display()))?,
+        // No `take`. The file is read to its end, so `truncated` below is
+        // false and `bytes_read == file_bytes` -- unless the file GREW
+        // between the `metadata` call and the read, which is real for a
+        // live session and is handled by the `<` comparison rather than by
+        // an equality assumption.
+        None => file
+            .read_to_end(&mut buf)
+            .map_err(|e| format!("{}: could not read it: {e}", path.display()))?,
+    };
 
     let mut out = Usage {
         bytes_read: buf.len() as u64,
@@ -225,6 +324,14 @@ pub fn summarise(path: &Path) -> Result<Usage, String> {
         // Whether we STOPPED early, measured against what was actually
         // read rather than against the constant: a file of exactly
         // BUDGET_BYTES is read whole and is not truncated.
+        //
+        // The same comparison serves the whole-file path (#1086), which is
+        // why it is a comparison and not `budget.is_some()`. Reading to the
+        // end can still land SHORT of `file_bytes` in one case -- the file
+        // was truncated between the `metadata` call and the read -- and
+        // that is a partial sum which must say so, budget or no budget.
+        // The opposite case, a live session that GREW, reads past
+        // `file_bytes` and is correctly not truncated.
         truncated: (buf.len() as u64) < file_bytes,
         ..Default::default()
     };
@@ -512,6 +619,179 @@ mod tests {
         let u = summarise(&p).unwrap();
         assert_eq!(u.messages, 1);
         assert_eq!(u.input_tokens, 7);
+    }
+
+    #[test]
+    fn a_selected_session_reads_a_file_over_the_budget_whole() {
+        // #1086: the same file `a_file_over_the_budget_reports_that_it_
+        // stopped_early` caps. Read by the selected-session path it is
+        // complete, and every counter is the whole-file sum rather than a
+        // floor.
+        let tmp = Tmp::new("whole-big");
+        let p = tmp.path().join("big.jsonl");
+        let mut records: u64 = 0;
+        {
+            let mut f = std::fs::File::create(&p).unwrap();
+            let rec = assistant("claude-opus-5", 1, 2, 3, 4);
+            let mut written: u64 = 0;
+            while written <= BUDGET_BYTES + 64 * 1024 {
+                writeln!(f, "{rec}").unwrap();
+                written += rec.len() as u64 + 1;
+                records += 1;
+            }
+        }
+
+        let capped = summarise(&p).unwrap();
+        assert!(capped.truncated, "the bulk path must still bound itself");
+        assert_eq!(capped.bytes_read, BUDGET_BYTES);
+
+        let whole = summarise_whole(&p).unwrap();
+        assert!(
+            !whole.truncated,
+            "a whole read must not report truncation -- the notice is \
+             supposed to disappear on its own, not be suppressed"
+        );
+        assert_eq!(whole.bytes_read, whole.file_bytes);
+        assert!(whole.file_bytes > BUDGET_BYTES);
+
+        // The totals, against the record count computed while writing --
+        // an independent sum, not a re-derivation from the same read.
+        assert_eq!(whole.messages, records);
+        assert_eq!(whole.input_tokens, records);
+        assert_eq!(whole.output_tokens, records * 2);
+        assert_eq!(whole.cache_read_tokens, records * 3);
+        assert_eq!(whole.cache_creation_tokens, records * 4);
+
+        // And it is strictly MORE than the capped read saw, which is the
+        // user-visible half of #1086.
+        assert!(
+            whole.messages > capped.messages,
+            "whole {} must exceed capped {}",
+            whole.messages,
+            capped.messages
+        );
+    }
+
+    #[test]
+    fn a_whole_read_of_a_session_with_no_usage_is_still_not_zero() {
+        // `observed()` must mean the same thing on both paths. 24 of
+        // 1,502 real transcripts carry no usage block, and reading them
+        // WHOLE finds exactly as much of it as reading 8 MB did -- none.
+        // Collapsing that into four zeros is #846.
+        let tmp = Tmp::new("whole-none");
+        let p = write(
+            tmp.path(),
+            "s.jsonl",
+            &[
+                r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+                r#"{"type":"ai-title","aiTitle":"Something"}"#,
+            ],
+        );
+        let u = summarise_whole(&p).unwrap();
+        assert_eq!(u.messages, 0);
+        assert!(
+            !u.observed(),
+            "a whole read that found no usage block must stay \
+             distinguishable from a session whose messages summed to zero"
+        );
+        assert!(!u.truncated);
+    }
+
+    #[test]
+    fn the_whole_path_drops_no_record_the_bounded_path_would_have_kept() {
+        // The bounded path pops its last line because the budget lands
+        // mid-record. The whole path must NOT, or every complete file
+        // would silently lose its final message -- a one-record error on
+        // every session, which is the quietest possible way to be wrong.
+        let tmp = Tmp::new("lastline");
+        let p = write(
+            tmp.path(),
+            "s.jsonl",
+            &[
+                &assistant("claude-opus-5", 1, 1, 1, 1),
+                &assistant("claude-opus-5", 1, 1, 1, 1),
+                &assistant("claude-opus-5", 1, 1, 1, 1),
+            ],
+        );
+        assert_eq!(summarise_whole(&p).unwrap().messages, 3);
+        // And the bounded path agrees on a file under the budget, which
+        // is what proves the difference is the BOUND and not the parse.
+        assert_eq!(summarise(&p).unwrap().messages, 3);
+    }
+
+    #[test]
+    fn a_missing_file_is_an_error_on_the_whole_path_too() {
+        let tmp = Tmp::new("whole-gone");
+        let e = summarise_whole(&tmp.path().join("nope.jsonl")).unwrap_err();
+        assert!(e.contains("could not open it"), "{e}");
+    }
+
+    /// The Rust measurement #1086 asks for, printed rather than asserted.
+    ///
+    /// `#[ignore]`d for the same reason as `real_corpus_usage` below: it
+    /// reads the developer's own `~/.claude/projects`, which CI does not
+    /// have. There is no assertion at all -- a duration threshold on the
+    /// author's SSD would be a flake generator on anyone else's machine,
+    /// and the issue asked for the number rather than for a gate.
+    ///
+    /// # The measured number, and how it differs from the issue's
+    ///
+    /// Recorded on the reporting machine, `cargo test --release`, warm
+    /// cache, three runs agreeing to within 4 ms:
+    ///
+    /// ```text
+    /// largest transcript   76,740,099 bytes
+    /// summarise_whole      160 ms      16,748 messages, truncated=false
+    /// summarise (8 MB)      13 ms       1,250 messages, truncated=true
+    /// ```
+    ///
+    /// **#1086 predicted 24 ms and asked to be told if it was wrong.** It
+    /// is: 160 ms, about 6.6x. The module doc's 0.024 s was the CAPPED
+    /// read of that file, not a whole read of it, and 13 ms measured here
+    /// is the same figure on faster hardware. A debug build is 1.4 s,
+    /// which is worth knowing because `cargo test` without `--release` is
+    /// where anyone re-running this will land first.
+    ///
+    /// The conclusion holds anyway, and for a reason the issue already
+    /// gave: this is one file behind an explicit user selection, on
+    /// `spawn_blocking`, once. 160 ms is not a hang and it buys the
+    /// difference between 1,250 messages and 16,748 -- the capped read of
+    /// this session reported 7.5% of its messages as if that were the
+    /// answer. What 160 ms does change is #1087's premise that the read is
+    /// so cheap the question is moot; see that issue's closing comment.
+    #[test]
+    #[ignore]
+    fn selected_session_reads_the_largest_real_transcript_whole() {
+        let Some(root) = crate::claude::transcript::projects_dir() else {
+            return;
+        };
+        let scan = crate::claude::transcript::scan(&root);
+        let Some((path, bytes)) = scan
+            .sessions
+            .iter()
+            .filter_map(|s| {
+                std::fs::metadata(&s.path)
+                    .ok()
+                    .map(|m| (s.path.clone(), m.len()))
+            })
+            .max_by_key(|(_, b)| *b)
+        else {
+            return;
+        };
+        println!("largest transcript   {bytes} bytes");
+
+        let t0 = std::time::Instant::now();
+        let whole = summarise_whole(Path::new(&path)).unwrap();
+        println!("summarise_whole      {:?}", t0.elapsed());
+
+        let t1 = std::time::Instant::now();
+        let capped = summarise(Path::new(&path)).unwrap();
+        println!("summarise (8 MB)     {:?}", t1.elapsed());
+
+        println!(
+            "messages whole={} capped={} truncated whole={} capped={}",
+            whole.messages, capped.messages, whole.truncated, capped.truncated
+        );
     }
 
     /// The real corpus, printed rather than asserted.
