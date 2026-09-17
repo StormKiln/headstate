@@ -1402,6 +1402,13 @@ async fn backfill_tick(
         return TickOutcome::Complete;
     }
 
+    // A measure whose days could never settle is not walked at all --
+    // see `backfill::walkable`. Marked worked so it cannot hold the
+    // rotation, and left alone otherwise.
+    if !bf::walkable(&scope.measure) {
+        mark_worked(&db, &scope.scope_key, now).await;
+        return TickOutcome::Complete;
+    }
     let Some(q) = bf::query_for(&scope.scope_kind, &scope.scope_value, &scope.measure) else {
         // A row this build cannot interpret. Marked worked so it cannot
         // hold the rotation, and left alone otherwise.

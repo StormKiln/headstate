@@ -347,6 +347,34 @@ pub fn classify(slice: &Slice, issue_count: u64, retrieved: u64, refused_fields:
     }
 }
 
+/// Whether this worker can actually COMPLETE a day for a measure.
+///
+/// `Board::retrieved_prs` keeps only pull requests with a readable
+/// `mergedAt` -- it is what distinguishes a merged pull request from an
+/// open one, and the outlier lists and `repo_counts` are drawn from that
+/// same population. For `Measure::Merged` the search is `is:merged`, so
+/// every node qualifies and `retrieved` can reach `issue_count`.
+///
+/// For `Measure::Opened` it cannot. The search counts pull requests
+/// CREATED in the range, open ones included, so `issue_count` is a
+/// superset of what the mapper keeps and a day would be recorded
+/// `Refused` however many times it is fetched -- a range the worker
+/// returns to forever, spending a point each time and never settling it.
+///
+/// So an opened scope is not walked, and this is where that is decided
+/// rather than at the call site: a future caller who registers one gets
+/// the same answer without having to know why. Nothing registers one
+/// today (`StatsPage` asks the board for `merged` only), which is exactly
+/// why the check belongs here -- the day that changes, the failure would
+/// otherwise be a silent, permanent spend on days that never settle.
+///
+/// The honest fix, when an opened board exists, is for the mapper to keep
+/// open pull requests for that measure. That is a change to the board's
+/// population and belongs with the feature that needs it, not here.
+pub fn walkable(measure: &str) -> bool {
+    measure == "merged"
+}
+
 /// Rebuild the query a registered scope describes.
 ///
 /// The scalars are stored exactly as `stats_board` receives them, so this
@@ -764,6 +792,27 @@ mod tests {
         let cov = pr_slice::coverage(&conn, &key, &days[0], &days[4]).unwrap();
         assert_eq!(cov.days_covered(), 5);
         assert_eq!(cov.total, Some(5), "an exact denominator, from the ledger");
+    }
+
+    /// An `opened` scope is NOT walked, because a day of it could never
+    /// settle.
+    ///
+    /// The search counts created pull requests including open ones, while
+    /// the mapper keeps only those with a `mergedAt` -- so `retrieved`
+    /// can never reach `issue_count`, the day records `Refused`, and the
+    /// worker returns to it forever at a point a time. Nothing registers
+    /// an opened scope today, which is precisely why this is checked in
+    /// code rather than left to the caller that might.
+    #[test]
+    fn an_opened_scope_is_not_walked_because_its_days_could_never_settle() {
+        assert!(walkable("merged"));
+        assert!(
+            !walkable("opened"),
+            "an opened day's issueCount counts pull requests the mapper \
+             drops, so the day would be refetched forever without ever \
+             settling"
+        );
+        assert!(!walkable("something-else"));
     }
 
     /// An unknown scope kind or measure is skipped rather than guessed.
