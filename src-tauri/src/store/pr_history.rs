@@ -1,5 +1,5 @@
-//! Per-pull-request accumulation, so a large account eventually assembles
-//! a complete answer (#1004).
+//! Per-pull-request accumulation, keyed on the SLICE that retrieved each
+//! row (#1004, re-keyed for #1092).
 //!
 //! # The defect this exists for
 //!
@@ -14,6 +14,24 @@
 //! This module is the layer beneath `stats_cache`, not a replacement for
 //! it. `stats_cache` still memoises the assembled answer; this remembers
 //! the pull requests it was assembled FROM, so consecutive loads union.
+//!
+//! # Why the key is a slice and not a window (#1092)
+//!
+//! #1004 keyed a row on the WINDOW the user asked about, and that key is
+//! what stopped accumulation from accumulating. A 30-day board and a
+//! 90-day board filed the same pull requests under two keys and neither
+//! helped the other; changing the range selector discarded everything;
+//! and at UTC midnight the window moved out from under every banked row
+//! at once. Worst of all, the question "do we hold 2026-08-14?" could not
+//! be asked, so a fetch could not subtract what is stored from what it was
+//! about to request -- which is why `count` had zero production callers.
+//!
+//! A row is now identified by `(scope_key, repo, number)` and carries the
+//! DAY it belongs to, so it is evidence about a date rather than about a
+//! question. [`super::pr_slice`] is the ledger saying which dates have
+//! been retrieved; the two together answer "what do we hold, and what have
+//! we never asked for" -- and absent from BOTH means uncovered, never
+//! zero.
 //!
 //! # Why this is not `merge_history`
 //!
@@ -113,6 +131,23 @@ const PRUNE_BATCH: usize = MAX_ROWS / 10;
 pub struct StoredPr {
     pub repo: String,
     pub number: u64,
+    /// The day this pull request belongs to, `YYYY-MM-DD`.
+    ///
+    /// Whichever date the MEASURE is about: `mergedAt` for
+    /// `Measure::Merged`, `createdAt` for `Measure::Opened` -- the same
+    /// date the slice's own `merged:`/`created:` qualifier ranged over, so
+    /// a row always falls inside the slice that retrieved it.
+    ///
+    /// The DATE, not the timestamp. GitHub's search grammar has no
+    /// sub-day range (`slice.rs`: a day is the floor), so the time of day
+    /// is precision the ledger cannot use and could not verify. Keeping
+    /// only what is meaningful is also what makes a day-level `GROUP BY`
+    /// an index scan rather than a string slice over every row.
+    ///
+    /// This is the field #1092 needed and #1004 did not store, and its
+    /// absence is precisely why the old rows could not be re-keyed:
+    /// nothing in a row said which day inside the window it came from.
+    pub merged_at: String,
     pub title: String,
     pub url: String,
     pub author: String,
@@ -142,11 +177,11 @@ impl StoredPr {
 
 /// Write pull requests down, merging with whatever is already stored.
 ///
-/// `INSERT OR REPLACE` on `(scope_key, window_start, window_end, repo,
-/// number)`. Replace rather than ignore for the same reason
-/// `stats::put` replaces: a later load's row is at worst equal to an
-/// earlier one, and re-fetching a pull request whose diff statistics were
-/// refused the first time must be able to correct them.
+/// `INSERT OR REPLACE` on `(scope_key, repo, number)`. Replace rather than
+/// ignore for the same reason `stats::put` replaces: a later load's row is
+/// at worst equal to an earlier one, and re-fetching a pull request whose
+/// diff statistics were refused the first time must be able to correct
+/// them.
 ///
 /// **This is the accumulation point, and it is called even by a load that
 /// later hits the cap** -- that is the entire feature. Writing only on a
@@ -154,15 +189,26 @@ impl StoredPr {
 ///
 /// Returns how many rows were written.
 ///
+/// # Why the identity dropped the window (#1092)
+///
+/// A pull request merged on 2026-08-14 is the same pull request whether a
+/// 30-day board or a 90-day board retrieved it, and #1004's key stored it
+/// twice with neither copy helping the other. `(scope_key, repo, number)`
+/// stores it ONCE, and `merged_at` is what places it in a window at read
+/// time -- so every window that contains that day gets the row for free,
+/// including one nobody has loaded yet.
+///
+/// `slice_from`/`slice_to` are still recorded, as provenance rather than
+/// identity: they say which request produced the row, which is what makes
+/// a stale row traceable to the slice that should be re-fetched.
+///
 /// One TRANSACTION for the whole batch, so a load that is interrupted
-/// part-way leaves either its pages or nothing, never a half-written page
-/// whose absence would be read as "this pull request is not in the
-/// window".
+/// part-way leaves either its pages or nothing.
 pub fn put_many(
     conn: &mut Connection,
     scope_key: &str,
-    window_start: &str,
-    window_end: &str,
+    slice_from: &str,
+    slice_to: &str,
     prs: &[StoredPr],
     stored_at: DateTime<Utc>,
 ) -> Result<usize, StoreError> {
@@ -170,70 +216,104 @@ pub fn put_many(
         return Ok(0);
     }
     let tx = conn.transaction()?;
-    let stamp = stored_at.to_rfc3339();
-    {
-        let mut stmt = tx.prepare(
-            "INSERT OR REPLACE INTO pr_history
-               (scope_key, window_start, window_end, repo, number, title, url,
-                author, cycle_time_hours, size, additions, deletions,
-                changed_files, reviews_received, stored_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-        )?;
-        for pr in prs {
-            stmt.execute(params![
-                scope_key,
-                window_start,
-                window_end,
-                pr.repo,
-                pr.number as i64,
-                pr.title,
-                pr.url,
-                pr.author,
-                pr.cycle_time_hours,
-                pr.size as i64,
-                pr.additions as i64,
-                pr.deletions as i64,
-                pr.changed_files as i64,
-                pr.reviews_received as i64,
-                stamp,
-            ])?;
-        }
-    }
+    let n = put_many_in(&tx, scope_key, slice_from, slice_to, prs, stored_at)?;
     tx.commit()?;
+    Ok(n)
+}
+
+/// [`put_many`] inside a transaction the CALLER owns.
+///
+/// So the rows and the [`super::pr_slice`] row claiming they are complete
+/// can be written in ONE transaction. Split out rather than duplicated
+/// because the alternative is two commits, and between them the ledger
+/// says a range is retrieved while the rows for it are not yet there --
+/// a ledger that lies, which the design is explicit is worse than no
+/// ledger at all. See `pr_slice::record_with_rows`.
+pub(super) fn put_many_in(
+    tx: &rusqlite::Transaction<'_>,
+    scope_key: &str,
+    slice_from: &str,
+    slice_to: &str,
+    prs: &[StoredPr],
+    stored_at: DateTime<Utc>,
+) -> Result<usize, StoreError> {
+    if prs.is_empty() {
+        return Ok(0);
+    }
+    let stamp = stored_at.to_rfc3339();
+    let mut stmt = tx.prepare(
+        "INSERT OR REPLACE INTO pr_history
+           (scope_key, slice_from, slice_to, repo, number, merged_at, title, url,
+            author, cycle_time_hours, size, additions, deletions,
+            changed_files, reviews_received, stored_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+    )?;
+    for pr in prs {
+        stmt.execute(params![
+            scope_key,
+            slice_from,
+            slice_to,
+            pr.repo,
+            pr.number as i64,
+            pr.merged_at,
+            pr.title,
+            pr.url,
+            pr.author,
+            pr.cycle_time_hours,
+            pr.size as i64,
+            pr.additions as i64,
+            pr.deletions as i64,
+            pr.changed_files as i64,
+            pr.reviews_received as i64,
+            stamp,
+        ])?;
+    }
     Ok(prs.len())
 }
 
-/// Every pull request stored for one scope and window.
+/// Every pull request stored for one scope whose day falls in `[from, to]`.
+///
+/// The read that makes the re-key pay: a window is a DATE RANGE over
+/// `merged_at`, so rows retrieved by any slice -- by a different window,
+/// by the background worker, by a load the user has forgotten -- all
+/// answer it. Under #1004's key this query could only return rows filed
+/// under that exact window.
 ///
 /// Ordered by `(repo, number)` so the assembled board is byte-identical
 /// between loads given the same rows -- the same determinism requirement
 /// `Board::top_by` states for its tie-breaks, applied to the source data.
+///
+/// **A row here is not a claim of completeness.** It says this pull
+/// request is held, never that every pull request in the range is.
+/// [`super::pr_slice::coverage`] is the only thing that answers that, and
+/// a range with rows but no ledger entry is partially covered at best.
 pub fn load(
     conn: &Connection,
     scope_key: &str,
-    window_start: &str,
-    window_end: &str,
+    from: &str,
+    to: &str,
 ) -> Result<Vec<StoredPr>, StoreError> {
     let mut stmt = conn.prepare(
-        "SELECT repo, number, title, url, author, cycle_time_hours, size,
+        "SELECT repo, number, merged_at, title, url, author, cycle_time_hours, size,
                 additions, deletions, changed_files, reviews_received
            FROM pr_history
-          WHERE scope_key = ?1 AND window_start = ?2 AND window_end = ?3
+          WHERE scope_key = ?1 AND merged_at >= ?2 AND merged_at <= ?3
           ORDER BY repo, number",
     )?;
-    let rows = stmt.query_map(params![scope_key, window_start, window_end], |r| {
+    let rows = stmt.query_map(params![scope_key, from, to], |r| {
         Ok(StoredPr {
             repo: r.get(0)?,
             number: r.get::<_, i64>(1)?.max(0) as u64,
-            title: r.get(2)?,
-            url: r.get(3)?,
-            author: r.get(4)?,
-            cycle_time_hours: r.get(5)?,
-            size: r.get::<_, i64>(6)?.max(0) as u64,
-            additions: r.get::<_, i64>(7)?.max(0) as u64,
-            deletions: r.get::<_, i64>(8)?.max(0) as u64,
-            changed_files: r.get::<_, i64>(9)?.max(0) as u64,
-            reviews_received: r.get::<_, i64>(10)?.max(0) as u64,
+            merged_at: r.get(2)?,
+            title: r.get(3)?,
+            url: r.get(4)?,
+            author: r.get(5)?,
+            cycle_time_hours: r.get(6)?,
+            size: r.get::<_, i64>(7)?.max(0) as u64,
+            additions: r.get::<_, i64>(8)?.max(0) as u64,
+            deletions: r.get::<_, i64>(9)?.max(0) as u64,
+            changed_files: r.get::<_, i64>(10)?.max(0) as u64,
+            reviews_received: r.get::<_, i64>(11)?.max(0) as u64,
         })
     })?;
     let mut out = Vec::new();
@@ -243,21 +323,21 @@ pub fn load(
     Ok(out)
 }
 
-/// How many pull requests are stored for one scope and window.
+/// How many pull requests are stored for one scope over a date range.
 ///
 /// Separate from [`load`] because completeness is a COUNT question and
 /// answering it by materialising every row would make the cheap check
 /// cost the expensive thing.
-pub fn count(
-    conn: &Connection,
-    scope_key: &str,
-    window_start: &str,
-    window_end: &str,
-) -> Result<u64, StoreError> {
+///
+/// Note what this is NOT: a denominator. It counts what is HELD, and
+/// comparing it against `issue_count` from the ledger is what states a
+/// shortfall. On its own a count of 40 is compatible with a range holding
+/// 40 and with one holding 4,000, and only the ledger distinguishes them.
+pub fn count(conn: &Connection, scope_key: &str, from: &str, to: &str) -> Result<u64, StoreError> {
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM pr_history
-          WHERE scope_key = ?1 AND window_start = ?2 AND window_end = ?3",
-        params![scope_key, window_start, window_end],
+          WHERE scope_key = ?1 AND merged_at >= ?2 AND merged_at <= ?3",
+        params![scope_key, from, to],
         |r| r.get(0),
     )?;
     Ok(n.max(0) as u64)
@@ -274,6 +354,14 @@ pub fn total_rows(conn: &Connection) -> Result<usize, StoreError> {
 /// Called for the same event `stats::clear` is: the identity behind `@me`
 /// changed, so rows keyed on the login that was current when they were
 /// written belong to somebody who is gone.
+///
+/// **The ledger must be cleared in the same place.** Rows without their
+/// `pr_slice` entries would leave the ledger claiming ranges are retrieved
+/// whose rows are gone -- a ledger that lies, and the worker would then
+/// skip exactly the ranges it needs to re-fetch. `pr_slice::clear` and
+/// `pr_backfill_scope::clear` go with this one, and
+/// `commands.rs`'s `the_identity_change_clears_every_backfill_table`
+/// guard is what stops a future caller from forgetting one.
 pub fn clear(conn: &Connection) -> Result<usize, StoreError> {
     Ok(conn.execute("DELETE FROM pr_history", [])?)
 }
@@ -319,10 +407,19 @@ mod tests {
         conn
     }
 
+    /// A stored pull request on a fixed day.
+    ///
+    /// Most tests here are about the KEY rather than the date, so the day
+    /// is constant unless a test says otherwise via [`pr_on`].
     fn pr(repo: &str, number: u64, author: &str) -> StoredPr {
+        pr_on(repo, number, author, "2026-01-15")
+    }
+
+    fn pr_on(repo: &str, number: u64, author: &str, day: &str) -> StoredPr {
         StoredPr {
             repo: repo.into(),
             number,
+            merged_at: day.into(),
             title: format!("PR {number}"),
             url: format!("https://github.com/{repo}/pull/{number}"),
             author: author.into(),
@@ -503,13 +600,17 @@ mod tests {
             "board|merged|*|org:X",
             "2026-02-01",
             "2026-02-28",
-            &[pr("o/a", 3, "carol")],
+            &[pr_on("o/a", 3, "carol", "2026-02-10")],
             Utc::now(),
         )
         .unwrap();
 
         let x_jan = load(&conn, "board|merged|*|org:X", "2026-01-01", "2026-01-31").unwrap();
-        assert_eq!(x_jan.len(), 1);
+        assert_eq!(
+            x_jan.len(),
+            1,
+            "another scope's row, and this scope's February row, are both out"
+        );
         assert_eq!(x_jan[0].number, 1);
         assert_eq!(
             count(&conn, "board|merged|*|org:Y", "2026-01-01", "2026-01-31").unwrap(),
@@ -519,35 +620,67 @@ mod tests {
             count(&conn, "board|merged|*|org:X", "2026-02-01", "2026-02-28").unwrap(),
             1
         );
+        // The date bound is a real filter, not decoration: the January row
+        // is absent from a February read of the SAME scope.
+        assert_eq!(
+            count(&conn, "board|merged|*|org:X", "2026-03-01", "2026-03-31").unwrap(),
+            0
+        );
     }
 
-    /// The same pull request legitimately appears in two windows, and
-    /// storing it under one must not remove it from the other.
+    /// **The re-key, stated as the behaviour change it is (#1092).**
+    ///
+    /// One pull request appearing in two windows is stored ONCE and read
+    /// back by both. Under #1004's key it was stored twice -- one row per
+    /// window -- and neither copy helped the other, which is the defect:
+    /// a 30-day board and a 90-day board duplicated each other's work and
+    /// changing the selector discarded all of it.
+    ///
+    /// This test previously asserted `total_rows == 2` and passed. It is
+    /// inverted deliberately rather than deleted, because the old figure
+    /// is precisely what was wrong.
     #[test]
-    fn one_pull_request_can_be_in_two_windows() {
+    fn one_pull_request_in_two_windows_is_stored_once_and_read_by_both() {
         let mut conn = db();
         let key = "board|merged|*|org:X";
+        // Retrieved by a narrow slice.
+        put_many(
+            &mut conn,
+            key,
+            "2026-01-15",
+            "2026-01-15",
+            &[pr_on("o/a", 1, "alice", "2026-01-15")],
+            Utc::now(),
+        )
+        .unwrap();
+        // And again by a wider one, as a later load would.
         put_many(
             &mut conn,
             key,
             "2026-01-01",
             "2026-01-31",
-            &[pr("o/a", 1, "alice")],
+            &[pr_on("o/a", 1, "alice", "2026-01-15")],
             Utc::now(),
         )
         .unwrap();
-        put_many(
-            &mut conn,
-            key,
-            "2026-01-01",
-            "2026-03-31",
-            &[pr("o/a", 1, "alice")],
-            Utc::now(),
-        )
-        .unwrap();
+
+        assert_eq!(
+            total_rows(&conn).unwrap(),
+            1,
+            "one pull request is one row, whatever retrieved it"
+        );
+        // Both windows containing the DAY see it -- including a window
+        // nothing has ever loaded.
         assert_eq!(count(&conn, key, "2026-01-01", "2026-01-31").unwrap(), 1);
-        assert_eq!(count(&conn, key, "2026-01-01", "2026-03-31").unwrap(), 1);
-        assert_eq!(total_rows(&conn).unwrap(), 2);
+        assert_eq!(count(&conn, key, "2026-01-15", "2026-01-15").unwrap(), 1);
+        assert_eq!(
+            count(&conn, key, "2025-12-01", "2026-03-31").unwrap(),
+            1,
+            "a window never loaded still reads the row, because the key is \
+             the day and not the question"
+        );
+        // And a window that does not contain the day does not.
+        assert_eq!(count(&conn, key, "2026-02-01", "2026-02-28").unwrap(), 0);
     }
 
     /// An empty batch is a no-op rather than an error or an empty
@@ -584,12 +717,12 @@ mod tests {
         // is slower than the bound is interesting.
         conn.execute_batch(
             "INSERT INTO pr_history
-               (scope_key, window_start, window_end, repo, number, title, url,
+               (scope_key, slice_from, slice_to, repo, number, merged_at, title, url,
                 author, cycle_time_hours, size, additions, deletions,
                 changed_files, reviews_received, stored_at)
              VALUES
-               ('k','2026-01-01','2026-01-31','o/a',1,'t','u','a',1.0,1,1,0,1,0,'2020-01-01T00:00:00Z'),
-               ('k','2026-01-01','2026-01-31','o/a',2,'t','u','a',1.0,1,1,0,1,0,'2026-01-01T00:00:00Z');",
+               ('k','2026-01-01','2026-01-31','o/a',1,'2026-01-15','t','u','a',1.0,1,1,0,1,0,'2020-01-01T00:00:00Z'),
+               ('k','2026-01-01','2026-01-31','o/a',2,'2026-01-15','t','u','a',1.0,1,1,0,1,0,'2026-01-01T00:00:00Z');",
         )
         .unwrap();
         // Force the bound down to what this table holds by pruning with a

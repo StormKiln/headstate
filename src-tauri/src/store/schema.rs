@@ -688,6 +688,160 @@ const MIGRATIONS: &[&str] = &[
     // they are untouched. Migration 16's own test makes the same
     // argument for the same table.
     "DELETE FROM claude_plugin_scan;",
+    // Migration 18: re-key `pr_history` on the SLICE that retrieved a row,
+    // and add the ledger that says which slices have been retrieved
+    // (#1092, #1093, design #1094).
+    //
+    // # The defect this fixes
+    //
+    // `pr_history` was keyed on `(scope_key, window_start, window_end)` --
+    // **the window the user asked about**, not the range the rows came
+    // from. Three consequences, all of them the reported symptom:
+    //
+    // - A 30-day board and a 90-day board overlapping by 30 days store the
+    //   same pull requests twice, under two keys, and NEITHER helps the
+    //   other.
+    // - Changing the day-range selector discards 100% of the accumulated
+    //   work, because the key it was filed under no longer matches.
+    // - There is no way to ask *"do we hold 2026-08-14 for org:X?"* --
+    //   only *"do we hold the 30-day window ending yesterday?"*. So a
+    //   fetch cannot subtract what is stored from what it is about to
+    //   request, which is #1092's finding: `pr_history::count` was built
+    //   so "completeness is a COUNT question" and had zero production
+    //   callers, because the question it answers is the wrong one.
+    //
+    // #1092 also records that the old key breaks at UTC midnight: the
+    // window is `now - N days`, so when the date rolls, `load` matches
+    // nothing and every banked row becomes unreachable. That is the same
+    // defect seen from a different angle, and re-keying fixes both.
+    //
+    // Eventual consistency requires the durable unit to be **a slice, not
+    // a question**. The columns are RENAMED rather than reused so the new
+    // meaning cannot be mistaken for the old: a `slice_from` that still
+    // held a window would be a silent lie, where a missing `window_start`
+    // is a compile error.
+    //
+    // # Why the existing rows are DROPPED rather than re-keyed
+    //
+    // They cannot be re-keyed. A row carries no `merged_at` -- the column
+    // did not exist -- so there is no way to learn which day inside the
+    // window it belongs to, and filing it under the whole window would
+    // reintroduce exactly the ambiguity being removed. Keeping them under
+    // a legacy interpretation means two meanings for one column, which is
+    // strictly worse than re-fetching.
+    //
+    // The cost is measured and trivial. `pr_history`'s own module records
+    // ~1 point per 250 pull requests, so the worst realistic corpus (the
+    // reporter's 2,942) is **~12 points to re-fetch -- 0.27% of one
+    // usable hour**. A permanently ambiguous key is the worse trade by a
+    // wide margin.
+    //
+    // `stats_cache` is deliberately NOT dropped: its payloads are opaque
+    // JSON, an unparseable one already degrades to a re-fetch, and
+    // #1004's `accumulated` fields are optional for exactly this reason.
+    //
+    // # `merged_at` is now on the row
+    //
+    // It is what attributes a pull request to a DAY, which is what makes
+    // day-level coverage answerable ("34 of 90 days measured") and what
+    // lets a row retrieved by one slice be counted toward another. Stored
+    // as the `YYYY-MM-DD` date rather than the full timestamp: the search
+    // grammar's finest unit is a day, so the time of day is precision the
+    // ledger cannot use and could not verify.
+    //
+    // Despite the name it holds whichever date the MEASURE is about --
+    // `mergedAt` for `Measure::Merged`, `createdAt` for `Measure::Opened`
+    // -- because that is the date the slice's own qualifier ranged over.
+    // The measure is already in `scope_key` (`StatsQuery::cache_key`
+    // includes it, checked: the key is `{merged|opened}|{who}|{scope}`),
+    // so two measures never share a row.
+    //
+    // # `pr_slice`: the ledger, and the three-way question it answers
+    //
+    // The piece that did not exist. A reader asks one question -- "what do
+    // we hold for this range?" -- and there are THREE answers, not two:
+    //
+    // | The question | The answer |
+    // |---|---|
+    // | "we hold this range complete" | a row with `state='complete'` |
+    // | "we asked and GitHub could not" | `state='refused'`/`'irreducible'` |
+    // | **"we have never asked"** | **no row at all** |
+    //
+    // That last line is load-bearing and is this feature's most likely
+    // place to ship a defect. A day with no `pr_slice` row is
+    // **uncovered**, never a measured zero. The root `CLAUDE.md` states
+    // the rule -- absent is not zero -- and #846 is the time this repo
+    // shipped it. A chart invites the eye to read shape, so rendering an
+    // unasked day as a zero is the most legible possible lie.
+    //
+    // `state` has **no `pending` value**, deliberately. In-flight is
+    // PROCESS state, not durable state: a crash mid-tick would leave a row
+    // stuck in `pending` forever with nothing to move it out, which is
+    // #1042's trap exactly ("Pending and Unknown are different states";
+    // a column skeletoned forever because nothing advanced it). A slice
+    // being worked on right now simply has no row yet, and is therefore
+    // uncovered -- which is true, and self-correcting.
+    //
+    // `issue_count` is GitHub's own `issueCount` for the range, which the
+    // 1,000-result cap does NOT limit (`slice.rs`: the cap limits
+    // retrieval, not counting). So the ledger's `SUM(issue_count)` is an
+    // exact denominator for the days it covers, and `retrieved` against it
+    // is what makes a shortfall detectable rather than invisible.
+    //
+    // # `pr_backfill_scope`: what the worker is allowed to walk
+    //
+    // A worker with no record of which scopes matter would either walk
+    // everything the token can see or nothing at all. This records the
+    // scopes a user has actually OPENED, so background spend follows
+    // demonstrated interest. `horizon_days` bounds how far back each one
+    // is walked; `last_worked` is what rotates between scopes rather than
+    // starving the second one behind the first.
+    "DROP TABLE IF EXISTS pr_history;
+     CREATE TABLE pr_history (
+        scope_key    TEXT NOT NULL,
+        slice_from   TEXT NOT NULL,
+        slice_to     TEXT NOT NULL,
+        repo         TEXT NOT NULL,
+        number       INTEGER NOT NULL,
+        merged_at    TEXT NOT NULL,
+        title        TEXT NOT NULL,
+        url          TEXT NOT NULL,
+        author       TEXT NOT NULL,
+        cycle_time_hours REAL NOT NULL,
+        size         INTEGER NOT NULL,
+        additions    INTEGER NOT NULL,
+        deletions    INTEGER NOT NULL,
+        changed_files INTEGER NOT NULL,
+        reviews_received INTEGER NOT NULL,
+        stored_at    TEXT NOT NULL,
+        PRIMARY KEY (scope_key, repo, number)
+     );
+     CREATE INDEX IF NOT EXISTS pr_history_day
+        ON pr_history (scope_key, merged_at);
+     CREATE INDEX IF NOT EXISTS pr_history_stored
+        ON pr_history (stored_at);
+     CREATE TABLE IF NOT EXISTS pr_slice (
+        scope_key    TEXT NOT NULL,
+        slice_from   TEXT NOT NULL,
+        slice_to     TEXT NOT NULL,
+        state        TEXT NOT NULL,
+        issue_count  INTEGER NOT NULL,
+        retrieved    INTEGER NOT NULL,
+        refused_fields INTEGER NOT NULL,
+        measured_at  TEXT NOT NULL,
+        PRIMARY KEY (scope_key, slice_from, slice_to)
+     );
+     CREATE INDEX IF NOT EXISTS pr_slice_range
+        ON pr_slice (scope_key, slice_from, slice_to);
+     CREATE TABLE IF NOT EXISTS pr_backfill_scope (
+        scope_key    TEXT PRIMARY KEY,
+        scope_kind   TEXT NOT NULL,
+        scope_value  TEXT NOT NULL,
+        measure      TEXT NOT NULL,
+        horizon_days INTEGER NOT NULL,
+        last_seen    TEXT NOT NULL,
+        last_worked  TEXT
+     );",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
@@ -1139,21 +1293,23 @@ mod tests {
             "an upgrade must not cost an existing cached answer"
         );
 
-        // The natural key is `(scope_key, window, repo, number)`: one row per
-        // pull request per window, so a second load UNIONS rather than
-        // duplicating. A table without it would double-count every overlap
-        // and inflate every author aggregate.
+        // Migrating a v12 database runs 13 through 18, so the table this
+        // lands on is the SLICE-keyed one: the natural key is
+        // `(scope_key, repo, number)`, one row per pull request per scope,
+        // so a second load UNIONS rather than duplicating. A table without
+        // it would double-count every overlap and inflate every author
+        // aggregate.
         conn.execute_batch(
             "INSERT INTO pr_history
-               (scope_key, window_start, window_end, repo, number, title, url,
+               (scope_key, slice_from, slice_to, repo, number, merged_at, title, url,
                 author, cycle_time_hours, size, additions, deletions,
                 changed_files, reviews_received, stored_at)
-             VALUES ('k','2026-01-01','2026-01-31','o/a',1,'t','u','a',1.0,1,1,0,1,0,'2026-02-01T00:00:00Z');
+             VALUES ('k','2026-01-01','2026-01-31','o/a',1,'2026-01-15','t','u','a',1.0,1,1,0,1,0,'2026-02-01T00:00:00Z');
              INSERT OR REPLACE INTO pr_history
-               (scope_key, window_start, window_end, repo, number, title, url,
+               (scope_key, slice_from, slice_to, repo, number, merged_at, title, url,
                 author, cycle_time_hours, size, additions, deletions,
                 changed_files, reviews_received, stored_at)
-             VALUES ('k','2026-01-01','2026-01-31','o/a',1,'t2','u','a',1.0,1,1,0,1,0,'2026-02-02T00:00:00Z');",
+             VALUES ('k','2026-01-15','2026-01-15','o/a',1,'2026-01-15','t2','u','a',1.0,1,1,0,1,0,'2026-02-02T00:00:00Z');",
         )
         .unwrap();
         let rows: i64 = conn
@@ -1161,8 +1317,113 @@ mod tests {
             .unwrap();
         assert_eq!(
             rows, 1,
-            "one row per pull request per window, or an overlap double-counts"
+            "one row per pull request per scope -- and note the two inserts \
+             above name DIFFERENT slices, which under #1004's key would \
+             have been two rows neither of which helped the other"
         );
+    }
+
+    /// Migration 18 re-keys `pr_history` on slices and adds the ledger
+    /// (#1092), from a real v17 state.
+    ///
+    /// v17 is every install that has the plugin engagement rescan -- the
+    /// version shipped immediately before this -- so this is the upgrade
+    /// path the change actually takes.
+    ///
+    /// Three things are asserted, and the third is the one that matters:
+    /// the new tables exist, the answer cache SURVIVES, and the old
+    /// window-keyed rows are gone. Dropping them is deliberate (they carry
+    /// no `merged_at`, so they cannot be re-keyed into slices), and a
+    /// migration that silently kept them under a legacy interpretation
+    /// would leave two meanings for one column.
+    #[test]
+    fn migration_eighteen_re_keys_pr_history_and_adds_the_ledger() {
+        let conn = Connection::open_in_memory().unwrap();
+        // A v17 database: the window-keyed `pr_history` holds accumulated
+        // rows, and `stats_cache` holds an answer.
+        conn.execute_batch(
+            "CREATE TABLE snapshot (id INTEGER PRIMARY KEY, payload TEXT NOT NULL,
+                fetched_at TEXT NOT NULL);
+             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE stats_cache (
+                key TEXT NOT NULL, window_start TEXT NOT NULL,
+                window_end TEXT NOT NULL, total INTEGER NOT NULL,
+                complete INTEGER NOT NULL, payload TEXT NOT NULL,
+                fetched_at TEXT NOT NULL,
+                PRIMARY KEY (key, window_start, window_end));
+             CREATE TABLE pr_history (
+                scope_key TEXT NOT NULL, window_start TEXT NOT NULL,
+                window_end TEXT NOT NULL, repo TEXT NOT NULL,
+                number INTEGER NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL,
+                author TEXT NOT NULL, cycle_time_hours REAL NOT NULL,
+                size INTEGER NOT NULL, additions INTEGER NOT NULL,
+                deletions INTEGER NOT NULL, changed_files INTEGER NOT NULL,
+                reviews_received INTEGER NOT NULL, stored_at TEXT NOT NULL,
+                PRIMARY KEY (scope_key, window_start, window_end, repo, number));
+             INSERT INTO pr_history VALUES
+               ('k','2026-01-01','2026-01-31','o/a',1,'t','u','a',1.0,1,1,0,1,0,
+                '2026-02-01T00:00:00Z');
+             INSERT INTO stats_cache VALUES
+               ('board|merged|*|org:X','2026-01-01','2026-01-31',5,1,'{}',
+                '2026-02-01T00:00:00Z');",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 17i64).unwrap();
+
+        migrate(&conn).unwrap();
+
+        assert!(has_table(&conn, "pr_history"));
+        assert!(has_table(&conn, "pr_slice"), "the ledger must exist");
+        assert!(has_table(&conn, "pr_backfill_scope"));
+        assert!(
+            has_table(&conn, "stats_cache"),
+            "the assembled-answer cache is NOT dropped: its payloads are \
+             opaque JSON and an unparseable one already degrades to a \
+             re-fetch"
+        );
+        let kept: i64 = conn
+            .query_row("SELECT COUNT(*) FROM stats_cache", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 1, "an upgrade must not cost an existing answer");
+
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pr_history", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            left, 0,
+            "the window-keyed rows go: they carry no merged_at, so there is \
+             no way to learn which day they belong to, and keeping them \
+             would mean two meanings for one column. MEASURED cost of \
+             re-fetching the worst realistic corpus: ~12 points, 0.27% of \
+             one usable hour"
+        );
+
+        // The new key really is the slice: the same pull request written
+        // from two different slices is ONE row.
+        conn.execute_batch(
+            "INSERT INTO pr_history
+               (scope_key, slice_from, slice_to, repo, number, merged_at, title, url,
+                author, cycle_time_hours, size, additions, deletions,
+                changed_files, reviews_received, stored_at)
+             VALUES ('k','2026-01-01','2026-01-31','o/a',1,'2026-01-15','t','u','a',
+                     1.0,1,1,0,1,0,'2026-02-01T00:00:00Z');
+             INSERT OR REPLACE INTO pr_history
+               (scope_key, slice_from, slice_to, repo, number, merged_at, title, url,
+                author, cycle_time_hours, size, additions, deletions,
+                changed_files, reviews_received, stored_at)
+             VALUES ('k','2026-01-15','2026-01-15','o/a',1,'2026-01-15','t2','u','a',
+                     1.0,1,1,0,1,0,'2026-02-02T00:00:00Z');",
+        )
+        .unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pr_history", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
     }
 
     /// Migration 6 adds `paired_devices` to a database that stopped at

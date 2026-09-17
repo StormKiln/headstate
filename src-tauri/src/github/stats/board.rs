@@ -681,10 +681,25 @@ impl Board {
     /// `Board` is serialised into `stats_cache`'s payload, and carrying
     /// every pull request there would put the whole corpus in the answer
     /// cache as well as in the table beneath it.
+    ///
+    /// # The day a row is filed under (#1092)
+    ///
+    /// Every row carries the DATE its slice ranged over, which is what
+    /// makes a stored pull request evidence about a day rather than about
+    /// a question. Read from the node's own `mergedAt`, because that is
+    /// the date GitHub itself matched against the `merged:` qualifier.
+    ///
+    /// When a node carries no readable date the row is filed under the
+    /// slice's own `from`. That is exact for the day-sized slices a board
+    /// plans (`SLICE_PAGE_FULL` subdivides to the date grammar's floor on
+    /// any busy scope) and, for a wider slice, is a date the row genuinely
+    /// falls on or after -- so the row lands inside the range that
+    /// retrieved it and can never be attributed to a day outside it. The
+    /// alternative, dropping the row, would lose a pull request that was
+    /// paid for.
     pub fn retrieved_prs(map: &serde_json::Value, slices: &[Slice]) -> Vec<StoredPr> {
         let mut out = Vec::new();
         for (i, slice) in slices.iter().enumerate() {
-            let _ = slice;
             let alias = super::query::slice_alias(i);
             let entry = &map[&alias];
             let nodes = entry["nodes"].as_array().map(Vec::as_slice).unwrap_or(&[]);
@@ -710,6 +725,7 @@ impl Board {
                 out.push(StoredPr {
                     repo: repo.to_string(),
                     number: n["number"].as_u64().unwrap_or(0),
+                    merged_at: merged_day(n).unwrap_or_else(|| slice.from.clone()),
                     title: n["title"].as_str().unwrap_or("").to_string(),
                     url: n["url"].as_str().unwrap_or("").to_string(),
                     author: n["author"]["login"].as_str().unwrap_or(GHOST).to_string(),
@@ -847,6 +863,23 @@ fn cycle_hours(node: &serde_json::Value) -> Option<f64> {
     let m = chrono::DateTime::parse_from_rfc3339(merged).ok()?;
     let hours = (m - c).num_seconds() as f64 / 3600.0;
     (hours >= 0.0).then_some(hours)
+}
+
+/// The `YYYY-MM-DD` day a node belongs to, for the slice ledger (#1092).
+///
+/// `mergedAt` is the date GitHub matched against the `merged:` qualifier,
+/// so it is the day the retrieving slice ranged over -- taking the first
+/// ten characters of the RFC 3339 timestamp rather than parsing and
+/// re-formatting, because the wire format is fixed and a round trip
+/// through a local timezone is exactly how a row lands on the wrong day.
+///
+/// `None` when the field is absent or too short to be a date. The caller
+/// falls back to the slice's own start rather than dropping the row: a
+/// pull request that was paid for should not be lost to an unreadable
+/// field, and the slice bound is a date it provably falls on or after.
+fn merged_day(node: &serde_json::Value) -> Option<String> {
+    let merged = node["mergedAt"].as_str()?;
+    (merged.len() >= 10).then(|| merged[..10].to_string())
 }
 
 /// The bucket for a pull request whose author no longer exists.
@@ -2017,6 +2050,7 @@ mod tests {
         StoredPr {
             repo: repo.into(),
             number,
+            merged_at: "2026-08-01".into(),
             title: format!("pr {number}"),
             url: format!("https://github.com/{repo}/pull/{number}"),
             author: author.into(),
