@@ -1,6 +1,6 @@
 .PHONY: dev build test test-rust test-ui lint lint-rust lint-ui lint-deps fmt icons \
 	mobile-frontend lint-mobile test-mobile check-mobile-ios check-mobile-android \
-	deny-mobile ios-init android-init icons-mobile ios-device android-device \
+	deny-mobile deny-stepup ios-init android-init icons-mobile ios-device android-device \
 	deny test-race check-intel
 
 # ---- Mobile companion (src-mobile) ---------------------------------------
@@ -55,6 +55,14 @@ check-mobile-android:
 
 deny-mobile:
 	cd src-mobile && cargo deny check
+
+# The step-up crate was the one with a lockfile and no advisory check at
+# all (#1008) -- `fmt`, `clippy` and `test` ran against it, `cargo deny`
+# never did. `scripts/check-lockfile-agreement.py` fails if a crate with a
+# lockfile is missing from this set, so the next one cannot be added
+# silently.
+deny-stepup:
+	cd crates/headstate-stepup && cargo deny check
 
 # Install and run on a REAL device, for the pairing walkthrough
 # (docs/mobile-pairing-walkthrough.md). The walkthrough refuses
@@ -227,6 +235,16 @@ lint-deps:
 	# cheapest place to ask is here, before anything installs.
 	python3 scripts/check-symlinks.test.py
 	python3 scripts/check-symlinks.py
+	# Three crates, three lockfiles, and until #1008 one of them was
+	# advisory-checked by nothing. The failure that named the class:
+	# `supply-chain` PASSED and `mobile-android` FAILED the same rustls
+	# advisory on the same commit, because an advisory fixed in one
+	# lockfile was believed fixed repo-wide. This asks the cheap
+	# structural question -- does every crate with a lockfile have an
+	# advisory check -- rather than the expensive one cargo-deny answers
+	# per crate.
+	python3 scripts/check-lockfile-agreement.test.py
+	python3 scripts/check-lockfile-agreement.py
 	# The gate guard's own self-test, added with the guard's `GATED_JOBS`
 	# derivation (#853). It was the one guard in this target with none,
 	# which is an uncomfortable gap for a guard whose failure mode is a
