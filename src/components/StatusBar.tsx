@@ -76,11 +76,23 @@ export function StatusBar({ updatedAt }: { updatedAt: number }) {
     failed: "bg-[#f85149]",
   } as const;
 
+  // Every label names its SUBJECT: this bar speaks for the pull request
+  // poll and for nothing else.
+  //
+  // It used to say a bare "Up to date", which is a claim about the app. A
+  // user watching the stats backfill fail on the PR Stats page read the
+  // green dot beside the yellow banner as a contradiction (#1115) -- and
+  // it was not one. The bar was correct about pull requests while a
+  // different subsystem was failing, with nothing on screen to say the
+  // two had different subjects.
+  //
+  // Naming the subject is cheaper than a second indicator and keeps the
+  // detail where it belongs: the stats page states its own condition.
   const TEXT = {
     fetching: "Checking GitHub…",
-    ok: "Up to date",
+    ok: "PRs up to date",
     retrying: "Retrying…",
-    stale: "Could not refresh",
+    stale: "Could not refresh PRs",
     failed: "Could not reach GitHub",
   } as const;
   const { seconds, set } = usePollInterval();

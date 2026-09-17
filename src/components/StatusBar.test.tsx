@@ -132,6 +132,24 @@ describe("StatusBar", () => {
     expect(Math.min(...opts)).toBeGreaterThanOrEqual(60);
   });
 
+  /// **The bar names its subject.**
+  ///
+  /// It speaks for the pull request poll and for nothing else. A bare
+  /// "Up to date" reads as a claim about the app, so a user watching the
+  /// stats backfill fail on the PR Stats page saw a green dot beside a
+  /// yellow banner and read them as contradictory (#1115). They were not:
+  /// two subsystems, one indicator, and the failing one unrepresented.
+  ///
+  /// Asserted because nothing did. Every label was changed here without a
+  /// single test failing -- the suite checked colours and absence, never
+  /// the words.
+  it("says WHICH thing is up to date", () => {
+    state.current = "idle";
+    state.error = null;
+    render(<StatusBar updatedAt={Date.now()} />);
+    expect(screen.getByText(/PRs up to date/i)).toBeTruthy();
+  });
+
   // The bug behind #190 being invisible: this line could only ever say
   // "Up to date", so it asserted everything was fine while both PR views
   // sat empty and no banner appeared.
