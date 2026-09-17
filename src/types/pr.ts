@@ -2896,6 +2896,34 @@ export interface PluginUsage {
   /// the two differently, because a false zero here argues for
   /// uninstalling something the user relies on.
   measured: boolean;
+  /// Engagement: work done on what this plugin owns (#1082).
+  ///
+  /// A SECOND reading beside the call counts, never added to them.
+  footprint: PluginFootprint;
+}
+
+/// A plugin's engagement -- work done on what it owns (#1082).
+///
+/// Invocations are exact but are not a measure of value: `remember` has
+/// 0 invocations and 406 memory files it wrote, because its whole
+/// contribution is instructions the model then follows. This counts the
+/// other thing, and the page shows both without ever blending them.
+export interface PluginFootprint {
+  /// Tool calls whose input touched a directory this plugin owns.
+  calls: number;
+  /// Those calls by the tool that made them. The shape is the argument:
+  /// all-`Read` is the model consulting the plugin's material, all-
+  /// `Write` is the plugin's output being produced.
+  by_tool: Record<string, number>;
+  /// Reads of files inside the plugin's own install path.
+  install_reads: number;
+  /// Whether this plugin has any owned directory declared at all.
+  ///
+  /// `false` means a zero above is "we cannot trace this plugin's
+  /// footprint", NOT "it has none" -- so the UI must render words, never
+  /// a bare `0`. Absent is not zero, at the level of the measurement's
+  /// own applicability.
+  owned_known: boolean;
 }
 
 /// One day of the plugin activity chart (#1075).

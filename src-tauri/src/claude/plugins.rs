@@ -167,6 +167,93 @@ impl Contribution {
     pub fn countable(&self) -> bool {
         self.mcp || self.skills || self.agents || self.commands
     }
+
+    /// What this plugin ships, in words, so a zero reads correctly.
+    ///
+    /// #1082's second requirement. A plugin shipping only `skills/` and
+    /// no MCP server cannot be measured like one exposing 31 tools: the
+    /// first is reached by the model choosing to follow instructions,
+    /// the second by an explicit call. Naming the shape lets the reader
+    /// judge whether a low count is surprising -- an MCP plugin with no
+    /// calls really is unused, and a skills-only plugin with no calls
+    /// may be doing its whole job.
+    ///
+    /// `None` when the install path could not be read: we do not know
+    /// what it ships, and a guess here would be the confident-wrong
+    /// answer in a new place.
+    pub fn summary(&self) -> Option<String> {
+        if !self.read {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if self.mcp {
+            parts.push("an MCP server");
+        }
+        if self.skills {
+            parts.push("skills");
+        }
+        if self.agents {
+            parts.push("agents");
+        }
+        if self.commands {
+            parts.push("commands");
+        }
+        Some(match parts.len() {
+            0 => "no tools, skills, agents or commands".to_string(),
+            1 => parts[0].to_string(),
+            _ => {
+                let last = parts.pop().unwrap_or_default();
+                format!("{} and {last}", parts.join(", "))
+            }
+        })
+    }
+}
+
+/// A directory a plugin OWNS, and which plugin owns it.
+///
+/// # Why this table is written out and not derived from the name
+///
+/// The obvious rule -- a plugin named `X` owns `.X/` -- is wrong, and
+/// MEASURED to be wrong on the real corpus. Applied to the 22 installed
+/// plugins it credits the `github` plugin with **2,406 tool calls**,
+/// every one of them a `.github/` workflow file that the plugin (an MCP
+/// server, shipping a `.mcp.json` and nothing else) has never touched.
+/// That is a bigger engagement figure than `superpowers`, the plugin
+/// this feature exists to measure, and it is entirely fictional.
+///
+/// A name collision between a plugin and an ordinary project directory
+/// is not rare -- `.github/`, `.vscode/`, `docs/` -- so a derived rule
+/// does not merely risk being wrong, it IS wrong on the first corpus it
+/// met. Ownership is therefore declared: a path is a plugin's only
+/// because someone established that it is, and adding a row here is a
+/// claim that must be checked against the plugin.
+///
+/// Empty for every plugin not named here, which is the honest default.
+/// An unlisted plugin gets no footprint rather than a guessed one, and
+/// [`Footprint::owned_known`] carries that distinction to the UI so a
+/// blank reads as "not something we can trace" and never as "nothing".
+const OWNED_DIRS: &[(&str, &[&str])] = &[
+    // `superpowers` writes its plans and progress under `.superpowers/`
+    // in the worktree it is working in, and its specs under
+    // `docs/superpowers/`. Both are the plugin's own filing system:
+    // MEASURED, 1,622 tool calls touch them, against 38 `Skill`
+    // invocations.
+    ("superpowers", &["/.superpowers/", "docs/superpowers/"]),
+    // `remember` writes its memory files to `<project>/memory/` under
+    // the transcript root. MEASURED: 0 invocations, 265 tool calls and
+    // 406 files. It is the clean case for why invocations are not value
+    // -- the plugin's whole job is instructions the model then follows,
+    // which is not shaped like a tool call and never will be.
+    ("remember", &["/memory/"]),
+];
+
+/// The directories a given plugin owns, empty when none are declared.
+fn owned_dirs(plugin: &str) -> &'static [&'static str] {
+    OWNED_DIRS
+        .iter()
+        .find(|(name, _)| *name == plugin)
+        .map(|(_, dirs)| *dirs)
+        .unwrap_or(&[])
 }
 
 /// Which of the four shapes a call was.
@@ -202,11 +289,77 @@ pub struct PluginUsage {
     /// page. A plugin installed after the last scan is `false` and must
     /// NOT render as a zero.
     pub measured: bool,
+    /// Engagement: work done on what this plugin owns, NOT invocations.
+    ///
+    /// A second reading beside the four call counts, never folded into
+    /// them. See [`Footprint`] for why one blended number would be a new
+    /// confident-wrong answer rather than a better one.
+    pub footprint: Footprint,
 }
 
 impl PluginUsage {
     pub fn total(&self) -> u64 {
         self.mcp_calls + self.skill_calls + self.agent_calls + self.command_calls
+    }
+}
+
+/// A plugin's ENGAGEMENT: tool calls that worked on what it owns.
+///
+/// # Why this is a second number and not a better first one
+///
+/// [`PluginUsage`] counts invocations, and it is exact: a `tool_use`
+/// block naming the plugin is the plugin being called, and nothing else
+/// is. What it is not is a measure of VALUE, and #1082 is the proof --
+/// `remember` has **0 invocations and 406 memory files it wrote**,
+/// because its entire contribution is instructions the model then
+/// follows. A plugin shaped like that scores zero forever, and a user
+/// reading that zero would uninstall it and lose the files.
+///
+/// So this counts a different thing: tool calls whose input touches a
+/// directory the plugin owns. MEASURED on the real corpus:
+///
+/// | Plugin | Invocations | Engagement |
+/// |---|---|---|
+/// | `superpowers` | 38 `Skill` | 1,622 tool calls |
+/// | `remember` | **0** | 265 tool calls |
+///
+/// **These two numbers are never added together.** "38 invocations,
+/// 1,622 related tool calls" is two readings of two different things and
+/// a reader can use both. One blended figure would be a new number that
+/// answers neither question, arrived at confidently -- which is the
+/// exact defect this feature exists to correct, reintroduced one layer
+/// up. `total()` deliberately does not exist here; see
+/// [`Footprint::calls`] and [`PluginUsage::total`] as separate readings.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Footprint {
+    /// Tool calls whose input touched a directory this plugin owns.
+    pub calls: u64,
+    /// Those calls broken down by the tool that made them, `Bash` ->
+    /// 702 and so on. Kept because the SHAPE is the argument: a
+    /// footprint that is all `Read` is the model consulting the plugin's
+    /// material, and one that is all `Write` is the plugin's output
+    /// being produced. Summing them would hide which.
+    pub by_tool: BTreeMap<String, u64>,
+    /// Reads of files inside the plugin's OWN `installPath` -- the model
+    /// consulting the plugin's shipped material directly. A subset of
+    /// [`Footprint::calls`] by construction, reported separately because
+    /// it is the one signal that is unambiguously about the plugin
+    /// itself rather than about files it manages.
+    pub install_reads: u64,
+    /// Whether this plugin has any owned directory declared at all.
+    ///
+    /// `false` means a zero above is "we have no way to trace this
+    /// plugin's footprint", NOT "this plugin has none". Absent is not
+    /// zero, at the level of the measurement's own applicability -- the
+    /// UI must not render an untraceable plugin as one with no
+    /// engagement.
+    pub owned_known: bool,
+}
+
+impl Footprint {
+    /// Whether anything at all was recorded here.
+    pub fn is_empty(&self) -> bool {
+        self.calls == 0 && self.install_reads == 0
     }
 }
 
@@ -310,6 +463,112 @@ pub struct SessionCounts {
     pub calls: Vec<Call>,
     /// `tool_use_id`s whose result was an error.
     pub failed_ids: Vec<String>,
+    /// `plugin -> (tool -> calls)`, the engagement signal.
+    ///
+    /// Harvested in the SAME pass and from the SAME parsed record as
+    /// `calls`, which is the constraint #1082 sets: the scan is already
+    /// 26 seconds cold over 1.7 GB, and a second traversal to collect
+    /// this would double that for a page that must stay cheap. The cost
+    /// added here is a few substring tests per LINE -- see `count_line`,
+    /// where hoisting them out of the per-block loop is what keeps the
+    /// scan at its baseline.
+    pub touches: BTreeMap<String, BTreeMap<String, u64>>,
+    /// `plugin -> reads of its own install path`.
+    pub install_reads: BTreeMap<String, u64>,
+    /// `(plugin, installPath)` from the inventory, so a tool call
+    /// touching a plugin's own shipped files can be attributed to it.
+    ///
+    /// An INPUT to the count rather than an output: the path lives in
+    /// `installed_plugins.json`, which the scanner does not read, so the
+    /// caller seeds it. Empty is the honest default -- with no inventory
+    /// there is nothing to attribute, which is the "we could not look"
+    /// case and not a zero.
+    pub install_paths: Vec<(String, String)>,
+    /// The longest prefix every install path shares, as a one-test gate
+    /// in front of the per-plugin scans. Derived, never a claim about
+    /// where plugins live; empty means "no gate", and then nothing is
+    /// attributed. Set by [`SessionCounts::with_install_paths`].
+    pub install_prefix: String,
+}
+
+impl SessionCounts {
+    /// Seed the inventory's install paths, deriving the shared prefix.
+    ///
+    /// The prefix is computed here, once per file, rather than per line:
+    /// it is a property of the inventory and recomputing it 300,000
+    /// times is exactly the per-line cost this gate exists to remove.
+    pub fn with_install_paths(install_paths: Vec<(String, String)>) -> Self {
+        let install_prefix = common_prefix(&install_paths);
+        Self {
+            install_paths,
+            install_prefix,
+            ..Default::default()
+        }
+    }
+}
+
+/// Whether any string anywhere in `v` contains `needle`.
+///
+/// # Why the parsed value, and not the raw line or a re-serialisation
+///
+/// Both alternatives were MEASURED against the real 1.7 GB corpus and
+/// both widen the scan, which #1082 forbids:
+///
+/// - Scanning the raw LINE costs **6.1s** on its own. The line is up to
+///   tens of kilobytes and is mostly message text, so this searches an
+///   entire gigabyte to find 4,000 hits -- and it is only a pre-filter,
+///   so an exact test still has to follow.
+/// - Re-SERIALISING each `tool_use` input to a string costs a similar
+///   amount, and allocates a fresh `String` per block to do it.
+///
+/// `count_line` has already parsed the record. The input is a sub-tree
+/// of that parse, so its strings can be read directly: no second scan
+/// of the message body, no allocation, and it visits only the tool's
+/// own arguments rather than the whole conversation turn.
+///
+/// Only string LEAVES are searched, which is also more precise than
+/// either alternative -- a key name or a number can never be a path,
+/// and a serialised blob would let a match straddle the quoting between
+/// two fields.
+fn value_contains(v: &serde_json::Value, needle: &str) -> bool {
+    match v {
+        serde_json::Value::String(s) => s.contains(needle),
+        serde_json::Value::Array(xs) => xs.iter().any(|x| value_contains(x, needle)),
+        serde_json::Value::Object(m) => m.values().any(|x| value_contains(x, needle)),
+        _ => false,
+    }
+}
+
+/// The longest string every install path begins with, on a path boundary.
+///
+/// Truncated at the last `/` so the gate is a real directory prefix
+/// rather than a partial component -- two plugins under `.../superpowers`
+/// and `.../super-tool` share the text `.../super`, which is not a
+/// directory any path is inside. Empty when there is nothing to gate.
+fn common_prefix(paths: &[(String, String)]) -> String {
+    let mut iter = paths.iter().map(|(_, p)| p.as_str());
+    let Some(first) = iter.next() else {
+        return String::new();
+    };
+    let mut len = first.len();
+    for p in iter {
+        len = len.min(
+            first
+                .as_bytes()
+                .iter()
+                .zip(p.as_bytes())
+                .take_while(|(a, b)| a == b)
+                .count(),
+        );
+    }
+    // A byte count from `zip` can land inside a multi-byte character,
+    // and slicing there would panic. The last `/` at or before it is a
+    // character boundary by construction, so searching the bytes for it
+    // avoids the slice entirely.
+    match first.as_bytes()[..len].iter().rposition(|b| *b == b'/') {
+        Some(cut) => first[..=cut].to_string(),
+        None => String::new(),
+    }
 }
 
 /// Count one JSONL line's contribution.
@@ -374,6 +633,51 @@ pub fn count_line(line: &str, out: &mut SessionCounts) {
         let name = blk.get("name").and_then(|n| n.as_str()).unwrap_or_default();
         let id = blk.get("id").and_then(|i| i.as_str()).map(str::to_string);
         let input = blk.get("input");
+
+        // ENGAGEMENT, harvested from this same block. Independent of
+        // whether the block is also an invocation: a `Bash` that writes
+        // a `superpowers` progress file is engagement and not a call,
+        // and a `Skill` invoking `superpowers` whose input names an
+        // owned path is both. Counting them in one place and reporting
+        // them as two numbers is the whole point -- see [`Footprint`].
+        // Engagement, read straight from the parsed input. See
+        // [`value_contains`] for why this does not scan the raw line or
+        // re-serialise the block -- both were measured, and both widen
+        // the scan that #1082 forbids widening.
+        //
+        // Matching any string in the input, rather than a known set of
+        // path fields, because the field carrying a path differs per
+        // tool (`file_path`, `path`, `command`, `pattern`, `prompt`). A
+        // whitelist of field names would silently miss most of the
+        // footprint: `Bash` alone is 702 of `superpowers`'s 1,627, and
+        // its path sits inside a shell command.
+        if let Some(input) = input {
+            for (plugin, dirs) in OWNED_DIRS.iter() {
+                if dirs.iter().any(|d| value_contains(input, d)) {
+                    *out.touches
+                        .entry((*plugin).to_string())
+                        .or_default()
+                        .entry(name.to_string())
+                        .or_default() += 1;
+                }
+            }
+            // Reads of the plugin's own shipped files. Gated on the
+            // shared prefix so a 22-plugin inventory is one test, not
+            // 22, on the overwhelming majority of blocks that match
+            // nothing.
+            if !out.install_prefix.is_empty() && value_contains(input, &out.install_prefix) {
+                let hits: Vec<String> = out
+                    .install_paths
+                    .iter()
+                    .filter(|(_, path)| value_contains(input, path))
+                    .map(|(plugin, _)| plugin.clone())
+                    .collect();
+                for plugin in hits {
+                    *out.install_reads.entry(plugin).or_default() += 1;
+                }
+            }
+        }
+
         let found = if let Some(p) = mcp_plugin_of(name) {
             Some((p.to_string(), Kind::Mcp))
         } else if name == "Skill" {
@@ -482,9 +786,12 @@ pub fn usage_files(root: &Path) -> (Vec<PathBuf>, Vec<String>, bool) {
 /// A full-body read, line by line, buffered -- the one place in this
 /// crate that reads a whole transcript. `super::transcript`'s bounded
 /// window is untouched by design; see the module docs.
-pub fn count_file(path: &Path) -> Result<SessionCounts, String> {
+pub fn count_file(
+    path: &Path,
+    install_paths: &[(String, String)],
+) -> Result<SessionCounts, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut out = SessionCounts::default();
+    let mut out = SessionCounts::with_install_paths(install_paths.to_vec());
     let reader = BufReader::new(file);
     for line in reader.lines() {
         // A single unreadable LINE (invalid UTF-8 mid-file) is not an
@@ -547,6 +854,32 @@ pub fn rollup(counts: &SessionCounts, into: &mut BTreeMap<String, PluginUsage>) 
                 e.last_called_at = Some(at.clone());
             }
         }
+    }
+
+    // Engagement rolls up beside the calls, into the SAME rows -- a
+    // plugin with footprint and no calls gets a row here, which is
+    // exactly the `remember` case the feature exists for. Without this
+    // it would have no row at all and could not be rendered.
+    for (plugin, by_tool) in &counts.touches {
+        let e = into.entry(plugin.clone()).or_insert_with(|| PluginUsage {
+            name: plugin.clone(),
+            measured: true,
+            ..Default::default()
+        });
+        e.measured = true;
+        for (tool, n) in by_tool {
+            *e.footprint.by_tool.entry(tool.clone()).or_default() += n;
+            e.footprint.calls += n;
+        }
+    }
+    for (plugin, n) in &counts.install_reads {
+        let e = into.entry(plugin.clone()).or_insert_with(|| PluginUsage {
+            name: plugin.clone(),
+            measured: true,
+            ..Default::default()
+        });
+        e.measured = true;
+        e.footprint.install_reads += n;
     }
 }
 
@@ -647,6 +980,20 @@ pub struct Cached {
     pub last: BTreeMap<String, String>,
     /// `YYYY-MM-DD -> calls`, for the activity chart.
     pub days: BTreeMap<String, u64>,
+    /// `plugin -> (tool -> calls)`, the engagement signal.
+    ///
+    /// Persisted with the calls, so a cache hit carries the footprint
+    /// too. Omitted from an OLD cache row, which `serde` fills as empty
+    /// -- and an empty footprint on a row written before this field
+    /// existed is indistinguishable from a real zero. That is why
+    /// migration 17 clears the table: an unmigrated cache would report
+    /// `remember` as having no footprint, which is precisely the false
+    /// zero this feature exists to remove.
+    #[serde(default)]
+    pub touches: BTreeMap<String, BTreeMap<String, u64>>,
+    /// `plugin -> reads of its own install path`.
+    #[serde(default)]
+    pub install_reads: BTreeMap<String, u64>,
 }
 
 impl Cached {
@@ -666,6 +1013,12 @@ impl Cached {
                 out.last.insert(name, at);
             }
         }
+        // The engagement signal, persisted beside the calls so a cache
+        // hit carries it. Taken from `counts` directly rather than from
+        // the rolled-up rows: the rollup is keyed by plugin and so is
+        // this, but going through it would lose the per-tool breakdown.
+        out.touches = counts.touches.clone();
+        out.install_reads = counts.install_reads.clone();
         for call in &counts.calls {
             // The UTC day, taken by prefix rather than by parsing: the
             // stamps are RFC 3339 in UTC and `SessionsChart` buckets by
@@ -707,6 +1060,30 @@ impl Cached {
                     e.last_called_at = Some(at.clone());
                 }
             }
+        }
+        // Engagement merges into the same rows, and CREATES a row for a
+        // plugin that has footprint and no calls -- `remember`, whose
+        // row would otherwise not exist.
+        for (plugin, by_tool) in &self.touches {
+            let e = totals.entry(plugin.clone()).or_insert_with(|| PluginUsage {
+                name: plugin.clone(),
+                measured: true,
+                ..Default::default()
+            });
+            e.measured = true;
+            for (tool, n) in by_tool {
+                *e.footprint.by_tool.entry(tool.clone()).or_default() += n;
+                e.footprint.calls += n;
+            }
+        }
+        for (plugin, n) in &self.install_reads {
+            let e = totals.entry(plugin.clone()).or_insert_with(|| PluginUsage {
+                name: plugin.clone(),
+                measured: true,
+                ..Default::default()
+            });
+            e.measured = true;
+            e.footprint.install_reads += n;
         }
         for (day, n) in &self.days {
             *days.entry(day.clone()).or_default() += n;
@@ -750,6 +1127,7 @@ pub fn scan_incremental(
     conn: &Connection,
     root: &Path,
     now: &str,
+    install_paths: &[(String, String)],
 ) -> Result<Scanned, rusqlite::Error> {
     let (paths, mut unreadable, absent) = usage_files(root);
 
@@ -799,7 +1177,7 @@ pub fn scan_incremental(
                 // through and re-read rather than dropping the file.
             }
         }
-        match count_file(path) {
+        match count_file(path, install_paths) {
             Ok(counts) => {
                 scanned += 1;
                 let c = Cached::from_counts(&counts);
@@ -919,6 +1297,15 @@ fn merge_rows(
         });
     }
     let mut rows: Vec<PluginUsage> = totals.into_values().collect();
+    // Whether this plugin's footprint is traceable AT ALL, decided here
+    // because it is a property of the declaration table and not of the
+    // scan. A plugin with no owned directory has an untraceable
+    // footprint, not an empty one, and the UI needs the difference: a
+    // blank engagement cell on `playwright` means "we cannot see this",
+    // never "this plugin did nothing".
+    for row in &mut rows {
+        row.footprint.owned_known = !owned_dirs(&row.name).is_empty();
+    }
     // Busiest first, then by name so equal rows have a stable order
     // rather than one that shuffles between reads.
     rows.sort_by(|a, b| b.total().cmp(&a.total()).then(a.name.cmp(&b.name)));
@@ -964,7 +1351,20 @@ pub fn report(
         return Ok(out);
     };
 
-    let scan = scan_incremental(conn, &root, &stamp)?;
+    // The inventory is already read above, so the install paths cost
+    // nothing extra -- and they must be gathered BEFORE the scan,
+    // because the scan is the single pass that may look at them.
+    let install_paths: Vec<(String, String)> = out
+        .installed
+        .iter()
+        .filter_map(|p| {
+            p.install_path
+                .as_ref()
+                .map(|path| (p.name.clone(), path.clone()))
+        })
+        .collect();
+
+    let scan = scan_incremental(conn, &root, &stamp, &install_paths)?;
     out.unreadable = scan.unreadable;
     out.scanned = scan.scanned;
     out.activity = fill_window(&scan.days, now, ACTIVITY_DAYS);
@@ -1234,6 +1634,7 @@ mod tests {
                 },
             ],
             failed_ids: vec![],
+            ..Default::default()
         };
         let mut got = BTreeMap::new();
         rollup(&counts, &mut got);
@@ -1287,7 +1688,7 @@ mod tests {
         }
 
         let conn = open_test_db();
-        let got = scan_incremental(&conn, dir.path(), "2026-09-16T00:00:00Z").unwrap();
+        let got = scan_incremental(&conn, dir.path(), "2026-09-16T00:00:00Z", &[]).unwrap();
 
         assert!(!got.absent, "the root exists");
         assert_eq!(
@@ -1327,13 +1728,13 @@ mod tests {
         .unwrap();
 
         let conn = open_test_db();
-        let first = scan_incremental(&conn, dir.path(), "2026-09-16T00:00:00Z").unwrap();
+        let first = scan_incremental(&conn, dir.path(), "2026-09-16T00:00:00Z", &[]).unwrap();
         assert_eq!(first.scanned, 1, "the first pass reads it");
         assert_eq!(first.totals["superpowers"].skill_calls, 1);
 
         // Second pass, nothing touched: served from the cache, and the
         // total is the same rather than doubled.
-        let second = scan_incremental(&conn, dir.path(), "2026-09-16T00:01:00Z").unwrap();
+        let second = scan_incremental(&conn, dir.path(), "2026-09-16T00:01:00Z", &[]).unwrap();
         assert_eq!(second.scanned, 0, "an unchanged file is not reopened");
         assert_eq!(
             second.totals["superpowers"].skill_calls, 1,
@@ -1344,7 +1745,7 @@ mod tests {
         let mut body = std::fs::read_to_string(&f).unwrap();
         body.push_str("\n{\"timestamp\":\"2026-09-02T10:00:00Z\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"b\",\"name\":\"Skill\",\"input\":{\"skill\":\"superpowers:y\"}}]}}");
         std::fs::write(&f, body).unwrap();
-        let third = scan_incremental(&conn, dir.path(), "2026-09-16T00:02:00Z").unwrap();
+        let third = scan_incremental(&conn, dir.path(), "2026-09-16T00:02:00Z", &[]).unwrap();
         assert_eq!(third.scanned, 1, "a changed file is re-read");
         assert_eq!(third.totals["superpowers"].skill_calls, 2);
     }
@@ -1362,11 +1763,11 @@ mod tests {
         )
         .unwrap();
         let conn = open_test_db();
-        let before = scan_incremental(&conn, dir.path(), "2026-09-16T00:00:00Z").unwrap();
+        let before = scan_incremental(&conn, dir.path(), "2026-09-16T00:00:00Z", &[]).unwrap();
         assert_eq!(before.totals["context7"].mcp_calls, 1);
 
         std::fs::remove_file(&f).unwrap();
-        let after = scan_incremental(&conn, dir.path(), "2026-09-16T00:01:00Z").unwrap();
+        let after = scan_incremental(&conn, dir.path(), "2026-09-16T00:01:00Z", &[]).unwrap();
         assert!(
             !after.totals.contains_key("context7"),
             "got {:?}",
@@ -1395,7 +1796,7 @@ mod tests {
         )
         .unwrap();
         let conn = open_test_db();
-        let got = scan_incremental(&conn, dir.path(), "2026-09-16T00:00:00Z").unwrap();
+        let got = scan_incremental(&conn, dir.path(), "2026-09-16T00:00:00Z", &[]).unwrap();
         assert_eq!(
             got.totals["playwright"].mcp_calls, 1,
             "a subagent's call is the user's plugin doing work"
@@ -1408,7 +1809,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let conn = open_test_db();
         let got =
-            scan_incremental(&conn, &dir.path().join("nope"), "2026-09-16T00:00:00Z").unwrap();
+            scan_incremental(&conn, &dir.path().join("nope"), "2026-09-16T00:00:00Z", &[]).unwrap();
         assert!(got.absent);
         assert!(got.totals.is_empty());
         assert!(
@@ -1479,6 +1880,324 @@ mod tests {
         assert_eq!(rows[0].name, "playwright");
     }
 
+    /// Invocations and engagement are reported as TWO numbers.
+    ///
+    /// #1082's first test, and the one the feature turns on. A plugin
+    /// invoked ONCE whose files are touched 100 times must report both
+    /// figures distinctly: "1 invocation, 100 related tool calls" is two
+    /// readings a user can act on, and any single blended number is a
+    /// third figure that answers neither question -- the confident-wrong
+    /// answer this feature exists to remove, rebuilt one layer up.
+    #[test]
+    fn an_invocation_and_its_engagement_are_never_one_number() {
+        let mut counts = SessionCounts::default();
+        // One real invocation of the plugin.
+        count_line(
+            r#"{"timestamp":"2026-09-01T10:00:00Z","message":{"content":[
+                {"type":"tool_use","id":"s1","name":"Skill","input":{"skill":"superpowers:brainstorming"}}
+            ]}}"#,
+            &mut counts,
+        );
+        // And a hundred tool calls working on what it owns.
+        for i in 0..100 {
+            count_line(
+                &format!(
+                    r#"{{"timestamp":"2026-09-01T10:00:00Z","message":{{"content":[
+                        {{"type":"tool_use","id":"b{i}","name":"Bash","input":{{"command":"cat /w/.superpowers/sdd/progress.md"}}}}
+                    ]}}}}"#
+                ),
+                &mut counts,
+            );
+        }
+
+        let mut got = BTreeMap::new();
+        rollup(&counts, &mut got);
+        let u = &got["superpowers"];
+
+        // Two readings, each exact, neither contaminated by the other.
+        assert_eq!(u.total(), 1, "invocations stay exactly what they were");
+        assert_eq!(u.skill_calls, 1);
+        assert_eq!(u.footprint.calls, 100, "engagement is counted separately");
+        assert_eq!(u.footprint.by_tool["Bash"], 100);
+
+        // The decisive assertion: NOTHING reports the blend. 101 is the
+        // number a merged implementation would produce, and it must
+        // appear nowhere.
+        assert_ne!(u.total(), 101, "invocations must not absorb engagement");
+        assert_ne!(
+            u.footprint.calls, 101,
+            "engagement must not absorb invocations"
+        );
+        // And the engagement did not leak into any call-shaped counter.
+        assert_eq!(u.mcp_calls, 0);
+        assert_eq!(u.agent_calls, 0);
+        assert_eq!(u.command_calls, 0);
+    }
+
+    /// `remember` -- 0 invocations, real footprint -- is not "unused".
+    ///
+    /// #1082's clean disproof, and the reason the feature exists. The
+    /// plugin's entire value is delivered as instructions the model then
+    /// follows, so it will score zero invocations forever. A page that
+    /// showed only that would argue for uninstalling it, and the user
+    /// would lose every memory file it wrote.
+    #[test]
+    fn a_plugin_with_no_invocations_but_real_footprint_is_not_unused() {
+        let mut counts = SessionCounts::default();
+        // Writes to the memory directory `remember` owns -- following
+        // its instructions, which is not shaped like a tool call.
+        for i in 0..16 {
+            count_line(
+                &format!(
+                    r#"{{"timestamp":"2026-09-01T10:00:00Z","message":{{"content":[
+                        {{"type":"tool_use","id":"w{i}","name":"Write","input":{{"file_path":"/Users/x/.claude/projects/p/memory/note-{i}.md"}}}}
+                    ]}}}}"#
+                ),
+                &mut counts,
+            );
+        }
+
+        let mut got = BTreeMap::new();
+        rollup(&counts, &mut got);
+
+        // It has a ROW at all -- without engagement it would not exist
+        // in the totals, and could not be rendered as anything.
+        let u = got
+            .get("remember")
+            .expect("a plugin with footprint and no calls still gets a row");
+        assert_eq!(u.total(), 0, "it really was never invoked");
+        assert_eq!(u.footprint.calls, 16, "and its work is still visible");
+        assert_eq!(u.footprint.by_tool["Write"], 16);
+        assert!(
+            !u.footprint.is_empty(),
+            "an empty footprint here would present it as unused"
+        );
+    }
+
+    /// A plugin with no traceable footprint says so, never a bare `0`.
+    ///
+    /// #1082's third test. `playwright` owns no directory we can trace,
+    /// so its engagement is UNKNOWN rather than zero -- and
+    /// `owned_known: false` is what carries that to the UI. Rendering it
+    /// as `0` would be the absent-is-not-zero defect in the new column.
+    #[test]
+    fn a_plugin_with_no_traceable_footprint_is_not_a_zero() {
+        let rows = merge_rows(BTreeMap::new(), &["playwright".to_string()], true);
+        let pw = rows.iter().find(|r| r.name == "playwright").unwrap();
+
+        // Measured for CALLS -- a complete scan really did look.
+        assert!(pw.measured);
+        assert_eq!(pw.total(), 0);
+        // But its footprint is not traceable, so the zero beside it is
+        // not a reading. The UI keys on this to print words.
+        assert!(
+            !pw.footprint.owned_known,
+            "no owned directory is declared, so engagement is unknown"
+        );
+        assert!(pw.footprint.is_empty());
+
+        // And a plugin that IS traceable reports so, so the flag is
+        // about the declaration and not about everything being false.
+        let rows = merge_rows(BTreeMap::new(), &["superpowers".to_string()], true);
+        let sp = rows.iter().find(|r| r.name == "superpowers").unwrap();
+        assert!(
+            sp.footprint.owned_known,
+            "superpowers owns declared directories"
+        );
+        assert!(
+            sp.footprint.is_empty(),
+            "traceable, and genuinely nothing found -- a real zero"
+        );
+    }
+
+    /// Ownership is declared, never derived from the plugin's name.
+    ///
+    /// MEASURED, and the reason the table is written out: the obvious
+    /// rule -- plugin `X` owns `.X/` -- credits the `github` plugin with
+    /// 2,406 tool calls on the real corpus, every one of them an
+    /// ordinary `.github/` workflow file. That is more engagement than
+    /// `superpowers`, the plugin this feature was built to measure, and
+    /// it is entirely fictional.
+    #[test]
+    fn a_project_directory_sharing_a_plugins_name_is_not_its_footprint() {
+        let mut counts = SessionCounts::default();
+        count_line(
+            r#"{"timestamp":"2026-09-01T10:00:00Z","message":{"content":[
+                {"type":"tool_use","id":"a","name":"Read","input":{"file_path":"/repo/.github/workflows/ci.yml"}},
+                {"type":"tool_use","id":"b","name":"Edit","input":{"file_path":"/repo/.github/dependabot.yml"}}
+            ]}}"#,
+            &mut counts,
+        );
+        let mut got = BTreeMap::new();
+        rollup(&counts, &mut got);
+        assert!(
+            !got.contains_key("github"),
+            "a CI directory is not the github plugin's footprint, got {got:?}"
+        );
+        assert!(owned_dirs("github").is_empty());
+    }
+
+    /// An availability list contributes no ENGAGEMENT either.
+    ///
+    /// The original defect, checked in the new column. Engagement reads
+    /// only a `tool_use` block's INPUT, so prose and availability lists
+    /// naming an owned path cannot inflate it -- otherwise the 69,765-
+    /// to-0 inversion would simply reappear here.
+    #[test]
+    fn prose_naming_an_owned_path_is_not_engagement() {
+        let mut counts = SessionCounts::default();
+        count_line(
+            r#"{"message":{"content":[
+                {"type":"text","text":"look under /w/.superpowers/sdd/progress.md for the plan"}
+            ]}}"#,
+            &mut counts,
+        );
+        count_line(
+            r#"{"type":"attachment","attachment":{"type":"deferred_tools_delta","addedNames":["/w/.superpowers/x"]}}"#,
+            &mut counts,
+        );
+        assert!(counts.touches.is_empty(), "got {:?}", counts.touches);
+
+        // And a real tool call on the same path DOES count, so the
+        // assertion above is about the record shape and not about the
+        // path being unmatchable.
+        count_line(
+            r#"{"message":{"content":[
+                {"type":"tool_use","id":"r","name":"Read","input":{"file_path":"/w/.superpowers/sdd/progress.md"}}
+            ]}}"#,
+            &mut counts,
+        );
+        assert_eq!(counts.touches["superpowers"]["Read"], 1);
+    }
+
+    /// A cache hit carries the footprint, and does not double it.
+    ///
+    /// Engagement is persisted in the same blob as the calls, so an
+    /// unchanged transcript must return its footprint from cache. A
+    /// version that forgot to persist it would silently report every
+    /// unchanged file as having none -- a false zero served from cache
+    /// and never corrected, because the file never changes again.
+    #[test]
+    fn an_unchanged_transcript_returns_its_footprint_from_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let slug = dir.path().join("proj");
+        std::fs::create_dir(&slug).unwrap();
+        std::fs::write(
+            slug.join("s.jsonl"),
+            r#"{"timestamp":"2026-09-01T10:00:00Z","message":{"content":[{"type":"tool_use","id":"a","name":"Bash","input":{"command":"cat /w/.superpowers/plan.md"}}]}}"#,
+        )
+        .unwrap();
+
+        let conn = open_test_db();
+        let first = scan_incremental(&conn, dir.path(), "2026-09-16T00:00:00Z", &[]).unwrap();
+        assert_eq!(first.scanned, 1);
+        assert_eq!(first.totals["superpowers"].footprint.calls, 1);
+
+        let second = scan_incremental(&conn, dir.path(), "2026-09-16T00:01:00Z", &[]).unwrap();
+        assert_eq!(second.scanned, 0, "served from cache");
+        assert_eq!(
+            second.totals["superpowers"].footprint.calls, 1,
+            "the footprint survives the cache and is not doubled"
+        );
+        assert_eq!(second.totals["superpowers"].footprint.by_tool["Bash"], 1);
+    }
+
+    /// A read of a plugin's own install path is attributed to it.
+    #[test]
+    fn reading_a_plugins_own_files_counts_as_engagement() {
+        let install = vec![("frontend-design".to_string(), "/plugins/fd/1.0".to_string())];
+        let mut counts = SessionCounts::with_install_paths(install);
+        count_line(
+            r#"{"message":{"content":[
+                {"type":"tool_use","id":"a","name":"Read","input":{"file_path":"/plugins/fd/1.0/skills/design/SKILL.md"}}
+            ]}}"#,
+            &mut counts,
+        );
+        let mut got = BTreeMap::new();
+        rollup(&counts, &mut got);
+        assert_eq!(got["frontend-design"].footprint.install_reads, 1);
+        // Consulting a plugin's shipped material is engagement, not an
+        // invocation -- the plugin was not called.
+        assert_eq!(got["frontend-design"].total(), 0);
+    }
+
+    /// The install-path gate cuts on a directory boundary, and never
+    /// costs a real read.
+    ///
+    /// The gate is an optimisation, so the thing to hold is that it
+    /// cannot change an ANSWER. A prefix that cut mid-component would
+    /// still be a valid gate; one that over-matched would not, and one
+    /// that under-matched would silently drop real engagement.
+    #[test]
+    fn the_install_path_gate_cuts_on_a_directory_boundary() {
+        // Two siblings sharing text but not a directory: the common
+        // text is `/p/super`, which is not a directory either is in.
+        let got = common_prefix(&[
+            ("a".into(), "/p/superpowers/1.0".into()),
+            ("b".into(), "/p/super-tool/2.0".into()),
+        ]);
+        assert_eq!(got, "/p/", "the cut is at a path separator");
+
+        // The real shape: every plugin under one cache directory.
+        let got = common_prefix(&[
+            ("a".into(), "/home/u/.claude/plugins/cache/mk/a/1.0".into()),
+            ("b".into(), "/home/u/.claude/plugins/cache/mk/b/2.0".into()),
+        ]);
+        assert_eq!(got, "/home/u/.claude/plugins/cache/mk/");
+
+        // Nothing to gate.
+        assert_eq!(common_prefix(&[]), "");
+
+        // And the gate does not cost a real reading: a genuine install
+        // read is still counted with the gate in place.
+        let mut counts = SessionCounts::with_install_paths(vec![
+            ("a".into(), "/home/u/.claude/plugins/cache/mk/a/1.0".into()),
+            ("b".into(), "/home/u/.claude/plugins/cache/mk/b/2.0".into()),
+        ]);
+        count_line(
+            r#"{"message":{"content":[
+                {"type":"tool_use","id":"r","name":"Read","input":{"file_path":"/home/u/.claude/plugins/cache/mk/b/2.0/README.md"}}
+            ]}}"#,
+            &mut counts,
+        );
+        assert_eq!(counts.install_reads.get("b"), Some(&1));
+        assert_eq!(counts.install_reads.get("a"), None);
+    }
+
+    /// What a plugin ships is said in words, and unknown stays unknown.
+    #[test]
+    fn a_contribution_summary_names_the_shape() {
+        let skills_only = Contribution {
+            skills: true,
+            read: true,
+            ..Default::default()
+        };
+        assert_eq!(skills_only.summary().as_deref(), Some("skills"));
+
+        let mcp_and_skills = Contribution {
+            mcp: true,
+            skills: true,
+            read: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            mcp_and_skills.summary().as_deref(),
+            Some("an MCP server and skills")
+        );
+
+        let lsp = Contribution {
+            read: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            lsp.summary().as_deref(),
+            Some("no tools, skills, agents or commands")
+        );
+
+        // Unreadable: we do not know, and must not say.
+        assert_eq!(Contribution::default().summary(), None);
+    }
+
     /// A test database with the schema applied.
     fn open_test_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -1494,10 +2213,24 @@ mod tests {
         let root = crate::claude::transcript::projects_dir().unwrap();
         let mut totals: BTreeMap<String, PluginUsage> = BTreeMap::new();
         let t0 = std::time::Instant::now();
+        // The real inventory's install paths, so `install_reads` is
+        // exercised the way production exercises it.
+        let install_paths: Vec<(String, String)> = plugins_dir()
+            .map(|d| d.join("installed_plugins.json"))
+            .and_then(|f| std::fs::read_to_string(f).ok())
+            .and_then(|body| parse_inventory(&body).ok())
+            .map(|list| {
+                list.into_iter()
+                    .filter_map(|p| p.install_path.map(|path| (p.name, path)))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let (paths, unreadable, _absent) = usage_files(&root);
+
         let files = paths.len();
         for p in &paths {
-            if let Ok(c) = count_file(p) {
+            if let Ok(c) = count_file(p, &install_paths) {
                 rollup(&c, &mut totals);
             }
         }
@@ -1511,6 +2244,22 @@ mod tests {
                 "{k}: mcp={} skill={} agent={} fail={} last={:?}",
                 v.mcp_calls, v.skill_calls, v.agent_calls, v.failures, v.last_called_at
             );
+        }
+        // #1082: the two readings, side by side, never added. Compare
+        // against the figures in the issue comment -- superpowers at 38
+        // Skill invocations against ~1,600 tool calls on what it owns,
+        // and remember at 0 invocations with a real footprint.
+        eprintln!("--- engagement (#1082) ---");
+        for (k, v) in &totals {
+            if !v.footprint.is_empty() {
+                eprintln!(
+                    "{k}: invocations={} engagement={} install_reads={} by_tool={:?}",
+                    v.total(),
+                    v.footprint.calls,
+                    v.footprint.install_reads,
+                    v.footprint.by_tool
+                );
+            }
         }
     }
 }

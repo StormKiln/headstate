@@ -4,6 +4,7 @@ import { relativeTime } from "../lib/time";
 import type {
   InstalledPlugin,
   PluginContribution,
+  PluginFootprint,
   PluginUsage,
   PluginsReport,
 } from "../types/pr";
@@ -27,6 +28,21 @@ export const PLUGIN_ACTIVITY_DAYS = 30;
 /// in another.
 function callsOf(u: PluginUsage): number {
   return u.mcp_calls + u.skill_calls + u.agent_calls + u.command_calls;
+}
+
+/// Whether a plugin shows ANY evidence of doing work -- calls or
+/// engagement.
+///
+/// Deliberately not a sum (#1082). The two figures stay separate
+/// everywhere they are shown; this is only the question "is there
+/// anything here at all", which decides whether a plugin appears in the
+/// "used" tally rather than what number is printed for it.
+///
+/// `remember` is why it exists: 0 calls and a real footprint, which a
+/// calls-only test counts as unused and would then argue for
+/// uninstalling.
+function showedActivity(u: PluginUsage): boolean {
+  return callsOf(u) > 0 || u.footprint.calls > 0 || u.footprint.install_reads > 0;
 }
 
 /// Whether a plugin ships nothing that could ever produce a counted call.
@@ -63,6 +79,24 @@ const COUNTING_RULE =
   "Counted from calls that were actually made. A plugin's tools are offered to every session, " +
   "so merely appearing in a session does not count here.";
 
+/// The limit on what "calls" measures, said on the page (#1082).
+///
+/// # Why this has to be here and not in a doc comment
+///
+/// Because the number invites a conclusion it cannot support. A call
+/// count is exact about invocations and says nothing about value, and
+/// the two come apart completely for a plugin whose contribution is
+/// instructions rather than tools: `remember` was called 0 times and
+/// wrote 406 memory files. A reader who takes the calls column as
+/// "value" uninstalls it and loses them.
+///
+/// Stated as a fact about the measurement, not an apology for it
+/// (#1088): what is counted, what is not, and what the other column is.
+const ENGAGEMENT_RULE =
+  "Calls are not the same as value. A plugin can contribute without ever being called — by " +
+  "adding instructions, context or background behaviour — so engagement counts a second thing: " +
+  "tool calls that worked on files the plugin owns.";
+
 /// Installed plugins, what they were used for, and what that is worth
 /// (#1075).
 ///
@@ -94,6 +128,7 @@ export function ClaudePluginsPage() {
     <div>
       <h2 className="text-base font-semibold text-[#e6edf3]">Plugins</h2>
       <p className="mt-1 text-xs text-[#8b949e]">{COUNTING_RULE}</p>
+      <p className="mt-1 text-xs text-[#8b949e]">{ENGAGEMENT_RULE}</p>
     </div>
   );
 
@@ -145,7 +180,17 @@ function Loaded({
 }) {
   const { installed, usage, activity, unreadable, inventory_failure, inventory_absent } = report;
   const partial = unreadable.length > 0;
-  const used = usage.filter((u) => callsOf(u) > 0);
+  // Two different questions, deliberately two lists.
+  //
+  // `called` ranks plugins by invocations and is what the bar chart
+  // draws -- a bar has to be a bar of ONE quantity, and mixing
+  // engagement into it would be the blended number #1082 forbids.
+  //
+  // `active` is "showed any evidence of doing work", which is what the
+  // headline tally should count: `remember` has 0 calls and a real
+  // footprint, and counting it as unused is the defect being fixed.
+  const called = usage.filter((u) => callsOf(u) > 0);
+  const active = usage.filter(showedActivity);
   const byName = new Map(installed.map((p) => [p.name, p] as const));
 
   return (
@@ -179,14 +224,14 @@ function Loaded({
         </div>
       )}
 
-      <Summary report={report} used={used.length} partial={partial} />
+      <Summary report={report} used={active.length} partial={partial} />
 
       <div className="mt-4">
         <PluginCallsChart points={activity} days={PLUGIN_ACTIVITY_DAYS} />
       </div>
 
       <div className="mt-4">
-        <Ranked usage={used} partial={partial} byName={byName} />
+        <Ranked usage={called} partial={partial} byName={byName} />
       </div>
 
       <div className="mt-4">
@@ -250,8 +295,13 @@ function Summary({
         </div>
       </Card>
       <Card className="px-4 py-3">
-        <div className="text-xs text-[#8b949e]">Used at least once</div>
-        <div className="mt-1 text-2xl font-semibold text-[#e6edf3]">{used.toLocaleString()}</div>
+        {/* "Showed activity", not "used at least once": the tally now
+            includes plugins with engagement and no calls, and calling
+            that "used" would overstate what was measured about them. */}
+        <div className="text-xs text-[#8b949e]">Showed activity</div>
+        <div data-testid="activity-tally" className="mt-1 text-2xl font-semibold text-[#e6edf3]">
+          {used.toLocaleString()}
+        </div>
         <div className="mt-1 text-xs text-[#6e7681]">
           {/* The denominator is the finding. "7" alone is not an
               argument; "7 of 22" is. */}
@@ -296,7 +346,8 @@ function Ranked({
         <p className="mt-2 text-sm text-[#8b949e]">
           No plugin call was recorded in any transcript on this machine. That is a measurement, not
           an error — plugins that contribute skills, agents or MCP tools leave a trace only when
-          one is actually called.
+          one is actually called, and a plugin can still be doing its job without one. The
+          engagement column below is the other half of the picture.
         </p>
       </Card>
     );
@@ -372,8 +423,20 @@ function Table({
               <th scope="col" className="px-4 py-2 font-medium">
                 Source
               </th>
+              {/* What it ships, so a zero in the next column reads
+                  correctly: a skills-only plugin and an MCP server with
+                  31 tools cannot be judged by the same number. */}
+              <th scope="col" className="px-4 py-2 font-medium">
+                Contributes
+              </th>
               <th scope="col" className="px-4 py-2 font-medium">
                 Calls
+              </th>
+              {/* Deliberately its own column. Merging it into "Calls"
+                  would produce a blended figure that answers neither
+                  question -- see ENGAGEMENT_RULE. */}
+              <th scope="col" className="px-4 py-2 font-medium">
+                Engagement
               </th>
               <th scope="col" className="px-4 py-2 font-medium">
                 Failures
@@ -424,8 +487,14 @@ function Row({
           </>
         )}
       </td>
+      <td className="px-4 py-2 align-top text-[#8b949e]">
+        <Contributes contribution={plugin?.contribution} />
+      </td>
       <td className="px-4 py-2 align-top tabular-nums">
         <CallCount usage={usage} n={n} partial={partial} notCountable={notCountable} />
+      </td>
+      <td className="px-4 py-2 align-top tabular-nums">
+        <Engagement footprint={usage.footprint} partial={partial} />
       </td>
       <td className="px-4 py-2 align-top tabular-nums text-[#8b949e]">
         {/* A failure count is only meaningful against calls that
@@ -442,6 +511,79 @@ function Row({
         )}
       </td>
     </tr>
+  );
+}
+
+/// What a plugin ships, so a zero in the Calls column reads correctly.
+///
+/// #1082's second requirement. A plugin shipping only `skills/` cannot
+/// be measured like one exposing 31 MCP tools: the first is reached by
+/// the model choosing to follow instructions, the second by an explicit
+/// call. Naming the shape lets the reader judge whether a low count is
+/// surprising at all.
+///
+/// An install path we could not read says so rather than guessing --
+/// the same absent-is-not-zero rule, applied to a feature list.
+function Contributes({ contribution }: { contribution: PluginContribution | undefined }) {
+  if (contribution === undefined || !contribution.read) {
+    return <span className="text-[#6e7681]">not known</span>;
+  }
+  const parts = [
+    contribution.mcp && "an MCP server",
+    contribution.skills && "skills",
+    contribution.agents && "agents",
+    contribution.commands && "commands",
+  ].filter((p): p is string => typeof p === "string");
+
+  if (parts.length === 0) {
+    // Real, and the reason `rust-analyzer-lsp` must never read as
+    // "unused": it ships a README and contributes background behaviour
+    // that leaves no tool call by construction.
+    return <span className="text-[#6e7681]">background behaviour only</span>;
+  }
+  return <span>{parts.join(", ")}</span>;
+}
+
+/// Engagement: work done on what the plugin owns (#1082).
+///
+/// # The three states, which must not collapse
+///
+/// - **untraceable** (`owned_known === false`) — this plugin has no
+///   owned directory we can follow, so we have no reading. Words, never
+///   a `0`: rendering it as zero would say "this plugin did nothing"
+///   when what we mean is "we cannot see what it did".
+/// - **traceable, nothing found** — a real measured zero.
+/// - **a figure** — with the tool that did the work, because the shape
+///   is the argument: 408 `Read`s is the model consulting the plugin's
+///   material; 185 `Write`s is the plugin's output being produced.
+function Engagement({ footprint, partial }: { footprint: PluginFootprint; partial: boolean }) {
+  if (!footprint.owned_known) {
+    // Absent is not zero. We cannot trace this one, and must say so.
+    return <span className="text-[#6e7681]">not traced</span>;
+  }
+  if (footprint.calls === 0 && footprint.install_reads === 0) {
+    return <span className="text-[#8b949e]">none recorded</span>;
+  }
+
+  // The busiest tool, named. One is enough to convey the shape without
+  // turning a table cell into a second table.
+  const top = Object.entries(footprint.by_tool).sort((a, b) => b[1] - a[1])[0];
+  return (
+    <div>
+      <div className="text-[#e6edf3]">
+        {partial ? `at least ${footprint.calls.toLocaleString()}` : footprint.calls.toLocaleString()}
+      </div>
+      {top !== undefined && (
+        <div className="text-[#6e7681]">
+          mostly {top[0]} ({top[1].toLocaleString()})
+        </div>
+      )}
+      {footprint.install_reads > 0 && (
+        <div className="text-[#6e7681]">
+          {footprint.install_reads.toLocaleString()} of its own files read
+        </div>
+      )}
+    </div>
   );
 }
 
