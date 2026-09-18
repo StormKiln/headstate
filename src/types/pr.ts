@@ -351,6 +351,11 @@ export interface WorktreeRepo {
   name: string;
   path: string;
   worktrees: Worktree[];
+  /// A repository with no working tree -- a bare clone or mirror
+  /// (#1142). Optional because it is `#[serde(default)]` on the Rust
+  /// side, so a cached scan written before this field existed
+  /// deserialises rather than failing.
+  bare?: boolean;
   /// When this repository's remote refs were last fetched, RFC 3339, or
   /// null if never fetched or unreadable.
   ///

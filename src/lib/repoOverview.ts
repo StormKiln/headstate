@@ -32,6 +32,10 @@ import type { Upstream, WorktreeRepo } from "@/types/pr";
 export interface RepoOverviewRow {
   /// Directory name, the table's leftmost cell and its sort key.
   name: string;
+  /// A repository with no working tree -- a bare clone or mirror
+  /// (#1142). Carried through so the table can decline to ask for an
+  /// upstream verdict about a checkout that is not there.
+  bare: boolean;
   /// Absolute path to the main checkout. The row's identity -- unique
   /// across the scan roots, where `name` is not (two scan roots may each
   /// hold an `api`).
@@ -125,6 +129,11 @@ export function repoOverviewRows(repos: readonly WorktreeRepo[]): RepoOverviewRo
     rows.push({
       name: repo.name,
       path: repo.path,
+      // `?? false` because the Rust field is `#[serde(default)]`: a
+      // cached scan written before #1142 has no `bare` key, and an
+      // absent flag means an ordinary checkout, which is what every
+      // such scan held.
+      bare: repo.bare ?? false,
       // `""` is what the porcelain parser leaves for a detached HEAD, and
       // it is normalised to null HERE rather than at every reader.
       branch: main.branch === "" ? null : main.branch,

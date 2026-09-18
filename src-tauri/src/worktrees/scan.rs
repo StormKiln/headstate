@@ -2739,6 +2739,9 @@ fn collect_inner(dir: &Path, depth: usize, out: &mut RepoScan, with_safety: bool
         // earlier.
         if orphan_gitdir(dir).is_some() {
             out.repos.push(Repo {
+                // Both existing branches reached a `.git` entry, which a
+                // bare repository does not have.
+                bare: false,
                 name: dir
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
@@ -2816,6 +2819,9 @@ fn collect_inner(dir: &Path, depth: usize, out: &mut RepoScan, with_safety: bool
                     })
                     .collect();
                 out.repos.push(Repo {
+                    // Both existing branches reached a `.git` entry, which a
+                    // bare repository does not have.
+                    bare: false,
                     identity: repo_identity(&dir.to_string_lossy()),
                     fetched_at: fetched_at(dir),
                     name: dir
@@ -2838,6 +2844,104 @@ fn collect_inner(dir: &Path, depth: usize, out: &mut RepoScan, with_safety: bool
                 .push(format!("{}: {e}", dir.to_string_lossy())),
         }
         return;
+    }
+    // A BARE repository -- a clone or mirror with no working tree
+    // (#1142).
+    //
+    // It has no `.git` entry in either form, so neither branch above
+    // recognised it and the walk descended into it as an ordinary
+    // directory until the depth cap at the top of this function stopped
+    // it. The repository and every worktree hanging off it were dropped
+    // with no entry in `unreadable`, so the scan came back short and did
+    // not say so -- the failure this function's other two branches exist
+    // to prevent.
+    //
+    // GATED on the layout git itself uses, rather than asking git about
+    // every directory the walk meets. `HEAD` plus `objects/` is what a
+    // bare repository has and an ordinary directory does not; two
+    // `is_file`/`is_dir` calls cost nothing, where spawning git per
+    // directory across ~38 roots would be the ten-minute regression the
+    // comment above the first branch already records.
+    if dir.join("HEAD").is_file() && dir.join("objects").is_dir() {
+        match git(dir, &["rev-parse", "--is-bare-repository"]) {
+            Ok(answer) if answer.trim() == "true" => {
+                // Only NOW is `git worktree list` worth spawning: this
+                // is established as a repository.
+                match git(dir, &["worktree", "list", "--porcelain"]) {
+                    Ok(list) => {
+                        let branch = default_branch(dir);
+                        let worktrees = parse_porcelain(&list)
+                            .into_iter()
+                            // The bare repository itself appears in its
+                            // own `worktree list` output with no branch.
+                            // It is the container, not a checkout, and
+                            // listing it as one would offer a removal
+                            // that cannot succeed.
+                            //
+                            // Compared through `canonicalize` rather
+                            // than as strings: git reports the resolved
+                            // path, and on macOS a scan root under
+                            // `/var` is reported as `/private/var`, so a
+                            // string compare misses and the container
+                            // lists itself. `PathBuf`, never `format!`
+                            // -- Windows `canonicalize` returns verbatim
+                            // `\\?\C:\` paths.
+                            .filter(|w| {
+                                let here = std::fs::canonicalize(dir);
+                                let there = std::fs::canonicalize(&w.path);
+                                match (here, there) {
+                                    (Ok(a), Ok(b)) => a != b,
+                                    // Unresolvable either way: keep the
+                                    // row rather than drop it. A
+                                    // worktree we cannot compare is not
+                                    // evidence that it is the container.
+                                    _ => true,
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        out.repos.push(Repo {
+                            // The whole point of the flag: no working
+                            // tree means `classify_main_checkout` must
+                            // not run, because `Safety::MainCheckout`
+                            // would claim a checkout is being protected
+                            // when there is none.
+                            bare: true,
+                            identity: repo_identity(&dir.to_string_lossy()),
+                            fetched_at: fetched_at(dir),
+                            name: dir
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                            path: dir.to_string_lossy().into_owned(),
+                            worktrees,
+                            default_ref: Some(branch),
+                        });
+                    }
+                    // Established as a repository, then git could not
+                    // list it. Same reasoning as the `.git` directory
+                    // branch above: that is a repository we could not
+                    // read, not an absence, and no `Repo` is pushed
+                    // because an empty `worktrees` would claim this one
+                    // has none.
+                    Err(e) => out
+                        .unreadable
+                        .push(format!("{}: {e}", dir.to_string_lossy())),
+                }
+                return;
+            }
+            // `false` is an ordinary directory that happens to hold a
+            // `HEAD` file and an `objects` directory. Fall through to
+            // the walk rather than reporting it: it is not a repository
+            // and nothing about it is unreadable.
+            Ok(_) => {}
+            // Git ran and failed on a directory that LOOKS like a bare
+            // repository. Reported for `scan.rs:2787`'s reason -- the
+            // layout is evidence enough that something is here, and a
+            // silent drop is the shortfall this function refuses.
+            Err(e) => out
+                .unreadable
+                .push(format!("{}: {e}", dir.to_string_lossy())),
+        }
     }
     // An unreadable scan ROOT used to yield zero repositories, and the
     // empty-list copy then blamed the user's settings (#951). Reported,
@@ -10140,4 +10244,157 @@ pub fn prune_worktrees(repo_path: &str) -> Result<u64, String> {
     // can be deleted at any moment -- and the honest answer then is
     // "none cleared", not a vast number.
     Ok(stale_before.saturating_sub(stale_after) as u64)
+}
+
+#[cfg(test)]
+mod bare_repository_tests {
+    use super::*;
+    use std::path::Path;
+    use std::process::Command;
+
+    const IDENT: [(&str, &str); 4] = [
+        ("GIT_AUTHOR_NAME", "octocat"),
+        ("GIT_COMMITTER_NAME", "octocat"),
+        ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+        ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+    ];
+
+    fn run(dir: &Path, args: &[&str]) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .envs(IDENT)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// #1142: a bare repository is found, and its worktrees with it.
+    ///
+    /// Before this, neither `.git` branch matched, so the walk descended
+    /// into it as an ordinary directory until the depth cap stopped it
+    /// -- and nothing was pushed to `unreadable`, so the scan came back
+    /// short and did not say so.
+    #[test]
+    fn a_bare_repository_and_its_worktrees_are_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // A source with one commit, then a BARE clone of it: the shape
+        // a mirror or a `--bare` clone actually has on disk.
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        assert!(run(&src, &["init", "-q", "-b", "main"]));
+        assert!(run(&src, &["commit", "-q", "--allow-empty", "-m", "one"]));
+
+        let bare = root.join("mirror.git");
+        assert!(Command::new("git")
+            .args(["clone", "-q", "--bare"])
+            .arg(&src)
+            .arg(&bare)
+            .envs(IDENT)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false));
+
+        // A worktree hanging off the bare repo -- the thing that was
+        // invisible along with it.
+        let wt = root.join("feature");
+        assert!(run(
+            &bare,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                wt.to_str().unwrap(),
+                "-b",
+                "feature"
+            ]
+        ));
+
+        let mut scan = RepoScan::default();
+        collect_inner(root, 0, &mut scan, false);
+
+        // Canonicalised on both sides: on macOS a tempdir under `/var`
+        // is reported by git as `/private/var`, and a string compare
+        // would fail for a reason that has nothing to do with the code
+        // under test.
+        let same = |a: &str, b: &Path| match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        };
+
+        let found = scan
+            .repos
+            .iter()
+            .find(|r| same(&r.path, &bare))
+            .expect("the bare repository must be found");
+        assert!(found.bare, "and must be marked bare");
+        assert!(
+            found.worktrees.iter().any(|w| same(&w.path, &wt)),
+            "its linked worktree must be listed, got {:?}",
+            found.worktrees.iter().map(|w| &w.path).collect::<Vec<_>>()
+        );
+        // The container itself is not a checkout. Listing it as one
+        // would offer a removal that cannot succeed.
+        assert!(
+            !found.worktrees.iter().any(|w| same(&w.path, &bare)),
+            "the bare repository must not list itself as one of its own worktrees"
+        );
+    }
+
+    /// The other direction: an ordinary checkout is still found, and is
+    /// NOT marked bare. A change that reported everything as bare would
+    /// pass the test above and break every safety verdict.
+    #[test]
+    fn an_ordinary_checkout_is_still_found_and_is_not_bare() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let repo = root.join("plain");
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(run(&repo, &["init", "-q", "-b", "main"]));
+        assert!(run(&repo, &["commit", "-q", "--allow-empty", "-m", "one"]));
+
+        let mut scan = RepoScan::default();
+        collect_inner(root, 0, &mut scan, false);
+
+        let found = scan
+            .repos
+            .iter()
+            .find(
+                |r| match (std::fs::canonicalize(&r.path), std::fs::canonicalize(&repo)) {
+                    (Ok(a), Ok(b)) => a == b,
+                    _ => false,
+                },
+            )
+            .expect("an ordinary checkout must still be found");
+        assert!(!found.bare, "a checkout with a working tree is not bare");
+    }
+
+    /// A directory that merely LOOKS like a bare repository -- a `HEAD`
+    /// file beside an `objects` directory -- must not be reported as
+    /// one. The cheap pre-check exists to avoid spawning git per
+    /// directory; it must not become the answer on its own.
+    #[test]
+    fn a_lookalike_directory_is_not_reported_as_a_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let fake = root.join("not-a-repo");
+        std::fs::create_dir_all(fake.join("objects")).unwrap();
+        std::fs::write(fake.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let mut scan = RepoScan::default();
+        collect_inner(root, 0, &mut scan, false);
+
+        assert!(
+            !scan.repos.iter().any(|r| {
+                matches!(
+                    (std::fs::canonicalize(&r.path), std::fs::canonicalize(&fake)),
+                    (Ok(a), Ok(b)) if a == b
+                )
+            }),
+            "a directory git does not call a repository must not be listed as one"
+        );
+    }
 }

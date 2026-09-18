@@ -16,6 +16,22 @@ pub struct Repo {
     /// Absolute path to the main checkout.
     pub path: String,
     pub worktrees: Vec<Worktree>,
+    /// Whether this is a BARE repository -- one with no working tree
+    /// (#1142).
+    ///
+    /// A bare clone or mirror has no `.git` entry, so the walk
+    /// recognised neither of its two forms and descended into it as an
+    /// ordinary directory until the depth cap stopped it. The repository
+    /// and every worktree hanging off it were invisible to a view whose
+    /// stated purpose is finding worktrees scattered across local
+    /// checkouts -- and invisible was reported as absent, with no entry
+    /// in `RepoScan.unreadable` to say the scan came back short.
+    ///
+    /// Carried rather than inferred because `Safety::MainCheckout` is
+    /// the wrong verdict for a bare repo: there is no checkout to
+    /// protect, so the row must not claim one is being guarded.
+    #[serde(default)]
+    pub bare: bool,
     /// When this repository's remote refs were last fetched, RFC 3339,
     /// or `None` if it has never been fetched or the time is unreadable.
     ///

@@ -29,6 +29,9 @@ const repo = (over: Partial<WorktreeRepo> = {}): WorktreeRepo => ({
 const row = (upstream: Upstream | null): RepoOverviewRow => ({
   name: "a",
   path: "/code/a",
+  // These fixtures exercise upstream sorting and labelling, where
+  // bareness plays no part. An ordinary checkout is the case they mean.
+  bare: false,
   branch: "main",
   defaultRef: "origin/main",
   upstream,
@@ -206,5 +209,33 @@ describe("sortByCurrency", () => {
     const before = [...rows];
     sortByCurrency(rows);
     expect(rows).toEqual(before);
+  });
+});
+
+
+/// #1142: a bare repository is carried through as such.
+///
+/// `AllRepositoriesTable` filters on this before asking for an upstream
+/// verdict, because `classify_main_checkout` would otherwise be asked to
+/// judge a checkout that is not there -- and `Safety::MainCheckout`
+/// means "this is the main checkout, protect it", a claim about
+/// something a mirror does not have.
+describe("a bare repository", () => {
+  it("is marked bare on its row", () => {
+    const rows = repoOverviewRows([repo({ bare: true })]);
+    expect(rows[0]?.bare).toBe(true);
+  });
+
+  it("is not marked bare when it has a working tree", () => {
+    const rows = repoOverviewRows([repo({ bare: false })]);
+    expect(rows[0]?.bare).toBe(false);
+  });
+
+  /// A scan cached before this field existed has no `bare` key. An
+  /// absent flag must read as an ordinary checkout, which is what every
+  /// such scan held -- not as `undefined` leaking into a filter.
+  it("reads an absent flag as an ordinary checkout", () => {
+    const rows = repoOverviewRows([repo({})]);
+    expect(rows[0]?.bare).toBe(false);
   });
 });
