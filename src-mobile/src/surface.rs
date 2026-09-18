@@ -199,6 +199,9 @@ pub const SURFACE: &[(&str, Class)] = &[
     // "Which of my plugins am I actually getting value from?" is a
     // question worth answering from a sofa, and the answer leads to an
     // action taken later, at the machine.
+    // Read: a directory walk over ~/.claude with no side effects
+    // (#1129).
+    ("claude_definitions", Class::Read),
     ("claude_plugins", Class::Read),
     // The DESKTOP's restart list (#1071): every session running there,
     // with the line that would bring each one back. Read -- a fold of

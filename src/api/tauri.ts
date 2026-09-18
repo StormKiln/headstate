@@ -855,6 +855,31 @@ export const claudeOverview = () => call<ClaudeOverview>("claude_overview");
 /// makes every later call read only what changed, so this is a normal
 /// query after the first one -- but it is not a poll target, and no hook
 /// here gives it a `refetchInterval`.
+/// Which kind of definition. Mirrors `claude::definitions::Kind`.
+export type ClaudeDefinitionKind = "skill" | "agent" | "command";
+
+export interface ClaudeDefinition {
+  kind: ClaudeDefinitionKind;
+  name: string;
+  /// Whether `name` came from frontmatter or from the filename. A skill
+  /// directory IS addressed by its name, so the fallback is real rather
+  /// than invented -- but a reader still has to be able to tell.
+  named_in_frontmatter: boolean;
+  description: string | null;
+  path: string;
+}
+
+export interface ClaudeDefinitions {
+  definitions: ClaudeDefinition[];
+  /// Directories that exist and could not be listed. A permission wall
+  /// hides an unknown number of definitions, so this is a message, not
+  /// a count.
+  unreadable: string[];
+}
+
+/// Every skill, subagent and slash command in `~/.claude` (#1129).
+export const claudeDefinitions = () => call<ClaudeDefinitions>("claude_definitions");
+
 export const claudePlugins = () => call<PluginsReport>("claude_plugins");
 
 /// Every running session's resume command, for a restart (#1071).

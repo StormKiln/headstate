@@ -16,6 +16,15 @@ const state = vi.hoisted(() => ({
 const refetchFn = vi.hoisted(() => vi.fn());
 
 vi.mock("../api/hooks", () => ({
+  // #1129. Empty by default: this file's tests are about the plugins
+  // table, and the definitions section is a sibling with its own tests.
+  useClaudeDefinitions: () => ({
+    data: { definitions: [], unreadable: [] },
+    isLoading: false,
+    isError: false,
+    error: null,
+    refetch: () => {},
+  }),
   useClaudePlugins: () => ({
     data: state.data,
     isLoading: state.loading,

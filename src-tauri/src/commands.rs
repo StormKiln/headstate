@@ -4462,6 +4462,25 @@ pub async fn claude_restart_list(
 /// "0 calls" column that look exactly like a measured absence, and on
 /// THIS page that argues for uninstalling a plugin the user relies on.
 #[tauri::command]
+/// Every skill, subagent and slash command in `~/.claude` (#1129).
+///
+/// `claude_plugins` reports which plugins ship a `skills/` directory and
+/// nothing about what is in it, so a user could not answer "what
+/// subagents do I have". Hand-written definitions -- the ones belonging
+/// to no plugin -- were invisible entirely.
+///
+/// No home directory is a REFUSAL, not an empty inventory: "you have no
+/// skills" and "we could not look" are different answers, and the
+/// second must not render as the first.
+pub async fn claude_definitions() -> Result<crate::claude::definitions::Definitions, String> {
+    let root = crate::claude::definitions::user_root()
+        .ok_or_else(|| "no home directory is set, so ~/.claude could not be read".to_string())?;
+    tauri::async_runtime::spawn_blocking(move || crate::claude::definitions::scan_in(&root))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn claude_plugins(
     app: tauri::AppHandle,
 ) -> Result<crate::claude::plugins::PluginsReport, String> {
