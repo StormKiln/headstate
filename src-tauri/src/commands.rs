@@ -1907,14 +1907,23 @@ pub async fn remove_worktree_forced(
     crate::worktrees::remove_worktree_forced(&repo_path, &worktree_path)?;
     // Drop the mark: the worktree is gone, so keeping it would leave a
     // stale entry that outlives the thing it described.
-    if let Ok(conn) = open_db(&db_path(&app)) {
-        let mut seen: std::collections::BTreeMap<String, String> =
-            settings::get(&conn, settings::keys::ASSESSED_WORKTREES)
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-        if seen.remove(&worktree_path).is_some() {
-            let _ = settings::set(&conn, settings::keys::ASSESSED_WORKTREES, &seen);
+    // A refused database is "do not write", not "no data" (#1143). The
+    // mark is left in place deliberately: a stale entry is recoverable,
+    // and writing to a schema this build does not understand is not.
+    match open_db(&db_path(&app)) {
+        Err(e) if e.forbids_writing() => {
+            log::warn!("not dropping the assessment mark: {e}");
+        }
+        Err(_) => {}
+        Ok(conn) => {
+            let mut seen: std::collections::BTreeMap<String, String> =
+                settings::get(&conn, settings::keys::ASSESSED_WORKTREES)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+            if seen.remove(&worktree_path).is_some() {
+                let _ = settings::set(&conn, settings::keys::ASSESSED_WORKTREES, &seen);
+            }
         }
     }
     log::warn!("{worktree_path} removed past the safety gate");

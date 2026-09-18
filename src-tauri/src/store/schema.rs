@@ -13,6 +13,42 @@ pub enum StoreError {
     Db(#[from] rusqlite::Error),
     #[error("serialisation error: {0}")]
     Json(#[from] serde_json::Error),
+    /// The file was written by a NEWER Headstate than this one (#1143).
+    ///
+    /// `migrate` walks forward from `user_version` and skips what is
+    /// already applied. With a version above the known list that skip
+    /// yielded an empty iterator and returned `Ok(())` -- so an older
+    /// build opened a database holding columns and tables it does not
+    /// know about, wrote against a schema it did not create, and read
+    /// columns that no longer mean what it thinks. Nothing warned; the
+    /// app looked healthy.
+    ///
+    /// Plausible rather than theoretical: the updater and the
+    /// `.deb`/AppImage split both make install-then-revert ordinary.
+    ///
+    /// Not a cache. `schema.rs`'s own tables "hold observations that
+    /// cannot be recovered", so proceeding risks data a reinstall cannot
+    /// restore.
+    #[error(
+        "this database was written by a newer Headstate (schema {found}, this build knows \
+         {known}). Install that version or newer -- an older build writing to it would \
+         corrupt data it cannot read."
+    )]
+    SchemaFromTheFuture { found: i64, known: i64 },
+}
+
+impl StoreError {
+    /// Whether this error means "do not write", as opposed to "no data".
+    ///
+    /// The distinction the opportunistic callers need. Several open the
+    /// database with `.ok()` or `if let Ok` and carry on when it fails,
+    /// which is right for a missing file and wrong for a future one: the
+    /// first means there is nothing to read, the second means there is
+    /// something we must not touch. Collapsing them is how an old build
+    /// would go on writing to a schema it does not understand.
+    pub fn forbids_writing(&self) -> bool {
+        matches!(self, Self::SchemaFromTheFuture { .. })
+    }
 }
 
 /// Numbered migrations from the first commit, so v0.1 installs stay
@@ -846,6 +882,21 @@ const MIGRATIONS: &[&str] = &[
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    // A version ABOVE the known list is not "nothing to do" (#1143).
+    //
+    // `.skip(n)` with `n > len` yields an empty iterator, so this
+    // function returned `Ok(())` for a database written by a newer
+    // build -- the one case where proceeding is least safe. Checked
+    // before the loop rather than inside it, because the loop's whole
+    // shape is "apply what is missing" and there is nothing missing
+    // here; there is something extra.
+    let known = MIGRATIONS.len() as i64;
+    if version > known {
+        return Err(StoreError::SchemaFromTheFuture {
+            found: version,
+            known,
+        });
+    }
     for (i, sql) in MIGRATIONS.iter().enumerate().skip(version as usize) {
         conn.execute_batch(sql)?;
         conn.pragma_update(None, "user_version", (i + 1) as i64)?;
@@ -873,7 +924,23 @@ pub fn open_db(path: &Path) -> Result<Connection, StoreError> {
     if let Err(e) = conn.busy_timeout(std::time::Duration::from_secs(5)) {
         log::warn!("could not set busy_timeout: {e}");
     }
-    migrate(&conn)?;
+    if let Err(e) = migrate(&conn) {
+        // LOUD for the future-schema case, whatever the caller does with
+        // the error (#1143). Several callers open the database
+        // opportunistically with `.ok()` or `if let Ok` and carry on
+        // when it fails, which is right for a missing file and wrong for
+        // a future one -- and those sites discard the error, so without
+        // this the single most consequential refusal in the app would
+        // leave no trace at all.
+        //
+        // `error!` rather than `warn!`: `poll.rs` reserves `error!` for
+        // the handful of conditions a user must act on, and this is one
+        // -- the app will not persist anything until they resolve it.
+        if e.forbids_writing() {
+            log::error!("refusing to open the database: {e}");
+        }
+        return Err(e);
+    }
     Ok(conn)
 }
 
@@ -1873,5 +1940,71 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM claude_hook_event", [], |r| r.get(0))
             .unwrap();
         assert_eq!(events, 1, "the same event read twice is one event");
+    }
+    /// #1143: a database from a newer build must be refused, not opened.
+    ///
+    /// `migrate` walked forward with `.skip(version)`, and `.skip(n)`
+    /// with `n` past the end yields an empty iterator -- so a future
+    /// schema returned `Ok(())` and the app carried on writing to tables
+    /// it does not understand.
+    ///
+    /// Sabotage-proven in BOTH directions per the `guard` skill: the
+    /// second half asserts a CURRENT database still opens, so the fix
+    /// cannot degenerate into refusing everything.
+    #[test]
+    fn a_database_from_the_future_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            migrate(&conn).expect("a fresh database migrates");
+            // One past what this build knows: the exact state a user
+            // reaches by installing a newer Headstate and reverting.
+            conn.pragma_update(None, "user_version", (MIGRATIONS.len() + 1) as i64)
+                .unwrap();
+        }
+
+        let conn = Connection::open(&path).unwrap();
+        let err = migrate(&conn).expect_err("a future schema must not be opened");
+        match err {
+            StoreError::SchemaFromTheFuture { found, known } => {
+                assert_eq!(found, MIGRATIONS.len() as i64 + 1);
+                assert_eq!(known, MIGRATIONS.len() as i64);
+            }
+            other => panic!("expected SchemaFromTheFuture, got {other:?}"),
+        }
+    }
+
+    /// The other direction. A guard that refused every database would
+    /// pass the test above and break the app.
+    #[test]
+    fn a_current_database_still_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(dir.path().join("current.db")).unwrap();
+        migrate(&conn).expect("a fresh database migrates");
+        // And again, idempotently: the common case is opening a database
+        // this build already migrated.
+        migrate(&conn).expect("an already-current database migrates to a no-op");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+    }
+
+    /// The error must be distinguishable from an ordinary failure, or
+    /// the opportunistic callers cannot treat it differently.
+    #[test]
+    fn only_a_future_schema_forbids_writing() {
+        let future = StoreError::SchemaFromTheFuture {
+            found: 99,
+            known: 18,
+        };
+        assert!(future.forbids_writing());
+
+        let ordinary = StoreError::Db(rusqlite::Error::QueryReturnedNoRows);
+        assert!(
+            !ordinary.forbids_writing(),
+            "an ordinary database error means there is no data, not that we must not write"
+        );
     }
 }
