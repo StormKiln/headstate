@@ -5,8 +5,11 @@ import { describe, expect, it } from "vitest";
 // resolves its own paths with `import.meta.url` for the same reason.
 import modelRs from "../../src-tauri/src/worktrees/model.rs?raw";
 import testSource from "./worktrees.test.ts?raw";
-import type { Lock, Safety, Worktree, WorktreeRepo } from "@/types/pr";
+import type {
+  ClaudeSession, Lock, Safety, Worktree, WorktreeRepo } from "@/types/pr";
 import {
+  worktreeSessions,
+  occupancy,
   canClaudify,
   forceWarning,
   formatSize,
@@ -1099,5 +1102,107 @@ describe("sessionWorktree", () => {
     );
     expect(got).not.toBeNull();
     expect(got?.worktree.prunable).toBeTruthy();
+  });
+});
+
+/// #1137: which agent is working where.
+///
+/// With ~100 worktrees and parallel agents, the question at the top of
+/// the Worktrees page is "which of these is something actively working
+/// in right now" -- and the page could not answer it, while the join
+/// already existed in the other direction at a measured 83.1% match
+/// rate.
+describe("worktree occupancy", () => {
+  const session = (over: Partial<ClaudeSession> = {}): ClaudeSession =>
+    ({
+      session_id: "s1",
+      name: "Fixing the retry",
+      cwd: "/code/widget",
+      git_branch: "feat/x",
+      last_activity_at: "2026-09-01T10:00:00Z",
+      liveness: { state: "running", pid: 42, status: "busy" },
+      cwd_state: { state: "exists" },
+      kind: { kind: "own" },
+      subagents: 0,
+      waiting: { state: "no", reason: "never-observed" },
+      context_pressure: null,
+      ...over,
+    }) as ClaudeSession;
+
+  it("finds the running session in a worktree", () => {
+    const idx = worktreeSessions([session()]);
+    expect(occupancy("/code/widget", [session()], idx)).toEqual({
+      kind: "occupied",
+      session: expect.objectContaining({ session_id: "s1" }),
+    });
+  });
+
+  /// A session that ENDED in a directory is not working in it. Treating
+  /// it as occupied would refuse removals forever on every worktree that
+  /// ever hosted one.
+  it("ignores a session that is no longer running", () => {
+    const ended = session({ liveness: { state: "not-running", why: "no-process" } as never });
+    const idx = worktreeSessions([ended]);
+    expect(occupancy("/code/widget", [ended], idx)).toEqual({ kind: "free" });
+  });
+
+  /// The load-bearing distinction. "No agent here" and "we could not
+  /// tell" must not render the same, and they must not behave the same:
+  /// a removal is refused in both, but only one is actionable.
+  it("reports unknown when the session list could not be read", () => {
+    expect(occupancy("/code/widget", undefined, new Map())).toEqual({ kind: "unknown" });
+  });
+
+  /// And an EMPTY list is a real answer, distinct from an absent one.
+  it("reports free when the list is empty rather than unread", () => {
+    expect(occupancy("/code/widget", [], new Map())).toEqual({ kind: "free" });
+  });
+
+  /// The same `normalisePath` as `sessionWorktree`, so the two
+  /// directions cannot disagree about one worktree.
+  it("matches paths the way the forward join does", () => {
+    const s = session({ cwd: "/code/widget/" });
+    const idx = worktreeSessions([s]);
+    expect(occupancy("/code/widget", [s], idx).kind).toBe("occupied");
+  });
+});
+
+/// #1137: the refusal, which is the half that protects work.
+///
+/// A worktree an agent is mid-edit in must not be one-click removable,
+/// and neither must one whose occupancy could not be established --
+/// "we could not tell" is not "nothing is there".
+describe("occupancy and removability", () => {
+  const running = (cwd: string): ClaudeSession =>
+    ({
+      session_id: "s1",
+      name: "Fixing the retry",
+      cwd,
+      git_branch: null,
+      last_activity_at: null,
+      liveness: { state: "running", pid: 42, status: "busy" },
+      cwd_state: { state: "exists" },
+      kind: { kind: "own" },
+      subagents: 0,
+      waiting: { state: "no", reason: "never-observed" },
+      context_pressure: null,
+    }) as ClaudeSession;
+
+  it("is occupied when a running session is in that directory", () => {
+    const list = [running("/code/widget")];
+    expect(occupancy("/code/widget", list, worktreeSessions(list)).kind).toBe("occupied");
+  });
+
+  it("is free for a worktree no session is in", () => {
+    const list = [running("/code/other")];
+    expect(occupancy("/code/widget", list, worktreeSessions(list)).kind).toBe("free");
+  });
+
+  /// The three-state rule. An unread list yields `unknown`, which the
+  /// page refuses on -- distinct from `free`, which it allows.
+  it("is unknown when the list could not be read, never free", () => {
+    const o = occupancy("/code/widget", undefined, worktreeSessions(undefined));
+    expect(o.kind).toBe("unknown");
+    expect(o.kind).not.toBe("free");
   });
 });

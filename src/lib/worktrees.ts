@@ -1,4 +1,5 @@
-import type { Lock, PullRequest, Safety, Upstream, Worktree, WorktreeRepo } from "@/types/pr";
+import type {
+  ClaudeSession, Lock, PullRequest, Safety, Upstream, Worktree, WorktreeRepo } from "@/types/pr";
 
 /// Only `safe` may be deleted.
 ///
@@ -1170,6 +1171,65 @@ function normalisePath(path: string): string {
   const parts = path.split(/[\\/]/).filter((p) => p !== "" && p !== ".");
   const lead = /^[\\/]/.test(path) ? "/" : "";
   return lead + parts.join("/");
+}
+
+/// Which live Claude session, if any, is working in each worktree
+/// (#1137).
+///
+/// The INVERSE of `sessionWorktree`, and it reuses that function's
+/// `normalisePath` deliberately: two path comparisons that could
+/// disagree would put an "agent here" badge on one page and not the
+/// other for the same worktree.
+///
+/// Keyed by the NORMALISED path, so callers look up with
+/// `normalisePath(wt.path)` and never have to know the rule.
+///
+/// Only RUNNING sessions. A session that ended in a directory is not
+/// working in it, and treating it as occupied would refuse removals
+/// forever on every worktree that ever hosted one.
+export function worktreeSessions(
+  sessions: ClaudeSession[] | undefined,
+): Map<string, ClaudeSession> {
+  const out = new Map<string, ClaudeSession>();
+  // `undefined` is "we could not read the session list", which is NOT
+  // "nothing is running". The caller distinguishes those -- see
+  // `occupancy` below -- because an empty map cannot.
+  if (!sessions) return out;
+  for (const s of sessions) {
+    if (s.liveness.state !== "running" || !s.cwd) continue;
+    const key = normalisePath(s.cwd);
+    // FIRST wins, and the list arrives newest-first, so the most recent
+    // session is the one named. Two agents in one directory is possible
+    // and the badge names one of them; the count is not the question the
+    // row asks.
+    if (!out.has(key)) out.set(key, s);
+  }
+  return out;
+}
+
+/// What is known about whether a worktree is occupied (#1137).
+///
+/// Three states, not two. "No agent here" and "we could not tell" must
+/// not render the same, and they must not behave the same either: a
+/// removal is refused in both cases, but only one of them is a reason
+/// the user can act on.
+export type Occupancy =
+  | { kind: "free" }
+  | { kind: "occupied"; session: ClaudeSession }
+  /// The session list could not be read, so occupancy is UNKNOWN. The
+  /// plain Remove path refuses on this too: "we could not tell" is not
+  /// "nothing is there", and this codebase's rule is that anything it
+  /// cannot establish is safe is refused rather than attempted.
+  | { kind: "unknown" };
+
+export function occupancy(
+  worktreePath: string,
+  sessions: ClaudeSession[] | undefined,
+  index: Map<string, ClaudeSession>,
+): Occupancy {
+  if (!sessions) return { kind: "unknown" };
+  const s = index.get(normalisePath(worktreePath));
+  return s ? { kind: "occupied", session: s } : { kind: "free" };
 }
 
 /// Find the worktree a session ran in, or `null` when none matches.
