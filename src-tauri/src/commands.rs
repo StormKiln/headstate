@@ -1487,8 +1487,11 @@ pub async fn pull_checkout(path: String) -> Result<String, String> {
         .map_err(|e| e.to_string())?;
 
     match &result {
-        Ok(_) => log::info!("updated checkout {path}"),
-        Err(e) => log::warn!("refused to update checkout {path}: {e}"),
+        Ok(_) => log::info!("updated checkout {}", crate::redact::redact(&path)),
+        Err(e) => log::warn!(
+            "refused to update checkout {}: {e}",
+            crate::redact::redact(&path)
+        ),
     }
     result
 }
@@ -1516,8 +1519,11 @@ pub async fn fetch_refs(path: String) -> Result<String, String> {
         .map_err(|e| e.to_string())?;
 
     match &result {
-        Ok(_) => log::info!("fetched refs for {path}"),
-        Err(e) => log::warn!("could not fetch refs for {path}: {e}"),
+        Ok(_) => log::info!("fetched refs for {}", crate::redact::redact(&path)),
+        Err(e) => log::warn!(
+            "could not fetch refs for {}: {e}",
+            crate::redact::redact(&path)
+        ),
     }
     result
 }
@@ -1547,8 +1553,11 @@ pub async fn remove_orphan(app: AppHandle, path: String) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
 
     match &result {
-        Ok(()) => log::info!("removed orphaned worktree {path}"),
-        Err(e) => log::warn!("refused to remove orphan {path}: {e}"),
+        Ok(()) => log::info!("removed orphaned worktree {}", crate::redact::redact(&path)),
+        Err(e) => log::warn!(
+            "refused to remove orphan {}: {e}",
+            crate::redact::redact(&path)
+        ),
     }
     result
 }
@@ -1771,7 +1780,7 @@ pub async fn docker_dangling_volumes() -> Result<Vec<crate::docker::DanglingVolu
 /// Remove one volume. Never bulk: a wrongly deleted volume costs data,
 /// where a wrongly deleted image costs a rebuild.
 pub fn docker_remove_volume(name: String) -> Result<(), String> {
-    log::warn!("docker: removing volume {name}");
+    log::warn!("docker: removing volume {}", crate::redact::redact(&name));
     crate::docker::remove_volume(&name)
 }
 
@@ -1934,7 +1943,10 @@ pub async fn prune_worktrees(repo_path: String) -> Result<u64, String> {
         tauri::async_runtime::spawn_blocking(move || crate::worktrees::prune_worktrees(&repo))
             .await
             .map_err(|e| format!("prune failed to run: {e}"))??;
-    log::info!("{repo_path}: pruned {cleared} stale worktree registration(s)");
+    log::info!(
+        "{}: pruned {cleared} stale worktree registration(s)",
+        crate::redact::redact(&repo_path)
+    );
     Ok(cleared)
 }
 

@@ -359,8 +359,10 @@ export function SettingsDialog({
                   reason to think this would help with a hanging
                   Virtualenvs page, which is now what it is for. */}
               <p className="text-xs text-[#8b949e]">
-                Records how long GitHub requests and local scans take. Counts and
-                timings only — never repository names, titles, or tokens.
+                Records how long GitHub requests and local scans take, and the
+                writes you make — each by repository and pull request number.
+                Never your token, never a local path. Worth a read before you
+                send it to anyone.
               </p>
               {/* Where the file IS. Without this the path has to be
                   passed on out of band, which is the friction the

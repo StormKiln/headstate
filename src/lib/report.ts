@@ -27,20 +27,27 @@ const MAX_ERROR = 500;
 /// from named fields that are known to be safe; this exists because one
 /// of those fields -- the error string -- is written by code we do not
 /// control and can quote anything.
-const SCRUB: [RegExp, string][] = [
+/// Exported for `redaction.mirror.test.ts`, which asserts the Rust copy
+/// in `src-tauri/src/redact.rs` still agrees with this table. Not part
+/// of the module's own interface -- `scrub` below is.
+export const SCRUB_PATTERNS: [RegExp, string][] = [
   // Every token shape gh can hand out. Checked before paths, since a
   // token can appear inside one.
   [/\b(gh[pousr]|github_pat)_[A-Za-z0-9_]+/g, "[redacted]"],
   // A home directory carries a username; a checkout path can name a
   // private project. Both are leaks the privacy guard exists to stop.
   [/(\/Users\/|\/home\/|C:\\Users\\)[^\s"']*/g, "[path]"],
-  // The poll log records counts only, never repository names. A report
-  // must not undo that.
+  // A report goes to a PUBLIC issue tracker, which the diagnostic log
+  // does not -- the log names repositories on purpose (its PR action
+  // lines are an audit trail) and the user chooses who sees it. A
+  // report has no such moment, so it scrubs repo names and the Rust
+  // table in `src-tauri/src/redact.rs` deliberately does not.
+  // `redaction.mirror.test.ts` asserts that asymmetry stays.
   [/\b[A-Za-z0-9][-\w.]*\/[A-Za-z0-9][-\w.]+\b/g, "[repo]"],
 ];
 
 function scrub(text: string): string {
-  return SCRUB.reduce((acc, [pattern, with_]) => acc.replace(pattern, with_), text);
+  return SCRUB_PATTERNS.reduce((acc, [pattern, with_]) => acc.replace(pattern, with_), text);
 }
 
 /// The report body, scrubbed and bounded.

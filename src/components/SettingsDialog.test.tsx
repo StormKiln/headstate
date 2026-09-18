@@ -327,10 +327,38 @@ describe("the diagnostic log controls", () => {
   });
 
   /// The promise is load-bearing: this log exists to be SENT to someone.
-  it("still promises no repository names", () => {
+  ///
+  /// It used to read "never repository names, titles, or tokens", and a
+  /// test asserted exactly that -- which is how the claim survived. The
+  /// logger never honoured it: #1122 found 30 unconditional sites
+  /// writing a repo, a branch or a home path, and no scrubbing on the
+  /// Rust side at all. The test locked in the sentence and nobody
+  /// checked the sentence against the logger.
+  ///
+  /// So this now asserts what is TRUE: tokens and paths are stripped
+  /// (`src-tauri/src/redact.rs`), and repository names are present on
+  /// purpose, because the PR action lines are the audit trail README
+  /// advertises.
+  it("promises no token and no local path", () => {
     uiState.diagnosticLogging = true;
     render(<SettingsDialog open onOpenChange={() => {}} />);
-    expect(screen.getByText(/never repository names/)).toBeTruthy();
+    expect(screen.getByText(/Never your token, never a local path/)).toBeTruthy();
+  });
+
+  /// The regression that matters: someone restoring the old, false
+  /// sentence. It reads well and it is what the log DOESN'T do.
+  it("does not claim repository names are absent", () => {
+    uiState.diagnosticLogging = true;
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+    expect(screen.queryByText(/never repository names/i)).toBeNull();
+  });
+
+  /// Says out loud that the log names your repositories, so a user
+  /// decides knowingly whether to send it.
+  it("says the log records the writes you made, by repository", () => {
+    uiState.diagnosticLogging = true;
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+    expect(screen.getByText(/repository and pull request number/)).toBeTruthy();
   });
 
   it("can reveal the log file", async () => {
