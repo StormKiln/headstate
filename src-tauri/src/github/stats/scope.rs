@@ -115,9 +115,128 @@ pub enum Scope {
     /// unqualified search covers every repository the token can see,
     /// which is a different and much larger question.
     Personal(String),
-    /// Everything the token can see. The widest and slowest scope, and
-    /// the one most likely to exceed the search cap.
-    All,
+    /// The viewer's whole account: every organisation they belong to,
+    /// plus their own repositories.
+    ///
+    /// # Why the members are CARRIED rather than left implicit
+    ///
+    /// This used to be a unit variant producing an EMPTY qualifier, on
+    /// the reasoning that GitHub reads an absent repository qualifier as
+    /// "everywhere the token can see". **It does not.** An absent
+    /// qualifier searches the whole of GitHub: measured live on
+    /// 2026-09-17, `is:pr is:merged merged:2026-09-10..2026-09-10`
+    /// reports **606,016** pull requests, and the five-slice document the
+    /// backfill sends returns **HTTP 502** every time (#1114).
+    ///
+    /// The same reasoning `Personal` already carries, one scope along:
+    /// an unqualified search is a different and much larger question.
+    ///
+    /// Carrying the members makes the empty qualifier unrepresentable
+    /// rather than merely discouraged, which is why this is a tuple
+    /// variant and not a flag.
+    All(AccountScope),
+}
+
+/// How many organisations one "Everything" search may name.
+///
+/// GitHub's search qualifier string has a practical length limit, and the
+/// sidebar already caps its own organisation list at 50 and says so. This
+/// is the same honesty one layer down: a viewer in more organisations than
+/// this gets a search over the first `ORG_UNION_CAP`, and
+/// [`AccountScope::trimmed`] reports that it happened so the page can say
+/// the answer is a floor rather than a total.
+pub const ORG_UNION_CAP: usize = 20;
+
+/// The organisations and login that "Everything" spans.
+///
+/// A named type rather than a bare `Vec<String>` so the empty case has one
+/// meaning everywhere: a viewer in NO organisations is their own
+/// repositories, `user:<login>`, never an unqualified search.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct AccountScope {
+    /// The viewer's login. Always present, so the qualifier can never be
+    /// empty even for a viewer with no organisations.
+    pub login: String,
+    /// Organisations the viewer belongs to, capped at [`ORG_UNION_CAP`].
+    pub orgs: Vec<String>,
+    /// Organisations beyond the cap that this search does NOT cover.
+    ///
+    /// Counted rather than dropped silently: a board over 20 of a
+    /// viewer's 30 organisations is a floor, and a floor that does not
+    /// say so is the lie this codebase's rules exist to prevent.
+    pub trimmed: usize,
+}
+
+impl AccountScope {
+    /// Parse the wire spelling: `login` then comma-separated organisations.
+    ///
+    /// Carried in `scope_value`, which is unused for this kind and is
+    /// already persisted by `pr_backfill_scope` and round-tripped by
+    /// `query_for` -- so the background worker reconstructs the SAME union
+    /// the click made rather than re-deriving it by a second route that
+    /// could disagree. That round trip is why this is a string rather than
+    /// a richer payload.
+    ///
+    /// An empty or absent value yields the login alone, which is a
+    /// correct, narrow, NON-empty qualifier. A viewer in no organisations
+    /// and a value that failed to arrive are the same search here, and
+    /// both are safe: the failure mode is a board that is too small, never
+    /// one that searches the planet.
+    /// Spelled `login,orgA,orgB`. The LOGIN LEADS so the value is
+    /// self-contained: `query_for` reconstructs the union from the stored
+    /// row alone, with no viewer lookup and no second request from a
+    /// background worker nobody is waiting for.
+    pub fn parse(value: &str) -> Option<Self> {
+        let mut parts = value
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string);
+        // No login means no searchable union. `None` rather than a
+        // default: a caller that cannot name the viewer must not fall
+        // back to an unqualified search, which is the whole of #1114.
+        let login = parts.next()?;
+        Some(Self::new(login, parts.collect()))
+    }
+
+    /// The wire spelling, for `scope_value`.
+    pub fn to_value(&self) -> String {
+        let mut v = String::from(&self.login);
+        for o in &self.orgs {
+            v.push(',');
+            v.push_str(o);
+        }
+        v
+    }
+
+    /// Build from the viewer's login and the organisations they belong to.
+    pub fn new(login: impl Into<String>, orgs: Vec<String>) -> Self {
+        let login = login.into();
+        let trimmed = orgs.len().saturating_sub(ORG_UNION_CAP);
+        let orgs = orgs.into_iter().take(ORG_UNION_CAP).collect();
+        Self {
+            login,
+            orgs,
+            trimmed,
+        }
+    }
+
+    /// `org:A org:B user:login` -- the union, as GitHub search spells it.
+    ///
+    /// Multiple `org:` qualifiers OR together, so this is ONE search over
+    /// the union rather than one search per organisation. Verified live on
+    /// 2026-09-17 at the five-slice document shape that returns HTTP 502
+    /// unqualified: `org:FNX-Labs org:Stohic org:StormKiln user:pktstorm`
+    /// answered all five slices for 1 point.
+    ///
+    /// `user:` is included so a viewer's own repositories are part of
+    /// "Everything", which is what distinguishes this row from the
+    /// Personal one BELOW it in the sidebar rather than duplicating it.
+    pub fn qualifier(&self) -> String {
+        let mut parts: Vec<String> = self.orgs.iter().map(|o| format!("org:{o}")).collect();
+        parts.push(format!("user:{}", self.login));
+        parts.join(" ")
+    }
 }
 
 impl Scope {
@@ -132,7 +251,7 @@ impl Scope {
             Scope::Repo(r) => format!("repo:{r}"),
             Scope::Org(o) => format!("org:{o}"),
             Scope::Personal(u) => format!("user:{u}"),
-            Scope::All => String::new(),
+            Scope::All(a) => a.qualifier(),
         }
     }
 
@@ -177,7 +296,13 @@ impl Scope {
             Scope::Repo(r) => format!("repo:{r}"),
             Scope::Org(o) => format!("org:{o}"),
             Scope::Personal(u) => format!("user:{u}"),
-            Scope::All => "all".to_string(),
+            // The KEY stays "all", with no members in it. It is the
+            // cache and ledger key, and folding a live org list into it
+            // would invalidate every stored row the moment the viewer
+            // joined or left an organisation -- discarding measured data
+            // over a membership change that does not alter who merged
+            // what in the past.
+            Scope::All(_) => "all".to_string(),
         }
     }
 }
@@ -430,12 +555,24 @@ mod tests {
 
     /// The viewer still spells as `@me`, so the cheapest and most common
     /// path needs no `fetch_viewer` round trip.
+    ///
+    /// Asserted over a NAMED scope. This test used `Scope::All` when that
+    /// variant contributed no qualifier, which made the expected string
+    /// shorter but coupled a test about the SUBJECT to the scope that was
+    /// silently unqualified -- so when `Scope::All` was fixed to name the
+    /// account (#1114), a test about `@me` failed. The subject is what is
+    /// under test here, and an org scope states that without borrowing
+    /// another scope's emptiness.
     #[test]
     fn the_viewer_still_resolves_server_side() {
-        let q = StatsQuery::new(Some(Subject::Viewer), Scope::All, Measure::Merged);
+        let q = StatsQuery::new(
+            Some(Subject::Viewer),
+            Scope::Org("acme".into()),
+            Measure::Merged,
+        );
         assert_eq!(
             q.search_query("2026-01-01", "2026-01-31"),
-            "is:pr is:merged author:@me merged:2026-01-01..2026-01-31"
+            "is:pr is:merged author:@me org:acme merged:2026-01-01..2026-01-31"
         );
     }
 
@@ -472,21 +609,84 @@ mod tests {
         assert!(!opened.contains("is:merged"));
     }
 
-    /// `Scope::All` carries NO repository qualifier. GitHub reads the
-    /// absence as "everywhere the token can see"; `repo:*` returns
-    /// nothing, so an invented wildcard would silently empty the view.
+    /// **The widest scope is still SCOPED.**
+    ///
+    /// This test used to assert the opposite -- that `Scope::All` carried
+    /// no qualifier at all -- on the belief that GitHub reads an absent
+    /// repository qualifier as "everywhere the token can see". It does
+    /// not. Measured live on 2026-09-17:
+    ///
+    /// | query | result |
+    /// |---|---|
+    /// | `is:pr is:merged merged:2026-09-10..2026-09-10` | **606,016** pull requests |
+    /// | the same, as the backfill's 5-slice document | **HTTP 502**, every tick |
+    ///
+    /// The old test passed throughout, because "no wildcard was invented"
+    /// was true and was never the question. Nothing asserted the search
+    /// returned the VIEWER's pull requests rather than the planet's, so
+    /// #1114 shipped under a green suite.
     #[test]
-    fn the_widest_scope_omits_the_qualifier_rather_than_inventing_one() {
-        assert_eq!(Scope::All.qualifier(), "");
-        let q = StatsQuery::new(None, Scope::All, Measure::Merged);
+    fn the_widest_scope_names_the_account_rather_than_the_whole_of_github() {
+        let all = Scope::All(AccountScope::new(
+            "octocat",
+            vec!["acme".into(), "beta".into()],
+        ));
+        let q = StatsQuery::new(None, all, Measure::Merged);
         let s = q.search_query("2026-01-01", "2026-01-02");
-        assert!(!s.contains("repo:"));
-        assert!(!s.contains('*'), "no invented wildcard");
-        // And no double space where the empty qualifier was spliced in.
+
+        assert!(s.contains("org:acme"), "the union must name each org: {s}");
+        assert!(s.contains("org:beta"), "the union must name each org: {s}");
         assert!(
-            !s.contains("  "),
-            "empty qualifier left a double space: {s}"
+            s.contains("user:octocat"),
+            "the viewer's own repositories are part of their account: {s}"
         );
+        assert!(!s.contains('*'), "no invented wildcard: {s}");
+        assert!(!s.contains("  "), "a qualifier left a double space: {s}");
+    }
+
+    /// A viewer in NO organisations still gets a scoped search.
+    ///
+    /// The empty-union case is the one that would quietly reintroduce the
+    /// defect: joining zero organisations must narrow to the viewer's own
+    /// repositories, never widen to everything.
+    #[test]
+    fn an_account_with_no_organisations_is_still_narrowed_to_its_viewer() {
+        let all = Scope::All(AccountScope::new("octocat", Vec::new()));
+        assert_eq!(all.qualifier(), "user:octocat");
+        assert!(!all.qualifier().is_empty(), "never an unqualified search");
+    }
+
+    /// The union round trips through `scope_value`, so the background
+    /// worker rebuilds the SAME question the click asked.
+    #[test]
+    fn the_account_union_round_trips_through_its_stored_value() {
+        let built = AccountScope::new("octocat", vec!["acme".into(), "beta".into()]);
+        let parsed = AccountScope::parse(&built.to_value()).expect("a value naming a viewer");
+        assert_eq!(parsed, built);
+        assert_eq!(parsed.qualifier(), "org:acme org:beta user:octocat");
+    }
+
+    /// A value that names no viewer yields `None` rather than a default.
+    ///
+    /// The caller then SKIPS the row. Defaulting here would put an
+    /// unqualified search back exactly where it was.
+    #[test]
+    fn a_value_that_names_no_viewer_is_refused_rather_than_defaulted() {
+        assert!(AccountScope::parse("").is_none());
+        assert!(AccountScope::parse("  ,  ").is_none());
+    }
+
+    /// Beyond the cap the union is TRIMMED and says by how much.
+    ///
+    /// A board over 20 of a viewer's 30 organisations is a floor, and a
+    /// floor that does not say so is the lie this codebase exists to
+    /// prevent.
+    #[test]
+    fn an_over_long_union_is_trimmed_and_counted() {
+        let orgs: Vec<String> = (0..ORG_UNION_CAP + 5).map(|i| format!("o{i}")).collect();
+        let a = AccountScope::new("octocat", orgs);
+        assert_eq!(a.orgs.len(), ORG_UNION_CAP);
+        assert_eq!(a.trimmed, 5, "the organisations left out must be counted");
     }
 
     /// Item 5 of #824, as a routing decision: only a single-repo scope
@@ -497,7 +697,7 @@ mod tests {
         assert!(!Scope::Repo("a/b".into()).needs_search());
         assert!(Scope::Org("a".into()).needs_search());
         assert!(Scope::Personal("a".into()).needs_search());
-        assert!(Scope::All.needs_search());
+        assert!(Scope::All(AccountScope::new("octocat", Vec::new())).needs_search());
     }
 
     #[test]

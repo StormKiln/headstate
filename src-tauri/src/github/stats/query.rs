@@ -917,7 +917,10 @@ mod tests {
     fn a_subject_cannot_break_out_of_the_string_literal() {
         let hostile = StatsQuery::new(
             Some(Subject::Login("a\" evil: \"b".into())),
-            Scope::All,
+            Scope::All(crate::github::stats::scope::AccountScope::new(
+                "octocat",
+                Vec::new(),
+            )),
             Measure::Merged,
         );
         let doc = probe_query(&hostile, &slices(1), 0);

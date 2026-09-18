@@ -1861,7 +1861,9 @@ mod tests {
         assert!(!routes_through_connection(&Scope::Personal(
             "pktstorm".into()
         )));
-        assert!(!routes_through_connection(&Scope::All));
+        assert!(!routes_through_connection(&Scope::All(
+            crate::github::stats::scope::AccountScope::new("octocat", Vec::new())
+        )));
     }
 
     /// An `Outcome` cannot report a total without also reporting whether

@@ -450,7 +450,12 @@ pub fn query_for(scope_kind: &str, scope_value: &str, measure: &str) -> Option<S
         "repo" => Scope::Repo(scope_value.to_string()),
         "org" => Scope::Org(scope_value.to_string()),
         "user" => Scope::Personal(scope_value.to_string()),
-        "all" => Scope::All,
+        // The union the click carried, round-tripped through
+        // `scope_value`. A row whose value cannot name a viewer yields
+        // `None` -- skipped, like any other row this build cannot
+        // interpret, rather than falling back to an unqualified search
+        // over the whole of GitHub (#1114).
+        "all" => Scope::All(super::scope::AccountScope::parse(scope_value)?),
         _ => return None,
     };
     let measure = match measure {

@@ -2530,7 +2530,15 @@ pub async fn stats_count(
         ("repo", Some(v)) => Scope::Repo(v),
         ("org", Some(v)) => Scope::Org(v),
         ("user", Some(v)) => Scope::Personal(v),
-        ("all", _) => Scope::All,
+        // `login,orgA,orgB` -- the union the sidebar already knows, sent
+        // through the `scope_value` this kind leaves unused. Refused
+        // rather than defaulted when absent: an unqualified search covers
+        // the whole of GitHub, not the viewer's account (#1114).
+        ("all", Some(v)) => Scope::All(
+            crate::github::stats::scope::AccountScope::parse(&v)
+                .ok_or("the account scope must name a viewer")?,
+        ),
+        ("all", None) => return Err("the account scope needs a value".into()),
         (k, None) => return Err(format!("scope {k} needs a value")),
         (k, _) => return Err(format!("unknown scope: {k}")),
     };
@@ -2784,7 +2792,15 @@ fn parse_scope_request(
         ("repo", Some(v)) => Scope::Repo(v),
         ("org", Some(v)) => Scope::Org(v),
         ("user", Some(v)) => Scope::Personal(v),
-        ("all", _) => Scope::All,
+        // `login,orgA,orgB` -- the union the sidebar already knows, sent
+        // through the `scope_value` this kind leaves unused. Refused
+        // rather than defaulted when absent: an unqualified search covers
+        // the whole of GitHub, not the viewer's account (#1114).
+        ("all", Some(v)) => Scope::All(
+            crate::github::stats::scope::AccountScope::parse(&v)
+                .ok_or("the account scope must name a viewer")?,
+        ),
+        ("all", None) => return Err("the account scope needs a value".into()),
         (k, None) => return Err(format!("scope {k} needs a value")),
         (k, _) => return Err(format!("unknown scope: {k}")),
     };
@@ -5823,7 +5839,7 @@ mod tests {
     #[test]
     fn the_window_excludes_today() {
         let now = chrono::Utc::now();
-        let r = parse_scope_request("all", None, 7, now).expect("parses");
+        let r = parse_scope_request("all", Some("octocat".into()), 7, now).expect("parses");
         let today = now.format("%Y-%m-%d").to_string();
         assert!(
             r.window.to < today,
@@ -5843,7 +5859,8 @@ mod tests {
     #[test]
     fn the_window_is_clamped_like_every_other_public_surface() {
         let now = chrono::Utc::now();
-        let huge = parse_scope_request("all", None, 100_000, now).expect("parses");
+        let huge =
+            parse_scope_request("all", Some("octocat".into()), 100_000, now).expect("parses");
         assert_eq!(
             huge.days.len(),
             usize::try_from(clamp_days(100_000)).unwrap()
@@ -5852,7 +5869,7 @@ mod tests {
         // backwards window, which would make every search a no-op that
         // returned a confident zero.
         for bad in [0_i64, -1, i64::MIN] {
-            let r = parse_scope_request("all", None, bad, now).expect("parses");
+            let r = parse_scope_request("all", Some("octocat".into()), bad, now).expect("parses");
             assert!(!r.days.is_empty(), "{bad} produced an empty window");
             assert!(
                 r.window.from <= r.window.to,
@@ -5866,14 +5883,22 @@ mod tests {
     #[test]
     fn a_scope_without_its_value_is_refused() {
         let now = chrono::Utc::now();
-        for kind in ["repo", "org", "user"] {
+        // EVERY kind, `all` included. `all` used to be exempted here, on
+        // the belief that "everything" had nothing to name -- and that
+        // exemption is exactly the silent widening this test's name
+        // forbids: the resulting search covered the whole of GitHub rather
+        // than the viewer's account (#1114). It now carries
+        // `login,orgA,orgB` like any other scope carries its value.
+        for kind in ["repo", "org", "user", "all"] {
             assert!(
                 parse_scope_request(kind, None, 30, now).is_err(),
                 "{kind} with no value must be refused, not widened"
             );
         }
-        // `all` is the one kind whose value is genuinely absent.
-        assert!(parse_scope_request("all", None, 30, now).is_ok());
+        assert!(
+            parse_scope_request("all", Some("octocat,acme".into()), 30, now).is_ok(),
+            "the account scope is valid once it names its viewer"
+        );
         assert!(parse_scope_request("nonsense", Some("x".into()), 30, now).is_err());
     }
 

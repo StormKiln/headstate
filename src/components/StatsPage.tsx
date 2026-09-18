@@ -268,7 +268,17 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
         daysCovered: backfill.daysCovered,
         daysTotal: backfill.daysTotal,
       })
-    : undefined;
+    : // NO FRAME YET. The worker sleeps one `BACKFILL_INTERVAL` before its
+      // first tick and walks one scope per tick, so the first frame for a
+      // freshly opened scope is up to a minute away -- longer if other
+      // scopes are registered ahead of it.
+      //
+      // Rendering nothing for that window is the exact silence this whole
+      // caveat exists to remove: an incomplete board with no word about
+      // collection reads as broken, which is what was reported against
+      // v5.23.3 (#1115). The page does not need a frame to know that
+      // collection is pending -- it knows the board is incomplete.
+      "Collection starting.";
   const caveat = board
     ? partialityCaveat(
         backfill

@@ -2617,6 +2617,38 @@ mod tests {
     /// `is_comment` gives: this codebase argues its rules directly above
     /// the code that implements them, so every name below appears in prose
     /// in this very file.
+    /// The account-union cap is the same number in Rust and in the page.
+    ///
+    /// The Rust side TRIMS the union to `ORG_UNION_CAP`; the sidebar says
+    /// how many organisations the account row covers. If they disagree the
+    /// sidebar's sentence is wrong -- it would claim a coverage the search
+    /// does not have, which is worse than saying nothing (#1114).
+    #[test]
+    fn the_account_union_cap_agrees_across_the_two_languages() {
+        let rust = include_str!("github/stats/scope.rs")
+            .split_once("pub const ORG_UNION_CAP: usize = ")
+            .expect("ORG_UNION_CAP must exist")
+            .1
+            .split_once(';')
+            .expect("a terminated constant")
+            .0
+            .trim()
+            .replace('_', "");
+        let ts = include_str!("../../src/components/StatsSidebar.tsx")
+            .split_once("const ACCOUNT_ORG_CAP = ")
+            .expect("ACCOUNT_ORG_CAP must exist in the sidebar")
+            .1
+            .split_once(';')
+            .expect("a terminated constant")
+            .0
+            .trim()
+            .to_string();
+        assert_eq!(
+            rust, ts,
+            "ORG_UNION_CAP ({rust}) and ACCOUNT_ORG_CAP ({ts}) must name the same number"
+        );
+    }
+
     /// A scope is registered for backfill BEFORE the cache can return.
     ///
     /// `stats_board` returns a cached board early. Registration used to
