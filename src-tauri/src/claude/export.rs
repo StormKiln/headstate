@@ -250,6 +250,8 @@ mod tests {
 
     fn row(session_id: &str, cwd: Option<&str>, liveness: ListLiveness) -> ListRow {
         ListRow {
+            // #1133: not part of what the restart list exports.
+            opening_prompt: None,
             session_id: session_id.into(),
             name: None,
             cwd: cwd.map(str::to_string),

@@ -898,6 +898,30 @@ const MIGRATIONS: &[&str] = &[
      );
      CREATE INDEX IF NOT EXISTS claude_session_pr_by_pr
         ON claude_session_pr (repo, number);",
+    // #1133: the first thing the user asked, for the session list.
+    //
+    // A nullable column rather than a new table: it is one short string
+    // per session, always read with the row it belongs to.
+    //
+    // The CREATE precedes the ALTER because a migration must not assume
+    // which tables a database already has. The schema tests seed a
+    // database at an older `user_version` carrying only the tables their
+    // case needs, and a bare `ALTER TABLE` fails outright against one
+    // that never created `claude_session` -- a real fragility, not a test
+    // artefact: the same shape would break any database restored from a
+    // partial backup. `IF NOT EXISTS` makes the CREATE a no-op on every
+    // ordinary upgrade.
+    "CREATE TABLE IF NOT EXISTS claude_session (
+        session_id       TEXT PRIMARY KEY,
+        name             TEXT,
+        cwd              TEXT,
+        git_branch       TEXT,
+        claude_version   TEXT,
+        transcript_path  TEXT,
+        first_seen_at    TEXT NOT NULL,
+        last_activity_at TEXT
+     );
+     ALTER TABLE claude_session ADD COLUMN opening_prompt TEXT;",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {

@@ -215,6 +215,7 @@ type WholeSession = ClaudeSession &
   Omit<ClaudeSessionDetail, "registry_failure" | "liveness" | "kind" | "subagents">;
 
 const whole = (over: Partial<WholeSession> = {}): WholeSession => ({
+  opening_prompt: null,
   session_id: "e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2",
   name: "HeadState GitHub issues filing",
   cwd: "/Users/acme/code/widget",
@@ -311,6 +312,8 @@ const session = (over: Partial<WholeSession> = {}): ClaudeSession => {
   return {
     session_id: w.session_id,
     name: w.name,
+    // #1133. The list row carries it; the detail does not need it.
+    opening_prompt: w.opening_prompt ?? null,
     cwd: w.cwd,
     git_branch: w.git_branch,
     last_activity_at: w.last_activity_at,
@@ -3050,5 +3053,43 @@ describe("the subagent agent types", () => {
 
     open("Kestrel");
     expect(screen.queryByText(/what its subagents did/i)).toBeNull();
+  });
+});
+
+/// #1133: the opening ask, under the title.
+///
+/// 286 of 1,438 real sessions share their `aiTitle` with another, so a
+/// list showing only titles cannot tell two rows apart at the moment
+/// someone is choosing which to resume.
+describe("the opening prompt", () => {
+  it("renders under the title", () => {
+    state.list = listOf([session({ name: "Fix the retry", opening_prompt: "make the backoff jittered" })]);
+    renderView();
+    expect(screen.getByText("make the backoff jittered")).toBeTruthy();
+  });
+
+  /// `null` renders as NOTHING. Never the title repeated, never the
+  /// UUID: a fabricated stand-in cannot be told from a real prompt,
+  /// which is the rule this page already states about titleless
+  /// sessions.
+  it("renders nothing when there is no prompt", () => {
+    state.list = listOf([session({ name: "Fix the retry", opening_prompt: null })]);
+    const { container } = renderView();
+    // The title is there once; nothing stands in for the missing prompt.
+    expect(screen.getAllByText("Fix the retry").length).toBe(1);
+    expect(container.textContent).not.toContain("undefined");
+  });
+
+  it("is searchable", () => {
+    state.list = listOf([
+      session({ session_id: "a", name: "One", opening_prompt: "fix the notarization bug" }),
+      session({ session_id: "b", name: "Two", opening_prompt: "add a chart" }),
+    ]);
+    renderView();
+    fireEvent.change(screen.getByPlaceholderText(/Search title, prompt/), {
+      target: { value: "notarization" },
+    });
+    expect(screen.getByText("One")).toBeTruthy();
+    expect(screen.queryByText("Two")).toBeNull();
   });
 });

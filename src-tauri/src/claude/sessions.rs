@@ -370,6 +370,14 @@ pub struct ListRow {
     /// The newest record in the transcript, NOT the time we scanned.
     /// `None` when nothing in the transcript carried a timestamp.
     pub last_activity_at: Option<String>,
+    /// The first thing the user asked (#1133).
+    ///
+    /// On the LIST rather than only the detail, because it is what the
+    /// list is for: 286 of 1,438 real sessions share their `aiTitle`
+    /// with another, so titles alone cannot tell two rows apart at the
+    /// moment someone is choosing which to resume. Clamped at the source
+    /// so the per-row payload stays small.
+    pub opening_prompt: Option<String>,
     /// Derived every read, never stored -- for EVERY row, not just the
     /// window a cap would draw. See [`SessionList`]: keeping this true of
     /// the whole corpus is what ruled out every row-dropping approach.
@@ -1038,6 +1046,8 @@ struct Stored {
     transcript_path: Option<String>,
     first_seen_at: String,
     last_activity_at: Option<String>,
+    /// The first thing the user asked (#1133).
+    opening_prompt: Option<String>,
 }
 
 fn stored_rows(conn: &Connection) -> Result<Vec<Stored>, rusqlite::Error> {
@@ -1049,7 +1059,7 @@ fn stored_rows(conn: &Connection) -> Result<Vec<Stored>, rusqlite::Error> {
         // a timestamp", and letting it sort as the newest would put the
         // two sessions we know least about at the top of the list.
         "SELECT session_id, name, cwd, git_branch, claude_version, transcript_path,
-                first_seen_at, last_activity_at
+                first_seen_at, last_activity_at, opening_prompt
          FROM claude_session
          ORDER BY last_activity_at IS NULL, last_activity_at DESC, first_seen_at DESC",
     )?;
@@ -1063,6 +1073,7 @@ fn stored_rows(conn: &Connection) -> Result<Vec<Stored>, rusqlite::Error> {
             transcript_path: r.get(5)?,
             first_seen_at: r.get(6)?,
             last_activity_at: r.get(7)?,
+            opening_prompt: r.get(8)?,
         })
     })?;
     rows.collect()
@@ -1075,7 +1086,7 @@ fn stored_rows(conn: &Connection) -> Result<Vec<Stored>, rusqlite::Error> {
 fn stored_row(conn: &Connection, session_id: &str) -> Result<Option<Stored>, rusqlite::Error> {
     let mut stmt = conn.prepare(
         "SELECT session_id, name, cwd, git_branch, claude_version, transcript_path,
-                first_seen_at, last_activity_at
+                first_seen_at, last_activity_at, opening_prompt
          FROM claude_session WHERE session_id = ?1",
     )?;
     let mut rows = stmt.query_map([session_id], |r| {
@@ -1088,6 +1099,7 @@ fn stored_row(conn: &Connection, session_id: &str) -> Result<Option<Stored>, rus
             transcript_path: r.get(5)?,
             first_seen_at: r.get(6)?,
             last_activity_at: r.get(7)?,
+            opening_prompt: r.get(8)?,
         })
     })?;
     rows.next().transpose()
@@ -1214,6 +1226,7 @@ fn assemble<P: ProcessProbe>(
                 .and_then(super::signals::Events::compactions)
                 .map(|c| c.under_pressure());
             ListRow {
+                opening_prompt: s.opening_prompt,
                 session_id: s.session_id,
                 name: s.name,
                 cwd,
