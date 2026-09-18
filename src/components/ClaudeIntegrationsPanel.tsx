@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { toast } from "sonner";
-import { useClaudeHooks } from "@/api/hooks";
+import { useClaudeHookInventory, useClaudeHooks } from "@/api/hooks";
 import { claudeRevealPath, type ClaudeHooksStatus, type UiPrefs } from "@/api/tauri";
 import { copyText } from "@/lib/clipboard";
 import { IS_MOBILE_BUILD } from "@/lib/target";
@@ -344,6 +344,7 @@ export function ClaudeIntegrationsPanel({
           </p>
         ) : null}
       </div>
+      <HookInventorySection enabled={enabled} />
     </div>
   );
 }
@@ -466,6 +467,76 @@ function RefusalActions({
         Check again re-reads the file without writing to it, so a hand-fix shows up here
         as soon as it is saved.
       </p>
+    </div>
+  );
+}
+
+/// Every hook in the file, ours and everyone else's (#1127).
+///
+/// Collapsed by default. The question it answers -- "what is actually
+/// wired into my sessions" -- is one a user asks when something is
+/// wrong, not on every visit to Settings, and `useClaudeHookInventory`
+/// does not read the file until this is opened.
+function HookInventorySection({ enabled }: { enabled: boolean }) {
+  const [open, setOpen] = useState(false);
+  const { data, error } = useClaudeHookInventory(enabled && open);
+
+  if (!enabled) return null;
+
+  return (
+    <div className="mt-2 border-t border-[#21262d] pt-2">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        className="tap-target text-xs text-[#58a6ff] hover:underline"
+      >
+        {open ? "Hide" : "Show"} every hook in this file
+      </button>
+      {open ? (
+        error ? (
+          // The refusal's own sentence, never an empty table. A file
+          // that could not be parsed is not a file with no hooks, and
+          // rendering nothing would say the second.
+          <p role="alert" className="mt-2 text-xs text-[#f85149]">
+            {String(error instanceof Error ? error.message : error)}
+          </p>
+        ) : !data ? (
+          <p className="mt-2 text-xs text-[#8b949e]">Reading…</p>
+        ) : data.events.length === 0 ? (
+          <p className="mt-2 text-xs text-[#8b949e]">
+            This file configures no hooks at all.
+          </p>
+        ) : (
+          <div className="mt-2 space-y-2">
+            {data.events.map((ev) => (
+              <div key={ev.event}>
+                <p className="text-xs font-semibold text-[#e6edf3]">{ev.event}</p>
+                <ul className="mt-0.5 space-y-0.5">
+                  {ev.matchers.map((m, i) => (
+                    <li
+                      key={`${ev.event}:${i}`}
+                      className={`text-[11px] ${m.ours ? "text-[#3fb950]" : "text-[#8b949e]"}`}
+                    >
+                      {/* Ours is marked rather than merely coloured:
+                          colour alone is not an answer for a reader who
+                          cannot see it. */}
+                      <span className="mr-1">{m.ours ? "[Headstate]" : "[other]"}</span>
+                      {/* An ABSENT matcher means "every tool", which is
+                          a different statement from a pattern that
+                          happens to be empty. */}
+                      <span className="mr-1 text-[#8b949e]">
+                        {m.matcher === null ? "(every tool)" : m.matcher}
+                      </span>
+                      <code className="break-all">{m.commands.join(" ; ")}</code>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+          </div>
+        )
+      ) : null}
     </div>
   );
 }

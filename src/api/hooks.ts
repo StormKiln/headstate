@@ -39,6 +39,7 @@ import type {
 import type { PrActionName } from "./tauri";
 import {
   backgroundPanicked,
+  claudeHooksInventory,
   getCached,
   actOnPrs,
   updatePrBranch,
@@ -3462,6 +3463,23 @@ export function useRemoteEnabled() {
 /// invalidates rather than writing an optimistic value. An optimistic
 /// "installed" would be precisely the lie the feature is built to avoid: it
 /// would show a green tick for a write that Claude Code will silently ignore.
+/// Every hook matcher in the file, ours and foreign (#1127).
+///
+/// Its own query rather than a field on `useClaudeHooks`: the panel
+/// renders the inventory in a collapsible section, so a user who never
+/// opens it should not pay for the read on every focus. Same staleTime
+/// as the status it sits beneath, because they read the same file and
+/// disagreeing about its age would be worse than either value.
+export function useClaudeHookInventory(enabled: boolean) {
+  return useQuery({
+    queryKey: ["claude-hooks-inventory"],
+    queryFn: claudeHooksInventory,
+    enabled,
+    staleTime: 5_000,
+    refetchOnWindowFocus: true,
+  });
+}
+
 export function useClaudeHooks() {
   const qc = useQueryClient();
   const query = useQuery({

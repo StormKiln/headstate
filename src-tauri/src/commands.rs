@@ -4946,6 +4946,16 @@ fn claude_settings_target() -> Result<(std::path::PathBuf, std::path::PathBuf), 
 ///
 /// [`Status`]: crate::claude::install::Status
 #[tauri::command]
+pub fn claude_hooks_inventory() -> Result<crate::claude::install::HookInventory, String> {
+    let (path, _exe) = claude_settings_target()?;
+    // The Refusal's own sentence, not a generic message: it names the
+    // file and what was wrong with it, and `refusalText` on the frontend
+    // renders it verbatim. An empty inventory here would say "no hooks
+    // are installed" for a file that could not be parsed.
+    crate::claude::install::inventory(&path).map_err(|r| r.to_string())
+}
+
+#[tauri::command]
 pub fn claude_hooks_status() -> Result<crate::claude::install::Status, String> {
     let (path, exe) = match claude_settings_target() {
         Ok(t) => t,

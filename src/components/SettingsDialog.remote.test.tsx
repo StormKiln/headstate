@@ -5,6 +5,9 @@ const setRemote = vi.fn<(enabled: boolean) => Promise<void>>(() => Promise.resol
 const remoteState = { enabled: false };
 
 vi.mock("../api/hooks", () => ({
+  // #1127. The inventory section is collapsed and reads nothing until
+  // opened, which is what these tests assume.
+  useClaudeHookInventory: () => ({ data: undefined, error: null }),
   useUiPrefs: () => ({
     prefs: { hidden_views: [], close_hides_to_tray: true },
     set: () => Promise.resolve(),

@@ -432,6 +432,9 @@ pub const SURFACE: &[(&str, Class)] = &[
     // settings file Claude Code cannot parse is IGNORED silently, so a
     // desktop in that state has every hook dead, and showing that as
     // "not installed" points at a button the phone does not even have.
+    // Read: one file, no side effects, and "what is wired into my
+    // sessions" is a reasonable thing to ask from a phone (#1127).
+    ("claude_hooks_inventory", Class::Read),
     ("claude_hooks_status", Class::Read),
     ("get_poll_interval", Class::Read),
     ("get_worktree_dirs", Class::Read),
@@ -988,6 +991,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "claude_restart_list" => res(commands::claude_restart_list(app.clone()).await),
         "claude_session_usage" => res(commands::claude_session_usage(a.get("path")?).await),
         "claude_transcript_tail" => res(commands::claude_transcript_tail(a.get("path")?).await),
+        "claude_hooks_inventory" => res(commands::claude_hooks_inventory()),
         "claude_hooks_status" => res(commands::claude_hooks_status()),
         "get_poll_interval" => ok(commands::get_poll_interval(app.state())),
         "get_worktree_dirs" => ok(commands::get_worktree_dirs(app.clone())),

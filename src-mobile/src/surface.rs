@@ -245,6 +245,9 @@ pub const SURFACE: &[(&str, Class)] = &[
     // as its own thing rather than as "not installed": a settings file
     // Claude Code cannot parse is ignored silently, so a desktop in that
     // state has every hook dead, and the remedy is at that keyboard.
+    // Read: one file, no side effects, and "what is wired into my
+    // sessions" is a reasonable thing to ask from a phone (#1127).
+    ("claude_hooks_inventory", Class::Read),
     ("claude_hooks_status", Class::Read),
     ("get_poll_interval", Class::Read),
     ("get_worktree_dirs", Class::Read),

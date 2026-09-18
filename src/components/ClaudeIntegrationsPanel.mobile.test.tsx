@@ -48,6 +48,10 @@ const hookState = vi.hoisted(() => ({ status: undefined as ClaudeHooksStatus | u
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 vi.mock("@/api/hooks", () => ({
+  // #1127. Disabled by default: the inventory section is collapsed and
+  // does not read the file until opened, which is the behaviour every
+  // test in this file assumes.
+  useClaudeHookInventory: () => ({ data: undefined, error: null }),
   useClaudeHooks: () => ({
     status: hookState.status,
     isLoading: hookState.status === undefined,
