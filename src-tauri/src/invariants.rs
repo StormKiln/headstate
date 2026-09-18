@@ -2617,6 +2617,44 @@ mod tests {
     /// `is_comment` gives: this codebase argues its rules directly above
     /// the code that implements them, so every name below appears in prose
     /// in this very file.
+    /// The poll loop writes the review queue it fetches.
+    ///
+    /// It fetches that list on EVERY tick to decide what to announce. It
+    /// used to compare it against the previous tick's copy and drop it,
+    /// while the authored list from the same tick was persisted and
+    /// emitted -- so the To Review page paid ~20s for a query the
+    /// background had already made a minute earlier (#1118).
+    ///
+    /// Asserted against the loop rather than the store: `save_snapshot`
+    /// has callers, and the question is whether THIS one is among them.
+    #[test]
+    fn the_poll_loop_caches_the_review_queue_it_fetches() {
+        let src = include_str!("poll.rs");
+        assert!(
+            src.contains("CachedList::Reviewing"),
+            "the poll loop must write the review list it already fetches, or the To Review \
+             page is only ever as fresh as its last visit (#1118)"
+        );
+        assert!(
+            src.contains("persist_reviewing(&app, &now).await"),
+            "and it must do so on the tick that fetched it"
+        );
+    }
+
+    /// The review fetch is not gated on a NOTIFICATION preference.
+    ///
+    /// "Interrupt me when something is ready" and "keep this list current"
+    /// are different questions. Gating the fetch on the first silently
+    /// answered the second with no (#1118).
+    #[test]
+    fn the_review_fetch_does_not_depend_on_wanting_an_alert() {
+        let src = include_str!("poll.rs");
+        assert!(
+            !src.contains("if read_notify_prefs(&app).await.ready_to_review"),
+            "the review queue must be fetched for its data, not only when an alert is wanted"
+        );
+    }
+
     /// The account-union cap is the same number in Rust and in the page.
     ///
     /// The Rust side TRIMS the union to `ORG_UNION_CAP`; the sidebar says

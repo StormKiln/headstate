@@ -85,7 +85,36 @@ use serde_json::json;
 ///
 /// So the cap is a process-wide [`READ_PERMITS`] acquired per request, which
 /// is what makes the number above true of the app rather than of one command.
-pub const READ_CONCURRENCY: usize = 6;
+///
+/// # Lowered from 6 to 4 on measurement (#1117)
+///
+/// Everything above is about SECONDARY RATE LIMITS. A second constraint was
+/// measured on 2026-09-18 and points the same way: GitHub times out
+/// resolving node-heavy documents when too many run at once, and answers
+/// **502 with HTML rather than JSON**.
+///
+/// Against `org:FNX-Labs` (453 merged pull requests over 30 days), waves of
+/// `ALIAS_CHUNK` aliases each resolving `SLICE_PAGE_FULL` nodes:
+///
+/// | concurrency | elapsed | documents lost |
+/// |---|---|---|
+/// | 2 | 2.4-3.0s | 0 of 2 |
+/// | 3 | 2.5-2.8s | 0 of 3 |
+/// | 4 | 3.5-4.8s | 0 of 4 |
+/// | 6 | 5.7-10.8s | **1 of 6, intermittently** |
+///
+/// Six is both SLOWER and lossy: the wave that lost a document took 10.8s
+/// where four took 3.5s. The server is the bottleneck, so asking for more
+/// parallelism buys nothing and costs a slice.
+///
+/// Intermittent, not deterministic -- one of three trials at 6 -- which
+/// matches the alias-ceiling behaviour recorded elsewhere and is why this
+/// stayed invisible: it needs a live call on a dense scope to see at all.
+///
+/// Four rather than three: three is no faster within measurement noise, and
+/// four keeps more of the headroom the secondary-limit argument above was
+/// written to preserve.
+pub const READ_CONCURRENCY: usize = 4;
 
 /// The process-wide permits that make [`READ_CONCURRENCY`] real.
 ///
@@ -1055,8 +1084,34 @@ async fn detail_round(
         // quadratic in waves for no gain.
         let mut wave_aliases = serde_json::Map::new();
         let mut wave_refused = 0usize;
+        // How many documents in THIS wave GitHub refused outright.
+        //
+        // A `?` here used to fail the whole load on one bad document
+        // (#1117). Measured against the live API on 2026-09-18, a wave of
+        // six concurrent documents each resolving 50 pull request nodes
+        // loses about one of six to a 502: the server gives up resolving
+        // the nested fields at ~10.5s and answers HTML rather than JSON.
+        // The other five had arrived.
+        //
+        // Their aliases are simply absent from the merged map, and
+        // `from_alias_map` already reads an absent alias as a named short
+        // slice of unknown size -- the shape #843 built for a refused
+        // wave. So the board comes back partial and SAYS which ranges it
+        // is missing, which is what `partial is not nothing` requires and
+        // what #1044 established for the timeout branch of this same
+        // function.
+        let mut wave_failed = 0usize;
+        let mut last_error: Option<ClientError> = None;
         while let Some(joined) = set.join_next().await {
-            let v = joined.map_err(|e| ClientError::Join(e.to_string()))??;
+            let v = match joined.map_err(|e| ClientError::Join(e.to_string()))? {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!("a stats detail document failed; its slices stay unmeasured: {e}");
+                    wave_failed += 1;
+                    last_error = Some(e);
+                    continue;
+                }
+            };
             if let Some(obj) = v.as_object() {
                 // Absolute alias indices, so chunks merge in any
                 // completion order without clobbering each other --
@@ -1095,6 +1150,20 @@ async fn detail_round(
         // from its own running sum, so the sink's figure is authoritative
         // and the stray copy is overwritten rather than double-counted.
         sink.record(&wave_aliases, wave_refused, base + wave.len());
+        // EVERY document in the wave failed. That is not partiality, it is
+        // a failure with nothing behind it: continuing would walk the
+        // remaining waves against a server that just refused all of this
+        // one, and return a board whose every slice is short. The error is
+        // surfaced so the page says what went wrong rather than rendering
+        // an empty leaderboard as a measurement.
+        //
+        // A wave that lost SOME documents carries on: what it retrieved is
+        // an answer, and the missing aliases name themselves.
+        if wave_failed == wave.chunks(chunk).len() {
+            if let Some(e) = last_error {
+                return Err(e);
+            }
+        }
     }
     // Written back as the merged map's own key, so `Board::from_alias_map`
     // keeps reading the count through `client::refused_fields_of` -- one
@@ -2014,9 +2083,15 @@ mod tests {
     /// number of slices one round-trip's worth of wall clock covers.
     /// Pinned because the doc comment on `READ_CONCURRENCY` reasons
     /// about exactly this product.
+    ///
+    /// Was 60 at `READ_CONCURRENCY` 6. Lowered to 40 with the concurrency
+    /// itself (#1117): six concurrent node-carrying documents lose about
+    /// one in six to a GitHub 502 and take LONGER than four do, so the
+    /// higher number bought nothing and cost a slice. The measurement is
+    /// in `READ_CONCURRENCY`'s own doc.
     #[test]
-    fn a_wave_covers_sixty_slices() {
-        const { assert!(ALIAS_CHUNK * READ_CONCURRENCY == 60) };
+    fn a_wave_covers_forty_slices() {
+        const { assert!(ALIAS_CHUNK * READ_CONCURRENCY == 40) };
     }
 
     /// A wave is refused once the budget is under the reserve, and permitted
@@ -2138,12 +2213,21 @@ mod tests {
         // the remaining figure came from the poll loop or an earlier wave.
         let b = Budget::new();
         b.record(&serde_json::json!({
-            "rateLimit": { "cost": 1, "remaining": RESERVE + 6, "resetAt": "2026-09-11T17:00:00Z" }
+            "rateLimit": {
+                "cost": 1,
+                "remaining": RESERVE + READ_CONCURRENCY as u64,
+                "resetAt": "2026-09-11T17:00:00Z"
+            }
         }));
-        // Six requests would leave exactly the reserve, which is permitted --
-        // `RESERVE` is the floor, not a margin above it. Stated as
-        // `READ_CONCURRENCY` because it happens to be 6, and a full wave at
-        // the shipped concurrency is the realistic ask.
+        // A full wave would leave exactly the reserve, which is permitted --
+        // `RESERVE` is the floor, not a margin above it.
+        //
+        // The seeded figure is `RESERVE + READ_CONCURRENCY`, not a literal.
+        // It was `RESERVE + 6` with a comment saying "stated as
+        // `READ_CONCURRENCY` because it happens to be 6" -- and when the
+        // concurrency was lowered to 4 (#1117) the two stopped happening to
+        // agree, so the test failed for a reason that had nothing to do
+        // with what it checks. The subject is the boundary, not the number.
         assert!(wave_permitted(&b, READ_CONCURRENCY));
         assert!(
             !wave_permitted(&b, READ_CONCURRENCY + 1),
