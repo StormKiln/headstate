@@ -1,8 +1,9 @@
 import { useState } from "react";
 import { useIsMobile } from "@/lib/useIsMobile";
 import { FileText } from "lucide-react";
-import type { ClaudeFile, ImportNode } from "@/types/pr";
-import { useClaudeMd, useClaudeMdText } from "@/api/hooks";
+import type {
+  ClaudeMdEffectiveScan, ClaudeFile, ImportNode } from "@/types/pr";
+import { useClaudeMdEffective, useClaudeMdText } from "@/api/hooks";
 import { useActiveFilters } from "@/store/filters";
 import { current } from "@/lib/ariaCurrent";
 import { formatSize } from "@/lib/worktrees";
@@ -31,6 +32,30 @@ function tokenLabel(n: number): string {
 /// import's weight could not be counted: the real total is higher by an
 /// unknown amount, and a user budgeting context otherwise reads a number
 /// that is too small with nothing on screen to say so.
+/// Every scope's tokens together. Mirrors
+/// `EffectiveScan::combined_tokens` -- the two must agree, or the page
+/// prints a number the backend did not compute.
+function combinedTokens(scan: ClaudeMdEffectiveScan): number {
+  return (
+    scan.repo.files.reduce((n, f) => n + f.total_tokens, 0) +
+    scan.extra.reduce((n, s) => n + s.file.total_tokens, 0)
+  );
+}
+
+/// Whether that figure is a floor. Mirrors
+/// `EffectiveScan::combined_partial`: an unread scope, an unreadable
+/// directory, or an unmeasured import tree all UNDERSTATE the total, so
+/// all three qualify it.
+function combinedPartial(scan: ClaudeMdEffectiveScan): boolean {
+  return (
+    scan.unreadable.length > 0 ||
+    scan.repo.unreadable_dirs.length > 0 ||
+    scan.repo.unreadable_files.length > 0 ||
+    scan.repo.files.some((f) => f.total_partial) ||
+    scan.extra.some((s) => s.file.total_partial)
+  );
+}
+
 function totalLabel(n: number, partial: boolean): string {
   return partial ? `at least ${tokenLabel(n)}` : tokenLabel(n);
 }
@@ -47,13 +72,18 @@ export function ClaudeMdPage() {
   // this repository" -- a confident, wrong answer to a question the app
   // could not answer, on a page whose own doc comment above stakes its
   // design on "a wrong render costs a confused reader".
+  // #1131: every scope a session loads, not only this repository.
+  // `effective.repo` is the scan this page always rendered, unchanged --
+  // the extra scopes are ADDITIVE, so no number already on screen means
+  // anything different.
   const {
-    data: scan,
+    data: effective,
     isLoading,
     isError,
     error,
     refetch,
-  } = useClaudeMd(repo);
+  } = useClaudeMdEffective(repo);
+  const scan = effective?.repo;
   // NOT `data.files = []`. The default lives here rather than on `data`
   // because the guards below need to see `undefined` -- a `= []` on the
   // query result is exactly what #846 was about, and #972 is the same
@@ -198,6 +228,29 @@ export function ClaudeMdPage() {
           unreadable={unreadablePaths}
           consequence={`the ${files.length === 1 ? "file" : `${files.length} files`} below may not be all of them.`}
         />
+        {/* GLOBAL first, and in its own group (#1131).
+            `~/.claude/CLAUDE.md` loads into every session on this
+            machine, so it belongs above the repository's own files
+            rather than among them -- listing it inside the repo group
+            would attribute a machine-wide file to one project. */}
+        {(effective?.extra ?? []).map((s) => (
+          <div key={s.file.path}>
+            <p className="px-2 pt-2 text-[10px] uppercase tracking-wide text-[#8b949e]">
+              {s.scope === "global" ? "Global — every session on this machine" : "Local overrides"}
+            </p>
+            <FileEntry
+              file={s.file}
+              repo={repo}
+              active={s.file.path === active?.path}
+              onSelect={() => setSelected(s.file.path)}
+            />
+          </div>
+        ))}
+        {(effective?.extra.length ?? 0) > 0 && files.length > 0 ? (
+          <p className="px-2 pt-2 text-[10px] uppercase tracking-wide text-[#8b949e]">
+            This repository
+          </p>
+        ) : null}
         {files.map((f) => (
           <FileEntry
             key={f.path}
@@ -207,6 +260,17 @@ export function ClaudeMdPage() {
             onSelect={() => setSelected(f.path)}
           />
         ))}
+        {/* The combined figure, and what it includes.
+            Stated rather than left to inference: a total that silently
+            spans scopes is the same defect as one that silently omits
+            them. `totalLabel` carries the existing "at least" idiom, so
+            an unread scope reads as a floor rather than a value. */}
+        {effective ? (
+          <p className="px-2 pt-3 text-xs text-[#8b949e]">
+            {totalLabel(combinedTokens(effective), combinedPartial(effective))} across{" "}
+            {effective.extra.length > 0 ? "every scope a session loads" : "this repository"}
+          </p>
+        ) : null}
       </div>
 
       <div

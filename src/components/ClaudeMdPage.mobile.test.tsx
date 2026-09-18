@@ -12,8 +12,13 @@ vi.mock("../api/hooks", async (orig) => ({
   ...(await orig<Record<string, unknown>>()),
   // A `Scan`, not a bare array (#972): the bare array is what made the page
   // unable to tell "this repository has none" from "we could not look".
-  useClaudeMd: () => ({
+  useClaudeMdEffective: () => ({
     data: {
+      // #1131: the repo scan is unchanged; the extra scopes are
+      // empty because these tests are about the repository list.
+      extra: [],
+      unreadable: [],
+      repo: {
       files: [
         { path: "CLAUDE.md", bytes: 100, tokens: 25, total_tokens: 25, total_partial: false, imports: [] },
         { path: "docs/CLAUDE.md", bytes: 200, tokens: 50, total_tokens: 50, total_partial: false, imports: [] },
@@ -21,6 +26,7 @@ vi.mock("../api/hooks", async (orig) => ({
       unreadable_dirs: [],
       unreadable_files: [],
       skipped_dirs: 0,
+      },
     },
     isLoading: false,
   }),

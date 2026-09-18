@@ -48,8 +48,14 @@ vi.mock("./api/hooks", () => ({
   }),
   useWorktrees: () => ({ data: [], isLoading: false, isError: false, refetch: () => {} }),
   // A `Scan`, not a bare array (#972).
-  useClaudeMd: () => ({
-    data: { files: [], unreadable_dirs: [], unreadable_files: [], skipped_dirs: 0 },
+  useClaudeMdEffective: () => ({
+    data: {
+      // #1131: the repo scan is unchanged; the extra scopes are
+      // empty because these tests are about the repository list.
+      extra: [],
+      unreadable: [],
+      repo: { files: [], unreadable_dirs: [], unreadable_files: [], skipped_dirs: 0 },
+    },
     isLoading: false,
     isError: false,
     error: null,

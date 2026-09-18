@@ -140,6 +140,9 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("claudify_command", Class::Read),
     ("check_packages", Class::Read),
     ("packages_markdown", Class::Read),
+    // Read: the effective context a session loads, across scopes
+    // (#1131). One more file read than `scan_claude_md`, same class.
+    ("claude_md_effective", Class::Read),
     ("scan_claude_md", Class::Read),
     ("read_claude_md", Class::Read),
     // Rescan the DESKTOP's `~/.claude/projects` (#914). Read: it reads
