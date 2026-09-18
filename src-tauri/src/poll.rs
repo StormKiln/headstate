@@ -757,6 +757,34 @@ async fn read_notify_prefs(app: &AppHandle) -> NotifyPrefs {
 /// are cheap and neither touches the disk, so only the database half moves
 /// off the runtime. Splitting it this way also keeps the ordering the UI
 /// depends on: the snapshot is on disk before `prs-updated` says so.
+/// Write the review queue to the local cache.
+///
+/// The counterpart to [`persist_and_emit`] for the OTHER list this loop
+/// fetches. No event: the To Review page reads this cache on mount, and
+/// the live query it also runs is what keeps an OPEN page current. What
+/// was missing is that the cache went stale the moment the user navigated
+/// away, because nothing but that page ever wrote it (#1118).
+///
+/// A failed write is logged and swallowed, matching the foreground
+/// command's own reasoning: this is a cache, and the tick has real work
+/// behind it that must not fail because a cache write did.
+async fn persist_reviewing(app: &AppHandle, prs: &[PullRequest]) {
+    let Ok(dir) = app.path().app_data_dir() else {
+        return;
+    };
+    let owned: Vec<PullRequest> = prs.to_vec();
+    let written = tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&dir.join("headstate.db")).map_err(|e| format!("{e}"))?;
+        save_snapshot(&conn, CachedList::Reviewing, &owned).map_err(|e| format!("{e}"))
+    })
+    .await;
+    match written {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log::warn!("could not cache the review list: {e}"),
+        Err(e) => log::warn!("the review-list cache write panicked: {e}"),
+    }
+}
+
 async fn persist_and_emit(app: &AppHandle, prs: &[PullRequest]) {
     match app.path().app_data_dir() {
         Ok(dir) => {
@@ -1085,19 +1113,29 @@ pub fn spawn(
                     Err(_) => Err(ClientError::Timeout(FETCH_TIMEOUT.as_secs())),
                 };
 
-            // The review queue, for the ready-to-review notification.
+            // The review queue: for the ready-to-review notification AND
+            // for the To Review page's cache.
             //
             // A SEPARATE request rather than `fetch_prs_and_reviewing`,
             // which returns both but drops the total this loop needs.
-            // Fetched only when the notification is wanted, so a user
-            // who turns it off pays nothing.
             //
             // A failure here is NOT a tick failure: the authored list
             // above is what the UI renders, and losing one notification
             // must not cost the poll. That is also what makes it the right
             // half to squeeze when the shared deadline is nearly spent.
             let remaining = remaining_tick_budget(tick_started.elapsed());
-            let reviewing_now = if read_notify_prefs(&app).await.ready_to_review {
+            // Fetched for the DATA, not only for the alert.
+            //
+            // This used to be gated on the `ready_to_review` notification
+            // preference, so a user who turned those alerts off silently
+            // turned off background refresh of the To Review list too --
+            // and the list was then only ever fetched by opening the page
+            // and waiting out a ~20s query (#1118). "Interrupt me" and
+            // "keep this current" are different questions.
+            //
+            // The preference still decides whether anything is ANNOUNCED;
+            // it no longer decides whether anything is known.
+            let reviewing_now = {
                 if remaining.is_zero() {
                     // The authored fetch used the whole tick. Skipped rather
                     // than issued with no time to answer: a request that
@@ -1122,8 +1160,6 @@ pub fn spawn(
                         }
                     }
                 }
-            } else {
-                None
             };
             crate::diag!(
                 "[diag] poll tick fetch done {}ms {}",
@@ -1189,6 +1225,16 @@ pub fn spawn(
                                 }
                             }
                         }
+                        // WRITTEN DOWN, not just compared (#1118).
+                        //
+                        // This list was fetched every tick and used only
+                        // to decide what to announce, then dropped on the
+                        // floor -- while the authored list on the same
+                        // tick went through `persist_and_emit` and reached
+                        // both the cache and the UI. So the To Review page
+                        // paid ~20s for a query the background had already
+                        // made a minute earlier.
+                        persist_reviewing(&app, &now).await;
                         previous_reviewing = Some(now);
                     }
 

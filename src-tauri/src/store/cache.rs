@@ -312,12 +312,23 @@ mod tests {
 
     /// The reported bug, at its root.
     ///
-    /// `CachedList::Reviewing` is written in exactly one place -- inside
-    /// `get_reviewing`, which only runs when the To review view is open.
-    /// The poll loop never touches it. So visiting that view once and not
-    /// returning froze the snapshot, and on a real machine a pull request
-    /// merged four days earlier was still listed as awaiting review, with
-    /// nothing on screen suggesting the data was old.
+    /// `CachedList::Reviewing` used to be written in exactly one place --
+    /// inside `get_reviewing`, which only runs when the To review view is
+    /// open. So visiting that view once and not returning froze the
+    /// snapshot, and on a real machine a pull request merged four days
+    /// earlier was still listed as awaiting review, with nothing on screen
+    /// suggesting the data was old.
+    ///
+    /// This guard REFUSES a stale snapshot, which stopped the lie. It did
+    /// not make the data fresh: the user still waited out a ~20s live
+    /// query on every visit, because nothing kept the cache current
+    /// between them. `poll::persist_reviewing` now writes it on every
+    /// tick (#1118) -- the loop was already fetching that exact list to
+    /// decide what to notify about, and discarding it.
+    ///
+    /// Both halves are load-bearing and neither replaces the other: the
+    /// freshness makes the cache useful, and this guard is what handles
+    /// the app having been closed.
     #[test]
     fn a_stale_snapshot_is_not_returned() {
         let dir = tempfile::TempDir::new().unwrap();

@@ -3324,4 +3324,78 @@ mod tests {
             "and it is still the timeout, not some other error: {e:?}"
         );
     }
+
+    /// **One refused document must not lose the whole wave.**
+    ///
+    /// The board fetches its slices as `READ_CONCURRENCY` concurrent
+    /// documents. A `?` on the join used to propagate one document's
+    /// failure into the whole load, so a board that had retrieved five
+    /// sixths of its slices returned an error and rendered a red banner
+    /// (#1117).
+    ///
+    /// Measured against the live API on 2026-09-18: at concurrency 6 over
+    /// a dense organisation, GitHub 502s about one document in six -- it
+    /// times out resolving the nested node fields and answers HTML. The
+    /// other documents had already arrived.
+    ///
+    /// This is `partial is not nothing` on the wave path. #1044
+    /// established it for the timeout branch of the same function.
+    #[tokio::test]
+    async fn one_refused_document_does_not_lose_the_slices_that_answered() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _permits = crate::github::stats::budget::READ_PERMIT_TEST_LOCK
+            .lock()
+            .await;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                let doc = body["query"].as_str().unwrap_or("");
+                let aliases = aliases_in(doc);
+                if doc.contains("nodes {") {
+                    // The document carrying s0 is refused the way GitHub
+                    // refuses one: 502, with HTML rather than JSON. Every
+                    // other document answers.
+                    if aliases.iter().any(|a| a == "s0") {
+                        return ResponseTemplate::new(502)
+                            .set_body_string("<html><body>502 Bad Gateway</body></html>");
+                    }
+                    return ResponseTemplate::new(200).set_body_json(detail_body(&aliases));
+                }
+                ResponseTemplate::new(200).set_body_json(probe_body(&aliases))
+            })
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let _observed = crate::github::stats::budget::scoped::enter(50_000);
+        let budget = Budget::new();
+        let board = super::load_board(
+            &client,
+            &Scope::Org("acme".into()),
+            super::super::scope::Measure::Merged,
+            Slice::new("2026-07-01".to_string(), "2026-07-10".to_string()),
+            &budget,
+        )
+        .await
+        .expect("a wave that lost one document still has the rest");
+
+        assert!(
+            board.retrieved > 0,
+            "the documents that answered must survive the one that did not"
+        );
+        assert!(
+            !board.complete,
+            "a board missing a document is not complete"
+        );
+        // And it NAMES what is missing rather than omitting it silently:
+        // the refused document's aliases are absent from the merged map,
+        // which `from_alias_map` reads as named short slices.
+        assert!(
+            !board.truncated_slices.is_empty(),
+            "the ranges that did not answer must be named"
+        );
+    }
 }
