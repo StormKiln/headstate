@@ -1056,10 +1056,7 @@ export interface ClaudeHooksUninstalled {
 /// Every hook matcher in the file, ours and foreign (#1127).
 export const claudeHooksInventory = () =>
   call<ClaudeHookInventory>("claude_hooks_inventory");
-<<<<<<< HEAD
-=======
 
->>>>>>> 13cd738 (fix: complete the rebase onto the hook-inventory changes)
 /// Which file a settings value came from, lowest precedence first.
 /// Mirrors `claude::settings::Origin`.
 export type ClaudeSettingsOrigin = "user" | "project" | "local";
