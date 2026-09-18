@@ -242,6 +242,15 @@ lint: lint-rust lint-ui lint-deps
 lint-deps:
 	python3 scripts/check-tauri-versions.test.py
 	python3 scripts/check-tauri-versions.py
+	# The compiler and Node version the build is verified against. CI
+	# resolved `stable` at run time, so a new stable with one more Clippy
+	# lint turned `-D warnings` red on untouched branches and -- under
+	# `strict_required_status_checks_policy` -- blocked every open PR at
+	# once, reproducible nowhere locally (#1153). A source read with no
+	# network, so it belongs in the target whose comment promises answers
+	# in a second.
+	python3 scripts/check-toolchain-pins.test.py
+	python3 scripts/check-toolchain-pins.py
 	python3 scripts/android-release-signing.test.py
 	# Same class of guard: the mobile jobs are required checks that skip
 	# their own steps when nothing mobile changed, and the way that wiring
