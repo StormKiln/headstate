@@ -1403,6 +1403,14 @@ export interface ClaudeSession {
   /// The `claude --resume` handle, and the row's identity. Verified to
   /// survive `--resume` and `--continue` unchanged, so it never goes
   /// stale. One of the four fields search covers.
+  /// The first thing the user asked (#1133).
+  ///
+  /// The ask, which a generated title cannot carry: 286 of 1,438 real
+  /// sessions share their `aiTitle` with another. Optional so a cached
+  /// list from before this field existed deserialises rather than
+  /// failing. `null` renders as NOTHING -- never the title repeated,
+  /// never the UUID.
+  opening_prompt?: string | null;
   session_id: string;
   /// Claude's own `aiTitle`, present for 1,436 of 1,438 real sessions.
   /// `null` for the two that never got one -- never the UUID in

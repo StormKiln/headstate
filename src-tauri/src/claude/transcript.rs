@@ -197,7 +197,52 @@ const TAIL_BYTES_RETRY: u64 = 256 * 1024;
 /// Only used to avoid parsing lines that cannot possibly carry what we
 /// want; the parse still decides.
 fn looks_interesting(line: &str) -> bool {
-    line.contains("\"cwd\"") || line.contains("\"aiTitle\"")
+    // `"type":"user"` rather than `"user"` alone (#1133): the bare word
+    // appears in `"role":"user"` and `"userType"` on records this gate
+    // is meant to skip, and widening it to those would parse most of the
+    // head for nothing.
+    line.contains("\"cwd\"") || line.contains("\"aiTitle\"") || line.contains("\"type\":\"user\"")
+}
+
+/// The text of a `user` record, if it carries one.
+///
+/// Handles both content shapes. Every first-user record in the 60 real
+/// transcripts sampled carries a plain string, but `preview.rs` already
+/// models the block-array form and a shape this does not understand must
+/// yield `None` rather than a fragment of JSON.
+fn user_text(v: &serde_json::Value) -> Option<String> {
+    let content = v.get("message")?.get("content")?;
+    if let Some(s) = content.as_str() {
+        return Some(s.to_string());
+    }
+    // An array of blocks: join the `text` ones, ignore tool results.
+    let parts: Vec<&str> = content
+        .as_array()?
+        .iter()
+        .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+        .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
+/// How much of the opening prompt to keep.
+///
+/// Enough for a second line under a title, and bounded because a pasted
+/// stack trace is a legitimate first prompt: the session list carries
+/// one of these per row across 1,438 rows, and the transport split
+/// `ClaudeCodePage` documents exists to keep that payload small.
+const PROMPT_CHARS: usize = 300;
+
+/// Clamp on a CHARACTER boundary, never a byte one.
+///
+/// `&s[..300]` panics mid-codepoint, and a prompt containing an emoji or
+/// any non-ASCII text is ordinary rather than exotic.
+fn clamp_prompt(text: &str) -> String {
+    let trimmed = text.trim();
+    match trimmed.char_indices().nth(PROMPT_CHARS) {
+        Some((i, _)) => format!("{}…", &trimmed[..i]),
+        None => trimmed.to_string(),
+    }
 }
 
 /// The fields a transcript can tell us about a session.
@@ -220,6 +265,21 @@ pub struct Transcript {
     /// record. `None` for the sessions that never got one -- never the
     /// UUID in disguise.
     pub name: Option<String>,
+    /// The first thing the user asked, clamped (#1133).
+    ///
+    /// The ASK, which a generated title cannot carry: 286 of 1,438 real
+    /// sessions share their `aiTitle` with another, so a list showing
+    /// only titles cannot tell two sessions apart at the moment someone
+    /// is choosing which to resume.
+    ///
+    /// Measured before relying on the head window: across 40 real
+    /// transcripts the first `user` record sits at depth 3, 8 or 11 --
+    /// well inside [`HEAD_RECORDS`], so this costs no extra read.
+    ///
+    /// `None` renders as NOTHING. Never the title repeated, never the
+    /// UUID: a fabricated stand-in cannot be told from a real prompt,
+    /// which is the rule this module already states about `name`.
+    pub opening_prompt: Option<String>,
     /// RFC 3339, the earliest timestamp seen in the head.
     pub first_seen_at: Option<String>,
     /// RFC 3339, the newest timestamp in the tail. The time the session
@@ -509,7 +569,15 @@ pub fn extract(path: &Path) -> Result<Transcript, String> {
                 // is still true, and the tail seek is independent of it.
                 Err(_) => break,
             }
-            if out.cwd.is_some() && out.name.is_some() && out.first_seen_at.is_some() {
+            // `opening_prompt` joins the set (#1133): without it, a
+            // session whose cwd, title and timestamp all land before the
+            // first user record would exit the loop having never seen
+            // one.
+            if out.cwd.is_some()
+                && out.name.is_some()
+                && out.first_seen_at.is_some()
+                && out.opening_prompt.is_some()
+            {
                 break;
             }
             // Skip the PARSE, not the record, when this line cannot carry
@@ -562,6 +630,16 @@ pub fn extract(path: &Path) -> Result<Transcript, String> {
             }
             if out.name.is_none() {
                 out.name = field(&rec, "aiTitle");
+            }
+            // The FIRST user record only (#1133). `is_none()` is what
+            // makes it the opening ask rather than whichever prompt
+            // happened to land last inside the window.
+            if out.opening_prompt.is_none()
+                && rec.get("type").and_then(|t| t.as_str()) == Some("user")
+            {
+                out.opening_prompt = user_text(&rec)
+                    .map(|t| clamp_prompt(&t))
+                    .filter(|t| !t.is_empty());
             }
         }
     }
@@ -1322,5 +1400,110 @@ mod tests {
         let got = scan(t.path());
         assert_eq!(got.sessions.len(), 1);
         assert_eq!(got.sessions[0].session_id, "s1");
+    }
+    /// #1133: the opening ask, which a generated title cannot carry --
+    /// 286 of 1,438 real sessions share their `aiTitle` with another.
+    #[test]
+    fn the_first_user_prompt_is_captured() {
+        let tmp = Tmp::new("prompt");
+        let path = tmp.0.join("s1.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"system","cwd":"/code/w","timestamp":"2026-09-01T10:00:00Z"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"role":"user","content":"fix the flaky test"}}}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let t = extract(&path).unwrap();
+        assert_eq!(t.opening_prompt.as_deref(), Some("fix the flaky test"));
+    }
+
+    /// The FIRST one. A session's later prompts are not the ask that
+    /// started it.
+    #[test]
+    fn only_the_first_prompt_is_kept() {
+        let tmp = Tmp::new("firstprompt");
+        let path = tmp.0.join("s1.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        for text in ["the opening ask", "a later follow-up"] {
+            writeln!(
+                f,
+                r#"{{"type":"user","message":{{"role":"user","content":"{text}"}}}}"#
+            )
+            .unwrap();
+        }
+        drop(f);
+
+        assert_eq!(
+            extract(&path).unwrap().opening_prompt.as_deref(),
+            Some("the opening ask")
+        );
+    }
+
+    /// Clamped on a CHARACTER boundary. `&s[..300]` panics mid-codepoint,
+    /// and a prompt containing an emoji is ordinary rather than exotic.
+    #[test]
+    fn a_long_multibyte_prompt_clamps_without_panicking() {
+        let tmp = Tmp::new("clamp");
+        let path = tmp.0.join("s1.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        let long = "é".repeat(500);
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"role":"user","content":"{long}"}}}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let got = extract(&path).unwrap().opening_prompt.unwrap();
+        assert!(got.ends_with('…'), "a clamped prompt says it was clamped");
+        assert_eq!(got.chars().count(), 301, "300 characters plus the ellipsis");
+    }
+
+    /// A session with no user record has NO opening prompt. `None`
+    /// renders as nothing -- never the title repeated, never the UUID,
+    /// because a fabricated stand-in cannot be told from a real prompt.
+    #[test]
+    fn a_session_with_no_user_record_has_no_prompt() {
+        let tmp = Tmp::new("noprompt");
+        let path = tmp.0.join("s1.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, r#"{{"type":"system","cwd":"/code/w"}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"content":"hello"}}}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        assert_eq!(extract(&path).unwrap().opening_prompt, None);
+    }
+
+    /// The block-array content shape. Every first-user record in the 60
+    /// real transcripts sampled carries a plain string, but `preview.rs`
+    /// already models this form and a shape we do not understand must
+    /// yield `None` rather than a fragment of JSON.
+    #[test]
+    fn a_block_array_prompt_is_read() {
+        let tmp = Tmp::new("blocks");
+        let path = tmp.0.join("s1.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"text","text":"from a block"}}]}}}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        assert_eq!(
+            extract(&path).unwrap().opening_prompt.as_deref(),
+            Some("from a block")
+        );
     }
 }

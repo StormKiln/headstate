@@ -158,14 +158,19 @@ fn upsert(conn: &Connection, t: &Transcript, now: &str) -> Result<(), rusqlite::
         // reads off the row being merged, not off argument order.
         "INSERT INTO claude_session
             (session_id, name, cwd, git_branch, claude_version,
-             transcript_path, first_seen_at, last_activity_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             transcript_path, first_seen_at, last_activity_at, opening_prompt)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(session_id) DO UPDATE SET
             cwd              = COALESCE(excluded.cwd, claude_session.cwd),
             git_branch       = COALESCE(excluded.git_branch, claude_session.git_branch),
             claude_version   = COALESCE(excluded.claude_version, claude_session.claude_version),
             transcript_path  = COALESCE(excluded.transcript_path, claude_session.transcript_path),
             name             = COALESCE(claude_session.name, excluded.name),
+            -- NEW value first, like `cwd` and unlike `name`: this is read
+            -- off disk every scan and the transcript is ground truth. A
+            -- name survives a rescan because a user may have renamed it;
+            -- nobody renames the prompt they typed (#1133).
+            opening_prompt   = COALESCE(excluded.opening_prompt, claude_session.opening_prompt),
             first_seen_at    = MIN(claude_session.first_seen_at, excluded.first_seen_at),
             last_activity_at = MAX(
                 COALESCE(claude_session.last_activity_at, excluded.last_activity_at),
@@ -180,6 +185,7 @@ fn upsert(conn: &Connection, t: &Transcript, now: &str) -> Result<(), rusqlite::
             t.path,
             first_seen,
             t.last_activity_at,
+            t.opening_prompt,
         ],
     )?;
     Ok(())
@@ -362,6 +368,7 @@ mod tests {
             git_branch: Some("feat/x".into()),
             claude_version: Some("2.1.270".into()),
             name: Some("Fix the retry backoff".into()),
+            opening_prompt: Some("make the backoff jittered".into()),
             first_seen_at: Some("2026-09-01T10:00:00Z".into()),
             last_activity_at: Some("2026-09-01T11:30:00Z".into()),
             cwd_record: Some(5),

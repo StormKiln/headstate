@@ -418,7 +418,10 @@ function useMatchedSessions() {
     const chipped = visible.filter((s) => matchesClaudeFilter(s, filter));
     const hits = q
       ? chipped.filter((s) =>
-          [s.name, s.cwd, s.git_branch, s.session_id].some((f) =>
+          // The opening prompt joins the searched fields (#1133): the
+          // thing a user remembers is often a phrase they typed, and
+          // the placeholder below says so.
+          [s.name, s.cwd, s.git_branch, s.session_id, s.opening_prompt].some((f) =>
             f?.toLowerCase().includes(q),
           ),
         )
@@ -648,7 +651,7 @@ export function ClaudeSessionColumn() {
             type="search"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search title, directory, branch or id"
+            placeholder="Search title, prompt, directory, branch or id"
             aria-label="Search Claude Code sessions"
             className="min-w-0 flex-1 bg-transparent py-1.5 text-xs text-[#e6edf3] outline-none placeholder:text-[#8b949e]"
           />
@@ -1340,6 +1343,19 @@ function SessionEntry({
           {s.name ?? s.session_id}
         </span>
       </span>
+      {/* The opening ask, under the title (#1133).
+          Absent entirely when there is none, rather than a placeholder:
+          `null` must render as NOTHING -- never the title repeated,
+          never the UUID -- because a fabricated stand-in cannot be told
+          from a real prompt, which is the rule this page already states
+          about the two titleless sessions above. */}
+      {s.opening_prompt ? (
+        <span
+          className={`w-full truncate text-[11px] ${active ? "text-white/80" : "text-[#6e7681]"}`}
+        >
+          {s.opening_prompt}
+        </span>
+      ) : null}
       {/* Full white on the selected row rather than `white/70`: at 12px
           on #1f6feb the dimmed variants measure under the 4.5:1
           threshold, and the row is already distinguished by the blue.
