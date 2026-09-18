@@ -380,7 +380,28 @@ export function BranchesPage() {
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
                   <span className="truncate text-[#e6edf3]">{b.name}</span>
-                  <span className="shrink-0 rounded bg-[#21262d] px-1.5 py-0.5 text-[10px] text-[#8b949e]">
+                  {/* `gone` is styled apart from the other three
+                      (#1139). It used to render as "local", which is the
+                      OPPOSITE claim: local means the work exists only on
+                      this machine, gone means it was pushed, merged and
+                      the remote branch cleaned up. One is a reason to
+                      keep a branch and the other is the safest thing on
+                      the page to delete, and they shared a word.
+
+                      The title names the dead upstream, because "gone"
+                      invites "gone from where". */}
+                  <span
+                    className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] ${
+                      b.location === "gone"
+                        ? "bg-[#d29922]/15 text-[#d29922]"
+                        : "bg-[#21262d] text-[#8b949e]"
+                    }`}
+                    title={
+                      b.location === "gone" && b.upstream
+                        ? `${b.upstream} no longer exists on the remote`
+                        : undefined
+                    }
+                  >
                     {b.location}
                   </span>
                 </div>

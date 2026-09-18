@@ -1994,7 +1994,13 @@ export interface Branch {
   /// The three cases clean up differently, which is why this is one
   /// value rather than a pair of booleans: deleting a tracked pair is
   /// two operations against two different things.
-  location: "local" | "remote" | "tracked";
+  /// `gone` is a local branch whose upstream is configured but no
+  /// longer on the remote -- the ordinary state after a PR merges and
+  /// the head branch is deleted (#1139). Distinct from `local`, which it
+  /// used to collapse into: `local` means the work exists only here,
+  /// `gone` means it was pushed, merged and cleaned up. Opposite claims,
+  /// and they used to share one word.
+  location: "local" | "remote" | "tracked" | "gone";
   upstream: string | null;
   /// `null` when the count could not be read -- git older than 2.41, git
   /// missing from a GUI-launched app's PATH, a `safe.directory` refusal.

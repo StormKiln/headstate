@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 /// Where a branch exists.
 ///
-/// The three cases clean up differently, which is why this is a type
+/// The four cases clean up differently, which is why this is a type
 /// rather than a pair of booleans. Deleting a tracked pair is two
 /// operations against two different things -- one local ref, one push
 /// to a shared remote -- and the UI must not present that as one click.
@@ -26,6 +26,26 @@ pub enum Location {
     Remote,
     /// Both, and the local one tracks the remote.
     Tracked,
+    /// A local branch whose upstream is configured but GONE from the
+    /// remote -- the ordinary state after a PR merges and GitHub deletes
+    /// the head branch (#1139).
+    ///
+    /// Distinct from `Local`, which it used to collapse into, and the
+    /// two make OPPOSITE claims: `Local` means the work exists only on
+    /// this machine, `Gone` means it was pushed, merged and cleaned up.
+    /// One is a reason to keep a branch; the other is the safest thing
+    /// to delete. Reporting both as "local" gave the user one word for
+    /// two answers.
+    ///
+    /// The worktree side already drew this distinction --
+    /// `Safety::MergedUpstreamDeleted` against `Safety::NeverPushed` --
+    /// so this is the same rule reaching its sibling.
+    ///
+    /// A unit variant, not a payload: `Branch` already carries
+    /// `upstream`, which is the dead remote's name. Duplicating it here
+    /// would give the UI two places to read one fact, and this enum is
+    /// `Copy` precisely because it is a classification rather than data.
+    Gone,
 }
 
 /// Why a branch may or may not be deleted.
