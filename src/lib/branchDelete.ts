@@ -25,6 +25,13 @@ export interface Targets {
 /// Offering a scope with nothing to act on is how a user ends up
 /// clicking "remote" and being told nothing happened. A selection of
 /// only local-only branches has no remote side at all.
+/// A `gone` branch (#1139) has a local side and NO remote side: its
+/// upstream is configured but the remote no longer has it, which is
+/// exactly what makes it safe to delete locally. Both predicates below
+/// already handle it correctly -- `!== "remote"` includes it, and the
+/// remote arm requires `tracked` -- and the tests pin that, because the
+/// dangerous version of this change would have typed it `tracked` and
+/// offered a push against a ref that is not there.
 export function scopesFor(selected: Branch[]): Scope[] {
   const hasLocalSide = selected.some((b) => b.location !== "remote");
   // A tracked branch's remote side is its upstream; a remote-only

@@ -18,6 +18,10 @@ const b = (over: Partial<Branch> = {}): Branch => ({
 const tracked = (name: string) =>
   b({ name, location: "tracked", upstream: `origin/${name}` });
 const remoteOnly = (name: string) => b({ name: `origin/${name}`, location: "remote" });
+/// A branch whose upstream is configured but no longer on the remote
+/// (#1139) -- the ordinary state after a PR merges. It keeps its
+/// `upstream` string, because that is the name of the ref that is gone.
+const gone = (name: string) => b({ name, location: "gone", upstream: `origin/${name}` });
 
 describe("scopesFor", () => {
   it("offers only local when nothing selected has a remote side", () => {
@@ -137,5 +141,51 @@ describe("scopeEffect", () => {
     for (const s of ["local", "remote", "both"] as const) {
       expect(scopeEffect(s).length).toBeGreaterThan(0);
     }
+  });
+});
+
+
+/// #1139: a gone branch has a local side and NO remote side.
+///
+/// The dangerous version of that change types it `tracked`, which would
+/// offer a push against a ref that is not there -- and `targetsFor`
+/// would hand `delete_remote` an `origin/foo` that the remote deleted
+/// weeks ago. These pin the safe shape.
+describe("a branch whose upstream is gone", () => {
+  it("is offered for local deletion", () => {
+    expect(scopesFor([gone("feature")])).toEqual(["local"]);
+  });
+
+  it("is never offered a remote or both scope", () => {
+    const scopes = scopesFor([gone("feature")]);
+    expect(scopes).not.toContain("remote");
+    expect(scopes).not.toContain("both");
+  });
+
+  it("is a local target, by its local name", () => {
+    expect(targetsFor([gone("feature")], "local")).toEqual({
+      local: ["feature"],
+      remote: [],
+    });
+  });
+
+  /// The load-bearing one. Even when a selection mixes a gone branch
+  /// with a tracked one -- so the remote scope IS on offer -- the gone
+  /// branch must not be pushed against.
+  it("is excluded from a remote scope it did not ask for", () => {
+    const mixed = [gone("old"), tracked("live")];
+    expect(scopesFor(mixed)).toContain("remote");
+    expect(targetsFor(mixed, "remote")).toEqual({
+      local: [],
+      remote: ["origin/live"],
+    });
+  });
+
+  it("is still deleted locally under a both scope", () => {
+    const mixed = [gone("old"), tracked("live")];
+    expect(targetsFor(mixed, "both")).toEqual({
+      local: ["old", "live"],
+      remote: ["origin/live"],
+    });
   });
 });

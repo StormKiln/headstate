@@ -42,7 +42,12 @@ const WORKERS: usize = 8;
 
 /// Fields pulled in one pass. Tab-separated because a branch name may
 /// contain almost anything else, including `|` and spaces.
-const REF_FORMAT: &str = "%(refname:short)\t%(upstream:short)\t%(committerdate:iso8601)\t%(authorname)\t%(objectname:short)";
+/// `%(upstream:track)` is the gone marker git already computes (#1139).
+/// It renders as `[gone]` for a configured upstream the remote no longer
+/// has -- the ordinary state after a PR merges and the head branch is
+/// deleted. Asking for it costs nothing: it is the same `for-each-ref`
+/// pass.
+const REF_FORMAT: &str = "%(refname:short)\t%(upstream:short)\t%(committerdate:iso8601)\t%(authorname)\t%(objectname:short)\t%(upstream:track)";
 
 /// Spawn a git command, retrying only the SPAWN.
 ///
@@ -212,7 +217,10 @@ fn checked_out(dir: &Path) -> Vec<(String, String)> {
 ///
 /// Returns None rather than a partial branch: a row we cannot read is
 /// not a branch we should offer to delete.
-fn parse_ref(line: &str, remote: bool) -> Option<(String, Option<String>, String, String, String)> {
+fn parse_ref(
+    line: &str,
+    remote: bool,
+) -> Option<(String, Option<String>, String, String, String, bool)> {
     let mut f = line.split('\t');
     let name = f.next()?.trim().to_string();
     if name.is_empty() {
@@ -223,12 +231,21 @@ fn parse_ref(line: &str, remote: bool) -> Option<(String, Option<String>, String
     let committed = f.next().unwrap_or("").trim().to_string();
     let author = f.next().unwrap_or("").trim().to_string();
     let tip = f.next().unwrap_or("").trim().to_string();
+    // `[gone]` appears inside a track field that can also carry
+    // `[ahead 3, behind 1]`, so this is `contains`, not equality.
+    //
+    // An ABSENT field is not "not gone": a git too old for
+    // `%(upstream:track)` emits nothing here, and reading that as a live
+    // upstream would be a confident wrong answer. The caller keeps
+    // `Local` in that case, which is what it reported before this
+    // change.
+    let gone = f.next().unwrap_or("").contains("[gone]");
 
     // `origin/HEAD` is a symref, not a branch anyone deletes.
     if remote && name.ends_with("/HEAD") {
         return None;
     }
-    Some((name, upstream, committed, author, tip))
+    Some((name, upstream, committed, author, tip, gone))
 }
 
 /// Ahead/behind counts for every local branch, in one process.
@@ -541,14 +558,22 @@ pub fn scan_with_progress(dir: &Path, progress: &dyn Progress) -> Result<Vec<Bra
     let mut local_upstreams: HashSet<String> = HashSet::new();
 
     for line in locals.lines() {
-        let Some((name, upstream, committed, author, tip)) = parse_ref(line, false) else {
+        let Some((name, upstream, committed, author, tip, gone)) = parse_ref(line, false) else {
             continue;
         };
         if let Some(u) = &upstream {
             local_upstreams.insert(u.clone());
         }
         let location = match &upstream {
+            // Checked FIRST: a gone upstream is still an upstream, so
+            // `remote_names.contains` can legitimately miss it while the
+            // branch is neither tracked nor local-only. Ordering the
+            // other way would let a live-but-unlisted remote mask it.
+            Some(_) if gone => Location::Gone,
             Some(u) if remote_names.contains(u) => Location::Tracked,
+            // Unchanged, and the fallback that keeps this safe: a git
+            // too old for `%(upstream:track)` emits no marker, so its
+            // branches stay `Local` exactly as before.
             _ => Location::Local,
         };
         // NOT `.unwrap_or((0, 0))` (#967). An empty map is what an old
@@ -576,7 +601,7 @@ pub fn scan_with_progress(dir: &Path, progress: &dyn Progress) -> Result<Vec<Bra
     // push to a shared remote, which is why they are a separate case
     // rather than a flag on the local row.
     for line in remotes.lines() {
-        let Some((name, _, committed, author, tip)) = parse_ref(line, true) else {
+        let Some((name, _, committed, author, tip, _gone)) = parse_ref(line, true) else {
             continue;
         };
         if local_upstreams.contains(&name) {
@@ -1019,6 +1044,57 @@ mod tests {
         let out = scan(&repo).unwrap();
         let b = find(&out, "origin/only-remote");
         assert_eq!(b.location, Location::Remote);
+    }
+
+    /// #1139: a branch whose upstream was deleted is not a branch that
+    /// never had one.
+    ///
+    /// Those are OPPOSITE claims -- one is work existing only on this
+    /// machine, the other is work that was pushed, merged and cleaned up
+    /// -- and they shared the word "local" because `%(upstream:track)`
+    /// was never asked for and the configured-but-vanished upstream fell
+    /// to the `_` arm.
+    #[test]
+    fn a_gone_upstream_is_not_reported_as_local_only() {
+        let (name, upstream, _, _, _, gone) = parse_ref(
+            "feature\torigin/feature\t2026-09-01T10:00:00+00:00\tsam\tabc1234\t[gone]",
+            false,
+        )
+        .expect("a well-formed ref parses");
+        assert_eq!(name, "feature");
+        assert_eq!(upstream.as_deref(), Some("origin/feature"));
+        assert!(gone, "the [gone] marker must be read");
+    }
+
+    /// The live case, so the fix cannot degenerate into marking
+    /// everything gone.
+    #[test]
+    fn a_live_upstream_is_not_gone() {
+        let (_, upstream, _, _, _, gone) = parse_ref(
+            "feature\torigin/feature\t2026-09-01T10:00:00+00:00\tsam\tabc1234\t[ahead 3, behind 1]",
+            false,
+        )
+        .unwrap();
+        assert_eq!(upstream.as_deref(), Some("origin/feature"));
+        assert!(!gone, "an ahead/behind branch is tracked, not gone");
+    }
+
+    /// A git too old for `%(upstream:track)` emits nothing in that
+    /// field. Reading an ABSENT marker as "not gone" is correct -- those
+    /// branches stay `Local`, exactly as before this change -- but
+    /// reading it as gone would be a confident wrong answer, so it is
+    /// pinned.
+    #[test]
+    fn an_absent_track_field_is_not_gone() {
+        let (_, _, _, _, _, gone) = parse_ref(
+            "feature\torigin/feature\t2026-09-01T10:00:00+00:00\tsam\tabc1234",
+            false,
+        )
+        .unwrap();
+        assert!(
+            !gone,
+            "an unread marker must not be reported as a deleted upstream"
+        );
     }
 
     #[test]
