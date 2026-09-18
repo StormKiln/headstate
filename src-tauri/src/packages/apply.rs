@@ -354,7 +354,7 @@ fn read_constraint(dir: &Path, eco: Ecosystem, name: &str) -> Option<String> {
 /// resolver that rewrites something unexpected shows up instead of
 /// being filtered out.
 fn changed_files(dir: &Path) -> Vec<String> {
-    let Ok(out) = std::process::Command::new("git")
+    let Ok(out) = std::process::Command::new(crate::auth::git_program())
         .args(["status", "--porcelain"])
         .current_dir(dir)
         .output()
@@ -384,7 +384,7 @@ fn changed_files(dir: &Path) -> Vec<String> {
 /// have no git identity configured, and the commit must not fail for
 /// that.
 pub fn commit_all(dir: &Path, message: &str) -> Result<(), String> {
-    let add = std::process::Command::new("git")
+    let add = std::process::Command::new(crate::auth::git_program())
         .args(["add", "-A"])
         .current_dir(dir)
         .output()
@@ -393,7 +393,7 @@ pub fn commit_all(dir: &Path, message: &str) -> Result<(), String> {
         return Err(String::from_utf8_lossy(&add.stderr).trim().to_string());
     }
 
-    let out = std::process::Command::new("git")
+    let out = std::process::Command::new(crate::auth::git_program())
         .args([
             "-c",
             "user.name=Headstate",
@@ -433,7 +433,7 @@ pub fn commit_all(dir: &Path, message: &str) -> Result<(), String> {
 /// remote branch of that name somehow exists, git's refusal is the right
 /// outcome and is returned verbatim.
 pub fn push_branch(dir: &Path, branch: &str) -> Result<(), String> {
-    let out = std::process::Command::new("git")
+    let out = std::process::Command::new(crate::auth::git_program())
         .args(["push", "--set-upstream", "origin", branch])
         .current_dir(dir)
         .output()
@@ -454,7 +454,7 @@ pub fn push_branch(dir: &Path, branch: &str) -> Result<(), String> {
 /// `master`, and opening a pull request against a branch that does not
 /// exist fails after the push has already happened.
 pub fn default_branch(dir: &Path) -> Option<String> {
-    let out = std::process::Command::new("git")
+    let out = std::process::Command::new(crate::auth::git_program())
         .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
         .current_dir(dir)
         .output()
@@ -498,7 +498,7 @@ pub fn create_worktree(repo: &Path, branch: &str, dir: &Path) -> Result<(), Stri
     }
     // Ask git, rather than testing for a directory under .git: a branch
     // can exist without a worktree and packed refs have no file.
-    let exists = std::process::Command::new("git")
+    let exists = std::process::Command::new(crate::auth::git_program())
         .args(["rev-parse", "--verify", "--quiet"])
         .arg(format!("refs/heads/{branch}"))
         .current_dir(repo)
@@ -509,7 +509,7 @@ pub fn create_worktree(repo: &Path, branch: &str, dir: &Path) -> Result<(), Stri
         return Err(format!("branch {branch} already exists"));
     }
 
-    let out = std::process::Command::new("git")
+    let out = std::process::Command::new(crate::auth::git_program())
         .args(["worktree", "add", "-b", branch])
         .arg(dir)
         .current_dir(repo)
@@ -1365,7 +1365,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path();
         let run = |args: &[&str]| {
-            let ok = std::process::Command::new("git")
+            let ok = std::process::Command::new(crate::auth::git_program())
                 .args(args)
                 .current_dir(dir)
                 .output()
@@ -1459,7 +1459,7 @@ mod tests {
         let commit = commit_args();
         let commit: Vec<&str> = commit.iter().map(String::as_str).collect();
         for args in [&["add", "-A"][..], &commit[..]] {
-            let out = std::process::Command::new("git")
+            let out = std::process::Command::new(crate::auth::git_program())
                 .args(args)
                 .current_dir(tmp.path())
                 .output()
@@ -1922,7 +1922,7 @@ mod real {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path();
         let git = |args: &[&str]| {
-            std::process::Command::new("git")
+            std::process::Command::new(crate::auth::git_program())
                 .args(args)
                 .current_dir(dir)
                 .output()

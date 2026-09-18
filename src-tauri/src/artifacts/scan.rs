@@ -208,7 +208,7 @@ fn is_ignored(path: &Path) -> bool {
     // believed, whatever it said.
     let mut status = None;
     for attempt in 0..3 {
-        let attempted = std::process::Command::new("git")
+        let attempted = std::process::Command::new(crate::auth::git_program())
             .arg("-C")
             .arg(parent)
             .arg("check-ignore")
@@ -280,7 +280,7 @@ mod tests {
     /// tests skip explicitly instead of failing for a reason that has
     /// nothing to do with what they check.
     fn git_available() -> bool {
-        std::process::Command::new("git")
+        std::process::Command::new(crate::auth::git_program())
             .arg("--version")
             .status()
             .is_ok()
@@ -301,7 +301,7 @@ mod tests {
     /// the scarce resource.
     fn git_init(dir: &Path) {
         for attempt in 0..5 {
-            let out = std::process::Command::new("git")
+            let out = std::process::Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(["init", "-q"])

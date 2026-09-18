@@ -569,7 +569,7 @@ mod tests {
         }
 
         fn git(&self, args: &[&str]) {
-            let out = std::process::Command::new("git")
+            let out = std::process::Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(&self.dir)
                 .args(args)

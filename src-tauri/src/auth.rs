@@ -156,6 +156,22 @@ const GH_FALLBACK_DIRS: &[&str] = &[
     "/usr/bin",
 ];
 
+/// Where `git` lives, beyond `PATH`.
+///
+/// Same GUI-PATH problem as `gh`, and worse in consequence. A machine
+/// where git is only at `/opt/homebrew/bin/git` -- Homebrew, `mise`,
+/// `asdf`, anything but the Xcode command line tools -- loses every
+/// worktree and branch feature. Xcode's shim at `/usr/bin/git` is last
+/// because it prompts to install the CLT if they are absent, so a
+/// Homebrew git found first is both faster and quieter.
+#[cfg(target_os = "macos")]
+const GIT_FALLBACK_DIRS: &[&str] = &[
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/opt/local/bin",
+    "/usr/bin",
+];
+
 /// Linux has no PATH-stripping equivalent of the macOS .app problem, but a
 /// desktop launcher can still start with a minimal environment, so the same
 /// belt-and-braces search applies. These are where distro packages, the
@@ -168,6 +184,14 @@ const GH_FALLBACK_DIRS: &[&str] = &[
     "/home/linuxbrew/.linuxbrew/bin",
 ];
 
+/// Where distro packages and manual installs put `git`.
+#[cfg(all(unix, not(target_os = "macos")))]
+const GIT_FALLBACK_DIRS: &[&str] = &[
+    "/usr/bin",
+    "/usr/local/bin",
+    "/home/linuxbrew/.linuxbrew/bin",
+];
+
 /// Windows installs `gh` via winget, the MSI, or Chocolatey/Scoop shims.
 /// The absolute paths here are only the machine-wide ones -- per-user
 /// locations depend on the profile directory and are resolved at runtime by
@@ -176,6 +200,17 @@ const GH_FALLBACK_DIRS: &[&str] = &[
 const GH_FALLBACK_DIRS: &[&str] = &[
     r"C:\Program Files\GitHub CLI\bin",
     r"C:\Program Files (x86)\GitHub CLI\bin",
+    r"C:\ProgramData\chocolatey\bin",
+];
+
+/// Where Git for Windows lands. `cmd` before `bin`: `cmd\git.exe` is the
+/// wrapper meant for use outside a Git-Bash shell, which is exactly the
+/// context a GUI app spawns from.
+#[cfg(windows)]
+const GIT_FALLBACK_DIRS: &[&str] = &[
+    r"C:\Program Files\Git\cmd",
+    r"C:\Program Files\Git\bin",
+    r"C:\Program Files (x86)\Git\cmd",
     r"C:\ProgramData\chocolatey\bin",
 ];
 
@@ -207,29 +242,19 @@ fn claude_fallback_dirs() -> Vec<String> {
 ///
 /// `HEADSTATE_CLAUDE` overrides everything, matching `HEADSTATE_GH`.
 pub fn find_claude() -> Option<std::path::PathBuf> {
-    let exe = format!("claude{}", std::env::consts::EXE_SUFFIX);
-
-    if let Ok(explicit) = std::env::var("HEADSTATE_CLAUDE") {
-        let p = std::path::PathBuf::from(explicit);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join(&exe);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    for dir in claude_fallback_dirs() {
-        let candidate = std::path::Path::new(&dir).join(&exe);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    // Routed through the shared search when `git` needed the same one
+    // (#1125). This function previously carried its own copy of the
+    // three tiers; the copy had drifted -- it never consulted
+    // `user_fallback_dirs`, so a winget or Scoop install of Claude Code
+    // was invisible to it while the same install of `gh` was found.
+    let fallbacks = claude_fallback_dirs();
+    let fallbacks: Vec<&str> = fallbacks.iter().map(String::as_str).collect();
+    find_exe_with(
+        &format!("claude{}", std::env::consts::EXE_SUFFIX),
+        &fallbacks,
+        std::env::var("PATH").ok().as_deref(),
+        std::env::var("HEADSTATE_CLAUDE").ok().as_deref(),
+    )
 }
 
 /// Locate the `gh` binary: `PATH` first, then the known install locations.
@@ -238,6 +263,62 @@ pub fn find_claude() -> Option<std::path::PathBuf> {
 /// which is a different message from "installed but not logged in".
 pub fn find_gh() -> Option<std::path::PathBuf> {
     find_gh_in(GH_FALLBACK_DIRS)
+}
+
+/// The `git` executable to spawn, resolved once.
+///
+/// Returns the resolved path, or the bare name when the search found
+/// nothing. Falling back to `"git"` rather than failing is deliberate:
+/// it preserves exactly today's behaviour on a machine where the search
+/// comes up empty but the process environment can still resolve it, so
+/// this change can only widen the set of machines that work.
+///
+/// CACHED, unlike `find_gh`. The branch scan calls this hundreds of
+/// times across 8 threads (`branches/scan.rs:41`), and a per-call
+/// search would stat every fallback directory each time. `gh` is called
+/// once per token read and needs no cache.
+///
+/// The cache also means `HEADSTATE_GIT` is read once per process. That
+/// is the same contract `find_gh` has in practice and the one #481
+/// argues for: a process-global that changes under a running scan is a
+/// worse failure than one that requires a restart.
+pub fn git_program() -> &'static std::path::Path {
+    static RESOLVED: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    RESOLVED.get_or_init(|| find_git().unwrap_or_else(|| std::path::PathBuf::from(git_exe())))
+}
+
+/// The `git` executable's filename on this platform.
+fn git_exe() -> String {
+    format!("git{}", std::env::consts::EXE_SUFFIX)
+}
+
+/// Where `git` actually is, or `None` if the search came up empty.
+///
+/// `None` is NOT "git is not installed" -- the process may still
+/// resolve it through an environment this search cannot see. It means
+/// "we could not locate it ourselves", which is why `git_program`
+/// degrades to the bare name rather than reporting an absence.
+pub fn find_git() -> Option<std::path::PathBuf> {
+    find_git_in(GIT_FALLBACK_DIRS)
+}
+
+/// `find_git` with the fallback list injected, for the same testability
+/// reason `find_gh_in` exists.
+pub fn find_git_in(fallbacks: &[&str]) -> Option<std::path::PathBuf> {
+    find_exe_with(
+        &git_exe(),
+        fallbacks,
+        std::env::var("PATH").ok().as_deref(),
+        std::env::var("HEADSTATE_GIT").ok().as_deref(),
+    )
+}
+
+/// The locations searched, for an error message that can be acted on.
+///
+/// Built from the same constant the search uses, so a message can never
+/// name a directory that was not actually looked in.
+pub fn git_searched() -> String {
+    GIT_FALLBACK_DIRS.join(", ")
 }
 
 /// `find_gh` with the fallback list injected, so the fallback branch --
@@ -263,7 +344,23 @@ pub fn find_gh_with(
     path: Option<&str>,
     explicit: Option<&str>,
 ) -> Option<std::path::PathBuf> {
-    let exe = gh_exe();
+    find_exe_with(&gh_exe(), fallbacks, path, explicit)
+}
+
+/// The search itself, with the executable name injected.
+///
+/// Extracted from `find_gh_with` when `git` needed the identical
+/// three-tier search (#1125). The ORDER is the contract and is shared:
+/// an explicit override, then `PATH`, then per-user installs, then
+/// machine-wide fallbacks. Anything that searched fallbacks before
+/// `PATH` would ignore a deliberately-installed binary in favour of
+/// whatever a package manager left lying around.
+pub fn find_exe_with(
+    exe: &str,
+    fallbacks: &[&str],
+    path: Option<&str>,
+    explicit: Option<&str>,
+) -> Option<std::path::PathBuf> {
     // An explicit override wins over everything: the escape hatch for a
     // non-standard install, and the only thing a user can act on when the
     // fallback list does not cover their setup.
@@ -276,7 +373,7 @@ pub fn find_gh_with(
     // `PATH` next so an explicitly-installed gh beats the fallbacks.
     if let Some(path) = path {
         for dir in std::env::split_paths(path) {
-            let candidate = dir.join(&exe);
+            let candidate = dir.join(exe);
             if candidate.is_file() {
                 return Some(candidate);
             }
@@ -285,13 +382,13 @@ pub fn find_gh_with(
     // Per-user installs before machine-wide ones: if a user installed gh
     // for themselves, that is the one they mean.
     for dir in user_fallback_dirs() {
-        let candidate = std::path::Path::new(&dir).join(&exe);
+        let candidate = std::path::Path::new(&dir).join(exe);
         if candidate.is_file() {
             return Some(candidate);
         }
     }
     for dir in fallbacks {
-        let candidate = std::path::Path::new(dir).join(&exe);
+        let candidate = std::path::Path::new(dir).join(exe);
         if candidate.is_file() {
             return Some(candidate);
         }
@@ -396,6 +493,122 @@ pub fn build_client(token: &str) -> Result<octocrab::Octocrab, AuthError> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The `git` search, with the environment injected for the reason
+    /// `find_gh_with`'s doc comment gives: `PATH` is process-global and
+    /// editing it under `--test-threads=8` broke every concurrent spawn
+    /// in the suite (#481).
+    mod git_search {
+        use super::super::find_exe_with;
+
+        /// A fake executable, since the search tests `is_file`.
+        fn touch(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+            let p = dir.join(name);
+            std::fs::write(&p, "").unwrap();
+            p
+        }
+
+        #[test]
+        fn an_explicit_override_wins_over_path() {
+            let tmp = tempfile::tempdir().unwrap();
+            let on_path = tmp.path().join("onpath");
+            let explicit_dir = tmp.path().join("explicit");
+            std::fs::create_dir_all(&on_path).unwrap();
+            std::fs::create_dir_all(&explicit_dir).unwrap();
+            touch(&on_path, "git");
+            let want = touch(&explicit_dir, "git");
+
+            let got = find_exe_with(
+                "git",
+                &[],
+                Some(on_path.to_str().unwrap()),
+                Some(want.to_str().unwrap()),
+            );
+            assert_eq!(got.as_deref(), Some(want.as_path()));
+        }
+
+        /// The ordering that matters most: a git the user deliberately
+        /// installed must beat whatever a package manager left in a
+        /// fallback directory.
+        #[test]
+        fn path_wins_over_the_fallbacks() {
+            let tmp = tempfile::tempdir().unwrap();
+            let on_path = tmp.path().join("onpath");
+            let fallback = tmp.path().join("fallback");
+            std::fs::create_dir_all(&on_path).unwrap();
+            std::fs::create_dir_all(&fallback).unwrap();
+            let want = touch(&on_path, "git");
+            touch(&fallback, "git");
+
+            let got = find_exe_with(
+                "git",
+                &[fallback.to_str().unwrap()],
+                Some(on_path.to_str().unwrap()),
+                None,
+            );
+            assert_eq!(got.as_deref(), Some(want.as_path()));
+        }
+
+        /// The whole point of the change: a GUI-launched app whose PATH
+        /// does not contain the git the user actually has.
+        #[test]
+        fn a_fallback_is_found_when_path_has_nothing() {
+            let tmp = tempfile::tempdir().unwrap();
+            let empty = tmp.path().join("empty");
+            let fallback = tmp.path().join("fallback");
+            std::fs::create_dir_all(&empty).unwrap();
+            std::fs::create_dir_all(&fallback).unwrap();
+            let want = touch(&fallback, "git");
+
+            let got = find_exe_with(
+                "git",
+                &[fallback.to_str().unwrap()],
+                Some(empty.to_str().unwrap()),
+                None,
+            );
+            assert_eq!(got.as_deref(), Some(want.as_path()));
+        }
+
+        /// An override naming something that is not there must NOT be
+        /// honoured -- it falls through to the real search rather than
+        /// returning a path that cannot be spawned.
+        #[test]
+        fn a_missing_override_does_not_win() {
+            let tmp = tempfile::tempdir().unwrap();
+            let on_path = tmp.path().join("onpath");
+            std::fs::create_dir_all(&on_path).unwrap();
+            let want = touch(&on_path, "git");
+
+            let got = find_exe_with(
+                "git",
+                &[],
+                Some(on_path.to_str().unwrap()),
+                Some(tmp.path().join("nope").to_str().unwrap()),
+            );
+            assert_eq!(got.as_deref(), Some(want.as_path()));
+        }
+
+        #[test]
+        fn nothing_anywhere_is_none() {
+            let tmp = tempfile::tempdir().unwrap();
+            let empty = tmp.path().join("empty");
+            std::fs::create_dir_all(&empty).unwrap();
+            assert!(find_exe_with("git", &[], Some(empty.to_str().unwrap()), None).is_none());
+        }
+
+        /// `git_program` degrades to the bare name rather than failing,
+        /// so a machine where the search finds nothing behaves exactly
+        /// as it did before this change.
+        #[test]
+        fn the_program_falls_back_to_the_bare_name() {
+            let p = super::super::git_program();
+            assert!(
+                p.is_absolute()
+                    || p == std::path::Path::new("git")
+                    || p == std::path::Path::new("git.exe")
+            );
+        }
+    }
     /// A user whose ONLY credential is `GITHUB_TOKEN` gets nothing from
     /// a desktop launch: the app inherits the session environment, not
     /// the shell's, so a variable exported in `~/.bashrc` is simply not
