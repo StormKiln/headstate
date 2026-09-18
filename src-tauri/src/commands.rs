@@ -1419,6 +1419,22 @@ pub fn packages_markdown(
 /// revealing is unsupported -- being told where the file is beats a
 /// button that silently does nothing.
 #[tauri::command]
+/// Whether a background task has panicked since launch (#1144).
+///
+/// The tray badge and the status bar otherwise cannot tell "nothing new
+/// to report" from "the loop that reports it is dead" -- they render
+/// identically, which is #1042's Pending-vs-Unknown collapse one surface
+/// over.
+///
+/// A bare bool rather than the panic's detail: the UI's question is
+/// whether background work has stopped, and the message, location and
+/// backtrace belong in the log where they sit together. `reveal_log`
+/// below is the remedy this points at.
+pub fn background_panicked() -> bool {
+    crate::panic_hook::panicked()
+}
+
+#[tauri::command]
 pub fn reveal_log(app: AppHandle) -> Result<String, String> {
     use tauri::Manager;
     let dir = app

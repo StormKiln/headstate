@@ -778,6 +778,13 @@ export const packagesMarkdown = (
 
 
 /// Reveal the diagnostic log in the file manager. Returns its path.
+/// Whether a background task has panicked since launch (#1144).
+///
+/// A frozen tray badge and a working one render identically, so without
+/// this the UI cannot tell "nothing new to report" from "the loop that
+/// reports it is dead" -- #1042's collapse one surface over.
+export const backgroundPanicked = () => call<boolean>("background_panicked");
+
 export const revealLog = () => call<string>("reveal_log");
 
 /// Every CLAUDE.md in a repository, with its import tree resolved, AND

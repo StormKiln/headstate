@@ -4,7 +4,7 @@ import { ExternalLink } from "./ExternalLink";
 import { getVersion } from "@tauri-apps/api/app";
 import { latestRelease } from "../api/tauri";
 import { UpdateDialog } from "./UpdateDialog";
-import { useUiPrefs } from "../api/hooks";
+import { useBackgroundPanicked, useUiPrefs } from "../api/hooks";
 import { Settings } from "lucide-react";
 import { useEffect, useState } from "react";
 import {
@@ -54,7 +54,19 @@ export function StatusBar({ updatedAt }: { updatedAt: number }) {
   // "Never succeeded" and "stale after a failure" are different. A green
   // dot beside "Updated 3 hours ago" is defensible; a green dot with no
   // successful fetch at all is not.
-  const status = pollError
+  // A panicked background task outranks anything this bar could say
+  // about GitHub (#1144). The poll loop is what produces every other
+  // state here, so once it is dead "PRs up to date" is a claim about a
+  // number nothing is refreshing -- true when it was written and
+  // indistinguishable from true now, which is the collapse #1042 names.
+  //
+  // Polled rather than pushed: a panic has no event to emit, since the
+  // task that would have emitted it is the one that died.
+  const panicked = useBackgroundPanicked();
+
+  const status = panicked
+    ? ("panicked" as const)
+    : pollError
     ? updatedAt > 0
       ? ("stale" as const)
       : ("failed" as const)
@@ -69,6 +81,7 @@ export function StatusBar({ updatedAt }: { updatedAt: number }) {
         : ("ok" as const);
 
   const DOT = {
+    panicked: "bg-[#f85149]",
     fetching: "bg-[#58a6ff]",
     ok: "bg-[#3fb950]",
     retrying: "bg-[#d29922]",
@@ -89,6 +102,10 @@ export function StatusBar({ updatedAt }: { updatedAt: number }) {
   // Naming the subject is cheaper than a second indicator and keeps the
   // detail where it belongs: the stats page states its own condition.
   const TEXT = {
+    // Says what STOPPED, not what failed: nothing the user did went
+    // wrong, and the numbers on screen are real -- they are simply not
+    // being refreshed any more. The log is where the panic itself is.
+    panicked: "Background updates stopped — see the log",
     fetching: "Checking GitHub…",
     ok: "PRs up to date",
     retrying: "Retrying…",

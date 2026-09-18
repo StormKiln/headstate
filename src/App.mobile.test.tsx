@@ -11,6 +11,9 @@ import { stubViewport } from "./test-utils";
 // tests exercise the layout, not the backend -- the same set App.test
 // uses, since the same components mount.
 vi.mock("./api/hooks", () => ({
+  // #1144. False is the healthy case every test in this file assumes;
+  // the panicked state has its own tests in StatusBar.test.tsx.
+  useBackgroundPanicked: () => false,
   useUiPrefs: () => ({
     prefs: { hidden_views: [], close_hides_to_tray: true },
     set: () => Promise.resolve(),
