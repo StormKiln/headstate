@@ -1486,6 +1486,16 @@ type ClaudeSessionKind =
 /// `null` when the store has no such id -- a session deleted between two
 /// polls -- which is a different answer from a rejected read and must not
 /// render as one (#846).
+/// One pull request a session produced (#1132). Mirrors
+/// `claude::subagent::PrLink`.
+export interface ClaudePrLink {
+  session_id: string;
+  repo: string;
+  number: number;
+  url: string;
+  first_seen_at: string | null;
+}
+
 export interface ClaudeSessionDetail {
   session_id: string;
   claude_version: string | null;
@@ -1506,6 +1516,12 @@ export interface ClaudeSessionDetail {
   /// the UI say "never observed" rather than implying we watched and
   /// lost it.
   runs: number;
+  /// The pull requests this session produced (#1132).
+  ///
+  /// Optional so a cached detail from before this field existed
+  /// deserialises rather than failing. Empty is a real answer: most
+  /// sessions open no pull request.
+  pull_requests?: ClaudePrLink[];
   /// Why the live registry could not be listed, for this read. Carried
   /// for the reason the list carries it: a `liveness` that is `unknown`
   /// because the registry was unreadable must be able to say so rather

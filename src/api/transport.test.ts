@@ -217,6 +217,7 @@ const ROWS: Row[] = [
   // reads above it needs no resolution guard: the id is looked up in
   // Headstate's OWN table, so an id the store does not have returns
   // `null` rather than reaching the filesystem.
+  row(api.claudeSessionsForPr, ["acme/api", 7], "claude_sessions_for_pr", { repo: "acme/api", number: 7 }),
   row(api.claudeSessionDetail, ["s1"], "claude_session_detail", { sessionId: "s1" }),
   row(api.claudeOverview, [], "claude_overview"),
   row(api.claudePlugins, [], "claude_plugins"),

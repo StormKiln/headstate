@@ -168,6 +168,8 @@ pub const SURFACE: &[(&str, Class)] = &[
     // link every ten seconds and was carrying every session's detail to
     // render one; it now carries what the list draws, and the phone asks
     // for the rest only when the user opens a session.
+    // Read: one indexed query (#1132).
+    ("claude_sessions_for_pr", Class::Read),
     ("claude_session_detail", Class::Read),
     ("claude_subagent_rollup", Class::Read),
     // The hook's failure and denial profile for one session, and

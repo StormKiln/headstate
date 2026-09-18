@@ -304,6 +304,8 @@ pub const SURFACE: &[(&str, Class)] = &[
     // crosses the pairing transport every ten seconds, and this is the
     // call that lets it stop carrying the detail for 1,474 rows to render
     // one.
+    // Read: one indexed query (#1132).
+    ("claude_sessions_for_pr", Class::Read),
     ("claude_session_detail", Class::Read),
     // #1002. Reads each attributed child transcript with #959's bounded
     // summariser and the app's own database; writes nothing. The phone
@@ -979,6 +981,12 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "read_claude_md" => res(commands::read_claude_md(a.get("path")?).await),
         "claude_import_transcripts" => res(commands::claude_import_transcripts(app.clone()).await),
         "claude_sessions" => res(commands::claude_sessions(app.clone()).await),
+        "claude_sessions_for_pr" => {
+            res(
+                commands::claude_sessions_for_pr(app.clone(), a.get("repo")?, a.get("number")?)
+                    .await,
+            )
+        }
         "claude_session_detail" => {
             res(commands::claude_session_detail(app.clone(), a.get("sessionId")?).await)
         }

@@ -297,6 +297,15 @@ pub struct Map {
     /// the map does not know which sessions those are until the store
     /// does. [`Map::parent_of`] takes them as an argument.
     mentions: HashMap<String, Vec<(String, String)>>,
+    /// Pull requests each session produced (#1132).
+    ///
+    /// Collected on this same walk because it is the only pass that
+    /// reads every transcript unbounded, and `pr-link` records are
+    /// scattered through a file rather than in its head.
+    ///
+    /// `pub` because the store persists it; the mention map stays
+    /// private because it needs `parent_of`'s resolution.
+    pub pr_links: Vec<PrLink>,
     /// Transcripts that could not be read while building the map, with
     /// why.
     ///
@@ -475,6 +484,57 @@ fn scan_ids(text: &str) -> Vec<String> {
 /// [`Map::unreadable`] and the pass continues -- one unreadable file must
 /// not cost the attribution of every other agent, and the count is
 /// carried so the UI can say the rollup may be short.
+/// One pull request a session touched (#1132).
+///
+/// From the `pr-link` records Claude Code writes. `preview.rs`'s own
+/// census counts 634 of them in a 19,725-record sample and nothing in
+/// this app read one -- so Headstate knew about pull requests, knew
+/// about sessions, and could not connect them.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrLink {
+    pub session_id: String,
+    pub repo: String,
+    pub number: u64,
+    pub url: String,
+    /// RFC 3339 of the FIRST time this session mentioned this PR.
+    ///
+    /// First rather than last: the question a reader asks is "when did
+    /// this session produce that PR", and a session that re-links the
+    /// same PR forty times has not produced it forty times.
+    pub first_seen_at: Option<String>,
+}
+
+/// Read the `pr-link` fields out of one line.
+///
+/// A cheap `contains` gate before parsing, matching `mentions_in`'s
+/// shape: this runs on every line of every transcript -- 0.86 GB on the
+/// real corpus -- and paying serde on lines that cannot match would
+/// dominate the walk.
+fn pr_link_in(line: &str, session_id: &str) -> Option<PrLink> {
+    if !line.contains("\"pr-link\"") {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    if v.get("type")?.as_str()? != "pr-link" {
+        return None;
+    }
+    Some(PrLink {
+        // The record carries its own `sessionId`, but the FILE is the
+        // authority: a transcript is named for its session, and a record
+        // naming another one would be a session claiming someone else's
+        // work.
+        session_id: session_id.to_string(),
+        repo: v.get("prRepository")?.as_str()?.to_string(),
+        number: v.get("prNumber")?.as_u64()?,
+        url: v.get("prUrl")?.as_str()?.to_string(),
+        first_seen_at: v
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .map(str::to_string),
+    })
+}
+
 pub fn build(paths: &[PathBuf]) -> Map {
     use std::io::BufRead;
 
@@ -500,6 +560,14 @@ pub fn build(paths: &[PathBuf]) -> Map {
                 // `usage.rs` and `transcript.rs` both take this view.
                 continue;
             };
+            // The pr-link side, on the same pass (#1132). This is the
+            // only walk that reads every transcript unbounded, and the
+            // records are scattered through the file rather than in the
+            // head -- so a second pass would double a 969 ms cost to
+            // collect something already streaming past.
+            if let Some(link) = pr_link_in(&line, &session_id) {
+                map.pr_links.push(link);
+            }
             let Some((at, ids)) = mentions_in(&line) else {
                 continue;
             };
@@ -514,6 +582,19 @@ pub fn build(paths: &[PathBuf]) -> Map {
             }
         }
     }
+    // DEDUPLICATED, and this is not cosmetic. Measured on the real
+    // corpus: 11,000+ `pr-link` records across 36 files, because a
+    // session re-links the same pull request on every turn that touches
+    // it. Keeping them all would make "sessions for this PR" a list of
+    // one session forty times.
+    //
+    // Sorted then deduped by (session, repo, number): the sort puts the
+    // earliest timestamp first within each group, so `dedup_by` keeps
+    // the FIRST mention, which is the one that answers "when did this
+    // session produce that PR".
+    map.pr_links.sort();
+    map.pr_links
+        .dedup_by(|a, b| a.session_id == b.session_id && a.repo == b.repo && a.number == b.number);
     map
 }
 
@@ -923,5 +1004,107 @@ mod tests {
         println!("unattributed         {unattributed}");
         println!("unreadable           {}", map.unreadable.len());
         println!("elapsed              {elapsed:?}");
+    }
+    /// #1132: pull requests are collected on the same walk.
+    #[test]
+    fn a_pr_link_record_is_collected() {
+        let tmp = Tmp::new("prlink");
+        let path = tmp.0.join("s1.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"pr-link","sessionId":"s1","prNumber":112,"prUrl":"https://github.com/acme/api/pull/112","prRepository":"acme/api","timestamp":"2026-09-11T12:20:14.181Z"}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let map = build(&[path]);
+        assert_eq!(map.pr_links.len(), 1);
+        let l = &map.pr_links[0];
+        assert_eq!(l.repo, "acme/api");
+        assert_eq!(l.number, 112);
+        assert_eq!(l.session_id, "s1");
+    }
+
+    /// The measurement that made dedup non-optional: the real corpus
+    /// holds 11,000+ of these across 36 files, because a session
+    /// re-links the same PR on every turn that touches it. Keeping them
+    /// all would make "sessions for this PR" one session forty times.
+    #[test]
+    fn repeated_mentions_of_one_pr_collapse_to_the_first() {
+        let tmp = Tmp::new("prdedup");
+        let path = tmp.0.join("s1.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        for ts in [
+            "2026-09-11T14:00:00.000Z",
+            "2026-09-11T12:00:00.000Z",
+            "2026-09-11T13:00:00.000Z",
+        ] {
+            writeln!(
+                f,
+                r#"{{"type":"pr-link","sessionId":"s1","prNumber":7,"prUrl":"u","prRepository":"acme/api","timestamp":"{ts}"}}"#
+            )
+            .unwrap();
+        }
+        drop(f);
+
+        let map = build(&[path]);
+        assert_eq!(map.pr_links.len(), 1, "one PR, one row");
+        assert_eq!(
+            map.pr_links[0].first_seen_at.as_deref(),
+            Some("2026-09-11T12:00:00.000Z"),
+            "and the EARLIEST mention survives, not whichever came last in the file"
+        );
+    }
+
+    /// Two different PRs from one session are two rows: a session can
+    /// legitimately produce several.
+    #[test]
+    fn distinct_pull_requests_are_kept_apart() {
+        let tmp = Tmp::new("prmulti");
+        let path = tmp.0.join("s1.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        for n in [1u64, 2] {
+            writeln!(
+                f,
+                r#"{{"type":"pr-link","sessionId":"s1","prNumber":{n},"prUrl":"u","prRepository":"acme/api","timestamp":"2026-09-11T12:00:00.000Z"}}"#
+            )
+            .unwrap();
+        }
+        drop(f);
+
+        assert_eq!(build(&[path]).pr_links.len(), 2);
+    }
+
+    /// The FILE is the authority on whose session this is. A record
+    /// naming another session would be one session claiming another's
+    /// work.
+    #[test]
+    fn the_file_name_decides_the_session_not_the_record() {
+        let tmp = Tmp::new("prauth");
+        let path = tmp.0.join("real-session.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"pr-link","sessionId":"someone-else","prNumber":1,"prUrl":"u","prRepository":"acme/api","timestamp":"2026-09-11T12:00:00.000Z"}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        assert_eq!(build(&[path]).pr_links[0].session_id, "real-session");
+    }
+
+    /// A record that is not a pr-link, and a line that merely contains
+    /// the words, must not produce one.
+    #[test]
+    fn only_real_pr_link_records_count() {
+        let tmp = Tmp::new("prnoise");
+        let path = tmp.0.join("s1.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, r#"{{"type":"user","text":"see the pr-link above"}}"#).unwrap();
+        writeln!(f, r#"{{"type":"assistant","text":"opened a PR"}}"#).unwrap();
+        drop(f);
+
+        assert!(build(&[path]).pr_links.is_empty());
     }
 }

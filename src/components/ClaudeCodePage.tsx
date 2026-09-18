@@ -34,6 +34,7 @@ import { useRowCursor } from "@/lib/useRowCursor";
 import { pathBasename, safetyReason, sessionWorktree } from "@/lib/worktrees";
 import { type ClaudeSessionFilter, useFilters } from "@/store/filters";
 import { QueryError, errorMessage } from "./QueryError";
+import { ExternalLink } from "./ExternalLink";
 
 /// How many rows are drawn before the list stops and says so.
 ///
@@ -1479,6 +1480,12 @@ function SessionDetail({
       ) : (
         <>
           <SessionBody session={s} detail={detail.data} copy={copy} reveal={reveal} />
+          {/* Directly after "where it ran", because it answers the
+              question a reader asks next: did this session ship
+              anything. Headstate knew about pull requests and knew about
+              sessions and the two never met, while the transcripts
+              carried the join key all along (#1132). */}
+          <SessionPullRequests detail={detail.data} />
           {/* Both BELOW "Where it ran" and above the worktree jump, which is
               the order the questions are asked in: what is this, how much was
               it, what was it saying, and where do I go next. The preview is
@@ -2996,5 +3003,31 @@ function Resume({
         Paste it into your own terminal — Headstate does not open one for you.
       </p>
     </section>
+  );
+}
+
+/// The pull requests one session produced (#1132).
+///
+/// Absent entirely when there are none, rather than an empty heading:
+/// most sessions open no pull request, and a permanent "Pull requests:
+/// none" would be noise on almost every row.
+function SessionPullRequests({ detail }: { detail: ClaudeSessionDetail }) {
+  const prs = detail.pull_requests ?? [];
+  if (prs.length === 0) return null;
+  return (
+    <div className="mt-3">
+      <p className="text-xs font-semibold text-[#e6edf3]">
+        Pull request{prs.length === 1 ? "" : "s"}
+      </p>
+      <ul className="mt-1 space-y-0.5">
+        {prs.map((pr) => (
+          <li key={`${pr.repo}#${pr.number}`} className="text-xs">
+            <ExternalLink href={pr.url} className="text-[#58a6ff] hover:underline">
+              {pr.repo}#{pr.number}
+            </ExternalLink>
+          </li>
+        ))}
+      </ul>
+    </div>
   );
 }
