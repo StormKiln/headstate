@@ -954,6 +954,32 @@ export type ClaudeHookRefusal =
 /// failure in the very code path whose whole purpose is to explain a silent
 /// failure. `install::tests::the_wire_shape_matches_the_typescript_type`
 /// pins the JSON on the Rust side, because nothing generates this type.
+/// Every hook matcher in `~/.claude/settings.json`, ours and everyone
+/// else's (#1127). Mirrors `claude::install::HookInventory`.
+///
+/// Foreign matchers fire in every Claude session on the machine, and
+/// Headstate read them on every status call and discarded them. This is
+/// that discarded half, made visible -- read-only: nothing here edits,
+/// reorders or disables a hook, least of all one another tool owns.
+export interface ClaudeHookInventory {
+  events: ClaudeHookEvent[];
+}
+
+export interface ClaudeHookEvent {
+  event: string;
+  matchers: ClaudeHookMatcher[];
+}
+
+export interface ClaudeHookMatcher {
+  /// `null` when the entry carries no pattern, which is legal and means
+  /// "every tool". Distinct from `""`, which reads as a pattern
+  /// matching nothing.
+  matcher: string | null;
+  commands: string[];
+  /// Whether Headstate wrote it, by the same test the installer uses.
+  ours: boolean;
+}
+
 export type ClaudeHooksStatus =
   | { state: "installed"; command: string }
   | { state: "not_installed" }
@@ -988,6 +1014,10 @@ export interface ClaudeHooksUninstalled {
 ///
 /// Read every time, never cached: a cached "installed" is wrong the moment
 /// the user hand-edits the file, and this is a file we invite them to edit.
+/// Every hook matcher in the file, ours and foreign (#1127).
+export const claudeHooksInventory = () =>
+  call<ClaudeHookInventory>("claude_hooks_inventory");
+
 export const claudeHooksStatus = () => call<ClaudeHooksStatus>("claude_hooks_status");
 
 /// Install the hooks, appending to whatever is already there.

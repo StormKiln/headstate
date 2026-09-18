@@ -5,6 +5,9 @@ const setPrefs = vi.fn(() => Promise.resolve());
 const prefsState: { prefs: unknown } = { prefs: undefined };
 
 vi.mock("../api/hooks", () => ({
+  // #1127. The inventory section is collapsed and reads nothing until
+  // opened, which is what these tests assume.
+  useClaudeHookInventory: () => ({ data: undefined, error: null }),
   // Defaults, matching the Rust side: nothing hidden, close hides.
   useUiPrefs: () => ({
     prefs: { hidden_views: [], close_hides_to_tray: true },

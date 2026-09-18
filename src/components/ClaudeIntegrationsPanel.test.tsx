@@ -18,6 +18,10 @@ const revealFn = vi.hoisted(() => vi.fn(() => Promise.resolve("/p")));
 
 vi.mock("sonner", () => ({ toast: { success: toastSuccess, error: toastError } }));
 vi.mock("@/api/hooks", () => ({
+  // #1127. Disabled by default: the inventory section is collapsed and
+  // does not read the file until opened, which is the behaviour every
+  // test in this file assumes.
+  useClaudeHookInventory: () => ({ data: undefined, error: null }),
   useClaudeHooks: () => ({
     status: hookState.status,
     isLoading: hookState.status === undefined,
@@ -489,5 +493,28 @@ describe("the status sentence", () => {
     // Specifically NOT "not installed": an unresolved query must not render
     // as a fact about the file.
     expect(text).not.toMatch(/not installed/i);
+  });
+});
+
+
+/// #1127: the hooks the app never showed.
+describe("the hook inventory", () => {
+  it("is collapsed until asked for", () => {
+    render(<ClaudeIntegrationsPanel prefs={{ ...PREFS, claude_integrations_enabled: true }} setPrefs={async () => {}} />);
+    const toggle = screen.getByRole("button", { name: /every hook in this file/i });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("offers to show every hook, not only ours", () => {
+    render(<ClaudeIntegrationsPanel prefs={{ ...PREFS, claude_integrations_enabled: true }} setPrefs={async () => {}} />);
+    expect(screen.getByRole("button", { name: /every hook in this file/i })).toBeTruthy();
+  });
+
+  /// The section is gated on the integration being enabled, so a user
+  /// who has not turned it on is not offered a view of a file the app
+  /// is not otherwise reading.
+  it("is absent when the integration is off", () => {
+    render(<ClaudeIntegrationsPanel prefs={{ ...PREFS, claude_integrations_enabled: false }} setPrefs={async () => {}} />);
+    expect(screen.queryByRole("button", { name: /every hook in this file/i })).toBeNull();
   });
 });

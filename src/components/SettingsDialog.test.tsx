@@ -39,6 +39,9 @@ const cleanupPrefs = vi.hoisted(() => ({
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 vi.mock("../api/tauri", () => ({ revealLog: revealFn }));
 vi.mock("../api/hooks", () => ({
+  // #1127. The inventory section is collapsed and reads nothing until
+  // opened, which is what these tests assume.
+  useClaudeHookInventory: () => ({ data: undefined, error: null }),
   // Defaults, matching the Rust side: nothing hidden, close hides.
   useUiPrefs: () => ({
     prefs: {

@@ -920,6 +920,110 @@ pub fn uninstall(path: &Path) -> Result<Uninstalled, Refusal> {
 /// caller write `.unwrap_or(NotInstalled)` and collapse "cannot tell" into
 /// "not installed", which is the one confusion §5.5 names -- the remedies
 /// are completely different, and one of them is "do not click Install".
+/// Every hook matcher in the file, ours and everyone else's (#1127).
+///
+/// `status` walks the same structure and throws the foreign entries away
+/// on every call. That discarded half is the interesting one: these
+/// matchers fire in every Claude session on the machine, and the module
+/// docs record a real file holding ten foreign hook events pointing at
+/// an iTerm2 `cc-status` binary plus a `codegraph prompt-hook`. When a
+/// session behaves strangely, or when an install is refused because the
+/// file is malformed, the user had no view of what is actually wired in
+/// and had to open the JSON by hand.
+///
+/// Read-only. Nothing here edits, reorders, enables or disables a hook
+/// -- least of all a foreign one, which this app has no standing to
+/// touch.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookInventory {
+    /// Events in file order, each with the matchers under it.
+    pub events: Vec<HookEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookEvent {
+    /// The event name, e.g. `SessionStart`.
+    pub event: String,
+    pub matchers: Vec<HookMatcher>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookMatcher {
+    /// The `matcher` pattern, or `None` when the entry carries none --
+    /// which is legal and means "every tool".
+    ///
+    /// `None` rather than `""`: an absent pattern and an empty one are
+    /// different things to a reader, and the empty string reads as a
+    /// pattern that matches nothing rather than one that matches all.
+    pub matcher: Option<String>,
+    /// The command lines this matcher runs, in order.
+    pub commands: Vec<String>,
+    /// Whether Headstate wrote it, by the same test `status` uses.
+    pub ours: bool,
+}
+
+/// Read every matcher, ours and foreign.
+///
+/// Returns the same [`Refusal`] `status` would for an unreadable or
+/// malformed file, because the two must not disagree about whether the
+/// file can be read -- and because an empty inventory rendered for a
+/// file that could not be parsed would say "no hooks are installed",
+/// which is the confident wrong answer this module exists to refuse.
+pub fn inventory(path: &Path) -> Result<HookInventory, Refusal> {
+    let root = match read_settings(path)? {
+        Some(root) => root,
+        // No file, or an empty one. Nothing is installed, which is a
+        // fact rather than a failure to establish one -- the same
+        // distinction `status`'s `Ok(None)` arm draws.
+        None => return Ok(HookInventory { events: Vec::new() }),
+    };
+
+    let Some(hooks) = root.get("hooks") else {
+        return Ok(HookInventory { events: Vec::new() });
+    };
+    let Some(hooks) = hooks.as_object() else {
+        return Err(Refusal::HooksNotAnObject {
+            path: path.display().to_string(),
+            found: type_name(hooks).to_string(),
+        });
+    };
+
+    let mut events = Vec::new();
+    for (event, slot) in hooks {
+        let Some(list) = slot.as_array() else {
+            return Err(Refusal::MatcherNotUnderstood {
+                path: path.display().to_string(),
+                event: event.clone(),
+            });
+        };
+        let matchers = list
+            .iter()
+            .map(|m| HookMatcher {
+                matcher: m.get("matcher").and_then(Value::as_str).map(str::to_string),
+                commands: m
+                    .get("hooks")
+                    .and_then(Value::as_array)
+                    .map(|cs| {
+                        cs.iter()
+                            .filter_map(|c| c.get("command").and_then(Value::as_str))
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                ours: is_ours(m),
+            })
+            .collect();
+        events.push(HookEvent {
+            event: event.clone(),
+            matchers,
+        });
+    }
+    Ok(HookInventory { events })
+}
+
 pub fn status(path: &Path, exe: &Path) -> Status {
     let command = hook_command(exe);
     let root = match read_settings(path) {
@@ -2492,5 +2596,90 @@ mod tests {
             );
         }
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+    /// #1127: the foreign matchers `status` discards are kept.
+    ///
+    /// `status` walks this same structure on every call and throws them
+    /// away. They are the interesting half: they fire in every Claude
+    /// session on the machine, and the user had no view of them.
+    #[test]
+    fn foreign_matchers_are_kept_and_marked_as_not_ours() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "hooks": {
+                "SessionStart": [
+                  {"matcher": "*", "hooks": [{"command": "cc-status --notify"}]},
+                  {"matcher": "*", "_headstate": true,
+                   "hooks": [{"command": "headstate claude-hook"}]}
+                ]
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let inv = inventory(&path).expect("a well-formed file reads");
+        let ev = inv
+            .events
+            .iter()
+            .find(|e| e.event == "SessionStart")
+            .expect("the event is listed");
+        assert_eq!(ev.matchers.len(), 2, "both matchers survive");
+
+        let foreign = ev
+            .matchers
+            .iter()
+            .find(|m| !m.ours)
+            .expect("the foreign one");
+        assert_eq!(foreign.commands, vec!["cc-status --notify".to_string()]);
+        assert!(
+            ev.matchers.iter().any(|m| m.ours),
+            "and ours is still recognised as ours"
+        );
+    }
+
+    /// An absent `matcher` is legal and means "every tool". `None`
+    /// rather than `""`, because an empty pattern reads as one that
+    /// matches nothing -- the opposite claim.
+    #[test]
+    fn an_absent_matcher_pattern_is_none_not_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"hooks": {"Stop": [{"hooks": [{"command": "x"}]}]}}"#,
+        )
+        .unwrap();
+
+        let inv = inventory(&path).unwrap();
+        assert_eq!(inv.events[0].matchers[0].matcher, None);
+    }
+
+    /// A file that could not be parsed is NOT a file with no hooks.
+    /// Returning an empty inventory here would say the second, which is
+    /// the confident wrong answer this module refuses everywhere else.
+    #[test]
+    fn a_malformed_file_refuses_rather_than_reporting_no_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{ not json").unwrap();
+
+        assert!(
+            inventory(&path).is_err(),
+            "an unparseable file must refuse, not report an empty inventory"
+        );
+    }
+
+    /// A missing file IS a file with no hooks -- a fact, not a failure
+    /// to establish one. The same distinction `status`'s `Ok(None)` arm
+    /// draws, and the other half of the test above.
+    #[test]
+    fn a_missing_file_is_an_empty_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let inv = inventory(&dir.path().join("nothing-here.json"))
+            .expect("an absent file is not an error");
+        assert!(inv.events.is_empty());
     }
 }

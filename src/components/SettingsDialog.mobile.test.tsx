@@ -17,6 +17,9 @@ vi.mock("../api/tauri", () => ({ revealLog: vi.fn() }));
 // The same shape SettingsDialog.test.tsx mocks: the dialog reads half a
 // dozen preference hooks, none of which this file is about.
 vi.mock("../api/hooks", () => ({
+  // #1127. The inventory section is collapsed and reads nothing until
+  // opened, which is what these tests assume.
+  useClaudeHookInventory: () => ({ data: undefined, error: null }),
   useUiPrefs: () => ({
     prefs: { hidden_views: [], close_hides_to_tray: true, diagnostic_logging: false },
     set: () => Promise.resolve(),
