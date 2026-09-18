@@ -30,9 +30,43 @@ pub struct AuthState {
 /// would otherwise return if the client type were unmanaged entirely.
 pub struct GhClient(pub Option<Arc<GitHubClient>>);
 
-/// Shown verbatim when no client exists. Duplicated across five commands
+/// Shown when no client exists. Duplicated across five commands
 /// before this; a const means the five cannot drift apart.
-pub const AUTH_ERR: &str = "not authenticated: run `gh auth login`";
+///
+/// # Why it carries a marker
+///
+/// This is a "we did not ask" condition, not a "they did not answer" one
+/// (#1050, #1124). `GhClient` holds `None`, so no request is ever
+/// constructed -- but it rejected through the same `Result<T, String>`
+/// channel as `ClientError::Timeout`, and `QueryError` therefore rendered
+/// both as one red panel offering the same "Try again". The retry could
+/// not work: nothing about pressing it makes a token appear.
+///
+/// #1050 is the same defect one surface over -- a stats load the process
+/// declined to issue, reported as GitHub having not answered, with both
+/// halves wrong.
+///
+/// The marker is how the variant survives the IPC boundary, which
+/// flattens everything to a string. Exactly the mechanism
+/// `src/lib/cancelled.ts` uses for a dismissed biometric prompt, and for
+/// the same reason: the classification exists on this side and has to
+/// reach the other one intact.
+pub const NOT_ASKED: &str = "headstate:not-asked";
+
+/// The prose shown to the user, after the marker is stripped.
+pub const AUTH_ERR_TEXT: &str = "not authenticated: run `gh auth login`";
+
+/// The rejection itself: marker, then the prose.
+///
+/// One string rather than two fields because a Tauri command's error IS
+/// a string; a struct would be serialised and the frontend would parse
+/// it, which is a heavier contract for one bit of information.
+/// Written out rather than concatenated from the two consts above:
+/// `concat!` takes literals only, and a `const fn` join is not possible
+/// for `&str` on stable. The agreement is asserted by
+/// `the_rejection_is_the_marker_then_the_prose` below rather than left
+/// to a reader to check.
+pub const AUTH_ERR: &str = "headstate:not-asked not authenticated: run `gh auth login`";
 
 /// Bound the history window.
 ///
@@ -4956,6 +4990,40 @@ pub fn claude_uninstall_hooks() -> Result<crate::claude::install::Uninstalled, S
 
 #[cfg(test)]
 mod tests {
+
+    /// #1124: the three constants must agree, since `AUTH_ERR` is
+    /// written out rather than composed.
+    #[test]
+    fn the_rejection_is_the_marker_then_the_prose() {
+        assert_eq!(
+            super::AUTH_ERR,
+            format!("{} {}", super::NOT_ASKED, super::AUTH_ERR_TEXT),
+            "AUTH_ERR must stay the marker, one space, then the prose"
+        );
+    }
+
+    /// The marker must be recognisable as one: a bare prose prefix would
+    /// eventually collide with a real GitHub error message.
+    #[test]
+    fn the_marker_is_namespaced() {
+        assert!(
+            super::NOT_ASKED.starts_with("headstate:"),
+            "a marker crossing the IPC boundary must be namespaced, like `cancelled.ts`'s"
+        );
+    }
+
+    /// The whole point: this rejection must be distinguishable from one
+    /// GitHub actually produced. If a real client error ever started
+    /// with the marker, the UI would withhold a retry that would have
+    /// worked.
+    #[test]
+    fn a_real_client_error_does_not_look_not_asked() {
+        let timeout = crate::github::client::ClientError::Timeout(60).to_string();
+        assert!(
+            !timeout.starts_with(super::NOT_ASKED),
+            "a timeout is a question GitHub did not answer, not one we declined to ask"
+        );
+    }
 
     /// The path guard the two `Class::Read` transcript commands share
     /// (#959, #982).

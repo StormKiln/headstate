@@ -2768,4 +2768,71 @@ mod tests {
              corpus on each page load"
         );
     }
+
+    /// A declined request must not reject through the same channel as a
+    /// failed one (#1124).
+    ///
+    /// When `GhClient` holds no client, no request is constructed. That
+    /// rejected as a bare string indistinguishable from
+    /// `ClientError::Timeout`, so the UI rendered a failed request and
+    /// offered a retry that could not work -- #1050's defect, still live
+    /// on 29 paths when this was written.
+    ///
+    /// The subject is the client unwrap itself. Every command that needs
+    /// a client does `client.0.clone().ok_or_else(...)`, and the `None`
+    /// arm is precisely the "we declined to ask" case. This asserts that
+    /// arm always produces `AUTH_ERR`, which carries the `NOT_ASKED`
+    /// marker the frontend branches on, rather than a message written
+    /// out at the call site.
+    ///
+    /// A sibling written next month with its own sentence is the failure
+    /// this catches: nothing about it looks wrong, and the retry it
+    /// restores is one that cannot work.
+    ///
+    /// Derived rather than enumerated, per this module's header: the
+    /// scan finds the unwraps, so a new command is covered without
+    /// anyone remembering to add it here.
+    #[test]
+    fn a_declined_request_is_marked_as_never_asked() {
+        let mut checked = 0usize;
+        for (crate_name, root) in crate_roots() {
+            for file in rust_files(&root) {
+                let Ok(src) = std::fs::read_to_string(&file) else {
+                    continue;
+                };
+                let prod = &production(&src);
+                let rel = file.strip_prefix(&root).unwrap_or(&file).display();
+                let mut at = 0usize;
+                // The UNWRAP specifically: `.ok_or_else(` is what makes
+                // this a `None` arm that produces a rejection. A bare
+                // `client.0.clone()` that stays an `Option` constructs
+                // no rejection and has nothing to mark.
+                while let Some(i) = prod[at..].find("client.0.clone().ok_or_else(") {
+                    let hit = at + i;
+                    at = hit + 1;
+                    let line_start = prod[..hit].rfind('\n').map_or(0, |j| j + 1);
+                    let line_end = prod[hit..].find('\n').map_or(prod.len(), |j| hit + j);
+                    let line = &prod[line_start..line_end];
+                    if is_comment(line) {
+                        continue;
+                    }
+                    checked += 1;
+                    assert!(
+                        line.contains("AUTH_ERR"),
+                        "{crate_name}/{rel}: a client unwrap whose `None` arm does not use \
+                         `AUTH_ERR`: {}\n\nThat arm is the \"we never asked\" case -- no request \
+                         is constructed. Without `AUTH_ERR`'s `NOT_ASKED` marker the frontend \
+                         cannot tell it from a request GitHub failed to answer, so it renders a \
+                         failure and offers a retry that cannot work (#1050, #1124).",
+                        line.trim()
+                    );
+                }
+            }
+        }
+        assert!(
+            checked > 0,
+            "the scan found no client unwrap at all, so it is asserting nothing -- the shape has \
+             probably changed, and this check must change with it"
+        );
+    }
 }
