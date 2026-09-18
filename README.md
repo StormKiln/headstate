@@ -427,6 +427,7 @@ Install dependencies with `yarn install --immutable`, then use the
 Makefile for everything else:
 
 ```
+make doctor       # check this checkout is ready before anything else
 make dev          # yarn tauri dev — run the app locally, live reload
 make build         # yarn tauri build — produce a runnable .app / .dmg
 make test          # both suites below

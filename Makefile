@@ -1,7 +1,7 @@
 .PHONY: dev build test test-rust test-ui lint lint-rust lint-ui lint-deps fmt icons \
 	mobile-frontend lint-mobile test-mobile check-mobile-ios check-mobile-android \
 	deny-mobile deny-stepup ios-init android-init icons-mobile ios-device android-device \
-	deny test-race check-intel
+	deny test-race check-intel doctor
 
 # ---- Mobile companion (src-mobile) ---------------------------------------
 #
@@ -210,6 +210,26 @@ mutants:
 check-intel:
 	rustup target add x86_64-apple-darwin
 	cd src-tauri && cargo check --target x86_64-apple-darwin --all-targets
+
+# What a fresh checkout needs before `lint` can evaluate any code.
+#
+# Deliberately NOT a dependency of `lint` (#1155). That target's contract
+# is answers in a second and this one shells out to five toolchains; it
+# is the step BEFORE the gate, run once in a new worktree rather than on
+# every cycle.
+#
+# It also does not fail on an absent OPTIONAL tool -- no Android NDK is
+# correct on a machine that never builds for Android. It exits non-zero
+# only for the two conditions that actually stop `lint` before it reads
+# any code, which is what makes a non-zero exit here worth reading.
+#
+# The cost it removes: `lint` in a fresh worktree dies with "Couldn't
+# find the node_modules state file", which names none of its causes. The
+# `verify` skill records hitting that twice in one cycle, and with ~100
+# sibling worktrees here a fresh one is the normal case.
+doctor:
+	python3 scripts/check-env.test.py
+	python3 scripts/check-env.py
 
 lint: lint-rust lint-ui lint-deps
 
