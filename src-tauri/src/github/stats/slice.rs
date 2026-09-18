@@ -126,6 +126,20 @@ pub struct Plan {
     /// Probe rounds it took. One round is one request per
     /// `ALIAS_CHUNK` slices, so this is the latency of the planning.
     pub rounds: u32,
+    /// Slices the planner never got to probe, because the ceiling
+    /// expired first (#1123).
+    ///
+    /// A SECOND honest-partial channel, distinct from `irreducible` on
+    /// purpose. Irreducible means "probed, and the answer is a floor".
+    /// This means "never probed, so these PRs are not in `total()` at
+    /// all" -- a smaller number rather than a qualified one, which is
+    /// the more dangerous of the two because nothing about the figure
+    /// itself looks wrong.
+    ///
+    /// Empty on every completed plan, which is why `is_complete` reads
+    /// it rather than a flag: a plan that finished cannot accidentally
+    /// claim it did not, and one that did not cannot claim it did.
+    pub unprobed: Vec<Slice>,
 }
 
 impl Plan {
@@ -161,6 +175,23 @@ impl Plan {
             .iter()
             .map(|s| s.count.saturating_sub(SEARCH_CAP))
             .sum()
+    }
+
+    /// Whether the planner probed the whole window (#1123).
+    ///
+    /// False means `total()` is a FLOOR in the strong sense: slices
+    /// exist that were never asked about, so their PRs are absent from
+    /// the sum entirely. A caller rendering a bare number from an
+    /// incomplete plan would be printing a confident wrong figure, which
+    /// is the failure this codebase's "qualify, or suppress" rule names.
+    pub fn is_complete(&self) -> bool {
+        self.unprobed.is_empty()
+    }
+
+    /// How many slices were never probed, for a message that can say
+    /// "28 of 37" rather than only that something is missing.
+    pub fn unprobed_slices(&self) -> usize {
+        self.unprobed.len()
     }
 }
 
@@ -332,6 +363,12 @@ where
         slices: done,
         irreducible,
         rounds,
+        // The synchronous planner has no ceiling: it either probes every
+        // slice or hits `MAX_DEPTH`, and the depth case is recorded as
+        // irreducible just above. So there is never an unprobed slice
+        // here, and saying so explicitly is what stops a future edit
+        // from quietly introducing one.
+        unprobed: Vec::new(),
     })
 }
 

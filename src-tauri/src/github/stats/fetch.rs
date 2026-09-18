@@ -368,7 +368,14 @@ pub async fn load_count(
     // Captured before the move: `window` goes into the inner future, and
     // the log below runs after that future has been dropped.
     let (from, to) = (window.from.clone(), window.to.clone());
-    match tokio::time::timeout(LOAD_TIMEOUT, load_count_inner(client, q, window, budget)).await {
+    // Owned HERE, outside the future the ceiling may drop (#1123).
+    let progress = PlanProgress::new();
+    match tokio::time::timeout(
+        LOAD_TIMEOUT,
+        load_count_inner(client, q, window, budget, &progress),
+    )
+    .await
+    {
         Ok(r) => r,
         Err(_) => {
             // What the timeout looked like from inside, because the error
@@ -402,7 +409,20 @@ pub async fn load_count(
                 budget.spent(),
                 budget.unmetered()
             );
-            Err(ClientError::Timeout(LOAD_TIMEOUT.as_secs()))
+            // Partial is not nothing (#1044, #1123). Every completed
+            // probe round measured slices whose `issueCount` is exact --
+            // the 1,000 cap limits retrieval, not counting -- so what
+            // survives is a real floor, not an estimate. It is returned
+            // with `retrievable: false`, which is the channel callers
+            // already branch on to qualify a figure.
+            //
+            // Nothing measured at all stays an error, for
+            // `PlanProgress::take`'s reason: a window with no rounds
+            // finished has nothing to qualify.
+            match progress.take() {
+                Some(partial) => Ok(outcome_from_plan(&partial, budget)),
+                None => Err(ClientError::Timeout(LOAD_TIMEOUT.as_secs())),
+            }
         }
     }
 }
@@ -412,6 +432,7 @@ async fn load_count_inner(
     q: &StatsQuery,
     window: Slice,
     budget: &Budget,
+    progress: &PlanProgress,
 ) -> Result<Outcome, ClientError> {
     // CONNECTION-FIRST. `repository.pullRequests` has no 1,000-result
     // cap (VERIFIED: pktstorm/headstate, 337 merged, cost 1), so a
@@ -430,17 +451,31 @@ async fn load_count_inner(
     // The COUNT path's threshold, which is the one `slice::SUBDIVIDE_AT`
     // exists for: just under the 1,000-result search cap, so the assembled
     // total is exact. A board needs a much smaller one -- see `plan_to`.
-    let plan = plan(client, q, window, budget, slice::SUBDIVIDE_AT).await?;
-    Ok(Outcome {
+    let plan = plan(client, q, window, budget, slice::SUBDIVIDE_AT, progress).await?;
+    Ok(outcome_from_plan(&plan, budget))
+}
+
+/// An `Outcome` from a plan, whole or partial.
+///
+/// One mapper for both paths, deliberately: #1044's remedy in `board.rs`
+/// makes the same choice ("the partial path must not need a second
+/// mapper, or the two would drift and the partial one would be the
+/// untested of the pair").
+fn outcome_from_plan(plan: &Plan, budget: &Budget) -> Outcome {
+    Outcome {
         total: plan.total(),
-        retrievable: plan.is_retrievable(),
+        // An unprobed slice is not retrievable either -- its nodes were
+        // never even counted, let alone fetched. Folding it in here
+        // means every existing caller that branches on `retrievable`
+        // qualifies a timed-out count without being taught to.
+        retrievable: plan.is_retrievable() && plan.is_complete(),
         unretrievable: plan.unretrievable(),
         slices: plan.slices.len(),
         rounds: plan.rounds,
         via_connection: false,
         spend: budget.snapshot(),
         refused_fields: 0,
-    })
+    }
 }
 
 /// Build a complete plan for a window, running each probe round's chunks
@@ -521,9 +556,141 @@ pub async fn plan_to(
     budget: &Budget,
     subdivide_at: u64,
 ) -> Result<Plan, ClientError> {
-    match tokio::time::timeout(LOAD_TIMEOUT, plan(client, q, window, budget, subdivide_at)).await {
+    plan_within(client, q, window, budget, subdivide_at, LOAD_TIMEOUT).await
+}
+
+/// [`plan_to`] against a caller-supplied ceiling.
+///
+/// # Why the ceiling is a parameter
+///
+/// So the RETENTION can be tested, for the reason `load_board_within`'s
+/// doc gives about #1044: the shipped ceiling is 60 seconds, a test that
+/// waited for it would take a minute, and one that faked the clock would
+/// exercise a timer rather than the drop. With the ceiling injected the
+/// test drives THIS function -- the one that ships -- against a stalling
+/// server and a ceiling short enough to expire between two probe rounds.
+///
+/// `LOAD_TIMEOUT` itself is unchanged and is not raised: #1044 is
+/// explicit that the defect is discarding the work, not the size of the
+/// budget.
+pub(super) async fn plan_within(
+    client: &GitHubClient,
+    q: &StatsQuery,
+    window: Slice,
+    budget: &Budget,
+    subdivide_at: u64,
+    ceiling: std::time::Duration,
+) -> Result<Plan, ClientError> {
+    // Owned HERE, outside the future the ceiling may drop (#1123). Same
+    // placement and same reason as `board.rs:1115`.
+    let progress = PlanProgress::new();
+    let started = std::time::Instant::now();
+    match tokio::time::timeout(
+        ceiling,
+        plan(client, q, window, budget, subdivide_at, &progress),
+    )
+    .await
+    {
         Ok(r) => r,
-        Err(_) => Err(ClientError::Timeout(LOAD_TIMEOUT.as_secs())),
+        Err(_) => {
+            // Partial is not nothing (#1044, #1123). The rounds that DID
+            // complete cost real requests against the rate limit, and
+            // each one measured slices whose counts are exact. Throwing
+            // them away turned a slow success into a total failure and
+            // meant a scope slow enough to need retrying never converged
+            // on anything.
+            //
+            // `None` -- no round finished at all -- stays an error: a
+            // window with nothing measured has nothing to qualify, and
+            // rendering it as a total would present "we asked nobody" as
+            // a measurement.
+            match progress.take() {
+                Some(partial) => {
+                    crate::diag!(
+                        "[diag] stats plan TIMEOUT after {:?} (ceiling {}s): \
+                         kept {} probed slice(s) over {} round(s), {} unprobed, \
+                         {} requests, {} points spent",
+                        started.elapsed(),
+                        ceiling.as_secs(),
+                        partial.slices.len(),
+                        partial.rounds,
+                        partial.unprobed_slices(),
+                        budget.requests(),
+                        budget.spent()
+                    );
+                    Ok(partial)
+                }
+                None => Err(ClientError::Timeout(LOAD_TIMEOUT.as_secs())),
+            }
+        }
+    }
+}
+
+/// A planner's progress, owned by the CALLER of the ceiling (#1123).
+///
+/// The same ownership trick `board.rs:1115` uses and for the same
+/// reason: `tokio::time::timeout` destroys the future and everything it
+/// owns, so anything a partial answer is built from has to live on the
+/// other side of the race. `plan` writes each finished round here; on
+/// expiry `plan_to` reads it back.
+#[derive(Debug, Clone, Default)]
+pub(super) struct PlanProgress(std::sync::Arc<std::sync::Mutex<PlanProgressInner>>);
+
+#[derive(Debug, Default)]
+struct PlanProgressInner {
+    done: Vec<slice::ProbedSlice>,
+    irreducible: Vec<slice::ProbedSlice>,
+    pending: Vec<Slice>,
+    rounds: u32,
+}
+
+impl PlanProgress {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Publish one completed round.
+    ///
+    /// A poisoned lock is recovered from rather than panicked on, for
+    /// `PartialDetail::record`'s reason: this is a plain accumulator
+    /// with no invariant a mid-write panic could break, and dying here
+    /// would turn a partial answer into no answer.
+    fn publish(
+        &self,
+        done: &[slice::ProbedSlice],
+        irreducible: &[slice::ProbedSlice],
+        pending: &[Slice],
+        rounds: u32,
+    ) {
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        g.done = done.to_vec();
+        g.irreducible = irreducible.to_vec();
+        g.pending = pending.to_vec();
+        g.rounds = rounds;
+    }
+
+    /// The plan as far as it got, or `None` if no round ever finished.
+    ///
+    /// `None` is deliberately not an empty plan: a window whose FIRST
+    /// probe never returned has nothing measured, and presenting that as
+    /// "0 pull requests" is the zero-for-absent confusion this module
+    /// forbids. The caller turns it back into the timeout error.
+    fn take(&self) -> Option<Plan> {
+        let g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if g.rounds == 0 {
+            return None;
+        }
+        let mut done = g.done.clone();
+        done.sort_by(|a, b| a.slice.from.cmp(&b.slice.from));
+        Some(Plan {
+            slices: done,
+            irreducible: g.irreducible.clone(),
+            rounds: g.rounds,
+            // What the ceiling stopped us asking about. These PRs are
+            // absent from `total()` entirely, which is what makes the
+            // figure a floor.
+            unprobed: g.pending.clone(),
+        })
     }
 }
 
@@ -533,6 +700,7 @@ async fn plan(
     window: Slice,
     budget: &Budget,
     subdivide_at: u64,
+    progress: &PlanProgress,
 ) -> Result<Plan, ClientError> {
     // `plan_with` is synchronous and takes a closure, because that is
     // what makes the completeness property testable without a network
@@ -579,6 +747,10 @@ async fn plan(
             next.extend(pieces);
         }
         pending = next;
+        // Published per ROUND rather than per slice: a round is the unit
+        // that costs a request, and a half-finished round has nothing a
+        // partial answer could use.
+        progress.publish(&done, &irreducible, &pending, rounds);
     }
     for s in pending {
         let probed = slice::ProbedSlice { slice: s, count: 0 };
@@ -590,6 +762,10 @@ async fn plan(
         slices: done,
         irreducible,
         rounds,
+        // Reaching here means the loop drained `pending`, so nothing is
+        // unprobed. The depth-limit case above is recorded as
+        // irreducible, which is a different claim: probed, and a floor.
+        unprobed: Vec::new(),
     })
 }
 
@@ -1620,6 +1796,267 @@ pub fn routes_through_connection(scope: &Scope) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// #1123: a planner that runs out of ceiling keeps the rounds that
+    /// finished.
+    ///
+    /// The ceiling is driven through `PlanProgress` directly rather than
+    /// through `plan_to`'s 60-second `LOAD_TIMEOUT`, for the reason
+    /// `load_board_within`'s doc gives about #1044: a test that waited
+    /// out the shipped ceiling would take a minute, and one that faked
+    /// the clock would exercise a timer rather than the drop. These
+    /// drive the accumulator that survives the drop, which is the thing
+    /// the fix adds.
+    mod plan_retention {
+
+        /// The WIRING, not the accumulator.
+        ///
+        /// The unit tests above drive `PlanProgress` directly, which
+        /// proved the sink survives a drop but said nothing about
+        /// `plan_within` actually reading it back -- reverting that arm
+        /// to a bare `Err` compiled clean and passed all five. This is
+        /// the test that fails when it does.
+        ///
+        /// Shape: round one probes the whole window and answers fast,
+        /// subdividing it. Round two stalls past the ceiling. What must
+        /// survive is round one's measurement.
+        #[tokio::test]
+        async fn a_timed_out_plan_keeps_the_rounds_that_finished() {
+            use crate::github::stats::scope::{Measure, Scope, StatsQuery};
+            use crate::GitHubClient;
+            use serde_json::json;
+            use wiremock::matchers::method;
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            // The read semaphore is process-wide and this test stalls a
+            // request on purpose -- see `budget::READ_PERMIT_TEST_LOCK`.
+            let _permits = crate::github::stats::budget::READ_PERMIT_TEST_LOCK
+                .lock()
+                .await;
+            let server = MockServer::start().await;
+
+            // Two orders of magnitude above what an undelayed round
+            // needs, and a tenth of the stall, for #1073's reason: the
+            // property is "what arrived is kept", never speed, so the
+            // margins must not race a loaded runner.
+            const CEILING: std::time::Duration = std::time::Duration::from_secs(3);
+            let round = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = round.clone();
+
+            Mock::given(method("POST"))
+                .respond_with(move |req: &wiremock::Request| {
+                    let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                    let doc = body["query"].as_str().unwrap_or("").to_string();
+                    let n = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // Round 0 must come back OVER the threshold so the
+                    // single window subdivides and a round 1 exists at
+                    // all. Round 1 is mixed, so some slices settle --
+                    // that is the measurement under test. Round 2 stalls.
+                    // A MIX, deliberately. Slices under `SUBDIVIDE_AT`
+                    // settle into `done` in round one -- those are the
+                    // measurement that has to survive. Slices over it go
+                    // back into `pending` and need a round two, which is
+                    // the round that stalls. An all-over-threshold mock
+                    // settles nothing in round one and the test passes
+                    // vacuously; an all-under one never needs a round two
+                    // and never times out.
+                    let mut data = serde_json::Map::new();
+                    for i in 0..64 {
+                        let alias = crate::github::stats::query::slice_alias(i);
+                        if doc.contains(&format!("  {alias}: search")) {
+                            let count = if n == 0 {
+                                5000
+                            } else if i % 2 == 0 {
+                                100
+                            } else {
+                                5000
+                            };
+                            data.insert(alias, json!({ "issueCount": count }));
+                        }
+                    }
+                    let resp = ResponseTemplate::new(200).set_body_json(json!({ "data": data }));
+                    if n < 2 {
+                        resp
+                    } else {
+                        // Ten times the ceiling, and BOUNDED rather than
+                        // infinite: `READ_PERMITS` is process-wide, so a
+                        // request that never returns would hold a permit
+                        // against every other test in the binary.
+                        resp.set_delay(std::time::Duration::from_secs(30))
+                    }
+                })
+                .mount(&server)
+                .await;
+
+            let oc = octocrab::Octocrab::builder()
+                .base_uri(server.uri())
+                .unwrap()
+                .personal_token("test-token".to_string())
+                .build()
+                .unwrap();
+            let client = GitHubClient::new(oc);
+            let budget = crate::github::stats::budget::Budget::seeded_for_test(5000, 1_789_412_400);
+            let q = StatsQuery {
+                subject: None,
+                scope: Scope::Org("example".into()),
+                measure: Measure::Merged,
+            };
+
+            let plan = super::super::plan_within(
+                &client,
+                &q,
+                // Round one probes this ONE window, which comes back
+                // over the threshold and subdivides into several pieces.
+                // Round two probes those: the even ones settle, the odd
+                // ones would subdivide again -- but round two is the
+                // stall, so what survives is whatever round one settled
+                // plus the pending list round two never answered.
+                Slice {
+                    from: "2026-01-01".into(),
+                    to: "2026-02-09".into(),
+                },
+                &budget,
+                crate::github::stats::slice::SUBDIVIDE_AT,
+                CEILING,
+            )
+            .await
+            .expect("a timed-out plan with a finished round is an answer, not an error");
+
+            // The premise held: round one really did land inside the
+            // ceiling. Without this the assertions below could pass
+            // vacuously on a runner slow enough to stall round one too.
+            assert!(
+                round.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+                "the test needs rounds 0 and 1 to answer and round 2 to stall"
+            );
+            assert!(
+                plan.total() > 0,
+                "round one measured slices and they must survive the drop"
+            );
+            assert!(
+                !plan.is_complete(),
+                "the window was not fully probed and the plan must say so"
+            );
+            assert!(
+                plan.unprobed_slices() > 0,
+                "and it must name how much it never reached"
+            );
+        }
+        use super::super::{PlanProgress, Slice};
+        use crate::github::stats::slice::ProbedSlice;
+
+        fn slice(from: &str, to: &str) -> Slice {
+            Slice {
+                from: from.to_string(),
+                to: to.to_string(),
+            }
+        }
+
+        fn probed(from: &str, to: &str, count: u64) -> ProbedSlice {
+            ProbedSlice {
+                slice: slice(from, to),
+                count,
+            }
+        }
+
+        /// The defect in one assertion: work that completed before the
+        /// ceiling is readable after the future that produced it is
+        /// dropped.
+        #[test]
+        fn a_finished_round_survives_the_drop() {
+            let progress = PlanProgress::new();
+            {
+                // Scoped so the publisher is gone before the read, which
+                // is the ownership property under test -- the sink
+                // outlives whatever wrote to it.
+                let done = vec![probed("2026-01-01", "2026-01-10", 120)];
+                let pending = vec![slice("2026-01-11", "2026-01-20")];
+                progress.publish(&done, &[], &pending, 1);
+            }
+
+            let partial = progress.take().expect("a finished round is an answer");
+            assert_eq!(partial.total(), 120, "the measured slice is kept");
+            assert_eq!(partial.rounds, 1);
+            assert_eq!(partial.unprobed_slices(), 1, "and what was missed is named");
+            assert!(
+                !partial.is_complete(),
+                "a plan with unprobed slices must not claim completeness"
+            );
+        }
+
+        /// The other half of "partial is not nothing": nothing IS
+        /// nothing. A window whose first probe never returned has no
+        /// measurement to qualify, and rendering it as a total would
+        /// present "we asked nobody" as an answer.
+        #[test]
+        fn no_finished_round_is_not_an_empty_plan() {
+            let progress = PlanProgress::new();
+            assert!(
+                progress.take().is_none(),
+                "zero rounds must stay an error rather than become a zero"
+            );
+        }
+
+        /// A completed plan must not be marked partial, or the
+        /// qualification becomes noise that users learn to ignore.
+        #[test]
+        fn a_drained_plan_is_complete() {
+            let progress = PlanProgress::new();
+            progress.publish(&[probed("2026-01-01", "2026-01-10", 7)], &[], &[], 2);
+
+            let partial = progress.take().expect("rounds finished");
+            assert!(
+                partial.is_complete(),
+                "nothing pending means nothing unprobed"
+            );
+            assert_eq!(partial.unprobed_slices(), 0);
+        }
+
+        /// `retrievable` is the channel every existing caller already
+        /// branches on to qualify a figure, so an incomplete plan must
+        /// clear it -- otherwise a timed-out count renders through the
+        /// unqualified path and looks exact.
+        #[test]
+        fn an_incomplete_plan_is_not_retrievable() {
+            let progress = PlanProgress::new();
+            progress.publish(
+                &[probed("2026-01-01", "2026-01-10", 120)],
+                &[],
+                &[slice("2026-01-11", "2026-01-20")],
+                1,
+            );
+            let partial = progress.take().unwrap();
+            let budget = crate::github::stats::budget::Budget::seeded_for_test(5000, 1_789_412_400);
+
+            let outcome = super::super::outcome_from_plan(&partial, &budget);
+            assert!(
+                !outcome.retrievable,
+                "an unprobed slice means the figure is a floor, and the caller must be told"
+            );
+            assert_eq!(outcome.total, 120, "and the floor is the measured total");
+        }
+
+        /// The distinction that is easy to lose: irreducible means
+        /// "probed, and a floor"; unprobed means "never asked". Both
+        /// qualify the answer, and conflating them would lose the
+        /// ability to say which.
+        #[test]
+        fn irreducible_and_unprobed_are_different_states() {
+            let progress = PlanProgress::new();
+            progress.publish(
+                &[probed("2026-01-01", "2026-01-01", 1200)],
+                &[probed("2026-01-01", "2026-01-01", 1200)],
+                &[slice("2026-01-02", "2026-01-03")],
+                1,
+            );
+            let partial = progress.take().unwrap();
+
+            assert!(!partial.is_retrievable(), "the probed day is over the cap");
+            assert!(!partial.is_complete(), "and another slice was never probed");
+            assert_eq!(partial.unretrievable(), 200, "1200 minus the 1000 cap");
+            assert_eq!(partial.unprobed_slices(), 1);
+        }
+    }
     use super::*;
 
     /// Reads are capped, and the number is not inherited from the
