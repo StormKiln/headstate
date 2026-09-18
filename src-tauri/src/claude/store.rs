@@ -191,6 +191,54 @@ fn upsert(conn: &Connection, t: &Transcript, now: &str) -> Result<(), rusqlite::
 /// contents rather than a half-merged list. Per-session write failures
 /// are collected and reported instead of aborting the import: one
 /// malformed row must not cost the user the other 1,429.
+/// The pull requests one session produced (#1132).
+pub fn prs_for_session(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<super::subagent::PrLink>, rusqlite::Error> {
+    let mut q = conn.prepare(
+        "SELECT session_id, repo, number, url, first_seen_at
+           FROM claude_session_pr WHERE session_id = ?1
+          ORDER BY first_seen_at, repo, number",
+    )?;
+    let rows = q.query_map([session_id], |r| {
+        Ok(super::subagent::PrLink {
+            session_id: r.get(0)?,
+            repo: r.get(1)?,
+            number: r.get::<_, i64>(2)? as u64,
+            url: r.get(3)?,
+            first_seen_at: r.get(4)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// The sessions that produced one pull request (#1132).
+///
+/// The reverse direction, and the one the PR view asks. Indexed on
+/// `(repo, number)` so it does not scan the table.
+pub fn sessions_for_pr(
+    conn: &Connection,
+    repo: &str,
+    number: u64,
+) -> Result<Vec<super::subagent::PrLink>, rusqlite::Error> {
+    let mut q = conn.prepare(
+        "SELECT session_id, repo, number, url, first_seen_at
+           FROM claude_session_pr WHERE repo = ?1 AND number = ?2
+          ORDER BY first_seen_at, session_id",
+    )?;
+    let rows = q.query_map(rusqlite::params![repo, number as i64], |r| {
+        Ok(super::subagent::PrLink {
+            session_id: r.get(0)?,
+            repo: r.get(1)?,
+            number: r.get::<_, i64>(2)? as u64,
+            url: r.get(3)?,
+            first_seen_at: r.get(4)?,
+        })
+    })?;
+    rows.collect()
+}
+
 pub fn import(conn: &mut Connection, scan: Scan) -> Result<Imported, rusqlite::Error> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut out = Imported {
@@ -235,6 +283,36 @@ pub fn import(conn: &mut Connection, scan: Scan) -> Result<Imported, rusqlite::E
     //
     // Inside the same transaction as the sessions, so a reader never sees
     // a list whose rows and whose attributions came from different scans.
+    // The pull-request links, on the same terms and for the same reason
+    // (#1132). They are derived from the corpus as a whole: a transcript
+    // deleted since the last scan should take its links with it, and an
+    // upsert would leave them behind with nothing to remove them.
+    //
+    // Inside this transaction so a reader never sees sessions and links
+    // from different scans.
+    tx.execute("DELETE FROM claude_session_pr", [])?;
+    for l in &scan.subagents.pr_links {
+        if let Err(e) = tx.execute(
+            "INSERT OR REPLACE INTO claude_session_pr
+                 (session_id, repo, number, url, first_seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            // `as i64`: SQLite integers are signed, and a PR number is
+            // never near the boundary -- GitHub's largest is six digits.
+            rusqlite::params![
+                l.session_id,
+                l.repo,
+                l.number as i64,
+                l.url,
+                l.first_seen_at
+            ],
+        ) {
+            out.write_failures.push(format!(
+                "{}: could not store its pull request link: {e}",
+                l.session_id
+            ));
+        }
+    }
+
     tx.execute("DELETE FROM claude_subagent", [])?;
     for t in &scan.sessions {
         let Kind::Subagent { agent_id } = Kind::classify(t.cwd.as_deref()) else {
@@ -815,5 +893,67 @@ mod tests {
             !got.is_partial(),
             "a machine with no history has a complete list of nothing"
         );
+    }
+    /// #1132: both directions of the pull-request link.
+    #[test]
+    fn pull_request_links_round_trip_in_both_directions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = crate::store::open_db(&dir.path().join("t.db")).unwrap();
+
+        let link = |session: &str, n: u64| super::super::subagent::PrLink {
+            session_id: session.to_string(),
+            repo: "acme/api".to_string(),
+            number: n,
+            url: format!("https://github.com/acme/api/pull/{n}"),
+            first_seen_at: Some("2026-09-11T12:00:00Z".to_string()),
+        };
+
+        let tx = conn.transaction().unwrap();
+        for l in [link("s1", 7), link("s1", 8), link("s2", 7)] {
+            tx.execute(
+                "INSERT OR REPLACE INTO claude_session_pr
+                     (session_id, repo, number, url, first_seen_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    l.session_id,
+                    l.repo,
+                    l.number as i64,
+                    l.url,
+                    l.first_seen_at
+                ],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        // Forward: what did this session produce.
+        let forward = prs_for_session(&conn, "s1").unwrap();
+        assert_eq!(forward.len(), 2, "one session can produce several");
+
+        // Reverse: which sessions produced this. The direction the PR
+        // view asks, and the one the app could not answer at all.
+        let reverse = sessions_for_pr(&conn, "acme/api", 7).unwrap();
+        assert_eq!(reverse.len(), 2);
+        assert!(reverse.iter().any(|l| l.session_id == "s1"));
+        assert!(reverse.iter().any(|l| l.session_id == "s2"));
+    }
+
+    /// The primary key is the dedup rule made structural: a session
+    /// re-links the same PR on every turn, and without this the table
+    /// would grow without bound on every rescan.
+    #[test]
+    fn re_storing_one_link_does_not_duplicate_the_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::store::open_db(&dir.path().join("t.db")).unwrap();
+        for _ in 0..3 {
+            conn.execute(
+                "INSERT OR REPLACE INTO claude_session_pr
+                     (session_id, repo, number, url, first_seen_at)
+                 VALUES ('s1', 'acme/api', 7, 'u', '2026-09-11T12:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(prs_for_session(&conn, "s1").unwrap().len(), 1);
     }
 }

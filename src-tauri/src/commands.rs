@@ -4118,6 +4118,27 @@ pub async fn claude_sessions(
 /// the list's, because the detail pane is where the reason is shown and
 /// a reason should be as fresh as the verdict it explains.
 #[tauri::command]
+/// The sessions that produced one pull request (#1132).
+///
+/// Headstate knew about pull requests and knew about Claude sessions,
+/// and the two never met -- while the transcripts carried the join key
+/// all along. `preview.rs`'s own record census counts 634 `pr-link`
+/// records in a 19,725-record sample and nothing read one.
+pub async fn claude_sessions_for_pr(
+    app: AppHandle,
+    repo: String,
+    number: u64,
+) -> Result<Vec<crate::claude::subagent::PrLink>, String> {
+    let db = db_path(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&db).map_err(|e| e.to_string())?;
+        crate::claude::store::sessions_for_pr(&conn, &repo, number).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 pub async fn claude_session_detail(
     app: tauri::AppHandle,
     session_id: String,

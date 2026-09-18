@@ -540,6 +540,12 @@ pub struct SessionDetail {
     /// liveness is `Unknown` because the registry was unreadable must be
     /// able to say so rather than present a shrug as a finding.
     pub registry_failure: Option<String>,
+    /// The pull requests this session produced (#1132).
+    ///
+    /// From the `pr-link` records the transcript carries. Empty means
+    /// none were recorded, which is a real answer: most sessions open
+    /// no pull request.
+    pub pull_requests: Vec<super::subagent::PrLink>,
     /// Whether this session ran in an agent worktree (#1002).
     pub kind: super::subagent::Kind,
     /// The subagent sessions traced to this one, newest first.
@@ -998,6 +1004,11 @@ pub fn detail(
             });
 
     Ok(Some(SessionDetail {
+        // A read failure is an EMPTY list here, not an error that takes
+        // the whole pane down: the pull requests are one line of a
+        // detail view whose other fields are all still real. Consistent
+        // with how `registry_failure` is carried rather than raised.
+        pull_requests: super::store::prs_for_session(conn, &stored.session_id).unwrap_or_default(),
         resume: resume_command(&stored.session_id, cwd.as_deref(), &cwd_state),
         transcript_state: check_transcript(stored.transcript_path.as_deref()),
         session_id: stored.session_id,

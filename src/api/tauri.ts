@@ -14,6 +14,7 @@
 import { call } from "./transport";
 import type {
   ClaudeMdEffectiveScan,
+  ClaudePrLink,
   AlertReport,
   CachedSnapshot,
   Artifact,
@@ -831,6 +832,10 @@ export const claudeSessions = () => call<WireClaudeSessionList>("claude_sessions
 /// session deleted between two polls produces. That is an ANSWER; a
 /// rejection means the database could not be read. The view words them
 /// differently and must never collapse them (#846).
+/// The sessions that produced one pull request (#1132).
+export const claudeSessionsForPr = (repo: string, number: number) =>
+  call<ClaudePrLink[]>("claude_sessions_for_pr", { repo, number });
+
 export const claudeSessionDetail = (sessionId: string) =>
   call<ClaudeSessionDetail | null>("claude_session_detail", { sessionId });
 

@@ -878,6 +878,26 @@ const MIGRATIONS: &[&str] = &[
         last_seen    TEXT NOT NULL,
         last_worked  TEXT
      );",
+    // #1132: the pull requests each session produced.
+    //
+    // A TABLE rather than a column on `claude_session`: one session can
+    // produce several, and the reverse question -- "which sessions
+    // produced this PR" -- has to be answerable too.
+    //
+    // The primary key is the dedup rule made structural. A session
+    // re-links the same PR on every turn that touches it (11,000+
+    // records across 36 files on the real corpus), so without this the
+    // table would grow without bound on every rescan.
+    "CREATE TABLE IF NOT EXISTS claude_session_pr (
+        session_id    TEXT NOT NULL,
+        repo          TEXT NOT NULL,
+        number        INTEGER NOT NULL,
+        url           TEXT NOT NULL,
+        first_seen_at TEXT,
+        PRIMARY KEY (session_id, repo, number)
+     );
+     CREATE INDEX IF NOT EXISTS claude_session_pr_by_pr
+        ON claude_session_pr (repo, number);",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
