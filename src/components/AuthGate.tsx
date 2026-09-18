@@ -6,6 +6,7 @@ import { getAuthState } from "../api/tauri";
 import { useConnectionState } from "@/api/connection";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { dismissSplash } from "../splash";
+import { isNotAsked, notAskedMessage } from "@/lib/notAsked";
 
 /// Gates the whole app on `get_auth_state`. Rust computes auth once at
 /// startup from the `gh` CLI token, so this is a one-shot check, not a
@@ -150,11 +151,23 @@ export function AuthGate({ children }: { children: ReactNode }) {
         )}
         {pollError !== null && (
           <div
-            role="alert"
-            className="flex items-start gap-2 border-b border-[#f85149]/30 bg-[#f85149]/10 px-4 py-2 text-sm text-[#f85149]"
+            // #1124: a poll the app DECLINED to issue is not a failed
+            // refresh. The banner said "Background refresh failed" and
+            // printed the rejection verbatim -- both wrong, and the
+            // marker would have reached the screen. Amber and `status`
+            // rather than red and `alert`, matching the store-error
+            // banner above: nothing went wrong, something is not set up.
+            role={isNotAsked(pollError) ? "status" : "alert"}
+            className={
+              isNotAsked(pollError)
+                ? "flex items-start gap-2 border-b border-[#d29922]/30 bg-[#d29922]/10 px-4 py-2 text-sm text-[#d29922]"
+                : "flex items-start gap-2 border-b border-[#f85149]/30 bg-[#f85149]/10 px-4 py-2 text-sm text-[#f85149]"
+            }
           >
             <span className="flex-1">
-            Background refresh failed: {pollError}
+            {isNotAsked(pollError)
+              ? `Not refreshing in the background: ${notAskedMessage(pollError)}`
+              : `Background refresh failed: ${pollError}`}
             {/* The errors that most need reporting are exactly the ones
                 a user cannot diagnose, and the banner offered nothing.
                 Opens a PREFILLED form rather than posting: the user is

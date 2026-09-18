@@ -1,4 +1,6 @@
 import type { ReactNode } from "react";
+import { isNotAsked, notAskedMessage } from "@/lib/notAsked";
+import { NotAskedNotice } from "./NotAskedNotice";
 
 /// The panel shown when a query FAILED, as distinct from returning nothing.
 ///
@@ -22,6 +24,18 @@ export function QueryError({
   onRetry?: () => void;
   children?: ReactNode;
 }) {
+  // DELEGATED here rather than at each of the dozen call sites (#1124).
+  // Every page that can show a query failure can also be handed a
+  // rejection the app never issued, and teaching each one separately is
+  // how half of them would be missed. `QueryError` already receives the
+  // only thing the decision needs.
+  //
+  // The marker is stripped before rendering: it is a wire detail and
+  // must never reach the screen, which is the failure `cancelled.ts`
+  // exists because of.
+  if (message && isNotAsked(message)) {
+    return <NotAskedNotice message={notAskedMessage(message)} />;
+  }
   return (
     <div
       role="alert"
