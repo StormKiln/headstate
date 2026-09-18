@@ -101,7 +101,14 @@ export function AllRepositoriesTable() {
   //
   // Keyed by repository PATH, which is the row's identity and unique
   // across scan roots where `name` is not.
-  const paths = useMemo(() => scanned.map((r) => r.path), [scanned]);
+  //
+  // A BARE repository is excluded (#1142): it has no working tree, so
+  // `classify_main_checkout` would be asked to judge a checkout that is
+  // not there. `Safety::MainCheckout` means "this is the main checkout,
+  // protect it", which is a claim about something a mirror does not
+  // have -- and an answer computed about nothing is exactly the
+  // confident wrong verdict this table's other guards exist to prevent.
+  const paths = useMemo(() => scanned.filter((r) => !r.bare).map((r) => r.path), [scanned]);
   const { upstreams } = useRepoUpstreams(paths);
 
   // The resolved verdict laid over the row, and `?? row.upstream`
