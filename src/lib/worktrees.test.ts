@@ -1206,3 +1206,50 @@ describe("occupancy and removability", () => {
     expect(o.kind).not.toBe("free");
   });
 });
+
+/// #1136: a stopped rebase, merge or cherry-pick.
+///
+/// Reported as `dirty` before this -- "7 uncommitted files" -- which
+/// reads like ordinary edits and is the one state a user must not
+/// remove: `git worktree remove` on a half-replayed rebase discards a
+/// commit series that exists nowhere else.
+describe("an operation in progress", () => {
+  const inProgress = (
+    op: "rebase" | "merge" | "cherryPick" | "revert" | "bisect",
+    conflicts: number | null,
+  ): Safety => ({ kind: "inProgress", op, conflicts });
+
+  it("names the operation and the conflict count", () => {
+    expect(safetyReason(inProgress("rebase", 3))).toBe(
+      "rebase in progress — 3 conflicted files",
+    );
+  });
+
+  it("renders cherryPick as the word git uses", () => {
+    expect(safetyReason(inProgress("cherryPick", 1))).toContain("cherry-pick");
+  });
+
+  /// An unreadable `git status` is NOT zero conflicts. The operation is
+  /// in progress either way, so the count is omitted rather than
+  /// rendered as 0 -- which would read as a clean conflict-free rebase.
+  it("omits the count when status could not be read", () => {
+    expect(safetyReason(inProgress("rebase", null))).toBe("rebase in progress");
+  });
+
+  it("is never one-click removable", () => {
+    expect(isSafe(inProgress("rebase", 1))).toBe(false);
+  });
+
+  /// Red rather than amber: a half-replayed rebase holds commits no
+  /// other ref points at, so this is "stop", not "needs attention".
+  it("is coloured like never_pushed", () => {
+    expect(safetyTone(inProgress("rebase", 1))).toBe(safetyTone({ kind: "never_pushed" }));
+  });
+
+  /// The force path names what is lost and what to do instead.
+  it("warns about the commits the removal would discard", () => {
+    const w = forceWarning(inProgress("rebase", 2));
+    expect(w).toContain("rebase");
+    expect(w).toMatch(/finish or abort/i);
+  });
+});

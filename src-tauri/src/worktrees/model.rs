@@ -88,6 +88,21 @@ pub struct Repo {
     pub default_ref: Option<String>,
 }
 
+/// Which multi-step git operation a worktree stopped in the middle of.
+///
+/// Each is a different story to the user: a rebase is resumed with
+/// `--continue`, a bisect ends with `--reset`. Naming the operation is
+/// what makes the row actionable rather than merely alarming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GitOperation {
+    Rebase,
+    Merge,
+    CherryPick,
+    Revert,
+    Bisect,
+}
+
 /// Why a worktree can or cannot be removed.
 ///
 /// Deliberately an enum rather than a bool: the UI has to explain ITSELF,
@@ -108,6 +123,26 @@ pub enum Safety {
     MainCheckout,
     /// Uncommitted changes; the number of affected paths.
     Dirty(u64),
+    /// A rebase, merge, cherry-pick, revert or bisect that stopped
+    /// part-way (#1136).
+    ///
+    /// Reported as `Dirty(n)` before this, which reads like ordinary
+    /// edits -- "7 uncommitted changes" -- and is the one state a user
+    /// cannot spot and must not remove: `git worktree remove` on a
+    /// half-replayed rebase discards a commit series that exists nowhere
+    /// else.
+    ///
+    /// Ordered ABOVE `Dirty` for the same reason `Dirty` sits above
+    /// `Locked`: it is the fact that survives the remedy. Committing the
+    /// working tree does not end a rebase.
+    ///
+    /// `conflicts` is `Option` because an unreadable `git status` is not
+    /// zero conflicts -- the operation is still in progress either way,
+    /// which is why the state does not depend on the count.
+    InProgress {
+        op: GitOperation,
+        conflicts: Option<u64>,
+    },
     /// Commits not on the remote; how many.
     Unpushed(u64),
     /// No upstream branch at all -- nothing has ever been pushed.
@@ -440,6 +475,29 @@ impl Safety {
             Safety::Safe => "merged, pushed, safe to delete".into(),
             Safety::MainCheckout => "the repository's main checkout".into(),
             Safety::Dirty(n) => format!("{n} uncommitted file{}", if *n == 1 { "" } else { "s" }),
+            // NAMES the operation, because the remedy differs per
+            // operation: a rebase is resumed with `--continue`, a bisect
+            // ends with `--reset`. "Something is in progress" would be
+            // alarming without being actionable.
+            Safety::InProgress { op, conflicts } => {
+                let what = match op {
+                    GitOperation::Rebase => "rebase",
+                    GitOperation::Merge => "merge",
+                    GitOperation::CherryPick => "cherry-pick",
+                    GitOperation::Revert => "revert",
+                    GitOperation::Bisect => "bisect",
+                };
+                match conflicts {
+                    // An unreadable status is NOT zero conflicts, so the
+                    // count is simply omitted rather than rendered as 0.
+                    None => format!("{what} in progress"),
+                    Some(0) => format!("{what} in progress"),
+                    Some(n) => format!(
+                        "{what} in progress — {n} conflicted file{}",
+                        if *n == 1 { "" } else { "s" }
+                    ),
+                }
+            }
             Safety::Unpushed(n) => {
                 format!("{n} unpushed commit{}", if *n == 1 { "" } else { "s" })
             }

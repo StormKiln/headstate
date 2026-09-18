@@ -246,6 +246,18 @@ export type Safety =
   | { kind: "safe" }
   | { kind: "main_checkout" }
   | { kind: "dirty"; detail: number }
+  /// A rebase, merge, cherry-pick, revert or bisect that stopped
+  /// part-way (#1136). Reported as `dirty` before this, which reads like
+  /// ordinary edits and is the one state a user must not remove.
+  ///
+  /// `conflicts` is `null` when `git status` could not be read: an
+  /// unreadable status is not zero conflicts, and the operation is in
+  /// progress either way.
+  | {
+      kind: "inProgress";
+      op: "rebase" | "merge" | "cherryPick" | "revert" | "bisect";
+      conflicts: number | null;
+    }
   | { kind: "unpushed"; detail: number }
   | { kind: "never_pushed" }
   /// Merged, but the remote branch was deleted afterwards -- the usual
