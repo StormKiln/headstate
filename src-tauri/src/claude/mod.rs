@@ -81,6 +81,7 @@ pub mod plugins;
 pub mod preview;
 pub mod registry;
 pub mod sessions;
+pub mod settings;
 /// Compaction pressure, stated agent types, and who is waiting on you
 /// (#1065, #1066, #1067).
 pub mod signals;

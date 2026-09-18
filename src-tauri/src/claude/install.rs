@@ -582,7 +582,7 @@ fn mentions_our_subcommand(command: &str) -> bool {
 /// `Ok(None)` is the file-does-not-exist case, which is normal: a user who
 /// has never written a setting has no file, and creating one with just our
 /// hooks is the right outcome rather than an error (§5.4).
-fn read_settings(path: &Path) -> Result<Option<Value>, Refusal> {
+pub(super) fn read_settings(path: &Path) -> Result<Option<Value>, Refusal> {
     let body = match std::fs::read_to_string(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),

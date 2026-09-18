@@ -256,6 +256,8 @@ pub const SURFACE: &[(&str, Class)] = &[
     // Read: one file, no side effects, and "what is wired into my
     // sessions" is a reasonable thing to ask from a phone (#1127).
     ("claude_hooks_inventory", Class::Read),
+    // Read: three file reads, no side effects (#1130).
+    ("claude_effective_settings", Class::Read),
     ("claude_hooks_status", Class::Read),
     ("get_poll_interval", Class::Read),
     ("get_worktree_dirs", Class::Read),

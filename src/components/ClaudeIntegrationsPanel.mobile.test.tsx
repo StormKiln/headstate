@@ -52,6 +52,9 @@ vi.mock("@/api/hooks", () => ({
   // does not read the file until opened, which is the behaviour every
   // test in this file assumes.
   useClaudeHookInventory: () => ({ data: undefined, error: null }),
+  // #1130. Collapsed by default, so nothing is read until opened --
+  // which is what these tests assume.
+  useClaudeEffectiveSettings: () => ({ data: undefined, error: null }),
   useClaudeHooks: () => ({
     status: hookState.status,
     isLoading: hookState.status === undefined,

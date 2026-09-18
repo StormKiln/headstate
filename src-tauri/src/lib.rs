@@ -297,6 +297,7 @@ pub fn run() {
             commands::claude_plugins,
             commands::claude_restart_list,
             commands::claude_hooks_inventory,
+            commands::claude_effective_settings,
             commands::claude_hooks_status,
             commands::claude_install_hooks,
             commands::claude_reinstall_hooks,

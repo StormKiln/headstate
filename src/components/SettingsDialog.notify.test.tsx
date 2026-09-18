@@ -8,6 +8,9 @@ vi.mock("../api/hooks", () => ({
   // #1127. The inventory section is collapsed and reads nothing until
   // opened, which is what these tests assume.
   useClaudeHookInventory: () => ({ data: undefined, error: null }),
+  // #1130. Collapsed by default, so nothing is read until opened --
+  // which is what these tests assume.
+  useClaudeEffectiveSettings: () => ({ data: undefined, error: null }),
   // Defaults, matching the Rust side: nothing hidden, close hides.
   useUiPrefs: () => ({
     prefs: { hidden_views: [], close_hides_to_tray: true },

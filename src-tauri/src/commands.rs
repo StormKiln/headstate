@@ -5031,6 +5031,27 @@ pub fn claude_hooks_inventory() -> Result<crate::claude::install::HookInventory,
 }
 
 #[tauri::command]
+/// What Claude Code actually reads for this repository (#1130).
+///
+/// `events.rs` records every `PermissionDenied` and tallies it by tool,
+/// so the EFFECT of a permission rule was visible while the rule itself
+/// was not -- a user had to open three files and merge them mentally.
+///
+/// No home directory is a refusal rather than an empty result: "nothing
+/// is configured" and "we could not look" are different answers.
+pub async fn claude_effective_settings(
+    repo_path: String,
+) -> Result<crate::claude::settings::Effective, String> {
+    let home = crate::auth::home_dir()
+        .ok_or_else(|| "no home directory is set, so ~/.claude could not be read".to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::claude::settings::effective_in(&home, std::path::Path::new(&repo_path))
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn claude_hooks_status() -> Result<crate::claude::install::Status, String> {
     let (path, exe) = match claude_settings_target() {
         Ok(t) => t,
