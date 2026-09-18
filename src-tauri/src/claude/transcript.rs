@@ -309,6 +309,26 @@ pub struct Scan {
     /// counted so the exclusion is visible and testable rather than
     /// invisible.
     pub subagent_files_skipped: usize,
+    /// Bytes across the session transcripts (#1135).
+    ///
+    /// The corpus this app reads most was the one footprint it never
+    /// reported, while worktrees, artifacts, venvs, Docker and packages
+    /// all had one. Measured on the real corpus at 916 MB across 1,502
+    /// session files, with one file at 76.7 MB.
+    ///
+    /// Taken from the metadata the walk already holds, so it costs no
+    /// extra I/O.
+    pub session_bytes: u64,
+    /// Bytes across the subagent transcripts, kept apart.
+    ///
+    /// Roughly half the `.jsonl` files on disk are subagent transcripts
+    /// -- 1,370 of 2,800 measured -- and the two mean different things:
+    /// one is sessions you can resume, the other is work they delegated.
+    pub subagent_bytes: u64,
+    /// Files whose size could not be read, making both totals FLOORS.
+    ///
+    /// A size we could not take is not a size of zero.
+    pub unsized_files: usize,
     /// Project directories that could not be listed, with why.
     ///
     /// A permission error here hides an unknown number of sessions, so it
@@ -445,10 +465,21 @@ fn session_files(root: &Path) -> Walk {
                 // `subagents/`. Counting what is underneath is what makes
                 // the exclusion a number the tests can assert on, so it
                 // cannot regress into an invisible behaviour.
-                out.nested += count_jsonl(&p);
+                let (found, bytes) = count_jsonl(&p);
+                out.nested += found;
+                out.subagent_bytes += bytes;
                 continue;
             }
             if p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                // The size, on the metadata this walk already has in
+                // hand (#1135). A file whose size cannot be read
+                // contributes nothing rather than failing the walk: the
+                // total becomes a floor, which `Scan::bytes_partial`
+                // below carries.
+                match f.metadata() {
+                    Ok(m) => out.session_bytes += m.len(),
+                    Err(_) => out.unsized_files += 1,
+                }
                 out.files.push(p);
             }
         }
@@ -468,10 +499,25 @@ struct Walk {
     files: Vec<PathBuf>,
     /// `.jsonl` files below `<slug>/<file>`, correctly excluded.
     nested: usize,
+    /// Bytes across the session transcripts in `files` (#1135).
+    session_bytes: u64,
+    /// Bytes across the SUBAGENT transcripts counted in `nested`.
+    ///
+    /// Kept apart from `session_bytes` because roughly half the `.jsonl`
+    /// files on disk are subagent transcripts -- 1,370 of 2,800 measured
+    /// -- and the two mean different things: one is sessions you can
+    /// resume, the other is work they delegated.
+    subagent_bytes: u64,
     /// Directories that could not be LISTED, with why.
     unreadable: Vec<String>,
     /// The root itself, when it does not exist. See [`Scan::absent_root`].
     absent_root: Option<String>,
+    /// Files whose size could not be read (#1135).
+    ///
+    /// Non-zero makes every byte total a FLOOR. A size we could not take
+    /// is not a size of zero, which is this module's own rule one field
+    /// over.
+    unsized_files: usize,
 }
 
 /// Every `.jsonl` at or below `dir`, for the skipped-file count.
@@ -479,8 +525,9 @@ struct Walk {
 /// Failures are not reported: this counts files we are deliberately NOT
 /// importing, so being unable to count one costs a slightly low number in
 /// a diagnostic, not a missing session.
-fn count_jsonl(dir: &Path) -> usize {
+fn count_jsonl(dir: &Path) -> (usize, u64) {
     let mut n = 0;
+    let mut bytes = 0u64;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&d) else {
@@ -492,12 +539,19 @@ fn count_jsonl(dir: &Path) -> usize {
                 Ok(t) if t.is_dir() => stack.push(p),
                 Ok(t) if t.is_file() && p.extension().and_then(|x| x.to_str()) == Some("jsonl") => {
                     n += 1;
+                    // A size that cannot be read contributes nothing and
+                    // the file is still counted: this is a diagnostic
+                    // total, and a low byte figure beside a correct file
+                    // count is the honest shape.
+                    if let Ok(m) = e.metadata() {
+                        bytes += m.len();
+                    }
                 }
                 _ => {}
             }
         }
     }
-    n
+    (n, bytes)
 }
 
 /// Pull a string field out of a record, treating empty as absent.
@@ -711,6 +765,9 @@ pub fn scan(root: &Path) -> Scan {
 
     let mut out = Scan {
         subagent_files_skipped: walk.nested,
+        session_bytes: walk.session_bytes,
+        subagent_bytes: walk.subagent_bytes,
+        unsized_files: walk.unsized_files,
         unreadable_dirs: walk.unreadable,
         absent_root: walk.absent_root,
         ..Default::default()
@@ -1505,5 +1562,46 @@ mod tests {
             extract(&path).unwrap().opening_prompt.as_deref(),
             Some("from a block")
         );
+    }
+
+    /// #1135: the corpus this app reads most was the one footprint it
+    /// never reported, while worktrees, artifacts, venvs, Docker and
+    /// packages all had one.
+    #[test]
+    fn session_and_subagent_bytes_are_counted_apart() {
+        let tmp = Tmp::new("bytes");
+        let root = tmp.0.join("projects");
+        let slug = root.join("slug");
+        std::fs::create_dir_all(slug.join("s1").join("subagents")).unwrap();
+
+        // A session transcript, and a subagent one under it.
+        std::fs::write(slug.join("s1.jsonl"), "x".repeat(100)).unwrap();
+        std::fs::write(
+            slug.join("s1").join("subagents").join("a1.jsonl"),
+            "y".repeat(40),
+        )
+        .unwrap();
+
+        let got = scan(&root);
+        assert_eq!(got.session_bytes, 100, "the session transcript");
+        assert_eq!(
+            got.subagent_bytes, 40,
+            "and the subagent one, kept apart -- the two mean different things"
+        );
+        assert_eq!(got.subagent_files_skipped, 1);
+        assert_eq!(got.unsized_files, 0, "everything was measurable");
+    }
+
+    /// An empty corpus reports zero bytes and zero unsized -- a real
+    /// answer, distinguishable from a corpus we could not measure.
+    #[test]
+    fn an_empty_corpus_reports_zero_rather_than_nothing() {
+        let tmp = Tmp::new("emptybytes");
+        let root = tmp.0.join("projects");
+        std::fs::create_dir_all(root.join("slug")).unwrap();
+
+        let got = scan(&root);
+        assert_eq!(got.session_bytes, 0);
+        assert_eq!(got.unsized_files, 0);
     }
 }

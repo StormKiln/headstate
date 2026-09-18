@@ -1142,6 +1142,17 @@ export interface ClaudeImported {
   /// transcripts, not sessions. Just under half the corpus -- counted so
   /// the exclusion stays visible rather than invisible.
   subagent_files_skipped: number;
+  /// Bytes across the session transcripts (#1135). Optional so a cached
+  /// import from before this field existed deserialises rather than
+  /// failing.
+  session_bytes?: number;
+  /// Bytes across the subagent transcripts, kept apart: roughly half the
+  /// `.jsonl` files on disk are subagent ones, and the two mean
+  /// different things.
+  subagent_bytes?: number;
+  /// Files whose size could not be read, making both totals FLOORS. A
+  /// size we could not take is not a size of zero.
+  unsized_files?: number;
   unreadable_dirs: string[];
   unreadable_files: string[];
   metadata_beyond_first_record: number;

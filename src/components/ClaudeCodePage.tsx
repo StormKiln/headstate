@@ -31,7 +31,8 @@ import { AUTO_COMPACT_PRESSURE, subagentDisagreement } from "@/lib/subagentDisag
 import { relativeTime } from "@/lib/time";
 import { useIsMobile } from "@/lib/useIsMobile";
 import { useRowCursor } from "@/lib/useRowCursor";
-import { pathBasename, safetyReason, sessionWorktree } from "@/lib/worktrees";
+import {
+  formatSize, pathBasename, safetyReason, sessionWorktree } from "@/lib/worktrees";
 import { type ClaudeSessionFilter, useFilters } from "@/store/filters";
 import { QueryError, errorMessage } from "./QueryError";
 import { ExternalLink } from "./ExternalLink";
@@ -1096,6 +1097,26 @@ function Banners({
                 {imported.data.subagent_files_skipped.toLocaleString()} subagent transcript
                 {imported.data.subagent_files_skipped === 1 ? "" : "s"} skipped — they are not
                 sessions and cannot be resumed
+              </>
+            ) : null}
+            {/* What the corpus costs on disk (#1135).
+                Headstate reports a footprint for worktrees, artifacts,
+                venvs, Docker and packages; the one corpus it reads most
+                had none. The two halves stay APART because they mean
+                different things -- sessions you can resume against work
+                they delegated.
+
+                Qualified when a size could not be read: a size we could
+                not take is not a size of zero, so the total is a floor
+                and says so. */}
+            {(imported.data.session_bytes ?? 0) > 0 ? (
+              <>
+                {" · "}
+                {(imported.data.unsized_files ?? 0) > 0 ? "at least " : ""}
+                {formatSize(imported.data.session_bytes ?? 0)} of transcripts
+                {(imported.data.subagent_bytes ?? 0) > 0
+                  ? `, plus ${formatSize(imported.data.subagent_bytes ?? 0)} of subagent transcripts`
+                  : ""}
               </>
             ) : null}
           </span>
