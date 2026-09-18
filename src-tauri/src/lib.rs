@@ -278,6 +278,7 @@ pub fn run() {
             commands::apply_updates_in_background,
             commands::cancel_update_run,
             commands::update_run_state,
+            commands::claude_md_effective,
             commands::scan_claude_md,
             commands::read_claude_md,
             commands::claude_import_transcripts,

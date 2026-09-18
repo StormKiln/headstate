@@ -1007,6 +1007,30 @@ export interface ClaudeFile {
 /// "we could not look", so an unreadable file rendered as #846's own
 /// sentence -- "No CLAUDE.md files in this repository" -- about a file on
 /// disk. The `Scan` shape is `ClaudeCodePage`'s, one view over.
+/// Which scope a CLAUDE.md came from (#1131). Mirrors
+/// `claudemd::Scope`.
+type ClaudeMdScope = "global" | "repo" | "local";
+
+interface ClaudeMdScopedFile {
+  scope: ClaudeMdScope;
+  file: ClaudeFile;
+}
+
+/// The repo scan plus the scopes a session actually loads (#1131).
+///
+/// The repo page answered "what is in this repository", which is not the
+/// context a session loads: `~/.claude/CLAUDE.md` goes into every
+/// session on the machine, so the token total was short by that amount
+/// with nothing saying so.
+export interface ClaudeMdEffectiveScan {
+  /// Unchanged from `scanClaudeMd`. Its totals keep their exact meaning.
+  repo: ClaudeMdScan;
+  extra: ClaudeMdScopedFile[];
+  /// Scopes that exist and could not be read. Non-empty means the
+  /// combined figure below is a floor.
+  unreadable: string[];
+}
+
 export interface ClaudeMdScan {
   /// What DID read. Never blanked because something else did not.
   files: ClaudeFile[];

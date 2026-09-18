@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { ClaudeFile, ClaudeMdScan, ImportNode } from "@/types/pr";
+import type {
+  ClaudeMdEffectiveScan, ClaudeFile, ClaudeMdScan, ImportNode } from "@/types/pr";
 
 const copyFn = vi.hoisted(() => vi.fn(() => Promise.resolve(null as string | null)));
 const state = vi.hoisted(() => ({
@@ -26,15 +27,21 @@ const refetchFn = vi.hoisted(() => vi.fn());
 const refetchTextFn = vi.hoisted(() => vi.fn());
 
 vi.mock("../api/hooks", () => ({
-  useClaudeMd: () => ({
+  useClaudeMdEffective: () => ({
     // A `Scan`, not a bare array (#972). The bare array was what made the
     // page unable to tell "none" from "could not look".
     data: {
-      files: state.files,
-      unreadable_dirs: state.unreadableDirs,
-      unreadable_files: state.unreadableFiles,
-      skipped_dirs: 0,
-    } satisfies ClaudeMdScan,
+      // #1131: the repo scan is unchanged; the extra scopes are
+      // empty because these tests are about the repository list.
+      extra: [],
+      unreadable: [],
+      repo: {
+        files: state.files,
+        unreadable_dirs: state.unreadableDirs,
+        unreadable_files: state.unreadableFiles,
+        skipped_dirs: 0,
+      } satisfies ClaudeMdScan,
+    } satisfies ClaudeMdEffectiveScan,
     isLoading: state.loading,
     isError: state.failed,
     error: "could not read the repository",
@@ -105,10 +112,25 @@ describe("ClaudeMdPage", () => {
   /// Every token figure is an ESTIMATE -- chars/4, not a tokeniser --
   /// and a number labelled "tokens" that is not measured is exactly the
   /// confidently-wrong figure this app refuses to ship.
+  /// `getAllByText`, not `getByText`: since #1131 the page also prints a
+  /// COMBINED figure across scopes, so there is more than one count on
+  /// screen. The property under test is that every one of them is
+  /// labelled an estimate, which is what this now asserts.
   it("labels every token count as an estimate", () => {
     state.files = [file()];
     render(<ClaudeMdPage />);
-    expect(screen.getByText(/est\. tokens/)).toBeTruthy();
+    const counts = screen.getAllByText(/est\. tokens/);
+    expect(counts.length).toBeGreaterThan(0);
+  });
+
+  /// #1131: the combined figure says what it spans.
+  ///
+  /// A total that silently crosses scopes is the same defect as one that
+  /// silently omits them, so the sentence names its own scope.
+  it("states what the combined total covers", () => {
+    state.files = [file()];
+    render(<ClaudeMdPage />);
+    expect(screen.getByText(/across this repository/)).toBeTruthy();
   });
 
   /// The number that matters: a small file pulling in a large tree.

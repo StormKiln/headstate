@@ -111,6 +111,110 @@ impl Scan {
 /// One unreadable file does NOT blank the list. The files that did read
 /// are real and useful, so the shortfall is reported beside them rather
 /// than in place of them.
+/// Which scope a CLAUDE.md came from (#1131).
+///
+/// The repo scan answers "what is in this repository", which is NOT the
+/// context a session loads: `~/.claude/CLAUDE.md` goes into every
+/// session on the machine, and the page's token total was short by that
+/// amount without saying so. A user budgeting context was reading a
+/// number missing its largest shared contributor.
+///
+/// Labelled rather than merged into the repo list, because attributing a
+/// machine-wide file to one project is its own wrong answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Scope {
+    /// `~/.claude/CLAUDE.md` -- loaded into every session on this machine.
+    Global,
+    /// A `CLAUDE.md` inside the repository.
+    Repo,
+    /// A `CLAUDE.local.md` -- the user's own overrides, not committed.
+    Local,
+}
+
+/// A CLAUDE.md with the scope it came from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScopedFile {
+    pub scope: Scope,
+    pub file: ClaudeFile,
+}
+
+/// The repo scan plus the scopes a session actually loads (#1131).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EffectiveScan {
+    /// The repository scan, unchanged. Its totals keep their exact
+    /// meaning -- this type ADDS scopes rather than redefining a number
+    /// users have been reading.
+    pub repo: Scan,
+    /// The global and local files, when they exist and could be read.
+    pub extra: Vec<ScopedFile>,
+    /// Scopes that exist and could NOT be read, with why.
+    ///
+    /// The load-bearing field: an unreadable global file means the
+    /// combined figure is a floor by an unknown amount, and silently
+    /// omitting it would understate the total in exactly the way this
+    /// page exists to prevent.
+    pub unreadable: Vec<String>,
+}
+
+impl EffectiveScan {
+    /// Every scope's tokens together. A FLOOR when `combined_partial`.
+    pub fn combined_tokens(&self) -> u64 {
+        self.repo.files.iter().map(|f| f.total_tokens).sum::<u64>()
+            + self.extra.iter().map(|s| s.file.total_tokens).sum::<u64>()
+    }
+
+    /// Whether the combined figure is a floor.
+    ///
+    /// Three ways it can be: a file's import tree went unmeasured, the
+    /// repo walk could not read something, or a scope file itself could
+    /// not be read. All three UNDERSTATE the total, so all three qualify
+    /// it.
+    pub fn combined_partial(&self) -> bool {
+        !self.unreadable.is_empty()
+            || !self.repo.unreadable_dirs.is_empty()
+            || !self.repo.unreadable_files.is_empty()
+            || self.repo.files.iter().any(|f| f.total_partial)
+            || self.extra.iter().any(|s| s.file.total_partial)
+    }
+}
+
+/// The repo scan, plus `~/.claude/CLAUDE.md` and any `CLAUDE.local.md`.
+///
+/// `home` is a PARAMETER for `expand_home_in`'s reason: `$HOME` is
+/// global state and a test that changes it races every other test in the
+/// binary.
+pub fn scan_effective_in(repo: &Path, home: &Path) -> EffectiveScan {
+    let mut out = EffectiveScan {
+        repo: scan_repo(repo),
+        ..Default::default()
+    };
+
+    // Read through the SAME `read_file_reporting` the repo scan uses, so
+    // imports resolve and count identically. A second code path here
+    // would be the one that drifts.
+    for (scope, path) in [
+        (Scope::Global, home.join(".claude").join("CLAUDE.md")),
+        (Scope::Local, repo.join("CLAUDE.local.md")),
+    ] {
+        // ABSENT is not unreadable. Most machines have no
+        // `CLAUDE.local.md`, and reporting that as a problem would make
+        // the honest signal worthless.
+        if !path.is_file() {
+            continue;
+        }
+        match read_file_reporting(&path) {
+            Ok(file) => out.extra.push(ScopedFile { scope, file }),
+            Err(e) => out
+                .unreadable
+                .push(format!("{}: {e}", path.to_string_lossy())),
+        }
+    }
+    out
+}
+
 pub fn scan_repo(repo: &Path) -> Scan {
     // WORKTREES are the important entries here.
     //
@@ -258,4 +362,100 @@ pub(crate) fn expand_home_in(raw: &str, home: &Path) -> Option<PathBuf> {
 /// The user's home directory, when there is one.
 pub(crate) fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod effective_tests {
+    use super::*;
+
+    /// Build a home and a repo under one tempdir. `home` is passed
+    /// explicitly everywhere rather than via `$HOME`, which is global
+    /// state that would race every other test in the binary.
+    fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        (tmp, home, repo)
+    }
+
+    /// #1131: the global file is counted, and labelled as global.
+    ///
+    /// `~/.claude/CLAUDE.md` loads into every session on the machine, so
+    /// a page that omits it prints a token total short by that amount
+    /// with nothing saying so.
+    #[test]
+    fn the_global_file_is_found_and_labelled() {
+        let (_t, home, repo) = fixture();
+        std::fs::write(home.join(".claude").join("CLAUDE.md"), "global rules here").unwrap();
+        std::fs::write(repo.join("CLAUDE.md"), "repo rules").unwrap();
+
+        let scan = scan_effective_in(&repo, &home);
+        let global = scan
+            .extra
+            .iter()
+            .find(|s| s.scope == Scope::Global)
+            .expect("the global file must be found");
+        assert!(global.file.tokens > 0, "and counted");
+        // NOT merged into the repo list: attributing a machine-wide file
+        // to one project is its own wrong answer.
+        assert!(
+            !scan.repo.files.iter().any(|f| f.path.contains(".claude")),
+            "the global file must not appear in the repo scan"
+        );
+    }
+
+    /// The combined figure must include every scope, or it is the same
+    /// short number under a new name.
+    #[test]
+    fn the_combined_total_includes_every_scope() {
+        let (_t, home, repo) = fixture();
+        std::fs::write(home.join(".claude").join("CLAUDE.md"), "a".repeat(400)).unwrap();
+        std::fs::write(repo.join("CLAUDE.md"), "b".repeat(400)).unwrap();
+
+        let scan = scan_effective_in(&repo, &home);
+        let repo_only: u64 = scan.repo.files.iter().map(|f| f.total_tokens).sum();
+        assert!(
+            scan.combined_tokens() > repo_only,
+            "combined {} must exceed the repo-only {repo_only}",
+            scan.combined_tokens()
+        );
+    }
+
+    /// An ABSENT `CLAUDE.local.md` is not a problem. Most machines have
+    /// none, and reporting that would make the honest signal worthless.
+    #[test]
+    fn an_absent_local_file_is_not_reported_as_unreadable() {
+        let (_t, home, repo) = fixture();
+        let scan = scan_effective_in(&repo, &home);
+        assert!(
+            scan.unreadable.is_empty(),
+            "a file that does not exist is not one that could not be read"
+        );
+        assert!(!scan.combined_partial(), "and the total is not a floor");
+    }
+
+    /// The repo scan's own totals keep their exact meaning. Redefining
+    /// them to include the global file would silently change a number
+    /// users have been reading.
+    #[test]
+    fn the_repo_scan_is_unchanged_by_the_global_file() {
+        let (_t, home, repo) = fixture();
+        std::fs::write(home.join(".claude").join("CLAUDE.md"), "x".repeat(4000)).unwrap();
+        std::fs::write(repo.join("CLAUDE.md"), "repo").unwrap();
+
+        let alone = scan_repo(&repo);
+        let effective = scan_effective_in(&repo, &home);
+        assert_eq!(
+            effective
+                .repo
+                .files
+                .iter()
+                .map(|f| f.total_tokens)
+                .sum::<u64>(),
+            alone.files.iter().map(|f| f.total_tokens).sum::<u64>(),
+            "the repo total must mean exactly what it meant before"
+        );
+    }
 }

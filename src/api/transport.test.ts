@@ -193,6 +193,7 @@ const ROWS: Row[] = [
   row(api.packagesMarkdown, [repoPath, reports, filter], "packages_markdown", { repoPath, reports, filter }),
   row(api.backgroundPanicked, [], "background_panicked"),
   row(api.revealLog, [], "reveal_log"),
+  row(api.claudeMdEffective, [repoPath], "claude_md_effective", { repoPath }),
   row(api.scanClaudeMd, [repoPath], "scan_claude_md", { repoPath }),
   // The Claude Code cache, its session list and its aggregates (#914,
   // #917, #921). Three of these are argument-free: they operate on

@@ -1464,6 +1464,41 @@ pub fn reveal_log(app: AppHandle) -> Result<String, String> {
 /// partial answer labelled partial beats an error page: the files that did
 /// read are real, and the shortfall travels beside them.
 #[tauri::command]
+pub async fn claude_md_effective(
+    repo_path: String,
+) -> Result<crate::claudemd::EffectiveScan, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        // `home()` here rather than inside the scan, so the scan itself
+        // stays a pure function of its two paths and remains testable
+        // without touching `$HOME` -- process-global state that would
+        // race every other test in the binary.
+        //
+        // No home is not a failure: the repo scan is still a real
+        // answer, and the combined figure simply has no global scope to
+        // include. An `unreadable` entry says so rather than the page
+        // silently omitting a scope it never looked for.
+        let repo = std::path::PathBuf::from(&repo_path);
+        match crate::claudemd::home() {
+            Some(home) => crate::claudemd::scan_effective_in(&repo, &home),
+            None => {
+                let mut scan = crate::claudemd::EffectiveScan {
+                    repo: crate::claudemd::scan_repo(&repo),
+                    ..Default::default()
+                };
+                scan.unreadable.push(
+                    "~/.claude/CLAUDE.md: no home directory is set, so the global scope \
+                     could not be read"
+                        .to_string(),
+                );
+                scan
+            }
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn scan_claude_md(repo_path: String) -> Result<crate::claudemd::Scan, String> {
     tauri::async_runtime::spawn_blocking(move || {
         crate::claudemd::scan_repo(std::path::Path::new(&repo_path))

@@ -40,6 +40,7 @@ import type { PrActionName } from "./tauri";
 import {
   backgroundPanicked,
   claudeHooksInventory,
+  claudeMdEffective,
   getCached,
   actOnPrs,
   updatePrBranch,
@@ -103,7 +104,6 @@ import {
   markAssessed,
   checkPackages,
   readClaudeMd,
-  scanClaudeMd,
   claudeImportTranscripts,
   claudeOverview,
   claudePlugins,
@@ -1102,17 +1102,17 @@ export function usePackages(repoPath: string | undefined) {
   });
 }
 
-/// CLAUDE.md files in one repository, with import trees resolved.
+
+/// Every scope a session loads, not only the repository (#1131).
 ///
-/// `retry: false`, paired with the page's explicit retry (#846). A
-/// rejected scan used to leave `data` at its `[]` default and the page
-/// then said "No CLAUDE.md files in this repository" -- a confident,
-/// wrong answer to a question it could not answer, which is the exact
-/// defect `QueryError` was written to diagnose.
-export function useClaudeMd(repoPath: string | undefined) {
+/// Replaces `useClaudeMd` rather than sitting beside it: two queries
+/// reading the same repository would let the per-file list and the
+/// combined total disagree about the scan they describe, which is the
+/// disagreement this page exists to prevent.
+export function useClaudeMdEffective(repoPath: string | undefined) {
   return useQuery({
-    queryKey: ["claude-md", repoPath],
-    queryFn: () => scanClaudeMd(repoPath as string),
+    queryKey: ["claude-md-effective", repoPath],
+    queryFn: () => claudeMdEffective(repoPath as string),
     enabled: Boolean(repoPath),
     staleTime: 30_000,
     retry: false,

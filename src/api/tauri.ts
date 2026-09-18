@@ -13,6 +13,7 @@
 
 import { call } from "./transport";
 import type {
+  ClaudeMdEffectiveScan,
   AlertReport,
   CachedSnapshot,
   Artifact,
@@ -786,6 +787,14 @@ export const packagesMarkdown = (
 export const backgroundPanicked = () => call<boolean>("background_panicked");
 
 export const revealLog = () => call<string>("reveal_log");
+
+/// Every scope a session actually loads: the repository, plus
+/// `~/.claude/CLAUDE.md` and any `CLAUDE.local.md` (#1131).
+///
+/// The repo scan alone answered a narrower question, and its token total
+/// was short by the global file's weight with nothing saying so.
+export const claudeMdEffective = (repoPath: string) =>
+  call<ClaudeMdEffectiveScan>("claude_md_effective", { repoPath });
 
 /// Every CLAUDE.md in a repository, with its import tree resolved, AND
 /// what the scan could not read (#972).

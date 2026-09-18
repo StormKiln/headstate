@@ -246,6 +246,9 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("claudify_command", Class::Read),
     ("check_packages", Class::Read),
     ("packages_markdown", Class::Read),
+    // Read: the effective context a session loads, across scopes
+    // (#1131). One more file read than `scan_claude_md`, same class.
+    ("claude_md_effective", Class::Read),
     ("scan_claude_md", Class::Read),
     ("read_claude_md", Class::Read),
     // Rescan `~/.claude/projects` and upsert into our own cache (#914).
@@ -969,6 +972,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             a.get("reports")?,
             a.get("filter")?,
         )),
+        "claude_md_effective" => res(commands::claude_md_effective(a.get("repoPath")?).await),
         "scan_claude_md" => res(commands::scan_claude_md(a.get("repoPath")?).await),
         // `async` since #1090: an unbounded `read_to_string` dispatched
         // inline held this listener for the length of the file.
