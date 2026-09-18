@@ -922,6 +922,33 @@ const MIGRATIONS: &[&str] = &[
         last_activity_at TEXT
      );
      ALTER TABLE claude_session ADD COLUMN opening_prompt TEXT;",
+    // #1134: per-session token usage, so it can be summed across
+    // sessions without re-reading 916 MB of transcripts.
+    //
+    // PERSISTED rather than recomputed: `usage.rs` measures the
+    // whole-corpus read at 3.8 s, which is affordable once in the import
+    // pass and ruinous in the session list's ten-second poll -- the same
+    // argument #1002 makes for the subagent map.
+    //
+    // `truncated` travels with the row because a sum over truncated
+    // measurements is a FLOOR, and a total that cannot say so is the
+    // #846 defect in its purest form.
+    "CREATE TABLE IF NOT EXISTS claude_session_usage (
+        session_id       TEXT PRIMARY KEY,
+        messages         INTEGER NOT NULL,
+        input_tokens     INTEGER NOT NULL,
+        output_tokens    INTEGER NOT NULL,
+        cache_read       INTEGER NOT NULL,
+        cache_creation   INTEGER NOT NULL,
+        truncated        INTEGER NOT NULL,
+        measured_at      TEXT NOT NULL
+     );
+     CREATE TABLE IF NOT EXISTS claude_session_model (
+        session_id  TEXT NOT NULL,
+        model       TEXT NOT NULL,
+        messages    INTEGER NOT NULL,
+        PRIMARY KEY (session_id, model)
+     );",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {

@@ -832,3 +832,65 @@ mod tests {
         println!("elapsed         {:?}", t0.elapsed());
     }
 }
+
+/// Token usage summed across sessions (#1134).
+///
+/// # Why this is persisted rather than computed on demand
+///
+/// The per-session figures already exist; only the aggregation was
+/// missing. But computing it live means reading the whole corpus --
+/// measured in this module's header at 3.8 s over 916 MB -- which is
+/// affordable once in the import pass and ruinous in a poll. So the
+/// import writes a row per session and this sums the rows.
+///
+/// # Why the denominators travel with the totals
+///
+/// A total is only as good as what it covers, and three things can make
+/// it short: a session never measured, a session whose transcript
+/// carried no usage block at all, and a session whose read stopped at
+/// `BUDGET_BYTES`. Each understates the sum, so each is reported
+/// alongside it rather than folded in silently -- the rule `usage.rs`
+/// already applies per session with `truncated`.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Profile {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub messages: u64,
+    /// Sessions with a stored measurement -- the denominator.
+    pub sessions_measured: u64,
+    /// Sessions whose measurement stopped at the budget, so their
+    /// figures are floors and therefore so is this total.
+    pub sessions_truncated: u64,
+    /// Models across every measured session, most messages first.
+    pub models: Vec<ModelCount>,
+    /// The heaviest directories by output tokens, most first.
+    ///
+    /// Output rather than input: it is what the model actually wrote,
+    /// and the figure that answers "where is the work happening".
+    pub by_directory: Vec<DirectoryUsage>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectoryUsage {
+    pub cwd: String,
+    pub output_tokens: u64,
+    pub sessions: u64,
+}
+
+impl Profile {
+    /// Whether every figure here is a floor rather than a total.
+    pub fn partial(&self) -> bool {
+        self.sessions_truncated > 0
+    }
+}
+
+/// How many directories the profile reports.
+///
+/// A top-N rather than every directory: the corpus holds sessions from
+/// hundreds of paths and a list that long answers nothing. Ten is what
+/// fits a panel without scrolling.
+pub const TOP_DIRECTORIES: usize = 10;

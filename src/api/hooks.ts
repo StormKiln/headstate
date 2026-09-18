@@ -37,8 +37,12 @@ import type {
   WorktreeScan,
 } from "../types/pr";
 import type {
+  ClaudeDefinitions,
+  ClaudeEffectiveSettings,
+  ClaudeUsageProfile,
+  PrActionName,
   ToolReport,
-  ClaudeDefinitions, ClaudeEffectiveSettings, PrActionName } from "./tauri";
+} from "./tauri";
 import {
   toolVersions,
   backgroundPanicked,
@@ -46,6 +50,7 @@ import {
   claudeMdEffective,
   claudeDefinitions,
   claudeEffectiveSettings,
+  claudeUsageProfile,
   getCached,
   actOnPrs,
   updatePrBranch,
@@ -1398,6 +1403,20 @@ export function useClaudeSessions(enabled: boolean) {
 /// A rejected read must reach the caller's error arm. Four zeroes for a
 /// transcript that could not be read is a confident wrong answer with a
 /// credible shape, which is precisely what this feature is filed against.
+/// Token usage across every measured session (#1134).
+///
+/// `staleTime: Infinity`: the rows change only when the import pass
+/// rewrites them, and the overview already refetches on a rescan.
+export function useClaudeUsageProfile(enabled = true) {
+  return useQuery<ClaudeUsageProfile>({
+    queryKey: ["claude-usage-profile"],
+    queryFn: claudeUsageProfile,
+    enabled,
+    staleTime: Infinity,
+    retry: false,
+  });
+}
+
 export function useClaudeSessionUsage(path: string | null) {
   return useQuery<ClaudeUsage>({
     queryKey: ["claude-usage", path],

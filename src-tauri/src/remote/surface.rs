@@ -409,6 +409,8 @@ pub const SURFACE: &[(&str, Class)] = &[
     // keeps the 76.7 MB transcript on the development machine from
     // hanging a phone's request -- the same "the limits live inside the
     // command" rule `stats_board` above is classed by.
+    // Read: one aggregate query over stored rows (#1134).
+    ("claude_usage_profile", Class::Read),
     ("claude_session_usage", Class::Read),
     // The tail of one session's transcript, as conversation (#982).
     //
@@ -1012,6 +1014,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "claude_definitions" => res(commands::claude_definitions().await),
         "claude_plugins" => res(commands::claude_plugins(app.clone()).await),
         "claude_restart_list" => res(commands::claude_restart_list(app.clone()).await),
+        "claude_usage_profile" => res(commands::claude_usage_profile(app.clone()).await),
         "claude_session_usage" => res(commands::claude_session_usage(a.get("path")?).await),
         "claude_transcript_tail" => res(commands::claude_transcript_tail(a.get("path")?).await),
         "claude_hooks_inventory" => res(commands::claude_hooks_inventory()),

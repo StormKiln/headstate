@@ -226,6 +226,7 @@ const ROWS: Row[] = [
   // #1071. No arguments: the fold is over the desktop's own session list,
   // so there is no id or path for a remote caller to steer.
   row(api.claudeRestartList, [], "claude_restart_list"),
+  row(api.claudeUsageProfile, [], "claude_usage_profile"),
   row(api.claudeSessionUsage, [path], "claude_session_usage", { path }),
   row(api.claudeSubagentRollup, ["s1"], "claude_subagent_rollup", { sessionId: "s1" }),
   row(api.claudeSessionEvents, ["s1"], "claude_session_events", { sessionId: "s1" }),
