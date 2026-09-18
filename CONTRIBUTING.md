@@ -50,11 +50,19 @@ Install dependencies once with `yarn install --immutable`, then use the
 Makefile targets for everything:
 
 ```
+make doctor   # what a fresh checkout needs before lint can run
 make dev      # run the app locally with live reload
 make test     # cargo test + yarn vitest run
 make lint     # cargo fmt --check, clippy, tsc, eslint, knip
 make fmt      # cargo fmt (writes, doesn't just check)
 ```
+
+**In a fresh checkout or a new worktree, run `make doctor` first.** `make
+lint` assumes an environment that is already set up, and when it isn't
+the error names none of its causes — an unlinked worktree fails with
+"Couldn't find the node_modules state file" after `tsc` has already
+started. `make doctor` answers that in one pass, tells you the command to
+fix each thing, and does not fail over optional tools you may not need.
 
 Run `make lint` and `make test` before opening a PR. Every CI check must be
 green before merge — there's no fast-tracking a red check.
