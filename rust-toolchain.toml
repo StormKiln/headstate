@@ -1,0 +1,34 @@
+# The compiler this repository is verified against.
+#
+# CI resolved `stable` at run time, so the compiler that gates every PR
+# changed underneath the repo without a commit. A new stable that adds a
+# Clippy lint turns `-D warnings` red on an untouched branch -- and
+# because the ruleset uses `strict_required_status_checks_policy`, that
+# blocks every open PR at once, with no local way to reproduce it since a
+# developer's `rustup` is on a different date (#1153).
+#
+# The repo's own standard was already stricter everywhere else:
+# `package.json` pins the package manager to an exact hash, and every
+# third-party action is pinned to a full commit SHA. Its own compiler was
+# the exception.
+#
+# Bumped deliberately, on a PR that runs the full gate, rather than
+# silently by the calendar. Dependabot has no ecosystem for this file or
+# for `.nvmrc`, so the bump is manual by design: edit the channel, run
+# `make lint` and `make test`, and let CI prove the new compiler against
+# the whole tree before it becomes the one gating everyone else. That is
+# the property the old floating `stable` could not offer -- there, the
+# new compiler arrived on someone else's unrelated PR.
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
+# The three targets `make check-intel`, `check-mobile-ios` and
+# `check-mobile-android` add by hand (Makefile:46, :53, :203). Declared
+# here so a fresh checkout has them without three separate
+# `rustup target add` invocations, and so the set is written down in one
+# place rather than inferred from Makefile recipes.
+targets = [
+  "x86_64-apple-darwin",
+  "aarch64-apple-ios",
+  "aarch64-linux-android",
+]
