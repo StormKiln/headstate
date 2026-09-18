@@ -27,6 +27,9 @@ const uiPrefs = vi.hoisted(() => ({
 }));
 
 vi.mock("./api/hooks", () => ({
+  // #1144. False is the healthy case every test in this file assumes;
+  // the panicked state has its own tests in StatusBar.test.tsx.
+  useBackgroundPanicked: () => false,
   // Defaults, matching the Rust side: nothing hidden, close hides.
   useUiPrefs: () => ({
     prefs: uiPrefs.value,

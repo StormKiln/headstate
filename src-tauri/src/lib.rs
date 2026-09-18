@@ -16,6 +16,7 @@ pub mod health;
 #[cfg(test)]
 mod invariants;
 pub mod packages;
+pub mod panic_hook;
 pub mod poll;
 pub mod redact;
 pub mod remote;
@@ -170,6 +171,11 @@ pub fn run() {
     // first `ClientConfig::builder()` in any dependency panics.
     remote::gate::install_crypto_provider();
 
+    // Before anything spawns. A panic in a background task otherwise
+    // kills that task silently -- the poll loop stops, the badge freezes
+    // on its last value, and the window still paints (#1144).
+    panic_hook::install();
+
     tauri::Builder::default()
         // A GUI-launched .app has no stderr, so every eprintln! in this
         // codebase went nowhere a user could reach. "It stopped updating"
@@ -219,6 +225,7 @@ pub fn run() {
         )
         .invoke_handler(tauri::generate_handler![
             commands::diag_log,
+            commands::background_panicked,
             commands::reveal_log,
             commands::pull_checkout,
             commands::fetch_refs,

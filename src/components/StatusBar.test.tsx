@@ -14,6 +14,9 @@ const version = vi.hoisted(() => ({
   value: "2.0.2" as string | null,
   newer: null as string | null,
 }));
+/// Whether a background task has died (#1144). Defaults false, which is
+/// the healthy case every other test in this file assumes.
+const panicked = vi.hoisted(() => ({ value: false }));
 vi.mock("../api/tauri", () => ({
   latestRelease: () => Promise.resolve(version.newer),
 }));
@@ -26,6 +29,7 @@ vi.mock("@tauri-apps/api/app", () => ({
 }));
 
 vi.mock("../api/hooks", () => ({
+  useBackgroundPanicked: () => panicked.value,
   // Defaults, matching the Rust side: nothing hidden, close hides.
   useUiPrefs: () => ({
     prefs: { hidden_views: [], close_hides_to_tray: true },
@@ -392,5 +396,47 @@ describe("StatusBar", () => {
     expect(screen.queryByText(/Updating packages/)).toBeNull();
     state.removal = null;
     state.updating = null;
+  });
+});
+
+
+/// #1144: a panicked background task must not render as a healthy app.
+///
+/// The poll loop produces every other state this bar shows, so once it
+/// is dead "PRs up to date" is a claim about a number nothing is
+/// refreshing -- true when written, indistinguishable from true now.
+/// That is #1042's Pending-vs-Unknown collapse on the status bar.
+describe("a panicked background task", () => {
+  afterEach(() => {
+    panicked.value = false;
+  });
+
+  it("says background updates stopped", async () => {
+    panicked.value = true;
+    render(<StatusBar updatedAt={Date.now()} />);
+    expect(await screen.findByText(/Background updates stopped/)).toBeTruthy();
+  });
+
+  /// The load-bearing half. A fresh timestamp and a healthy poll would
+  /// otherwise render "PRs up to date" beside numbers nothing is
+  /// updating.
+  it("outranks a successful poll", async () => {
+    panicked.value = true;
+    state.current = "idle";
+    state.error = null;
+    render(<StatusBar updatedAt={Date.now()} />);
+    expect(await screen.findByText(/Background updates stopped/)).toBeTruthy();
+    expect(screen.queryByText("PRs up to date")).toBeNull();
+  });
+
+  /// And the other direction, so the state cannot become permanent: a
+  /// healthy process must still say so.
+  it("does not claim a healthy process has stopped", async () => {
+    panicked.value = false;
+    state.current = "idle";
+    state.error = null;
+    render(<StatusBar updatedAt={Date.now()} />);
+    expect(await screen.findByText("PRs up to date")).toBeTruthy();
+    expect(screen.queryByText(/Background updates stopped/)).toBeNull();
   });
 });

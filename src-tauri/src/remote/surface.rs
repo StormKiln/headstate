@@ -61,6 +61,11 @@ pub enum Class {
 /// diff against the design document is a line-by-line comparison.
 pub const SURFACE: &[(&str, Class)] = &[
     // read: no side effects on GitHub or disk.
+    // Read: the phone asking whether the DESKTOP's background work died
+    // is a question about state, not an action on the machine. The
+    // remedy it points at (`reveal_log`) stays Local, which is why the
+    // companion says the log opens at that Mac.
+    ("background_panicked", Class::Read),
     ("get_auth_state", Class::Read),
     ("get_cached", Class::Read),
     ("get_cached_reviewing", Class::Read),
@@ -825,6 +830,7 @@ pub async fn dispatch(
 async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, RemoteError> {
     match command {
         // ---- read -------------------------------------------------------
+        "background_panicked" => ok(commands::background_panicked()),
         "get_auth_state" => ok(commands::get_auth_state(app.state())),
         "get_cached" => res(commands::get_cached(app.clone())),
         "get_cached_reviewing" => res(commands::get_cached_reviewing(app.clone())),

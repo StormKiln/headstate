@@ -38,6 +38,7 @@ import type {
 } from "../types/pr";
 import type { PrActionName } from "./tauri";
 import {
+  backgroundPanicked,
   getCached,
   actOnPrs,
   updatePrBranch,
@@ -3359,6 +3360,32 @@ export function usePollInterval() {
 }
 
 /// Interface preferences.
+/// Whether a background task has panicked since launch (#1144).
+///
+/// POLLED rather than pushed, and that is not a shortcut: a panic has no
+/// event to emit, because the task that would have emitted it is the one
+/// that died. Thirty seconds is chosen against what it competes with --
+/// the badge is already stale by the time this matters, so arriving a
+/// few seconds later costs nothing, and a tighter interval would spend a
+/// command round-trip per tick to learn a bool that almost never changes.
+///
+/// `staleTime: 0` so a remount re-asks. The answer is monotonic within a
+/// process (nothing clears the flag), but a relaunch clears it, and a
+/// cached `true` surviving into a healthy process would be the mirror of
+/// the defect this fixes.
+export function useBackgroundPanicked(): boolean {
+  const query = useQuery({
+    queryKey: ["background-panicked"],
+    queryFn: backgroundPanicked,
+    refetchInterval: 30_000,
+    staleTime: 0,
+  });
+  // `undefined` while it is in flight renders as healthy, deliberately:
+  // "not asked yet" must not paint the alarming state, which is the
+  // Pending-vs-Unknown rule pointed the other way.
+  return query.data === true;
+}
+
 export function useUiPrefs() {
   const qc = useQueryClient();
   const query = useQuery({

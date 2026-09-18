@@ -30,6 +30,11 @@ pub enum Class {
 /// Command name to class, in the desktop's order.
 pub const SURFACE: &[(&str, Class)] = &[
     // read: no side effects on GitHub or disk.
+    // Whether the DESKTOP's background work has died (#1144). Read: a
+    // question about state, not an action on that machine. The remedy it
+    // points at (`reveal_log`) stays Local, which is why the companion
+    // says the log opens at that Mac.
+    ("background_panicked", Class::Read),
     ("get_auth_state", Class::Read),
     ("get_cached", Class::Read),
     ("get_cached_reviewing", Class::Read),
