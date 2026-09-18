@@ -1,5 +1,6 @@
 import { Card } from "@/components/ui/card";
-import { useClaudePlugins } from "../api/hooks";
+import { useClaudeDefinitions, useClaudePlugins } from "../api/hooks";
+import type { ClaudeDefinition } from "../api/tauri";
 import { relativeTime } from "../lib/time";
 import type {
   InstalledPlugin,
@@ -237,6 +238,8 @@ function Loaded({
       <div className="mt-4">
         <Table usage={usage} byName={byName} partial={partial} />
       </div>
+
+      <DefinitionsSection />
 
       {inventory_absent && installed.length === 0 && (
         // Measured, and the answer is none. Not a failure, and not
@@ -626,5 +629,101 @@ function CallCount({
   // because a floor of zero is not a zero.
   return (
     <span className="text-[#8b949e]">{partial ? "none recorded so far" : "no calls"}</span>
+  );
+}
+
+/// Every skill, subagent and slash command on this machine (#1129).
+///
+/// The plugins table above reports which plugins SHIP a `skills/`
+/// directory and nothing about what is inside it, so a user could not
+/// answer "what subagents do I have". Hand-written definitions -- the
+/// ones belonging to no plugin -- were invisible entirely.
+/// Exported for its own test file: the plugins report this page also
+/// renders is a large fixture, and reconstructing it to exercise a
+/// sibling section would test the fixture.
+export function DefinitionsSection() {
+  const { data, isLoading, isError, error, refetch } = useClaudeDefinitions();
+
+  if (isError) {
+    // NOT an empty list. "You have no skills" and "we could not look"
+    // are different answers, and this page's whole argument is that the
+    // second must never render as the first.
+    return (
+      <div className="mt-6">
+        <h3 className="text-sm font-semibold text-[#e6edf3]">Skills, agents and commands</h3>
+        <div className="mt-2">
+          <QueryError
+            title="Definitions could not be read"
+            message={errorMessage(error)}
+            onRetry={() => void refetch()}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  if (isLoading || !data) {
+    return (
+      <div className="mt-6">
+        <h3 className="text-sm font-semibold text-[#e6edf3]">Skills, agents and commands</h3>
+        <div className="mt-2 min-h-20" aria-busy="true" />
+      </div>
+    );
+  }
+
+  const byKind = (k: ClaudeDefinition["kind"]) => data.definitions.filter((d) => d.kind === k);
+
+  return (
+    <div className="mt-6">
+      <h3 className="text-sm font-semibold text-[#e6edf3]">Skills, agents and commands</h3>
+      <p className="mt-1 text-xs text-[#8b949e]">
+        Everything in <code>~/.claude</code>, including definitions that belong to no plugin.
+      </p>
+
+      {/* What could not be read, ABOVE the list rather than instead of
+          it: the definitions that did read are real and worth showing,
+          which is the trade `PartialScanNotice` states. */}
+      {data.unreadable.length > 0 && (
+        <p role="status" className="mt-2 text-xs text-[#d29922]">
+          {data.unreadable.length} director{data.unreadable.length === 1 ? "y" : "ies"} could
+          not be read, so the list below may not be all of them.
+        </p>
+      )}
+
+      {data.definitions.length === 0 ? (
+        <p className="mt-2 text-sm text-[#8b949e]">
+          No skills, agents or commands are defined here.
+        </p>
+      ) : (
+        <div className="mt-2 space-y-3">
+          {(["skill", "agent", "command"] as const).map((kind) => {
+            const items = byKind(kind);
+            if (items.length === 0) return null;
+            return (
+              <div key={kind}>
+                <p className="text-xs uppercase tracking-wide text-[#8b949e]">
+                  {kind}s ({items.length})
+                </p>
+                <ul className="mt-1 space-y-0.5">
+                  {items.map((d) => (
+                    <li key={d.path} className="text-xs">
+                      <span className="text-[#e6edf3]">{d.name}</span>
+                      {/* A name taken from the filename is marked, so a
+                          reader can tell it from one the author wrote. */}
+                      {!d.named_in_frontmatter && (
+                        <span className="ml-1 text-[10px] text-[#6e7681]">(from filename)</span>
+                      )}
+                      {d.description && (
+                        <span className="ml-2 text-[#8b949e]">{d.description}</span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
   );
 }

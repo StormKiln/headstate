@@ -36,11 +36,13 @@ import type {
   Worktree,
   WorktreeScan,
 } from "../types/pr";
-import type { PrActionName } from "./tauri";
+import type {
+  ClaudeDefinitions, PrActionName } from "./tauri";
 import {
   backgroundPanicked,
   claudeHooksInventory,
   claudeMdEffective,
+  claudeDefinitions,
   getCached,
   actOnPrs,
   updatePrBranch,
@@ -1491,6 +1493,21 @@ export function useClaudeEventProfile(enabled = true) {
 /// `retry: false` on the same grounds as the hooks above: the failures
 /// this can have -- no home directory, an unreadable database -- are
 /// settled refusals that a second identical call cannot fix.
+/// Every skill, subagent and slash command in `~/.claude` (#1129).
+///
+/// `staleTime: Infinity` matching `useClaudePlugins`: these are files a
+/// user edits by hand, not state that moves under them, so a refetch on
+/// every focus would be a directory walk for nothing.
+export function useClaudeDefinitions(enabled = true) {
+  return useQuery<ClaudeDefinitions>({
+    queryKey: ["claude-definitions"],
+    queryFn: () => claudeDefinitions(),
+    enabled,
+    staleTime: Infinity,
+    retry: false,
+  });
+}
+
 export function useClaudePlugins(enabled = true) {
   return useQuery<PluginsReport>({
     queryKey: ["claude-plugins"],

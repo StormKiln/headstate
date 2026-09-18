@@ -219,6 +219,7 @@ const ROWS: Row[] = [
   // `null` rather than reaching the filesystem.
   row(api.claudeSessionDetail, ["s1"], "claude_session_detail", { sessionId: "s1" }),
   row(api.claudeOverview, [], "claude_overview"),
+  row(api.claudeDefinitions, [], "claude_definitions"),
   row(api.claudePlugins, [], "claude_plugins"),
   // #1071. No arguments: the fold is over the desktop's own session list,
   // so there is no id or path for a remote caller to steer.
