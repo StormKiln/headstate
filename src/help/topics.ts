@@ -567,11 +567,20 @@ rather than guesswork.
 
 ### What it contains
 
-**Counts, timings and durations only.** Never repository names, never
-pull request titles, never your token. Error messages from GitHub are
-recorded on the Rust side only after they have been scrubbed.
+**Timings, counts, and the writes you made.** Every merge, close, review
+and branch deletion is recorded with its repository and pull request
+number — that audit trail is the point of it, and it names your
+repositories.
 
-That matters because the point of the log is to send it to someone.
+**Never your token, and never a local path.** Those are stripped on the
+Rust side before anything is written, because they carry a username or
+a private project name and are no use in diagnosing anything.
+
+Pull request *titles* are not recorded, and neither is any file content.
+
+That matters because the point of the log is to send it to someone — so
+read it first. If your repository names are themselves sensitive, this
+log is not safe to hand over, and no setting makes it so.
 
 ### Where to find it
 

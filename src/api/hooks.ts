@@ -819,8 +819,10 @@ export function useArtifactSizes(artifacts: Artifact[], enabled: boolean) {
       queryKey: ["artifact-sizes", repo],
       queryFn: () =>
         // The GROUP INDEX in the log label, never the path. This log is
-        // meant to be sent to someone, and Settings promises it carries
-        // "counts and timings only -- never repository names".
+        // meant to be sent to someone, and a path carries a username and
+        // can name a private project. `src-tauri/src/redact.rs` strips
+        // paths that reach the log anyway; not writing one here means
+        // there is nothing to strip.
         timeCall(`size_artifacts[#${i}] n=${paths.length}`, () => sizeArtifacts(paths)),
       enabled,
       staleTime: 5 * 60 * 1000,

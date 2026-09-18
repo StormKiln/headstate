@@ -17,6 +17,7 @@ pub mod health;
 mod invariants;
 pub mod packages;
 pub mod poll;
+pub mod redact;
 pub mod remote;
 pub mod repos;
 pub mod store;

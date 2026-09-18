@@ -547,7 +547,7 @@ impl PairingState {
                 }
             }
             let device_id = devices::insert(conn, &pending.device)?;
-            log::info!("paired device {device_id} ({name})");
+            log::info!("paired device {device_id}");
             Ok(PairOutcome {
                 device_id,
                 device_name: name,

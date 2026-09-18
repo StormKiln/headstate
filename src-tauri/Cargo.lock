@@ -2087,6 +2087,7 @@ dependencies = [
  "p256",
  "rand",
  "rcgen",
+ "regex",
  "reqwest",
  "rusqlite",
  "rustls",

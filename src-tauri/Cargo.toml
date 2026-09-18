@@ -62,6 +62,15 @@ octocrab = { version = "0.54", default-features = false, features = [
   "default-client", "rustls-ring", "rustls-webpki-tokio", "jwt-aws-lc-rs",
 ] }
 rusqlite = { version = "0.40", features = ["bundled"] }
+# ALREADY in the tree at this version, pulled in underneath the build
+# stack -- declaring it adds no new code to the supply chain.
+#
+# For `redact.rs`, which strips tokens and home paths out of the
+# diagnostic log before it is written. The two patterns carry a word
+# boundary and an alternation that hand-rolled matching gets subtly
+# wrong, and this runs on a path where a miss writes a token to a file
+# built to be sent to someone.
+regex = { version = "1.13", default-features = false, features = ["std", "perf"] }
 # ALREADY in the tree at this version, pulled in by tauri's build stack --
 # declaring it adds no new code to the supply chain.
 #
