@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { toast } from "sonner";
 import { useClaudeHookInventory, useClaudeHooks } from "@/api/hooks";
+import { EffectiveSettingsPanel } from "./EffectiveSettingsPanel";
 import { claudeRevealPath, type ClaudeHooksStatus, type UiPrefs } from "@/api/tauri";
 import { copyText } from "@/lib/clipboard";
 import { IS_MOBILE_BUILD } from "@/lib/target";
@@ -345,6 +346,7 @@ export function ClaudeIntegrationsPanel({
         ) : null}
       </div>
       <HookInventorySection enabled={enabled} />
+      <EffectiveSettingsPanel enabled={enabled} />
     </div>
   );
 }

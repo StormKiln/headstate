@@ -237,6 +237,7 @@ const ROWS: Row[] = [
   // is deliberate -- a path supplied over the wire would be a way to make
   // the desktop write to an arbitrary file.
   row(api.claudeHooksInventory, [], "claude_hooks_inventory"),
+  row(api.claudeEffectiveSettings, [repoPath], "claude_effective_settings", { repoPath }),
   row(api.claudeHooksStatus, [], "claude_hooks_status"),
   row(api.claudeInstallHooks, [], "claude_install_hooks"),
   row(api.claudeReinstallHooks, [], "claude_reinstall_hooks"),

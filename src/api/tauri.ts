@@ -1057,6 +1057,40 @@ export interface ClaudeHooksUninstalled {
 export const claudeHooksInventory = () =>
   call<ClaudeHookInventory>("claude_hooks_inventory");
 
+/// Which file a settings value came from, lowest precedence first.
+/// Mirrors `claude::settings::Origin`.
+export type ClaudeSettingsOrigin = "user" | "project" | "local";
+
+export interface ClaudeSettingsContribution {
+  origin: ClaudeSettingsOrigin;
+  value: unknown;
+}
+
+export interface ClaudeResolvedKey {
+  key: string;
+  /// `null` when a scope outranking the best readable one could not be
+  /// parsed, so what it carried is unknown. The lower scope's value is
+  /// NOT the answer.
+  winner: ClaudeSettingsContribution | null;
+  contributions: ClaudeSettingsContribution[];
+  undecidable: boolean;
+}
+
+export interface ClaudeSettingsRefusal {
+  origin: ClaudeSettingsOrigin;
+  path: string;
+  detail: string;
+}
+
+export interface ClaudeEffectiveSettings {
+  keys: ClaudeResolvedKey[];
+  unreadable: ClaudeSettingsRefusal[];
+}
+
+/// What Claude Code actually reads for this repository (#1130).
+export const claudeEffectiveSettings = (repoPath: string) =>
+  call<ClaudeEffectiveSettings>("claude_effective_settings", { repoPath });
+
 export const claudeHooksStatus = () => call<ClaudeHooksStatus>("claude_hooks_status");
 
 /// Install the hooks, appending to whatever is already there.

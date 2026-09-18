@@ -37,12 +37,13 @@ import type {
   WorktreeScan,
 } from "../types/pr";
 import type {
-  ClaudeDefinitions, PrActionName } from "./tauri";
+  ClaudeDefinitions, ClaudeEffectiveSettings, PrActionName } from "./tauri";
 import {
   backgroundPanicked,
   claudeHooksInventory,
   claudeMdEffective,
   claudeDefinitions,
+  claudeEffectiveSettings,
   getCached,
   actOnPrs,
   updatePrBranch,
@@ -3494,6 +3495,21 @@ export function useClaudeHookInventory(enabled: boolean) {
     enabled,
     staleTime: 5_000,
     refetchOnWindowFocus: true,
+  });
+}
+
+/// What Claude Code actually reads for a repository (#1130).
+///
+/// Enabled by the caller rather than always: this reads three files, and
+/// the panel that shows it is collapsed by default.
+export function useClaudeEffectiveSettings(repoPath: string | undefined, enabled: boolean) {
+  return useQuery<ClaudeEffectiveSettings>({
+    queryKey: ["claude-effective-settings", repoPath],
+    queryFn: () => claudeEffectiveSettings(repoPath as string),
+    enabled: enabled && Boolean(repoPath),
+    staleTime: 5_000,
+    refetchOnWindowFocus: true,
+    retry: false,
   });
 }
 
