@@ -944,7 +944,7 @@ mod tests {
             ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
         ];
         let run_in = |dir: &Path, args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = std::process::Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(args)

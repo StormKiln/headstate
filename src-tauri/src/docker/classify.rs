@@ -80,7 +80,7 @@ fn resolve_tag(repos: &[PathBuf], tag: &str) -> Option<super::model::Origin> {
 /// answer deletes an image whose work is not actually landed.
 fn default_branch(repo: &Path) -> String {
     let git = |args: &[&str]| -> Option<String> {
-        let o = std::process::Command::new("git")
+        let o = std::process::Command::new(crate::auth::git_program())
             .arg("-C")
             .arg(repo)
             .args(args)
@@ -291,7 +291,7 @@ mod default_branch_tests {
     ];
 
     fn run(dir: &Path, args: &[&str]) -> bool {
-        std::process::Command::new("git")
+        std::process::Command::new(crate::auth::git_program())
             .arg("-C")
             .arg(dir)
             .args(args)

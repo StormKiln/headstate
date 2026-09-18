@@ -536,7 +536,7 @@ mod tests {
     /// Six Windows-only failures have cost this repository, all of them a
     /// separator baked into a string.
     fn run(dir: &PathBuf, args: &[&str]) {
-        let out = Command::new("git")
+        let out = Command::new(crate::auth::git_program())
             .args(args)
             .current_dir(dir)
             .output()
@@ -699,7 +699,7 @@ mod tests {
         let (_tmp, origin, clone) = origin_and_clone();
         advance(&origin);
         run(&clone, &["checkout", "--quiet", "--detach", "HEAD"]);
-        let before = Command::new("git")
+        let before = Command::new(crate::auth::git_program())
             .args(["rev-parse", "HEAD"])
             .current_dir(&clone)
             .output()
@@ -720,7 +720,7 @@ mod tests {
             other => panic!("a detached HEAD must be skipped, got {other:?}"),
         }
         assert!(
-            Command::new("git")
+            Command::new(crate::auth::git_program())
                 .args(["symbolic-ref", "--quiet", "HEAD"])
                 .current_dir(&clone)
                 .output()
@@ -730,7 +730,7 @@ mod tests {
                 != Some(0),
             "it must still be detached -- never helpfully checked out"
         );
-        let after = Command::new("git")
+        let after = Command::new(crate::auth::git_program())
             .args(["rev-parse", "HEAD"])
             .current_dir(&clone)
             .output()
@@ -762,7 +762,7 @@ mod tests {
             }
             other => panic!("a feature branch must be skipped, got {other:?}"),
         }
-        let head = Command::new("git")
+        let head = Command::new(crate::auth::git_program())
             .args(["symbolic-ref", "--short", "HEAD"])
             .current_dir(&clone)
             .output()

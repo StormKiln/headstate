@@ -54,7 +54,7 @@ const REF_FORMAT: &str = "%(refname:short)\t%(upstream:short)\t%(committerdate:i
 fn spawn_git(dir: &Path, args: &[&str], stdin: bool) -> Option<std::process::Child> {
     use std::process::Stdio;
     retrying(|| {
-        let mut cmd = std::process::Command::new("git");
+        let mut cmd = std::process::Command::new(crate::auth::git_program());
         cmd.arg("-C")
             .arg(dir)
             .args(args)
@@ -268,20 +268,34 @@ fn ahead_behind(dir: &Path, default: &str) -> std::collections::HashMap<String, 
     map
 }
 
+/// The mainline patch-ids, or the reason they could not be built.
+///
+/// `Err` is NOT an empty set (#1125). Every failure arm below used to
+/// `return set` with nothing in it, which is indistinguishable from a
+/// repository that genuinely has no matching patch-ids -- and the
+/// consequence was the worst available: a squash-merged branch failed
+/// its `mainline.contains(&pid)` test and was reported `Unmerged`, so a
+/// scan where git could not be spawned rendered as "nothing here is
+/// deletable" rather than as a failure. That is the same shape as #967
+/// one field over, and the same remedy: the unread case gets its own
+/// state instead of borrowing a real one.
+type Mainline = Result<HashSet<String>, String>;
+
 /// The patch-ids of every commit on the default branch since `since`.
 ///
 /// Built ONCE per repository and shared by every branch. Measured at
 /// 4.2s for 1729 commits; doing it per branch is what made the naive
 /// version take minutes.
-fn mainline_patch_ids(dir: &Path, default: &str) -> HashSet<String> {
+fn mainline_patch_ids(dir: &Path, default: &str) -> Mainline {
     use std::io::Write;
 
     let mut set = HashSet::new();
-    let Ok(shas) = git(dir, &["rev-list", default, "-n", "5000"]) else {
-        return set;
-    };
+    let shas = git(dir, &["rev-list", default, "-n", "5000"])
+        .map_err(|e| format!("could not list commits on {default}: {e}"))?;
+    // A genuinely empty history IS an empty set -- the check ran and
+    // found nothing, which is a real answer and not a failure.
     if shas.trim().is_empty() {
-        return set;
+        return Ok(set);
     }
 
     let Some(mut log) = spawn_git(
@@ -289,17 +303,17 @@ fn mainline_patch_ids(dir: &Path, default: &str) -> HashSet<String> {
         &["log", "--stdin", "--no-walk", "-p", "--format=commit %H"],
         true,
     ) else {
-        return set;
+        return Err(format!("could not run git log in {}", dir.display()));
     };
     if let Some(mut stdin) = log.stdin.take() {
         let _ = stdin.write_all(shas.as_bytes());
     }
-    let Ok(log_out) = log.wait_with_output() else {
-        return set;
-    };
+    let log_out = log
+        .wait_with_output()
+        .map_err(|e| format!("git log did not complete: {e}"))?;
 
     let Some(mut pid) = spawn_git(dir, &["patch-id", "--stable"], true) else {
-        return set;
+        return Err(format!("could not run git patch-id in {}", dir.display()));
     };
     // Feed stdin from ITS OWN THREAD.
     //
@@ -333,9 +347,9 @@ fn mainline_patch_ids(dir: &Path, default: &str) -> HashSet<String> {
             drop(stdin);
         })
     };
-    let Ok(out) = pid.wait_with_output() else {
-        return set;
-    };
+    let out = pid
+        .wait_with_output()
+        .map_err(|e| format!("git patch-id did not complete: {e}"))?;
     let _ = writer.join();
 
     for line in String::from_utf8_lossy(&out.stdout).lines() {
@@ -343,7 +357,7 @@ fn mainline_patch_ids(dir: &Path, default: &str) -> HashSet<String> {
             set.insert(id.to_string());
         }
     }
-    set
+    Ok(set)
 }
 
 /// The patch-id of everything `branch` adds on top of the default.
@@ -388,7 +402,7 @@ fn classify(
     ancestors: &HashSet<String>,
     checked_out: &[(String, String)],
     ahead: Option<(u64, u64)>,
-    mainline: &HashSet<String>,
+    mainline: &Mainline,
 ) -> Deletable {
     // The default branch, under either its local or remote name.
     let bare_default = default.rsplit('/').next().unwrap_or(default);
@@ -407,6 +421,20 @@ fn classify(
             how: MergedHow::Ancestor,
         };
     }
+
+    // The mainline set failing to build is NOT "this branch is not
+    // squash-merged" (#1125). Nothing was established, so nothing is
+    // claimed -- and critically this must be checked BEFORE the
+    // patch-id comparison below, which would otherwise read a missing
+    // set as a negative result and report the branch `Unmerged`.
+    let mainline = match mainline {
+        Ok(set) => set,
+        Err(reason) => {
+            return Deletable::Unknown {
+                reason: format!("could not check whether this branch was squash-merged: {reason}"),
+            };
+        }
+    };
 
     match branch_patch_id(dir, name, default) {
         Some(pid) if mainline.contains(&pid) => Deletable::Merged {
@@ -739,7 +767,7 @@ mod tests {
     fn run(dir: &Path, args: &[&str]) {
         let mut last = None;
         for _ in 0..3 {
-            match Command::new("git")
+            match Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(args)
@@ -921,6 +949,74 @@ mod tests {
     /// "Not merged — 0 commits not on the default branch" beside a delete
     /// checkbox: the warning and the reassurance that cancels it, in one
     /// sentence, resolving in the dangerous direction.
+    /// #1125: a mainline set that could not be BUILT is not a mainline
+    /// set that is empty.
+    ///
+    /// The distinction is load-bearing in the dangerous direction. A
+    /// squash-merged branch is recognised only by finding its patch-id
+    /// in the mainline set; if the set failed to build and that failure
+    /// renders as an empty set, the branch fails the lookup and is
+    /// reported `Unmerged`. Repeated across a repository, a scan where
+    /// git could not be spawned rendered as "nothing here is deletable"
+    /// -- a confident wrong answer, not an error.
+    #[test]
+    fn a_mainline_that_could_not_be_built_is_unknown_not_unmerged() {
+        let (_t, repo) = fixture();
+        run(&repo, &["checkout", "-q", "-b", "wip"]);
+        commit(&repo, "wip-one");
+        run(&repo, &["checkout", "-q", "main"]);
+
+        let default = default_branch(&repo).unwrap();
+
+        let verdict = classify(
+            &repo,
+            "wip",
+            &default,
+            &HashSet::new(),
+            &[],
+            None,
+            &Err("git could not be spawned".to_string()),
+        );
+
+        match &verdict {
+            Deletable::Unknown { reason } => {
+                assert!(
+                    reason.contains("squash-merged"),
+                    "the reason must say what could not be checked, got {reason:?}"
+                );
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+        assert!(!verdict.is_deletable());
+    }
+
+    /// The other direction, so the fix cannot be "return Unknown
+    /// always": a repository whose history genuinely yields an empty
+    /// mainline set still gets a real verdict.
+    #[test]
+    fn an_empty_mainline_is_still_a_real_answer() {
+        let (_t, repo) = fixture();
+        run(&repo, &["checkout", "-q", "-b", "wip"]);
+        commit(&repo, "wip-one");
+        run(&repo, &["checkout", "-q", "main"]);
+
+        let default = default_branch(&repo).unwrap();
+        let verdict = classify(
+            &repo,
+            "wip",
+            &default,
+            &HashSet::new(),
+            &[],
+            Some((1, 0)),
+            &Ok(HashSet::new()),
+        );
+
+        assert!(
+            !matches!(verdict, Deletable::Unknown { .. }),
+            "an empty-but-successful mainline must not be reported as a failed check, got {verdict:?}"
+        );
+    }
+
     #[test]
     fn a_branch_whose_ahead_count_could_not_be_read_does_not_report_zero() {
         let (_t, repo) = fixture();

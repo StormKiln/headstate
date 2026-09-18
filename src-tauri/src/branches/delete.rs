@@ -331,7 +331,7 @@ mod tests {
     fn run(dir: &Path, args: &[&str]) {
         let mut last = None;
         for _ in 0..3 {
-            match Command::new("git")
+            match Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(args)
@@ -492,7 +492,7 @@ mod tests {
     }
 
     fn branch_exists(repo: &Path, name: &str) -> bool {
-        Command::new("git")
+        Command::new(crate::auth::git_program())
             .arg("-C")
             .arg(repo)
             .args(["rev-parse", "--verify", &format!("refs/heads/{name}")])
@@ -641,7 +641,7 @@ mod tests {
         let out = delete_remote(repo.to_str().unwrap(), &["origin/shipped".to_string()]);
         assert_eq!(out[0].error, None, "{:?}", out[0]);
 
-        let refs = Command::new("git")
+        let refs = Command::new(crate::auth::git_program())
             .arg("-C")
             .arg(&repo)
             .args(["ls-remote", "--heads", "origin", "shipped"])
@@ -667,7 +667,7 @@ mod tests {
         let out = delete_remote(repo.to_str().unwrap(), &["origin/live-remote".to_string()]);
         assert!(out[0].error.is_some(), "unmerged remote must be refused");
 
-        let refs = Command::new("git")
+        let refs = Command::new(crate::auth::git_program())
             .arg("-C")
             .arg(&repo)
             .args(["ls-remote", "--heads", "origin", "live-remote"])
@@ -773,7 +773,7 @@ mod tests {
         assert_eq!(remote[0].error, None, "{:?}", remote[0]);
 
         assert!(!branch_exists(&repo, "shipped"));
-        let refs = Command::new("git")
+        let refs = Command::new(crate::auth::git_program())
             .arg("-C")
             .arg(&repo)
             .args(["ls-remote", "--heads", "origin", "shipped"])

@@ -185,6 +185,19 @@ launchctl setenv HEADSTATE_GH /full/path/to/gh
 
 then relaunch the app. `which gh` in your terminal prints the path to use.
 
+The same applies to `git`, which Headstate needs for every worktree and
+branch view. It looks on `PATH` first and then in the usual install
+locations — Homebrew, MacPorts, `/usr/bin`, and Git for Windows. If
+yours is somewhere else:
+
+```
+launchctl setenv HEADSTATE_GIT /full/path/to/git
+```
+
+`which git` prints the path to use. This matters on a machine where git
+came from Homebrew, `mise` or `asdf` rather than the Xcode command line
+tools, because a GUI-launched app does not inherit your shell's `PATH`.
+
 ## What it shows
 
 **Pull request list.** Every open PR you authored, across every repo you

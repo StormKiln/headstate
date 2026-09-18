@@ -50,7 +50,7 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     // a slow one.
     let mut spawned = None;
     for _ in 0..3 {
-        match Command::new("git")
+        match Command::new(crate::auth::git_program())
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -1619,7 +1619,7 @@ fn batch_contains_patch(dir: &Path, candidates: &str, want: &str) -> Safety {
     // `--no-walk` treats each SHA as its own root, and `-p` gives each
     // one its own diff -- the squash commit's contents, which is what
     // the per-candidate `sha^..sha` was computing.
-    let Ok(mut log) = Command::new("git")
+    let Ok(mut log) = Command::new(crate::auth::git_program())
         .arg("-C")
         .arg(dir)
         .args(["log", "--stdin", "--no-walk", "-p", "--format=commit %H"])
@@ -1640,7 +1640,7 @@ fn batch_contains_patch(dir: &Path, candidates: &str, want: &str) -> Safety {
         return Safety::Unmerged;
     }
 
-    let Ok(mut pid) = Command::new("git")
+    let Ok(mut pid) = Command::new(crate::auth::git_program())
         .arg("-C")
         .arg(dir)
         .args(["patch-id", "--stable"])
@@ -1684,7 +1684,7 @@ fn patch_id(dir: &Path, from: &str, to: &str) -> Option<String> {
     use std::io::Write;
     use std::process::Stdio;
 
-    let diff = Command::new("git")
+    let diff = Command::new(crate::auth::git_program())
         .arg("-C")
         .arg(dir)
         .args(["diff", from, to])
@@ -1696,7 +1696,7 @@ fn patch_id(dir: &Path, from: &str, to: &str) -> Option<String> {
         return None;
     }
 
-    let mut child = Command::new("git")
+    let mut child = Command::new(crate::auth::git_program())
         .arg("-C")
         .arg(dir)
         .args(["patch-id", "--stable"])
@@ -3154,7 +3154,7 @@ prunable gitdir file points to non-existent location
             vec!["init", "-q", "-b", "main"],
             vec!["commit", "-q", "--allow-empty", "-m", "init"],
         ] {
-            let ok = Command::new("git")
+            let ok = Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(&repo)
                 .args(&args)
@@ -3168,7 +3168,7 @@ prunable gitdir file points to non-existent location
         // A real worktree, created as a SIBLING -- the layout that made
         // the scan quadratic.
         let wt = base.join("proj-feature");
-        let ok = Command::new("git")
+        let ok = Command::new(crate::auth::git_program())
             .arg("-C")
             .arg(&repo)
             .args(["worktree", "add", "-q", "-b", "feature"])
@@ -3229,7 +3229,7 @@ prunable gitdir file points to non-existent location
             ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
         ];
         let run = |dir: &Path, args: &[&str]| {
-            let ok = Command::new("git")
+            let ok = Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(args)
@@ -3252,7 +3252,7 @@ prunable gitdir file points to non-existent location
         // Cloned into the scan root, so the walk finds it as a
         // repository with a remote whose HEAD is `master`.
         let repo = base.join("proj");
-        let ok = Command::new("git")
+        let ok = Command::new(crate::auth::git_program())
             .args(["clone", "-q"])
             .arg(&origin)
             .arg(&repo)
@@ -3532,7 +3532,7 @@ prunable gitdir file points to non-existent location
             ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
         ];
         let run_in = |dir: &Path, args: &[&str]| {
-            let out = Command::new("git")
+            let out = Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(args)
@@ -3662,7 +3662,7 @@ prunable gitdir file points to non-existent location
             vec!["add", "-A"],
             vec!["commit", "-q", "-m", "work that exists only here"],
         ] {
-            let out = Command::new("git")
+            let out = Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(&wt)
                 .args(&args)
@@ -3699,7 +3699,7 @@ prunable gitdir file points to non-existent location
     #[test]
     fn a_detached_head_was_not_ever_pushed() {
         let (_t, _repo, wt) = upstream_deleted_fixture(true);
-        let out = Command::new("git")
+        let out = Command::new(crate::auth::git_program())
             .arg("-C")
             .arg(&wt)
             .args(["checkout", "-q", "--detach"])
@@ -3723,7 +3723,7 @@ prunable gitdir file points to non-existent location
             ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
         ];
         let run_in = |dir: &Path, args: &[&str]| {
-            let out = Command::new("git")
+            let out = Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(args)
@@ -3874,7 +3874,7 @@ prunable gitdir file points to non-existent location
                 &["init", "-q", "-b", "main"][..],
                 &["commit", "-q", "--allow-empty", "-m", "one"][..],
             ] {
-                let out = std::process::Command::new("git")
+                let out = std::process::Command::new(crate::auth::git_program())
                     .arg("-C")
                     .arg(&local_only)
                     .args(args)
@@ -3961,7 +3961,7 @@ prunable gitdir file points to non-existent location
             ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
         ];
         let run_in = |dir: &Path, args: &[&str]| {
-            let out = Command::new("git")
+            let out = Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(args)
@@ -4046,7 +4046,7 @@ prunable gitdir file points to non-existent location
             ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
         ];
         let run = |args: &[&str]| {
-            let ok = Command::new("git")
+            let ok = Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(&repo)
                 .args(args)
@@ -4076,7 +4076,7 @@ prunable gitdir file points to non-existent location
             ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
             ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
         ];
-        let out = Command::new("git")
+        let out = Command::new(crate::auth::git_program())
             .arg("-C")
             .arg(dir)
             .args(["commit", "-q", "--allow-empty", "-m", message])
@@ -4192,7 +4192,7 @@ prunable gitdir file points to non-existent location
     /// Run git in `dir`, asserting success. For the #753 fixtures,
     /// which lock and unlock real worktrees.
     fn git_ok(dir: &Path, args: &[&str]) {
-        let out = Command::new("git")
+        let out = Command::new(crate::auth::git_program())
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -5228,7 +5228,7 @@ prunable gitdir file points to non-existent location
             ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
         ];
         let run_in = |dir: &Path, args: &[&str]| {
-            let out = Command::new("git")
+            let out = Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(args)
@@ -5388,7 +5388,7 @@ prunable gitdir file points to non-existent location
             ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
         ];
         let run_in = |dir: &Path, args: &[&str]| {
-            let out = Command::new("git")
+            let out = Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(args)
@@ -5432,7 +5432,7 @@ prunable gitdir file points to non-existent location
     fn local_commits_report_ahead() {
         let (_t, repo) = upstream_fixture(|repo, _| {
             for m in ["a", "b"] {
-                Command::new("git")
+                Command::new(crate::auth::git_program())
                     .arg("-C")
                     .arg(repo)
                     .args(["commit", "-q", "--allow-empty", "-m", m])
@@ -5468,7 +5468,7 @@ prunable gitdir file points to non-existent location
             // Advance the remote from a second clone, then fetch so the
             // local ref knows about it without moving HEAD.
             let other = repo.parent().unwrap().join("other");
-            Command::new("git")
+            Command::new(crate::auth::git_program())
                 .args([
                     "clone",
                     "-q",
@@ -5478,7 +5478,7 @@ prunable gitdir file points to non-existent location
                 .output()
                 .unwrap();
             for m in ["x", "y", "z"] {
-                Command::new("git")
+                Command::new(crate::auth::git_program())
                     .arg("-C")
                     .arg(&other)
                     .args(["commit", "-q", "--allow-empty", "-m", m])
@@ -5486,13 +5486,13 @@ prunable gitdir file points to non-existent location
                     .output()
                     .unwrap();
             }
-            Command::new("git")
+            Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(&other)
                 .args(["push", "-q", "origin", "main"])
                 .output()
                 .unwrap();
-            Command::new("git")
+            Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(repo)
                 .args(["fetch", "-q", "origin"])
@@ -5519,7 +5519,7 @@ prunable gitdir file points to non-existent location
             ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
         ];
         let run_in = |dir: &Path, args: &[&str]| {
-            let out = Command::new("git")
+            let out = Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(args)
@@ -5563,7 +5563,7 @@ prunable gitdir file points to non-existent location
             vec!["init", "-q", "-b", "main"],
             vec!["commit", "-q", "--allow-empty", "-m", "base"],
         ] {
-            Command::new("git")
+            Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(&args)
@@ -5584,7 +5584,7 @@ prunable gitdir file points to non-existent location
     #[test]
     fn a_detached_head_reports_detached_not_an_error() {
         let (_t, repo) = upstream_fixture(|repo, _| {
-            Command::new("git")
+            Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(repo)
                 .args(["checkout", "-q", "--detach", "HEAD"])
@@ -5961,7 +5961,7 @@ prunable gitdir file points to non-existent location
         let (_t, repo, _wt) = squash_merged_fixture(true);
         // The premise the batching rests on: ancestry cannot see this
         // merge, so the patch-id path is what answers it.
-        let anc = Command::new("git")
+        let anc = Command::new(crate::auth::git_program())
             .arg("-C")
             .arg(&repo)
             .args(["merge-base", "--is-ancestor", "feature", "origin/main"])
@@ -5996,7 +5996,7 @@ prunable gitdir file points to non-existent location
         for i in 0..12 {
             std::fs::write(repo.join(format!("filler{i}.txt")), "x").unwrap();
             for args in [vec!["add", "-A"], vec!["commit", "-m", "filler"]] {
-                Command::new("git")
+                Command::new(crate::auth::git_program())
                     .arg("-C")
                     .arg(&repo)
                     .args(args)
@@ -6028,7 +6028,7 @@ prunable gitdir file points to non-existent location
         // The premise: ancestry genuinely cannot see this merge. If this
         // assertion ever fails the fixture stopped reproducing the bug,
         // and the test below would pass for the wrong reason.
-        let anc = Command::new("git")
+        let anc = Command::new(crate::auth::git_program())
             .arg("-C")
             .arg(&repo)
             .args(["merge-base", "--is-ancestor", "feature", "origin/main"])
@@ -6078,7 +6078,7 @@ prunable gitdir file points to non-existent location
             ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
         ];
         let run_in = |dir: &Path, args: &[&str]| {
-            let out = Command::new("git")
+            let out = Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(args)
@@ -6266,7 +6266,7 @@ prunable gitdir file points to non-existent location
         let (_t, repo) = stale_local_default_fixture();
         // A hostile remote's `origin/HEAD`. `symbolic-ref` accepts it
         // where `git branch` would refuse.
-        let out = Command::new("git")
+        let out = Command::new(crate::auth::git_program())
             .arg("-C")
             .arg(&repo)
             .args([
@@ -6319,7 +6319,7 @@ prunable gitdir file points to non-existent location
             ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
         ];
         let run_in = |dir: &Path, args: &[&str]| {
-            let ok = Command::new("git")
+            let ok = Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(args)
@@ -6412,7 +6412,7 @@ prunable gitdir file points to non-existent location
             ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
         ];
         let run_in = |dir: &Path, args: &[&str]| {
-            let out = Command::new("git")
+            let out = Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(args)
@@ -6707,7 +6707,7 @@ prunable gitdir file points to non-existent location
             ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
         ];
         let run_in = |dir: &Path, args: &[&str]| {
-            let out = Command::new("git")
+            let out = Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(args)
@@ -6817,7 +6817,7 @@ prunable gitdir file points to non-existent location
             ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
         ];
         let run_in = |dir: &Path, args: &[&str]| {
-            let out = Command::new("git")
+            let out = Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(args)
@@ -6884,7 +6884,7 @@ prunable gitdir file points to non-existent location
             ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
         ];
         let run_in = |dir: &Path, args: &[&str]| {
-            let out = Command::new("git")
+            let out = Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(args)
@@ -6967,7 +6967,7 @@ prunable gitdir file points to non-existent location
             ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
         ];
         let run_in = |dir: &Path, args: &[&str]| {
-            let out = Command::new("git")
+            let out = Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(args)
@@ -7023,7 +7023,7 @@ prunable gitdir file points to non-existent location
             ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
         ];
         let run_in = |dir: &Path, args: &[&str]| {
-            let out = Command::new("git")
+            let out = Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(args)
@@ -7112,7 +7112,7 @@ prunable gitdir file points to non-existent location
             ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
         ];
         let run_in = |dir: &Path, args: &[&str]| {
-            let out = Command::new("git")
+            let out = Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(args)
@@ -7165,7 +7165,7 @@ prunable gitdir file points to non-existent location
             vec!["init", "-q", "-b", "main"],
             vec!["commit", "-q", "--allow-empty", "-m", "base"],
         ] {
-            Command::new("git")
+            Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(&args)
@@ -7579,7 +7579,7 @@ prunable gitdir file points to non-existent location
                 ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
             ];
             let run = |dir: &Path, args: &[&str]| {
-                let out = Command::new("git")
+                let out = Command::new(crate::auth::git_program())
                     .arg("-C")
                     .arg(dir)
                     .args(args)
@@ -7950,7 +7950,7 @@ prunable gitdir file points to non-existent location
             ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
         ];
         let run_in = |dir: &Path, args: &[&str]| {
-            let out = Command::new("git")
+            let out = Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(args)
@@ -8128,7 +8128,7 @@ prunable gitdir file points to non-existent location
             ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
         ];
         let run_in = |dir: &Path, args: &[&str]| {
-            let out = Command::new("git")
+            let out = Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(args)
@@ -8243,7 +8243,7 @@ prunable gitdir file points to non-existent location
     fn a_detached_worktree_is_merged_never_never_pushed() {
         let (_t, repo, _wt) = repo_with_worktree("feature");
         let detached = repo.parent().unwrap().join("scratch");
-        let out = Command::new("git")
+        let out = Command::new(crate::auth::git_program())
             .arg("-C")
             .arg(&repo)
             .args([
@@ -8427,7 +8427,7 @@ prunable gitdir file points to non-existent location
             ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
         ];
         let run = |dir: &Path, args: &[&str]| {
-            let out = Command::new("git")
+            let out = Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(args)
@@ -8647,7 +8647,7 @@ mod live {
         ];
 
         fn run(dir: &Path, args: &[&str]) -> bool {
-            Command::new("git")
+            Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(args)
@@ -8668,7 +8668,7 @@ mod live {
             ));
 
             let clone = base.join("clone");
-            assert!(Command::new("git")
+            assert!(Command::new(crate::auth::git_program())
                 .args(["clone", "-q"])
                 .arg(&origin)
                 .arg(&clone)
@@ -8822,7 +8822,7 @@ mod live {
         ];
 
         fn run(dir: &Path, args: &[&str]) -> bool {
-            Command::new("git")
+            Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(args)
@@ -8842,7 +8842,7 @@ mod live {
             ));
 
             let clone = base.join("clone");
-            assert!(Command::new("git")
+            assert!(Command::new(crate::auth::git_program())
                 .args(["clone", "-q"])
                 .arg(&origin)
                 .arg(&clone)
@@ -8978,7 +8978,7 @@ mod live {
         ];
 
         fn run(dir: &Path, args: &[&str]) -> bool {
-            Command::new("git")
+            Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(args)
@@ -9356,7 +9356,7 @@ mod live {
         ];
 
         fn run(dir: &Path, args: &[&str]) -> bool {
-            Command::new("git")
+            Command::new(crate::auth::git_program())
                 .arg("-C")
                 .arg(dir)
                 .args(args)

@@ -39,7 +39,7 @@ pub fn looks_like_sha(tag: &str) -> bool {
 /// non-existent-but-well-formed SHA, which would invent provenance.
 pub fn resolve_in_repo(repo: &Path, tag: &str, default_branch: &str) -> Option<Origin> {
     let git = |args: &[&str]| -> Option<String> {
-        let out = Command::new("git")
+        let out = Command::new(crate::auth::git_program())
             .arg("-C")
             .arg(repo)
             .args(args)
@@ -58,7 +58,7 @@ pub fn resolve_in_repo(repo: &Path, tag: &str, default_branch: &str) -> Option<O
     // Merged means the commit is reachable from the default branch, so
     // nothing will ever want this image again. Deliberately checked
     // against origin/<default>, not a local branch that may be stale.
-    let merged = Command::new("git")
+    let merged = Command::new(crate::auth::git_program())
         .arg("-C")
         .arg(repo)
         .args(["merge-base", "--is-ancestor", tag, default_branch])
