@@ -134,6 +134,13 @@ fired on CI's 1.98 while passing locally on 1.93.1. A clean local `make
 lint` is necessary but not sufficient; if CI disagrees, check
 `rustc --version` before assuming a flake.
 
+**And clippy caches, so a second local run can be a false green.** Two
+6.0 PRs failed CI on lints (`clippy::manual_is_multiple_of`,
+`non_snake_case`) that a local `cargo clippy` had just reported clean —
+because nothing in the crate had changed since the previous run and
+clippy replayed its cached verdict. `touch src-tauri/src/lib.rs` before
+the run, or trust CI over a green that came back instantly.
+
 ## Resolving a conflict in an append-only file (#1176)
 
 Several files are append-only registries that **every** feature touches:
