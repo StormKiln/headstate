@@ -1502,6 +1502,43 @@ pub async fn tool_versions() -> Result<Vec<crate::tools::version::ToolReport>, S
 }
 
 #[tauri::command]
+/// The end of the log, for the panel that shows it (#1147).
+///
+/// `Class::Read`: it returns text about the desktop, which is exactly
+/// what a phone diagnosing a failure needs -- and the gap it closes is
+/// the one `reveal_log` cannot, because there is no Finder on the phone
+/// to reveal into. `reveal_log` stays `Class::Local` and stays offered:
+/// this shows the tail, that opens the whole file.
+///
+/// Redacted in `diag::tail::read`, on the far side of this boundary, so
+/// no caller can forget to.
+///
+/// # Why `spawn_blocking`
+///
+/// It opens and reads a file, which
+/// `no_sync_command_reaches_a_subprocess_or_a_whole_file` forbids on a
+/// sync command for the freeze it causes (#1090) -- and this one is
+/// reached from a panel a user may leave open, and dispatched inline on
+/// the HTTP listener for a paired phone.
+pub async fn read_log_tail(
+    app: AppHandle,
+    max_bytes: Option<u32>,
+) -> Result<crate::diag::tail::LogTail, String> {
+    use tauri::Manager;
+    let dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|e| format!("could not locate the log directory: {e}"))?;
+    let file = dir.join("headstate.log");
+    let want = max_bytes.unwrap_or(crate::diag::tail::DEFAULT_BYTES);
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::diag::tail::read(&file, want).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("could not read the log: {e}"))?
+}
+
+#[tauri::command]
 pub fn reveal_log(app: AppHandle) -> Result<String, String> {
     use tauri::Manager;
     let dir = app

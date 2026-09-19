@@ -47,6 +47,7 @@ import type {
 } from "@/types/pr";
 import { toast } from "sonner";
 import { revealLog } from "@/api/tauri";
+import { LogPanel } from "./LogPanel";
 import { copyText } from "@/lib/clipboard";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { useConnectionState } from "@/api/connection";
@@ -661,9 +662,14 @@ function HealthConditions({
               would need, rather than leaving a reader unable to tell
               "there is no log" from "not from here". */}
           {IS_MOBILE_BUILD ? (
+            // No reveal button -- `reveal_log` is still `Class::Local`
+            // and there is still no Finder here. What changed is that
+            // the apology is no longer the whole offer: `LogPanel`
+            // below is `Class::Read` and shows the text, which is what
+            // a phone diagnosing a failure actually needed (#1147).
             <span className="text-[#8b949e]">
-              The desktop&rsquo;s diagnostic log is opened at that Mac; there is no Finder
-              here to reveal it in.
+              The desktop&rsquo;s diagnostic log cannot be opened from here — there is no
+              Finder on this device. It can be read below.
             </span>
           ) : (
             <button
@@ -683,6 +689,10 @@ function HealthConditions({
             </button>
           )}
         </div>
+        {/* The log itself, on the same state that offers to reveal it
+            (#946, #1147). This is precisely where the cause is written,
+            and until now the view could only point at a file. */}
+        <LogPanel />
       </div>
     );
   }

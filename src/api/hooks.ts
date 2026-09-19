@@ -42,9 +42,11 @@ import type {
   ClaudeUsageProfile,
   PrActionName,
   ToolReport,
+  LogTail,
 } from "./tauri";
 import {
   toolVersions,
+  readLogTail,
   backgroundPanicked,
   claudeHooksInventory,
   claudeMdEffective,
@@ -3539,6 +3541,30 @@ export function useClaudeEffectiveSettings(repoPath: string | undefined, enabled
 /// `staleTime: Infinity`: the answer changes when a user installs
 /// something, which is not during a session. Refetching on focus would
 /// spawn four processes for a figure that has not moved.
+/// The end of the diagnostic log (#1147).
+///
+/// `enabled` because the panel is collapsed by default: reading the tail
+/// costs a file read and a payload over the phone's transport, and a
+/// user who has not opened the panel should not pay for either.
+///
+/// NOT polled. `staleTime: 0` with a manual `refetch` instead, because
+/// the interesting moment is "something just went wrong, show me" -- a
+/// background poll would spend the read on every user who leaves the
+/// page open and never looks at it. The panel offers a Refresh button.
+///
+/// `retry: false`: a log that does not exist yet is the normal state of
+/// a fresh install, and retrying an absence three times just delays the
+/// panel saying so.
+export function useLogTail(enabled: boolean, maxBytes?: number) {
+  return useQuery<LogTail>({
+    queryKey: ["log-tail", maxBytes ?? null],
+    queryFn: () => readLogTail(maxBytes),
+    enabled,
+    staleTime: 0,
+    retry: false,
+  });
+}
+
 export function useToolVersions() {
   return useQuery<ToolReport[]>({
     queryKey: ["tool-versions"],

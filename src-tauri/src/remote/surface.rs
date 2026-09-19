@@ -660,6 +660,12 @@ pub const SURFACE: &[(&str, Class)] = &[
     // what actually runs an update, and it is classed and dispatched.
     // local: not exposed remotely.
     ("diag_log", Class::Local),
+    // Read: the tail of the DESKTOP's log, redacted before it leaves
+    // (#1147). A question about what happened on that machine, which is
+    // exactly what a phone diagnosing a failure asks -- and the gap
+    // `reveal_log` cannot close, because there is no Finder here to
+    // reveal into. That one stays Local; this shows the text.
+    ("read_log_tail", Class::Read),
     ("reveal_log", Class::Local),
     // Reveals a session's directory or transcript in the file manager
     // (#917). `Local` for exactly the reason this class's own doc comment
@@ -851,6 +857,10 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         // ---- read -------------------------------------------------------
         "background_panicked" => ok(commands::background_panicked()),
         "tool_versions" => res(commands::tool_versions().await),
+        // `maxBytes` is optional: a missing key decodes as `None`, and
+        // the command applies its own default and its own ceiling, so a
+        // phone cannot ask for a larger payload than the desktop would.
+        "read_log_tail" => res(commands::read_log_tail(app.clone(), a.get("maxBytes")?).await),
         "get_auth_state" => ok(commands::get_auth_state(app.state())),
         "get_cached" => res(commands::get_cached(app.clone())),
         "get_cached_reviewing" => res(commands::get_cached_reviewing(app.clone())),

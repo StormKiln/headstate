@@ -199,3 +199,322 @@ mod tests {
         assert!(!enabled());
     }
 }
+
+/// Reading the log back, for the panel that shows it (#1147).
+///
+/// Until now `reveal_log` was the only log-facing command: it opened a
+/// Finder window and nothing read a byte of the file. So a user who hit
+/// a failure had to leave the app, find `~/Library/Logs`, and open the
+/// file in another program -- and on the phone could not do even that,
+/// because there is no Finder to reveal into.
+pub mod tail {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+    use std::path::Path;
+
+    use serde::{Deserialize, Serialize};
+
+    /// The most this will return in one call, whatever is asked for.
+    ///
+    /// A ceiling on the CALLER, not a guess at the right size: the
+    /// payload crosses the Tauri bridge and, for a paired phone, an HTTP
+    /// connection. The log rotates at 4 MB and this machine's is
+    /// routinely near that, so an unbounded read is a multi-megabyte
+    /// string built in memory and serialized to JSON on request.
+    pub const MAX_BYTES: u32 = 512 * 1024;
+
+    /// The default when the caller does not care.
+    pub const DEFAULT_BYTES: u32 = 64 * 1024;
+
+    /// The end of the log, and the truth about what was left out.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct LogTail {
+        /// The last bytes of the file, redacted, as text.
+        pub text: String,
+        /// The byte this excerpt starts at. Zero means the whole file.
+        ///
+        /// Carried so the view can say "showing the last 64 KB of 4.2
+        /// MB" rather than presenting an excerpt as the log. A panel
+        /// that silently shows the tail is one where a user scrolls to
+        /// the top, sees no error, and concludes there was none.
+        pub offset: u64,
+        /// The file's total size in bytes.
+        pub total: u64,
+        /// Whether anything was cut from the front.
+        ///
+        /// Derivable from `offset > 0`, and kept anyway: it is the fact
+        /// the UI actually branches on, and re-deriving a claim at each
+        /// call site is how two surfaces come to disagree about it.
+        pub truncated: bool,
+        /// The path, so the panel can say where this came from and the
+        /// reveal button still has something to name.
+        pub path: String,
+    }
+
+    /// Why the log could not be read.
+    ///
+    /// `NotFound` is deliberately distinct from an IO error: a log that
+    /// has never been written is the normal state of a fresh install,
+    /// and reporting it as a failure would send a user looking for a
+    /// problem that is not there. "Absent is not zero" (#846) cuts both
+    /// ways -- absent is also not broken.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    pub enum TailError {
+        /// The file does not exist yet.
+        NotFound { path: String },
+        /// It exists and could not be read, with the reason.
+        Unreadable { path: String, why: String },
+    }
+
+    impl std::fmt::Display for TailError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::NotFound { path } => write!(
+                    f,
+                    "No log has been written yet ({path}). It appears once something is logged."
+                ),
+                Self::Unreadable { path, why } => {
+                    write!(f, "Could not read {path}: {why}")
+                }
+            }
+        }
+    }
+
+    /// Read the last `max_bytes` of `path`.
+    ///
+    /// Seeks rather than reading the whole file: the log rotates at 4 MB
+    /// and this is reached from a panel a user may leave open.
+    ///
+    /// # The seek can land mid-character, and mid-line
+    ///
+    /// UTF-8 is multi-byte, so an offset chosen by arithmetic can split
+    /// a character. `from_utf8_lossy` would turn that into U+FFFD --
+    /// a replacement character at the start of the panel, which reads as
+    /// corruption. Instead the first partial LINE is dropped, which also
+    /// removes the partial character inside it and is what a reader
+    /// expects: a log excerpt starts at a line.
+    pub fn read(path: &Path, max_bytes: u32) -> Result<LogTail, TailError> {
+        let shown = path.to_string_lossy().into_owned();
+        let meta = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(TailError::NotFound { path: shown })
+            }
+            Err(e) => {
+                return Err(TailError::Unreadable {
+                    path: shown,
+                    why: e.to_string(),
+                })
+            }
+        };
+        let total = meta.len();
+        let want = u64::from(max_bytes.clamp(1, MAX_BYTES));
+        let offset = total.saturating_sub(want);
+
+        let mut f = File::open(path).map_err(|e| TailError::Unreadable {
+            path: shown.clone(),
+            why: e.to_string(),
+        })?;
+        if offset > 0 {
+            f.seek(SeekFrom::Start(offset))
+                .map_err(|e| TailError::Unreadable {
+                    path: shown.clone(),
+                    why: e.to_string(),
+                })?;
+        }
+        let mut buf = Vec::with_capacity(want.min(total) as usize);
+        f.take(want)
+            .read_to_end(&mut buf)
+            .map_err(|e| TailError::Unreadable {
+                path: shown.clone(),
+                why: e.to_string(),
+            })?;
+
+        // Drop the partial first line -- but only when there IS a
+        // preceding part. At offset 0 the first line is the real first
+        // line of the file, and dropping it would hide the log's
+        // beginning on every small log.
+        let body: &[u8] = if offset > 0 {
+            match buf.iter().position(|b| *b == b'\n') {
+                Some(i) => &buf[i + 1..],
+                // No newline in the whole excerpt: one enormous line.
+                // Keeping it lossily is better than returning nothing,
+                // and the truncation is already declared.
+                None => &buf[..],
+            }
+        } else {
+            &buf[..]
+        };
+
+        Ok(LogTail {
+            // Redacted on THIS side of the bridge (#1122). The panel is
+            // reachable from a paired phone, so an unredacted tail would
+            // put tokens and home paths on a network transport -- and
+            // the copy button exists precisely so this text gets pasted
+            // into a bug report.
+            text: crate::redact::redact(&String::from_utf8_lossy(body)),
+            offset,
+            total,
+            truncated: offset > 0,
+            path: shown,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tail_tests {
+    use super::tail::{self, TailError};
+
+    /// A temp file holding `body`, removed when the guard drops.
+    struct Tmp(std::path::PathBuf);
+    impl Tmp {
+        fn new(name: &str, body: &[u8]) -> Self {
+            let p = std::env::temp_dir().join(format!("headstate-tail-{name}"));
+            std::fs::write(&p, body).unwrap();
+            Self(p)
+        }
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_short_log_comes_back_whole_and_says_it_was_not_truncated() {
+        let t = Tmp::new("short", b"line one\nline two\n");
+        let got = tail::read(&t.0, 64 * 1024).unwrap();
+        assert_eq!(got.text, "line one\nline two\n");
+        assert_eq!(got.offset, 0);
+        assert_eq!(got.total, 18);
+        assert!(!got.truncated);
+    }
+
+    #[test]
+    fn the_first_line_of_a_short_log_is_never_dropped() {
+        // The partial-line trim must NOT run at offset 0: there is no
+        // preceding part, so the first line is the file's real first
+        // line and dropping it would hide the start of every small log.
+        let t = Tmp::new("firstline", b"THE FIRST LINE\nsecond\n");
+        let got = tail::read(&t.0, 64 * 1024).unwrap();
+        assert!(got.text.starts_with("THE FIRST LINE"), "{:?}", got.text);
+    }
+
+    #[test]
+    fn a_long_log_is_cut_at_a_line_boundary_and_declares_it() {
+        let body: Vec<u8> = (0..2000)
+            .flat_map(|i| format!("line {i}\n").into_bytes())
+            .collect();
+        let total = body.len() as u64;
+        let t = Tmp::new("long", &body);
+        let got = tail::read(&t.0, 100).unwrap();
+
+        assert!(got.truncated);
+        assert_eq!(got.total, total);
+        assert!(got.offset > 0);
+        // Starts at a line, never mid-line: an excerpt beginning
+        // "ne 1993" reads as corruption.
+        assert!(got.text.starts_with("line "), "{:?}", got.text);
+        // And it really is the END of the file, not the start.
+        assert!(got.text.ends_with("line 1999\n"), "{:?}", got.text);
+    }
+
+    #[test]
+    fn a_split_multibyte_character_never_becomes_a_replacement_char() {
+        // THE reason the partial line is dropped rather than decoded
+        // lossily. An offset chosen by arithmetic splits a 4-byte emoji,
+        // and `from_utf8_lossy` would put U+FFFD at the top of the panel.
+        let mut body = Vec::new();
+        for i in 0..200 {
+            body.extend_from_slice(format!("padding {i} 🎉🎉🎉🎉🎉\n").as_bytes());
+        }
+        let t = Tmp::new("utf8", &body);
+        for want in [50u32, 61, 73, 99, 128, 257] {
+            let got = tail::read(&t.0, want).unwrap();
+            assert!(
+                !got.text.contains('\u{FFFD}'),
+                "want={want} produced a replacement char: {:?}",
+                got.text
+            );
+        }
+    }
+
+    #[test]
+    fn one_enormous_line_is_returned_rather_than_nothing() {
+        // No newline anywhere in the excerpt. Returning an empty panel
+        // would look like an empty log, which is a different claim.
+        let body = vec![b'x'; 10_000];
+        let t = Tmp::new("oneline", &body);
+        let got = tail::read(&t.0, 100).unwrap();
+        assert!(!got.text.is_empty());
+        assert!(got.truncated);
+    }
+
+    #[test]
+    fn an_absent_log_is_not_found_rather_than_an_error() {
+        // A log that was never written is the normal state of a fresh
+        // install. Reporting it as a failure sends a user looking for a
+        // problem that is not there.
+        let p = std::env::temp_dir().join("headstate-tail-definitely-absent");
+        let _ = std::fs::remove_file(&p);
+        match tail::read(&p, 1024).unwrap_err() {
+            TailError::NotFound { path } => assert!(path.contains("definitely-absent")),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_two_failures_read_differently() {
+        // Each names a different remedy: "nothing has been logged yet"
+        // is not "something is wrong with your disk".
+        let a = TailError::NotFound { path: "p".into() }.to_string();
+        let b = TailError::Unreadable {
+            path: "p".into(),
+            why: "denied".into(),
+        }
+        .to_string();
+        assert_ne!(a, b);
+        assert!(a.contains("yet"), "{a}");
+        assert!(b.contains("denied"), "{b}");
+    }
+
+    #[test]
+    fn an_empty_log_is_empty_rather_than_missing() {
+        // The file EXISTS. Reporting NotFound would claim logging has
+        // never happened, which is a different fact.
+        let t = Tmp::new("empty", b"");
+        let got = tail::read(&t.0, 1024).unwrap();
+        assert_eq!(got.text, "");
+        assert_eq!(got.total, 0);
+        assert!(!got.truncated);
+    }
+
+    #[test]
+    fn the_request_is_capped_however_much_is_asked_for() {
+        // The payload crosses the Tauri bridge and, for a phone, an
+        // HTTP connection. A caller asking for everything must not get
+        // a multi-megabyte string.
+        let body = vec![b'x'; (tail::MAX_BYTES as usize) * 2];
+        let t = Tmp::new("cap", &body);
+        let got = tail::read(&t.0, u32::MAX).unwrap();
+        assert!(
+            got.text.len() <= tail::MAX_BYTES as usize,
+            "returned {} bytes",
+            got.text.len()
+        );
+        assert!(got.truncated);
+    }
+
+    #[test]
+    fn a_token_in_the_log_never_reaches_the_caller() {
+        // The panel is reachable from a paired phone and its copy button
+        // exists so this text gets pasted into a bug report (#1122).
+        let t = Tmp::new(
+            "secret",
+            b"line one\nauth failed for ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+        );
+        let got = tail::read(&t.0, 64 * 1024).unwrap();
+        assert!(!got.text.contains("ghp_AAAA"), "{:?}", got.text);
+    }
+}
