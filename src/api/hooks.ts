@@ -43,6 +43,7 @@ import type {
   PrActionName,
   ToolReport,
 } from "./tauri";
+import { createCoalescer } from "@/lib/coalesce";
 import {
   toolVersions,
   backgroundPanicked,
@@ -1964,16 +1965,18 @@ function useStreamingSafety(): Map<string, Worktree> {
     // `usePullRequests` for why the promise cannot be unwrapped naively.
     let unlisten: UnlistenFn | undefined;
     let cancelled = false;
-    listen<Worktree>("worktree-safety", (e) => {
-      const w = e.payload;
+    // Batched per frame, exactly as the size stream is (#1150): the
+    // safety pass lands one verdict per worktree and the same ~295-row
+    // burst costs the same 295 re-renders without it.
+    const coalescer = createCoalescer<Worktree>((batch) => {
       setSeen((prev) => {
-        // A fresh Map, not a mutation: React compares by identity, and
-        // an in-place `set` would leave every row showing its skeleton
-        // because nothing re-rendered.
         const next = new Map(prev);
-        next.set(w.path, w);
+        for (const w of batch) next.set(w.path, w);
         return next;
       });
+    });
+    listen<Worktree>("worktree-safety", (e) => {
+      coalescer.push(e.payload);
     }).then(
       (fn) => {
         if (cancelled) safeUnlisten(fn);
@@ -1983,6 +1986,7 @@ function useStreamingSafety(): Map<string, Worktree> {
     );
     return () => {
       cancelled = true;
+      coalescer.stop();
       safeUnlisten(unlisten);
     };
   }, []);
@@ -2103,16 +2107,24 @@ function useStreamingSizes(): Map<string, number | null> {
     // `usePullRequests` for why the promise cannot be unwrapped naively.
     let unlisten: UnlistenFn | undefined;
     let cancelled = false;
-    listen<[string, number | null]>("worktree-size", (e) => {
-      const [path, bytes] = e.payload;
+    // One state update per FRAME rather than per event (#1150). A fresh
+    // Map is still what React needs to see a change; what changes is
+    // that a burst of ~295 sizes allocates one rather than 295, and
+    // costs one re-render rather than 295 -- each of which rebuilds
+    // every derived row and re-sorts the list.
+    //
+    // The null-versus-absent distinction is load-bearing and survives
+    // untouched: `null` means "could not measure" and must never
+    // flatten to 0.
+    const coalescer = createCoalescer<[string, number | null]>((batch) => {
       setSizes((prev) => {
-        // A fresh Map, not a mutation: React compares by identity, and
-        // an in-place `set` would leave every row showing its skeleton
-        // because nothing re-rendered.
         const next = new Map(prev);
-        next.set(path, bytes);
+        for (const [path, bytes] of batch) next.set(path, bytes);
         return next;
       });
+    });
+    listen<[string, number | null]>("worktree-size", (e) => {
+      coalescer.push(e.payload);
     }).then(
       (fn) => {
         if (cancelled) safeUnlisten(fn);
@@ -2122,6 +2134,10 @@ function useStreamingSizes(): Map<string, number | null> {
     );
     return () => {
       cancelled = true;
+      // Stopped BEFORE the unlisten: a batch committing into an
+      // unmounted component is the one thing this indirection could
+      // newly break.
+      coalescer.stop();
       safeUnlisten(unlisten);
     };
   }, []);

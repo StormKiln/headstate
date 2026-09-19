@@ -1253,12 +1253,32 @@ export function WorktreesPage() {
   // passes run against the same repository a moment apart, and a worktree
   // created in that gap should appear rather than wait for the next
   // listing refetch.
-  const listedRows = selected?.worktrees ?? [];
-  const rows = [
-    ...listedRows,
-    ...[...verdicts.values()].filter((v) => !listedRows.some((l) => l.path === v.path)),
-  ];
-  const withSizes = rows.map((w) => ({
+  // A `??` on an optional field yields a NEW `[]` on every render when
+  // the left side is undefined, which would change the identity of both
+  // memos below on every render and make them useless. The linter names
+  // this case specifically.
+  const listedRows = useMemo(() => selected?.worktrees ?? [], [selected]);
+  // Memoised as well (#1150). `rows` feeds `withSizes` below, so a
+  // fresh array every render would make that memo useless -- the
+  // dependency would change on every render by construction. The
+  // linter's exhaustive-deps rule catches exactly this, which is how
+  // the omission was found rather than shipped.
+  const rows = useMemo(
+    () => [
+      ...listedRows,
+      ...[...verdicts.values()].filter((v) => !listedRows.some((l) => l.path === v.path)),
+    ],
+    [listedRows, verdicts],
+  );
+  // Memoised too (#1150): memoising `shown` against a `withSizes` that
+  // is rebuilt every render would save nothing, because the dependency
+  // would change every time. Both, or neither.
+  //
+  // `rows` is itself derived per render, so the deps are the three
+  // things that actually move: the listing, the verdict map and the
+  // size map -- each of which now changes once per frame rather than
+  // once per event.
+  const withSizes = useMemo(() => rows.map((w) => ({
     ...w,
     // The verdict's fields win over the listing's -- that is the point --
     // but ONLY for the fields classification actually answers. It also
@@ -1274,7 +1294,7 @@ export function WorktreesPage() {
     /// sizing pass failed. Either way no number is coming for it, and
     /// the row must say so instead of holding a skeleton.
     sizeUnmeasurable: (sizes?.has(w.path) && sizes.get(w.path) === null) || sizingFailed,
-  }));
+  })), [rows, verdicts, sizes, sizingFailed]);
 
   // SORTING VS STREAMING (#771).
   //
@@ -1366,9 +1386,25 @@ export function WorktreesPage() {
   // seen yet sorts to the end rather than being dropped -- a worktree
   // must never vanish from the list because it appeared between
   // gestures.
-  const rank = new Map(order.map((p, i) => [p, i]));
-  const shown = [...withSizes].sort(
-    (a, b) => (rank.get(a.path) ?? Infinity) - (rank.get(b.path) ?? Infinity),
+  // Memoised against the batched map identity (#1150).
+  //
+  // `withSizes` is a new array on every render -- the file says so at
+  // its own definition -- and this rebuilds a Map of every path and
+  // re-sorts the whole list. With the streams batched per frame that is
+  // now ~1 rebuild per frame rather than ~295 in a burst, and memoising
+  // makes the saving real rather than merely available: without it the
+  // sort runs again on every unrelated render too.
+  //
+  // The frozen sort order (#771/#817) is untouched -- `order` is still
+  // the snapshot's, and a path it has not seen still sorts to the end
+  // rather than being dropped.
+  const rank = useMemo(() => new Map(order.map((p, i) => [p, i])), [order]);
+  const shown = useMemo(
+    () =>
+      [...withSizes].sort(
+        (a, b) => (rank.get(a.path) ?? Infinity) - (rank.get(b.path) ?? Infinity),
+      ),
+    [withSizes, rank],
   );
 
   const [forcing, setForcing] = useState<Worktree | null>(null);
