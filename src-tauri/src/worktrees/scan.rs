@@ -2370,12 +2370,6 @@ fn conflicted_files(dir: &Path) -> Option<u64> {
 /// The single place both scan paths go through: `classify_repo` and
 /// `collect_inner` previously each had their own copy, and adding the
 /// merge date to one silently left the other behind.
-
-/// Classify a worktree and, when merged, date it.
-///
-/// The single place both scan paths go through: `classify_repo` and
-/// `collect_inner` previously each had their own copy, and adding the
-/// merge date to one silently left the other behind.
 fn classify(w: &mut Worktree, repo: &Path, default_branch: &str) {
     let dir = Path::new(&w.path);
 
