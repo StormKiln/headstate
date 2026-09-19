@@ -39,6 +39,9 @@ const cleanupPrefs = vi.hoisted(() => ({
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 vi.mock("../api/tauri", () => ({ revealLog: revealFn }));
 vi.mock("../api/hooks", () => ({
+  // #1154. Undefined renders nothing, which is what these tests assume:
+  // a failed probe must not draw "not found" for every tool.
+  useToolVersions: () => ({ data: undefined, isError: false }),
   // #1127. The inventory section is collapsed and reads nothing until
   // opened, which is what these tests assume.
   useClaudeHookInventory: () => ({ data: undefined, error: null }),

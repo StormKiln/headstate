@@ -2,6 +2,7 @@ import { useState } from "react";
 import { ChevronLeft, ChevronRight } from "lucide-react";
 import { toast } from "sonner";
 import { revealLog } from "@/api/tauri";
+import { ToolVersions } from "./ToolVersions";
 import { useIsMobile } from "@/lib/useIsMobile";
 import { HelpButton } from "./HelpButton";
 import { GetCompanionPanel } from "./GetCompanionPanel";
@@ -389,6 +390,9 @@ export function SettingsDialog({
               {autostartError}
             </p>
           ) : null}
+          {/* Beside the log, because both answer the same question:
+              something is not working and what do I check (#1154). */}
+          <ToolVersions />
         </div>
 
         {/* Automatic cleanup, which in this build cannot remove

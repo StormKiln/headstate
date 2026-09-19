@@ -5,6 +5,9 @@ const setPrefs = vi.fn(() => Promise.resolve());
 const prefsState: { prefs: unknown } = { prefs: undefined };
 
 vi.mock("../api/hooks", () => ({
+  // #1154. Undefined renders nothing, which is what these tests assume:
+  // a failed probe must not draw "not found" for every tool.
+  useToolVersions: () => ({ data: undefined, isError: false }),
   // #1127. The inventory section is collapsed and reads nothing until
   // opened, which is what these tests assume.
   useClaudeHookInventory: () => ({ data: undefined, error: null }),

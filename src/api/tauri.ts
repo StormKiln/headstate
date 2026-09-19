@@ -787,6 +787,28 @@ export const packagesMarkdown = (
 /// reports it is dead" -- #1042's collapse one surface over.
 export const backgroundPanicked = () => call<boolean>("background_panicked");
 
+/// A tool's version, or why we do not have one (#1154). Mirrors
+/// `tools::version::ToolVersion`.
+///
+/// `cannotTell` is deliberately distinct from `tooOld` and `notFound`:
+/// the remedies differ, and rendering "we could not tell" as "too old"
+/// sends a user to upgrade something that may be current.
+export type ToolVersion =
+  | { state: "ok"; found: string }
+  | { state: "tooOld"; found: string; required: string }
+  | { state: "notFound" }
+  | { state: "cannotTell"; detail: string };
+
+export interface ToolReport {
+  name: string;
+  path: string | null;
+  version: ToolVersion;
+  /// What stops working without it. The tools are not equal.
+  matters: string;
+}
+
+export const toolVersions = () => call<ToolReport[]>("tool_versions");
+
 export const revealLog = () => call<string>("reveal_log");
 
 /// Every scope a session actually loads: the repository, plus

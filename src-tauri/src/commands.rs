@@ -1435,6 +1435,19 @@ pub fn background_panicked() -> bool {
 }
 
 #[tauri::command]
+/// What version of each external tool this machine has (#1154).
+///
+/// Probed through the same resolvers the app uses everywhere else, so
+/// this reports the binary Headstate would actually run rather than
+/// whatever is first on an interactive PATH -- a GUI-launched .app does
+/// not inherit that PATH, which is why those resolvers exist.
+pub async fn tool_versions() -> Result<Vec<crate::tools::version::ToolReport>, String> {
+    tauri::async_runtime::spawn_blocking(crate::tools::version::report_all)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn reveal_log(app: AppHandle) -> Result<String, String> {
     use tauri::Manager;
     let dir = app

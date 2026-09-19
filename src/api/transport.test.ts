@@ -192,6 +192,7 @@ const ROWS: Row[] = [
   row(api.checkPackages, [repoPath], "check_packages", { repoPath }),
   row(api.packagesMarkdown, [repoPath, reports, filter], "packages_markdown", { repoPath, reports, filter }),
   row(api.backgroundPanicked, [], "background_panicked"),
+  row(api.toolVersions, [], "tool_versions"),
   row(api.revealLog, [], "reveal_log"),
   row(api.claudeMdEffective, [repoPath], "claude_md_effective", { repoPath }),
   row(api.scanClaudeMd, [repoPath], "scan_claude_md", { repoPath }),

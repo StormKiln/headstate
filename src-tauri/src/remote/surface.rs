@@ -66,6 +66,10 @@ pub const SURFACE: &[(&str, Class)] = &[
     // remedy it points at (`reveal_log`) stays Local, which is why the
     // companion says the log opens at that Mac.
     ("background_panicked", Class::Read),
+    // Read: spawns four `--version` probes and returns what they said.
+    // A question about the DESKTOP's toolchain, which a phone
+    // diagnosing "why are there no worktrees" reasonably asks (#1154).
+    ("tool_versions", Class::Read),
     ("get_auth_state", Class::Read),
     ("get_cached", Class::Read),
     ("get_cached_reviewing", Class::Read),
@@ -844,6 +848,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
     match command {
         // ---- read -------------------------------------------------------
         "background_panicked" => ok(commands::background_panicked()),
+        "tool_versions" => res(commands::tool_versions().await),
         "get_auth_state" => ok(commands::get_auth_state(app.state())),
         "get_cached" => res(commands::get_cached(app.clone())),
         "get_cached_reviewing" => res(commands::get_cached_reviewing(app.clone())),

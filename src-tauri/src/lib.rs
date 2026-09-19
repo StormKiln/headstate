@@ -22,6 +22,7 @@ pub mod redact;
 pub mod remote;
 pub mod repos;
 pub mod store;
+pub mod tools;
 pub mod tray;
 mod worktrees;
 
@@ -226,6 +227,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::diag_log,
             commands::background_panicked,
+            commands::tool_versions,
             commands::reveal_log,
             commands::pull_checkout,
             commands::fetch_refs,
