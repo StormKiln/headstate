@@ -325,12 +325,40 @@ export type Upstream =
   | { kind: "detached" }
   | { kind: "unknown"; n: string };
 
+/// Which of a worktree's dirty lines are submodules (#1138).
+///
+/// Counts, not paths: this rides on every worktree row, and #985
+/// measured per-row payload as the thing that matters.
+export interface SubmoduleState {
+  /// How many submodules this worktree has.
+  total: number;
+  /// How many carry uncommitted work of their own.
+  ///
+  /// Read with `git status --porcelain` INSIDE each submodule, not from
+  /// `git submodule status`'s `+` flag -- that flag means "at a
+  /// different commit", which is a different fact and reads 0 for a
+  /// submodule with a modified file in it.
+  dirty: number;
+  /// How many are not at the commit the parent records.
+  ///
+  /// Separate from `dirty` because the remedy differs: this is
+  /// `git submodule update`, and removing the worktree loses nothing.
+  out_of_sync: number;
+}
+
 export interface Worktree {
   path: string;
   branch: string;
   head: string;
   size_bytes: number | null;
   safety: Safety;
+  /// Submodule detail, or `null` when there are none.
+  ///
+  /// NOT a safety signal -- `safety` already carries `Dirty` for a
+  /// worktree with a dirty submodule, because the parent's porcelain
+  /// reports it as a ` M <path>` line. This says which KIND of dirt,
+  /// so "1 uncommitted file" can be stated as what it actually is.
+  submodules?: SubmoduleState | null;
   is_main: boolean;
   /// `YYYY-MM-DD` when this branch landed in the default branch, when it
   /// can be determined. The date the work REACHED the default branch, not
@@ -363,6 +391,17 @@ export interface WorktreeRepo {
   name: string;
   path: string;
   worktrees: Worktree[];
+  /// Entries on this repository's stash stack, or `null` if unread.
+  ///
+  /// Per REPOSITORY because the stack is shared repo-wide: an entry
+  /// pushed in one worktree is listed from every other, and survives
+  /// `git worktree remove` on the tree that made it. Verified against
+  /// real git, and it is what makes the number worth showing -- the
+  /// entries outlive the directory they belong to and git records no
+  /// attribution.
+  ///
+  /// `null` is "not read", never zero (#846).
+  stash_entries?: number | null;
   /// A repository with no working tree -- a bare clone or mirror
   /// (#1142). Optional because it is `#[serde(default)]` on the Rust
   /// side, so a cached scan written before this field existed

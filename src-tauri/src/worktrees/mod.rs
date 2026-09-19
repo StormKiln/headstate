@@ -14,6 +14,8 @@
 mod assess;
 mod model;
 pub(crate) mod scan;
+/// Submodule state per worktree (#1138).
+pub mod submodule;
 mod update;
 
 pub use assess::{assess, Assessment};

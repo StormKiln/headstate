@@ -1,5 +1,5 @@
 import type {
-  ClaudeSession, Lock, PullRequest, Safety, Upstream, Worktree, WorktreeRepo } from "@/types/pr";
+  ClaudeSession, Lock, PullRequest, Safety, SubmoduleState, Upstream, Worktree, WorktreeRepo } from "@/types/pr";
 
 /// Only `safe` may be deleted.
 ///
@@ -219,6 +219,36 @@ export function lockHolderNote(lock: Lock): string | null {
 /// Mirrors `Safety::reason` on the Rust side. Deliberately duplicated
 /// rather than sent over the wire: the wire type is data, and prose in a
 /// payload is harder to change than prose in a component.
+/// What a worktree's submodules add to the dirty count, or null.
+///
+/// A SEPARATE sentence rather than a change to `safetyReason`, and that
+/// is deliberate. `safetyReason` takes a `Safety` and answers "can I
+/// remove this"; the submodule state does not change that answer --
+/// `Safety::Dirty` already refuses -- it changes what the user should
+/// DO about it. Folding it in would also mean threading a second
+/// argument through every caller of a function whose whole job is to
+/// turn one value into one string.
+///
+/// Null when there is nothing to say. A worktree whose submodules are
+/// clean and in sync is the ordinary case, and a line reading
+/// "0 submodules with changes" on every row is noise.
+export function submoduleNote(sub: SubmoduleState | null | undefined): string | null {
+  if (!sub || (sub.dirty === 0 && sub.out_of_sync === 0)) return null;
+  const parts: string[] = [];
+  // Dirty first: it is the half that means work would be lost, and the
+  // half the dirty count the user is already looking at came from.
+  if (sub.dirty > 0) {
+    parts.push(`${sub.dirty} submodule${sub.dirty === 1 ? "" : "s"} with uncommitted work`);
+  }
+  if (sub.out_of_sync > 0) {
+    // "not at the recorded commit" rather than "out of date": the
+    // submodule may be AHEAD, and calling that out of date would be
+    // wrong in a way that sends the user to the wrong command.
+    parts.push(`${sub.out_of_sync} not at the recorded commit`);
+  }
+  return parts.join(", ");
+}
+
 export function safetyReason(s: Safety): string {
   switch (s.kind) {
     case "safe":

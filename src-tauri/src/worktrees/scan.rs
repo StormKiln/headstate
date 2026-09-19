@@ -31,6 +31,26 @@ const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Shared with `branches`, which needs the same timeout contract: a
 /// git call that hangs must become "cannot say", never "safe to
 /// delete".
+/// How many entries are on this repository's stash stack (#1138).
+///
+/// `None` on failure, never `Some(0)`: "we could not read the stack" and
+/// "the stack is empty" are different claims, and only one of them means
+/// there is nothing to lose (#846).
+///
+/// Called once per REPOSITORY. The stack is shared repo-wide -- verified
+/// against real git: an entry pushed in the main checkout is listed from
+/// every worktree and survives `git worktree remove` on the tree that
+/// made it. Asking per worktree would be ~295 subprocesses returning the
+/// same number.
+///
+/// `git stash list` measured at 10 ms, the same as `git status`, so this
+/// needs no gate of its own beyond the caller's `with_safety`.
+fn stash_count(dir: &Path) -> Option<u64> {
+    git(dir, &["stash", "list"])
+        .ok()
+        .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count() as u64)
+}
+
 pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     // RETRIED on a spawn failure.
     //
@@ -2373,6 +2393,19 @@ fn conflicted_files(dir: &Path) -> Option<u64> {
 fn classify(w: &mut Worktree, repo: &Path, default_branch: &str) {
     let dir = Path::new(&w.path);
 
+    // Behind a `stat` on `.gitmodules`, which is 80,000 times cheaper
+    // than the command it guards and exact rather than heuristic --
+    // git records submodules there, so a repository without one has
+    // none. Measured: the status call costs 65 ms even where there is
+    // nothing to report, and 17 of the 18 repositories here have no
+    // submodules at all (#1138).
+    //
+    // NOT a safety input. `git status --porcelain` already reports a
+    // dirty submodule as a ` M <path>` line, so `Safety::Dirty` below
+    // already wins and plain Remove already declines. This says WHICH
+    // kind of dirt, because the remedies differ.
+    w.submodules = crate::worktrees::submodule::read(dir);
+
     // Upstream FIRST, so its answers feed the safety check rather than
     // being recomputed there. This removed two duplicated calls per
     // worktree -- a second `rev-parse @{u}` and a `log --oneline @{u}..`
@@ -2832,6 +2865,12 @@ fn collect_inner(dir: &Path, depth: usize, out: &mut RepoScan, with_safety: bool
                 // Both existing branches reached a `.git` entry, which a
                 // bare repository does not have.
                 bare: false,
+                // `None`, not `Some(0)`, for the reason `default_ref`
+                // below is None: reading the stack means running git in
+                // the parent repository, and there is no parent
+                // repository. "We did not look" is not "there is
+                // nothing" (#846).
+                stash_entries: None,
                 name: dir
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
@@ -2857,6 +2896,11 @@ fn collect_inner(dir: &Path, depth: usize, out: &mut RepoScan, with_safety: bool
                     // run -- no status, no merge-base, no upstream. The
                     // app cannot answer "is this merged" or "is this
                     // dirty", so it must not claim to.
+                    // `None` for the same reason as `safety` beside
+                    // it: reading submodule state means running git in
+                    // this directory, and an orphan has no repository
+                    // to run it against.
+                    submodules: None,
                     safety: Safety::Orphaned,
                     is_main: false,
                     merged_at: None,
@@ -2912,6 +2956,15 @@ fn collect_inner(dir: &Path, depth: usize, out: &mut RepoScan, with_safety: bool
                     // Both existing branches reached a `.git` entry, which a
                     // bare repository does not have.
                     bare: false,
+                    // Gated on `with_safety` like every other subprocess
+                    // here: a scan that skipped the safety verdicts is
+                    // the fast path, and one `git stash list` per repo
+                    // would put it back on the slow one.
+                    //
+                    // ONCE PER REPOSITORY, because the stack is shared
+                    // repo-wide -- asking per worktree would be ~295
+                    // subprocesses returning the same number.
+                    stash_entries: with_safety.then(|| stash_count(dir)).flatten(),
                     identity: repo_identity(&dir.to_string_lossy()),
                     fetched_at: fetched_at(dir),
                     name: dir
@@ -2996,6 +3049,11 @@ fn collect_inner(dir: &Path, depth: usize, out: &mut RepoScan, with_safety: bool
                             // would claim a checkout is being protected
                             // when there is none.
                             bare: true,
+                            // Asked even though there is no working
+                            // tree: the stack lives in the repository,
+                            // not in a checkout, and the worktrees
+                            // hanging off this bare repo share it.
+                            stash_entries: with_safety.then(|| stash_count(dir)).flatten(),
                             identity: repo_identity(&dir.to_string_lossy()),
                             fetched_at: fetched_at(dir),
                             name: dir

@@ -1052,6 +1052,99 @@ describe("WorktreesPage", () => {
   // 124 of 268 worktrees on a real machine cannot be removed. The row
   // used to show a dead Remove there; it now answers the question that
   // actually applies -- is there anything in here worth keeping?
+  /// Submodules and the shared stash stack (#1138).
+  describe("submodules and stashes", () => {
+    it("says nothing about submodules when there are none", () => {
+      // The state of 17 of the 18 repositories checked out here. A
+      // sentence on every row would be noise.
+      state.classified = [wt({ safety: { kind: "dirty", detail: 1 } })];
+      render(<WorktreesPage />);
+      expect(screen.queryByText(/submodule/i)).toBeNull();
+    });
+
+    it("says which of the dirty lines are submodules", () => {
+      // The count is already right -- `Dirty` wins and Remove already
+      // declines -- but "1 uncommitted file" does not say the file is
+      // in a different repository with its own commit and push.
+      state.classified = [
+        wt({
+          safety: { kind: "dirty", detail: 1 },
+          submodules: { total: 1, dirty: 1, out_of_sync: 0 },
+        }),
+      ];
+      render(<WorktreesPage />);
+      expect(screen.getByText(/1 uncommitted file/)).toBeTruthy();
+      expect(screen.getByText(/1 submodule with uncommitted work/)).toBeTruthy();
+    });
+
+    it("does not change the removal verdict", () => {
+      // Deliberately NOT a second gate. `Safety::Dirty` already refuses,
+      // and a refusal with two reasons over one fact buys nothing.
+      state.classified = [
+        wt({
+          safety: { kind: "safe" },
+          submodules: { total: 1, dirty: 0, out_of_sync: 1 },
+        }),
+      ];
+      render(<WorktreesPage />);
+      expect(screen.getByRole("button", { name: /^remove$/i })).toBeTruthy();
+    });
+
+    it("reports the stash stack once, with the fact that makes it matter", () => {
+      // The entries SURVIVE the worktree that made them and git records
+      // no attribution -- so a user clearing worktrees is looking at
+      // work that reappears, unlabelled, in whatever tree they open
+      // next. Without that sentence the number is trivia.
+      state.repos = [
+        {
+          identity: null,
+          name: "proj",
+          path: "/code/proj",
+          worktrees: [wt({})],
+          stash_entries: 3,
+        },
+      ];
+      state.classified = [wt({})];
+      render(<WorktreesPage />);
+      expect(screen.getByText(/3 stash entries/)).toBeTruthy();
+      expect(screen.getByText(/shared\s+by all worktrees/)).toBeTruthy();
+    });
+
+    it("says nothing when the stack is empty", () => {
+      state.repos = [
+        {
+          identity: null,
+          name: "proj",
+          path: "/code/proj",
+          worktrees: [wt({})],
+          stash_entries: 0,
+        },
+      ];
+      state.classified = [wt({})];
+      render(<WorktreesPage />);
+      expect(screen.queryByText(/stash/i)).toBeNull();
+    });
+
+    it("says nothing when the stack was not read, rather than zero", () => {
+      // `null` is "did not look", which is not "there is nothing"
+      // (#846). Rendering it as "0 stash entries" would be a claim the
+      // scan never made.
+      state.repos = [
+        {
+          identity: null,
+          name: "proj",
+          path: "/code/proj",
+          worktrees: [wt({})],
+          stash_entries: null,
+        },
+      ];
+      state.classified = [wt({})];
+      render(<WorktreesPage />);
+      expect(screen.queryByText(/stash/i)).toBeNull();
+      expect(screen.queryByText(/0 stash/)).toBeNull();
+    });
+  });
+
   describe("Claudify", () => {
     it.each([["never_pushed"], ["unmerged"], ["dirty"], ["unpushed"], ["empty"]])(
       "offers it for %s",

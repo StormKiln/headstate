@@ -32,6 +32,26 @@ pub struct Repo {
     /// protect, so the row must not claim one is being guarded.
     #[serde(default)]
     pub bare: bool,
+    /// How many entries are on this repository's stash stack, or `None`
+    /// if it was not read (#1138).
+    ///
+    /// Per REPOSITORY and not per worktree, because the stack is shared
+    /// repo-wide -- verified rather than assumed: an entry pushed in the
+    /// main checkout is listed by `git stash list` from every worktree,
+    /// and SURVIVES `git worktree remove` on the tree that made it. That
+    /// is exactly what makes it worth showing: the entries outlive the
+    /// working directory they belong to, git records no attribution, and
+    /// the user meets them later in a different tree.
+    ///
+    /// `Option` because unread must never render as zero (#846). "No
+    /// stashes" and "we did not look" are different claims, and only one
+    /// of them means there is nothing to lose.
+    ///
+    /// `worktrees/update.rs` explains why Headstate never CREATES a
+    /// stash entry. Reading the existing stack is the other half of that
+    /// reasoning and was simply missing.
+    #[serde(default)]
+    pub stash_entries: Option<u64>,
     /// When this repository's remote refs were last fetched, RFC 3339,
     /// or `None` if it has never been fetched or the time is unreadable.
     ///
@@ -712,6 +732,17 @@ pub struct Worktree {
     /// a branch written weeks before it merged, and the merge date is the
     /// one that answers "is this safe to forget about".
     pub merged_at: Option<String>,
+    /// Which of this worktree's dirty lines are submodules (#1138).
+    ///
+    /// `None` means there are no submodules -- the common case, and the
+    /// state in 17 of the 18 repositories checked out here. It is NOT a
+    /// safety signal: `git status --porcelain` already reports a dirty
+    /// submodule as a ` M <path>` line, so `Safety::Dirty` already wins
+    /// and plain Remove already declines. What this adds is WHICH kind
+    /// of dirt, because "1 uncommitted file" and "a submodule has work
+    /// in it" have different remedies.
+    #[serde(default)]
+    pub submodules: Option<crate::worktrees::submodule::SubmoduleState>,
     /// Git's `locked` line: `Some(reason)`, `Some("")` for a bare lock,
     /// `None` when the worktree is not locked (#753).
     ///
