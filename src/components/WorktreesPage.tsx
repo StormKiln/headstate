@@ -36,6 +36,8 @@ import {
   canClaudify,
   submoduleNote,
   reclaimable,
+  matchesWorktreeFilters,
+  worktreeFiltersActive,
   isPending,
   isSafe,
   pathBasename,
@@ -60,6 +62,7 @@ import {
 } from "../lib/worktrees";
 import { HelpButton } from "./HelpButton";
 import { WorktreeKebab } from "./WorktreeKebab";
+import { WorktreeFilterBar } from "./WorktreeFilterBar";
 import { claudeLaunchWorktree, claudifyCommand } from "../api/tauri";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { isCancelled } from "@/lib/cancelled";
@@ -119,6 +122,8 @@ function Row({
   onCopyClaudify,
   terminalConfigured = false,
   onForget,
+  checked = false,
+  onToggle,
   sizePending,
   sizeUnmeasurable = false,
   removing = false,
@@ -156,6 +161,15 @@ function Row({
   /// Whether a terminal is configured, which decides the kebab's
   /// labels and whether it offers two Claudify items or one.
   terminalConfigured?: boolean;
+  /// Whether this row is in the bulk selection (#1140).
+  checked?: boolean;
+  /// Toggle this row, with whether shift was held.
+  ///
+  /// Absent means the row is not selectable. The row reports the
+  /// modifier and the LIST decides what a range means, because only the
+  /// list can see the other worktrees -- the same split `PrRow` makes,
+  /// with the range folded into one prop rather than two.
+  onToggle?: (path: string, shiftKey: boolean) => void;
   onForget: (wt: Worktree) => void;
   /// This row's removal is in flight. Per row, not per page: with 100+
   /// rows, freezing all of them because one is deleting would be worse
@@ -267,6 +281,39 @@ function Row({
   /// narrower than its TEXT, which a floor well under the text's width
   /// still allows. The phone keeps `min-w-0`, since a stacked name has
   /// the whole row and no competitor to be floored against.
+  /// The selection checkbox, or null when the row is not selectable.
+  ///
+  /// LEADING, before the name, mirroring `PrRow` -- and it does not
+  /// breach this row's "one action per row, never two" rule, which is
+  /// about the ACTION cell: a checkbox selects, it does not act.
+  ///
+  /// `self-center` because the desktop row is `items-baseline`, where a
+  /// checkbox would otherwise sit on the text baseline.
+  ///
+  /// ONE `onChange`, never an `onClick`/`onChange` pair, and `shiftKey`
+  /// read off `e.nativeEvent`: both are `PrRow`'s hard-won lessons. A
+  /// pair fires twice for a mouse click, so shift-click computed the
+  /// range and then re-added the endpoint on top of it; and React's
+  /// `ChangeEvent` carries no modifier keys at all.
+  const selectCell = onToggle ? (
+    <label
+      className="flex shrink-0 self-center"
+      onClick={(e) => e.stopPropagation()}
+      onKeyDown={(e) => e.stopPropagation()}
+    >
+      <span className="sr-only">Select {pathBasename(wt.path)}</span>
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => {
+          const shift = (e.nativeEvent as MouseEvent).shiftKey === true;
+          onToggle(wt.path, shift);
+        }}
+        className="h-4 w-4 cursor-pointer accent-[#1f6feb]"
+      />
+    </label>
+  ) : null;
+
   const nameCell = (
       <span
         className={`${isMobile ? "min-w-0" : "min-w-48"} flex-1 truncate font-mono text-[#e6edf3]`}
@@ -730,6 +777,7 @@ function Row({
     {isMobile ? (
       <div className="flex flex-col gap-1 px-4 py-2.5 text-sm">
         <div className="flex items-baseline gap-3">
+          {selectCell}
           {nameCell}
           {sizeCell}
         </div>
@@ -738,6 +786,7 @@ function Row({
       </div>
     ) : (
     <div className="flex items-baseline gap-3 px-4 py-2.5 text-sm">
+      {selectCell}
       {nameCell}
       {safetyCell}
       {sizeCell}
@@ -1037,6 +1086,23 @@ export function WorktreesPage() {
   // that found nothing. One cache hit -- `staleTime: Infinity`.
   const { dirs } = useWorktreeDirs();
   const filters = useActiveFilters();
+  /// Rows ticked for a bulk action, keyed by path (#1140).
+  ///
+  /// UP HERE with the other store hooks, not beside the selection
+  /// logic below: this component has two early returns further down,
+  /// and a hook after them renders a different number of hooks per
+  /// branch. An existing test catches exactly that.
+  ///
+  /// The store's existing `checked`, reused rather than a parallel key:
+  /// `setView` already clears it on every view change, so worktree
+  /// paths and PR `repo#number` keys can never be in it at once.
+  const checked = useFilters((st) => st.checked);
+  const toggleChecked = useFilters((st) => st.toggleChecked);
+  const setChecked = useFilters((st) => st.setChecked);
+  const clearChecked = useFilters((st) => st.clearChecked);
+  const anchor = useFilters((st) => st.anchor);
+  const setAnchor = useFilters((st) => st.setAnchor);
+
   const { setFilter } = useFilters();
   const isMobile = useIsMobile();
 
@@ -1267,6 +1333,8 @@ export function WorktreesPage() {
   /// boolean so only the clicked row goes busy.
   const [removing, setRemoving] = useState<string | null>(null);
   const [bulkOpen, setBulkOpen] = useState(false);
+  /// The selection-scoped removal dialog (#1140).
+  const [selectionOpen, setSelectionOpen] = useState(false);
   const [bulkBusy, setBulkBusy] = useState(false);
   const removalProgress = useRemovalProgress();
   const removeMany = useRemoveWorktrees();
@@ -2105,11 +2173,76 @@ export function WorktreesPage() {
     return o.kind === "occupied" ? o.session : null;
   };
 
+  /// The rows after the page's own filters (#1140).
+  ///
+  /// Applied AFTER `shown`, never before the sort. The order is
+  /// deliberately frozen against the streaming size data (see the
+  /// comment above `snapshot`), and filtering upstream of
+  /// `sortWorktrees` would mean toggling a facet re-enters that
+  /// machinery and reshuffles rows that have not changed.
+  ///
+  /// Every count below reads `visible`, so "9 safe to remove" describes
+  /// what is on screen. `worktreeFiltersActive` is what makes that
+  /// honest: a count of a narrowed list needs to say it is narrowed.
+  //
+  // NOT a `useMemo`, deliberately: this sits BELOW the page's two early
+  // returns (the orphan view and the all-repositories rollup), so a
+  // hook here renders a different number of hooks depending on which
+  // branch ran -- "Rendered more hooks than during the previous
+  // render", which an existing test caught. A filter over at most a few
+  // hundred rows is a string compare per row and does not need memoising.
+  const visible = shown.filter((w) =>
+    matchesWorktreeFilters(w, filters, (path) => agentIn(path) !== null),
+  );
+  /// Whether anything is being hidden, for the counts and the dialogs.
+  const filtered = worktreeFiltersActive(filters);
+  /// How many rows the filter is hiding, for the sentence that says so.
+  const hiddenCount = shown.length - visible.length;
+
+  /// The paths currently on screen, in order, for range selection.
+  const visibleKeys = visible.map((w) => w.path);
+
+  /// Toggle one row, or extend from the anchor when shift is held.
+  ///
+  /// The range is additive -- a union, never a deselection -- matching
+  /// `PrList`: shift-clicking is how you GROW a selection, and having
+  /// it silently drop rows would make a long range unusable.
+  const toggleRow = (path: string, shiftKey: boolean) => {
+    if (shiftKey && anchor) {
+      const a = visibleKeys.indexOf(anchor);
+      const b = visibleKeys.indexOf(path);
+      if (a !== -1 && b !== -1) {
+        const [lo, hi] = a <= b ? [a, b] : [b, a];
+        setChecked([...new Set([...checked, ...visibleKeys.slice(lo, hi + 1)])]);
+        return;
+      }
+      // The anchor has been filtered away since it was set. Falls
+      // through to a plain toggle rather than guessing a range against
+      // a row that is no longer on screen.
+    }
+    toggleChecked(path);
+    setAnchor(path);
+  };
+
+  /// The selected rows that are actually ON SCREEN.
+  ///
+  /// THE safety rule (#1140): a bulk action only ever destroys rows the
+  /// user can see. This deliberately diverges from `BulkBar`, which
+  /// resolves PR selections against the unfiltered list so a batch
+  /// cannot shrink -- there the cost of being wrong is a missed merge,
+  /// here it is a deleted directory.
+  ///
+  /// Nothing vanishes silently: `selectedHidden` below is what the
+  /// dialog says out loud.
+  const selectedVisible = visible.filter((w) => checked.includes(w.path));
+  /// Selected rows the filter is hiding, which will NOT be acted on.
+  const selectedHidden = checked.length - selectedVisible.length;
+
   const removable = (w: Worktree) =>
     isSafe(w.safety) &&
     (!claudeOn || occupancy(w.path, sessionList, occupiedBy).kind === "free");
 
-  const shownSafe = shown.filter(removable);
+  const shownSafe = visible.filter(removable);
   const safeCount = shownSafe.length;
   /// What those rows are holding on disk (#1181).
   ///
@@ -2129,7 +2262,7 @@ export function WorktreesPage() {
   /// wider gate -- it was an action and a number of its own. Folding
   /// them into the green count would claim 12 directories are
   /// recoverable disk when they are 12 dangling pointers.
-  const shownPrunable = shown.filter((w) => w.safety.kind === "prunable");
+  const shownPrunable = visible.filter((w) => w.safety.kind === "prunable");
   const prunableCount = shownPrunable.length;
   /// Locks whose named holder is provably gone (#792).
   ///
@@ -2138,22 +2271,28 @@ export function WorktreesPage() {
   /// unlock may touch; every other locked row keeps the single-row
   /// confirmation, because a bulk action over claims that might be live
   /// is exactly what #753 refused to offer and was right to.
-  const shownDeadLocks = shown.filter(isDeadLock);
+  const shownDeadLocks = visible.filter(isDeadLock);
   const deadLockCount = shownDeadLocks.length;
   // Same honesty rule as the all-repositories rollup: an unmeasured
   // size is null, and counting it as zero would report a confident
   // wrong total. Sizes arrive in their own pass after safety, so this
   // grows as results land rather than being computed once.
-  const measured = shown.filter((w) => w.size_bytes !== null && w.size_bytes !== undefined);
+  const measured = visible.filter((w) => w.size_bytes !== null && w.size_bytes !== undefined);
   const totalBytes = measured.reduce((n, w) => n + (w.size_bytes ?? 0), 0);
-  const sizesComplete = measured.length === shown.length;
+  const sizesComplete = measured.length === visible.length;
 
   return (
     <div className="flex flex-col gap-3">
       <div className="flex flex-wrap items-baseline gap-3 text-sm">
         <span className="font-semibold">{selected?.name}</span>
         <span className="text-[#8b949e]">
-          {shown.length} worktree{shown.length === 1 ? "" : "s"}
+          {visible.length} worktree{visible.length === 1 ? "" : "s"}
+          {/* A count of a NARROWED list has to say it is narrowed
+              (#1140). "12 worktrees" beside a filter that is hiding 40
+              is a claim about the repository that is not true. */}
+          {hiddenCount > 0 ? (
+            <span className="text-[#8b949e]"> ({hiddenCount} hidden by filters)</span>
+          ) : null}
         </span>
         {/* The stash stack, once per repository, because it IS once per
             repository (#1138).
@@ -2403,7 +2542,7 @@ export function WorktreesPage() {
             "broken". */}
         {!classifying && sizing ? (
           <span className="text-xs text-[#8b949e]">
-            measuring sizes — {shown.length - measured.length} of {shown.length} to go
+            measuring sizes — {visible.length - measured.length} of {visible.length} to go
           </span>
         ) : null}
         {/* "at least" until every worktree has been measured. Reported
@@ -2430,6 +2569,36 @@ export function WorktreesPage() {
 
             BEFORE the Sort group, and that order is the rest of #817.
             See the group's own comment below for why. */}
+        {/* The SELECTION button, beside the verdict-scoped one rather
+            than replacing it (#1140).
+
+            Two buttons, each stating its own scope in its own label.
+            One button that meant "all safe" with nothing ticked and
+            "the ticked ones" otherwise would change what it destroys
+            depending on state the user cannot see from the label --
+            which is exactly what the issue warns about.
+
+            Only when something is ticked: a permanently disabled
+            "Remove 0 selected" is noise on every visit. */}
+        {selectedVisible.length > 0 ? (
+          <button
+            type="button"
+            disabled={bulkBusy}
+            onClick={() => setSelectionOpen(true)}
+            className="rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#f85149] hover:bg-[#f85149]/10 disabled:opacity-50"
+          >
+            Remove {selectedVisible.length} selected
+          </button>
+        ) : null}
+        {selectedVisible.length > 0 ? (
+          <button
+            type="button"
+            onClick={clearChecked}
+            className="text-xs text-[#8b949e] underline hover:no-underline"
+          >
+            Clear selection
+          </button>
+        ) : null}
         {safeCount > 1 && safeKnown ? (
           <button
             type="button"
@@ -2444,7 +2613,12 @@ export function WorktreesPage() {
               ? removalProgress
                 ? `Removed ${removalProgress.done} of ${removalProgress.total}…`
                 : "Removing…"
-              : `Remove ${safeCount} safe worktree${safeCount === 1 ? "" : "s"}`}
+              : // "safe worktrees" describes the whole repository; with a
+                // filter on it describes a subset, and the button has to
+                // say which (#1140).
+                `Remove ${safeCount} safe worktree${safeCount === 1 ? "" : "s"}${
+                  filtered ? " shown" : ""
+                }`}
           </button>
         ) : null}
         {/* Beside the button rather than in the dialog: the question
@@ -2925,11 +3099,107 @@ export function WorktreesPage() {
         </Dialog>
       ) : null}
 
+      {/* Removal over an explicit SELECTION (#1140). A separate dialog
+          from the verdict-scoped one beside it, because the two answer
+          different questions and a shared title could not honestly
+          describe both. */}
+      {selectionOpen ? (
+        <Dialog open onOpenChange={(o) => !o && setSelectionOpen(false)}>
+          <DialogContent className="max-w-2xl">
+            <DialogTitle>
+              Remove {selectedVisible.length} selected worktree
+              {selectedVisible.length === 1 ? "" : "s"}?
+            </DialogTitle>
+            <ActingOnDesktop />
+            <p className="mt-2 text-sm text-[#8b949e]">
+              {(() => {
+                const total = totalSize(selectedVisible);
+                return total === null
+                  ? "Sizes are still being measured."
+                  : `Reclaims ${formatSize(total)}.`;
+              })()}{" "}
+              Each is re-checked before deletion, so anything that changed since the scan is
+              skipped.
+            </p>
+            {/* THE sentence #1140 requires. A selection narrowed by a
+                filter acts on what is VISIBLE, and a row silently
+                dropped from a batch the user assembled is exactly the
+                surprise the issue is about. Said out loud, with a
+                count, so nothing vanishes quietly. */}
+            {selectedHidden > 0 ? (
+              <p className="mt-2 text-sm text-[#d29922]">
+                {selectedHidden} selected worktree{selectedHidden === 1 ? " is" : "s are"} hidden
+                by the current filters and will NOT be removed.
+              </p>
+            ) : null}
+            {/* Every path, not a count: these are directories on disk. */}
+            <ul className="mt-3 max-h-64 overflow-y-auto font-mono text-xs text-[#8b949e]">
+              {selectedVisible.map((w) => (
+                <li key={w.path} className="py-0.5">
+                  {w.path}
+                </li>
+              ))}
+            </ul>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setSelectionOpen(false)}
+                className="rounded border border-[#30363d] px-3 py-1.5 text-sm hover:bg-[#21262d]"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const targets = selectedVisible.map((w) => w.path);
+                  setBulkBusy(true);
+                  setSelectionOpen(false);
+                  removeMany(selected?.path ?? "", targets).then(
+                    (outcomes) => {
+                      setBulkBusy(false);
+                      const failed = outcomes.filter((o) => o.error !== null);
+                      const ok = outcomes.length - failed.length;
+                      // Never a bare "done": a worktree that went dirty
+                      // since the scan is refused, and hiding that
+                      // would misreport what is still on disk.
+                      if (failed.length === 0) {
+                        toast.success(`Removed ${ok} worktree${ok === 1 ? "" : "s"}`);
+                      } else {
+                        toast.error(
+                          `Removed ${ok}, refused ${failed.length}`,
+                          { description: failed.map((f) => `${f.path}: ${f.error}`).join("\n") },
+                        );
+                      }
+                      // Cleared only on the paths actually acted on, so
+                      // a refused row stays ticked and the user can see
+                      // what did not go.
+                      setChecked(checked.filter((k) => !outcomes.some(
+                        (o) => o.path === k && o.error === null,
+                      )));
+                    },
+                    (e: unknown) => {
+                      setBulkBusy(false);
+                      toast.error("Could not remove the selected worktrees", {
+                        description: errorMessage(e),
+                      });
+                    },
+                  );
+                }}
+                className="rounded border border-[#f85149]/40 px-3 py-1.5 text-sm text-[#f85149] hover:bg-[#f85149]/10"
+              >
+                Remove {selectedVisible.length} worktree{selectedVisible.length === 1 ? "" : "s"}
+              </button>
+            </div>
+          </DialogContent>
+        </Dialog>
+      ) : null}
+
       {bulkOpen ? (
         <Dialog open onOpenChange={(o) => !o && setBulkOpen(false)}>
           <DialogContent className="max-w-2xl">
             <DialogTitle>
-              Remove {safeCount} safe worktree{safeCount === 1 ? "" : "s"}?
+              Remove {safeCount} safe worktree{safeCount === 1 ? "" : "s"}
+              {filtered ? " matching these filters" : ""}?
             </DialogTitle>
             <ActingOnDesktop />
             <p className="mt-2 text-sm text-[#8b949e]">
@@ -2939,7 +3209,7 @@ export function WorktreesPage() {
               {/* "Still measuring" and "nothing to reclaim" are
                   different answers and used to share one dash. */}
               {(() => {
-                const total = totalSize(shown.filter(removable));
+                const total = totalSize(visible.filter(removable));
                 return total === null
                   ? "Sizes are still being measured."
                   : `Reclaims ${formatSize(total)}.`;
@@ -3054,15 +3324,46 @@ export function WorktreesPage() {
           were unreachable. `rounded-md` also only actually rounds the
           first and last rows' corners once the box clips them. */}
       <div className="overflow-hidden rounded-md border border-[#30363d]">
-        {shown.length === 0 ? (
+        {/* Narrowing, above the list it narrows (#1140). Fed the
+            UNFILTERED rows so its per-facet counts describe the
+            repository rather than the user's own current selection. */}
+        <WorktreeFilterBar
+          rows={shown}
+          occupiedCount={shown.filter((w) => !w.is_main && agentIn(w.path) !== null).length}
+        />
+        {visible.length === 0 ? (
           <div className="px-4 py-12 text-center text-sm text-[#8b949e]">
-            No worktrees in this repository.
+            {/* "No worktrees in this repository" is FALSE when a filter
+                is hiding them, and it is the exact confident wrong
+                answer this codebase keeps having to remove (#846). The
+                repository has not changed; the question has. */}
+            {filtered ? (
+              <>
+                No worktrees match these filters
+                {shown.length > 0 ? ` — ${shown.length} hidden.` : "."}{" "}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setFilter("safety", undefined);
+                    setFilter("worktreeQuery", undefined);
+                    setFilter("occupiedOnly", undefined);
+                  }}
+                  className="underline hover:no-underline"
+                >
+                  Clear filters
+                </button>
+              </>
+            ) : (
+              "No worktrees in this repository."
+            )}
           </div>
         ) : (
-          shown.map((wt) => (
+          visible.map((wt) => (
             <Row
               key={wt.path}
               wt={wt}
+              checked={checked.includes(wt.path)}
+              onToggle={toggleRow}
               agent={agentIn(wt.path)}
               repoPath={selected?.path ?? ""}
               pr={prForWorktree(prs, selected?.identity ?? null, wt.branch)}
