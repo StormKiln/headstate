@@ -3794,3 +3794,200 @@ describe("WorktreesPage", () => {
     });
   });
 });
+
+/// Filtering and per-row selection (#1140).
+describe("WorktreesPage filtering", () => {
+  beforeEach(() => {
+    Object.assign(state, {
+      repos: [{ identity: null, name: "proj", path: "/code/proj", worktrees: [wt({})] }],
+      isLoading: false,
+      isError: false,
+      // `safeKnown` gates the bulk button, and an earlier test in this
+      // file leaves these set -- without resetting them the button is
+      // absent for reasons that have nothing to do with filtering.
+      classifying: false,
+      classifyFailed: false,
+      sizing: false,
+      sizingFailed: false,
+      unreadable: [],
+    });
+    useFilters.setState({
+      filtersByView: { ...EMPTY, worktrees: { repo: "/code/proj" } },
+      view: "worktrees",
+      checked: [],
+      anchor: null,
+    } as never);
+  });
+
+  it("narrows the list to the chosen verdict", () => {
+    state.classified = [
+      wt({ path: "/code/a", safety: { kind: "safe" } }),
+      wt({ path: "/code/b", safety: { kind: "dirty", detail: 2 } }),
+    ];
+    useFilters.setState({
+      filtersByView: { ...EMPTY, worktrees: { repo: "/code/proj", safety: ["dirty"] } },
+      view: "worktrees",
+    } as never);
+    render(<WorktreesPage />);
+    // The row shows the BASENAME, which is what a user reads.
+    expect(screen.getByText("b")).toBeTruthy();
+    expect(screen.queryByText("a")).toBeNull();
+  });
+
+  it("says how many rows the filter is hiding", () => {
+    // A count of a NARROWED list has to say it is narrowed: "1 worktree"
+    // beside a filter hiding two is a claim about the repository that
+    // is not true.
+    state.classified = [
+      wt({ path: "/code/a", safety: { kind: "safe" } }),
+      wt({ path: "/code/b", safety: { kind: "dirty", detail: 2 } }),
+      wt({ path: "/code/c", safety: { kind: "unmerged" } }),
+    ];
+    useFilters.setState({
+      filtersByView: { ...EMPTY, worktrees: { repo: "/code/proj", safety: ["dirty"] } },
+      view: "worktrees",
+    } as never);
+    render(<WorktreesPage />);
+    expect(screen.getByText(/2 hidden by filters/)).toBeTruthy();
+  });
+
+  it("does not claim the repository is empty when a filter emptied it", () => {
+    // THE honesty rule (#846). "No worktrees in this repository" is
+    // FALSE when a filter is hiding them -- the repository has not
+    // changed, the question has.
+    state.classified = [wt({ path: "/code/a", safety: { kind: "safe" } })];
+    useFilters.setState({
+      filtersByView: { ...EMPTY, worktrees: { repo: "/code/proj", safety: ["dirty"] } },
+      view: "worktrees",
+    } as never);
+    render(<WorktreesPage />);
+    expect(screen.getByText(/No worktrees match these filters/)).toBeTruthy();
+    expect(screen.queryByText(/No worktrees in this repository/)).toBeNull();
+  });
+
+  it("still says the repository is empty when it really is", () => {
+    state.classified = [];
+    render(<WorktreesPage />);
+    expect(screen.getByText(/No worktrees in this repository/)).toBeTruthy();
+  });
+
+  it("says the safe-removal button is scoped to the filter", () => {
+    // "safe worktrees" describes the whole repository; with a filter on
+    // it describes a subset, and the button has to say which.
+    state.classified = [
+      wt({ path: "/code/a", safety: { kind: "safe" } }),
+      wt({ path: "/code/b", safety: { kind: "safe" } }),
+      wt({ path: "/code/c", safety: { kind: "dirty", detail: 1 } }),
+    ];
+    useFilters.setState({
+      filtersByView: { ...EMPTY, worktrees: { repo: "/code/proj", safety: ["safe"] } },
+      view: "worktrees",
+    } as never);
+    render(<WorktreesPage />);
+    expect(screen.getByRole("button", { name: /Remove 2 safe worktrees shown/ })).toBeTruthy();
+  });
+
+  afterEach(() => {
+    // `setState` is a partial merge, so a filter set here survives into
+    // the next test and silently narrows a list it was never about.
+    useFilters.setState({
+      filtersByView: { ...EMPTY },
+      checked: [],
+      anchor: null,
+    } as never);
+  });
+});
+
+describe("WorktreesPage selection", () => {
+  beforeEach(() => {
+    Object.assign(state, {
+      repos: [{ identity: null, name: "proj", path: "/code/proj", worktrees: [wt({})] }],
+      isLoading: false,
+      isError: false,
+      // `safeKnown` gates the bulk button, and an earlier test in this
+      // file leaves these set -- without resetting them the button is
+      // absent for reasons that have nothing to do with filtering.
+      classifying: false,
+      classifyFailed: false,
+      sizing: false,
+      sizingFailed: false,
+      unreadable: [],
+    });
+    useFilters.setState({
+      filtersByView: { ...EMPTY, worktrees: { repo: "/code/proj" } },
+      view: "worktrees",
+      checked: [],
+      anchor: null,
+    } as never);
+    state.classified = [
+      wt({ path: "/code/a", safety: { kind: "safe" } }),
+      wt({ path: "/code/b", safety: { kind: "safe" } }),
+      wt({ path: "/code/c", safety: { kind: "safe" } }),
+    ];
+  });
+
+  it("offers no selection button until a row is ticked", () => {
+    // A permanently disabled "Remove 0 selected" is noise on every visit.
+    render(<WorktreesPage />);
+    expect(screen.queryByRole("button", { name: /selected/ })).toBeNull();
+  });
+
+  it("ticks a row and offers to remove the selection", () => {
+    render(<WorktreesPage />);
+    fireEvent.click(screen.getByRole("checkbox", { name: /Select a/ }));
+    expect(screen.getByRole("button", { name: /Remove 1 selected/ })).toBeTruthy();
+  });
+
+  it("keeps the verdict-scoped button alongside it", () => {
+    // Two buttons, each stating its own scope. One button that changed
+    // what it destroys depending on hidden state is what #1140 warns
+    // against.
+    render(<WorktreesPage />);
+    fireEvent.click(screen.getByRole("checkbox", { name: /Select a/ }));
+    expect(screen.getByRole("button", { name: /Remove 1 selected/ })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Remove 3 safe worktrees/ })).toBeTruthy();
+  });
+
+  it("extends the selection with shift-click", () => {
+    // At 100+ rows, ticking individually is not usable.
+    render(<WorktreesPage />);
+    fireEvent.click(screen.getByRole("checkbox", { name: /Select a/ }));
+    const third = screen.getByRole("checkbox", { name: /Select c/ });
+    fireEvent.click(third, { shiftKey: true });
+    expect(screen.getByRole("button", { name: /Remove 3 selected/ })).toBeTruthy();
+  });
+
+  it("acts only on rows that are visible, and says what it dropped", () => {
+    // THE safety rule (#1140). A bulk action only destroys rows the
+    // user can see -- and a row silently dropped from a batch they
+    // assembled is exactly the surprise this is about.
+    state.classified = [
+      wt({ path: "/code/a", safety: { kind: "safe" } }),
+      wt({ path: "/code/b", safety: { kind: "dirty", detail: 3 } }),
+    ];
+    useFilters.setState({
+      filtersByView: { ...EMPTY, worktrees: { repo: "/code/proj" } },
+      view: "worktrees",
+      checked: ["/code/a", "/code/b"],
+      anchor: null,
+    } as never);
+    render(<WorktreesPage />);
+    // Now narrow so one of the two is hidden.
+    useFilters.setState({
+      filtersByView: { ...EMPTY, worktrees: { repo: "/code/proj", safety: ["safe"] } },
+    } as never);
+    render(<WorktreesPage />);
+
+    fireEvent.click(screen.getAllByRole("button", { name: /Remove 1 selected/ })[0]);
+    expect(screen.getByText(/1 selected worktree is hidden by the current filters/)).toBeTruthy();
+    expect(screen.getByText(/will NOT be removed/)).toBeTruthy();
+  });
+
+  it("says nothing about hidden rows when none are hidden", () => {
+    // A caveat shown always is a caveat nobody reads.
+    render(<WorktreesPage />);
+    fireEvent.click(screen.getByRole("checkbox", { name: /Select a/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Remove 1 selected/ }));
+    expect(screen.queryByText(/will NOT be removed/)).toBeNull();
+  });
+});

@@ -1,5 +1,6 @@
 import type {
   ClaudeSession, Lock, PullRequest, Safety, SubmoduleState, Upstream, Worktree, WorktreeRepo } from "@/types/pr";
+import type { Filters } from "./derive";
 
 /// Only `safe` may be deleted.
 ///
@@ -219,6 +220,68 @@ export function lockHolderNote(lock: Lock): string | null {
 /// Mirrors `Safety::reason` on the Rust side. Deliberately duplicated
 /// rather than sent over the wire: the wire type is data, and prose in a
 /// payload is harder to change than prose in a component.
+/// Whether a worktree survives the Worktrees page's filters (#1140).
+///
+/// # Empty means everything
+///
+/// `undefined` and `[]` are both "no safety facet chosen". An empty
+/// facet set is what a user gets by unticking the last box, and
+/// rendering an empty list for it would read as "this repository has no
+/// worktrees" -- the confident wrong answer #846 keeps having to
+/// remove. Narrowing to nothing is not a question anyone asks.
+///
+/// # The main checkout is never filtered out
+///
+/// It is the repository, not a candidate for removal, and every count
+/// and total on the page is stated relative to it. Hiding it behind a
+/// facet would make the page describe a repository it is not showing.
+///
+/// # It is a PREDICATE, not a selection
+///
+/// This narrows what is displayed. What a bulk action destroys is the
+/// user's explicit selection, which is a separate set -- see #1140's
+/// safety rule: a filtered-away row must never be silently included,
+/// and a filtered-IN row must never be silently acted on either.
+export function matchesWorktreeFilters(
+  w: Worktree,
+  f: Pick<Filters, "safety" | "worktreeQuery" | "occupiedOnly">,
+  isOccupied: (path: string) => boolean,
+): boolean {
+  if (w.is_main) return true;
+
+  if (f.safety && f.safety.length > 0 && !f.safety.includes(w.safety.kind)) {
+    return false;
+  }
+
+  if (f.occupiedOnly && !isOccupied(w.path)) return false;
+
+  const q = f.worktreeQuery?.trim().toLowerCase();
+  if (q) {
+    // Path AND branch, because a user looking for a worktree knows one
+    // or the other -- the directory name they created it under, or the
+    // branch they have open in it -- and which of the two they reach
+    // for is not something this can predict.
+    const hay = `${w.path} ${w.branch}`.toLowerCase();
+    if (!hay.includes(q)) return false;
+  }
+
+  return true;
+}
+
+/// Whether any worktree filter is currently narrowing the list.
+///
+/// Used to decide whether a count needs qualifying: "9 safe to remove"
+/// means something different when six others are hidden, and a bulk
+/// action's dialog has to say so. Derived in ONE place so the page and
+/// the dialog cannot disagree about whether a filter is on.
+export function worktreeFiltersActive(
+  f: Pick<Filters, "safety" | "worktreeQuery" | "occupiedOnly">,
+): boolean {
+  return Boolean(
+    (f.safety && f.safety.length > 0) || f.worktreeQuery?.trim() || f.occupiedOnly,
+  );
+}
+
 /// What a worktree's submodules add to the dirty count, or null.
 ///
 /// A SEPARATE sentence rather than a change to `safetyReason`, and that

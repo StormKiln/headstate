@@ -22,6 +22,31 @@ export interface Filters {
   awaitingReviewOnly?: boolean;
   readyToQueueOnly?: boolean;
   sort?: "newest" | "oldest" | "recently-updated" | "least-recently-updated";
+  /// Safety verdicts to show on the Worktrees page (#1140).
+  ///
+  /// `undefined` and `[]` both mean "show everything", deliberately.
+  /// An empty facet set is what a user gets by unticking the last box,
+  /// and rendering an empty list for it would read as "this repository
+  /// has no worktrees" -- the confident wrong answer #846 keeps having
+  /// to remove. Narrowing to nothing is not a question anyone asks.
+  ///
+  /// Kinds rather than a `Safety`, because the verdicts carry payloads
+  /// (`Dirty(n)`, `Locked{..}`) and a facet is about the CATEGORY. A
+  /// user filtering for "dirty" wants all of them, not one file count.
+  safety?: string[];
+  /// Free-text match over a worktree's path and branch (#1140).
+  ///
+  /// Separate from `query`, which is PR-shaped and matches title, repo
+  /// and number. One key for both would mean a search typed on the PR
+  /// list silently narrowing the Worktrees page, and the store persists
+  /// filters per view precisely so the two do not leak into each other.
+  worktreeQuery?: string;
+  /// Only worktrees a Claude Code session is working in (#1140).
+  ///
+  /// The one facet that is not a safety verdict: "who is using this" is
+  /// a different question from "can I remove it", and it is the one
+  /// that stops a user removing a tree out from under a running agent.
+  occupiedOnly?: boolean;
   /// WHERE a PR Stats question is scoped, mirroring
   /// `github::stats::scope::Scope` (#827) rather than inventing a parallel
   /// representation (#825 requirement 7).
