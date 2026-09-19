@@ -52,6 +52,9 @@ const footprintFn = vi.hoisted(() => vi.fn<() => Promise<Footprint>>());
 // rest of the sample. The Worktrees, Artifacts and Docker pages own
 // those measurements and test them.
 vi.mock("../api/hooks", () => ({
+  // Healthy by default: the notice renders nothing, which is the
+  // state every assertion in this file assumes (#1145).
+  useBackgroundHealth: () => ({ data: [] }),
   useSystemHealth: (enabled: boolean) =>
     useQuery({ queryKey: ["system-health"], queryFn: liveFn, enabled, retry: false }),
   // The current conditions (#864). The CPU page renders them, so the

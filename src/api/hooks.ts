@@ -42,6 +42,7 @@ import type {
   ClaudeUsageProfile,
   PrActionName,
   ToolReport,
+  TaskHealth,
   LogTail,
 } from "./tauri";
 import { createCoalescer } from "@/lib/coalesce";
@@ -49,6 +50,7 @@ import {
   toolVersions,
   readLogTail,
   backgroundPanicked,
+  backgroundHealth,
   claudeHooksInventory,
   claudeMdEffective,
   claudeDefinitions,
@@ -3431,6 +3433,25 @@ export function usePollInterval() {
 /// process (nothing clears the flag), but a relaunch clears it, and a
 /// cached `true` surviving into a healthy process would be the mirror of
 /// the defect this fixes.
+/// Whether the background loops are still doing their job (#1145).
+///
+/// Polled on the same 30 s cadence as `useBackgroundPanicked` beside it
+/// and for the same reason: it is two atomics on the Rust side, and the
+/// user should learn the sampler has stopped within a cycle rather than
+/// on the next relaunch.
+///
+/// Returns the raw list rather than a boolean, unlike the panic hook:
+/// the notice names WHICH loop failed and why, and a boolean would make
+/// that impossible.
+export function useBackgroundHealth() {
+  return useQuery<TaskHealth[]>({
+    queryKey: ["background-health"],
+    queryFn: backgroundHealth,
+    refetchInterval: 30_000,
+    staleTime: 0,
+  });
+}
+
 export function useBackgroundPanicked(): boolean {
   const query = useQuery({
     queryKey: ["background-panicked"],

@@ -1,5 +1,7 @@
 pub mod artifacts;
 pub mod auth;
+/// Whether the background loops are still working (#1145).
+pub mod background;
 pub mod branches;
 pub mod caches;
 pub mod claude;
@@ -227,6 +229,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::diag_log,
             commands::background_panicked,
+            commands::background_health,
             commands::tool_versions,
             commands::read_log_tail,
             commands::reveal_log,
@@ -620,6 +623,13 @@ pub fn run() {
                                 store::health::history(&c).map_err(|e| e.to_string())
                             }) {
                             Ok(history) => {
+                                // The write landed, so the consecutive
+                                // count resets. `last_error` is kept:
+                                // "it failed 40 times and then
+                                // recovered" is worth reading, and a
+                                // chart with a gap and no explanation
+                                // is what clearing it produces.
+                                background::HEALTH_SAMPLER.ok(background::now_ms());
                                 // Read per tick rather than cached, like
                                 // the poll loop's: a setting change
                                 // takes effect on the next sample
@@ -692,7 +702,27 @@ pub fn run() {
                                     }
                                 }
                             }
-                            Err(e) => log::warn!("system health: could not record a sample: {e}"),
+                            Err(e) => {
+                                // Logged as before, AND counted (#1145).
+                                // The chart cannot otherwise tell a gap
+                                // the user caused by closing the app
+                                // from a gap the app caused by failing
+                                // to write, and it currently reassures
+                                // the user it is the former.
+                                log::warn!("system health: could not record a sample: {e}");
+                                if background::HEALTH_SAMPLER.failed(e.to_string()) {
+                                    use tauri::Emitter;
+                                    // Only on the THRESHOLD, not on
+                                    // every failure: one blip that
+                                    // fixes itself is not worth a
+                                    // banner, which is the reasoning
+                                    // `poll.rs` already applies.
+                                    let _ = app_handle.emit(
+                                        "background-degraded",
+                                        background::HEALTH_SAMPLER.snapshot(),
+                                    );
+                                }
+                            }
                         }
 
                         // ---- The Claude Code live pass (#947) ----
@@ -733,6 +763,7 @@ pub fn run() {
                         if commands::read_ui_prefs(&app_handle).claude_integrations_enabled {
                             match commands::claude_live_pass(&commands::db_path(&app_handle)) {
                                 Ok(state) => {
+                                    background::CLAUDE_LIVE.ok(background::now_ms());
                                     // ---- "your session died" (#979) ----
                                     //
                                     // `crashed_sessions` and NOT a query
@@ -796,7 +827,16 @@ pub fn run() {
                                 // gives: a pass that could not read
                                 // `~/.claude` must not stop the loop
                                 // that also records system health.
-                                Err(e) => log::warn!("claude: live pass failed: {e}"),
+                                Err(e) => {
+                                    log::warn!("claude: live pass failed: {e}");
+                                    if background::CLAUDE_LIVE.failed(e.to_string()) {
+                                        use tauri::Emitter;
+                                        let _ = app_handle.emit(
+                                            "background-degraded",
+                                            background::CLAUDE_LIVE.snapshot(),
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
