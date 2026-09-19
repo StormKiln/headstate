@@ -154,7 +154,7 @@ pub fn project_dirs_streaming(
 
     while let Some(dir) = stack.pop() {
         visited += 1;
-        if visited % REPORT_EVERY == 0 {
+        if visited.is_multiple_of(REPORT_EVERY) {
             report(WalkProgress {
                 found: out.len(),
                 visited,
