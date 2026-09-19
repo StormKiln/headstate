@@ -134,6 +134,54 @@ fired on CI's 1.98 while passing locally on 1.93.1. A clean local `make
 lint` is necessary but not sufficient; if CI disagrees, check
 `rustc --version` before assuming a flake.
 
+## Resolving a conflict in an append-only file (#1176)
+
+Several files are append-only registries that **every** feature touches:
+`src/api/hooks.ts`, `src/api/tauri.ts`, `src-tauri/src/store/schema.rs`,
+plus `commands.rs`, `lib.rs` and the two `surface.rs` tables. Two
+branches appending to one list is the textbook conflict, and on a busy
+epic every branch hits it.
+
+The conflict is routine. **The shape of it is the trap.**
+
+Git splits an append-only region mid-block, so each side of the hunk is
+internally unbalanced by the same amount — the closing braces sit
+*outside* the conflict and are shared by whichever side lands last.
+Concatenating both sides therefore produces two merged function bodies
+that look plausible and do not compile:
+
+```
+    rows.collect()
+/// Record one session's token usage (#1134).    <- previous fn never closed
+```
+
+That happened four times on the 6.0 epic, and once it was pushed —
+because the resolution *looked* like the import-list conflicts that
+preceded it.
+
+**So:**
+
+- An **import list** is safe to resolve by keeping both sides. That is
+  the benign case and the one people pattern-match on.
+- **Anything with a body** — a function, a `describe`, a `match` arm —
+  must be resolved at the **whole-block boundary**. Move a complete
+  block; never stitch a line range.
+- **Always run the build and the full tests after resolving**, before
+  pushing. `git rebase --continue` succeeding proves nothing about
+  whether the result compiles.
+- When it gets messy, **`git rebase --abort`** and re-apply your change
+  onto fresh `main` instead. On a small additive change that is faster
+  and cannot produce this failure.
+
+**Append new `describe` blocks at the end of a test file**, not before an
+existing sibling. Two branches then touch disjoint regions and there is
+no conflict to mis-resolve.
+
+`scripts/check-merge-residue.py` catches markers that were committed
+outright. It deliberately does **not** try to detect unbalanced braces —
+`tsc` and `cargo build` do that correctly, and a second half-parser would
+produce false positives and lull people into trusting it.
+
 ## When `main` goes red
 
 A red `main` is a stop. It blocks everyone, and it blocks tagging — so the

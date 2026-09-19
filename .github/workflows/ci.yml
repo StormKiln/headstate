@@ -111,6 +111,19 @@ jobs:
         run: |
           python3 scripts/check-symlinks.test.py
           python3 scripts/check-symlinks.py
+      # A conflict resolved by committing the markers (#1176). FIRST
+      # among the cheap guards because a marker left in a file makes
+      # every later gate's failure misleading: `tsc` reports a syntax
+      # error somewhere else entirely, and a marker inside a comment or
+      # a Markdown file fails nothing at all and simply ships.
+      #
+      # The self-test first, the same shape the symlink guard above
+      # uses: this guard's failure mode is a silent pass, so something
+      # has to watch it fail.
+      - name: Merge residue
+        run: |
+          python3 scripts/check-merge-residue.test.py
+          python3 scripts/check-merge-residue.py
       # The mobile jobs skip their own steps when nothing mobile changed.
       # The failure mode of getting that wiring wrong is a job that
       # reports green having compiled nothing, forever -- so it is
