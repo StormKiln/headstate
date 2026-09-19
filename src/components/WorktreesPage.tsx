@@ -4,6 +4,8 @@ import { ExternalLink } from "./ExternalLink";
 import { Sparkles } from "lucide-react";
 import { useMemo, useState } from "react";
 import {
+  useClaudeSessions,
+  useUiPrefs,
   useClearAssessed,
   useMarkAssessed,
   useRemoveWorktree,
@@ -27,6 +29,8 @@ import {
   useWorktreeDirs,
 } from "../api/hooks";
 import {
+  worktreeSessions,
+  occupancy,
   formatSize,
   totalSize,
   canClaudify,
@@ -63,7 +67,8 @@ import { useIsMobile } from "../lib/useIsMobile";
 import { assessmentSummary } from "../lib/assessment";
 import { rollupRepos } from "../lib/rollup";
 import { useActiveFilters, useFilters } from "../store/filters";
-import type { PullRequest, Worktree } from "../types/pr";
+import type {
+  ClaudeSession, PullRequest, Worktree } from "../types/pr";
 import { toast } from "sonner";
 import { PartialScanNotice } from "./PartialScanNotice";
 import { QueryError, errorMessage } from "./QueryError";
@@ -123,8 +128,17 @@ function Row({
   fetching = false,
   fetchedAt = null,
   scannedAt,
+  agent = null,
 }: {
   wt: Worktree;
+  /// The live Claude session working in this worktree, if any (#1137).
+  ///
+  /// `null` covers both "nothing is here" and "the integration is off".
+  /// The REFUSAL distinguishes those -- see `removable` on the page --
+  /// because only one of them is a reason the user can act on. This prop
+  /// is about the badge, and a badge for a session that is not there is
+  /// the same absence either way.
+  agent?: ClaudeSession | null;
   /// The open pull request for this worktree, when there is one.
   /// DISPLAY ONLY -- it never feeds a safety gate.
   pr?: PullRequest | null;
@@ -251,6 +265,23 @@ function Row({
         ) : (
           <span className="ml-2 text-xs text-[#8b949e]">detached</span>
         )}
+        {/* Which agent is working here (#1137).
+            The question at the top of this page on a machine running
+            ~100 worktrees, and it could not be answered -- while the
+            join already existed in the other direction at a measured
+            83.1% match rate, imported by exactly one component.
+
+            Named rather than a bare dot: "an agent is here" invites
+            "which one", and the session's own title is what the Claude
+            page shows for the same row. */}
+        {agent ? (
+          <span
+            className="ml-2 shrink-0 rounded bg-[#1f6feb]/15 px-1.5 py-0.5 text-[10px] text-[#58a6ff]"
+            title={`${agent.name ?? agent.session_id} is working here`}
+          >
+            agent here
+          </span>
+        ) : null}
       </span>
   );
   /// The verdict as ONE plain string, for the desktop cell's tooltip.
@@ -1576,6 +1607,23 @@ export function WorktreesPage() {
     />
   ) : null;
 
+  // Which worktree each live agent is working in (#1137).
+  //
+  // Here rather than beside the code that uses it, because six early
+  // returns sit below this point: a hook called after any of them is a
+  // conditional hook, and React fails the next render outright. The
+  // test that caught it renders a state that takes one of those
+  // branches.
+  //
+  // Gated on the Claude integration like every other reader of this
+  // data: a user who has not enabled it is not asked to pay a poll for
+  // a badge they did not ask for.
+  const { prefs } = useUiPrefs();
+  const claudeOn = prefs?.claude_integrations_enabled ?? false;
+  const sessions = useClaudeSessions(claudeOn);
+  const sessionList = sessions.list.data?.sessions;
+  const occupiedBy = useMemo(() => worktreeSessions(sessionList), [sessionList]);
+
   if (isLoading) {
     return (
       <div className="rounded-md border border-[#30363d] px-4 py-12 text-center text-sm text-[#8b949e]">
@@ -1930,7 +1978,32 @@ export function WorktreesPage() {
   // used to resolve as an empty success, so rows sat on "checking..."
   // forever while this read a confident "0 safe to remove".
   const safeKnown = !classifying && !classifyFailed;
-  const shownSafe = shown.filter((w) => isSafe(w.safety));
+
+  // Which worktree each live agent is working in (#1137).
+  //
+  // Gated on the Claude integration like every other reader of this
+  // data: a user who has not enabled it is not asked to pay a poll for
+  // a badge they did not ask for.
+  // A worktree an agent is working in is NOT one-click removable, and
+  // neither is one whose occupancy could not be established. "We could
+  // not tell" is not "nothing is there" -- this page refuses anything it
+  // cannot establish is safe, which is the rule the force path exists
+  // to let a user override deliberately.
+  /// The session working in a worktree, for the row's badge (#1137).
+  ///
+  /// Through `occupancy`, never the map directly: the path-matching rule
+  /// lives in one place, so the badge and the refusal below cannot
+  /// disagree about one worktree.
+  const agentIn = (path: string) => {
+    const o = occupancy(path, sessionList, occupiedBy);
+    return o.kind === "occupied" ? o.session : null;
+  };
+
+  const removable = (w: Worktree) =>
+    isSafe(w.safety) &&
+    (!claudeOn || occupancy(w.path, sessionList, occupiedBy).kind === "free");
+
+  const shownSafe = shown.filter(removable);
   const safeCount = shownSafe.length;
   /// Stale registrations, counted and labelled SEPARATELY from "safe to
   /// remove" (#793).
@@ -2712,7 +2785,7 @@ export function WorktreesPage() {
               {/* "Still measuring" and "nothing to reclaim" are
                   different answers and used to share one dash. */}
               {(() => {
-                const total = totalSize(shown.filter((w) => isSafe(w.safety)));
+                const total = totalSize(shown.filter(removable));
                 return total === null
                   ? "Sizes are still being measured."
                   : `Reclaims ${formatSize(total)}.`;
@@ -2836,6 +2909,7 @@ export function WorktreesPage() {
             <Row
               key={wt.path}
               wt={wt}
+              agent={agentIn(wt.path)}
               repoPath={selected?.path ?? ""}
               pr={prForWorktree(prs, selected?.identity ?? null, wt.branch)}
               assessed={assessed.has(wt.path)}

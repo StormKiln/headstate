@@ -120,6 +120,10 @@ const removeImagesFn = vi.hoisted(() =>
 );
 
 vi.mock("../api/hooks", () => ({
+  // #1137. Integration OFF by default, so occupancy plays no part --
+  // which is what every test in this file assumes.
+  useUiPrefs: () => ({ prefs: { claude_integrations_enabled: false }, set: async () => {} }),
+  useClaudeSessions: () => ({ list: { data: undefined }, imported: { data: undefined }, now: 0, rescan: async () => {} }),
   // #952: the scan's input, so the empty arm can tell "nowhere to look"
   // from "nothing there".
   useWorktreeDirs: () => ({ dirs: state.dirs, set: vi.fn() }),
