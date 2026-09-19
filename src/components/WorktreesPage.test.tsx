@@ -1068,6 +1068,64 @@ describe("WorktreesPage", () => {
   // 124 of 268 worktrees on a real machine cannot be removed. The row
   // used to show a dead Remove there; it now answers the question that
   // actually applies -- is there anything in here worth keeping?
+  /// What the removable rows are WORTH (#1181).
+  describe("the reclaimable figure", () => {
+    it("says how much disk the safe rows are holding", () => {
+      // The join the app never made: it knew every row's size and every
+      // row's merge state and never put them together, so "these merged
+      // worktrees are holding 124 GB" had to be computed by hand with
+      // `du` and `gh pr list`.
+      state.classified = [
+        wt({ path: "/code/a", safety: { kind: "safe" }, size_bytes: 2 * 1024 ** 3 }),
+        wt({ path: "/code/b", safety: { kind: "safe" }, size_bytes: 3 * 1024 ** 3 }),
+      ];
+      render(<WorktreesPage />);
+      expect(screen.getByText(/2 safe to remove/)).toBeTruthy();
+      expect(screen.getByText(/5(\.0)? ?GB to reclaim/)).toBeTruthy();
+    });
+
+    it("does not count a row that is not safe to remove", () => {
+      // The figure must describe exactly the rows the Remove button
+      // would act on, or it offers space the button then refuses.
+      state.classified = [
+        wt({ path: "/code/a", safety: { kind: "safe" }, size_bytes: 1024 ** 3 }),
+        wt({ path: "/code/b", safety: { kind: "dirty", detail: 4 }, size_bytes: 9 * 1024 ** 3 }),
+      ];
+      render(<WorktreesPage />);
+      expect(screen.getByText(/1 safe to remove/)).toBeTruthy();
+      // The dirty row's 9 GB must not be in the figure. Asserted on the
+      // figure's own text rather than on the absence of a number, since
+      // "1.0 GB" contains "10" once the space is optional.
+      expect(screen.getByText(/to reclaim/).textContent).not.toMatch(/9|10/);
+    });
+
+    it("says at least when a safe row has no measured size", () => {
+      // An unmeasured worktree contributes nothing to the total, so
+      // presenting the sum as a total would understate it silently
+      // (#846).
+      state.classified = [
+        wt({ path: "/code/a", safety: { kind: "safe" }, size_bytes: 1024 ** 3 }),
+        wt({ path: "/code/b", safety: { kind: "safe" }, size_bytes: null }),
+      ];
+      render(<WorktreesPage />);
+      expect(screen.getByText(/to reclaim/).textContent).toMatch(/at least/);
+    });
+
+    it("says nothing when the safe rows hold nothing measurable", () => {
+      // "0 B to reclaim" beside a count is noise, and worse, it reads
+      // as a measurement that came back zero.
+      state.classified = [wt({ path: "/code/a", safety: { kind: "safe" }, size_bytes: null })];
+      render(<WorktreesPage />);
+      expect(screen.queryByText(/to reclaim/)).toBeNull();
+    });
+
+    it("says nothing when nothing is safe to remove", () => {
+      state.classified = [wt({ safety: { kind: "dirty", detail: 1 }, size_bytes: 9 * 1024 ** 3 })];
+      render(<WorktreesPage />);
+      expect(screen.queryByText(/to reclaim/)).toBeNull();
+    });
+  });
+
   /// Submodules and the shared stash stack (#1138).
   describe("submodules and stashes", () => {
     it("says nothing about submodules when there are none", () => {

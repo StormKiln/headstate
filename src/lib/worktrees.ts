@@ -464,6 +464,49 @@ export function prForWorktree(
   );
 }
 
+/// How much disk the removable worktrees are holding (#1181).
+///
+/// # The join the app never made
+///
+/// Headstate's stated purpose is finding what stale build output is
+/// costing you in disk. It already knew all three facts -- a worktree's
+/// branch, that branch's merge state, and the worktree's size -- and
+/// never put them together. On the machine that filed this, 23
+/// worktrees held 164 GB of `src-tauri/target/`, 124 GB of it in
+/// eighteen whose pull requests had already merged, and a build failed
+/// with `No space left on device` at 130 MB free. Finding that took
+/// `du` and `gh pr list` by hand, from the app whose job it is.
+///
+/// # It takes the ALREADY-GATED list
+///
+/// The caller passes the rows it has decided are removable, rather than
+/// this re-deriving them from `isSafe`. The page's gate is not only
+/// safety -- it also excludes worktrees a Claude session is working in
+/// -- and a summary offering to reclaim space from rows the button then
+/// refuses would send the user round a loop. #770's lesson: one gate,
+/// so the two cannot disagree.
+///
+/// # Unmeasured is not zero
+///
+/// A worktree whose size could not be read contributes nothing to the
+/// total, and its absence would understate the figure silently (#846,
+/// #1044). `unmeasured` is what lets the caller say "at least" -- the
+/// same qualification `rollupRepos` already applies.
+export function reclaimable(removableRows: Worktree[]): {
+  /// Their total size, over the ones that were measured.
+  bytes: number;
+  /// How many have no size, so `bytes` is a floor rather than a total.
+  unmeasured: number;
+} {
+  let bytes = 0;
+  let unmeasured = 0;
+  for (const w of removableRows) {
+    if (w.size_bytes === null || w.size_bytes === undefined) unmeasured += 1;
+    else bytes += w.size_bytes;
+  }
+  return { bytes, unmeasured };
+}
+
 /// Whether this row can be handed to a coding agent.
 ///
 /// Every state that is NOT removable and not the main checkout. That is
