@@ -756,7 +756,15 @@ export default function App() {
 
             The root boundary in `main.tsx` still sits above everything
             and keeps its heavier remedy; this one never reloads. */}
-        <ViewErrorBoundary key={view} view={viewLabel(view)}>
+        <ViewErrorBoundary
+          key={view}
+          view={viewLabel(view)}
+          // Passed down rather than read in the boundary: it is a class
+          // component and cannot call a hook, and `App` already has
+          // prefs. `undefined` while the query is in flight, which the
+          // report states as "not known" rather than as "off" (#1042).
+          diagnostics={prefs?.diagnostic_logging}
+        >
 
         {/* Local-state views never render a PR detail: a pull request
             selected earlier in My PRs would otherwise take over the

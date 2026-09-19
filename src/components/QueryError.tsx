@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { ReportLink } from "./ReportLink";
 import { isNotAsked, notAskedMessage } from "@/lib/notAsked";
 import { NotAskedNotice } from "./NotAskedNotice";
 
@@ -17,11 +18,29 @@ export function QueryError({
   title,
   message,
   onRetry,
+  report = false,
+  reportView,
+  reportDiagnostics,
   children,
 }: {
   title: string;
   message?: string;
   onRetry?: () => void;
+  /// Offer "Report this" beside the retry (#1148).
+  ///
+  /// OPT-IN rather than automatic, because not every failure is worth a
+  /// bug report: "no network" and "your token expired" are the user's
+  /// to fix, and a Report link on those invites issues that can only be
+  /// closed with "this is working as intended". The caller knows which
+  /// of its failures are surprising; this component does not.
+  report?: boolean;
+  /// The view to name in the report, when the caller knows it.
+  reportView?: string;
+  /// Whether diagnostic logging was on, when the caller knows it.
+  ///
+  /// `undefined` is "not known", which the report omits rather than
+  /// printing as "off" (#1042).
+  reportDiagnostics?: boolean;
   children?: ReactNode;
 }) {
   // DELEGATED here rather than at each of the dozen call sites (#1124).
@@ -46,14 +65,29 @@ export function QueryError({
         <p className="mx-auto mt-2 max-w-lg break-words text-sm text-[#8b949e]">{message}</p>
       ) : null}
       {children}
-      {onRetry ? (
-        <button
-          type="button"
-          onClick={onRetry}
-          className="tap-target mt-4 rounded border border-[#30363d] px-3 py-1.5 text-sm text-[#e6edf3] hover:bg-[#161b22]"
-        >
-          Try again
-        </button>
+      {onRetry || report ? (
+        <div className="mt-4 flex items-center justify-center gap-3">
+          {onRetry ? (
+            <button
+              type="button"
+              onClick={onRetry}
+              className="tap-target rounded border border-[#30363d] px-3 py-1.5 text-sm text-[#e6edf3] hover:bg-[#161b22]"
+            >
+              Try again
+            </button>
+          ) : null}
+          {/* Second, always: retrying is the remedy and reporting is
+              what you do when it does not work. The order is the order
+              to try them in. */}
+          {report ? (
+            <ReportLink
+              error={message ?? title}
+              view={reportView}
+              diagnostics={reportDiagnostics}
+              className="text-sm underline hover:no-underline"
+            />
+          ) : null}
+        </div>
       ) : null}
     </div>
   );

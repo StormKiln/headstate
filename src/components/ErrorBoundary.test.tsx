@@ -104,3 +104,36 @@ describe("ErrorBoundary", () => {
     }
   });
 });
+
+/// "Report this" on the crash panel (#1148).
+describe("ErrorBoundary offers a report", () => {
+  it("offers Report this beside the reset", () => {
+    // A crash is the error most worth reporting and the one the user is
+    // least able to describe: their only route was to recall a red box
+    // from memory.
+    render(
+      <ErrorBoundary>
+        <Boom />
+      </ErrorBoundary>,
+    );
+    expect(screen.getByRole("link", { name: /report this/i })).toBeTruthy();
+    // Beside, not instead of: retrying is still the remedy.
+    expect(screen.getByRole("button", { name: /reset/i })).toBeTruthy();
+  });
+
+  it("attaches the component stack to the report URL", () => {
+    // THE point of this change. The stack was `console.error`'d and
+    // nothing else -- invisible on a release build, where nobody has a
+    // console open.
+    render(
+      <ErrorBoundary>
+        <Boom />
+      </ErrorBoundary>,
+    );
+    const href = screen.getByRole("link", { name: /report this/i }).getAttribute("href") ?? "";
+    const body = decodeURIComponent(href);
+    expect(body).toContain("### Where");
+    // React names the throwing component in the stack it supplies.
+    expect(body).toContain("Boom");
+  });
+});

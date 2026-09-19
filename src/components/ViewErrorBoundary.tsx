@@ -21,6 +21,12 @@ import { QueryError } from "./QueryError";
 /// surface for a failed query.
 interface Props {
   children: ReactNode;
+  /// Whether the verbose `[diag]` log was being written (#1148).
+  ///
+  /// A prop because this is a class component and cannot call a hook,
+  /// and `App` already reads prefs. `undefined` means "not known" --
+  /// distinct from `false`, which would claim it was off.
+  diagnostics?: boolean;
   /// The view's own name, so the panel can say which pane is dead.
   ///
   /// "Something went wrong" over a still-working shell does not say
@@ -99,6 +105,15 @@ export class ViewErrorBoundary extends Component<Props, State> {
               : error.message
           }
           onRetry={this.retry}
+          // A render crash is a bug and the user cannot describe it;
+          // this is the report that is actually worth filing (#1148).
+          //
+          // NOT on the chunk arm: a failed `import()` after an update
+          // is a stale build, not a defect, and a Report link there
+          // invites issues closeable only with "relaunch the app".
+          report={!chunk}
+          reportView={this.props.view}
+          reportDiagnostics={this.props.diagnostics}
         >
           <p className="mt-2 text-xs text-[#8b949e]">
             {/* Says what SURVIVED, which is the whole point of the
