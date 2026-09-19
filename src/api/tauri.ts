@@ -839,6 +839,36 @@ export interface ToolReport {
 
 export const toolVersions = () => call<ToolReport[]>("tool_versions");
 
+/// The end of the log, redacted on the Rust side (#1147).
+export interface LogTail {
+  /// The last bytes of the file, as text.
+  text: string;
+  /// The byte this excerpt starts at. Zero means the whole file.
+  offset: number;
+  /// The file's total size in bytes.
+  total: number;
+  /// Whether anything was cut from the front.
+  ///
+  /// The panel branches on this to say "showing the last 64 KB of 4.2
+  /// MB" rather than presenting an excerpt as the log -- a user who
+  /// scrolls to the top of a silent tail, sees no error and concludes
+  /// there was none has been told something false.
+  truncated: boolean;
+  /// Where this came from.
+  path: string;
+}
+
+/// Read the end of the log.
+///
+/// `Class::Read`, unlike `revealLog` below: the phone cannot reveal a
+/// file in a Finder it does not have, and reading the text is what it
+/// actually needs. The tail is redacted before it crosses, so this is
+/// safe on the remote transport and safe to paste into a bug report.
+///
+/// `maxBytes` is capped on the Rust side whatever is asked for.
+export const readLogTail = (maxBytes?: number) =>
+  call<LogTail>("read_log_tail", { maxBytes: maxBytes ?? null });
+
 export const revealLog = () => call<string>("reveal_log");
 
 /// Every scope a session actually loads: the repository, plus

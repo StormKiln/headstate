@@ -397,6 +397,12 @@ pub const SURFACE: &[(&str, Class)] = &[
     // than the desktop on this flow, not wider.
     // local: not exposed remotely.
     ("diag_log", Class::Local),
+    // Read: the tail of the DESKTOP's log, redacted before it leaves
+    // (#1147). A question about what happened on that machine, which is
+    // exactly what a phone diagnosing a failure asks -- and the gap
+    // `reveal_log` cannot close, because there is no Finder here to
+    // reveal into. That one stays Local; this shows the text.
+    ("read_log_tail", Class::Read),
     ("reveal_log", Class::Local),
     // Reveals a session's directory or transcript in the DESKTOP's file
     // manager (#917). Local: this phone cannot see that Finder, which is

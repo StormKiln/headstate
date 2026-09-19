@@ -228,6 +228,7 @@ pub fn run() {
             commands::diag_log,
             commands::background_panicked,
             commands::tool_versions,
+            commands::read_log_tail,
             commands::reveal_log,
             commands::pull_checkout,
             commands::fetch_refs,

@@ -31,6 +31,16 @@ const alertsFn = vi.hoisted(() => vi.fn<() => Promise<AlertReport[]>>());
 // unprimed; the CPU and Memory detail pages that DO call it are tested,
 // with a populated fixture, in `SystemHealthPage.detail.test.tsx`.
 vi.mock("../api/hooks", () => ({
+  // Collapsed by default, so the panel issues no query until opened --
+  // which is the behaviour, not a test convenience (#1147).
+  useLogTail: () => ({
+    data: undefined,
+    isLoading: false,
+    isError: false,
+    isFetching: false,
+    error: undefined,
+    refetch: logRefetch,
+  }),
   useSystemHealth: (enabled: boolean) =>
     useQuery({ queryKey: ["system-health"], queryFn: liveFn, enabled, retry: false }),
   useSystemHealthHistory: (enabled: boolean) =>
@@ -87,11 +97,13 @@ vi.mock("@/api/connection", () => ({
 /// assertions are about the CONTROL rather than about jsdom.
 const copyFn = vi.hoisted(() => vi.fn(() => Promise.resolve(null as string | null)));
 const revealLogFn = vi.hoisted(() => vi.fn(() => Promise.resolve("/log/headstate.log")));
+const readLogTailFn = vi.hoisted(() => vi.fn());
+const logRefetch = vi.hoisted(() => vi.fn());
 const toastSuccess = vi.hoisted(() => vi.fn());
 const toastError = vi.hoisted(() => vi.fn());
 vi.mock("sonner", () => ({ toast: { success: toastSuccess, error: toastError } }));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyFn }));
-vi.mock("@/api/tauri", () => ({ revealLog: revealLogFn }));
+vi.mock("@/api/tauri", () => ({ revealLog: revealLogFn, readLogTail: readLogTailFn }));
 import { SystemHealthPage } from "./SystemHealthPage";
 // The pure logic lives in `lib/health` rather than in the component, so
 // the gap detection -- the single most important piece of correctness
@@ -427,9 +439,13 @@ describe("SystemHealthPage", () => {
     show();
     await screen.findByText(/the rules did not run/);
 
-    expect(screen.queryByRole("button", { name: /show the log/i })).toBeNull();
-    expect(screen.getByText(/no Finder here to reveal it in/i)).toBeTruthy();
+    // The REVEAL button, which stays Local and stays absent here.
+    expect(screen.queryByRole("button", { name: /^show the log$/i })).toBeNull();
+    expect(screen.getByText(/no Finder on this device/i)).toBeTruthy();
     expect(screen.getByRole("button", { name: /try again/i })).toBeTruthy();
+    // But the log is READABLE here now, which is the gap the sentence
+    // used to only apologise for (#1147).
+    expect(screen.getByRole("button", { name: /read the log here/i })).toBeTruthy();
   });
 
   /// #946: the 24-hour history failure gets a retry, and keeps its wording.
