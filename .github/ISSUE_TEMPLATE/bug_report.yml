@@ -1,0 +1,94 @@
+name: Bug report
+description: Something Headstate did that it should not have, or did not do that it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Four facts start every triage here, and the fields below collect
+        them. Without them the first reply is always the same request,
+        which costs a round trip on both sides.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: >-
+        What you saw, and what you expected instead. If a number looked
+        wrong, say what it said and what you believe it should have said —
+        this project treats a confidently wrong figure as a defect in its
+        own right.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to get there
+      description: The shortest path from launching Headstate to seeing it.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Headstate version
+      description: >-
+        Settings shows it, and it is in the window title. The version is
+        stamped from the release tag, so "latest" is not enough to
+        identify a build.
+      placeholder: v5.23.4
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How you installed it
+      description: >-
+        These update differently. The `.deb` does NOT self-update — Tauri
+        publishes no updater signature for it, so a `.deb` install stays
+        on the version it was installed at.
+      options:
+        - macOS DMG
+        - Linux AppImage
+        - Linux .deb
+        - Windows installer
+        - Built from source
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS and architecture
+      placeholder: macOS 15.6 arm64
+    validations:
+      required: true
+
+  - type: input
+    id: gh-version
+    attributes:
+      label: Output of `gh --version`
+      description: >-
+        Headstate reads your token through the GitHub CLI, and several
+        reported failures have turned out to be an old or unauthenticated
+        `gh`.
+      placeholder: gh version 2.101.0
+    validations:
+      required: false
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Diagnostic log
+      description: |
+        Turn on **Settings → diagnostic logging**, reproduce the problem,
+        then use **Reveal Log** and paste the relevant part.
+
+        Read it first. It records your GitHub actions with repository and
+        pull request number — never your token and never a local path,
+        but if your repository names are themselves sensitive it is not
+        safe to paste here.
+    validations:
+      required: false

@@ -1,0 +1,23 @@
+name: Feature request
+description: Something Headstate could show or do that it does not
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The question you are trying to answer
+      description: >-
+        What were you doing when you wanted this? Headstate's design
+        principle is that the answer should already be on screen when you
+        think to ask — so the moment you wanted it matters as much as the
+        feature.
+    validations:
+      required: true
+
+  - type: textarea
+    id: today
+    attributes:
+      label: What you do instead today
+      description: The browser tab, the terminal command, the thing you check by hand.
+    validations:
+      required: false
