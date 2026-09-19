@@ -8,6 +8,9 @@ const state = vi.hoisted(() => ({
   cached: undefined as
     | { data: { path: string; size_bytes: number | null; repo_path: string }[]; ageSecs: number; stale: boolean }
     | undefined,
+  /// Scan progress and unreadable roots, for the streaming tests (#1151).
+  scanProgress: undefined as { roots_done: number; roots_total: number; found: number } | undefined,
+  failedRoots: undefined as { root: string; why: string }[] | undefined,
   artifacts: [] as Artifact[],
   loading: false,
   // #846: a REJECTED scan, which the `= []` default made
@@ -45,6 +48,12 @@ vi.mock("../api/hooks", () => ({
   // assertion in this file assumes (#1152). A cached result would paint
   // a dated list instead of the live one.
   useCachedScan: () => state.cached,
+  // No progress and no failed roots by default: the settled state, which
+  // every other assertion in this file assumes (#1151).
+  useArtifactScanProgress: () => state.scanProgress,
+  useArtifactScanFailures: () => state.failedRoots,
+  // The page renders VenvSection, which reads this since #1151.
+  useVenvWalkProgress: () => undefined,
   useRemoveArtifacts: () => removeFn,
   // The page renders VenvSection, which has its own hooks. Stubbed to
   // empty here rather than exercised: that component has its own test
@@ -834,6 +843,72 @@ describe("ArtifactsPage toolbar ordering", () => {
     const { container } = render(<ArtifactsPage />);
     const regions = [...container.querySelectorAll('[aria-live="polite"]')];
     expect(regions.some((r) => /measuring — 3 of 5/.test(r.textContent ?? ""))).toBe(true);
+  });
+});
+
+/// Progress and unreadable roots (#1151).
+describe("ArtifactsPage while the scan runs", () => {
+  beforeEach(() => {
+    state.loading = true;
+    state.scanProgress = undefined;
+    state.failedRoots = undefined;
+  });
+
+  it("says only that it is looking before the first event", () => {
+    // "0 of 0 folders" reads as a scan that found nothing to do, which
+    // is a different claim from "we have not heard back yet".
+    render(<ArtifactsPage />);
+    expect(screen.getByText(/Looking for build output…/)).toBeTruthy();
+    expect(screen.queryByText(/of 0 folders/)).toBeNull();
+  });
+
+  it("says how far along it is, with a denominator", () => {
+    // #754 and #830 were both "indefinite load" reports. The number
+    // that answers "is it stuck" is how many roots are left, not how
+    // many directories have gone by.
+    state.scanProgress = { roots_done: 3, roots_total: 4, found: 142 };
+    render(<ArtifactsPage />);
+    expect(screen.getByText(/3 of 4 folders, 142 found/)).toBeTruthy();
+  });
+
+  it("gets the singular right for one folder", () => {
+    state.scanProgress = { roots_done: 1, roots_total: 1, found: 7 };
+    render(<ArtifactsPage />);
+    expect(screen.getByText(/1 of 1 folder,/)).toBeTruthy();
+  });
+});
+
+describe("ArtifactsPage and roots it could not read", () => {
+  beforeEach(() => {
+    state.loading = false;
+    state.scanProgress = undefined;
+    state.failedRoots = undefined;
+  });
+
+  it("says nothing when every root was readable", () => {
+    render(<ArtifactsPage />);
+    expect(screen.queryByText(/could not be read/)).toBeNull();
+  });
+
+  it("names an unreadable root and why, rather than omitting it", () => {
+    // THE rule (#846). A root the scan could not read contributes
+    // nothing, and an empty list for a configured directory reads as an
+    // answer about that directory.
+    state.failedRoots = [{ root: "/Volumes/code", why: "Permission denied (os error 13)" }];
+    render(<ArtifactsPage />);
+    expect(screen.getByText(/1 configured folder could not be read/)).toBeTruthy();
+    expect(screen.getByText(/\/Volumes\/code — Permission denied/)).toBeTruthy();
+  });
+
+  it("keeps showing the artifacts that WERE found", () => {
+    // A warning about one unreadable path must not hide the real
+    // results from the roots that worked -- that replaces one silent
+    // loss with another.
+    state.failedRoots = [{ root: "/Volumes/code", why: "Permission denied" }];
+    state.artifacts = [art({ path: "/code/proj/target" })];
+    render(<ArtifactsPage />);
+    expect(screen.getByText(/could not be read/)).toBeTruthy();
+    expect(screen.getByText(/\/code\/proj\/target/)).toBeTruthy();
   });
 });
 

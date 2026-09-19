@@ -999,12 +999,35 @@ pub async fn scan_artifacts(app: AppHandle) -> Result<Vec<crate::artifacts::Arti
     // would be one more thing to keep in sync, and a user who has told
     // the app where their code lives has already answered this question.
     let dirs = get_worktree_dirs(app.clone());
+    // Progress, so the page can say "3 of 4 roots, 142 found" rather
+    // than showing an unqualified spinner for a walk it cannot see the
+    // end of (#1151). One event per ROOT: per-directory would be 178
+    // for a 1.5 s walk, and the number that answers "is it stuck" is
+    // how many roots are left.
+    let emitter = app.clone();
     let scanned = dirs.clone();
-    let out = tauri::async_runtime::spawn_blocking(move || crate::artifacts::scan(&scanned))
-        .await
-        .map_err(|e| e.to_string())?;
+    let (out, failed) = tauri::async_runtime::spawn_blocking(move || {
+        crate::artifacts::scan::scan_streaming(&scanned, &mut |p| {
+            use tauri::Emitter;
+            let _ = emitter.emit("artifact-scan-progress", p);
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    // A root that could not be read is NAMED, never silently dropped:
+    // an empty list for a configured directory reads as an answer about
+    // it (#846).
+    for f in &failed {
+        log::warn!("artifact scan: could not read {}: {}", f.root, f.why);
+    }
+    {
+        use tauri::Emitter;
+        let _ = app.emit("artifact-scan-failed-roots", &failed);
+    }
     // ~1.5 s to discover and ~56 s to size, every cold start, against a
-    // blank page (#1152).
+    // blank page (#1152). Stored AFTER the failed roots are reported:
+    // the cache holds what this scan actually found, and a root that
+    // could not be read contributes nothing to it either way.
     remember_scan(&app, crate::store::scans::ScanKind::Artifacts, &dirs, &out);
     Ok(out)
 }
@@ -1119,7 +1142,7 @@ pub async fn remove_artifacts(
     app: AppHandle,
     paths: Vec<String>,
 ) -> Result<Vec<crate::artifacts::ArtifactRemoval>, String> {
-    let roots = get_worktree_dirs(app);
+    let roots = get_worktree_dirs(app.clone());
     // DIAGNOSTIC LOGGING (Settings > diagnostic log). This is the
     // BACKEND half of the freeze report: paired with the frontend's
     // `ui remove_artifacts` marks, it separates a slow `remove_dir_all`
@@ -1159,9 +1182,20 @@ pub async fn scan_venvs(app: AppHandle) -> Result<Vec<crate::caches::Venv>, Stri
     // start while this one still has eight threads on the disk.
     let _permit = scan_permit().await?;
     let roots = get_worktree_dirs(app.clone());
+    let emitter = app.clone();
     let scanned = roots.clone();
     let out = tauri::async_runtime::spawn_blocking(move || {
-        let dirs = crate::caches::project_dirs(&scanned);
+        let dirs = crate::caches::project_dirs_streaming(&scanned, &mut |p| {
+            use tauri::Emitter;
+            // Every 200 directories, not every one: the walk visits
+            // 28,144 on a real machine and per-directory events are the
+            // render storm the coalescer exists to absorb (#1151).
+            //
+            // `remove_venvs` calls the NON-streaming form deliberately:
+            // it re-verifies before deleting and nobody is watching a
+            // progress bar for it.
+            let _ = emitter.emit("venv-walk-progress", p);
+        });
         log::info!(
             "venv scan: {} candidate project directories{}",
             dirs.dirs.len(),
