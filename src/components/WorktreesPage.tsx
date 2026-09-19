@@ -34,6 +34,7 @@ import {
   formatSize,
   totalSize,
   canClaudify,
+  submoduleNote,
   isPending,
   isSafe,
   pathBasename,
@@ -374,6 +375,15 @@ function Row({
         aria-busy={pending || sizePending ? true : undefined}
       >
         {pending ? <Skeleton className="w-40" /> : safetyReason(wt.safety)}
+        {/* WHICH KIND of dirt, beside the count (#1138). The count is
+            already right -- `git status --porcelain` reports a dirty
+            submodule as a ` M <path>` line, so `Dirty` already wins and
+            Remove already declines -- but "1 uncommitted file" and "a
+            submodule has work in it" send the user to different
+            commands, and only one of them is `git add`. */}
+        {!pending && submoduleNote(wt.submodules) ? (
+          <span className="text-[#d29922]"> · {submoduleNote(wt.submodules)}</span>
+        ) : null}
         {wt.merged_at ? (
           <span className="text-[#8b949e]"> · merged {wt.merged_at}</span>
         ) : null}
@@ -2137,6 +2147,29 @@ export function WorktreesPage() {
         <span className="text-[#8b949e]">
           {shown.length} worktree{shown.length === 1 ? "" : "s"}
         </span>
+        {/* The stash stack, once per repository, because it IS once per
+            repository (#1138).
+
+            Stated with the shared-stack fact, which is the part that
+            makes it actionable: an entry pushed in one worktree is
+            listed from every other and SURVIVES `git worktree remove`
+            on the tree that made it, and git records no attribution. So
+            a user clearing worktrees here is looking at work that will
+            outlive the directory it belongs to and reappear, unlabelled,
+            in whatever tree they open next.
+
+            Absent at zero and absent when unread -- `null` means the
+            scan did not ask, not that the stack is empty (#846), and
+            zero is the ordinary case that needs no sentence. */}
+        {selected?.stash_entries ? (
+          <span
+            className="text-[#d29922]"
+            title="The stash stack is shared by every worktree of this repository, and entries outlive the worktree that created them."
+          >
+            {selected.stash_entries} stash entr{selected.stash_entries === 1 ? "y" : "ies"} (shared
+            by all worktrees)
+          </span>
+        ) : null}
         {/* How old these answers are, for the whole repository.
 
             Every verdict on the rows below is computed against refs on
