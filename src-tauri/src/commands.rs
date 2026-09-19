@@ -761,6 +761,10 @@ pub async fn classify_worktrees(
     app: AppHandle,
     repo_path: String,
 ) -> Result<Vec<crate::worktrees::Worktree>, String> {
+    // One budget across every filesystem scan (#1149). Held for
+    // the whole walk: releasing early would let the next caller
+    // start while this one still has eight threads on the disk.
+    let _permit = scan_permit().await?;
     // Two failure modes, both real: the join can fail if the blocking
     // task panicked, and classification itself can fail if git refuses.
     // Flattened rather than swallowed, so an unreadable repo surfaces as
@@ -832,6 +836,10 @@ pub async fn classify_worktrees(
 pub async fn classify_repo_upstream(
     repo_path: String,
 ) -> Result<crate::worktrees::Worktree, String> {
+    // One budget across every filesystem scan (#1149). Held for
+    // the whole walk: releasing early would let the next caller
+    // start while this one still has eight threads on the disk.
+    let _permit = scan_permit().await?;
     // Blocking git work: off the async runtime's worker threads, the
     // same treatment `list_worktrees` above gives the walk.
     tauri::async_runtime::spawn_blocking(move || {
@@ -868,6 +876,10 @@ pub async fn size_worktrees(
     app: AppHandle,
     repo_path: String,
 ) -> Result<Vec<(String, Option<u64>)>, String> {
+    // One budget across every filesystem scan (#1149). Held for
+    // the whole walk: releasing early would let the next caller
+    // start while this one still has eight threads on the disk.
+    let _permit = scan_permit().await?;
     tauri::async_runtime::spawn_blocking(move || {
         let mut out = Vec::new();
         crate::worktrees::size_repo_streaming(&repo_path, &mut |path, bytes| {
@@ -892,6 +904,10 @@ pub async fn size_worktrees(
 /// shaped the worktree view.
 #[tauri::command]
 pub async fn scan_artifacts(app: AppHandle) -> Result<Vec<crate::artifacts::Artifact>, String> {
+    // One budget across every filesystem scan (#1149). Held for
+    // the whole walk: releasing early would let the next caller
+    // start while this one still has eight threads on the disk.
+    let _permit = scan_permit().await?;
     // The SAME roots the worktree view scans. A second directory setting
     // would be one more thing to keep in sync, and a user who has told
     // the app where their code lives has already answered this question.
@@ -921,16 +937,53 @@ pub async fn scan_artifacts(app: AppHandle) -> Result<Vec<crate::artifacts::Arti
 /// A cap makes the total no slower (the disk is the bottleneck either
 /// way) while leaving the blocking pool free for everything else --
 /// which is what actually made the UI look frozen.
-static SIZE_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+/// One budget for every filesystem scan, not two that cannot see each
+/// other (#1149).
+///
+/// `SIZE_LIMIT` bounded the artifact and venv sizing and nothing else,
+/// while `size_worktrees` spawned `SIZE_WORKERS` (8) OS threads per call
+/// and the frontend fired one call per repository. On the reporting
+/// machine that is ~38 repositories, so up to ~304 concurrent disk
+/// walkers competing for one disk -- the same contention the comment
+/// above measured at 17.6 seconds for groups of two.
+///
+/// Sized from the machine rather than a literal. The disk is the
+/// bottleneck either way, so a cap costs no total wall clock; what it
+/// buys is that the blocking pool stays free, and an interactive action
+/// -- a removal, a page switch -- is not queued behind three hundred
+/// walkers.
+///
+/// A `OnceLock` rather than `const_new` because the width is computed:
+/// `available_parallelism` can fail, and four is the figure the
+/// measurement above already justified.
+fn scan_permits() -> &'static tokio::sync::Semaphore {
+    static PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| {
+        let n = std::thread::available_parallelism()
+            .map(|n| n.get().clamp(2, 8))
+            .unwrap_or(4);
+        tokio::sync::Semaphore::new(n)
+    })
+}
+
+/// Take a scan permit, held for the whole walk.
+///
+/// `acquire` only fails when the semaphore is closed, which never
+/// happens for a process-lifetime static -- but the error is reported
+/// rather than unwrapped, because a panic here would take down a scan
+/// for a condition that has a perfectly good message.
+async fn scan_permit() -> Result<tokio::sync::SemaphorePermit<'static>, String> {
+    scan_permits()
+        .acquire()
+        .await
+        .map_err(|e| format!("could not schedule the scan: {e}"))
+}
 
 #[tauri::command]
 pub async fn size_artifacts(paths: Vec<String>) -> Result<Vec<(String, u64, Option<u64>)>, String> {
     // Held for the whole walk. `acquire` only fails if the semaphore is
     // closed, which never happens for a static.
-    let _permit = SIZE_LIMIT
-        .acquire()
-        .await
-        .map_err(|e| format!("could not schedule the measurement: {e}"))?;
+    let _permit = scan_permit().await?;
     tauri::async_runtime::spawn_blocking(move || {
         // DIAGNOSTIC LOGGING (Settings > diagnostic log). Per-directory,
         // for the same reason as `size_venvs`: the total says the batch
@@ -1009,6 +1062,10 @@ pub async fn remove_artifacts(
 /// paint before that finishes.
 #[tauri::command]
 pub async fn scan_venvs(app: AppHandle) -> Result<Vec<crate::caches::Venv>, String> {
+    // One budget across every filesystem scan (#1149). Held for
+    // the whole walk: releasing early would let the next caller
+    // start while this one still has eight threads on the disk.
+    let _permit = scan_permit().await?;
     let roots = get_worktree_dirs(app);
     tauri::async_runtime::spawn_blocking(move || {
         let dirs = crate::caches::project_dirs(&roots);
@@ -1037,10 +1094,7 @@ pub async fn scan_venvs(app: AppHandle) -> Result<Vec<crate::caches::Venv>, Stri
 pub async fn size_venvs(paths: Vec<String>) -> Result<Vec<(String, u64, Option<u64>)>, String> {
     // Shares the artifact cap: both walk the same disk, and a venv batch
     // competing with a 54-way artifact fan-out is the same contention.
-    let _permit = SIZE_LIMIT
-        .acquire()
-        .await
-        .map_err(|e| format!("could not schedule the measurement: {e}"))?;
+    let _permit = scan_permit().await?;
     tauri::async_runtime::spawn_blocking(move || {
         // DIAGNOSTIC LOGGING (Settings > diagnostic log).
         //
@@ -5150,6 +5204,54 @@ pub fn claude_uninstall_hooks() -> Result<crate::claude::install::Uninstalled, S
 
 #[cfg(test)]
 mod tests {
+    /// #1149: one budget across every filesystem scan.
+    ///
+    /// `SIZE_LIMIT` bounded two commands and nothing else, while
+    /// `size_worktrees` spawned eight OS threads per call and the
+    /// frontend fired one per repository -- ~304 concurrent walkers on
+    /// the reporting machine, against one disk.
+    #[test]
+    fn the_scan_budget_is_bounded_and_shared() {
+        let sem = super::scan_permits();
+        let n = sem.available_permits();
+        assert!(n >= 2, "a budget of {n} would serialise every scan");
+        assert!(
+            n <= 8,
+            "a budget of {n} is not a budget -- the contention this exists to stop \
+             was measured at 17.6 seconds for groups of two"
+        );
+    }
+
+    /// The SAME semaphore for every caller. Two budgets that cannot see
+    /// each other is the state this replaces, and a fresh one per call
+    /// would be exactly that with extra steps.
+    #[test]
+    fn every_caller_shares_one_budget() {
+        assert!(
+            std::ptr::eq(super::scan_permits(), super::scan_permits()),
+            "scan_permits must return one shared semaphore, not a new one per call"
+        );
+    }
+
+    /// A permit is actually taken and released, so a scan cannot leak
+    /// one and starve every later caller.
+    #[tokio::test]
+    async fn a_permit_is_returned_when_the_scan_ends() {
+        let before = super::scan_permits().available_permits();
+        {
+            let _p = super::scan_permit().await.expect("a permit is available");
+            assert_eq!(
+                super::scan_permits().available_permits(),
+                before - 1,
+                "holding a permit must reduce the budget"
+            );
+        }
+        assert_eq!(
+            super::scan_permits().available_permits(),
+            before,
+            "and dropping it must return the permit"
+        );
+    }
 
     /// #1124: the three constants must agree, since `AUTH_ERR` is
     /// written out rather than composed.

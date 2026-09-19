@@ -2835,4 +2835,90 @@ mod tests {
              probably changed, and this check must change with it"
         );
     }
+
+    /// Every filesystem scan takes a permit from the shared budget
+    /// (#1149).
+    ///
+    /// `SIZE_LIMIT` bounded two commands and nothing else. The others
+    /// each spawned a walk -- `size_worktrees` eight OS threads per call
+    /// -- and the frontend fires one per repository, so ~38 repositories
+    /// became up to ~304 concurrent walkers against one disk. The
+    /// contention was measured at 17.6 seconds for groups of two.
+    ///
+    /// The guard is the NEXT scan command rather than these five: a
+    /// sixth added next month is exactly the sibling this codebase's
+    /// invariants module exists to catch.
+    ///
+    /// Derived from the walk functions the command layer calls, not from
+    /// a list of command names, per #844's lesson that a hand-written
+    /// list cannot cover the item nobody remembered to add.
+    #[test]
+    fn every_filesystem_scan_takes_a_permit() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands.rs"),
+        )
+        .expect("commands.rs is readable");
+        let prod = &production(&src);
+
+        // The calls that start a walk. Each is a real entry point into
+        // `worktrees::scan`, `artifacts::scan` or `caches`, and each one
+        // costs disk.
+        const WALKS: &[&str] = &[
+            "worktrees::size_repo",
+            "worktrees::classify_repo",
+            "worktrees::classify_main_checkout",
+            "artifacts::scan",
+            "caches::scan",
+        ];
+
+        let mut checked = 0usize;
+        for walk in WALKS {
+            let mut at = 0usize;
+            while let Some(i) = prod[at..].find(walk) {
+                let hit = at + i;
+                at = hit + 1;
+                let line_start = prod[..hit].rfind('\n').map_or(0, |j| j + 1);
+                let line_end = prod[hit..].find('\n').map_or(prod.len(), |j| hit + j);
+                if is_comment(&prod[line_start..line_end]) {
+                    continue;
+                }
+
+                // The enclosing `#[tauri::command]`, NOT the enclosing
+                // function: every one of these sits inside a
+                // `spawn_blocking` closure, so `enclosing_fn` returns
+                // the closure and the permit -- which is taken at the
+                // top of the command -- is outside it.
+                //
+                // So the search runs backwards from the call to the
+                // nearest command attribute, and the region between
+                // them is what must contain the permit.
+                let Some(cmd) = prod[..hit].rfind("#[tauri::command]") else {
+                    continue;
+                };
+                checked += 1;
+                let region = &prod[cmd..hit];
+                let name = region
+                    .split("pub async fn ")
+                    .nth(1)
+                    .or_else(|| region.split("pub fn ").nth(1))
+                    .and_then(|r| r.split('(').next())
+                    .unwrap_or("<unnamed>");
+                assert!(
+                    region.contains("scan_permit().await?"),
+                    "commands.rs: `{name}` starts a filesystem walk ({walk}) without \
+                     taking a scan permit. The frontend fires one of these per \
+                     repository and each spawns up to eight OS threads, so an ungated \
+                     one puts ~300 walkers on one disk -- measured at 17.6 seconds for \
+                     groups of two (#1149). Add `let _permit = scan_permit().await?;`."
+                );
+            }
+        }
+        assert_eq!(
+            checked,
+            WALKS.len(),
+            "every walk in WALKS must be reached exactly once from a command; finding \
+             {checked} means one has been renamed and this guard is asserting less than \
+             it claims"
+        );
+    }
 }
