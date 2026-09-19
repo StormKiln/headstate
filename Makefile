@@ -240,6 +240,12 @@ lint-deps:
 	# belongs in the target whose comment promises answers in a second.
 	python3 scripts/check-required-contexts.test.py
 	python3 scripts/check-required-contexts.py
+	# The intake path. Templates are PROMPTS, not gates -- nothing here
+	# blocks a merge -- but the checklist restates rules that have
+	# shipped as defects, and a fifth rule added to CLAUDE.md would not
+	# reach it on its own. A source read with no network (#1156).
+	python3 scripts/check-issue-templates.test.py
+	python3 scripts/check-issue-templates.py
 	# A `run:` step with no `shell:` runs under PowerShell on Windows,
 	# where bash syntax (a heredoc, `$(...)`) is a parse error. CI-only
 	# until now (ci.yml), so the author of such a step ran `make lint`

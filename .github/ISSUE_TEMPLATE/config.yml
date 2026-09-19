@@ -1,0 +1,7 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/StormKiln/headstate/security/policy
+    about: >-
+      Do not open a public issue. SECURITY.md has the reporting route —
+      this app holds a GitHub token and reads your local checkouts.
