@@ -3,7 +3,13 @@ import { ActingOnDesktop } from "./ActingOnDesktop";
 import { useMemo, useState } from "react";
 import { HardDrive } from "lucide-react";
 import type { Artifact, ArtifactKind } from "@/types/pr";
-import { useArtifacts, useArtifactSizes, useRemoveArtifacts, useVenvs } from "@/api/hooks";
+import {
+  useArtifacts,
+  useArtifactSizes,
+  useCachedScan,
+  useRemoveArtifacts,
+  useVenvs,
+} from "@/api/hooks";
 import { useActiveFilters } from "@/store/filters";
 import { relativeSeconds } from "@/lib/time";
 import { useIsMobile } from "@/lib/useIsMobile";
@@ -95,6 +101,79 @@ export const ACTIVE_SECS = 15 * 60;
 /// prompted this: 0.28 GB of Rust build output sat inside worktrees,
 /// against 108 GB beside main checkouts -- so the worktree view
 /// structurally could not reach 99.7% of the largest thing on the disk.
+/// The previous scan, painted while the live one runs (#1152).
+///
+/// # Why this is a separate component
+///
+/// It must NOT be the ordinary list. The rows are real but dated, and
+/// nothing on them may be acted on: `branches/cache.rs` states the rule
+/// -- a stale "safe to delete" computed against a tree that has since
+/// moved on is the one thing a cache must not authorise. So this renders
+/// no remove controls and no selection, which is a structural guarantee
+/// rather than a disabled attribute someone can later re-enable.
+///
+/// # It says what it is, every time
+///
+/// The age is not a caveat on an exceptional path; it is the whole
+/// claim. #742 records what happens when "nothing found" and "nothing
+/// known yet" share a rendering, and an undated previous scan is the
+/// same lie about disk -- a user who deleted 40 GB this morning and
+/// sees it listed would reasonably conclude the deletion failed.
+function ArtifactsFromCache({
+  artifacts,
+  ageSecs,
+  stale,
+}: {
+  artifacts: Artifact[];
+  ageSecs: number;
+  stale: boolean;
+}) {
+  const total = artifacts.reduce((n, a) => n + (a.size_bytes ?? 0), 0);
+  return (
+    <div className="p-4">
+      <div
+        className={`rounded-md border px-3 py-2 text-xs ${
+          stale
+            ? "border-[#d29922]/40 bg-[#d29922]/5 text-[#d29922]"
+            : "border-[#30363d] bg-[#161b22] text-[#8b949e]"
+        }`}
+        role="status"
+      >
+        Showing the last scan, from {describeAge(ageSecs)}. Rescanning now
+        {stale ? " — this result is old enough that it may have changed." : "."}
+      </div>
+      <ul className="mt-3 space-y-1">
+        {artifacts.slice(0, 50).map((a) => (
+          <li key={a.path} className="flex justify-between text-xs text-[#8b949e]">
+            <span className="truncate">{a.path}</span>
+            <span className="ml-3 shrink-0">{formatSize(a.size_bytes)}</span>
+          </li>
+        ))}
+      </ul>
+      {artifacts.length > 50 ? (
+        <p className="mt-2 text-xs text-[#8b949e]">
+          and {artifacts.length - 50} more — the full list appears when the scan finishes.
+        </p>
+      ) : null}
+      <p className="mt-2 text-xs text-[#8b949e]">
+        {artifacts.length} director{artifacts.length === 1 ? "y" : "ies"}, {formatSize(total)}{" "}
+        as of that scan.
+      </p>
+    </div>
+  );
+}
+
+/// How long ago, in words a sentence can use.
+function describeAge(secs: number): string {
+  if (secs < 60) return "moments ago";
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins} minute${mins === 1 ? "" : "s"} ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+  const days = Math.floor(hours / 24);
+  return `${days} day${days === 1 ? "" : "s"} ago`;
+}
+
 export function ArtifactsPage() {
   const filters = useActiveFilters();
   const isMobile = useIsMobile();
@@ -208,7 +287,26 @@ export function ArtifactsPage() {
   const showArtifacts = group !== VENV_GROUP;
   const showVenvs = group === undefined || group === VENV_GROUP;
 
+  /// The previous scan, if there is one (#1152).
+  ///
+  /// Read only while the live scan is in flight: once it lands, the
+  /// real result is strictly better and this stops being consulted.
+  const cached = useCachedScan<Artifact[]>("artifacts", isLoading && showArtifacts);
+
   if (isLoading && showArtifacts) {
+    // A blank page for the ~1.5 s discovery plus ~56 s of sizing this
+    // scan takes, every cold start. The previous result is not current
+    // -- and it is strictly more than nothing, and those directories
+    // were there this morning.
+    if (cached && cached.data.length > 0) {
+      return (
+        <ArtifactsFromCache
+          artifacts={cached.data}
+          ageSecs={cached.ageSecs}
+          stale={cached.stale}
+        />
+      );
+    }
     return <p className="p-4 text-sm text-[#8b949e]">Looking for build output…</p>;
   }
 

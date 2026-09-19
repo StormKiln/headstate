@@ -187,6 +187,7 @@ const ROWS: Row[] = [
   row(api.getMergedDetail, [], "get_merged_detail"),
   row(api.getAuthState, [], "get_auth_state"),
   row(api.scanArtifacts, [], "scan_artifacts"),
+  row(api.readCachedScan, ["artifacts"], "read_cached_scan", { kind: "artifacts" }),
   row(api.sizeArtifacts, [paths], "size_artifacts", { paths }),
   row(api.removeArtifacts, [paths], "remove_artifacts", { paths }),
   row(api.scanVenvs, [], "scan_venvs"),

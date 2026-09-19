@@ -744,6 +744,44 @@ export const getAuthState = () => call<AuthState>("get_auth_state");
 /// `sizeArtifacts` for the second pass.
 export const scanArtifacts = () => call<Artifact[]>("scan_artifacts");
 
+/// Which stored scan to read (#1152).
+export type ScanKind = "artifacts" | "venvs" | "worktrees";
+
+/// A previously stored scan, and how old it is.
+export interface CachedScan {
+  /// The scan's own JSON, exactly as the command returned it.
+  ///
+  /// Opaque on the Rust side deliberately: a typed store would need one
+  /// function per scan and a migration every time a result type gained
+  /// a field.
+  payload: string;
+  /// How many seconds ago it was written.
+  ///
+  /// ALWAYS present. This is read on a cold start to paint before any
+  /// live result exists, so the age is not a caveat on an exceptional
+  /// path -- it is what the view labels itself with every time.
+  age_secs: number;
+  /// Whether it is past the six-hour window.
+  ///
+  /// Carried rather than re-derived, so Rust and the view cannot
+  /// disagree about what counts as old.
+  stale: boolean;
+}
+
+/// Read a previously stored scan.
+///
+/// `null` means nothing is stored -- a first run, or a root just added.
+/// That is NOT an empty scan, and the caller must keep painting its
+/// scanning state for it: #742 records what happens when "nothing
+/// found" and "nothing known yet" share a representation.
+///
+/// NEVER the basis of a removal. `branches/cache.rs` states the rule: a
+/// stale "safe to delete" computed against a repository that has since
+/// moved on is the one thing a cache must not authorise. Every
+/// destructive path re-verifies live at click time.
+export const readCachedScan = (kind: ScanKind) =>
+  call<CachedScan | null>("read_cached_scan", { kind });
+
 /// Sizes for specific artifact directories, as
 /// `[path, bytes, secsSinceWrite]`.
 export const sizeArtifacts = (paths: string[]) =>

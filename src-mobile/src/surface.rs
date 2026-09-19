@@ -104,6 +104,11 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("size_worktrees", Class::Read),
     ("list_branches", Class::Read),
     ("scan_artifacts", Class::Read),
+    // Read: what a previous scan already found, so a cold start paints
+    // rows instead of a blank page (#1152). Same class as the scan
+    // above -- it returns the same information, just earlier -- and it
+    // authorises nothing: every destructive path re-verifies live.
+    ("read_cached_scan", Class::Read),
     ("size_artifacts", Class::Read),
     ("scan_venvs", Class::Read),
     ("size_venvs", Class::Read),

@@ -949,6 +949,29 @@ const MIGRATIONS: &[&str] = &[
         messages    INTEGER NOT NULL,
         PRIMARY KEY (session_id, model)
      );",
+    // #1152: filesystem scan results, so a cold start is not a blank
+    // page for the ~56s an artifact sizing pass takes.
+    //
+    // One JSON payload per (kind, root), exactly as `snapshot` holds the
+    // PR list: a normalised schema would buy nothing and cost migrations
+    // later, and these are read whole or not at all.
+    //
+    // `root` is in the key because the scans are per configured
+    // directory -- two roots produce two independent results, and a
+    // single-row table would have one silently overwrite the other.
+    //
+    // What this deliberately does NOT hold is any SAFETY verdict.
+    // `branches/cache.rs` states the reason: a stale "safe to delete"
+    // computed against a repository that has since moved on is the one
+    // thing a cache must never authorise. Sizes, paths and discovery
+    // only.
+    "CREATE TABLE IF NOT EXISTS scan_cache (
+        kind       TEXT NOT NULL,
+        root       TEXT NOT NULL,
+        payload    TEXT NOT NULL,
+        fetched_at TEXT NOT NULL,
+        PRIMARY KEY (kind, root)
+     );",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
