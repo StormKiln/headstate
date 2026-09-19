@@ -304,6 +304,19 @@ export function safetyReason(s: Safety): string {
       // is gone, so nothing about the contents can be established, and
       // the user needs that before deciding.
       return "its repository is gone — nothing here can be checked";
+    case "inProgress": {
+      // The row's own sentence (#1136). Names the operation, because
+      // that is the fact that survives the remedy -- committing the
+      // working tree does not end a rebase -- and it is what the user
+      // has to resolve.
+      //
+      // A null count is omitted rather than rendered as 0: an
+      // unreadable `git status` is not a conflict-free rebase.
+      const what = s.op === "cherryPick" ? "cherry-pick" : s.op;
+      return s.conflicts && s.conflicts > 0
+        ? `${what} in progress — ${s.conflicts} conflicted file${s.conflicts === 1 ? "" : "s"}`
+        : `${what} in progress`;
+    }
     default:
       return `could not determine: ${s.detail}`;
   }
@@ -343,6 +356,17 @@ export function forceWarning(s: Safety): string {
       // disk that no git object holds a copy of, so there is no reflog
       // and no stash to recover them from.
       return `${s.detail} uncommitted file${s.detail === 1 ? "" : "s"} will be deleted permanently. This cannot be undone.`;
+    case "inProgress": {
+      // NAMES the operation, because that is what the user has to
+      // resolve and the remedy differs per operation (#1136). The stakes
+      // are specific for the same reason `dirty` above names its count:
+      // a half-replayed rebase holds commits that exist in no other
+      // ref, so there is no reflog entry to recover them from once the
+      // directory is gone.
+      const what =
+        s.op === "cherryPick" ? "cherry-pick" : s.op;
+      return `A ${what} is in progress here. Removing the worktree discards it, along with any commits it has replayed so far. This cannot be undone — finish or abort the ${what} first.`;
+    }
     case "empty":
       return "This branch has no commits of its own, so nothing on it would be lost. Removing the directory cannot be undone.";
     case "locked":
@@ -604,6 +628,12 @@ export function safetyTone(s: Safety): string {
     case "pending":
       return "text-[#8b949e]";
     case "never_pushed":
+      return "text-[#f85149]";
+    // RED, like `never_pushed` and for the same reason (#1136): a
+    // half-replayed rebase holds commits no other ref points at, so
+    // removing the worktree loses work with no reflog to recover it
+    // from. Amber would read as "needs attention"; this is "stop".
+    case "inProgress":
       return "text-[#f85149]";
     case "empty":
       // Grey, and explicitly so rather than by falling through to the

@@ -1,4 +1,4 @@
-use super::model::{Lock, Repo, Safety, Upstream, Worktree};
+use super::model::{GitOperation, Lock, Repo, Safety, Upstream, Worktree};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Command;
@@ -328,6 +328,18 @@ pub fn worktree_safety(
             });
         }
         return Safety::Unknown("directory is missing".into());
+    }
+
+    // BEFORE the dirty check (#1136). A half-finished rebase has a dirty
+    // working tree by definition, so `Dirty(n)` would win and report "7
+    // uncommitted files" -- ordinary edits, and the one state a user
+    // must not remove: `git worktree remove` on a half-replayed rebase
+    // discards a commit series that exists nowhere else.
+    if let Some(op) = operation_in_progress(dir) {
+        return Safety::InProgress {
+            op,
+            conflicts: conflicted_files(dir),
+        };
     }
 
     match git(dir, &["status", "--porcelain"]) {
@@ -2285,6 +2297,74 @@ const CLASSIFY_WORKERS: usize = 8;
 /// worktree is 13x the worst thing ever measured here.
 const CLASSIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
+/// Which multi-step git operation this worktree stopped inside, if any
+/// (#1136).
+///
+/// Verified against real repositories rather than inferred: a conflicted
+/// `git rebase` leaves `REBASE_HEAD` and `rebase-merge/`, a conflicted
+/// `git merge` leaves `MERGE_HEAD`, and `git cherry-pick` leaves
+/// `CHERRY_PICK_HEAD`.
+///
+/// Paths are built with `PathBuf::join`, never `format!`: Windows
+/// `canonicalize` returns verbatim `\\?\C:\` paths and this has cost
+/// six Windows-only failures.
+fn operation_in_progress(dir: &Path) -> Option<GitOperation> {
+    // The worktree's OWN git dir, not the repository's. A linked
+    // worktree has `.git` as a file pointing at
+    // `<repo>/.git/worktrees/<name>`, and its rebase state lives there
+    // -- looking in the repository root would report the main
+    // checkout's rebase against every worktree.
+    let git_dir = git(dir, &["rev-parse", "--absolute-git-dir"]).ok()?;
+    let git_dir = Path::new(git_dir.trim());
+
+    // Ordered most- to least-specific. `rebase-merge` is checked
+    // alongside `REBASE_HEAD` because an interactive rebase stopped
+    // between commits has the directory without the ref.
+    for (marker, op) in [
+        ("rebase-merge", GitOperation::Rebase),
+        ("rebase-apply", GitOperation::Rebase),
+        ("REBASE_HEAD", GitOperation::Rebase),
+        ("MERGE_HEAD", GitOperation::Merge),
+        ("CHERRY_PICK_HEAD", GitOperation::CherryPick),
+        ("REVERT_HEAD", GitOperation::Revert),
+        ("BISECT_LOG", GitOperation::Bisect),
+    ] {
+        if git_dir.join(marker).exists() {
+            return Some(op);
+        }
+    }
+    None
+}
+
+/// How many files are conflicted, or `None` when status could not be
+/// read.
+///
+/// `None` is NOT zero: the operation is in progress either way, which is
+/// why the state above does not depend on this count. An unreadable
+/// status yields a row that names the operation without a number rather
+/// than one claiming a clean conflict-free rebase.
+fn conflicted_files(dir: &Path) -> Option<u64> {
+    let out = git(dir, &["status", "--porcelain"]).ok()?;
+    Some(
+        out.lines()
+            .filter(|l| {
+                // The unmerged codes git documents: both sides added,
+                // both deleted, or one of each.
+                matches!(
+                    l.get(..2),
+                    Some("UU")
+                        | Some("AA")
+                        | Some("DD")
+                        | Some("AU")
+                        | Some("UA")
+                        | Some("DU")
+                        | Some("UD")
+                )
+            })
+            .count() as u64,
+    )
+}
+
 /// Classify a worktree and, when merged, date it.
 ///
 /// The single place both scan paths go through: `classify_repo` and
@@ -2360,6 +2440,16 @@ fn safety_label(s: &Safety) -> &'static str {
         Safety::Safe => "safe",
         Safety::MainCheckout => "main",
         Safety::Dirty(_) => "dirty",
+        // The OPERATION is carried, the conflict count is not: the
+        // operation is a fixed word from a closed set and names nothing
+        // about the user, which is what this function is for.
+        Safety::InProgress { op, .. } => match op {
+            GitOperation::Rebase => "rebase_in_progress",
+            GitOperation::Merge => "merge_in_progress",
+            GitOperation::CherryPick => "cherry_pick_in_progress",
+            GitOperation::Revert => "revert_in_progress",
+            GitOperation::Bisect => "bisect_in_progress",
+        },
         Safety::Unpushed(_) => "unpushed",
         Safety::NeverPushed => "never_pushed",
         Safety::MergedUpstreamDeleted => "merged_upstream_deleted",
@@ -8664,6 +8754,7 @@ mod live {
                 Safety::Prunable(_) => "prunable",
                 Safety::Pending => "pending",
                 Safety::Orphaned => "orphaned",
+                Safety::InProgress { .. } => "in_progress",
                 Safety::Unknown(_) => "unknown",
             };
             *counts.entry(k).or_default() += 1;
@@ -10396,5 +10487,140 @@ mod bare_repository_tests {
             }),
             "a directory git does not call a repository must not be listed as one"
         );
+    }
+}
+
+#[cfg(test)]
+mod in_progress_tests {
+    use super::*;
+
+    const IDENT: [(&str, &str); 4] = [
+        ("GIT_AUTHOR_NAME", "octocat"),
+        ("GIT_COMMITTER_NAME", "octocat"),
+        ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+        ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+    ];
+
+    fn run(dir: &Path, args: &[&str]) -> bool {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .envs(IDENT)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// A repository with two branches that conflict on one file.
+    fn conflicting(dir: &Path) {
+        assert!(run(dir, &["init", "-q", "-b", "main"]));
+        std::fs::write(dir.join("f.txt"), "base\n").unwrap();
+        assert!(run(dir, &["add", "f.txt"]));
+        assert!(run(dir, &["commit", "-q", "-m", "base"]));
+
+        assert!(run(dir, &["checkout", "-q", "-b", "feat"]));
+        std::fs::write(dir.join("f.txt"), "theirs\n").unwrap();
+        assert!(run(dir, &["commit", "-q", "-am", "theirs"]));
+
+        assert!(run(dir, &["checkout", "-q", "main"]));
+        std::fs::write(dir.join("f.txt"), "ours\n").unwrap();
+        assert!(run(dir, &["commit", "-q", "-am", "ours"]));
+    }
+
+    /// #1136: a stopped rebase is not "7 uncommitted files".
+    ///
+    /// Driven against a REAL conflicted rebase rather than a fabricated
+    /// git dir: the marker files are git's own behaviour, and a test
+    /// that wrote them by hand would assert what this code assumes
+    /// rather than what git does.
+    #[test]
+    fn a_conflicted_rebase_is_in_progress_not_dirty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        conflicting(dir);
+        assert!(run(dir, &["checkout", "-q", "feat"]));
+        // Expected to FAIL: that is the conflict this test needs.
+        let _ = run(dir, &["rebase", "main"]);
+
+        let op = operation_in_progress(dir).expect("a stopped rebase must be detected");
+        assert_eq!(op, GitOperation::Rebase);
+        assert_eq!(
+            conflicted_files(dir),
+            Some(1),
+            "and the conflicted file is counted"
+        );
+    }
+
+    #[test]
+    fn a_conflicted_merge_is_detected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        conflicting(dir);
+        let _ = run(dir, &["merge", "feat"]);
+
+        assert_eq!(operation_in_progress(dir), Some(GitOperation::Merge));
+    }
+
+    #[test]
+    fn a_conflicted_cherry_pick_is_detected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        conflicting(dir);
+        let _ = run(dir, &["cherry-pick", "feat"]);
+
+        assert_eq!(operation_in_progress(dir), Some(GitOperation::CherryPick));
+    }
+
+    /// The other direction, which is what stops this reporting every
+    /// worktree as mid-rebase: an ordinary clean checkout has no
+    /// operation in progress.
+    #[test]
+    fn a_clean_checkout_has_no_operation_in_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        conflicting(dir);
+
+        assert_eq!(operation_in_progress(dir), None);
+        assert_eq!(conflicted_files(dir), Some(0), "and nothing is conflicted");
+    }
+
+    /// An ABORTED rebase leaves no markers, so the row goes back to
+    /// whatever it was. A state that survived its own resolution would
+    /// be worse than not detecting it.
+    #[test]
+    fn aborting_the_rebase_clears_the_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        conflicting(dir);
+        assert!(run(dir, &["checkout", "-q", "feat"]));
+        let _ = run(dir, &["rebase", "main"]);
+        assert!(operation_in_progress(dir).is_some(), "precondition");
+
+        assert!(run(dir, &["rebase", "--abort"]));
+        assert_eq!(operation_in_progress(dir), None);
+    }
+
+    /// `classify` must report it ABOVE `Dirty`: a rebase has a dirty
+    /// tree by definition, so the ordering is the whole fix.
+    #[test]
+    fn classify_reports_in_progress_rather_than_dirty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        conflicting(dir);
+        assert!(run(dir, &["checkout", "-q", "feat"]));
+        let _ = run(dir, &["rebase", "main"]);
+
+        let mut w = Worktree {
+            path: dir.to_string_lossy().into_owned(),
+            branch: "feat".into(),
+            ..Default::default()
+        };
+        classify(&mut w, dir, "main");
+        match w.safety {
+            Safety::InProgress { op, .. } => assert_eq!(op, GitOperation::Rebase),
+            other => panic!("expected InProgress, got {other:?} -- Dirty would hide it"),
+        }
+        assert!(!w.safety.is_safe(), "and it is never one-click removable");
     }
 }
