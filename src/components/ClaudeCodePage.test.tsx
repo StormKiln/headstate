@@ -3093,3 +3093,40 @@ describe("the opening prompt", () => {
     expect(screen.queryByText("Two")).toBeNull();
   });
 });
+
+/// #1135: what the transcript corpus costs on disk.
+///
+/// Headstate reports a footprint for worktrees, artifacts, venvs, Docker
+/// and packages. The one corpus it reads most had none.
+describe("the transcript footprint", () => {
+  it("states what the session transcripts cost", () => {
+    state.imported = imported({ session_bytes: 916_000_000, subagent_bytes: 0 });
+    renderView();
+    expect(screen.getByText(/of transcripts/)).toBeTruthy();
+  });
+
+  /// The two halves stay APART: sessions you can resume against work
+  /// they delegated. Roughly half the .jsonl files on disk are subagent
+  /// transcripts.
+  it("keeps subagent transcripts apart from sessions", () => {
+    state.imported = imported({ session_bytes: 916_000_000, subagent_bytes: 400_000_000 });
+    renderView();
+    expect(screen.getByText(/of subagent transcripts/)).toBeTruthy();
+  });
+
+  /// A size we could not take is not a size of zero, so the total is a
+  /// floor and says so.
+  it("qualifies the total when a size could not be read", () => {
+    state.imported = imported({ session_bytes: 916_000_000, unsized_files: 3 });
+    renderView();
+    expect(screen.getByText(/at least/)).toBeTruthy();
+  });
+
+  /// Nothing measured renders nothing, rather than "0 B" -- which would
+  /// read as a corpus that costs nothing.
+  it("says nothing when no bytes were measured", () => {
+    state.imported = imported({ session_bytes: 0 });
+    renderView();
+    expect(screen.queryByText(/of transcripts/)).toBeNull();
+  });
+});

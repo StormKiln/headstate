@@ -66,6 +66,13 @@ pub struct Imported {
     /// scan that read 1,430 transcripts and stored 1,200 must say so.
     pub write_failures: Vec<String>,
     pub subagent_files_skipped: usize,
+    /// Bytes across the session transcripts (#1135).
+    pub session_bytes: u64,
+    /// Bytes across the subagent transcripts, kept apart because the two
+    /// mean different things.
+    pub subagent_bytes: u64,
+    /// Files whose size could not be read, making both totals floors.
+    pub unsized_files: usize,
     pub unreadable_dirs: Vec<String>,
     pub unreadable_files: Vec<String>,
     pub metadata_beyond_first_record: usize,
@@ -249,6 +256,9 @@ pub fn import(conn: &mut Connection, scan: Scan) -> Result<Imported, rusqlite::E
     let now = chrono::Utc::now().to_rfc3339();
     let mut out = Imported {
         subagent_files_skipped: scan.subagent_files_skipped,
+        session_bytes: scan.session_bytes,
+        subagent_bytes: scan.subagent_bytes,
+        unsized_files: scan.unsized_files,
         unreadable_dirs: scan.unreadable_dirs,
         unreadable_files: scan.unreadable_files,
         metadata_beyond_first_record: scan.metadata_beyond_first_record,
