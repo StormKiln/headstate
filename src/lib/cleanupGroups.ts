@@ -11,10 +11,15 @@ export interface CleanupGroup {
   label: string;
   /// Whether the automatic pass actually acts on this yet.
   ///
-  /// `propose` implements artifacts and virtualenvs; the rest are
-  /// stored and shown but do nothing on a timer. Said in the UI rather
-  /// than left to look functional — a setting that silently does
-  /// nothing is worse than one that is honestly not ready.
+  /// `propose` implements artifacts, virtualenvs, worktrees and
+  /// branches (#1141); Docker is stored and shown but does nothing on a
+  /// timer. Said in the UI rather than left to look functional — a
+  /// setting that silently does nothing is worse than one that is
+  /// honestly not ready.
+  ///
+  /// The label has to stop claiming "pending" the MOMENT it stops being
+  /// true, which is why this moves in the same change as the proposer
+  /// rather than after it.
   pending?: true;
   /// The children, each a field of its own.
   children: { key: keyof CleanupPrefs; label: string; hint: string }[];
@@ -44,7 +49,6 @@ export const CLEANUP_GROUPS: CleanupGroup[] = [
   },
   {
     key: "branches",
-    pending: true,
     label: "Merged branches",
     children: [
       {
@@ -61,7 +65,6 @@ export const CLEANUP_GROUPS: CleanupGroup[] = [
   },
   {
     key: "worktrees",
-    pending: true,
     label: "Merged worktrees",
     children: [
       {

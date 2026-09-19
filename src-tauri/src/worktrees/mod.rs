@@ -22,7 +22,7 @@ pub use assess::{assess, Assessment};
 // `Repo` is still the payload `RepoScan` carries, so it stays exported
 // even though #951 left `list_worktrees`' signature naming only the scan.
 #[allow(unused_imports)]
-pub use model::{Repo, Worktree};
+pub use model::{Repo, Safety, Worktree};
 // `git` is the ONE bounded git invocation in this crate, and the
 // repository browser (#1031) needs it for exactly the reason `branches`
 // already did: a git call that hangs must become an answer rather than

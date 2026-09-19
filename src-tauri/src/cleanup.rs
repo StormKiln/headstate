@@ -407,7 +407,211 @@ pub fn propose(prefs: &CleanupPrefs, roots: &[String], now: &str) -> Vec<LedgerE
         }
     }
 
+    if prefs.worktrees {
+        propose_worktrees(prefs, roots, now, cap, &mut out);
+    }
+
+    if prefs.branches {
+        propose_branches(prefs, roots, now, cap, &mut out);
+    }
+
     out
+}
+
+/// Whether an unattended pass may propose removing this worktree.
+///
+/// Extracted so the decision is testable as itself, the pattern
+/// `venv_eligibility` establishes: the alternative is building real git
+/// repositories in a unit test to assert a boolean.
+///
+/// Only `Safety::Safe`. Not `MergedUpstreamDeleted`, not
+/// `DetachedMerged` -- each is a separate CLAIM and would need its own
+/// opt-in field. "Merged and pushed" is checkable against a remote that
+/// still has the branch; "the upstream is gone" means the evidence went
+/// with it; a detached HEAD has no branch to have been merged at all.
+///
+/// The main checkout is excluded EXPLICITLY rather than relying on
+/// `MainCheckout` never being `Safe`. That happens to be true and is
+/// the kind of property that quietly stops being true.
+fn worktree_eligible(wt: &crate::worktrees::Worktree) -> bool {
+    !wt.is_main && matches!(wt.safety, crate::worktrees::Safety::Safe)
+}
+
+/// Whether an unattended pass may propose deleting this branch.
+///
+/// The two merge proofs are separately gated because they do not
+/// deserve equal confidence: `Ancestor` is certain -- the tip IS in the
+/// default branch's history -- while `Squash` is an inference from a
+/// diff appearing under a different commit, which is the shape a
+/// squash-merged PR leaves AND the shape a cherry-picked-then-reverted
+/// branch leaves.
+///
+/// Every other `Deletable` is a refusal, and an unattended pass must
+/// not reinterpret one.
+fn branch_eligible(d: &crate::branches::Deletable, prefs: &CleanupPrefs) -> bool {
+    use crate::branches::{Deletable, MergedHow};
+    match d {
+        Deletable::Merged {
+            how: MergedHow::Ancestor,
+        } => prefs.branches_ancestor,
+        Deletable::Merged {
+            how: MergedHow::Squash,
+        } => prefs.branches_squash,
+        _ => false,
+    }
+}
+
+/// Merged worktrees, proposed for removal (#1141).
+///
+/// # Only `Safety::Safe`
+///
+/// Not `MergedUpstreamDeleted`, not `DetachedMerged`. Each is a separate
+/// CLAIM and would need its own opt-in field: "merged and pushed" is
+/// checkable against a remote that still has the branch, while "the
+/// upstream is gone" means the evidence went with it, and a detached
+/// HEAD has no branch to have been merged at all. `worktrees_safe`
+/// gates exactly the one this proposes.
+///
+/// An unattended pass is the worst place to widen a claim, because
+/// nobody is watching it decide (#747) -- the same reasoning the venv
+/// proposer gives for gating staleness.
+///
+/// # The main checkout is never proposed
+///
+/// It is the repository. `Safety::MainCheckout` is its own verdict and
+/// never `Safe`, so this falls out of the gate above -- but it is
+/// asserted in a test, because "the gate happens to exclude it" is a
+/// property that could quietly stop being true.
+fn propose_worktrees(
+    prefs: &CleanupPrefs,
+    roots: &[String],
+    now: &str,
+    cap: usize,
+    out: &mut Vec<LedgerEntry>,
+) {
+    // The opt-in for the one claim this makes. Without it the category
+    // is enabled and proposes nothing, which is the state #1141 is
+    // about -- so this is a real gate, not a formality.
+    if !prefs.worktrees_safe {
+        return;
+    }
+    for repo in crate::worktrees::scan_dirs_fast_reporting(roots).repos {
+        for wt in repo.worktrees {
+            if out.len() >= cap {
+                return;
+            }
+            if !worktree_eligible(&wt) {
+                continue;
+            }
+            out.push(LedgerEntry {
+                at: now.to_string(),
+                kind: "worktree".into(),
+                target: wt.path,
+                // The BRANCH, which is what the user recognises. A path
+                // under `.worktrees/` is a directory name; the branch
+                // is the work.
+                detail: Some(wt.branch),
+                // `size_bytes` is whatever the fast scan knew. NOT
+                // measured here: the venv and artifact proposers
+                // measure because staleness needs the idle time, and
+                // this gate needs no such thing -- a walk per worktree
+                // on a machine with 295 of them would be minutes of
+                // disk for a number the ledger only displays.
+                bytes: wt.size_bytes,
+                action: "proposed".into(),
+                error: None,
+            });
+        }
+    }
+}
+
+/// Merged branches, proposed for deletion (#1141).
+///
+/// # LOCAL branches only, and that is not a default
+///
+/// #1141's own scope says it plainly and it is worth restating where
+/// the code is: **no remote branch deletion, ever, from an unattended
+/// pass.** `branches::scan` reports local refs and this proposes
+/// exactly those; a remote delete is irreversible for everyone else on
+/// the repository, not just the person whose machine ran the timer.
+///
+/// # The two merge proofs are separately gated
+///
+/// `Ancestor` is certain -- the tip IS in the default branch's history.
+/// `Squash` is an inference from a diff appearing under a different
+/// commit, which is the shape a squash-merged PR leaves AND the shape a
+/// cherry-picked-then-reverted branch leaves. They do not deserve equal
+/// confidence, so `branches_ancestor` and `branches_squash` gate them
+/// separately, exactly as the issue specifies.
+fn propose_branches(
+    prefs: &CleanupPrefs,
+    roots: &[String],
+    now: &str,
+    cap: usize,
+    out: &mut Vec<LedgerEntry>,
+) {
+    use crate::branches::{Deletable, MergedHow};
+
+    // Neither proof enabled: the category is on and has nothing it is
+    // allowed to propose.
+    if !prefs.branches_ancestor && !prefs.branches_squash {
+        return;
+    }
+    for repo in crate::worktrees::scan_dirs_fast_reporting(roots).repos {
+        if out.len() >= cap {
+            return;
+        }
+        // A repository whose branches could not be read proposes
+        // nothing, and says so rather than looking like one with no
+        // merged branches (#846). One row per repository, not per
+        // branch -- the failure is about the repository.
+        let branches = match crate::branches::scan(std::path::Path::new(&repo.path)) {
+            Ok(b) => b,
+            Err(e) => {
+                out.push(LedgerEntry {
+                    at: now.to_string(),
+                    kind: "branch".into(),
+                    target: repo.path.clone(),
+                    detail: None,
+                    bytes: None,
+                    action: "skipped".into(),
+                    error: Some(e),
+                });
+                continue;
+            }
+        };
+        for b in branches {
+            if out.len() >= cap {
+                return;
+            }
+            if !branch_eligible(&b.deletable, prefs) {
+                continue;
+            }
+            out.push(LedgerEntry {
+                at: now.to_string(),
+                kind: "branch".into(),
+                target: b.name,
+                // WHICH proof, carried into the ledger. A user reading
+                // "proposed" later needs to know whether it rested on
+                // an ancestor check or on a diff inference -- they are
+                // not the same evidence.
+                detail: Some(
+                    match &b.deletable {
+                        Deletable::Merged {
+                            how: MergedHow::Squash,
+                        } => "squash-merged",
+                        _ => "merged",
+                    }
+                    .to_string(),
+                ),
+                // A branch is a ref. Reporting 0 would claim a
+                // measurement of nothing (#846).
+                bytes: None,
+                action: "proposed".into(),
+                error: None,
+            });
+        }
+    }
 }
 
 /// Mirrors the artifact view's rule, and the backend's delete-time one.
@@ -430,6 +634,158 @@ mod tests {
             artifacts: true,
             venvs: false,
             ..Default::default()
+        }
+    }
+
+    /// #1141: which worktrees and branches an UNATTENDED pass may
+    /// propose.
+    ///
+    /// Tested as the decision itself rather than through `propose`, for
+    /// the reason `venv_eligibility` below gives: reaching those arms
+    /// means building real git repositories on the machine running the
+    /// tests.
+    mod worktree_eligibility {
+        use super::*;
+        use crate::worktrees::{Safety, Worktree};
+
+        fn wt(safety: Safety, is_main: bool) -> Worktree {
+            Worktree {
+                path: "/code/proj/.worktrees/x".into(),
+                branch: "feature".into(),
+                head: "abc".into(),
+                size_bytes: Some(1024),
+                safety,
+                is_main,
+                merged_at: None,
+                upstream: None,
+                last_commit: None,
+                submodules: None,
+                locked: None,
+                prunable: None,
+            }
+        }
+
+        #[test]
+        fn a_safe_worktree_is_proposed() {
+            assert!(worktree_eligible(&wt(Safety::Safe, false)));
+        }
+
+        #[test]
+        fn the_main_checkout_is_never_proposed_even_if_it_reads_safe() {
+            // Excluded EXPLICITLY rather than relying on
+            // `MainCheckout` never being `Safe`. That happens to be
+            // true and is the kind of property that quietly stops
+            // being true -- and the cost of being wrong is proposing
+            // the repository itself for removal.
+            assert!(!worktree_eligible(&wt(Safety::Safe, true)));
+            assert!(!worktree_eligible(&wt(Safety::MainCheckout, true)));
+        }
+
+        #[test]
+        fn a_merged_upstream_deleted_worktree_is_NOT_proposed() {
+            // A separate CLAIM needing its own opt-in: "merged and
+            // pushed" is checkable against a remote that still has the
+            // branch, while "the upstream is gone" means the evidence
+            // went with it.
+            assert!(!worktree_eligible(&wt(
+                Safety::MergedUpstreamDeleted,
+                false
+            )));
+        }
+
+        #[test]
+        fn a_detached_merged_worktree_is_NOT_proposed() {
+            // No branch to have been merged at all.
+            assert!(!worktree_eligible(&wt(
+                Safety::DetachedMerged("abc".into()),
+                false
+            )));
+        }
+
+        #[test]
+        fn nothing_with_work_in_it_is_proposed() {
+            for s in [
+                Safety::Dirty(3),
+                Safety::Unpushed(2),
+                Safety::NeverPushed,
+                Safety::Unmerged,
+                Safety::Prunable("gone".into()),
+                Safety::Orphaned,
+                Safety::Unknown("could not check".into()),
+            ] {
+                assert!(!worktree_eligible(&wt(s.clone(), false)), "{s:?}");
+            }
+        }
+    }
+
+    mod branch_eligibility {
+        use super::*;
+        use crate::branches::{Deletable, MergedHow};
+
+        fn prefs(ancestor: bool, squash: bool) -> CleanupPrefs {
+            CleanupPrefs {
+                enabled: true,
+                branches: true,
+                branches_ancestor: ancestor,
+                branches_squash: squash,
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn each_merge_proof_is_gated_separately() {
+            // They do not deserve equal confidence: `Ancestor` is
+            // certain, `Squash` is an inference from a diff shape that
+            // a cherry-picked-then-reverted branch also leaves.
+            let anc = Deletable::Merged {
+                how: MergedHow::Ancestor,
+            };
+            let sq = Deletable::Merged {
+                how: MergedHow::Squash,
+            };
+
+            assert!(branch_eligible(&anc, &prefs(true, false)));
+            assert!(!branch_eligible(&sq, &prefs(true, false)));
+
+            assert!(!branch_eligible(&anc, &prefs(false, true)));
+            assert!(branch_eligible(&sq, &prefs(false, true)));
+        }
+
+        #[test]
+        fn neither_proof_enabled_proposes_nothing() {
+            // The state #1141 is about: the category is ticked and
+            // nothing happens. With both sub-options off that is
+            // CORRECT rather than the bug -- the bug was that it was
+            // true however they were set.
+            for d in [
+                Deletable::Merged {
+                    how: MergedHow::Ancestor,
+                },
+                Deletable::Merged {
+                    how: MergedHow::Squash,
+                },
+            ] {
+                assert!(!branch_eligible(&d, &prefs(false, false)));
+            }
+        }
+
+        #[test]
+        fn a_refusal_is_never_reinterpreted_as_permission() {
+            // Every other `Deletable` means "no", and an unattended
+            // pass is the last place to read one as a maybe.
+            let all_on = prefs(true, true);
+            for d in [
+                Deletable::DefaultBranch,
+                Deletable::CheckedOut {
+                    path: "/code/proj".into(),
+                },
+                Deletable::Unmerged { ahead: Some(4) },
+                // `None` is the UNREAD count, not zero (#967). It must
+                // not become permission either.
+                Deletable::Unmerged { ahead: None },
+            ] {
+                assert!(!branch_eligible(&d, &all_on), "{d:?}");
+            }
         }
     }
 
