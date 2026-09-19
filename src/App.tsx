@@ -43,6 +43,7 @@ import { DockerSidebar } from "./components/DockerSidebar";
 import { BranchesPage } from "./components/BranchesPage";
 import { WorktreesPage } from "./components/WorktreesPage";
 import { QueryError, errorMessage } from "./components/QueryError";
+import { ViewErrorBoundary } from "./components/ViewErrorBoundary";
 import { RepoSidebar } from "./components/RepoSidebar";
 import { StatsSidebar } from "./components/StatsSidebar";
 import { StatusBar } from "./components/StatusBar";
@@ -58,7 +59,7 @@ import { shortcutFor } from "./lib/shortcuts";
 import { activeRowCursor, nextCursor, type RowCursorTarget } from "./lib/rowCursor";
 import { useIsMobile } from "./lib/useIsMobile";
 import { relativeSeconds } from "./lib/time";
-import { MOBILE_HIDDEN_VIEWS, useActiveFilters, useFilters } from "./store/filters";
+import { MOBILE_HIDDEN_VIEWS, useActiveFilters, useFilters, viewLabel } from "./store/filters";
 
 /// The chart-carrying views, split off the launch chunk (#838, #921).
 ///
@@ -722,44 +723,14 @@ export default function App() {
               every page competed with it. Since #794 that is true of PR
               Stats too -- it was the last destination reached any other
               way. */}
-          <h1 className="text-sm font-semibold">
-            {view === "to-review"
-              ? "Pull requests to review"
-              : view === "system-health"
-                ? "System health"
-              : view === "claude-md"
-                ? "CLAUDE.md"
-              // Matching the switcher entry exactly, per #794's finding:
-              // a header naming the page something other than the menu
-              // item that opened it is how a user doubts they are where
-              // they meant to be.
-              : view === "claude-code"
-                ? "Claude Code"
-              : view === "packages"
-                ? "Package updates"
-              : view === "artifacts"
-                ? "Build artifacts"
-              : view === "docker"
-                ? "Docker images"
-                : view === "worktrees"
-                  ? "Worktrees"
-                : view === "branches"
-                  ? "Branches"
-                // Matching the switcher entry exactly, per #794's
-                // finding: a header naming the page something other than
-                // the menu item that opened it is how a user doubts they
-                // are where they meant to be.
-                : view === "repositories"
-                  ? "Repositories"
-                  // "PR Stats", matching the switcher entry exactly
-                  // (#794). The header naming the page something other
-                  // than the menu item that opened it is how a user
-                  // doubts they are where they meant to be -- and this
-                  // said "Stats" while that now says "PR Stats".
-                : view === "pr-stats"
-                  ? "PR Stats"
-                  : "Pull requests"}
-          </h1>
+          {/* One shared label table (`viewLabel`), not a ternary chain
+              here and another one elsewhere: the header and the view
+              boundary must name the same page the same way, and two
+              copies drift. The table is total over `View`, so a new view
+              is a compile error rather than a page silently headed
+              "Pull requests" -- which is what the chain's default arm
+              did. */}
+          <h1 className="text-sm font-semibold">{viewLabel(view)}</h1>
           <div className="ml-auto">
             {/* My pull requests ONLY. The wizard composes a nudge for
                 pull requests YOU authored, so it means nothing on
@@ -773,6 +744,19 @@ export default function App() {
             ) : null}
           </div>
         </header>
+        {/* Contains a render throw to THIS view (#1146). Outside the
+            header and the sidebar on purpose: those are what the user
+            steers with, and a throw in one chart should not take away
+            the means to navigate to a working page.
+
+            Keyed by `view` so switching away from a broken view clears
+            the error rather than pinning it -- without the key, picking
+            another page would keep showing the dead one's panel,
+            because the boundary's error state survives a re-render.
+
+            The root boundary in `main.tsx` still sits above everything
+            and keeps its heavier remedy; this one never reloads. */}
+        <ViewErrorBoundary key={view} view={viewLabel(view)}>
 
         {/* Local-state views never render a PR detail: a pull request
             selected earlier in My PRs would otherwise take over the
@@ -1095,6 +1079,7 @@ export default function App() {
             )}
           </div>
         )}
+        </ViewErrorBoundary>
       </main>
       </div>
       {/* Pinned below both the sidebar and the list, so it reads as the
