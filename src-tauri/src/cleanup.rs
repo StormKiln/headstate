@@ -682,7 +682,7 @@ mod tests {
         }
 
         #[test]
-        fn a_merged_upstream_deleted_worktree_is_NOT_proposed() {
+        fn a_merged_upstream_deleted_worktree_is_not_proposed() {
             // A separate CLAIM needing its own opt-in: "merged and
             // pushed" is checkable against a remote that still has the
             // branch, while "the upstream is gone" means the evidence
@@ -694,7 +694,7 @@ mod tests {
         }
 
         #[test]
-        fn a_detached_merged_worktree_is_NOT_proposed() {
+        fn a_detached_merged_worktree_is_not_proposed() {
             // No branch to have been merged at all.
             assert!(!worktree_eligible(&wt(
                 Safety::DetachedMerged("abc".into()),
