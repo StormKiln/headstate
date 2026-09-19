@@ -870,11 +870,18 @@ function CorpusTallies({
 /// One row of the resumable list.
 ///
 /// The action is a COPY of `cd <dir> && claude --resume <id>`, never a
-/// spawned terminal. That is the house answer and it is already argued in
+/// GUESSED terminal. That is the house answer and it is already argued in
 /// `claudify_command`: macOS has no default-terminal concept at all, so
 /// there is no way to know whether to open Terminal.app or iTerm, and on
 /// Linux `x-terminal-emulator` is Debian-only. The clipboard works
 /// identically everywhere and lands the user in their OWN shell.
+///
+/// This overview keeps the copy, deliberately, even though #1126 gave
+/// the session DETAIL a launch button: the detail's button acts on the
+/// one session you opened, while this is a summary row, and launching a
+/// terminal from a glanceable list is a bigger gesture than the surface
+/// implies. Nothing stops it later; it is simply not what this page is
+/// for.
 ///
 /// The `cd` is included because `claude --resume <id>` adopts the
 /// INVOKING directory rather than the recorded one -- measured in #918 --

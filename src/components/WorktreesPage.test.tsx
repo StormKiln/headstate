@@ -6,6 +6,8 @@ import { stubViewport } from "@/test-utils";
 import { ORPHAN_FILTER } from "@/lib/worktrees";
 
 const state = vi.hoisted(() => ({
+  /// The configured terminal template, empty for none (#1126).
+  terminal: "",
   repos: undefined as WorktreeRepo[] | undefined,
   isLoading: false,
   isError: false,
@@ -122,7 +124,12 @@ const removeImagesFn = vi.hoisted(() =>
 vi.mock("../api/hooks", () => ({
   // #1137. Integration OFF by default, so occupancy plays no part --
   // which is what every test in this file assumes.
-  useUiPrefs: () => ({ prefs: { claude_integrations_enabled: false }, set: async () => {} }),
+  // `terminal` is empty by default: no terminal configured, which is
+  // the default and what the Claudify assertions below assume (#1126).
+  useUiPrefs: () => ({
+    prefs: { claude_integrations_enabled: false, terminal_command: state.terminal },
+    set: async () => {},
+  }),
   useClaudeSessions: () => ({ list: { data: undefined }, imported: { data: undefined }, now: 0, rescan: async () => {} }),
   // #952: the scan's input, so the empty arm can tell "nowhere to look"
   // from "nothing there".
@@ -265,12 +272,13 @@ const pruneFn = vi.hoisted(() => vi.fn<(repo: string) => Promise<number>>(() => 
 const retryClassifyFn = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 const markAssessedFn = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 const clearAssessedFn = vi.hoisted(() => vi.fn(() => Promise.resolve()));
+const launchWorktree = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 const claudify = vi.hoisted(() =>
   vi.fn(() =>
     Promise.resolve({ command: "cd '/code/proj-a' && claude 'assess'", claude_installed: true }),
   ),
 );
-vi.mock("../api/tauri", () => ({ claudifyCommand: claudify }));
+vi.mock("../api/tauri", () => ({ claudifyCommand: claudify, claudeLaunchWorktree: launchWorktree }));
 
 // The build target, as a mock: `IS_MOBILE_BUILD` is read at module
 // scope, and re-importing the component to change it would lose
@@ -325,6 +333,9 @@ describe("WorktreesPage on a phone", () => {
   beforeEach(() => {
     dockerImages.mockReturnValue([]);
     Object.assign(state, {
+      // No terminal configured: the default, and what the Claudify
+      // assertions in this file assume (#1126).
+      terminal: "",
       repos: [{ identity: null, name: "proj", path: "/code/proj", worktrees: [wt({})] }],
       isLoading: false,
       isError: false,
@@ -469,6 +480,11 @@ describe("WorktreesPage", () => {
     // Reset between tests: a leaked image list makes a later assertion
     // about paths fail on a Docker line it never set up.
     dockerImages.mockReturnValue([]);
+    // No terminal configured: the default, and what every Claudify
+    // assertion below assumes (#1126). A leaked template makes the copy
+    // tests fail on a launch they never set up.
+    state.terminal = "";
+    launchWorktree.mockClear();
     removeImagesFn.mockClear();
     // `removeManyFn` is asserted as "not called" by a later test, and a
     // confirm click in an earlier one leaks into it. Cleared here rather
@@ -1068,6 +1084,55 @@ describe("WorktreesPage", () => {
       render(<WorktreesPage />);
       expect(screen.queryByRole("button", { name: /claudify/i })).toBeNull();
       expect(screen.getByRole("button", { name: /remove/i })).toBeTruthy();
+    });
+
+    /// The configured terminal (#1126). Unset, the button copies, which
+    /// every other assertion in this block covers.
+    describe("with a terminal configured", () => {
+      it("launches instead of copying", async () => {
+        state.terminal = "open -a Terminal {command}";
+        state.classified = [wt({ safety: { kind: "dirty", detail: 2 } })];
+        render(<WorktreesPage />);
+        fireEvent.click(screen.getByRole("button", { name: /claudify/i }));
+        await vi.waitFor(() =>
+          expect(launchWorktree).toHaveBeenCalledWith("/code/proj", "/code/proj-a", "feature"),
+        );
+        // Not both: a button that copies AND launches is a button
+        // whose label describes half of what it did.
+        expect(claudify).not.toHaveBeenCalled();
+      });
+
+      /// **The regression this change could easily have caused.**
+      ///
+      /// The Claudify toast carries "I read the assessment", which is
+      /// the ONLY route to "Remove anyway…" -- #770 moved removal onto
+      /// the kebab precisely because that toast was too easy to lose.
+      /// A launch path without it would silently take away the user's
+      /// way of saying they read the answer.
+      it("still offers the assessment action on the toast", async () => {
+        state.terminal = "open -a Terminal {command}";
+        state.classified = [wt({ safety: { kind: "dirty", detail: 2 } })];
+        render(<WorktreesPage />);
+        fireEvent.click(screen.getByRole("button", { name: /claudify/i }));
+        await vi.waitFor(() => expect(toastSuccess).toHaveBeenCalled());
+        const opts = toastSuccess.mock.calls.at(-1)?.[1] as
+          | { action?: { label?: string } }
+          | undefined;
+        expect(opts?.action?.label).toBe("I read the assessment");
+      });
+
+      it("never launches on the phone, which cannot use the window", () => {
+        // `claude_launch_worktree` is `Class::Local`; the remote
+        // surface refuses it, so a launching button there would be one
+        // that only ever errors.
+        mobileBuild.current = true;
+        state.terminal = "open -a Terminal {command}";
+        state.classified = [wt({ safety: { kind: "dirty", detail: 2 } })];
+        render(<WorktreesPage />);
+        fireEvent.click(screen.getByRole("button", { name: /claudify/i }));
+        expect(launchWorktree).not.toHaveBeenCalled();
+        mobileBuild.current = false;
+      });
     });
 
     /// The phone has no terminal to paste into, and `copyText` reports

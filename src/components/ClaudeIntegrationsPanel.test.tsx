@@ -47,6 +47,7 @@ const PREFS: UiPrefs = {
   announce_updates: true,
   claude_integrations_enabled: false,
   diagnostic_logging: false,
+  terminal_command: "",
   stale_venv_days: 0,
   battery_low_percent: 0,
 };

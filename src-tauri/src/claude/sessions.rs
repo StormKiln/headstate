@@ -54,12 +54,19 @@
 //! copied command is good indefinitely, which is what makes copying
 //! text the right action rather than a link to something that expires.
 //!
-//! # No terminal is spawned, deliberately
+//! # No terminal is GUESSED, deliberately
 //!
 //! `commands::claudify_command` already settled this for the app:
 //! copying text works identically everywhere and lands the user in their
 //! OWN shell, while macOS has no default-terminal concept at all. This
 //! module returns strings for the clipboard for the same reason.
+//!
+//! Since #1126 a user may configure one, and
+//! `commands::claude_launch_session` opens it on the string this module
+//! builds. Nothing here changed: it still returns text, caveats and all,
+//! and with no terminal configured the clipboard remains the only
+//! route. Spawning is `claude::launch`'s job, and it runs only what the
+//! user configured.
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};

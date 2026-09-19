@@ -16,12 +16,15 @@ import { useFilters } from "@/store/filters";
 
 const copyFn = vi.hoisted(() => vi.fn(() => Promise.resolve(null as string | null)));
 const revealFn = vi.hoisted(() => vi.fn(() => Promise.resolve("/code/app")));
+const launchFn = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 const toastError = vi.hoisted(() => vi.fn());
 const toastSuccess = vi.hoisted(() => vi.fn());
 const rescanFn = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 const refetchFn = vi.hoisted(() => vi.fn());
 
 const state = vi.hoisted(() => ({
+  /// The configured terminal template, empty for none (#1126).
+  terminal: "",
   list: undefined as ClaudeSessionList | undefined,
   loading: false,
   failed: false,
@@ -92,6 +95,10 @@ const state = vi.hoisted(() => ({
 }));
 
 vi.mock("../api/hooks", () => ({
+  // Empty by default, which is what every assertion in this file about
+  // "Copy resume command" assumes (#1126). Set per-test to reach the
+  // launch path.
+  useUiPrefs: () => ({ prefs: { terminal_command: state.terminal } }),
   useClaudeSessions: () => ({
     list: {
       data: state.list,
@@ -177,7 +184,7 @@ vi.mock("../api/hooks", () => ({
 }));
 vi.mock("sonner", () => ({ toast: { success: toastSuccess, error: toastError } }));
 vi.mock("../lib/clipboard", () => ({ copyText: copyFn }));
-vi.mock("../api/tauri", () => ({ claudeRevealPath: revealFn }));
+vi.mock("../api/tauri", () => ({ claudeRevealPath: revealFn, claudeLaunchSession: launchFn }));
 
 import { ClaudeCodePage, ClaudeSessionColumn } from "./ClaudeCodePage";
 
@@ -401,6 +408,8 @@ beforeEach(() => {
   // from a previous test would answer for an id this one never defined,
   // which is exactly the cross-talk the map exists to make visible.
   state.details.clear();
+  // Default: no terminal, the pre-#1126 behaviour.
+  state.terminal = "";
   state.detailFailed = false;
   state.detailMissing = false;
   state.detailAskedFor = [];
@@ -790,6 +799,69 @@ describe("the resume command carries the cwd that makes it work", () => {
     expect(copyFn).toHaveBeenCalledWith(
       "cd '/Users/acme/code/widget' && claude --resume e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2",
     );
+  });
+
+  /// The configured terminal (#1126). Empty is the default, asserted
+  /// above: the button copies and says to paste.
+  describe("with a terminal configured", () => {
+    it("the button launches instead of copying, and says so", () => {
+      state.terminal = "open -a Terminal {command}";
+      renderView();
+      open("HeadState GitHub issues filing");
+      fireEvent.click(screen.getByRole("button", { name: /resume in terminal/i }));
+      expect(launchFn).toHaveBeenCalledWith(
+        "e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2",
+        "/Users/acme/code/widget",
+      );
+      // It must NOT also copy: a button that does both is a button
+      // whose label describes half of what it did.
+      expect(copyFn).not.toHaveBeenCalled();
+    });
+
+    it("passes the id and cwd, never the built command string", () => {
+      // Rust rebuilds the command from these, so `claude_launch_session`
+      // can never become "run this text in a terminal".
+      state.terminal = "open -a Terminal {command}";
+      renderView();
+      open("HeadState GitHub issues filing");
+      fireEvent.click(screen.getByRole("button", { name: /resume in terminal/i }));
+      const args = launchFn.mock.calls[0] as unknown[];
+      expect(args.some((a) => typeof a === "string" && a.includes("claude --resume"))).toBe(
+        false,
+      );
+    });
+
+    it("still offers Copy beside it", () => {
+      // The terminal is one user's choice of one tool; the raw string
+      // is what you need to paste elsewhere or read before running.
+      state.terminal = "open -a Terminal {command}";
+      renderView();
+      open("HeadState GitHub issues filing");
+      fireEvent.click(screen.getByRole("button", { name: /^copy$/i }));
+      expect(copyFn).toHaveBeenCalledWith(
+        "cd '/Users/acme/code/widget' && claude --resume e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2",
+      );
+      expect(launchFn).not.toHaveBeenCalled();
+    });
+
+    it("stops telling the user to paste it somewhere", () => {
+      // The old sentence -- "Headstate does not open one for you" --
+      // would be a statement the app contradicts the moment the button
+      // is pressed.
+      state.terminal = "open -a Terminal {command}";
+      renderView();
+      open("HeadState GitHub issues filing");
+      expect(screen.queryByText(/does not open one for you/)).toBeNull();
+      expect(screen.getByText(/terminal you configured/i)).toBeTruthy();
+    });
+
+    it("says a terminal can be configured when none is", () => {
+      // The default path must POINT somewhere: the old sentence stated
+      // a permanent limitation, and it is now a setting.
+      renderView();
+      open("HeadState GitHub issues filing");
+      expect(screen.getByText(/only if you configure it in Settings/i)).toBeTruthy();
+    });
   });
 
   /// **The sabotage test for #918.** A bare command MUST show its caveat.

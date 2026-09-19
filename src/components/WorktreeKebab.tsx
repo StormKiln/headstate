@@ -29,6 +29,8 @@ export function WorktreeKebab({
   worktree,
   assessed = false,
   onClaudify,
+  onCopyClaudify,
+  terminalConfigured = false,
   onForget,
   onRemove,
   onForce,
@@ -39,7 +41,26 @@ export function WorktreeKebab({
   /// moved since. Decides whether the Claudify/Forget pair is offered —
   /// NOT whether removal is, which #770 deliberately decoupled from it.
   assessed?: boolean;
+  /// The row's PRIMARY Claudify action, whatever that currently is:
+  /// it copies, or -- once a terminal is configured -- it launches one
+  /// (#1126). The kebab does not decide which; it calls the same thing
+  /// the button does, so the two can never disagree.
   onClaudify: (wt: Worktree) => void;
+  /// Copy the command as text, ALWAYS, whatever `onClaudify` does.
+  ///
+  /// A separate prop rather than a flag on the one above, because with
+  /// a terminal configured these are two different actions and the menu
+  /// offers both. Copy stays reachable on purpose: the terminal is one
+  /// user's choice of one tool, and the raw string is what you need to
+  /// paste somewhere else, read before running, or send to someone.
+  onCopyClaudify: (wt: Worktree) => void;
+  /// Whether a terminal is configured, which decides the LABELS above.
+  ///
+  /// The menu must say which of the two it does. With a terminal set,
+  /// an item reading "Copy the Claudify command" that opened a terminal
+  /// would be a button lying about itself -- and the label is the only
+  /// thing distinguishing the two items from each other.
+  terminalConfigured?: boolean;
   onForget: (wt: Worktree) => void;
   /// The plain, confirmed removal. Only ever called for a row the gate
   /// already considers safe.
@@ -177,14 +198,37 @@ export function WorktreeKebab({
             <>
               {/* The whole point: needing the prompt again is normal.
                   The terminal was closed, the paste was lost, the
-                  assessment wants rerunning. */}
+                  assessment wants rerunning.
+
+                  With a terminal configured this is TWO items, because
+                  they are two different actions and one label cannot
+                  honestly describe both (#1126). Without one it stays
+                  the single item it has always been -- the second would
+                  be a duplicate of the first. */}
+              {terminalConfigured ? (
+                <button
+                  type="button"
+                  role="menuitem"
+                  className={item}
+                  onClick={() => {
+                    setOpen(false);
+                    onClaudify(worktree);
+                  }}
+                >
+                  <Bot className="h-3 w-3" aria-hidden="true" />
+                  Open the Claudify command
+                </button>
+              ) : null}
               <button
                 type="button"
                 role="menuitem"
                 className={item}
                 onClick={() => {
                   setOpen(false);
-                  onClaudify(worktree);
+                  // `onCopyClaudify` and not `onClaudify`: with a
+                  // terminal configured the latter LAUNCHES, and this
+                  // item says "copy".
+                  onCopyClaudify(worktree);
                 }}
               >
                 <Bot className="h-3 w-3" aria-hidden="true" />

@@ -103,6 +103,11 @@ describe("the remote surface's frontend half", () => {
     // this list and visible on both builds.
     const DESKTOP_ONLY_WRAPPERS = [
       "claudeInstallHooks",
+      // Opens a terminal WINDOW on the desktop (#1126). The phone
+      // cannot use one that appeared on a Mac it cannot see, which is
+      // `Class::Local`'s stated test.
+      "claudeLaunchSession",
+      "claudeLaunchWorktree",
       "claudeReinstallHooks",
       "claudeRevealPath",
       "claudeUninstallHooks",

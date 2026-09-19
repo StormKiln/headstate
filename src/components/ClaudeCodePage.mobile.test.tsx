@@ -72,6 +72,10 @@ const state = vi.hoisted(() => ({
 }));
 
 vi.mock("../api/hooks", () => ({
+  // The phone never launches a terminal -- `claude_launch_session` is
+  // `Class::Local` -- so an unset template is the only state this view
+  // can be in on mobile, and the assertions below depend on it.
+  useUiPrefs: () => ({ prefs: undefined }),
   useClaudeSessions: () => ({
     list: {
       data: state.list,

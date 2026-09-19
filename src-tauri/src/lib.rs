@@ -353,6 +353,8 @@ pub fn run() {
             commands::docker_start,
             commands::assess_worktree,
             commands::claudify_command,
+            commands::claude_launch_worktree,
+            commands::claude_launch_session,
             commands::assessed_worktrees,
             commands::remove_worktree_forced,
             commands::unlock_worktree,

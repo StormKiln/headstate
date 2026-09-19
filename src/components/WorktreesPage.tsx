@@ -58,7 +58,7 @@ import {
 } from "../lib/worktrees";
 import { HelpButton } from "./HelpButton";
 import { WorktreeKebab } from "./WorktreeKebab";
-import { claudifyCommand } from "../api/tauri";
+import { claudeLaunchWorktree, claudifyCommand } from "../api/tauri";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { isCancelled } from "@/lib/cancelled";
 import { copyText } from "../lib/clipboard";
@@ -114,6 +114,8 @@ function Row({
   pr,
   onRemove,
   onClaudify,
+  onCopyClaudify,
+  terminalConfigured = false,
   onForget,
   sizePending,
   sizeUnmeasurable = false,
@@ -143,7 +145,15 @@ function Row({
   /// DISPLAY ONLY -- it never feeds a safety gate.
   pr?: PullRequest | null;
   onRemove: (wt: Worktree) => void;
+  /// The row's primary Claudify action: copy, or launch a terminal once
+  /// one is configured (#1126). The row does not decide which.
   onClaudify: (wt: Worktree) => void;
+  /// Copy as text, always -- passed through to the kebab, which offers
+  /// both once the two actions differ.
+  onCopyClaudify: (wt: Worktree) => void;
+  /// Whether a terminal is configured, which decides the kebab's
+  /// labels and whether it offers two Claudify items or one.
+  terminalConfigured?: boolean;
   onForget: (wt: Worktree) => void;
   /// This row's removal is in flight. Per row, not per page: with 100+
   /// rows, freezing all of them because one is deleting would be worse
@@ -595,6 +605,8 @@ function Row({
         worktree={wt}
         assessed={assessed}
         onClaudify={onClaudify}
+        onCopyClaudify={onCopyClaudify}
+        terminalConfigured={terminalConfigured}
         onForget={onForget}
         onRemove={onRemove}
         onForce={onForce}
@@ -1136,7 +1148,32 @@ export function WorktreesPage() {
     },
   });
 
-  const claudify = (wt: Worktree) => {
+  /// Open the Claudify command in the configured terminal.
+  ///
+  /// Keeps `assessmentAction` on BOTH outcomes, which is the thing that
+  /// must not be lost in this change: that toast button is the only
+  /// route to "Remove anyway…", and a launch path without it would
+  /// silently remove the user's way of saying they read the answer.
+  const launchClaudify = (wt: Worktree) => {
+    claudeLaunchWorktree(selected?.path ?? "", wt.path, wt.branch).then(
+      () =>
+        toast.success("Opening the assessment in your terminal", {
+          description: "Claude Code is starting there.",
+          action: assessmentAction(wt),
+        }),
+      (e: unknown) =>
+        // Falls back to NOTHING automatically -- deliberately. A launch
+        // that silently copied instead would leave the user watching
+        // for a terminal that never opens. The offer to copy is here,
+        // as an action they choose.
+        toast.error("Could not open your terminal", {
+          description: typeof e === "string" ? e : undefined,
+          action: { label: "Copy instead", onClick: () => copyClaudify(wt) },
+        }),
+    );
+  };
+
+  const copyClaudify = (wt: Worktree) => {
     claudifyCommand(selected?.path ?? "", wt.path, wt.branch).then(
       async ({ command, claude_installed }) => {
         // The phone has no terminal to paste into, and no usable
@@ -1181,6 +1218,13 @@ export function WorktreesPage() {
         }),
     );
   };
+  /// What the Claudify BUTTON does.
+  ///
+  /// One function so the button and the kebab's "Open"/"Copy" items
+  /// cannot drift: the button is always the primary action, and this is
+  /// the only place that decides which that is.
+  const claudify = (wt: Worktree) => (terminalConfigured ? launchClaudify : copyClaudify)(wt);
+
   /// The command to show on the phone, which has no terminal to paste
   /// into. Null on the desktop, always: that path copies instead.
   const [claudifying, setClaudifying] = useState<{
@@ -1620,6 +1664,19 @@ export function WorktreesPage() {
   // a badge they did not ask for.
   const { prefs } = useUiPrefs();
   const claudeOn = prefs?.claude_integrations_enabled ?? false;
+  /// Whether a terminal is configured, which decides what the Claudify
+  /// button DOES (#1126).
+  ///
+  /// Empty means unset, which is the default and the pre-existing
+  /// behaviour: the button copies and no launch affordance appears
+  /// anywhere. `claudify_command`'s own comment explains why nothing is
+  /// guessed -- this launches only what the user configured.
+  ///
+  /// Never on the phone. `claude_launch_worktree` is `Class::Local` and
+  /// the remote surface refuses it, so offering it here would be a
+  /// button that always errors.
+  const terminalConfigured = !IS_MOBILE_BUILD && (prefs?.terminal_command ?? "").trim() !== "";
+
   const sessions = useClaudeSessions(claudeOn);
   const sessionList = sessions.list.data?.sessions;
   const occupiedBy = useMemo(() => worktreeSessions(sessionList), [sessionList]);
@@ -1816,6 +1873,8 @@ export function WorktreesPage() {
             scannedAt={scannedAt}
             onRemove={setPending}
             onClaudify={claudify}
+            onCopyClaudify={copyClaudify}
+            terminalConfigured={terminalConfigured}
               onForget={forget}
             removing={removing === wt.path}
           />
@@ -2929,6 +2988,8 @@ export function WorktreesPage() {
               scannedAt={scannedAt}
               onRemove={setPending}
               onClaudify={claudify}
+            onCopyClaudify={copyClaudify}
+            terminalConfigured={terminalConfigured}
               onForget={forget}
               sizePending={sizing}
               sizeUnmeasurable={wt.sizeUnmeasurable}
