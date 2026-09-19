@@ -31,6 +31,9 @@ const alertsFn = vi.hoisted(() => vi.fn<() => Promise<AlertReport[]>>());
 // unprimed; the CPU and Memory detail pages that DO call it are tested,
 // with a populated fixture, in `SystemHealthPage.detail.test.tsx`.
 vi.mock("../api/hooks", () => ({
+  // Healthy by default: the notice renders nothing, which is the
+  // state every assertion in this file assumes (#1145).
+  useBackgroundHealth: () => ({ data: [] }),
   // Collapsed by default, so the panel issues no query until opened --
   // which is the behaviour, not a test convenience (#1147).
   useLogTail: () => ({

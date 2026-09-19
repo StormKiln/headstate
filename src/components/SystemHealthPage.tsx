@@ -6,6 +6,7 @@ import {
   useSystemFootprint,
   useSystemHealth,
   useHealthAlerts,
+  useBackgroundHealth,
   useSystemHealthHistory,
   useUiPrefs,
 } from "@/api/hooks";
@@ -48,6 +49,7 @@ import type {
 import { toast } from "sonner";
 import { revealLog } from "@/api/tauri";
 import { LogPanel } from "./LogPanel";
+import { BackgroundHealthNotice } from "./BackgroundHealthNotice";
 import { copyText } from "@/lib/clipboard";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { useConnectionState } from "@/api/connection";
@@ -588,16 +590,31 @@ function InlineRetry({ onRetry }: { onRetry: () => void }) {
   );
 }
 
-function HealthConditions({
+/// Exported for `SystemHealthPage.stale.test.tsx`, which asserts which
+/// of two CAUSES the stale banner names (#1145). Reaching that arm
+/// through the page means driving four queries into a specific
+/// combination of states; the component is pure and takes the one fact
+/// under test as a prop.
+export function HealthConditions({
   alerts,
   failed,
   error,
   onRetry,
   sampledAt,
   now,
+  samplerDegraded = false,
 }: {
   alerts: AlertReport[] | undefined;
   failed: boolean;
+  /// Whether the sampler itself is failing (#1145).
+  ///
+  /// Decides which of TWO causes the stale banner names. An old last
+  /// reading means either the app was closed or the sampler ran and
+  /// could not write, and the banner asserted the first
+  /// unconditionally. Defaults false, which keeps the previous wording
+  /// when the answer is not known -- the honest fallback, since "the
+  /// app was not watching" is the far more common cause.
+  samplerDegraded?: boolean;
   /// The rejection, for the failed arm (#946). Threaded down rather than
   /// dropped: "the rules did not run" is the state where the app says its
   /// own verdicts are untrustworthy, and it was the only one of the four
@@ -707,8 +724,17 @@ function HealthConditions({
         role="status"
       >
         No conditions found, but the last reading is{" "}
-        {Math.round(lastSampleAgoMs / 60_000)} minutes old — the app was not watching for
-        most of that time, so a problem in the gap would not have been seen.
+        {Math.round(lastSampleAgoMs / 60_000)} minutes old, so a problem in the gap would
+        not have been seen.{" "}
+        {/* "The app was not watching" was asserted unconditionally and
+            is one of TWO possible causes (#1145). The sampler logs a
+            failed write and carries on, so an identical gap is produced
+            by an app that ran the whole time and could not record. The
+            page cannot tell from the timestamp -- but `background_health`
+            can, so the cause is stated only when it is known. */}
+        {samplerDegraded
+          ? "The app was running: the sampler could not record, and the banner above says why."
+          : "The app was not watching for most of that time."}
       </div>
     );
   }
@@ -879,6 +905,10 @@ export function SystemHealthPage() {
   const live = useSystemHealth(true);
   const history = useSystemHealthHistory(true);
   const alerts = useHealthAlerts(true);
+  // Whether the loops that PRODUCE everything on this page are
+  // still working (#1145). The page reports the machine; this reports
+  // whether the reporting itself is running.
+  const background = useBackgroundHealth();
   // Which page of the view is open. Read HERE rather than in each
   // detail component so the live sample, the history and the error and
   // loading states are fetched once and shared: a drill-down that
@@ -1047,6 +1077,11 @@ export function SystemHealthPage() {
       <HealthPageNav gpuCount={s.gpus.length} />
       {/* Above the pressure cards and the nav: a condition that is
           already true outranks the numbers it was derived from. #864. */}
+      {/* ABOVE the conditions, deliberately. A failing sampler means
+          the conditions below were computed from incomplete data, so a
+          reader has to meet that fact before the verdicts it qualifies
+          (#1145). Renders nothing while the loops are working. */}
+      <BackgroundHealthNotice tasks={background.data} now={renderedAt} />
       <HealthConditions
         alerts={alerts.data}
         failed={alerts.isError}
@@ -1054,6 +1089,9 @@ export function SystemHealthPage() {
         onRetry={() => void alerts.refetch()}
         sampledAt={sampledAt}
         now={renderedAt}
+        samplerDegraded={
+          background.data?.some((t) => t.task === "health-sampler" && t.degraded) ?? false
+        }
       />
       {/* Whose machine, said once, at the top, on the phone only.
           `ConnectionBanner` already names the paired desktop, but it

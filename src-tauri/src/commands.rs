@@ -1489,6 +1489,23 @@ pub fn background_panicked() -> bool {
 }
 
 #[tauri::command]
+/// Whether the background loops are still doing their job (#1145).
+///
+/// `Class::Read`: it reports state about the DESKTOP's own loops, which
+/// is the same question `background_panicked` beside it answers and the
+/// same reason that one is Read. A phone diagnosing "why has the chart
+/// stopped" reasonably asks it.
+///
+/// Sync and infallible: it reads two atomics and clones two short
+/// strings. No subprocess, no file, no database -- so
+/// `no_sync_command_reaches_a_subprocess_or_a_whole_file` is satisfied
+/// by construction rather than by a `spawn_blocking` that would cost
+/// more than the work.
+pub fn background_health() -> Vec<crate::background::TaskHealth> {
+    crate::background::snapshot_all()
+}
+
+#[tauri::command]
 /// What version of each external tool this machine has (#1154).
 ///
 /// Probed through the same resolvers the app uses everywhere else, so

@@ -201,6 +201,7 @@ const ROWS: Row[] = [
   row(api.checkPackages, [repoPath], "check_packages", { repoPath }),
   row(api.packagesMarkdown, [repoPath, reports, filter], "packages_markdown", { repoPath, reports, filter }),
   row(api.backgroundPanicked, [], "background_panicked"),
+  row(api.backgroundHealth, [], "background_health"),
   row(api.toolVersions, [], "tool_versions"),
   row(api.readLogTail, [4096], "read_log_tail", { maxBytes: 4096 }),
   row(api.revealLog, [], "reveal_log"),

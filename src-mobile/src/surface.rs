@@ -35,6 +35,11 @@ pub const SURFACE: &[(&str, Class)] = &[
     // points at (`reveal_log`) stays Local, which is why the companion
     // says the log opens at that Mac.
     ("background_panicked", Class::Read),
+    // Read: whether the desktop's background LOOPS are still working,
+    // as distinct from whether one panicked (#1145). Same question and
+    // same class as the row above -- a phone asking "why has the chart
+    // stopped" needs the answer, and the answer is about that Mac.
+    ("background_health", Class::Read),
     // Read: spawns four `--version` probes and returns what they said.
     // A question about the DESKTOP's toolchain, which a phone
     // diagnosing "why are there no worktrees" reasonably asks (#1154).
