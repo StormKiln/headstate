@@ -255,6 +255,7 @@ pub fn run() {
             commands::review_pr,
             commands::comment_on_pr,
             commands::scan_artifacts,
+            commands::read_cached_scan,
             commands::remove_artifacts,
             commands::size_artifacts,
             commands::mark_assessed,

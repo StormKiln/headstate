@@ -188,6 +188,11 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("size_worktrees", Class::Read),
     ("list_branches", Class::Read),
     ("scan_artifacts", Class::Read),
+    // Read: what a previous scan already found, so a cold start paints
+    // rows instead of a blank page (#1152). Same class as the scan
+    // above -- it returns the same information, just earlier -- and it
+    // authorises nothing: every destructive path re-verifies live.
+    ("read_cached_scan", Class::Read),
     ("size_artifacts", Class::Read),
     ("scan_venvs", Class::Read),
     ("size_venvs", Class::Read),
@@ -959,6 +964,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "size_worktrees" => res(commands::size_worktrees(app.clone(), a.get("repoPath")?).await),
         "list_branches" => res(commands::list_branches(app.clone(), a.get("repoPath")?).await),
         "scan_artifacts" => res(commands::scan_artifacts(app.clone()).await),
+        "read_cached_scan" => res(commands::read_cached_scan(app.clone(), a.get("kind")?).await),
         "size_artifacts" => res(commands::size_artifacts(a.get("paths")?).await),
         "scan_venvs" => res(commands::scan_venvs(app.clone()).await),
         "size_venvs" => res(commands::size_venvs(a.get("paths")?).await),

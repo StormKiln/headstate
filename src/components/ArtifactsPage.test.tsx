@@ -4,6 +4,10 @@ import type { Artifact } from "@/types/pr";
 import { stubViewport } from "@/test-utils";
 
 const state = vi.hoisted(() => ({
+  /// A previously stored scan, for the cold-start tests (#1152).
+  cached: undefined as
+    | { data: { path: string; size_bytes: number | null; repo_path: string }[]; ageSecs: number; stale: boolean }
+    | undefined,
   artifacts: [] as Artifact[],
   loading: false,
   // #846: a REJECTED scan, which the `= []` default made
@@ -37,6 +41,10 @@ const refetchVenvsFn = vi.hoisted(() => vi.fn());
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 
 vi.mock("../api/hooks", () => ({
+  // Undefined by default: the first-run state, which every other
+  // assertion in this file assumes (#1152). A cached result would paint
+  // a dated list instead of the live one.
+  useCachedScan: () => state.cached,
   useRemoveArtifacts: () => removeFn,
   // The page renders VenvSection, which has its own hooks. Stubbed to
   // empty here rather than exercised: that component has its own test
@@ -826,5 +834,75 @@ describe("ArtifactsPage toolbar ordering", () => {
     const { container } = render(<ArtifactsPage />);
     const regions = [...container.querySelectorAll('[aria-live="polite"]')];
     expect(regions.some((r) => /measuring — 3 of 5/.test(r.textContent ?? ""))).toBe(true);
+  });
+});
+
+/// The cold start: a dated previous scan instead of a blank page (#1152).
+describe("ArtifactsPage while the scan is running", () => {
+  const cachedRows = [
+    { path: "/code/proj/target", size_bytes: 10 * 1024 ** 3, repo_path: "/code/proj" },
+    { path: "/code/other/target", size_bytes: 2 * 1024 ** 3, repo_path: "/code/other" },
+  ];
+
+  beforeEach(() => {
+    state.loading = true;
+    // No live result yet -- the state this whole describe is about.
+    state.artifacts = [];
+    state.cached = undefined;
+  });
+
+  it("says it is looking when nothing has ever been scanned", () => {
+    // A first run has no previous result, and a cache MISS is not an
+    // empty scan -- painting "no build output found" here is the #742
+    // conflation.
+    render(<ArtifactsPage />);
+    expect(screen.getByText(/Looking for build output/)).toBeTruthy();
+  });
+
+  it("paints the previous scan instead of a blank page", () => {
+    // ~1.5 s to discover and ~56 s to size, every cold start. Those
+    // directories were there this morning, which is strictly more than
+    // nothing.
+    state.cached = { data: cachedRows, ageSecs: 45 * 60, stale: false };
+    render(<ArtifactsPage />);
+    expect(screen.getByText("/code/proj/target")).toBeTruthy();
+    expect(screen.queryByText(/Looking for build output/)).toBeNull();
+  });
+
+  it("says how old it is, every time", () => {
+    // The age is not a caveat on an exceptional path -- it is the whole
+    // claim. A user who deleted 40 GB this morning and sees it listed
+    // undated would reasonably conclude the deletion failed.
+    state.cached = { data: cachedRows, ageSecs: 45 * 60, stale: false };
+    render(<ArtifactsPage />);
+    expect(screen.getByText(/Showing the last scan, from 45 minutes ago/)).toBeTruthy();
+    expect(screen.getByText(/Rescanning now/)).toBeTruthy();
+  });
+
+  it("warns harder when the scan is past the staleness window", () => {
+    state.cached = { data: cachedRows, ageSecs: 9 * 3600, stale: true };
+    render(<ArtifactsPage />);
+    expect(screen.getByText(/9 hours ago/)).toBeTruthy();
+    expect(screen.getByText(/old enough that it may have changed/)).toBeTruthy();
+  });
+
+  it("offers NO removal controls on a cached result", () => {
+    // THE rule `branches/cache.rs` states: a stale verdict must never
+    // authorise a destructive action. Structural -- this view renders
+    // no controls at all -- rather than a disabled attribute someone
+    // can later re-enable.
+    state.cached = { data: cachedRows, ageSecs: 60, stale: false };
+    render(<ArtifactsPage />);
+    expect(screen.queryByRole("button", { name: /remove|delete/i })).toBeNull();
+    expect(screen.queryByRole("checkbox")).toBeNull();
+  });
+
+  it("falls back to the scanning state when the cached scan is empty", () => {
+    // An empty cached list is indistinguishable from "we found
+    // nothing", and painting it during a live scan would claim a result
+    // the app does not have yet.
+    state.cached = { data: [], ageSecs: 60, stale: false };
+    render(<ArtifactsPage />);
+    expect(screen.getByText(/Looking for build output/)).toBeTruthy();
   });
 });

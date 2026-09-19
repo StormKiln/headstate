@@ -29,6 +29,8 @@ pub mod pr_history;
 /// The ledger saying which date ranges have been retrieved -- and, by the
 /// ABSENCE of a row, which have never been asked for (#1092).
 pub mod pr_slice;
+/// Filesystem scan results, so a cold start is not a blank page (#1152).
+pub mod scans;
 mod schema;
 pub mod settings;
 pub mod stats;

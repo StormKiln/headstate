@@ -43,11 +43,13 @@ import type {
   PrActionName,
   ToolReport,
   LogTail,
+  ScanKind,
 } from "./tauri";
 import { createCoalescer } from "@/lib/coalesce";
 import {
   toolVersions,
   readLogTail,
+  readCachedScan,
   backgroundPanicked,
   claudeHooksInventory,
   claudeMdEffective,
@@ -773,6 +775,45 @@ export function useReplyToThread() {
 /// passes differ by three orders of magnitude and blocking the list on
 /// the slow one would leave the view empty for a minute -- the exact
 /// complaint that shaped the worktree page.
+/// A stored scan for the cold start, parsed, or undefined (#1152).
+///
+/// # Why this is a separate query rather than `initialData`
+///
+/// `initialData` would make the live query look SETTLED -- `isLoading`
+/// false, `dataUpdatedAt` set -- so the page could not tell a cached
+/// result from a fresh one, which is exactly the conflation #742
+/// records. Kept apart, the caller has both and can label which it is
+/// showing.
+///
+/// Reading is cheap (one indexed row and a `JSON.parse`) and happens
+/// once: `staleTime: Infinity`, because the cache only changes when a
+/// scan writes it, and the scan's own query is what the page then
+/// switches to.
+///
+/// A parse failure yields `undefined`, not a throw: a corrupt cache row
+/// must cost the cold-start paint and nothing else.
+export function useCachedScan<T>(kind: ScanKind, enabled: boolean) {
+  const query = useQuery({
+    queryKey: ["cached-scan", kind],
+    queryFn: () => readCachedScan(kind),
+    enabled,
+    staleTime: Infinity,
+    // A cache miss is the answer, not a failure to retry three times.
+    retry: false,
+  });
+  const raw = query.data;
+  if (!raw) return undefined;
+  try {
+    return {
+      data: JSON.parse(raw.payload) as T,
+      ageSecs: raw.age_secs,
+      stale: raw.stale,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 export function useArtifacts(enabled: boolean) {
   return useQuery({
     queryKey: ["artifacts"],
@@ -793,6 +834,17 @@ export function useArtifacts(enabled: boolean) {
     // Acceptable only because the page now has an explicit retry, which
     // is the rule `useStatsBoard` states.
     retry: false,
+    // An in-session revisit must not re-walk the tree (#1152). The
+    // default `gcTime` is five minutes, so leaving the page and coming
+    // back after lunch discarded the result and paid the whole scan
+    // again -- on a query measured in tens of seconds.
+    //
+    // Set HERE rather than as a `QueryClient` default: raising it
+    // globally would keep every cheap query's payload alive for an
+    // hour to fix three expensive ones, and `hooks.ts` already reserves
+    // `gcTime: Infinity` for a few-KB PR detail rather than applying it
+    // broadly.
+    gcTime: 60 * 60 * 1000,
   });
 }
 
@@ -953,6 +1005,17 @@ export function useVenvs(enabled: boolean) {
     // retry that tells the user it is trying again" -- and the section
     // now renders `QueryError` with exactly that.
     retry: false,
+    // An in-session revisit must not re-walk the tree (#1152). The
+    // default `gcTime` is five minutes, so leaving the page and coming
+    // back after lunch discarded the result and paid the whole scan
+    // again -- on a query measured in tens of seconds.
+    //
+    // Set HERE rather than as a `QueryClient` default: raising it
+    // globally would keep every cheap query's payload alive for an
+    // hour to fix three expensive ones, and `hooks.ts` already reserves
+    // `gcTime: Infinity` for a few-KB PR detail rather than applying it
+    // broadly.
+    gcTime: 60 * 60 * 1000,
   });
 }
 

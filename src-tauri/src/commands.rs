@@ -702,6 +702,84 @@ pub async fn get_pr_detail(
     out
 }
 
+#[tauri::command]
+/// A previously stored scan, for the cold start (#1152).
+///
+/// `Class::Read`: it returns what a scan already found, which is the
+/// same class as the scan itself.
+///
+/// Returns `None` when nothing is stored -- a first run, or a root the
+/// user just added. That is NOT an empty scan, and the caller must keep
+/// painting its scanning state for it: #742 records what happens when
+/// "nothing found" and "nothing known yet" share a representation.
+///
+/// The payload is the scan's own JSON, opaque here. Deserialising it
+/// would mean this command knowing all three result types and gaining a
+/// migration every time one of them changes a field.
+///
+/// # This is never the source of a removal decision
+///
+/// `branches/cache.rs` states the rule and it holds: a stale "safe to
+/// delete" computed against a repository that has since moved on is the
+/// one thing a cache must not authorise. Every destructive path
+/// re-verifies against the live filesystem at click time --
+/// `remove_artifacts` already does. What this feeds is the first paint.
+pub async fn read_cached_scan(
+    app: AppHandle,
+    kind: crate::store::scans::ScanKind,
+) -> Result<Option<crate::store::scans::CachedScan>, String> {
+    let dirs = get_worktree_dirs(app.clone());
+    let db = db_path(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&db).map_err(|e| e.to_string())?;
+        crate::store::scans::load(&conn, kind, &scan_key(&dirs)).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("could not read the scan cache: {e}"))?
+}
+
+/// The cache key for a scan over a set of roots (#1152).
+///
+/// The scans take a LIST of directories and return one flat result, so
+/// the key is the whole set rather than one path. Sorted and joined, so
+/// reordering the configured directories does not orphan the previous
+/// entry and re-blank the page.
+///
+/// It also means changing the set invalidates by construction: a user
+/// who adds a directory gets a cache miss and a scanning state, which is
+/// correct -- the old result did not cover the new root.
+fn scan_key(dirs: &[String]) -> String {
+    let mut v: Vec<&str> = dirs.iter().map(String::as_str).collect();
+    v.sort_unstable();
+    v.join("\u{1f}")
+}
+
+/// Store a successful scan, best-effort.
+///
+/// Failures are logged and swallowed: a cache that could not be written
+/// costs the NEXT cold start a blank page, and turning that into a
+/// failed scan would cost the user the result they are looking at right
+/// now. A refused database is "do not write", not "no data" (#1143).
+fn remember_scan<T: serde::Serialize>(
+    app: &AppHandle,
+    kind: crate::store::scans::ScanKind,
+    dirs: &[String],
+    value: &T,
+) {
+    let Ok(payload) = serde_json::to_string(value) else {
+        log::warn!("scan cache: could not serialise a {kind:?} result");
+        return;
+    };
+    match open_db(&db_path(app)) {
+        Ok(conn) => {
+            if let Err(e) = crate::store::scans::save(&conn, kind, &scan_key(dirs), &payload) {
+                log::warn!("scan cache: could not store a {kind:?} result: {e}");
+            }
+        }
+        Err(e) => log::warn!("scan cache: no database to store a {kind:?} result: {e}"),
+    }
+}
+
 /// Repos and their worktrees, unclassified, WITH what could not be read.
 ///
 /// Fast enough to block a view on: ~800ms for 37 repos and 295 worktrees
@@ -723,12 +801,21 @@ pub async fn get_pr_detail(
 /// unreadable directory labels the list partial rather than blanking it.
 #[tauri::command]
 pub async fn list_worktrees(app: AppHandle) -> Result<crate::worktrees::RepoScan, String> {
-    let dirs = get_worktree_dirs(app);
+    let dirs = get_worktree_dirs(app.clone());
     // Blocking filesystem and subprocess work: keep it off the async
     // runtime's worker threads.
-    tauri::async_runtime::spawn_blocking(move || crate::worktrees::scan_dirs_fast_reporting(&dirs))
-        .await
-        .map_err(|e| e.to_string())
+    let scanned = dirs.clone();
+    let out = tauri::async_runtime::spawn_blocking(move || {
+        crate::worktrees::scan_dirs_fast_reporting(&scanned)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    // Stored so the next cold start paints rows instead of a blank page
+    // (#1152). Paths and sizes only -- `Safety` rides along in the
+    // payload but `read_cached_scan` is never the source of a removal
+    // decision, and every destructive path re-verifies live.
+    remember_scan(&app, crate::store::scans::ScanKind::Worktrees, &dirs, &out);
+    Ok(out)
 }
 
 /// Classify one repo's worktrees. See `list_worktrees`.
@@ -911,10 +998,15 @@ pub async fn scan_artifacts(app: AppHandle) -> Result<Vec<crate::artifacts::Arti
     // The SAME roots the worktree view scans. A second directory setting
     // would be one more thing to keep in sync, and a user who has told
     // the app where their code lives has already answered this question.
-    let dirs = get_worktree_dirs(app);
-    tauri::async_runtime::spawn_blocking(move || crate::artifacts::scan(&dirs))
+    let dirs = get_worktree_dirs(app.clone());
+    let scanned = dirs.clone();
+    let out = tauri::async_runtime::spawn_blocking(move || crate::artifacts::scan(&scanned))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // ~1.5 s to discover and ~56 s to size, every cold start, against a
+    // blank page (#1152).
+    remember_scan(&app, crate::store::scans::ScanKind::Artifacts, &dirs, &out);
+    Ok(out)
 }
 
 /// Sizes for artifact directories, as `(path, bytes, secs_since_write)`.
@@ -1066,9 +1158,10 @@ pub async fn scan_venvs(app: AppHandle) -> Result<Vec<crate::caches::Venv>, Stri
     // the whole walk: releasing early would let the next caller
     // start while this one still has eight threads on the disk.
     let _permit = scan_permit().await?;
-    let roots = get_worktree_dirs(app);
-    tauri::async_runtime::spawn_blocking(move || {
-        let dirs = crate::caches::project_dirs(&roots);
+    let roots = get_worktree_dirs(app.clone());
+    let scanned = roots.clone();
+    let out = tauri::async_runtime::spawn_blocking(move || {
+        let dirs = crate::caches::project_dirs(&scanned);
         log::info!(
             "venv scan: {} candidate project directories{}",
             dirs.dirs.len(),
@@ -1081,7 +1174,10 @@ pub async fn scan_venvs(app: AppHandle) -> Result<Vec<crate::caches::Venv>, Stri
         crate::caches::scan_poetry(&dirs)
     })
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    // 9-40 s measured, every cold start, against a blank page (#1152).
+    remember_scan(&app, crate::store::scans::ScanKind::Venvs, &roots, &out);
+    Ok(out)
 }
 
 /// Sizes and idle times, as `(path, bytes, idle_secs)`.
@@ -2386,6 +2482,17 @@ pub fn set_worktree_dirs(app: AppHandle, dirs: Vec<String>) -> Result<Vec<String
     let ok = validate_dirs(dirs)?;
     let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
     settings::set(&conn, settings::keys::WORKTREE_DIRS, &ok).map_err(|e| e.to_string())?;
+    // Drop scan caches keyed on the OLD set (#1152). Nothing stale is
+    // painted without this -- the key is the whole set, so a changed
+    // set already misses -- but those rows would never be read again,
+    // and a user who reorganises their directories a few times would
+    // accumulate a table of dead payloads.
+    //
+    // Best-effort: failing to tidy a cache must not fail the setting
+    // the user actually asked to change.
+    if let Err(e) = crate::store::scans::retain_only(&conn, &scan_key(&ok)) {
+        log::warn!("scan cache: could not drop entries for the previous roots: {e}");
+    }
     log::info!("worktree directories set to {} path(s)", ok.len());
     Ok(ok)
 }
