@@ -2273,9 +2273,11 @@ pub async fn claude_launch_session(
 ) -> Result<(), String> {
     let state = {
         let c = cwd.clone();
-        tauri::async_runtime::spawn_blocking(move || crate::claude::sessions::check_cwd(c.as_deref()))
-            .await
-            .map_err(|e| format!("could not check the directory: {e}"))?
+        tauri::async_runtime::spawn_blocking(move || {
+            crate::claude::sessions::check_cwd(c.as_deref())
+        })
+        .await
+        .map_err(|e| format!("could not check the directory: {e}"))?
     };
     let built = crate::claude::sessions::resume_command(&session_id, cwd.as_deref(), &state);
     let anchor = built.anchored.then(|| cwd.clone()).flatten();

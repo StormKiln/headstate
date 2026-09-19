@@ -120,7 +120,10 @@ enum Arg {
     Literal(String),
     /// The slot the built command goes into, with whatever literal text
     /// surrounds it in the same word (`-e{command}` is one argv entry).
-    Command { prefix: String, suffix: String },
+    Command {
+        prefix: String,
+        suffix: String,
+    },
 }
 
 impl Template {
@@ -299,7 +302,10 @@ mod tests {
         ("gnome", "gnome-terminal -- bash -c {command}"),
         ("konsole", "konsole -e {command}"),
         ("wezterm", "wezterm start -- bash -lc {command}"),
-        ("quoted path", "\"/Applications/My Terminal.app/x\" -e {command}"),
+        (
+            "quoted path",
+            "\"/Applications/My Terminal.app/x\" -e {command}",
+        ),
     ];
 
     /// The presets the settings panel offers, read from the TypeScript
@@ -350,7 +356,10 @@ mod tests {
             let t = Template::parse(raw).unwrap_or_else(|e| panic!("{name}: {e}"));
             let (_prog, argv) = t.render("cd 'x' && claude");
             let hits = argv.iter().filter(|a| a.contains("claude")).count();
-            assert_eq!(hits, 1, "{name}: command landed in {hits} argv slots: {argv:?}");
+            assert_eq!(
+                hits, 1,
+                "{name}: command landed in {hits} argv slots: {argv:?}"
+            );
         }
     }
 
@@ -372,7 +381,10 @@ mod tests {
         let nasty = "cd '/tmp/a b; rm -rf ~' && claude --resume '$(whoami) `id`'";
         let t = Template::parse("open -a Terminal {command}").unwrap();
         let (_p, argv) = t.render(nasty);
-        assert_eq!(argv, vec!["-a".to_string(), "Terminal".to_string(), nasty.to_string()]);
+        assert_eq!(
+            argv,
+            vec!["-a".to_string(), "Terminal".to_string(), nasty.to_string()]
+        );
     }
 
     #[test]
@@ -418,7 +430,10 @@ mod tests {
     fn an_empty_template_is_not_configured_rather_than_a_parse_error() {
         // Different remedies: "set one up" versus "fix the one you set".
         for raw in ["", "   ", "\t\n"] {
-            assert_eq!(launch(raw, "c", None).unwrap_err(), LaunchError::NotConfigured);
+            assert_eq!(
+                launch(raw, "c", None).unwrap_err(),
+                LaunchError::NotConfigured
+            );
         }
     }
 
@@ -427,8 +442,12 @@ mod tests {
         // A terminal that opens and immediately fails its own `cd`
         // leaves the user in an unrelated directory with a Claude
         // session about to start there.
-        let e = launch("open -a Terminal {command}", "cd x && claude", Some("/no/such/dir"))
-            .unwrap_err();
+        let e = launch(
+            "open -a Terminal {command}",
+            "cd x && claude",
+            Some("/no/such/dir"),
+        )
+        .unwrap_err();
         assert!(matches!(e, LaunchError::CwdMissing { .. }), "{e:?}");
     }
 
