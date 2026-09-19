@@ -291,6 +291,7 @@ pub fn run() {
             commands::claude_session_events,
             commands::claude_event_profile,
             commands::claude_reveal_path,
+            commands::claude_usage_profile,
             commands::claude_session_usage,
             commands::claude_transcript_tail,
             commands::claude_poll_live,

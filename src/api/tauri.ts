@@ -934,6 +934,26 @@ export const claudeRestartList = () => call<ClaudeRestartList>("claude_restart_l
 ///
 /// Rejects when the transcript could not be read. A resolved `messages: 0`
 /// means it WAS read and carried no usage, which is a different fact.
+/// Token usage across every measured session (#1134). Mirrors
+/// `claude::usage::Profile`.
+///
+/// The denominators travel with the totals: a sum is only as good as
+/// what it covers, and a truncated measurement makes the whole figure a
+/// floor.
+export interface ClaudeUsageProfile {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  messages: number;
+  sessionsMeasured: number;
+  sessionsTruncated: number;
+  models: { model: string; messages: number }[];
+  byDirectory: { cwd: string; outputTokens: number; sessions: number }[];
+}
+
+export const claudeUsageProfile = () => call<ClaudeUsageProfile>("claude_usage_profile");
+
 export const claudeSessionUsage = (path: string) =>
   call<ClaudeUsage>("claude_session_usage", { path });
 

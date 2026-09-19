@@ -4671,6 +4671,22 @@ fn transcript_path_in(root: &std::path::Path, path: &str) -> Result<std::path::P
 /// 24 of 1,502 real sessions. The UI must render those differently, and
 /// `Usage::observed()` is the gate.
 #[tauri::command]
+/// Token usage summed across every measured session (#1134).
+///
+/// Reads the stored rows rather than the transcripts: `usage.rs`
+/// measures a whole-corpus read at 3.8 s, which the import pass pays
+/// once and a command must not.
+pub async fn claude_usage_profile(app: AppHandle) -> Result<crate::claude::usage::Profile, String> {
+    let db = db_path(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&db).map_err(|e| e.to_string())?;
+        crate::claude::store::usage_profile(&conn).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 pub async fn claude_session_usage(path: String) -> Result<crate::claude::usage::Usage, String> {
     let p = claude_transcript_path(&path)?;
     // `spawn_blocking` because it reads a whole transcript off disk --

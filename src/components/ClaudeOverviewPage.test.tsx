@@ -41,6 +41,20 @@ const restartFn = vi.hoisted(() =>
 );
 
 const state = vi.hoisted(() => ({
+  usage: undefined as
+    | {
+        inputTokens: number;
+        outputTokens: number;
+        cacheReadTokens: number;
+        cacheCreationTokens: number;
+        messages: number;
+        sessionsMeasured: number;
+        sessionsTruncated: number;
+        models: { model: string; messages: number }[];
+        byDirectory: { cwd: string; outputTokens: number; sessions: number }[];
+      }
+    | undefined,
+  usageFailed: false,
   data: undefined as unknown,
   loading: false,
   failed: false,
@@ -60,6 +74,9 @@ const state = vi.hoisted(() => ({
 }));
 
 vi.mock("../api/hooks", () => ({
+  // #1134. Undefined renders nothing, which is what these tests assume:
+  // a failed or absent profile must not draw a card of zeros.
+  useClaudeUsageProfile: () => ({ data: state.usage, isError: state.usageFailed }),
   // #1062-#1064, the cross-session profile card. Defaults to a resolved
   // `unobserved`, which is the state of a machine before the hooks go in
   // -- and therefore the state every existing assertion in this file was
@@ -944,5 +961,64 @@ describe("ClaudeOverviewPage's purity", () => {
     // And the `now` prop is genuinely threaded through, so this is not
     // passing merely because no date is rendered at all.
     expect(code).toMatch(/new Date\(now\)/);
+  });
+});
+
+
+/// #1134: usage across sessions, which could only be seen one at a time.
+describe("the token usage card", () => {
+  const profile = (over = {}) => ({
+    inputTokens: 1000,
+    outputTokens: 2000,
+    cacheReadTokens: 500,
+    cacheCreationTokens: 100,
+    messages: 40,
+    sessionsMeasured: 3,
+    sessionsTruncated: 0,
+    models: [{ model: "claude-opus-5", messages: 40 }],
+    byDirectory: [{ cwd: "/code/widget", outputTokens: 2000, sessions: 3 }],
+    ...over,
+  });
+
+  it("states the denominator beside the totals", () => {
+    state.usage = profile();
+    render(<ClaudeOverviewPage />);
+    expect(screen.getByText(/summed over 3 measured sessions/)).toBeTruthy();
+  });
+
+  /// A truncated measurement makes the whole sum a FLOOR, and the card
+  /// uses the "at least" idiom this codebase already applies wherever a
+  /// measurement is short.
+  it("qualifies every figure when a session hit the read budget", () => {
+    state.usage = profile({ sessionsTruncated: 1 });
+    render(<ClaudeOverviewPage />);
+    expect(screen.getByText("at least 2,000")).toBeTruthy();
+    expect(screen.getByText(/stopped at the read budget/)).toBeTruthy();
+  });
+
+  /// The load-bearing one. A card of zeros is indistinguishable from a
+  /// quiet month, and on this page that argues for a conclusion nobody
+  /// measured.
+  it("renders nothing rather than zeros when the read failed", () => {
+    state.usage = undefined;
+    state.usageFailed = true;
+    render(<ClaudeOverviewPage />);
+    expect(screen.queryByText(/Tokens across your sessions/)).toBeNull();
+    state.usageFailed = false;
+  });
+
+  /// Nothing measured is not a total of zero.
+  it("renders nothing when no session has been measured", () => {
+    state.usage = profile({ sessionsMeasured: 0 });
+    render(<ClaudeOverviewPage />);
+    expect(screen.queryByText(/Tokens across your sessions/)).toBeNull();
+  });
+
+  /// Tokens, never dollars: rates change and a quietly wrong cost with
+  /// a currency symbol is worse than no cost at all.
+  it("shows no currency", () => {
+    state.usage = profile();
+    const { container } = render(<ClaudeOverviewPage />);
+    expect(container.textContent).not.toMatch(/[$£€]/);
   });
 });

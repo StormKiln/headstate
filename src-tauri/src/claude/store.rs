@@ -252,6 +252,111 @@ pub fn sessions_for_pr(
     rows.collect()
 }
 
+/// Record one session's token usage (#1134).
+///
+/// Called from the import pass, which is the only place that can afford
+/// the read: `usage.rs` measures the whole corpus at 3.8 s.
+pub fn record_usage(
+    conn: &Connection,
+    session_id: &str,
+    u: &super::usage::Usage,
+    now: &str,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT OR REPLACE INTO claude_session_usage
+            (session_id, messages, input_tokens, output_tokens,
+             cache_read, cache_creation, truncated, measured_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            session_id,
+            u.messages as i64,
+            u.input_tokens as i64,
+            u.output_tokens as i64,
+            u.cache_read_tokens as i64,
+            u.cache_creation_tokens as i64,
+            u.truncated as i64,
+            now,
+        ],
+    )?;
+    // Rewritten whole for this session: a re-measure can legitimately
+    // find fewer models than before, and an upsert would leave the old
+    // one behind with nothing to remove it.
+    conn.execute(
+        "DELETE FROM claude_session_model WHERE session_id = ?1",
+        [session_id],
+    )?;
+    for m in &u.models {
+        conn.execute(
+            "INSERT OR REPLACE INTO claude_session_model (session_id, model, messages)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![session_id, m.model, m.messages as i64],
+        )?;
+    }
+    Ok(())
+}
+
+/// Token usage summed across every measured session (#1134).
+pub fn usage_profile(conn: &Connection) -> Result<super::usage::Profile, rusqlite::Error> {
+    let mut out: super::usage::Profile = conn.query_row(
+        "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                COALESCE(SUM(cache_read),0), COALESCE(SUM(cache_creation),0),
+                COALESCE(SUM(messages),0), COUNT(*),
+                COALESCE(SUM(truncated),0)
+           FROM claude_session_usage",
+        [],
+        |r| {
+            Ok(super::usage::Profile {
+                input_tokens: r.get::<_, i64>(0)? as u64,
+                output_tokens: r.get::<_, i64>(1)? as u64,
+                cache_read_tokens: r.get::<_, i64>(2)? as u64,
+                cache_creation_tokens: r.get::<_, i64>(3)? as u64,
+                messages: r.get::<_, i64>(4)? as u64,
+                sessions_measured: r.get::<_, i64>(5)? as u64,
+                sessions_truncated: r.get::<_, i64>(6)? as u64,
+                ..Default::default()
+            })
+        },
+    )?;
+
+    let mut q = conn.prepare(
+        "SELECT model, SUM(messages) FROM claude_session_model
+          GROUP BY model ORDER BY SUM(messages) DESC",
+    )?;
+    out.models = q
+        .query_map([], |r| {
+            Ok(super::usage::ModelCount {
+                model: r.get(0)?,
+                messages: r.get::<_, i64>(1)? as u64,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Joined to `claude_session` for the cwd, because usage rows carry
+    // only the id. A session whose cwd was never recorded is excluded
+    // rather than bucketed as empty: an unknown directory is not a
+    // directory.
+    let mut q = conn.prepare(
+        "SELECT s.cwd, SUM(u.output_tokens), COUNT(*)
+           FROM claude_session_usage u
+           JOIN claude_session s ON s.session_id = u.session_id
+          WHERE s.cwd IS NOT NULL
+          GROUP BY s.cwd
+          ORDER BY SUM(u.output_tokens) DESC
+          LIMIT ?1",
+    )?;
+    out.by_directory = q
+        .query_map([super::usage::TOP_DIRECTORIES as i64], |r| {
+            Ok(super::usage::DirectoryUsage {
+                cwd: r.get(0)?,
+                output_tokens: r.get::<_, i64>(1)? as u64,
+                sessions: r.get::<_, i64>(2)? as u64,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(out)
+}
+
 pub fn import(conn: &mut Connection, scan: Scan) -> Result<Imported, rusqlite::Error> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut out = Imported {
@@ -326,6 +431,27 @@ pub fn import(conn: &mut Connection, scan: Scan) -> Result<Imported, rusqlite::E
                 "{}: could not store its pull request link: {e}",
                 l.session_id
             ));
+        }
+    }
+
+    // Token usage, measured on the same pass (#1134).
+    //
+    // BOUNDED per session by `summarise`, not `summarise_whole`: the
+    // budget is what keeps the whole-corpus read at 3.8 s, and a
+    // truncated measurement is carried as a floor rather than dropped.
+    // A session whose transcript is gone keeps whatever was measured
+    // last -- absent is not zero.
+    for t in &scan.sessions {
+        // A transcript that could not be read leaves the PREVIOUS
+        // measurement in place rather than writing zeros over it: absent
+        // is not zero, and a session whose file is temporarily
+        // unreadable has not suddenly cost nothing.
+        let Ok(u) = super::usage::summarise(std::path::Path::new(&t.path)) else {
+            continue;
+        };
+        if let Err(e) = record_usage(&tx, &t.session_id, &u, &now) {
+            out.write_failures
+                .push(format!("{}: could not store its usage: {e}", t.session_id));
         }
     }
 
@@ -972,5 +1098,99 @@ mod tests {
             .unwrap();
         }
         assert_eq!(prs_for_session(&conn, "s1").unwrap().len(), 1);
+    }
+
+    /// #1134: the aggregation, and the denominators that qualify it.
+    #[test]
+    fn usage_sums_across_sessions_with_its_denominators() {
+        let conn = db();
+        let u = |messages, out_tokens, truncated| super::super::usage::Usage {
+            messages,
+            input_tokens: 100,
+            output_tokens: out_tokens,
+            cache_read_tokens: 10,
+            cache_creation_tokens: 5,
+            models: vec![super::super::usage::ModelCount {
+                model: "claude-opus-5".into(),
+                messages,
+            }],
+            truncated,
+            ..Default::default()
+        };
+        record_usage(&conn, "s1", &u(10, 500, false), "2026-09-01T00:00:00Z").unwrap();
+        record_usage(&conn, "s2", &u(20, 700, true), "2026-09-01T00:00:00Z").unwrap();
+
+        let p = usage_profile(&conn).unwrap();
+        assert_eq!(p.output_tokens, 1200);
+        assert_eq!(p.messages, 30);
+        assert_eq!(
+            p.sessions_measured, 2,
+            "the denominator travels with the total"
+        );
+        assert_eq!(p.sessions_truncated, 1, "and so does what makes it a floor");
+        assert!(
+            p.partial(),
+            "one truncated session makes the whole sum a floor"
+        );
+        assert_eq!(p.models[0].model, "claude-opus-5");
+        assert_eq!(p.models[0].messages, 30, "models sum across sessions");
+    }
+
+    /// A profile over nothing is zeros with a zero denominator -- which
+    /// is honest, and distinguishable from a real total by
+    /// `sessions_measured`.
+    #[test]
+    fn an_empty_corpus_reports_a_zero_denominator() {
+        let conn = db();
+        let p = usage_profile(&conn).unwrap();
+        assert_eq!(p.sessions_measured, 0);
+        assert!(
+            !p.partial(),
+            "nothing measured is not a truncated measurement"
+        );
+    }
+
+    /// A session whose cwd was never recorded is EXCLUDED from the
+    /// directory breakdown rather than bucketed as empty: an unknown
+    /// directory is not a directory.
+    #[test]
+    fn a_session_with_no_cwd_is_not_a_directory() {
+        let mut conn = db();
+        let t = |id: &str, cwd: Option<&str>| Transcript {
+            // #1133 landed while this branch was open; the directory
+            // breakdown does not depend on it.
+            opening_prompt: None,
+            session_id: id.into(),
+            path: format!("/p/{id}.jsonl"),
+            cwd: cwd.map(str::to_string),
+            git_branch: None,
+            claude_version: None,
+            name: None,
+            first_seen_at: Some("2026-09-01T10:00:00Z".into()),
+            last_activity_at: Some("2026-09-01T11:00:00Z".into()),
+            cwd_record: Some(3),
+        };
+        let tx = conn.transaction().unwrap();
+        for s in [t("s1", Some("/code/widget")), t("s2", None)] {
+            upsert(&tx, &s, "2026-09-01T00:00:00Z").unwrap();
+        }
+        tx.commit().unwrap();
+
+        let u = super::super::usage::Usage {
+            messages: 1,
+            output_tokens: 100,
+            ..Default::default()
+        };
+        record_usage(&conn, "s1", &u, "2026-09-01T00:00:00Z").unwrap();
+        record_usage(&conn, "s2", &u, "2026-09-01T00:00:00Z").unwrap();
+
+        let p = usage_profile(&conn).unwrap();
+        assert_eq!(p.sessions_measured, 2, "both are measured");
+        assert_eq!(
+            p.by_directory.len(),
+            1,
+            "but only the one with a known directory is bucketed"
+        );
+        assert_eq!(p.by_directory[0].cwd, "/code/widget");
     }
 }

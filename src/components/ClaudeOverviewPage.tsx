@@ -1,7 +1,8 @@
 import { AlertTriangle, Bot, ClipboardList, FolderX, Play, RotateCw } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
-import { useClaudeEventProfile, useClaudeOverview } from "../api/hooks";
+import {
+  useClaudeUsageProfile, useClaudeEventProfile, useClaudeOverview } from "../api/hooks";
 import { claudeRestartList } from "../api/tauri";
 import { copyText } from "../lib/clipboard";
 import { restartExportText } from "../lib/restartExport";
@@ -516,6 +517,8 @@ export function ClaudeOverviewPage() {
         ) : null}
       </div>
 
+      <UsageProfileCard />
+
       {/* The centrepiece, ABOVE the chart. The chart is context; this is
           the thing a user came to do. */}
       <Card className="px-4">
@@ -943,5 +946,87 @@ function ResumableRow({
         Copy resume
       </button>
     </li>
+  );
+}
+
+/// Token usage across every measured session (#1134).
+///
+/// Usage could only be seen one session at a time, so "what did this
+/// week cost me" and "which directory consumes the most output" had no
+/// answer short of opening 1,500 sessions.
+///
+/// TOKENS, NOT DOLLARS. `usage.rs` rules out a rate table: rates change,
+/// this app cannot keep a hardcoded one true, and a quietly wrong cost
+/// with a currency symbol in front of it is the confident-wrong-answer
+/// failure at its worst. That decision stands here.
+function UsageProfileCard() {
+  const { data, isError } = useClaudeUsageProfile();
+
+  // A failed read renders nothing rather than zeros. A card of "0
+  // tokens" is indistinguishable from a quiet month, and on this page
+  // that argues for a conclusion nobody measured.
+  if (isError || !data) return null;
+  if (data.sessionsMeasured === 0) return null;
+
+  const n = (v: number) => v.toLocaleString();
+  // The floor idiom this codebase already uses everywhere a measurement
+  // is short (`ArtifactsPage`, `WorktreesPage`, `ClaudeMdPage`).
+  const qualify = (v: number) =>
+    data.sessionsTruncated > 0 ? `at least ${n(v)}` : n(v);
+
+  return (
+    <Card className="px-4">
+      <div className="text-sm font-semibold">Tokens across your sessions</div>
+      <div className="text-xs text-[#8b949e]">
+        {/* The DENOMINATOR, always. A total is only as good as what it
+            covers, and saying so is what makes the number usable. */}
+        summed over {n(data.sessionsMeasured)} measured session
+        {data.sessionsMeasured === 1 ? "" : "s"}
+        {data.sessionsTruncated > 0
+          ? ` — ${n(data.sessionsTruncated)} stopped at the read budget, so these are floors`
+          : ""}
+      </div>
+
+      <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-xs sm:grid-cols-4">
+        <div>
+          <dt className="text-[#8b949e]">Output</dt>
+          <dd className="text-[#e6edf3]">{qualify(data.outputTokens)}</dd>
+        </div>
+        <div>
+          <dt className="text-[#8b949e]">Input</dt>
+          <dd className="text-[#e6edf3]">{qualify(data.inputTokens)}</dd>
+        </div>
+        <div>
+          <dt className="text-[#8b949e]">Cache read</dt>
+          <dd className="text-[#e6edf3]">{qualify(data.cacheReadTokens)}</dd>
+        </div>
+        <div>
+          <dt className="text-[#8b949e]">Messages</dt>
+          <dd className="text-[#e6edf3]">{qualify(data.messages)}</dd>
+        </div>
+      </dl>
+
+      {data.models.length > 0 && (
+        <p className="mt-2 text-xs text-[#8b949e]">
+          {/* Per MESSAGE, because the corpus is mixed: "which model was
+              this" has no single answer, which `usage.rs` measured. */}
+          {data.models.map((m) => `${m.model} (${n(m.messages)})`).join(" · ")}
+        </p>
+      )}
+
+      {data.byDirectory.length > 0 && (
+        <div className="mt-2">
+          <p className="text-xs text-[#8b949e]">Heaviest directories, by output</p>
+          <ul className="mt-1 space-y-0.5">
+            {data.byDirectory.map((d) => (
+              <li key={d.cwd} className="flex justify-between gap-2 text-xs">
+                <span className="truncate text-[#e6edf3]">{d.cwd}</span>
+                <span className="shrink-0 text-[#8b949e]">{n(d.outputTokens)}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </Card>
   );
 }

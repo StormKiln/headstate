@@ -230,6 +230,8 @@ pub const SURFACE: &[(&str, Class)] = &[
     // picked -- and the response is a handful of integers, so it costs
     // the transport nothing. See the desktop copy for the 8 MB read
     // budget and why it is reported rather than silent.
+    // Read: one aggregate query over stored rows (#1134).
+    ("claude_usage_profile", Class::Read),
     ("claude_session_usage", Class::Read),
     // The tail of one of the DESKTOP's transcripts, as conversation
     // (#982). Read: one bounded tail read, writing nothing.
