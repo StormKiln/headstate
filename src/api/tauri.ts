@@ -95,6 +95,11 @@ export interface UiPrefs {
   /// switched-off integration must not survive either, because there is no
   /// page behind the entry. See the note at the `capabilityOff` check.
   claude_integrations_enabled: boolean;
+  /// A launcher template holding `{command}`, or empty for none.
+  ///
+  /// Empty is the default and means the Claude buttons copy, exactly as
+  /// they always have (#1126).
+  terminal_command: string;
   /// Whether to write the verbose `[diag]` timing log.
   ///
   /// Kept as a switch rather than removed after v3.5.3: the next
@@ -540,13 +545,38 @@ export interface ClaudifyCommand {
 
 /// The shell command that hands a worktree to Claude Code.
 ///
-/// Text for the clipboard, not a spawn. Spawning a terminal is not
+/// Text for the clipboard, not a spawn. GUESSING a terminal is not
 /// portable -- macOS has no default-terminal concept, and on Linux
 /// `gio open` on a shell script opens an editor -- and the clipboard
 /// lands the user in their own shell, where `claude` resolves even
 /// though a GUI app's PATH does not include it.
+///
+/// `claudeLaunchWorktree` below is the configured route added in #1126.
+/// It does not replace this one: with no terminal set it refuses, and
+/// this stays what the button calls.
 export const claudifyCommand = (repoPath: string, worktreePath: string, branch: string) =>
   call<ClaudifyCommand>("claudify_command", { repoPath, worktreePath, branch });
+
+/// Open the configured terminal on a worktree's Claudify command.
+///
+/// The counterpart to `claudifyCommand`, not a replacement: with no
+/// terminal configured this REFUSES, and the copy path above stays the
+/// only route. The comment there still holds for the default -- nothing
+/// is guessed; this runs only what the user configured (#1126).
+///
+/// The command is rebuilt in Rust from these three arguments rather
+/// than passed as a string, so this can never become "run arbitrary
+/// text in a terminal".
+export const claudeLaunchWorktree = (repoPath: string, worktreePath: string, branch: string) =>
+  call<void>("claude_launch_worktree", { repoPath, worktreePath, branch });
+
+/// Open the configured terminal on a session's resume command.
+///
+/// `cwd` is what the session recorded; Rust re-checks whether it still
+/// exists and decides whether the command carries a `cd`, exactly as
+/// the clipboard path does.
+export const claudeLaunchSession = (sessionId: string, cwd: string | null) =>
+  call<void>("claude_launch_session", { sessionId, cwd });
 
 /// Merge a pull request when its checks pass, or cancel that.
 ///

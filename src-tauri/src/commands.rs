@@ -2142,12 +2142,19 @@ pub async fn assess_worktree(
 /// The shell command that hands a worktree to Claude Code.
 ///
 /// Returns text for the clipboard rather than spawning anything.
-/// Spawning a terminal is not portable: macOS has no default-terminal
+/// GUESSING a terminal is not portable: macOS has no default-terminal
 /// concept at all (no LaunchServices handler exists, so a machine with
 /// both Terminal.app and iTerm gives no way to know which the user
 /// wants), and on Linux `x-terminal-emulator` is Debian-only while
 /// `gio open` on a shell script opens an editor. The clipboard works
 /// identically everywhere and lands the user in their OWN shell.
+///
+/// That argument survives #1126, which added [`claude_launch_worktree`]:
+/// it rules out guessing, not asking. With `terminal_command` unset --
+/// the default -- this is still the only route, and nothing is spawned.
+/// What changed is that a user who tells the app which terminal they
+/// use gets it opened; this function is unchanged and builds the same
+/// string either way.
 ///
 /// It also sidesteps PATH: `claude` lives in `~/.local/bin`, outside a
 /// GUI app's PATH, but the pasted command runs in a login shell where it
@@ -2185,6 +2192,96 @@ pub fn claudify_command(
         command: facts.command(&bin),
         claude_installed: installed,
     }
+}
+
+/// Open the configured terminal on an already-built command (#1126).
+///
+/// Shared by [`claude_launch_worktree`] and [`claude_launch_session`],
+/// which differ only in where the command string comes from. Neither
+/// builds one: `claudify_command` and `sessions::resume_command` are
+/// reused verbatim, caveats and shell-quoting included, so the line that
+/// runs is the same line the clipboard would have carried.
+///
+/// # Why `spawn_blocking`
+///
+/// `Command::spawn` is a real subprocess, and
+/// `no_sync_command_reaches_a_subprocess_or_a_whole_file` forbids one on
+/// a sync command for the freeze it causes (#1090). `spawn` does not
+/// wait for the child -- a terminal lives as long as the user keeps it
+/// open -- but it still forks, and `remote/surface.rs` would dispatch a
+/// sync command inline on the HTTP listener.
+async fn launch_in_terminal(
+    app: &AppHandle,
+    command: String,
+    cwd: Option<String>,
+) -> Result<(), String> {
+    let template = read_ui_prefs(app).terminal_command;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::claude::launch::launch(&template, &command, cwd.as_deref())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("terminal launch did not run: {e}"))?
+}
+
+#[tauri::command]
+/// Open the configured terminal on the Claudify command for a worktree.
+///
+/// `Class::Local`: it opens a window on THIS machine, which is the
+/// stated test for that class -- the phone cannot act on a terminal
+/// that appeared on a Mac it cannot see.
+///
+/// The command is rebuilt here rather than passed in from the frontend.
+/// Accepting a command string from the caller would make this "run
+/// whatever you are given in a terminal", which is a different and much
+/// larger capability than "open the button the user just pressed"; a
+/// paired phone is already refused by the class, but the remote surface
+/// is not the only thing that could ever call it.
+pub async fn claude_launch_worktree(
+    app: AppHandle,
+    repo_path: String,
+    worktree_path: String,
+    branch: String,
+) -> Result<(), String> {
+    let built = {
+        let repo = repo_path.clone();
+        let wt = worktree_path.clone();
+        tauri::async_runtime::spawn_blocking(move || claudify_command(repo, wt, branch))
+            .await
+            .map_err(|e| format!("could not build the command: {e}"))?
+    };
+    // The worktree path IS the directory the command cds into, so the
+    // gone-directory refusal in `launch` covers a worktree removed
+    // since the page was rendered.
+    launch_in_terminal(&app, built.command, Some(worktree_path)).await
+}
+
+#[tauri::command]
+/// Open the configured terminal on the resume command for a session.
+///
+/// `Class::Local`, for the reason [`claude_launch_worktree`] states.
+///
+/// `cwd` is passed to the launcher ONLY when the command is anchored --
+/// that is, when `resume_command` decided the directory is there and
+/// emitted a `cd`. An unanchored command carries a caveat saying it will
+/// resume wherever it runs, and refusing to launch it for a missing
+/// directory would refuse the very case the caveat exists to describe.
+pub async fn claude_launch_session(
+    app: AppHandle,
+    session_id: String,
+    cwd: Option<String>,
+) -> Result<(), String> {
+    let state = {
+        let c = cwd.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            crate::claude::sessions::check_cwd(c.as_deref())
+        })
+        .await
+        .map_err(|e| format!("could not check the directory: {e}"))?
+    };
+    let built = crate::claude::sessions::resume_command(&session_id, cwd.as_deref(), &state);
+    let anchor = built.anchored.then(|| cwd.clone()).flatten();
+    launch_in_terminal(&app, built.command, anchor).await
 }
 
 #[tauri::command]

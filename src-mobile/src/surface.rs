@@ -142,6 +142,13 @@ pub const SURFACE: &[(&str, Class)] = &[
     // Write -- so the phone could record an assessment it had no
     // way to obtain.
     ("claudify_command", Class::Read),
+    // Local: opens a terminal WINDOW on the desktop, which is the
+    // stated test for this class -- the phone cannot use a window that
+    // appeared on a Mac it cannot see. `claudify_command` above stays
+    // Read because it returns a string the phone CAN act on: it can
+    // show it, and the user can copy it.
+    ("claude_launch_worktree", Class::Local),
+    ("claude_launch_session", Class::Local),
     ("check_packages", Class::Read),
     ("packages_markdown", Class::Read),
     // Read: the effective context a session loads, across scopes

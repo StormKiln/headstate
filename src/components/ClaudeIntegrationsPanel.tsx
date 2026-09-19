@@ -5,6 +5,7 @@ import { EffectiveSettingsPanel } from "./EffectiveSettingsPanel";
 import { claudeRevealPath, type ClaudeHooksStatus, type UiPrefs } from "@/api/tauri";
 import { copyText } from "@/lib/clipboard";
 import { IS_MOBILE_BUILD } from "@/lib/target";
+import { PLACEHOLDER, PRESETS, templateProblem } from "@/lib/terminalTemplate";
 
 /// One sentence saying what the file says, and what to do about it.
 ///
@@ -129,6 +130,28 @@ export function ClaudeIntegrationsPanel({
   const [error, setError] = useState<string | null>(null);
 
   const enabled = prefs?.claude_integrations_enabled ?? false;
+
+  /// The template as TYPED, which is not the saved value until blur.
+  ///
+  /// Seeded from prefs and deliberately not re-synced on every render:
+  /// overwriting the field from props while someone is typing in it is
+  /// the classic controlled-input bug, and `useUiPrefs` refetches.
+  const [terminal, setTerminal] = useState(prefs?.terminal_command ?? "");
+  const problem = templateProblem(terminal);
+
+  /// Persist the template, unless it is obviously broken.
+  ///
+  /// Refusing to SAVE a bad one rather than saving it and failing at
+  /// launch: the error belongs where the mistake was made. The typed
+  /// text stays in the field so it can be corrected -- discarding it
+  /// would punish a typo by deleting the work.
+  const saveTerminal = (next?: string) => {
+    const value = (next ?? terminal).trim();
+    if (!prefs) return;
+    if (value !== "" && templateProblem(value) !== null) return;
+    if (value === (prefs.terminal_command ?? "")) return;
+    void setPrefs({ ...prefs, terminal_command: value });
+  };
   const line = statusLine(status);
   // The file the refusal is about, and the gate on all three of #961's
   // controls. `null` for every state that read the file successfully.
@@ -203,6 +226,62 @@ export function ClaudeIntegrationsPanel({
         command to resume one that is not.
         {enabled ? null : " Hidden while this is off."}
       </p>
+
+      {/* Desktop only: `claude_launch_*` is `Class::Local`, so a phone
+          would get a refusal from a control that looked available. */}
+      {IS_MOBILE_BUILD ? null : (
+        <div className="mt-3 flex flex-col gap-1">
+          <span className="text-sm font-medium">Terminal</span>
+          <p className="text-xs text-[#8b949e]">
+            Set this and the Claudify and Resume buttons open your terminal instead of
+            copying. Leave it empty and they copy, exactly as they do now — Headstate
+            never guesses a terminal, because there is no reliable way to know which one
+            you use.
+          </p>
+          <input
+            type="text"
+            value={terminal}
+            spellCheck={false}
+            // Not saved on every keystroke: a half-typed template is
+            // not a preference, and writing one would make the buttons
+            // launch something broken between two keys.
+            onChange={(e) => setTerminal(e.target.value)}
+            onBlur={() => saveTerminal()}
+            onKeyDown={(e) => e.key === "Enter" && saveTerminal()}
+            placeholder={`open -a Terminal ${PLACEHOLDER}`}
+            aria-label="Terminal command"
+            aria-invalid={problem !== null}
+            className="rounded border border-[#30363d] bg-[#0d1117] px-2 py-1 font-mono text-xs text-[#e6edf3]"
+          />
+          {/* Said while typing rather than at launch: the alternative
+              is a button that does nothing and a user with no idea
+              why. */}
+          {problem ? (
+            <p className="text-xs text-[#f85149]" role="alert">
+              {problem}
+            </p>
+          ) : (
+            <p className="text-xs text-[#8b949e]">
+              <code>{PLACEHOLDER}</code> is replaced with the command to run.
+            </p>
+          )}
+          <div className="mt-1 flex flex-wrap gap-1">
+            {PRESETS.map((p) => (
+              <button
+                key={p.label}
+                type="button"
+                onClick={() => {
+                  setTerminal(p.template);
+                  saveTerminal(p.template);
+                }}
+                className="rounded border border-[#30363d] px-2 py-0.5 text-xs text-[#8b949e] hover:bg-[#21262d] hover:text-[#e6edf3]"
+              >
+                {p.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* THE thing this panel exists to say. Shown whatever the switch is
           set to, because it is true whatever the switch is set to -- and it

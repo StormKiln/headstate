@@ -308,6 +308,22 @@ pub struct UiPrefs {
     /// should be asked for rather than assumed.
     #[serde(default)]
     pub claude_integrations_enabled: bool,
+    /// The terminal to open Claude commands in, or empty for none.
+    ///
+    /// A launcher template holding `{command}`, e.g.
+    /// `open -a Terminal {command}`. See [`crate::claude::launch`] for
+    /// the grammar and for why the command lands in exactly one argv
+    /// slot.
+    ///
+    /// Defaults EMPTY, and that is the whole reason this is a setting
+    /// rather than a detection. `claudify_command` records why nothing
+    /// is spawned today: macOS has no default-terminal concept, so a
+    /// machine with both Terminal.app and iTerm gives no way to know
+    /// which the user wants. That argument rules out guessing; it does
+    /// not rule out asking once. Unset, the app behaves exactly as it
+    /// did -- the buttons copy, and no launch affordance appears.
+    #[serde(default)]
+    pub terminal_command: String,
     /// Whether to write the verbose `[diag]` timing log.
     ///
     /// Added in v3.5.3 to diagnose a slow review query on one machine,
@@ -374,6 +390,9 @@ impl Default for UiPrefs {
             // this installs hooks into another tool's config file, which
             // is a thing to be asked for rather than assumed on upgrade.
             claude_integrations_enabled: false,
+            // Empty: no terminal configured, so the buttons copy
+            // exactly as they always have.
+            terminal_command: String::new(),
             // Announcing is the point of checking. The status bar has
             // always shown the hint and it was easy to miss; a user who
             // finds the dialog intrusive can turn it off, which is what

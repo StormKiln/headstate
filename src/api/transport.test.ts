@@ -155,6 +155,15 @@ const ROWS: Row[] = [
   row(api.unlockWorktree, [repoPath, worktreePath], "unlock_worktree", { repoPath, worktreePath }),
   row(api.pruneWorktrees, [repoPath], "prune_worktrees", { repoPath }),
   row(api.claudifyCommand, [repoPath, worktreePath, branch], "claudify_command", { repoPath, worktreePath, branch }),
+  row(api.claudeLaunchWorktree, [repoPath, worktreePath, branch], "claude_launch_worktree", {
+    repoPath,
+    worktreePath,
+    branch,
+  }),
+  row(api.claudeLaunchSession, ["sess-1", "/tmp/x"], "claude_launch_session", {
+    sessionId: "sess-1",
+    cwd: "/tmp/x",
+  }),
   row(api.setAutoMerge, [id, repo, number, expectedHead, enable], "set_auto_merge", { id, repo, number, expectedHead, enable }),
   row(api.deleteHeadBranch, [refId, repo, number, branch, merged], "delete_head_branch", { refId, repo, number, branch, merged }),
   row(api.updatePrBranch, [id, repo, number, expectedHead], "update_pr_branch", { id, repo, number, expectedHead }),

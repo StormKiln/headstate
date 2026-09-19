@@ -72,6 +72,8 @@ pub mod export;
 pub mod handoff;
 pub mod hook;
 pub mod install;
+/// Opening the user's configured terminal on a built command (#1126).
+pub mod launch;
 pub mod live;
 pub mod liveness;
 pub mod overview;

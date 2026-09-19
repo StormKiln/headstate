@@ -22,8 +22,9 @@ import {
   useClaudeSessions,
   useClaudeTranscriptTail,
   useWorktrees,
+  useUiPrefs,
 } from "@/api/hooks";
-import { claudeRevealPath } from "@/api/tauri";
+import { claudeLaunchSession, claudeRevealPath } from "@/api/tauri";
 import { current } from "@/lib/ariaCurrent";
 import { copyText } from "@/lib/clipboard";
 import { IS_MOBILE_BUILD } from "@/lib/target";
@@ -1479,6 +1480,36 @@ function SessionDetail({
         : toast.error(`Could not copy the ${what.toLowerCase()}`, { description: failure }),
     );
   };
+  /// Whether a terminal is configured (#1126).
+  ///
+  /// Empty is the default: the buttons copy and no launch affordance
+  /// appears, which is the behaviour every build had until now. Never
+  /// on the phone -- `claude_launch_session` is `Class::Local`, so the
+  /// remote surface refuses it and the button would only ever error.
+  const { prefs } = useUiPrefs();
+  const terminalConfigured =
+    !IS_MOBILE_BUILD && (prefs?.terminal_command ?? "").trim() !== "";
+
+  /// Open a session's resume command in the configured terminal.
+  ///
+  /// Offers copy as the remedy rather than silently falling back to it:
+  /// a launch that quietly copied instead would leave the user watching
+  /// for a terminal that never opens.
+  const launchResume = (sessionId: string, cwd: string | null) => {
+    void claudeLaunchSession(sessionId, cwd).then(
+      () => toast.success("Opening the session in your terminal"),
+      (e: unknown) =>
+        toast.error("Could not open your terminal", {
+          description: errorMessage(e),
+          action: {
+            label: "Copy instead",
+            onClick: () =>
+              detail.data ? copy(detail.data.resume.command, "Resume command") : undefined,
+          },
+        }),
+    );
+  };
+
   const reveal = (path: string, what: string) => {
     void claudeRevealPath(path).then(
       (shown) => toast.success(`Revealed ${shown}`),
@@ -1516,7 +1547,14 @@ function SessionDetail({
         <p className="text-xs text-[#8b949e]">Reading the rest of this session…</p>
       ) : (
         <>
-          <SessionBody session={s} detail={detail.data} copy={copy} reveal={reveal} />
+          <SessionBody
+            session={s}
+            detail={detail.data}
+            copy={copy}
+            reveal={reveal}
+            launchResume={launchResume}
+            terminalConfigured={terminalConfigured}
+          />
           {/* Directly after "where it ran", because it answers the
               question a reader asks next: did this session ship
               anything. Headstate knew about pull requests and knew about
@@ -1771,18 +1809,31 @@ function SessionBody({
   detail: d,
   copy,
   reveal,
+  launchResume,
+  terminalConfigured,
 }: {
   session: ClaudeSession;
   detail: ClaudeSessionDetail;
   copy: (value: string, what: string) => void;
   reveal: (path: string, what: string) => void;
+  /// Open the resume command in the configured terminal (#1126).
+  launchResume: (sessionId: string, cwd: string | null) => void;
+  /// Whether a terminal is configured, which decides whether the
+  /// primary button launches or copies.
+  terminalConfigured: boolean;
 }) {
   // A fragment, not a wrapper: `SessionDetail` owns the column gap so
   // that `WorktreeJump` is spaced from these sections by the same rule
   // they are spaced from each other.
   return (
     <>
-      <Resume session={s} detail={d} onCopy={copy} />
+      <Resume
+        session={s}
+        detail={d}
+        onCopy={copy}
+        onLaunch={launchResume}
+        terminalConfigured={terminalConfigured}
+      />
 
       <section className="rounded-md border border-[#30363d] bg-[#161b22] p-3">
         <h3 className="text-xs font-semibold text-[#e6edf3]">Where it ran</h3>
@@ -2434,9 +2485,11 @@ function formatMb(bytes: number): string {
 ///
 /// # It is NOT the resume path
 ///
-/// The primary action stays the clipboard copy, for the reason
-/// `claudify_command` records: macOS has no default-terminal concept. This
-/// pane is for deciding, not for doing.
+/// The primary action is whatever the Resume section's is -- a copy, or
+/// the configured terminal once one is set (#1126). It is not decided
+/// HERE: this pane is for deciding, not for doing, and `Resume` owns
+/// that button. Nothing is guessed either way, which is the part of
+/// `claudify_command`'s reasoning that still holds.
 /// What the hook recorded about this session's failures and denials
 /// (#1062, #1063, #1064).
 ///
@@ -2955,6 +3008,8 @@ function Resume({
   session: s,
   detail: d,
   onCopy,
+  onLaunch,
+  terminalConfigured,
 }: {
   session: ClaudeSession;
   /// The command itself, built on the backend against the cwd's state.
@@ -2963,6 +3018,14 @@ function Resume({
   /// payload -- the single largest field.
   detail: ClaudeSessionDetail;
   onCopy: (value: string, what: string) => void;
+  /// Open the resume command in the configured terminal (#1126).
+  ///
+  /// Takes the id and cwd rather than the built command: Rust rebuilds
+  /// it, so this can never become "run this text in a terminal".
+  onLaunch: (sessionId: string, cwd: string | null) => void;
+  /// Whether a terminal is configured, which decides what the primary
+  /// button does and whether a separate Copy is offered beside it.
+  terminalConfigured: boolean;
 }) {
   if (s.liveness.state === "running") {
     return (
@@ -3018,26 +3081,65 @@ function Resume({
           open somewhere. Resuming it then starts a second copy.
         </p>
       ) : null}
-      <button
-        type="button"
-        onClick={() =>
-          onCopy(d.resume.command, anchored ? "Resume command" : "Resume command (no directory)")
-        }
-        className={`tap-target mt-2 rounded-md px-2 py-1 text-xs ${
-          anchored
-            ? "bg-[#1f6feb] text-white hover:bg-[#388bfd]"
-            : "border border-[#30363d] bg-[#21262d] text-[#e6edf3] hover:bg-[#30363d]"
-        }`}
-      >
-        {anchored ? "Copy resume command" : "Copy anyway"}
-      </button>
-      {/* No terminal is spawned, and that is a decision rather than a
-          gap -- `claudify_command` records it: macOS has no
-          default-terminal concept, so the app would have to guess, while
-          the clipboard works everywhere and lands the user in their own
-          shell. */}
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          // Launches when a terminal is configured, copies otherwise
+          // (#1126). One button either way: a permanent second button
+          // that most users can never use is the thing the setting
+          // exists to avoid.
+          onClick={() =>
+            terminalConfigured
+              ? onLaunch(s.session_id, s.cwd ?? null)
+              : onCopy(
+                  d.resume.command,
+                  anchored ? "Resume command" : "Resume command (no directory)",
+                )
+          }
+          className={`tap-target rounded-md px-2 py-1 text-xs ${
+            anchored
+              ? "bg-[#1f6feb] text-white hover:bg-[#388bfd]"
+              : "border border-[#30363d] bg-[#21262d] text-[#e6edf3] hover:bg-[#30363d]"
+          }`}
+        >
+          {terminalConfigured
+            ? anchored
+              ? "Resume in terminal"
+              : "Resume anyway"
+            : anchored
+              ? "Copy resume command"
+              : "Copy anyway"}
+        </button>
+        {/* Copy stays reachable whenever the button no longer does it.
+            The configured terminal is one user's choice of one tool,
+            and the raw string is what you need to paste elsewhere,
+            read before running, or hand to someone else. */}
+        {terminalConfigured ? (
+          <button
+            type="button"
+            onClick={() =>
+              onCopy(
+                d.resume.command,
+                anchored ? "Resume command" : "Resume command (no directory)",
+              )
+            }
+            className="tap-target rounded-md border border-[#30363d] px-2 py-1 text-xs text-[#8b949e] hover:bg-[#21262d] hover:text-[#e6edf3]"
+          >
+            Copy
+          </button>
+        ) : null}
+      </div>
+      {/* What happens next, which differs by whether a terminal is set.
+          The old sentence -- "Headstate does not open one for you" --
+          was true for every build until #1126 and would now be a
+          statement the app contradicts the moment the button is
+          pressed. `claudify_command`'s reasoning still holds for the
+          DEFAULT: nothing is guessed, and this opens only what the user
+          configured. */}
       <p className="mt-1.5 text-[11px] text-[#8b949e]">
-        Paste it into your own terminal — Headstate does not open one for you.
+        {terminalConfigured
+          ? "Opens in the terminal you configured in Settings."
+          : "Paste it into your own terminal — Headstate opens one only if you configure it in Settings."}
       </p>
     </section>
   );
