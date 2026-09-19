@@ -35,6 +35,7 @@ import {
   totalSize,
   canClaudify,
   submoduleNote,
+  reclaimable,
   isPending,
   isSafe,
   pathBasename,
@@ -2110,6 +2111,13 @@ export function WorktreesPage() {
 
   const shownSafe = shown.filter(removable);
   const safeCount = shownSafe.length;
+  /// What those rows are holding on disk (#1181).
+  ///
+  /// From `shownSafe` and not a second pass over `shown`: that list is
+  /// already gated on safety AND on whether a Claude session is working
+  /// in the tree, so the figure describes exactly the rows the Remove
+  /// button would act on.
+  const reclaim = reclaimable(shownSafe);
   /// Stale registrations, counted and labelled SEPARATELY from "safe to
   /// remove" (#793).
   ///
@@ -2231,6 +2239,24 @@ export function WorktreesPage() {
         ) : (
           <span className="inline-flex items-center text-xs text-[#3fb950]">
             {safeCount} safe to remove
+            {/* WHAT IT IS WORTH, which is the whole point of #1181.
+                The app knew every row's size and every row's merge
+                state and never put the two together, so the highest-
+                value cleanup signal on a machine that works this way --
+                "these merged worktrees are holding 124 GB" -- had to be
+                computed by hand with `du` and `gh pr list`.
+
+                "at least" when any of those rows has no size: an
+                unmeasured worktree contributes nothing to the total,
+                and presenting a floor as a total would understate it
+                silently (#846). */}
+            {safeCount > 0 && reclaim.bytes > 0 ? (
+              <span className="text-[#8b949e]">
+                {" "}
+                — {reclaim.unmeasured > 0 ? "at least " : ""}
+                {formatSize(reclaim.bytes)} to reclaim
+              </span>
+            ) : null}
             {/* This view deletes directories on the strength of a
                 one-line verdict. The rules behind it run to several
                 paragraphs and lived only in source comments. */}
