@@ -35,6 +35,10 @@ pub const SURFACE: &[(&str, Class)] = &[
     // points at (`reveal_log`) stays Local, which is why the companion
     // says the log opens at that Mac.
     ("background_panicked", Class::Read),
+    // Read: spawns four `--version` probes and returns what they said.
+    // A question about the DESKTOP's toolchain, which a phone
+    // diagnosing "why are there no worktrees" reasonably asks (#1154).
+    ("tool_versions", Class::Read),
     ("get_auth_state", Class::Read),
     ("get_cached", Class::Read),
     ("get_cached_reviewing", Class::Read),

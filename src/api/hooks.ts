@@ -37,8 +37,10 @@ import type {
   WorktreeScan,
 } from "../types/pr";
 import type {
+  ToolReport,
   ClaudeDefinitions, ClaudeEffectiveSettings, PrActionName } from "./tauri";
 import {
+  toolVersions,
   backgroundPanicked,
   claudeHooksInventory,
   claudeMdEffective,
@@ -3509,6 +3511,20 @@ export function useClaudeEffectiveSettings(repoPath: string | undefined, enabled
     enabled: enabled && Boolean(repoPath),
     staleTime: 5_000,
     refetchOnWindowFocus: true,
+    retry: false,
+  });
+}
+
+/// What version of each external tool this machine has (#1154).
+///
+/// `staleTime: Infinity`: the answer changes when a user installs
+/// something, which is not during a session. Refetching on focus would
+/// spawn four processes for a figure that has not moved.
+export function useToolVersions() {
+  return useQuery<ToolReport[]>({
+    queryKey: ["tool-versions"],
+    queryFn: toolVersions,
+    staleTime: Infinity,
     retry: false,
   });
 }
