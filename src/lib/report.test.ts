@@ -90,3 +90,65 @@ describe("issueUrl", () => {
     expect(issueUrl("x")).toContain("issues/new?");
   });
 });
+
+/// The context added in #1148: view, diagnostics and component stack.
+describe("buildReport carries what the user cannot describe", () => {
+  const base = { version: "1.0", platform: "macos", arch: "arm64", error: "boom" };
+
+  it("includes the component stack under its own heading", () => {
+    // The single most valuable thing in a crash report, and until now
+    // it existed only in a console nobody has open on a release build.
+    const body = buildReport({ ...base, componentStack: "\n    at DockerPage\n    at App" });
+    expect(body).toContain("### Where");
+    expect(body).toContain("at DockerPage");
+  });
+
+  it("omits the stack section entirely when there is none", () => {
+    // An empty code block reads as "no stack was captured", which is a
+    // claim. Omitting the section says nothing, which is the truth.
+    const body = buildReport(base);
+    expect(body).not.toContain("### Where");
+  });
+
+  it("scrubs the component stack like every other field", () => {
+    // A stack carries file paths in a dev build, and the scrub table is
+    // the second line of defence precisely for fields written by code
+    // this module does not control.
+    const body = buildReport({
+      ...base,
+      componentStack: "at Foo (/Users/octocat/Components.tsx:12)",
+    });
+    expect(body).not.toContain("/Users/acme");
+    expect(body).toContain("[path]");
+  });
+
+  it("bounds a very deep stack", () => {
+    // A GitHub URL has a practical length limit, past which the form
+    // opens truncated or not at all -- worse than a short stack.
+    const deep = Array.from({ length: 500 }, (_, i) => `    at Component${i}`).join("\n");
+    const body = buildReport({ ...base, componentStack: deep });
+    expect(body.length).toBeLessThan(6000);
+    // And it keeps the TOP frames, which are the useful ones.
+    expect(body).toContain("at Component0");
+    expect(body).not.toContain("at Component499");
+  });
+
+  it("names the view when it is known", () => {
+    expect(buildReport({ ...base, view: "Docker images" })).toContain("On the Docker images view");
+  });
+
+  it("says nothing about the view when it is not known", () => {
+    // A boot failure has no view to name, and guessing one would be a
+    // claim about where the user was.
+    expect(buildReport(base)).not.toContain("On the");
+  });
+
+  it("distinguishes diagnostics off from diagnostics unknown", () => {
+    // THREE states, not two (#1042). "Could not read the setting" is
+    // not "it was off", and a maintainer's first reply differs: one is
+    // "please turn this on", the other means a log already exists.
+    expect(buildReport({ ...base, diagnostics: true })).toContain("Diagnostic logging was on");
+    expect(buildReport({ ...base, diagnostics: false })).toContain("Diagnostic logging was off");
+    expect(buildReport(base)).not.toContain("Diagnostic logging");
+  });
+});

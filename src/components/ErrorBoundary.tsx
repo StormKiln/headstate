@@ -1,5 +1,6 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
 import { QueryError } from "./QueryError";
+import { ReportLink } from "./ReportLink";
 import { dismissSplash } from "../splash";
 
 /// Last-resort catch for a render-time throw.
@@ -26,12 +27,23 @@ interface Props {
 
 interface State {
   error: Error | null;
+  /// The component stack, for the report (#1148).
+  ///
+  /// Separate from `error` because the two arrive at different times:
+  /// `getDerivedStateFromError` gets the error and NOT the stack, and
+  /// `componentDidCatch` runs afterwards with the stack. `null` means
+  /// either not caught yet or React did not supply one -- the report
+  /// omits the section rather than printing an empty block.
+  componentStack: string | null;
 }
 
 export class ErrorBoundary extends Component<Props, State> {
-  state: State = { error: null };
+  state: State = { error: null, componentStack: null };
 
-  static getDerivedStateFromError(error: Error): State {
+  static getDerivedStateFromError(error: Error): Partial<State> {
+    // NOT the stack: `getDerivedStateFromError` does not receive it.
+    // `componentDidCatch` runs after and adds it, which is why the two
+    // live in separate state fields rather than one object.
     return { error };
   }
 
@@ -40,6 +52,13 @@ export class ErrorBoundary extends Component<Props, State> {
     // actually locates the throw. Kept even though the UI shows the
     // message: the message alone did not identify the file in #244.
     console.error("Unhandled render error:", error, info.componentStack);
+
+    // And kept in state, so "Report this" can attach it (#1148). The
+    // stack is the single most valuable thing in a crash report and
+    // until now it existed only in a console nobody has open on a
+    // release build -- so the user's report said "it showed a red box"
+    // and the maintainer had nothing to go on.
+    this.setState({ componentStack: info.componentStack ?? null });
 
     // The splash is a fixed, inset-0, z-index-9999 overlay dismissed only
     // by AuthGate's settled-auth effect. A crash before that point renders
@@ -65,13 +84,29 @@ export class ErrorBoundary extends Component<Props, State> {
       <div className="flex h-screen items-center justify-center bg-[#0d1117] p-8 text-[#e6edf3]">
         <div className="w-full max-w-lg">
           <QueryError title="Something went wrong" message={error.message}>
-            <button
-              type="button"
-              onClick={this.handleReset}
-              className="mt-4 rounded border border-[#30363d] px-3 py-1.5 text-sm text-[#e6edf3] hover:bg-[#161b22]"
-            >
-              Reset and reload
-            </button>
+            <div className="mt-4 flex items-center justify-center gap-3">
+              <button
+                type="button"
+                onClick={this.handleReset}
+                className="rounded border border-[#30363d] px-3 py-1.5 text-sm text-[#e6edf3] hover:bg-[#161b22]"
+              >
+                Reset and reload
+              </button>
+              {/* Beside the remedy, not instead of it. A crash is the
+                  error most worth reporting and the one the user is
+                  least able to describe -- their only route was to
+                  recall a red box from memory (#1148).
+
+                  No `view`: this boundary sits above `AuthGate` and
+                  `QueryClientProvider`, so a throw here may be a boot
+                  failure with no view to name. Naming one would be a
+                  guess, and an omitted line is honest. */}
+              <ReportLink
+                error={error.message}
+                componentStack={this.state.componentStack ?? undefined}
+                className="text-sm underline hover:no-underline"
+              />
+            </div>
           </QueryError>
         </div>
       </div>

@@ -1,6 +1,6 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { buildTarget } from "../api/tauri";
-import { buildReport, issueUrl } from "./report";
+import { buildReport, issueUrl, type ReportContext } from "./report";
 
 /// The prefilled issue URL for an error the user just saw.
 ///
@@ -15,25 +15,39 @@ import { buildReport, issueUrl } from "./report";
 /// Returns a URL rather than opening one: the caller renders it as an
 /// `ExternalLink`, which is how every external link in the app reaches
 /// the browser.
-export async function reportUrl(error: string): Promise<string> {
+export async function reportUrl(error: string, extra: ReportExtra = {}): Promise<string> {
   const [version, target] = await Promise.all([
     settled(getVersion(), "unknown"),
     settled(buildTarget(), ["unknown", "unknown"] as [string, string]),
   ]);
   const [platform, arch] = target;
-  return issueUrl(buildReport({ version, platform, arch, error }));
+  return issueUrl(buildReport({ version, platform, arch, error, ...extra }));
 }
+
+/// What the CALLER knows that the environment lookups cannot find.
+///
+/// Passed in rather than read here: the view lives in a store and the
+/// diagnostics flag in a query, and reaching into either from a
+/// non-React module would make this untestable and would couple a
+/// helper to a hook. The boundary that catches the error already has
+/// both.
+export type ReportExtra = Pick<ReportContext, "view" | "diagnostics" | "componentStack">;
 
 /// A report with just the error, for the instant the banner appears.
 ///
 /// The environment lookups are asynchronous; this is what the link
 /// carries until they answer, so it is never absent.
-export function errorOnlyReport(error: string): string {
+export function errorOnlyReport(error: string, extra: ReportExtra = {}): string {
   return buildReport({
     version: "unknown",
     platform: "unknown",
     arch: "unknown",
     error,
+    // The caller's context is NOT a lookup -- it is already in hand, so
+    // it belongs in the immediate URL too. Omitting it here would mean
+    // a user who clicked before the environment resolved filed a report
+    // missing the component stack, which is the most valuable part.
+    ...extra,
   });
 }
 
