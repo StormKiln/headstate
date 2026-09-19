@@ -11,6 +11,8 @@ const removeFn = vi.hoisted(() =>
   ),
 );
 const state = vi.hoisted(() => ({
+  /// Directory-walk progress, for the streaming tests (#1151).
+  walk: undefined as { found: number; visited: number; max_dirs: number } | undefined,
   venvs: [] as Venv[],
   sizes: new Map<string, number>(),
   idle: new Map<string, number>(),
@@ -46,6 +48,9 @@ const refetchFn = vi.hoisted(() => vi.fn());
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 vi.mock("../api/hooks", () => ({
+  // No walk progress by default: the settled state, which every other
+  // assertion here assumes (#1151).
+  useVenvWalkProgress: () => state.walk,
   useVenvs: () => ({
     data: state.venvs,
     isLoading: state.loading,
@@ -832,5 +837,37 @@ describe("VenvSection's confirmation wording", () => {
       const box = screen.getByLabelText(/Select here virtualenv/) as HTMLInputElement;
       expect(box.disabled).toBe(false);
     });
+  });
+});
+
+/// Progress through the 26-second directory walk (#1151).
+describe("VenvSection while the walk runs", () => {
+  beforeEach(() => {
+    state.loading = true;
+    state.walk = undefined;
+  });
+
+  it("says only that it is looking before the first event", () => {
+    // "0 directories" reads as a walk that has stalled, which is the
+    // opposite of what an unstarted scan means.
+    render(<VenvSection />);
+    expect(screen.getByText(/Looking for Poetry virtualenvs…/)).toBeTruthy();
+    expect(screen.queryByText(/0 directories/)).toBeNull();
+  });
+
+  it("reports a rising directory count, not a percentage", () => {
+    // The walk discovers the tree as it goes and has no denominator, so
+    // a fabricated percentage would stick or jump. This scan is
+    // measured at 26 seconds over 28,144 directories.
+    state.walk = { found: 41, visited: 12_400, max_dirs: 2_000_000 };
+    render(<VenvSection />);
+    expect(screen.getByText(/12,400 directories, 41 projects/)).toBeTruthy();
+    expect(screen.queryByText(/%/)).toBeNull();
+  });
+
+  it("gets the singular right for one project", () => {
+    state.walk = { found: 1, visited: 30, max_dirs: 2_000_000 };
+    render(<VenvSection />);
+    expect(screen.getByText(/1 project\b/)).toBeTruthy();
   });
 });

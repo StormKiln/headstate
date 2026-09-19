@@ -777,6 +777,96 @@ export function useReplyToThread() {
 /// passes differ by three orders of magnitude and blocking the list on
 /// the slow one would leave the view empty for a minute -- the exact
 /// complaint that shaped the worktree page.
+/// How far a scan has got, for the page that would otherwise show an
+/// unqualified spinner (#1151).
+export interface ScanProgress {
+  roots_done: number;
+  roots_total: number;
+  found: number;
+}
+
+/// Progress through the project-directory walk.
+///
+/// `visited` rather than a percentage: the walk discovers the tree as
+/// it goes and has no denominator, and a fabricated percentage that
+/// sticks at 90% is worse than an honest rising count.
+export interface WalkProgress {
+  found: number;
+  visited: number;
+  max_dirs: number;
+}
+
+/// A root the scan could not read.
+export interface FailedRoot {
+  root: string;
+  why: string;
+}
+
+/// The latest progress event of a kind, or undefined before the first.
+///
+/// NOT coalesced, and it does not need to be: progress is a single
+/// latest value, so `setState` with the newest payload is already one
+/// render per event -- and the Rust side emits one per root (artifacts)
+/// or one per 200 directories (venvs) precisely so there is no burst to
+/// absorb. `useStreamingSizes` coalesces because it accumulates ~295
+/// distinct entries; this replaces one.
+///
+/// `undefined` means no event has arrived yet, which the caller must
+/// render as "starting" rather than as zero progress -- a "0 of 0"
+/// reads as a scan that found nothing to do.
+function useLatestEvent<T>(event: string, enabled: boolean): T | undefined {
+  const [latest, setLatest] = useState<T | undefined>(undefined);
+  useEffect(() => {
+    if (!enabled) return;
+    let cancelled = false;
+    let unlisten: UnlistenFn | undefined;
+    listen<T>(event, (e) => {
+      if (!cancelled) setLatest(e.payload);
+    }).then(
+      (fn) => {
+        if (cancelled) safeUnlisten(fn);
+        else unlisten = fn;
+      },
+      () => {},
+    );
+    return () => {
+      cancelled = true;
+      safeUnlisten(unlisten);
+    };
+  }, [event, enabled]);
+  // Gated on `enabled` at READ time rather than cleared in the effect.
+  //
+  // Clearing would be a synchronous `setState` in an effect, which is a
+  // cascading render. This rules out the same thing -- a figure from
+  // the previous scan shown against the next one -- for free, because a
+  // disabled hook returns nothing whatever is left in state.
+  //
+  // An `enabled`-tagged payload was tried and removed: the tag is
+  // written inside an effect that has already returned early when
+  // disabled, so it is always `true` and the comparison can never fail.
+  return enabled ? latest : undefined;
+}
+
+/// How far the artifact scan has got (#1151).
+export function useArtifactScanProgress(enabled: boolean) {
+  return useLatestEvent<ScanProgress>("artifact-scan-progress", enabled);
+}
+
+/// Roots the artifact scan could not read.
+///
+/// Separate from the progress, because they answer different questions
+/// and only one of them stops being true when the scan finishes: the
+/// progress is transient, and "we could not read /Volumes/code" is a
+/// fact about the result the user is now looking at.
+export function useArtifactScanFailures(enabled: boolean) {
+  return useLatestEvent<FailedRoot[]>("artifact-scan-failed-roots", enabled);
+}
+
+/// How far the virtualenv directory walk has got (#1151).
+export function useVenvWalkProgress(enabled: boolean) {
+  return useLatestEvent<WalkProgress>("venv-walk-progress", enabled);
+}
+
 /// A stored scan for the cold start, parsed, or undefined (#1152).
 ///
 /// # Why this is a separate query rather than `initialData`

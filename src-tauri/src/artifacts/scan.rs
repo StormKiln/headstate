@@ -29,20 +29,89 @@ const MAX_DEPTH: usize = 4;
 /// at 56 seconds against 54ms to find them, so the two are separate
 /// passes and the UI renders the first while the second runs.
 pub fn scan(roots: &[String]) -> Vec<Artifact> {
+    scan_streaming(roots, &mut |_| {}).0
+}
+
+/// What a scan could not read.
+///
+/// A root that failed is NOT silently omitted (#1151). The walk swallows
+/// an unreadable directory deep in a tree -- one permission-denied
+/// `node_modules` is not worth a banner -- but a whole ROOT that could
+/// not be opened means the scan did not cover what the user configured,
+/// and reporting "no build output found" for it is the confident wrong
+/// answer this codebase keeps having to remove (#846).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FailedRoot {
+    pub root: String,
+    pub why: String,
+}
+
+/// Progress, as the walk makes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ScanProgress {
+    /// Roots finished so far.
+    pub roots_done: usize,
+    /// Roots in total, so the UI can say "3 of 4" rather than a count
+    /// with no denominator.
+    pub roots_total: usize,
+    /// Artifact directories found so far.
+    pub found: usize,
+}
+
+/// [`scan`], reporting as it goes.
+///
+/// The worktree pages solved the indefinite-spinner problem twice (#754,
+/// #830) and the fix was never carried across: this walk takes ~1.5 s
+/// over 178 directories on a 221 GB tree with no signal at all, and the
+/// venv equivalent 9-40 s.
+///
+/// `report` is called per ROOT completed rather than per directory
+/// found. Per-directory would be 178 events for a 1.5 s walk, which is
+/// the render storm the coalescer (#1150) exists to absorb -- and the
+/// number that actually answers "is it stuck" is how many roots are
+/// left, not how many directories have gone by.
+///
+/// Returns the failed roots alongside the artifacts, because a caller
+/// that only got a `Vec` could not tell a clean machine from one it
+/// could not read.
+pub fn scan_streaming(
+    roots: &[String],
+    report: &mut dyn FnMut(ScanProgress),
+) -> (Vec<Artifact>, Vec<FailedRoot>) {
     let mut out = Vec::new();
-    for root in roots {
-        walk(Path::new(root), Path::new(root), 0, &mut out);
+    let mut failed = Vec::new();
+    for (i, root) in roots.iter().enumerate() {
+        let dir = Path::new(root);
+        // Checked BEFORE walking, because `walk` cannot distinguish "an
+        // empty root" from "a root I could not open" -- it returns the
+        // same empty result for both.
+        match std::fs::read_dir(dir) {
+            Ok(_) => walk(dir, dir, 0, &mut out),
+            Err(e) => failed.push(FailedRoot {
+                root: root.clone(),
+                why: e.to_string(),
+            }),
+        }
+        report(ScanProgress {
+            roots_done: i + 1,
+            roots_total: roots.len(),
+            found: out.len(),
+        });
     }
     // Deterministic order, so a rescan does not visibly reshuffle rows
     // that have not changed.
     out.sort_by(|a, b| a.path.cmp(&b.path));
-    out
+    (out, failed)
 }
 
 fn walk(dir: &Path, root: &Path, depth: usize, out: &mut Vec<Artifact>) {
     if depth > MAX_DEPTH {
         return;
     }
+    // Swallowed deliberately, and only HERE. A permission-denied
+    // directory deep in a tree is ordinary and not worth a banner; a
+    // whole root that could not be opened is a different claim, and
+    // `scan_streaming` checks that separately before calling this.
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -632,5 +701,128 @@ dist/
         ] {
             assert!(!k.regenerated_by().is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+
+    struct Tmp(std::path::PathBuf);
+    impl Tmp {
+        fn new(name: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("headstate-scan-{name}"));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+        fn s(&self) -> String {
+            self.0.to_string_lossy().into_owned()
+        }
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_root_that_cannot_be_opened_is_reported_rather_than_omitted() {
+        // THE rule (#1151, #846). A root the scan could not read
+        // contributes nothing, and reporting "no build output found"
+        // for it is the confident wrong answer -- the user configured
+        // that directory and would reasonably read an empty list as an
+        // answer about it.
+        let (found, failed) = scan_streaming(
+            &["/definitely/not/a/directory/anywhere".to_string()],
+            &mut |_| {},
+        );
+        assert!(found.is_empty());
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].root.contains("definitely/not"));
+        assert!(!failed[0].why.is_empty(), "the reason must travel too");
+    }
+
+    #[test]
+    fn a_readable_root_is_not_reported_as_failed() {
+        // The other direction: an EMPTY root is a real answer, not a
+        // failure, and flagging it would teach the user to ignore the
+        // warning that matters.
+        let t = Tmp::new("empty");
+        let (found, failed) = scan_streaming(&[t.s()], &mut |_| {});
+        assert!(found.is_empty());
+        assert!(failed.is_empty(), "{failed:?}");
+    }
+
+    #[test]
+    fn one_failed_root_does_not_stop_the_others() {
+        // A scan that abandoned the remaining roots would lose real
+        // results over one unreadable path.
+        let t = Tmp::new("mixed");
+        std::fs::create_dir_all(t.0.join("proj/target")).unwrap();
+        std::fs::write(t.0.join("proj/Cargo.toml"), b"").unwrap();
+
+        let (found, failed) = scan_streaming(&["/nope/nowhere".to_string(), t.s()], &mut |_| {});
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            found.len(),
+            1,
+            "the good root's artifact must survive: {found:?}"
+        );
+    }
+
+    #[test]
+    fn progress_is_reported_once_per_root_with_a_denominator() {
+        // "3 of 4 roots" rather than a count with nothing to compare it
+        // to -- the number that answers "is it stuck".
+        let a = Tmp::new("p1");
+        let b = Tmp::new("p2");
+        let mut seen: Vec<ScanProgress> = Vec::new();
+        scan_streaming(&[a.s(), b.s()], &mut |p| seen.push(p));
+
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].roots_done, 1);
+        assert_eq!(seen[1].roots_done, 2);
+        assert!(seen.iter().all(|p| p.roots_total == 2));
+    }
+
+    #[test]
+    fn a_failed_root_still_advances_the_progress_count() {
+        // Otherwise the bar stalls at "2 of 4" forever on a machine
+        // with an unreadable root, which is the stuck-looking state
+        // this whole issue is about.
+        let t = Tmp::new("adv");
+        let mut seen: Vec<ScanProgress> = Vec::new();
+        scan_streaming(&["/nope/nowhere".to_string(), t.s()], &mut |p| seen.push(p));
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen.last().unwrap().roots_done, 2);
+    }
+
+    #[test]
+    fn the_final_order_is_still_deterministic() {
+        // `scan`'s own comment: "so a rescan does not visibly reshuffle
+        // rows that have not changed". Streaming must not cost that.
+        let t = Tmp::new("order");
+        for n in ["zeta", "alpha", "middle"] {
+            std::fs::create_dir_all(t.0.join(n).join("target")).unwrap();
+            std::fs::write(t.0.join(n).join("Cargo.toml"), b"").unwrap();
+        }
+        let (found, _) = scan_streaming(&[t.s()], &mut |_| {});
+        let paths: Vec<&str> = found.iter().map(|a| a.path.as_str()).collect();
+        let mut sorted = paths.clone();
+        sorted.sort_unstable();
+        assert_eq!(paths, sorted, "{paths:?}");
+    }
+
+    #[test]
+    fn the_non_streaming_scan_still_works_and_agrees() {
+        // `scan` is now a wrapper. If the two ever disagreed, every
+        // existing caller would silently change behaviour.
+        let t = Tmp::new("agree");
+        std::fs::create_dir_all(t.0.join("proj/target")).unwrap();
+        std::fs::write(t.0.join("proj/Cargo.toml"), b"").unwrap();
+        let plain = scan(&[t.s()]);
+        let (streamed, _) = scan_streaming(&[t.s()], &mut |_| {});
+        assert_eq!(plain, streamed);
     }
 }

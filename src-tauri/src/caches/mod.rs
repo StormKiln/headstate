@@ -47,6 +47,15 @@ const MAX_WALK: std::time::Duration = std::time::Duration::from_secs(10);
 /// one read, and this stops the vector growing without bound inside it.
 const MAX_DIRS: usize = 2_000_000;
 
+/// How many directories between progress reports (#1151).
+///
+/// 200, against a walk measured at 28,144 directories: that is ~140
+/// events for a 26-second scan, roughly five a second. Per-directory
+/// would be 28,144, which is the render storm the coalescer exists to
+/// absorb -- and a count stepping by 200 reads the same to a human as
+/// one stepping by 1.
+const REPORT_EVERY: usize = 200;
+
 /// Every directory under the scan roots that could have produced a venv,
 /// and whether the walk finished.
 ///
@@ -100,12 +109,58 @@ impl ProjectDirs {
 const SKIP: &[&str] = &[".git", "node_modules", "target", ".terraform", ".venv"];
 
 pub fn project_dirs(roots: &[String]) -> ProjectDirs {
+    project_dirs_streaming(roots, &mut |_| {})
+}
+
+/// Progress through the project-directory walk (#1151).
+///
+/// `dirs_visited` rather than a percentage: the walk has no denominator
+/// -- it discovers the tree as it goes -- and a fabricated percentage
+/// that jumps or sticks at 90% is worse than an honest rising count.
+/// The caps are carried so the UI can say how close the walk is to the
+/// limit that would truncate it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WalkProgress {
+    /// Project directories found so far.
+    pub found: usize,
+    /// Directories opened so far, which is the number that moves while
+    /// a deep tree yields nothing.
+    pub visited: usize,
+    /// The cap on `found`, past which the walk stops and suppresses
+    /// orphan detection.
+    pub max_dirs: usize,
+}
+
+/// [`project_dirs`], reporting as it goes.
+///
+/// This is the 26-second half of the venv scan -- measured at 28,144
+/// directories walked -- and it showed an unqualified spinner
+/// throughout. The worktree pages solved exactly this twice (#754,
+/// #830) and the fix was never carried across.
+///
+/// `report` is called every [`REPORT_EVERY`] directories rather than per
+/// directory: 28,144 events for one scan is the render storm the
+/// coalescer (#1150) exists to absorb, and a count that moves in steps
+/// of 200 reads the same to a human as one that moves by one.
+pub fn project_dirs_streaming(
+    roots: &[String],
+    report: &mut dyn FnMut(WalkProgress),
+) -> ProjectDirs {
     let deadline = std::time::Instant::now() + MAX_WALK;
     let mut out = Vec::new();
     let mut truncated = false;
+    let mut visited = 0usize;
     let mut stack: Vec<std::path::PathBuf> = roots.iter().map(std::path::PathBuf::from).collect();
 
     while let Some(dir) = stack.pop() {
+        visited += 1;
+        if visited.is_multiple_of(REPORT_EVERY) {
+            report(WalkProgress {
+                found: out.len(),
+                visited,
+                max_dirs: MAX_DIRS,
+            });
+        }
         if out.len() >= MAX_DIRS || std::time::Instant::now() > deadline {
             log::warn!(
                 "stopped walking project directories after {} entries; \
@@ -139,6 +194,15 @@ pub fn project_dirs(roots: &[String]) -> ProjectDirs {
             stack.push(e.path());
         }
     }
+    // The LAST report, unconditionally. Without it a walk shorter than
+    // `REPORT_EVERY` reports nothing at all, and every walk ends on a
+    // stale count -- the UI would show "1,800 visited" for a scan that
+    // finished at 1,847.
+    report(WalkProgress {
+        found: out.len(),
+        visited,
+        max_dirs: MAX_DIRS,
+    });
     ProjectDirs {
         dirs: out,
         truncated,
@@ -897,5 +961,77 @@ mod removal_tests {
         assert_eq!(out.len(), 2);
         assert!(out[0].error.is_none(), "{:?}", out[0].error);
         assert!(out[1].error.is_some());
+    }
+}
+
+#[cfg(test)]
+mod walk_progress_tests {
+    use super::*;
+
+    struct Tmp(std::path::PathBuf);
+    impl Tmp {
+        fn new(name: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("headstate-walk-{name}"));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+        fn s(&self) -> String {
+            self.0.to_string_lossy().into_owned()
+        }
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_short_walk_still_reports_once() {
+        // Without the unconditional final report, a walk shorter than
+        // `REPORT_EVERY` reports NOTHING -- the spinner this issue is
+        // about, unchanged, on every small tree.
+        let t = Tmp::new("short");
+        let mut seen: Vec<WalkProgress> = Vec::new();
+        project_dirs_streaming(&[t.s()], &mut |p| seen.push(p));
+        assert!(!seen.is_empty(), "a short walk must still report");
+    }
+
+    #[test]
+    fn the_last_report_carries_the_final_count() {
+        // Every walk otherwise ends on a stale number: the UI would
+        // show "1,800 visited" for a scan that finished at 1,847.
+        let t = Tmp::new("final");
+        for i in 0..5 {
+            std::fs::create_dir_all(t.0.join(format!("d{i}"))).unwrap();
+        }
+        let mut seen: Vec<WalkProgress> = Vec::new();
+        let out = project_dirs_streaming(&[t.s()], &mut |p| seen.push(p));
+        let last = seen.last().unwrap();
+        assert_eq!(last.found, out.dirs.len());
+        assert!(last.visited >= 1, "{last:?}");
+    }
+
+    #[test]
+    fn the_cap_travels_so_the_ui_can_say_how_close_it_is() {
+        // A walk that truncates suppresses orphan detection, and a user
+        // watching a count with no limit cannot tell it is about to.
+        let t = Tmp::new("cap");
+        let mut seen: Vec<WalkProgress> = Vec::new();
+        project_dirs_streaming(&[t.s()], &mut |p| seen.push(p));
+        assert_eq!(seen.last().unwrap().max_dirs, MAX_DIRS);
+    }
+
+    #[test]
+    fn the_non_streaming_walk_still_agrees() {
+        // `project_dirs` is now a wrapper; a disagreement would change
+        // every existing caller silently.
+        let t = Tmp::new("agree");
+        std::fs::create_dir_all(t.0.join("proj")).unwrap();
+        std::fs::write(t.0.join("proj/pyproject.toml"), b"").unwrap();
+        let plain = project_dirs(&[t.s()]);
+        let streamed = project_dirs_streaming(&[t.s()], &mut |_| {});
+        assert_eq!(plain.dirs, streamed.dirs);
+        assert_eq!(plain.truncated, streamed.truncated);
     }
 }

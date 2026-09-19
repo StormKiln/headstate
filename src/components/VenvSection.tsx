@@ -3,7 +3,13 @@ import { ActingOnDesktop } from "./ActingOnDesktop";
 import { useState } from "react";
 import { toast } from "sonner";
 import type { Venv, VenvState } from "@/types/pr";
-import { useRemoveVenvs, useUiPrefs, useVenvs, useVenvSizes } from "@/api/hooks";
+import {
+  useRemoveVenvs,
+  useUiPrefs,
+  useVenvs,
+  useVenvSizes,
+  useVenvWalkProgress,
+} from "@/api/hooks";
 import { staleVenvDays, staleVenvSecs } from "@/lib/staleVenv";
 import { formatSize } from "@/lib/worktrees";
 import { relativeSeconds } from "@/lib/time";
@@ -129,6 +135,10 @@ export function VenvSection() {
   // this renders an explicit retry, which is the pairing
   // `useStatsBoard`'s rule requires.
   const { data: venvs = [], isLoading, isError, error, refetch } = useVenvs(true);
+  /// How far the directory walk has got (#1151). Only while it runs: a
+  /// figure left on screen afterwards would describe a walk that is
+  /// over.
+  const walk = useVenvWalkProgress(isLoading);
   const { sizes, idle, measuring, pending, total, failed } = useVenvSizes(
     venvs,
     venvs.length > 0,
@@ -166,7 +176,24 @@ export function VenvSection() {
   if (isLoading) {
     return (
       <p className="px-1 py-2 text-xs text-[#8b949e]" aria-live="polite">
-        Looking for Poetry virtualenvs…
+        Looking for Poetry virtualenvs
+        {/* WITH progress (#1151). The comment above records this scan
+            at 26 SECONDS walking 28,144 directories, and it showed an
+            unqualified spinner for every one of them.
+
+            `visited` rather than a percentage: the walk discovers the
+            tree as it goes and has no denominator, so a fabricated
+            percentage would stick or jump. A rising count of directories
+            is honest and answers the only question being asked -- is it
+            still moving.
+
+            `undefined` renders as the plain sentence: "0 visited" reads
+            as a walk that has stalled, which is the opposite of what an
+            unstarted scan means. */}
+        {walk ? ` — ${walk.visited.toLocaleString()} directories, ${walk.found} project${
+          walk.found === 1 ? "" : "s"
+        }` : ""}
+        …
       </p>
     );
   }

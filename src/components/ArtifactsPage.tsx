@@ -5,6 +5,8 @@ import { HardDrive } from "lucide-react";
 import type { Artifact, ArtifactKind } from "@/types/pr";
 import {
   useArtifacts,
+  useArtifactScanFailures,
+  useArtifactScanProgress,
   useArtifactSizes,
   useCachedScan,
   useRemoveArtifacts,
@@ -198,6 +200,13 @@ export function ArtifactsPage() {
     error,
     refetch,
   } = useArtifacts(true);
+  /// How far the walk has got (#1151). Only while it is running: a
+  /// figure left on screen after the scan settles would describe a
+  /// result the page has already replaced.
+  const scanProgress = useArtifactScanProgress(isLoading);
+  /// Roots the scan could not read, which is a fact about the RESULT
+  /// and so outlives the progress figure.
+  const failedRoots = useArtifactScanFailures(true);
   // Read here only to decide the empty state; VenvSection owns the rest.
   const { data: venvList = [] } = useVenvs(true);
   const venvCount = venvList.length;
@@ -297,7 +306,7 @@ export function ArtifactsPage() {
     // A blank page for the ~1.5 s discovery plus ~56 s of sizing this
     // scan takes, every cold start. The previous result is not current
     // -- and it is strictly more than nothing, and those directories
-    // were there this morning.
+    // were there this morning (#1152).
     if (cached && cached.data.length > 0) {
       return (
         <ArtifactsFromCache
@@ -307,7 +316,22 @@ export function ArtifactsPage() {
         />
       );
     }
-    return <p className="p-4 text-sm text-[#8b949e]">Looking for build output…</p>;
+    // No previous scan: the spinner, but WITH progress so a walk the
+    // user cannot see the end of does not look stuck (#1151).
+    //
+    // `undefined` renders as the plain sentence rather than "0 of 0",
+    // which reads as a scan that found nothing to do.
+    return (
+      <p className="p-4 text-sm text-[#8b949e]">
+        Looking for build output
+        {scanProgress
+          ? ` — ${scanProgress.roots_done} of ${scanProgress.roots_total} folder${
+              scanProgress.roots_total === 1 ? "" : "s"
+            }, ${scanProgress.found} found`
+          : ""}
+        …
+      </p>
+    );
   }
 
   /// The failed artifact scan, as a panel rather than a page (#846).
@@ -322,6 +346,38 @@ export function ArtifactsPage() {
   ///
   /// Gated on `showArtifacts` for the same reason the loading arm is: on
   /// the virtualenv group page the artifact scan is not the subject.
+  /// Roots the scan could not read (#1151, #846).
+  ///
+  /// A panel rather than an early return, the same shape
+  /// `artifactsError` below uses and for the same reason: the roots
+  /// that DID read produced real results, and hiding them behind a
+  /// warning about one unreadable path replaces one silent loss with
+  /// another.
+  ///
+  /// Shown whatever the scan's outcome, because it qualifies the list
+  /// the user is looking at: an empty list for a configured directory
+  /// reads as an answer about that directory.
+  const failedRootsNotice =
+    failedRoots && failedRoots.length > 0 ? (
+      <div
+        className="mx-4 mt-3 rounded-md border border-[#d29922]/40 bg-[#d29922]/5 px-3 py-2 text-xs text-[#d29922]"
+        role="status"
+      >
+        <p className="font-semibold">
+          {failedRoots.length} configured folder{failedRoots.length === 1 ? "" : "s"} could not
+          be read, so anything under {failedRoots.length === 1 ? "it" : "them"} is missing from
+          this list.
+        </p>
+        <ul className="mt-1 space-y-0.5">
+          {failedRoots.map((f) => (
+            <li key={f.root} className="break-all text-[#8b949e]">
+              {f.root} — {f.why}
+            </li>
+          ))}
+        </ul>
+      </div>
+    ) : null;
+
   const artifactsError =
     isError && showArtifacts ? (
       <QueryError
@@ -375,6 +431,7 @@ export function ArtifactsPage() {
           once and let the eye take the reassuring one. The virtualenv
           section below is untouched and still renders, which is the whole
           reason this is a panel rather than an early return. */}
+      {failedRootsNotice}
       {artifactsError}
       {showArtifacts && !isError ? (
       // Wraps on the phone: six items on one 390px line broke "3
