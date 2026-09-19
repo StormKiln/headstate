@@ -257,7 +257,7 @@ subtle = "2"
 # 32 random bytes for the pairing token. Already in the tree at this
 # version; `rand::rng()` is OS-seeded ChaCha, which is what a bearer token
 # needs.
-rand = "0.9"
+rand = "0.10"
 # Every non-loopback address of this machine, for the pairing QR payload
 # -- std has no interface enumeration. One crate over `getifaddrs` with
 # only `libc` beneath it, which is already in the tree.
