@@ -79,6 +79,44 @@ export const ALL_VIEWS = [
 
 export type View = (typeof ALL_VIEWS)[number];
 
+/// The name a view goes by in the UI.
+///
+/// A `Record<View, string>` rather than a ternary chain with a default
+/// arm, because the default arm is a silent failure: a view added to
+/// `ALL_VIEWS` without a label here rendered as "Pull requests", which
+/// is the same header the PR list shows. #916's finding, in a second
+/// place -- a registered view id with no arm reads as a page that
+/// quietly went somewhere else. Being total, this is a compile error.
+///
+/// These are the HEADER names, carried over verbatim from the ternary
+/// chain this replaced. Four of them do not match the switcher entry
+/// that opens the page -- "My pull requests" opens a page headed "Pull
+/// requests", "To review" one headed "Pull requests to review",
+/// "Docker" one headed "Docker images", "Artifacts" one headed "Build
+/// artifacts" -- even though the chain's own comments claimed three
+/// times that they matched exactly (#794). Reconciling them changes
+/// four visible headers, so it is filed separately rather than smuggled
+/// into a refactor; `viewLabel.switcher.test.ts` pins the pairs that DO
+/// match so the gap cannot widen unnoticed.
+const VIEW_LABELS: Record<View, string> = {
+  "my-prs": "Pull requests",
+  "to-review": "Pull requests to review",
+  "pr-stats": "PR Stats",
+  "claude-md": "CLAUDE.md",
+  packages: "Package updates",
+  artifacts: "Build artifacts",
+  docker: "Docker images",
+  worktrees: "Worktrees",
+  branches: "Branches",
+  "claude-code": "Claude Code",
+  repositories: "Repositories",
+  "system-health": "System health",
+};
+
+export function viewLabel(view: View): string {
+  return VIEW_LABELS[view];
+}
+
 /// Views the mobile companion does not offer, whatever is persisted.
 ///
 /// A BUILD-time set, not a viewport one, for the reason `lib/target.ts`
