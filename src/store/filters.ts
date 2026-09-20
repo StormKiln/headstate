@@ -99,13 +99,22 @@ export type View = (typeof ALL_VIEWS)[number];
 /// into a refactor; `viewLabel.switcher.test.ts` pins the pairs that DO
 /// match so the gap cannot widen unnoticed.
 const VIEW_LABELS: Record<View, string> = {
-  "my-prs": "Pull requests",
-  "to-review": "Pull requests to review",
+  // The MENU wording, which is what the user clicked (#1185). Four of
+  // these used to differ from the switcher entry -- "My pull requests"
+  // opened a page headed "Pull requests", which is also the generic
+  // fallback the old default arm produced, so the page specifically
+  // about your own PRs carried the least specific name in the app.
+  //
+  // #794's rule is that the header should match the menu item that
+  // opened it. `ViewSwitcher` now READS this table rather than keeping
+  // its own, so there is one place to change and nothing left to drift.
+  "my-prs": "My pull requests",
+  "to-review": "To review",
   "pr-stats": "PR Stats",
   "claude-md": "CLAUDE.md",
   packages: "Package updates",
-  artifacts: "Build artifacts",
-  docker: "Docker images",
+  artifacts: "Artifacts",
+  docker: "Docker",
   worktrees: "Worktrees",
   branches: "Branches",
   "claude-code": "Claude Code",

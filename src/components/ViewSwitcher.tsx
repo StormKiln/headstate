@@ -1,6 +1,6 @@
 import { Activity, BarChart3, Bot, ChevronDown, Container, Eye, FileText, FolderGit2, FolderTree, GitBranch, GitPullRequest, HardDrive, Package } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import { MOBILE_HIDDEN_VIEWS, type View, useFilters } from "../store/filters";
+import { MOBILE_HIDDEN_VIEWS, type View, useFilters, viewLabel } from "../store/filters";
 import { useUiPrefs } from "../api/hooks";
 import { IS_MOBILE_BUILD } from "../lib/target";
 import { current } from "../lib/ariaCurrent";
@@ -70,7 +70,17 @@ export type Group = (typeof GROUPS)[number]["id"];
 /// `SettingsDialog.tsx` still maps this flat array for its checkboxes:
 /// the grouping is applied at render, so the array stays one list rather
 /// than becoming a nested structure every consumer has to walk.
-export const VIEWS: { id: View; label: string; Icon: typeof GitPullRequest; group: Group }[] = [
+/// The menu entries, with their labels DERIVED rather than declared.
+///
+/// `label` used to be written out here beside the icon, which made this
+/// the second hand-maintained table over `View` -- and the two drifted
+/// on four of twelve entries (#1185). `viewLabel` is now the only place
+/// a view's name is written, so a change lands in the menu and the page
+/// header together and cannot land in one alone.
+///
+/// The remaining fields are genuinely this file's: an icon and a group
+/// mean nothing to the store.
+const VIEW_ENTRIES: { id: View; Icon: typeof GitPullRequest; group: Group }[] = [
   // FIRST in the menu, per #823 -- and still first once grouped, because
   // it leads the group that leads `GROUPS`. See `ALL_VIEWS` in
   // `store/filters.ts` for why this leads; note that since #1017 the two
@@ -82,11 +92,11 @@ export const VIEWS: { id: View; label: string; Icon: typeof GitPullRequest; grou
   // pull requests in them. In a flat menu beside "System health" it
   // would read as stats about the machine, which is the one thing it is
   // not about.
-  { id: "pr-stats", label: "PR Stats", Icon: BarChart3, group: "pull-requests" },
-  { id: "my-prs", label: "My pull requests", Icon: GitPullRequest, group: "pull-requests" },
-  { id: "to-review", label: "To review", Icon: Eye, group: "pull-requests" },
-  { id: "worktrees", label: "Worktrees", Icon: FolderGit2, group: "repos" },
-  { id: "branches", label: "Branches", Icon: GitBranch, group: "repos" },
+  { id: "pr-stats", Icon: BarChart3, group: "pull-requests" },
+  { id: "my-prs", Icon: GitPullRequest, group: "pull-requests" },
+  { id: "to-review", Icon: Eye, group: "pull-requests" },
+  { id: "worktrees", Icon: FolderGit2, group: "repos" },
+  { id: "branches", Icon: GitBranch, group: "repos" },
   // Third in the Repos group, after the two views about a checkout's
   // STATE (#1023, epic #1011). This one answers "what is in it", which is
   // why it sits with them rather than anywhere else -- the group is the
@@ -95,22 +105,31 @@ export const VIEWS: { id: View; label: string; Icon: typeof GitPullRequest; grou
   // `group` is required as of #1024, and that requirement is what makes
   // this entry safe to add: a new view whose group was forgotten does not
   // silently vanish from a grouped menu, the compiler demands it.
-  { id: "repositories", label: "Repositories", Icon: FolderTree, group: "repos" },
-  { id: "docker", label: "Docker", Icon: Container, group: "builds" },
-  { id: "artifacts", label: "Artifacts", Icon: HardDrive, group: "builds" },
-  { id: "packages", label: "Package updates", Icon: Package, group: "builds" },
-  { id: "claude-md", label: "CLAUDE.md", Icon: FileText, group: "ai" },
+  { id: "repositories", Icon: FolderTree, group: "repos" },
+  { id: "docker", Icon: Container, group: "builds" },
+  { id: "artifacts", Icon: HardDrive, group: "builds" },
+  { id: "packages", Icon: Package, group: "builds" },
+  { id: "claude-md", Icon: FileText, group: "ai" },
   // Offered only while `claude_integrations_enabled` is on -- see the
   // `capabilityOff` check below for why that is not a `hidden_views` entry.
   // With grouping this is also what can empty the "AI" group, which is
   // why the render drops a group with no visible members (#1018).
-  { id: "claude-code", label: "Claude Code", Icon: Bot, group: "ai" },
+  { id: "claude-code", Icon: Bot, group: "ai" },
   // Last, and deliberately so: it is the only entry that is not about
   // the user's code at all. Grouping it with the repo-scoped views
   // would imply it takes a repository, which it does not -- and now that
   // the menu has headings, its own group says that outright.
-  { id: "system-health", label: "System health", Icon: Activity, group: "system" },
+  { id: "system-health", Icon: Activity, group: "system" },
 ];
+
+/// The menu, with each entry's label resolved from the one table.
+///
+/// Derived here rather than at every call site so `VIEWS` keeps the
+/// shape its readers already expect -- `ViewSwitcher` itself, and the
+/// tests that assert against `.label`.
+export const VIEWS: { id: View; label: string; Icon: typeof GitPullRequest; group: Group }[] =
+  VIEW_ENTRIES.map((e) => ({ ...e, label: viewLabel(e.id) }));
+
 
 /// Views that are offered whatever `hidden_views` says.
 ///

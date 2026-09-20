@@ -575,7 +575,7 @@ describe("the Claude Code route is gated on the capability", () => {
     uiPrefs.value = { hidden_views: [], close_hides_to_tray: true, claude_integrations_enabled: false };
     at("claude-code");
     expect(screen.queryByRole("heading", { name: "Claude Code" })).toBeNull();
-    expect(screen.getByRole("heading", { name: "Pull requests" })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "My pull requests" })).toBeTruthy();
   });
 
   /// Undefined prefs -- in flight, or `get_ui_prefs` REJECTED -- falls
@@ -587,7 +587,7 @@ describe("the Claude Code route is gated on the capability", () => {
     uiPrefs.value = undefined;
     at("claude-code");
     expect(screen.queryByRole("heading", { name: "Claude Code" })).toBeNull();
-    expect(screen.getByRole("heading", { name: "Pull requests" })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "My pull requests" })).toBeTruthy();
   });
 
   /// Scoped to this ONE view. A predicate that also suppressed unrelated

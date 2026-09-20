@@ -365,10 +365,25 @@ runs:
         #   - Adding cache scope, which is what #889 proposed and #895
         #     reverted on exactly this evidence.
         #
-        # Tags and the merge queue save too: `release.yml` waits on a tag
-        # run's CI, and a merge-group run is the last build before a merge
-        # lands, so both are as worth warming as `main` itself.
+        # The merge queue saves too: a merge-group run is the last build
+        # before a merge lands, so it is as worth warming as `main`.
+        #
+        # TAGS NO LONGER SAVE (#1107), and the reason they used to was a
+        # half-truth. `release.yml` does wait on a tag run's CI, so a tag
+        # run genuinely READS a cache -- but it reads `main`'s, because
+        # every ref restores from the default branch (see the heading
+        # above). What a tag's own SAVE produces is an entry pinned to a
+        # ref nothing ever builds from again.
+        #
+        # MEASURED rather than argued: the v6.0.0 caches were written at
+        # 16:56 and 17:01 and their `last_accessed_at` never moved off
+        # those timestamps. Write-once, read-never, 1.34GB, held for the
+        # full seven-day idle window because a tag ref cannot merge and
+        # drain early.
+        #
+        # That was 1.34GB of a 10GB quota per release, permanently
+        # recurring, in a repository that was already evicting mid-day.
         # One line on purpose. A folded scalar keeps the newlines INSIDE
         # `${{ }}`, and an expression is not the place to find out which
         # whitespace GitHub's parser forgives.
-        save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') || github.event_name == 'merge_group' }}
+        save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'merge_group' }}
