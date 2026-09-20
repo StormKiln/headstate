@@ -227,6 +227,45 @@ pub fn scan_repo(repo: &Path) -> Scan {
     // difference is real -- but near-duplicates at that ratio make the
     // view unusable for the question it answers, and the checkout's own
     // file is the one being asked about.
+    //
+    // # Why this list is longer than it was (#1236)
+    //
+    // The config health sweep cost 4.7 s over 39 repositories and 99.8%
+    // of it was this walk. Measured, the walk listed **22,265
+    // directories to find 42 CLAUDE.md files**, and the directories were
+    // overwhelmingly dependency and build output that this list simply
+    // did not happen to name:
+    //
+    // ```text
+    // .venv        6953 dirs      Pods          4796 dirs
+    // __pycache__  1797 dirs      .mypy_cache    364 dirs
+    // ```
+    //
+    // Naming them is not a new policy. It is the SAME policy as
+    // `node_modules` and `target` -- a directory that holds installed or
+    // generated artifacts rather than a project's own instructions --
+    // applied to the ecosystems that were missed. Python, CocoaPods and
+    // the JS metaframework caches were the gaps.
+    //
+    // # This is lossless, and that is the point
+    //
+    // Verified against this machine's real `~/code`: the extended list
+    // finds **all 42 files while listing 9,682 directories instead of
+    // 22,265** -- 57% fewer, zero files lost.
+    //
+    // That property is what makes this the right fix rather than a
+    // depth limit. A bounded walk was measured first and rejected: no
+    // depth reached full coverage (four repositories were still
+    // truncated at depth 12), so every workable bound turned most
+    // repositories into `Verdict::Unknown` -- trading a slow honest
+    // answer for a fast non-answer. Skipping a directory that provably
+    // holds no instructions costs no coverage at all, so nothing
+    // downstream has to be re-labelled unknown.
+    //
+    // `vendor` is deliberately ABSENT despite saving 33 directories: a
+    // real `vendor/CLAUDE.md` exists on this machine. A vendored tree is
+    // checked-in source someone may well document, unlike the entries
+    // above, which are all reproducible from a lockfile.
     const SKIP: &[&str] = &[
         ".git",
         "node_modules",
@@ -236,6 +275,28 @@ pub fn scan_repo(repo: &Path) -> Scan {
         "build",
         ".worktrees",
         "worktrees",
+        // Python: virtualenvs and tool caches.
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+        // Swift/iOS: CocoaPods installs and Xcode build output.
+        "Pods",
+        "DerivedData",
+        // JS/TS metaframework and toolchain caches. `node_modules` was
+        // already here; these sit BESIDE it rather than inside it.
+        ".next",
+        ".nuxt",
+        ".svelte-kit",
+        ".turbo",
+        ".parcel-cache",
+        ".nx",
+        ".yarn",
+        ".gradle",
+        ".cache",
     ];
     let mut scan = Scan::default();
     let mut stack = vec![repo.to_path_buf()];
@@ -362,6 +423,137 @@ pub(crate) fn expand_home_in(raw: &str, home: &Path) -> Option<PathBuf> {
 /// The user's home directory, when there is one.
 pub(crate) fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod skip_tests {
+    use super::*;
+
+    fn write(path: &Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    /// #1236: dependency and build directories are not walked.
+    ///
+    /// The whole saving. Each of these held 300+ directories on the
+    /// machine that motivated the ticket, and none of them can hold a
+    /// project's own instructions -- they are reproducible from a
+    /// lockfile.
+    ///
+    /// Asserted per-directory rather than as a count, so a regression
+    /// names the ecosystem it broke.
+    #[test]
+    fn dependency_and_build_directories_are_skipped() {
+        for dir in [
+            ".venv",
+            "venv",
+            "__pycache__",
+            ".mypy_cache",
+            ".pytest_cache",
+            ".ruff_cache",
+            ".tox",
+            "Pods",
+            "DerivedData",
+            ".next",
+            ".nuxt",
+            ".svelte-kit",
+            ".turbo",
+            ".parcel-cache",
+            ".nx",
+            ".yarn",
+            ".gradle",
+            ".cache",
+        ] {
+            let t = tempfile::tempdir().unwrap();
+            write(&t.path().join("CLAUDE.md"), "# real\n");
+            // A CLAUDE.md INSIDE the artifact directory. If the skip
+            // stops working this file appears and the count goes to 2.
+            write(&t.path().join(dir).join("CLAUDE.md"), "# installed\n");
+
+            let scan = scan_repo(t.path());
+            assert_eq!(
+                scan.files.len(),
+                1,
+                "`{dir}` must not be walked, but a file inside it was returned: {:?}",
+                scan.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+            );
+            assert!(!scan.is_partial(), "a deliberate skip is not a shortfall");
+        }
+    }
+
+    /// `vendor` is deliberately NOT skipped.
+    ///
+    /// The judgement this list turns on, pinned so it is not "tidied"
+    /// into the group above. A vendored tree is checked-in source that
+    /// someone may genuinely document -- a real `vendor/CLAUDE.md`
+    /// exists on the machine #1236 was measured on -- unlike every entry
+    /// that IS skipped, all of which are reproducible from a lockfile.
+    ///
+    /// Skipping it would save 33 directories and lose a real file: the
+    /// wrong side of that trade, and the reason this list was extended
+    /// by measurement rather than by listing plausible-sounding names.
+    #[test]
+    fn a_vendored_directory_is_still_walked() {
+        let t = tempfile::tempdir().unwrap();
+        write(&t.path().join("CLAUDE.md"), "# root\n");
+        write(&t.path().join("vendor").join("CLAUDE.md"), "# vendored\n");
+
+        let scan = scan_repo(t.path());
+        assert_eq!(
+            scan.files.len(),
+            2,
+            "a vendored CLAUDE.md is checked-in documentation and must be found"
+        );
+    }
+
+    /// The skip is by NAME at any depth, not only at the repository
+    /// root.
+    ///
+    /// `.venv` in a monorepo sits under `apps/api/`, which is where the
+    /// 6,953 directories actually were.
+    #[test]
+    fn an_artifact_directory_is_skipped_at_any_depth() {
+        let t = tempfile::tempdir().unwrap();
+        let nested = t.path().join("apps").join("api");
+        write(&nested.join("CLAUDE.md"), "# api\n");
+        write(&nested.join(".venv").join("CLAUDE.md"), "# installed\n");
+
+        let scan = scan_repo(t.path());
+        assert_eq!(
+            scan.files.len(),
+            1,
+            "got: {:?}",
+            scan.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+        assert!(scan.files[0].path.ends_with("api/CLAUDE.md"));
+    }
+
+    /// A skip is COUNTED, and never reaches `is_partial()`.
+    ///
+    /// The existing contract, re-pinned because this change adds 18
+    /// names to the list: if a skip were ever mistaken for a shortfall,
+    /// every healthy repository would now report itself as incompletely
+    /// scanned, which is the failure mode that makes an honest signal
+    /// worthless.
+    #[test]
+    fn the_new_skips_are_counted_not_reported_as_unreadable() {
+        let t = tempfile::tempdir().unwrap();
+        write(&t.path().join("CLAUDE.md"), "# root\n");
+        std::fs::create_dir_all(t.path().join(".venv").join("lib")).unwrap();
+        std::fs::create_dir_all(t.path().join("__pycache__")).unwrap();
+
+        let scan = scan_repo(t.path());
+        assert!(scan.skipped_dirs >= 2, "the skips must be counted");
+        assert!(
+            scan.unreadable_dirs.is_empty() && scan.unreadable_files.is_empty(),
+            "a documented exclusion is not something that could not be read"
+        );
+        assert!(
+            !scan.is_partial(),
+            "a healthy repository must not report itself as incompletely scanned"
+        );
+    }
 }
 
 #[cfg(test)]

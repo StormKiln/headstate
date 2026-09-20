@@ -79,12 +79,35 @@
 //! ```
 //!
 //! So the settings half -- the one this ticket is actually about -- is
-//! free, and essentially all the cost is `claudemd::scan_repo` walking
-//! directory trees. That is a real number and not a small one, which is
-//! why the command is `async`, why the panel is collapsed by default,
-//! and why its query does not refetch on window focus. It is NOT
-//! quadratic: nothing compares repositories to each other, so the cost
-//! is linear in repositories and in the files each walk visits.
+//! free, and essentially all the cost was `claudemd::scan_repo` walking
+//! directory trees. It is NOT quadratic: nothing compares repositories
+//! to each other, so the cost is linear in repositories and in the
+//! directories each walk visits.
+//!
+//! # What #1236 changed, and what it did not
+//!
+//! That walk was 99.8% of the sweep, so it was attacked at the source:
+//! `claudemd`'s `SKIP` list did not name `.venv`, `Pods`,
+//! `__pycache__` or the JS toolchain caches, and the walk was listing
+//! **22,265 directories to find 42 files**. Naming them cut it to
+//! 9,682 directories -- **5.9x faster, and all 42 files still found**.
+//!
+//! The per-repository distribution is what made that the right fix.
+//! The cost was extremely skewed -- five repositories were 76% of it --
+//! so this was a traversal problem in a handful of trees rather than a
+//! caching problem across 39. Caching would have made a second sweep
+//! cheap while leaving the first one slow; this makes every sweep
+//! cheap.
+//!
+//! Nothing here was made narrower, and that is deliberate. A
+//! depth-limited walk was measured first and REJECTED: no depth reached
+//! full coverage, so every workable bound turned most repositories into
+//! [`Verdict::Unknown`] and bought its speed by lowering what the sweep
+//! claims to have checked. Skipping a directory that provably holds no
+//! instructions costs no coverage, so every verdict this module
+//! produces is unchanged -- measured, 39 clean before and 39 clean
+//! after. The command is still `async`, the panel is still collapsed by
+//! default, and its query still does not refetch on window focus.
 //!
 //! Read-only. Nothing here writes, repairs, or offers to.
 
@@ -895,6 +918,41 @@ mod tests {
         }
         let md_ms = m_only.elapsed().as_millis();
         println!("MEASURED split: settings {settings_ms} ms, claude.md walk {md_ms} ms");
+
+        // The PER-REPOSITORY distribution, not just the total (#1236).
+        //
+        // Printed as a distribution because the mean is the one statistic
+        // that misleads here. The cost is extremely skewed -- measured
+        // before the fix, the five worst repositories were 74% of the
+        // sweep and one of them was 33% on its own -- so "121 ms per
+        // repository" described no repository that existed. `dirs` is
+        // the number the `SKIP` list actually moves; the walk is
+        // dominated by directories listed, not by files read.
+        let mut rows: Vec<(u128, usize, usize, String)> = Vec::new();
+        for (n, p) in &repos {
+            let t = std::time::Instant::now();
+            let sc = crate::claudemd::scan_repo(Path::new(p));
+            rows.push((
+                t.elapsed().as_millis(),
+                sc.files.len(),
+                sc.skipped_dirs,
+                n.clone(),
+            ));
+        }
+        rows.sort_by_key(|a| std::cmp::Reverse(a.0));
+        let walk_total: u128 = rows.iter().map(|r| r.0).sum();
+        let files: usize = rows.iter().map(|r| r.1).sum();
+        let top5: u128 = rows.iter().take(5).map(|r| r.0).sum();
+        let median = rows[rows.len() / 2].0;
+        println!(
+            "MEASURED walk: {walk_total} ms over {} repos, {files} files; \
+             median {median} ms, top-5 {top5} ms ({}%)",
+            rows.len(),
+            top5 * 100 / walk_total.max(1)
+        );
+        for (ms, files, skipped, n) in &rows {
+            println!("  {ms:>6} ms  files={files:<3} skipped={skipped:<5} {n}");
+        }
 
         let t = std::time::Instant::now();
         let sweep = sweep_in(&home, &repos, scan.unreadable);
