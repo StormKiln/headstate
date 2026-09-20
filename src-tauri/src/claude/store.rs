@@ -295,6 +295,59 @@ pub fn record_usage(
     Ok(())
 }
 
+/// Sessions whose stored usage is a floor, not a total (#1213).
+///
+/// The bulk import reads at most `usage::BUDGET_BYTES` per transcript,
+/// which keeps the whole-corpus pass at 3.8 s. Measured on a real
+/// machine, that bound leaves 0.33 GB unread -- and all of it sits in
+/// **14 files**, which between them hold 53.6% of all session bytes.
+///
+/// So "what did this cost" is answered with a floor precisely on the
+/// longest sessions, which are the ones anybody asks it about.
+///
+/// Returned newest-first so a backfill that stops early has done the
+/// most useful work.
+pub fn truncated_sessions(conn: &Connection) -> Result<Vec<String>, rusqlite::Error> {
+    let mut q = conn.prepare(
+        "SELECT session_id FROM claude_session_usage
+         WHERE truncated = 1
+         ORDER BY measured_at DESC",
+    )?;
+    let rows = q.query_map([], |r| r.get::<_, String>(0))?;
+    rows.collect()
+}
+
+/// Re-measure one truncated session without the budget (#1213).
+///
+/// A BACKFILL, not a scan. The caller walks only the rows
+/// [`truncated_sessions`] returns -- 14 files on the machine this was
+/// measured on, one at a time, off the interactive path. #1086 measured
+/// `summarise_whole` at 160 ms for the 76.7 MB worst case, so the whole
+/// backfill is a few seconds of background work.
+///
+/// It runs **once**. The cache is keyed on the transcript, so a session
+/// re-measured whole has `truncated` flipped to 0 and is never returned
+/// again unless the file grows past the budget afresh.
+///
+/// The 3.8 s whole-corpus figure `BUDGET_BYTES` defends against is real
+/// and is not incurred here: nothing re-reads the untruncated majority.
+pub fn backfill_one(
+    conn: &Connection,
+    session_id: &str,
+    path: &std::path::Path,
+    now: &str,
+) -> Result<bool, rusqlite::Error> {
+    // A transcript that has gone leaves its previous measurement in
+    // place rather than writing zeros over it -- the same rule the
+    // import loop states: absent is not zero, and a session whose file
+    // is temporarily unreadable has not suddenly cost nothing.
+    let Ok(u) = super::usage::summarise_whole(path) else {
+        return Ok(false);
+    };
+    record_usage(conn, session_id, &u, now)?;
+    Ok(true)
+}
+
 /// Token usage summed across every measured session (#1134).
 pub fn usage_profile(conn: &Connection) -> Result<super::usage::Profile, rusqlite::Error> {
     let mut out: super::usage::Profile = conn.query_row(
@@ -453,6 +506,52 @@ pub fn import(conn: &mut Connection, scan: Scan) -> Result<Imported, rusqlite::E
             out.write_failures
                 .push(format!("{}: could not store its usage: {e}", t.session_id));
         }
+    }
+
+    // THE BACKFILL (#1213). Only the rows the bulk pass had to truncate.
+    //
+    // Measured on a real machine: 14 of 1,453 sessions exceed the
+    // budget, and those 14 hold 53.6% of all session bytes. Every one
+    // of them currently reports a floor for the question -- "what did
+    // this cost" -- that is asked about long sessions above all others.
+    //
+    // Bounded by construction rather than by a cap: the set is the
+    // truncated rows, it shrinks to empty as they are measured, and a
+    // re-measured session is not returned again. At the 160 ms #1086
+    // measured for the 76.7 MB worst case this is seconds of work,
+    // once -- not the 3.8 s whole-corpus read `BUDGET_BYTES` exists to
+    // prevent, which nothing here performs.
+    //
+    // Runs AFTER the loop above so a session measured fresh this pass
+    // is backfilled in the same transaction rather than waiting for
+    // the next one.
+    let by_id: std::collections::HashMap<&str, &str> = scan
+        .sessions
+        .iter()
+        .map(|t| (t.session_id.as_str(), t.path.as_str()))
+        .collect();
+    match truncated_sessions(&tx) {
+        Ok(ids) => {
+            for id in ids {
+                // A truncated row whose transcript is not in this scan
+                // is skipped, not cleared: the file may be on a volume
+                // that was not mounted, and its last measurement is
+                // still the best thing known about it.
+                let Some(path) = by_id.get(id.as_str()) else {
+                    continue;
+                };
+                if let Err(e) = backfill_one(&tx, &id, std::path::Path::new(path), &now) {
+                    out.write_failures
+                        .push(format!("{id}: could not re-measure its usage: {e}"));
+                }
+            }
+        }
+        // Reported rather than swallowed: a backfill that could not
+        // even list its work leaves every floor in place, and a silent
+        // skip would make that indistinguishable from having no work.
+        Err(e) => out
+            .write_failures
+            .push(format!("could not list truncated sessions: {e}")),
     }
 
     tx.execute("DELETE FROM claude_subagent", [])?;
@@ -1008,6 +1107,181 @@ mod tests {
         assert_eq!(got.unreadable_files.len(), 1);
         assert_eq!(got.metadata_beyond_first_record, 1);
         assert_eq!(got.elapsed_ms, 42);
+    }
+
+    /// The truncated-session backfill (#1213).
+    ///
+    /// The bulk pass reads at most `BUDGET_BYTES` per transcript, which
+    /// on a real machine leaves 14 of 1,453 sessions reporting a floor
+    /// -- and those 14 hold 53.6% of all session bytes.
+    mod backfill {
+        use super::*;
+
+        fn usage(messages: u64, truncated: bool) -> super::super::super::usage::Usage {
+            super::super::super::usage::Usage {
+                messages,
+                input_tokens: 100,
+                output_tokens: 500,
+                cache_read_tokens: 10,
+                cache_creation_tokens: 5,
+                truncated,
+                ..Default::default()
+            }
+        }
+
+        /// A transcript on disk, so `summarise_whole` has something real
+        /// to read. Removed when the guard drops.
+        struct Tmp(std::path::PathBuf);
+        impl Tmp {
+            fn new(name: &str, messages: usize) -> Self {
+                let p = std::env::temp_dir().join(format!("headstate-backfill-{name}.jsonl"));
+                let line = r#"{"type":"assistant","message":{"model":"claude-opus-5","usage":{"input_tokens":7,"output_tokens":11,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
+                let body = std::iter::repeat_n(line, messages)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                std::fs::write(&p, body).unwrap();
+                Self(p)
+            }
+        }
+        impl Drop for Tmp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        #[test]
+        fn only_truncated_rows_are_listed() {
+            // THE bound. Listing everything would re-read the whole
+            // corpus, which is the 3.8 s cost `BUDGET_BYTES` exists to
+            // prevent -- the opposite of what this change is for.
+            let conn = db();
+            record_usage(&conn, "whole", &usage(10, false), "2026-09-01T00:00:00Z").unwrap();
+            record_usage(&conn, "floor", &usage(20, true), "2026-09-01T00:00:00Z").unwrap();
+
+            assert_eq!(
+                truncated_sessions(&conn).unwrap(),
+                vec!["floor".to_string()]
+            );
+        }
+
+        #[test]
+        fn nothing_to_do_is_an_empty_list_rather_than_an_error() {
+            // The steady state after one backfill has run. It must be
+            // cheap and silent, not a failure.
+            let conn = db();
+            record_usage(&conn, "whole", &usage(10, false), "2026-09-01T00:00:00Z").unwrap();
+            assert!(truncated_sessions(&conn).unwrap().is_empty());
+        }
+
+        /// The whole point: a transcript LARGER than the budget must be
+        /// read whole, not re-truncated.
+        ///
+        /// The earlier version of this test used a three-record fixture,
+        /// which the capped reader also reads whole -- so swapping
+        /// `summarise_whole` for `summarise` passed it. That is the one
+        /// substitution this change exists to prevent, so the fixture
+        /// has to exceed `BUDGET_BYTES`.
+        ///
+        /// 8 MB of writes is slower than a unit test should be, so the
+        /// assertion is on `truncated` rather than on a token sum: the
+        /// capped reader sets it, the whole reader clears it, and that
+        /// difference is the entire contract.
+        #[test]
+        fn a_transcript_over_the_budget_is_read_whole() {
+            let conn = db();
+            let p = std::env::temp_dir().join("headstate-backfill-over-budget.jsonl");
+            // One record, then padding past the cap. The padding lines
+            // are not usage records, so they change no figure -- they
+            // exist only to push the file past `BUDGET_BYTES`.
+            let mut body = String::from(
+                r#"{"type":"assistant","message":{"model":"claude-opus-5","usage":{"input_tokens":7,"output_tokens":11,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            );
+            let filler = format!(r#"{{"type":"system","pad":"{}"}}"#, "x".repeat(4096));
+            while body.len() as u64 <= super::super::super::usage::BUDGET_BYTES {
+                body.push('\n');
+                body.push_str(&filler);
+            }
+            std::fs::write(&p, &body).unwrap();
+
+            record_usage(&conn, "s", &usage(1, true), "2026-09-01T00:00:00Z").unwrap();
+            backfill_one(&conn, "s", &p, "2026-09-02T00:00:00Z").unwrap();
+            let _ = std::fs::remove_file(&p);
+
+            let truncated: i64 = conn
+                .query_row(
+                    "SELECT truncated FROM claude_session_usage WHERE session_id = 's'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                truncated, 0,
+                "a capped read would leave this at 1 -- the file is over BUDGET_BYTES"
+            );
+        }
+
+        #[test]
+        fn a_backfilled_session_stops_being_listed() {
+            // It runs ONCE. A session re-measured whole must not come
+            // back on the next pass, or the backfill never terminates.
+            let conn = db();
+            let f = Tmp::new("once", 3);
+            record_usage(&conn, "s", &usage(1, true), "2026-09-01T00:00:00Z").unwrap();
+            assert_eq!(truncated_sessions(&conn).unwrap().len(), 1);
+
+            assert!(backfill_one(&conn, "s", &f.0, "2026-09-02T00:00:00Z").unwrap());
+            assert!(
+                truncated_sessions(&conn).unwrap().is_empty(),
+                "a whole read must clear the floor"
+            );
+        }
+
+        #[test]
+        fn the_re_measured_figures_replace_the_floor() {
+            // The point of the exercise: the stored numbers change to
+            // the complete ones, not merely the flag.
+            let conn = db();
+            let f = Tmp::new("figures", 3);
+            record_usage(&conn, "s", &usage(1, true), "2026-09-01T00:00:00Z").unwrap();
+
+            backfill_one(&conn, "s", &f.0, "2026-09-02T00:00:00Z").unwrap();
+
+            let (messages, truncated): (i64, i64) = conn
+                .query_row(
+                    "SELECT messages, truncated FROM claude_session_usage WHERE session_id = 's'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(messages, 3, "all three records, not the stored floor of 1");
+            assert_eq!(truncated, 0);
+        }
+
+        #[test]
+        fn a_vanished_transcript_leaves_the_previous_measurement_alone() {
+            // Absent is not zero. A session whose file is temporarily
+            // unreadable -- an unmounted volume, a pruned directory --
+            // has not suddenly cost nothing, and writing zeros over its
+            // last known figures would claim exactly that.
+            let conn = db();
+            record_usage(&conn, "s", &usage(42, true), "2026-09-01T00:00:00Z").unwrap();
+
+            let gone = std::path::Path::new("/no/such/transcript.jsonl");
+            assert!(
+                !backfill_one(&conn, "s", gone, "2026-09-02T00:00:00Z").unwrap(),
+                "an unreadable transcript reports that it did nothing"
+            );
+
+            let (messages, truncated): (i64, i64) = conn
+                .query_row(
+                    "SELECT messages, truncated FROM claude_session_usage WHERE session_id = 's'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(messages, 42, "the previous measurement survives");
+            assert_eq!(truncated, 1, "and is still honestly marked a floor");
+        }
     }
 
     /// An absent root survives the storage boundary WITHOUT making the
