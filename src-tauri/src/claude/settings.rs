@@ -39,9 +39,37 @@ use super::install::{read_settings, Refusal};
 ///
 /// Later beats earlier: a project file overrides the user's, and a local
 /// file overrides both.
+///
+/// # Why `Plugin` lives in this enum (#1216)
+///
+/// The MCP inventory needed a fourth scope: a server can be shipped by
+/// an installed plugin's `.mcp.json`, which is not any of the three
+/// settings files. The choice was to EXTEND this enum or to wrap it in
+/// a second one carrying `Origin` plus a plugin case.
+///
+/// Extending, because wrapping would give the MCP page a vocabulary the
+/// settings page does not speak -- two enums for one question ("which
+/// scope defines this"), which is exactly what #1216 asked not to
+/// happen. One enum means `ORIGIN_LABEL` on the frontend is one table
+/// and a reader learns the word "project" once.
+///
+/// `Plugin` is declared FIRST, so it is the LOWEST precedence in the
+/// derived `Ord`. That is load-bearing twice over. It is correct --
+/// Claude Code lets a user or project `mcpServers` entry shadow a
+/// plugin's server of the same name -- and it is what keeps
+/// [`effective_in`] below untouched: that function compares origins
+/// with `>` to decide whether an unreadable scope could have overridden
+/// a winner, and a variant beneath every settings scope can never
+/// change one of those answers. No settings file ever yields `Plugin`,
+/// and [`Origin::ORDER`] deliberately still lists only the three that
+/// name a settings file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Origin {
+    /// An installed plugin's `.mcp.json`. Not a settings file, and not
+    /// produced by [`effective_in`] -- see the enum's docs for why it
+    /// sits here anyway, and why it sorts lowest.
+    Plugin,
     /// `~/.claude/settings.json`
     User,
     /// `<repo>/.claude/settings.json` -- committed, shared with the team.
@@ -51,7 +79,12 @@ pub enum Origin {
 }
 
 impl Origin {
-    /// Every scope, lowest precedence first.
+    /// Every SETTINGS scope, lowest precedence first.
+    ///
+    /// Three, not four: `Plugin` names no settings file, so adding it
+    /// here would make [`effective_in`] try to read
+    /// `<repo>/.claude/settings.json`-shaped path that does not exist
+    /// and report a refusal for a scope that was never in question.
     pub const ORDER: [Origin; 3] = [Origin::User, Origin::Project, Origin::Local];
 
     fn path(self, home: &Path, repo: &Path) -> PathBuf {
@@ -59,6 +92,10 @@ impl Origin {
             Origin::User => home.join(".claude").join("settings.json"),
             Origin::Project => repo.join(".claude").join("settings.json"),
             Origin::Local => repo.join(".claude").join("settings.local.json"),
+            // Unreachable through `ORDER`, which is the only caller.
+            // Returning the user path rather than panicking: a panic
+            // here would be a crash in a read-only inventory.
+            Origin::Plugin => home.join(".claude").join("settings.json"),
         }
     }
 }

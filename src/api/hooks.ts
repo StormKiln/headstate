@@ -41,6 +41,7 @@ import type {
   ClaudeDefinitions,
   ClaudeEffectiveSettings,
   ClaudeConfigHealth,
+  ClaudeMcpInventory,
   ClaudeUsageProfile,
   PrActionName,
   ToolReport,
@@ -60,6 +61,7 @@ import {
   claudeDefinitions,
   claudeEffectiveSettings,
   claudeConfigHealth,
+  claudeMcpServers,
   claudeUsageProfile,
   getCached,
   actOnPrs,
@@ -3783,6 +3785,24 @@ export function useClaudeConfigHealth(enabled: boolean) {
     enabled,
     staleTime: Infinity,
     refetchOnWindowFocus: false,
+/// Every MCP server configured on this machine, and which scope defines
+/// it (#1216).
+///
+/// `staleTime: Infinity` and no focus refetch, unlike the settings hook
+/// above. `~/.claude.json` is rewritten every few seconds by Claude
+/// Code, so refetching on focus would re-read a file whose MCP
+/// configuration almost never changes -- the churn is in the transcript
+/// history this ignores. A user who added a server refreshes.
+///
+/// `retry: false`: a refusal is an ANSWER here, carrying the path and
+/// the parse position, and retrying would delay showing it while
+/// producing the same one.
+export function useClaudeMcpServers(enabled = true) {
+  return useQuery<ClaudeMcpInventory>({
+    queryKey: ["claude-mcp-servers"],
+    queryFn: () => claudeMcpServers(),
+    enabled,
+    staleTime: Infinity,
     retry: false,
   });
 }

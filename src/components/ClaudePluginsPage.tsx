@@ -1,6 +1,11 @@
 import { Card } from "@/components/ui/card";
-import { useClaudeDefinitions, useClaudePlugins } from "../api/hooks";
-import type { ClaudeDefinition, ClaudeDefinitionSource } from "../api/tauri";
+import { useClaudeDefinitions, useClaudeMcpServers, useClaudePlugins } from "../api/hooks";
+import type {
+  ClaudeDefinition,
+  ClaudeDefinitionSource,
+  ClaudeMcpTransport,
+  ClaudeSettingsOrigin,
+} from "../api/tauri";
 import { definitionSourceLabel } from "../lib/definitionSource";
 import { relativeTime } from "../lib/time";
 import type {
@@ -241,6 +246,8 @@ function Loaded({
       </div>
 
       <DefinitionsSection />
+
+      <McpSection />
 
       {inventory_absent && installed.length === 0 && (
         // Measured, and the answer is none. Not a failure, and not
@@ -814,6 +821,127 @@ export function DefinitionsSection() {
             );
           })}
         </div>
+      )}
+    </div>
+  );
+}
+
+/// Which scope defines a server, in words a reader can act on.
+///
+/// The PATH shape for the settings scopes, for the reason
+/// `EffectiveSettingsPanel`'s own table gives: a reader needs to know
+/// which file to open, and "project" does not say where. `plugin` is
+/// the scope `Origin` grew for #1216 and names a directory rather than
+/// a file, because a plugin's manifest may be `.mcp.json` or
+/// `mcp.json`.
+const MCP_ORIGIN_LABEL: Record<ClaudeSettingsOrigin, string> = {
+  user: "~/.claude.json",
+  project: "~/.claude.json (this project only)",
+  local: ".claude/settings.local.json",
+  plugin: "a plugin's .mcp.json",
+};
+
+/// One server's transport, for display.
+function transportText(t: ClaudeMcpTransport): string {
+  if (t.kind === "stdio") return t.command;
+  if (t.kind === "url") return t.url;
+  // Neither a command nor a url. Named rather than blank: the entry
+  // exists and we could not describe it, which is a different fact from
+  // a server with no transport.
+  return "transport not recognised";
+}
+
+/// Every MCP server configured on this machine, and which scope defines
+/// it (#1216).
+///
+/// Before this the app could not name a single MCP tool: `plugins.rs`
+/// matched a filename to set one boolean, so a plugin contributing 31
+/// tools and one contributing zero were one boolean apart.
+///
+/// Scope is the load-bearing column, not the list. A server added for
+/// one project is easy to forget and then confusing everywhere else, so
+/// every row says which scope defines it and a project-scoped row says
+/// which project.
+///
+/// Exported for its own test file, for the reason `DefinitionsSection`
+/// gives: the plugins report this page also renders is a large fixture.
+export function McpSection() {
+  const { data, isLoading, isError, error, refetch } = useClaudeMcpServers();
+
+  if (isError) {
+    // NOT an empty list, and this is the whole point of the ticket.
+    // "You have no MCP servers" and "we could not look" are different
+    // answers.
+    return (
+      <div className="mt-6">
+        <h3 className="text-sm font-semibold text-[#e6edf3]">MCP servers</h3>
+        <div className="mt-2">
+          <QueryError
+            title="MCP servers could not be read"
+            message={errorMessage(error)}
+            onRetry={() => void refetch()}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  if (isLoading || !data) {
+    return (
+      <div className="mt-6">
+        <h3 className="text-sm font-semibold text-[#e6edf3]">MCP servers</h3>
+        <div className="mt-2 min-h-20" aria-busy="true" />
+      </div>
+    );
+  }
+
+  // A scope that could not be read means the list below is a floor, not
+  // a total -- so the empty case must not say "none are configured"
+  // while a refusal is standing.
+  const refused = data.unreadable.length > 0;
+
+  return (
+    <div className="mt-6">
+      <h3 className="text-sm font-semibold text-[#e6edf3]">MCP servers</h3>
+      <p className="mt-1 text-xs text-[#8b949e]">
+        Configured in <code>~/.claude.json</code> and in installed plugins. Read only —
+        Headstate never writes to that file, which Claude Code rewrites while it runs.
+      </p>
+
+      {/* Refusals FIRST and in their own colour, above the list rather
+          than instead of it: the servers that DID read are real. */}
+      {data.unreadable.map((r) => (
+        <p key={r.path} role="alert" className="mt-2 text-xs text-[#f85149]">
+          {r.detail}
+        </p>
+      ))}
+
+      {data.servers.length === 0 ? (
+        refused ? (
+          // The sentence the module exists to keep separate from the one
+          // below it.
+          <p className="mt-2 text-sm text-[#d29922]">
+            No servers could be listed, because the configuration above could not be read.
+            This is not the same as having none configured.
+          </p>
+        ) : (
+          <p className="mt-2 text-sm text-[#8b949e]">No MCP servers are configured.</p>
+        )
+      ) : (
+        <ul className="mt-2 space-y-1">
+          {data.servers.map((s) => (
+            <li key={`${s.origin}:${s.scopeDetail ?? ""}:${s.name}`} className="text-xs">
+              <span className="text-[#e6edf3]">{s.name}</span>
+              {/* The scope, in TEXT rather than by position or colour:
+                  it is the column the page exists for. */}
+              <span className="ml-2 text-[#8b949e]">{MCP_ORIGIN_LABEL[s.origin]}</span>
+              {s.scopeDetail !== null && s.origin !== "user" && (
+                <span className="ml-1 text-[10px] text-[#6e7681]">{s.scopeDetail}</span>
+              )}
+              <code className="ml-2 break-all text-[#6e7681]">{transportText(s.transport)}</code>
+            </li>
+          ))}
+        </ul>
       )}
     </div>
   );

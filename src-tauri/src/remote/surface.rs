@@ -493,6 +493,10 @@ pub const SURFACE: &[(&str, Class)] = &[
     // `Local` because the answer is about the desktop's repositories,
     // which is exactly what a phone cannot see for itself.
     ("claude_config_health", Class::Read),
+    // Read: `~/.claude.json` plus each installed plugin's `.mcp.json`,
+    // bounded and read-only (#1216). Never a write: that file is Claude
+    // Code's live state, rewritten by its owner while it runs.
+    ("claude_mcp_servers", Class::Read),
     ("claude_hooks_status", Class::Read),
     ("get_poll_interval", Class::Read),
     ("get_worktree_dirs", Class::Read),
@@ -1076,6 +1080,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             res(commands::claude_effective_settings(a.get("repoPath")?).await)
         }
         "claude_config_health" => res(commands::claude_config_health(app.clone()).await),
+        "claude_mcp_servers" => res(commands::claude_mcp_servers().await),
         "claude_hooks_status" => res(commands::claude_hooks_status()),
         "get_poll_interval" => ok(commands::get_poll_interval(app.state())),
         "get_worktree_dirs" => ok(commands::get_worktree_dirs(app.clone())),

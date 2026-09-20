@@ -12,6 +12,13 @@ const ORIGIN_LABEL: Record<ClaudeSettingsOrigin, string> = {
   user: "~/.claude/settings.json",
   project: ".claude/settings.json",
   local: ".claude/settings.local.json",
+  // `plugin` is the scope `Origin` grew for the MCP inventory (#1216),
+  // and `claude_effective_settings` never returns it -- no settings file
+  // yields a plugin scope. The row is here because the table is total
+  // over the union, and it names the real thing rather than carrying a
+  // placeholder: if it ever DID render, "a plugin's .mcp.json" is true,
+  // whereas an empty string or "unknown" would be a silent hole.
+  plugin: "a plugin's .mcp.json",
 };
 
 /// What Claude Code actually reads for this repository (#1130).

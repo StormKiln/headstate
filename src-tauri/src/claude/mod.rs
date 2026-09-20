@@ -78,6 +78,11 @@ pub mod install;
 pub mod launch;
 pub mod live;
 pub mod liveness;
+/// Every MCP server configured on this machine, and which scope defines
+/// it (#1216). Reads `~/.claude.json` -- Claude Code's LIVE state file --
+/// read-only and bounded, and treats a parse failure as a refusal rather
+/// than an empty inventory.
+pub mod mcp;
 pub mod overview;
 /// Installed plugins, and what they were actually used for (#1075).
 pub mod plugins;

@@ -25,6 +25,17 @@ vi.mock("../api/hooks", () => ({
     error: null,
     refetch: () => {},
   }),
+  // #1216, and empty for the same reason: the MCP section is a sibling
+  // with its own tests. Empty AND unrefused, so it renders the honest
+  // zero rather than a refusal that would add an alert to every
+  // assertion in this file.
+  useClaudeMcpServers: () => ({
+    data: { servers: [], unreadable: [], truncated: false, sizeBytes: null },
+    isLoading: false,
+    isError: false,
+    error: null,
+    refetch: () => {},
+  }),
   useClaudePlugins: () => ({
     data: state.data,
     isLoading: state.loading,

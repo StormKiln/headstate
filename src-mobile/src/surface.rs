@@ -292,6 +292,11 @@ pub const SURFACE: &[(&str, Class)] = &[
     // a good place for this one: "is any of my agent config silently
     // dead" is asked away from the keyboard, and the remedy is at it.
     ("claude_config_health", Class::Read),
+    // Read: `~/.claude.json` plus each installed plugin's `.mcp.json`,
+    // bounded and read-only (#1216). "Which MCP servers does this
+    // machine have, and which apply here" is a reasonable thing to ask
+    // from a phone, and nothing about the answer is a side effect.
+    ("claude_mcp_servers", Class::Read),
     ("claude_hooks_status", Class::Read),
     ("get_poll_interval", Class::Read),
     ("get_worktree_dirs", Class::Read),
