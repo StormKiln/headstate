@@ -213,6 +213,10 @@ beforeEach(() => {
     truncated: false,
     bytes_read: 183_237,
     file_bytes: 183_237,
+    // No `cost-state` record, the majority case (#1210). The phone test
+    // that wants one sets it, so the absent arm is what every other test
+    // here renders.
+    recorded_cost: null,
   };
   state.preview = {
     messages: [
@@ -380,6 +384,47 @@ describe("the companion offers the view and hides only the Local actions", () =>
     expect(screen.getByText(/how much work it did/i)).toBeTruthy();
     expect(screen.getByText("994")).toBeTruthy();
     expect(screen.getByText("582,035")).toBeTruthy();
+  });
+
+  /// #1210 on the phone. The recorded cost rides the SAME command as the
+  /// token panel above — `claude_session_usage`, already `Class::Read` —
+  /// so no new surface row was needed and the phone gets it for free.
+  ///
+  /// This is the positive half `surfaceGuard.test.ts` cannot make: that
+  /// test checks the classification and would stay green whether the page
+  /// rendered this or not.
+  ///
+  /// The standing fixture carries no record, which is the majority of the
+  /// corpus, so the assertion is the ABSENT one — the arm that must never
+  /// be `$0.00`, and the arm a phone user hits most.
+  ///
+  /// **Sabotage:** wrap `<SessionCost>` in `!IS_MOBILE_BUILD` in
+  /// `ClaudeCodePage` and this fails while every other test stays green.
+  it("says Claude Code recorded no cost rather than $0.00, because it is the same Class::Read command", () => {
+    render(<ClaudeCodePage />);
+    open("HeadState GitHub issues filing");
+
+    expect(screen.getByText(/Claude Code did not record a cost for this session/i)).toBeTruthy();
+    expect(screen.queryByText("$0.00")).toBeNull();
+  });
+
+  /// The recorded half on the phone: the figure, attributed in the label.
+  it("shows a recorded cost attributed to Claude Code", () => {
+    state.usage = {
+      ...state.usage!,
+      recorded_cost: {
+        total_cost_usd: 1.3242615,
+        models: [{ model: "claude-opus-5[1m]", cost_usd: 1.3230755 }],
+        total_api_ms: 84_690,
+        total_api_without_retries_ms: 84_622,
+        has_unknown_model_cost: false,
+      },
+    };
+    render(<ClaudeCodePage />);
+    open("HeadState GitHub issues filing");
+
+    expect(screen.getByText(/as recorded by claude code/i)).toBeTruthy();
+    expect(screen.getByText("$1.32")).toBeTruthy();
   });
 
   /// #1002 on the phone. `claude_subagent_rollup` is `Class::Read`, so

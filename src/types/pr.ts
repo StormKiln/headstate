@@ -1782,12 +1782,17 @@ export interface ClaudeSubagentRollup {
 /// every real session measured, so a single summed "tokens" figure would
 /// be a cache-read count wearing a misleading name.
 ///
-/// # Tokens, never dollars
+/// # Tokens, never dollars -- and never a dollar figure this app derived
 ///
 /// A dollar figure needs per-model rates, those rates change, and this
 /// app cannot keep a hardcoded table true. A quietly wrong cost with a
 /// currency symbol in front of it is the confident-wrong-answer failure
-/// #941 is about.
+/// #941 is about. No rate table ships, and `recorded_cost` below does not
+/// weaken that by one inch: it is a figure CLAUDE CODE computed and wrote
+/// into the transcript, transcribed here exactly as `output_tokens` is.
+/// Computing a cost stays forbidden; transcribing one the vendor already
+/// computed is the same act as reading any other field. The label carries
+/// the distinction -- see `ClaudeCostState`.
 export interface ClaudeUsage {
   /// Assistant messages carrying a usage block. `0` means NONE WAS FOUND
   /// -- 24 of 1,502 real transcripts -- and must never render as four
@@ -1807,6 +1812,51 @@ export interface ClaudeUsage {
   truncated: boolean;
   bytes_read: number;
   file_bytes: number;
+  /// What Claude Code itself recorded this session cost (#1210).
+  ///
+  /// `null` means NO `cost-state` record was found, which is the majority
+  /// of the corpus. It must render as a sentence about Claude Code's
+  /// recording -- never `$0.00`, never an estimate, never a blank that
+  /// reads as zero. The absent-is-not-zero rule with a currency symbol
+  /// attached, which makes a wrong zero worse rather than better.
+  recorded_cost: ClaudeCostState | null;
+}
+
+/// One session's `cost-state` record, as Claude Code wrote it (#1210).
+///
+/// Mirrors `claude::usage::CostState`. Every field is transcribed from
+/// the transcript; nothing here is derived, because this app holds no
+/// rates and never will.
+///
+/// # Attributed, or not shown
+///
+/// A figure this app transcribed and a figure this app derived have
+/// different failure modes, and a reader cannot tell them apart from the
+/// number alone. So the total is never labelled "cost" unqualified: the
+/// rendering says **as recorded by Claude Code**, which is what makes
+/// showing it honest.
+export interface ClaudeCostState {
+  /// `totalCostUSD`, verbatim. A FLOOR rather than a total when
+  /// `has_unknown_model_cost` is set.
+  total_cost_usd: number;
+  /// The per-model split, costliest first. Possibly empty: a record can
+  /// carry a total with no breakdown, and the total still stands.
+  models: { model: string; cost_usd: number }[];
+  /// `totalAPIDuration` in milliseconds, retries included.
+  total_api_ms: number;
+  /// `totalAPIDurationWithoutRetries` in milliseconds. The difference
+  /// against `total_api_ms` is time lost to retries -- invisible
+  /// everywhere else in the app, and a direct "is this going badly"
+  /// signal. Subtracted at the render site, which guards the case where
+  /// the two disagree the wrong way round.
+  total_api_without_retries_ms: number;
+  /// Claude Code met a model it had no cost for, so `total_cost_usd`
+  /// omits that model's spend and is a FLOOR.
+  ///
+  /// `false` on every record measured, which means this path is untested
+  /// in the wild and is handled rather than assumed away -- the argument
+  /// `ToolVersion::CannotTell` already makes for a state nobody has hit.
+  has_unknown_model_cost: boolean;
 }
 
 /// One content block of a previewed message (#982).
