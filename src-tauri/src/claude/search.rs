@@ -1353,6 +1353,53 @@ mod tests {
         );
     }
 
+    /// The wire shape matches what the frontend's discriminated union
+    /// expects (#1203).
+    ///
+    /// A `serde` tag rename that disagreed with `ClaudeSearchVerdict` in
+    /// `types/pr.ts` would typecheck on both sides and fail only at
+    /// runtime -- and the failure mode is the one this feature exists to
+    /// prevent: an unmatched `kind` falls through the component's
+    /// branches to the settled "No matches", which is exactly the
+    /// sentence a partial index must never produce.
+    #[test]
+    fn the_verdict_serialises_as_the_frontend_union() {
+        let partial = serde_json::to_value(Verdict::NoneYet {
+            indexed: 340,
+            total: 1482,
+        })
+        .unwrap();
+        assert_eq!(partial["kind"], "none_yet");
+        assert_eq!(partial["indexed"], 340);
+        assert_eq!(partial["total"], 1482);
+
+        let settled = serde_json::to_value(Verdict::None).unwrap();
+        assert_eq!(settled["kind"], "none");
+
+        let hits = serde_json::to_value(Verdict::Matches {
+            hits: vec![Hit {
+                session_id: "s1".into(),
+                snippet: "x".into(),
+                truncated: false,
+            }],
+        })
+        .unwrap();
+        assert_eq!(hits["kind"], "matches");
+        assert_eq!(hits["hits"][0]["session_id"], "s1");
+
+        // Coverage's field names, which the component reads directly.
+        let cov = serde_json::to_value(Coverage::default()).unwrap();
+        for key in [
+            "indexed",
+            "total",
+            "unreadable",
+            "truncated",
+            "last_indexed_at",
+        ] {
+            assert!(cov.get(key).is_some(), "coverage is missing `{key}`");
+        }
+    }
+
     /// `pending` does not wrap when the denominator is stale.
     #[test]
     fn a_stale_denominator_is_not_a_huge_backlog() {
