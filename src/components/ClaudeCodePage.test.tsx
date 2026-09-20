@@ -6,6 +6,7 @@ import type {
   ClaudeSession,
   ClaudeSessionDetail,
   ClaudeSessionList,
+  ClaudeCostState,
   ClaudeUsage,
   ClaudeObservation,
   ClaudeSubagentRollup,
@@ -373,6 +374,31 @@ const usage = (over: Partial<ClaudeUsage> = {}): ClaudeUsage => ({
   truncated: false,
   bytes_read: 183_237,
   file_bytes: 183_237,
+  /// No `cost-state` record, which is the majority of the corpus and
+  /// therefore the right DEFAULT: a fixture that carried one by default
+  /// would leave the absent arm -- the one #846 is about -- reachable
+  /// only by a test that opted out of it. The tests that want a recorded
+  /// cost opt IN, with `costState()` below.
+  recorded_cost: null,
+  ...over,
+});
+
+/// One session's `cost-state` record (#1210).
+///
+/// The defaults are a REAL record from the development machine
+/// (`9e24f824`): two models, a sub-cent haiku slice beside a $1.32 opus
+/// one, 68 ms of retry time, and `has_unknown_model_cost: false` -- which
+/// is its value on every record measured, so the `true` path is opted
+/// into explicitly and exists only in a test.
+const costState = (over: Partial<ClaudeCostState> = {}): ClaudeCostState => ({
+  total_cost_usd: 1.3242615,
+  models: [
+    { model: "claude-opus-5[1m]", cost_usd: 1.3230755 },
+    { model: "claude-haiku-4-5-20251001", cost_usd: 0.001186 },
+  ],
+  total_api_ms: 84_690,
+  total_api_without_retries_ms: 84_622,
+  has_unknown_model_cost: false,
   ...over,
 });
 
@@ -2010,6 +2036,7 @@ describe("the subagent rollup is beside the parent's own usage, never inside it"
       cache_read_tokens: 300,
       cache_creation_tokens: 400,
       models: [],
+      recorded_cost: null,
       truncated: false,
       bytes_read: 10,
       file_bytes: 10,
@@ -2385,15 +2412,30 @@ describe("how much work a session did", () => {
     expect(screen.getByText(/claude-opus-5 \(900\), claude-opus-4-7 \(94\)/)).toBeTruthy();
   });
 
-  /// No dollars anywhere, and this is asserted rather than left to
-  /// review. A cost needs per-model rates, those rates change, and a
-  /// quietly stale number with a currency symbol on it is the
-  /// confident-wrong-answer failure #941 exists for.
-  it("shows tokens and never a dollar figure", () => {
+  /// No DERIVED dollars anywhere, and this is asserted rather than left
+  /// to review. A cost this app computed needs per-model rates, those
+  /// rates change, and a quietly stale number with a currency symbol on
+  /// it is the confident-wrong-answer failure #941 exists for.
+  ///
+  /// # What #1210 changed here, and what it did not
+  ///
+  /// The assertion used to be "no `$` on the page", which stopped being
+  /// the right spelling of the rule the moment a session carried a
+  /// `cost-state` record: Claude Code's own figure is transcribed and
+  /// shown, attributed. What has NOT changed is that this app derives
+  /// nothing — so the test now pins the case it always meant. The
+  /// standing fixture carries `recorded_cost: null`, which is the
+  /// majority of the corpus, and on that row a `$` anywhere would have to
+  /// have been invented from the token counts beside it.
+  ///
+  /// **Sabotage:** make `SessionCost` fall back to a computed figure when
+  /// `recorded_cost` is null — any rate at all, even a right one — and
+  /// this fails on the first assertion.
+  it("invents no dollar figure for a session Claude Code recorded no cost for", () => {
     renderView();
     open("HeadState GitHub issues filing");
     expect(screen.queryByText(/\$/)).toBeNull();
-    expect(screen.queryByText(/cost/i)).toBeNull();
+    expect(screen.getByText(/did not record a cost for this session/i)).toBeTruthy();
   });
 
   /// A row with no transcript is a real row. It must say there is nothing
@@ -2417,6 +2459,181 @@ describe("how much work a session did", () => {
     renderView();
     open("HeadState GitHub issues filing");
     expect(screen.getByText("994")).toBeTruthy();
+  });
+});
+
+/// What Claude Code recorded a session cost (#1210).
+///
+/// `usage.rs:33-41` rules out a figure this app DERIVES and that stands.
+/// These tests pin the other half: a figure the vendor computed and wrote
+/// to the transcript is transcribed, attributed, and — where there is no
+/// record — replaced by a sentence about the recording rather than a zero.
+describe("what Claude Code recorded a session cost", () => {
+  /// **The sabotage test for the absent case, and the one that matters
+  /// most.** Replace the `cost === null` arm with a `$0.00` field and
+  /// this fails on both assertions. `$0.00` states that the vendor
+  /// measured nothing spent — a confident wrong answer made MORE
+  /// credible by the attribution standing next to it, which is #846 with
+  /// a currency symbol on it.
+  ///
+  /// The standing fixture is this case, because it is the majority of
+  /// the corpus.
+  it("says Claude Code did not record a cost rather than showing $0.00", () => {
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.getByText(/Claude Code did not record a cost for this session/i)).toBeTruthy();
+    expect(screen.queryByText("$0.00")).toBeNull();
+  });
+
+  /// The figure, ATTRIBUTED — in the visible label, not in a comment.
+  ///
+  /// **Sabotage:** relabel the field "Cost" and this fails. A reader who
+  /// cannot tell a transcribed figure from a derived one has been handed
+  /// the more dangerous of the two by default, so the provenance is part
+  /// of the rendering rather than part of the documentation.
+  it("attributes the recorded figure to Claude Code in the label", () => {
+    state.usage = usage({ recorded_cost: costState() });
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.getByText(/as recorded by claude code/i)).toBeTruthy();
+    expect(screen.getByText("$1.32")).toBeTruthy();
+  });
+
+  /// The per-model split, costliest first, each model's own `costUSD`.
+  ///
+  /// **Sabotage:** drop the `models` field from `SessionCost` and this
+  /// fails. Nothing here is apportioned — the figures are the vendor's,
+  /// per model, as written.
+  it("shows the per-model split the record carries", () => {
+    state.usage = usage({ recorded_cost: costState() });
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(
+      screen.getByText(/claude-opus-5\[1m\] \$1\.32, claude-haiku-4-5-20251001 \$0\.0012/),
+    ).toBeTruthy();
+  });
+
+  /// `totalAPIDuration` minus `totalAPIDurationWithoutRetries`: time lost
+  /// to retries, invisible everywhere else in the app.
+  ///
+  /// **Sabotage:** render `total_api_ms` instead of the difference and
+  /// this fails — 84,690 ms is 84.7 s, not 68 ms.
+  it("shows time lost to retries as the difference between the two durations", () => {
+    state.usage = usage({ recorded_cost: costState() });
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.getByText("68 ms")).toBeTruthy();
+  });
+
+  /// **The arm no real transcript exercises.** `hasUnknownModelCost` is
+  /// `false` on every record measured, so this fixture is the only place
+  /// the floor path is ever run — which is exactly why it is handled
+  /// rather than assumed away, on the argument `ToolVersion::CannotTell`
+  /// already makes for a state nobody has hit.
+  ///
+  /// **Sabotage:** ignore the flag and label the figure a total, or drop
+  /// the warning paragraph, and this fails. When it is set the recorded
+  /// figure omits an unknown model's spend, so "total" understates it by
+  /// an unknown amount.
+  it("calls the figure a floor when Claude Code met a model it had no cost for", () => {
+    state.usage = usage({ recorded_cost: costState({ has_unknown_model_cost: true }) });
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.getByText(/floor, not a total/i)).toBeTruthy();
+    expect(screen.getByText(/at least, as recorded by claude code/i)).toBeTruthy();
+    // The figure itself is unchanged — it is the LABEL that moves.
+    expect(screen.getByText("$1.32")).toBeTruthy();
+  });
+
+  /// The happy-path pair for the test above: a record with the flag clear
+  /// must not wear a floor label it has not earned.
+  it("does not call an ordinary recorded figure a floor", () => {
+    state.usage = usage({ recorded_cost: costState() });
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.queryByText(/floor, not a total/i)).toBeNull();
+    expect(screen.queryByText(/at least, as recorded/i)).toBeNull();
+  });
+
+  /// A failed read and a session Claude Code recorded no cost for are
+  /// different facts, and neither of them is "it cost nothing". The #846
+  /// arm, ordered BEFORE the absent one for the reason that issue records.
+  ///
+  /// **Sabotage:** move the error arm below the `cost === null` arm and
+  /// this fails on the second assertion — `data` is undefined on a
+  /// rejection exactly as it is before the first read, so an error arm
+  /// placed after never renders.
+  it("names a failed read rather than claiming no cost was recorded", () => {
+    state.usageFailed = true;
+    state.usage = undefined;
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(
+      screen.getByText(/what Claude Code recorded it cost is unknown/i),
+    ).toBeTruthy();
+    expect(screen.queryByText(/did not record a cost for this session/i)).toBeNull();
+    expect(screen.queryByText(/\$/)).toBeNull();
+  });
+
+  /// A sub-cent recorded figure keeps its precision. `$0.00` is the one
+  /// string this whole section exists to never print, and rounding a real
+  /// `0.001186` down to it would print it by accident — a wrong zero
+  /// arrived at from a right number.
+  ///
+  /// **Sabotage:** drop the sub-cent branch in `formatUsd` and this
+  /// fails, showing `$0.00` for a session that cost something.
+  it("does not round a sub-cent recorded figure down to $0.00", () => {
+    state.usage = usage({
+      recorded_cost: costState({ total_cost_usd: 0.001186, models: [] }),
+    });
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.queryByText("$0.00")).toBeNull();
+    expect(screen.getByText("$0.0012")).toBeTruthy();
+  });
+
+  /// This app does not own the invariant between the two duration fields.
+  /// A pair that disagrees the wrong way round yields no row at all —
+  /// clamping to zero would state "no time was lost to retries" about a
+  /// record that makes no sense.
+  ///
+  /// **Sabotage:** change `retryMillis` to clamp at zero and this fails,
+  /// rendering "0 ms" for an incoherent record.
+  it("shows no retry time rather than zero when the durations disagree", () => {
+    state.usage = usage({
+      recorded_cost: costState({
+        total_api_ms: 100,
+        total_api_without_retries_ms: 200,
+      }),
+    });
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.queryByText(/time lost to retries/i)).toBeNull();
+    // The cost still renders: one incoherent pair of timings must not
+    // suppress the figure the section exists for.
+    expect(screen.getByText("$1.32")).toBeTruthy();
+  });
+
+  /// A record with a total and no breakdown is still a record of a cost.
+  /// A panel that demanded the split would suppress a figure the vendor
+  /// did write down.
+  it("shows the total when the record carries no per-model split", () => {
+    state.usage = usage({ recorded_cost: costState({ models: [] }) });
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.getByText("$1.32")).toBeTruthy();
+    expect(screen.queryByText(/by model/i)).toBeNull();
+  });
+
+  /// A row with no transcript is a real row: it must say there is nothing
+  /// to read from, not report a zero cost.
+  it("says there is nothing to read when no transcript was recorded", () => {
+    state.list = listOf([
+      session({ transcript_path: null, transcript_state: { state: "not-recorded" } }),
+    ]);
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.queryByText(/\$/)).toBeNull();
   });
 });
 

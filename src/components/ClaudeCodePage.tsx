@@ -4,6 +4,7 @@ import { toast } from "sonner";
 import type {
   ClaudeAgentTypes,
   ClaudeCompactions,
+  ClaudeCostState,
   ClaudePreviewBlock,
   ClaudeSession,
   ClaudeObservation,
@@ -1566,6 +1567,13 @@ function SessionDetail({
               it, what was it saying, and where do I go next. The preview is
               last of the two because it is the one that costs a read. */}
           <SessionUsage detail={detail.data} />
+          {/* Directly after the token figures, because it is the same
+              question in the unit a reader actually budgets in -- and
+              because the two must be seen to come from DIFFERENT places.
+              The tokens above are summed here, per message. The figure
+              below was computed by Claude Code and is transcribed. Nothing
+              in this app multiplies one into the other (#1210). */}
+          <SessionCost detail={detail.data} />
           {/* Right after the token figures, because it answers the same
               question from the other side: the tokens say how much work
               happened, and this says what that volume cost the session in
@@ -2451,6 +2459,206 @@ function SessionSubagents({ detail: d }: { detail: ClaudeSessionDetail }) {
       )}
     </section>
   );
+}
+
+/// What Claude Code recorded this session cost (#1210).
+///
+/// # Transcribed, never computed
+///
+/// `usage.rs:33-41` rules out a dollar figure this app DERIVES, and that
+/// argument is untouched: no rate table ships, nothing here multiplies a
+/// token count by anything. What it never ruled out is reading a number
+/// the vendor already computed. Claude Code writes a `cost-state` record
+/// carrying `totalCostUSD`, measured while the session ran. Rendering it
+/// is the same act as rendering `output_tokens` one section up.
+///
+/// The distinction only survives if the LABEL carries it, which is why
+/// the figure is never shown as "Cost". It is shown as **"as recorded by
+/// Claude Code"**, in the visible text and not merely in this comment,
+/// because a reader who cannot tell a transcribed figure from a derived
+/// one has been given the more dangerous of the two by default.
+///
+/// # A session panel, and deliberately nothing wider
+///
+/// No tile, no chart, no corpus total. The record is on a minority of
+/// sessions lifetime, and a sum over that minority would be read as a sum
+/// over all of them however the denominator was printed beside it -- the
+/// confident-wrong-answer failure at aggregate scale rather than on one
+/// row. The measured coverage lives in `claude/usage.rs`'s module docs,
+/// where a figure that decays is a historical note about a decision
+/// rather than a claim printed at a user (#969).
+///
+/// # Five absences, five renderings
+///
+/// `SessionUsage` above is the pattern, one question along:
+///
+/// | condition | rendering |
+/// |---|---|
+/// | no transcript path on the row | says so, and why: nothing to read |
+/// | the read failed | the reason. NOT `$0.00`. |
+/// | it is still reading | says so |
+/// | read, and NO `cost-state` record | "Claude Code did not record a cost for this session." |
+/// | recorded, `hasUnknownModelCost` | the figure, labelled a FLOOR |
+///
+/// The fourth row is the whole point and is the #846 rule with a currency
+/// symbol on it. `$0.00` here would assert that the vendor measured
+/// nothing spent -- a confident wrong answer made MORE credible by the
+/// attribution standing next to it. The sentence is a fact about Claude
+/// Code's RECORDING, never about the session's spend, because this app
+/// knows the first and cannot know the second.
+///
+/// The fifth is the one nobody has hit. `hasUnknownModelCost` is `false`
+/// on every record measured, so this arm ships unexercised by any real
+/// transcript and is handled anyway -- `ToolVersion::CannotTell` exists on
+/// exactly that argument. When it is set the recorded figure omits an
+/// unknown model's spend, so calling it a total would understate it by an
+/// unknown amount, and it is called a floor instead.
+///
+/// The error arm is BEFORE the absent arm, per #846: `data` is undefined
+/// on a rejection exactly as it is before the first read, so an error arm
+/// placed after would never render in the case it exists for.
+function SessionCost({ detail: d }: { detail: ClaudeSessionDetail }) {
+  // The same reading, the same key, the same query as `SessionUsage`.
+  // React Query dedupes on the key, so this is one read of the transcript
+  // rendered in two places rather than two reads -- which matters, since
+  // the largest real transcript is 76.7 MB.
+  const readable = d.transcript_path !== null && d.transcript_state.state !== "gone";
+  const { data, isError, error, isLoading } = useClaudeSessionUsage(
+    readable ? d.transcript_path : null,
+  );
+  const cost = data?.recorded_cost ?? null;
+  const retryMs = retryMillis(cost);
+
+  return (
+    <section className="rounded-md border border-[#30363d] bg-[#161b22] p-3">
+      <h3 className="text-xs font-semibold text-[#e6edf3]">What Claude Code recorded it cost</h3>
+      {/* Each sentence below names WHAT is unknown -- "what it cost", not
+          a bare "cannot be read". The token section one up renders the
+          same four absences about a different question, and two
+          identically worded paragraphs would leave a reader unable to
+          tell which figure was missing. */}
+      {d.transcript_path === null ? (
+        <p className="mt-2 text-xs text-[#8b949e]">
+          This session has no transcript, so there is nothing to read a recorded cost from.
+        </p>
+      ) : d.transcript_state.state === "gone" ? (
+        <p className="mt-2 text-xs text-[#8b949e]">
+          Its transcript is no longer on disk, so what Claude Code recorded it cost cannot be read.
+        </p>
+      ) : isError ? (
+        // NOT $0.00 (#846). A failed read and a session Claude Code
+        // recorded nothing for are different facts, and neither of them
+        // is "it cost nothing".
+        <p className="mt-2 text-xs text-[#8b949e]">
+          Its transcript could not be read, so what Claude Code recorded it cost is unknown
+          {errorMessage(error) ? ` (${errorMessage(error)})` : ""}.
+        </p>
+      ) : isLoading || data === undefined ? (
+        <p className="mt-2 text-xs text-[#8b949e]">Reading its transcript for a recorded cost…</p>
+      ) : cost === null ? (
+        // The majority of sessions. A fact about the RECORDING, never
+        // about the spend: this app knows what Claude Code wrote down and
+        // cannot know what the session cost. The second sentence exists
+        // so a reader who does not know a vendor record is involved does
+        // not read the first as "it was free".
+        <p className="mt-2 text-xs text-[#8b949e]">
+          Claude Code did not record a cost for this session. Claude Code only began writing this
+          figure into transcripts recently, so older sessions carry no record of it — which is not
+          the same as having cost nothing.
+        </p>
+      ) : (
+        <>
+          <dl className="mt-2 space-y-1.5 text-xs">
+            {/* The attribution is IN THE LABEL, not in a footnote and not
+                only in the comment above. "Cost" alone would read as a
+                figure this app stands behind, and it is not one -- it is
+                Claude Code's measurement, quoted. */}
+            <Field
+              label={
+                cost.has_unknown_model_cost
+                  ? "At least, as recorded by Claude Code"
+                  : "As recorded by Claude Code"
+              }
+            >
+              {formatUsd(cost.total_cost_usd)}
+            </Field>
+            {/* The split is the vendor's own `modelUsage`, costliest
+                first. Nothing is apportioned here: each figure is that
+                model's `costUSD` as written. */}
+            {cost.models.length > 0 ? (
+              <Field label={cost.models.length === 1 ? "Model" : "By model"}>
+                {cost.models.map((m) => `${m.model} ${formatUsd(m.cost_usd)}`).join(", ")}
+              </Field>
+            ) : null}
+            {/* `totalAPIDuration` minus `totalAPIDurationWithoutRetries`:
+                time lost to retries, which nothing else in this app shows
+                and which is a direct "is this going badly" signal.
+                Rendered only when the subtraction makes sense -- see
+                `retryMillis`. */}
+            {retryMs !== null ? (
+              <Field label="Time lost to retries">{formatRetry(retryMs)}</Field>
+            ) : null}
+          </dl>
+          {cost.has_unknown_model_cost ? (
+            // The untested arm, stated rather than assumed away. The
+            // recorded figure omits a model Claude Code had no cost for,
+            // so it is a floor and the real spend is that or more.
+            <p className="mt-2 text-xs text-[#d29922]">
+              That is a floor, not a total: Claude Code recorded that it met a model it had no cost
+              for, so whatever that model cost is missing from the figure above.
+            </p>
+          ) : null}
+        </>
+      )}
+    </section>
+  );
+}
+
+/// Time lost to retries, or `null` when the record cannot support the
+/// subtraction (#1210).
+///
+/// `totalAPIDuration` minus `totalAPIDurationWithoutRetries`. This app
+/// does not own the invariant between the two fields — Claude Code writes
+/// them — so a pair that disagrees the wrong way round yields `null` and
+/// the row simply does not render. Clamping to zero would state "no time
+/// was lost to retries" about a record that does not make sense, which is
+/// the confident wrong answer in its quietest form.
+///
+/// Exported to nothing: it exists as a named function rather than an
+/// inline expression so the guard above is one thing with one test,
+/// rather than a subtraction that gets simplified back into a clamp by
+/// the next person who reads it.
+function retryMillis(cost: ClaudeCostState | null): number | null {
+  if (cost === null) return null;
+  const lost = cost.total_api_ms - cost.total_api_without_retries_ms;
+  return lost >= 0 ? lost : null;
+}
+
+/// A transcribed dollar figure, to the cent.
+///
+/// Two decimal places, because the question is "what did this cost" and
+/// the recorded value carries seven (`1.3242615`) — digits that state a
+/// precision the reader has no use for and that make the figure look
+/// derived rather than quoted.
+///
+/// Sub-cent totals are the exception and keep their precision: a session
+/// that recorded `0.001186` would round to `$0.00`, which is the exact
+/// string this whole section exists to never print. `$0.0012` is small
+/// and true; `$0.00` is a claim that nothing was spent.
+function formatUsd(usd: number): string {
+  if (usd > 0 && usd < 0.005) return `$${usd.toFixed(4)}`;
+  return `$${usd.toFixed(2)}`;
+}
+
+/// Milliseconds of retry time, in the largest unit that keeps it legible.
+///
+/// The measured values run from tens of milliseconds to whole minutes on
+/// a bad session, and "68 ms" and "2.3 min" are both answers a reader can
+/// act on where a raw millisecond count is not.
+function formatRetry(ms: number): string {
+  if (ms < 1000) return `${ms.toLocaleString()} ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)} s`;
+  return `${(ms / 60_000).toFixed(1)} min`;
 }
 
 /// Bytes as MB, for the two truncation labels.

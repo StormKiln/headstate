@@ -40,6 +40,34 @@
 //! authoritative. Tokens are what the file actually records, and they
 //! stay true for as long as the file does.
 //!
+//! ## Computing a figure, and transcribing one (#1210)
+//!
+//! The paragraph above is untouched and still governs: **nothing here
+//! multiplies a token count by a rate.** No rate table ships, and none
+//! ever will, for exactly the reason it gives.
+//!
+//! What it does not govern is a number the vendor already computed and
+//! wrote to the file. A `cost-state` record carries `totalCostUSD`,
+//! measured by Claude Code itself at the time the session ran. Reading
+//! that and reading `output_tokens` are the same act: both transcribe a
+//! field the transcript states. Neither is an estimate, because neither
+//! involves a rate this app would have to keep true.
+//!
+//! The distinction survives only if the label carries it, so
+//! [`CostState`] is never rendered as "cost" unqualified. It is rendered
+//! **attributed** -- "as recorded by Claude Code" -- because a figure
+//! this app transcribed and a figure this app derived have different
+//! failure modes and a reader has to be able to tell which one is on
+//! screen.
+//!
+//! And it is attached per SESSION, never summed across the corpus. The
+//! record is on 6.1% of sessions lifetime (88 of 1,453 re-measured for
+//! #1210, up from the 43 recorded above). A corpus total over 6% of the
+//! rows would be read as a total over all of them no matter what
+//! denominator sat beside it -- the confident-wrong-answer failure at
+//! aggregate scale. One session's panel states one session's record, and
+//! the sessions without one say so in words.
+//!
 //! The four counters are reported SEPARATELY rather than as one total,
 //! because they are not interchangeable. Measured on the four newest
 //! sessions:
@@ -154,7 +182,12 @@ pub const BUDGET_BYTES: u64 = 8 * 1024 * 1024;
 /// Four counters, not a total. See the module docs: cache reads run two
 /// to three orders of magnitude above fresh input, so a single summed
 /// figure would be a cache-read count wearing the word "tokens".
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Eq` is gone since #1210 and `PartialEq` stays: `recorded_cost` carries
+/// an `f64` transcribed from the vendor's record, and `f64` is not `Eq`.
+/// Nothing compares a `Usage` for total equality outside the tests, which
+/// compare the fields they mean.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     /// Assistant messages carrying a `usage` block.
     ///
@@ -191,6 +224,114 @@ pub struct Usage {
     pub bytes_read: u64,
     /// The file's whole size, so the label can state the fraction.
     pub file_bytes: u64,
+    /// What Claude Code itself recorded this session cost, if it recorded
+    /// anything (#1210).
+    ///
+    /// `None` means NO `cost-state` record was found -- which is the
+    /// majority of the corpus -- and must render as a sentence about
+    /// Claude Code's recording, never as `$0.00`. It is the
+    /// absent-is-not-zero rule this module already states for
+    /// [`Usage::observed`], one field along and with a currency symbol
+    /// attached, which makes a wrong zero worse rather than better.
+    ///
+    /// Transcribed, never computed. See the module docs: no rate table
+    /// ships and none ever will.
+    pub recorded_cost: Option<CostState>,
+}
+
+/// One session's `cost-state` record, as Claude Code wrote it (#1210).
+///
+/// # Why this is not an estimate
+///
+/// Every field here is copied out of the transcript. Nothing is
+/// multiplied by a rate, because this app holds no rates -- see the
+/// module docs on computing versus transcribing. The figure's accuracy is
+/// Claude Code's problem and its provenance is stated on screen, which is
+/// the only honest way to show a number this app did not derive.
+///
+/// # Why the LAST record wins
+///
+/// A transcript carries the record more than once: Claude Code appends a
+/// fresh one as the session goes, and the two in the sampled file differ
+/// only in `totalDuration` (481,454 then 481,458 ms). They are cumulative
+/// snapshots, not increments, so the last is the session's final state
+/// and summing them would double a figure that was never additive. This
+/// is the same hazard the token path avoids by excluding the record
+/// entirely.
+///
+/// # Why the token fields of the record are NOT read
+///
+/// `modelUsage` carries `inputTokens` and friends, already summed.
+/// [`read_and_sum`] deliberately does not count them and this does not
+/// either: the per-message blocks are the token source on 98.4% of
+/// sessions, and mixing a pre-summed rollup into them would double every
+/// figure on the sessions that have one. Only the per-model COST is taken
+/// from here, which the per-message blocks do not carry at all.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CostState {
+    /// `totalCostUSD`, verbatim.
+    ///
+    /// A floor rather than a total when [`CostState::has_unknown_model_cost`]
+    /// is set. See that field.
+    pub total_cost_usd: f64,
+    /// The per-model split from `modelUsage`, costliest first.
+    ///
+    /// Empty is possible and is not an error: the record can carry a
+    /// total with no breakdown, and a panel that demanded the split would
+    /// suppress a figure the vendor did record.
+    pub models: Vec<ModelCost>,
+    /// `totalAPIDuration` in milliseconds: time in API calls, retries
+    /// included.
+    pub total_api_ms: u64,
+    /// `totalAPIDurationWithoutRetries` in milliseconds.
+    ///
+    /// The subtraction against [`CostState::total_api_ms`] is time lost
+    /// to retries, which is invisible everywhere else in the app and is a
+    /// direct "is this going badly" signal. Done at the render site
+    /// rather than stored, so a record whose two fields disagree the
+    /// wrong way round cannot be frozen into a negative here --
+    /// [`CostState::retry_ms`] is the guarded accessor.
+    pub total_api_without_retries_ms: u64,
+    /// `hasUnknownModelCost`: Claude Code met a model it had no cost for.
+    ///
+    /// `true` makes [`CostState::total_cost_usd`] a FLOOR: the recorded
+    /// figure omits whatever the unknown model cost, so the real spend is
+    /// that figure or more, and labelling it a total would understate it
+    /// by an unknown amount.
+    ///
+    /// **Untested in the wild, and handled anyway.** It is `false` on all
+    /// 88 records measured for #1210, so no real transcript exercises the
+    /// floor path -- a fixture in this module's tests is the only place
+    /// it is ever exercised. That is precisely why it is carried rather
+    /// than assumed away: `ToolVersion::CannotTell` in `tools/version.rs`
+    /// exists on the same argument, for a case nobody has hit, because
+    /// the day it is hit it must not render as the confident answer.
+    pub has_unknown_model_cost: bool,
+}
+
+impl CostState {
+    /// Milliseconds lost to retries: `totalAPIDuration` minus
+    /// `totalAPIDurationWithoutRetries`.
+    ///
+    /// `checked_sub` and `None` rather than a saturating zero. The two
+    /// fields are written by Claude Code and this app does not own the
+    /// invariant between them; if the without-retries figure ever exceeds
+    /// the total, "0 ms of retries" would be a confident wrong answer
+    /// about a record that does not make sense, and `None` is the honest
+    /// reading -- the same split `Usage::observed` draws between "none"
+    /// and "we cannot say".
+    pub fn retry_ms(&self) -> Option<u64> {
+        self.total_api_ms
+            .checked_sub(self.total_api_without_retries_ms)
+    }
+}
+
+/// One model's slice of a `cost-state` record (#1210).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelCost {
+    pub model: String,
+    /// `costUSD` for this model, verbatim from the record.
+    pub cost_usd: f64,
 }
 
 impl Usage {
@@ -226,6 +367,15 @@ pub struct ModelCount {
 /// `"usage"` in it cannot carry what we want, so it is never parsed. A
 /// false positive costs one wasted parse; a false negative is impossible,
 /// since the substring tested is exactly the key we read.
+///
+/// The `cost-state` line (#1210) needs its own test and does NOT get it
+/// for free from the one above: the record spells its key `"modelUsage"`,
+/// which does not contain the substring `"usage"` -- the opening quote
+/// falls before `modelUsage`, not before `Usage`. A filter that assumed
+/// otherwise would have silently found no record on every transcript, and
+/// the panel would have rendered the absent sentence corpus-wide while
+/// looking perfectly healthy. So the tested substring is `"cost-state"`,
+/// which is again exactly the value read back off the record.
 ///
 /// # Why the last line is dropped when truncated
 ///
@@ -345,6 +495,23 @@ fn read_and_sum(path: &Path, budget: Option<u64>) -> Result<Usage, String> {
 
     let mut models: Vec<ModelCount> = Vec::new();
     for line in lines {
+        // The `cost-state` pre-filter (#1210), tested before the token
+        // one because the two select disjoint records and the token
+        // filter would reject this line. See the doc above on why
+        // `"modelUsage"` does not satisfy `"usage"`.
+        if line.contains("\"cost-state\"") {
+            if let Some(c) = parse_cost_state(line) {
+                // LAST wins, not summed. The records are cumulative
+                // snapshots -- see `CostState`'s docs -- so overwriting
+                // is what keeps the final state final.
+                out.recorded_cost = Some(c);
+            }
+            // A `cost-state` record carries no per-message usage block,
+            // so there is nothing below for it to contribute. Falling
+            // through would be harmless (the `type` check rejects it) but
+            // skipping states the disjointness rather than relying on it.
+            continue;
+        }
         // The pre-filter. See the doc above.
         if !line.contains("\"usage\"") {
             continue;
@@ -411,6 +578,87 @@ fn read_and_sum(path: &Path, budget: Option<u64>) -> Result<Usage, String> {
     });
     out.models = models;
     Ok(out)
+}
+
+/// Read one `cost-state` line into a [`CostState`] (#1210).
+///
+/// # Why `totalCostUSD` is the gate
+///
+/// `None` rather than a defaulted record when the line will not parse or
+/// carries no `totalCostUSD`. A `CostState` whose total defaulted to 0.0
+/// would render as `$0.00 as recorded by Claude Code`, which states that
+/// the vendor measured nothing spent -- a confident wrong answer wearing
+/// an attribution that makes it MORE credible, not less. The absent
+/// sentence is the correct rendering for a record we could not read, and
+/// `None` is how the UI gets there.
+///
+/// The timing fields default to 0 rather than gating, because they are
+/// secondary to the figure the panel exists for and a record missing them
+/// is still a record of a cost. `retry_ms` then reads 0, which is a true
+/// statement about two fields that are both zero.
+///
+/// # Why the models are sorted costliest first
+///
+/// The same rule `read_and_sum` applies to `models`: a stable order the
+/// reader can use, rather than whichever key `serde_json`'s map happened
+/// to yield. Costliest first because the question the split answers is
+/// "what did the money go on". Ties fall back to the name so the order is
+/// deterministic rather than input-dependent.
+fn parse_cost_state(line: &str) -> Option<CostState> {
+    let rec = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    // The substring pre-filter can match a `cost-state` mention inside
+    // some other record's text, so the TYPE is checked rather than
+    // assumed -- the same check `read_and_sum` makes for `assistant`.
+    if rec.get("type").and_then(|t| t.as_str()) != Some("cost-state") {
+        return None;
+    }
+    let total_cost_usd = rec.get("totalCostUSD").and_then(|v| v.as_f64())?;
+
+    let ms = |key: &str| rec.get(key).and_then(|v| v.as_u64()).unwrap_or_default();
+
+    let mut models: Vec<ModelCost> = rec
+        .get("modelUsage")
+        .and_then(|m| m.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(model, v)| {
+                    // A model entry with no `costUSD` is DROPPED rather
+                    // than shown as 0.00, for the reason the gate above
+                    // gives: a zero beside a model name asserts that model
+                    // was free. The session total still carries whatever
+                    // it cost, so nothing is lost from the headline
+                    // figure -- only from a split that cannot speak for
+                    // that model.
+                    Some(ModelCost {
+                        model: model.clone(),
+                        cost_usd: v.get("costUSD").and_then(|c| c.as_f64())?,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    models.sort_by(|a, b| {
+        b.cost_usd
+            .partial_cmp(&a.cost_usd)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.model.cmp(&b.model))
+    });
+
+    Some(CostState {
+        total_cost_usd,
+        models,
+        total_api_ms: ms("totalAPIDuration"),
+        total_api_without_retries_ms: ms("totalAPIDurationWithoutRetries"),
+        // Absent reads as `false`, which is the right default only
+        // because it is the recorded value on every record measured. If
+        // Claude Code ever stops writing the key the figure reverts to
+        // being labelled a total, which is the same reading it had before
+        // the flag existed.
+        has_unknown_model_cost: rec
+            .get("hasUnknownModelCost")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    })
 }
 
 #[cfg(test)]
@@ -525,6 +773,190 @@ mod tests {
         let u = summarise(&p).unwrap();
         assert_eq!(u.messages, 1, "only the assistant record counts");
         assert_eq!(u.input_tokens, 10);
+        // #1210 added a SECOND reading of the same record, and this is
+        // the assertion that keeps the two apart. The cost is taken;
+        // the record's pre-summed `inputTokens: 730` is still not, and
+        // `input_tokens` above proves it. If the cost reading ever
+        // starts feeding the token path, that assertion goes to 740.
+        assert_exact(u.recorded_cost.as_ref().unwrap().total_cost_usd, 1.96);
+    }
+
+    /// Assert a transcribed dollar figure is EXACTLY the one the record
+    /// carries.
+    ///
+    /// Exact, not approximate, and that is the assertion this feature
+    /// needs: the figure is transcribed rather than computed, so any
+    /// drift at all means something derived it. An epsilon comparison
+    /// here would pass a build that had started rounding, or scaling, or
+    /// re-deriving from tokens -- the one defect these tests exist to
+    /// catch.
+    ///
+    /// `to_bits` rather than `==` because clippy's `float_cmp` forbids
+    /// the latter under `-D warnings`, correctly in general and not here.
+    /// Bit equality is the same comparison, spelled so the deliberateness
+    /// is visible. Neither side is ever NaN -- both come from a JSON
+    /// number literal.
+    #[track_caller]
+    fn assert_exact(got: f64, want: f64) {
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "transcribed figure drifted: got {got}, the record says {want}"
+        );
+    }
+
+    /// One `cost-state` line as Claude Code really writes it.
+    ///
+    /// Copied from a real transcript on the development machine
+    /// (`9e24f824`, two models, `hasUnknownModelCost: false`) rather than
+    /// invented, so the field spellings are the vendor's and not this
+    /// module's idea of them. `unknown` is the one substitution, because
+    /// no real record carries `true` -- see [`CostState::has_unknown_model_cost`].
+    fn cost_state(total: f64, unknown: bool) -> String {
+        format!(
+            r#"{{"type":"cost-state","sessionId":"9e24f824","totalCostUSD":{total},"totalAPIDuration":84690,"totalAPIDurationWithoutRetries":84622,"totalToolDuration":6387,"totalDuration":481454,"modelUsage":{{"claude-haiku-4-5-20251001":{{"inputTokens":1106,"outputTokens":16,"costUSD":0.001186}},"claude-opus-5[1m]":{{"inputTokens":624,"outputTokens":5542,"costUSD":1.3230755}}}},"hasUnknownModelCost":{unknown}}}"#
+        )
+    }
+
+    #[test]
+    fn a_recorded_cost_is_transcribed_with_its_split_and_its_retry_time() {
+        // The whole feature in one assertion set: the figure, the
+        // per-model split costliest-first, and the retry subtraction.
+        // Nothing here is computed from a token count -- the record
+        // carries `inputTokens` and they appear in no expectation below.
+        let tmp = Tmp::new("recorded");
+        let p = write(
+            tmp.path(),
+            "s.jsonl",
+            &[
+                &assistant("claude-opus-5", 10, 100, 1_000, 50),
+                &cost_state(1.3242615, false),
+            ],
+        );
+        let c = summarise_whole(&p).unwrap().recorded_cost.unwrap();
+        assert_exact(c.total_cost_usd, 1.3242615);
+        assert!(!c.has_unknown_model_cost, "a total, not a floor");
+        // Costliest first: opus at 1.32 ahead of haiku at 0.001.
+        assert_eq!(c.models.len(), 2);
+        assert_eq!(c.models[0].model, "claude-opus-5[1m]");
+        assert_exact(c.models[0].cost_usd, 1.3230755);
+        assert_eq!(c.models[1].model, "claude-haiku-4-5-20251001");
+        // 84,690 - 84,622. Invisible everywhere else in the app and a
+        // direct "is this going badly" signal.
+        assert_eq!(c.retry_ms(), Some(68));
+    }
+
+    #[test]
+    fn a_transcript_with_no_cost_state_records_no_cost_rather_than_zero() {
+        // The majority of the corpus. `None`, never `Some(0.0)`: a
+        // `$0.00` attributed to Claude Code would assert the vendor
+        // measured nothing spent, which is a confident wrong answer made
+        // MORE credible by the attribution beside it.
+        let tmp = Tmp::new("nocost");
+        let p = write(
+            tmp.path(),
+            "s.jsonl",
+            &[&assistant("claude-opus-5", 10, 100, 1_000, 50)],
+        );
+        let u = summarise_whole(&p).unwrap();
+        assert!(u.observed(), "the token half is unaffected");
+        assert!(
+            u.recorded_cost.is_none(),
+            "no record must not read as a recorded zero"
+        );
+    }
+
+    #[test]
+    fn an_unknown_model_cost_is_carried_through_so_the_figure_can_be_called_a_floor() {
+        // `hasUnknownModelCost` is `false` on all 88 records measured, so
+        // THIS FIXTURE IS THE ONLY PLACE THE FLAG IS EVER TRUE. Without
+        // it the floor path ships entirely unexercised, which is the
+        // argument `ToolVersion::CannotTell` makes for a state nobody has
+        // hit: the day it happens it must not render as the confident
+        // answer.
+        let tmp = Tmp::new("unknowncost");
+        let p = write(tmp.path(), "s.jsonl", &[&cost_state(1.3242615, true)]);
+        let c = summarise_whole(&p).unwrap().recorded_cost.unwrap();
+        assert!(
+            c.has_unknown_model_cost,
+            "the flag must survive the read, or the UI can never label a floor"
+        );
+        // The figure itself is unchanged by the flag. It is the LABEL
+        // that changes -- a floor is still the number the vendor wrote.
+        assert_exact(c.total_cost_usd, 1.3242615);
+    }
+
+    #[test]
+    fn the_last_cost_state_record_wins_rather_than_the_records_summing() {
+        // A real transcript carries the record twice: cumulative
+        // snapshots, differing only in `totalDuration`. Summing them
+        // would double a figure that was never additive -- the same
+        // hazard the token path avoids by excluding the record outright.
+        let tmp = Tmp::new("lastcost");
+        let p = write(
+            tmp.path(),
+            "s.jsonl",
+            &[&cost_state(0.51, false), &cost_state(1.3242615, false)],
+        );
+        let c = summarise_whole(&p).unwrap().recorded_cost.unwrap();
+        // The final snapshot, not 1.8342615.
+        assert_exact(c.total_cost_usd, 1.3242615);
+    }
+
+    #[test]
+    fn a_cost_state_record_with_no_total_is_absent_rather_than_zero() {
+        // A record we could not read the figure out of is a record we
+        // cannot speak for. `None` sends the UI to the absent sentence,
+        // which is true; a defaulted `0.0` would send it to "$0.00 as
+        // recorded by Claude Code", which is a lie with a citation.
+        let tmp = Tmp::new("nototal");
+        let p = write(
+            tmp.path(),
+            "s.jsonl",
+            &[r#"{"type":"cost-state","sessionId":"x","modelUsage":{}}"#],
+        );
+        assert!(summarise_whole(&p).unwrap().recorded_cost.is_none());
+    }
+
+    #[test]
+    fn a_retry_time_that_cannot_be_subtracted_is_unknown_rather_than_zero() {
+        // This app does not own the invariant between the two duration
+        // fields. If they ever disagree the wrong way round, "0 ms of
+        // retries" would be a confident wrong answer about a nonsensical
+        // record, and `None` is the honest reading.
+        let tmp = Tmp::new("badretry");
+        let p = write(
+            tmp.path(),
+            "s.jsonl",
+            &[
+                r#"{"type":"cost-state","totalCostUSD":1.0,"totalAPIDuration":100,"totalAPIDurationWithoutRetries":200,"modelUsage":{}}"#,
+            ],
+        );
+        let c = summarise_whole(&p).unwrap().recorded_cost.unwrap();
+        assert_eq!(c.retry_ms(), None);
+        // The cost itself still reads: one incoherent pair of timings
+        // must not suppress the figure the panel exists for.
+        assert_exact(c.total_cost_usd, 1.0);
+    }
+
+    #[test]
+    fn a_model_entry_with_no_cost_is_dropped_rather_than_shown_as_free() {
+        // A zero beside a model name asserts that model was free. The
+        // session total still carries whatever it cost, so only the split
+        // loses a row it could not speak for.
+        let tmp = Tmp::new("nomodelcost");
+        let p = write(
+            tmp.path(),
+            "s.jsonl",
+            &[
+                r#"{"type":"cost-state","totalCostUSD":2.0,"modelUsage":{"a":{"costUSD":2.0},"b":{"inputTokens":9}}}"#,
+            ],
+        );
+        let c = summarise_whole(&p).unwrap().recorded_cost.unwrap();
+        assert_eq!(c.models.len(), 1);
+        assert_eq!(c.models[0].model, "a");
+        // The headline figure is untouched.
+        assert_exact(c.total_cost_usd, 2.0);
     }
 
     #[test]
