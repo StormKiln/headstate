@@ -87,6 +87,13 @@ pub mod settings;
 /// Compaction pressure, stated agent types, and who is waiting on you
 /// (#1065, #1066, #1067).
 pub mod signals;
+/// Proposing and carrying out a stop of a live session (#1219).
+///
+/// The ONE place in this tree that signals a Claude Code process, and it
+/// does not write to `~/.claude` at all -- see its header for why
+/// signalling is not what this module's read-only rule governs, and for
+/// the SIGTERM-first and re-derived-pid constraints it ships under.
+pub mod stop;
 pub mod store;
 /// Which sessions are subagents, and which session spawned each (#1002).
 pub mod subagent;

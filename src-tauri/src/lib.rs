@@ -360,6 +360,8 @@ pub fn run() {
             commands::claudify_command,
             commands::claude_launch_worktree,
             commands::claude_launch_session,
+            commands::claude_propose_stop,
+            commands::claude_stop_session,
             commands::assessed_worktrees,
             commands::remove_worktree_forced,
             commands::unlock_worktree,

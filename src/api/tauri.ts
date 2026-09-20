@@ -27,6 +27,8 @@ import type {
   ClaudeRestartList,
   ClaudePreview,
   ClaudeSessionDetail,
+  ClaudeStopProposal,
+  ClaudeStopOutcome,
   WireClaudeSessionList,
   ClaudeUsage,
   ClaudeSubagentRollup,
@@ -577,6 +579,32 @@ export const claudeLaunchWorktree = (repoPath: string, worktreePath: string, bra
 /// the clipboard path does.
 export const claudeLaunchSession = (sessionId: string, cwd: string | null) =>
   call<void>("claude_launch_session", { sessionId, cwd });
+
+/// Propose stopping live sessions, with the evidence (#1219).
+///
+/// Signals nothing. It re-reads the live registry and re-probes the
+/// process table on this call, and returns a row per session asked
+/// about -- including the refusals, which are the point: a stop refused
+/// because the pid was reused is what stops an unrelated process being
+/// killed, and a dropped refusal would look like a button that did
+/// nothing.
+///
+/// Desktop only. It is `Class::Local` beside `claudeStopSession` so the
+/// phone never renders evidence for an action it cannot take.
+export const claudeProposeStop = (sessionIds: string[]) =>
+  call<ClaudeStopProposal[]>("claude_propose_stop", { sessionIds });
+
+/// Stop one live session: SIGTERM, then SIGKILL only after a bounded wait.
+///
+/// Takes the SESSION ID and never a pid. Rust re-derives the pid on this
+/// call and refuses if the recorded and actual start times disagree --
+/// the session list is ten seconds stale, and signalling a pid read off
+/// it is how a process that inherited the number gets killed.
+///
+/// `Class::Local` with NO dispatch arm: a phone must not be able to kill
+/// a session on a Mac it is not sitting at.
+export const claudeStopSession = (sessionId: string) =>
+  call<ClaudeStopOutcome>("claude_stop_session", { sessionId });
 
 /// Merge a pull request when its checks pass, or cancel that.
 ///
