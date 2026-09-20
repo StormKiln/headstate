@@ -1302,11 +1302,9 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    tauri::async_runtime::spawn_blocking(f)
-        .await
-        .map_err(|e| {
-            RemoteError::Command(CommandError::classify(format!("command task failed: {e}")))
-        })
+    tauri::async_runtime::spawn_blocking(f).await.map_err(|e| {
+        RemoteError::Command(CommandError::classify(format!("command task failed: {e}")))
+    })
 }
 
 #[cfg(test)]
@@ -1483,7 +1481,10 @@ mod tests {
             message: "m".into(),
         };
         assert_eq!(bad.http_status(), 400);
-        assert_eq!(RemoteError::Command(CommandError::classify("m")).http_status(), 500);
+        assert_eq!(
+            RemoteError::Command(CommandError::classify("m")).http_status(),
+            500
+        );
     }
 
     #[test]
@@ -1633,7 +1634,12 @@ mod tests {
     #[test]
     fn a_command_error_is_passed_through_verbatim() {
         let r: Result<(), String> = Err(commands::AUTH_ERR.to_string());
-        assert_eq!(res(r), Err(RemoteError::Command(CommandError::classify(commands::AUTH_ERR))));
+        assert_eq!(
+            res(r),
+            Err(RemoteError::Command(CommandError::classify(
+                commands::AUTH_ERR
+            )))
+        );
         assert_eq!(res(Ok(("a".to_string(), 1u64))), Ok(json!(["a", 1])));
     }
 
