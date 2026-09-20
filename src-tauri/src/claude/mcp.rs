@@ -184,8 +184,16 @@ impl Inventory {
     /// User-scope and plugin-scope servers apply everywhere; a
     /// project-scope server applies only to the project it was
     /// configured under. This is the per-repository question #1216
-    /// asks, answered here rather than in the UI so the rule has one
-    /// home and a test.
+    /// asks.
+    ///
+    /// The frontend's `mcpInForce` applies the SAME rule, because the
+    /// page marks rows per server rather than requesting a filtered
+    /// list. Two implementations of one rule is a real cost and it is
+    /// taken deliberately: the alternative is a second command round
+    /// trip per repository selection, over a transport the phone also
+    /// uses. Both sides are tested against the same cases -- including
+    /// the trailing separator -- and this comment is the pointer
+    /// between them, so a change to one is a change to two.
     ///
     /// Paths are compared after normalising a trailing separator, which
     /// is the only difference observed between what a user types and

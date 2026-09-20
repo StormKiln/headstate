@@ -1,10 +1,15 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import type { ClaudeMcpInventory } from "@/api/tauri";
+import type { ClaudeMcpInventory, ClaudeMcpServer } from "@/api/tauri";
 
 const state = vi.hoisted(() => ({
   data: undefined as ClaudeMcpInventory | undefined,
   isError: false,
+  repo: undefined as string | undefined,
+}));
+
+vi.mock("@/store/filters", () => ({
+  useActiveFilters: () => ({ repo: state.repo }),
 }));
 
 vi.mock("../api/hooks", () => ({
@@ -17,7 +22,7 @@ vi.mock("../api/hooks", () => ({
   }),
 }));
 
-const { McpSection } = await import("./ClaudePluginsPage");
+const { McpSection, mcpInForce } = await import("./ClaudePluginsPage");
 
 /// #1216: the configuration blind spot the app could not name.
 describe("the MCP section", () => {
@@ -148,5 +153,104 @@ describe("the MCP section", () => {
     render(<McpSection />);
     expect(screen.getByText("future")).toBeTruthy();
     expect(screen.getByText(/transport not recognised/)).toBeTruthy();
+  });
+
+  /// The per-repository half of #1216. A project-scope server belonging
+  /// to ANOTHER project is marked as not applying here -- which is the
+  /// confusion the feature exists to remove.
+  it("marks a server from another project as not in force here", () => {
+    state.repo = "/Users/x/code/two";
+    state.data = {
+      servers: [
+        {
+          name: "atlassian",
+          transport: { kind: "url", url: "https://a" },
+          origin: "project",
+          scopeDetail: "/Users/x/code/one",
+        },
+        {
+          name: "codegraph",
+          transport: { kind: "stdio", command: "npx" },
+          origin: "user",
+          scopeDetail: null,
+        },
+      ],
+      unreadable: [],
+      truncated: false,
+      sizeBytes: null,
+    };
+    render(<McpSection />);
+    // Exactly one row is marked, and it is the other project's.
+    expect(screen.getAllByText(/not in this repository/).length).toBe(1);
+    state.repo = undefined;
+  });
+
+  /// With no repository selected the question has no subject, so no row
+  /// is marked -- rather than every project row being marked absent for
+  /// a repository nobody named.
+  it("marks nothing when no repository is selected", () => {
+    state.repo = undefined;
+    state.data = {
+      servers: [
+        {
+          name: "atlassian",
+          transport: { kind: "url", url: "https://a" },
+          origin: "project",
+          scopeDetail: "/Users/x/code/one",
+        },
+      ],
+      unreadable: [],
+      truncated: false,
+      sizeBytes: null,
+    };
+    render(<McpSection />);
+    expect(screen.queryByText(/not in this repository/)).toBeNull();
+  });
+});
+
+/// The rule itself, mirroring `claude::mcp::Inventory::in_force`.
+describe("mcpInForce", () => {
+  const project = (path: string): ClaudeMcpServer => ({
+    name: "s",
+    transport: { kind: "stdio", command: "c" },
+    origin: "project",
+    scopeDetail: path,
+  });
+
+  it("applies a user-scope server everywhere", () => {
+    const s: ClaudeMcpServer = {
+      name: "s",
+      transport: { kind: "stdio", command: "c" },
+      origin: "user",
+      scopeDetail: null,
+    };
+    expect(mcpInForce(s, "/any/repo")).toBe(true);
+  });
+
+  it("applies a plugin-scope server everywhere", () => {
+    const s: ClaudeMcpServer = {
+      name: "s",
+      transport: { kind: "stdio", command: "c" },
+      origin: "plugin",
+      scopeDetail: "some-plugin",
+    };
+    expect(mcpInForce(s, "/any/repo")).toBe(true);
+  });
+
+  it("confines a project-scope server to its own project", () => {
+    expect(mcpInForce(project("/a/b"), "/a/b")).toBe(true);
+    expect(mcpInForce(project("/a/b"), "/a/c")).toBe(false);
+  });
+
+  /// A trailing separator must not hide a project's servers -- the same
+  /// normalisation the Rust side applies.
+  it("ignores a trailing separator", () => {
+    expect(mcpInForce(project("/a/b/"), "/a/b")).toBe(true);
+    expect(mcpInForce(project("/a/b"), "/a/b/")).toBe(true);
+  });
+
+  /// No repository means no answer, not a false one.
+  it("answers null when no repository is selected", () => {
+    expect(mcpInForce(project("/a/b"), undefined)).toBeNull();
   });
 });

@@ -1,8 +1,10 @@
 import { Card } from "@/components/ui/card";
+import { useActiveFilters } from "@/store/filters";
 import { useClaudeDefinitions, useClaudeMcpServers, useClaudePlugins } from "../api/hooks";
 import type {
   ClaudeDefinition,
   ClaudeDefinitionSource,
+  ClaudeMcpServer,
   ClaudeMcpTransport,
   ClaudeSettingsOrigin,
 } from "../api/tauri";
@@ -841,6 +843,26 @@ const MCP_ORIGIN_LABEL: Record<ClaudeSettingsOrigin, string> = {
   plugin: "a plugin's .mcp.json",
 };
 
+/// Whether a server applies in the selected repository.
+///
+/// The per-repository half of #1216. User-scope and plugin-scope
+/// servers apply everywhere; a project-scope server applies only to the
+/// project it was configured under. Mirrors
+/// `claude::mcp::Inventory::in_force`, whose doc comment argues the
+/// trailing-separator rule, why no symlink is resolved, and why the
+/// rule deliberately exists on both sides. A change here is a change
+/// there.
+///
+/// `null` when no repository is selected -- the question has no subject
+/// then, and answering it anyway would mark rows as out of force for a
+/// repository the user has not named.
+export function mcpInForce(server: ClaudeMcpServer, repo: string | undefined): boolean | null {
+  if (repo === undefined) return null;
+  if (server.origin !== "project") return true;
+  const trim = (p: string) => p.replace(/\/+$/, "");
+  return server.scopeDetail !== null && trim(server.scopeDetail) === trim(repo);
+}
+
 /// One server's transport, for display.
 function transportText(t: ClaudeMcpTransport): string {
   if (t.kind === "stdio") return t.command;
@@ -867,6 +889,9 @@ function transportText(t: ClaudeMcpTransport): string {
 /// gives: the plugins report this page also renders is a large fixture.
 export function McpSection() {
   const { data, isLoading, isError, error, refetch } = useClaudeMcpServers();
+  // Read unconditionally, above every early return: a hook below one
+  // would not run on the loading and error paths.
+  const repo = useActiveFilters().repo;
 
   if (isError) {
     // NOT an empty list, and this is the whole point of the ticket.
@@ -937,6 +962,15 @@ export function McpSection() {
               <span className="ml-2 text-[#8b949e]">{MCP_ORIGIN_LABEL[s.origin]}</span>
               {s.scopeDetail !== null && s.origin !== "user" && (
                 <span className="ml-1 text-[10px] text-[#6e7681]">{s.scopeDetail}</span>
+              )}
+              {/* Whether it applies HERE, in text rather than by colour.
+                  Shown only when a repository is selected: without one
+                  the question has no subject, and marking every row
+                  would answer it for a repository nobody named. */}
+              {mcpInForce(s, repo) === false && (
+                <span className="ml-1 text-[10px] text-[#6e7681]">
+                  [not in this repository]
+                </span>
               )}
               <code className="ml-2 break-all text-[#6e7681]">{transportText(s.transport)}</code>
             </li>
