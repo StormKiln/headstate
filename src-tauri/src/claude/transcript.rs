@@ -815,6 +815,151 @@ pub fn scan(root: &Path) -> Scan {
     out
 }
 
+/// The corpus as a LIST, without reading a byte of any transcript
+/// (#1246).
+///
+/// # Why this exists beside [`scan`]
+///
+/// [`scan`] answers "what are my sessions": it opens every transcript
+/// for a head read and a tail seek to recover the title, cwd, branch and
+/// last-activity time, and it hands the whole file list to
+/// [`super::subagent::build`], which reads every transcript END TO END
+/// to find the spawn records. That is 0.84 GB of reads and it is the
+/// right price for a session list, which cannot be drawn without those
+/// fields.
+///
+/// The content indexer needs NONE of them. [`super::search::index_pass`]
+/// reads exactly three things off a [`Scan`]: each session's `path` and
+/// `session_id`, and `unreadable_files`. It then takes its own
+/// `fs::metadata` per session anyway, because the ledger is keyed on
+/// `(size, mtime)`. Every other field the scan worked for is discarded
+/// at that call.
+///
+/// Measured on the real corpus, release build, warm cache:
+///
+/// ```text
+/// scan(), warm         878-935 ms   1,510 sessions, 0.84 GB
+/// corpus(), warm        49- 60 ms   the same 1,510 sessions
+/// ```
+///
+/// So the live pass was paying ~880 ms per tick for ~51 ms of
+/// information. The difference is not the directory walk -- that is 15
+/// ms of the 51 -- it is the 0.84 GB of file CONTENT the scan reads and
+/// the indexer discards.
+///
+/// # Why this is not change detection
+///
+/// #1246 suggested detecting an unchanged corpus and skipping the walk.
+/// That was aimed at the wrong cost. The walk and its stats are 15 ms;
+/// the 829 ms is the per-file CONTENT reads. A directory mtime also does not
+/// move when a transcript inside a project directory is appended to --
+/// which is the ordinary case, since Claude Code appends to the session
+/// you are in -- so the signal would have had to be a stat sweep of
+/// every file, which is what this already is. Detecting "nothing
+/// changed" to skip work that is already only 15 ms buys nothing and
+/// adds a staleness bug.
+///
+/// # What it deliberately keeps
+///
+/// `unreadable_files` and the denominator, because the honesty property
+/// in [`super::search`] rests on both. They are not weakened by
+/// stopping early: [`extract`] returns `Err` only when a file cannot be
+/// opened or its size cannot be read, and this performs BOTH of those
+/// calls on every session file for exactly that reason -- so a
+/// permission-walled transcript lands in `unreadable_files` here just
+/// as it does there, and `is_complete()`'s third clause still sees it.
+/// The body of the file is what goes unread, not the question of
+/// whether it can be read at all. See the comment at the open below for
+/// the version of this that got it wrong.
+///
+/// `sessions` carries a [`Transcript`] with only `session_id` and
+/// `path` filled in. That is not a lie by omission: the other fields
+/// are `Option`/`Default` and mean "not known", which is precisely
+/// true of a listing that did not open the file. This is NOT a
+/// substitute for [`scan`] at any call site that draws metadata.
+///
+/// # Errors
+///
+/// Never. A missing root is [`Scan::absent_root`] and an unreadable one
+/// is `unreadable_dirs`, exactly as in [`scan`].
+pub fn corpus(root: &Path) -> Scan {
+    let t0 = std::time::Instant::now();
+    let walk = session_files(root);
+
+    let mut out = Scan {
+        subagent_files_skipped: walk.nested,
+        session_bytes: walk.session_bytes,
+        subagent_bytes: walk.subagent_bytes,
+        unsized_files: walk.unsized_files,
+        unreadable_dirs: walk.unreadable,
+        absent_root: walk.absent_root,
+        ..Default::default()
+    };
+
+    for path in &walk.files {
+        let Some(session_id) = path.file_stem().and_then(|s| s.to_str()) else {
+            out.unreadable_files
+                .push(format!("{}: unreadable file name", path.display()));
+            continue;
+        };
+        // The same two failures `extract` reports, in the same order,
+        // and NOT a stat alone.
+        //
+        // A stat alone was the first version of this and it was wrong.
+        // `extract` fails when the file cannot be OPENED; `stat(2)` does
+        // not need read permission on its target, so a transcript with
+        // mode 000 stats perfectly well. That version put such a file in
+        // `sessions` as an ordinary indexable session, where the indexer
+        // would fail to read it and -- correctly -- report it. But a
+        // `corpus()` caller that only reads `unreadable_files`, which
+        // `claude_index_coverage` and `claude_search_transcripts` both
+        // are, would have been told the corpus was whole.
+        //
+        // That is `Coverage::is_complete()`'s third clause going quiet,
+        // which licenses the word "no matches" over a hole. It is the
+        // exact failure this epic exists to prevent, so the open stays.
+        // `the_listing_still_reports_an_unreadable_transcript` is the
+        // test that caught it and pins it.
+        //
+        // Measured on the real corpus, release, warm: the open probe
+        // costs ~22 ms over 1,510 files. The listing is ~51 ms with it
+        // and ~15 ms without, against ~880 ms for the full `scan`. The
+        // handle is dropped immediately -- nothing is READ, which is
+        // where the other 829 ms lived.
+        if let Err(e) = std::fs::metadata(path) {
+            out.unreadable_files
+                .push(format!("{}: could not read its size: {e}", path.display()));
+            continue;
+        }
+        if let Err(e) = std::fs::File::open(path) {
+            out.unreadable_files
+                .push(format!("{}: could not open it: {e}", path.display()));
+            continue;
+        }
+        out.sessions.push(Transcript {
+            session_id: session_id.to_string(),
+            path: path.display().to_string(),
+            ..Default::default()
+        });
+    }
+
+    out.elapsed_ms = t0.elapsed().as_millis() as u64;
+    out
+}
+
+/// The real `~/.claude/projects`, listed rather than read (#1246).
+///
+/// [`corpus`] on [`projects_dir`]. See [`corpus`] for why the indexer
+/// uses this and the session list does not.
+///
+/// # Errors
+///
+/// Only when there is no home directory, matching [`scan_default`].
+pub fn corpus_default() -> Result<Scan, String> {
+    let root = projects_dir().ok_or("could not find your home directory")?;
+    Ok(corpus(&root))
+}
+
 /// Scan the real `~/.claude/projects`.
 ///
 /// # Errors

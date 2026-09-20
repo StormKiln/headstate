@@ -20,35 +20,68 @@
 //!
 //! index build, cold, to full coverage    9,953 ms over 15 passes
 //! steady-state index step                    3 ms
-//! ADDED COST to the live pass, warm        927 ms (922 scan + 5 index)
+//! ADDED COST to the live pass, warm         56 ms (51 listing + 5 index)
 //! database growth                         0.06 GB
 //! transcripts truncated at 8 MB                17
 //! query latency                           1-19 ms
 //! ```
 //!
-//! # The live pass IS materially slower, and by how much
+//! # What the live pass pays, and what it used to (#1246)
 //!
-//! 927 ms per tick, warm, not the 3 ms the index step costs on its own.
-//! Quoting the index step alone would be picking the flattering half of
-//! the number a reader uses to decide whether this belongs on a
-//! 60-second timer.
+//! As #1203 shipped it, the added cost was **885 ms per tick**, and
+//! only 5 ms of that was indexing. The other 880 ms was
+//! `transcript::scan`, which `claude_live_pass` had no reason to call
+//! before #1203 -- that is new work on that loop, and it was 99% of
+//! the bill.
 //!
-//! Almost all of it is the corpus SCAN, which is new work on that loop:
-//! `claude_live_pass` did not walk `~/.claude/projects` before #1203.
-//! The index step itself is 3-5 ms because the ledger's `(size, mtime)`
-//! check skips an unchanged transcript without opening it.
+//! #1246 removed it. The scan was never the work this module needed:
+//! [`index_pass`] reads a session's `path` and `session_id` and the
+//! scan's `unreadable_files`, and takes its own `fs::metadata` per file
+//! because the ledger is keyed on `(size, mtime)`. `scan` opens every
+//! transcript for a head read and a tail seek to recover a title, a cwd
+//! and a last-activity time, then hands the file list to
+//! `subagent::build`, which reads all 0.84 GB end to end. Every one of
+//! those fields is discarded at the `index_pass` call.
 //!
-//! It is affordable where it sits -- a background thread, 927 ms of
-//! every 60,000, all of it off the UI -- but it is real, and a future
-//! change that moves this pass anywhere interactive has to start from
-//! 927 ms rather than from 3.
+//! So the pass now calls [`super::transcript::corpus`], which walks the
+//! tree and checks each transcript can be opened, but reads none of
+//! them. Same 1,510 sessions, same denominator, same unreadable set --
+//! **51 ms instead of 880**.
 //!
-//! The obvious saving is to share one scan with the session import
-//! rather than walking the tree twice per tick. It is deliberately not
-//! taken here: the import and this index are currently independent, and
-//! coupling them to save 900 ms of background time is a change to the
-//! live pass's structure that belongs in its own issue with its own
-//! reasoning, not smuggled in under a search feature.
+//! ```text
+//! added cost to the live pass, warm    #1203      #1246
+//!   corpus listing / scan              880 ms     51 ms
+//!   index step                           5 ms      5 ms
+//!                                      ------     -----
+//!                                      885 ms     56 ms
+//! ```
+//!
+//! Measured four consecutive times with both paths warm, release
+//! build: `corpus` 49-60 ms against `scan` 878-935 ms, the same 1,510
+//! sessions each time. A **16x** reduction on the live pass, and the
+//! remaining 56 ms is 0.09% of the 60-second tick.
+//!
+//! The same substitution was made in `claude_search_transcripts` and
+//! `claude_index_coverage`, which each paid the same 880 ms for the
+//! denominator alone -- on the path of a user waiting for a search
+//! result rather than on a background timer.
+//!
+//! #1246's own suggestion was to share one scan with the session
+//! import. It does not fit: `claude_import_transcripts` is a separate
+//! user-triggered Tauri command, not part of the live pass, so there is
+//! no shared tick to fold into. The issue's second suggestion, cheap
+//! change detection before the walk, was aimed at the wrong cost -- the
+//! walk and its stats are 15 ms of the 51, and the 829 ms that went
+//! away was file CONTENT the indexer never looked at.
+//!
+//! # The index still advances every tick
+//!
+//! This does not slow the index down, which is the thing that would
+//! have put the honesty property at risk. [`SESSIONS_PER_PASS`] is
+//! unchanged, a pass still runs every 60 seconds, and a cold corpus
+//! still reaches full coverage in about fifteen passes -- faster in
+//! wall-clock terms, because each pass now spends its time indexing
+//! rather than reading files it will throw away.
 //!
 //! # Two figures that are better than the issue assumed
 //!
@@ -1069,6 +1102,130 @@ mod tests {
         std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o644)).unwrap();
     }
 
+    /// The cheap listing and the full scan agree about the corpus
+    /// (#1246).
+    ///
+    /// THE test for the substitution. The live pass now feeds
+    /// `index_pass` a `corpus()` listing rather than a `scan()`, and
+    /// the only thing that makes that safe is that the two agree about
+    /// the three things `index_pass` reads: the session ids, the paths,
+    /// and the unreadable set.
+    ///
+    /// Asserted as an equality between the two functions rather than
+    /// against a literal count, so a future change to either walk has
+    /// to keep them in step or fail here. A listing that found fewer
+    /// sessions would shrink the denominator, and a shrunken
+    /// denominator is precisely how an incomplete index starts calling
+    /// itself complete.
+    #[test]
+    fn the_listing_and_the_scan_agree_about_the_corpus() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_session(root, "alpha", "s1", "fsevents stream died");
+        write_session(root, "alpha", "s2", "kubernetes rollout");
+        write_session(root, "beta", "s3", "retry backoff");
+        // A subagent transcript, which neither must count.
+        let nested = root.join("alpha").join("s1").join("subagents");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("agent-x.jsonl"), "{}\n").unwrap();
+
+        let listed = crate::claude::corpus(root);
+        let scanned = crate::claude::scan(root);
+
+        let ids = |s: &crate::claude::Scan| {
+            let mut v: Vec<_> = s.sessions.iter().map(|t| t.session_id.clone()).collect();
+            v.sort();
+            v
+        };
+        let paths = |s: &crate::claude::Scan| {
+            let mut v: Vec<_> = s.sessions.iter().map(|t| t.path.clone()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(ids(&listed), ids(&scanned), "the same session ids");
+        assert_eq!(paths(&listed), paths(&scanned), "the same paths");
+        assert_eq!(listed.unreadable_files, scanned.unreadable_files);
+        assert_eq!(
+            listed.subagent_files_skipped, scanned.subagent_files_skipped,
+            "and the same exclusion, so the denominator cannot drift"
+        );
+        assert_eq!(listed.sessions.len(), 3);
+    }
+
+    /// The listing indexes to exactly the same coverage as the scan
+    /// (#1246).
+    ///
+    /// One level up from the test above: not just that the two walks
+    /// agree, but that feeding either into `index_pass` produces the
+    /// same searchable index and the same `Coverage`. This is the
+    /// property the live pass actually rests on.
+    #[test]
+    fn indexing_from_the_listing_matches_indexing_from_the_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_session(root, "alpha", "s1", "fsevents stream died");
+        write_session(root, "beta", "s2", "kubernetes rollout");
+
+        let mut from_listing = db();
+        let mut from_scan = db();
+        index_pass(&mut from_listing, &crate::claude::corpus(root)).unwrap();
+        index_pass(&mut from_scan, &crate::claude::scan(root)).unwrap();
+
+        let a = coverage(&from_listing, vec![]).unwrap();
+        let b = coverage(&from_scan, vec![]).unwrap();
+        assert_eq!(a.indexed, b.indexed);
+        assert_eq!(a.total, b.total);
+        assert!(a.is_complete() && b.is_complete());
+
+        // And the content is really there, not merely counted.
+        for conn in [&from_listing, &from_scan] {
+            assert!(matches!(
+                search(conn, "fsevents", 20, vec![]).unwrap().verdict,
+                Verdict::Matches { .. }
+            ));
+        }
+    }
+
+    /// A transcript the LISTING could not read is still a gap (#1246).
+    ///
+    /// The honesty property's third clause survives the cheaper walk.
+    /// `corpus()` stops before opening any transcript, so the worry is
+    /// that a permission-walled file would now sail through as an
+    /// ordinary session and let the index call itself complete over a
+    /// hole. It does not: the listing takes `fs::metadata` on every
+    /// session file, which is the same call whose failure `extract`
+    /// reports, so the file lands in `unreadable_files` either way.
+    #[test]
+    #[cfg(unix)]
+    fn the_listing_still_reports_an_unreadable_transcript() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_session(root, "slug", "good", "fsevents stream died");
+        let bad = write_session(root, "slug", "bad", "never readable");
+        // A directory nobody can traverse, so `fs::metadata` on the file
+        // inside it fails. Revoking the FILE's own bits is not enough:
+        // `stat(2)` does not need read permission on its target.
+        let walled = root.join("walled");
+        std::fs::create_dir_all(&walled).unwrap();
+        std::fs::write(walled.join("x.jsonl"), "{}\n").unwrap();
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let listed = crate::claude::corpus(root);
+        let scanned = crate::claude::scan(root);
+
+        // Whatever the platform makes unreadable, both walks must agree
+        // -- that is the invariant, not a particular count.
+        assert_eq!(
+            listed.unreadable_files.len(),
+            scanned.unreadable_files.len(),
+            "the listing must report exactly the gaps the scan does"
+        );
+
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
     /// Subagent transcripts are not indexed.
     ///
     /// They live at `<slug>/<session-id>/subagents/agent-*.jsonl`, carry
@@ -1398,21 +1555,47 @@ mod tests {
         );
 
         // What the LIVE PASS actually pays every 60 seconds, which is
-        // the scan PLUS the index step -- not the index step alone.
+        // the corpus listing PLUS the index step -- not the index step
+        // alone. Quoting only the 3 ms index would be picking the
+        // flattering half of a number the reader is using to judge
+        // whether this belongs on a 60-second timer.
         //
-        // The scan is new cost on that loop: `claude_live_pass` did not
-        // walk the corpus before #1203. Quoting only the 3 ms index
-        // would be picking the flattering half of a number the reader
-        // is using to judge whether this belongs on a 60-second timer.
+        // BOTH are measured, because #1246's whole claim is the
+        // difference between them: the pass called `scan` as #1203
+        // shipped it and calls `corpus` now, and a reader should be
+        // able to reproduce the saving rather than take the module
+        // docs' word for it.
         let t = std::time::Instant::now();
-        let warm = crate::claude::scan(&root);
-        let warm_scan_ms = t.elapsed().as_millis();
+        let warm = crate::claude::corpus(&root);
+        let warm_corpus_ms = t.elapsed().as_millis();
         let warm_index = index_pass(&mut conn, &warm).unwrap();
         println!(
-            "live-pass added cost      {} ms ({} ms scan + {} ms index), warm",
-            warm_scan_ms as u64 + warm_index.elapsed_ms,
-            warm_scan_ms,
+            "live-pass added cost      {} ms ({} ms listing + {} ms index), warm  <- #1246",
+            warm_corpus_ms as u64 + warm_index.elapsed_ms,
+            warm_corpus_ms,
             warm_index.elapsed_ms
+        );
+
+        let t = std::time::Instant::now();
+        let warm_scan = crate::claude::scan(&root);
+        let warm_scan_ms = t.elapsed().as_millis();
+        let warm_scan_index = index_pass(&mut conn, &warm_scan).unwrap();
+        println!(
+            "  was, via scan()         {} ms ({} ms scan + {} ms index), warm  <- #1203",
+            warm_scan_ms as u64 + warm_scan_index.elapsed_ms,
+            warm_scan_ms,
+            warm_scan_index.elapsed_ms
+        );
+
+        // The saving is only real if the two agree about the corpus.
+        // A cheaper listing that found fewer sessions would shrink the
+        // denominator, and a shrunken denominator is exactly how an
+        // incomplete index starts reporting itself complete.
+        assert_eq!(
+            warm.sessions.len(),
+            warm_scan.sessions.len(),
+            "the listing and the scan must find the same sessions, or the \
+             cheaper one has changed the denominator"
         );
 
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();

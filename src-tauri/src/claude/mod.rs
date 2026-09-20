@@ -132,7 +132,7 @@ pub mod usage;
 // module, which is how a merge has eaten them twice in this epic -- the error
 // names a function in a module that still contains it, and five CI checks
 // fail for one missing line. Do not remove them to "tidy" a conflict.
-pub use transcript::{scan, scan_default, Scan, Transcript};
+pub use transcript::{corpus, corpus_default, scan, scan_default, Scan, Transcript};
 
 #[cfg(test)]
 mod tests {
