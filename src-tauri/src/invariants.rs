@@ -2446,6 +2446,146 @@ mod tests {
     /// to CRLF and injecting a sync `Command::new` command fails here
     /// naming it, with no new false positive. The `replace("\r\n", "\n")`
     /// below is what makes that true, and it is tested.
+    /// A platform `cfg` block must not `return` with a sibling below it.
+    ///
+    /// # The shape, and why only one platform sees it
+    ///
+    /// ```ignore
+    /// #[cfg(not(unix))] { return Err(..); }
+    /// #[cfg(unix)]      { ...the real thing... }
+    /// ```
+    ///
+    /// On Unix the first block vanishes and this is ordinary code. On
+    /// Windows the SECOND vanishes -- and then the `return` is the only
+    /// thing left in the function, which is to say its FINAL expression.
+    /// `clippy::needless_return` fires, `-D warnings` rejects it, and
+    /// the build fails.
+    ///
+    /// #1219 shipped exactly that and paid a CI round-trip for it. The
+    /// error was:
+    ///
+    /// ```text
+    /// error: unneeded `return` statement
+    ///     --> src\commands.rs:2629:9
+    ///     = note: `-D clippy::needless-return` implied by `-D warnings`
+    /// ```
+    ///
+    /// Note it is NOT `unreachable_code`, which was the first guess and
+    /// was wrong: `rustc` alone accepts this shape on both platforms,
+    /// and only `clippy` rejects it. Written down because the wrong
+    /// diagnosis costs a second round-trip, and because a guard whose
+    /// prose names the wrong lint teaches the next reader the wrong
+    /// thing. Both halves were reproduced with `clippy-driver` on a
+    /// four-line file before this was committed.
+    ///
+    /// The remedy is the one `health::runaway::nice_of` already used
+    /// before this guard existed: gate the WHOLE item, twice. Neither
+    /// copy needs a `return` at all, because in each one the value is
+    /// already the tail expression -- verified clean the same way.
+    ///
+    /// # Why this is a guard and not a comment
+    ///
+    /// It is the class of defect a comment cannot prevent, because the
+    /// author is on the platform where the code is correct. Nothing
+    /// local can see it -- which is the same argument
+    /// `no_sync_command_reaches_a_subprocess_or_a_whole_file` makes
+    /// below about CRLF, and the same reason it is written as a scanner.
+    ///
+    /// SABOTAGE, both directions. Reintroducing #1219's original shape
+    /// in `commands.rs` fails here naming
+    /// `headstate/commands.rs:2626`; restoring the two gated functions
+    /// passes. A `#[cfg(not(unix))]` block with no `return` -- the
+    /// single-statement `assert!` in `claude/cli.rs:308` -- is NOT
+    /// flagged, which is what keeps this from firing on every platform
+    /// gate in the tree.
+    #[test]
+    fn a_platform_cfg_block_never_returns_with_a_sibling_below_it() {
+        let mut checked = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for (crate_name, root) in crate_roots() {
+            for file in rust_files(&root) {
+                let Ok(src) = std::fs::read_to_string(&file) else {
+                    continue;
+                };
+                // By PATH, not by comment-matching: this file's own prose
+                // spells the offending shape out in full, and the rule
+                // the module header states is that a guard skips its own
+                // explanation by path (#874).
+                if file.ends_with("invariants.rs") {
+                    continue;
+                }
+                let rel = file.strip_prefix(&root).unwrap_or(&file).display();
+                // Normalised before any `\n`-anchored split, for the
+                // reason the invariant below records: a CRLF checkout
+                // otherwise leaves a trailing `\r` and this passes
+                // silently on Windows only -- which would be this very
+                // guard failing in the way it exists to catch.
+                let src = src.replace("\r\n", "\n");
+                let lines: Vec<&str> = src.lines().collect();
+                for (i, line) in lines.iter().enumerate() {
+                    let t = line.trim();
+                    // A platform gate opening a BLOCK. An attribute on a
+                    // single statement (`#[cfg(..)] assert!(..)`) cannot
+                    // strand anything and is deliberately not matched.
+                    if !(t.starts_with("#[cfg(") && (t.contains("unix") || t.contains("windows"))) {
+                        continue;
+                    }
+                    let Some(open) = lines.get(i + 1).map(|l| l.trim()) else {
+                        continue;
+                    };
+                    if open != "{" {
+                        continue;
+                    }
+                    checked += 1;
+                    let indent = line.len() - line.trim_start().len();
+                    let end = item_end(&lines, i + 1, indent);
+                    let block: String = lines[i + 1..end]
+                        .iter()
+                        .filter(|l| !is_comment(l))
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !block.contains("return ") {
+                        continue;
+                    }
+                    // A `return` is only a problem when something FOLLOWS
+                    // the block -- that is what becomes unreachable on
+                    // the other platform. A gated block that is the last
+                    // thing in its function strands nothing.
+                    let follows = lines[end..]
+                        .iter()
+                        .take_while(|l| {
+                            let ind = l.len() - l.trim_start().len();
+                            !l.trim().is_empty() && ind >= indent || l.trim().is_empty()
+                        })
+                        .any(|l| {
+                            let ind = l.len() - l.trim_start().len();
+                            !l.trim().is_empty() && ind == indent && !is_comment(l)
+                        });
+                    if follows {
+                        offenders.push(format!(
+                            "{crate_name}/{rel}:{} -- a `#[cfg]` block that returns, with a \
+                             sibling `#[cfg]` below it. On the OTHER platform that sibling \
+                             vanishes, the `return` becomes the function's final expression, \
+                             and `clippy::needless_return` fails the build under `-D \
+                             warnings` -- on that platform only. Gate the whole item twice \
+                             instead, as `health::runaway::nice_of` does.",
+                            i + 1
+                        ));
+                    }
+                }
+            }
+        }
+        // Guards the guard: a scanner that matched no platform gate at
+        // all would pass vacuously while checking nothing.
+        assert!(
+            checked > 0,
+            "no `#[cfg(unix)]`/`#[cfg(windows)]` block was found at all, so this guard \
+             checked nothing"
+        );
+        assert!(offenders.is_empty(), "{}", offenders.join("\n"));
+    }
+
     #[test]
     fn no_sync_command_reaches_a_subprocess_or_a_whole_file() {
         /// The spellings that mean "another program" or "a file of
