@@ -526,7 +526,14 @@ mod skip_tests {
             "got: {:?}",
             scan.files.iter().map(|f| &f.path).collect::<Vec<_>>()
         );
-        assert!(scan.files[0].path.ends_with("api/CLAUDE.md"));
+        // Compared against a BUILT path rather than a literal with a
+        // separator in it: `/` is not the separator on Windows, and the
+        // first draft of this assertion failed there for that reason
+        // alone while the skip itself was working correctly.
+        assert_eq!(
+            scan.files[0].path,
+            nested.join("CLAUDE.md").to_string_lossy()
+        );
     }
 
     /// A skip is COUNTED, and never reaches `is_partial()`.
