@@ -1895,7 +1895,13 @@ interface ClaudeQueue {
 /// Every field is nullable, and in each case `null` means NOT OBSERVED,
 /// never zero and never a default. A renderer that substitutes a benign
 /// value for any of these is the #846 defect.
-export interface ClaudeLifecycle {
+///
+/// Not exported, for the reason `ClaudePreviewMessage` is not: it is
+/// reached only through `ClaudePreview.lifecycle`, and `yarn knip` is
+/// right that a second name for the same shape earns nothing. The
+/// surfaces that consume these records are separate issues; exporting it
+/// the moment one of them needs it is one word.
+interface ClaudeLifecycle {
   /// `null` whenever the read was truncated, however many
   /// `queue-operation` records the window held. The window cuts the
   /// middle of things: an `enqueue` outside it whose `dequeue` is inside
