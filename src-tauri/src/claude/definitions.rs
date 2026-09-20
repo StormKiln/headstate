@@ -7,14 +7,20 @@
 //! which have I ever used?" -- and every hand-written definition in
 //! `~/.claude/` was invisible, because it belongs to no plugin at all.
 //!
-//! # Absent is not zero, again
+//! # Usage counts are NOT joined here, and the rule for adding them
 //!
-//! `plugins.rs`'s header makes this argument at length and it applies
-//! unchanged: a definition with no recorded calls may have never been
-//! used, or may simply predate the scan. A false zero argues for
-//! deleting something the user relies on. So a definition carries
-//! `calls: Option<u64>` -- `None` renders as "never observed", never as
-//! "0 calls".
+//! A `Definition` carries what is on disk and nothing about use: there
+//! is no call count in this module, and an earlier version of this
+//! header wrongly described one as already shipped (#1207).
+//!
+//! Stated as a requirement rather than a description, for whoever
+//! joins the counts: `plugins.rs`'s "absent is not zero" argument
+//! applies here unchanged. A definition with no recorded calls may
+//! have never been used, or may simply predate the scan -- and a false
+//! zero argues for deleting something the user relies on. So the field
+//! must be `Option<u64>`, rendering `None` as "never observed" and
+//! never as "0 calls". A plain `u64` reintroduces exactly the defect
+//! `plugins.rs:89-105` exists to prevent.
 //!
 //! # What could not be read is reported
 //!
