@@ -2033,6 +2033,32 @@ function SessionBody({
 /// The error arm is BEFORE the empty arm, per #846: `data` is undefined on
 /// a rejection exactly as it is before the first read, so an error arm
 /// placed after would never render in the case it exists for.
+///
+/// # The context floor, and why nothing beside it names a source (#1248)
+///
+/// The first field is what the session's context cost BEFORE the user's
+/// first message: the system prompt, the tool definitions, the
+/// `CLAUDE.md` files and the injected reminders. It is first because it
+/// is the only figure in this panel a reader holds a lever on — the
+/// whole-session counters below say how much work happened, which is
+/// history, and the floor says what loads every time, which is a choice.
+///
+/// It is ONE number. #1242's spike tested three routes to splitting it
+/// by source and all three fail: the cache TTL buckets report which
+/// caching strategy ran rather than what the context contained (zero
+/// sessions use both), sizing `CLAUDE.md` from its bytes on disk is an
+/// estimate rendered beside a measurement, and contrasting repositories
+/// that hold a `CLAUDE.md` against those that do not is suggestive
+/// rather than attributive. The floor is a fact and a breakdown would be
+/// a guess, and the failure this panel exists to avoid is exactly the
+/// two of them sitting side by side where a reader cannot tell which is
+/// which.
+///
+/// `context_floor === null` is the fifth absence and takes the same arm
+/// as the fourth, with one sentence added: a session with no usage block
+/// was not measured, and a floor of zero would state that it started
+/// from no context at all — which cannot happen, because every session
+/// loads a system prompt.
 function SessionUsage({ detail: d }: { detail: ClaudeSessionDetail }) {
   // The transcript's OWN state, never the cwd's (#919): 1,213 of 1,461
   // rows have a dead cwd and a live transcript, so a reading gated on the
@@ -2080,12 +2106,36 @@ function SessionUsage({ detail: d }: { detail: ClaudeSessionDetail }) {
            observation about a design decision rather than a claim about
            the machine it is printed on. */
         <p className="mt-2 text-xs text-[#8b949e]">
-          Its transcript records no token usage, so there is nothing to total. That is unusual —
+          Its transcript records no token usage, so there is nothing to total — including the
+          context it started from, which was not measured rather than empty. Every session loads a
+          system prompt, so a zero here would be a measurement nobody took. That is unusual —
           nearly every transcript carries it.
         </p>
       ) : (
         <>
           <dl className="mt-2 space-y-1.5 text-xs">
+            {/* The context floor (#1248), FIRST because it is the one
+                figure here a reader can act on: it is what loaded before
+                they typed anything, and trimming what loads is a lever
+                they hold. The whole-session counters below answer a
+                different question — how much work happened — and the
+                floor is invisible inside them once a session has run for
+                hundreds of messages.
+
+                ONE number and no breakdown. #1242 tested three routes to
+                attributing this to the system prompt, the tools and
+                CLAUDE.md, and all three fail: the cache TTL split reports
+                which caching strategy ran rather than what the context
+                held (zero sessions use both buckets), an on-disk proxy is
+                an estimate rendered beside a measurement, and contrast
+                inference is suggestive rather than attributive. The floor
+                is a fact, a breakdown would be a guess, and they must not
+                sit side by side — so nothing here names a source. */}
+            {data.context_floor !== null ? (
+              <Field label="Context before your first message">
+                {data.context_floor.tokens.toLocaleString()}
+              </Field>
+            ) : null}
             <Field label="Assistant messages">{data.messages.toLocaleString()}</Field>
             {/* Four counters, never one total. Cache reads run two to
                 three orders of magnitude above fresh input on every real

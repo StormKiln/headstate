@@ -237,6 +237,18 @@ pub struct Usage {
     /// Transcribed, never computed. See the module docs: no rate table
     /// ships and none ever will.
     pub recorded_cost: Option<CostState>,
+    /// What the context cost before the user's first message (#1248).
+    ///
+    /// `None` means no usage block was found at all -- the same 24 of
+    /// 1,502 transcripts [`Usage::observed`] gates on -- and must render
+    /// as NOT MEASURED, never as zero. A session cannot legitimately
+    /// start from zero context: every one of the 1,494 transcripts that
+    /// carried a usage block carried all three fields this sums.
+    ///
+    /// Set from the FIRST assistant message carrying a usage block and
+    /// never updated after, because the question is what was loaded
+    /// before the session did anything.
+    pub context_floor: Option<ContextFloor>,
 }
 
 /// One session's `cost-state` record, as Claude Code wrote it (#1210).
@@ -332,6 +344,90 @@ pub struct ModelCost {
     pub model: String,
     /// `costUSD` for this model, verbatim from the record.
     pub cost_usd: f64,
+}
+
+/// What the session's context cost BEFORE the user's first message
+/// (#1248, from #1242's spike).
+///
+/// The first assistant message's `input_tokens` +
+/// `cache_read_input_tokens` + `cache_creation_input_tokens`. That sum is
+/// the system prompt, the tool definitions, the `CLAUDE.md` files and the
+/// injected reminders -- everything loaded before the session could do
+/// any work at all.
+///
+/// # Why it is worth its own field when four counters already ship
+///
+/// The four counters on [`Usage`] are WHOLE-SESSION sums, and the floor
+/// is invisible inside them: a session that did a lot of work and one
+/// that started from a huge context look the same once both are summed
+/// over hundreds of messages. Re-measured for #1248 against the real
+/// `~/.claude/projects`, over the 1,494 transcripts carrying a usage
+/// block:
+///
+/// ```text
+/// median              33,836 tokens
+/// p90                 59,381
+/// max                206,707
+/// over 50k on turn 1     243  (16%)
+/// ```
+///
+/// A six-fold spread, and the one figure on this panel a user can
+/// directly act on -- by trimming what loads. Every one of the three
+/// fields was present on all 1,494, so this is not a coverage-limited
+/// number.
+///
+/// # Why the three fields are SUMMED here, when `Usage` refuses to sum
+///
+/// [`Usage`]'s four counters stay apart for a stated reason: cache reads
+/// run orders of magnitude above fresh input over a session's life, so
+/// one total would be a cache-read count wearing the word "tokens". That
+/// argument is about sums over MANY messages and does not reach this
+/// one.
+///
+/// On the first message the three fields are not three kinds of work.
+/// They are one context, split by how the cache happened to serve it: a
+/// token read from cache and a token sent fresh were both in the window
+/// the model saw, and which bucket a given token landed in reflects
+/// whether a previous session warmed the cache. Reporting them apart
+/// would invite reading the split as composition, which is exactly what
+/// this must not do.
+///
+/// # Why there is NO per-source breakdown, and never will be
+///
+/// #1242 tested three routes to attributing this sum to the system
+/// prompt, the tools and `CLAUDE.md`, and all three fail:
+///
+/// 1. **The cache TTL split does not decompose context.** The hypothesis
+///    was that `ephemeral_1h` holds stable context and `ephemeral_5m`
+///    per-turn work. Re-measured for #1248 over the same corpus:
+///    `1h` only on 63, `5m` only on 1,230, **both on 0**, neither on
+///    201. Zero sessions use both, so the split reports which caching
+///    strategy ran, not what the context contained.
+/// 2. **A measured-on-disk proxy is an estimate beside measured
+///    figures.** Sizing `CLAUDE.md` from its bytes and calling the
+///    result its token cost is a derivation this app cannot keep true,
+///    which is the argument the module docs already make about dollars,
+///    one field along.
+/// 3. **Contrast inference is suggestive, not attributive.** Sessions
+///    whose `cwd` holds a `CLAUDE.md` showed a +3,228 token median
+///    difference -- n=120 against n=1,366, no control for repository
+///    size or tool count, and a `cwd` that may have changed since.
+///
+/// So the floor is a FACT and a breakdown would be a GUESS, and this
+/// struct carries only the fact. There is deliberately no field here
+/// that names a source: adding one would not compile against
+/// [`ContextFloor::tokens`] being a single scalar, which is the same
+/// type-level refusal `coverage.rs`'s `the_report_carries_no_grade`
+/// enforces one module over.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextFloor {
+    /// `input_tokens + cache_read_input_tokens +
+    /// cache_creation_input_tokens` from the FIRST assistant message
+    /// carrying a usage block.
+    ///
+    /// ONE scalar, never a breakdown. See the struct docs: the sum is
+    /// measured and any split of it by source would be invented.
+    pub tokens: u64,
 }
 
 impl Usage {
@@ -554,6 +650,36 @@ fn read_and_sum(path: &Path, budget: Option<u64>) -> Result<Usage, String> {
             &mut out.cache_creation_tokens,
         );
 
+        // The context floor (#1248): the FIRST usage block only.
+        //
+        // `is_none()` and not `messages == 1`, because the two can come
+        // apart -- a leading record that parses but carries no usage
+        // block is skipped above without incrementing `messages`, and a
+        // future caller that resumes a partial sum would break the
+        // equality. The field's own emptiness is the condition that
+        // cannot drift.
+        //
+        // The three fields are summed here and NOT stored apart. See
+        // `ContextFloor`'s docs: on one message they are one context
+        // split by how the cache served it, and reporting the split
+        // would invite reading it as composition -- the breakdown #1242
+        // ruled out.
+        //
+        // `unwrap_or_default()` per field rather than gating on all
+        // three: every one of the 1,494 real transcripts measured
+        // carried all three, so a missing one is a shape this has never
+        // seen, and summing what IS there is a floor on a floor rather
+        // than a wrong answer. The absent case that matters -- no usage
+        // block anywhere -- is caught by `Option` on the field itself.
+        if out.context_floor.is_none() {
+            let first = |key: &str| usage.get(key).and_then(|v| v.as_u64()).unwrap_or_default();
+            out.context_floor = Some(ContextFloor {
+                tokens: first("input_tokens")
+                    .saturating_add(first("cache_read_input_tokens"))
+                    .saturating_add(first("cache_creation_input_tokens")),
+            });
+        }
+
         if let Some(model) = message
             .get("model")
             .and_then(|m| m.as_str())
@@ -752,6 +878,95 @@ mod tests {
         assert!(
             !u.observed(),
             "no usage block must not read as a measured zero"
+        );
+    }
+
+    /// The floor is the FIRST message's three input fields, summed
+    /// (#1248).
+    ///
+    /// Every field is distinct here on purpose: input 7, cache read
+    /// 30,000 and cache creation 3,800 sum to 33,807, and no PAIR of
+    /// them sums to that. So dropping any one of the three fails this,
+    /// which is the sabotage the issue asks be provable.
+    ///
+    /// The second message is deliberately larger and must not move the
+    /// figure: the floor is what was loaded before the user's first
+    /// message, not a running maximum or a whole-session sum.
+    #[test]
+    fn the_context_floor_sums_all_three_input_fields_of_the_first_message() {
+        let tmp = Tmp::new("floor");
+        let p = write(
+            tmp.path(),
+            "s.jsonl",
+            &[
+                &assistant("claude-opus-5", 7, 100, 30_000, 3_800),
+                &assistant("claude-opus-5", 900, 200, 90_000, 7_000),
+            ],
+        );
+        let u = summarise(&p).unwrap();
+        let floor = u.context_floor.expect("a usage block was present");
+        assert_eq!(
+            floor.tokens, 33_807,
+            "the floor is input + cache read + cache creation from the FIRST message"
+        );
+        // Each drop is individually fatal, stated so a reader can see
+        // which sabotage each guards.
+        assert_ne!(floor.tokens, 30_007, "dropping cache_creation must fail");
+        assert_ne!(floor.tokens, 3_807, "dropping cache_read must fail");
+        assert_ne!(floor.tokens, 33_800, "dropping input_tokens must fail");
+        // The whole-session sums moved and the floor did not.
+        assert_eq!(u.input_tokens, 907);
+        assert_eq!(
+            u.context_floor.unwrap().tokens,
+            33_807,
+            "a later, larger message must not raise the floor"
+        );
+    }
+
+    /// A transcript with no usage block has NOT been measured, and its
+    /// floor is `None` rather than 0 (#1248, #846).
+    ///
+    /// 24 of 1,502 real transcripts are exactly this. Zero here would
+    /// state that the session started from no context at all, which
+    /// cannot happen -- every session loads a system prompt -- and would
+    /// be a confident wrong answer with an entirely credible shape.
+    #[test]
+    fn a_transcript_with_no_usage_has_no_floor_rather_than_a_zero_one() {
+        let tmp = Tmp::new("floornone");
+        let p = write(
+            tmp.path(),
+            "s.jsonl",
+            &[
+                r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+                r#"{"type":"ai-title","aiTitle":"Something"}"#,
+            ],
+        );
+        let u = summarise(&p).unwrap();
+        assert!(!u.observed());
+        assert!(
+            u.context_floor.is_none(),
+            "an unmeasured session must carry no floor, not a floor of zero"
+        );
+    }
+
+    /// The floor carries ONE scalar and no attribution (#1248).
+    ///
+    /// #1242 ruled out every route to a per-source breakdown. This test
+    /// is the standing guard on that conclusion: it serialises the
+    /// struct and asserts the shape is a single `tokens` key. Adding a
+    /// `claude_md`, `system_prompt` or `tools` field -- or splitting the
+    /// TTL buckets back out, which #1242 measured as zero sessions using
+    /// both -- fails here rather than shipping a guess beside a fact.
+    #[test]
+    fn the_context_floor_carries_no_per_source_attribution() {
+        let floor = ContextFloor { tokens: 33_807 };
+        let v = serde_json::to_value(floor).unwrap();
+        let obj = v.as_object().expect("a struct");
+        assert_eq!(
+            obj.keys().collect::<Vec<_>>(),
+            vec!["tokens"],
+            "the floor is one measured scalar; any field naming a SOURCE would be an estimate \
+             rendered beside a measurement, which #1242 ruled out on three separate grounds"
         );
     }
 

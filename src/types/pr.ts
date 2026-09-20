@@ -2034,6 +2034,45 @@ export interface ClaudeUsage {
   /// reads as zero. The absent-is-not-zero rule with a currency symbol
   /// attached, which makes a wrong zero worse rather than better.
   recorded_cost: ClaudeCostState | null;
+  /// What the context cost BEFORE the user's first message (#1248).
+  ///
+  /// `null` means no usage block was found at all, and must render as
+  /// NOT MEASURED — never as zero. A session cannot start from no
+  /// context: every one loads a system prompt. Zero here would be a
+  /// measurement nobody took, wearing a perfectly credible shape.
+  context_floor: ClaudeContextFloor | null;
+}
+
+/// The first turn's input total — prompt plus cache (#1248, from
+/// #1242's spike).
+///
+/// Mirrors `claude::usage::ContextFloor`. The sum of `input_tokens`,
+/// `cache_read_input_tokens` and `cache_creation_input_tokens` from the
+/// first assistant message carrying a usage block: the system prompt,
+/// the tool definitions, the `CLAUDE.md` files and the injected
+/// reminders, all of it loaded before the session could do any work.
+///
+/// # One scalar, and no breakdown — by construction
+///
+/// #1242 tested three routes to attributing this sum to a source and
+/// all three fail: the cache TTL split reports which caching strategy
+/// ran rather than what the context held (zero sessions use both
+/// buckets), a measured-on-disk proxy is an estimate rendered beside a
+/// measurement, and contrast inference is suggestive rather than
+/// attributive.
+///
+/// So this interface carries exactly one number and any field naming a
+/// SOURCE would be a guess sitting beside a fact. The Rust side's
+/// `the_context_floor_carries_no_per_source_attribution` is the standing
+/// guard, in the spirit of `coverage.rs`'s `the_report_carries_no_grade`.
+///
+/// Not exported, for the reason `ClaudeNotWaitingReason` above is not: it
+/// is reached only through `ClaudeUsage.context_floor`, and `yarn knip`
+/// is right that a second name nothing imports earns nothing. Exporting
+/// it the moment something else needs it is one word.
+interface ClaudeContextFloor {
+  /// The three input fields, summed. Measured, never apportioned.
+  tokens: number;
 }
 
 /// One session's `cost-state` record, as Claude Code wrote it (#1210).
