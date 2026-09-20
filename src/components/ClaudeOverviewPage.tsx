@@ -9,6 +9,7 @@ import { restartExportText } from "../lib/restartExport";
 import { IS_DESKTOP_BUILD } from "../lib/target";
 import { relativeTime } from "../lib/time";
 import { pathBasename } from "../lib/worktrees";
+import { ClaudeCoveragePanel } from "./ClaudeCoveragePanel";
 import { QueryError, errorMessage } from "./QueryError";
 import { SessionsChart } from "./stats/SessionsChart";
 import { Card } from "@/components/ui/card";
@@ -516,6 +517,13 @@ export function ClaudeOverviewPage() {
           </>
         ) : null}
       </div>
+
+      {/* The scope statement, between the tiles above and every
+          measured figure below. #1212: it qualifies both, so it sits
+          between them rather than at the foot of the page where it would
+          be read after the numbers had already been believed -- the same
+          placement argument the scan-health line above makes. */}
+      <ClaudeCoveragePanel />
 
       <UsageProfileCard />
 

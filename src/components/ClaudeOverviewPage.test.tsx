@@ -98,6 +98,17 @@ vi.mock("../api/hooks", () => ({
     now: state.now,
     rescan: rescanFn,
   }),
+  // #1212's coverage panel, which the page mounts between the tiles and
+  // the usage card. Defaults to `isLoading`, which renders an empty
+  // placeholder -- so every assertion in this file stays about the page's
+  // OWN figures rather than about the panel's, which
+  // `ClaudeCoveragePanel.test.tsx` covers directly.
+  useClaudeCoverage: () => ({
+    data: undefined,
+    isLoading: true,
+    isError: false,
+    error: undefined,
+  }),
 }));
 vi.mock("sonner", () => ({ toast: { success: toastSuccess, error: toastError } }));
 vi.mock("../lib/clipboard", () => ({ copyText: copyFn }));

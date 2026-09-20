@@ -389,6 +389,18 @@ pub const SURFACE: &[(&str, Class)] = &[
     // it leads to is a copy of `claude --resume <id>`, which
     // `claudify_command` is already `Read` for.
     ("claude_overview", Class::Read),
+    // What the app has read against what it holds (#1212).
+    //
+    // `Read`, and the narrowest in this whole table: three COUNTs over
+    // Headstate's own cache. It opens no transcript, stats no directory
+    // and writes nothing.
+    //
+    // Exposed on `Local`'s own test -- could the phone act on the
+    // answer? The question here is subtler than "act": this is the panel
+    // that says what every OTHER figure covers, so withholding it from
+    // the companion would leave the phone showing bounded numbers with
+    // the bound only visible at the desk.
+    ("claude_coverage", Class::Read),
     // Installed plugins and their measured usage (#1075).
     //
     // `Read`: it lists `~/.claude/plugins/installed_plugins.json`, reads
@@ -1065,6 +1077,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "claude_event_profile" => res(commands::claude_event_profile(app.clone()).await),
         "claude_poll_live" => res(commands::claude_poll_live(app.clone()).await),
         "claude_overview" => res(commands::claude_overview(app.clone()).await),
+        "claude_coverage" => res(commands::claude_coverage(app.clone()).await),
         "claude_definitions" => res(commands::claude_definitions(app.clone()).await),
         "claude_plugins" => res(commands::claude_plugins(app.clone()).await),
         "claude_restart_list" => res(commands::claude_restart_list(app.clone()).await),

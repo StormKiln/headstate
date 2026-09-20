@@ -217,6 +217,19 @@ pub const SURFACE: &[(&str, Class)] = &[
     // "how much work is waiting for me back at the laptop". See the
     // desktop copy for the full argument.
     ("claude_overview", Class::Read),
+    // The DESKTOP's coverage report: what it has read against what it
+    // holds (#1212).
+    //
+    // `Read`, and the narrowest one in this group: three COUNTs over
+    // Headstate's own cache, no filesystem access at all.
+    //
+    // Present here because the companion renders the same `src/`
+    // frontend, so the panel exists on the phone and would otherwise be
+    // one that could never load. It is also the panel that most needs
+    // to: every figure the phone shows about the corpus is the DESKTOP's
+    // measurement, and a reader away from the machine has even less
+    // context for what a number covers.
+    ("claude_coverage", Class::Read),
     // The DESKTOP's installed plugins and their measured usage (#1075).
     //
     // `Read`, for the desktop copy's reasons. Present here because the

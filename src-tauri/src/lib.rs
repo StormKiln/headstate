@@ -301,6 +301,7 @@ pub fn run() {
             commands::claude_transcript_tail,
             commands::claude_poll_live,
             commands::claude_overview,
+            commands::claude_coverage,
             commands::claude_definitions,
             commands::claude_plugins,
             commands::claude_restart_list,

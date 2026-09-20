@@ -1810,6 +1810,69 @@ export interface ClaudeCorpus {
   sessions_with_events: number;
 }
 
+/// How far one measurement reaches across the corpus (#1212).
+///
+/// THREE counts, because collapsing any pair loses the distinction the
+/// coverage caveats exist to preserve. Two of them are settled answers
+/// and one is a failure, which is a difference in KIND -- they are not
+/// ordered by severity and must never be summed into a grade.
+///
+/// | field | meaning | rendering |
+/// |---|---|---|
+/// | `measured` | the reading was taken | a total; a 0 in its sums is real |
+/// | `outOfScope` | outside what was measured | NORMAL — never damage |
+/// | `unread` | the read was attempted and did not finish | the only fault |
+export interface ClaudeReach {
+  measured: number;
+  /// Sessions the measurement does not cover, with nothing wrong.
+  ///
+  /// Usually the biggest number in the row, and not a problem. See
+  /// `claude/coverage.rs`, and `overview.rs`'s rule that the archived
+  /// majority "must not be rendered as damage".
+  outOfScope: number;
+  /// Sessions whose read was attempted and did not complete.
+  ///
+  /// Short by an UNKNOWN amount, where `outOfScope` is short by a known
+  /// one. That is why it cannot be folded in.
+  unread: number;
+}
+
+/// One measurement's reach, with the words that say what it covers.
+///
+/// The label, the unit and the reason travel WITH the counts rather than
+/// living in the component, so the Rust side and the view cannot come to
+/// disagree about what a figure counts.
+export interface ClaudeMeasurement {
+  id: string;
+  label: string;
+  /// What the denominator counts, singular: "session".
+  unit: string;
+  /// Why the out-of-scope rows are out of scope, in one clause.
+  ///
+  /// Required. A count of uncovered rows with no reason beside it reads
+  /// as a defect list, which is what this panel must not be.
+  scopeNote: string;
+  reach: ClaudeReach;
+}
+
+/// What the app has READ, against what it HOLDS (#1212).
+///
+/// Deliberately carries no total, no percentage and no score: the rows
+/// answer different questions over one denominator, and combining them
+/// would produce a figure that answers none of them.
+export interface ClaudeCoverage {
+  /// Every stored session, as the denominator the rows are read against.
+  sessions: number;
+  /// One row per measurement, in a FIXED order — never sorted by how
+  /// much is uncovered, which would be a grade expressed as a layout.
+  measurements: ClaudeMeasurement[];
+  /// Sessions whose stored token sum stopped at the read budget.
+  ///
+  /// These ARE measured; their figures are floors. Reported beside the
+  /// rows because it is a different kind of shortfall.
+  truncatedMeasurements: number;
+}
+
 /// What one session's subagents cost, as a figure of its own (#1002).
 ///
 /// NEVER added into the parent's own `ClaudeUsage`. A parent's own tokens
