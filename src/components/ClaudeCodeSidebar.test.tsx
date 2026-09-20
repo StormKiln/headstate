@@ -231,6 +231,36 @@ describe("the session list, which #939 moved into this column", () => {
     expect(screen.queryByRole("button", { name: row })).toBeNull();
   });
 
+  /// #1200 added `<mark>` highlighting inside the row, and the first
+  /// version of it BROKE this: wrapping matched runs in `<mark>` and
+  /// `<span>` split the label into several text nodes, the computed
+  /// accessible name came out EMPTY, and every row stopped being
+  /// reachable by name -- a screen reader announced nothing at all.
+  ///
+  /// Caught by the two search tests above, which is why the name is now
+  /// stated with `aria-label` rather than computed from the children.
+  /// This asserts the property directly, so a future change that drops
+  /// the attribute fails HERE, where the reason is written down, rather
+  /// than showing up as a confusing failure in a search test.
+  it("names each row independently of how the search highlights it", () => {
+    useFilters.setState({ claudePage: "sessions" });
+    render(<ClaudeCodeSidebar />);
+    const box = screen.getByLabelText(/search claude code sessions/i);
+    const row = /HeadState GitHub issues filing/i;
+
+    // The name is the same with a search active, with a search that
+    // matches the name itself, and with none.
+    for (const term of ["", "headstate", "github", "nothing"]) {
+      fireEvent.change(box, { target: { value: term } });
+      const found = screen.queryAllByRole("button", { name: row });
+      if (term === "nothing") {
+        expect(found).toHaveLength(0);
+      } else {
+        expect(found.length, `row unreachable by name while searching "${term}"`).toBeGreaterThan(0);
+      }
+    }
+  });
+
   /// Clicking a row writes the id the main panel reads, which is the whole
   /// point of the state living in the store: the row is in this column and
   /// the detail is in another.
