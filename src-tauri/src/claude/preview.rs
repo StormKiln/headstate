@@ -327,6 +327,32 @@ pub struct Preview {
     /// understood and chose not to show, the other is a record we could
     /// not read. Absent is not zero, and "skipped" is not "failed".
     pub unparseable_records: usize,
+    /// Every `tool_use_id` in the window, and how it paired (#1209).
+    ///
+    /// A side table rather than a field on [`Block`], because pairing is
+    /// a fact about the WINDOW and not about the block: the identical
+    /// `tool_use` block is paired in a window that reached its result and
+    /// unanswered in one that stopped a line short. Putting it on the
+    /// block would make two reads of the same bytes produce unequal
+    /// blocks, which is the property the existing tests rest on.
+    ///
+    /// Keyed by id, so the UI looks up the block it is drawing rather
+    /// than tracking position.
+    pub pairings: std::collections::BTreeMap<String, Pairing>,
+    /// Calls in the window with no result in it.
+    ///
+    /// A count, so the pane can say "3 calls have no recorded result"
+    /// without walking every block. The MEANING of a non-zero count is
+    /// not decided here: a running session has calls in flight, and a
+    /// dead one has calls that never came back. Those are different
+    /// facts and `liveness.rs` owns the difference.
+    pub unanswered_calls: usize,
+    /// Results in the window whose call is above it.
+    ///
+    /// Non-zero is the normal consequence of a tail read, not a defect,
+    /// and the pane says so rather than leaving the reader to wonder why
+    /// output appeared with nothing that asked for it.
+    pub results_above_window: usize,
 }
 
 /// One message in the conversation.
@@ -358,12 +384,50 @@ pub enum Block {
     /// 195 of 1,500 blocks sampled are thinking, and a reader scanning
     /// for "what was it doing" does not want it inline by default.
     Thinking { text: String, truncated: bool },
-    /// A tool call. The NAME, not the arguments: "Read" or "Bash" tells
-    /// the reader what the session was doing, and a 40 KB argument blob
-    /// does not.
-    ToolUse { name: String },
-    /// A tool's output, bounded like any other text.
-    ToolResult { text: String, truncated: bool },
+    /// A tool call: its name, its pairing key, and its arguments PARSED
+    /// into the shape that tool actually takes.
+    ///
+    /// # Why not the raw `input`, and why not nothing either
+    ///
+    /// The original reading was right about the blob and wrong about the
+    /// structure. "Read" or "Bash" does tell the reader what the session
+    /// was doing, and a 40 KB argument blob dumped verbatim does not --
+    /// so this does not dump it. It PARSES it: [`ToolArgs`] carries one
+    /// variant per tool shape the corpus actually holds, and the UI
+    /// renders a command as a command and an edit as a diff. Saying a
+    /// session edited 40 files while being unable to say what it changed
+    /// in any of them is the gap this closes (#1209).
+    ///
+    /// `id` is the pairing key. It is on the `tool_use` block in
+    /// **28,370 of 28,370** sampled calls, and the matching
+    /// `tool_result.tool_use_id` in 28,393 of 28,393 results -- so
+    /// pairing is not best-effort, it is the format's own contract.
+    ToolUse {
+        name: String,
+        /// The `id` this call's result will name. `None` only for a call
+        /// that carried none, which the corpus does not contain but the
+        /// format does not forbid -- and such a call can never be paired,
+        /// so it must not be silently treated as orphaned.
+        id: Option<String>,
+        args: ToolArgs,
+    },
+    /// A tool's output, bounded like any other text, carrying the key
+    /// that names the call it answers.
+    ToolResult {
+        text: String,
+        truncated: bool,
+        /// The `tool_use_id` this result answers.
+        tool_use_id: Option<String>,
+        /// Whether the tool reported failure. `None` when the record
+        /// carried no `is_error` at all (4,065 of 28,393 sampled), which
+        /// is not the same as `Some(false)`.
+        is_error: Option<bool>,
+        /// The diff this result recorded, when it recorded one.
+        ///
+        /// Read from the record's `toolUseResult` sibling, NOT from the
+        /// block -- see [`FileChange`] on where this actually lives.
+        change: Option<FileChange>,
+    },
     /// A block kind this build does not know.
     ///
     /// Reported rather than dropped: Claude Code owns this format, and a
@@ -371,6 +435,285 @@ pub enum Block {
     /// an exchange with a hole in it and no sign that anything was
     /// missing.
     Other { block_type: String },
+}
+
+/// A tool call's arguments, as the shape that tool actually takes.
+///
+/// One variant per tool the corpus carries in quantity, measured over 40
+/// real transcripts (28,370 calls):
+///
+/// ```text
+/// Bash 24,258   Edit 543   Write 378   Read 255   Grep 69   Glob 1
+/// ```
+///
+/// [`ToolArgs::Other`] keeps [`Block::Other`]'s guarantee one level down:
+/// a tool this build does not know is REPORTED by name with its argument
+/// keys, never silently dropped and never dumped whole. Claude Code owns
+/// this format and adds tools -- 18 distinct names appear in the sample,
+/// most of them MCP tools that did not exist when the pane was written.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "tool", rename_all = "snake_case")]
+pub enum ToolArgs {
+    /// `Edit`: a string-level replacement in one file.
+    Edit {
+        file_path: String,
+        old_string: String,
+        new_string: String,
+        replace_all: bool,
+        /// Whether either string was clipped by [`MAX_TEXT_CHARS`].
+        truncated: bool,
+    },
+    /// `MultiEdit`: several replacements in one file, applied in order.
+    ///
+    /// Absent from this machine's corpus (0 of 28,370 calls) but named in
+    /// the ticket and shipped by Claude Code, so it is parsed rather than
+    /// left to fall through to [`ToolArgs::Other`]. `edits` is bounded by
+    /// [`MAX_EDITS`] and says when the bound bit.
+    MultiEdit {
+        file_path: String,
+        edits: Vec<Replacement>,
+        /// Edits beyond [`MAX_EDITS`] that are not listed. `0` when all
+        /// of them are -- a count, not a flag, so the pane can say how
+        /// many are missing rather than only that some are.
+        edits_omitted: usize,
+    },
+    /// `Write`: the whole new contents of a file.
+    Write {
+        file_path: String,
+        content: String,
+        truncated: bool,
+    },
+    /// `Bash`: the command, and the description the caller gave it.
+    Bash {
+        command: String,
+        /// The one-line description. Present on 24,258 of 24,258 sampled
+        /// `Bash` calls, and it is the sentence a reader actually scans.
+        description: Option<String>,
+        truncated: bool,
+    },
+    /// `Read`: a file, optionally a window within it.
+    Read {
+        file_path: String,
+        offset: Option<i64>,
+        limit: Option<i64>,
+    },
+    /// `Grep`: the pattern and where it was run.
+    Grep {
+        pattern: String,
+        path: Option<String>,
+        output_mode: Option<String>,
+    },
+    /// `Glob`: the pattern and where it was run.
+    Glob {
+        pattern: String,
+        path: Option<String>,
+    },
+    /// `Task` / `Agent`: a delegated sub-session.
+    ///
+    /// Both names, because this machine's corpus spells it `Agent` (236
+    /// calls) and the ticket and older transcripts spell it `Task`. One
+    /// variant rather than two: it is the same act, and a pane that
+    /// rendered them differently would be reporting a rename as a
+    /// distinction.
+    Task {
+        description: Option<String>,
+        subagent_type: Option<String>,
+        prompt: String,
+        truncated: bool,
+    },
+    /// A tool whose argument shape this build does not know.
+    ///
+    /// The KEYS, not the values: the keys are what tell a reader whether
+    /// Headstate is simply behind, and the values are the 40 KB blob the
+    /// original reasoning was right to refuse. Keys are sorted so two
+    /// renderings of the same call cannot differ by `serde_json`'s map
+    /// order.
+    Other { keys: Vec<String> },
+    /// The call carried no `input` object at all.
+    ///
+    /// Distinct from [`ToolArgs::Other`] with no keys: one is "arguments
+    /// we did not recognise", the other is "no arguments were recorded".
+    /// Absent is not zero.
+    None,
+}
+
+/// One replacement inside a [`ToolArgs::MultiEdit`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Replacement {
+    pub old_string: String,
+    pub new_string: String,
+    pub replace_all: bool,
+    pub truncated: bool,
+}
+
+/// The most edits listed from one `MultiEdit`.
+///
+/// A bound for the same reason [`MAX_MESSAGES`] is one: the render is
+/// what has to stay finite, and a 200-edit call drawn whole is the hang
+/// the byte cap exists to prevent reached by another route. Stated, never
+/// silent -- `edits_omitted` carries the remainder.
+const MAX_EDITS: usize = 20;
+
+/// The most hunks kept from one recorded patch.
+const MAX_HUNKS: usize = 20;
+
+/// The most lines kept from one hunk.
+///
+/// Per hunk rather than per patch, for [`MAX_TEXT_CHARS`]'s own reason:
+/// clipping per unit keeps the SHAPE -- the reader still sees that five
+/// regions changed -- where a whole-patch cap would drop the last four
+/// entirely.
+const MAX_HUNK_LINES: usize = 60;
+
+/// What a file change was reconstructed FROM.
+///
+/// The whole point of the type, and the reason it is an enum rather than
+/// a boolean on [`FileChange`]. A diff built from content the transcript
+/// RECORDED and one reconstructed from the replacement strings alone are
+/// different epistemic objects: the first shows the surrounding lines as
+/// they actually were, the second cannot show them at all. Rendering both
+/// as "a diff" tells the reader the second has context it does not have.
+///
+/// # The option that is not here
+///
+/// Reading the file from disk NOW would produce a diff with context for
+/// every edit. It is forbidden, and not as a matter of taste: the file
+/// has changed since -- that is what a session DOES -- so its current
+/// content is not its content at the time of the edit. Presenting it as
+/// the historical original is fabrication in the exact shape the reader
+/// is least able to detect, because it looks like a well-formed diff. The
+/// #846 rule ("a reading you could not take is not a reading of zero")
+/// with the failure mode inverted: here the fabricated reading is not
+/// zero but a plausible wrong number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffSource {
+    /// Built from a `structuredPatch` the transcript recorded, so the
+    /// context lines around each change are the file as it WAS.
+    ///
+    /// Measured: present on 915 of 915 sampled records that carry any
+    /// edit information at all -- which is why it is the primary source
+    /// and not the rare one.
+    Recorded,
+    /// Reconstructed from `old_string`/`new_string` alone.
+    ///
+    /// Honest and narrow: the replaced text and its replacement, with NO
+    /// surrounding context, because none was recorded. The fallback when
+    /// no patch was recorded.
+    Reconstructed,
+}
+
+/// A change to one file, as the transcript recorded it.
+///
+/// # Where this actually lives, which is not where the ticket said
+///
+/// The ticket expected `originalFile` on the `tool_result` BLOCK. It is
+/// not there. It is on a `toolUseResult` field of the enclosing RECORD,
+/// a sibling of `message` -- so a parser that only ever descends into
+/// `message.content` cannot see it at all. Measured over 40 real
+/// transcripts:
+///
+/// ```text
+/// records carrying edit information   915
+///   with `structuredPatch`            915  (100%)
+///   with a non-null `originalFile`    181  ( 20%)
+///   with `oldString`/`newString`      539  ( 59%)
+/// ```
+///
+/// So `originalFile` is the MINORITY case, not the primary one, and
+/// `structuredPatch` -- a ready-made unified diff with real context lines
+/// -- is universal. This takes `structuredPatch` as the recorded source,
+/// which is the same epistemic object the ticket wanted `originalFile`
+/// for (content the transcript wrote down, not content read back now) and
+/// available five times as often.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileChange {
+    pub file_path: Option<String>,
+    /// What this was built from. Renders differently per variant; see
+    /// [`DiffSource`].
+    pub source: DiffSource,
+    pub hunks: Vec<Hunk>,
+    /// Hunks beyond [`MAX_HUNKS`] that are not shown.
+    pub hunks_omitted: usize,
+    /// Whether the file did not exist before -- a creation, not an edit.
+    ///
+    /// `Some(true)` from a recorded `type: "create"`. `None` when the
+    /// record said nothing, which is not "it existed".
+    pub created: Option<bool>,
+}
+
+/// One region of a change.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Hunk {
+    /// The first line of this region in the file as it was, when the
+    /// record said. `None` for a reconstructed hunk, which has no line
+    /// numbers because nothing recorded any.
+    pub old_start: Option<i64>,
+    pub new_start: Option<i64>,
+    pub lines: Vec<DiffLine>,
+    /// Lines dropped from THIS hunk by [`MAX_HUNK_LINES`].
+    ///
+    /// Per hunk, not per pane, and a count rather than a flag. A clipped
+    /// diff that does not say it was clipped is a lie about what changed:
+    /// the reader sees three changed lines and concludes three lines
+    /// changed. Stating it once for the whole pane is not enough either,
+    /// because it does not say WHICH hunk is short.
+    pub lines_omitted: usize,
+}
+
+/// One line of a hunk, as the role it plays.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum DiffLine {
+    /// Present in both. Only ever from a RECORDED patch -- a
+    /// reconstructed hunk has no context by construction.
+    Context {
+        text: String,
+    },
+    Added {
+        text: String,
+    },
+    Removed {
+        text: String,
+    },
+}
+
+/// How a tool call and its result did or did not meet.
+///
+/// Four states, and the three orphan ones do NOT mean the same thing.
+/// The pairing key crosses a message boundary and [`TAIL_BYTES`] cuts
+/// wherever 256 KB lands, so orphans are the common case at a window
+/// edge, not a corruption.
+///
+/// Resolved in the UI rather than here for the middle two: this module
+/// reads a file and has no business asking whether a process is alive.
+/// See [`Preview::unanswered_calls`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Pairing {
+    /// The call and its result are both inside the window.
+    Paired,
+    /// A result whose call is NOT in the window.
+    ///
+    /// Means the call is older than the 256 KB we read -- "the call this
+    /// answers is above the window". It is not a missing call; it is a
+    /// call we did not look at. Nothing is wrong with the session.
+    CallAboveWindow,
+    /// A call with no result in the window.
+    ///
+    /// Deliberately does NOT say why. Whether this means "still running"
+    /// or "it never came back" depends on whether the session is alive,
+    /// which is `liveness.rs`'s question and has exactly one answer in
+    /// this codebase. Deriving a second one here would produce two
+    /// answers that disagree the first time either changes.
+    Unanswered,
+    /// The block carried no pairing key at all, so it can never be
+    /// matched.
+    ///
+    /// Distinct from [`Pairing::Unanswered`]: that is "we looked and
+    /// found no result", this is "we could not look". A call with no `id`
+    /// is not evidence of anything about the session.
+    Unkeyed,
 }
 
 /// Read the tail of `path` as conversation.
@@ -449,6 +792,25 @@ pub fn tail(path: &Path) -> Result<Preview, String> {
             out.non_conversation_records += 1;
             continue;
         };
+        // The change lives on the RECORD (`toolUseResult`), not in
+        // `message.content`, so it is read here and attached to the
+        // result block below. A parser that only descends into the
+        // message cannot see it at all -- which is why the ticket
+        // expected `originalFile` in a place it has never been.
+        let change = file_change(&rec);
+        let mut blocks = blocks_of(message.get("content"));
+        if let Some(change) = change {
+            // Onto the FIRST result block only. A record carries one
+            // `toolUseResult`, so attaching it to every result block in
+            // a batched message would claim the same diff came back from
+            // several different calls.
+            if let Some(Block::ToolResult { change: slot, .. }) = blocks
+                .iter_mut()
+                .find(|b| matches!(b, Block::ToolResult { .. }))
+            {
+                *slot = Some(change);
+            }
+        }
         out.messages.push(Message {
             role: kind.to_owned(),
             // The record's own timestamp, not the message's: the record
@@ -465,7 +827,7 @@ pub fn tail(path: &Path) -> Result<Preview, String> {
                 .and_then(|m| m.as_str())
                 .filter(|m| !m.is_empty())
                 .map(str::to_owned),
-            blocks: blocks_of(message.get("content")),
+            blocks,
         });
     }
 
@@ -485,6 +847,11 @@ pub fn tail(path: &Path) -> Result<Preview, String> {
     if !out.truncated {
         out.lifecycle.queue = Some(queue.into_queue());
     }
+    // Pairing runs AFTER the message cap, so it describes the window the
+    // reader is actually shown. Computing it before would pair a call
+    // against a result that then got dropped, and the pane would render
+    // "paired" beside a block with nothing to pair to.
+    pair(&mut out);
 
     Ok(out)
 }
@@ -600,6 +967,62 @@ fn lifecycle_record(
     }
 }
 
+/// Match each `tool_use` to its `tool_result` across the message
+/// boundary, and classify what did not match (#1209).
+///
+/// The keys are on the blocks -- `tool_use.id` and
+/// `tool_result.tool_use_id`, present on 28,370 and 28,393 of the same
+/// number of sampled blocks -- so this is a lookup, not a heuristic.
+///
+/// The three unmatched cases are not one case. A result whose call is
+/// above the window is a consequence of reading a tail and says nothing
+/// is wrong. A call with no result is a genuine open question, and its
+/// ANSWER depends on whether the session is still running -- which this
+/// module does not ask and must not, because `liveness.rs` already
+/// answers it and two answers to one question disagree the first time
+/// either changes.
+fn pair(out: &mut Preview) {
+    let mut calls: Vec<&str> = Vec::new();
+    let mut results: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for m in &out.messages {
+        for b in &m.blocks {
+            match b {
+                Block::ToolUse { id: Some(id), .. } => calls.push(id),
+                Block::ToolResult {
+                    tool_use_id: Some(id),
+                    ..
+                } => {
+                    results.insert(id);
+                }
+                _ => {}
+            }
+        }
+    }
+    let called: std::collections::HashSet<&str> = calls.iter().copied().collect();
+
+    for id in &calls {
+        let state = if results.contains(id) {
+            Pairing::Paired
+        } else {
+            Pairing::Unanswered
+        };
+        if state == Pairing::Unanswered {
+            out.unanswered_calls += 1;
+        }
+        out.pairings.insert((*id).to_owned(), state);
+    }
+    for id in &results {
+        if called.contains(id) {
+            continue;
+        }
+        // A result with no call in the window. The call is OLDER than the
+        // 256 KB we read, which is what a tail read does at its edge.
+        out.results_above_window += 1;
+        out.pairings
+            .insert((*id).to_owned(), Pairing::CallAboveWindow);
+    }
+}
+
 /// The blocks of one `content` value.
 ///
 /// Handles both shapes the corpus actually carries -- a list of blocks
@@ -625,21 +1048,48 @@ fn block_of(v: &serde_json::Value) -> Block {
             let (text, truncated) = clamp(field("thinking"));
             Block::Thinking { text, truncated }
         }
-        "tool_use" => Block::ToolUse {
-            name: v
+        "tool_use" => {
+            let name = v
                 .get("name")
                 .and_then(|n| n.as_str())
                 .unwrap_or("a tool")
-                .to_owned(),
-            // Deliberately NOT the `input`. See `Block::ToolUse`.
-        },
+                .to_owned();
+            Block::ToolUse {
+                // PARSED, not dumped and not discarded. See
+                // `Block::ToolUse` on why the original reasoning was
+                // right about the blob and wrong about the structure.
+                args: tool_args(&name, v.get("input")),
+                name,
+                id: v
+                    .get("id")
+                    .and_then(|i| i.as_str())
+                    .filter(|i| !i.is_empty())
+                    .map(str::to_owned),
+            }
+        }
         "tool_result" => {
             // A tool result's content is itself either a string or a
             // block array -- the same split as a message's, one level
             // down -- so it is flattened to its text rather than
             // assumed to be a string.
             let (text, truncated) = clamp(&flatten_text(v.get("content")));
-            Block::ToolResult { text, truncated }
+            Block::ToolResult {
+                text,
+                truncated,
+                tool_use_id: v
+                    .get("tool_use_id")
+                    .and_then(|i| i.as_str())
+                    .filter(|i| !i.is_empty())
+                    .map(str::to_owned),
+                // `None` when the record carried no `is_error` at all,
+                // which 4,065 of 28,393 sampled results do. Not folded
+                // into `false`: "it did not say" is not "it succeeded".
+                is_error: v.get("is_error").and_then(serde_json::Value::as_bool),
+                // Filled by the caller, which can see the RECORD. A
+                // block cannot: `toolUseResult` is a sibling of
+                // `message`, not a field inside it.
+                change: None,
+            }
         }
         other => Block::Other {
             block_type: if other.is_empty() {
@@ -648,6 +1098,261 @@ fn block_of(v: &serde_json::Value) -> Block {
                 other.to_owned()
             },
         },
+    }
+}
+
+/// One tool call's arguments, as the shape that tool takes.
+///
+/// Dispatches on the NAME, because the input object carries no type tag
+/// of its own. `Task`/`Agent` share a variant: see [`ToolArgs::Task`].
+fn tool_args(name: &str, input: Option<&serde_json::Value>) -> ToolArgs {
+    let Some(serde_json::Value::Object(map)) = input else {
+        // No `input` object at all. Distinct from an input whose keys we
+        // did not recognise -- absent is not zero.
+        return ToolArgs::None;
+    };
+    let text = |k: &str| map.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let opt = |k: &str| {
+        map.get(k)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    let flag = |k: &str| map.get(k).and_then(serde_json::Value::as_bool);
+    let num = |k: &str| map.get(k).and_then(serde_json::Value::as_i64);
+
+    match name {
+        "Edit" => {
+            let (old_string, a) = clamp(text("old_string"));
+            let (new_string, b) = clamp(text("new_string"));
+            ToolArgs::Edit {
+                file_path: text("file_path").to_owned(),
+                old_string,
+                new_string,
+                replace_all: flag("replace_all").unwrap_or(false),
+                truncated: a || b,
+            }
+        }
+        "MultiEdit" => {
+            let all = map
+                .get("edits")
+                .and_then(|e| e.as_array())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let edits = all
+                .iter()
+                .take(MAX_EDITS)
+                .map(|e| {
+                    let f = |k: &str| e.get(k).and_then(|v| v.as_str()).unwrap_or("");
+                    let (old_string, a) = clamp(f("old_string"));
+                    let (new_string, b) = clamp(f("new_string"));
+                    Replacement {
+                        old_string,
+                        new_string,
+                        replace_all: e
+                            .get("replace_all")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false),
+                        truncated: a || b,
+                    }
+                })
+                .collect();
+            ToolArgs::MultiEdit {
+                file_path: text("file_path").to_owned(),
+                edits,
+                edits_omitted: all.len().saturating_sub(MAX_EDITS),
+            }
+        }
+        "Write" => {
+            let (content, truncated) = clamp(text("content"));
+            ToolArgs::Write {
+                file_path: text("file_path").to_owned(),
+                content,
+                truncated,
+            }
+        }
+        "Bash" => {
+            let (command, truncated) = clamp(text("command"));
+            ToolArgs::Bash {
+                command,
+                description: opt("description"),
+                truncated,
+            }
+        }
+        "Read" => ToolArgs::Read {
+            file_path: text("file_path").to_owned(),
+            offset: num("offset"),
+            limit: num("limit"),
+        },
+        "Grep" => ToolArgs::Grep {
+            pattern: text("pattern").to_owned(),
+            path: opt("path"),
+            output_mode: opt("output_mode"),
+        },
+        "Glob" => ToolArgs::Glob {
+            pattern: text("pattern").to_owned(),
+            path: opt("path"),
+        },
+        // One variant, two spellings. This machine's corpus says `Agent`
+        // 236 times and `Task` none; older transcripts say `Task`. A
+        // rename is not a distinction.
+        "Task" | "Agent" => {
+            let (prompt, truncated) = clamp(text("prompt"));
+            ToolArgs::Task {
+                description: opt("description"),
+                subagent_type: opt("subagent_type"),
+                prompt,
+                truncated,
+            }
+        }
+        // Everything else -- 18 distinct tool names appear in the sample,
+        // most of them MCP tools. The KEYS, so a reader can see that
+        // Headstate is behind rather than that the call was empty; not
+        // the values, which is the blob the original reasoning refused.
+        _ => ToolArgs::Other {
+            keys: {
+                let mut k: Vec<String> = map.keys().cloned().collect();
+                // `serde_json` preserves insertion order without the
+                // `preserve_order` feature off, and either way two reads
+                // of one call must render identically.
+                k.sort();
+                k
+            },
+        },
+    }
+}
+
+/// The file change a record's `toolUseResult` recorded, if it recorded
+/// one.
+///
+/// Takes the RECORD, not the block: see [`FileChange`] on why
+/// `toolUseResult` is a sibling of `message` and invisible to anything
+/// that only descends into `message.content`.
+///
+/// Prefers the recorded `structuredPatch` (915 of 915 sampled edit
+/// records carry one) and falls back to reconstructing from
+/// `oldString`/`newString`. It never reads the file from disk; see
+/// [`DiffSource`] for why that option is fabrication rather than a
+/// trade-off.
+fn file_change(record: &serde_json::Value) -> Option<FileChange> {
+    let tur = record.get("toolUseResult")?.as_object()?;
+    let file_path = tur
+        .get("filePath")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let created = match tur.get("type").and_then(|v| v.as_str()) {
+        Some("create") => Some(true),
+        Some("update") => Some(false),
+        // The record said nothing. NOT "it existed" -- 539 of 915 edit
+        // records carry no `type` at all.
+        _ => None,
+    };
+
+    if let Some(patch) = tur.get("structuredPatch").and_then(|p| p.as_array()) {
+        // A recorded patch, with the surrounding lines as the file
+        // actually was. An EMPTY patch array is still a recorded answer
+        // -- "this changed nothing" -- but it is only a `FileChange` at
+        // all if the record is about a file, which `filePath` decides.
+        if file_path.is_some() || !patch.is_empty() {
+            let hunks: Vec<Hunk> = patch.iter().take(MAX_HUNKS).map(recorded_hunk).collect();
+            return Some(FileChange {
+                file_path,
+                source: DiffSource::Recorded,
+                hunks,
+                hunks_omitted: patch.len().saturating_sub(MAX_HUNKS),
+                created,
+            });
+        }
+    }
+
+    // No patch was recorded. Reconstruct the replacement itself, with no
+    // surrounding context, and LABEL it as that -- the reader must be
+    // able to tell a diff with real context from one that has none.
+    let old = tur.get("oldString").and_then(|v| v.as_str());
+    let new = tur.get("newString").and_then(|v| v.as_str());
+    if old.is_none() && new.is_none() {
+        return None;
+    }
+    Some(FileChange {
+        file_path,
+        source: DiffSource::Reconstructed,
+        hunks: vec![reconstructed_hunk(old.unwrap_or(""), new.unwrap_or(""))],
+        hunks_omitted: 0,
+        created,
+    })
+}
+
+/// One hunk of a recorded `structuredPatch`.
+///
+/// Claude Code writes each line with its unified-diff marker in column
+/// zero: `+`, `-` or a space. A line with no marker at all is treated as
+/// context, which is what an empty trailing line in a patch is.
+fn recorded_hunk(h: &serde_json::Value) -> Hunk {
+    let all = h
+        .get("lines")
+        .and_then(|l| l.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let lines = all
+        .iter()
+        .filter_map(|l| l.as_str())
+        .take(MAX_HUNK_LINES)
+        .map(|l| {
+            let rest = l.get(1..).unwrap_or("").to_owned();
+            match l.as_bytes().first() {
+                Some(b'+') => DiffLine::Added { text: rest },
+                Some(b'-') => DiffLine::Removed { text: rest },
+                Some(b' ') => DiffLine::Context { text: rest },
+                _ => DiffLine::Context { text: l.to_owned() },
+            }
+        })
+        .collect();
+    Hunk {
+        old_start: h.get("oldStart").and_then(serde_json::Value::as_i64),
+        new_start: h.get("newStart").and_then(serde_json::Value::as_i64),
+        lines,
+        // Per hunk. A clipped diff that does not say so is a lie about
+        // what changed.
+        lines_omitted: all.len().saturating_sub(MAX_HUNK_LINES),
+    }
+}
+
+/// A hunk reconstructed from the replacement strings alone.
+///
+/// No line numbers and no context, because nothing recorded any. The
+/// [`DiffSource::Reconstructed`] label is what stops this being read as
+/// the narrower thing it is not.
+fn reconstructed_hunk(old: &str, new: &str) -> Hunk {
+    let mut lines = Vec::new();
+    let mut omitted = 0usize;
+    // One budget SHARED across both sides, so a 10,000-line `old_string`
+    // cannot push the replacement off the end entirely -- and so the
+    // omission count is exact rather than per-side.
+    let mut budget = MAX_HUNK_LINES;
+    let removed = |text: String| DiffLine::Removed { text };
+    let added = |text: String| DiffLine::Added { text };
+    let ctors: [(&str, &dyn Fn(String) -> DiffLine); 2] = [(old, &removed), (new, &added)];
+    for (text, ctor) in ctors {
+        if text.is_empty() {
+            continue;
+        }
+        let total = text.lines().count();
+        let taken = total.min(budget);
+        for l in text.lines().take(taken) {
+            lines.push(ctor(l.to_owned()));
+        }
+        budget -= taken;
+        omitted += total - taken;
+    }
+    Hunk {
+        // No line numbers: a reconstructed hunk does not know where in
+        // the file it sits, and inventing one would be the same class of
+        // fabrication as reading the file back.
+        old_start: None,
+        new_start: None,
+        lines,
+        lines_omitted: omitted,
     }
 }
 
@@ -734,8 +1439,8 @@ mod tests {
             tmp.path(),
             "s.jsonl",
             &[
-                r#"{"type":"assistant","timestamp":"2026-09-13T10:00:00Z","message":{"role":"assistant","model":"claude-opus-5","content":[{"type":"text","text":"Looking now."},{"type":"thinking","thinking":"hmm"},{"type":"tool_use","name":"Read","input":{"file_path":"/tmp/x"}}]}}"#,
-                r#"{"type":"user","timestamp":"2026-09-13T10:00:01Z","message":{"role":"user","content":[{"type":"tool_result","content":[{"type":"text","text":"file contents"}]}]}}"#,
+                r#"{"type":"assistant","timestamp":"2026-09-13T10:00:00Z","message":{"role":"assistant","model":"claude-opus-5","content":[{"type":"text","text":"Looking now."},{"type":"thinking","thinking":"hmm"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/tmp/x","offset":10,"limit":20}}]}}"#,
+                r#"{"type":"user","timestamp":"2026-09-13T10:00:01Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","is_error":false,"content":[{"type":"text","text":"file contents"}]}]}}"#,
             ],
         );
         let v = tail(&p).unwrap();
@@ -754,7 +1459,15 @@ mod tests {
                     truncated: false
                 },
                 Block::ToolUse {
-                    name: "Read".into()
+                    name: "Read".into(),
+                    id: Some("toolu_1".into()),
+                    // PARSED, not discarded and not dumped: the reader
+                    // now learns WHICH file and which window of it.
+                    args: ToolArgs::Read {
+                        file_path: "/tmp/x".into(),
+                        offset: Some(10),
+                        limit: Some(20),
+                    },
                 },
             ]
         );
@@ -762,7 +1475,10 @@ mod tests {
             v.messages[1].blocks,
             vec![Block::ToolResult {
                 text: "file contents".into(),
-                truncated: false
+                truncated: false,
+                tool_use_id: Some("toolu_1".into()),
+                is_error: Some(false),
+                change: None,
             }]
         );
     }
@@ -970,6 +1686,574 @@ mod tests {
             }
             other => panic!("expected text, got {other:?}"),
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Pairing and argument rendering (#1209).
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn a_call_and_its_result_are_paired_across_the_message_boundary() {
+        // The key is on the blocks and the blocks are on DIFFERENT
+        // messages -- the call on an `assistant` record and the result on
+        // the `user` record after it. Nothing joined them before this.
+        let tmp = Tmp::new("pair");
+        let p = write(
+            tmp.path(),
+            "s.jsonl",
+            &[
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_A","name":"Bash","input":{"command":"ls -la","description":"List files"}}]}}"#,
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_A","content":"a.txt"}]}}"#,
+            ],
+        );
+        let v = tail(&p).unwrap();
+        assert_eq!(v.pairings.get("toolu_A"), Some(&Pairing::Paired));
+        assert_eq!(v.unanswered_calls, 0);
+        assert_eq!(v.results_above_window, 0);
+        // And the call now says WHAT it ran, not merely that Bash ran.
+        assert_eq!(
+            v.messages[0].blocks,
+            vec![Block::ToolUse {
+                name: "Bash".into(),
+                id: Some("toolu_A".into()),
+                args: ToolArgs::Bash {
+                    command: "ls -la".into(),
+                    description: Some("List files".into()),
+                    truncated: false,
+                },
+            }]
+        );
+    }
+
+    /// The three orphan cases must not render identically.
+    ///
+    /// This asserts the two the MODULE distinguishes -- a result whose
+    /// call is above the window, and a call with no result. The third
+    /// (`Unanswered` on a dead session) is the same `Pairing` resolved
+    /// against `liveness.rs`'s answer, and it is asserted where that
+    /// resolution happens: `ClaudeCodePage.test.tsx`. Deriving liveness
+    /// here would be the second answer to one question that
+    /// `liveness.rs`'s module docs forbid.
+    #[test]
+    fn an_orphan_result_and_an_orphan_call_are_different_states() {
+        let tmp = Tmp::new("orphans");
+        let p = write(
+            tmp.path(),
+            "s.jsonl",
+            &[
+                // A result whose call is above the window: the window
+                // starts here, so nothing ever issued `toolu_OLD`.
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_OLD","content":"output from before"}]}}"#,
+                // A call whose result never arrives.
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_NEW","name":"Bash","input":{"command":"sleep 600"}}]}}"#,
+            ],
+        );
+        let v = tail(&p).unwrap();
+        assert_eq!(
+            v.pairings.get("toolu_OLD"),
+            Some(&Pairing::CallAboveWindow),
+            "a result with no call means the call is older than the window"
+        );
+        assert_eq!(
+            v.pairings.get("toolu_NEW"),
+            Some(&Pairing::Unanswered),
+            "a call with no result is an open question, not a stale window"
+        );
+        // The two are counted separately, because they are different
+        // facts with different remedies: one is "read more of the file",
+        // the other is "the session may have died".
+        assert_eq!(v.results_above_window, 1);
+        assert_eq!(v.unanswered_calls, 1);
+        assert_ne!(
+            v.pairings.get("toolu_OLD"),
+            v.pairings.get("toolu_NEW"),
+            "collapsing the two loses the distinction that makes this worth having"
+        );
+    }
+
+    #[test]
+    fn a_call_with_no_id_is_unpairable_rather_than_unanswered() {
+        // "We could not look" is not "we looked and found nothing" --
+        // the same split `unparseable_records` draws against
+        // `non_conversation_records`. A call with no key is not evidence
+        // that a session died.
+        let tmp = Tmp::new("unkeyed");
+        let p = write(
+            tmp.path(),
+            "s.jsonl",
+            &[
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"x"}}]}}"#,
+            ],
+        );
+        let v = tail(&p).unwrap();
+        assert!(v.pairings.is_empty());
+        assert_eq!(
+            v.unanswered_calls, 0,
+            "an unkeyed call must not be counted as a call that never came back"
+        );
+        match &v.messages[0].blocks[0] {
+            Block::ToolUse { id, .. } => assert_eq!(*id, None),
+            other => panic!("expected a tool_use, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_recorded_patch_is_labelled_differently_from_a_reconstructed_one() {
+        // The heart of the diff half of #1209. Both records describe an
+        // edit; only the first wrote down the file's surrounding lines.
+        // Rendering both as "a diff" tells the reader the second has
+        // context it does not have.
+        let tmp = Tmp::new("diffsrc");
+        let p = write(
+            tmp.path(),
+            "s.jsonl",
+            &[
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"/a.rs","old_string":"let x=1;","new_string":"let x=2;"}}]}}"#,
+                r#"{"type":"user","toolUseResult":{"filePath":"/a.rs","structuredPatch":[{"oldStart":10,"newStart":10,"lines":[" fn main() {","-    let x=1;","+    let x=2;"," }"]}]},"message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Edit","input":{"file_path":"/b.rs","old_string":"let y=1;","new_string":"let y=2;"}}]}}"#,
+                r#"{"type":"user","toolUseResult":{"filePath":"/b.rs","oldString":"let y=1;","newString":"let y=2;"},"message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"ok"}]}}"#,
+            ],
+        );
+        let v = tail(&p).unwrap();
+
+        let recorded = match &v.messages[1].blocks[0] {
+            Block::ToolResult { change, .. } => change.clone().expect("a change was recorded"),
+            other => panic!("expected a tool_result, got {other:?}"),
+        };
+        let reconstructed = match &v.messages[3].blocks[0] {
+            Block::ToolResult { change, .. } => change.clone().expect("a change was recorded"),
+            other => panic!("expected a tool_result, got {other:?}"),
+        };
+
+        assert_eq!(recorded.source, DiffSource::Recorded);
+        assert_eq!(reconstructed.source, DiffSource::Reconstructed);
+        assert_ne!(
+            recorded.source, reconstructed.source,
+            "two different epistemic objects must be distinguishable"
+        );
+
+        // The recorded one carries CONTEXT lines and real line numbers,
+        // which is exactly what the other cannot have.
+        assert_eq!(recorded.hunks[0].old_start, Some(10));
+        assert!(
+            recorded.hunks[0]
+                .lines
+                .iter()
+                .any(|l| matches!(l, DiffLine::Context { .. })),
+            "a recorded patch carries the surrounding lines as they were"
+        );
+
+        // The reconstructed one has no line numbers and no context,
+        // because nothing recorded any. Inventing either would be the
+        // same fabrication as reading the file back off disk.
+        assert_eq!(reconstructed.hunks[0].old_start, None);
+        assert_eq!(reconstructed.hunks[0].new_start, None);
+        assert!(
+            !reconstructed.hunks[0]
+                .lines
+                .iter()
+                .any(|l| matches!(l, DiffLine::Context { .. })),
+            "a reconstructed hunk has no context to show"
+        );
+        assert_eq!(
+            reconstructed.hunks[0].lines,
+            vec![
+                DiffLine::Removed {
+                    text: "let y=1;".into()
+                },
+                DiffLine::Added {
+                    text: "let y=2;".into()
+                },
+            ]
+        );
+    }
+
+    /// A clipped diff says so, PER HUNK.
+    ///
+    /// The fixture genuinely exceeds `MAX_HUNK_LINES` -- a small one read
+    /// whole proves nothing about a bound that never bound. Two hunks,
+    /// one over the limit and one under, so the test also proves the
+    /// statement is per hunk and not a single flag for the pane: a
+    /// reader told "something here was clipped" still cannot tell which
+    /// region is short.
+    #[test]
+    fn a_clipped_hunk_says_so_and_an_unclipped_one_does_not() {
+        let tmp = Tmp::new("clip");
+        let big: Vec<String> = (0..MAX_HUNK_LINES + 40)
+            .map(|i| format!("\"+added line {i}\""))
+            .collect();
+        let small = r#"" context","+one added""#;
+        let line = format!(
+            r#"{{"type":"user","toolUseResult":{{"filePath":"/big.rs","structuredPatch":[{{"oldStart":1,"newStart":1,"lines":[{}]}},{{"oldStart":900,"newStart":900,"lines":[{}]}}]}},"message":{{"content":[{{"type":"tool_result","tool_use_id":"t9","content":"ok"}}]}}}}"#,
+            big.join(","),
+            small
+        );
+        let p = write(tmp.path(), "s.jsonl", &[&line]);
+        let v = tail(&p).unwrap();
+        let change = match &v.messages[0].blocks[0] {
+            Block::ToolResult { change, .. } => change.clone().expect("a change was recorded"),
+            other => panic!("expected a tool_result, got {other:?}"),
+        };
+        assert_eq!(change.hunks.len(), 2);
+
+        // The bound actually bound -- the fixture is genuinely over it.
+        assert_eq!(change.hunks[0].lines.len(), MAX_HUNK_LINES);
+        assert_eq!(
+            change.hunks[0].lines_omitted, 40,
+            "the clipped hunk must say how much is missing, not merely that some is"
+        );
+
+        // And the hunk that was NOT clipped must not claim it was: a
+        // false clip warning is its own lie about what changed.
+        assert_eq!(change.hunks[1].lines.len(), 2);
+        assert_eq!(change.hunks[1].lines_omitted, 0);
+    }
+
+    #[test]
+    fn a_patch_with_more_hunks_than_the_cap_says_how_many_are_missing() {
+        let tmp = Tmp::new("hunks");
+        let hunks: Vec<String> = (0..MAX_HUNKS + 7)
+            .map(|i| {
+                format!(
+                    r#"{{"oldStart":{i},"newStart":{i},"lines":["+line {i}"]}}"#,
+                    i = i + 1
+                )
+            })
+            .collect();
+        let line = format!(
+            r#"{{"type":"user","toolUseResult":{{"filePath":"/m.rs","structuredPatch":[{}]}},"message":{{"content":[{{"type":"tool_result","tool_use_id":"tz","content":"ok"}}]}}}}"#,
+            hunks.join(",")
+        );
+        let p = write(tmp.path(), "s.jsonl", &[&line]);
+        let v = tail(&p).unwrap();
+        let change = match &v.messages[0].blocks[0] {
+            Block::ToolResult { change, .. } => change.clone().unwrap(),
+            other => panic!("expected a tool_result, got {other:?}"),
+        };
+        assert_eq!(change.hunks.len(), MAX_HUNKS);
+        assert_eq!(change.hunks_omitted, 7);
+    }
+
+    #[test]
+    fn a_write_records_a_creation_rather_than_an_edit() {
+        // 357 of 915 sampled edit records carry `type: "create"` with a
+        // NULL `originalFile` -- there was no original. Rendering that as
+        // an edit to an empty file would be a claim about a file that did
+        // not exist.
+        let tmp = Tmp::new("create");
+        let p = write(
+            tmp.path(),
+            "s.jsonl",
+            &[
+                r#"{"type":"user","toolUseResult":{"type":"create","filePath":"/new.md","originalFile":null,"structuredPatch":[{"oldStart":1,"newStart":1,"lines":["+hello"]}]},"message":{"content":[{"type":"tool_result","tool_use_id":"tc","content":"created"}]}}"#,
+            ],
+        );
+        let v = tail(&p).unwrap();
+        let change = match &v.messages[0].blocks[0] {
+            Block::ToolResult { change, .. } => change.clone().unwrap(),
+            other => panic!("expected a tool_result, got {other:?}"),
+        };
+        assert_eq!(change.created, Some(true));
+        assert_eq!(change.source, DiffSource::Recorded);
+    }
+
+    #[test]
+    fn a_result_that_recorded_no_change_carries_none() {
+        // Most results are not edits at all -- 23,889 of 28,393 sampled
+        // `toolUseResult`s are Bash stdout/stderr. A `FileChange` there
+        // would be a diff invented from nothing.
+        let tmp = Tmp::new("nochange");
+        let p = write(
+            tmp.path(),
+            "s.jsonl",
+            &[
+                r#"{"type":"user","toolUseResult":{"stdout":"hi","stderr":"","interrupted":false,"isImage":false},"message":{"content":[{"type":"tool_result","tool_use_id":"tb","content":"hi"}]}}"#,
+            ],
+        );
+        let v = tail(&p).unwrap();
+        match &v.messages[0].blocks[0] {
+            Block::ToolResult { change, .. } => assert_eq!(*change, None),
+            other => panic!("expected a tool_result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_tool_reports_its_argument_keys_rather_than_its_values() {
+        // `Block::Other`'s guarantee, one level down. 18 distinct tool
+        // names appear in the sample and most are MCP tools that did not
+        // exist when this pane was written; a pane that dropped their
+        // arguments silently would show a call with no sign anything was
+        // missing, and one that dumped them would be the 40 KB blob the
+        // original reasoning was right to refuse.
+        let tmp = Tmp::new("unknowntool");
+        let p = write(
+            tmp.path(),
+            "s.jsonl",
+            &[
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tm","name":"mcp__enclave__enclave_sql","input":{"query":"SELECT secret FROM t","enclave":"one"}}]}}"#,
+            ],
+        );
+        let v = tail(&p).unwrap();
+        match &v.messages[0].blocks[0] {
+            Block::ToolUse { name, args, .. } => {
+                assert_eq!(name, "mcp__enclave__enclave_sql");
+                // Sorted, so two reads of one call cannot differ by map
+                // order.
+                assert_eq!(
+                    *args,
+                    ToolArgs::Other {
+                        keys: vec!["enclave".into(), "query".into()]
+                    }
+                );
+            }
+            other => panic!("expected a tool_use, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_call_with_no_input_is_distinct_from_one_with_unknown_arguments() {
+        // Absent is not zero: "no arguments were recorded" and
+        // "arguments we did not recognise" are different readings.
+        let tmp = Tmp::new("noinput");
+        let p = write(
+            tmp.path(),
+            "s.jsonl",
+            &[
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tn","name":"Whatever"},{"type":"tool_use","id":"to","name":"Whatever","input":{}}]}}"#,
+            ],
+        );
+        let v = tail(&p).unwrap();
+        let args: Vec<&ToolArgs> = v.messages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::ToolUse { args, .. } => Some(args),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(*args[0], ToolArgs::None);
+        assert_eq!(*args[1], ToolArgs::Other { keys: vec![] });
+        assert_ne!(args[0], args[1]);
+    }
+
+    #[test]
+    fn a_huge_bash_command_is_clamped_and_says_so() {
+        // The arguments go through the SAME bound as any other text --
+        // adding a parsed shape must not reopen the 40 KB blob by
+        // another door. The fixture genuinely exceeds the limit.
+        let tmp = Tmp::new("bigcmd");
+        let long = "x".repeat(MAX_TEXT_CHARS + 500);
+        let p = write(
+            tmp.path(),
+            "s.jsonl",
+            &[&format!(
+                r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"tq","name":"Bash","input":{{"command":"{long}"}}}}]}}}}"#
+            )],
+        );
+        let v = tail(&p).unwrap();
+        match &v.messages[0].blocks[0] {
+            Block::ToolUse {
+                args: ToolArgs::Bash {
+                    command, truncated, ..
+                },
+                ..
+            } => {
+                assert!(truncated, "a clipped command must say it was clipped");
+                assert_eq!(command.chars().count(), MAX_TEXT_CHARS);
+            }
+            other => panic!("expected a Bash call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_multi_edit_lists_its_replacements_and_counts_the_ones_it_drops() {
+        let tmp = Tmp::new("multi");
+        let edits: Vec<String> = (0..MAX_EDITS + 5)
+            .map(|i| format!(r#"{{"old_string":"a{i}","new_string":"b{i}"}}"#))
+            .collect();
+        let line = format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"tme","name":"MultiEdit","input":{{"file_path":"/x.rs","edits":[{}]}}}}]}}}}"#,
+            edits.join(",")
+        );
+        let p = write(tmp.path(), "s.jsonl", &[&line]);
+        let v = tail(&p).unwrap();
+        match &v.messages[0].blocks[0] {
+            Block::ToolUse {
+                args:
+                    ToolArgs::MultiEdit {
+                        file_path,
+                        edits,
+                        edits_omitted,
+                    },
+                ..
+            } => {
+                assert_eq!(file_path, "/x.rs");
+                assert_eq!(edits.len(), MAX_EDITS);
+                assert_eq!(*edits_omitted, 5);
+            }
+            other => panic!("expected a MultiEdit call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_and_agent_are_one_shape_because_a_rename_is_not_a_distinction() {
+        let tmp = Tmp::new("task");
+        let p = write(
+            tmp.path(),
+            "s.jsonl",
+            &[
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Task","input":{"description":"find it","prompt":"go","subagent_type":"Explore"}},{"type":"tool_use","id":"t2","name":"Agent","input":{"description":"find it","prompt":"go","subagent_type":"Explore"}}]}}"#,
+            ],
+        );
+        let v = tail(&p).unwrap();
+        let args: Vec<&ToolArgs> = v.messages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::ToolUse { args, .. } => Some(args),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(args[0], args[1]);
+        assert!(matches!(args[0], ToolArgs::Task { .. }));
+    }
+
+    /// Pairing describes the window the reader is SHOWN, not the window
+    /// that was read.
+    ///
+    /// The message cap drops the oldest messages, and a call dropped by
+    /// it leaves its result behind. Pairing computed before the cap would
+    /// mark that result `Paired` and the pane would render "paired"
+    /// beside a block with nothing in view to pair to. The fixture
+    /// genuinely exceeds `MAX_MESSAGES`.
+    #[test]
+    fn a_call_dropped_by_the_message_cap_leaves_its_result_above_the_window() {
+        let tmp = Tmp::new("capped");
+        let pth = tmp.path().join("c.jsonl");
+        {
+            let mut f = std::fs::File::create(&pth).unwrap();
+            // The call, then enough messages to push it past the cap.
+            writeln!(
+                f,
+                r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"toolu_FAR","name":"Bash","input":{{"command":"x"}}}}]}}}}"#
+            )
+            .unwrap();
+            for i in 0..MAX_MESSAGES {
+                writeln!(
+                    f,
+                    r#"{{"type":"user","message":{{"role":"user","content":"m{i}"}}}}"#
+                )
+                .unwrap();
+            }
+            writeln!(
+                f,
+                r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_FAR","content":"late"}}]}}}}"#
+            )
+            .unwrap();
+        }
+        let v = tail(&pth).unwrap();
+        assert_eq!(v.messages.len(), MAX_MESSAGES);
+        assert!(v.truncated);
+        assert_eq!(
+            v.pairings.get("toolu_FAR"),
+            Some(&Pairing::CallAboveWindow),
+            "a call the cap dropped is above the window the reader sees"
+        );
+        assert_eq!(v.unanswered_calls, 0);
+    }
+
+    /// The parser against the REAL corpus, not only fixtures.
+    ///
+    /// `#[ignore]` for the reason the other corpus tests in this tree
+    /// are: it needs `~/.claude/projects/` to exist with real
+    /// transcripts, which a CI runner does not have. Run with
+    /// `cargo test -- --ignored real_transcripts_pair`.
+    #[test]
+    #[ignore = "reads the developer's real ~/.claude corpus"]
+    fn real_transcripts_pair_and_carry_arguments() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let root = PathBuf::from(home).join(".claude").join("projects");
+        let Ok(dirs) = std::fs::read_dir(&root) else {
+            return;
+        };
+        let mut files = Vec::new();
+        for d in dirs.flatten() {
+            let Ok(inner) = std::fs::read_dir(d.path()) else {
+                continue;
+            };
+            for f in inner.flatten() {
+                let p = f.path();
+                if p.extension().is_some_and(|e| e == "jsonl")
+                    && f.metadata().is_ok_and(|m| m.len() > 50_000)
+                {
+                    files.push(p);
+                }
+            }
+            if files.len() >= 40 {
+                break;
+            }
+        }
+        if files.is_empty() {
+            return;
+        }
+
+        let (mut paired, mut above, mut unanswered) = (0usize, 0usize, 0usize);
+        let (mut recorded, mut reconstructed, mut parsed_args) = (0usize, 0usize, 0usize);
+        for f in &files {
+            let Ok(v) = tail(f) else { continue };
+            for state in v.pairings.values() {
+                match state {
+                    Pairing::Paired => paired += 1,
+                    Pairing::CallAboveWindow => above += 1,
+                    Pairing::Unanswered => unanswered += 1,
+                    Pairing::Unkeyed => {}
+                }
+            }
+            for m in &v.messages {
+                for b in &m.blocks {
+                    match b {
+                        Block::ToolUse { args, .. } => {
+                            if !matches!(args, ToolArgs::Other { .. } | ToolArgs::None) {
+                                parsed_args += 1;
+                            }
+                        }
+                        Block::ToolResult {
+                            change: Some(c), ..
+                        } => match c.source {
+                            DiffSource::Recorded => recorded += 1,
+                            DiffSource::Reconstructed => reconstructed += 1,
+                        },
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // The pairing key is on the blocks in the real corpus, so the
+        // overwhelming majority of calls inside one window DO pair. If
+        // this is zero the parser is reading a field that is not there.
+        assert!(
+            paired > 0,
+            "no call paired across {} real transcripts",
+            files.len()
+        );
+        assert!(parsed_args > 0, "no tool arguments parsed from real calls");
+        // Orphans are the normal consequence of a tail read, so at least
+        // one of the two orphan kinds should appear over 40 files.
+        assert!(
+            above + unanswered > 0,
+            "a 256 KB tail read over {} files produced no orphan at all, which \
+             means the window never cut between a call and its result -- \
+             suspicious enough to check the parser",
+            files.len()
+        );
+        eprintln!(
+            "real corpus: {} files, paired {paired}, above-window {above}, \
+             unanswered {unanswered}, recorded diffs {recorded}, \
+             reconstructed {reconstructed}, parsed args {parsed_args}",
+            files.len()
+        );
     }
 
     #[test]

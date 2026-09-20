@@ -10,6 +10,7 @@ import type {
   ClaudeUsage,
   ClaudeObservation,
   ClaudeSubagentRollup,
+  Liveness,
   Worktree,
   WorktreeRepo,
 } from "@/types/pr";
@@ -427,7 +428,12 @@ const preview = (over: Partial<ClaudePreview> = {}): ClaudePreview => ({
       model: "claude-opus-5",
       blocks: [
         { kind: "text", text: "Running them now.", truncated: false },
-        { kind: "tool_use", name: "Bash" },
+        {
+          kind: "tool_use",
+          name: "Bash",
+          id: "toolu_base",
+          args: { tool: "bash", command: "cargo test", description: null, truncated: false },
+        },
       ],
     },
   ],
@@ -441,6 +447,9 @@ const preview = (over: Partial<ClaudePreview> = {}): ClaudePreview => ({
     permission_mode: null,
     worktree: { state: "unknown" },
   },
+  pairings: { toolu_base: "unanswered" },
+  unanswered_calls: 1,
+  results_above_window: 0,
   ...over,
 });
 
@@ -2687,8 +2696,25 @@ describe("reading a transcript rather than revealing it", () => {
           blocks: [
             { kind: "text", text: "Looking now.", truncated: false },
             { kind: "thinking", text: "weighing it up", truncated: false },
-            { kind: "tool_use", name: "Bash" },
-            { kind: "tool_result", text: "3 tests passed", truncated: false },
+            {
+              kind: "tool_use",
+              name: "Bash",
+              id: "toolu_1",
+              args: {
+                tool: "bash",
+                command: "cargo test",
+                description: null,
+                truncated: false,
+              },
+            },
+            {
+              kind: "tool_result",
+              text: "3 tests passed",
+              truncated: false,
+              tool_use_id: "toolu_1",
+              is_error: false,
+              change: null,
+            },
           ],
         },
       ],
@@ -2698,10 +2724,399 @@ describe("reading a transcript rather than revealing it", () => {
     fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
     expect(screen.getByText("Looking now.")).toBeTruthy();
     expect(screen.getByText("weighing it up")).toBeTruthy();
-    // The tool's NAME, not its arguments: "Bash" says what the session
-    // was doing and a 40 KB argument blob does not.
+    // The name AND the parsed arguments (#1209). "Ran Bash" and "ran
+    // `cargo test`" are not the same sentence, and the second is the one
+    // that stops a user leaving for a terminal.
     expect(screen.getByText("Bash")).toBeTruthy();
+    expect(screen.getByText(/cargo test/)).toBeTruthy();
     expect(screen.getByText(/3 tests passed/)).toBeTruthy();
+  });
+
+  // -----------------------------------------------------------------
+  // Tool pairing, arguments and diffs (#1209).
+  // -----------------------------------------------------------------
+
+  /// A helper for a transcript whose one call never got a result.
+  ///
+  /// The three orphan cases below differ ONLY in the session's liveness,
+  /// so the transcript is held constant and the liveness varied. That is
+  /// the claim under test: one recorded fact, three meanings, and the
+  /// meaning comes from `liveness.rs` rather than from the transcript.
+  const unansweredCall = () =>
+    preview({
+      messages: [
+        {
+          role: "assistant",
+          timestamp: "2026-09-13T11:00:05Z",
+          model: "claude-opus-5",
+          blocks: [
+            {
+              kind: "tool_use",
+              name: "Bash",
+              id: "toolu_open",
+              args: {
+                tool: "bash",
+                command: "cargo test --all",
+                description: null,
+                truncated: false,
+              },
+            },
+          ],
+        },
+      ],
+      pairings: { toolu_open: "unanswered" },
+      unanswered_calls: 1,
+    });
+
+  /// Orphan case 2 of 3: a call with no result on a RUNNING session.
+  ///
+  /// Nothing is wrong. The result has not been written yet.
+  it("says an unanswered call on a running session is still executing", () => {
+    state.list = listOf([
+      session({ liveness: { state: "running", pid: 14779, status: "busy" } }),
+    ]);
+    state.preview = unansweredCall();
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    expect(screen.getByText(/still running, so the call may still be executing/i)).toBeTruthy();
+    // And emphatically NOT the crash wording, which would report a
+    // healthy session as a dead one.
+    expect(screen.queryByText(/did not come back/i)).toBeNull();
+  });
+
+  /// Orphan case 3 of 3: a call with no result on a DEAD session.
+  ///
+  /// This is the signature of a crash mid tool call, and it is real
+  /// information -- it says WHERE the session died, which is exactly what
+  /// a user about to resume it wants. Rendering it the same as case 2
+  /// throws away the only one of the two worth surfacing.
+  it("says an unanswered call on a dead session never came back", () => {
+    state.list = listOf([
+      session({ liveness: { state: "dead", why: "pid 14779 is no longer running" } }),
+    ]);
+    state.preview = unansweredCall();
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    expect(screen.getByText(/no result was recorded.*did not come back/i)).toBeTruthy();
+    expect(screen.queryByText(/may still be executing/i)).toBeNull();
+  });
+
+  /// And the tri-state's third arm, which is not a shade of dead.
+  ///
+  /// A check that could not be completed must not report a crash: the
+  /// session may be alive and mid-work. `Liveness`'s own rule, applied
+  /// where it is rendered.
+  it("does not call an unanswered call a crash when liveness is unknown", () => {
+    state.list = listOf([
+      session({
+        liveness: { state: "unknown", why: "could not read the live session registry" },
+      }),
+    ]);
+    state.preview = unansweredCall();
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    expect(
+      screen.getByText(/whether the call is still running could not be determined/i),
+    ).toBeTruthy();
+    expect(screen.queryByText(/did not come back/i)).toBeNull();
+    expect(screen.queryByText(/may still be executing/i)).toBeNull();
+  });
+
+  /// Orphan case 1 of 3: a result whose call is above the window.
+  ///
+  /// The 256 KB tail cut between the call and its result. Nothing is
+  /// wrong with the session at all, so this must read as a fact about the
+  /// WINDOW and not about the session -- and in particular must not wear
+  /// either of the two call-side wordings.
+  it("says an orphan result's call is above the window, not that it is missing", () => {
+    state.preview = preview({
+      messages: [
+        {
+          role: "user",
+          timestamp: "2026-09-13T11:00:05Z",
+          model: null,
+          blocks: [
+            {
+              kind: "tool_result",
+              text: "output with nothing that asked for it",
+              truncated: false,
+              tool_use_id: "toolu_gone",
+              is_error: null,
+              change: null,
+            },
+          ],
+        },
+      ],
+      pairings: { toolu_gone: "call_above_window" },
+      unanswered_calls: 0,
+      results_above_window: 1,
+    });
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    expect(screen.getByText(/the call this answers is above the window/i)).toBeTruthy();
+    // The distinction that makes the feature worth having: this is not
+    // the crash case and not the in-flight case.
+    expect(screen.queryByText(/did not come back/i)).toBeNull();
+    expect(screen.queryByText(/may still be executing/i)).toBeNull();
+  });
+
+  /// All three orphan cases produce DIFFERENT sentences.
+  ///
+  /// Asserted as one claim as well as three, because the failure this
+  /// guards against is collapse: a refactor that routed two of them
+  /// through one message would leave each individual test above passing
+  /// on a substring while the distinction was gone.
+  it("gives each of the three orphan cases its own distinct message", () => {
+    const said = (liveness: Liveness, view: ClaudePreview) => {
+      state.list = listOf([session({ liveness })]);
+      state.preview = view;
+      const { unmount } = renderView();
+      open("HeadState GitHub issues filing");
+      fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+      // Read through `screen`, not the render's own `container`:
+      // `renderView` mounts into the shared document body and `open`
+      // queries it globally, so a per-render container can lag the pane
+      // these assertions are actually about.
+      const text = document.body.textContent ?? "";
+      unmount();
+      cleanup();
+      return text;
+    };
+
+    const aboveWindow = said(
+      { state: "dead", why: "pid 1 is no longer running" },
+      preview({
+        messages: [
+          {
+            role: "user",
+            timestamp: "2026-09-13T11:00:05Z",
+            model: null,
+            blocks: [
+              {
+                kind: "tool_result",
+                text: "orphan output",
+                truncated: false,
+                tool_use_id: "toolu_gone",
+                is_error: null,
+                change: null,
+              },
+            ],
+          },
+        ],
+        pairings: { toolu_gone: "call_above_window" },
+        results_above_window: 1,
+      }),
+    );
+    const stillRunning = said(
+      { state: "running", pid: 14779, status: "busy" },
+      unansweredCall(),
+    );
+    const neverCameBack = said(
+      { state: "dead", why: "pid 14779 is no longer running" },
+      unansweredCall(),
+    );
+
+    // Three panes, three different sentences. Pairwise, because
+    // "at least two differ" would pass with two of the three collapsed.
+    expect(aboveWindow).not.toEqual(stillRunning);
+    expect(stillRunning).not.toEqual(neverCameBack);
+    expect(aboveWindow).not.toEqual(neverCameBack);
+    expect(aboveWindow).toMatch(/above the window/i);
+    expect(stillRunning).toMatch(/still be executing/i);
+    expect(neverCameBack).toMatch(/did not come back/i);
+  });
+
+  /// A recorded diff and a reconstructed one are LABELLED differently.
+  ///
+  /// The substance of the diff half of #1209. A diff built from content
+  /// the transcript wrote down shows the surrounding lines as the file
+  /// actually was; one reconstructed from `old_string`/`new_string` has
+  /// no context at all. Rendering both as "a diff" tells the reader the
+  /// second has context it does not have.
+  it("labels a recorded diff differently from a reconstructed one", () => {
+    state.preview = preview({
+      messages: [
+        {
+          role: "user",
+          timestamp: "2026-09-13T11:00:05Z",
+          model: null,
+          blocks: [
+            {
+              kind: "tool_result",
+              text: "ok",
+              truncated: false,
+              tool_use_id: "t1",
+              is_error: false,
+              change: {
+                file_path: "/a.rs",
+                source: "recorded",
+                hunks: [
+                  {
+                    old_start: 10,
+                    new_start: 10,
+                    lines: [
+                      { op: "context", text: "fn main() {" },
+                      { op: "removed", text: "  let x = 1;" },
+                      { op: "added", text: "  let x = 2;" },
+                    ],
+                    lines_omitted: 0,
+                  },
+                ],
+                hunks_omitted: 0,
+                created: false,
+              },
+            },
+            {
+              kind: "tool_result",
+              text: "ok",
+              truncated: false,
+              tool_use_id: "t2",
+              is_error: false,
+              change: {
+                file_path: "/b.rs",
+                source: "reconstructed",
+                hunks: [
+                  {
+                    old_start: null,
+                    new_start: null,
+                    lines: [
+                      { op: "removed", text: "let y = 1;" },
+                      { op: "added", text: "let y = 2;" },
+                    ],
+                    lines_omitted: 0,
+                  },
+                ],
+                hunks_omitted: 0,
+                created: null,
+              },
+            },
+          ],
+        },
+      ],
+      pairings: { t1: "call_above_window", t2: "call_above_window" },
+      results_above_window: 2,
+    });
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+
+    // The recorded one says its context is real.
+    expect(
+      screen.getByText(/recorded at the time, so the surrounding lines are the file as it was/i),
+    ).toBeTruthy();
+    // The reconstructed one says it has none -- and says WHY, so the
+    // reader does not read the absence as "nothing else changed".
+    expect(
+      screen.getByText(/reconstructed from the replaced text alone.*no surrounding lines/i),
+    ).toBeTruthy();
+    // And the forbidden third construction leaves no trace: nothing
+    // claims to have read the file as it is now.
+    expect(screen.queryByText(/current contents/i)).toBeNull();
+  });
+
+  /// A clipped diff says so, PER HUNK.
+  ///
+  /// Two hunks, one clipped and one not. A single pane-level notice would
+  /// pass a test that only looked for the words; it would not tell the
+  /// reader which of the two regions is short, and the reader would read
+  /// the intact hunk as complete either way.
+  it("says which hunk was clipped rather than warning once for the pane", () => {
+    state.preview = preview({
+      messages: [
+        {
+          role: "user",
+          timestamp: "2026-09-13T11:00:05Z",
+          model: null,
+          blocks: [
+            {
+              kind: "tool_result",
+              text: "ok",
+              truncated: false,
+              tool_use_id: "t1",
+              is_error: false,
+              change: {
+                file_path: "/big.rs",
+                source: "recorded",
+                hunks: [
+                  {
+                    old_start: 1,
+                    new_start: 1,
+                    lines: [{ op: "added", text: "one of many" }],
+                    lines_omitted: 40,
+                  },
+                  {
+                    old_start: 900,
+                    new_start: 900,
+                    lines: [{ op: "added", text: "all of it" }],
+                    lines_omitted: 0,
+                  },
+                ],
+                hunks_omitted: 3,
+                created: false,
+              },
+            },
+          ],
+        },
+      ],
+      pairings: { t1: "call_above_window" },
+      results_above_window: 1,
+    });
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+
+    // The clipped hunk says how much is missing.
+    expect(screen.getAllByText(/40 more lines in this hunk are not shown/i)).toHaveLength(1);
+    // And EXACTLY ONE hunk carries a clip notice at all. Counting every
+    // notice, not only the one with the right number, is what makes this
+    // a per-hunk claim: a notice hoisted to the pane and repeated under
+    // each hunk still renders the right sentence under the clipped one,
+    // and would pass a test that only looked for that sentence. It
+    // renders "0 more lines … are not shown" under the intact one, which
+    // is a false statement about a hunk that is complete.
+    expect(screen.getAllByText(/more lines? in this hunk are not shown/i)).toHaveLength(1);
+    // And the whole-file omission is its own separate statement, because
+    // "this hunk is short" and "three regions are missing entirely" are
+    // different facts.
+    expect(
+      screen.getByText(/3 more changed regions in this file are not shown/i),
+    ).toBeTruthy();
+  });
+
+  /// A tool this build does not know reports its KEYS.
+  ///
+  /// `Block::Other`'s guarantee, one level down: not dropped (a call with
+  /// an invisible hole in it) and not dumped (the 40 KB blob the original
+  /// reasoning was right to refuse).
+  it("names an unknown tool's argument keys without showing their values", () => {
+    state.preview = preview({
+      messages: [
+        {
+          role: "assistant",
+          timestamp: "2026-09-13T11:00:05Z",
+          model: "claude-opus-5",
+          blocks: [
+            {
+              kind: "tool_use",
+              name: "mcp__enclave__enclave_sql",
+              id: "tm",
+              args: { tool: "other", keys: ["enclave", "query"] },
+            },
+          ],
+        },
+      ],
+      pairings: { tm: "paired" },
+      unanswered_calls: 0,
+    });
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    expect(screen.getByText(/does not know how to show/i)).toBeTruthy();
+    expect(screen.getByText(/enclave, query/)).toBeTruthy();
   });
 
   /// **The sabotage test for the truncation label.** Delete the

@@ -1944,13 +1944,126 @@ export interface ClaudeCostState {
 export type ClaudePreviewBlock =
   | { kind: "text"; text: string; truncated: boolean }
   | { kind: "thinking"; text: string; truncated: boolean }
-  | { kind: "tool_use"; name: string }
-  | { kind: "tool_result"; text: string; truncated: boolean }
+  /// A tool call, with its arguments PARSED rather than discarded
+  /// (#1209). `id` is the key its result names.
+  | { kind: "tool_use"; name: string; id: string | null; args: ClaudeToolArgs }
+  | {
+      kind: "tool_result";
+      text: string;
+      truncated: boolean;
+      tool_use_id: string | null;
+      /// `null` when the record carried no `is_error` at all, which is
+      /// not the same as `false`.
+      is_error: boolean | null;
+      change: ClaudeFileChange | null;
+    }
   /// A block kind this build does not know. Reported rather than
   /// dropped: Claude Code owns this format, and a pane that silently
   /// omitted a future kind would show an exchange with an invisible hole
   /// in it.
   | { kind: "other"; block_type: string };
+
+/// A tool call's arguments, as the shape that tool actually takes
+/// (#1209).
+///
+/// Rust side: `preview.rs`'s `ToolArgs`, which measures the tool
+/// distribution this is cut against. `other` keeps the `Block::Other`
+/// guarantee one level down -- a tool this build does not know reports
+/// its argument KEYS, never its values and never nothing.
+export type ClaudeToolArgs =
+  | {
+      tool: "edit";
+      file_path: string;
+      old_string: string;
+      new_string: string;
+      replace_all: boolean;
+      truncated: boolean;
+    }
+  | {
+      tool: "multi_edit";
+      file_path: string;
+      edits: ClaudeReplacement[];
+      edits_omitted: number;
+    }
+  | { tool: "write"; file_path: string; content: string; truncated: boolean }
+  | { tool: "bash"; command: string; description: string | null; truncated: boolean }
+  | { tool: "read"; file_path: string; offset: number | null; limit: number | null }
+  | { tool: "grep"; pattern: string; path: string | null; output_mode: string | null }
+  | { tool: "glob"; pattern: string; path: string | null }
+  | {
+      tool: "task";
+      description: string | null;
+      subagent_type: string | null;
+      prompt: string;
+      truncated: boolean;
+    }
+  /// A tool whose shape this build does not know: its argument keys, so
+  /// the reader can see Headstate is behind rather than that the call
+  /// was empty.
+  | { tool: "other"; keys: string[] }
+  /// No `input` was recorded at all. DISTINCT from `other` with no keys
+  /// -- absent is not zero.
+  | { tool: "none" };
+
+interface ClaudeReplacement {
+  old_string: string;
+  new_string: string;
+  replace_all: boolean;
+  truncated: boolean;
+}
+
+/// What a diff was reconstructed FROM (#1209).
+///
+/// Not exported: reached only through `ClaudeFileChange`, and `yarn
+/// knip` is right that a second name for the same shape earns nothing.
+/// The same call `ClaudePreviewMessage` makes.
+///
+/// `recorded` carries the file's surrounding lines as they actually
+/// were, from a `structuredPatch` the transcript wrote down.
+/// `reconstructed` has the replaced text and its replacement and NO
+/// context, because nothing recorded any. They are different epistemic
+/// objects and the UI must render them differently -- showing the second
+/// as a plain diff tells the reader it has context it does not have.
+///
+/// Reading the file from disk now would give every edit context. It is
+/// forbidden: the file has changed since, so its current content is not
+/// its historical content, and presenting it as such is fabrication in
+/// the shape a reader is least able to detect.
+type ClaudeDiffSource = "recorded" | "reconstructed";
+
+export interface ClaudeFileChange {
+  file_path: string | null;
+  source: ClaudeDiffSource;
+  hunks: ClaudeHunk[];
+  hunks_omitted: number;
+  /// `true` for a creation. `null` when the record said nothing, which
+  /// is not "it existed".
+  created: boolean | null;
+}
+
+interface ClaudeHunk {
+  /// `null` for a reconstructed hunk, which has no line numbers because
+  /// nothing recorded any.
+  old_start: number | null;
+  new_start: number | null;
+  lines: ClaudeDiffLine[];
+  /// Lines dropped from THIS hunk. Per hunk, not per pane: a reader told
+  /// "something here was clipped" still cannot tell which region is
+  /// short, and a clipped diff that does not say so is a lie about what
+  /// changed.
+  lines_omitted: number;
+}
+
+type ClaudeDiffLine =
+  | { op: "context"; text: string }
+  | { op: "added"; text: string }
+  | { op: "removed"; text: string };
+
+/// How a tool call and its result did or did not meet (#1209).
+///
+/// The three unmatched states do NOT mean the same thing, and the UI
+/// renders three different sentences for them. See `resolveOrphan`.
+export type ClaudePairing = "paired" | "call_above_window" | "unanswered" | "unkeyed";
 
 /// One previewed message.
 ///
@@ -2073,6 +2186,19 @@ export interface ClaudePreview {
   /// `non_conversation_records` -- that count means "we opened this and
   /// threw it away", and these are no longer thrown away.
   lifecycle: ClaudeLifecycle;
+  /// Every `tool_use_id` in the window and how it paired (#1209).
+  ///
+  /// A side table rather than a field on the block, because pairing is a
+  /// fact about the WINDOW: the same call is paired in a window that
+  /// reached its result and unanswered in one that stopped a line short.
+  pairings: Record<string, ClaudePairing>;
+  /// Calls in the window with no result in it. What a non-zero count
+  /// MEANS depends on whether the session is still running, which this
+  /// does not decide.
+  unanswered_calls: number;
+  /// Results whose call is older than the window. Non-zero is the normal
+  /// consequence of a tail read, not a defect.
+  results_above_window: number;
 }
 
 /// The session list, INCLUDING what could not be read (#917).

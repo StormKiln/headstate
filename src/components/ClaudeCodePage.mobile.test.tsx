@@ -237,6 +237,9 @@ beforeEach(() => {
       permission_mode: null,
       worktree: { state: "unknown" },
     },
+    pairings: {},
+    unanswered_calls: 0,
+    results_above_window: 0,
   };
   // 390px: an iPhone 15's CSS width, comfortably under `MOBILE_BREAKPOINT`.
   stubViewport(390);
