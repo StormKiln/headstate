@@ -87,8 +87,13 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let count = MenuItem::with_id(app, "count", badge_tooltip(0), false, None::<&str>)?;
     let show = MenuItem::with_id(app, "show", "Show Headstate", true, None::<&str>)?;
     let refresh = MenuItem::with_id(app, "refresh", "Refresh now", true, None::<&str>)?;
+    // The RUNTIME version (#1239). `CARGO_PKG_VERSION` reads `0.1.0` in
+    // a dev build -- see `release_notes`' header for why that matters
+    // here and not only in the update check.
+    let target = crate::release_notes::target_for(&app.package_info().version.to_string());
+    let notes = MenuItem::with_id(app, "release-notes", target.label(), true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit Headstate", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&count, &show, &refresh, &quit])?;
+    let menu = Menu::with_items(app, &[&count, &show, &refresh, &notes, &quit])?;
     app.manage(CountItem(count));
 
     TrayIconBuilder::with_id(TRAY_ID)
@@ -118,6 +123,21 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                     waker.0.notify_one();
                 }
                 let _ = app.emit_to("main", "refresh-requested", ());
+            }
+            "release-notes" => {
+                // Recomputed rather than captured: the label was built
+                // from the same call, and deriving both from one place
+                // at one moment is what keeps the link and the words on
+                // the item describing the same page.
+                let target =
+                    crate::release_notes::target_for(&app.package_info().version.to_string());
+                if let Err(e) = tauri_plugin_opener::open_url(target.url(), None::<&str>) {
+                    // Logged, not swallowed silently and not surfaced as
+                    // a toast: the browser reports its own failure in
+                    // its own words, and a second message about the same
+                    // event reads as two problems.
+                    log::warn!("failed to open release notes: {e}");
+                }
             }
             "quit" => app.exit(0),
             _ => {}
