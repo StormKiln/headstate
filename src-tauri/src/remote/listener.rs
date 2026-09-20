@@ -557,8 +557,34 @@ async fn call(
     }
 }
 
+/// The wire form of a refusal.
+///
+/// A `Command` rejection travels as JSON carrying its classified kind
+/// beside the message (#1202); every other variant stays plain text.
+///
+/// # Why this does not break an already-paired phone
+///
+/// `client.rs`'s `status_message` reads a JSON body's `error` or
+/// `message` key BEFORE falling back to the raw body, and has done
+/// since before this change -- see its test at `client.rs:954`. So a
+/// companion built against the old plain-text format extracts
+/// `message`, ignores `kind` it does not know, and shows exactly the
+/// string it showed before. The forward compatibility was already
+/// there; this relies on it rather than adding a version gate.
+///
+/// The other three variants are the listener's own refusals, not a
+/// command's, and they have consumers that expect text. They are left
+/// alone: this increment changes one path, so there is no half-migrated
+/// state to reason about.
 fn refusal_for(e: RemoteError) -> Response {
-    refusal(e.http_status(), e.to_string())
+    let status = e.http_status();
+    match e {
+        RemoteError::Command(err) => {
+            let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (code, Json(err)).into_response()
+        }
+        other => refusal(status, other.to_string()),
+    }
 }
 
 fn router(state: Arc<AppState>) -> Router {

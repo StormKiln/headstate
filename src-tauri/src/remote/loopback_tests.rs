@@ -441,11 +441,27 @@ async fn call_refuses_what_the_allowlist_and_the_body_rule_out() {
 
     assert!(desktop.host.calls.lock().unwrap().is_empty());
 
-    // What the host itself reports comes back as its status and text.
-    *desktop.host.fail_with.lock().unwrap() = Some(RemoteError::Command("boom".into()));
+    // What the host itself reports comes back as its status, and as JSON
+    // carrying the classified kind beside the verbatim message (#1202).
+    *desktop.host.fail_with.lock().unwrap() = Some(RemoteError::Command(
+        crate::remote::error_kind::CommandError::classify("boom"),
+    ));
     let failed = desktop.call(&phone, "get_cached", &[], None).await;
     assert_eq!(failed.status, 500);
-    assert_eq!(failed.body, "boom");
+    let body: serde_json::Value = serde_json::from_str(&failed.body)
+        .expect("a command rejection travels as JSON, not plain text");
+    assert_eq!(body["message"], "boom");
+    assert_eq!(body["kind"], "other");
+
+    // A declined request is distinguishable WITHOUT reading the prose --
+    // which is the whole point of the change.
+    *desktop.host.fail_with.lock().unwrap() = Some(RemoteError::Command(
+        crate::remote::error_kind::CommandError::classify(crate::commands::AUTH_ERR),
+    ));
+    let declined = desktop.call(&phone, "get_cached", &[], None).await;
+    let declined: serde_json::Value = serde_json::from_str(&declined.body).unwrap();
+    assert_eq!(declined["kind"], "not-asked");
+    assert_eq!(declined["message"], crate::commands::AUTH_ERR);
     *desktop.host.fail_with.lock().unwrap() = Some(RemoteError::BadArgs {
         command: "get_history".into(),
         message: "missing required argument `days`".into(),

@@ -955,6 +955,35 @@ mod tests {
         assert_eq!(status_message(502, ""), "desktop answered HTTP 502");
     }
 
+    /// #1202 moved a command rejection from plain text to JSON carrying
+    /// a `kind` beside the message. THIS is the test that the move is
+    /// safe for a phone that has not been rebuilt.
+    ///
+    /// The argument for the change is that an already-shipped companion
+    /// reads the `message` key and ignores a `kind` it has never heard
+    /// of. That argument is worth nothing asserted in a comment, so it
+    /// is asserted here against the real function, with the exact body
+    /// the desktop now sends.
+    ///
+    /// If someone later renames the field or wraps the payload, this
+    /// fails -- which is the point. The compatibility is a contract,
+    /// not a coincidence.
+    #[test]
+    fn an_old_companion_still_reads_a_typed_rejection() {
+        // Byte-for-byte what `refusal_for` now writes for a rejection.
+        let declined = r#"{"kind":"not-asked","message":"headstate:not-asked not authenticated: run `gh auth login`"}"#;
+        assert_eq!(
+            status_message(500, declined),
+            "headstate:not-asked not authenticated: run `gh auth login`"
+        );
+
+        // And an ordinary one degrades to exactly its old text.
+        assert_eq!(
+            status_message(500, r#"{"kind":"other","message":"boom"}"#),
+            "boom"
+        );
+    }
+
     #[test]
     fn the_config_offers_tls13_only_with_the_hybrid_group_first() {
         let cfg = tls_config(&identity(), &"ab".repeat(32)).unwrap();

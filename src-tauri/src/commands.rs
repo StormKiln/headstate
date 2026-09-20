@@ -61,6 +61,19 @@ pub const AUTH_ERR_TEXT: &str = "not authenticated: run `gh auth login`";
 /// One string rather than two fields because a Tauri command's error IS
 /// a string; a struct would be serialised and the frontend would parse
 /// it, which is a heavier contract for one bit of information.
+///
+/// That reasoning held while there was ONE bit, and #1202 is the point
+/// where it stopped holding: the frontend now pattern-matches message
+/// TEXT at a dozen sites to recover distinctions this side already
+/// knew. So the remote wire carries [`crate::remote::error_kind`]'s
+/// `{kind, message}` object instead -- classified once at
+/// `surface::res`, the single place a rejection crosses.
+///
+/// This constant is NOT superseded. It is still the marker, still
+/// embedded in the prose, and still what `classify` matches on; the
+/// struct is built around it rather than replacing it, which is why no
+/// command signature had to change and why `notAsked.ts` keeps working
+/// untouched.
 /// Written out rather than concatenated from the two consts above:
 /// `concat!` takes literals only, and a `const fn` join is not possible
 /// for `&str` on stable. The agreement is asserted by
