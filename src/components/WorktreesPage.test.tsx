@@ -278,7 +278,32 @@ const claudify = vi.hoisted(() =>
     Promise.resolve({ command: "cd '/code/proj-a' && claude 'assess'", claude_installed: true }),
   ),
 );
-vi.mock("../api/tauri", () => ({ claudifyCommand: claudify, claudeLaunchWorktree: launchWorktree }));
+/// The #1214 additions. `claudeLaunchTerms` serves the vocabulary the
+/// picker renders and `claudeLaunchWorktreePreview` the argv it shows,
+/// both from Rust -- mocked here so a component test needs no backend.
+const launchTerms = vi.hoisted(() =>
+  vi.fn(() =>
+    Promise.resolve({
+      models: ["opus", "sonnet"],
+      permissionModes: ["default", "acceptEdits", "bypassPermissions"],
+      unattended: ["bypassPermissions"],
+    }),
+  ),
+);
+const launchPreview = vi.hoisted(() =>
+  vi.fn(() =>
+    Promise.resolve({
+      program: "open",
+      args: ["-a", "Terminal", "cd '/code/proj-a' && claude 'assess'"],
+    }),
+  ),
+);
+vi.mock("../api/tauri", () => ({
+  claudifyCommand: claudify,
+  claudeLaunchWorktree: launchWorktree,
+  claudeLaunchTerms: launchTerms,
+  claudeLaunchWorktreePreview: launchPreview,
+}));
 
 // The build target, as a mock: `IS_MOBILE_BUILD` is read at module
 // scope, and re-importing the component to change it would lose
@@ -1240,17 +1265,72 @@ describe("WorktreesPage", () => {
     /// The configured terminal (#1126). Unset, the button copies, which
     /// every other assertion in this block covers.
     describe("with a terminal configured", () => {
-      it("launches instead of copying", async () => {
+      /// #1214 put a dialog between the button and the spawn.
+      ///
+      /// The button no longer launches on click, and that is the
+      /// POINT rather than an inconvenience for the test: the user
+      /// chooses the terms and reads the exact argv before a terminal
+      /// appears. So this asserts both halves -- the click alone
+      /// spawns nothing, and confirming spawns on the default terms.
+      it("asks for the terms first, then launches instead of copying", async () => {
         state.terminal = "open -a Terminal {command}";
         state.classified = [wt({ safety: { kind: "dirty", detail: 2 } })];
         render(<WorktreesPage />);
         fireEvent.click(screen.getByRole("button", { name: /claudify/i }));
+
+        // Nothing has been spawned yet. A dialog that opened AFTER a
+        // launch would be decoration.
+        expect(launchWorktree).not.toHaveBeenCalled();
+
+        fireEvent.click(await screen.findByRole("button", { name: /open in terminal/i }));
         await vi.waitFor(() =>
-          expect(launchWorktree).toHaveBeenCalledWith("/code/proj", "/code/proj-a", "feature"),
+          expect(launchWorktree).toHaveBeenCalledWith("/code/proj", "/code/proj-a", "feature", {}),
         );
         // Not both: a button that copies AND launches is a button
         // whose label describes half of what it did.
         expect(claudify).not.toHaveBeenCalled();
+      });
+
+      /// The argv is on screen BEFORE the terminal is, which is the
+      /// thing #1126's spawn path took away and #1214 gives back.
+      ///
+      /// Asserted against what the preview returned rather than a
+      /// sentence typed here: the words are Rust's, and a test that
+      /// hardcoded them would pass while the real ones drifted.
+      it("shows the exact argv before anything is spawned", async () => {
+        state.terminal = "open -a Terminal {command}";
+        state.classified = [wt({ safety: { kind: "dirty", detail: 2 } })];
+        render(<WorktreesPage />);
+        fireEvent.click(screen.getByRole("button", { name: /claudify/i }));
+
+        // The whole built command, in ONE element -- because it is one
+        // argv word. Split across two would be the bug this shows.
+        expect(await screen.findByText("cd '/code/proj-a' && claude 'assess'")).toBeTruthy();
+        expect(launchWorktree).not.toHaveBeenCalled();
+      });
+
+      /// The terms the user picked are the terms that travel.
+      it("sends the chosen terms as tokens", async () => {
+        state.terminal = "open -a Terminal {command}";
+        state.classified = [wt({ safety: { kind: "dirty", detail: 2 } })];
+        render(<WorktreesPage />);
+        fireEvent.click(screen.getByRole("button", { name: /claudify/i }));
+
+        const model = await screen.findByLabelText(/model/i);
+        fireEvent.change(model, { target: { value: "opus" } });
+        const perms = screen.getByLabelText(/permissions/i);
+        fireEvent.change(perms, { target: { value: "bypassPermissions" } });
+
+        // The one consequence worth saying in words appears with it.
+        expect(await screen.findByText(/act without asking/i)).toBeTruthy();
+
+        fireEvent.click(screen.getByRole("button", { name: /open in terminal/i }));
+        await vi.waitFor(() =>
+          expect(launchWorktree).toHaveBeenCalledWith("/code/proj", "/code/proj-a", "feature", {
+            model: "opus",
+            permissionMode: "bypassPermissions",
+          }),
+        );
       });
 
       /// **The regression this change could easily have caused.**
@@ -1265,6 +1345,7 @@ describe("WorktreesPage", () => {
         state.classified = [wt({ safety: { kind: "dirty", detail: 2 } })];
         render(<WorktreesPage />);
         fireEvent.click(screen.getByRole("button", { name: /claudify/i }));
+        fireEvent.click(await screen.findByRole("button", { name: /open in terminal/i }));
         await vi.waitFor(() => expect(toastSuccess).toHaveBeenCalled());
         const opts = toastSuccess.mock.calls.at(-1)?.[1] as
           | { action?: { label?: string } }

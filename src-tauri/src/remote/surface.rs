@@ -283,6 +283,19 @@ pub const SURFACE: &[(&str, Class)] = &[
     // reject, which is the #603/#604/#606 shape.
     ("claude_propose_stop", Class::Local),
     ("claude_stop_session", Class::Local),
+    // Local for the same reason as the two above, and it is the
+    // reason more than the side effect: these describe the argv of a
+    // WINDOW that would open on the desktop. A phone shown that line
+    // would be reading the preview of a button it cannot press (#1214).
+    ("claude_launch_worktree_preview", Class::Local),
+    ("claude_launch_session_preview", Class::Local),
+    // Read, unlike the four above: a constant list of the tokens
+    // `terms::Terms::parse` accepts, with no side effect and nothing
+    // desktop-specific about it. Classing a constant as Local would
+    // make the desktop refuse to forward a call that cannot do
+    // anything -- Local is about what a command DOES, not about which
+    // screen its caller sits on.
+    ("claude_launch_terms", Class::Read),
     ("check_packages", Class::Read),
     ("packages_markdown", Class::Read),
     // Read: the effective context a session loads, across scopes
@@ -1084,6 +1097,10 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             a.get("worktreePath")?,
             a.get("branch")?,
         )),
+        // The four `claude_launch*` commands have no arm: they are
+        // `Class::Local` and `admit` rejects them before this match is
+        // reached. `claude_launch_terms` is `Class::Read`, so it does.
+        "claude_launch_terms" => ok(commands::claude_launch_terms()),
         "check_packages" => res(commands::check_packages(a.get("repoPath")?).await),
         "packages_markdown" => ok(commands::packages_markdown(
             a.get("repoPath")?,

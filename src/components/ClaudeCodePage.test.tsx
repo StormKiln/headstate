@@ -224,11 +224,41 @@ vi.mock("../api/hooks", () => ({
 }));
 vi.mock("sonner", () => ({ toast: { success: toastSuccess, error: toastError } }));
 vi.mock("../lib/clipboard", () => ({ copyText: copyFn }));
+/// The #1214 additions: the vocabulary Rust admits and the argv it
+/// would spawn, both served rather than listed in TypeScript.
+const launchTerms = vi.hoisted(() =>
+  vi.fn(() =>
+    Promise.resolve({
+      models: ["opus", "sonnet"],
+      permissionModes: ["default", "acceptEdits", "bypassPermissions"],
+      unattended: ["bypassPermissions"],
+    }),
+  ),
+);
+const launchPreviewFn = vi.hoisted(() =>
+  vi.fn(() =>
+    Promise.resolve({
+      program: "open",
+      // Deliberately NOT the same string as `d.resume.command`, which
+      // this page also renders in its own `<pre>`. With both the same,
+      // an assertion on the text would match the `<pre>` and pass with
+      // the preview missing entirely -- which is exactly what it must
+      // not do. The `--model` here stands for "the terms are applied".
+      args: [
+        "-a",
+        "Terminal",
+        "cd '/Users/acme/code/widget' && claude --model opus --resume e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2",
+      ],
+    }),
+  ),
+);
 vi.mock("../api/tauri", () => ({
   claudeRevealPath: revealFn,
   claudeLaunchSession: launchFn,
   claudeProposeStop: proposeFn,
   claudeStopSession: stopFn,
+  claudeLaunchTerms: launchTerms,
+  claudeLaunchSessionPreview: launchPreviewFn,
 }));
 
 import { ClaudeCodePage, ClaudeSessionColumn } from "./ClaudeCodePage";
@@ -906,6 +936,9 @@ describe("the resume command carries the cwd that makes it work", () => {
       expect(launchFn).toHaveBeenCalledWith(
         "e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2",
         "/Users/acme/code/widget",
+        // The terms, empty because nothing was chosen -- which means
+        // "say nothing", the behaviour this button had before #1214.
+        {},
       );
       // It must NOT also copy: a button that does both is a button
       // whose label describes half of what it did.
@@ -947,6 +980,52 @@ describe("the resume command carries the cwd that makes it work", () => {
       open("HeadState GitHub issues filing");
       expect(screen.queryByText(/does not open one for you/)).toBeNull();
       expect(screen.getByText(/terminal you configured/i)).toBeTruthy();
+    });
+
+    /// The argv is on screen before the button is pressed (#1214).
+    ///
+    /// The spawn path took away what copying gave for free -- the
+    /// chance to read the line first -- and this is where it comes
+    /// back. Asserted against what the preview returned, so a display
+    /// string built separately in the component would fail here.
+    it("shows the exact argv, and the terms that change it", async () => {
+      state.terminal = "open -a Terminal {command}";
+      renderView();
+      open("HeadState GitHub issues filing");
+      expect(
+        await screen.findByText(
+          "cd '/Users/acme/code/widget' && claude --model opus --resume e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2",
+        ),
+      ).toBeTruthy();
+      // And the OTHER two argv words are on screen too, each its own
+      // element: the preview is the whole argv, not its last slot.
+      expect(screen.getByText("-a")).toBeTruthy();
+      expect(screen.getByText("Terminal")).toBeTruthy();
+      // Both choices are offered, from the served vocabulary.
+      expect(screen.getByLabelText(/model/i)).toBeTruthy();
+      expect(screen.getByLabelText(/permissions/i)).toBeTruthy();
+      expect(launchFn).not.toHaveBeenCalled();
+    });
+
+    it("sends the chosen terms as tokens, never as flags", async () => {
+      state.terminal = "open -a Terminal {command}";
+      renderView();
+      open("HeadState GitHub issues filing");
+      fireEvent.change(await screen.findByLabelText(/model/i), {
+        target: { value: "sonnet" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: /resume in terminal/i }));
+      expect(launchFn).toHaveBeenCalledWith(
+        "e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2",
+        "/Users/acme/code/widget",
+        // Only the key that was touched: an untouched choice is
+        // ABSENT, which `tauri.ts` sends as an explicit null.
+        { model: "sonnet" },
+      );
+      // A TOKEN, never the flag itself: nothing this component sends
+      // is a word that could reach argv.
+      const sent = JSON.stringify(launchFn.mock.calls.at(-1));
+      expect(sent).not.toContain("--model");
     });
 
     it("says a terminal can be configured when none is", () => {

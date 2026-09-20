@@ -119,6 +119,10 @@ pub mod stop;
 pub mod store;
 /// Which sessions are subagents, and which session spawned each (#1002).
 pub mod subagent;
+/// Which model and how much autonomy a launched session starts on
+/// (#1214). A closed vocabulary rendered to argv by Rust, never a
+/// command string from the caller.
+pub mod terms;
 pub mod transcript;
 /// Per-message token usage, summed per session (#959).
 pub mod usage;

@@ -1,4 +1,4 @@
-import { useDeferredValue, useEffect, useMemo, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
 import { Bot, Circle, FolderOpen, GitBranch, RefreshCw, Search, Terminal } from "lucide-react";
 import { toast } from "sonner";
 import type {
@@ -32,10 +32,13 @@ import {
 } from "@/api/hooks";
 import {
   claudeLaunchSession,
+  claudeLaunchSessionPreview,
   claudeProposeStop,
   claudeRevealPath,
   claudeStopSession,
+  type LaunchTerms,
 } from "@/api/tauri";
+import { LaunchTermsPicker } from "./LaunchTermsPicker";
 import { current } from "@/lib/ariaCurrent";
 import { copyText } from "@/lib/clipboard";
 import { segments } from "@/lib/findOverData";
@@ -1555,8 +1558,8 @@ function SessionDetail({
   /// Offers copy as the remedy rather than silently falling back to it:
   /// a launch that quietly copied instead would leave the user watching
   /// for a terminal that never opens.
-  const launchResume = (sessionId: string, cwd: string | null) => {
-    void claudeLaunchSession(sessionId, cwd).then(
+  const launchResume = (sessionId: string, cwd: string | null, terms: LaunchTerms) => {
+    void claudeLaunchSession(sessionId, cwd, terms).then(
       () => toast.success("Opening the session in your terminal"),
       (e: unknown) =>
         toast.error("Could not open your terminal", {
@@ -1890,8 +1893,9 @@ function SessionBody({
   detail: ClaudeSessionDetail;
   copy: (value: string, what: string) => void;
   reveal: (path: string, what: string) => void;
-  /// Open the resume command in the configured terminal (#1126).
-  launchResume: (sessionId: string, cwd: string | null) => void;
+  /// Open the resume command in the configured terminal (#1126), on
+  /// the terms the user chose (#1214).
+  launchResume: (sessionId: string, cwd: string | null, terms: LaunchTerms) => void;
   /// Whether a terminal is configured, which decides whether the
   /// primary button launches or copies.
   terminalConfigured: boolean;
@@ -3904,11 +3908,30 @@ function Resume({
   ///
   /// Takes the id and cwd rather than the built command: Rust rebuilds
   /// it, so this can never become "run this text in a terminal".
-  onLaunch: (sessionId: string, cwd: string | null) => void;
+  onLaunch: (sessionId: string, cwd: string | null, terms: LaunchTerms) => void;
   /// Whether a terminal is configured, which decides what the primary
   /// button does and whether a separate Copy is offered beside it.
   terminalConfigured: boolean;
 }) {
+  /// Which model and how much autonomy this resume starts on (#1214).
+  ///
+  /// Both null by default -- "say nothing", which is what this button
+  /// did before the choice existed. Held here rather than persisted:
+  /// the terms are a decision about THIS handoff, and a remembered
+  /// `bypassPermissions` would silently apply to the next session the
+  /// user resumed without looking.
+  ///
+  /// ABOVE the early return below, which is not a style point: React
+  /// runs hooks unconditionally, and a `useState` after that `return`
+  /// fails the next render outright for a session that is running.
+  const [terms, setTerms] = useState<LaunchTerms>({});
+  /// Stable across renders so the picker's preview effect does not
+  /// refetch on every keystroke elsewhere in the page.
+  const previewResume = useCallback(
+    (t: LaunchTerms) => claudeLaunchSessionPreview(s.session_id, s.cwd ?? null, t),
+    [s.session_id, s.cwd],
+  );
+
   if (s.liveness.state === "running") {
     return (
       <section className="rounded-md border border-[#3fb950]/40 bg-[#3fb950]/5 p-3">
@@ -3963,6 +3986,14 @@ function Resume({
           open somewhere. Resuming it then starts a second copy.
         </p>
       ) : null}
+      {/* The terms, and the argv they produce, only on the LAUNCH path
+          (#1214). The copy path hands over `d.resume.command` shown
+          above, which carries no flags -- rendering a model picker
+          beside a string it does not affect would be a control that
+          lies about what it does. */}
+      {terminalConfigured ? (
+        <LaunchTermsPicker terms={terms} onChange={setTerms} preview={previewResume} />
+      ) : null}
       <div className="mt-2 flex flex-wrap items-center gap-2">
         <button
           type="button"
@@ -3972,7 +4003,7 @@ function Resume({
           // exists to avoid.
           onClick={() =>
             terminalConfigured
-              ? onLaunch(s.session_id, s.cwd ?? null)
+              ? onLaunch(s.session_id, s.cwd ?? null, terms)
               : onCopy(
                   d.resume.command,
                   anchored ? "Resume command" : "Resume command (no directory)",

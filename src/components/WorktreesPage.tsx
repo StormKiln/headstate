@@ -63,7 +63,13 @@ import {
 import { HelpButton } from "./HelpButton";
 import { WorktreeKebab } from "./WorktreeKebab";
 import { WorktreeFilterBar } from "./WorktreeFilterBar";
-import { claudeLaunchWorktree, claudifyCommand } from "../api/tauri";
+import {
+  claudeLaunchWorktree,
+  claudeLaunchWorktreePreview,
+  claudifyCommand,
+  type LaunchTerms,
+} from "../api/tauri";
+import { LaunchTermsPicker } from "./LaunchTermsPicker";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { isCancelled } from "@/lib/cancelled";
 import { copyText } from "../lib/clipboard";
@@ -1231,8 +1237,14 @@ export function WorktreesPage() {
   /// must not be lost in this change: that toast button is the only
   /// route to "Remove anyway…", and a launch path without it would
   /// silently remove the user's way of saying they read the answer.
-  const launchClaudify = (wt: Worktree) => {
-    claudeLaunchWorktree(selected?.path ?? "", wt.path, wt.branch).then(
+  /// Fire the launch on the chosen terms.
+  ///
+  /// Split from `launchClaudify` below, which now OPENS the dialog
+  /// rather than spawning: #1214's rule is that the user reads the
+  /// exact argv before a terminal appears, and a button that spawned
+  /// straight from the row would be the case that rule exists for.
+  const launchClaudifyOn = (wt: Worktree, terms: LaunchTerms) => {
+    claudeLaunchWorktree(selected?.path ?? "", wt.path, wt.branch, terms).then(
       () =>
         toast.success("Opening the assessment in your terminal", {
           description: "Claude Code is starting there.",
@@ -1295,12 +1307,33 @@ export function WorktreesPage() {
         }),
     );
   };
+  /// Open the terms dialog for a worktree (#1214).
+  ///
+  /// The button no longer spawns directly. Which model and how much
+  /// autonomy is the decision the user is actually making when they
+  /// hand a worktree to an agent, and the exact argv has to be
+  /// readable before a terminal appears -- neither fits in a table row,
+  /// so it is a dialog.
+  const launchClaudify = (wt: Worktree) => setLaunching({ worktree: wt, terms: {} });
+
   /// What the Claudify BUTTON does.
   ///
   /// One function so the button and the kebab's "Open"/"Copy" items
   /// cannot drift: the button is always the primary action, and this is
   /// the only place that decides which that is.
   const claudify = (wt: Worktree) => (terminalConfigured ? launchClaudify : copyClaudify)(wt);
+
+  /// The worktree whose launch terms are being chosen, and the terms
+  /// so far (#1214). Null when no dialog is open.
+  ///
+  /// The terms live WITH the worktree rather than beside it, so closing
+  /// the dialog forgets them. A remembered `bypassPermissions` would
+  /// otherwise apply to the next worktree the user launched without
+  /// looking, which is the one place this feature could do real harm.
+  const [launching, setLaunching] = useState<{
+    worktree: Worktree;
+    terms: LaunchTerms;
+  } | null>(null);
 
   /// The command to show on the phone, which has no terminal to paste
   /// into. Null on the desktop, always: that path copies instead.
@@ -2729,6 +2762,56 @@ export function WorktreesPage() {
       {/* Per worktree, not bulk. Bulk-deleting directories is where a
           wrong predicate becomes unrecoverable at scale, and with 149
           removable worktrees on one repo the temptation is real. */}
+      {/* The terms this worktree is handed over on, and the exact argv
+          they produce (#1214).
+
+          A dialog rather than controls in the row: the decision has
+          three parts -- which model, how much autonomy, and reading the
+          line that will run -- and a table row has space for none of
+          them. The Launch button is the ONLY thing here that spawns, so
+          the user has read the argv by the time a terminal appears.
+
+          `terminalConfigured` gates the button that opens this, so
+          reaching it with no terminal set is not possible; the preview
+          would say so anyway, which is why there is no second check. */}
+      {launching !== null ? (
+        <Dialog open onOpenChange={() => setLaunching(null)}>
+          <DialogContent className="max-w-lg">
+            <DialogTitle>Hand {pathBasename(launching.worktree.path)} to Claude Code</DialogTitle>
+            <p className="text-sm text-[#8b949e]">
+              This opens the terminal you configured in Settings and starts Claude Code on the
+              assessment prompt for this worktree.
+            </p>
+            <LaunchTermsPicker
+              terms={launching.terms}
+              onChange={(terms) => setLaunching((cur) => (cur === null ? cur : { ...cur, terms }))}
+              preview={(terms) =>
+                claudeLaunchWorktreePreview(
+                  selected?.path ?? "",
+                  launching.worktree.path,
+                  launching.worktree.branch,
+                  terms,
+                )
+              }
+            />
+            <div className="flex justify-end gap-2">
+              <Button
+                className="min-h-11"
+                onClick={() => {
+                  const { worktree, terms } = launching;
+                  setLaunching(null);
+                  launchClaudifyOn(worktree, terms);
+                }}
+              >
+                Open in terminal
+              </Button>
+              <Button variant="ghost" className="min-h-11" onClick={() => setLaunching(null)}>
+                Cancel
+              </Button>
+            </div>
+          </DialogContent>
+        </Dialog>
+      ) : null}
       {claudifying !== null ? (
         <Dialog open onOpenChange={() => setClaudifying(null)}>
           <DialogContent className="max-w-lg">

@@ -574,16 +574,116 @@ export const claudifyCommand = (repoPath: string, worktreePath: string, branch: 
 /// The command is rebuilt in Rust from these three arguments rather
 /// than passed as a string, so this can never become "run arbitrary
 /// text in a terminal".
-export const claudeLaunchWorktree = (repoPath: string, worktreePath: string, branch: string) =>
-  call<void>("claude_launch_worktree", { repoPath, worktreePath, branch });
+///
+/// `terms` is the same shape: TOKENS, never flags. `claude_launch_terms`
+/// below serves the list they come from, and Rust refuses any token not
+/// on it -- so the flags that reach the command line are `&'static str`s
+/// compiled into the desktop binary, and nothing typed here can become
+/// an argv word (#1214).
+export const claudeLaunchWorktree = (
+  repoPath: string,
+  worktreePath: string,
+  branch: string,
+  terms: LaunchTerms = {},
+) =>
+  call<void>("claude_launch_worktree", {
+    repoPath,
+    worktreePath,
+    branch,
+    model: terms.model ?? null,
+    permissionMode: terms.permissionMode ?? null,
+  });
 
 /// Open the configured terminal on a session's resume command.
 ///
 /// `cwd` is what the session recorded; Rust re-checks whether it still
 /// exists and decides whether the command carries a `cd`, exactly as
 /// the clipboard path does.
-export const claudeLaunchSession = (sessionId: string, cwd: string | null) =>
-  call<void>("claude_launch_session", { sessionId, cwd });
+export const claudeLaunchSession = (
+  sessionId: string,
+  cwd: string | null,
+  terms: LaunchTerms = {},
+) =>
+  call<void>("claude_launch_session", {
+    sessionId,
+    cwd,
+    model: terms.model ?? null,
+    permissionMode: terms.permissionMode ?? null,
+  });
+
+/// Which model and how much autonomy a launch runs on (#1214).
+///
+/// Both optional, and absent means "say nothing" -- the binary's own
+/// default, which is what every launch did before this existed. The
+/// values are tokens from `claudeLaunchTerms`; they are typed `string`
+/// rather than a union spelled out here on purpose, because a second
+/// copy of the vocabulary in TypeScript is exactly the thing that
+/// drifts from the Rust enum and then offers a button Rust refuses.
+export interface LaunchTerms {
+  model?: string | null;
+  permissionMode?: string | null;
+}
+
+/// The tokens a launch may be started on, from the Rust enum itself.
+export interface LaunchTermOptions {
+  models: string[];
+  permissionModes: string[];
+  /// The subset of `permissionModes` that act without asking.
+  unattended: string[];
+}
+
+/// The exact argv a launch would spawn.
+///
+/// `program` and `args` as `Command::new(program).args(args)` receives
+/// them, NOT a pre-joined sentence: keeping the words apart is what
+/// shows the reader which text is one argument, which is the question
+/// "could this inject" is really asking.
+export interface LaunchPreview {
+  program: string;
+  args: string[];
+}
+
+/// What terms a session can be started on (#1214).
+///
+/// Served by Rust rather than listed here so the choices the UI offers
+/// and the choices Rust accepts are the same list. Claude Code exposes
+/// no way to interrogate the installed binary for its accepted values,
+/// so the list is deliberately short and every entry is one this
+/// repository already has evidence for.
+export const claudeLaunchTerms = () => call<LaunchTermOptions>("claude_launch_terms");
+
+/// The argv `claudeLaunchWorktree` would spawn, for the user to read.
+///
+/// A spawn path takes away what the clipboard gave for free -- the
+/// chance to read the line before it runs. This gives it back, and it
+/// is the SAME render Rust hands to `Command::new`, not a display
+/// string built alongside it.
+export const claudeLaunchWorktreePreview = (
+  repoPath: string,
+  worktreePath: string,
+  branch: string,
+  terms: LaunchTerms = {},
+) =>
+  call<LaunchPreview>("claude_launch_worktree_preview", {
+    repoPath,
+    worktreePath,
+    branch,
+    model: terms.model ?? null,
+    permissionMode: terms.permissionMode ?? null,
+  });
+
+/// The argv `claudeLaunchSession` would spawn, for the user to read.
+export const claudeLaunchSessionPreview = (
+  sessionId: string,
+  cwd: string | null,
+  terms: LaunchTerms = {},
+) =>
+  call<LaunchPreview>("claude_launch_session_preview", {
+    sessionId,
+    cwd,
+    model: terms.model ?? null,
+    permissionMode: terms.permissionMode ?? null,
+  });
 
 /// Propose stopping live sessions, with the evidence (#1219).
 ///
