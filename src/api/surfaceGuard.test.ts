@@ -107,6 +107,11 @@ describe("the remote surface's frontend half", () => {
       // cannot use one that appeared on a Mac it cannot see, which is
       // `Class::Local`'s stated test.
       "claudeLaunchSession",
+      // The two previews (#1214) are `Class::Local` for the same
+      // reason the launches are: they describe the argv of a WINDOW
+      // that would open on the desktop, so a phone shown one would be
+      // reading the preview of a button it cannot press.
+      "claudeLaunchSessionPreview",
       "claudeLaunchWorktree",
       // #1219's stop. `Class::Local` with NO dispatch arm, and the class
       // IS the safety property here rather than a rendering hint: a
@@ -117,6 +122,7 @@ describe("the remote surface's frontend half", () => {
       // #603/#604/#606 shape this list exists to stop. Both callers in
       // `ClaudeCodePage` sit behind `!IS_MOBILE_BUILD`.
       "claudeProposeStop",
+      "claudeLaunchWorktreePreview",
       "claudeReinstallHooks",
       "claudeRevealPath",
       "claudeStopSession",

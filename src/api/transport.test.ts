@@ -155,20 +155,44 @@ const ROWS: Row[] = [
   row(api.unlockWorktree, [repoPath, worktreePath], "unlock_worktree", { repoPath, worktreePath }),
   row(api.pruneWorktrees, [repoPath], "prune_worktrees", { repoPath }),
   row(api.claudifyCommand, [repoPath, worktreePath, branch], "claudify_command", { repoPath, worktreePath, branch }),
-  row(api.claudeLaunchWorktree, [repoPath, worktreePath, branch], "claude_launch_worktree", {
-    repoPath,
-    worktreePath,
-    branch,
-  }),
-  row(api.claudeLaunchSession, ["sess-1", "/tmp/x"], "claude_launch_session", {
-    sessionId: "sess-1",
-    cwd: "/tmp/x",
-  }),
   row(api.claudeProposeStop, [["sess-1"]], "claude_propose_stop", { sessionIds: ["sess-1"] }),
   // The SESSION ID, never a pid: Rust re-derives the pid at the moment
   // of the stop, because the list it would have come from is 10s stale
   // and a recycled pid is somebody else's process (#1219).
   row(api.claudeStopSession, ["sess-1"], "claude_stop_session", { sessionId: "sess-1" }),
+  // #1214 widened both with the terms. Passed explicitly here rather
+  // than left to the default so the wire keys are asserted: a token
+  // arriving under the wrong name is a launch on terms nobody chose.
+  row(
+    api.claudeLaunchWorktree,
+    [repoPath, worktreePath, branch, { model: "opus", permissionMode: "acceptEdits" }],
+    "claude_launch_worktree",
+    { repoPath, worktreePath, branch, model: "opus", permissionMode: "acceptEdits" },
+  ),
+  row(
+    api.claudeLaunchSession,
+    ["sess-1", "/tmp/x", { model: "sonnet", permissionMode: "bypassPermissions" }],
+    "claude_launch_session",
+    {
+      sessionId: "sess-1",
+      cwd: "/tmp/x",
+      model: "sonnet",
+      permissionMode: "bypassPermissions",
+    },
+  ),
+  row(api.claudeLaunchTerms, [], "claude_launch_terms"),
+  row(
+    api.claudeLaunchWorktreePreview,
+    [repoPath, worktreePath, branch, { model: "opus" }],
+    "claude_launch_worktree_preview",
+    { repoPath, worktreePath, branch, model: "opus", permissionMode: null },
+  ),
+  row(
+    api.claudeLaunchSessionPreview,
+    ["sess-1", "/tmp/x", { permissionMode: "acceptEdits" }],
+    "claude_launch_session_preview",
+    { sessionId: "sess-1", cwd: "/tmp/x", model: null, permissionMode: "acceptEdits" },
+  ),
   row(api.setAutoMerge, [id, repo, number, expectedHead, enable], "set_auto_merge", { id, repo, number, expectedHead, enable }),
   row(api.deleteHeadBranch, [refId, repo, number, branch, merged], "delete_head_branch", { refId, repo, number, branch, merged }),
   row(api.updatePrBranch, [id, repo, number, expectedHead], "update_pr_branch", { id, repo, number, expectedHead }),
@@ -349,6 +373,24 @@ describe("tauri.ts wrappers through the transport", () => {
     const covered = new Set<unknown>(ROWS.map((r) => r.fn));
     for (const fn of exported) expect(covered.has(fn)).toBe(true);
     expect(ROWS).toHaveLength(exported.length);
+  });
+
+  /// The pre-#1214 call shape still works and still says "no terms".
+  ///
+  /// A separate assertion rather than a second ROWS entry, because
+  /// `covers every wrapper` counts rows against exports. What it pins
+  /// is that omitting the terms sends them as explicit `null` rather
+  /// than omitting the keys -- the same shape `respondToPairing` uses
+  /// for its optional argument, so the wire is not two shapes depending
+  /// on what the caller passed.
+  it("sends null terms when the caller chooses none", async () => {
+    await api.claudeLaunchSession("sess-1", "/tmp/x");
+    expect(local.call).toHaveBeenCalledWith("claude_launch_session", {
+      sessionId: "sess-1",
+      cwd: "/tmp/x",
+      model: null,
+      permissionMode: null,
+    });
   });
 
   it("resolves with what the transport returns and rejects with what it throws", async () => {

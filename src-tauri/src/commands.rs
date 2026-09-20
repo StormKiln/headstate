@@ -2394,18 +2394,104 @@ pub fn claudify_command(
 /// wait for the child -- a terminal lives as long as the user keeps it
 /// open -- but it still forks, and `remote/surface.rs` would dispatch a
 /// sync command inline on the HTTP listener.
+///
+/// # The terms are spliced here, not built here (#1214)
+///
+/// `terms` arrives as two TOKENS which
+/// [`crate::claude::terms::Terms::parse`] has already turned into a
+/// closed enum -- so the flag words added to `command` are `&'static
+/// str`s compiled into this binary, and no caller-supplied text reaches
+/// the line. That is the same rule as the paragraph above, one level
+/// down: neither the command nor now the flags are text the caller
+/// chose.
 async fn launch_in_terminal(
     app: &AppHandle,
     command: String,
+    terms: crate::claude::terms::Terms,
     cwd: Option<String>,
 ) -> Result<(), String> {
     let template = read_ui_prefs(app).terminal_command;
+    let command = terms.splice(&command);
     tauri::async_runtime::spawn_blocking(move || {
         crate::claude::launch::launch(&template, &command, cwd.as_deref())
             .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("terminal launch did not run: {e}"))?
+}
+
+/// The tokens the frontend may choose from, and how to describe them.
+///
+/// Served rather than hardcoded in TypeScript, which is the point of
+/// #1214's closed vocabulary: the list the UI renders and the list Rust
+/// accepts are the SAME list, so a frontend cannot offer a button whose
+/// value the backend refuses. `claude_launch_terms` below returns it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchTermOptions {
+    /// Model tokens, in the order to list them.
+    pub models: Vec<String>,
+    /// Permission-mode tokens, in increasing order of autonomy.
+    pub permission_modes: Vec<String>,
+    /// The subset of `permission_modes` that act without asking, so the
+    /// UI can warn about exactly those without a second copy of the
+    /// judgment.
+    pub unattended: Vec<String>,
+}
+
+#[tauri::command]
+/// What terms a session can be started on (#1214).
+///
+/// `Class::Read`: a list of tokens with no side effect. It is NOT
+/// `Class::Local` even though the launch buttons are -- the phone
+/// showing what the desktop would offer is harmless, and classing a
+/// constant list as Local would make the desktop refuse to forward a
+/// read that cannot do anything.
+pub fn claude_launch_terms() -> LaunchTermOptions {
+    use crate::claude::terms::{Model, PermissionMode};
+    LaunchTermOptions {
+        models: Model::ALL.iter().map(|m| m.token().to_string()).collect(),
+        permission_modes: PermissionMode::ALL
+            .iter()
+            .map(|m| m.token().to_string())
+            .collect(),
+        unattended: PermissionMode::ALL
+            .iter()
+            .filter(|m| m.is_unattended())
+            .map(|m| m.token().to_string())
+            .collect(),
+    }
+}
+
+/// The exact argv a launch would spawn, for the user to read first.
+///
+/// `program` and `args` are the pair `Command::new(program).args(args)`
+/// receives -- not a rendered sentence. The UI joins them for display;
+/// keeping them apart here is what makes "which word is one argument"
+/// visible at all, which is the question a shell-injection worry is
+/// actually asking.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchPreview {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+/// Build the preview, or say why there would be no launch.
+///
+/// Shared by the two preview commands for the same reason
+/// `launch_in_terminal` is shared: they differ only in where the built
+/// command comes from.
+fn preview_in_terminal(
+    app: &AppHandle,
+    command: &str,
+    terms: crate::claude::terms::Terms,
+) -> Result<LaunchPreview, String> {
+    let template = read_ui_prefs(app).terminal_command;
+    let (program, args) = terms
+        .preview(&template, command)
+        .map_err(|e| e.to_string())?;
+    Ok(LaunchPreview { program, args })
 }
 
 #[tauri::command]
@@ -2421,12 +2507,28 @@ async fn launch_in_terminal(
 /// larger capability than "open the button the user just pressed"; a
 /// paired phone is already refused by the class, but the remote surface
 /// is not the only thing that could ever call it.
+///
+/// # The terms (#1214)
+///
+/// `model` and `permission_mode` are TOKENS, not flags. They are looked
+/// up in a closed enum before anything is built, and an unrecognised one
+/// is refused here rather than forwarded -- so the widened signature
+/// does not widen the capability: the caller still chooses only from a
+/// list this binary compiled in. `None` on either means "say nothing",
+/// which is byte-for-byte what this command did before.
 pub async fn claude_launch_worktree(
     app: AppHandle,
     repo_path: String,
     worktree_path: String,
     branch: String,
+    model: Option<String>,
+    permission_mode: Option<String>,
 ) -> Result<(), String> {
+    // FIRST, before any work: a term we do not recognise means the
+    // caller asked for a session we cannot promise, and building the
+    // command before finding that out only makes the refusal slower.
+    let terms = crate::claude::terms::Terms::parse(model.as_deref(), permission_mode.as_deref())
+        .map_err(|e| e.to_string())?;
     let built = {
         let repo = repo_path.clone();
         let wt = worktree_path.clone();
@@ -2437,7 +2539,42 @@ pub async fn claude_launch_worktree(
     // The worktree path IS the directory the command cds into, so the
     // gone-directory refusal in `launch` covers a worktree removed
     // since the page was rendered.
-    launch_in_terminal(&app, built.command, Some(worktree_path)).await
+    launch_in_terminal(&app, built.command, terms, Some(worktree_path)).await
+}
+
+#[tauri::command]
+/// The exact argv `claude_launch_worktree` would spawn (#1214).
+///
+/// `Class::Local`, like the launch it describes: it reads the terminal
+/// template, which is a property of the desktop, and describes a window
+/// that would open there. Showing a phone the argv of a launch it can
+/// never perform is an invitation to a button that always errors, which
+/// is what that class exists to prevent.
+///
+/// This exists because a spawn path takes away the thing the clipboard
+/// path gave for free. Copying let the user read the line before running
+/// it; a button does not, and `LaunchError::CwdMissing` already states
+/// the rule that follows -- spawning on someone's behalf has to be
+/// stricter, because they are not reading the line before it runs.
+///
+/// `spawn_blocking` because `claudify_command` runs several `git`
+/// subprocesses per call.
+pub async fn claude_launch_worktree_preview(
+    app: AppHandle,
+    repo_path: String,
+    worktree_path: String,
+    branch: String,
+    model: Option<String>,
+    permission_mode: Option<String>,
+) -> Result<LaunchPreview, String> {
+    let terms = crate::claude::terms::Terms::parse(model.as_deref(), permission_mode.as_deref())
+        .map_err(|e| e.to_string())?;
+    let built = tauri::async_runtime::spawn_blocking(move || {
+        claudify_command(repo_path, worktree_path, branch)
+    })
+    .await
+    .map_err(|e| format!("could not build the command: {e}"))?;
+    preview_in_terminal(&app, &built.command, terms)
 }
 
 #[tauri::command]
@@ -2450,11 +2587,18 @@ pub async fn claude_launch_worktree(
 /// emitted a `cd`. An unanchored command carries a caveat saying it will
 /// resume wherever it runs, and refusing to launch it for a missing
 /// directory would refuse the very case the caveat exists to describe.
+///
+/// `model` and `permission_mode` are tokens refused before anything is
+/// built, exactly as in [`claude_launch_worktree`].
 pub async fn claude_launch_session(
     app: AppHandle,
     session_id: String,
     cwd: Option<String>,
+    model: Option<String>,
+    permission_mode: Option<String>,
 ) -> Result<(), String> {
+    let terms = crate::claude::terms::Terms::parse(model.as_deref(), permission_mode.as_deref())
+        .map_err(|e| e.to_string())?;
     let state = {
         let c = cwd.clone();
         tauri::async_runtime::spawn_blocking(move || {
@@ -2465,7 +2609,36 @@ pub async fn claude_launch_session(
     };
     let built = crate::claude::sessions::resume_command(&session_id, cwd.as_deref(), &state);
     let anchor = built.anchored.then(|| cwd.clone()).flatten();
-    launch_in_terminal(&app, built.command, anchor).await
+    launch_in_terminal(&app, built.command, terms, anchor).await
+}
+
+#[tauri::command]
+/// The exact argv `claude_launch_session` would spawn (#1214).
+///
+/// `Class::Local`, for the reason [`claude_launch_worktree_preview`]
+/// states. `check_cwd` is a `metadata` call rather than a subprocess,
+/// but this is `async` alongside it: the worktree preview must be, and
+/// a pair of previews where one blocks the runtime and one does not is
+/// the kind of asymmetry #1090 is about.
+pub async fn claude_launch_session_preview(
+    app: AppHandle,
+    session_id: String,
+    cwd: Option<String>,
+    model: Option<String>,
+    permission_mode: Option<String>,
+) -> Result<LaunchPreview, String> {
+    let terms = crate::claude::terms::Terms::parse(model.as_deref(), permission_mode.as_deref())
+        .map_err(|e| e.to_string())?;
+    let state = {
+        let c = cwd.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            crate::claude::sessions::check_cwd(c.as_deref())
+        })
+        .await
+        .map_err(|e| format!("could not check the directory: {e}"))?
+    };
+    let built = crate::claude::sessions::resume_command(&session_id, cwd.as_deref(), &state);
+    preview_in_terminal(&app, &built.command, terms)
 }
 
 /// Read the live registry and probe the pids it names, NOW.
