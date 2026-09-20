@@ -1276,13 +1276,18 @@ interface ClaudeSearchHit {
 /// - `none_yet` — nothing matched in the part that is searchable. Must
 ///   render with its numbers: "no matches in the {indexed} of {total}
 ///   sessions indexed so far".
+/// - `not_asked` — no query was given, so nothing was searched. A fourth
+///   state, not a kind of empty result: an empty box is not a search that
+///   found nothing, and rendering it as `none` would paint "No matches"
+///   under a search box nobody has typed in.
 ///
 /// Collapsing `none_yet` into `none` is the #846 conflation in the one
 /// place a user is least likely to question it.
 type ClaudeSearchVerdict =
   | { kind: "matches"; hits: ClaudeSearchHit[] }
   | { kind: "none" }
-  | { kind: "none_yet"; indexed: number; total: number };
+  | { kind: "none_yet"; indexed: number; total: number }
+  | { kind: "not_asked" };
 
 /// A search result and the coverage that qualifies it, together.
 ///

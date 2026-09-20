@@ -132,6 +132,24 @@ describe("an unfinished index never says 'no matches'", () => {
     expect(complete).not.toMatch(/indexed so far/i);
   });
 
+  /// An empty box is not a search that found nothing.
+  ///
+  /// Over a COMPLETE index the wrong answer here is a confident "No
+  /// matches. All 1,482 sessions were searched." painted under a box
+  /// nobody has typed in -- a settled answer to a question nobody asked.
+  it("says nothing about matches when no query was asked", () => {
+    const cov = coverage();
+    state.coverage = cov;
+    state.answer = { verdict: { kind: "not_asked" }, coverage: cov };
+    render(<ClaudeTranscriptSearch />);
+
+    expect(screen.queryByText(/no matches/i)).toBeNull();
+    expect(screen.queryByText(/were searched/i)).toBeNull();
+    // The coverage line still shows: how much is searchable is worth
+    // saying before anyone types.
+    expect(screen.getByText(/all 1,482 sessions are searchable/i)).toBeTruthy();
+  });
+
   /// A search that FAILED is neither empty state. #846's exact shape.
   it("renders a failed search as an error, not as an empty result", () => {
     state.coverage = coverage();

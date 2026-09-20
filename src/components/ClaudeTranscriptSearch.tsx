@@ -186,6 +186,11 @@ function SearchResult({
 }) {
   const { verdict } = answer;
 
+  // Nothing was asked, so there is nothing to report about matches. The
+  // coverage line above the box already says how much is searchable,
+  // which is the honest thing to show before anyone types.
+  if (verdict.kind === "not_asked") return null;
+
   if (verdict.kind === "matches") {
     return (
       <ul className="flex flex-col gap-1">

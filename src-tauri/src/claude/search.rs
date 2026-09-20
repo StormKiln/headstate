@@ -212,8 +212,19 @@ pub enum Verdict {
     Matches { hits: Vec<Hit> },
     /// Nothing matched, and the whole corpus was searched. This is the
     /// only variant that may be rendered as a plain "no matches", and
-    /// [`answer`] will not produce it while coverage is incomplete.
+    /// [`search`] will not produce it while coverage is incomplete.
     None,
+    /// No query was asked, so nothing was searched.
+    ///
+    /// A FOURTH state, and not a kind of empty result. An empty box is
+    /// not a search that found nothing, and over a complete index the
+    /// alternative would be `None` -- a confident statement that the
+    /// corpus does not contain something nobody asked about, painted
+    /// under an empty search box.
+    ///
+    /// It carries the coverage like every other verdict, so the page can
+    /// still say how much is searchable before anyone types.
+    NotAsked,
     /// Nothing matched in the part of the corpus that is searchable,
     /// and the rest has not been indexed yet.
     ///
@@ -708,11 +719,14 @@ pub fn search(
 
     let Some(expr) = fts_query(query) else {
         // An empty query is not a search that found nothing. It is not a
-        // search at all, so it gets the coverage and no verdict about
-        // matches -- rendering it as "no matches" would answer a
-        // question the user never asked.
+        // search at all, so it gets its own verdict: over a COMPLETE
+        // index, `none_verdict` here would return `Verdict::None` and
+        // the page would paint "No matches. All 1,494 sessions were
+        // searched." under an empty box -- a confident answer to a
+        // question nobody asked. The coverage still travels, so the page
+        // can say how much is searchable before anyone types.
         return Ok(SearchAnswer {
-            verdict: none_verdict(&cov),
+            verdict: Verdict::NotAsked,
             coverage: cov,
         });
     };
@@ -1463,6 +1477,47 @@ mod tests {
             "last_indexed_at",
         ] {
             assert!(cov.get(key).is_some(), "coverage is missing `{key}`");
+        }
+    }
+
+    /// An empty query does not produce a settled "no matches".
+    ///
+    /// It is not a search that found nothing; it is not a search. Over a
+    /// COMPLETE index the honest-looking `Verdict::None` is exactly the
+    /// wrong answer here -- it is a confident statement that the corpus
+    /// does not contain something nobody asked about, and it would paint
+    /// "No matches. All 1,494 sessions were searched." under an empty
+    /// box.
+    ///
+    /// The frontend hook also declines to run an empty query, but this
+    /// is asserted at the boundary that OWNS the claim rather than
+    /// relying on a caller to never ask.
+    #[test]
+    fn an_empty_query_is_not_a_search_that_found_nothing() {
+        let conn = db();
+        conn.execute(
+            "INSERT INTO claude_index_ledger (session_id, size_bytes, mtime_ms, truncated, indexed_at)
+             VALUES ('a', 1, 1, 0, 'now')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO claude_index_state (id, corpus_sessions, last_pass_at) VALUES (1, 1, 'now')",
+            [],
+        )
+        .unwrap();
+
+        // The premise: this index IS complete, so nothing about coverage
+        // is holding the settled answer back.
+        assert!(coverage(&conn, vec![]).unwrap().is_complete());
+
+        for empty in ["", "   ", "\t"] {
+            let answer = search(&conn, empty, 20, vec![]).unwrap();
+            assert_eq!(
+                answer.verdict,
+                Verdict::NotAsked,
+                "an empty query must not be answered as though it were a search"
+            );
         }
     }
 
