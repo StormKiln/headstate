@@ -40,6 +40,7 @@ import type {
 import type {
   ClaudeDefinitions,
   ClaudeEffectiveSettings,
+  ClaudeConfigHealth,
   ClaudeUsageProfile,
   PrActionName,
   ToolReport,
@@ -58,6 +59,7 @@ import {
   claudeMdEffective,
   claudeDefinitions,
   claudeEffectiveSettings,
+  claudeConfigHealth,
   claudeUsageProfile,
   getCached,
   actOnPrs,
@@ -3753,6 +3755,34 @@ export function useClaudeEffectiveSettings(repoPath: string | undefined, enabled
     enabled: enabled && Boolean(repoPath),
     staleTime: 5_000,
     refetchOnWindowFocus: true,
+    retry: false,
+  });
+}
+
+/// Silently-broken agent configuration across every scanned repository
+/// (#1217).
+///
+/// `enabled` because the panel is collapsed by default, and this one is
+/// the most expensive read on the page: it parses three settings files
+/// and walks a CLAUDE.md tree per repository, across every checkout the
+/// app scans. A user who never opens the section should not pay for it.
+///
+/// `retry: false` for #846's reason: a failure here means the sweep did
+/// not run, and the honest rendering of that is the error, not three
+/// silent retries that end in an empty list a reader would take for
+/// "nothing is wrong".
+///
+/// `staleTime: Infinity` and no refetch on focus: the answer changes when
+/// someone edits a config file, not while they look at the page, and a
+/// 38-repository sweep on every window focus would be a real cost for a
+/// figure that has not moved. The panel offers an explicit re-check.
+export function useClaudeConfigHealth(enabled: boolean) {
+  return useQuery<ClaudeConfigHealth>({
+    queryKey: ["claude-config-health"],
+    queryFn: claudeConfigHealth,
+    enabled,
+    staleTime: Infinity,
+    refetchOnWindowFocus: false,
     retry: false,
   });
 }

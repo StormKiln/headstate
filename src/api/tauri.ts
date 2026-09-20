@@ -1296,6 +1296,63 @@ export interface ClaudeEffectiveSettings {
 export const claudeEffectiveSettings = (repoPath: string) =>
   call<ClaudeEffectiveSettings>("claude_effective_settings", { repoPath });
 
+/// A repository's configuration-health verdict (#1217).
+///
+/// Three states, because two would lie. `unknown` is NOT a pass with a
+/// caveat -- it means a check could not run, and the ranking keeps it out
+/// of the passes for that reason.
+export type ClaudeHealthVerdict = "pass" | "problem" | "unknown";
+
+/// Whether a finding is proven wrong, or could not be determined.
+export type ClaudeHealthSeverity = "problem" | "unknown";
+
+/// Which check produced a finding.
+///
+/// Carried rather than pattern-matched out of the proof's wording: the
+/// remedy differs per check, and a frontend reading sentences would break
+/// the first time one was reworded.
+export type ClaudeHealthCheck =
+  | "settingsParse"
+  | "claudeMdImport"
+  | "definition"
+  | "unreadable";
+
+export interface ClaudeHealthFinding {
+  check: ClaudeHealthCheck;
+  severity: ClaudeHealthSeverity;
+  path: string;
+  /// Which settings scope refused, or null for a finding that has none.
+  scope: ClaudeSettingsOrigin | null;
+  /// The producing code's own sentence -- serde's parse error with its
+  /// line and column, or the import resolver's message. Rendered
+  /// VERBATIM: paraphrasing it would discard the only actionable thing
+  /// in it and turn a check into an opinion.
+  proof: string;
+  /// The tracked keys this refusal put in doubt, which is the
+  /// consequence the user feels.
+  undecidableKeys: string[];
+}
+
+export interface ClaudeRepoHealth {
+  name: string;
+  path: string;
+  verdict: ClaudeHealthVerdict;
+  findings: ClaudeHealthFinding[];
+}
+
+export interface ClaudeConfigHealth {
+  repos: ClaudeRepoHealth[];
+  /// Scan roots the repository walk could not read. The shortfall in the
+  /// CENSUS, which is what makes "all clear" honest or not.
+  unreadableRoots: string[];
+  /// Findings about the machine rather than any repository.
+  userFindings: ClaudeHealthFinding[];
+}
+
+/// Sweep every scanned repository for silently-broken agent config (#1217).
+export const claudeConfigHealth = () =>
+  call<ClaudeConfigHealth>("claude_config_health");
+
 export const claudeHooksStatus = () => call<ClaudeHooksStatus>("claude_hooks_status");
 
 /// Install the hooks, appending to whatever is already there.
