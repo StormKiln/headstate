@@ -410,60 +410,95 @@ fn collect(out: &mut Inventory, v: &Value) {
 
 /// Every installed plugin's `.mcp.json`, as servers.
 ///
-/// A directory that cannot be listed is a refusal rather than silence,
-/// the rule [`super::definitions`] states: a permission wall hides an
-/// unknown number of servers, and omitting them would understate the
-/// inventory without saying so.
-fn collect_plugins(out: &mut Inventory, root: &Path) {
-    if !root.exists() {
-        // No plugins directory at all is an honest zero: nothing is
-        // installed. Distinct from one that exists and will not open.
-        return;
-    }
-    let entries = match std::fs::read_dir(root) {
-        Ok(e) => e,
+/// Driven by `installed_plugins.json` and its `installPath`, NOT by
+/// walking a directory. That distinction was measured, and getting it
+/// wrong produced exactly the false zero this whole module exists to
+/// prevent: an earlier version listed `~/.claude/plugins/*/` and found
+/// ZERO manifests on a real machine, because the plugin tree's top
+/// level is `cache/`, `repos/` and `marketplaces/` and every real
+/// manifest sits three or four levels down under a marketplace
+/// directory. A page confidently reporting no plugin-shipped servers
+/// while ten plugins ship one is the #846 defect with a new cause.
+///
+/// `installed_plugins.json` is also the AUTHORITATIVE list: a manifest
+/// found by walking might belong to a marketplace entry that is not
+/// installed, which would overstate the inventory in the other
+/// direction. `plugins.rs` already owns the parse, so this reuses
+/// `parse_inventory` rather than teaching a second file the format.
+///
+/// A file that cannot be read is a refusal rather than silence, the
+/// rule `definitions.rs` states: it hides an unknown number of servers,
+/// and omitting them would understate the inventory without saying so.
+fn collect_plugins(out: &mut Inventory, plugins_root: &Path) {
+    let file = plugins_root.join("installed_plugins.json");
+    let body = match std::fs::read_to_string(&file) {
+        Ok(b) => b,
+        // Nothing installed is an honest zero, the line `plugins.rs`
+        // draws with `inventory_absent`.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
         Err(e) => {
             out.unreadable.push(ScopeRefusal {
                 origin: Origin::Plugin,
-                path: root.display().to_string(),
+                path: file.display().to_string(),
                 detail: format!(
-                    "{} could not be listed: {e}. Any MCP servers shipped by installed \
+                    "{} could not be read: {e}. Any MCP servers shipped by installed \
                      plugins are therefore unlisted rather than absent.",
-                    root.display()
+                    file.display()
                 ),
             });
             return;
         }
     };
-    let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-    // Sorted so the inventory is stable between calls: `read_dir` order
-    // is the filesystem's and a list that reorders itself on refresh
-    // reads as having changed when it has not.
-    dirs.sort();
-    for dir in dirs {
-        if !dir.is_dir() {
-            continue;
+
+    let installed = match super::plugins::parse_inventory(&body) {
+        Ok(list) => list,
+        Err(e) => {
+            out.unreadable.push(ScopeRefusal {
+                origin: Origin::Plugin,
+                path: file.display().to_string(),
+                detail: format!(
+                    "{} did not parse: {e}. Any MCP servers shipped by installed plugins \
+                     are therefore unlisted rather than absent.",
+                    file.display()
+                ),
+            });
+            return;
         }
-        let plugin = dir
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
+    };
+
+    for plugin in installed {
+        // No install path means we cannot look, which is not the same
+        // as looking and finding nothing. Reported so the inventory is
+        // a floor with a stated reason rather than a silent omission.
+        let Some(root) = plugin.install_path.as_deref() else {
+            out.unreadable.push(ScopeRefusal {
+                origin: Origin::Plugin,
+                path: file.display().to_string(),
+                detail: format!(
+                    "the plugin `{}` records no install path, so any MCP server it ships \
+                     could not be listed.",
+                    plugin.name
+                ),
+            });
+            continue;
+        };
         // Both spellings, matching `plugins::read_contribution`, which
         // observed each in the real cache.
         for name in [".mcp.json", "mcp.json"] {
-            let file = dir.join(name);
-            if !file.exists() {
+            let manifest = Path::new(root).join(name);
+            if !manifest.exists() {
                 continue;
             }
-            match read_bounded(&file) {
+            match read_bounded(&manifest) {
                 Ok((bytes, false, _)) => match serde_json::from_slice::<Value>(&bytes) {
-                    Ok(v) => out
-                        .servers
-                        .extend(servers_from(&v, Origin::Plugin, Some(&plugin))),
+                    Ok(v) => {
+                        out.servers
+                            .extend(servers_from(&v, Origin::Plugin, Some(&plugin.name)))
+                    }
                     Err(e) => out.unreadable.push(ScopeRefusal {
                         origin: Origin::Plugin,
-                        path: file.display().to_string(),
-                        detail: format!("{} did not parse as JSON: {e}", file.display()),
+                        path: manifest.display().to_string(),
+                        detail: format!("{} did not parse as JSON: {e}", manifest.display()),
                     }),
                 },
                 Ok((_, true, size)) => {
@@ -472,18 +507,18 @@ fn collect_plugins(out: &mut Inventory, root: &Path) {
                         .unwrap_or_else(|| "an unknown size".to_string());
                     out.unreadable.push(ScopeRefusal {
                         origin: Origin::Plugin,
-                        path: file.display().to_string(),
+                        path: manifest.display().to_string(),
                         detail: format!(
                             "{} is {total}, larger than the {BUDGET_BYTES}-byte read budget, \
                              so the servers it ships could not be listed.",
-                            file.display()
+                            manifest.display()
                         ),
                     });
                 }
                 Err(e) => out.unreadable.push(ScopeRefusal {
                     origin: Origin::Plugin,
-                    path: file.display().to_string(),
-                    detail: format!("{} could not be read: {e}", file.display()),
+                    path: manifest.display().to_string(),
+                    detail: format!("{} could not be read: {e}", manifest.display()),
                 }),
             }
             break;
@@ -787,12 +822,36 @@ mod tests {
         );
     }
 
+    /// Install one plugin whose manifest sits where a REAL one sits:
+    /// nested under a marketplace directory, reachable only through
+    /// `installed_plugins.json`'s `installPath`. A fixture that put the
+    /// manifest one level under the plugins root would pass against the
+    /// flat walk this code deliberately does not do -- measured on the
+    /// real machine, that walk finds zero of ten manifests.
+    fn install_plugin(plugins: &Path, name: &str, manifest: &str) {
+        let path = plugins
+            .join("marketplaces")
+            .join("claude-plugins-official")
+            .join("external_plugins")
+            .join(name);
+        write(&path.join(".mcp.json"), manifest);
+        write(
+            &plugins.join("installed_plugins.json"),
+            &format!(
+                r#"{{"version": 2, "plugins": {{"{name}@claude-plugins-official":
+                   [{{"scope": "user", "installPath": "{}"}}]}}}}"#,
+                path.display()
+            ),
+        );
+    }
+
     #[test]
     fn a_plugin_shipped_server_carries_the_plugin_origin() {
         let (_t, home, plugins) = fixture();
         write(&state_path_in(&home), r#"{"mcpServers": {}}"#);
-        write(
-            &plugins.join("github").join(".mcp.json"),
+        install_plugin(
+            &plugins,
+            "github",
             r#"{"mcpServers": {"github": {"command": "gh-mcp"}}}"#,
         );
 
@@ -806,6 +865,46 @@ mod tests {
         assert_eq!(inv.in_force(Path::new("/anywhere")).len(), 1);
     }
 
+    /// The regression this module already shipped once and caught
+    /// before merge.
+    ///
+    /// An earlier version listed `~/.claude/plugins/*/` looking for
+    /// manifests. On the real machine that finds ZERO of the ten that
+    /// exist, because the top level is `cache/`, `repos/` and
+    /// `marketplaces/` and every manifest is three or four levels down.
+    /// The page would have confidently reported no plugin-shipped
+    /// servers while seven were configured -- the exact false zero this
+    /// module exists to prevent.
+    ///
+    /// So this fixture puts a DECOY at the shallow path a walk would
+    /// find, and the real manifest where `installPath` points. Finding
+    /// the decoy fails the test.
+    #[test]
+    fn a_plugin_manifest_is_found_through_its_install_path_not_by_walking() {
+        let (_t, home, plugins) = fixture();
+        write(&state_path_in(&home), r#"{"mcpServers": {}}"#);
+
+        // What a flat walk of `plugins/*/` would hit.
+        write(
+            &plugins.join("cache").join(".mcp.json"),
+            r#"{"mcpServers": {"decoy": {"command": "should-not-appear"}}}"#,
+        );
+        // Where the real one lives.
+        install_plugin(
+            &plugins,
+            "context7",
+            r#"{"mcpServers": {"context7": {"command": "c7-mcp"}}}"#,
+        );
+
+        let inv = inventory_in(&home, &plugins);
+        let names: Vec<&str> = inv.servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["context7"],
+            "the nested manifest must be found and the shallow decoy must not be"
+        );
+    }
+
     /// A plugin's unparseable `.mcp.json` is its own scope's refusal and
     /// must not take the user scope's servers down with it.
     #[test]
@@ -815,7 +914,7 @@ mod tests {
             &state_path_in(&home),
             r#"{"mcpServers": {"ok": {"command": "c"}}}"#,
         );
-        write(&plugins.join("broken").join(".mcp.json"), "{not json");
+        install_plugin(&plugins, "broken", "{not json");
 
         let inv = inventory_in(&home, &plugins);
         // The user scope still answered.
