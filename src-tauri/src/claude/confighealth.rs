@@ -328,15 +328,40 @@ fn settings_findings(home: &Path, repo: &Path, out: &mut Vec<Finding>) {
     let eff = effective_in(home, repo);
 
     for refusal in &eff.unreadable {
-        // WHICH keys this scope put in doubt. `effective_in` already
-        // decided that per key, including the precedence rule that an
-        // unreadable lower scope cannot unsettle a key a higher one
-        // decided -- so this reads its answer rather than recomputing a
-        // second, divergent one.
+        // WHICH keys THIS scope put in doubt -- not every key some scope
+        // did.
+        //
+        // The distinction only shows up when two scopes refuse at once,
+        // and getting it wrong is constraint 3's own defect one level
+        // down: an unreadable USER file would claim credit for a key
+        // only the LOCAL file could have overridden, and the reader
+        // would fix the wrong file.
+        //
+        // So the same precedence rule `effective_in` applies at :177 is
+        // applied per refusal: a key is in doubt because of THIS scope
+        // only when this scope outranks the best READABLE contribution,
+        // or when no readable scope carried the key at all.
+        //
+        // `contributions` is what that rule is read from, NOT `winner`:
+        // `effective_in` sets `winner` to `None` for exactly the keys
+        // that are undecidable, so matching on it here would take the
+        // "no readable scope carried it" arm every time and attribute
+        // every key to every refusal -- the bug this comment exists to
+        // prevent a return to. `contributions` still lists the scopes
+        // that DID carry the key, in precedence order.
+        //
+        // `undecidable` is still required, so this never widens
+        // `effective_in`'s answer -- it only attributes it.
         let undecidable_keys: Vec<String> = eff
             .keys
             .iter()
-            .filter(|k| k.undecidable)
+            .filter(|k| {
+                k.undecidable
+                    && match k.contributions.last().map(|c| c.origin) {
+                        Some(best_readable) => refusal.origin > best_readable,
+                        None => true,
+                    }
+            })
             .map(|k| k.key.clone())
             .collect();
 
@@ -701,6 +726,75 @@ mod tests {
                 .count(),
             1,
             "only the scope that actually failed may be reported"
+        );
+    }
+
+    /// When TWO scopes refuse, each finding claims only the keys ITS
+    /// OWN scope put in doubt.
+    ///
+    /// The case that exposes constraint 3's defect one level down. The
+    /// first draft filtered on `k.undecidable` alone, so both findings
+    /// listed every undecidable key -- an unreadable USER file taking
+    /// credit for a key only the LOCAL file could have overridden, which
+    /// sends the reader to the wrong file. Exactly the flattening the
+    /// per-scope model exists to prevent.
+    ///
+    /// The fixture: PROJECT readably sets `model`, and both USER (which
+    /// it outranks) and LOCAL (which outranks it) refuse. So `model` is
+    /// undecidable because of LOCAL and NOT because of USER.
+    #[test]
+    fn two_refusing_scopes_do_not_share_each_others_undecidable_keys() {
+        let (_t, home) = fixture();
+        let repo = _t.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        write(&home.join(".claude").join("settings.json"), "{ broken");
+        write(
+            &repo.join(".claude").join("settings.json"),
+            r#"{"model": "sonnet"}"#,
+        );
+        write(
+            &repo.join(".claude").join("settings.local.json"),
+            "{ also broken",
+        );
+
+        let health = check_repo(&home, &repo);
+        let find = |o: Origin| {
+            health
+                .findings
+                .iter()
+                .find(|f| f.scope == Some(o))
+                .unwrap_or_else(|| panic!("{o:?} refused, so it must have a finding"))
+        };
+
+        // BOTH scopes are reported: each is a separate inert file with
+        // its own remedy.
+        assert_eq!(
+            health
+                .findings
+                .iter()
+                .filter(|f| f.check == Check::SettingsParse)
+                .count(),
+            2
+        );
+
+        assert!(
+            find(Origin::Local)
+                .undecidable_keys
+                .iter()
+                .any(|k| k == "model"),
+            "the local file outranks the readable project value, so it is what puts \
+             `model` in doubt; got: {:?}",
+            find(Origin::Local).undecidable_keys
+        );
+        assert!(
+            !find(Origin::User)
+                .undecidable_keys
+                .iter()
+                .any(|k| k == "model"),
+            "an unreadable USER file cannot override a key the PROJECT file already \
+             decided, so claiming `model` here would send the reader to the wrong \
+             file; got: {:?}",
+            find(Origin::User).undecidable_keys
         );
     }
 
