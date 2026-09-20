@@ -1130,6 +1130,57 @@ mod tests {
         assert_eq!(second.unchanged, 1);
     }
 
+    /// A transcript that GREW is re-indexed, so a session stays
+    /// findable by what was added to it after it was first indexed.
+    ///
+    /// The case the incremental design is most likely to get wrong: the
+    /// ledger exists to SKIP work, and a skip keyed on the wrong thing
+    /// would leave every long-running session searchable only by its
+    /// opening minutes. That failure is invisible -- the session is in
+    /// the index, the coverage reads complete, and the search simply
+    /// does not find the thing the user remembers saying.
+    #[test]
+    fn a_transcript_that_grew_is_reindexed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let p = write_session(root, "slug", "s1", "the first thing said");
+
+        let mut conn = db();
+        index_pass(&mut conn, &crate::claude::scan(root)).unwrap();
+        assert!(!matches!(
+            search(&conn, "zzzsaidlaterzzz", 20, vec![])
+                .unwrap()
+                .verdict,
+            Verdict::Matches { .. }
+        ));
+
+        // Appended, as a live session's transcript is.
+        let mut body = std::fs::read_to_string(&p).unwrap();
+        body.push_str(
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"zzzsaidlaterzzz\"}}\n",
+        );
+        std::fs::write(&p, body).unwrap();
+
+        let second = index_pass(&mut conn, &crate::claude::scan(root)).unwrap();
+        assert_eq!(second.indexed, 1, "the grown transcript was re-read");
+        assert_eq!(second.unchanged, 0);
+
+        let found = search(&conn, "zzzsaidlaterzzz", 20, vec![]).unwrap();
+        let Verdict::Matches { hits } = found.verdict else {
+            panic!("a session must be findable by what was appended to it");
+        };
+        assert_eq!(hits[0].session_id, "s1");
+
+        // And the OLD content is still findable: a re-index replaces the
+        // row rather than leaving two, and rather than losing the head.
+        assert!(matches!(
+            search(&conn, "the first thing said", 20, vec![])
+                .unwrap()
+                .verdict,
+            Verdict::Matches { .. }
+        ));
+    }
+
     /// A session whose transcript is gone leaves the index, so a search
     /// cannot offer a hit on a session the corpus no longer holds.
     #[test]
