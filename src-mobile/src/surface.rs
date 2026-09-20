@@ -327,6 +327,9 @@ pub const SURFACE: &[(&str, Class)] = &[
     // machine have, and which apply here" is a reasonable thing to ask
     // from a phone, and nothing about the answer is a side effect.
     ("claude_mcp_servers", Class::Read),
+    // Read: two file reads plus a sweep of Headstate's own ledger (#1199).
+    // Nothing under `~/.claude` is written.
+    ("claude_permission_ownership", Class::Read),
     ("claude_hooks_status", Class::Read),
     ("get_poll_interval", Class::Read),
     ("get_worktree_dirs", Class::Read),

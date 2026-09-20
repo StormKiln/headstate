@@ -726,7 +726,12 @@ fn drop_ours(hooks: &mut Map<String, Value>, event: &str, path: &Path) -> Result
 /// and `/tmp` is routinely a different one on macOS. `sync_all` before the
 /// rename so a power loss cannot leave a renamed-but-empty file -- which
 /// would be the malformed state this module refuses to create.
-fn write_atomically(path: &Path, root: &Value) -> Result<(), Refusal> {
+/// `pub(super)` rather than private since #1199: `permissions.rs` writes
+/// its own sidecar ledger and must not invent a second temp-and-rename.
+/// The re-parse guard and the same-directory rename above are the whole
+/// reason it is shared -- two implementations of "write this file
+/// safely" is two chances to get the malformed-file case wrong.
+pub(super) fn write_atomically(path: &Path, root: &Value) -> Result<(), Refusal> {
     let io = |e: std::io::Error| Refusal::Io {
         path: path.display().to_string(),
         detail: e.to_string(),

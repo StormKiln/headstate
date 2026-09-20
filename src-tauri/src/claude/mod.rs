@@ -90,6 +90,14 @@ pub mod liveness;
 /// than an empty inventory.
 pub mod mcp;
 pub mod overview;
+/// Which permission rules in `settings.json` are Headstate's (#1199).
+///
+/// The THIRD writer question, answered before the first write rather
+/// than after the first support report. Its ledger is Headstate's own
+/// file and lives in Headstate's own data directory -- so the rule above
+/// still holds: `install` is the only thing in here that writes to
+/// `~/.claude`, and #1199 did not make it two.
+pub mod permissions;
 /// Installed plugins, and what they were actually used for (#1075).
 pub mod plugins;
 /// The tail of one transcript, as conversation rather than JSONL (#982).
