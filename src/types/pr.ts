@@ -1842,6 +1842,79 @@ interface ClaudePreviewMessage {
   blocks: ClaudePreviewBlock[];
 }
 
+/// What the window could say about a session's worktree (#1206).
+///
+/// Not exported for the reason `ClaudePreviewMessage` is not: it is
+/// reached only through `ClaudeLifecycle.worktree`.
+///
+/// A TAGGED union, mirroring the Rust enum, because the three states
+/// must stay three states: `unknown` is "no record in the window", which
+/// is NOT a statement that the session is outside a worktree, while
+/// `not_in_worktree` is a measured negative (82% of real records). A
+/// renderer that treats them alike reports "unknown" for the 82% that
+/// are a definite answer.
+///
+/// `original_branch` and `original_head_commit` are the facts the
+/// path-based session-to-worktree join cannot recover once the directory
+/// is gone (#1137). Every field is nullable and none is substituted.
+type ClaudeWorktree =
+  | { state: "unknown" }
+  | { state: "not_in_worktree" }
+  | {
+      state: "in";
+      original_cwd: string | null;
+      worktree_path: string | null;
+      worktree_name: string | null;
+      worktree_branch: string | null;
+      original_branch: string | null;
+      original_head_commit: string | null;
+    };
+
+/// The prompt queue as a BALANCE, not a list (#1206).
+///
+/// Only ever reached through `ClaudeLifecycle.queue`, which is `null`
+/// when the read was truncated -- so a value of this shape always
+/// accounts for every operation in the file.
+interface ClaudeQueue {
+  enqueued: number;
+  dequeued: number;
+  /// Prompts taken off the queue WITHOUT running, by reason, VERBATIM.
+  /// `absorbed_mid_turn` is a prompt the user typed that never ran as
+  /// its own turn. Never bucketed into "other": a vocabulary that grew
+  /// is information.
+  removed: [string, number][];
+  /// `remove` records that named no reason -- not the same fact as any
+  /// named reason.
+  removed_unexplained: number;
+  /// Operations that are none of the three documented kinds, verbatim.
+  unknown_operations: [string, number][];
+}
+
+/// What the lifecycle records in the window said (#1206).
+///
+/// Every field is nullable, and in each case `null` means NOT OBSERVED,
+/// never zero and never a default. A renderer that substitutes a benign
+/// value for any of these is the #846 defect.
+export interface ClaudeLifecycle {
+  /// `null` whenever the read was truncated, however many
+  /// `queue-operation` records the window held. The window cuts the
+  /// middle of things: an `enqueue` outside it whose `dequeue` is inside
+  /// gives a negative queue, and the reverse gives a phantom pending
+  /// prompt. Both are wrong answers that look right.
+  queue: ClaudeQueue | null;
+  /// The newest `permission-mode` value in the window, VERBATIM.
+  ///
+  /// `null` is the COMMON case -- the record is written on CHANGE, not
+  /// continuously, so a session that set its mode early and ran for
+  /// hours has it outside the window. It must render as absent, NEVER as
+  /// "ask every time", "auto" or any other default.
+  permission_mode: string | null;
+  /// Three-valued, and the middle value is the common one. See
+  /// `ClaudeWorktree`: `unknown` and `not_in_worktree` must never render
+  /// the same way.
+  worktree: ClaudeWorktree;
+}
+
 /// The tail of one transcript, as conversation (#982).
 ///
 /// Rust side: `src-tauri/src/claude/preview.rs`, which argues the 256 KB
@@ -1863,6 +1936,11 @@ export interface ClaudePreview {
   /// count above: one is a record we understood and chose not to show,
   /// the other is one we could not read.
   unparseable_records: number;
+  /// What the lifecycle records in the window said (#1206). Read rather
+  /// than counted-and-dropped, and NOT included in
+  /// `non_conversation_records` -- that count means "we opened this and
+  /// threw it away", and these are no longer thrown away.
+  lifecycle: ClaudeLifecycle;
 }
 
 /// The session list, INCLUDING what could not be read (#917).

@@ -400,6 +400,11 @@ const preview = (over: Partial<ClaudePreview> = {}): ClaudePreview => ({
   file_bytes: 183_237,
   non_conversation_records: 0,
   unparseable_records: 0,
+  lifecycle: {
+    queue: null,
+    permission_mode: null,
+    worktree: { state: "unknown" },
+  },
   ...over,
 });
 
