@@ -21,6 +21,7 @@ pub mod packages;
 pub mod panic_hook;
 pub mod poll;
 pub mod redact;
+pub mod release_notes;
 pub mod remote;
 pub mod repos;
 pub mod store;
