@@ -159,6 +159,12 @@ pub const SURFACE: &[(&str, Class)] = &[
     // show it, and the user can copy it.
     ("claude_launch_worktree", Class::Local),
     ("claude_launch_session", Class::Local),
+    // Local: they end a Claude Code process on the DESKTOP, and a phone
+    // must not be able to kill a session on a Mac it is not sitting at
+    // (#1219). The desktop table carries the full reasoning, including
+    // why `Destructive` was rejected.
+    ("claude_propose_stop", Class::Local),
+    ("claude_stop_session", Class::Local),
     ("check_packages", Class::Read),
     ("packages_markdown", Class::Read),
     // Read: the effective context a session loads, across scopes

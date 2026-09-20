@@ -10,6 +10,7 @@ import type {
   ClaudeObservation,
   ClaudeProfile,
   ClaudeSessionDetail,
+  ClaudeStopProposal,
   ClaudeTally,
   ClaudeWaiting,
   CwdState,
@@ -25,7 +26,12 @@ import {
   useWorktrees,
   useUiPrefs,
 } from "@/api/hooks";
-import { claudeLaunchSession, claudeRevealPath } from "@/api/tauri";
+import {
+  claudeLaunchSession,
+  claudeProposeStop,
+  claudeRevealPath,
+  claudeStopSession,
+} from "@/api/tauri";
 import { current } from "@/lib/ariaCurrent";
 import { copyText } from "@/lib/clipboard";
 import { IS_MOBILE_BUILD } from "@/lib/target";
@@ -1591,6 +1597,13 @@ function SessionDetail({
               the one a user acts on, so it sits above the preview rather
               than below it. */}
           <SessionTrouble sessionId={s.session_id} />
+          {/* LAST of the action sections and directly above the
+              transcript, which is the order the decision is made in:
+              read what went wrong, see what it last said, then decide.
+              Rendering it higher would put an end-this button above the
+              evidence for it, which is the arrangement #1219 exists to
+              avoid (#1219). */}
+          <StopSession session={s} detail={detail.data} />
           <TranscriptPreview detail={detail.data} />
         </>
       )}
@@ -2884,6 +2897,240 @@ function concentratedTool(tallies: ClaudeTally[]): string | null {
   if (total < 2) return null;
   const top = tallies.find((t) => t.count * 2 > total && t.name !== null);
   return top?.name ?? null;
+}
+
+/// How long a session has been up, in the terms a reader thinks in.
+///
+/// `null` in, `null` out: an uptime we could not read is not "0s", which
+/// is the same absent-is-not-zero rule the rest of this page follows.
+function uptimeLabel(secs: number | null): string | null {
+  if (secs === null) return null;
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m`;
+  return `${secs}s`;
+}
+
+/// Stop a live session, proposed with its evidence (#1219).
+///
+/// # Why this exists at all
+///
+/// Headstate already tells the user this session auto-compacted
+/// repeatedly, that its tools are failing in a concentrated pattern
+/// (`SessionTrouble`, directly above), that it has waited for hours
+/// (`WaitingBadge`), and that the machine is oversubscribed (the System
+/// Health page). It surfaced every input to "should I stop this" and then
+/// made the user go and find, in Activity Monitor, a pid Headstate
+/// already holds.
+///
+/// # This is an indicator, not advice
+///
+/// `health::runaway`'s Notice-vs-Alert split is the rule: a stuck session
+/// is an INDICATOR. So this section states FACTS -- how long it has run,
+/// how often it auto-compacted, what it last said -- and the button is
+/// secondary-styled and plainly worded. Nothing here says the session
+/// should be stopped, and nothing here acts unattended: the proposal is
+/// fetched on an explicit click, and the stop needs a second one.
+///
+/// # Only for a session that is RUNNING, and only on the desktop
+///
+/// A session that is `dead` has nothing to stop, and one whose liveness
+/// is `unknown` is precisely the case where signalling would be a guess
+/// -- so neither gets the affordance, and `unknown` says why rather than
+/// rendering nothing. `claude_stop_session` is `Class::Local`, so the
+/// phone is behind `IS_MOBILE_BUILD` with a sentence in its place.
+function StopSession({
+  session: s,
+  detail: d,
+}: {
+  session: ClaudeSession;
+  detail: ClaudeSessionDetail;
+}) {
+  // Every hook unconditionally, before any early return.
+  const [proposal, setProposal] = useState<ClaudeStopProposal | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  // The DETAIL's liveness, not the row's: the row's was derived on the
+  // list's poll and is up to ten seconds old, and this section is about
+  // a process that may have exited in that window.
+  const live = d.liveness;
+
+  const propose = () => {
+    setBusy(true);
+    void claudeProposeStop([s.session_id]).then(
+      (rows) => {
+        setBusy(false);
+        setProposal(rows[0] ?? null);
+      },
+      (e: unknown) => {
+        setBusy(false);
+        toast.error("Could not look at this session", { description: errorMessage(e) });
+      },
+    );
+  };
+
+  const stop = () => {
+    setBusy(true);
+    // The SESSION ID, never the pid shown above. Rust re-derives the pid
+    // on that call and refuses if the start times disagree -- the number
+    // on screen is stale the instant it is rendered.
+    void claudeStopSession(s.session_id).then(
+      (out) => {
+        setBusy(false);
+        setProposal(null);
+        toast.success(
+          out.signal === "terminated"
+            ? `Session stopped — it took SIGTERM after ${Math.round(out.waited_ms / 100) / 10}s, so it wrote its transcript`
+            : `Session killed — it did not exit within the grace period, so SIGKILL followed and no end record was written`,
+        );
+      },
+      (e: unknown) =>
+        // NAMES the refusal. The pid-reuse refusal in particular is the
+        // most useful thing this feature can say, and a generic "could
+        // not stop" would throw it away.
+        toast.error("Nothing was signalled", { description: errorMessage(e) }),
+    );
+  };
+
+  if (IS_MOBILE_BUILD) {
+    if (live.state !== "running") return null;
+    return (
+      <section className="rounded-md border border-[#30363d] bg-[#161b22] p-3">
+        <h3 className="text-xs font-semibold text-[#e6edf3]">Stopping this session</h3>
+        <p className="mt-1.5 text-xs text-[#8b949e]">
+          A session can only be stopped from the Mac it is running on, so this is not available
+          here.
+        </p>
+      </section>
+    );
+  }
+
+  if (live.state === "dead") return null;
+
+  if (live.state === "unknown") {
+    return (
+      <section className="rounded-md border border-[#30363d] bg-[#161b22] p-3">
+        <h3 className="text-xs font-semibold text-[#e6edf3]">Stopping this session</h3>
+        {/* Says why rather than showing nothing: "could not tell" is the
+            one state in which signalling would be a guess, and a user who
+            expected the button needs to know it was withheld deliberately
+            rather than missing. */}
+        <p className="mt-1.5 text-xs text-[#8b949e]">
+          Whether this session is running could not be confirmed, so nothing can be signalled
+          without guessing at which process is meant. {live.why}
+        </p>
+      </section>
+    );
+  }
+
+  const ev = proposal?.evidence;
+  const uptime = uptimeLabel(ev?.uptime_secs ?? null);
+
+  return (
+    <section className="rounded-md border border-[#30363d] bg-[#161b22] p-3">
+      <h3 className="text-xs font-semibold text-[#e6edf3]">Stopping this session</h3>
+      <p className="mt-1.5 text-xs text-[#8b949e]">
+        This session is running as pid {live.pid}. Headstate does not recommend stopping it — the
+        figures above describe it, and the decision is yours.
+      </p>
+
+      {proposal === null ? (
+        <button
+          type="button"
+          disabled={busy}
+          onClick={propose}
+          className="tap-target mt-3 rounded-md border border-[#30363d] bg-[#21262d] px-2 py-1 text-xs text-[#e6edf3] hover:bg-[#30363d] disabled:opacity-60"
+        >
+          {busy ? "Looking…" : "Review stopping it"}
+        </button>
+      ) : proposal.action !== "proposed" ? (
+        <>
+          {/* A REFUSAL, shown as one. The pid-reuse case is the reason
+              this feature re-derives the pid, and hiding the refusal
+              would leave the user with a button that appeared to do
+              nothing. */}
+          <p className="mt-3 text-xs text-[#f85149]">{proposal.why}</p>
+          <button
+            type="button"
+            onClick={() => setProposal(null)}
+            className="tap-target mt-3 rounded-md border border-[#30363d] bg-[#21262d] px-2 py-1 text-xs text-[#e6edf3] hover:bg-[#30363d]"
+          >
+            Close
+          </button>
+        </>
+      ) : (
+        <>
+          <dl className="mt-3 space-y-1.5 text-xs">
+            <Field label="Process">
+              <span className="font-mono">pid {proposal.pid}</span>
+              {/* Advisory, and labelled as such: `status` is STORED by
+                  the session and a killed one never corrects it. */}
+              {ev?.status ? (
+                <span className="ml-1.5 rounded-full bg-[#21262d] px-2 py-0.5 text-[11px] text-[#8b949e]">
+                  it last published {ev.status}
+                </span>
+              ) : null}
+            </Field>
+            <Field label="Running for">
+              {uptime ?? "could not be read"}
+            </Field>
+            {/* Absent is not zero: `null` is "no compaction record
+                exists for this session", which is not "it never
+                compacted" (#1065). */}
+            <Field label="Auto-compactions">
+              {ev?.auto_compactions === null || ev?.auto_compactions === undefined
+                ? "no compaction record — not the same as none"
+                : ev.auto_compactions.toLocaleString()}
+            </Field>
+          </dl>
+
+          {/* WHAT IT LAST SAID, above the button. The issue's
+              requirement, and the reason this is a proposal rather than
+              a confirmation dialog: a user asked to end something must
+              be shown what they are ending. */}
+          <div className="mt-3">
+            <h4 className="text-xs font-semibold text-[#e6edf3]">What it last said</h4>
+            {ev?.last_turn ? (
+              <p className="mt-1 whitespace-pre-wrap break-words rounded-md bg-[#0d1117] p-2 text-xs text-[#c9d1d9]">
+                {ev.last_turn}
+              </p>
+            ) : (
+              <p className="mt-1 text-xs text-[#8b949e]">
+                Its transcript could not be read, so there is nothing to show here — which is not
+                the same as the session having said nothing.
+              </p>
+            )}
+          </div>
+
+          <p className="mt-3 text-xs text-[#8b949e]">
+            Stopping sends SIGTERM first, so the session can write its transcript and record that
+            it ended. Only if it has not exited after a few seconds does SIGKILL follow, and that
+            leaves no end record.
+          </p>
+
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button
+              type="button"
+              disabled={busy}
+              onClick={stop}
+              className="tap-target rounded-md border border-[#30363d] bg-[#21262d] px-2 py-1 text-xs text-[#e6edf3] hover:bg-[#30363d] disabled:opacity-60"
+            >
+              {busy ? "Stopping…" : "Stop this session"}
+            </button>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => setProposal(null)}
+              className="tap-target rounded-md border border-[#30363d] bg-[#21262d] px-2 py-1 text-xs text-[#8b949e] hover:bg-[#30363d] disabled:opacity-60"
+            >
+              Leave it running
+            </button>
+          </div>
+        </>
+      )}
+    </section>
+  );
 }
 
 function TranscriptPreview({ detail: d }: { detail: ClaudeSessionDetail }) {

@@ -164,6 +164,11 @@ const ROWS: Row[] = [
     sessionId: "sess-1",
     cwd: "/tmp/x",
   }),
+  row(api.claudeProposeStop, [["sess-1"]], "claude_propose_stop", { sessionIds: ["sess-1"] }),
+  // The SESSION ID, never a pid: Rust re-derives the pid at the moment
+  // of the stop, because the list it would have come from is 10s stale
+  // and a recycled pid is somebody else's process (#1219).
+  row(api.claudeStopSession, ["sess-1"], "claude_stop_session", { sessionId: "sess-1" }),
   row(api.setAutoMerge, [id, repo, number, expectedHead, enable], "set_auto_merge", { id, repo, number, expectedHead, enable }),
   row(api.deleteHeadBranch, [refId, repo, number, branch, merged], "delete_head_branch", { refId, repo, number, branch, merged }),
   row(api.updatePrBranch, [id, repo, number, expectedHead], "update_pr_branch", { id, repo, number, expectedHead }),

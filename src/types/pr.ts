@@ -1644,6 +1644,82 @@ export interface ClaudeSessionDetail {
   waiting: ClaudeWaiting;
 }
 
+/// Why a stop was NOT attempted (#1219).
+///
+/// A discriminated union rather than a string, because the arms have
+/// different remedies: `pid_reused` means the list is stale and a refresh
+/// fixes it, `registry_unreadable` is a permissions problem on
+/// `~/.claude/sessions`, and `not_running` needs no remedy at all.
+///
+/// `unconfirmable` is the arm that must never be collapsed into
+/// `not_running`. It is "we could not establish the start time", and the
+/// stop is refused on it -- signalling on a guess is how an unrelated
+/// process that inherited the pid gets killed.
+type ClaudeStopRefusal =
+  | { kind: "registry_unreadable"; why: string }
+  | { kind: "not_running"; why: string }
+  | { kind: "pid_reused"; pid: number; drift_secs: number }
+  | { kind: "unconfirmable"; why: string }
+  | { kind: "cap_reached"; cap: number };
+
+/// The evidence shown beside a proposed stop (#1219).
+///
+/// Facts about the session, and deliberately no recommendation: per
+/// `health::runaway`'s Notice-vs-Alert framing a stuck session is an
+/// INDICATOR, and this pane must not read as the app advising a kill.
+///
+/// Every field is nullable and `null` means "we could not read this",
+/// never zero. `auto_compactions: null` is a session with no `PreCompact`
+/// record, which is not the same claim as one that never compacted.
+interface ClaudeStopEvidence {
+  name: string | null;
+  cwd: string | null;
+  /// `busy` / `idle` as the session last PUBLISHED it. Advisory only: it
+  /// is stored, not derived, and a killed session never corrects it.
+  status: string | null;
+  uptime_secs: number | null;
+  auto_compactions: number | null;
+  /// What the session last SAID. The thing a user must see before ending
+  /// something; `null` when the transcript could not be read, which the
+  /// pane states rather than rendering as silence.
+  last_turn: string | null;
+}
+
+/// One session a stop pass considered (#1219).
+///
+/// A refusal is a ROW here, not an omission -- `cleanup::propose`'s rule,
+/// and the reason it matters more here: a stop refused because the pid was
+/// reused is the single most important thing this feature can tell a user.
+export interface ClaudeStopProposal {
+  session_id: string;
+  /// `"proposed"` or `"refused"`.
+  action: string;
+  /// The pid confirmed at PROPOSAL time, shown so the user can see which
+  /// process is meant. Deliberately not what the stop signals: the pid is
+  /// re-derived again at the moment of the stop, because this number is
+  /// stale the instant it is rendered.
+  pid: number | null;
+  refusal: ClaudeStopRefusal | null;
+  why: string | null;
+  evidence: ClaudeStopEvidence;
+}
+
+/// Which signal actually ended the session (#1219).
+///
+/// `"terminated"` means SIGTERM was enough, so the session wrote its
+/// transcript tail and `SessionEnd` fired. `"killed"` means it needed
+/// SIGKILL, so it did neither and left its registry file behind with
+/// `status` frozen. The pane says which; the user should not have to guess.
+type ClaudeStopSignal = "terminated" | "killed";
+
+/// What one stop did (#1219).
+export interface ClaudeStopOutcome {
+  session_id: string;
+  pid: number;
+  signal: ClaudeStopSignal;
+  waited_ms: number;
+}
+
 /// One subagent session, as its parent's detail lists it (#1002).
 interface ClaudeSubagentChild {
   session_id: string;

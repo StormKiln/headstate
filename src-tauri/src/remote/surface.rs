@@ -265,6 +265,24 @@ pub const SURFACE: &[(&str, Class)] = &[
     // show it, and the user can copy it.
     ("claude_launch_worktree", Class::Local),
     ("claude_launch_session", Class::Local),
+    // Local, and here the class IS the safety property rather than a
+    // rendering hint (#1219). These two end a Claude Code process on
+    // THIS machine, and a phone must not be able to kill a session on a
+    // Mac it is not sitting at -- so neither has a dispatch arm in
+    // `call()` below, and `every_registered_command_has_exactly_one_class`'s
+    // sibling assertion fails on any that grows one.
+    //
+    // `Destructive` was considered and rejected: a stopped session keeps
+    // its transcript and can be resumed, so a step-up signature would be
+    // friction disproportionate to a recoverable action -- and would make
+    // the genuinely irreversible actions feel routine by association.
+    //
+    // The PROPOSAL signals nothing and could have been `Read`. It is
+    // `Local` anyway, because splitting the classification would put the
+    // evidence for an action on the phone beside a button that can only
+    // reject, which is the #603/#604/#606 shape.
+    ("claude_propose_stop", Class::Local),
+    ("claude_stop_session", Class::Local),
     ("check_packages", Class::Read),
     ("packages_markdown", Class::Read),
     // Read: the effective context a session loads, across scopes

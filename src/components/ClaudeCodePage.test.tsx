@@ -20,6 +20,11 @@ const revealFn = vi.hoisted(() => vi.fn(() => Promise.resolve("/code/app")));
 const launchFn = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 const toastError = vi.hoisted(() => vi.fn());
 const toastSuccess = vi.hoisted(() => vi.fn());
+/// #1219's two calls. `proposeFn` returns the evidence and `stopFn` does
+/// the stop -- both mocked, because a test that reached the real ones
+/// would read this machine's own registry and could signal a live pid.
+const proposeFn = vi.hoisted(() => vi.fn());
+const stopFn = vi.hoisted(() => vi.fn());
 const rescanFn = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 const refetchFn = vi.hoisted(() => vi.fn());
 
@@ -185,7 +190,12 @@ vi.mock("../api/hooks", () => ({
 }));
 vi.mock("sonner", () => ({ toast: { success: toastSuccess, error: toastError } }));
 vi.mock("../lib/clipboard", () => ({ copyText: copyFn }));
-vi.mock("../api/tauri", () => ({ claudeRevealPath: revealFn, claudeLaunchSession: launchFn }));
+vi.mock("../api/tauri", () => ({
+  claudeRevealPath: revealFn,
+  claudeLaunchSession: launchFn,
+  claudeProposeStop: proposeFn,
+  claudeStopSession: stopFn,
+}));
 
 import { ClaudeCodePage, ClaudeSessionColumn } from "./ClaudeCodePage";
 
@@ -459,6 +469,10 @@ beforeEach(() => {
   // `eventsFailed` would silently put unrelated tests in the error arm.
   state.events = { state: "unobserved" };
   state.eventsFailed = false;
+  // #1219. Reset per test so a proposal or a stop from a previous one
+  // cannot answer for a session this one never described.
+  proposeFn.mockReset();
+  stopFn.mockReset();
   state.preview = preview();
   state.previewFailed = false;
   state.previewEnabledFor = [];
@@ -3422,5 +3436,252 @@ describe("the transcript footprint", () => {
     state.imported = imported({ session_bytes: 0 });
     renderView();
     expect(screen.queryByText(/of transcripts/)).toBeNull();
+  });
+});
+
+/// Stopping a live session (#1219).
+///
+/// Every one of these drives the two mocked calls. Nothing here reaches
+/// the real `claudeStopSession`, so no test in this file can signal a
+/// process on the machine running it -- which is the precondition for
+/// having these tests at all.
+describe("stopping a session", () => {
+  const running = () =>
+    session({ liveness: { state: "running", pid: 14779, status: "busy" } });
+
+  const proposal = (over: Record<string, unknown> = {}) => ({
+    session_id: "e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2",
+    action: "proposed",
+    pid: 14779,
+    refusal: null,
+    why: "pid 14779 is running and its start time matches what the registry recorded",
+    evidence: {
+      name: "widget-c3",
+      cwd: "/Users/acme/code/widget",
+      status: "busy",
+      uptime_secs: 7_200,
+      auto_compactions: 4,
+      last_turn: "Running the integration suite against the staging cluster",
+    },
+    ...over,
+  });
+
+  /// A dead session has nothing to stop, so the affordance is absent
+  /// rather than present and disabled.
+  it("offers nothing for a session that is not running", () => {
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.queryByRole("button", { name: /review stopping it/i })).toBeNull();
+  });
+
+  /// "Could not tell" is the one state in which signalling would be a
+  /// guess. Withheld, and it SAYS it was withheld -- a missing button
+  /// with no explanation reads as the app being broken.
+  it("refuses an unknown liveness and says why rather than showing nothing", () => {
+    state.list = listOf([
+      session({ liveness: { state: "unknown", why: "the registry could not be read" } }),
+    ]);
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.queryByRole("button", { name: /review stopping it/i })).toBeNull();
+    expect(screen.getByText(/could not be confirmed/i)).toBeTruthy();
+    // `getAllBy`: the heading states the same reason for its own badge,
+    // and the two saying the same thing is correct -- a section that
+    // withheld the button without a reason is what this pins against.
+    expect(screen.getAllByText(/the registry could not be read/i).length).toBeGreaterThan(0);
+  });
+
+  /// The evidence is shown BEFORE any stop is offered, and the last turn
+  /// is part of it. This is the issue's requirement and the reason this
+  /// is a proposal rather than a confirmation dialog.
+  it("shows the last turn and the evidence before offering the stop", async () => {
+    proposeFn.mockResolvedValueOnce([proposal()]);
+    state.list = listOf([running()]);
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /review stopping it/i }));
+    await vi.waitFor(() =>
+      expect(screen.getByText(/Running the integration suite/)).toBeTruthy(),
+    );
+    expect(screen.getByText(/2h 0m/)).toBeTruthy();
+    expect(screen.getByText("4")).toBeTruthy();
+    // And the stop is only offered once the evidence is on screen.
+    expect(screen.getByRole("button", { name: /stop this session/i })).toBeTruthy();
+  });
+
+  /// SIGTERM-first is stated to the user, not just implemented. The
+  /// escalation and what it costs are named before it can happen.
+  it("states that SIGTERM goes first and what SIGKILL would cost", async () => {
+    proposeFn.mockResolvedValueOnce([proposal()]);
+    state.list = listOf([running()]);
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /review stopping it/i }));
+    await vi.waitFor(() => expect(screen.getByText(/SIGTERM first/i)).toBeTruthy());
+    expect(screen.getByText(/leaves no end record/i)).toBeTruthy();
+  });
+
+  /// The SESSION ID is what crosses, never the pid on screen. The pid is
+  /// re-derived in Rust at the moment of the stop, because the list it
+  /// came from is ten seconds stale.
+  it("sends the session id and never the rendered pid", async () => {
+    proposeFn.mockResolvedValueOnce([proposal()]);
+    stopFn.mockResolvedValueOnce({
+      session_id: "e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2",
+      pid: 14779,
+      signal: "terminated",
+      waited_ms: 300,
+    });
+    state.list = listOf([running()]);
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /review stopping it/i }));
+    await vi.waitFor(() =>
+      expect(screen.getByRole("button", { name: /stop this session/i })).toBeTruthy(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /stop this session/i }));
+    await vi.waitFor(() =>
+      expect(stopFn).toHaveBeenCalledWith("e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2"),
+    );
+    expect(stopFn).toHaveBeenCalledTimes(1);
+    // One argument, and it is not the pid.
+    expect(stopFn.mock.calls[0]).toHaveLength(1);
+    expect(stopFn.mock.calls[0][0]).not.toBe(14779);
+  });
+
+  /// Which signal ended it is REPORTED, because the two outcomes leave
+  /// the user with different things: SIGTERM wrote a transcript tail and
+  /// SIGKILL did not.
+  it("says which signal ended the session", async () => {
+    proposeFn.mockResolvedValue([proposal()]);
+    stopFn.mockResolvedValueOnce({
+      session_id: "e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2",
+      pid: 14779,
+      signal: "killed",
+      waited_ms: 5_000,
+    });
+    state.list = listOf([running()]);
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /review stopping it/i }));
+    await vi.waitFor(() =>
+      expect(screen.getByRole("button", { name: /stop this session/i })).toBeTruthy(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /stop this session/i }));
+    await vi.waitFor(() =>
+      expect(toastSuccess).toHaveBeenCalledWith(expect.stringMatching(/SIGKILL/)),
+    );
+  });
+
+  /// A REFUSAL is rendered as one. The pid-reuse case is the reason the
+  /// pid is re-derived at all, and hiding it would leave the user with a
+  /// button that appeared to do nothing.
+  it("renders a pid-reuse refusal rather than dropping it", async () => {
+    proposeFn.mockResolvedValueOnce([
+      proposal({
+        action: "refused",
+        pid: null,
+        refusal: { kind: "pid_reused", pid: 14779, drift_secs: 28_800 },
+        why: "pid 14779 is running but started 28800s from the recorded time, so the number has been reused by a different process -- nothing was signalled",
+      }),
+    ]);
+    state.list = listOf([running()]);
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /review stopping it/i }));
+    await vi.waitFor(() => expect(screen.getByText(/reused by a different process/)).toBeTruthy());
+    expect(screen.getByText(/nothing was signalled/)).toBeTruthy();
+    // And no stop is offered on a refusal.
+    expect(screen.queryByRole("button", { name: /stop this session/i })).toBeNull();
+  });
+
+  /// Absent is not zero: a session with no compaction record must not
+  /// render "0", which would be a confident wrong answer about a session
+  /// that may have compacted many times before the hook existed.
+  it("does not render a missing compaction count as zero", async () => {
+    proposeFn.mockResolvedValueOnce([
+      proposal({ evidence: { ...proposal().evidence, auto_compactions: null } }),
+    ]);
+    state.list = listOf([running()]);
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /review stopping it/i }));
+    await vi.waitFor(() => expect(screen.getByText(/no compaction record/i)).toBeTruthy());
+    expect(screen.getByText(/not the same as none/i)).toBeTruthy();
+  });
+
+  /// A transcript that could not be read is said so, rather than
+  /// rendering a blank that reads as the session having said nothing.
+  it("names an unreadable transcript rather than showing a blank", async () => {
+    proposeFn.mockResolvedValueOnce([
+      proposal({ evidence: { ...proposal().evidence, last_turn: null } }),
+    ]);
+    state.list = listOf([running()]);
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /review stopping it/i }));
+    await vi.waitFor(() =>
+      expect(screen.getByText(/transcript could not be read/i)).toBeTruthy(),
+    );
+  });
+
+  /// Nothing acts unattended. Opening the pane proposes nothing, and a
+  /// proposal alone signals nothing -- two clicks, and the first only
+  /// reads.
+  it("signals nothing until the user asks twice", async () => {
+    proposeFn.mockResolvedValueOnce([proposal()]);
+    state.list = listOf([running()]);
+    renderView();
+    open("HeadState GitHub issues filing");
+    // Selecting the session proposed nothing.
+    expect(proposeFn).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: /review stopping it/i }));
+    await vi.waitFor(() =>
+      expect(screen.getByRole("button", { name: /stop this session/i })).toBeTruthy(),
+    );
+    // And the proposal signalled nothing.
+    expect(stopFn).not.toHaveBeenCalled();
+  });
+
+  /// The pane does not read as the app advising a kill.
+  /// `health::runaway`'s Notice-vs-Alert split: a stuck session is an
+  /// INDICATOR.
+  it("does not recommend stopping", async () => {
+    proposeFn.mockResolvedValueOnce([proposal()]);
+    state.list = listOf([running()]);
+    const { container } = renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /review stopping it/i }));
+    await vi.waitFor(() =>
+      expect(screen.getByRole("button", { name: /stop this session/i })).toBeTruthy(),
+    );
+    expect(screen.getByText(/does not recommend stopping it/i)).toBeTruthy();
+    const text = container.textContent ?? "";
+    expect(text).not.toMatch(/you should stop|we recommend stopping|this session should be/i);
+  });
+
+  /// A refused stop NAMES the reason. A generic "could not stop" would
+  /// throw away the most useful thing this feature can say.
+  it("names the refusal when the stop itself is refused", async () => {
+    proposeFn.mockResolvedValueOnce([proposal()]);
+    stopFn.mockRejectedValueOnce(
+      "pid 14779 is running but started 28800s from the recorded time, so the number has been reused by a different process -- nothing was signalled",
+    );
+    state.list = listOf([running()]);
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /review stopping it/i }));
+    await vi.waitFor(() =>
+      expect(screen.getByRole("button", { name: /stop this session/i })).toBeTruthy(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /stop this session/i }));
+    await vi.waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith(
+        expect.stringMatching(/nothing was signalled/i),
+        expect.objectContaining({
+          description: expect.stringMatching(/reused by a different process/),
+        }),
+      ),
+    );
   });
 });

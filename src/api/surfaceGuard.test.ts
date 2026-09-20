@@ -108,8 +108,18 @@ describe("the remote surface's frontend half", () => {
       // `Class::Local`'s stated test.
       "claudeLaunchSession",
       "claudeLaunchWorktree",
+      // #1219's stop. `Class::Local` with NO dispatch arm, and the class
+      // IS the safety property here rather than a rendering hint: a
+      // phone must not be able to kill a session on a Mac it is not
+      // sitting at. The PROPOSAL signals nothing and could have been
+      // `Read`; it is `Local` beside the stop so the phone never renders
+      // the evidence for an action it cannot take, which is the
+      // #603/#604/#606 shape this list exists to stop. Both callers in
+      // `ClaudeCodePage` sit behind `!IS_MOBILE_BUILD`.
+      "claudeProposeStop",
       "claudeReinstallHooks",
       "claudeRevealPath",
+      "claudeStopSession",
       "claudeUninstallHooks",
       "getAutostart",
       "getNotifyPrefs",

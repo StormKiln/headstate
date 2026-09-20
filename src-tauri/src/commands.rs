@@ -2468,6 +2468,203 @@ pub async fn claude_launch_session(
     launch_in_terminal(&app, built.command, anchor).await
 }
 
+/// Read the live registry and probe the pids it names, NOW.
+///
+/// Shared by [`claude_propose_stop`] and [`claude_stop_session`] so the
+/// two cannot diverge about what "the registry says" means, and so
+/// neither can be given a registry read that some caller cached.
+///
+/// Returns the registry and the probe together because they are one
+/// observation: a probe refreshed against a different set of pids than
+/// the registry listed would pair a start time against the wrong entry.
+fn registry_and_probe() -> (
+    crate::claude::liveness::Registry,
+    crate::claude::liveness::SysinfoProbe,
+) {
+    let registry = match crate::claude::liveness::registry_dir() {
+        Some(dir) => crate::claude::liveness::read_registry(&dir),
+        None => crate::claude::liveness::Registry {
+            failure: Some("no home directory, so the live session registry is unreachable".into()),
+            ..Default::default()
+        },
+    };
+    let pids: Vec<u32> = registry.entries.values().map(|e| e.pid).collect();
+    let probe = crate::claude::liveness::SysinfoProbe::for_pids(&pids);
+    (registry, probe)
+}
+
+/// Propose stopping one or more live sessions, with the evidence (#1219).
+///
+/// `Class::Local`, and this is the half that could arguably have been
+/// `Read` -- it signals nothing. It is `Local` anyway, because splitting
+/// the classification would put the evidence for an action on the phone
+/// beside a button that can only reject, which is the #603/#604/#606
+/// shape `surfaceGuard.test.ts` exists to stop.
+///
+/// Nothing here decides a session SHOULD be stopped. Per
+/// `health::runaway`'s Notice-vs-Alert framing a stuck session is an
+/// indicator, so this states what is true about one -- how long it has
+/// run, how often it auto-compacted, and what it last said -- and the
+/// user decides. `claude::stop::propose` caps the pass, and refusals are
+/// rows rather than omissions.
+///
+/// # Why `async`
+///
+/// It refreshes the process table and reads a transcript tail per
+/// session. `no_sync_command_reaches_a_subprocess_or_a_whole_file`
+/// forbids either on a sync command, and `remote/surface.rs` would
+/// dispatch a sync command inline.
+#[tauri::command]
+pub async fn claude_propose_stop(
+    app: AppHandle,
+    session_ids: Vec<String>,
+) -> Result<Vec<crate::claude::stop::StopProposal>, String> {
+    let db = db_path(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let (registry, probe) = registry_and_probe();
+        let conn = open_db(&db).ok();
+        let now = chrono::Utc::now().timestamp();
+        let proposals =
+            crate::claude::stop::propose(&probe, &registry, &session_ids, |id, started_at| {
+                let entry = registry.entries.get(id);
+                // Read through `sessions::detail`, the SAME reader the
+                // detail pane uses, so the proposal and the pane cannot
+                // disagree about the session the user is looking at.
+                let detail = conn
+                    .as_ref()
+                    .and_then(|c| crate::claude::sessions::detail(c, id).ok())
+                    .flatten();
+                crate::claude::stop::StopEvidence {
+                    name: entry.and_then(|e| e.name.clone()),
+                    cwd: entry.and_then(|e| e.cwd.clone()),
+                    status: entry.and_then(|e| e.status.clone()),
+                    uptime_secs: started_at.map(|s| (now - s).max(0)),
+                    // `None` stays `None`: no `PreCompact` record is a
+                    // silence, not a zero (#1065).
+                    auto_compactions: detail
+                        .as_ref()
+                        .and_then(|d| d.compactions.as_ref())
+                        .map(|c| c.auto as u32),
+                    // The LAST TURN, which the issue requires be shown
+                    // before acting. Read through the same bounded
+                    // `preview::tail` the transcript pane uses; `None`
+                    // when it could not be read, which the UI states
+                    // rather than rendering a blank as "it said nothing".
+                    last_turn: detail
+                        .as_ref()
+                        .and_then(|d| d.transcript_path.as_deref())
+                        .and_then(|p| crate::claude::preview::tail(std::path::Path::new(p)).ok())
+                        .and_then(|preview| last_turn_text(&preview)),
+                }
+            });
+        Ok(proposals)
+    })
+    .await
+    .map_err(|e| format!("the stop proposal did not run: {e}"))?
+}
+
+/// The newest thing the session actually SAID, for the proposal's
+/// evidence.
+///
+/// Text blocks only, newest message first: a tool result is usually a
+/// file and a tool name is not what the session was saying. `None` when
+/// the window held no prose, which is a real answer and not a blank.
+fn last_turn_text(preview: &crate::claude::preview::Preview) -> Option<String> {
+    /// Long enough to show what it was working on, short enough that a
+    /// proposal stays readable beside the rest of the evidence.
+    const MAX: usize = 600;
+    for message in preview.messages.iter().rev() {
+        for block in &message.blocks {
+            if let crate::claude::preview::Block::Text { text, .. } = block {
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                return Some(match trimmed.char_indices().nth(MAX) {
+                    // Says it was cut, rather than presenting a
+                    // truncation as the whole of what was said.
+                    Some((at, _)) => format!("{}…", &trimmed[..at]),
+                    None => trimmed.to_string(),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Stop one live session: SIGTERM, then SIGKILL only after a bounded
+/// wait (#1219).
+///
+/// `Class::Local`, and the class is the safety property rather than a
+/// rendering hint: there is **no dispatch arm** for this command in
+/// `remote/surface.rs`, so a paired phone cannot kill a session on a Mac
+/// it is not sitting at. `Destructive` was considered and rejected --
+/// a stopped session keeps its transcript and can be resumed, so a
+/// step-up signature would be friction disproportionate to a recoverable
+/// action and would make the genuinely irreversible actions feel routine.
+///
+/// # The pid is re-derived HERE, not taken from the caller
+///
+/// `session_id` is what this accepts; a pid is not. The session list is
+/// ten seconds stale (`CLAUDE_POLL_MS`) and signalling a pid read off it
+/// is how an unrelated process that inherited the number gets killed.
+/// `caches/mod.rs`'s "re-derived NOW" rule is the precedent, and
+/// `claude::stop::confirm` applies it: the registry is re-read, the
+/// process table re-probed, and the two paired with
+/// `liveness::START_TOLERANCE_SECS`. A start time that cannot be
+/// confirmed is `Unknown`, and `Unknown` REFUSES.
+///
+/// # Why `async`
+///
+/// It signals a process and waits on it. A sync command doing either is
+/// the freeze `no_sync_command_reaches_a_subprocess_or_a_whole_file`
+/// exists to prevent.
+/// # Two whole functions rather than one with a `cfg` block inside
+///
+/// `health::runaway::nice_of` is the house pattern and this follows it.
+/// A single body with `#[cfg(not(unix))] { return Err(..) }` above the
+/// Unix arm compiles on Windows to a `return` followed by code that can
+/// never run, which `-D warnings` rejects as `unreachable_code` -- a
+/// failure visible only on the Windows runner. Gating the WHOLE function
+/// cannot produce that shape.
+#[tauri::command]
+#[cfg(unix)]
+pub async fn claude_stop_session(
+    session_id: String,
+) -> Result<crate::claude::stop::StopOutcome, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        // BOTH re-derived on this call. Nothing about the process is
+        // carried in from the proposal that put the button on screen.
+        let (registry, probe) = registry_and_probe();
+        let confirmed =
+            crate::claude::stop::confirm(&probe, &registry, &session_id).map_err(|r| r.why())?;
+        crate::claude::stop::stop(&crate::claude::stop::UnixSignaller, &confirmed)
+    })
+    .await
+    .map_err(|e| format!("the stop did not run: {e}"))?
+}
+
+/// Windows has no SIGTERM, so there is no stop to offer.
+///
+/// Refused rather than faked. The whole design rests on giving the
+/// session a chance to write its transcript before anything harder
+/// happens, and a platform with no graceful signal cannot honour that --
+/// so this says so instead of reaching for `TerminateProcess`, which is
+/// SIGKILL's equivalent and is precisely what `registry.rs`'s measurement
+/// argues against.
+#[tauri::command]
+#[cfg(not(unix))]
+pub async fn claude_stop_session(
+    session_id: String,
+) -> Result<crate::claude::stop::StopOutcome, String> {
+    let _ = session_id;
+    Err(
+        "stopping a session needs SIGTERM, which this platform does not have -- end it from \
+         its own window instead"
+            .into(),
+    )
+}
+
 #[tauri::command]
 /// Worktrees that have been assessed and are still at the head they were
 /// assessed at.
