@@ -1,10 +1,13 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useFilters } from "../store/filters";
 import type { PrDetail } from "@/types/pr";
 import { stubViewport } from "@/test-utils";
 import { scopeEffect } from "@/lib/branchDelete";
 
 const state = vi.hoisted(() => ({
+  /// Sessions linked to this PR, for the reverse-link tests (#1211).
+  prSessions: [] as { session_id: string; repo: string; number: number; url: string; first_seen_at: string | null }[],
   data: undefined as PrDetail | undefined,
   isLoading: false,
   // True while `usePrDetail` is serving the clicked row's own facts in
@@ -31,6 +34,9 @@ const commentOnPr = vi.fn(() => Promise.resolve());
 const viewer = vi.hoisted(() => ({ current: undefined as string | undefined }));
 
 vi.mock("../api/hooks", () => ({
+  // No linked session by default: the panel renders nothing, which is
+  // what every other assertion in this file assumes (#1211).
+  useClaudeSessionsForPr: () => ({ data: state.prSessions }),
   usePrDetail: () => ({ ...state, error: "boom", refetch: vi.fn() }),
   useActOnPr: () => vi.fn(() => Promise.resolve()),
   useDeleteHeadBranch: () => deleteBranch,
@@ -850,5 +856,75 @@ describe("PrDetailView", () => {
       render(<PrDetailView repo="o/r" number={42} onBack={() => {}} />);
       expect(screen.queryByText(/showing 1 of 1 conversations/i)).toBeNull();
     });
+  });
+});
+
+/// The reverse session link (#1211).
+///
+/// `pr-link` has been read since #1132 and surfaced in one direction
+/// only. This is the other half, and the more useful one: a PR that
+/// broke sends you looking for the session, and finding it by title
+/// fails — 286 of 1,438 sessions share a title with another.
+describe("PrDetailView and the session that wrote the PR", () => {
+  beforeEach(() => {
+    state.prSessions = [];
+  });
+
+  it("renders nothing when this machine holds no transcript for the PR", () => {
+    // Absence means THIS MACHINE has no transcript — it may have been
+    // opened by a teammate, by CI, or by a session since pruned.
+    // Rendering "no session" would be a confident wrong answer about
+    // someone else's work, so the panel is absent entirely.
+    view();
+    expect(screen.queryByText(/Written by/)).toBeNull();
+  });
+
+  it("names the session that produced it", () => {
+    state.prSessions = [
+      {
+        session_id: "e5df3bd1-1b5f-40cf-8d4b-5e0cc8939abc",
+        repo: "acme/api",
+        number: 7,
+        url: "https://github.com/acme/api/pull/7",
+        first_seen_at: "2026-09-01",
+      },
+    ];
+    view();
+    expect(screen.getByText(/Written by/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "e5df3bd1" })).toBeTruthy();
+  });
+
+  it("jumps to that session's detail, on the sessions page", () => {
+    // Three writes in order: the Claude Code view has two pages, and
+    // landing on the overview with a session selected shows the
+    // overview.
+    state.prSessions = [
+      {
+        session_id: "abc12345-0000-0000-0000-000000000000",
+        repo: "acme/api",
+        number: 7,
+        url: "https://github.com/acme/api/pull/7",
+        first_seen_at: null,
+      },
+    ];
+    view();
+    fireEvent.click(screen.getByRole("button", { name: "abc12345" }));
+
+    const st = useFilters.getState();
+    expect(st.claudeSelected).toBe("abc12345-0000-0000-0000-000000000000");
+    expect(st.claudePage).toBe("sessions");
+    expect(st.view).toBe("claude-code");
+  });
+
+  it("lists every session when more than one produced it", () => {
+    // A PR can be the work of several sessions — a first pass and a
+    // fix-up after review is the common shape.
+    state.prSessions = [
+      { session_id: "aaaaaaaa-0000-0000-0000-000000000000", repo: "acme/api", number: 7, url: "u", first_seen_at: null },
+      { session_id: "bbbbbbbb-0000-0000-0000-000000000000", repo: "acme/api", number: 7, url: "u", first_seen_at: null },
+    ];
+    view();
+    expect(screen.getByRole("button", { name: "aaaaaaaa" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "bbbbbbbb" })).toBeTruthy();
   });
 });

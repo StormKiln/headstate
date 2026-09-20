@@ -22,6 +22,7 @@ import type {
   ClaudeCorpus,
   ClaudeSessionList,
   ClaudeSessionDetail,
+  ClaudePrLink,
   WireClaudeSessionList,
   Liveness,
   CleanupPrefs,
@@ -130,6 +131,7 @@ import {
   claudeEventProfile,
   claudeSessions,
   claudeSessionDetail,
+  claudeSessionsForPr,
   claudeTranscriptTail,
   claudeHooksStatus,
   claudeInstallHooks,
@@ -1491,6 +1493,35 @@ export function useClaudeSessionDetail(sessionId: string | null, enabled: boolea
     enabled: enabled && sessionId !== null && sessionId !== "",
     refetchInterval: enabled && sessionId ? CLAUDE_POLL_MS : false,
     staleTime: CLAUDE_POLL_MS - 1_000,
+    retry: false,
+  });
+}
+
+/// The Claude sessions that produced this pull request (#1211).
+///
+/// The reverse of `SessionDetail.pull_requests`, and the more useful
+/// direction: a PR fails CI, and the transcript of the session that
+/// wrote it is one click away rather than a search through 1,453 rows
+/// whose titles collide -- `preview.rs` measures 286 of 1,438 sessions
+/// sharing a title with another.
+///
+/// `staleTime: Infinity` and no poll. A `pr-link` record is written
+/// once, when the PR is opened, and never changes afterwards; a session
+/// that produced a PR does not stop having produced it. Polling would
+/// re-ask a question whose answer is immutable.
+///
+/// `enabled` because this is a secondary panel on a detail view that
+/// already fetches the PR itself -- a closed detail should not pay for
+/// it.
+export function useClaudeSessionsForPr(repo: string, number: number, enabled: boolean) {
+  return useQuery<ClaudePrLink[]>({
+    queryKey: ["claude-sessions-for-pr", repo, number],
+    queryFn: () => claudeSessionsForPr(repo, number),
+    enabled: enabled && repo !== "" && number > 0,
+    staleTime: Infinity,
+    // A machine with no imported transcripts answers with an empty
+    // list, not an error. Retrying an empty answer three times delays
+    // the panel saying so.
     retry: false,
   });
 }

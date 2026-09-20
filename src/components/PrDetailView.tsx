@@ -2,6 +2,7 @@ import { ExternalLink } from "./ExternalLink";
 import { ArrowLeft, Trash2, Bot, Check, CircleDot, CircleSlash, ExternalLink as ExternalLinkIcon, X } from "lucide-react";
 import { toast } from "sonner";
 import {
+  useClaudeSessionsForPr,
   useCommentOnPr,
   useDeleteHeadBranch,
   usePrDetail,
@@ -11,6 +12,8 @@ import {
 } from "../api/hooks";
 import { useState } from "react";
 import type { ReviewVerdictName } from "../api/tauri";
+import type { ClaudePrLink } from "../types/pr";
+import { useFilters } from "../store/filters";
 import { agentPrompt, toAgentContext } from "../lib/agentPrompt";
 import { rerunnableRun } from "../lib/rerun";
 import { useIsMobile } from "../lib/useIsMobile";
@@ -66,6 +69,72 @@ function CheckRow({ name, state, url }: { name: string; state: string; url: stri
 /// tool: no file diff, no commit history, no posting comments. Headstate
 /// is for deciding and acting; reviewing code belongs in GitHub or an
 /// editor, and "View on GitHub" covers the rest.
+/// The Claude sessions that produced this pull request (#1211).
+///
+/// The `pr-link` record has been read since #1132 and surfaced in one
+/// direction only: a session names its pull requests, and a pull
+/// request named nothing. The reverse is the more useful half -- a PR
+/// fails CI, and its session's transcript is one click away rather than
+/// a search through 1,453 rows whose titles collide.
+///
+/// # Absent means something specific, and it is not "no session"
+///
+/// A pull request with no linked session means THIS MACHINE holds no
+/// transcript for it. It may have been opened by a teammate, by CI, or
+/// by a session whose transcript has since been pruned. Rendering that
+/// as "no session" would be a confident wrong answer about someone
+/// else's work, so the panel is absent entirely rather than empty --
+/// the same choice `SessionPullRequests` makes for the same reason.
+function PrSessions({ repo, number }: { repo: string; number: number }) {
+  const q = useClaudeSessionsForPr(repo, number, true);
+  const links = q.data ?? [];
+
+  // Nothing to say: no link recorded here, or the lookup failed. A
+  // failed lookup is deliberately silent rather than an error panel --
+  // this is provenance, not the subject of the page, and a red box
+  // about a secondary join would crowd out the PR the user came for.
+  if (links.length === 0) return null;
+
+  return (
+    <Section title="Written by" count={links.length}>
+      <ul className="space-y-0.5">
+        {links.map((l: ClaudePrLink) => (
+          <li key={l.session_id} className="text-xs">
+            <button
+              type="button"
+              onClick={() => {
+                // `setView` FIRST, and the order is load-bearing: it
+                // resets `claudePage` to "overview" and clears
+                // `claudeSelected`, so the natural-reading order --
+                // select, then page, then view -- lands on the overview
+                // with nothing selected.
+                //
+                // This is #920's bug in a new place. The store's own
+                // `showClaudeSessions` comment records it: "that jump
+                // had to call `setView` BEFORE `setFilter`... the
+                // natural-reading order filed the value under the page
+                // being left and the destination opened on its
+                // default." A test asserting only the view would not
+                // have noticed; the one asserting all three caught it.
+                const st = useFilters.getState();
+                st.setView("claude-code");
+                st.setClaudePage("sessions");
+                st.selectClaudeSession(l.session_id);
+              }}
+              className="text-[#58a6ff] hover:underline"
+            >
+              {l.session_id.slice(0, 8)}
+            </button>
+            {l.first_seen_at ? (
+              <span className="ml-2 text-[#8b949e]">first linked {l.first_seen_at}</span>
+            ) : null}
+          </li>
+        ))}
+      </ul>
+    </Section>
+  );
+}
+
 export function PrDetailView({
   repo,
   number,
@@ -491,6 +560,17 @@ export function PrDetailView({
         repo={pr.repo}
         number={pr.number}
       />
+
+      {/* WHICH SESSION WROTE THIS (#1211). The reverse of the link the
+          Claude Code page has shown since #1132, and the more useful
+          direction: a PR that broke sends you looking for the session,
+          and finding it by title fails -- 286 of 1,438 sessions share a
+          title with another.
+
+          Below the review threads because it answers "where did this
+          come from" rather than "what is wrong with it", and the second
+          question is the one a reader opens a failing PR to ask. */}
+      <PrSessions repo={pr.repo} number={pr.number} />
 
       {pr.comments.length > 0 ? (
         // COLLAPSED past a handful. Fifty comments is the longest block
