@@ -3785,6 +3785,10 @@ export function useClaudeConfigHealth(enabled: boolean) {
     enabled,
     staleTime: Infinity,
     refetchOnWindowFocus: false,
+    retry: false,
+  });
+}
+
 /// Every MCP server configured on this machine, and which scope defines
 /// it (#1216).
 ///

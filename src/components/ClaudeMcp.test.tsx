@@ -249,6 +249,15 @@ describe("mcpInForce", () => {
     expect(mcpInForce(project("/a/b"), "/a/b/")).toBe(true);
   });
 
+  /// A Windows trailing separator must normalise too, matching
+  /// `claude::mcp::normalise`. Trimming only `/` was correct on Unix
+  /// and wrong on Windows -- the same project reported twice, the
+  /// second copy showing none of its servers.
+  it("ignores a trailing backslash", () => {
+    expect(mcpInForce(project("C:\\code\\one\\"), "C:\\code\\one")).toBe(true);
+    expect(mcpInForce(project("C:\\code\\one"), "C:\\code\\one\\")).toBe(true);
+  });
+
   /// No repository means no answer, not a false one.
   it("answers null when no repository is selected", () => {
     expect(mcpInForce(project("/a/b"), undefined)).toBeNull();

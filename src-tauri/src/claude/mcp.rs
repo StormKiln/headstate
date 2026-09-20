@@ -218,7 +218,12 @@ impl Inventory {
 
 /// Trim a trailing path separator so `/a/b` and `/a/b/` compare equal.
 fn normalise(p: &str) -> String {
-    p.trim_end_matches('/').to_string()
+    // BOTH separators. Trimming only `/` is correct on Unix and wrong
+    // on Windows, where Claude Code stores `C:\code\one` and a user may
+    // type `C:\code\one\` -- the same project, reported as two, with
+    // the second showing none of its servers. The repository's
+    // `PathBuf::join` rule is the same hazard one layer down.
+    p.trim_end_matches(['/', '\\']).to_string()
 }
 
 /// `~/.claude.json`.
@@ -835,13 +840,26 @@ mod tests {
             .join("external_plugins")
             .join(name);
         write(&path.join(".mcp.json"), manifest);
+        // Built with `serde_json` rather than `format!`, because a
+        // Windows path interpolated raw into a JSON string is INVALID
+        // JSON: every `\` in `C:\Users\...` is an illegal escape, so
+        // `parse_inventory` rejects the fixture and the plugin tests
+        // fail on Windows only. That is what CI caught -- the fixture
+        // was wrong, not the code under test, which reads a file Claude
+        // Code wrote with proper escaping. Letting the serialiser
+        // escape the path is also the only version that stays correct
+        // for a path containing a quote.
+        let doc = serde_json::json!({
+            "version": 2,
+            "plugins": {
+                format!("{name}@claude-plugins-official"): [
+                    {"scope": "user", "installPath": path.to_string_lossy()}
+                ]
+            }
+        });
         write(
             &plugins.join("installed_plugins.json"),
-            &format!(
-                r#"{{"version": 2, "plugins": {{"{name}@claude-plugins-official":
-                   [{{"scope": "user", "installPath": "{}"}}]}}}}"#,
-                path.display()
-            ),
+            &serde_json::to_string(&doc).unwrap(),
         );
     }
 
@@ -957,6 +975,18 @@ mod tests {
         );
     }
 
+    /// A Windows trailing separator must not hide a project's servers
+    /// either. `normalise` trimming only `/` was correct on Unix and
+    /// wrong on Windows, where the same project would be reported twice
+    /// and the second copy would show nothing.
+    #[test]
+    fn a_trailing_backslash_is_normalised_too() {
+        assert_eq!(normalise(r"C:\code\one\"), r"C:\code\one");
+        assert_eq!(normalise("/Users/x/one/"), "/Users/x/one");
+        // Mixed, as a path that crossed a config file can be.
+        assert_eq!(normalise(r"C:\code\one/"), r"C:\code\one");
+    }
+
     /// A trailing separator must not hide a project's servers.
     #[test]
     fn a_trailing_separator_does_not_change_what_is_in_force() {
@@ -968,5 +998,21 @@ mod tests {
 
         let inv = inventory_in(&home, &plugins);
         assert_eq!(inv.in_force(Path::new("/Users/x/code/one")).len(), 1);
+    }
+    /// Proves the fixture survives a Windows-shaped install path.
+    #[test]
+    fn windows_shaped_install_path_round_trips_through_the_fixture() {
+        let doc = serde_json::json!({
+            "version": 2,
+            "plugins": {
+                "p@m": [{"scope": "user", "installPath": r"C:\Users\runner\plugins\p"}]
+            }
+        });
+        let body = serde_json::to_string(&doc).unwrap();
+        let got = super::super::plugins::parse_inventory(&body).unwrap();
+        assert_eq!(
+            got[0].install_path.as_deref(),
+            Some(r"C:\Users\runner\plugins\p")
+        );
     }
 }

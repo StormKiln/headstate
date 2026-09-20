@@ -859,7 +859,10 @@ const MCP_ORIGIN_LABEL: Record<ClaudeSettingsOrigin, string> = {
 export function mcpInForce(server: ClaudeMcpServer, repo: string | undefined): boolean | null {
   if (repo === undefined) return null;
   if (server.origin !== "project") return true;
-  const trim = (p: string) => p.replace(/\/+$/, "");
+  // BOTH separators, matching `claude::mcp::normalise`. Trimming only
+  // `/` is correct on Unix and wrong on Windows, where the same project
+  // would be reported twice with the second showing nothing.
+  const trim = (p: string) => p.replace(/[/\\]+$/, "");
   return server.scopeDetail !== null && trim(server.scopeDetail) === trim(repo);
 }
 
