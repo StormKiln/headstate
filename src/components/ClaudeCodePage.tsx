@@ -5,8 +5,11 @@ import type {
   ClaudeAgentTypes,
   ClaudeCompactions,
   ClaudeCostState,
+  ClaudeFileChange,
+  ClaudePairing,
   ClaudePreviewBlock,
   ClaudeSession,
+  ClaudeToolArgs,
   ClaudeObservation,
   ClaudeProfile,
   ClaudeSessionDetail,
@@ -2987,7 +2990,18 @@ function TranscriptPreview({ detail: d }: { detail: ClaudeSessionDetail }) {
                   {m.blocks.length === 0 ? (
                     <p className="text-xs text-[#6e7681]">(nothing in this message)</p>
                   ) : (
-                    m.blocks.map((b, j) => <PreviewBlock key={j} block={b} />)
+                    m.blocks.map((b, j) => (
+                      <PreviewBlock
+                        key={j}
+                        block={b}
+                        pairings={data.pairings}
+                        // The session's liveness, passed DOWN rather than
+                        // re-derived. `liveness.rs` owns "is this running"
+                        // and two answers to one question disagree the
+                        // first time either changes.
+                        liveness={d.liveness}
+                      />
+                    ))
                   )}
                 </div>
               </li>
@@ -3009,6 +3023,248 @@ function formatKb(bytes: number): string {
     : `${Math.round(bytes / 1024).toLocaleString()} KB`;
 }
 
+/// A call with no result, said in the way the session's state makes true
+/// (#1209).
+///
+/// # Why this is not one sentence
+///
+/// A `tool_use` with no `tool_result` in the window means one of two
+/// completely different things, and which one depends on whether the
+/// process is still alive:
+///
+/// - **Running** — it is still executing. Nothing is wrong; the result
+///   has not been written yet.
+/// - **Dead** — it never came back. That is the signature of a crash mid
+///   tool call, and it is real information: it says WHERE the session
+///   died, which is exactly what a user resuming it wants to know.
+///
+/// Rendering both as "no result" throws away the second, which is the
+/// only one of the two worth surfacing. This is the house rule stated in
+/// `CLAUDE.md` — "Pending and Unknown are different states" — applied to
+/// a third pair.
+///
+/// `unknown` is a third wording again, and mandatory for `Liveness`'s own
+/// reason: a check that could not be completed is not a shade of dead. A
+/// pane that rendered it as "it never came back" would report a crash for
+/// a session that may be mid-work.
+function UnansweredNote({ liveness }: { liveness: Liveness }) {
+  switch (liveness.state) {
+    case "running":
+      return (
+        <p className="text-[11px] text-[#8b949e]">
+          No result yet — this session is still running, so the call may still be executing.
+        </p>
+      );
+    case "dead":
+      // The crash signature. Worded as a FACT about the recording, not a
+      // diagnosis: we know no result was written, and inferring the
+      // cause from that would be a second claim we cannot support.
+      return (
+        <p className="text-[11px] text-[#d29922]">
+          No result was recorded, and this session is no longer running — the call did not come
+          back.
+        </p>
+      );
+    case "unknown":
+      return (
+        <p className="text-[11px] text-[#8b949e]">
+          No result was recorded. Whether the call is still running could not be determined.
+        </p>
+      );
+  }
+}
+
+/// One tool call's arguments, rendered as the shape that tool takes
+/// (#1209).
+///
+/// Per tool, because they answer different questions: a command is read
+/// as a command, a path as a path, a pattern as a pattern. The `other`
+/// arm keeps the guarantee `Block::Other` makes one level up — a tool
+/// this build does not know is NAMED with its argument keys, so the
+/// reader can tell "Headstate is behind" from "the call was empty".
+function ToolArguments({ args }: { args: ClaudeToolArgs }) {
+  const clipped = (t: boolean) =>
+    t ? <span className="text-[#8b949e]"> … (clipped)</span> : null;
+  const mono = "font-mono text-[11px] text-[#e6edf3]";
+
+  switch (args.tool) {
+    case "bash":
+      return (
+        <div className="mt-0.5">
+          {args.description ? (
+            <p className="text-[11px] text-[#8b949e]">{args.description}</p>
+          ) : null}
+          <pre className="mt-0.5 max-h-24 overflow-auto whitespace-pre-wrap break-words rounded bg-[#161b22] p-1.5 text-[11px] text-[#e6edf3]">
+            {args.command}
+            {args.truncated ? "\n… (clipped)" : ""}
+          </pre>
+        </div>
+      );
+    case "read":
+      return (
+        <p className="mt-0.5 text-[11px] text-[#8b949e]">
+          <span className={mono}>{args.file_path}</span>
+          {/* A window, when one was asked for. Absent is not zero: no
+              offset means the whole file, not offset 0 of nothing. */}
+          {args.offset !== null || args.limit !== null
+            ? ` (from line ${args.offset ?? 1}${args.limit !== null ? `, ${args.limit} lines` : ""})`
+            : ""}
+        </p>
+      );
+    case "write":
+      return (
+        <div className="mt-0.5">
+          <p className="text-[11px] text-[#8b949e]">
+            Wrote <span className={mono}>{args.file_path}</span>
+          </p>
+          <pre className="mt-0.5 max-h-24 overflow-auto whitespace-pre-wrap break-words rounded bg-[#161b22] p-1.5 text-[11px] text-[#8b949e]">
+            {args.content}
+            {args.truncated ? "\n… (clipped)" : ""}
+          </pre>
+        </div>
+      );
+    case "edit":
+      // The ARGUMENTS of an edit, which are the replacement itself. The
+      // diff with context, when one was recorded, comes back on the
+      // result — see `FileChangeView`.
+      return (
+        <div className="mt-0.5">
+          <p className="text-[11px] text-[#8b949e]">
+            <span className={mono}>{args.file_path}</span>
+            {args.replace_all ? " (every occurrence)" : ""}
+          </p>
+          {clipped(args.truncated)}
+        </div>
+      );
+    case "multi_edit":
+      return (
+        <p className="mt-0.5 text-[11px] text-[#8b949e]">
+          <span className={mono}>{args.file_path}</span> —{" "}
+          {args.edits.length.toLocaleString()} replacement
+          {args.edits.length === 1 ? "" : "s"}
+          {/* STATED, not silent. A budget with the total named is the
+              rule `MAX_MESSAGES` follows. */}
+          {args.edits_omitted > 0
+            ? `, and ${args.edits_omitted.toLocaleString()} more not shown`
+            : ""}
+        </p>
+      );
+    case "grep":
+      return (
+        <p className="mt-0.5 text-[11px] text-[#8b949e]">
+          <span className={mono}>{args.pattern}</span>
+          {args.path ? <> in <span className={mono}>{args.path}</span></> : null}
+          {args.output_mode ? ` (${args.output_mode})` : ""}
+        </p>
+      );
+    case "glob":
+      return (
+        <p className="mt-0.5 text-[11px] text-[#8b949e]">
+          <span className={mono}>{args.pattern}</span>
+          {args.path ? <> in <span className={mono}>{args.path}</span></> : null}
+        </p>
+      );
+    case "task":
+      return (
+        <div className="mt-0.5">
+          <p className="text-[11px] text-[#8b949e]">
+            {args.description ?? "A delegated task"}
+            {args.subagent_type ? ` (${args.subagent_type})` : ""}
+          </p>
+          <p className="mt-0.5 whitespace-pre-wrap break-words text-[11px] text-[#6e7681]">
+            {args.prompt}
+            {clipped(args.truncated)}
+          </p>
+        </div>
+      );
+    case "other":
+      // NAMED, never dropped and never dumped. The keys say whether
+      // Headstate simply does not know this tool yet; the values are the
+      // blob that tells a reader nothing.
+      return args.keys.length === 0 ? null : (
+        <p className="mt-0.5 text-[11px] text-[#6e7681]">
+          Arguments this version of Headstate does not know how to show:{" "}
+          <span className="font-mono">{args.keys.join(", ")}</span>
+        </p>
+      );
+    case "none":
+      // Distinct from `other` with no keys, and said so: "nothing was
+      // recorded" is not "we did not recognise what was recorded".
+      return <p className="mt-0.5 text-[11px] text-[#6e7681]">No arguments were recorded.</p>;
+  }
+}
+
+/// A file change, LABELLED with what it was built from (#1209).
+///
+/// The label is the substance, not decoration. A `recorded` diff shows
+/// the lines around the change as the file actually was, because the
+/// transcript wrote them down. A `reconstructed` one shows only the text
+/// that was replaced and what replaced it, because nothing else was
+/// recorded — and a reader who cannot tell the two apart will read the
+/// second as a narrow change when it may have been anything.
+///
+/// The third option — reading the file off disk now — would give every
+/// edit context and is refused. The file has changed since; that is what
+/// a session does. Presenting today's content as the content at the time
+/// of the edit is fabrication, and worse than a gap because it has the
+/// credible shape of a real diff.
+function FileChangeView({ change }: { change: ClaudeFileChange }) {
+  return (
+    <div className="mt-1 rounded border border-[#30363d] bg-[#0d1117] p-1.5">
+      <p className="text-[11px] text-[#8b949e]">
+        {change.created === true ? "Created " : "Changed "}
+        <span className="font-mono text-[#e6edf3]">{change.file_path ?? "a file"}</span>
+      </p>
+      {/* The two sources, worded so they cannot be mistaken for each
+          other. */}
+      <p className="mt-0.5 text-[10px] text-[#6e7681]">
+        {change.source === "recorded"
+          ? "From the diff recorded at the time, so the surrounding lines are the file as it was."
+          : "Reconstructed from the replaced text alone — the transcript recorded no surrounding lines, so none are shown."}
+      </p>
+      {change.hunks.map((h, i) => (
+        <div key={i} className="mt-1">
+          {h.old_start !== null ? (
+            <p className="text-[10px] text-[#6e7681]">Line {h.old_start.toLocaleString()}</p>
+          ) : null}
+          <pre className="overflow-auto whitespace-pre-wrap break-words text-[11px] leading-tight">
+            {h.lines.map((l, j) => (
+              <span
+                key={j}
+                className={
+                  l.op === "added"
+                    ? "block bg-[#0f2e17] text-[#7ee787]"
+                    : l.op === "removed"
+                      ? "block bg-[#3a1418] text-[#ff7b72]"
+                      : "block text-[#8b949e]"
+                }
+              >
+                {l.op === "added" ? "+" : l.op === "removed" ? "-" : " "}
+                {l.text}
+              </span>
+            ))}
+          </pre>
+          {/* PER HUNK. A clipped diff that does not say so is a lie about
+              what changed, and saying it once for the pane does not tell
+              the reader WHICH region is short. */}
+          {h.lines_omitted > 0 ? (
+            <p className="text-[10px] text-[#d29922]">
+              {h.lines_omitted.toLocaleString()} more line
+              {h.lines_omitted === 1 ? "" : "s"} in this hunk are not shown.
+            </p>
+          ) : null}
+        </div>
+      ))}
+      {change.hunks_omitted > 0 ? (
+        <p className="mt-0.5 text-[10px] text-[#d29922]">
+          {change.hunks_omitted.toLocaleString()} more changed region
+          {change.hunks_omitted === 1 ? "" : "s"} in this file are not shown.
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
 /// One content block of a previewed message.
 ///
 /// Five kinds, five renderings, because they answer different questions:
@@ -3016,7 +3272,15 @@ function formatKb(bytes: number): string {
 /// is usually far too long to show whole. Flattening them into prose is
 /// how 12,903 of 13,425 assistant messages would have rendered as nothing
 /// (they stop on `tool_use`).
-function PreviewBlock({ block: b }: { block: ClaudePreviewBlock }) {
+function PreviewBlock({
+  block: b,
+  pairings,
+  liveness,
+}: {
+  block: ClaudePreviewBlock;
+  pairings: Record<string, ClaudePairing>;
+  liveness: Liveness;
+}) {
   switch (b.kind) {
     case "text":
       return (
@@ -3035,21 +3299,51 @@ function PreviewBlock({ block: b }: { block: ClaudePreviewBlock }) {
           {b.truncated ? " … (clipped)" : ""}
         </p>
       );
-    case "tool_use":
-      // The NAME, not the arguments: "Read" tells the reader what the
-      // session was doing and a 40 KB argument blob does not.
+    case "tool_use": {
+      // The name AND the parsed arguments (#1209). The original reading
+      // was right that a 40 KB blob tells a reader nothing; it was wrong
+      // that the remedy is to show nothing. "Ran Bash" and "ran
+      // `cargo test`" are not the same sentence.
+      const pairing = b.id === null ? "unkeyed" : (pairings[b.id] ?? "unanswered");
       return (
-        <p className="text-xs text-[#8b949e]">
-          Ran <span className="font-mono text-[#e6edf3]">{b.name}</span>
-        </p>
+        <div className="text-xs text-[#8b949e]">
+          <p>
+            Ran <span className="font-mono text-[#e6edf3]">{b.name}</span>
+          </p>
+          <ToolArguments args={b.args} />
+          {/* The two call-side orphan cases, resolved against the ONE
+              liveness answer this app has. A call still in flight and a
+              call that never came back are different facts, and the
+              second is the signature of a crash. */}
+          {pairing === "unanswered" ? <UnansweredNote liveness={liveness} /> : null}
+        </div>
       );
-    case "tool_result":
+    }
+    case "tool_result": {
+      const orphaned = b.tool_use_id !== null && pairings[b.tool_use_id] === "call_above_window";
       return (
-        <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-[#161b22] p-1.5 text-[11px] text-[#8b949e]">
-          {b.text || "(no output)"}
-          {b.truncated ? "\n… (clipped)" : ""}
-        </pre>
+        <div>
+          {/* The result-side orphan. NOT a missing call -- a call we did
+              not read, because the 256 KB window began after it. Nothing
+              is wrong with the session, so this must not wear the
+              wording the crash case wears. */}
+          {orphaned ? (
+            <p className="text-[11px] text-[#8b949e]">
+              The call this answers is above the window — it is older than the part of the
+              transcript that was read.
+            </p>
+          ) : null}
+          {b.is_error === true ? (
+            <p className="text-[11px] text-[#f85149]">The tool reported an error.</p>
+          ) : null}
+          <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-[#161b22] p-1.5 text-[11px] text-[#8b949e]">
+            {b.text || "(no output)"}
+            {b.truncated ? "\n… (clipped)" : ""}
+          </pre>
+          {b.change !== null ? <FileChangeView change={b.change} /> : null}
+        </div>
       );
+    }
     case "other":
       // NAMED, not dropped. Claude Code owns this format, and a pane that
       // silently omitted a future block kind would show an exchange with
