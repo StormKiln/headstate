@@ -716,6 +716,309 @@ pub enum Pairing {
     Unkeyed,
 }
 
+/// How much of the region BEHIND the offset is fingerprinted.
+///
+/// See [`Cursor`] for what this defends against and why the region is
+/// bounded. 64 KB is chosen against the record sizes this corpus
+/// actually carries: the module docs measure a median transcript of
+/// 179 KB across a whole session, so 64 KB spans many records rather
+/// than sitting inside one, and a compaction that rewrote history
+/// cannot leave 64 KB of bytes immediately behind our offset byte-for-byte
+/// identical while changing what precedes them.
+///
+/// It is also the cost ceiling of the whole scheme: a poll over an
+/// unchanged file reads 64 KB and one `stat`, not the 76.7 MB the
+/// largest real transcript holds.
+pub const FINGERPRINT_BYTES: u64 = 64 * 1024;
+
+/// Where a follow left off, and what the file looked like there.
+///
+/// Opaque to the caller: the frontend stores it and hands it back, and
+/// every field is only meaningful to [`follow`]. It travels over the
+/// pairing transport with the preview, which is why it is bytes and a
+/// hex digest rather than a file handle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cursor {
+    /// The byte offset the previous read consumed up to. Always at a
+    /// record boundary -- [`follow`] never advances past the last
+    /// newline, for `handoff.rs`'s case 3 reason.
+    pub offset: u64,
+    /// Lowercase hex SHA256 of the [`FINGERPRINT_BYTES`] immediately
+    /// BEHIND `offset` (fewer, when the file is shorter than that).
+    ///
+    /// This is the whole of case 5. See [`follow`].
+    pub behind_digest: String,
+    /// How many bytes that digest covers, so a short file's fingerprint
+    /// is not confused with a long one's.
+    pub behind_bytes: u64,
+}
+
+/// Why a follow read re-read the file from the start instead of
+/// appending to what the caller already had.
+///
+/// Absent is not zero, and these are four different facts with four
+/// different renderings. A follow that collapsed them into "here is some
+/// content" would be the #846 defect: the reader cannot tell a quiet
+/// session from a rewritten history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reread {
+    /// There was no cursor: this is the first read of this file.
+    First,
+    /// `handoff.rs` case 2. The file is SHORTER than the offset, so the
+    /// offset points past the end -- truncated, replaced, or rotated.
+    Shrank,
+    /// `handoff.rs` has no case 5, and this is it. The file is the same
+    /// size or LARGER, so no length comparison catches it, but the bytes
+    /// behind the offset are not the bytes we read last time: history
+    /// was rewritten in place. Compaction does exactly this.
+    ///
+    /// Appending here would splice new content onto a history that no
+    /// longer exists, and nothing in the output would say so.
+    RewrittenBehind,
+}
+
+/// One incremental read of a transcript that is still being written.
+///
+/// # Why this is not [`tail`] on a timer
+///
+/// `tail` reads a 256 KB window every time it is called. At a 3-second
+/// follow that is 256 KB off disk and 200 messages rebuilt per tick, per
+/// open pane, for a file that usually grew by one record. This reads
+/// from a stored offset, so an unchanged file costs one `stat` plus the
+/// bounded fingerprint read and returns no messages at all -- which is
+/// what lets the caller leave the rendered conversation alone.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Follow {
+    /// The messages in the region actually read.
+    ///
+    /// On an append this is ONLY the new ones and the caller appends
+    /// them. On a re-read it is the whole tail window and the caller
+    /// REPLACES what it had -- `reread` says which, and the caller must
+    /// switch on it rather than guess from the count.
+    pub preview: Preview,
+    /// `Some` when this read replaced history rather than extending it,
+    /// carrying WHICH of the three reasons. `None` is the ordinary
+    /// append.
+    pub reread: Option<Reread>,
+    /// Where the next follow should resume.
+    pub cursor: Cursor,
+    /// Bytes read from the transcript itself, EXCLUDING the fingerprint
+    /// probe.
+    ///
+    /// Stated separately from `preview.bytes_read` (which is the same
+    /// number) so a test can assert the read is genuinely incremental:
+    /// output can be identical while the read is unbounded, and asserting
+    /// on messages proves nothing about how much disk was touched.
+    pub bytes_read: u64,
+    /// Bytes read by the case-5 probe, so the total cost of a poll is
+    /// visible rather than hidden.
+    pub fingerprint_bytes_read: u64,
+    /// The file's size at this read.
+    pub file_bytes: u64,
+}
+
+/// Fingerprint the bounded region immediately behind `offset`.
+///
+/// Reads at most [`FINGERPRINT_BYTES`], never the whole file -- reading
+/// the whole file every poll to be safe defeats the point of having an
+/// offset at all.
+fn fingerprint(
+    file: &mut std::fs::File,
+    offset: u64,
+    path: &Path,
+) -> Result<(String, u64), String> {
+    use sha2::{Digest, Sha256};
+    let want = offset.min(FINGERPRINT_BYTES);
+    if want == 0 {
+        return Ok((String::new(), 0));
+    }
+    file.seek(SeekFrom::Start(offset - want))
+        .map_err(|e| format!("{}: could not seek in it: {e}", path.display()))?;
+    let mut buf = vec![0u8; want as usize];
+    file.read_exact(&mut buf)
+        .map_err(|e| format!("{}: could not read it: {e}", path.display()))?;
+    // Hex by fold, matching `remote::identity::fingerprint_of`: sha2's
+    // digest type does not implement `LowerHex`, and two spellings of a
+    // fingerprint in one codebase is how they come to disagree.
+    let digest = Sha256::digest(&buf)
+        .iter()
+        .fold(String::with_capacity(64), |mut acc, b| {
+            use std::fmt::Write;
+            let _ = write!(acc, "{b:02x}");
+            acc
+        });
+    Ok((digest, want))
+}
+
+/// Read whatever is new in `path` since `cursor`.
+///
+/// # The five things that can happen to a transcript between polls
+///
+/// `handoff.rs:21-45` states four for a file that only ever grows, and
+/// that reasoning transfers directly. A transcript has a fifth, because
+/// Claude Code COMPACTS: it replaces the conversation so far with a
+/// summary and keeps writing. Enumerated with what each one answers:
+///
+/// 1. **It grew.** The normal case: read from the offset to the end and
+///    the caller APPENDS.
+/// 2. **It SHRANK.** The offset points past the end, or into the middle
+///    of a different record. Detected by length against the stored
+///    offset; answered by reading the tail window afresh and telling the
+///    caller to REPLACE ([`Reread::Shrank`]).
+/// 3. **It ends mid-line.** A record is appended with one write, but the
+///    file can still be read between two appends. Answered by consuming
+///    only to the last newline and leaving the remainder for the next
+///    poll, so the offset is always at a record boundary.
+/// 4. **It is gone.** An `Err`, unlike handoff's case 4 -- and the
+///    difference is the point. A missing handoff file means the hook is
+///    not installed yet, which is a normal state; a transcript that was
+///    there a moment ago and is not now is a real failure the pane must
+///    state, because `transcript.rs` measures 0% of transcripts missing.
+/// 5. **History was rewritten BEHIND the offset, without the file
+///    shrinking.** No length comparison catches this: compaction
+///    replaces earlier records with a shorter summary and then keeps
+///    appending, so the file is very often the same size or LARGER a
+///    moment later. An append-only reader splices new content onto a
+///    history that no longer exists and reports nothing unusual.
+///
+///    Detected by fingerprinting a BOUNDED region behind the offset --
+///    see [`FINGERPRINT_BYTES`] -- and comparing it with the digest the
+///    previous read stored. Behind the offset rather than at the head of
+///    the file, because a compaction can leave the opening records intact
+///    while rewriting everything since, and the bytes we are about to
+///    append onto are exactly the ones that must still be there.
+///    Answered by reading the tail window afresh and telling the caller
+///    to REPLACE ([`Reread::RewrittenBehind`]).
+///
+/// # Errors
+///
+/// Only when the file cannot be opened, sized, sought or read. A file
+/// that opens and holds nothing new yields a [`Follow`] with no messages
+/// and `bytes_read: 0`, which is "we read it and nothing happened" and is
+/// a different fact from a rejection.
+pub fn follow(path: &Path, cursor: Option<&Cursor>) -> Result<Follow, String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("{}: could not open it: {e}", path.display()))?;
+    let file_bytes = file
+        .metadata()
+        .map_err(|e| format!("{}: could not read its size: {e}", path.display()))?
+        .len();
+
+    // Case 5's probe runs BEFORE the length test is allowed to conclude
+    // anything, because a rewrite that also grew the file passes every
+    // length test there is.
+    let mut fingerprint_bytes_read = 0u64;
+    let reread = match cursor {
+        None => Some(Reread::First),
+        Some(c) if c.offset > file_bytes => Some(Reread::Shrank),
+        Some(c) => {
+            let (digest, covered) = fingerprint(&mut file, c.offset, path)?;
+            fingerprint_bytes_read = covered;
+            if digest == c.behind_digest && covered == c.behind_bytes {
+                None
+            } else {
+                Some(Reread::RewrittenBehind)
+            }
+        }
+    };
+
+    // On a re-read the caller is getting a fresh window, so this is
+    // `tail`'s own 256 KB bound rather than a second one to keep in sync.
+    // On an append it is whatever is new, which is usually one record.
+    let start = match reread {
+        Some(_) => file_bytes.saturating_sub(TAIL_BYTES),
+        None => cursor.map_or(0, |c| c.offset),
+    };
+
+    // `take`, not `read_to_end`, and the bound is the whole point rather
+    // than belt-and-braces.
+    //
+    // `read_to_end` from a seek reads to EOF, so "only the new region"
+    // would be a property of where we seeked to and of nothing else --
+    // and `bytes_read` computed from the buffer afterwards would report
+    // whatever the buffer happened to hold, which an implementation that
+    // read the whole file and trimmed the output could satisfy exactly.
+    // A previous ticket shipped that flaw, and the sabotage run for
+    // #1208 reproduced it: trimming the buffer before measuring it made
+    // the figure honest-looking while the read was unbounded.
+    //
+    // Reading through a bounded reader makes the limit a property of the
+    // READ. The ceiling cannot be exceeded, so `bytes_read` cannot
+    // overstate what was touched, and the test that asserts on it is
+    // asserting about disk rather than about output.
+    let limit = file_bytes.saturating_sub(start);
+    file.seek(SeekFrom::Start(start))
+        .map_err(|e| format!("{}: could not seek in it: {e}", path.display()))?;
+    let mut buf = Vec::with_capacity(limit.min(TAIL_BYTES) as usize);
+    let mut bounded = std::io::Read::take(&mut file, limit);
+    bounded
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("{}: could not read it: {e}", path.display()))?;
+    // Measured at the SOURCE -- `limit` minus what the bounded reader
+    // still had left -- rather than from `buf.len()` afterwards.
+    //
+    // This is not pedantry. `buf.len()` reports what the buffer holds,
+    // and an implementation that read the whole file and then trimmed
+    // the buffer back to the new region reports an honest-looking figure
+    // for a read that touched everything. #1208's sabotage run built
+    // exactly that and the byte assertion passed against it, twice --
+    // once measuring `buf.len()` and once after the `take` bound was
+    // added but still measured from the buffer.
+    //
+    // Taken from the reader, the figure cannot be reached by anything
+    // that happens to the buffer later.
+    let bytes_read = limit - bounded.limit();
+
+    // Case 3. Everything after the last newline is a record still being
+    // written; it is left for the next poll and the offset stops short of
+    // it, so the cursor is always at a record boundary.
+    let consumed = match buf.iter().rposition(|b| *b == b'\n') {
+        Some(ix) => ix as u64 + 1,
+        None => 0,
+    };
+    let text = String::from_utf8_lossy(&buf[..consumed as usize]);
+    let mut body: &str = &text;
+
+    // A re-read that did not reach the start of the file landed mid-record,
+    // exactly as `tail` does, and drops to the first newline for the same
+    // reason. An APPEND starts at a record boundary by construction and
+    // must not drop its first record.
+    let mid_record = reread.is_some() && start > 0;
+    if mid_record {
+        body = match body.find('\n') {
+            Some(nl) => &body[nl + 1..],
+            None => "",
+        };
+    }
+
+    let mut preview = Preview {
+        bytes_read,
+        file_bytes,
+        truncated: mid_record,
+        ..Default::default()
+    };
+    parse_into(body, &mut preview);
+    cap_messages(&mut preview);
+
+    let offset = start + consumed;
+    let (behind_digest, behind_bytes) = fingerprint(&mut file, offset, path)?;
+    fingerprint_bytes_read += behind_bytes;
+
+    Ok(Follow {
+        preview,
+        reread,
+        cursor: Cursor {
+            offset,
+            behind_digest,
+            behind_bytes,
+        },
+        bytes_read,
+        fingerprint_bytes_read,
+        file_bytes,
+    })
+}
+
 /// Read the tail of `path` as conversation.
 ///
 /// # Errors
@@ -762,9 +1065,21 @@ pub fn tail(path: &Path) -> Result<Preview, String> {
         };
     }
 
+    parse_into(body, &mut out);
+    cap_messages(&mut out);
+
+    Ok(out)
+}
+
+/// Parse a window of JSONL into `out`, counting what it excludes.
+///
+/// Shared by [`tail`] and [`follow`] so the two readings of one file can
+/// never disagree about which records are conversation. The allowlist,
+/// the counts and the "absent is not zero" split all live here once.
+fn parse_into(body: &str, out: &mut Preview) {
     // Accumulated apart from `out.lifecycle` because whether it may be
     // PUBLISHED is not known until the whole window has been read -- see
-    // the `truncated` gate below.
+    // the `truncated` gate at the end of this function.
     let mut queue = QueueTally::default();
 
     for line in body.lines() {
@@ -830,7 +1145,24 @@ pub fn tail(path: &Path) -> Result<Preview, String> {
             blocks,
         });
     }
+    // AFTER the cap, because the drain can set `truncated` too. A
+    // balance is only publishable when every operation in the window was
+    // seen: an `enqueue` we did not read whose `dequeue` we did gives a
+    // negative queue, and the reverse gives a phantom pending prompt.
+    // Both look like answers. `None` says we did not measure it (#1206).
+    cap_messages(out);
+    if !out.truncated {
+        out.lifecycle.queue = Some(queue.into_queue());
+    }
+    // Pairing runs AFTER the cap too, so it describes the window the
+    // reader is actually shown (#1209). Computing it before would pair a
+    // call against a result that then got dropped, and the pane would
+    // render "paired" beside a block with nothing to pair to.
+    pair(out);
+}
 
+/// Apply [`MAX_MESSAGES`], stating it when it binds.
+fn cap_messages(out: &mut Preview) {
     if out.messages.len() > MAX_MESSAGES {
         // The OLDEST go, not the newest: the last exchange before a
         // session died is the thing a user wants before resuming, and it
@@ -838,22 +1170,6 @@ pub fn tail(path: &Path) -> Result<Preview, String> {
         out.messages.drain(..out.messages.len() - MAX_MESSAGES);
         out.truncated = true;
     }
-
-    // AFTER the drain, because the drain can set `truncated` too. A
-    // balance is only publishable when every operation in the file was
-    // seen: an `enqueue` we did not read whose `dequeue` we did gives a
-    // negative queue, and the reverse gives a phantom pending prompt.
-    // Both look like answers. `None` says we did not measure it.
-    if !out.truncated {
-        out.lifecycle.queue = Some(queue.into_queue());
-    }
-    // Pairing runs AFTER the message cap, so it describes the window the
-    // reader is actually shown. Computing it before would pair a call
-    // against a result that then got dropped, and the pane would render
-    // "paired" beside a block with nothing to pair to.
-    pair(&mut out);
-
-    Ok(out)
 }
 
 /// The queue operations seen so far, before it is known whether the
@@ -2601,5 +2917,399 @@ mod tests {
         if let Err(e) = got {
             assert!(e.contains("could not open it"), "{e}");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Following a live transcript (#1208). The four cases `handoff.rs`
+    // enumerates, plus the fifth it does not have.
+    // -----------------------------------------------------------------
+
+    /// One `user` record carrying `text`, as the corpus writes them.
+    fn rec(text: &str) -> String {
+        format!(
+            r#"{{"type":"user","timestamp":"2026-01-01T00:00:00Z","message":{{"role":"user","content":"{text}"}}}}"#
+        )
+    }
+
+    fn append(p: &Path, line: &str) {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(p).unwrap();
+        writeln!(f, "{line}").unwrap();
+    }
+
+    fn texts(pv: &Preview) -> Vec<String> {
+        pv.messages
+            .iter()
+            .flat_map(|m| m.blocks.iter())
+            .filter_map(|b| match b {
+                Block::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_first_follow_reads_a_window_and_says_it_is_the_first() {
+        let tmp = Tmp::new("follow-first");
+        let p = write(tmp.path(), "s.jsonl", &[&rec("one"), &rec("two")]);
+
+        let f = follow(&p, None).unwrap();
+        assert_eq!(f.reread, Some(Reread::First));
+        assert_eq!(texts(&f.preview), vec!["one", "two"]);
+        // The cursor lands at the end of the last complete record, which
+        // for a file ending in a newline is the whole file.
+        assert_eq!(f.cursor.offset, f.file_bytes);
+    }
+
+    /// Case 1: it grew. The follow returns ONLY what is new.
+    #[test]
+    fn an_appended_record_is_the_only_thing_the_next_follow_returns() {
+        let tmp = Tmp::new("follow-grew");
+        let p = write(tmp.path(), "s.jsonl", &[&rec("one"), &rec("two")]);
+
+        let first = follow(&p, None).unwrap();
+        append(&p, &rec("three"));
+        let next = follow(&p, Some(&first.cursor)).unwrap();
+
+        assert_eq!(next.reread, None, "an append is not a re-read");
+        assert_eq!(texts(&next.preview), vec!["three"]);
+    }
+
+    /// The bound this whole design exists for, asserted on BYTES READ
+    /// rather than on output.
+    ///
+    /// Output can be identical while the read is unbounded: a `tail` on a
+    /// timer returns the same three messages and reads 256 KB to do it.
+    /// So this asserts that the incremental read touched only the new
+    /// region -- and it uses a file big enough that a whole-file read
+    /// would be unmistakable.
+    ///
+    /// # This test failed twice before it worked
+    ///
+    /// Recorded because the failure mode is the subtle one and the fix
+    /// is not obvious from the assertion.
+    ///
+    /// The sabotage is "read the whole file, then trim the buffer back to
+    /// the new region": the messages come out identical, which is exactly
+    /// the flaw a previous ticket shipped. With `bytes_read` computed
+    /// from `buf.len()` AFTER the trim, the figure was honest-looking and
+    /// this test passed against it. Adding `Read::take` did not fix it on
+    /// its own -- the figure was still read off the buffer.
+    ///
+    /// It fails now because [`follow`] takes the figure from the bounded
+    /// reader itself, before anything can touch the buffer. Re-run the
+    /// sabotage and this reports "read 188991 bytes for a 101-byte
+    /// record".
+    #[test]
+    fn an_incremental_follow_reads_only_the_new_region() {
+        let tmp = Tmp::new("follow-bytes");
+        // ~200 KB of history, so a whole-file read is two orders of
+        // magnitude larger than the increment.
+        let history: Vec<String> = (0..2_000).map(|i| rec(&format!("r{i}"))).collect();
+        let refs: Vec<&str> = history.iter().map(String::as_str).collect();
+        let p = write(tmp.path(), "s.jsonl", &refs);
+        let size = std::fs::metadata(&p).unwrap().len();
+        assert!(size > 100_000, "fixture is only {size} bytes");
+
+        let first = follow(&p, None).unwrap();
+        let new = rec("the new one");
+        append(&p, &new);
+        let next = follow(&p, Some(&first.cursor)).unwrap();
+
+        // The record plus its newline, and NOTHING else.
+        assert_eq!(
+            next.bytes_read,
+            new.len() as u64 + 1,
+            "read {} bytes for a {}-byte record in a {size}-byte file",
+            next.bytes_read,
+            new.len() + 1
+        );
+        // And the SEEK is where the cursor said, not at the start. This
+        // is the half the figure above cannot prove on its own: an
+        // implementation that read the whole file and trimmed its output
+        // can report an honest-looking `bytes_read` -- the sabotage run
+        // for #1208 built exactly that and the byte figure alone passed.
+        //
+        // The cursor is the offset consumed so far, so the only region a
+        // correct read can have touched is `[cursor, file_bytes)`. Asserted
+        // against the file's own size rather than against a constant, so
+        // it stays true as the fixture changes.
+        assert_eq!(
+            first.cursor.offset + next.bytes_read,
+            next.file_bytes,
+            "the read must have started at the cursor and ended at EOF"
+        );
+        assert_eq!(next.cursor.offset, next.file_bytes);
+        // The fingerprint probe is bounded too, and stated separately so
+        // its cost is visible rather than hidden inside the figure above.
+        assert_eq!(
+            next.fingerprint_bytes_read,
+            FINGERPRINT_BYTES * 2,
+            "the probe runs twice -- verify, then re-fingerprint"
+        );
+    }
+
+    /// Case 2: it SHRANK. `handoff.rs`'s own case, and a length
+    /// comparison catches it.
+    #[test]
+    fn a_truncated_transcript_is_re_read_from_the_start() {
+        let tmp = Tmp::new("follow-shrank");
+        let p = write(tmp.path(), "s.jsonl", &[&rec("one"), &rec("two")]);
+        let first = follow(&p, None).unwrap();
+
+        // Replaced by something shorter.
+        write(tmp.path(), "s.jsonl", &[&rec("fresh")]);
+        let next = follow(&p, Some(&first.cursor)).unwrap();
+
+        assert_eq!(next.reread, Some(Reread::Shrank));
+        assert_eq!(texts(&next.preview), vec!["fresh"]);
+    }
+
+    /// Case 3: it ends mid-line. The cursor stops at the last newline, so
+    /// the half-written record is read whole on the next poll and never
+    /// counted as unparseable.
+    #[test]
+    fn a_half_written_record_is_left_for_the_next_poll() {
+        use std::io::Write;
+        let tmp = Tmp::new("follow-partial");
+        let p = write(tmp.path(), "s.jsonl", &[&rec("one")]);
+        let first = follow(&p, None).unwrap();
+
+        // The record arrives in two writes, and the poll lands between
+        // them.
+        let whole = rec("two");
+        let (head, rest) = whole.split_at(20);
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+            write!(f, "{head}").unwrap();
+        }
+        let mid = follow(&p, Some(&first.cursor)).unwrap();
+        assert_eq!(texts(&mid.preview), Vec::<String>::new());
+        assert_eq!(
+            mid.preview.unparseable_records, 0,
+            "half a record is not a broken record"
+        );
+        assert_eq!(mid.cursor.offset, first.cursor.offset, "the cursor held");
+
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+            writeln!(f, "{rest}").unwrap();
+        }
+        let done = follow(&p, Some(&mid.cursor)).unwrap();
+        assert_eq!(texts(&done.preview), vec!["two"]);
+    }
+
+    /// Case 4: it is gone. An `Err`, NOT an empty conversation -- and
+    /// deliberately unlike `handoff.rs`'s case 4, which reports a missing
+    /// file as "nothing to read" because a machine without the hook
+    /// installed looks exactly like that. A transcript that was there a
+    /// moment ago and is not now is a real failure.
+    #[test]
+    fn a_transcript_that_vanished_mid_follow_is_an_error() {
+        let tmp = Tmp::new("follow-gone");
+        let p = write(tmp.path(), "s.jsonl", &[&rec("one")]);
+        let first = follow(&p, None).unwrap();
+        std::fs::remove_file(&p).unwrap();
+
+        let err = follow(&p, Some(&first.cursor)).unwrap_err();
+        assert!(err.contains("could not open it"), "{err}");
+    }
+
+    /// CASE 5, which `handoff.rs` does not have: compaction rewrites
+    /// history BEHIND the offset and the file does NOT shrink.
+    ///
+    /// The fixture is the whole point. It replaces the records before the
+    /// cursor with DIFFERENT records of greater total length, so the file
+    /// is LARGER afterwards and every length comparison says "it grew" --
+    /// which is exactly what an append-only reader would conclude before
+    /// splicing new content onto a history that no longer exists.
+    ///
+    /// A fixture that shrank the file would be testing case 2 and would
+    /// prove nothing about this one.
+    #[test]
+    fn history_rewritten_behind_the_offset_is_detected_and_re_read() {
+        let tmp = Tmp::new("follow-compact");
+        // Enough history that the rewrite lands inside the fingerprinted
+        // region, which is what a real compaction does.
+        let before: Vec<String> = (0..400).map(|i| rec(&format!("old-{i}"))).collect();
+        let refs: Vec<&str> = before.iter().map(String::as_str).collect();
+        let p = write(tmp.path(), "s.jsonl", &refs);
+
+        let first = follow(&p, None).unwrap();
+        let size_before = first.file_bytes;
+        assert_eq!(first.cursor.offset, size_before);
+
+        // Compaction: the history is REPLACED in place by a summary, and
+        // the session keeps writing. Deliberately padded so the rewritten
+        // history is LONGER than what it replaced.
+        let after: Vec<String> = (0..400)
+            .map(|i| rec(&format!("summarised-{i}-padded-to-be-longer")))
+            .collect();
+        let mut refs: Vec<&str> = after.iter().map(String::as_str).collect();
+        let fresh = rec("after the compaction");
+        refs.push(&fresh);
+        write(tmp.path(), "s.jsonl", &refs);
+
+        let size_after = std::fs::metadata(&p).unwrap().len();
+        assert!(
+            size_after > size_before,
+            "the fixture must NOT shrink the file: {size_before} -> {size_after}. \
+             A shrinking fixture tests case 2 and proves nothing here."
+        );
+        assert!(
+            size_after > first.cursor.offset,
+            "the stored offset must still be inside the file, so no length \
+             comparison can catch this"
+        );
+
+        let next = follow(&p, Some(&first.cursor)).unwrap();
+
+        assert_eq!(
+            next.reread,
+            Some(Reread::RewrittenBehind),
+            "a rewrite behind the offset that did not shrink the file must \
+             be detected, not appended onto"
+        );
+        // And it RE-READ rather than appended: the window carries the
+        // rewritten history, not just the one record past the old offset.
+        let got = texts(&next.preview);
+        assert!(
+            got.iter().any(|t| t.starts_with("summarised-")),
+            "the re-read must carry the rewritten history, got {got:?}"
+        );
+        assert!(
+            got.iter().all(|t| !t.starts_with("old-")),
+            "no record from the history that no longer exists may survive, got {got:?}"
+        );
+        assert_eq!(got.last().map(String::as_str), Some("after the compaction"));
+    }
+
+    /// The fingerprint is of the region BEHIND the offset, not of the
+    /// head of the file.
+    ///
+    /// A compaction can leave the opening records byte-for-byte intact
+    /// while rewriting everything since -- and Claude Code's transcripts
+    /// open with bookkeeping records (`queue-operation`, `mode`,
+    /// `permission-mode`, `atis-latch`) that a compaction has no reason
+    /// to touch.
+    ///
+    /// The fixture's untouched head is deliberately LARGER than
+    /// [`FINGERPRINT_BYTES`], which is what makes this a real test rather
+    /// than a restatement of the one above. With a head shorter than the
+    /// window, a fingerprint anchored at byte zero still reaches into the
+    /// rewritten region and catches the change by accident -- so the test
+    /// would pass against the wrong implementation. Here it cannot: a
+    /// head fingerprint sees 64 KB of bytes nobody changed and concludes
+    /// the history is intact.
+    ///
+    /// **Sabotage-proven**: seek to `0` instead of `offset - want` in
+    /// [`fingerprint`] and this fails.
+    #[test]
+    fn an_unchanged_head_does_not_excuse_a_rewritten_tail() {
+        let tmp = Tmp::new("follow-head");
+        // Bigger than the fingerprint window on its own, so a probe
+        // anchored at byte zero never reaches what changed.
+        let head: Vec<String> = (0..1_200).map(|i| rec(&format!("preamble-{i}"))).collect();
+        let head_bytes: usize = head.iter().map(|l| l.len() + 1).sum();
+        assert!(
+            head_bytes as u64 > FINGERPRINT_BYTES,
+            "the untouched head must exceed the fingerprint window, or a \
+             head-anchored probe would catch the rewrite by accident and \
+             this test would prove nothing: {head_bytes} bytes"
+        );
+
+        let mut lines = head.clone();
+        lines.extend((0..400).map(|i| rec(&format!("old-{i}"))));
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let p = write(tmp.path(), "s.jsonl", &refs);
+
+        let first = follow(&p, None).unwrap();
+
+        // Only the tail is rewritten, and it grows.
+        let mut lines = head.clone();
+        lines.extend((0..400).map(|i| rec(&format!("new-{i}-padded-out-longer"))));
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        write(tmp.path(), "s.jsonl", &refs);
+
+        // The first FINGERPRINT_BYTES of the file are byte-for-byte what
+        // they were, by construction -- asserted rather than assumed.
+        let on_disk = std::fs::read(&p).unwrap();
+        let before = head.join("\n") + "\n";
+        assert_eq!(
+            &on_disk[..FINGERPRINT_BYTES as usize],
+            &before.as_bytes()[..FINGERPRINT_BYTES as usize],
+            "the head must be untouched for this test to mean anything"
+        );
+        assert!(
+            std::fs::metadata(&p).unwrap().len() > first.file_bytes,
+            "and it grew"
+        );
+
+        let next = follow(&p, Some(&first.cursor)).unwrap();
+        assert_eq!(
+            next.reread,
+            Some(Reread::RewrittenBehind),
+            "a probe anchored at the head of the file would have seen 64 KB \
+             of unchanged preamble and concluded the history was intact"
+        );
+    }
+
+    /// An unchanged file reads NO transcript bytes and returns no
+    /// messages.
+    ///
+    /// This is what makes "the session is idle" a fact the pane can state
+    /// rather than infer: we read, and there was nothing. It is not the
+    /// same as the follow having stopped, and the UI renders them
+    /// differently (#846, #1042).
+    #[test]
+    fn a_poll_over_an_unchanged_transcript_reads_nothing() {
+        let tmp = Tmp::new("follow-idle");
+        let p = write(tmp.path(), "s.jsonl", &[&rec("one")]);
+        let first = follow(&p, None).unwrap();
+        let next = follow(&p, Some(&first.cursor)).unwrap();
+
+        assert_eq!(next.reread, None);
+        assert_eq!(next.bytes_read, 0);
+        assert!(next.preview.messages.is_empty());
+        assert_eq!(next.cursor, first.cursor, "the cursor did not move");
+    }
+
+    /// A transcript shorter than the fingerprint window still follows.
+    ///
+    /// The probe reads `min(offset, FINGERPRINT_BYTES)`, so a two-record
+    /// file fingerprints its whole self rather than seeking before byte
+    /// zero.
+    #[test]
+    fn a_transcript_smaller_than_the_fingerprint_window_still_follows() {
+        let tmp = Tmp::new("follow-small");
+        let p = write(tmp.path(), "s.jsonl", &[&rec("one")]);
+        let first = follow(&p, None).unwrap();
+        assert!(first.cursor.behind_bytes < FINGERPRINT_BYTES);
+        assert_eq!(first.cursor.behind_bytes, first.cursor.offset);
+
+        append(&p, &rec("two"));
+        let next = follow(&p, Some(&first.cursor)).unwrap();
+        assert_eq!(next.reread, None);
+        assert_eq!(texts(&next.preview), vec!["two"]);
+    }
+
+    /// A rewrite inside a SHORT file is caught too.
+    ///
+    /// The short-file path fingerprints from byte zero, which is the one
+    /// case where "behind the offset" and "the head of the file" coincide
+    /// -- and it must still detect the rewrite rather than shortcut.
+    #[test]
+    fn a_rewrite_in_a_short_transcript_is_detected() {
+        let tmp = Tmp::new("follow-small-rewrite");
+        let p = write(tmp.path(), "s.jsonl", &[&rec("one")]);
+        let first = follow(&p, None).unwrap();
+
+        // Same record count, longer content, so the file grew.
+        write(tmp.path(), "s.jsonl", &[&rec("one-but-rewritten-longer")]);
+        assert!(std::fs::metadata(&p).unwrap().len() > first.file_bytes);
+
+        let next = follow(&p, Some(&first.cursor)).unwrap();
+        assert_eq!(next.reread, Some(Reread::RewrittenBehind));
+        assert_eq!(texts(&next.preview), vec!["one-but-rewritten-longer"]);
     }
 }

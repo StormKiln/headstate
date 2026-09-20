@@ -28,6 +28,8 @@ import type {
   PluginsReport,
   ClaudeRestartList,
   ClaudePreview,
+  ClaudeFollow,
+  ClaudeFollowCursor,
   ClaudeSessionDetail,
   ClaudeStopProposal,
   ClaudeStopOutcome,
@@ -1209,6 +1211,23 @@ export const claudeEventProfile = () => call<ClaudeCorpus>("claude_event_profile
 /// machine cannot be pulled over the pairing transport.
 export const claudeTranscriptTail = (path: string) =>
   call<ClaudePreview>("claude_transcript_tail", { path });
+
+/// One incremental step of following a live transcript (#1208).
+///
+/// The companion to `claudeTranscriptTail` and deliberately a separate
+/// command: `tail` answers "show me this session" and reads a 256 KB
+/// window every call, which is the wrong shape for a poll. This answers
+/// "what changed since byte N" and reads nothing when nothing did.
+///
+/// `cursor` is opaque -- whatever the last call returned, handed back
+/// unread. `null` on the first poll.
+///
+/// `Class::Read`, bounded by the same constants as `tail` plus a 64 KB
+/// fingerprint probe; the phone's case is the stronger one, because a
+/// companion user watching a RUNNING agent is exactly who a frozen
+/// snapshot fails.
+export const claudeTranscriptFollow = (path: string, cursor: ClaudeFollowCursor | null) =>
+  call<ClaudeFollow>("claude_transcript_follow", { path, cursor });
 
 // ---------------------------------------------------------------------
 // The Claude Code hook installer (#915). Rust side:

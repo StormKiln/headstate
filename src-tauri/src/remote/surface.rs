@@ -483,6 +483,19 @@ pub const SURFACE: &[(&str, Class)] = &[
     // from a paired device rather than from this machine's own frontend;
     // `claude_transcript_path` in `commands.rs` argues it.
     ("claude_transcript_tail", Class::Read),
+    // One incremental step of following a live transcript (#1208).
+    //
+    // `Read` on exactly the grounds the row above carries, and the phone
+    // benefits more than the desktop again: a companion user watching a
+    // running agent gets the transcript as it is written rather than a
+    // snapshot frozen at the moment they tapped.
+    //
+    // It reads LESS than the row above, not more. `tail` pulls a 256 KB
+    // window per call; this reads from the cursor the caller returns, so
+    // a poll over a transcript that did not change moves no transcript
+    // bytes at all -- only the bounded 64 KB fingerprint that detects a
+    // compaction having rewritten history behind the cursor.
+    ("claude_transcript_follow", Class::Read),
     // Whether the Claude Code hooks are in `~/.claude/settings.json`
     // (#915).
     //
@@ -1098,6 +1111,9 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "claude_usage_profile" => res(commands::claude_usage_profile(app.clone()).await),
         "claude_session_usage" => res(commands::claude_session_usage(a.get("path")?).await),
         "claude_transcript_tail" => res(commands::claude_transcript_tail(a.get("path")?).await),
+        "claude_transcript_follow" => {
+            res(commands::claude_transcript_follow(a.get("path")?, a.get("cursor")?).await)
+        }
         "claude_hooks_inventory" => res(commands::claude_hooks_inventory()),
         "claude_effective_settings" => {
             res(commands::claude_effective_settings(a.get("repoPath")?).await)

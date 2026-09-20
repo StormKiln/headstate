@@ -258,6 +258,14 @@ const ROWS: Row[] = [
   row(api.claudeSessionEvents, ["s1"], "claude_session_events", { sessionId: "s1" }),
   row(api.claudeEventProfile, [], "claude_event_profile"),
   row(api.claudeTranscriptTail, [path], "claude_transcript_tail", { path }),
+  // #1208. `cursor` rides as an explicit `null` on the first poll rather
+  // than being omitted: the Rust argument is an `Option`, and a key that
+  // is present-and-null and a key that is absent must not become two
+  // different wire shapes for one call.
+  row(api.claudeTranscriptFollow, [path, null], "claude_transcript_follow", {
+    path,
+    cursor: null,
+  }),
   row(api.claudeRevealPath, [path], "claude_reveal_path", { path }),
   row(api.readClaudeMd, [path], "read_claude_md", { path }),
   // The Claude Code hook installer (#915). All four take no arguments: the
