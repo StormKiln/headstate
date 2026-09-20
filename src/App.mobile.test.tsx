@@ -386,6 +386,6 @@ describe("the phone's shell with the desktop unreachable", () => {
     expect(screen.queryByText(/not signed in to GitHub/i)).toBeNull();
     expect(screen.queryByText(/brew install/i)).toBeNull();
     // And the app is genuinely there underneath, not merely uncovered.
-    expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Pull requests");
+    expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("My pull requests");
   });
 });

@@ -631,6 +631,47 @@ describe("StatsPage honesty", () => {
   /// the LIVE figure, not the one frozen at load time. Without this the
   /// page states a number that never moves while collection continues,
   /// which is indistinguishable from a collection that has stopped.
+  /// The FIRST interval, before any frame exists (#1115).
+  ///
+  /// The worker sleeps one `BACKFILL_INTERVAL` before its first tick and
+  /// walks one scope per tick, so a freshly opened scope waits up to a
+  /// minute -- longer with other scopes registered ahead of it. That
+  /// window used to render nothing at all, which is the exact silence
+  /// the activity line exists to remove: an incomplete board saying
+  /// what it is missing and nothing about what is being done reads as
+  /// broken, which is what was reported against v5.23.3.
+  it("says collection is starting before the first frame arrives", () => {
+    vi.mocked(useStatsBoard).mockReturnValue(
+      settled(board({ complete: false, total: 500, retrieved: 120, accumulating: true })),
+    );
+    // No frame yet -- the hook's own default, and the state under test.
+    vi.mocked(useStatsBackfill).mockReturnValue(null);
+    render(<StatsPage />);
+    fireEvent.click(screen.getByRole("tab", { name: /others/i }));
+    expect(screen.getByText(/Collection starting/)).toBeTruthy();
+  });
+
+  it("stops saying starting once a frame has arrived", () => {
+    // The other half: "starting" must not outlive the start. A label
+    // that stuck would be the #1103 complaint again -- an unchanging
+    // sentence for ten minutes reads as a page that has stopped.
+    vi.mocked(useStatsBoard).mockReturnValue(
+      settled(board({ complete: false, total: 500, retrieved: 120, accumulating: true })),
+    );
+    vi.mocked(useStatsBackfill).mockReturnValue({
+      scopeKey: "board|merged|*|org:acme",
+      daysCovered: 18,
+      daysTotal: 30,
+      collected: 400,
+      total: 500,
+      phase: { kind: "working" },
+      nextTickAtMs: null,
+    });
+    render(<StatsPage />);
+    fireEvent.click(screen.getByRole("tab", { name: /others/i }));
+    expect(screen.queryByText(/Collection starting/)).toBeNull();
+  });
+
   it("shows the backfill's live figures rather than the board's snapshot", () => {
     vi.mocked(useStatsBoard).mockReturnValue(
       settled(

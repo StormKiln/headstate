@@ -25,6 +25,24 @@ read, because GitHub scopes cache WRITES to the branch that made them.
 the other half of #901's ask -- "decide a budget per job class and assert
 it, rather than discovering the ceiling through a 3x-slower run".
 
+---- What FAILS a run, and what only gets printed (#1107) ----
+
+Two findings follow from a diff and block it: a Rust job class with no
+declared budget, and a class that has outgrown its ceiling. Both are
+fixed by editing this file or the job.
+
+Two are the repository's state at that moment and are printed WITHOUT
+failing: a base-ref total over budget, and duplicate live generations
+left by a dependency bump that already merged. Neither can be caused or
+cured from a branch -- nobody can evict a cache entry from a pull
+request -- so blocking on them stopped unrelated work for a reason its
+author could not act on. That is the cry-wolf shape this project refuses
+elsewhere, and dismissing a guard is how a real regression gets through.
+
+The floor is blocking despite not being anybody's fault: a measurement
+that did not happen is a broken guard, and a 0.00GB "under budget" would
+be the most reassuring possible way to report that (#853).
+
 ---- Why a budget guard and not a prune workflow ----
 
 A scheduled REST prune was the other candidate. It is real new surface --
@@ -141,8 +159,26 @@ def _is_base(entry: dict) -> bool:
     return ref == BASE_REF or ref.startswith("refs/tags/")
 
 
-def verdict(entries: list[dict]) -> list[str]:
-    """BUDGET findings for the measured cache entries. Empty means healthy.
+def verdict(entries: list[dict]) -> tuple[list[str], list[str]]:
+    """BUDGET findings, split by WHO CAN FIX THEM (#1107).
+
+    Returns `(blocking, ambient)`.
+
+    `blocking` is what the branch under test is answerable for: a new job
+    class with no budget, or a class that has outgrown its ceiling. Both
+    are consequences of a diff, and both are fixed by editing this file
+    or the job.
+
+    `ambient` is the repository's state at this moment -- duplicate live
+    generations left by a dependency bump, or a base-ref total over
+    budget. Real, worth printing, and NOT the fault of whoever happens to
+    be running `make lint`. Failing on them blocks unrelated work for a
+    reason the author cannot act on, and a check that cries wolf is one
+    people learn to dismiss -- which is how a real regression gets
+    through.
+
+    That split is the whole of #1107's second question. The first (tags
+    holding 2.84GB) is fixed in `setup/action.yml`.
 
     Judges the STEADY STATE -- `main` and tags -- because that is the part
     this repository controls and the part `save-if` now guarantees is the
@@ -154,7 +190,8 @@ def verdict(entries: list[dict]) -> list[str]:
     Pure on purpose -- it takes the parsed API rows and makes every
     decision, so the self-test can drive it without a network or a token.
     """
-    problems: list[str] = []
+    blocking: list[str] = []
+    ambient: list[str] = []
 
     # THE FLOOR, first and before any arithmetic. No entries is not a tidy
     # cache; it is a guard that failed to look, and a 0.00GB "under
@@ -165,18 +202,23 @@ def verdict(entries: list[dict]) -> list[str]:
     # returned nothing" and "main happens to hold nothing right now" are
     # different facts, and only the first is a broken measurement.
     if not entries:
-        problems.append(
+        # BLOCKING even though it is not the branch's doing: a guard that
+        # cannot see is not a guard, and passing it would be the most
+        # reassuring possible way to report a broken check (#853).
+        blocking.append(
             "no cache entries were measured at all. That is not an empty cache, "
             "it is a measurement that did not happen -- a budget check with "
             "nothing in it passes trivially and tells you nothing."
         )
-        return problems
+        return blocking, ambient
 
     base = [e for e in entries if _is_base(e)]
 
     total = sum(e["size_in_bytes"] for e in base) / GIB
     if total > TOTAL_BUDGET_GIB:
-        problems.append(
+        # AMBIENT: the sum of what the repository is holding right now.
+        # A branch cannot evict an entry.
+        ambient.append(
             f"`{BASE_REF}` holds {total:.2f}GB, over the {TOTAL_BUDGET_GIB}GB budget "
             f"(GitHub's quota is {QUOTA_GIB}GB for the whole repository, and over it "
             f"entries are evicted least-recently-used -- which is how a 562s job "
@@ -194,7 +236,9 @@ def verdict(entries: list[dict]) -> list[str]:
     for cls, rows in sorted(by_class.items()):
         if cls not in CLASS_BUDGET_GIB:
             size = sum(r["size_in_bytes"] for r in rows) / GIB
-            problems.append(
+            # BLOCKING: a job class only appears because a diff added
+            # one, and the fix is in this file.
+            blocking.append(
                 f"`{cls}` has no budget ({size:.2f}GB measured). A new Rust job is "
                 f"how the ceiling gets exceeded without anyone deciding to -- add "
                 f"it to CLASS_BUDGET_GIB with a measured figure, and check the "
@@ -205,7 +249,10 @@ def verdict(entries: list[dict]) -> list[str]:
         budget = CLASS_BUDGET_GIB[cls]
         if len(rows) > 1:
             size = sum(r["size_in_bytes"] for r in rows) / GIB
-            problems.append(
+            # AMBIENT: the old generation was left resident by a bump
+            # that has already merged. It drains on its own; a branch
+            # can neither cause nor cure it.
+            ambient.append(
                 f"`{cls}` has {len(rows)} live generations on `{BASE_REF}` totalling "
                 f"{size:.2f}GB. Two generations of one class on the base ref is the "
                 f"state that evicts (#901), and it means a dependency bump left the "
@@ -215,13 +262,16 @@ def verdict(entries: list[dict]) -> list[str]:
         for r in rows:
             size = r["size_in_bytes"] / GIB
             if size > budget:
-                problems.append(
+                # BLOCKING: either what this job caches grew -- which a
+                # diff can do -- or the ceiling is wrong. Both are
+                # decided here.
+                blocking.append(
                     f"`{cls}` is {size:.2f}GB, over its {budget}GB ceiling "
                     f"({r['key']}). Either what it caches grew, or the ceiling was "
                     f"set too tight -- decide which, and move the number on purpose"
                 )
 
-    return problems
+    return blocking, ambient
 
 
 def leftovers(entries: list[dict]) -> dict[str, float]:
@@ -300,7 +350,7 @@ def main() -> int:
         print("CI asks with --require, where a token exists.")
         return 0
 
-    problems = verdict(measured)
+    blocking, ambient = verdict(measured)
     total = sum(e["size_in_bytes"] for e in measured) / GIB
     base_total = sum(e["size_in_bytes"] for e in measured if _is_base(e)) / GIB
     held = leftovers(measured)
@@ -315,16 +365,36 @@ def main() -> int:
             print(f"  {gb:.2f}GB  {ref}")
         print()
 
-    if problems:
-        print(f"The Actions cache is outside its budget ({base_total:.2f}GB on the base ref):")
-        for p in problems:
+    # AMBIENT first: printed whether or not anything blocks, because it
+    # is the state that explains a surprising eviction -- and printed as
+    # a NOTICE, because a branch cannot act on it (#1107).
+    if ambient:
+        print(f"The repository's cache is outside its budget ({base_total:.2f}GB on the base ref):")
+        for p in ambient:
             print(f"  {p}")
         print()
-        print("Why this is a failure and not a warning: over GitHub's")
+        print("NOT failing on this. It is the repository's state right now, not")
+        print("anything this branch did: a branch cannot evict an entry or drain")
+        print("a generation left by a bump that already merged. Blocking here")
+        print("stops unrelated work for a reason its author cannot fix, and a")
+        print("check that cries wolf is one people learn to dismiss -- which is")
+        print("how a real regression gets through (#1107).")
+        print()
+        print("It still matters: over GitHub's")
         print(f"{QUOTA_GIB}GB quota, entries are evicted least-recently-used, so a")
-        print("run can evict the entry the next run needs. A cache that does not")
-        print("fit is slower than no cache at all, because it pays the upload")
-        print("too -- and it makes every CI timing unreproducible (#901).")
+        print("run can evict the entry the next run needs, which is how a 562s")
+        print("job became 1716s (#901). If it persists past a few days, that is")
+        print("a steady state to fix rather than a bump draining.")
+        print()
+
+    if blocking:
+        print("This branch is over the cache budget:")
+        for p in blocking:
+            print(f"  {p}")
+        print()
+        print("Failing on this: unlike the notice above, these follow from a")
+        print("diff -- a job class with no declared budget, or one that has")
+        print("outgrown its ceiling -- and both are decided in this file.")
         return 1
 
     print(f"The Actions cache is within budget: {base_total:.2f}GB of {TOTAL_BUDGET_GIB}GB")

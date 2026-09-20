@@ -4,10 +4,16 @@ import { VIEWS } from "../components/ViewSwitcher";
 
 /// The header label table against the switcher's.
 ///
-/// `viewLabel` is what the header and the view error boundary both name
-/// a page with. The switcher is what the user clicked to get there, and
-/// a page named something other than the menu item that opened it is
-/// how a user doubts they are where they meant to be (#794).
+/// `viewLabel` is what the header, the view error boundary and now the
+/// menu all name a page with. #794's rule: a page named something other
+/// than the menu item that opened it is how a user doubts they are
+/// where they meant to be.
+///
+/// Four of twelve used to differ (#1185). They no longer can: `VIEWS`
+/// DERIVES its label from `viewLabel` rather than declaring its own, so
+/// there is one table and nothing to drift. These tests assert that the
+/// derivation is actually in place -- a future edit that reintroduces a
+/// hand-written `label:` would pass a type check and fail here.
 describe("viewLabel against the switcher", () => {
   it("has a label for every registered view", () => {
     // Totality is a compile error via `Record<View, string>`, but that
@@ -20,47 +26,29 @@ describe("viewLabel against the switcher", () => {
 
   it("names every view the switcher offers", () => {
     // The switcher is the route in. A view listed there with no label
-    // here would be a menu entry leading to an unheaded page -- and
-    // since the boundary uses the same table, an error panel that
-    // could not say which page had failed.
+    // would be a menu entry leading to an unheaded page -- and since
+    // the boundary uses the same table, an error panel that could not
+    // say which page had failed.
     for (const { id } of VIEWS) {
       expect(viewLabel(id), id).toBeTruthy();
     }
   });
 
-  /// The four pairs that are KNOWN to differ, quoted in full.
-  ///
-  /// Not an excuse list: it is the record of a real mismatch found
-  /// while extracting the header's ternary chain (#1146), pinned so it
-  /// cannot silently grow. Fixing any entry means deleting it from
-  /// here, and the test below fails if a fifth appears.
-  const KNOWN_DIFFERENT: Record<string, { header: string; switcher: string }> = {
-    "my-prs": { header: "Pull requests", switcher: "My pull requests" },
-    "to-review": { header: "Pull requests to review", switcher: "To review" },
-    docker: { header: "Docker images", switcher: "Docker" },
-    artifacts: { header: "Build artifacts", switcher: "Artifacts" },
-  };
-
-  it("matches the switcher everywhere except the four known pairs", () => {
-    const differing: string[] = [];
-    for (const { id, label } of VIEWS) {
-      if (viewLabel(id) !== label) differing.push(id);
-    }
-    // Sorted compare, so the failure names WHICH view drifted rather
-    // than just a count -- a count tells you something broke and not
-    // what.
-    expect(differing.sort()).toEqual(Object.keys(KNOWN_DIFFERENT).sort());
+  it("matches the switcher for EVERY view, with no exceptions", () => {
+    // The whole point of #1185, and the test that replaced a
+    // `KNOWN_DIFFERENT` table of four accepted mismatches. There is
+    // nothing to except now: a divergence means someone reintroduced a
+    // second source of truth.
+    const differing = VIEWS.filter((v) => viewLabel(v.id) !== v.label).map((v) => v.id);
+    expect(differing.sort()).toEqual([]);
   });
 
-  it("records the known pairs with their real current text", () => {
-    // Pins both sides. Without this, someone could "fix" a mismatch by
-    // editing the entry above rather than the label, and the test
-    // would keep passing while the user still saw two names.
-    for (const [id, { header, switcher }] of Object.entries(KNOWN_DIFFERENT)) {
-      const entry = VIEWS.find((v) => v.id === id);
-      expect(entry, id).toBeDefined();
-      expect(entry?.label, id).toBe(switcher);
-      expect(viewLabel(id as (typeof ALL_VIEWS)[number]), id).toBe(header);
-    }
+  it("gives the two vaguest pages their specific names", () => {
+    // Pinned by value, not just by agreement: before #1185 the page
+    // specifically about your own pull requests was headed "Pull
+    // requests", which was also the generic fallback -- so the two
+    // agreeing on the WRONG word would satisfy the test above.
+    expect(viewLabel("my-prs")).toBe("My pull requests");
+    expect(viewLabel("to-review")).toBe("To review");
   });
 });

@@ -72,25 +72,49 @@ MEASURED = [
 
 
 def checks(name: str, entries: list[dict], should_pass: bool) -> None:
-    problems = guard.verdict(entries)
-    passed = not problems
+    """Assert whether this state BLOCKS a branch.
+
+    Since #1107 `verdict` returns `(blocking, ambient)`, and only
+    `blocking` fails a run. `should_pass=True` therefore means "does not
+    block" -- it does NOT mean "found nothing", which is what `ambient`
+    exists to record. Cases that produce an ambient notice assert it
+    explicitly with `ambient_only` below, so "tolerated" can never be
+    confused with "invisible".
+    """
+    blocking, _ambient = guard.verdict(entries)
+    passed = not blocking
     if passed != should_pass:
         want = "pass" if should_pass else "fail"
-        failures.append(f"{name}\n    expected {want}, got problems={problems!r}")
+        failures.append(f"{name}\n    expected {want}, got blocking={blocking!r}")
+
+
+def ambient_only(name: str, entries: list[dict]) -> None:
+    """Assert this state is REPORTED but does not block (#1107).
+
+    The distinction the whole split exists for: a branch cannot evict a
+    cache entry or drain a generation left by a bump that already
+    merged, so blocking on one stops unrelated work for a reason its
+    author cannot fix. Asserting `ambient` is non-empty is what keeps
+    "not blocking" from silently becoming "not noticing".
+    """
+    blocking, ambient = guard.verdict(entries)
+    if blocking:
+        failures.append(f"{name}\n    expected no blocking findings, got {blocking!r}")
+    if not ambient:
+        failures.append(f"{name}\n    expected an ambient notice, got none")
 
 
 checks("the measured steady state passes", MEASURED, True)
 
 # THE TOTAL, on the base ref. Two extra generations on `main` is the
 # dependency-bump case the budget has to fit or reject.
-checks(
-    "a base-ref total over budget fails",
+ambient_only(
+    "a base-ref total over budget is reported, not blocked on (#1107)",
     MEASURED
     + [
         entry("v0-rust-platform-Linux-x64-05562ec6-aaaaaaaa", 1.65),
         entry("v0-rust-platform-Windows_NT-x64-cca5e066-aaaaaaaa", 1.48),
     ],
-    False,
 )
 
 # THE PER-JOB-CLASS CEILING, and the reason the guard is not just a total.
@@ -98,10 +122,9 @@ checks(
 # here the TOTAL is still under budget -- 7.37 + 1.48 = 8.85GB -- so only
 # the per-class check can catch it. A total-only guard would have called
 # this healthy on the very run that produced the incident.
-checks(
-    "one job class with two live generations on the base ref fails while the total is still under",
+ambient_only(
+    "two live generations on the base ref are reported while the total is still under",
     MEASURED + [entry("v0-rust-platform-Windows_NT-x64-cca5e066-bbbbbbbb", 1.48)],
-    False,
 )
 
 # THE BASE-REF SCOPE. The same duplicate, but on a pull request's ref, must
@@ -163,6 +186,40 @@ checks(
     MEASURED + [entry("node-modules-abc123", 0.3)],
     True,
 )
+
+
+# ---- THE BLOCKING HALF still blocks (#1107) ----
+#
+# The split is only worth having if the branch-caused findings still
+# fail. A guard that reclassified everything as ambient would print
+# tidily and stop catching anything, which is the failure mode of
+# "make the check less annoying".
+
+# A new Rust job class with no declared budget. A diff adds one; the fix
+# is in `CLASS_BUDGET_GIB`.
+checks(
+    "an unbudgeted job class BLOCKS, because a diff introduced it",
+    MEASURED + [entry("v0-rust-brandnewjob-Linux-x64-05562ec6-cccccccc", 0.4)],
+    False,
+)
+
+# A class that has outgrown its ceiling. Either what it caches grew --
+# which a diff can do -- or the ceiling was set too tight.
+checks(
+    "a class over its ceiling BLOCKS, because a diff can cause it",
+    [
+        e
+        for e in MEASURED
+        if guard.job_class(e["key"]) != "platform-Linux"
+    ]
+    + [entry("v0-rust-platform-Linux-x64-05562ec6-dddddddd", 9.0)],
+    False,
+)
+
+# The floor. A measurement that did not happen is not ambient state --
+# it is a broken guard, and passing it would be the most reassuring
+# possible way to report that (#853).
+checks("an empty measurement BLOCKS rather than passing trivially", [], False)
 
 
 if failures:
