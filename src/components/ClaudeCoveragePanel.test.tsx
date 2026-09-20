@@ -2,7 +2,16 @@ import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { ABSENCE, CoverageBody, ofTotal } from "./ClaudeCoveragePanel";
 import panelSource from "./ClaudeCoveragePanel.tsx?raw";
-import type { ClaudeCoverage, ClaudeMeasurement } from "@/types/pr";
+import type { ClaudeCoverage, ClaudeMeasurement, ClaudeReach } from "@/types/pr";
+
+/// The three-count shape, named so each test says which of the three it
+/// is varying. `ClaudeReach` is the type the panel reasons about, and
+/// spelling it here keeps a test's fixture honest to the wire shape: a
+/// field renamed in `types/pr.ts` fails this file rather than silently
+/// producing a fixture the component never sees.
+function reach(over: Partial<ClaudeReach> = {}): ClaudeReach {
+  return { measured: 88, outOfScope: 1365, unread: 0, ...over };
+}
 
 function measurement(over: Partial<ClaudeMeasurement> = {}): ClaudeMeasurement {
   return {
@@ -10,7 +19,7 @@ function measurement(over: Partial<ClaudeMeasurement> = {}): ClaudeMeasurement {
     label: "Token and cost totals",
     unit: "session",
     scopeNote: "ran before the usage importer read them",
-    reach: { measured: 88, outOfScope: 1365, unread: 0 },
+    reach: reach(),
     ...over,
   };
 }
@@ -55,7 +64,7 @@ describe("every figure names its denominator", () => {
             measurement({
               id: "hooks",
               label: "Run and lifecycle records",
-              reach: { measured: 12, outOfScope: 1400, unread: 41 },
+              reach: reach({ measured: 12, outOfScope: 1400, unread: 41 }),
             }),
           ],
           truncatedMeasurements: 7,
@@ -111,7 +120,7 @@ describe("the three absence cases are distinguishable", () => {
       <CoverageBody
         data={coverage({
           measurements: [
-            measurement({ reach: { measured: 88, outOfScope: 1300, unread: 65 } }),
+            measurement({ reach: reach({ outOfScope: 1300, unread: 65 }) }),
           ],
         })}
       />,
@@ -130,7 +139,7 @@ describe("the three absence cases are distinguishable", () => {
       <CoverageBody
         data={coverage({
           sessions: 0,
-          measurements: [measurement({ reach: { measured: 0, outOfScope: 0, unread: 0 } })],
+          measurements: [measurement({ reach: reach({ measured: 0, outOfScope: 0 }) })],
         })}
       />,
     );
@@ -174,7 +183,7 @@ describe("a normal absence is not rendered as damage", () => {
       <CoverageBody
         data={coverage({
           measurements: [
-            measurement({ reach: { measured: 88, outOfScope: 1300, unread: 65 } }),
+            measurement({ reach: reach({ outOfScope: 1300, unread: 65 }) }),
           ],
           truncatedMeasurements: 9,
         })}
