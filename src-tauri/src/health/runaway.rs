@@ -312,6 +312,30 @@ pub const OVERSUBSCRIBED_INDEX: usize = 2;
 /// freshly opened app, where the series is short.
 pub const OVERSUBSCRIBED_MINUTES: f64 = 10.0;
 
+/// How many concurrently running Claude Code sessions it takes before
+/// the count is worth saying out loud BESIDE an oversubscribed machine
+/// (#1218).
+///
+/// Two, because the sentence this gates is a join and the count is the
+/// half that is known exactly. One session on an oversubscribed machine
+/// is not a concurrency observation -- the machine is busy and
+/// [`Notice::Oversubscribed`] already says so, and adding "1 session is
+/// running" to it names nothing the user did not know. Two is the
+/// smallest number for which "several sessions are running" is a
+/// different statement from "a session is running".
+///
+/// It is deliberately NOT a tuned threshold, and there is no measured
+/// figure here to tune it against: nine sessions on a 12-core machine
+/// and three on a 2-core one are the same condition, and the thing that
+/// distinguishes them is the load average, which
+/// [`OVERSUBSCRIBED_RATIO`] already reads. Putting a second bar on the
+/// count would be a second guess about the same question, and the
+/// weaker of the two -- the count knows nothing about core count.
+///
+/// See [`concurrency`] for why the machine condition, not this, is what
+/// carries the finding.
+pub const CONCURRENT_SESSIONS: usize = 2;
+
 /// Tier 1's CPU floor, as a percentage of one core.
 pub const TIER1_PERCENT: f64 = 80.0;
 
@@ -827,8 +851,16 @@ pub fn evaluate(samples: &[Sample], live: Option<&Aggregate>) -> Vec<Alert> {
 /// is the shape that invites a zero to be read as a measurement. Two
 /// unrelated types would mean [`Watched`] holding two lists and
 /// `health_alerts` concatenating them, for a consumer that only ever
-/// calls [`key`], [`title`] and [`body`]. So: one enum, two variants,
-/// three methods.
+/// calls [`key`], [`title`] and [`body`].
+///
+/// #1218 adds a third variant on the same argument. It is about neither
+/// one process nor the machine alone: it JOINS a count this app knows
+/// exactly to the machine condition [`Oversubscribed`] already measures.
+/// It has no `name`, no `cpu_percent` and no pid, and the accessors
+/// answer for it the way they answer for the machine-wide variant --
+/// see [`concurrency`] for why no per-session CPU figure appears on it.
+///
+/// [`Oversubscribed`]: Notice::Oversubscribed
 ///
 /// [`key`]: Notice::key
 /// [`title`]: Notice::title
@@ -913,6 +945,49 @@ pub enum Notice {
         /// How long it has held, in minutes, over ungapped samples only.
         minutes: f64,
     },
+    /// Several Claude Code sessions running while the machine is
+    /// oversubscribed (#1218).
+    ///
+    /// The join this app had both halves of and never made. Every field
+    /// is measured or counted; none is apportioned. See [`concurrency`].
+    Concurrency {
+        /// Sessions the registry sweep positively confirmed running:
+        /// a live pid whose start time matches what the record stored.
+        ///
+        /// Known EXACTLY, which is the whole reason this variant is
+        /// defensible. It is not a sample, an estimate or a share.
+        running: usize,
+        /// Registry records whose liveness could not be confirmed, kept
+        /// separate from `running` rather than folded into it.
+        ///
+        /// Migration 11's NULL `pid_start_time` means "cannot confirm",
+        /// which must read as Unknown rather than Running -- the same
+        /// split `commands::ClaudeLiveState` keeps, carried through
+        /// rather than collapsed. "9 running" and "9 running, 2
+        /// unconfirmed" are different claims, and [`body`] says the
+        /// second one only when it is true.
+        ///
+        /// It is NOT added to `running` anywhere, and it does not gate
+        /// the notice: sessions that might be running cannot raise a
+        /// count that is supposed to be exact.
+        ///
+        /// [`body`]: Notice::body
+        unconfirmed: usize,
+        /// The mean load average across the oversubscribed run -- the
+        /// same fifteen-minute figure [`Oversubscribed`] carries, taken
+        /// from that notice rather than re-derived, so the two rows
+        /// cannot disagree about the same machine at the same moment.
+        ///
+        /// [`Oversubscribed`]: Notice::Oversubscribed
+        load: f64,
+        /// The core count it was normalised by. Never 0, for
+        /// [`oversubscribed`]'s reason.
+        cores: usize,
+        /// `load / cores`: runnable threads per core.
+        ratio: f64,
+        /// How long the oversubscription has held, in minutes.
+        minutes: f64,
+    },
 }
 
 impl Notice {
@@ -929,6 +1004,11 @@ impl Notice {
             // No figures and no name: there is one machine, so there is
             // one row, however the load moves.
             Notice::Oversubscribed { .. } => "cpu_oversubscribed".to_string(),
+            // Not keyed on the session count, for the reason the two
+            // above are not keyed on their figures: a user opening and
+            // closing a session while the machine stays buried is ONE
+            // standing condition, not a new row every poll.
+            Notice::Concurrency { .. } => "claude_concurrency".to_string(),
         }
     }
 
@@ -938,16 +1018,30 @@ impl Notice {
     pub fn cpu_percent(&self) -> f64 {
         match self {
             Notice::Process { cpu_percent, .. } => *cpu_percent,
-            Notice::Oversubscribed { .. } => 0.0,
+            // 0.0 for both machine-scoped variants, and for
+            // `Concurrency` it is load-bearing: there IS no per-session
+            // CPU figure, so there is nothing to put here. See
+            // [`concurrency`].
+            Notice::Oversubscribed { .. } | Notice::Concurrency { .. } => 0.0,
         }
     }
 
     /// How many processes this row stands for. 1 for the machine-wide
-    /// variant, which is not a process count at all.
+    /// variants, which are not process counts at all.
+    ///
+    /// Deliberately NOT the session count for [`Concurrency`]. This
+    /// accessor answers "how many PROCESSES did this row collapse", and
+    /// a session is not a process -- most of a session's work is in the
+    /// children it spawns. Returning the session count here would put a
+    /// number where callers read a process count, which is the shape
+    /// [`Notice::name`] refuses for the same reason. The session figures
+    /// are fields, read by name.
+    ///
+    /// [`Concurrency`]: Notice::Concurrency
     pub fn count(&self) -> usize {
         match self {
             Notice::Process { count, .. } => *count,
-            Notice::Oversubscribed { .. } => 1,
+            Notice::Oversubscribed { .. } | Notice::Concurrency { .. } => 1,
         }
     }
 
@@ -963,6 +1057,16 @@ impl Notice {
             // is the thing it means.
             Notice::Oversubscribed { .. } => {
                 "More work is queued than this machine has cores".to_string()
+            }
+            // The COUNT leads, because it is the half of this sentence
+            // the user can act on: the machine condition is already its
+            // own row, and what this one adds is that several sessions
+            // are running while it holds. `unconfirmed` stays out of the
+            // headline -- a title cannot carry two numbers and stay
+            // readable, and the one that belongs in it is the one that
+            // is known.
+            Notice::Concurrency { running, .. } => {
+                format!("{running} Claude Code sessions are running on an oversubscribed machine")
             }
         }
     }
@@ -1005,6 +1109,35 @@ impl Notice {
             } => format!(
                 "The load average has been about {load:.0} on {cores} cores for {minutes:.0} minutes -- roughly {ratio:.1} times as much work queued as there are cores to run it. A large build does this briefly; for this long it usually means something is not finishing."
             ),
+            // Two measurements beside each other and NO third number
+            // derived from them. The count is exact, the load is
+            // measured, and the sentence deliberately stops short of
+            // saying the sessions caused the load -- it says they are
+            // both true, which is all the evidence supports.
+            Notice::Concurrency {
+                running,
+                unconfirmed,
+                load,
+                cores,
+                ratio,
+                minutes,
+            } => {
+                // Said only when there is something to say. A trailing
+                // ", and 0 more could not be confirmed" on every row
+                // would train the reader to skip the clause that
+                // matters, and zero unconfirmed records is not a finding.
+                let unsure = if *unconfirmed > 0 {
+                    format!(
+                        " Another {unsure_n} could not be confirmed either way, so the real figure may be higher.",
+                        unsure_n = unconfirmed
+                    )
+                } else {
+                    String::new()
+                };
+                format!(
+                    "{running} Claude Code sessions are confirmed running, and the load average has been about {load:.0} on {cores} cores for {minutes:.0} minutes -- roughly {ratio:.1} times as much work queued as there are cores to run it.{unsure} How much of that load is these sessions is not measured: a session's work happens in the builds and searches it spawns, which are not attributed back to it. Worth knowing how many you have open."
+                )
+            }
         }
     }
 
@@ -1016,7 +1149,7 @@ impl Notice {
     pub fn name(&self) -> Option<&str> {
         match self {
             Notice::Process { name, .. } => Some(name),
-            Notice::Oversubscribed { .. } => None,
+            Notice::Oversubscribed { .. } | Notice::Concurrency { .. } => None,
         }
     }
 
@@ -1031,10 +1164,15 @@ impl Notice {
     /// looks exactly like one that names the right one.
     ///
     /// [`name`]: Notice::name
+    /// Four ways to be `None` since #1218. The concurrency variant is
+    /// about SEVERAL sessions and the machine they share; naming one
+    /// session's pid would name a process the row is not about, and the
+    /// pid of a session is not even the pid doing the work -- see
+    /// [`concurrency`].
     pub fn pid(&self) -> Option<u32> {
         match self {
             Notice::Process { pid, .. } => *pid,
-            Notice::Oversubscribed { .. } => None,
+            Notice::Oversubscribed { .. } | Notice::Concurrency { .. } => None,
         }
     }
 
@@ -1042,7 +1180,12 @@ impl Notice {
     /// one, and it is what [`watch`] sorts on.
     pub fn minutes(&self) -> f64 {
         match self {
-            Notice::Process { minutes, .. } | Notice::Oversubscribed { minutes, .. } => *minutes,
+            Notice::Process { minutes, .. }
+            | Notice::Oversubscribed { minutes, .. }
+            // The MACHINE condition's duration, not the sessions'. How
+            // long a session has been open is not measured here and is
+            // not what this row is about.
+            | Notice::Concurrency { minutes, .. } => *minutes,
         }
     }
 
@@ -1402,6 +1545,109 @@ pub fn oversubscribed(samples: &[Sample], cores: usize) -> Option<Notice> {
         return None;
     }
     Some(Notice::Oversubscribed {
+        load,
+        cores,
+        ratio,
+        minutes,
+    })
+}
+
+/// "You have N sessions running and this machine is oversubscribed"
+/// (#1218).
+///
+/// The join Headstate had both halves of and never made. `running` and
+/// `unconfirmed` are the two counts `commands::ClaudeLiveState` already
+/// carries from the registry sweep; `machine` is whatever
+/// [`oversubscribed`] concluded about the same moment, passed in rather
+/// than recomputed so the two rows cannot disagree.
+///
+/// Returns `None` -- nothing to show -- unless BOTH halves are true:
+/// at least [`CONCURRENT_SESSIONS`] confirmed sessions, and a machine
+/// the load rule already called oversubscribed.
+///
+/// # Why the machine condition is required, and is not optional
+///
+/// **This is the #853 direction, and it is the one that matters.** Nine
+/// concurrent agent sessions is a completely ordinary Tuesday, and a row
+/// that appeared whenever the count was high would fire on every heavy
+/// working day -- the ~40 false positives that got a guard turned off,
+/// reproduced one module over. The count alone is not a finding. It
+/// becomes one only beside a machine that is measurably buried, which is
+/// the condition #865's incident was screaming: load average 53 on 12
+/// cores, while every CPU rule stayed under its bar because
+/// `cpu_percent` saturates.
+///
+/// So the gate is the load rule's, in full, and this function adds no
+/// threshold of its own to it.
+///
+/// # Why there is no per-session CPU figure anywhere in this
+///
+/// Because it would be a guess wearing a number. A session's work is
+/// overwhelmingly in the children it spawns -- `yarn build`, `cargo`,
+/// `rg` -- and nothing here attributes a child back to the session that
+/// started it. `worktrees::model::Lock` records the measured version of
+/// this trap on closely related evidence: 20 worktree locks all naming
+/// the same live pid, all carrying the identical timestamp (the
+/// session's start, not the lock's), and `lsof -d cwd` returning nothing
+/// for any of them -- "the pid is noise dressed as evidence". A
+/// per-session percentage built on the same pid would look exactly as
+/// authoritative and be exactly as empty.
+///
+/// The defensible statement is the one this returns: a COUNT that is
+/// known exactly beside a MACHINE-WIDE condition that is measured
+/// exactly, with no split between them claimed and no session ranked
+/// against another. [`Notice::body`] says that limitation out loud
+/// rather than leaving the reader to assume a split exists.
+///
+/// # Why `unconfirmed` does not raise the count
+///
+/// Because it is the count's exactness that makes this defensible at
+/// all. Migration 11's NULL `pid_start_time` means "cannot confirm",
+/// which must read as Unknown rather than Running -- folding those rows
+/// into `running` would trade the one figure here that is certain for a
+/// bigger one that is not, to make a finding easier to reach. It travels
+/// as its own field and is reported as its own sentence.
+///
+/// # Why this is a [`Notice`] and never an [`Alert`]
+///
+/// For [`oversubscribed`]'s reason, plus one that is stronger here:
+/// "many sessions are running" is legitimately true during normal heavy
+/// use, and the user is the person who started every one of them.
+/// Interrupting someone to tell them they are doing the thing they are
+/// doing is the definition of a guard that gets turned off.
+/// `nothing_converts_a_notice_into_an_alert` holds that boundary for
+/// this variant exactly as it does for the other two -- it forbids the
+/// conversion for the TYPE, so a new variant is covered the moment it
+/// exists -- and `a_concurrency_notice_is_never_an_alert` says so for
+/// this one by name.
+///
+/// Pure, like [`evaluate`], [`watch`] and [`oversubscribed`]: no clock,
+/// no database, no process table, no registry read. The counts arrive as
+/// numbers, so "nine sessions on a buried machine" is arithmetic in a
+/// test rather than nine sessions someone has to start.
+pub fn concurrency(running: usize, unconfirmed: usize, machine: Option<&Notice>) -> Option<Notice> {
+    // Confirmed sessions only. `unconfirmed` is reported, never counted
+    // toward the bar -- see above.
+    if running < CONCURRENT_SESSIONS {
+        return None;
+    }
+    // The machine half, taken from the load rule's verdict. A `Process`
+    // notice is not it: that is one process worth a glance, which says
+    // nothing about whether the machine is oversubscribed, and matching
+    // it here would make this row appear on a machine with plenty of
+    // headroom.
+    let &Notice::Oversubscribed {
+        load,
+        cores,
+        ratio,
+        minutes,
+    } = machine?
+    else {
+        return None;
+    };
+    Some(Notice::Concurrency {
+        running,
+        unconfirmed,
         load,
         cores,
         ratio,
@@ -2859,6 +3105,335 @@ mod tests {
             .filter(|l| l.trim_start().starts_with("DiffuseCpu"))
             .count();
         assert_eq!(variants, 1);
+    }
+
+    // ---- #1218: the concurrency join ----
+
+    /// The oversubscribed machine, as a `Notice`, for the join's other
+    /// half. THE incident's figures: load 53 on 12 cores.
+    fn buried() -> Notice {
+        oversubscribed(&load_series(&[53.0; 30]), 12).expect("the incident is oversubscribed")
+    }
+
+    /// **The sentence the app could never say (#1218).**
+    ///
+    /// Both halves were on the same timer and nothing joined them. Nine
+    /// confirmed sessions beside load 53 on 12 cores is the condition the
+    /// issue names, and the row must carry both figures.
+    #[test]
+    fn nine_sessions_on_a_buried_machine_is_one_sentence() {
+        let n = concurrency(9, 0, Some(&buried())).expect("the join must surface");
+
+        match &n {
+            Notice::Concurrency {
+                running,
+                unconfirmed,
+                load,
+                cores,
+                ratio,
+                minutes,
+            } => {
+                assert_eq!(*running, 9);
+                assert_eq!(*unconfirmed, 0);
+                // Taken from the machine notice, not re-derived.
+                assert!((load - 53.0).abs() < 0.01, "{load}");
+                assert_eq!(*cores, 12);
+                assert!((ratio - 53.0 / 12.0).abs() < 0.01, "{ratio}");
+                assert!(*minutes >= OVERSUBSCRIBED_MINUTES, "{minutes}");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        assert_eq!(n.key(), "claude_concurrency");
+        let title = n.title();
+        assert!(title.contains('9'), "the count leads the title: {title}");
+        let body = n.body();
+        assert!(body.contains('9'), "the count is in the body: {body}");
+        assert!(body.contains("53"), "the load is in the body: {body}");
+        assert!(body.contains("12"), "the core count is in the body: {body}");
+    }
+
+    /// **MANDATORY TEST 3, and the one that matters most.**
+    ///
+    /// Many sessions running on a machine that is NOT oversubscribed must
+    /// produce nothing. This is the #853 direction: "I have a lot of
+    /// Claude sessions open" is heavy legitimate use, not a finding, and
+    /// a row that appeared on the count alone would fire on every busy
+    /// working day until someone turned it off.
+    ///
+    /// Three ways for the machine half to be absent and all three stay
+    /// silent, because the caller cannot tell them apart and must not:
+    /// an idle machine, a real `cargo build -j12`, and a machine whose
+    /// core count could not be read.
+    #[test]
+    fn many_sessions_without_oversubscription_is_not_a_finding() {
+        // Twenty sessions. An absurd number, deliberately: if the count
+        // could carry this on its own, twenty would be where it did.
+        assert!(
+            concurrency(20, 0, None).is_none(),
+            "the session count alone is never a finding"
+        );
+
+        // An idle machine: the load rule says nothing, so neither does
+        // this.
+        let idle = oversubscribed(&load_series(&[0.4; 30]), 12);
+        assert!(
+            idle.is_none(),
+            "the fixture is genuinely not oversubscribed"
+        );
+        assert!(
+            concurrency(20, 0, idle.as_ref()).is_none(),
+            "twenty sessions on an idle machine is twenty sessions on an idle machine"
+        );
+
+        // The MEASURED `cargo build -j12` from
+        // `a_parallel_build_is_not_oversubscribed`, ending on its 8.06
+        // peak for that test's stated reason -- a series ending on the
+        // decay tail breaks its own run early and would pass at almost
+        // any ratio. Someone running a real build with sessions open is
+        // the exact false positive this guards.
+        let build = [
+            1.83, 2.31, 3.16, 3.27, 3.25, 3.22, 3.19, 3.13, 3.38, 3.53, 5.88, 7.57, 7.71, 7.86,
+            8.00, 8.06,
+        ];
+        let building = oversubscribed(&load_series(&build), 12);
+        assert!(building.is_none(), "the build fixture must stay silent");
+        assert!(
+            concurrency(12, 3, building.as_ref()).is_none(),
+            "a real build with twelve sessions open must not surface a concurrency row"
+        );
+
+        // An unknown core count: `oversubscribed` refuses to divide, so
+        // there is no machine half and this stays silent rather than
+        // joining a count to nothing.
+        let no_cores = oversubscribed(&load_series(&[53.0; 30]), 0);
+        assert!(no_cores.is_none(), "0 cores is 'cannot say'");
+        assert!(
+            concurrency(20, 0, no_cores.as_ref()).is_none(),
+            "a machine whose cores could not be counted cannot be called oversubscribed"
+        );
+    }
+
+    /// **MANDATORY TEST 2.** `unconfirmed` is never folded into
+    /// `running`, and the two stay distinct in the output.
+    ///
+    /// Migration 11's NULL `pid_start_time` means "cannot confirm", which
+    /// must read as Unknown rather than Running. "9 running" and "9
+    /// running, 2 unconfirmed" are different claims, and collapsing them
+    /// is the exact defect the field exists to prevent.
+    #[test]
+    fn unconfirmed_sessions_are_not_counted_as_running() {
+        let n = concurrency(9, 2, Some(&buried())).expect("nine confirmed is over the bar");
+        match &n {
+            Notice::Concurrency {
+                running,
+                unconfirmed,
+                ..
+            } => {
+                assert_eq!(*running, 9, "the confirmed count is untouched");
+                assert_eq!(*unconfirmed, 2, "the unconfirmed count travels separately");
+                // The sum is what a fold would have produced. Asserted as
+                // an absence so a future `running + unconfirmed` is caught
+                // by this test rather than by a user reading 11.
+                assert_ne!(*running, 11, "unconfirmed must not be added to running");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        // And it must not let a count under the bar reach it. One
+        // confirmed session plus eight that could not be confirmed is
+        // ONE session as far as this rule is concerned: sessions that
+        // might be running cannot raise a count whose whole value is
+        // that it is exact.
+        assert!(
+            concurrency(1, 8, Some(&buried())).is_none(),
+            "eight unconfirmed records must not carry one confirmed session over the bar"
+        );
+
+        // The wording keeps them apart too. A reader must be able to tell
+        // the measured figure from the one that could not be taken.
+        let body = n.body();
+        assert!(
+            body.contains("9 Claude Code sessions are confirmed running"),
+            "the body states the confirmed count as confirmed: {body}"
+        );
+        assert!(
+            body.contains("Another 2 could not be confirmed"),
+            "the body states the unconfirmed count separately: {body}"
+        );
+
+        // With nothing unconfirmed the clause is absent entirely rather
+        // than reading "another 0", which would train the reader to skip
+        // the sentence that matters.
+        let clean = concurrency(9, 0, Some(&buried())).expect("fires");
+        assert!(
+            !clean.body().contains("could not be confirmed"),
+            "no unconfirmed records means no unconfirmed clause: {}",
+            clean.body()
+        );
+    }
+
+    /// The count is the exact half and the machine is the measured half,
+    /// and NEITHER is apportioned to the other.
+    ///
+    /// `worktrees::model::Lock` records the measured version of this
+    /// trap: 20 locks naming the same live pid, all carrying the
+    /// session's start rather than the lock's -- "the pid is noise
+    /// dressed as evidence". A per-session CPU figure built on the same
+    /// pid would look just as authoritative and be just as empty, so
+    /// there is none: no field carries one, `cpu_percent` answers 0.0 for
+    /// the same reason the machine-wide variant does, and there is no pid
+    /// to rank sessions by.
+    #[test]
+    fn the_concurrency_notice_attributes_no_cpu_to_any_session() {
+        let n = concurrency(9, 2, Some(&buried())).expect("fires");
+
+        // No per-process figures. All three accessors answer the way they
+        // answer for a row that is about no single process.
+        // Asserted as "not positive" rather than "equals zero".
+        // `float_cmp` forbids the equality, and the weaker form is the
+        // honest one anyway: the claim is that NO share was computed,
+        // and any share this variant could invent would be positive.
+        // A tolerance would be wrong here -- "near zero" is not the
+        // claim, and a computed 0.004 would satisfy it.
+        assert!(
+            n.cpu_percent() <= 0.0,
+            "there is no per-session CPU figure, got {}",
+            n.cpu_percent()
+        );
+        assert_eq!(n.pid(), None, "there is no session to point at");
+        assert_eq!(n.name(), None, "there is no process name");
+        assert!(!n.niced());
+        assert!(!n.orphaned());
+        assert!(!n.long());
+        // Not the session count: this accessor answers "how many
+        // PROCESSES did this row collapse", and a session is not a
+        // process.
+        assert_eq!(n.count(), 1);
+        // The minutes are the MACHINE condition's duration.
+        assert!((n.minutes() - buried().minutes()).abs() < 0.01);
+
+        // And the body says the limitation out loud rather than leaving
+        // the reader to assume a split exists.
+        let body = n.body();
+        assert!(
+            body.contains("is not measured"),
+            "the body admits the attribution it does not have: {body}"
+        );
+        assert!(
+            !body.contains('%'),
+            "no percentage belongs on a row that attributes nothing: {body}"
+        );
+    }
+
+    /// The bar is [`CONCURRENT_SESSIONS`], and one session is not a
+    /// concurrency observation however buried the machine is --
+    /// `Oversubscribed` already says the machine is buried, and "1
+    /// session is running" adds nothing to it.
+    #[test]
+    fn one_session_is_not_a_concurrency_finding() {
+        assert!(concurrency(0, 0, Some(&buried())).is_none());
+        assert!(concurrency(1, 0, Some(&buried())).is_none());
+        assert!(
+            concurrency(CONCURRENT_SESSIONS, 0, Some(&buried())).is_some(),
+            "the bar itself qualifies"
+        );
+    }
+
+    /// A `Process` notice is not the machine half.
+    ///
+    /// The join's machine condition is specifically sustained
+    /// oversubscription. One process worth a glance says nothing about
+    /// whether the machine has more queued than it can run, and accepting
+    /// it here would put this row on a machine with plenty of headroom --
+    /// the false-positive direction again, one variant over.
+    #[test]
+    fn a_process_notice_is_not_the_machine_half() {
+        let p = Notice::Process {
+            name: "node".to_string(),
+            pid: Some(4242),
+            count: 1,
+            cpu_percent: 62.0,
+            minutes: 40.0,
+            niced: false,
+            orphaned: false,
+            long: true,
+        };
+        assert!(
+            concurrency(9, 0, Some(&p)).is_none(),
+            "only an oversubscribed machine joins to a session count"
+        );
+    }
+
+    /// **MANDATORY TEST 1.** The join is a `Notice` and is never an
+    /// `Alert`.
+    ///
+    /// `nothing_converts_a_notice_into_an_alert` below forbids the
+    /// conversion for the TYPE, so this variant is covered by it the
+    /// moment it exists -- that test is generic over `Notice` and needed
+    /// no change for #1218. This one says it for the concurrency row by
+    /// name, because the reason is specific to it and stronger than for
+    /// the other two: many sessions running is legitimately true during
+    /// normal heavy use, and the user is the person who started every one
+    /// of them. Interrupting someone to tell them they are doing the
+    /// thing they are doing is precisely the guard that gets turned off.
+    #[test]
+    fn a_concurrency_notice_is_never_an_alert() {
+        let n = concurrency(9, 2, Some(&buried())).expect("fires");
+        // It IS a Notice -- the type that reaches the page and nothing
+        // else.
+        assert!(matches!(n, Notice::Concurrency { .. }));
+
+        let src = include_str!("runaway.rs");
+        let body: Vec<&str> = src
+            .lines()
+            .take_while(|l| !l.starts_with("#[cfg(test)]"))
+            .collect();
+        assert!(!body.is_empty(), "the module body parsed to nothing");
+
+        // `concurrency` must return an Option<Notice> and nothing else.
+        // A signature returning an `Alert`, or a `Vec<Alert>`, is the
+        // change this forbids.
+        let sig = body
+            .iter()
+            .find(|l| l.contains("pub fn concurrency("))
+            .expect("concurrency exists");
+        assert!(
+            sig.contains("-> Option<Notice>"),
+            "concurrency must yield a Notice: {sig}"
+        );
+
+        // And the concurrency variant must not be named on any line that
+        // notifies. The sibling test checks the type name; this checks
+        // the variant, so a `notify_runaway(&Alert::from(Concurrency…))`
+        // built without an `impl From` is still caught.
+        assert!(
+            !body
+                .iter()
+                .any(|l| l.contains("notify") && l.contains("Concurrency")),
+            "the concurrency notice must not reach a notification path"
+        );
+
+        // Still exactly one Alert variant. #1218 adds a Notice variant
+        // and deliberately no Alert one; this is the assertion
+        // `nothing_converts_a_shadow_into_an_alert` makes for the same
+        // reason, restated where a reader of this feature will see it.
+        let start = body
+            .iter()
+            .position(|l| l.trim() == "pub enum Alert {")
+            .expect("Alert exists");
+        let len = body[start..]
+            .iter()
+            .position(|l| *l == "}")
+            .expect("Alert closes");
+        assert_eq!(
+            body[start..start + len]
+                .iter()
+                .filter(|l| l.trim_start().starts_with(char::is_uppercase))
+                .count(),
+            1,
+            "#1218 adds a Notice variant and no Alert variant"
+        );
     }
 
     /// A `Notice` must never become an `Alert`, which is the #865

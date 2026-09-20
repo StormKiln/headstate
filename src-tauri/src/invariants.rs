@@ -3061,4 +3061,99 @@ mod tests {
              it claims"
         );
     }
+
+    /// **"Cannot confirm" must never be added to "running" (#1218).**
+    ///
+    /// The registry sweep classifies a record three ways, and the split
+    /// between two of them is load-bearing: `running` is a live pid whose
+    /// start time matches what was stored, and `unknown` is a record
+    /// whose liveness could NOT be determined -- migration 11's NULL
+    /// `pid_start_time`, which means "cannot confirm" and must read as
+    /// Unknown rather than Running.
+    ///
+    /// `commands::ClaudeLiveState` states that in prose and keeps the two
+    /// in separate fields. `health::runaway::concurrency` keeps them in
+    /// separate parameters, and
+    /// `unconfirmed_sessions_are_not_counted_as_running` proves the rule
+    /// holds INSIDE it. Neither says anything about the call sites, which
+    /// is where the fold would actually be written -- and a fold there is
+    /// invisible: it produces a larger number of exactly the right shape,
+    /// reported with the confidence due a count that was exact.
+    ///
+    /// This is the #854 case the module header describes almost word for
+    /// word: the rule is known, written down, and asserted one layer
+    /// away from where the next author will break it. **Measured by
+    /// sabotage**: with only the behavioural tests in place,
+    /// `swept.running.len() + swept.unknown.len()` at the `health_alerts`
+    /// call site passed all 2021 of them.
+    ///
+    /// # What it cannot see
+    ///
+    /// Text, not semantics, per the module header. A fold routed through
+    /// a local binding or a helper is outside this, and so is one written
+    /// with different spacing than the forms below. It catches the
+    /// obvious spelling of the mistake at the place it would be made,
+    /// which is what the surrounding guards claim for themselves too.
+    #[test]
+    fn a_sweeps_unconfirmed_records_are_never_added_to_its_running_ones() {
+        /// The additions that would collapse the distinction. Both
+        /// orders, and both the `Vec`s and their lengths, because the
+        /// mistake is as natural to write one way round as the other.
+        const FOLDS: &[&str] = &[
+            "running.len() + swept.unknown.len()",
+            "unknown.len() + swept.running.len()",
+            "running.len() + sweep.unknown.len()",
+            "unknown.len() + sweep.running.len()",
+            "running + unconfirmed",
+            "unconfirmed + running",
+        ];
+
+        let mut offenders: Vec<String> = Vec::new();
+        let mut scanned = 0usize;
+        for (crate_name, root) in crate_roots() {
+            for file in rust_files(&root) {
+                let Ok(src) = std::fs::read_to_string(&file) else {
+                    continue;
+                };
+                // This file's own prose spells every pattern above.
+                // Skipped BY PATH, the rule the module header states and
+                // #874 paid for.
+                if file.ends_with("invariants.rs") {
+                    continue;
+                }
+                scanned += 1;
+                let src = src.replace("\r\n", "\n");
+                let rel = file.strip_prefix(&root).unwrap_or(&file).display();
+                for (i, line) in src.lines().enumerate() {
+                    let t = line.trim_start();
+                    // Comments dropped: the reasoning for this rule is
+                    // written out at length next to the code that follows
+                    // it, and prose describing a fold is not one.
+                    if t.starts_with("//") || t.starts_with("///") {
+                        continue;
+                    }
+                    for fold in FOLDS {
+                        if line.contains(fold) {
+                            offenders.push(format!("{crate_name}/{rel}:{}: {t}", i + 1));
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            scanned > 20,
+            "the scan found only {scanned} files, so it is asserting less than it claims"
+        );
+        assert!(
+            offenders.is_empty(),
+            "a sweep's unconfirmed records were added to its running ones, which reports \
+             sessions whose liveness could NOT be determined as confirmed running. \
+             Migration 11's NULL `pid_start_time` means 'cannot confirm', and \
+             '9 running' and '9 running, 2 unconfirmed' are different claims. Pass the \
+             two counts separately -- `runaway::concurrency` takes them that way for \
+             this reason:\n{}",
+            offenders.join("\n")
+        );
+    }
 }

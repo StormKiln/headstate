@@ -7560,9 +7560,10 @@ pub async fn health_alerts(app: AppHandle) -> Result<Vec<crate::health::AlertRep
         // rather than dividing -- a division would be an infinity that
         // cleared the threshold on every machine whose core count could
         // not be read. Absent is not zero.
+        let machine = crate::health::runaway::oversubscribed(&history, aggregate.cores);
         out.extend(
-            crate::health::runaway::oversubscribed(&history, aggregate.cores)
-                .into_iter()
+            machine
+                .iter()
                 .map(|n| crate::health::AlertReport {
                     key: n.key(),
                     title: n.title(),
@@ -7572,8 +7573,68 @@ pub async fn health_alerts(app: AppHandle) -> Result<Vec<crate::health::AlertRep
                     // accessor rather than hard-coded so the two cannot
                     // disagree if a third variant ever lands (#943).
                     pid: n.pid(),
-                }),
+                })
+                .collect::<Vec<_>>(),
         );
+
+        // #1218's join: the session COUNT beside the machine condition
+        // directly above. The two halves were both already here on the
+        // same timer and nothing put them in one sentence.
+        //
+        // # Why the sweep is re-read here rather than the live pass reused
+        //
+        // Because `claude_live_pass` WRITES -- it records crash rows and
+        // truncates Headstate's own handoff file -- and a read-only
+        // health query must not do either as a side effect of being
+        // asked. `registry::sweep_default` is the read half of exactly
+        // that pass and the source `ClaudeLiveState` builds both its
+        // fields from (`running` is `swept.running`, `unconfirmed` is
+        // `swept.unknown`), so this is the SAME derivation of liveness,
+        // not a second one. #984 is what a second one costs: an overview
+        // and a list disagreeing about the same rows off the same read.
+        //
+        // A sweep that could not be read produces NO notice rather than a
+        // count of zero. Absent is not zero, and here a zero would be
+        // silently un-joinable anyway -- `concurrency` returns `None`
+        // below `CONCURRENT_SESSIONS`, so the failure mode is silence in
+        // both directions. Said out loud in the log rather than swallowed.
+        //
+        // Gated on `claude_integrations_enabled` for the reason the poll
+        // loop gates its own pass: a user who turned the feature off must
+        // not have `~/.claude` read on their behalf, and a health page
+        // that quietly kept reading it would be the thing the switch
+        // exists to stop.
+        if read_ui_prefs(&app).claude_integrations_enabled {
+            match crate::claude::registry::sweep_default() {
+                Ok(swept) => out.extend(
+                    crate::health::runaway::concurrency(
+                        swept.running.len(),
+                        // `unknown`, NOT added to `running`. Migration 11's
+                        // NULL `pid_start_time` means "cannot confirm",
+                        // which reads as Unknown rather than Running -- the
+                        // distinction `ClaudeLiveState` keeps and this
+                        // carries through to the notice as its own field.
+                        swept.unknown.len(),
+                        machine.as_ref(),
+                    )
+                    .into_iter()
+                    .map(|n| crate::health::AlertReport {
+                        key: n.key(),
+                        title: n.title(),
+                        body: n.body(),
+                        // `None`: this row is about several sessions and
+                        // the machine they share, so there is no single
+                        // pid to look with. From the accessor, like the
+                        // rows above.
+                        pid: n.pid(),
+                    }),
+                ),
+                Err(e) => log::warn!(
+                    "health: could not sweep the Claude session registry, \
+                     so the concurrency notice is withheld: {e}"
+                ),
+            }
+        }
 
         // #865's watch notices: processes holding a moderate amount of
         // CPU for long enough to be worth a human glance. Read from the
