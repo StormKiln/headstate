@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   ClaudeImported,
   ClaudePreview,
+  ClaudeReread,
   ClaudeSession,
   ClaudeSessionDetail,
   ClaudeSessionList,
@@ -82,6 +83,16 @@ const state = vi.hoisted(() => ({
   /// preview costs a 256 KB read over the pairing transport and must not
   /// happen on selection.
   previewEnabledFor: [] as (string | null)[],
+  /// #1208. THREE states, never two: "following", "idle" (we read and
+  /// the session wrote nothing) and "stopped" (we are not reading). The
+  /// fixture keeps them apart because collapsing two of them is the
+  /// exact #846/#1042 defect the pane must not have.
+  following: "following" as "following" | "idle" | "stopped",
+  /// When the follow last heard from disk, epoch ms. `0` is "never yet".
+  lastReadAt: 0,
+  /// The last read that REPLACED history rather than extending it.
+  /// `null` is the ordinary append.
+  reread: null as { why: ClaudeReread; at: number } | null,
   /// What `useClaudeSessionDetail` returns (#985), keyed by session id.
   ///
   /// A MAP rather than one value, because the split made "the detail for
@@ -177,15 +188,37 @@ vi.mock("../api/hooks", () => ({
       refetch: refetchFn,
     };
   },
-  // #982. Records what it was asked for and whether the disclosure was
-  // open, so a test can assert the read does not happen on selection.
-  useClaudeTranscriptTail: (path: string | null, enabled: boolean) => {
+  // #982, now a FOLLOW (#1208). Records what it was asked for and whether
+  // the disclosure was open, so a test can assert the read does not
+  // happen on selection.
+  //
+  // The fixture keeps `preview` as the shape #982 used and derives the
+  // follow's flattened return from it, so the pre-existing content tests
+  // still pin what they always pinned. `following`, `lastReadAt` and
+  // `reread` are the new surface and have their own fixtures.
+  useClaudeTranscriptFollow: (path: string | null, enabled: boolean) => {
     if (enabled) state.previewEnabledFor.push(path);
+    const pv = state.preview;
     return {
-      data: state.preview,
+      messages: pv?.messages ?? [],
+      following: state.following,
+      lastReadAt: state.lastReadAt,
+      reread: state.reread,
+      window:
+        pv === undefined
+          ? null
+          : {
+              truncated: pv.truncated,
+              file_bytes: pv.file_bytes,
+              bytes_read: pv.bytes_read,
+              non_conversation_records: pv.non_conversation_records,
+              unparseable_records: pv.unparseable_records,
+            },
+      pairings: pv?.pairings ?? {},
       isError: state.previewFailed,
       error: state.previewFailed ? "Permission denied" : undefined,
-      isLoading: enabled && !state.previewFailed && state.preview === undefined,
+      isLoading: enabled && !state.previewFailed && pv === undefined,
+      pollMs: 3_000,
     };
   },
 }));
@@ -485,6 +518,13 @@ beforeEach(() => {
   state.preview = preview();
   state.previewFailed = false;
   state.previewEnabledFor = [];
+  // #1208. A FOLLOWING follow that has read once, by default: the state
+  // the pane is in for the overwhelming majority of the tests below, and
+  // an explicit default so a test that cares about "idle" or "stopped"
+  // has to say so rather than inherit it.
+  state.following = "following";
+  state.lastReadAt = Date.UTC(2026, 0, 1, 12, 4, 31);
+  state.reread = null;
   // A LOADED, empty listing by default -- not `undefined`. `undefined`
   // means "still loading or unreadable", and leaving it there would make
   // every unrelated test render the wrong one of the #920 section's three
@@ -2677,7 +2717,7 @@ describe("reading a transcript rather than revealing it", () => {
     renderView();
     open("HeadState GitHub issues filing");
     expect(state.previewEnabledFor).toEqual([]);
-    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
     expect(state.previewEnabledFor).toContain(
       "/Users/acme/.claude/projects/slug/e5dff3bd.jsonl",
     );
@@ -2721,7 +2761,7 @@ describe("reading a transcript rather than revealing it", () => {
     });
     renderView();
     open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
     expect(screen.getByText("Looking now.")).toBeTruthy();
     expect(screen.getByText("weighing it up")).toBeTruthy();
     // The name AND the parsed arguments (#1209). "Ran Bash" and "ran
@@ -2778,7 +2818,7 @@ describe("reading a transcript rather than revealing it", () => {
     state.preview = unansweredCall();
     renderView();
     open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
     expect(screen.getByText(/still running, so the call may still be executing/i)).toBeTruthy();
     // And emphatically NOT the crash wording, which would report a
     // healthy session as a dead one.
@@ -2798,7 +2838,7 @@ describe("reading a transcript rather than revealing it", () => {
     state.preview = unansweredCall();
     renderView();
     open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
     expect(screen.getByText(/no result was recorded.*did not come back/i)).toBeTruthy();
     expect(screen.queryByText(/may still be executing/i)).toBeNull();
   });
@@ -2817,7 +2857,7 @@ describe("reading a transcript rather than revealing it", () => {
     state.preview = unansweredCall();
     renderView();
     open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
     expect(
       screen.getByText(/whether the call is still running could not be determined/i),
     ).toBeTruthy();
@@ -2856,7 +2896,7 @@ describe("reading a transcript rather than revealing it", () => {
     });
     renderView();
     open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
     expect(screen.getByText(/the call this answers is above the window/i)).toBeTruthy();
     // The distinction that makes the feature worth having: this is not
     // the crash case and not the in-flight case.
@@ -2876,7 +2916,7 @@ describe("reading a transcript rather than revealing it", () => {
       state.preview = view;
       const { unmount } = renderView();
       open("HeadState GitHub issues filing");
-      fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+      fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
       // Read through `screen`, not the render's own `container`:
       // `renderView` mounts into the shared document body and `open`
       // queries it globally, so a per-render container can lag the pane
@@ -3002,7 +3042,7 @@ describe("reading a transcript rather than revealing it", () => {
     });
     renderView();
     open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
 
     // The recorded one says its context is real.
     expect(
@@ -3067,7 +3107,7 @@ describe("reading a transcript rather than revealing it", () => {
     });
     renderView();
     open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
 
     // The clipped hunk says how much is missing.
     expect(screen.getAllByText(/40 more lines in this hunk are not shown/i)).toHaveLength(1);
@@ -3114,7 +3154,7 @@ describe("reading a transcript rather than revealing it", () => {
     });
     renderView();
     open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
     expect(screen.getByText(/does not know how to show/i)).toBeTruthy();
     expect(screen.getByText(/enclave, query/)).toBeTruthy();
   });
@@ -3132,9 +3172,9 @@ describe("reading a transcript rather than revealing it", () => {
     });
     renderView();
     open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
     expect(screen.getByText(/the last 2 messages/i)).toBeTruthy();
-    expect(screen.getByText(/final 256 KB of a 73\.2 MB transcript/i)).toBeTruthy();
+    expect(screen.getByText(/of a 73\.2 MB transcript/i)).toBeTruthy();
     expect(screen.getByText(/earlier exchanges are not shown/i)).toBeTruthy();
   });
 
@@ -3144,7 +3184,7 @@ describe("reading a transcript rather than revealing it", () => {
   it("says it is showing everything when it read the whole file", () => {
     renderView();
     open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
     expect(screen.getByText(/all 2 messages in this transcript/i)).toBeTruthy();
     expect(screen.queryByText(/earlier exchanges are not shown/i)).toBeNull();
   });
@@ -3157,8 +3197,8 @@ describe("reading a transcript rather than revealing it", () => {
     state.preview = preview({ non_conversation_records: 298 });
     renderView();
     open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
-    expect(screen.getByText(/298 bookkeeping records in that window/i)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
+    expect(screen.getByText(/298 bookkeeping records in the last window/i)).toBeTruthy();
   });
 
   /// A future block kind is NAMED, never dropped. Claude Code owns this
@@ -3177,7 +3217,7 @@ describe("reading a transcript rather than revealing it", () => {
     });
     renderView();
     open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
     expect(screen.getByText("image")).toBeTruthy();
     expect(screen.getByText(/does not know how to show/i)).toBeTruthy();
   });
@@ -3189,7 +3229,7 @@ describe("reading a transcript rather than revealing it", () => {
     state.preview = undefined;
     renderView();
     open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
     expect(screen.getByText(/could not read its transcript/i)).toBeTruthy();
     expect(screen.getByText(/not the same as the session having said nothing/i)).toBeTruthy();
   });
@@ -3205,7 +3245,7 @@ describe("reading a transcript rather than revealing it", () => {
     });
     renderView();
     open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
     expect(screen.getByText(/no conversation in the last/i)).toBeTruthy();
     expect(screen.getByText(/300 bookkeeping records and 2 that could not be read/i))
       .toBeTruthy();
@@ -3227,7 +3267,7 @@ describe("reading a transcript rather than revealing it", () => {
     expect(
       screen.getByText(/there is nothing to read here: the path no longer exists/i),
     ).toBeTruthy();
-    expect(screen.queryByRole("button", { name: /read the transcript/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /follow the transcript/i })).toBeNull();
   });
 
   it("names the reason a transcript check failed", () => {
@@ -3245,6 +3285,143 @@ describe("reading a transcript rather than revealing it", () => {
       ),
     ).toBeTruthy();
     expect(screen.queryByText(/no longer exists/i)).toBeNull();
+  });
+});
+
+/// Following a live transcript (#1208).
+///
+/// The list polls every 10 s and sorts running sessions first, so the app
+/// draws attention to a working agent -- and before #1208 the pane it
+/// opened onto was a snapshot frozen at the moment of the click. The most
+/// valuable view in the app was its most stale one.
+///
+/// These tests are about the HONESTY of the follow rather than about its
+/// content, which the section above already pins.
+describe("following a transcript as it is written", () => {
+  /// Requirement 2, and the one this codebase keeps having to re-apply
+  /// (#846, #1042): "this session is idle" and "we stopped following" are
+  /// different facts with different remedies.
+  ///
+  /// Asserted as DISTINCT STRINGS, in both directions. A test that only
+  /// checked "some text appears" would pass against a pane that rendered
+  /// one shared shrug for both, which is exactly the defect.
+  it("says a session is idle in different words from a follow that stopped", () => {
+    state.following = "idle";
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
+    const idle = screen.getByTestId("follow-status").textContent ?? "";
+
+    cleanup();
+    state.following = "stopped";
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
+    const stopped = screen.getByTestId("follow-status").textContent ?? "";
+
+    expect(idle).not.toEqual(stopped);
+    // And each says its OWN thing, so "distinct" is not two equally
+    // uninformative shrugs that merely differ.
+    expect(idle).toMatch(/idle/i);
+    expect(idle).toMatch(/nothing new has been written/i);
+    expect(idle).not.toMatch(/stopped/i);
+    expect(stopped).toMatch(/stopped following/i);
+    expect(stopped).not.toMatch(/idle/i);
+  });
+
+  /// The third rendering, distinct from BOTH of the above. An actively
+  /// following pane must not read like an idle one.
+  it("says it is following in different words again", () => {
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
+    const following = screen.getByTestId("follow-status").textContent ?? "";
+    expect(following).toMatch(/^Following\./);
+    expect(following).not.toMatch(/idle/i);
+    expect(following).not.toMatch(/stopped/i);
+  });
+
+  /// Requirement 1 and 3: the pane states WHEN it last read, and that
+  /// value CHANGES as it re-reads.
+  ///
+  /// To the second, not to the minute: a follow polls every 3 s, and a
+  /// label that only moved once a minute could not show a reader that it
+  /// is still reading. `clockTime` elsewhere on this page is HH:MM and
+  /// right for its own question; this one is not that.
+  it("states when it last read, and the time moves as it re-reads", () => {
+    state.lastReadAt = Date.UTC(2026, 0, 1, 12, 4, 31);
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
+    const first = screen.getByTestId("follow-status").textContent ?? "";
+    expect(first).toMatch(/last read at \d\d:\d\d:\d\d/i);
+
+    cleanup();
+    // Seven seconds later: two polls on.
+    state.lastReadAt = Date.UTC(2026, 0, 1, 12, 4, 38);
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
+    const second = screen.getByTestId("follow-status").textContent ?? "";
+
+    expect(second).not.toEqual(first);
+    expect(second).toMatch(/last read at \d\d:\d\d:\d\d/i);
+  });
+
+  /// A follow that has STOPPED still states when it last read, and that
+  /// value does NOT keep moving. It is the frozen clock that makes a dead
+  /// follow visibly dead -- a relative phrase re-rendered from the wall
+  /// clock would keep counting and read as live-but-quiet.
+  it("a stopped follow still says when it last read", () => {
+    state.following = "stopped";
+    state.lastReadAt = Date.UTC(2026, 0, 1, 12, 4, 31);
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
+    const text = screen.getByTestId("follow-status").textContent ?? "";
+    expect(text).toMatch(/stopped following/i);
+    expect(text).toMatch(/nothing has been read since \d\d:\d\d:\d\d/i);
+  });
+
+  /// Requirement 3 of the ticket's honesty list: if the read detected the
+  /// file changed behind the offset, SAY SO. It is the fifth case
+  /// `handoff.rs` has no entry for, and a pane that swapped the
+  /// conversation silently would leave the reader unable to tell a
+  /// re-read from a very talkative agent.
+  it("says when history was rewritten behind the offset, in its own words", () => {
+    state.reread = { why: "rewritten_behind", at: Date.UTC(2026, 0, 1, 12, 4, 31) };
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
+    const said = screen.getByTestId("follow-reread").textContent ?? "";
+    expect(said).toMatch(/changed behind where we had read to/i);
+    expect(said).toMatch(/compaction rewrote the history/i);
+    expect(said).toMatch(/read again rather than appended to/i);
+  });
+
+  /// And a truncation is worded DIFFERENTLY from a rewrite. Both re-read,
+  /// but the reasons are not the same fact: one is a file that shrank and
+  /// a length comparison caught, the other is a file that did not.
+  it("words a truncation differently from a rewrite behind the offset", () => {
+    state.reread = { why: "shrank", at: Date.UTC(2026, 0, 1, 12, 4, 31) };
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
+    const shrank = screen.getByTestId("follow-reread").textContent ?? "";
+    expect(shrank).toMatch(/replaced or truncated/i);
+    expect(shrank).not.toMatch(/compaction/i);
+  });
+
+  /// The FIRST read is a re-read too, mechanically -- it has no cursor to
+  /// extend. It must not be announced: "we read this from the start" is
+  /// noise on every single open, and a banner that fires every time is a
+  /// banner nobody reads when it matters.
+  it("does not announce the first read as a re-read", () => {
+    state.reread = { why: "first", at: Date.UTC(2026, 0, 1, 12, 4, 31) };
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
+    expect(screen.queryByTestId("follow-reread")).toBeNull();
   });
 });
 

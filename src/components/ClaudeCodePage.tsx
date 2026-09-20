@@ -8,6 +8,7 @@ import type {
   ClaudeFileChange,
   ClaudePairing,
   ClaudePreviewBlock,
+  ClaudeReread,
   ClaudeSession,
   ClaudeToolArgs,
   ClaudeObservation,
@@ -25,7 +26,7 @@ import {
   useClaudeSessionUsage,
   useClaudeSubagentRollup,
   useClaudeSessions,
-  useClaudeTranscriptTail,
+  useClaudeTranscriptFollow,
   useWorktrees,
   useUiPrefs,
 } from "@/api/hooks";
@@ -3185,16 +3186,68 @@ function StopSession({
   );
 }
 
+/// A clock time for "when we last read", to the SECOND, from epoch ms.
+///
+/// `clockTime` above is HH:MM and right for its question -- when did a
+/// session stop, matched against the reader's own day. This one is the
+/// wrong question at that resolution: a follow polls every 3 seconds, and
+/// a label that only changes once a minute cannot show the reader that it
+/// is still reading. Requirement 3 of #1208 is that the value CHANGES as
+/// it re-reads.
+///
+/// An absolute time rather than "3 seconds ago", and that is the honesty
+/// requirement rather than a style choice: a relative phrase re-rendered
+/// from the clock keeps counting after the follow has stopped, so a dead
+/// follow reads as a live one that is merely quiet. A fixed "12:04:31"
+/// that stops advancing is visibly stopped.
+///
+/// No clock read in here either -- the instant is the argument, and it
+/// comes from the query's `dataUpdatedAt`. See the page's doc comment on
+/// why that rule is absolute in this file.
+function readClockTime(ms: number): string {
+  const at = new Date(ms);
+  if (Number.isNaN(at.getTime())) return "an unknown time";
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(at.getHours())}:${p(at.getMinutes())}:${p(at.getSeconds())}`;
+}
+
+/// What a follow that re-read rather than appended should say.
+///
+/// Three reasons, three sentences. The third is the one `handoff.rs` has
+/// no case for: compaction rewrote history behind our offset without the
+/// file shrinking, so nothing about its LENGTH gave it away.
+function rereadReason(why: ClaudeReread): string {
+  switch (why) {
+    case "first":
+      return "read from the start";
+    case "shrank":
+      return "the transcript was replaced or truncated, so it was read again from the start";
+    case "rewritten_behind":
+      return "the transcript changed behind where we had read to — a compaction rewrote the history — so it was read again rather than appended to";
+  }
+}
+
 function TranscriptPreview({ detail: d }: { detail: ClaudeSessionDetail }) {
   const [open, setOpen] = useState(false);
   // `transcript_state`, never `cwd_state` (#919, and
   // `ClaudeSessionDetail`'s own doc): 0% of transcripts are gone against
   // 83% of cwds. Both live on the detail since #985.
   const refusal = revealRefusal(d.transcript_path, d.transcript_state);
-  const { data, isError, error, isLoading } = useClaudeTranscriptTail(
-    d.transcript_path,
-    open && refusal === null,
-  );
+  // #1208: a FOLLOW, not a one-shot tail. The list sorts running sessions
+  // first and then this pane used to show a snapshot frozen at the moment
+  // the user clicked -- the most valuable view in the app was its most
+  // stale one.
+  const {
+    messages,
+    following,
+    lastReadAt,
+    reread,
+    window,
+    pairings,
+    isError,
+    error,
+    isLoading,
+  } = useClaudeTranscriptFollow(d.transcript_path, open && refusal === null);
 
   return (
     <section className="rounded-md border border-[#30363d] bg-[#161b22] p-3">
@@ -3220,7 +3273,8 @@ function TranscriptPreview({ detail: d }: { detail: ClaudeSessionDetail }) {
       ) : !open ? (
         <>
           <p className="mt-2 text-xs text-[#8b949e]">
-            The last few exchanges, to check this is the session you meant before resuming it.
+            The last few exchanges, followed as they are written, to see what this session is doing
+            now.
           </p>
           <button
             type="button"
@@ -3228,81 +3282,111 @@ function TranscriptPreview({ detail: d }: { detail: ClaudeSessionDetail }) {
             className="tap-target mt-3 flex items-center gap-1.5 rounded-md border border-[#30363d] bg-[#21262d] px-2 py-1 text-xs text-[#e6edf3] hover:bg-[#30363d]"
           >
             <Terminal className="h-3 w-3" aria-hidden="true" />
-            Read the transcript
+            Follow the transcript
           </button>
         </>
       ) : isError ? (
-        // BEFORE the empty arm (#846): `data` is undefined on a rejection
+        // BEFORE the empty arm (#846): `messages` is empty on a rejection
         // exactly as it is before the first read.
         <p className="mt-2 text-xs text-[#8b949e]">
           Could not read its transcript
           {errorMessage(error) ? ` (${errorMessage(error)})` : ""}. This is not the same as the
           session having said nothing.
         </p>
-      ) : isLoading || data === undefined ? (
+      ) : isLoading && lastReadAt === 0 ? (
         <p className="mt-2 text-xs text-[#8b949e]">Reading its transcript…</p>
-      ) : data.messages.length === 0 ? (
-        // Read, and there was no conversation in the window. The counts
-        // say which kind of nothing it was, because "300 machinery
-        // records" and "an empty file" are different facts.
-        <p className="mt-2 text-xs text-[#8b949e]">
-          {data.non_conversation_records > 0 || data.unparseable_records > 0
-            ? `No conversation in the last ${formatKb(data.bytes_read)} — ${data.non_conversation_records.toLocaleString()} bookkeeping record${data.non_conversation_records === 1 ? "" : "s"} and ${data.unparseable_records.toLocaleString()} that could not be read.`
-            : "Its transcript holds no conversation to show."}
-        </p>
       ) : (
         <>
-          {/* The cap, STATED, and this is where it matters most: a reader
-              who cannot tell a short conversation from a truncated one has
-              been told something false by omission. #910's own words asked
-              for "a 'showing the last N lines of a large file' label", and
-              the 39 real files over 1 MB are where it binds. */}
-          <p className="mt-2 text-xs text-[#8b949e]">
-            {data.truncated
-              ? `The last ${data.messages.length.toLocaleString()} message${data.messages.length === 1 ? "" : "s"}, from the final ${formatKb(data.bytes_read)} of a ${formatKb(data.file_bytes)} transcript. Earlier exchanges are not shown.`
-              : `All ${data.messages.length.toLocaleString()} message${data.messages.length === 1 ? "" : "s"} in this transcript.`}
-            {data.non_conversation_records > 0
-              ? ` ${data.non_conversation_records.toLocaleString()} bookkeeping record${data.non_conversation_records === 1 ? "" : "s"} in that window are not conversation and are not shown.`
-              : ""}
+          {/* WHEN WE LAST READ, always, and in three distinct wordings
+              (#1208, and the #846/#1042 rule this codebase keeps having
+              to re-apply).
+
+              "This session is idle" and "we stopped following" are
+              different facts with different remedies, and a pane that
+              shared one rendering between them would tell the reader a
+              running agent is quiet when in truth nobody is looking. The
+              third state -- actively following -- is distinct again. */}
+          <p className="mt-2 text-xs text-[#8b949e]" data-testid="follow-status">
+            {following === "stopped"
+              ? `Stopped following. Nothing has been read since ${readClockTime(lastReadAt)}.`
+              : following === "idle"
+                ? `This session is idle: nothing new has been written. Last read at ${readClockTime(lastReadAt)}.`
+                : `Following. Last read at ${readClockTime(lastReadAt)}.`}
           </p>
-          <ol className="mt-3 space-y-2">
-            {data.messages.map((m, i) => (
-              <li
-                // The index is the key on purpose: transcript records
-                // carry no stable id this reads, and two identical
-                // messages in a row are a real thing a session does. The
-                // list is never reordered or filtered, so the index IS the
-                // identity here.
-                key={i}
-                className="rounded border border-[#30363d] bg-[#0d1117] p-2"
-              >
-                <div className="flex flex-wrap items-center gap-x-2 text-[11px] text-[#8b949e]">
-                  <span className="font-semibold text-[#e6edf3]">
-                    {m.role === "assistant" ? "Claude" : "You"}
-                  </span>
-                  {m.model ? <span>{m.model}</span> : null}
-                </div>
-                <div className="mt-1 space-y-1">
-                  {m.blocks.length === 0 ? (
-                    <p className="text-xs text-[#6e7681]">(nothing in this message)</p>
-                  ) : (
-                    m.blocks.map((b, j) => (
-                      <PreviewBlock
-                        key={j}
-                        block={b}
-                        pairings={data.pairings}
-                        // The session's liveness, passed DOWN rather than
-                        // re-derived. `liveness.rs` owns "is this running"
-                        // and two answers to one question disagree the
-                        // first time either changes.
-                        liveness={d.liveness}
-                      />
-                    ))
-                  )}
-                </div>
-              </li>
-            ))}
-          </ol>
+          {/* A re-read is STATED rather than silently swapping the
+              conversation under the reader. `rewritten_behind` is the
+              case a length comparison cannot catch. */}
+          {reread !== null && reread.why !== "first" ? (
+            <p className="mt-1 text-xs text-[#d29922]" data-testid="follow-reread">
+              At {readClockTime(reread.at)}, {rereadReason(reread.why)}.
+            </p>
+          ) : null}
+          {messages.length === 0 ? (
+            // Read, and there was no conversation in the window. The
+            // counts say which kind of nothing it was, because "300
+            // machinery records" and "an empty file" are different facts.
+            <p className="mt-2 text-xs text-[#8b949e]">
+              {window !== null &&
+              (window.non_conversation_records > 0 || window.unparseable_records > 0)
+                ? `No conversation in the last ${formatKb(window.bytes_read)} — ${window.non_conversation_records.toLocaleString()} bookkeeping record${window.non_conversation_records === 1 ? "" : "s"} and ${window.unparseable_records.toLocaleString()} that could not be read.`
+                : "Its transcript holds no conversation to show."}
+            </p>
+          ) : (
+            <>
+              {/* The cap, STATED, and this is where it matters most: a reader
+                  who cannot tell a short conversation from a truncated one has
+                  been told something false by omission. #910's own words asked
+                  for "a 'showing the last N lines of a large file' label", and
+                  the 39 real files over 1 MB are where it binds. */}
+              <p className="mt-2 text-xs text-[#8b949e]">
+                {window?.truncated
+                  ? `The last ${messages.length.toLocaleString()} message${messages.length === 1 ? "" : "s"} of a ${formatKb(window.file_bytes)} transcript. Earlier exchanges are not shown.`
+                  : `All ${messages.length.toLocaleString()} message${messages.length === 1 ? "" : "s"} in this transcript.`}
+                {window !== null && window.non_conversation_records > 0
+                  ? ` ${window.non_conversation_records.toLocaleString()} bookkeeping record${window.non_conversation_records === 1 ? "" : "s"} in the last window are not conversation and are not shown.`
+                  : ""}
+              </p>
+              <ol className="mt-3 space-y-2">
+                {messages.map((m, i) => (
+                  <li
+                    // The index is the key on purpose: transcript records
+                    // carry no stable id this reads, and two identical
+                    // messages in a row are a real thing a session does. The
+                    // list is only ever appended to or replaced whole, never
+                    // reordered or filtered, so the index IS the identity.
+                    key={i}
+                    className="rounded border border-[#30363d] bg-[#0d1117] p-2"
+                  >
+                    <div className="flex flex-wrap items-center gap-x-2 text-[11px] text-[#8b949e]">
+                      <span className="font-semibold text-[#e6edf3]">
+                        {m.role === "assistant" ? "Claude" : "You"}
+                      </span>
+                      {m.model ? <span>{m.model}</span> : null}
+                    </div>
+                    <div className="mt-1 space-y-1">
+                      {m.blocks.length === 0 ? (
+                        <p className="text-xs text-[#6e7681]">(nothing in this message)</p>
+                      ) : (
+                        m.blocks.map((b, j) => (
+                          <PreviewBlock
+                            key={j}
+                            block={b}
+                            pairings={pairings}
+                            // The session's liveness, passed DOWN rather
+                            // than re-derived (#1209). `liveness.rs` owns
+                            // "is this running" and two answers to one
+                            // question disagree the first time either
+                            // changes.
+                            liveness={d.liveness}
+                          />
+                        ))
+                      )}
+                    </div>
+                  </li>
+                ))}
+              </ol>
+            </>
+          )}
         </>
       )}
     </section>

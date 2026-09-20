@@ -118,11 +118,28 @@ vi.mock("../api/hooks", () => ({
       refetch: refetchFn,
     };
   },
-  useClaudeTranscriptTail: (path: string | null, enabled: boolean) => ({
-    data: state.preview,
+  // #1208: a FOLLOW. The phone's case for it is the stronger one -- the
+  // companion user cannot reach the machine, so a frozen snapshot of a
+  // RUNNING agent is the worst view in the app.
+  useClaudeTranscriptFollow: (path: string | null, enabled: boolean) => ({
+    messages: state.preview?.messages ?? [],
+    following: "following" as const,
+    lastReadAt: Date.UTC(2026, 0, 1, 12, 4, 31),
+    reread: null,
+    window:
+      state.preview === undefined
+        ? null
+        : {
+            truncated: state.preview.truncated,
+            file_bytes: state.preview.file_bytes,
+            bytes_read: state.preview.bytes_read,
+            non_conversation_records: state.preview.non_conversation_records,
+            unparseable_records: state.preview.unparseable_records,
+          },
     isError: false,
     error: undefined,
     isLoading: enabled && path !== null && state.preview === undefined,
+    pollMs: 3_000,
   }),
 }));
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
@@ -493,8 +510,8 @@ describe("the companion offers the view and hides only the Local actions", () =>
     // Behind the disclosure on the phone as on the desktop: a 256 KB read
     // over the pairing transport is exactly what must not happen on every
     // selection.
-    expect(screen.getByRole("button", { name: /read the transcript/i })).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: /read the transcript/i }));
+    expect(screen.getByRole("button", { name: /follow the transcript/i })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
     expect(screen.getByText("Running the tests now.")).toBeTruthy();
   });
 

@@ -5375,6 +5375,61 @@ pub async fn claude_transcript_tail(
         .map_err(|e| e.to_string())?
 }
 
+/// One incremental step of following a live transcript (#1208).
+///
+/// The companion to `claude_transcript_tail`, and the reason it is a
+/// separate command rather than a parameter: `tail` answers "show me this
+/// session" and reads a 256 KB window every time. This answers "what has
+/// changed since byte N", and on an unchanged file reads no transcript
+/// bytes at all.
+///
+/// # Why polling, and not a watcher
+///
+/// `claude/handoff.rs:9-19` argues it for its own file and the argument
+/// is the same here: `notify` is not a dependency, and a dead FSEvents
+/// stream on macOS reports "no new records" indistinguishably from "the
+/// watch died". Silence is the one failure a pane that claims to be
+/// following must never produce. A poll that stops is visible, because
+/// the pane states when it last read. #1201 is open on the same question
+/// for the filesystem scans.
+///
+/// # `Class::Read`
+///
+/// Same grounds as `claude_transcript_tail`: one `.jsonl` under
+/// `~/.claude/projects`, read-only, resolved through the same
+/// `claude_transcript_path` guard. Its response is bounded by the same
+/// constants -- a 256 KB window on any re-read, at most 200 messages,
+/// each block clamped -- plus a 64 KB fingerprint probe, so a phone
+/// following a 76 MB transcript is handed the same bounded answer the
+/// desktop is.
+///
+/// `cursor` is opaque to the caller: it is handed back exactly as it was
+/// received. `None` means "I have nothing, read me a window", which is
+/// the first poll after the pane opens.
+///
+/// # Absent is not zero
+///
+/// An `Err` means the transcript could not be READ -- including that it
+/// is GONE, which differs from `handoff.rs`'s case 4 on purpose: a
+/// missing handoff file is a machine without the hook installed, while a
+/// transcript that vanished mid-follow is a real failure the pane must
+/// state. A `Follow` with no messages and `bytes_read: 0` means we read
+/// it and the session wrote nothing, which is the session being idle --
+/// a different fact from the follow having stopped, and the UI must not
+/// render them the same way (#846, #1042).
+#[tauri::command]
+pub async fn claude_transcript_follow(
+    path: String,
+    cursor: Option<crate::claude::preview::Cursor>,
+) -> Result<crate::claude::preview::Follow, String> {
+    let p = claude_transcript_path(&path)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::claude::preview::follow(&p, cursor.as_ref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 // ---------------------------------------------------------------------
 // The repository browser (#1030-#1036, epic #1011). Rust side:
 // `repos/mod.rs`, where the git-index listing, the 256 KB bound and the

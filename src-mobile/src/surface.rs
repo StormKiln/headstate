@@ -269,6 +269,14 @@ pub const SURFACE: &[(&str, Class)] = &[
     // so asking for the desktop's 76 MB transcript cannot hand the phone
     // 76 MB. See the desktop copy for the path guard both commands share.
     ("claude_transcript_tail", Class::Read),
+    // Following that transcript as it is written (#1208). Same `Read`
+    // grounds as the row above, and the phone's case is the stronger one
+    // again: the companion user cannot reach the machine, so a frozen
+    // snapshot of a RUNNING agent is the worst view in the app.
+    //
+    // Bounded by the same constants, and cheaper per poll than the row
+    // above: it reads from a cursor rather than a fixed 256 KB window.
+    ("claude_transcript_follow", Class::Read),
     // Whether the DESKTOP's hooks are installed (#915). Read: one file
     // read, no side effects, and "is that desktop recording?" is a real
     // away-from-desk question.

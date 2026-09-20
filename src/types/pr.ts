@@ -2067,11 +2067,13 @@ export type ClaudePairing = "paired" | "call_above_window" | "unanswered" | "unk
 
 /// One previewed message.
 ///
-/// Not exported: it is reached only through `ClaudePreview.messages`, and
+/// Exported since #1208: `useClaudeTranscriptFollow` accumulates these
+/// across polls, so the conversation lives in a `ClaudePreviewMessage[]`
+/// of its own rather than only inside a `ClaudePreview`.
 /// `yarn knip` is right that a second name for the same shape earns
 /// nothing. The same call `ResumeCommand` above makes, and exporting it
 /// the moment something else needs it is one word.
-interface ClaudePreviewMessage {
+export interface ClaudePreviewMessage {
   /// `"assistant"` or `"user"`.
   role: string;
   /// RFC 3339, or `null` for a record that carried none. Never
@@ -2199,6 +2201,45 @@ export interface ClaudePreview {
   /// Results whose call is older than the window. Non-zero is the normal
   /// consequence of a tail read, not a defect.
   results_above_window: number;
+}
+
+/// Where a follow left off, and what the file looked like there (#1208).
+///
+/// Opaque: the pane stores it and hands it straight back. Rust side:
+/// `preview::Cursor`, which argues every field.
+export interface ClaudeFollowCursor {
+  offset: number;
+  /// SHA256 of the bounded region BEHIND `offset`. This is how a
+  /// compaction that rewrote history without shrinking the file is
+  /// caught -- see `ClaudeFollow.reread`.
+  behind_digest: string;
+  behind_bytes: number;
+}
+
+/// Why a follow read replaced what the pane had instead of extending it.
+///
+/// Three distinct facts, and the pane must switch on this rather than
+/// infer from the message count. `"rewritten_behind"` is the case
+/// `handoff.rs` does not have: compaction rewrote history behind the
+/// cursor and the file did not shrink, so no length comparison catches
+/// it and an append would splice new content onto a history that no
+/// longer exists.
+export type ClaudeReread = "first" | "shrank" | "rewritten_behind";
+
+/// One incremental step of following a live transcript (#1208).
+export interface ClaudeFollow {
+  /// On an append, ONLY the new messages. On a re-read, a whole fresh
+  /// window. `reread` says which, and the caller must not guess.
+  preview: ClaudePreview;
+  /// `null` is the ordinary append.
+  reread: ClaudeReread | null;
+  cursor: ClaudeFollowCursor;
+  /// Transcript bytes read, excluding the fingerprint probe. `0` means
+  /// the file did not change -- the session is idle, which is a
+  /// different fact from the follow having stopped.
+  bytes_read: number;
+  fingerprint_bytes_read: number;
+  file_bytes: number;
 }
 
 /// The session list, INCLUDING what could not be read (#917).
