@@ -5318,6 +5318,37 @@ fn installed_plugin_roots() -> (Vec<(String, String)>, Option<String>) {
 }
 
 #[tauri::command]
+/// Every MCP server configured on this machine, and which scope defines
+/// it (#1216).
+///
+/// Before this the app could not name a single MCP tool: the only trace
+/// of MCP anywhere in the backend was `plugins.rs` matching a filename
+/// to set one boolean, and `~/.claude.json` -- where the configuration
+/// actually lives -- was never opened.
+///
+/// `async` because it reads files, which the
+/// `no_sync_command_reaches_a_subprocess_or_a_whole_file` invariant
+/// forbids a sync command from doing. The read itself is bounded and
+/// READ-ONLY: `~/.claude.json` is Claude Code's live state file,
+/// rewritten by its owner while it runs, so this never writes to it and
+/// never holds more than `mcp::BUDGET_BYTES` of it.
+///
+/// No home directory is a REFUSAL, not an empty inventory, for the
+/// reason `claude_definitions` gives one line up: "you have no MCP
+/// servers" and "we could not look" are different answers, and the
+/// second must not render as the first.
+pub async fn claude_mcp_servers() -> Result<crate::claude::mcp::Inventory, String> {
+    let home = crate::auth::home_dir().ok_or_else(|| {
+        "no home directory is set, so ~/.claude.json could not be read".to_string()
+    })?;
+    let plugins = crate::claude::plugins::plugins_dir()
+        .ok_or_else(|| "no home directory is set, so ~/.claude could not be read".to_string())?;
+    tauri::async_runtime::spawn_blocking(move || crate::claude::mcp::inventory_in(&home, &plugins))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn claude_plugins(
     app: tauri::AppHandle,
 ) -> Result<crate::claude::plugins::PluginsReport, String> {

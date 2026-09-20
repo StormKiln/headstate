@@ -15,6 +15,7 @@ const ORIGIN_LABEL: Record<ClaudeSettingsOrigin, string> = {
   user: "~/.claude/settings.json",
   project: ".claude/settings.json",
   local: ".claude/settings.local.json",
+  plugin: "a plugin's .mcp.json",
 };
 
 /// What each verdict is called, and how it is coloured.

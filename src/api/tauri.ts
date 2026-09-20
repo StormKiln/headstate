@@ -1311,9 +1311,15 @@ export interface ClaudeHooksUninstalled {
 export const claudeHooksInventory = () =>
   call<ClaudeHookInventory>("claude_hooks_inventory");
 
-/// Which file a settings value came from, lowest precedence first.
+/// Which scope a value came from, lowest precedence first.
 /// Mirrors `claude::settings::Origin`.
-export type ClaudeSettingsOrigin = "user" | "project" | "local";
+///
+/// `"plugin"` is an installed plugin's `.mcp.json` (#1216). It is in
+/// THIS union rather than a parallel one so the settings page and the
+/// MCP page speak one vocabulary -- see the Rust enum's docs for the
+/// decision. `claudeEffectiveSettings` never returns it: no settings
+/// file yields a plugin scope.
+export type ClaudeSettingsOrigin = "plugin" | "user" | "project" | "local";
 
 export interface ClaudeSettingsContribution {
   origin: ClaudeSettingsOrigin;
@@ -1403,6 +1409,48 @@ export const claudeConfigHealth = () =>
   call<ClaudeConfigHealth>("claude_config_health");
 
 export const claudeHooksStatus = () => call<ClaudeHooksStatus>("claude_hooks_status");
+
+/// How an MCP server is reached. Mirrors `claude::mcp::Transport`.
+export type ClaudeMcpTransport =
+  | { kind: "stdio"; command: string }
+  | { kind: "url"; url: string }
+  /// The entry carried neither a command nor a url. Listed rather than
+  /// dropped: a server we cannot describe is still configured.
+  | { kind: "unknown" };
+
+export interface ClaudeMcpServer {
+  name: string;
+  transport: ClaudeMcpTransport;
+  /// Which scope defines it -- the load-bearing column (#1216).
+  origin: ClaudeSettingsOrigin;
+  /// The project path for a project-scope server, or the plugin name for
+  /// a plugin-shipped one. `null` for user scope, which has one home.
+  scopeDetail: string | null;
+}
+
+export interface ClaudeMcpInventory {
+  servers: ClaudeMcpServer[];
+  /// Scopes that exist and could not be read. NON-EMPTY with an empty
+  /// `servers` means "could not read the configuration", which is NOT
+  /// "no servers are configured" and must never render as it.
+  unreadable: ClaudeSettingsRefusal[];
+  /// Whether the read of `~/.claude.json` hit its byte budget. When
+  /// true the file was too large to read, which is why `servers` is
+  /// empty -- a different remedy from a malformed file.
+  truncated: boolean;
+  /// The file's size, when it could be measured, so a truncation notice
+  /// can state the total rather than only the floor.
+  sizeBytes: number | null;
+}
+
+/// Every MCP server configured on this machine, and which scope defines
+/// it (#1216).
+///
+/// Takes no arguments: the paths are resolved on the Rust side, which is
+/// deliberate for the reason the hook installer gives -- a path supplied
+/// over the wire would be a way to make the desktop read an arbitrary
+/// file.
+export const claudeMcpServers = () => call<ClaudeMcpInventory>("claude_mcp_servers");
 
 /// Install the hooks, appending to whatever is already there.
 ///
