@@ -87,6 +87,22 @@ vi.mock("../api/hooks", () => ({
     error: state.profileFailed ? "permission denied reading ~/.claude" : undefined,
     isLoading: !state.profileFailed && state.profile === undefined,
   }),
+  // #1203, the content-search section. This file's subject is the tiles
+  // and the cards, so the search resolves to nothing searched and no
+  // query run -- the state before anyone types. Its own empty-state
+  // wording is asserted in `ClaudeTranscriptSearch.test.tsx`.
+  useClaudeTranscriptSearch: () => ({
+    data: undefined,
+    isPending: false,
+    isError: false,
+    error: null,
+  }),
+  useClaudeIndexCoverage: () => ({
+    data: undefined,
+    isPending: false,
+    isError: false,
+    error: null,
+  }),
   useClaudeOverview: () => ({
     query: {
       data: state.data,
@@ -807,7 +823,14 @@ describe("ClaudeOverviewPage at real scale", () => {
     // #1071 adds ONE button for the whole page for the same reason: the
     // export is one action over every running session, not a control per
     // row.
-    expect(buttons.length).toBe(13 + 3 + 1 + 1);
+    //
+    // #1203 adds ONE more, and it is the same fixed cost: the transcript
+    // search is a single Search control over the whole corpus, not a
+    // control per session. A content search rendered per row is exactly
+    // what this assertion exists to prevent -- it would make the node
+    // count depend on the corpus on the one page whose design is a
+    // bounded render over 1,461 sessions.
+    expect(buttons.length).toBe(13 + 3 + 1 + 1 + 1);
     // And the total DOM is small enough that no windowing is warranted.
     expect(container.querySelectorAll("*").length).toBeLessThan(200);
   });

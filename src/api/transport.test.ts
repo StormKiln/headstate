@@ -230,6 +230,15 @@ const ROWS: Row[] = [
   // absence of a parameter, is what keeps them from being "read anything
   // and send it back".
   row(api.claudeImportTranscripts, [], "claude_import_transcripts"),
+  // #1203. `Class::Read`: it walks `~/.claude/projects` without writing
+  // and queries our own FTS5 index. The away-from-desk case is the same
+  // one the session list serves -- the phone has no transcripts of its
+  // own to search.
+  row(api.claudeSearchTranscripts, ["fsevents", 20], "claude_search_transcripts", {
+    query: "fsevents",
+    limit: 20,
+  }),
+  row(api.claudeIndexCoverage, [], "claude_index_coverage"),
   row(api.claudeSessions, [], "claude_sessions"),
   // #985. Takes a session ID rather than a path, and unlike the two path
   // reads above it needs no resolution guard: the id is looked up in

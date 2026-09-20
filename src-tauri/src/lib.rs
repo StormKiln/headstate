@@ -289,6 +289,8 @@ pub fn run() {
             commands::scan_claude_md,
             commands::read_claude_md,
             commands::claude_import_transcripts,
+            commands::claude_search_transcripts,
+            commands::claude_index_coverage,
             commands::claude_sessions,
             commands::claude_sessions_for_pr,
             commands::claude_session_detail,
@@ -804,6 +806,55 @@ pub fn run() {
                                         if prefs.enabled && prefs.claude_crashed {
                                             for crashed in &state.sweep.crashed_sessions {
                                                 notify_claude_crash(&app_handle, crashed);
+                                            }
+                                        }
+                                    }
+
+                                    // ---- Indexing failures (#1203) ----
+                                    //
+                                    // Through #1145's mechanism, which
+                                    // is what this loop already has. A
+                                    // transcript that could not be
+                                    // indexed is a known gap in what a
+                                    // search can cover, and a gap
+                                    // nobody is told about becomes an
+                                    // unexplained "no matches" the next
+                                    // time somebody searches for
+                                    // something that is in it.
+                                    //
+                                    // `indexed: None` -- the pass could
+                                    // not run at all -- is a failure
+                                    // too, and a worse one: no session
+                                    // was indexed and coverage is
+                                    // frozen wherever it stood.
+                                    match &state.indexed {
+                                        Some(done) if done.is_partial() => {
+                                            let why = format!(
+                                                "{} transcript(s) could not be indexed,                                                  {} row(s) refused",
+                                                done.all_unreadable().len(),
+                                                done.write_failures.len()
+                                            );
+                                            log::warn!("claude: index pass incomplete: {why}");
+                                            if background::CLAUDE_INDEX.failed(why) {
+                                                use tauri::Emitter;
+                                                let _ = app_handle.emit(
+                                                    "background-degraded",
+                                                    background::CLAUDE_INDEX.snapshot(),
+                                                );
+                                            }
+                                        }
+                                        Some(_) => {
+                                            background::CLAUDE_INDEX.ok(background::now_ms());
+                                        }
+                                        None => {
+                                            let why =
+                                                "the transcript index pass could not run".to_string();
+                                            if background::CLAUDE_INDEX.failed(why) {
+                                                use tauri::Emitter;
+                                                let _ = app_handle.emit(
+                                                    "background-degraded",
+                                                    background::CLAUDE_INDEX.snapshot(),
+                                                );
                                             }
                                         }
                                     }

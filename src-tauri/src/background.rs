@@ -167,13 +167,30 @@ pub static HEALTH_SAMPLER: Task = Task::new("health-sampler");
 /// The Claude Code live pass.
 pub static CLAUDE_LIVE: Task = Task::new("claude-live");
 
+/// The transcript content indexer, which rides along on the live pass
+/// (#1203).
+///
+/// Its OWN task rather than folded into `claude-live`, because the two
+/// fail independently and mean different things. The live pass failing
+/// means the session list is stale; the indexer failing means SEARCH
+/// coverage has stopped growing, and a user searching a corpus whose
+/// index quietly stopped advancing would read a partial answer as a
+/// settled one. Counting an index failure as a live-pass failure would
+/// also let a healthy live pass reset the consecutive count and hide a
+/// permanently stuck indexer.
+pub static CLAUDE_INDEX: Task = Task::new("claude-index");
+
 /// Every tracked loop, for the command.
 ///
-/// A fixed list rather than a registry: there are two, they are named in
-/// `lib.rs`, and a registry would be a lookup table with two entries
-/// plus a way to get them wrong.
+/// A fixed list rather than a registry: there are three, they are named
+/// in `lib.rs`, and a registry would be a lookup table with three
+/// entries plus a way to get them wrong.
 pub fn snapshot_all() -> Vec<TaskHealth> {
-    vec![HEALTH_SAMPLER.snapshot(), CLAUDE_LIVE.snapshot()]
+    vec![
+        HEALTH_SAMPLER.snapshot(),
+        CLAUDE_LIVE.snapshot(),
+        CLAUDE_INDEX.snapshot(),
+    ]
 }
 
 /// Milliseconds since the epoch.
@@ -288,11 +305,22 @@ mod tests {
     fn both_real_loops_are_reported_and_named_distinctly() {
         // The command returns this list; two entries sharing a name
         // would make the page unable to say which loop is broken.
+        //
+        // Three since #1203. The content indexer is its own entry
+        // rather than part of `claude-live` because the two fail
+        // independently and mean different things: a failed live pass
+        // means the session list is stale, a failed index means SEARCH
+        // COVERAGE has stopped growing. Folded together, a healthy live
+        // pass would reset the consecutive count every minute and hide
+        // a permanently stuck indexer -- and a user searching a corpus
+        // whose index quietly stopped would read a partial answer as a
+        // settled one.
         let all = snapshot_all();
-        assert_eq!(all.len(), 2);
+        assert_eq!(all.len(), 3);
         let names: Vec<&str> = all.iter().map(|t| t.task.as_str()).collect();
         assert!(names.contains(&"health-sampler"), "{names:?}");
         assert!(names.contains(&"claude-live"), "{names:?}");
+        assert!(names.contains(&"claude-index"), "{names:?}");
         let mut uniq = names.clone();
         uniq.sort_unstable();
         uniq.dedup();

@@ -313,6 +313,22 @@ pub const SURFACE: &[(&str, Class)] = &[
     // costs a bounded head read plus a 16 KB tail seek, and the ceiling
     // lives inside the command rather than in this table.
     ("claude_import_transcripts", Class::Read),
+    // Content search over the transcript corpus (#1203). Read: it walks
+    // `~/.claude/projects` without writing to it and queries the FTS5
+    // index in Headstate's own cache. The one write it makes is to our
+    // OWN denominator row, which records how many transcripts exist --
+    // bookkeeping about our index, not about the user's data.
+    //
+    // Worth exposing remotely for the reason the session list is: "which
+    // session was I in when I hit that error" is an away-from-desk
+    // question, and the phone has no transcripts of its own to search.
+    ("claude_search_transcripts", Class::Read),
+    // How much of the corpus is searchable (#1203). Read: two COUNT
+    // queries and one directory walk. Separate from the search so a
+    // client can state coverage before anything is typed -- a search box
+    // that says nothing about its own readiness invites an empty result
+    // to be read as settled.
+    ("claude_index_coverage", Class::Read),
     // The session list with derived liveness (#917). Read: it queries our
     // own cache, lists `~/.claude/sessions` and probes the process table.
     // Nothing is written anywhere, and `~/.claude` is only ever read.
@@ -1046,6 +1062,13 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         // inline held this listener for the length of the file.
         "read_claude_md" => res(commands::read_claude_md(a.get("path")?).await),
         "claude_import_transcripts" => res(commands::claude_import_transcripts(app.clone()).await),
+        "claude_search_transcripts" => {
+            res(
+                commands::claude_search_transcripts(app.clone(), a.get("query")?, a.get("limit")?)
+                    .await,
+            )
+        }
+        "claude_index_coverage" => res(commands::claude_index_coverage(app.clone()).await),
         "claude_sessions" => res(commands::claude_sessions(app.clone()).await),
         "claude_sessions_for_pr" => {
             res(

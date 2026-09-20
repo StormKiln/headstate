@@ -1224,6 +1224,81 @@ export interface ClaudeImported {
   absent_root: string | null;
 }
 
+/// How much of the transcript corpus is searchable (#1203).
+///
+/// Every field is a COUNT, not a ratio, because the sentence the UI has
+/// to write names the numbers literally: "no matches in the 340 of 1,482
+/// sessions indexed so far". A percentage cannot be put in that sentence
+/// and a progress bar cannot be read out loud.
+export interface ClaudeIndexCoverage {
+  /// Sessions whose content is in the index right now.
+  indexed: number;
+  /// Session transcripts found on disk. The denominator. Zero means the
+  /// corpus size is unknown -- no pass has recorded one -- which is NOT
+  /// a complete index of nothing.
+  total: number;
+  /// Transcripts that could not be read, with why. A known gap, not a
+  /// pending one: re-running the pass will not move these, so an index
+  /// with a non-empty list here is never complete however high `indexed`
+  /// climbs.
+  unreadable: string[];
+  /// Sessions indexed only as far as the 8 MB bound. Their content IS
+  /// searchable, just not all of it -- so a MISS against one is weaker
+  /// evidence than a miss against a whole file.
+  truncated: number;
+  /// When the index last ran, or `null` if it never has.
+  ///
+  /// `null` is not "just now" and not "long ago": it is "no pass has
+  /// completed", which is a fourth state and the honest one for a fresh
+  /// install.
+  last_indexed_at: string | null;
+}
+
+/// One matching session.
+interface ClaudeSearchHit {
+  session_id: string;
+  /// The text around the match, with matched terms wrapped in `[` `]`.
+  snippet: string;
+  /// Whether this session was indexed only to the 8 MB bound.
+  truncated: boolean;
+}
+
+/// What a content search concluded (#1203).
+///
+/// A tagged union rather than a possibly-empty array, because "nothing
+/// matched" and "nothing matched YET" are different conclusions and an
+/// array has ONE empty value for both. The type makes a caller say which
+/// empty state it is rendering:
+///
+/// - `matches` — hits, always non-empty.
+/// - `none` — nothing matched and the WHOLE corpus was searched. The
+///   only variant that may render as a plain "no matches".
+/// - `none_yet` — nothing matched in the part that is searchable. Must
+///   render with its numbers: "no matches in the {indexed} of {total}
+///   sessions indexed so far".
+/// - `not_asked` — no query was given, so nothing was searched. A fourth
+///   state, not a kind of empty result: an empty box is not a search that
+///   found nothing, and rendering it as `none` would paint "No matches"
+///   under a search box nobody has typed in.
+///
+/// Collapsing `none_yet` into `none` is the #846 conflation in the one
+/// place a user is least likely to question it.
+type ClaudeSearchVerdict =
+  | { kind: "matches"; hits: ClaudeSearchHit[] }
+  | { kind: "none" }
+  | { kind: "none_yet"; indexed: number; total: number }
+  | { kind: "not_asked" };
+
+/// A search result and the coverage that qualifies it, together.
+///
+/// One object, deliberately: handing a caller the hits and making the
+/// coverage available separately is the design that lets a UI render an
+/// empty list without it.
+export interface ClaudeSearchAnswer {
+  verdict: ClaudeSearchVerdict;
+  coverage: ClaudeIndexCoverage;
+}
+
 /// A liveness exactly as it arrives on the wire, with its reason
 /// interned (#985).
 ///

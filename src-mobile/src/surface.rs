@@ -178,6 +178,15 @@ pub const SURFACE: &[(&str, Class)] = &[
     // why it asks the desktop -- see the desktop table for the full
     // reasoning.
     ("claude_import_transcripts", Class::Read),
+    // Content search over the DESKTOP's transcript corpus (#1203). Read:
+    // it walks the desktop's `~/.claude/projects` without writing to it
+    // and queries the desktop's own FTS5 index. The phone has no
+    // transcripts of its own, which is exactly why it asks -- see the
+    // desktop table for the full reasoning.
+    ("claude_search_transcripts", Class::Read),
+    // How much of the desktop's corpus is searchable (#1203). Read: two
+    // counts and a directory walk, writing nothing.
+    ("claude_index_coverage", Class::Read),
     // The DESKTOP's session list with derived liveness (#917). Read: it
     // queries the desktop's cache, lists its `~/.claude/sessions` and
     // probes its process table, writing nothing. "Did the thing I left
