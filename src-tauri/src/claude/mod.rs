@@ -65,6 +65,12 @@
 pub mod cli;
 /// Silently-broken agent configuration, swept across repositories (#1217).
 pub mod confighealth;
+/// What the app has READ, against what it HOLDS (#1212).
+///
+/// A read-only aggregate over columns the modules around it already
+/// own, so the coverage caveats each of them argues in prose reach the
+/// screen ONCE rather than as a footnote per panel.
+pub mod coverage;
 pub mod crash;
 pub mod definitions;
 pub mod events;

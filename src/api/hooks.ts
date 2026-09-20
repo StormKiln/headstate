@@ -15,6 +15,7 @@ import type {
   StatsBackfillFrame,
   ClaudeImported,
   ClaudeOverview,
+  ClaudeCoverage,
   PluginsReport,
   ClaudePreviewMessage,
   ClaudeFollow,
@@ -134,6 +135,7 @@ import {
   readClaudeMd,
   claudeImportTranscripts,
   claudeOverview,
+  claudeCoverage,
   claudePlugins,
   claudeSessionUsage,
   claudeSubagentRollup,
@@ -2104,8 +2106,32 @@ export function useClaudeOverview(enabled: boolean) {
       await claudeImportTranscripts();
       await qc.invalidateQueries({ queryKey: ["claude-import"] });
       await qc.invalidateQueries({ queryKey: ["claude-overview"] });
+      await qc.invalidateQueries({ queryKey: ["claude-coverage"] });
     },
   };
+}
+
+/// What the app has read, against what it holds (#1212).
+///
+/// Shares `useClaudeOverview`'s cadence rather than picking its own: the
+/// two are read side by side on one page, and a coverage row that
+/// refreshed on a different tick would disagree with the counts above it
+/// for as long as the offset lasted -- #984's defect arrived at through
+/// timing instead of through a second derivation.
+///
+/// Cheap enough to poll: three COUNTs over the local cache, no
+/// filesystem work at all. The rescan in `useClaudeOverview` invalidates
+/// this key too, because a rescan is exactly the thing that moves these
+/// numbers.
+export function useClaudeCoverage(enabled: boolean) {
+  return useQuery<ClaudeCoverage>({
+    queryKey: ["claude-coverage"],
+    queryFn: claudeCoverage,
+    enabled,
+    refetchInterval: enabled ? CLAUDE_OVERVIEW_POLL_MS : false,
+    staleTime: CLAUDE_OVERVIEW_POLL_MS - 1_000,
+    retry: false,
+  });
 }
 
 /// Merge the base branch into a pull request's head.

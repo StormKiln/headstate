@@ -25,6 +25,7 @@ import type {
   ClaudeIndexCoverage,
   ClaudeSearchAnswer,
   ClaudeOverview,
+  ClaudeCoverage,
   PluginsReport,
   ClaudeRestartList,
   ClaudePreview,
@@ -1057,6 +1058,13 @@ export const claudeRevealPath = (path: string) =>
 /// Two SELECTs over the cache plus a stat per session and one directory
 /// listing; measured at 7ms for 1,461 sessions. Writes nothing.
 export const claudeOverview = () => call<ClaudeOverview>("claude_overview");
+
+/// What the app has read, against what it holds (#1212).
+///
+/// Three COUNTs over Headstate's own cache and no filesystem access at
+/// all, which is the point: the panel whose subject is the cost of
+/// reading the corpus does not read the corpus to draw itself.
+export const claudeCoverage = () => call<ClaudeCoverage>("claude_coverage");
 
 /// Installed plugins and what they were actually used for (#1075).
 ///

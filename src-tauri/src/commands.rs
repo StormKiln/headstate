@@ -5136,6 +5136,42 @@ pub async fn claude_overview(
     .map_err(|e| e.to_string())?
 }
 
+/// What the app has read, against what it holds (#1212, epic #1121).
+///
+/// The single place that states the corpus's scope, so the coverage
+/// caveat on every other Claude figure is stated once instead of
+/// re-argued at each call site. `claude/coverage.rs` carries the whole
+/// reasoning, including why this is counts-with-denominators and never a
+/// score.
+///
+/// # Why this is cheap where `claude_overview` is not
+///
+/// `claude_overview` stats one directory per session. This touches no
+/// filesystem at all -- three `COUNT`s over Headstate's own cache -- and
+/// that bound is deliberate: a panel whose subject is the cost of
+/// reading the corpus must not read the corpus to draw itself.
+///
+/// `spawn_blocking` anyway, because it opens SQLite, which is blocking
+/// work that does not belong on the async runtime however small it is.
+///
+/// A database that could not be read is an `Err`, for the reason
+/// `claude_overview` gives one variant of: a struct of zeros would
+/// render "0 of 0 sessions" on every row, which looks exactly like an
+/// empty corpus. That is the absent-is-not-zero defect committed by the
+/// one panel written to prevent it.
+#[tauri::command]
+pub async fn claude_coverage(
+    app: tauri::AppHandle,
+) -> Result<crate::claude::coverage::CoverageReport, String> {
+    let db = db_path(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&db).map_err(|e| e.to_string())?;
+        crate::claude::coverage::report(&conn).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Every running session's resume command, for a restart (#1071).
 ///
 /// The user is about to reboot and wants the lines that bring their
