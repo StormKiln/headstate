@@ -900,6 +900,51 @@ mod tests {
         assert!(unreadable.is_empty());
     }
 
+    /// `Collision::members` index into the FINAL, sorted list. Computing
+    /// them before the sort -- or sorting again afterwards -- would leave
+    /// every index pointing at the wrong row, and the UI marks rows by
+    /// exactly these numbers. A silent off-by-one here mislabels which
+    /// definition is in conflict, which is worse than not reporting it.
+    #[test]
+    fn collision_members_index_the_sorted_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home").join(".claude");
+        let repo = tmp.path().join("repo");
+        // `zeta` is written FIRST and in the user scope, so an
+        // unsorted list would put it at index 0 -- the sort moves it
+        // last, and the collision indices must follow.
+        write(
+            &home.join("agents").join("zeta.md"),
+            "---\nname: zeta\n---\n",
+        );
+        write(
+            &home.join("agents").join("alpha.md"),
+            "---\nname: alpha\n---\n",
+        );
+        write(
+            &repo.join(".claude").join("agents").join("alpha.md"),
+            "---\nname: alpha\n---\n",
+        );
+
+        let inv = scan_scopes(&roots(Some(home), std::slice::from_ref(&repo), &[]));
+
+        assert_eq!(
+            inv.definitions
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "alpha", "zeta"],
+        );
+        let c = &inv.collisions[0];
+        assert_eq!(c.name, "alpha");
+        for m in &c.members {
+            assert_eq!(
+                inv.definitions[*m].name, "alpha",
+                "member {m} points at the wrong row: the indices did not follow the sort"
+            );
+        }
+    }
+
     /// A definition in NO scope at all is the shape #1215 exists to
     /// fix: before this, a project skill simply did not appear.
     #[test]

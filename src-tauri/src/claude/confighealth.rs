@@ -460,7 +460,10 @@ fn collect_import_problems(
 pub fn user_findings(home: &Path) -> Vec<Finding> {
     let mut out = Vec::new();
 
-    let defs = crate::claude::definitions::scan_in(&home.join(".claude"));
+    let defs = crate::claude::definitions::scan_in(
+        &home.join(".claude"),
+        &crate::claude::definitions::Source::User,
+    );
     for entry in &defs.unreadable {
         out.push(Finding {
             check: Check::Definition,
