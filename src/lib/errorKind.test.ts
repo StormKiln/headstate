@@ -7,7 +7,7 @@ import {
   type CommandError,
   type ErrorKind,
 } from "./errorKind";
-import { NOT_ASKED } from "./notAsked";
+import { AUTH_EXPIRED, NOT_ASKED } from "./notAsked";
 
 describe("isCommandError", () => {
   it("accepts the shape the remote wire now sends", () => {
@@ -66,6 +66,37 @@ describe("commandError", () => {
   it("does not claim a GitHub failure was never asked", () => {
     expect(commandError(new Error("request timed out after 60s")).kind).toBe("other");
     expect(commandError(new Error("401 Bad credentials")).kind).toBe("other");
+  });
+
+  /// The refused-token marker, and the property that makes it a type
+  /// rather than the old regex relocated (#1230).
+  ///
+  /// `"401 Bad credentials"` above is unmarked prose, and it stays
+  /// `"other"` -- which is the whole point. The deleted regex matched
+  /// exactly that string and would have claimed it; this classifier
+  /// only recognises what Rust marked, and Rust marks it from
+  /// `octocrab::Error::GitHub`'s `status_code`. No sentence decides
+  /// anything on this side any more.
+  it("recognises a refused token only by its marker", () => {
+    expect(commandError(new Error(`${AUTH_EXPIRED} GitHub rejected the token`)).kind).toBe(
+      "expired-token",
+    );
+    // Unmarked prose that would have matched the old regex.
+    expect(commandError(new Error("unauthorized")).kind).toBe("other");
+    expect(commandError(new Error("GitHub request failed: GitHub")).kind).toBe("other");
+    // And the prefix rule, as with `NOT_ASKED`.
+    expect(commandError(`quoting ${AUTH_EXPIRED} in passing`).kind).toBe("other");
+  });
+
+  /// The two markers must not collide. `AUTH_EXPIRED` and `NOT_ASKED`
+  /// are both `headstate:`-prefixed, and a prefix test on the shorter
+  /// one would swallow the other if either were ever reworded into a
+  /// prefix of its sibling.
+  it("keeps the two markers distinct", () => {
+    expect(AUTH_EXPIRED.startsWith(NOT_ASKED)).toBe(false);
+    expect(NOT_ASKED.startsWith(AUTH_EXPIRED)).toBe(false);
+    expect(commandError(`${NOT_ASKED} x`).kind).toBe("not-asked");
+    expect(commandError(`${AUTH_EXPIRED} x`).kind).toBe("expired-token");
   });
 
   /// The marker is a PREFIX, matched as one -- the same rule

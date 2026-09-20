@@ -15,10 +15,11 @@ import { ACTIVE_SECS } from "@/components/ArtifactsPage";
 import { ACTIVITY_DAYS } from "@/components/ClaudeOverviewPage";
 import { PLUGIN_ACTIVITY_DAYS } from "@/components/ClaudePluginsPage";
 import { TOP_N } from "@/components/stats/Leaderboard";
-import { ERROR_KINDS } from "./errorKind";
+import { ERROR_KINDS, commandError } from "./errorKind";
 import { ABSOLUTE_GAP_MS } from "./health";
 import { AUTO_COMPACT_PRESSURE } from "./subagentDisagreement";
 import { CANCELLED } from "./cancelled";
+import { AUTH_EXPIRED, NOT_ASKED } from "./notAsked";
 import {
   DEFAULT_STALE_DAYS,
   MAX_STALE_DAYS,
@@ -520,7 +521,58 @@ describe("the command rejection kinds", () => {
     const kinds = rustKinds();
     expect(kinds.length).toBeGreaterThan(1);
     expect(kinds).toContain("not-asked");
+    expect(kinds).toContain("expired-token");
     expect(new Set(kinds).size).toBe(kinds.length);
+  });
+
+  /// The MARKERS, which is the half the kind list cannot cover (#1230).
+  ///
+  /// A kind is only as good as the string that carries it. Neither
+  /// transport delivers `{kind, message}` to the webview -- the
+  /// desktop's `poll-error` is a Tauri event carrying a bare `String`,
+  /// and the phone's `remote_call` is `Result<Value, String>` -- so
+  /// what actually crosses is a marker embedded in the prose, written
+  /// by Rust and matched by `commandError`.
+  ///
+  /// That makes a drifted marker the worst failure in this file,
+  /// because it does not fail: the `ErrorKind` list still agrees in
+  /// both directions, `commandError` still returns a kind, and it is
+  /// simply always `"other"`. The relaunch remedy disappears from the
+  /// banner with every test on both sides passing -- and on the
+  /// `NOT_ASKED` side, the marker starts reaching the user's screen,
+  /// which is the concrete thing `cancelled.ts` was written about.
+  ///
+  /// Both markers, not just the new one: `notAsked.ts` has asserted its
+  /// own since #1202 and the check belongs with its sibling.
+  it("carry the exact markers the Rust side writes", async () => {
+    const commandsRs = (await import("../../src-tauri/src/commands.rs?raw")).default;
+    expect(NOT_ASKED).toBe(rustStrConst(commandsRs, "NOT_ASKED", "commands.rs"));
+    expect(AUTH_EXPIRED).toBe(rustStrConst(commandsRs, "AUTH_EXPIRED", "commands.rs"));
+  });
+
+  /// And that each marker actually produces its kind, end to end.
+  ///
+  /// The assertion above proves the two spellings agree; this proves
+  /// `commandError` is wired to them. Both are needed: matching
+  /// constants with a classifier that never consults them is the
+  /// "mirror test that quietly stops reading the real value" this
+  /// file's header warns about, one layer along.
+  ///
+  /// The marker is asserted STRIPPED as well, because it is a wire
+  /// detail that must never be rendered -- `cancelled.ts` exists
+  /// because one reached a user's screen.
+  it("classify to the kind their marker names, with the marker stripped", () => {
+    const expired = commandError(`${AUTH_EXPIRED} GitHub rejected the token: Bad credentials`);
+    expect(expired.kind).toBe("expired-token");
+    expect(expired.message).toBe("GitHub rejected the token: Bad credentials");
+
+    const declined = commandError(`${NOT_ASKED} not authenticated`);
+    expect(declined.kind).toBe("not-asked");
+    expect(declined.message).toBe("not authenticated");
+
+    // And neither marker claims a message that merely mentions it.
+    expect(commandError(`GitHub said ${AUTH_EXPIRED} once`).kind).toBe("other");
+    expect(commandError("request timed out after 60s").kind).toBe("other");
   });
 
   /// Both directions. A kind added to Rust alone fails the first
