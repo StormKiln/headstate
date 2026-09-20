@@ -1048,26 +1048,57 @@ export const claudeOverview = () => call<ClaudeOverview>("claude_overview");
 /// Which kind of definition. Mirrors `claude::definitions::Kind`.
 export type ClaudeDefinitionKind = "skill" | "agent" | "command";
 
+/// Which scope a definition came from (#1215). Mirrors
+/// `claude::definitions::Source`, which is an internally tagged enum.
+export type ClaudeDefinitionSource =
+  | { scope: "user" }
+  | { scope: "project"; path: string }
+  | { scope: "plugin"; name: string; path: string };
+
 export interface ClaudeDefinition {
   kind: ClaudeDefinitionKind;
   name: string;
   /// Whether `name` came from frontmatter or from the filename. A skill
   /// directory IS addressed by its name, so the fallback is real rather
   /// than invented -- but a reader still has to be able to tell.
-  named_in_frontmatter: boolean;
+  namedInFrontmatter: boolean;
   description: string | null;
   path: string;
+  source: ClaudeDefinitionSource;
+}
+
+/// Two or more definitions of one kind claiming one name.
+///
+/// A REPORT, not a resolution: which one Claude Code loads is a rule
+/// Headstate has not measured, so it names the claimants and asserts no
+/// winner. `members` index into `ClaudeDefinitions.definitions`.
+export interface ClaudeDefinitionCollision {
+  kind: ClaudeDefinitionKind;
+  name: string;
+  members: number[];
+}
+
+/// One scope that exists and could not be listed.
+export interface ClaudeDefinitionScopeRefusal {
+  source: ClaudeDefinitionSource;
+  /// The message naming the path and the OS error.
+  detail: string;
 }
 
 export interface ClaudeDefinitions {
+  /// Every definition from every scope. NOTHING is deduped -- a name
+  /// claimed twice appears twice, and `collisions` is how a reader
+  /// finds out.
   definitions: ClaudeDefinition[];
-  /// Directories that exist and could not be listed. A permission wall
-  /// hides an unknown number of definitions, so this is a message, not
-  /// a count.
-  unreadable: string[];
+  collisions: ClaudeDefinitionCollision[];
+  /// Per scope, so a walled-off project cannot hide inside a successful
+  /// user scan. A permission wall hides an unknown number of
+  /// definitions, so this is a message, not a count.
+  unreadable: ClaudeDefinitionScopeRefusal[];
 }
 
-/// Every skill, subagent and slash command in `~/.claude` (#1129).
+/// Every skill, subagent and slash command, across user, project and
+/// plugin scope (#1129, #1215).
 export const claudeDefinitions = () => call<ClaudeDefinitions>("claude_definitions");
 
 export const claudePlugins = () => call<PluginsReport>("claude_plugins");
