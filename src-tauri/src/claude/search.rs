@@ -18,15 +18,41 @@
 //! sessions this app indexes   1,489 files   0.83 GB
 //! subagent transcripts, excluded  1,037 files
 //!
-//! index build, cold, to full coverage    9,944 ms over 15 passes
-//! steady-state pass (nothing changed)        3 ms
+//! index build, cold, to full coverage    9,953 ms over 15 passes
+//! steady-state index step                    3 ms
+//! ADDED COST to the live pass, warm        927 ms (922 scan + 5 index)
 //! database growth                         0.06 GB
 //! transcripts truncated at 8 MB                17
-//! query latency                           0-18 ms
+//! query latency                           1-19 ms
 //! ```
 //!
-//! Two of those deserve comment because they are better than the issue
-//! assumed, and the reason is not luck.
+//! # The live pass IS materially slower, and by how much
+//!
+//! 927 ms per tick, warm, not the 3 ms the index step costs on its own.
+//! Quoting the index step alone would be picking the flattering half of
+//! the number a reader uses to decide whether this belongs on a
+//! 60-second timer.
+//!
+//! Almost all of it is the corpus SCAN, which is new work on that loop:
+//! `claude_live_pass` did not walk `~/.claude/projects` before #1203.
+//! The index step itself is 3-5 ms because the ledger's `(size, mtime)`
+//! check skips an unchanged transcript without opening it.
+//!
+//! It is affordable where it sits -- a background thread, 927 ms of
+//! every 60,000, all of it off the UI -- but it is real, and a future
+//! change that moves this pass anywhere interactive has to start from
+//! 927 ms rather than from 3.
+//!
+//! The obvious saving is to share one scan with the session import
+//! rather than walking the tree twice per tick. It is deliberately not
+//! taken here: the import and this index are currently independent, and
+//! coupling them to save 900 ms of background time is a change to the
+//! live pass's structure that belongs in its own issue with its own
+//! reasoning, not smuggled in under a search feature.
+//!
+//! # Two figures that are better than the issue assumed
+//!
+//! Not luck; the reason is worth stating so it is not lost.
 //!
 //! **0.06 GB, not 0.83 GB.** #1203 expected "a second copy of 881 MB of
 //! text in the database". It is 7% of that, because [`readable_text`]
@@ -1299,12 +1325,29 @@ mod tests {
         println!("index build total         {total_ms} ms");
         println!("truncated at 8 MB         {truncated}");
 
-        // A steady-state pass: everything unchanged, which is what the
-        // live pass actually pays every 60 seconds.
+        // A steady-state pass: everything unchanged.
         let steady = index_pass(&mut conn, &scan).unwrap();
         println!(
-            "steady-state pass         {} ms ({} unchanged)",
+            "steady-state index        {} ms ({} unchanged)",
             steady.elapsed_ms, steady.unchanged
+        );
+
+        // What the LIVE PASS actually pays every 60 seconds, which is
+        // the scan PLUS the index step -- not the index step alone.
+        //
+        // The scan is new cost on that loop: `claude_live_pass` did not
+        // walk the corpus before #1203. Quoting only the 3 ms index
+        // would be picking the flattering half of a number the reader
+        // is using to judge whether this belongs on a 60-second timer.
+        let t = std::time::Instant::now();
+        let warm = crate::claude::scan(&root);
+        let warm_scan_ms = t.elapsed().as_millis();
+        let warm_index = index_pass(&mut conn, &warm).unwrap();
+        println!(
+            "live-pass added cost      {} ms ({} ms scan + {} ms index), warm",
+            warm_scan_ms as u64 + warm_index.elapsed_ms,
+            warm_scan_ms,
+            warm_index.elapsed_ms
         );
 
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
@@ -1327,7 +1370,30 @@ mod tests {
         // and the control measured the opposite of what it claimed. A
         // self-referential corpus is the trap here, and the literal
         // below is deliberately not a word anyone would type.
-        for q in ["fsevents", "migration", "qqxzvw7unlikelytoken"] {
+        // The third is a CONTROL: a term that must match nothing, so the
+        // no-hit path is timed too.
+        //
+        // RANDOM per run, and that is not belt-and-braces. The corpus is
+        // self-referential -- the transcript of the session running this
+        // test lands in `~/.claude/projects` and contains this file's
+        // source -- so any fixed token is searchable on the NEXT run,
+        // and the control then measures the opposite of what it claims.
+        //
+        // Observed twice, not feared: a readable phrase ("no such word
+        // anywhere") returned 2 hits, and so did a nonsense literal once
+        // the run that introduced it had been written to disk. Splitting
+        // the literal across a `format!` did not help either, because
+        // the assembled string is what gets indexed. A value that did
+        // not exist when the corpus was written is the only thing that
+        // can be absent from it.
+        let control = format!(
+            "zzctl{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        for q in ["fsevents", "migration", &control] {
             let t = std::time::Instant::now();
             let a = search(&conn, q, 50, scan.unreadable_files.clone()).unwrap();
             let hits = match &a.verdict {
