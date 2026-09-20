@@ -136,10 +136,14 @@ const LIFECYCLE_TYPES: [&str; 3] = ["queue-operation", "permission-mode", "workt
 
 /// What the lifecycle records in the window said (#1206).
 ///
-/// Every field is [`Observed`], because every one of them can be absent
-/// for a reason that is not zero -- the record is outside the window, or
-/// the session predates the feature that writes it. `None` is "not
-/// observed", never "none happened".
+/// Every field can be absent for a reason that is not zero -- the record
+/// is outside the window, or the session predates the feature that
+/// writes it -- so every field carries that state explicitly. "Not
+/// observed" never means "none happened".
+///
+/// Two of them use [`Observed`], which is `Option`. [`Self::worktree`]
+/// cannot: it has THREE states rather than two, and nested `Option`
+/// serialises two of them to the same JSON `null`. See [`Worktree`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lifecycle {
     /// The prompt queue, or `None` when it could not be counted.
