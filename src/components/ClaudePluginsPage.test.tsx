@@ -19,7 +19,7 @@ vi.mock("../api/hooks", () => ({
   // #1129. Empty by default: this file's tests are about the plugins
   // table, and the definitions section is a sibling with its own tests.
   useClaudeDefinitions: () => ({
-    data: { definitions: [], unreadable: [] },
+    data: { definitions: [], collisions: [], unreadable: [] },
     isLoading: false,
     isError: false,
     error: null,

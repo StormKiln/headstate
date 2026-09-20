@@ -5039,22 +5039,125 @@ pub async fn claude_restart_list(
 /// "0 calls" column that look exactly like a measured absence, and on
 /// THIS page that argues for uninstalling a plugin the user relies on.
 #[tauri::command]
-/// Every skill, subagent and slash command in `~/.claude` (#1129).
+/// Every skill, subagent and slash command, across every scope (#1129,
+/// #1215).
 ///
 /// `claude_plugins` reports which plugins ship a `skills/` directory and
 /// nothing about what is in it, so a user could not answer "what
 /// subagents do I have". Hand-written definitions -- the ones belonging
 /// to no plugin -- were invisible entirely.
 ///
+/// # Three kinds of scope, and no winner between them
+///
+/// #1129 scanned `~/.claude` alone, which on a machine with ~38
+/// repositories hid every project-scoped definition and everything
+/// shipped by an installed plugin. This walks all three and stamps each
+/// result with its `Source`.
+///
+/// It does NOT dedupe. A project skill and a user skill with the same
+/// name are reported as a `Collision` naming both, because which one
+/// Claude Code actually loads is a rule this app has not measured --
+/// the argument `claude::definitions`' header makes at length, and the
+/// same one `claude::settings::KEYS` makes for its deliberately short
+/// list.
+///
+/// # Why the roots are resolved here
+///
+/// `definitions::scan_scopes` takes its roots as a parameter so it is
+/// testable without a home directory, a settings database or an
+/// `installed_plugins.json` -- process-global and app-global state that
+/// would race every other test in the binary. Resolving them is this
+/// command's job, and the three resolutions fail INDEPENDENTLY: no home
+/// directory still leaves the projects worth scanning, and an
+/// unreadable plugin inventory still leaves the user root.
+///
 /// No home directory is a REFUSAL, not an empty inventory: "you have no
 /// skills" and "we could not look" are different answers, and the
-/// second must not render as the first.
-pub async fn claude_definitions() -> Result<crate::claude::definitions::Definitions, String> {
-    let root = crate::claude::definitions::user_root()
+/// second must not render as the first. It stays a refusal because
+/// without a home there are no plugins either, and `~/.claude` is where
+/// most definitions live -- a partial answer with that hole in it would
+/// be the confident-wrong shape in a new place.
+///
+/// `spawn_blocking` because this is now N directory walks rather than
+/// one, and the invariant test forbids a sync command doing either.
+pub async fn claude_definitions(
+    app: AppHandle,
+) -> Result<crate::claude::definitions::Inventory, String> {
+    use crate::claude::definitions as defs;
+
+    let user = defs::user_root()
         .ok_or_else(|| "no home directory is set, so ~/.claude could not be read".to_string())?;
-    tauri::async_runtime::spawn_blocking(move || crate::claude::definitions::scan_in(&root))
-        .await
-        .map_err(|e| e.to_string())
+    let dirs = get_worktree_dirs(app.clone());
+    // The plugin inventory, read on the blocking pool with everything
+    // else. A plugin list we could not read is NOT an error: the user
+    // and project scopes are real answers and worth showing, the trade
+    // `list_worktrees` states. It surfaces as a `ScopeRefusal` below.
+    tauri::async_runtime::spawn_blocking(move || {
+        let (repos, repo_refusals) = defs::project_roots(&dirs);
+        let (plugins, plugin_refusal) = installed_plugin_roots();
+        let roots = defs::roots(Some(user), &repos, &plugins);
+        let mut out = defs::scan_scopes(&roots);
+        // A directory we could not even walk LOOKING for a `.claude` can
+        // hide any number of project scopes, so it is reported with the
+        // rest rather than dropped -- the same rule `RepoScan::unreadable`
+        // follows one layer up.
+        for detail in repo_refusals {
+            out.unreadable.push(defs::ScopeRefusal {
+                source: defs::Source::Project {
+                    path: String::new(),
+                },
+                detail,
+            });
+        }
+        if let Some(detail) = plugin_refusal {
+            out.unreadable.push(defs::ScopeRefusal {
+                source: defs::Source::Plugin {
+                    name: String::new(),
+                    path: String::new(),
+                },
+                detail,
+            });
+        }
+        out
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Installed plugins as `(name, install_path)`, plus why the inventory
+/// could not be read.
+///
+/// Reads the same `installed_plugins.json` `claude_plugins` does, via
+/// `plugins::parse_inventory`, so the two pages name plugins
+/// identically. A plugin with no recorded install path is SKIPPED rather
+/// than guessed at: `plugins.rs`'s ownership table records what a
+/// derived path rule costs, and inventing one here would attribute a
+/// stranger's definitions to a plugin.
+fn installed_plugin_roots() -> (Vec<(String, String)>, Option<String>) {
+    let Some(dir) = crate::claude::plugins::plugins_dir() else {
+        // Unreachable in practice -- the caller already refused without a
+        // home -- but stated rather than unwrapped.
+        return (Vec::new(), None);
+    };
+    let path = dir.join("installed_plugins.json");
+    let body = match std::fs::read_to_string(&path) {
+        Ok(b) => b,
+        // An ABSENT inventory is a machine with no plugins, not a
+        // failure, and reporting it would make the honest signal
+        // worthless -- `absent_directories_are_not_reported_as_unreadable`
+        // one layer down.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Vec::new(), None),
+        Err(e) => return (Vec::new(), Some(format!("{}: {e}", path.display()))),
+    };
+    match crate::claude::plugins::parse_inventory(&body) {
+        Ok(list) => (
+            list.into_iter()
+                .filter_map(|p| p.install_path.map(|ip| (p.name, ip)))
+                .collect(),
+            None,
+        ),
+        Err(e) => (Vec::new(), Some(format!("{}: {e}", path.display()))),
+    }
 }
 
 #[tauri::command]

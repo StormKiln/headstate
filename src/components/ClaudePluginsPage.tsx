@@ -1,6 +1,7 @@
 import { Card } from "@/components/ui/card";
 import { useClaudeDefinitions, useClaudePlugins } from "../api/hooks";
-import type { ClaudeDefinition } from "../api/tauri";
+import type { ClaudeDefinition, ClaudeDefinitionSource } from "../api/tauri";
+import { definitionSourceLabel } from "../lib/definitionSource";
 import { relativeTime } from "../lib/time";
 import type {
   InstalledPlugin,
@@ -632,12 +633,49 @@ function CallCount({
   );
 }
 
-/// Every skill, subagent and slash command on this machine (#1129).
+/// A scope badge, so every row says where it came from.
+///
+/// The scope is on the ROW rather than only in a grouping header
+/// because the list is sorted by name -- which is what puts a colliding
+/// pair adjacent, and a collision is unreadable if you cannot see which
+/// row is which.
+function SourceBadge({ source }: { source: ClaudeDefinitionSource }) {
+  const tone =
+    source.scope === "user"
+      ? "text-[#58a6ff]"
+      : source.scope === "project"
+        ? "text-[#3fb950]"
+        : "text-[#d2a8ff]";
+  return (
+    <span
+      className={`ml-2 text-[10px] ${tone}`}
+      title={source.scope === "user" ? "~/.claude" : source.path}
+    >
+      {definitionSourceLabel(source)}
+    </span>
+  );
+}
+
+/// Every skill, subagent and slash command on this machine (#1129,
+/// #1215).
 ///
 /// The plugins table above reports which plugins SHIP a `skills/`
 /// directory and nothing about what is inside it, so a user could not
 /// answer "what subagents do I have". Hand-written definitions -- the
-/// ones belonging to no plugin -- were invisible entirely.
+/// ones belonging to no plugin -- were invisible entirely, and before
+/// #1215 so was everything outside `~/.claude`.
+///
+/// # Why a collision is shown rather than resolved
+///
+/// Two definitions of one kind with one name shadow each other, and
+/// which one Claude Code loads is a rule this app has not measured.
+/// `claude/definitions.rs`'s header makes the argument at length: a
+/// precedence rule invented here would be a second source of truth for
+/// someone else's behaviour, and unlike a wrong merged VALUE a wrong
+/// precedence here deletes a definition from the page entirely. So both
+/// are listed, marked, and their sources named -- the user resolves it
+/// against the tool that actually decides.
+///
 /// Exported for its own test file: the plugins report this page also
 /// renders is a large fixture, and reconstructing it to exercise a
 /// sibling section would test the fixture.
@@ -671,23 +709,65 @@ export function DefinitionsSection() {
     );
   }
 
-  const byKind = (k: ClaudeDefinition["kind"]) => data.definitions.filter((d) => d.kind === k);
+  // Indices, not definitions: a collision names rows in THIS list, and
+  // matching by name again on the frontend would be a second
+  // implementation of the grouping that could disagree with the first.
+  const colliding = new Set<number>();
+  for (const c of data.collisions) for (const m of c.members) colliding.add(m);
+
+  const indexed = data.definitions.map((d, i) => ({ d, i }));
+  const byKind = (k: ClaudeDefinition["kind"]) => indexed.filter((x) => x.d.kind === k);
 
   return (
     <div className="mt-6">
       <h3 className="text-sm font-semibold text-[#e6edf3]">Skills, agents and commands</h3>
       <p className="mt-1 text-xs text-[#8b949e]">
-        Everything in <code>~/.claude</code>, including definitions that belong to no plugin.
+        Everything in <code>~/.claude</code>, in each scanned project&rsquo;s{" "}
+        <code>.claude</code>, and in every installed plugin.
       </p>
 
       {/* What could not be read, ABOVE the list rather than instead of
           it: the definitions that did read are real and worth showing,
-          which is the trade `PartialScanNotice` states. */}
+          which is the trade `PartialScanNotice` states. Each refusal
+          names its SCOPE, because a project behind a permission wall
+          hides an unknown number of definitions and a successful user
+          scan beside it must not paper over that. */}
       {data.unreadable.length > 0 && (
-        <p role="status" className="mt-2 text-xs text-[#d29922]">
-          {data.unreadable.length} director{data.unreadable.length === 1 ? "y" : "ies"} could
-          not be read, so the list below may not be all of them.
-        </p>
+        <div role="status" className="mt-2 text-xs text-[#d29922]">
+          <p>
+            {data.unreadable.length} scope{data.unreadable.length === 1 ? "" : "s"} could not
+            be read, so the list below may not be all of them.
+          </p>
+          <ul className="mt-1 space-y-0.5">
+            {data.unreadable.map((r) => (
+              <li key={r.detail} className="text-[10px] text-[#8b949e]">
+                {r.detail}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* Collisions, named rather than resolved. See this component's
+          doc comment and `claude/definitions.rs`'s header. */}
+      {data.collisions.length > 0 && (
+        <div role="status" className="mt-2 text-xs text-[#d29922]">
+          <p>
+            {data.collisions.length} name{data.collisions.length === 1 ? " is" : "s are"}{" "}
+            claimed by more than one scope. Which one Claude Code loads is its rule, not
+            Headstate&rsquo;s, so both are listed below.
+          </p>
+          <ul className="mt-1 space-y-0.5">
+            {data.collisions.map((c) => (
+              <li key={`${c.kind}:${c.name}`} className="text-[10px] text-[#8b949e]">
+                {c.kind} <span className="text-[#e6edf3]">{c.name}</span>:{" "}
+                {c.members
+                  .map((m) => definitionSourceLabel(data.definitions[m].source))
+                  .join(" and ")}
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
 
       {data.definitions.length === 0 ? (
@@ -705,12 +785,23 @@ export function DefinitionsSection() {
                   {kind}s ({items.length})
                 </p>
                 <ul className="mt-1 space-y-0.5">
-                  {items.map((d) => (
-                    <li key={d.path} className="text-xs">
+                  {items.map(({ d, i }) => (
+                    // Keyed on the INDEX as well as the path: overlapping
+                    // scan roots can reach one file twice, and a
+                    // duplicate key would drop a row React should keep.
+                    <li key={`${i}:${d.path}`} className="text-xs">
                       <span className="text-[#e6edf3]">{d.name}</span>
+                      <SourceBadge source={d.source} />
+                      {/* Marked on the ROW as well as in the summary
+                          above: a user scrolling the list has to be able
+                          to see that this entry is not the only one
+                          answering to this name. */}
+                      {colliding.has(i) && (
+                        <span className="ml-1 text-[10px] text-[#d29922]">(name collision)</span>
+                      )}
                       {/* A name taken from the filename is marked, so a
                           reader can tell it from one the author wrote. */}
-                      {!d.named_in_frontmatter && (
+                      {!d.namedInFrontmatter && (
                         <span className="ml-1 text-[10px] text-[#6e7681]">(from filename)</span>
                       )}
                       {d.description && (

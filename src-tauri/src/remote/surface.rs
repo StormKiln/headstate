@@ -1065,7 +1065,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "claude_event_profile" => res(commands::claude_event_profile(app.clone()).await),
         "claude_poll_live" => res(commands::claude_poll_live(app.clone()).await),
         "claude_overview" => res(commands::claude_overview(app.clone()).await),
-        "claude_definitions" => res(commands::claude_definitions().await),
+        "claude_definitions" => res(commands::claude_definitions(app.clone()).await),
         "claude_plugins" => res(commands::claude_plugins(app.clone()).await),
         "claude_restart_list" => res(commands::claude_restart_list(app.clone()).await),
         "claude_usage_profile" => res(commands::claude_usage_profile(app.clone()).await),
