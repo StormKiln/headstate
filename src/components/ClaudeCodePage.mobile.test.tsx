@@ -232,6 +232,11 @@ beforeEach(() => {
     file_bytes: 183_237,
     non_conversation_records: 0,
     unparseable_records: 0,
+    lifecycle: {
+      queue: null,
+      permission_mode: null,
+      worktree: { state: "unknown" },
+    },
   };
   // 390px: an iPhone 15's CSS width, comfortably under `MOBILE_BREAKPOINT`.
   stubViewport(390);
