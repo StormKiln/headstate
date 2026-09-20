@@ -2619,32 +2619,50 @@ fn last_turn_text(preview: &crate::claude::preview::Preview) -> Option<String> {
 /// It signals a process and waits on it. A sync command doing either is
 /// the freeze `no_sync_command_reaches_a_subprocess_or_a_whole_file`
 /// exists to prevent.
+/// # Two whole functions rather than one with a `cfg` block inside
+///
+/// `health::runaway::nice_of` is the house pattern and this follows it.
+/// A single body with `#[cfg(not(unix))] { return Err(..) }` above the
+/// Unix arm compiles on Windows to a `return` followed by code that can
+/// never run, which `-D warnings` rejects as `unreachable_code` -- a
+/// failure visible only on the Windows runner. Gating the WHOLE function
+/// cannot produce that shape.
 #[tauri::command]
+#[cfg(unix)]
 pub async fn claude_stop_session(
     session_id: String,
 ) -> Result<crate::claude::stop::StopOutcome, String> {
-    #[cfg(not(unix))]
-    {
-        let _ = session_id;
-        return Err(
-            "stopping a session needs SIGTERM, which this platform does not have -- \
-             end it from its own window instead"
-                .into(),
-        );
-    }
-    #[cfg(unix)]
-    {
-        tauri::async_runtime::spawn_blocking(move || {
-            // BOTH re-derived on this call. Nothing about the process is
-            // carried in from the proposal that put the button on screen.
-            let (registry, probe) = registry_and_probe();
-            let confirmed = crate::claude::stop::confirm(&probe, &registry, &session_id)
-                .map_err(|r| r.why())?;
-            crate::claude::stop::stop(&crate::claude::stop::UnixSignaller, &confirmed)
-        })
-        .await
-        .map_err(|e| format!("the stop did not run: {e}"))?
-    }
+    tauri::async_runtime::spawn_blocking(move || {
+        // BOTH re-derived on this call. Nothing about the process is
+        // carried in from the proposal that put the button on screen.
+        let (registry, probe) = registry_and_probe();
+        let confirmed =
+            crate::claude::stop::confirm(&probe, &registry, &session_id).map_err(|r| r.why())?;
+        crate::claude::stop::stop(&crate::claude::stop::UnixSignaller, &confirmed)
+    })
+    .await
+    .map_err(|e| format!("the stop did not run: {e}"))?
+}
+
+/// Windows has no SIGTERM, so there is no stop to offer.
+///
+/// Refused rather than faked. The whole design rests on giving the
+/// session a chance to write its transcript before anything harder
+/// happens, and a platform with no graceful signal cannot honour that --
+/// so this says so instead of reaching for `TerminateProcess`, which is
+/// SIGKILL's equivalent and is precisely what `registry.rs`'s measurement
+/// argues against.
+#[tauri::command]
+#[cfg(not(unix))]
+pub async fn claude_stop_session(
+    session_id: String,
+) -> Result<crate::claude::stop::StopOutcome, String> {
+    let _ = session_id;
+    Err(
+        "stopping a session needs SIGTERM, which this platform does not have -- end it from \
+         its own window instead"
+            .into(),
+    )
 }
 
 #[tauri::command]
