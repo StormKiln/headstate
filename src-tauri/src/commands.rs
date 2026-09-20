@@ -5427,6 +5427,57 @@ pub async fn claude_effective_settings(
 }
 
 #[tauri::command]
+/// Sweep every scanned repository for silently-broken agent configuration
+/// (#1217).
+///
+/// `install.rs` measured the failure this answers: a corrupt
+/// `settings.json` produced a Claude Code that started normally and whose
+/// hooks never ran, with nothing on stderr. Headstate detected exactly
+/// one instance of that, for one file, as a side effect of the install
+/// dialog. This asks the same question of every checkout.
+///
+/// `async`, and not incidentally: the sweep opens settings files and
+/// walks CLAUDE.md trees across ~38 repositories. `invariants.rs`'s
+/// `no_sync_command_reaches_a_subprocess_or_a_whole_file` forbids exactly
+/// that on a sync command, because it would run on the UI thread.
+///
+/// No home directory is a REFUSAL rather than an empty sweep: two of the
+/// three settings scopes and the global CLAUDE.md all hang off it, so
+/// without one every repository would be reported as clean on the
+/// strength of three checks that never ran. That is the precise
+/// substitution this ticket exists to prevent.
+pub async fn claude_config_health(
+    app: AppHandle,
+) -> Result<crate::claude::confighealth::Sweep, String> {
+    let home = crate::auth::home_dir()
+        .ok_or_else(|| "no home directory is set, so ~/.claude could not be read".to_string())?;
+    let dirs = get_worktree_dirs(app);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        // The census first. `scan_dirs_fast_reporting` returns what it
+        // could not read alongside what it found, and that shortfall is
+        // carried into the sweep rather than dropped (#1025): it is what
+        // makes "38 repositories are clean" honest or not.
+        let scan = crate::worktrees::scan_dirs_fast_reporting(&dirs);
+        let repos: Vec<(String, String)> = scan
+            .repos
+            .iter()
+            .map(|r| (r.name.clone(), r.path.clone()))
+            .collect();
+        let mut sweep = crate::claude::confighealth::sweep_in(&home, &repos, scan.unreadable);
+
+        // The machine-wide half, attached to no repository. A definition
+        // directory under `~/.claude` is loaded into every session on the
+        // machine, so blaming it on one checkout would be a wrong answer
+        // repeated once per repository.
+        sweep.user_findings = crate::claude::confighealth::user_findings(&home);
+        sweep
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn claude_hooks_status() -> Result<crate::claude::install::Status, String> {
     let (path, exe) = match claude_settings_target() {
         Ok(t) => t,

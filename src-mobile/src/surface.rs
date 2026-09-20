@@ -281,6 +281,11 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("claude_hooks_inventory", Class::Read),
     // Read: three file reads, no side effects (#1130).
     ("claude_effective_settings", Class::Read),
+    // Read: the configuration-health sweep (#1217). Many file reads
+    // across every scanned repository and no side effects. The phone is
+    // a good place for this one: "is any of my agent config silently
+    // dead" is asked away from the keyboard, and the remedy is at it.
+    ("claude_config_health", Class::Read),
     ("claude_hooks_status", Class::Read),
     ("get_poll_interval", Class::Read),
     ("get_worktree_dirs", Class::Read),

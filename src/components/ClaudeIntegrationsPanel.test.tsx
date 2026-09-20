@@ -25,6 +25,12 @@ vi.mock("@/api/hooks", () => ({
   // #1130. Collapsed by default, so nothing is read until opened --
   // which is what these tests assume.
   useClaudeEffectiveSettings: () => ({ data: undefined, error: null }),
+  useClaudeConfigHealth: () => ({
+    data: undefined,
+    error: null,
+    isFetching: false,
+    refetch: () => Promise.resolve(),
+  }),
   useClaudeHooks: () => ({
     status: hookState.status,
     isLoading: hookState.status === undefined,

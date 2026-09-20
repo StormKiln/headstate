@@ -252,6 +252,7 @@ const ROWS: Row[] = [
   // the desktop write to an arbitrary file.
   row(api.claudeHooksInventory, [], "claude_hooks_inventory"),
   row(api.claudeEffectiveSettings, [repoPath], "claude_effective_settings", { repoPath }),
+  row(api.claudeConfigHealth, [], "claude_config_health"),
   row(api.claudeHooksStatus, [], "claude_hooks_status"),
   row(api.claudeInstallHooks, [], "claude_install_hooks"),
   row(api.claudeReinstallHooks, [], "claude_reinstall_hooks"),

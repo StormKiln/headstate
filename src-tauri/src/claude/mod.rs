@@ -63,6 +63,8 @@
 //! files `claude --resume` depends on.
 
 pub mod cli;
+/// Silently-broken agent configuration, swept across repositories (#1217).
+pub mod confighealth;
 pub mod crash;
 pub mod definitions;
 pub mod events;

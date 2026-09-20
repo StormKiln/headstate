@@ -468,6 +468,13 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("claude_hooks_inventory", Class::Read),
     // Read: three file reads, no side effects (#1130).
     ("claude_effective_settings", Class::Read),
+    // Read: the configuration-health sweep (#1217). Many file reads
+    // across every scanned repository and no side effects -- it parses
+    // settings and resolves CLAUDE.md imports, and writes nothing, offers
+    // no repair and takes no path from the caller. `Read` rather than
+    // `Local` because the answer is about the desktop's repositories,
+    // which is exactly what a phone cannot see for itself.
+    ("claude_config_health", Class::Read),
     ("claude_hooks_status", Class::Read),
     ("get_poll_interval", Class::Read),
     ("get_worktree_dirs", Class::Read),
@@ -1050,6 +1057,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "claude_effective_settings" => {
             res(commands::claude_effective_settings(a.get("repoPath")?).await)
         }
+        "claude_config_health" => res(commands::claude_config_health(app.clone()).await),
         "claude_hooks_status" => res(commands::claude_hooks_status()),
         "get_poll_interval" => ok(commands::get_poll_interval(app.state())),
         "get_worktree_dirs" => ok(commands::get_worktree_dirs(app.clone())),
