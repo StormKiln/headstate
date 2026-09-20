@@ -1407,6 +1407,41 @@ export interface ClaudeConfigHealth {
 /// Sweep every scanned repository for silently-broken agent config (#1217).
 export const claudeConfigHealth = () =>
   call<ClaudeConfigHealth>("claude_config_health");
+/// Which list under `permissions` a rule sits in.
+///
+/// Part of a rule's identity: the same text under `deny` and under
+/// `allow` are opposite instructions.
+export type ClaudeRuleList = "allow" | "deny" | "ask";
+
+/// What comparing one recorded rule against the live settings file said.
+///
+/// `userEdited` is the one that must never render as removable: the rule's
+/// value has changed since Headstate wrote it, so it is the user's now.
+export type ClaudeRuleOwnership = "ours" | "user_edited" | "gone";
+
+export interface ClaudePermissionVerdict {
+  list: ClaudeRuleList;
+  rule: string;
+  ownership: ClaudeRuleOwnership;
+}
+
+export interface ClaudePermissionOwnership {
+  verdicts: ClaudePermissionVerdict[];
+  /// Ours and untouched: the ONLY rules a removal may act on.
+  removable: ClaudePermissionVerdict[];
+  /// Entries dropped because the rule is no longer in the file.
+  dropped: ClaudePermissionVerdict[];
+  ledgerRewritten: boolean;
+}
+
+/// Which permission rules in `~/.claude/settings.json` are Headstate's (#1199).
+///
+/// Rejects rather than resolving when the ledger cannot be read or the
+/// settings file cannot be parsed. An empty result would mean "we own
+/// nothing", which for an unreadable ledger is the answer that strands
+/// every rule Headstate ever wrote.
+export const claudePermissionOwnership = () =>
+  call<ClaudePermissionOwnership>("claude_permission_ownership");
 
 export const claudeHooksStatus = () => call<ClaudeHooksStatus>("claude_hooks_status");
 

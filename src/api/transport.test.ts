@@ -267,6 +267,7 @@ const ROWS: Row[] = [
   row(api.claudeHooksInventory, [], "claude_hooks_inventory"),
   row(api.claudeEffectiveSettings, [repoPath], "claude_effective_settings", { repoPath }),
   row(api.claudeConfigHealth, [], "claude_config_health"),
+  row(api.claudePermissionOwnership, [], "claude_permission_ownership"),
   row(api.claudeHooksStatus, [], "claude_hooks_status"),
   row(api.claudeMcpServers, [], "claude_mcp_servers"),
   row(api.claudeInstallHooks, [], "claude_install_hooks"),

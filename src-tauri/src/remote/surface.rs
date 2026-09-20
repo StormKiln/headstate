@@ -513,6 +513,11 @@ pub const SURFACE: &[(&str, Class)] = &[
     // bounded and read-only (#1216). Never a write: that file is Claude
     // Code's live state, rewritten by its owner while it runs.
     ("claude_mcp_servers", Class::Read),
+    // Read: two file reads plus a sweep of Headstate's OWN ledger, which
+    // is not the user's settings file (#1199). Nothing under `~/.claude`
+    // is written, and the middle state -- a rule the user has edited
+    // since we wrote it -- must render as theirs rather than as ours.
+    ("claude_permission_ownership", Class::Read),
     ("claude_hooks_status", Class::Read),
     ("get_poll_interval", Class::Read),
     ("get_worktree_dirs", Class::Read),
@@ -1104,6 +1109,9 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         }
         "claude_config_health" => res(commands::claude_config_health(app.clone()).await),
         "claude_mcp_servers" => res(commands::claude_mcp_servers().await),
+        "claude_permission_ownership" => {
+            res(commands::claude_permission_ownership(app.clone()).await)
+        }
         "claude_hooks_status" => res(commands::claude_hooks_status()),
         "get_poll_interval" => ok(commands::get_poll_interval(app.state())),
         "get_worktree_dirs" => ok(commands::get_worktree_dirs(app.clone())),

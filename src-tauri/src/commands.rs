@@ -6033,6 +6033,67 @@ pub fn claude_uninstall_hooks() -> Result<crate::claude::install::Uninstalled, S
         .map_err(|e| e.to_string())
 }
 
+// ---------------------------------------------------------------------
+// The permission-rule ownership ledger (#1199). Rust side:
+// `claude/permissions.rs`, which is where every rule below is argued.
+// ---------------------------------------------------------------------
+
+/// Which permission rules in `~/.claude/settings.json` are Headstate's.
+///
+/// The ledger, not the UI. #1199 exists because the marker pattern
+/// `claude_uninstall_hooks` relies on does NOT transfer: a hook matcher
+/// points at our own binary and is recognisable, while
+/// `"Bash(git status:*)"` written by Headstate is byte-identical to one
+/// the user typed. Removing by marker would strand every rule we wrote;
+/// removing by value would delete the user's.
+///
+/// So this compares a sidecar ledger -- Headstate's own file, in
+/// Headstate's own data directory, NOT in `~/.claude` -- against the
+/// live settings file, and reports three states per rule. The one that
+/// matters most is the middle one: a rule whose value has changed since
+/// we wrote it is the user's now, and is never offered for removal.
+///
+/// # Why this refuses rather than returning an empty answer
+///
+/// Two refusals reach the caller verbatim, and neither may render as
+/// "nothing is ours":
+///
+/// - A ledger that cannot be read is **Unknown**. Treating it as an
+///   empty ledger is how a removal pass strands every rule we wrote.
+/// - A settings file that cannot be parsed is refused with its parse
+///   error, line and column included. Claude Code ignores such a file
+///   silently, so the user's remedy is an editor.
+///
+/// `async` because it reads two files and may write one, which is what
+/// `invariants::no_sync_command_reaches_a_subprocess_or_a_whole_file`
+/// requires of anything touching the filesystem.
+///
+/// A `Read` on the remote surface despite the ledger sweep it performs:
+/// the only file it writes is Headstate's OWN bookkeeping, it never
+/// touches the user's settings, and "which of these rules did Headstate
+/// put there" is a reasonable thing to ask from a phone. The operations
+/// that CHANGE `~/.claude/settings.json` are not exposed at all.
+#[tauri::command]
+pub async fn claude_permission_ownership(
+    app: AppHandle,
+) -> Result<crate::claude::permissions::Reconciled, String> {
+    let home = crate::auth::home_dir()
+        .ok_or_else(|| "no home directory, so there is no ~/.claude to read".to_string())?;
+    let data = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("no data directory for the ownership ledger: {e}"))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::claude::permissions::reconcile(
+            &crate::claude::install::settings_path_in(&home),
+            &crate::claude::permissions::ledger_path_in(&data),
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[cfg(test)]
 mod tests {
     /// #1149: one budget across every filesystem scan.
