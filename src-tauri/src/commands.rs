@@ -4403,6 +4403,118 @@ pub async fn claude_import_transcripts(
     .map_err(|e| e.to_string())?
 }
 
+/// Search the transcript corpus by content (#1203, epic #1121).
+///
+/// The app has always held 1,482 transcripts and 0.83 GB of text and
+/// indexed only their metadata, so "find the session where I was
+/// debugging the FSEvents thing" was unanswerable from data already on
+/// disk. This answers it, over the FTS5 index the live pass populates.
+///
+/// # An unfinished index may never say "no matches"
+///
+/// The whole point of the return type. [`SearchAnswer`] carries a
+/// three-way [`Verdict`] and its [`Coverage`] together, so there is no
+/// way for a caller to render an empty result without the numbers that
+/// qualify it:
+///
+/// | state | what the user reads |
+/// |---|---|
+/// | hits | the hits |
+/// | nothing matched, whole corpus searched | "no matches" |
+/// | nothing matched, index still building | "no matches in the 340 of 1,482 sessions indexed so far" |
+///
+/// The third row is the feature. 6.0 removed that conflation from four
+/// other surfaces (#846, #1042, #1044, #1152), and a search box is the
+/// place a user is least likely to question an empty result.
+///
+/// # Why this rescans rather than trusting the stored denominator
+///
+/// The coverage denominator must describe the corpus as it is NOW, not
+/// as the last pass found it. A user who started a session ninety
+/// seconds ago is exactly the user most likely to search for it, and a
+/// denominator from before it existed would report the index as
+/// complete while the session they want is not in it. The scan is the
+/// same bounded-seek walk the session list already does -- measured
+/// sub-second -- and it is what lets the answer distinguish "not in
+/// your history" from "the index has not reached it yet".
+///
+/// `async` and `spawn_blocking`: this walks the corpus directory and
+/// reads a database, which is exactly the shape
+/// `no_sync_command_reaches_a_subprocess_or_a_whole_file` forbids on
+/// the async runtime.
+///
+/// [`SearchAnswer`]: crate::claude::search::SearchAnswer
+/// [`Verdict`]: crate::claude::search::Verdict
+/// [`Coverage`]: crate::claude::search::Coverage
+#[tauri::command]
+pub async fn claude_search_transcripts(
+    app: tauri::AppHandle,
+    query: String,
+    limit: Option<usize>,
+) -> Result<crate::claude::search::SearchAnswer, String> {
+    let db = db_path(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&db).map_err(|e| e.to_string())?;
+        // A fresh scan for the denominator and the unreadable set, so
+        // the coverage sentence describes the corpus the user has right
+        // now. A failure to scan is NOT fatal: the index is still
+        // searchable and the stored denominator is still the last thing
+        // we knew, so the search proceeds with an empty unreadable list
+        // rather than refusing -- but it can then only report the
+        // coverage it has, which `is_complete` handles.
+        let unreadable = match crate::claude::scan_default() {
+            Ok(scan) => {
+                // The denominator is refreshed here as well as in the
+                // index pass, so a session created since the last pass
+                // makes the index read as INCOMPLETE rather than
+                // letting a stale "complete" license a "no matches"
+                // about a session that was never indexed.
+                let total = (scan.sessions.len() + scan.unreadable_files.len()) as i64;
+                let _ = conn.execute(
+                    "INSERT INTO claude_index_state (id, corpus_sessions, last_pass_at)
+                     VALUES (1, ?1, COALESCE(
+                        (SELECT last_pass_at FROM claude_index_state WHERE id = 1), ?2))
+                     ON CONFLICT(id) DO UPDATE SET corpus_sessions = ?1",
+                    rusqlite::params![total, chrono::Utc::now().to_rfc3339()],
+                );
+                scan.unreadable_files
+            }
+            Err(e) => {
+                log::warn!("claude: could not re-scan the corpus for search coverage: {e}");
+                Vec::new()
+            }
+        };
+        crate::claude::search::search(&conn, &query, limit.unwrap_or(50), unreadable)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// How much of the transcript corpus is searchable right now (#1203).
+///
+/// Separate from the search itself so a UI can state coverage on an
+/// EMPTY search box -- "1,482 sessions searchable", or "340 of 1,482
+/// indexed so far" -- which is the honest thing to show before anyone
+/// has typed. A number that only appears alongside results cannot be
+/// shown then, and a search box that says nothing about its own
+/// readiness invites the user to read the first empty result as settled.
+#[tauri::command]
+pub async fn claude_index_coverage(
+    app: tauri::AppHandle,
+) -> Result<crate::claude::search::Coverage, String> {
+    let db = db_path(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&db).map_err(|e| e.to_string())?;
+        let unreadable = crate::claude::scan_default()
+            .map(|s| s.unreadable_files)
+            .unwrap_or_default();
+        crate::claude::search::coverage(&conn, unreadable).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Every stored Claude Code session, with liveness derived NOW (#917).
 ///
 /// The Claude Code view's only data source. Each row carries a
@@ -4632,6 +4744,15 @@ pub struct ClaudeLiveState {
     /// into `running`: migration 11's NULL `pid_start_time` means "cannot
     /// confirm", which must read as Unknown rather than Running.
     pub unconfirmed: Vec<crate::claude::registry::Live>,
+    /// What the transcript content index did this pass (#1203).
+    ///
+    /// `None` when the pass could not scan the corpus at all, which is a
+    /// different state from an index that ran and found nothing to do --
+    /// the same absent-is-not-zero line the fields above draw. Its
+    /// `unreadable` is the count #1145's failure reporting consumes: a
+    /// transcript that could not be indexed is a known gap in what a
+    /// search can cover, not a silent absence.
+    pub indexed: Option<crate::claude::search::Indexed>,
 }
 
 /// Consume the hook's handoff file and sweep the live session registry
@@ -4728,11 +4849,47 @@ pub fn claude_live_pass(db: &std::path::Path) -> Result<ClaudeLiveState, String>
             log::warn!("claude: could not persist the handoff offset: {e}");
         }
 
+        // ---- The transcript content index (#1203) ----
+        //
+        // Here, on the pass that already walks the corpus, because that
+        // is the cheapest steady state: the alternative designs were an
+        // on-demand index (a first search over 0.83 GB is not
+        // interactive) and a one-off backfill (which still needs an
+        // incremental path afterwards, so it is this plus an extra
+        // mode).
+        //
+        // BOUNDED at `SESSIONS_PER_PASS`, so this never becomes a
+        // whole-corpus read on a 60-second loop and never blocks the UI:
+        // a cold corpus reaches full coverage over about fifteen passes,
+        // and every search in the meantime reports the coverage it
+        // actually had.
+        //
+        // A failure here does NOT fail the pass. The live state above is
+        // already computed and is still true; refusing all of it because
+        // the content index could not run would trade a working session
+        // list for a missing one. The failure travels as data instead --
+        // `indexed: None` -- which is the distinction this file's own
+        // "absent is not zero" section draws for every other field.
+        let indexed = match crate::claude::scan_default() {
+            Ok(scan) => match crate::claude::search::index_pass(&mut conn, &scan) {
+                Ok(done) => Some(done),
+                Err(e) => {
+                    log::warn!("claude: the transcript index pass failed: {e}");
+                    None
+                }
+            },
+            Err(e) => {
+                log::warn!("claude: could not scan the corpus to index it: {e}");
+                None
+            }
+        };
+
         Ok(ClaudeLiveState {
             handoff,
             sweep,
             running: swept.running,
             unconfirmed: swept.unknown,
+            indexed,
         })
     }
 }

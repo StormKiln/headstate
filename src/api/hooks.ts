@@ -20,6 +20,8 @@ import type {
   ClaudeSubagentRollup,
   ClaudeObservation,
   ClaudeCorpus,
+  ClaudeIndexCoverage,
+  ClaudeSearchAnswer,
   ClaudeSessionList,
   ClaudeSessionDetail,
   ClaudePrLink,
@@ -129,6 +131,8 @@ import {
   claudeSubagentRollup,
   claudeSessionEvents,
   claudeEventProfile,
+  claudeSearchTranscripts,
+  claudeIndexCoverage,
   claudeSessions,
   claudeSessionDetail,
   claudeSessionsForPr,
@@ -1685,6 +1689,50 @@ export function useClaudeEventProfile(enabled = true) {
     queryFn: () => claudeEventProfile(),
     enabled,
     staleTime: Infinity,
+    retry: false,
+  });
+}
+
+/// Content search over the transcript corpus (#1203).
+///
+/// # Why the empty query is not run
+///
+/// `enabled` is false for a blank box, so no query is issued and the
+/// hook stays `pending` rather than resolving to a result. An empty
+/// search box that resolved to "no matches" would answer a question
+/// nobody asked -- and it is the same conflation this feature exists to
+/// remove, reached from the other side.
+///
+/// # Why there is no `staleTime: Infinity`
+///
+/// The index grows underneath this. A result cached forever would go on
+/// reporting "340 of 1,482 indexed" after the index finished, which
+/// turns an honest partial answer into a stale false one -- and the
+/// partial answer is the thing the user is being asked to trust.
+export function useClaudeTranscriptSearch(query: string, enabled = true) {
+  const trimmed = query.trim();
+  return useQuery<ClaudeSearchAnswer>({
+    queryKey: ["claude-transcript-search", trimmed],
+    queryFn: () => claudeSearchTranscripts(trimmed),
+    enabled: enabled && trimmed.length > 0,
+    staleTime: 30_000,
+    retry: false,
+  });
+}
+
+/// How much of the corpus is searchable right now (#1203).
+///
+/// Polled, because the index is being built underneath the page: a
+/// coverage figure that never moved would leave a user watching "340 of
+/// 1,482" forever and conclude the feature is broken, when in fact it
+/// is working exactly as designed and would have finished in ten
+/// minutes.
+export function useClaudeIndexCoverage(enabled = true) {
+  return useQuery<ClaudeIndexCoverage>({
+    queryKey: ["claude-index-coverage"],
+    queryFn: () => claudeIndexCoverage(),
+    enabled,
+    refetchInterval: enabled ? 30_000 : false,
     retry: false,
   });
 }

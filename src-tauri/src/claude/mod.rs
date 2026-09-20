@@ -82,6 +82,7 @@ pub mod plugins;
 /// The tail of one transcript, as conversation rather than JSONL (#982).
 pub mod preview;
 pub mod registry;
+pub mod search;
 pub mod sessions;
 pub mod settings;
 /// Compaction pressure, stated agent types, and who is waiting on you

@@ -22,6 +22,8 @@ import type {
   DeleteOutcome,
   ClaudeMdScan,
   ClaudeImported,
+  ClaudeIndexCoverage,
+  ClaudeSearchAnswer,
   ClaudeOverview,
   PluginsReport,
   ClaudeRestartList,
@@ -965,6 +967,22 @@ export const readClaudeMd = (path: string) => call<string>("read_claude_md", { p
 /// Rescan `~/.claude/projects` into our own cache. Returns what it read
 /// AND what it could not read.
 export const claudeImportTranscripts = () => call<ClaudeImported>("claude_import_transcripts");
+
+/// Search the transcript corpus by content (#1203).
+///
+/// Returns the verdict AND the coverage, always. An empty result is
+/// never a bare empty list: it is either `none` (the whole corpus was
+/// searched) or `none_yet` (it was not), and only the first may render
+/// as "no matches".
+export const claudeSearchTranscripts = (query: string, limit?: number) =>
+  call<ClaudeSearchAnswer>("claude_search_transcripts", { query, limit });
+
+/// How much of the corpus is searchable right now (#1203).
+///
+/// Separate from the search so the coverage can be stated on an EMPTY
+/// search box, before anyone has typed.
+export const claudeIndexCoverage = () =>
+  call<ClaudeIndexCoverage>("claude_index_coverage");
 
 /// Every stored Claude Code session, with liveness derived NOW (#917).
 ///

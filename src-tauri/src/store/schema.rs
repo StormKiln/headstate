@@ -972,6 +972,65 @@ const MIGRATIONS: &[&str] = &[
         fetched_at TEXT NOT NULL,
         PRIMARY KEY (kind, root)
      );",
+    // 23: the transcript CONTENT index (#1203, epic #1121).
+    //
+    // Everything before this indexed transcript METADATA -- ids, working
+    // directories, timestamps, token counts. The corpus itself, measured
+    // at 1,482 sessions and 0.83 GB on the development machine, was read
+    // and never indexed, so "find the session where I was debugging the
+    // FSEvents thing" was unanswerable from data the app already held.
+    //
+    // # Three tables, because they answer three different questions
+    //
+    // `claude_transcript_fts` is the index. FTS5 external-content was
+    // considered and rejected: the content lives in `~/.claude`, which
+    // this app treats as read-only and which the user rewrites out from
+    // under us, so an external-content table would need the source rows
+    // in SQLite anyway -- which is the second copy it exists to avoid.
+    //
+    // `contentless_delete` is not used, for the reason `snippet()` is
+    // wanted: a hit has to show the user WHERE it matched, and a
+    // contentless table cannot produce a snippet. The storage cost is
+    // accepted deliberately and is measured in the pull request rather
+    // than guessed at.
+    //
+    // `claude_index_ledger` is the COVERAGE record, and it is the half
+    // that makes #1203's honesty constraint enforceable. FTS5 can say
+    // what matched; only this table can say what was SEARCHED. One row
+    // per indexed session, so `COUNT(*)` is the numerator of the
+    // sentence "no matches in the 340 of 1,482 sessions indexed so far".
+    //
+    // `size_bytes` and `mtime_ms` are what make the pass incremental: an
+    // unchanged transcript is skipped without being opened, which is
+    // what makes riding along on a 60-second loop affordable.
+    // `truncated` travels with the row because a session indexed only to
+    // its first 8 MB is searchable but not wholly so, and a miss against
+    // one is weaker evidence than a miss against a whole file -- the
+    // same reasoning `claude_session_usage.truncated` records one table
+    // over.
+    //
+    // `claude_index_state` is the DENOMINATOR, and it is a separate
+    // table rather than a count over the ledger because it is a
+    // different fact: the ledger says what we indexed, this says how
+    // much there was to index. Deriving the second from the first would
+    // make every index trivially complete -- "we indexed everything we
+    // indexed" -- which is precisely the reassuring non-answer #1203
+    // exists to prevent. Single-row, `CHECK (id = 1)`, exactly as
+    // `snapshot` was before migration 4.
+    "CREATE VIRTUAL TABLE IF NOT EXISTS claude_transcript_fts
+        USING fts5(session_id UNINDEXED, body);
+     CREATE TABLE IF NOT EXISTS claude_index_ledger (
+        session_id  TEXT PRIMARY KEY,
+        size_bytes  INTEGER NOT NULL,
+        mtime_ms    INTEGER NOT NULL,
+        truncated   INTEGER NOT NULL,
+        indexed_at  TEXT NOT NULL
+     );
+     CREATE TABLE IF NOT EXISTS claude_index_state (
+        id               INTEGER PRIMARY KEY CHECK (id = 1),
+        corpus_sessions  INTEGER NOT NULL,
+        last_pass_at     TEXT NOT NULL
+     );",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
@@ -1181,6 +1240,83 @@ mod tests {
             compaction, 1,
             "an upgrade must not cost a point event #1065-#1067 recorded"
         );
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+    }
+
+    /// Migration 23 adds the transcript content index without costing
+    /// anything a v22 database already held (#1203).
+    ///
+    /// The upgrade path that matters: every existing install has a
+    /// populated `claude_session` table, and a migration that dropped it
+    /// to add a search index would trade 1,482 sessions of real history
+    /// for a feature.
+    #[test]
+    fn migration_23_adds_the_content_index_without_costing_sessions() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in MIGRATIONS.iter().take(22) {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 22i64).unwrap();
+        conn.execute(
+            "INSERT INTO claude_session (session_id, first_seen_at) VALUES ('s1', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        // The three new tables exist and are usable.
+        conn.execute(
+            "INSERT INTO claude_transcript_fts (session_id, body) VALUES ('s1', 'fsevents stream')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO claude_index_ledger (session_id, size_bytes, mtime_ms, truncated, indexed_at)
+             VALUES ('s1', 1, 1, 0, '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO claude_index_state (id, corpus_sessions, last_pass_at)
+             VALUES (1, 1, '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        // FTS5 is actually present and actually matches. A `CREATE
+        // VIRTUAL TABLE` that silently did nothing would pass a test
+        // that only checked the table exists.
+        let hit: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claude_transcript_fts WHERE claude_transcript_fts MATCH 'fsevents'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hit, 1, "FTS5 must be compiled in and matching");
+
+        // The single-row constraint on the denominator is enforced,
+        // because two denominators is two answers to "how much is
+        // there" and they would disagree the first time either moved.
+        assert!(
+            conn.execute(
+                "INSERT INTO claude_index_state (id, corpus_sessions, last_pass_at)
+                 VALUES (2, 9, 'x')",
+                [],
+            )
+            .is_err(),
+            "a second corpus size row must be impossible"
+        );
+
+        let kept: i64 = conn
+            .query_row("SELECT COUNT(*) FROM claude_session", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 1, "an upgrade must not cost a stored session");
 
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))

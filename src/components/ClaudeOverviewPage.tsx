@@ -19,6 +19,7 @@ import type {
   ClaudeResumable,
   ClaudeTally,
 } from "@/types/pr";
+import { ClaudeTranscriptSearch } from "./ClaudeTranscriptSearch";
 
 /// How many days the activity chart covers.
 ///
@@ -487,6 +488,11 @@ export function ClaudeOverviewPage() {
           onClick={() => showSessions("gone")}
         />
       </div>
+
+      {/* Content search (#1203). Here, under the tiles, because this is
+          the page that already answers "what do I have" and the search
+          answers "which one was it". */}
+      <ClaudeTranscriptSearch />
 
       <div className="text-xs text-[#8b949e]">
         {counts.sessions.toLocaleString()} sessions in the cache
