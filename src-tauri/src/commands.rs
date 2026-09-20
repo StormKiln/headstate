@@ -4845,7 +4845,14 @@ pub async fn claude_search_transcripts(
         // we knew, so the search proceeds with an empty unreadable list
         // rather than refusing -- but it can then only report the
         // coverage it has, which `is_complete` handles.
-        let unreadable = match crate::claude::scan_default() {
+        // `corpus_default`, for the reason `claude_live_pass` gives
+        // (#1246): this needs the denominator and the unreadable set
+        // and nothing else, and the full scan would read 0.84 GB to
+        // produce titles and timestamps that are discarded three lines
+        // down. Warm, that is ~51 ms instead of ~880 -- and this one is
+        // on the path of somebody waiting for a search result, not on
+        // a background timer.
+        let unreadable = match crate::claude::corpus_default() {
             Ok(scan) => {
                 // The denominator is refreshed here as well as in the
                 // index pass, so a session created since the last pass
@@ -4889,7 +4896,10 @@ pub async fn claude_index_coverage(
     let db = db_path(&app);
     tauri::async_runtime::spawn_blocking(move || {
         let conn = open_db(&db).map_err(|e| e.to_string())?;
-        let unreadable = crate::claude::scan_default()
+        // `corpus_default` (#1246): only `unreadable_files` is read
+        // here, and the listing computes it from the same `fs::metadata`
+        // failure `extract` reports, without opening a transcript.
+        let unreadable = crate::claude::corpus_default()
             .map(|s| s.unreadable_files)
             .unwrap_or_default();
         crate::claude::search::coverage(&conn, unreadable).map_err(|e| e.to_string())
@@ -5253,7 +5263,30 @@ pub fn claude_live_pass(db: &std::path::Path) -> Result<ClaudeLiveState, String>
         // list for a missing one. The failure travels as data instead --
         // `indexed: None` -- which is the distinction this file's own
         // "absent is not zero" section draws for every other field.
-        let indexed = match crate::claude::scan_default() {
+        //
+        // `corpus_default` and NOT `scan_default` (#1246). The index
+        // pass needs each session's path, its id, and the unreadable
+        // set; it takes its own `fs::metadata` per file because the
+        // ledger is keyed on `(size, mtime)`. It reads no other field.
+        // `scan_default` would additionally open every transcript for a
+        // head read and a tail seek AND hand the list to
+        // `subagent::build`, which reads all 0.84 GB end to end -- all
+        // of it discarded at this call.
+        //
+        // Measured on the real corpus, release, warm, four consecutive
+        // rounds: the full scan is 878-935 ms and the listing is 49-60
+        // ms, for the same 1,510 sessions each time. The added cost of
+        // #1203 on this loop was ~885 ms per tick and is now ~56 ms --
+        // 0.09% of the 60-second tick this pass actually runs on, which
+        // is the cadence #1246's framing should have used.
+        //
+        // The denominator and `unreadable_files` are unchanged by this,
+        // which is the part that matters: `search::Coverage::is_complete`
+        // is what licenses the words "no matches", and both of its
+        // inputs from the scan survive the switch. See `corpus`'s own
+        // doc for why stopping before the file reads cannot lose an
+        // unreadable transcript.
+        let indexed = match crate::claude::corpus_default() {
             Ok(scan) => match crate::claude::search::index_pass(&mut conn, &scan) {
                 Ok(done) => Some(done),
                 Err(e) => {
