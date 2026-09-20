@@ -9,11 +9,13 @@ import cleanupRs from "../../src-tauri/src/cleanup.rs?raw";
 import alertsRs from "../../src-tauri/src/health/alerts.rs?raw";
 import boardRs from "../../src-tauri/src/github/stats/board.rs?raw";
 import companionRs from "../../src-mobile/src/companion.rs?raw";
+import errorKindRs from "../../src-tauri/src/remote/error_kind.rs?raw";
 import eventsRs from "../../src-tauri/src/remote/events.rs?raw";
 import { ACTIVE_SECS } from "@/components/ArtifactsPage";
 import { ACTIVITY_DAYS } from "@/components/ClaudeOverviewPage";
 import { PLUGIN_ACTIVITY_DAYS } from "@/components/ClaudePluginsPage";
 import { TOP_N } from "@/components/stats/Leaderboard";
+import { ERROR_KINDS } from "./errorKind";
 import { ABSOLUTE_GAP_MS } from "./health";
 import { AUTO_COMPACT_PRESSURE } from "./subagentDisagreement";
 import { CANCELLED } from "./cancelled";
@@ -481,5 +483,62 @@ describe("the re-emitted event names", () => {
     for (const name of covered) {
       expect(emitted.has(name), `POLL_EVENTS covers "${name}", absent from EVENT_NAMES`).toBe(true);
     }
+  });
+});
+
+describe("the command rejection kinds", () => {
+  /// Every `ErrorKind` variant, read out of the Rust source and
+  /// converted to its kebab-case wire spelling.
+  ///
+  /// A VARIANT is an identifier alone on its line ending in a comma,
+  /// matched per line rather than by scanning the enum body. The
+  /// distinction is the one `EVENT_NAMES` documents above and it applies
+  /// here for the same reason: this enum is heavily commented, and a
+  /// doc-comment sentence containing a capitalised word followed by a
+  /// comma would otherwise be read as a variant -- which would then
+  /// demand a TypeScript member for a kind that does not exist.
+  function rustKinds(): string[] {
+    const start = errorKindRs.indexOf("pub enum ErrorKind");
+    expect(start, "error_kind.rs must define ErrorKind").toBeGreaterThan(-1);
+    const body = errorKindRs.slice(start);
+    const end = body.indexOf("}");
+    expect(end, "ErrorKind must close").toBeGreaterThan(-1);
+    return body
+      .slice(0, end)
+      .split("\n")
+      .map((line) => line.trim().match(/^([A-Z][A-Za-z0-9]*),$/))
+      .filter((m): m is RegExpMatchArray => m !== null)
+      .map((m) =>
+        m[1].replace(/([a-z0-9])([A-Z])/g, "$1-$2").toLowerCase(),
+      );
+  }
+
+  it("reads a plausible list out of error_kind.rs", () => {
+    // Guards the guard: a regex that matched nothing would make both
+    // assertions below vacuously true, which is the failure mode this
+    // whole file exists to prevent.
+    const kinds = rustKinds();
+    expect(kinds.length).toBeGreaterThan(1);
+    expect(kinds).toContain("not-asked");
+    expect(new Set(kinds).size).toBe(kinds.length);
+  });
+
+  /// Both directions. A kind added to Rust alone fails the first
+  /// assertion; one added to TypeScript alone fails the second. Either
+  /// half changing on its own is the drift `cancelled.ts` records.
+  it("match the TypeScript union exactly, in both directions", () => {
+    const rust = [...rustKinds()].sort();
+    const ts = [...ERROR_KINDS].sort();
+    expect(ts, "a kind in Rust has no TypeScript member").toEqual(rust);
+    expect(rust, "a kind in TypeScript has no Rust variant").toEqual(ts);
+  });
+
+  /// The kebab-case conversion is the serde attribute's behaviour
+  /// restated in TypeScript, so it is asserted rather than assumed: if
+  /// `rename_all` were removed from the enum, the wire spelling would
+  /// become `NotAsked` and this file would keep passing while the
+  /// frontend silently stopped recognising the kind.
+  it("are serialised kebab-case by the Rust enum", () => {
+    expect(errorKindRs).toContain('#[serde(rename_all = "kebab-case")]');
   });
 });

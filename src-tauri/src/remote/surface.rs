@@ -35,6 +35,7 @@ use serde_json::Value;
 use tauri::{AppHandle, Manager};
 
 use crate::commands;
+use crate::remote::error_kind::CommandError;
 
 /// What a command does, which decides what a phone must present to run it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -781,11 +782,16 @@ pub enum RemoteError {
     /// status: 400.
     #[error("bad arguments for `{command}`: {message}")]
     BadArgs { command: String, message: String },
-    /// The command ran and returned its own `Err(String)`; the message is
-    /// verbatim what the webview would have seen as the rejection reason.
+    /// The command ran and rejected. The message is verbatim what the
+    /// webview would have seen, and `kind` is that rejection classified
+    /// on this side rather than guessed back on the other one (#1202).
     /// Suggested status: 500.
-    #[error("{0}")]
-    Command(String),
+    ///
+    /// `Display` is the message ALONE, so `to_string()` is byte-identical
+    /// to what this variant produced when it held a bare `String`. Every
+    /// existing reader of the plain-text refusal keeps working unchanged.
+    #[error("{}", .0.message)]
+    Command(CommandError),
 }
 
 impl RemoteError {
@@ -853,12 +859,19 @@ impl<'a> Args<'a> {
 
 /// A command's plain return value, as the webview would receive it.
 fn ok<T: Serialize>(value: T) -> Result<Value, RemoteError> {
-    serde_json::to_value(value).map_err(|e| RemoteError::Command(e.to_string()))
+    serde_json::to_value(value)
+        .map_err(|e| RemoteError::Command(CommandError::classify(e.to_string())))
 }
 
 /// A command's `Result<T, String>`, as the webview would receive it.
+///
+/// The single place a command's own rejection becomes a `RemoteError`,
+/// which is why classifying here covers all 103 dispatch arms without
+/// touching one command signature (#1202).
 fn res<T: Serialize>(result: Result<T, String>) -> Result<Value, RemoteError> {
-    result.map_err(RemoteError::Command).and_then(ok)
+    result
+        .map_err(|m| RemoteError::Command(CommandError::classify(m)))
+        .and_then(ok)
 }
 
 /// Run one allowlisted command on behalf of a paired device.
@@ -1291,7 +1304,9 @@ where
 {
     tauri::async_runtime::spawn_blocking(f)
         .await
-        .map_err(|e| RemoteError::Command(format!("command task failed: {e}")))
+        .map_err(|e| {
+            RemoteError::Command(CommandError::classify(format!("command task failed: {e}")))
+        })
 }
 
 #[cfg(test)]
@@ -1468,7 +1483,7 @@ mod tests {
             message: "m".into(),
         };
         assert_eq!(bad.http_status(), 400);
-        assert_eq!(RemoteError::Command("m".into()).http_status(), 500);
+        assert_eq!(RemoteError::Command(CommandError::classify("m")).http_status(), 500);
     }
 
     #[test]
@@ -1618,7 +1633,7 @@ mod tests {
     #[test]
     fn a_command_error_is_passed_through_verbatim() {
         let r: Result<(), String> = Err(commands::AUTH_ERR.to_string());
-        assert_eq!(res(r), Err(RemoteError::Command(commands::AUTH_ERR.into())));
+        assert_eq!(res(r), Err(RemoteError::Command(CommandError::classify(commands::AUTH_ERR))));
         assert_eq!(res(Ok(("a".to_string(), 1u64))), Ok(json!(["a", 1])));
     }
 
