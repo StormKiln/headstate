@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useDeferredValue, useEffect, useMemo, useState } from "react";
 import { Bot, Circle, FolderOpen, GitBranch, RefreshCw, Search, Terminal } from "lucide-react";
 import { toast } from "sonner";
 import type {
@@ -34,6 +34,7 @@ import {
 } from "@/api/tauri";
 import { current } from "@/lib/ariaCurrent";
 import { copyText } from "@/lib/clipboard";
+import { segments } from "@/lib/findOverData";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { AUTO_COMPACT_PRESSURE, subagentDisagreement } from "@/lib/subagentDisagreement";
 import { relativeTime } from "@/lib/time";
@@ -400,7 +401,12 @@ export function matchesClaudeFilter(s: ClaudeSession, filter: ClaudeSessionFilte
 /// disagree about which session the same id names.
 function useMatchedSessions() {
   const { list } = useClaudeSessions(true);
-  const query = useFilters((f) => f.claudeQuery);
+  const typed = useFilters((f) => f.claudeQuery);
+  // Deferred so typing stays responsive over a corpus this size: the
+  // input updates immediately and the 1,400-row filter catches up. NOT a
+  // debounce -- a debounce drops keystrokes; this renders every
+  // character and only lets React deprioritise the expensive pass.
+  const query = useDeferredValue(typed);
   const filter = useFilters((f) => f.claudeFilter);
   const showSubagents = useFilters((f) => f.claudeShowSubagents);
 
@@ -1328,6 +1334,40 @@ function cwdNote(state: CwdState): string | null {
   }
 }
 
+/// The search query's matches inside one field, marked (#1200).
+///
+/// Reads the query from the store rather than taking it as a prop: the
+/// row already subscribes to the store, and threading it through every
+/// caller would be a second copy of a value that is authoritative in one
+/// place.
+///
+/// Renders ONE field. A highlight never spans two of them -- see
+/// `findOverData`'s header for why a cross-field match would make the
+/// highlights disagree with the count beside the search box.
+function Highlight({ value }: { value: string }) {
+  const query = useFilters((f) => f.claudeQuery);
+  const parts = useMemo(() => segments(value, query), [value, query]);
+  // No search: render the string itself rather than a single-element
+  // span, so the common case adds no DOM.
+  if (parts.length === 1 && !parts[0].hit) return <>{value}</>;
+  return (
+    <>
+      {parts.map((part, i) =>
+        part.hit ? (
+          // `key` is the index because the segments ARE positional: two
+          // runs of the same text at different offsets are different
+          // segments, so text would be an unstable key.
+          <mark key={i} className="rounded-sm bg-[#9e6a03] px-0.5 text-[#e6edf3]">
+            {part.text}
+          </mark>
+        ) : (
+          <span key={i}>{part.text}</span>
+        ),
+      )}
+    </>
+  );
+}
+
 function SessionEntry({
   session: s,
   now,
@@ -1344,6 +1384,7 @@ function SessionEntry({
   ///
   /// Distinct from `active`: `active` is the SELECTION, which the detail
   /// pane is showing, and this is where the next `Enter` would land.
+
   /// `PrRow` draws the same distinction with the same ring, and its
   /// comment gives the reason the ring is not a background -- "a cursor
   /// that looked like a hover" is not a cursor.
@@ -1359,6 +1400,14 @@ function SessionEntry({
       type="button"
       onClick={onSelect}
       aria-current={current(active)}
+      // The name is stated rather than computed from the children
+      // (#1200). `Highlight` wraps matched runs in `<mark>`, which
+      // splits the text into several nodes; a computed name over those
+      // nodes came out EMPTY, so a screen reader announced nothing and
+      // the row became unreachable by name. Search highlighting is
+      // presentation and must not be able to change what the control is
+      // called -- so it does not.
+      aria-label={s.name ?? s.session_id}
       className={`mb-1 flex w-full flex-col items-start gap-0.5 rounded px-2 py-1.5 text-left ${
         active ? "bg-[#1f6feb] text-white" : "text-[#e6edf3] hover:bg-[#161b22]"
       } ${cursored ? "ring-2 ring-inset ring-[#1f6feb]" : ""}`}
@@ -1369,7 +1418,7 @@ function SessionEntry({
             transcripts in 1,438 with no title get their id, which is at
             least true and is also the resume handle. */}
         <span className="min-w-0 flex-1 truncate text-xs font-medium">
-          {s.name ?? s.session_id}
+          <Highlight value={s.name ?? s.session_id} />
         </span>
       </span>
       {/* The opening ask, under the title (#1133).
@@ -1382,7 +1431,7 @@ function SessionEntry({
         <span
           className={`w-full truncate text-[11px] ${active ? "text-white/80" : "text-[#6e7681]"}`}
         >
-          {s.opening_prompt}
+          <Highlight value={s.opening_prompt} />
         </span>
       ) : null}
       {/* Full white on the selected row rather than `white/70`: at 12px
@@ -1435,7 +1484,7 @@ function SessionEntry({
           active ? "text-white" : "text-[#8b949e]"
         }`}
       >
-        {s.cwd ?? "no directory recorded"}
+        {s.cwd === null ? "no directory recorded" : <Highlight value={s.cwd} />}
         {note ? ` · ${note}` : ""}
       </span>
     </button>
