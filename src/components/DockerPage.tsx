@@ -456,12 +456,26 @@ export function DockerPage() {
   // say "your machine is clean" when the truth is we could not ask.
   if (state && !up) {
     const notInstalled = state.kind === "not_installed";
-    // Unknown carries the REAL message -- a 20s timeout, a
-    // permission-denied socket, a broken context -- and used to fall
-    // into the "not running" branch, discarding the detail and offering
-    // a Start button that cannot help because Docker is already running.
-    // Its fix is nothing like "start Docker", so it gets its own screen
-    // rather than a Start button that cannot help.
+    // Unknown carries the REAL message -- a 20s timeout, a broken
+    // context -- and used to fall into the "not running" branch,
+    // discarding the detail and offering a Start button that cannot
+    // help because Docker is already running.
+    //
+    // A refused socket is NOT one of those: `cli.rs` classifies it as
+    // `PermissionDenied` before `Unknown` is ever reached, and its fix
+    // is nothing like "start Docker", so it gets its own screen.
+    //
+    // This branch used to ALSO run `/permission denied/i` over
+    // `state.detail` and print the docker-group remedy a second time
+    // (#1230). That regex was a discarded type guessed back from prose:
+    // the variant it was re-deriving already existed one branch up,
+    // produced by `is_permission_denied` in `docker/cli.rs`. Two
+    // classifiers for one distinction is how they drift -- and this
+    // pair already had: `is_permission_denied` requires the message to
+    // name docker as well ("permission denied: /etc/shadow" is not
+    // Docker's, and its own test pins that), where the bare regex here
+    // did not, so the remedy could be printed for a permission error
+    // that had nothing to do with the docker group.
     if (state.kind === "permission_denied") {
       return (
         <div className="rounded-md border border-[#30363d] px-4 py-12 text-center">
@@ -480,12 +494,6 @@ export function DockerPage() {
           <p className="mx-auto mt-2 max-w-xl break-words text-sm text-[#8b949e]">
             {state.detail}
           </p>
-          {/permission denied/i.test(state.detail) ? (
-            <p className="mx-auto mt-2 max-w-md text-sm text-[#8b949e]">
-              On Linux this usually means your user is not in the <code>docker</code>{" "}
-              group: <code>sudo usermod -aG docker $USER</code>, then log out and back in.
-            </p>
-          ) : null}
         </div>
       );
     }

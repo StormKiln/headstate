@@ -499,25 +499,59 @@ describe("DockerPage", () => {
 
   // Unknown carries the real message and used to be rendered as "not
   // running" with a Start button that cannot help.
+  //
+  // The detail here is deliberately NOT a permission error: this case is
+  // about Unknown carrying its own prose, and using the permission text
+  // would have made the assertion pass through the `/permission denied/i`
+  // regex #1230 removed rather than through the detail itself.
   it("shows the real reason when Docker cannot be reached", () => {
     state.docker = {
       kind: "unknown",
-      detail: "permission denied while trying to connect to the Docker daemon socket",
+      detail: "docker did not respond within 20s",
     } as DockerState;
     render(<DockerPage />);
     expect(screen.getByText(/could not talk to docker/i)).toBeTruthy();
-    expect(screen.getByText(/permission denied/i)).toBeTruthy();
+    expect(screen.getByText(/did not respond within 20s/i)).toBeTruthy();
     expect(screen.queryByRole("button", { name: /start docker/i })).toBeNull();
   });
 
-  // The actionable remedy for the most common Linux Docker failure.
-  it("names the docker group fix for a permission error", () => {
+  /// The actionable remedy for the most common Linux Docker failure,
+  /// reached through the VARIANT rather than through the prose (#1230).
+  ///
+  /// `DockerState::PermissionDenied` already existed and `cli.rs`
+  /// already produced it; the page nonetheless ran `/permission
+  /// denied/i` over `Unknown`'s detail to re-derive it. That is the
+  /// #1202 defect exactly: a type that exists, is discarded, and is
+  /// guessed back from the sentence.
+  it("names the docker group fix for the permission-denied state", () => {
+    state.docker = { kind: "permission_denied" } as DockerState;
+    render(<DockerPage />);
+    expect(screen.getByText(/refused the connection/i)).toBeTruthy();
+    expect(screen.getByText(/usermod -aG docker/)).toBeTruthy();
+    // Starting Docker is not the fix, and offering it sends the user in
+    // circles: the daemon is already up, it just will not talk to them.
+    expect(screen.queryByRole("button", { name: /start docker/i })).toBeNull();
+  });
+
+  /// The sabotage, kept as an assertion: the SAME prose under `Unknown`
+  /// must not claim a permission diagnosis.
+  ///
+  /// This is what makes the test above load-bearing rather than merely
+  /// passing. Restore the regex and this fails -- which is the point,
+  /// because `Unknown` means the classifier did not recognise the
+  /// failure, and printing the docker-group remedy anyway asserts a
+  /// cause nobody established. `cli.rs` is the one place that decides,
+  /// and it requires the message to name docker too; the regex did not.
+  it("does not claim a permission diagnosis for the same prose under unknown", () => {
     state.docker = {
       kind: "unknown",
       detail: "permission denied while trying to connect to the Docker daemon socket",
     } as DockerState;
     render(<DockerPage />);
-    expect(screen.getByText(/usermod -aG docker/)).toBeTruthy();
+    // The detail itself still shows, verbatim -- that is Unknown's job.
+    expect(screen.getByText(/permission denied while trying to connect/i)).toBeTruthy();
+    // But the remedy is the permission-denied STATE's, and this is not it.
+    expect(screen.queryByText(/usermod -aG docker/)).toBeNull();
   });
 
   /// #326: the Builds page was retired, so its one glanceable number

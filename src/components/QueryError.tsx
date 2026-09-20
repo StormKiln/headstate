@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { ReportLink } from "./ReportLink";
-import { isNotAsked, notAskedMessage } from "@/lib/notAsked";
+import { commandError } from "@/lib/errorKind";
 import { NotAskedNotice } from "./NotAskedNotice";
 
 /// The panel shown when a query FAILED, as distinct from returning nothing.
@@ -49,11 +49,13 @@ export function QueryError({
   // how half of them would be missed. `QueryError` already receives the
   // only thing the decision needs.
   //
-  // The marker is stripped before rendering: it is a wire detail and
-  // must never reach the screen, which is the failure `cancelled.ts`
-  // exists because of.
-  if (message && isNotAsked(message)) {
-    return <NotAskedNotice message={notAskedMessage(message)} />;
+  // Branches on the KIND rather than on the prose (#1230). The marker
+  // is stripped by `commandError`, so what reaches the screen is
+  // display-ready in both arms -- a wire detail on screen is the failure
+  // `cancelled.ts` exists because of.
+  const err = message === undefined ? undefined : commandError(message);
+  if (err?.kind === "not-asked") {
+    return <NotAskedNotice message={err.message} />;
   }
   return (
     <div
@@ -61,8 +63,12 @@ export function QueryError({
       className="rounded-md border border-[#f85149]/40 bg-[#f85149]/5 px-4 py-8 text-center"
     >
       <p className="text-sm font-semibold text-[#f85149]">{title}</p>
-      {message ? (
-        <p className="mx-auto mt-2 max-w-lg break-words text-sm text-[#8b949e]">{message}</p>
+      {/* `err.message`, not `message`: the marker is stripped on BOTH
+          arms, so no path through this component can put a wire detail
+          on screen. Identical prose for every rejection that carries no
+          marker, which is nearly all of them. */}
+      {message && err ? (
+        <p className="mx-auto mt-2 max-w-lg break-words text-sm text-[#8b949e]">{err.message}</p>
       ) : null}
       {children}
       {onRetry || report ? (

@@ -8,26 +8,23 @@
 /// comparing its own copy to the TS one, and a changed Rust constant
 /// that left every test on both sides passing while the user saw
 /// `headstate:cancelled` in a toast.
+///
+/// # Why the readers are gone (#1230)
+///
+/// `isNotAsked` and `notAskedMessage` used to live here, and every
+/// consumer asked them whether a rejection's PROSE began with this
+/// marker. That is the defect #1202 named: a distinction the Rust side
+/// knows, flattened at the boundary, and guessed back from the sentence
+/// at each site that needs it.
+///
+/// The marker itself is NOT the defect and does not move. It is how the
+/// classification survives an IPC boundary that carries a command's
+/// `Err(String)` as a string, and `commands.rs` is explicit that #1202
+/// did not supersede it. What changed is that it is now read in exactly
+/// ONE place -- `commandError` in `errorKind.ts`, the client-side twin
+/// of Rust's `CommandError::classify` -- which hands every consumer a
+/// typed `kind` and a message with the marker already stripped.
+///
+/// So this file is down to the constant and its cross-language
+/// assertion, which is all it was ever uniquely for.
 export const NOT_ASKED = "headstate:not-asked";
-
-/// Whether this rejection is a question Headstate never asked.
-///
-/// The distinction is #1050's, and it is the difference between two
-/// sentences that are not interchangeable: "GitHub did not answer" and
-/// "we did not ask". When `GhClient` holds no client, no request is
-/// constructed -- so reporting a failed request is wrong in both halves,
-/// and the retry it offers cannot work. Nothing about pressing "Try
-/// again" makes a token appear.
-export function isNotAsked(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.startsWith(NOT_ASKED);
-}
-
-/// The rejection's prose, with the marker stripped.
-///
-/// The marker is a wire detail and must never reach the screen --
-/// `cancelled.ts` exists because a marker did exactly that.
-export function notAskedMessage(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.startsWith(NOT_ASKED) ? message.slice(NOT_ASKED.length).trim() : message;
-}

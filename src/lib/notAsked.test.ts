@@ -2,8 +2,20 @@ import { describe, expect, it } from "vitest";
 // `?raw` rather than `node:fs`, for `mirroredConstants.test.ts:3`'s
 // reason: the project carries no `@types/node`.
 import commandsRs from "../../src-tauri/src/commands.rs?raw";
-import { NOT_ASKED, isNotAsked, notAskedMessage } from "./notAsked";
+import { NOT_ASKED } from "./notAsked";
 
+/// What is left here after #1230 is the cross-language agreement.
+///
+/// The BEHAVIOUR that used to live in this file -- recognising the
+/// marker, stripping it before display -- moved to `commandError` in
+/// `errorKind.test.ts`, because it moved in the source: every consumer
+/// now reads a typed `kind` instead of re-testing the prose.
+///
+/// This assertion does not move and must not. It is the one that reads
+/// the RUST source, and it is the reason the marker can be relied on at
+/// all: a changed Rust constant with no TS counterpart is precisely the
+/// drift `cancelled.ts` records, where every test on both sides passed
+/// while the user saw marker syntax in a toast.
 describe("the not-asked marker", () => {
   /// Reads the RUST source, so changing either side alone fails. A test
   /// comparing this module's constant to its own literal would pass at
@@ -14,25 +26,12 @@ describe("the not-asked marker", () => {
     expect(m![1]).toBe(NOT_ASKED);
   });
 
-  it("recognises a rejection that carries it", () => {
-    expect(isNotAsked(new Error(`${NOT_ASKED} not authenticated`))).toBe(true);
-  });
-
-  /// The half that matters: a real failure must keep its retry.
-  it("does not claim a GitHub failure was never asked", () => {
-    expect(isNotAsked(new Error("request timed out after 60s"))).toBe(false);
-    expect(isNotAsked(new Error("401 Bad credentials"))).toBe(false);
-  });
-
-  it("strips the marker before the text is shown", () => {
-    expect(notAskedMessage(new Error(`${NOT_ASKED} not authenticated: run \`gh auth login\``))).toBe(
-      "not authenticated: run `gh auth login`",
-    );
-  });
-
-  /// A message with no marker passes through unchanged, so a caller can
-  /// use this unconditionally.
-  it("leaves an unmarked message alone", () => {
-    expect(notAskedMessage(new Error("request timed out"))).toBe("request timed out");
+  /// Guards the guard: the regex above must actually have found a
+  /// marker-shaped value. A pattern that silently matched something
+  /// empty would make the assertion vacuous in the one direction it
+  /// exists for.
+  it("reads a plausible marker out of commands.rs", () => {
+    expect(NOT_ASKED.length).toBeGreaterThan(0);
+    expect(NOT_ASKED).toContain(":");
   });
 });
