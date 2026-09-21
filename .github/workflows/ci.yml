@@ -158,12 +158,30 @@ jobs:
       # the next release attempt (#787). --require because a token exists
       # here: an unreachable Releases API is a real failure in CI, where
       # locally it is just a laptop offline.
+      #
+      # Except in the merge queue. A `merge_group` run rebuilds a PR that
+      # passed this exact step, with `--require`, minutes earlier; the
+      # mark it checks moves only when a mobile release ships. What the
+      # queue adds is the combined tree, and this step reads no tree at
+      # all -- so a Releases API hiccup here can only dequeue a PR that
+      # was already known good, and cost it a rebase and a full requeue.
+      # Without `--require` a STALE mark still fails (the script exits 1
+      # on `mark < highest` either way); only "could not look" is allowed
+      # through, and it says so in the log. The pull_request run, the
+      # `push` to main and the tag run keep `--require`.
       - name: Mobile build high-water mark
         env:
           GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
         run: |
+          set -euo pipefail
           python3 scripts/check-mobile-build-mark.test.py
-          python3 scripts/check-mobile-build-mark.py --require
+          if [ "$EVENT" = "merge_group" ]; then
+            echo "Event is merge_group; the mark check runs advisory on a failure to look."
+            python3 scripts/check-mobile-build-mark.py
+          else
+            python3 scripts/check-mobile-build-mark.py --require
+          fi
       # Asserted against the SOURCE css, unlike the toast check below which
       # needs a built bundle. This rule is hand-written and survives the
       # build unchanged, and the test suite structurally cannot see it:
