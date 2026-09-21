@@ -8,6 +8,7 @@ import type {
   ClaudeFileChange,
   ClaudePairing,
   ClaudePreviewBlock,
+  ClaudePrLink,
   ClaudeReread,
   ClaudeSession,
   ClaudeToolArgs,
@@ -658,6 +659,18 @@ const CLAUDE_CHIPS: ReadonlyArray<{
 /// about to appear must not first be denied: "No session recorded"
 /// flashing for 40 ms before the session arrives is the Pending-as-
 /// Unknown collapse (#1042) at a smaller scale.
+/// The pull requests a set of links names, as prose.
+///
+/// Read off the LINKS rather than off the query, because a bare
+/// `#1234` was resolved through the tracked pull request list and the
+/// query never said which repository answered. Almost always one; two
+/// only when two repositories both carry that number, and then naming
+/// both is the point.
+function prRefsOf(links: readonly ClaudePrLink[]): string {
+  const refs = [...new Set(links.map((l) => `${l.repo}#${l.number}`))].sort();
+  return refs.length <= 2 ? refs.join(" and ") : `${refs.slice(0, -1).join(", ")} and ${refs.at(-1)}`;
+}
+
 function PrQueryNote({ q }: { q: PrQueryState }) {
   if (q.state === "off" || q.state === "loading") return null;
   if (q.state === "unresolved") {
@@ -691,8 +704,13 @@ function PrQueryNote({ q }: { q: PrQueryState }) {
           five searched fields, which #1200's find-over-data highlighting
           correctly renders as nothing marked. This line is what tells
           the reader why those rows are there. */}
-      {q.links.length === 1 ? "1 session" : `${q.links.length} sessions`} produced {q.ref}, shown
-      below.
+      {q.links.length === 1 ? "1 session" : `${q.links.length} sessions`} produced{" "}
+      {/* The REPOSITORY, from the links rather than from the query. A
+          bare `#1234` was resolved against the tracked pull requests, so
+          `q.ref` is `#1234` and does not say which repository answered
+          -- and "1 session produced #1234" leaves the reader unable to
+          tell which of two repositories' `#1234` they are looking at. */}
+      {prRefsOf(q.links)}, shown below.
     </p>
   );
 }

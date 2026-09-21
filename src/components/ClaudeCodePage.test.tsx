@@ -4619,6 +4619,37 @@ describe("searching for a pull request finds the session that produced it", () =
     );
   });
 
+  /// The found sentence names the REPOSITORY, and reads it off the
+  /// links rather than off the query. A bare `#1234` was resolved
+  /// against the tracked pull requests, so the query itself never said
+  /// which repository answered -- and with two of them carrying that
+  /// number, "2 sessions produced #1234" would leave the reader unable
+  /// to tell which is which.
+  ///
+  /// SABOTAGE: render `q.ref` in place of `prRefsOf(q.links)` and this
+  /// fails on both repository names, because `ref` is `#1234`.
+  it("names the repository a bare number resolved to", () => {
+    state.list = listOf([
+      session({ session_id: "owner-1", name: "Kestrel" }),
+      session({ session_id: "owner-2", name: "Osprey" }),
+    ]);
+    state.prQuery = {
+      state: "done",
+      ref: "#1234",
+      links: [
+        { ...link("owner-1"), repo: "acme/api" },
+        { ...link("owner-2"), repo: "acme/ui" },
+      ],
+    };
+    renderView();
+    type("1234");
+
+    const note = screen.getByTestId("pr-query-note").textContent ?? "";
+    expect(note).toMatch(/2 sessions produced/i);
+    expect(note).toMatch(/acme\/api#1234/);
+    expect(note).toMatch(/acme\/ui#1234/);
+  });
+
   /// The issue's second constraint: PR matching is an ADDITION. A query
   /// that happens to contain a number still matches titles and prompts,
   /// and a lookup that found nothing does not take those rows away.
