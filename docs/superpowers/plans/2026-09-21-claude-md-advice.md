@@ -22,6 +22,8 @@ order; a producer's `Err` becomes `CheckRun::Unknown`. The frontend mounts
 
 **Spec:** `docs/superpowers/specs/2026-09-21-claude-md-advice-design.md`
 
+**Epic:** #1255, with one sub-issue per task (numbers in the task headings).
+
 ## Global Constraints
 
 - Read-only. No producer writes to a CLAUDE.md, a skill, or `~/.claude`.
@@ -50,7 +52,7 @@ order; a producer's `Err` becomes `CheckRun::Unknown`. The frontend mounts
 
 ---
 
-### Task 1: Model, command, panel, seed, shared parsers
+### Task 1: Model, command, panel, seed, shared parsers (#1262)
 
 **Files:**
 - Create: `src-tauri/src/claudemd/advice/{mod,brief,imports}.rs`,
@@ -87,7 +89,7 @@ order; a producer's `Err` becomes `CheckRun::Unknown`. The frontend mounts
 
 ---
 
-### Task 2: Toolchain coverage producer
+### Task 2: Toolchain coverage producer (#1256)
 
 **Files:** create `src-tauri/src/claudemd/advice/toolchain.rs`; modify `advice/mod.rs` (variant, `ALL`, `PRODUCERS`), `advice/brief.rs` (arm).
 
@@ -103,7 +105,7 @@ order; a producer's `Err` becomes `CheckRun::Unknown`. The frontend mounts
 
 ---
 
-### Task 3: Missing subdirectory CLAUDE.md producer
+### Task 3: Missing subdirectory CLAUDE.md producer (#1258)
 
 **Files:** create `src-tauri/src/claudemd/advice/gaps.rs`; modify `claudemd/mod.rs` (`DirFacts` recorded inside `scan_repo`'s loop, behind a field on `Scan` that existing callers ignore), `advice/mod.rs`, `advice/brief.rs`, `text.rs` (`sections_naming(dir)`).
 
@@ -120,7 +122,7 @@ order; a producer's `Err` becomes `CheckRun::Unknown`. The frontend mounts
 
 ---
 
-### Task 4: Content in the wrong file producer
+### Task 4: Content in the wrong file producer (#1259)
 
 **Files:** create `src-tauri/src/claudemd/advice/placement.rs`; modify `advice/mod.rs`, `advice/brief.rs`.
 
@@ -136,7 +138,7 @@ order; a producer's `Err` becomes `CheckRun::Unknown`. The frontend mounts
 
 ---
 
-### Task 5: Rot producer
+### Task 5: Rot producer (#1260)
 
 **Files:** create `src-tauri/src/claudemd/advice/rot.rs`; modify `advice/mod.rs`, `advice/brief.rs`, `refs.rs` if extraction needs a kind it lacks.
 
@@ -151,7 +153,7 @@ order; a producer's `Err` becomes `CheckRun::Unknown`. The frontend mounts
 
 ---
 
-### Task 6: Skills producer
+### Task 6: Skills producer (#1261)
 
 **Files:** create `src-tauri/src/claudemd/advice/skills.rs`; modify `advice/mod.rs`, `advice/brief.rs`; `definitions.rs` unchanged except promoting `frontmatter` helpers to `pub(crate)` if needed.
 
@@ -168,7 +170,7 @@ order; a producer's `Err` becomes `CheckRun::Unknown`. The frontend mounts
 
 ---
 
-### Task 7: Content-shape producer
+### Task 7: Content-shape producer (#1263)
 
 **Files:** create `src-tauri/src/claudemd/advice/shape.rs`; modify `advice/mod.rs`, `advice/brief.rs`; `src/components/ClaudeMdAdvicePanel.tsx` gains a "Guidance" footer listing the judgement-only advice as text.
 
@@ -183,7 +185,7 @@ order; a producer's `Err` becomes `CheckRun::Unknown`. The frontend mounts
 
 ---
 
-### Task 8: Transcript-derived advice producer
+### Task 8: Transcript-derived advice producer (#1257)
 
 **Files:** create `src-tauri/src/claudemd/advice/transcripts.rs`; modify `advice/mod.rs`, `advice/brief.rs`, `src-tauri/src/store/schema.rs` (migration: `claude_advice_signal`, `claude_advice_ledger`), `src-tauri/src/claude/preview.rs` (promote `tool_args`/`file_change` to `pub(crate)`; do not copy them), `advice/gaps.rs` (accept the edit signal).
 

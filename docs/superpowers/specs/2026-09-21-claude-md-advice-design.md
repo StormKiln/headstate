@@ -1,7 +1,7 @@
 # CLAUDE.md Advice Design
 
 **Date:** 2026-09-21
-**Status:** Proposed for Headstate 7.1
+**Status:** Proposed for Headstate 7.1 (epic #1255; sub-issues #1256–#1263)
 
 Written as a design for the 7.1 epic *CLAUDE.md and skills, from inventory
 to advice*. Each numbered producer below is one sub-issue and one pull
