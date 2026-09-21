@@ -183,6 +183,9 @@ pub const SURFACE: &[(&str, Class)] = &[
     // Read: the effective context a session loads, across scopes
     // (#1131). One more file read than `scan_claude_md`, same class.
     ("claude_md_effective", Class::Read),
+    // Read: the same walk as `claude_md_effective`, with every advice
+    // producer run over it. Reads local disk and writes nothing.
+    ("claude_md_advice", Class::Read),
     ("scan_claude_md", Class::Read),
     ("read_claude_md", Class::Read),
     // Rescan the DESKTOP's `~/.claude/projects` (#914). Read: it reads

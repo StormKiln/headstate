@@ -10,6 +10,7 @@ import { formatSize } from "@/lib/worktrees";
 import { Markdown } from "./Markdown";
 import { QueryError, errorMessage } from "./QueryError";
 import { PartialScanNotice } from "./PartialScanNotice";
+import { ClaudeMdAdvicePanel } from "./ClaudeMdAdvicePanel";
 import { copyText } from "@/lib/clipboard";
 import { toast } from "sonner";
 
@@ -271,6 +272,11 @@ export function ClaudeMdPage() {
             {effective.extra.length > 0 ? "every scope a session loads" : "this repository"}
           </p>
         ) : null}
+        {/* Advice, in the rail below the total so on a phone it is on the
+            list screen and reachable without a third screen. A finding
+            about a file selects it, which on a phone is the navigation
+            `showingList` keys on. */}
+        <ClaudeMdAdvicePanel repo={repo} activePath={active?.path} onSelectFile={setSelected} />
       </div>
 
       <div

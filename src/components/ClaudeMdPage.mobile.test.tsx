@@ -31,6 +31,29 @@ vi.mock("../api/hooks", async (orig) => ({
     isLoading: false,
   }),
   useClaudeMdText: () => ({ data: "# the file body", isLoading: false }),
+  // One finding whose subject is a file, so the panel's row can be
+  // tapped and the navigation it triggers asserted.
+  useClaudeMdAdvice: () => ({
+    data: {
+      repo: "octocat/hello-world",
+      findings: [
+        {
+          check: "imports",
+          severity: "problem",
+          subject: { kind: "claudeMd", path: "docs/CLAUDE.md", scope: "repo", section: null },
+          evidence: [{ at: { kind: "file", path: "docs/CLAUDE.md", line: null }, measured: "`@./x.md`: file not found" }],
+          finding: "`@./x.md` in `docs/CLAUDE.md` does not resolve: file not found",
+          brief: "## brief",
+        },
+      ],
+      checks: [{ check: "imports", run: { state: "ran", findings: 1 } }],
+      brief: "# all",
+    },
+    isError: false,
+    error: undefined,
+    isFetching: false,
+    refetch: () => {},
+  }),
 }));
 
 vi.mock("@/store/filters", async (orig) => ({
@@ -73,6 +96,21 @@ describe("ClaudeMdPage on a phone", () => {
     fireEvent.click(screen.getByRole("button", { name: /all files/i }));
     expect(screen.queryByRole("button", { name: /all files/i })).toBeNull();
     expect(screen.getByText("docs/")).toBeTruthy();
+  });
+
+  /// The advice panel lives in the rail, which on a phone IS the list
+  /// screen. A finding about a file is a button that selects it, and
+  /// selecting is what navigates to the file screen -- no third screen.
+  it("tapping a file-subject finding shows the file screen", () => {
+    stubViewport(390);
+    renderPage();
+    fireEvent.click(screen.getByRole("button", { name: /show advice/i }));
+    expect(screen.queryByRole("button", { name: /all files/i })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "docs/CLAUDE.md" }));
+
+    expect(screen.getByRole("button", { name: /all files/i })).toBeTruthy();
+    expect(screen.getByText("the file body")).toBeTruthy();
   });
 
   it("keeps both panes side by side on a desktop", () => {

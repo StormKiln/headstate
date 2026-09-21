@@ -13,6 +13,7 @@
 
 import { call } from "./transport";
 import type {
+  ClaudeMdAdviceReport,
   ClaudeMdEffectiveScan,
   ClaudePrLink,
   AlertReport,
@@ -1086,6 +1087,13 @@ export const revealLog = () => call<string>("reveal_log");
 /// was short by the global file's weight with nothing saying so.
 export const claudeMdEffective = (repoPath: string) =>
   call<ClaudeMdEffectiveScan>("claude_md_effective", { repoPath });
+
+/// Advice about a repository's CLAUDE.md files: every producer's findings,
+/// which checks ran, and a brief per finding. One command for every
+/// producer; a producer's failure is Unknown coverage inside the report,
+/// never a rejection (#1044).
+export const claudeMdAdvice = (repoPath: string) =>
+  call<ClaudeMdAdviceReport>("claude_md_advice", { repoPath });
 
 /// Every CLAUDE.md in a repository, with its import tree resolved, AND
 /// what the scan could not read (#972).

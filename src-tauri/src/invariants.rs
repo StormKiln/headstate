@@ -3156,4 +3156,160 @@ mod tests {
             offenders.join("\n")
         );
     }
+
+    /// Every `match` in `src` whose scrutinee satisfies `wanted`, with
+    /// the wildcard arms found in each.
+    ///
+    /// Returns `(matches seen, offending lines)`. Comment lines are
+    /// skipped before anything is matched, for the reason [`is_comment`]
+    /// gives: this tree states its rules in prose directly above the code
+    /// they govern, so the `_ =>` a guard forbids appears in a doc comment
+    /// far more often than in an arm. A block runs from the `match` line
+    /// to the next line at the same indentation that starts with `}`,
+    /// which is `}` for a tail-expression match and `};` for a `let`
+    /// binding; `cargo fmt --check` in `make lint` is what makes the
+    /// column reliable, the argument [`item_end`] makes.
+    ///
+    /// A wildcard arm is a pattern that is, or contains as an
+    /// alternative, the bare `_`: `_ =>`, `_ | X =>`, `X | _ =>`, and
+    /// `_ if cond =>`. `Some(_)` and `Check::X { .. }` are not wildcards
+    /// -- they bind one variant -- and a match that names every variant
+    /// with those is exactly the shape the guard wants.
+    fn wildcard_arms(src: &str, wanted: impl Fn(&str) -> bool) -> (usize, Vec<String>) {
+        let src = src.replace("\r\n", "\n");
+        let lines: Vec<&str> = src.lines().collect();
+        let mut seen = 0;
+        let mut offenders = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if is_comment(line) {
+                continue;
+            }
+            let t = line.trim_end();
+            let Some(at) = t.find("match ") else {
+                continue;
+            };
+            if !t.ends_with('{') {
+                continue;
+            }
+            let scrutinee = t[at + "match ".len()..].trim_end_matches('{').trim();
+            if !wanted(scrutinee) {
+                continue;
+            }
+            seen += 1;
+            let indent = line.len() - line.trim_start().len();
+            let end = lines
+                .iter()
+                .enumerate()
+                .skip(i + 1)
+                .find(|(_, l)| {
+                    l.trim_start().starts_with('}') && l.len() - l.trim_start().len() == indent
+                })
+                .map_or(lines.len(), |(j, _)| j);
+            for (j, arm) in lines[i + 1..end].iter().enumerate() {
+                if is_comment(arm) {
+                    continue;
+                }
+                let Some((pattern, _)) = arm.split_once("=>") else {
+                    continue;
+                };
+                // The guard, if any, is not part of the pattern.
+                let pattern = pattern.split(" if ").next().unwrap_or(pattern);
+                if pattern.split('|').any(|alt| alt.trim() == "_") {
+                    offenders.push(format!("{}: {}", i + 2 + j, arm.trim()));
+                }
+            }
+        }
+        (seen, offenders)
+    }
+
+    /// The `match` on `Check` in `claudemd/advice/brief.rs` has no
+    /// wildcard arm.
+    ///
+    /// `rustc` already refuses a match that misses a variant, so the
+    /// defect a guard can catch is the other one: a `_ =>` that lets a
+    /// producer's new `Check` variant compile with a generic suggestion.
+    /// A brief whose "Suggested change" is generic tells the agent
+    /// nothing, and the panel copies it without reading it. So the arm
+    /// must be written per producer, and this is what makes forgetting it
+    /// a failed test rather than a quiet default.
+    ///
+    /// Sabotage-proven both ways per the `guard` skill. Adding
+    /// `_ => String::new()` to `suggestion`'s match failed this test
+    /// naming `brief.rs` and the line; the same wildcard placed in a
+    /// comment line above the match did not, which is the comment
+    /// stripping doing its job. The negative proofs below run the same
+    /// scanner over real code: `confighealth.rs`'s `match self` in
+    /// `Verdict::rank` is seen and stays silent, and `markdown.rs`'s
+    /// `Filter::admits` -- which legitimately ends `_ => false` on a
+    /// TUPLE -- is silent under the `Check` scope and flagged without it,
+    /// so the scoping is what keeps a real wildcard elsewhere from
+    /// becoming a false positive here.
+    #[test]
+    fn the_brief_match_on_check_has_no_wildcard_arm() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let read = |rel: &str| {
+            std::fs::read_to_string(manifest.join(rel))
+                .unwrap_or_else(|e| panic!("read {rel}: {e}"))
+        };
+        let on_check = |s: &str| s.ends_with(".check") || s == "check" || s.contains("Check");
+
+        let brief = read("src/claudemd/advice/brief.rs");
+        let (seen, offenders) = wildcard_arms(&production(&brief), on_check);
+        assert!(
+            seen > 0,
+            "no `match` on Check was found in brief.rs, so the shape this guard depends \
+             on has changed and it is asserting nothing"
+        );
+        assert!(
+            offenders.is_empty(),
+            "src/claudemd/advice/brief.rs: the match on Check has a wildcard arm, which lets \
+             a new producer's variant compile with a generic suggestion. Write its arm:\n{}",
+            offenders.join("\n")
+        );
+
+        // Negative proof: a real match with no wildcard is seen and
+        // passes.
+        let health = read("src/claude/confighealth.rs");
+        let (seen, offenders) = wildcard_arms(&production(&health), |s| s == "self");
+        assert!(
+            seen > 0,
+            "confighealth.rs's `match self` must be visible to the scanner"
+        );
+        assert!(
+            offenders.is_empty(),
+            "false positive on confighealth.rs:\n{}",
+            offenders.join("\n")
+        );
+
+        // Scoping proof: a real `_ =>` on a tuple is flagged when the
+        // scanner is unscoped, and silent under the Check scope.
+        let markdown = read("src/packages/markdown.rs");
+        let (_, unscoped) = wildcard_arms(&production(&markdown), |_| true);
+        assert!(
+            !unscoped.is_empty(),
+            "the scanner cannot see `Filter::admits`'s `_ => false`, so it could not see one \
+             in brief.rs either"
+        );
+        let (seen, scoped) = wildcard_arms(&production(&markdown), on_check);
+        assert_eq!(seen, 0);
+        assert!(scoped.is_empty());
+
+        // Positive proof, on a fixture: the shapes the guard forbids are
+        // each flagged, and the same wildcard in a comment line is not.
+        let fixture = "\
+fn suggestion(f: &Finding) -> String {
+    // a comment saying _ => is forbidden
+    match f.check {
+        Check::Imports => a(),
+        Check::Rot | _ => b(),
+        _ if f.evidence.is_empty() => c(),
+        _ => String::new(),
+    }
+}
+";
+        let (seen, offenders) = wildcard_arms(fixture, on_check);
+        assert_eq!(seen, 1);
+        assert_eq!(offenders.len(), 3, "{offenders:?}");
+        assert!(offenders[0].starts_with("5: "), "{offenders:?}");
+    }
 }
