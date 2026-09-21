@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
+import type { PullRequest } from "../types/pr";
 import { PR_FIXTURES, prWithState } from "../fixtures/prs";
 import {
   applyFilters, awaitingReview, changesRequested, deriveStacked, deriveStats,
   isStale, needsAttention, pendingReview, pendingReviewers, readyToQueue, sortPrs, STALE_DAYS,
+  sortReadyForReview,
 } from "./derive";
 
 const [approved, broken, checking] = PR_FIXTURES;
@@ -123,6 +125,69 @@ describe("applyFilters", () => {
       const out = applyFilters([fresh], { staleOnly: true }, now);
       expect(out).toEqual([]);
     });
+  });
+});
+
+describe("sortReadyForReview", () => {
+  const at = (number: number, created_at: string): PullRequest => ({
+    ...PR_FIXTURES[0],
+    number,
+    created_at,
+  });
+
+  // Deliberately handed in NEWEST-first order, so a function that returns
+  // its input untouched fails. Passing the list already oldest-first would
+  // measure the fixture rather than the code.
+  const NEWEST_FIRST = [
+    at(3, "2026-09-03T00:00:00Z"),
+    at(2, "2026-09-02T00:00:00Z"),
+    at(1, "2026-09-01T00:00:00Z"),
+  ];
+
+  it("defaults to oldest opened first", () => {
+    expect(sortReadyForReview(NEWEST_FIRST).map((pr) => pr.number)).toEqual([1, 2, 3]);
+  });
+
+  it("orders newest opened first when asked", () => {
+    const oldestFirst = [...NEWEST_FIRST].reverse();
+    expect(sortReadyForReview(oldestFirst, "newest-opened").map((pr) => pr.number)).toEqual(
+      [3, 2, 1],
+    );
+  });
+
+  it("does not mutate its input", () => {
+    const original = [...NEWEST_FIRST];
+    sortReadyForReview(NEWEST_FIRST);
+    expect(NEWEST_FIRST).toEqual(original);
+  });
+
+  /// A `NaN` comparator result is treated as 0 by `Array.prototype.sort`,
+  /// which leaves an undated row wherever it happened to be -- including
+  /// the top of the queue, where it would claim to be the longest-waiting
+  /// work and push genuinely old pull requests down. Last is the honest
+  /// place for "we do not know".
+  it("sorts an unparseable created_at last, not first", () => {
+    const withJunk = [at(9, "not a date"), ...NEWEST_FIRST];
+    expect(sortReadyForReview(withJunk).map((pr) => pr.number)).toEqual([1, 2, 3, 9]);
+  });
+
+  it("sorts a missing created_at last, not first", () => {
+    const withEmpty = [at(9, ""), ...NEWEST_FIRST];
+    expect(sortReadyForReview(withEmpty).map((pr) => pr.number)).toEqual([1, 2, 3, 9]);
+  });
+
+  // Last in BOTH directions. "Unknown" is not a date to be flipped -- on
+  // newest-first it would otherwise land at the top for the same reason.
+  it("keeps undated rows last under newest-opened too", () => {
+    const withJunk = [at(9, "not a date"), ...NEWEST_FIRST];
+    expect(sortReadyForReview(withJunk, "newest-opened").map((pr) => pr.number)).toEqual(
+      [3, 2, 1, 9],
+    );
+  });
+
+  it("leaves several undated rows in a stable order among themselves", () => {
+    const many = [at(8, ""), at(9, "nonsense"), ...NEWEST_FIRST];
+    expect(sortReadyForReview(many).map((pr) => pr.number)).toEqual([1, 2, 3, 8, 9]);
   });
 });
 

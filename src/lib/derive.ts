@@ -22,6 +22,23 @@ export interface Filters {
   awaitingReviewOnly?: boolean;
   readyToQueueOnly?: boolean;
   sort?: "newest" | "oldest" | "recently-updated" | "least-recently-updated";
+  /// How the "Ready for review" strip on the To Review page is ordered
+  /// (#1277). Defaults to `"oldest-opened"` when absent.
+  ///
+  /// SEPARATE from `sort`, which orders the main PR list below the strip
+  /// and defaults to newest-first. One key for both would mean the review
+  /// queue could not default to oldest without flipping the list's default
+  /// too, and a reviewer changing the strip's order would silently reorder
+  /// the list they were reading.
+  ///
+  /// The values name the FIELD, not just the direction. "Oldest first" is
+  /// ambiguous between "opened oldest" and "waiting for review longest",
+  /// and those are different PRs whenever something sat in draft -- which
+  /// is the ambiguity #1277 was filed about. `PullRequest` carries
+  /// `created_at` and `updated_at` only, with no ready-for-review
+  /// timestamp fetched anywhere, so this sorts on `created_at` and says so
+  /// rather than implying an answer it does not have.
+  readySort?: "oldest-opened" | "newest-opened";
   /// Safety verdicts to show on the Worktrees page (#1140).
   ///
   /// `undefined` and `[]` both mean "show everything", deliberately.
@@ -86,9 +103,9 @@ export interface Filters {
 /// that is filtering hard from one that is not filtering at all.
 ///
 /// `query` is excluded because the search field stays visible beside the
-/// button and speaks for itself, and `sort` because ordering the list is
-/// not hiding any of it -- counting either would make the badge argue
-/// with what the user can already see.
+/// button and speaks for itself, and `sort` and `readySort` because
+/// ordering a list is not hiding any of it -- counting any of them would
+/// make the badge argue with what the user can already see.
 ///
 /// The three `stats*` keys are excluded for the reason `repo` is excluded
 /// from the triage chips below: they are sidebar NAVIGATION, not filters
@@ -103,7 +120,8 @@ export function activeFilterCount(filters: Filters): number {
     "statsSubject",
   ]);
   return (Object.entries(filters) as [keyof Filters, unknown][]).filter(([key, value]) => {
-    if (key === "query" || key === "sort" || navigation.has(key)) return false;
+    if (key === "query" || key === "sort" || key === "readySort" || navigation.has(key))
+      return false;
     if (Array.isArray(value)) return value.length > 0;
     return value !== undefined && value !== false;
   }).length;
@@ -312,6 +330,52 @@ export function readyForReview(pr: PullRequest): boolean {
     pr.review !== "changes_requested" &&
     !pr.in_merge_queue
   );
+}
+
+/// The "Ready for review" strip's order, oldest OPENED first by default.
+///
+/// A review queue is the one list where oldest-first is the right
+/// default: a pull request that has been waiting three days is the one
+/// whose author is blocked, and newest-first buries it exactly when it
+/// matters most. That is a different question from the session list and
+/// the main PR list, which are newest-first so they answer "what was I
+/// just doing" -- hence `readySort` rather than reusing `sort` (#1277).
+///
+/// Sorts on `created_at`, which is WHEN THE PULL REQUEST WAS OPENED, not
+/// when it was marked ready for review. Those differ whenever something
+/// sat in draft, and the second is the better answer to "how long has
+/// this been waiting" -- but `PullRequest` carries `created_at` and
+/// `updated_at` only, and no ready-for-review timestamp is fetched
+/// anywhere in the app. Rather than guess, the control's labels name the
+/// field ("Oldest opened first"), so a reader can tell which question
+/// they are getting an answer to. Fetching `readyForReviewAt` is a
+/// separate change.
+///
+/// A missing or unparseable `created_at` sorts LAST in both directions,
+/// never first. `new Date("")` is `NaN`, and a `NaN` comparator result
+/// is treated as 0 by `Array.prototype.sort` -- which leaves such a row
+/// wherever it happened to be, including the top. At the top of a review
+/// queue it would claim to be the longest-waiting work and push genuinely
+/// old pull requests down, which is the one outcome this ordering exists
+/// to prevent. Last is the honest place for "we do not know": it is
+/// visible, and it is not making a claim.
+///
+/// Pure and non-mutating, like `sortPrs`.
+export function sortReadyForReview(
+  prs: PullRequest[],
+  sort: NonNullable<Filters["readySort"]> = "oldest-opened",
+): PullRequest[] {
+  const opened = (pr: PullRequest) => new Date(pr.created_at).getTime();
+  return [...prs].sort((a, b) => {
+    const x = opened(a);
+    const y = opened(b);
+    // Undated rows go last regardless of direction, and keep a stable
+    // order among themselves.
+    const xBad = Number.isNaN(x);
+    const yBad = Number.isNaN(y);
+    if (xBad || yBad) return xBad && yBad ? 0 : xBad ? 1 : -1;
+    return sort === "newest-opened" ? y - x : x - y;
+  });
 }
 
 /// Needs MY attention as a reviewer.
