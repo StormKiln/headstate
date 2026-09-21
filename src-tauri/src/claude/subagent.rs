@@ -490,8 +490,32 @@ fn scan_ids(text: &str) -> Vec<String> {
 /// census counts 634 of them in a 19,725-record sample and nothing in
 /// this app read one -- so Headstate knew about pull requests, knew
 /// about sessions, and could not connect them.
+///
+/// # Serialised snake_case, deliberately (#1288)
+///
+/// NO `rename_all` here. This struct is returned by
+/// `claude_sessions_for_pr` and nested in [`sessions::SessionDetail`],
+/// and its TypeScript mirror `ClaudePrLink` -- like `ClaudeSession`,
+/// `ClaudeSessionDetail` and the rest of `src/types/pr.ts` -- declares
+/// snake_case. `SessionDetail` itself carries no `rename_all`, so a
+/// camelCase `PrLink` made ONE response speak both spellings: its own
+/// `session_id` beside its `pull_requests[].sessionId`.
+///
+/// It did carry one, and v7.1.0 shipped the crash: the wire sent
+/// `sessionId`, `PrDetailView` read `l.session_id.slice(0, 8)` off
+/// `undefined`, and every pull request with a linked Claude session
+/// threw `undefined is not an object`. `first_seen_at` broke
+/// identically and failed soft, so the "first linked" date was silently
+/// always absent. Nothing transforms response keys --
+/// `src/api/transport.ts`'s camelCase comment is about OUTBOUND
+/// argument keys.
+///
+/// Nothing else constrains the spelling: `store.rs` persists these as
+/// explicit SQLite columns rather than as serialised JSON, and no other
+/// crate consumes the type. `invariants.rs`'s
+/// `every_mirrored_type_agrees_with_its_rust_wire_spelling` now fails if
+/// this drifts again.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct PrLink {
     pub session_id: String,
     pub repo: String,
@@ -1106,5 +1130,45 @@ mod tests {
         drop(f);
 
         assert!(build(&[path]).pr_links.is_empty());
+    }
+
+    /// The keys this struct actually puts on the wire (#1288).
+    ///
+    /// Asserted against the SERIALISED JSON rather than against the
+    /// field names, because the field names were never the thing in
+    /// doubt: `rename_all = "camelCase"` left them reading `session_id`
+    /// in Rust while the wire carried `sessionId`, and every reader of
+    /// this file saw the spelling the frontend expected.
+    ///
+    /// The whole key set is compared, not just the two that broke, so a
+    /// future `rename_all` cannot be caught on one field and missed on
+    /// the next.
+    #[test]
+    fn pr_link_serialises_snake_case() {
+        let link = PrLink {
+            session_id: "e5df3bd1-1b5f-40cf-8d4b-5e0cc8939abc".to_string(),
+            repo: "acme/api".to_string(),
+            number: 7,
+            url: "https://github.com/acme/api/pull/7".to_string(),
+            first_seen_at: Some("2026-09-01T00:00:00Z".to_string()),
+        };
+        let v: serde_json::Value = serde_json::to_value(&link).unwrap();
+        // Sorted: serde preserves declaration order and the ASSERTION is
+        // about the key SET, not the order a field happens to be
+        // written in. Comparing order too would fail on a harmless
+        // reordering and teach the next reader to edit the expectation.
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["first_seen_at", "number", "repo", "session_id", "url"],
+            "PrLink must serialise the spelling `ClaudePrLink` declares; a camelCase \
+             wire is #1288, which threw on every pull request with a linked Claude session"
+        );
+
+        // Round-trips, so the cached `SessionDetail` this is nested in
+        // still reads back.
+        let back: PrLink = serde_json::from_value(v).unwrap();
+        assert_eq!(back, link);
     }
 }

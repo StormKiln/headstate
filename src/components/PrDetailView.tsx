@@ -87,7 +87,28 @@ function CheckRow({ name, state, url }: { name: string; state: string; url: stri
 /// the same choice `SessionPullRequests` makes for the same reason.
 function PrSessions({ repo, number }: { repo: string; number: number }) {
   const q = useClaudeSessionsForPr(repo, number, true);
-  const links = q.data ?? [];
+  // Rows without a usable `session_id` are DROPPED rather than rendered
+  // (#1288).
+  //
+  // The contract is asserted where a contract can be asserted -- in
+  // Rust, by `PrLink`'s `pr_link_serialises_snake_case` and by
+  // `invariants.rs`'s
+  // `every_mirrored_type_agrees_with_its_rust_wire_spelling`, which
+  // compare the real serialised keys against this file's type. This
+  // filter is not a second spelling of that contract and deliberately
+  // does NOT read `sessionId`: accepting both spellings would make the
+  // wire unfalsifiable and let the next drift through in silence.
+  //
+  // What it buys is proportionality. `PrLink` serialised `sessionId`
+  // for a release and `l.session_id.slice(0, 8)` threw on `undefined`,
+  // which took down the ENTIRE pull request page -- title, checks,
+  // diff, review -- over a provenance footnote. This panel already
+  // treats a failed lookup as silent for exactly that reason: it is not
+  // the subject of the page. A malformed row now costs its own line and
+  // nothing else.
+  const links = (q.data ?? []).filter(
+    (l: ClaudePrLink) => typeof l?.session_id === "string" && l.session_id.length > 0,
+  );
 
   // Nothing to say: no link recorded here, or the lookup failed. A
   // failed lookup is deliberately silent rather than an error panel --
