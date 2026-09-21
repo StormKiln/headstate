@@ -1797,7 +1797,8 @@ pub async fn claude_md_effective(
 }
 
 /// Advice about a repository's CLAUDE.md files: every producer's
-/// findings, which checks ran, and a brief per finding.
+/// findings, which checks ran, a brief per finding, and where the answer
+/// came from.
 ///
 /// One command for every producer rather than one per check: each
 /// command costs five wiring points twice over for the phone, and
@@ -1813,10 +1814,10 @@ pub async fn claude_md_effective(
 /// The store is opened here, the way `claude_import_transcripts` opens
 /// it, and handed to the producers as `Context::conn`. The transcripts
 /// producer reads sessions through it and writes only Headstate's own
-/// cache (`claude_advice_ledger`, `claude_advice_signal`), which is why
-/// the command stays `Class::Read`. A store that cannot be opened is not
-/// a rejection: `conn` is `None`, that one producer reports itself
-/// Unknown, and the producers that need no store still answer (#1044).
+/// caches, which is why the command stays `Class::Read`. A store that
+/// cannot be opened is not a rejection: `conn` is `None`, that one
+/// producer reports itself Unknown, nothing is cached, and the producers
+/// that need no store still answer (#1044).
 ///
 /// The definitions inventory is built the way `claude_definitions`
 /// builds it -- user root, this repository's `.claude`, installed
@@ -1832,13 +1833,31 @@ pub async fn claude_md_effective(
 /// whole run sits on ONE `spawn_blocking`, because the transcript pass
 /// is a whole-body read of every session under the repository and must
 /// never run on the async runtime or on the live pass (#1246).
+///
+/// # The report is cached, and the answer says so (#1293)
+///
+/// `advice::cache::serve` decides between running the producers and
+/// serving the stored report, and returns the `Freshness` that says
+/// which. The scan and the inventory are still built on every call
+/// BEFORE that decision, and deliberately: they are the fingerprint's
+/// input, so there is no way to know whether the cache is current
+/// without them. What the cache saves is the eight producers on top --
+/// and the transcript pass is most of that.
+///
+/// `mode` is the caller's, never guessed here: `Cached` is what opening
+/// a repository wants, `Fresh` is what Refresh wants, and a command that
+/// decided for itself would make Refresh a no-op exactly when a user
+/// presses it. It is `Option` on the wire so an existing caller that
+/// omits it gets `Mode::Cached`.
 #[tauri::command]
 pub async fn claude_md_advice(
     app: AppHandle,
     repo_path: String,
-) -> Result<crate::claudemd::advice::Report, String> {
+    mode: Option<crate::claudemd::advice::Mode>,
+) -> Result<crate::claudemd::advice::AdviceResult, String> {
     use crate::claude::definitions as defs;
     let db = db_path(&app);
+    let mode = mode.unwrap_or_default();
     tauri::async_runtime::spawn_blocking(move || {
         let repo = std::path::PathBuf::from(&repo_path);
         let home = crate::claudemd::home();
@@ -1875,7 +1894,7 @@ pub async fn claude_md_advice(
             definitions: Some(&inv),
             conn: conn.as_ref(),
         };
-        crate::claudemd::advice::run(&cx)
+        crate::claudemd::advice::cache::serve(&cx, mode, &chrono::Utc::now().to_rfc3339())
     })
     .await
     .map_err(|e| e.to_string())

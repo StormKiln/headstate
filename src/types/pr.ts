@@ -1146,6 +1146,52 @@ export interface ClaudeMdAdviceReport {
   brief: string;
 }
 
+/// Why a caller is asking. Mirrors `claudemd::advice::Mode` (#1293).
+///
+/// Not guessed by the backend: `"cached"` is what opening a repository
+/// wants, `"fresh"` is what Refresh wants, and a command that decided
+/// for itself would make Refresh a no-op exactly when a user presses it.
+export type ClaudeMdAdviceMode = "cached" | "fresh";
+
+/// Where a served report came from, and whether it can be called
+/// current. Mirrors `claudemd::advice::Freshness` (#1293).
+///
+/// THREE states that must never collapse into two (#846, #1042):
+///
+/// - `"fresh"` -- the producers ran during this call (`recomputed`
+///   true), or the stored report's fingerprint was recomputed in full
+///   and matched (`recomputed` false). Either way every tracked input
+///   was read.
+/// - `"cached"` -- served from the store without a run. `stale` says
+///   whether a tracked input has changed since.
+/// - `"unverified"` -- an input could not be read, so currency is
+///   UNKNOWN. This is NOT `"fresh"` with a footnote: a matching
+///   fingerprint here proves nothing, because it omitted something both
+///   times. `recomputed` says whether the producers ran, because an
+///   unverified run that just happened is the best available answer and
+///   still not a current one.
+///
+/// "From cache, refreshing" -- the epic's second state -- is this type
+/// plus the caller's own knowledge: a `"cached"` result held on screen
+/// while a `"fresh"` call is in flight. It is deliberately not a member
+/// here, because one synchronous call cannot be both the cached answer
+/// and the running one.
+export type ClaudeMdAdviceFreshness =
+  | { state: "fresh"; recomputed: boolean }
+  | { state: "cached"; stale: boolean }
+  | { state: "unverified"; reason: string; recomputed: boolean };
+
+/// A report and the honest account of where it came from. Mirrors
+/// `claudemd::advice::AdviceResult` (#1293).
+export interface ClaudeMdAdviceResult {
+  report: ClaudeMdAdviceReport;
+  freshness: ClaudeMdAdviceFreshness;
+  /// RFC 3339, when the PRODUCERS ran -- not when this call answered.
+  /// For a cached result this is older than now, which is the point of
+  /// showing it.
+  computedAt: string;
+}
+
 export interface ClaudeMdScan {
   /// What DID read. Never blanked because something else did not.
   files: ClaudeFile[];

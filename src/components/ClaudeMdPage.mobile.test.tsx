@@ -33,21 +33,27 @@ vi.mock("../api/hooks", async (orig) => ({
   useClaudeMdText: () => ({ data: "# the file body", isLoading: false }),
   // One finding whose subject is a file, so the panel's row can be
   // tapped and the navigation it triggers asserted.
+  // Wrapped in its freshness since #1293: the command returns the report
+  // plus where the answer came from, and the panel reads `data.report`.
   useClaudeMdAdvice: () => ({
     data: {
-      repo: "octocat/hello-world",
-      findings: [
-        {
-          check: "imports",
-          severity: "problem",
-          subject: { kind: "claudeMd", path: "docs/CLAUDE.md", scope: "repo", section: null },
-          evidence: [{ at: { kind: "file", path: "docs/CLAUDE.md", line: null }, measured: "`@./x.md`: file not found" }],
-          finding: "`@./x.md` in `docs/CLAUDE.md` does not resolve: file not found",
-          brief: "## brief",
-        },
-      ],
-      checks: [{ check: "imports", run: { state: "ran", findings: 1 } }],
-      brief: "# all",
+      report: {
+        repo: "octocat/hello-world",
+        findings: [
+          {
+            check: "imports",
+            severity: "problem",
+            subject: { kind: "claudeMd", path: "docs/CLAUDE.md", scope: "repo", section: null },
+            evidence: [{ at: { kind: "file", path: "docs/CLAUDE.md", line: null }, measured: "`@./x.md`: file not found" }],
+            finding: "`@./x.md` in `docs/CLAUDE.md` does not resolve: file not found",
+            brief: "## brief",
+          },
+        ],
+        checks: [{ check: "imports", run: { state: "ran", findings: 1 } }],
+        brief: "# all",
+      },
+      freshness: { state: "fresh", recomputed: true },
+      computedAt: "2026-01-01T00:00:00Z",
     },
     isError: false,
     error: undefined,

@@ -451,7 +451,12 @@ fn sessions_under(conn: &Connection, repo: &Path) -> Result<Vec<SessionRow>, Str
 /// A session's cwd, re-rooted when it is an agent worktree root: the
 /// last three components `.claude/worktrees/agent-<id>` are stripped, the
 /// exact shape `Kind::classify` matches and nothing looser.
-fn reroot_cwd(cwd: &str) -> PathBuf {
+///
+/// `pub(super)` so `cache::session_keys` selects the same session set
+/// this producer will read. Two copies of this rule would be two answers
+/// to "is this session under the repository", and the fingerprint would
+/// cover a set the producer does not read.
+pub(super) fn reroot_cwd(cwd: &str) -> PathBuf {
     let p = Path::new(cwd);
     if Kind::classify(Some(cwd)).is_subagent() {
         if let Some(root) = p.parent().and_then(Path::parent).and_then(Path::parent) {

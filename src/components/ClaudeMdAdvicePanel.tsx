@@ -123,7 +123,7 @@ export function ClaudeMdAdvicePanel({
         <Skeleton />
       ) : (
         <ReportView
-          report={data}
+          report={data.report}
           repo={repo}
           activePath={activePath}
           onSelectFile={onSelectFile}

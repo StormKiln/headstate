@@ -303,7 +303,15 @@ pub const SURFACE: &[(&str, Class)] = &[
     // (#1131). One more file read than `scan_claude_md`, same class.
     ("claude_md_effective", Class::Read),
     // Read: the same walk as `claude_md_effective`, with every advice
-    // producer run over it. Reads local disk and writes nothing.
+    // producer run over it, or the stored report served when the tracked
+    // inputs still match (#1293).
+    //
+    // Still `Read` with the cache: the only thing it writes is
+    // Headstate's own derived report, the same ground on which
+    // `claude_import_transcripts` is Read -- it changes no GitHub state,
+    // no desktop setting, and nothing under `~/.claude`. `Write` is for
+    // a command that changes something a user would not want changed by
+    // a phone.
     ("claude_md_advice", Class::Read),
     ("scan_claude_md", Class::Read),
     ("read_claude_md", Class::Read),
@@ -1125,7 +1133,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         )),
         "claude_md_effective" => res(commands::claude_md_effective(a.get("repoPath")?).await),
         "claude_md_advice" => {
-            res(commands::claude_md_advice(app.clone(), a.get("repoPath")?).await)
+            res(commands::claude_md_advice(app.clone(), a.get("repoPath")?, a.get("mode")?).await)
         }
         "scan_claude_md" => res(commands::scan_claude_md(a.get("repoPath")?).await),
         // `async` since #1090: an unbounded `read_to_string` dispatched

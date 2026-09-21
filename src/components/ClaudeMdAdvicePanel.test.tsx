@@ -1,6 +1,12 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { ClaudeMdAdviceCheck, ClaudeMdAdviceFinding, ClaudeMdAdviceReport } from "@/types/pr";
+import type {
+  ClaudeMdAdviceCheck,
+  ClaudeMdAdviceFinding,
+  ClaudeMdAdviceFreshness,
+  ClaudeMdAdviceReport,
+  ClaudeMdAdviceResult,
+} from "@/types/pr";
 
 const copyFn = vi.hoisted(() => vi.fn(() => Promise.resolve(null as string | null)));
 const toastFns = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn() }));
@@ -40,12 +46,23 @@ const finding = (over: Partial<ClaudeMdAdviceFinding> = {}): ClaudeMdAdviceFindi
   ...over,
 });
 
-const report = (over: Partial<ClaudeMdAdviceReport> = {}): ClaudeMdAdviceReport => ({
-  repo: REPO,
-  findings: [],
-  checks: [{ check: "imports", run: { state: "ran", findings: 0 } }],
-  brief: "# CLAUDE.md advice\n",
-  ...over,
+/// The wire shape since #1293: the report WRAPPED in its freshness.
+///
+/// The helper builds the wrapper so every case below exercises the shape
+/// the command actually returns. The panel reads `data.report` and makes
+/// no currency claim of its own -- #1290 to #1292 own that -- so the
+/// default freshness here is the honest one for a report that was just
+/// computed.
+const report = (over: Partial<ClaudeMdAdviceReport> = {}): ClaudeMdAdviceResult => ({
+  report: {
+    repo: REPO,
+    findings: [],
+    checks: [{ check: "imports", run: { state: "ran", findings: 0 } }],
+    brief: "# CLAUDE.md advice\n",
+    ...over,
+  },
+  freshness: { state: "fresh", recomputed: true },
+  computedAt: "2026-01-01T00:00:00Z",
 });
 
 function open(activePath?: string) {
@@ -68,6 +85,35 @@ beforeEach(() => {
 });
 
 describe("ClaudeMdAdvicePanel", () => {
+  /// The panel renders the same report whichever freshness it arrived
+  /// with, and claims NOTHING about currency either way (#1293).
+  ///
+  /// The panel is deliberately unchanged by the cache: #1290 to #1292
+  /// own the advice surface and will render the freshness. What must
+  /// hold in the meantime is that serving from cache did not silently
+  /// change what the panel shows, AND that the panel does not start
+  /// asserting currency it was never given -- an "up to date" badge
+  /// added here over an `unverified` result would be the exact lie the
+  /// three states exist to prevent.
+  ///
+  /// Every member of the union is constructed, so a member removed or
+  /// renamed on the wire fails to compile here rather than silently
+  /// ceasing to be handled.
+  it.each<[string, ClaudeMdAdviceFreshness]>([
+    ["computed now", { state: "fresh", recomputed: true }],
+    ["verified current", { state: "fresh", recomputed: false }],
+    ["from cache, stale", { state: "cached", stale: true }],
+    ["from cache, could not verify", { state: "unverified", reason: "x: Permission denied", recomputed: false }],
+  ])("renders the finding the same way when the report is %s", (_label, freshness) => {
+    state.data = { ...report({ findings: [finding()] }), freshness };
+    open();
+    expect(screen.getByText(/does not resolve/)).toBeTruthy();
+    // No currency claim, in either direction. The panel neither says
+    // the report is up to date nor says it is out of date, because it
+    // does not render the freshness at all yet.
+    expect(screen.queryByText(/up to date|out of date|current/i)).toBeNull();
+  });
+
   /// Collapsed by default, and nothing is claimed while closed.
   it("is collapsed by default", () => {
     state.data = report();
