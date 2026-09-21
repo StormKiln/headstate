@@ -8,6 +8,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 import type {
   ClaudePairing,
   AlertReport,
+  ClaudeMdAdviceMode,
   Artifact,
   Branch,
   BranchDeleteFrame,
@@ -1447,16 +1448,28 @@ export function useClaudeMdEffective(repoPath: string | undefined) {
   });
 }
 
-/// Advice about a repository's CLAUDE.md files.
+/// Advice about a repository's CLAUDE.md files, and where the answer
+/// came from.
 ///
 /// `enabled` is whether the panel is open: fetched only then, so the
 /// page's file list and content pane never wait on the producers. A
 /// closed panel shows no state at all, which is different from a query
 /// that was asked and failed.
-export function useClaudeMdAdvice(repoPath: string | undefined, enabled: boolean) {
+///
+/// `mode` is in the query key since #1293. A `"fresh"` read and a
+/// `"cached"` read of the same repository are different questions with
+/// different answers -- one runs the producers, one may serve the store
+/// -- and sharing a key would let a cached result satisfy a caller that
+/// asked for a run. The default stays `"cached"`, which is what opening
+/// the panel wants.
+export function useClaudeMdAdvice(
+  repoPath: string | undefined,
+  enabled: boolean,
+  mode: ClaudeMdAdviceMode = "cached",
+) {
   return useQuery({
-    queryKey: ["claude-md-advice", repoPath],
-    queryFn: () => claudeMdAdvice(repoPath as string),
+    queryKey: ["claude-md-advice", repoPath, mode],
+    queryFn: () => claudeMdAdvice(repoPath as string, mode),
     enabled: Boolean(repoPath) && enabled,
     staleTime: 30_000,
     retry: false,

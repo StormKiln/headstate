@@ -236,7 +236,11 @@ const ROWS: Row[] = [
   row(api.readLogTail, [4096], "read_log_tail", { maxBytes: 4096 }),
   row(api.revealLog, [], "reveal_log"),
   row(api.claudeMdEffective, [repoPath], "claude_md_effective", { repoPath }),
-  row(api.claudeMdAdvice, [repoPath], "claude_md_advice", { repoPath }),
+  // `mode` is omitted by the caller and sent as explicit `null` (#1293):
+  // the Rust side takes `Option<Mode>` and defaults to `Cached`, and a
+  // missing key and a `null` decode identically there. Sent rather than
+  // dropped so the argument object has one shape for both callers.
+  row(api.claudeMdAdvice, [repoPath], "claude_md_advice", { repoPath, mode: null }),
   row(api.scanClaudeMd, [repoPath], "scan_claude_md", { repoPath }),
   // The Claude Code cache, its session list and its aggregates (#914,
   // #917, #921). Three of these are argument-free: they operate on
@@ -396,6 +400,22 @@ describe("tauri.ts wrappers through the transport", () => {
     const covered = new Set<unknown>(ROWS.map((r) => r.fn));
     for (const fn of exported) expect(covered.has(fn)).toBe(true);
     expect(ROWS).toHaveLength(exported.length);
+  });
+
+  /// The advice cache's `mode` reaches the wire when the caller sets it.
+  ///
+  /// A separate assertion for the same reason the terms one is, and it
+  /// earns its place: the row above pins the DEFAULT path, where `mode`
+  /// is `null` and the Rust side reads `Mode::Cached`. If `mode` were
+  /// dropped on the way out, that row would still pass and Refresh
+  /// (#1293) would silently be a cached read -- a no-op exactly when a
+  /// user presses it.
+  it("sends the advice mode the caller chose", async () => {
+    await api.claudeMdAdvice("/repos/hello-world", "fresh");
+    expect(local.call).toHaveBeenCalledWith("claude_md_advice", {
+      repoPath: "/repos/hello-world",
+      mode: "fresh",
+    });
   });
 
   /// The pre-#1214 call shape still works and still says "no terms".

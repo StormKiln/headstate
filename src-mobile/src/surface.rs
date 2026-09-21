@@ -184,7 +184,9 @@ pub const SURFACE: &[(&str, Class)] = &[
     // (#1131). One more file read than `scan_claude_md`, same class.
     ("claude_md_effective", Class::Read),
     // Read: the same walk as `claude_md_effective`, with every advice
-    // producer run over it. Reads local disk and writes nothing.
+    // producer run over it, or the stored report served when the tracked
+    // inputs still match (#1293). Still Read with the cache: the only
+    // thing it writes is Headstate's own derived report.
     ("claude_md_advice", Class::Read),
     ("scan_claude_md", Class::Read),
     ("read_claude_md", Class::Read),

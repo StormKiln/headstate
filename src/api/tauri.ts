@@ -13,7 +13,8 @@
 
 import { call } from "./transport";
 import type {
-  ClaudeMdAdviceReport,
+  ClaudeMdAdviceMode,
+  ClaudeMdAdviceResult,
   ClaudeMdEffectiveScan,
   ClaudePrLink,
   AlertReport,
@@ -1089,11 +1090,17 @@ export const claudeMdEffective = (repoPath: string) =>
   call<ClaudeMdEffectiveScan>("claude_md_effective", { repoPath });
 
 /// Advice about a repository's CLAUDE.md files: every producer's findings,
-/// which checks ran, and a brief per finding. One command for every
-/// producer; a producer's failure is Unknown coverage inside the report,
-/// never a rejection (#1044).
-export const claudeMdAdvice = (repoPath: string) =>
-  call<ClaudeMdAdviceReport>("claude_md_advice", { repoPath });
+/// which checks ran, a brief per finding, and where the answer came from.
+/// One command for every producer; a producer's failure is Unknown
+/// coverage inside the report, never a rejection (#1044).
+///
+/// Returns the report WRAPPED in its freshness since #1293: the report is
+/// cached in the database and `freshness` says whether it was computed
+/// now, verified current, served from cache, or could not be verified.
+/// `mode` is `"cached"` (the default -- serve the store when the tracked
+/// inputs match) or `"fresh"` (run the producers regardless).
+export const claudeMdAdvice = (repoPath: string, mode?: ClaudeMdAdviceMode) =>
+  call<ClaudeMdAdviceResult>("claude_md_advice", { repoPath, mode: mode ?? null });
 
 /// Every CLAUDE.md in a repository, with its import tree resolved, AND
 /// what the scan could not read (#972).

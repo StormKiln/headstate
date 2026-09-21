@@ -1081,6 +1081,58 @@ const MIGRATIONS: &[&str] = &[
      );
      CREATE INDEX IF NOT EXISTS claude_advice_signal_session
         ON claude_advice_signal (session_id);",
+    // 25: the assembled CLAUDE.md advice REPORT, per repository (#1293).
+    //
+    // Not to be confused with migration 24 above. Those two tables are
+    // the transcripts producer's own incremental cache -- they let that
+    // one pass skip an unchanged session -- and they hold no report.
+    // Until this migration the `Report` itself was never stored, so
+    // every open of the advice panel re-ran all eight producers, the
+    // whole-body transcript read included.
+    //
+    // One row per repository holding the whole report as JSON, rather
+    // than one row per check. `claudemd::advice::cache`'s module docs
+    // carry the argument: all eight producers read the one CLAUDE.md
+    // walk, seven of eight answer a question about those files, and
+    // `Report::brief` is rendered over the whole finding set -- so
+    // per-check rows would invalidate together anyway and would let a
+    // read assemble a report no run ever produced.
+    //
+    // `digest` is the fingerprint of the tracked inputs AS OF the run:
+    // SHA256 over every CLAUDE.md's and every definition's bytes, plus
+    // `(size, mtime)` per session. Content rather than `mtime` for the
+    // files, because a checkout rewrites timestamps without changing
+    // content and a same-second write hides a change that did -- and the
+    // file set is small and already in hand from the scan. Sessions keep
+    // `(size, mtime)`, migration 24's own change key, because hashing
+    // their bodies is exactly the read this cache exists to avoid.
+    //
+    // `unverified` is the load-bearing column and the reason this is not
+    // a boolean pair. NULL means the fingerprint covered every tracked
+    // input; a string means one could not be read, and names which. A
+    // report stored under a non-NULL `unverified` is unverified on every
+    // later open, not just the one that wrote it, because the digest it
+    // will be compared against was never a complete statement. "Could
+    // not verify" is not "current" (#846, #1042).
+    //
+    // `payload_version` is checked before `payload` is decoded: a decode
+    // failure already covers a changed `Report` shape, and this covers a
+    // report that still decodes but no longer means the same thing. A
+    // mismatch on either is a MISS -- recompute and overwrite -- never a
+    // crash and never a half-decoded report.
+    //
+    // No `ON DELETE` and no foreign key: the key is a repository PATH,
+    // which nothing else in this schema owns. A stale row for a
+    // repository that has moved costs one row and is overwritten the
+    // next time that path is asked about.
+    "CREATE TABLE IF NOT EXISTS claude_advice_report (
+        repo             TEXT PRIMARY KEY,
+        payload_version  INTEGER NOT NULL,
+        digest           TEXT NOT NULL,
+        payload          TEXT NOT NULL,
+        unverified       TEXT,
+        computed_at      TEXT NOT NULL
+     );",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
@@ -1437,6 +1489,90 @@ mod tests {
             kept_index, 1,
             "an upgrade must not cost the search index's ledger"
         );
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+    }
+
+    /// Migration 25 adds the advice REPORT cache without costing what a
+    /// v24 database holds (#1293).
+    ///
+    /// The table is derived data -- losing it costs one recompute -- but
+    /// the transcript tables beside it are the expensive thing it exists
+    /// to avoid re-reading, and an upgrade that dropped THEM would make
+    /// the first open after every release slower than before.
+    #[test]
+    fn migration_25_adds_the_report_cache_without_costing_the_advice_tables() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in MIGRATIONS.iter().take(24) {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 24i64).unwrap();
+        conn.execute(
+            "INSERT INTO claude_advice_ledger (session_id, size_bytes, mtime_ms, truncated, analysed_at)
+             VALUES ('s1', 1, 1, 0, '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let kept: i64 = conn
+            .query_row("SELECT COUNT(*) FROM claude_advice_ledger", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            kept, 1,
+            "an upgrade must not cost the transcripts producer's ledger"
+        );
+
+        // `unverified` is NULLABLE, and that is the whole point of the
+        // column: NULL is "every tracked input was read", a string is
+        // "one was not, and here is which". A NOT NULL column with a
+        // sentinel would make the two indistinguishable at a glance.
+        conn.execute(
+            "INSERT INTO claude_advice_report
+                (repo, payload_version, digest, payload, unverified, computed_at)
+             VALUES ('/home/octocat/hello-world', 1, 'abc', '{}', NULL, '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO claude_advice_report
+                (repo, payload_version, digest, payload, unverified, computed_at)
+             VALUES ('/home/octocat/other', 1, 'def', '{}', 'CLAUDE.md: Permission denied',              '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let unverified: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claude_advice_report WHERE unverified IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unverified, 1);
+
+        // One row per repository: a second run replaces, never appends.
+        conn.execute(
+            "INSERT INTO claude_advice_report
+                (repo, payload_version, digest, payload, unverified, computed_at)
+             VALUES ('/home/octocat/hello-world', 1, 'zzz', '{}', NULL, '2026-01-02T00:00:00Z')
+             ON CONFLICT(repo) DO UPDATE SET digest = 'zzz'",
+            [],
+        )
+        .unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claude_advice_report WHERE repo = '/home/octocat/hello-world'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
 
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))

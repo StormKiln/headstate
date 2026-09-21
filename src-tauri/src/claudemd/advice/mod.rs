@@ -64,6 +64,7 @@
 //! text for an agent, and its last line is the read-only policy.
 
 pub mod brief;
+pub mod cache;
 pub mod gaps;
 pub mod imports;
 pub mod placement;
@@ -376,6 +377,129 @@ impl Report {
             .filter(|c| matches!(c.run, CheckRun::Ran { .. }))
             .count()
     }
+}
+
+/// Why a caller is asking, and therefore whether a cached report may be
+/// served (#1293).
+///
+/// A parameter rather than a heuristic inside the command, because the
+/// two callers want opposite things and neither can be guessed from the
+/// arguments: opening a repository wants an answer NOW and will accept a
+/// previous run, while pressing Refresh wants the producers to run. A
+/// command that decided for itself would make Refresh a no-op on a
+/// repository whose inputs have not moved -- which is exactly when a
+/// user presses it, because the last run said something they want
+/// re-checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Mode {
+    /// Answer from the store when there is anything stored, labelled
+    /// `Fresh` or `Cached { stale }` according to the fingerprint, and
+    /// run the producers only on a miss. The default, and what a
+    /// repository selection uses: it always answers at cache speed.
+    #[default]
+    Cached,
+    /// Run the producers regardless, and replace what is stored. What
+    /// Refresh uses, and what the second half of a two-phase read uses
+    /// after a `Cached` call came back not [`Freshness::Fresh`].
+    Fresh,
+}
+
+/// Where a served report came from, and whether it can be called current.
+///
+/// THREE states that must never collapse into two (#846, #1042, #1044).
+/// The distinction that matters is not "cached vs not" -- it is whether
+/// the app can HONESTLY claim the report describes the repository as it
+/// is now:
+///
+/// - [`Freshness::Fresh`] -- the producers ran during this call, or the
+///   stored report's fingerprint was recomputed in full and matched. In
+///   both cases every tracked input was read.
+/// - [`Freshness::Cached`] -- the stored report is being served and a
+///   run has NOT happened. `stale` says whether the fingerprint
+///   disagreed, which is what tells a caller a refresh is worth making.
+/// - [`Freshness::Unverified`] -- a tracked input could not be read, so
+///   the fingerprint is not a statement about currency in either
+///   direction. This is NOT `Fresh` with a footnote and NOT `Cached`
+///   with a shrug: a matching digest here proves nothing, because the
+///   digest omitted something both times.
+///
+/// The third state is reachable from both sides, which is why it is a
+/// variant rather than a flag on `Cached`: a run that JUST happened can
+/// also be unverified, if a CLAUDE.md the scan listed could not be read
+/// when the fingerprint was taken. Calling that run "fresh" would be the
+/// same lie one open later.
+///
+/// # Why a stale report is SERVED rather than withheld
+///
+/// [`Mode::Cached`] returns the stored report even when the fingerprint
+/// says it is out of date, labelled `Cached { stale: true }`. Silently
+/// recomputing instead would make this variant one no caller could ever
+/// observe -- the API would not in fact expose the epic's second state
+/// -- and it would put the expensive run back on the path #1293 exists
+/// to take it off, at the exact moment the panel most wants to show
+/// something: a repository whose CLAUDE.md was edited a second ago.
+///
+/// A previous run is a real answer. What the user is owed is not the
+/// withholding of it but being TOLD (#1044: partial is not nothing, and
+/// out of date is not nothing either).
+///
+/// "From cache, refreshing" -- the epic's second state -- is therefore
+/// this variant plus what the caller knows: it shows the
+/// `Cached { stale: true }` report and fires a [`Mode::Fresh`] call
+/// behind it. There is no `Refreshing` variant, because a single
+/// synchronous call cannot be both the cached answer and the running
+/// one, and a backend variant claiming "a refresh is happening" would
+/// be a claim about a future this call cannot observe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum Freshness {
+    /// Computed during this call, or the cache's fingerprint was
+    /// verified against every tracked input and matched.
+    #[serde(rename_all = "camelCase")]
+    Fresh {
+        /// Whether the producers ran during this call, as opposed to the
+        /// stored report being verified current. Both are fresh; only
+        /// one of them cost the transcript read.
+        recomputed: bool,
+    },
+    /// Served from the store without running the producers.
+    #[serde(rename_all = "camelCase")]
+    Cached {
+        /// Whether a tracked input has changed since the report was
+        /// computed. `true` means the report is a PREVIOUS answer and a
+        /// [`Mode::Fresh`] call would produce a different one.
+        stale: bool,
+    },
+    /// Currency could not be established, in the fingerprint's own
+    /// words. Says nothing about whether the report is right.
+    #[serde(rename_all = "camelCase")]
+    Unverified {
+        reason: String,
+        /// Whether the producers ran during this call. An unverified run
+        /// that JUST happened is the best available answer and still not
+        /// a current one.
+        recomputed: bool,
+    },
+}
+
+/// A [`Report`] and the honest account of where it came from.
+///
+/// A struct rather than widening `Report`, because `Report` is what a
+/// run PRODUCES and this is what a call SERVES: a report stored in
+/// January and read in March is the same report and a different
+/// freshness. Keeping them apart is also why the cached payload holds a
+/// bare `Report` -- the freshness is recomputed on every read from the
+/// fingerprint, never replayed from the row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdviceResult {
+    pub report: Report,
+    pub freshness: Freshness,
+    /// RFC 3339, when the PRODUCERS ran -- not when this call answered.
+    /// For a cached result this is older than now, which is the whole
+    /// point of showing it.
+    pub computed_at: String,
 }
 
 /// What every producer may read. Built once per run, so the CLAUDE.md
