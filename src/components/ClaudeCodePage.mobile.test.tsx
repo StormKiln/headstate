@@ -72,6 +72,11 @@ const state = vi.hoisted(() => ({
 }));
 
 vi.mock("../api/hooks", () => ({
+  // #1280's reverse lookup. `off` -- nothing typed here is a pull
+  // request reference -- which is what every assertion in this file
+  // assumes; `ClaudeCodePage.test.tsx` is where the other states are
+  // exercised.
+  useClaudeSessionsForPrQuery: () => ({ state: "off" }),
   // The phone never launches a terminal -- `claude_launch_session` is
   // `Class::Local` -- so an unset template is the only state this view
   // can be in on mobile, and the assertions below depend on it.

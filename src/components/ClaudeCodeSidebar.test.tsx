@@ -22,6 +22,11 @@ const state = vi.hoisted(() => ({
 }));
 
 vi.mock("../api/hooks", () => ({
+  // #1280's reverse lookup. `off` -- nothing typed here is a pull
+  // request reference -- which is what every assertion in this file
+  // assumes; `ClaudeCodePage.test.tsx` is where the other states are
+  // exercised.
+  useClaudeSessionsForPrQuery: () => ({ state: "off" }),
   useClaudeSessions: () => ({
     list: {
       data: state.list,

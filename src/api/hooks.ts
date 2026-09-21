@@ -57,6 +57,7 @@ import type {
   ScanKind,
 } from "./tauri";
 import { createCoalescer, type Scheduler } from "@/lib/coalesce";
+import { parsePrQuery, reposForNumber } from "@/lib/claudePrs";
 import {
   toolVersions,
   readLogTail,
@@ -1555,6 +1556,143 @@ export function useClaudeSessionsForPr(repo: string, number: number, enabled: bo
     // the panel saying so.
     retry: false,
   });
+}
+
+/// What a PR-shaped search query resolved to (#1280).
+///
+/// FOUR states, and the reason they are four rather than three is the
+/// rule this codebase keeps re-applying (#846, #1044): an absence has to
+/// say which absence it is.
+///
+/// | state | what happened |
+/// |---|---|
+/// | `"off"` | the query is not a pull request reference -- nothing was asked |
+/// | `"unresolved"` | a bare number whose repository we could not name, so no lookup ran |
+/// | `"loading"` | a lookup is in flight |
+/// | `"done"` | every lookup answered; `links` may be empty, which is a real answer |
+/// | `"failed"` | at least one lookup rejected; `links` holds what did answer |
+///
+/// `"done"` with an empty `links` is the finding "no session recorded
+/// for this PR". `"failed"` is NOT that, and the caller must never word
+/// them alike -- a database that could not be read has said nothing
+/// about who wrote the PR.
+export type PrQueryState =
+  | { state: "off" }
+  | { state: "unresolved"; number: number }
+  | { state: "loading"; ref: string }
+  | { state: "done"; ref: string; links: ClaudePrLink[] }
+  | { state: "failed"; ref: string; links: ClaudePrLink[]; error: string };
+
+/// How long the search box rests before a PR reference reaches the
+/// backend (#1280).
+///
+/// Typing `owner/repo#1234` passes through fifteen prefixes, four of
+/// which parse as a reference (`owner/repo#1`, `#12`, ...). Firing on
+/// each would be four command round trips for one query the user was
+/// midway through typing. 250 ms is below the threshold where a pause
+/// reads as lag and above a fast typist's inter-key gap.
+const PR_QUERY_DEBOUNCE_MS = 250;
+
+/// The reason a lookup rejected, as prose.
+///
+/// Tauri surfaces a Rust `Err(String)` as a rejected promise carrying
+/// the bare string, while a transport failure rejects with an `Error` --
+/// the same two shapes `QueryError`'s own `errorMessage` normalises.
+/// Duplicated as four lines here rather than imported, because
+/// `hooks.ts` pulling in a component module to format a string would
+/// make every consumer of the API layer depend on the view layer.
+///
+/// Never empty: a failure with no message still has to render as a
+/// failure, and "" would make the caller's arm read as a success.
+function prLookupError(err: unknown): string {
+  if (typeof err === "string" && err !== "") return err;
+  if (err instanceof Error && err.message !== "") return err.message;
+  return "the lookup rejected without saying why";
+}
+
+/// Resolve a search query to the sessions that produced the PR it names.
+///
+/// # Why this is debounced and the text filter is not
+///
+/// The text filter is a pass over an array already in memory, which
+/// `useMatchedSessions` runs through `useDeferredValue` precisely so no
+/// keystroke is dropped. This is a command round trip to SQLite, so the
+/// same treatment would be wrong: a deferred value still fires for every
+/// character, it merely fires late.
+///
+/// # Why the parse comes before the debounce
+///
+/// So that ordinary prose costs nothing at all. `parsePrQuery` rejects
+/// "notarization" synchronously, which is the overwhelming majority of
+/// what is typed here, and only a query that really names a pull request
+/// ever starts a timer.
+export function useClaudeSessionsForPrQuery(query: string, enabled: boolean): PrQueryState {
+  const parsed = useMemo(() => parsePrQuery(query), [query]);
+  // The parse RESULT is debounced, not the raw text. Two prefixes that
+  // parse to the same reference -- which cannot happen for a number, but
+  // can when trailing whitespace is typed -- settle without restarting
+  // the timer, and a query that stops being a reference clears it.
+  const key = parsed === null ? "" : `${parsed.repo ?? ""}#${parsed.number}`;
+  // `""` on mount rather than `key`, so a component that mounts with a
+  // reference already in the box -- a restored search, or a remount
+  // while the user was mid-query -- still waits out the debounce
+  // instead of firing on its first render.
+  const [settled, setSettled] = useState("");
+  useEffect(() => {
+    if (key === settled) return;
+    const t = setTimeout(() => setSettled(key), PR_QUERY_DEBOUNCE_MS);
+    return () => clearTimeout(t);
+    // `settled` is read to skip the timer when it already agrees, and
+    // must not be a dependency: including it would re-run this effect
+    // the moment the timer lands and schedule a second one.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key]);
+
+  const ref = settled === key ? key : "";
+  const live = ref === "" ? null : parsed;
+
+  // The tracked pull requests, read from cache (#1280). `staleTime:
+  // Infinity` on that query means this is a cache read and not a fetch,
+  // so a bare `#1234` costs no extra round trip to learn its repository.
+  const prs = useQuery({ queryKey: ["prs"], queryFn: PRS_FN, staleTime: Infinity, enabled });
+  const repos = useMemo(() => {
+    if (live === null) return [];
+    if (live.repo !== null) return [live.repo];
+    return reposForNumber(prs.data, live.number);
+  }, [live, prs.data]);
+
+  const results = useQueries({
+    queries: repos.map((repo) => ({
+      // The SAME key `useClaudeSessionsForPr` uses, so a PR detail view
+      // already opened for this pull request has warmed this and the
+      // search answers from cache.
+      queryKey: ["claude-sessions-for-pr", repo, live?.number ?? 0],
+      queryFn: () => claudeSessionsForPr(repo, live?.number ?? 0),
+      enabled: enabled && live !== null,
+      staleTime: Infinity,
+      retry: false,
+    })),
+  });
+
+  // Derived during render rather than stored, so there is no effect
+  // writing state and no frame where the two disagree.
+  if (live === null) return { state: "off" };
+  if (repos.length === 0) {
+    // A bare number we could not attach to a repository. NOT an empty
+    // lookup: nothing was asked, and saying "no session recorded" here
+    // would claim a finding we never went looking for.
+    return { state: "unresolved", number: live.number };
+  }
+  if (results.some((r) => r.isLoading)) return { state: "loading", ref };
+  const links = results.flatMap((r) => r.data ?? []);
+  const failed = results.find((r) => r.isError);
+  if (failed) {
+    // PARTIAL is not nothing (#1044): whichever repos answered keep
+    // their links, and the caller renders them alongside the failure
+    // rather than instead of it.
+    return { state: "failed", ref, links, error: prLookupError(failed.error) };
+  }
+  return { state: "done", ref, links };
 }
 
 export function useClaudeSessions(enabled: boolean) {
