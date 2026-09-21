@@ -1,7 +1,6 @@
 import { useState } from "react";
 import { useClaudeMdAdvice } from "@/api/hooks";
 import type {
-  ClaudeMdAdviceCheck,
   ClaudeMdAdviceCoverage,
   ClaudeMdAdviceFinding,
   ClaudeMdAdviceLocator,
@@ -10,22 +9,29 @@ import type {
 } from "@/types/pr";
 import { current } from "@/lib/ariaCurrent";
 import { copyText } from "@/lib/clipboard";
+import {
+  CHECK_LABEL,
+  type AdviceGroup,
+  type AdviceGrouping,
+  groupFindings,
+} from "@/lib/adviceGrouping";
+import type { Filters } from "@/lib/derive";
+import { useActiveFilters, useFilters } from "@/store/filters";
 import { toast } from "sonner";
 import { PartialScanNotice } from "./PartialScanNotice";
 import { QueryError, errorMessage } from "./QueryError";
 
-/// What each check is called. A `Record` so adding a variant to the
-/// wire type without a label fails to compile.
-const CHECK_LABEL: Record<ClaudeMdAdviceCheck, string> = {
-  imports: "imports",
-  toolchain: "toolchain coverage",
-  transcripts: "sessions",
-  gaps: "missing subdirectory files",
-  placement: "placement",
-  rot: "rot",
-  skills: "skills",
-  shape: "content shape",
-};
+/// The three arrangements, and what the control calls them (#1291).
+///
+/// "Flat" is named rather than left as a bare "off", because it is a real
+/// arrangement -- the backend's severity ranking, worst first -- and a
+/// user who has grouped needs to be able to name the thing they are going
+/// back to.
+const GROUPING_OPTIONS: { value: AdviceGrouping; label: string }[] = [
+  { value: "none", label: "Flat (worst first)" },
+  { value: "check", label: "By check" },
+  { value: "file", label: "By file" },
+];
 
 /// What each severity is called, and how it is coloured.
 ///
@@ -170,6 +176,16 @@ function ReportView({
   const everyRan = report.checks.every((c) => c.run.state === "ran");
   const n = report.findings.length;
 
+  // The grouping preference, from the per-view filter store where every
+  // other view preference lives (#1291). Absent means the flat list.
+  const { adviceGrouping } = useActiveFilters();
+  const setFilter = useFilters((s) => s.setFilter);
+  const grouping: AdviceGrouping = adviceGrouping ?? "none";
+
+  // Partitioned, never re-sorted within a group. `groupFindings` states
+  // the two orderings and why they differ.
+  const groups = groupFindings(report, grouping);
+
   return (
     <div className="mt-2 space-y-2">
       {/* The shortfall FIRST, and stated as the producer wrote it. The
@@ -180,7 +196,14 @@ function ReportView({
         consequence={`the ${n === 1 ? "finding" : `${n} findings`} below ${n === 1 ? "is" : "are"} at least the findings; ${unknown.length} of ${report.checks.length} checks could not run.`}
       />
 
-      {unknown.length > 0 ? (
+      {/* The flat list keeps its own coverage list, because there is no
+          by-check group to carry an Unknown. Under `"check"` the Unknowns
+          move INTO their group, where the heading names the check and the
+          reason sits under it -- printing them twice would read as two
+          separate failures of the same producer. Under `"file"` they stay
+          here: a check that could not run belongs to no file, and hanging
+          it off one would invent a subject the producer never named. */}
+      {unknown.length > 0 && grouping !== "check" ? (
         <ul className="space-y-0.5">
           {unknown.map((c) => (
             <li key={c.check} className="break-words text-[11px] text-[#d29922]">
@@ -191,21 +214,44 @@ function ReportView({
         </ul>
       ) : null}
 
-      {/* Wire order. The backend ranks worst first; re-sorting here would
-          be a second ordering to keep in step with `Severity::rank`. */}
-      {n > 0 ? (
-        <ul className="space-y-2">
-          {report.findings.map((f, i) => (
-            <FindingRow
-              key={`${f.check}:${f.subject.path}:${i}`}
-              finding={f}
-              repo={repo}
-              activePath={activePath}
-              onSelectFile={onSelectFile}
-            />
+      {/* The arrangement control. Offered whenever there is a report at
+          all, including one whose only content is checks that could not
+          run -- that is exactly the report the by-check view is most
+          worth switching to. */}
+      <div className="flex flex-wrap items-center gap-2">
+        <label htmlFor="advice-grouping" className="text-[11px] text-[#8b949e]">
+          Group:
+        </label>
+        <select
+          id="advice-grouping"
+          value={grouping}
+          onChange={(e) =>
+            setFilter("adviceGrouping", e.target.value as Filters["adviceGrouping"])
+          }
+          className="tap-target rounded border border-[#30363d] bg-[#0d1117] px-1 py-0.5 text-[11px] text-[#e6edf3]"
+        >
+          {GROUPING_OPTIONS.map((opt) => (
+            <option key={opt.value} value={opt.value}>
+              {opt.label}
+            </option>
           ))}
-        </ul>
-      ) : null}
+        </select>
+      </div>
+
+      {/* One render path for all three arrangements: `"none"` is a single
+          unlabelled group holding the wire list verbatim. Within a group
+          the order is the backend's; between groups it is worst-first, so
+          grouping can never bury a problem under a quiet file. */}
+      {groups.map((g) => (
+        <GroupSection
+          key={g.key}
+          group={g}
+          labelled={grouping !== "none"}
+          repo={repo}
+          activePath={activePath}
+          onSelectFile={onSelectFile}
+        />
+      ))}
 
       {/* Only a run in which EVERY check completed may say this. The
           partial arm above has already spoken for the other case. */}
@@ -241,6 +287,79 @@ function ReportView({
 
 function reason(c: ClaudeMdAdviceCoverage): string {
   return c.run.state === "unknown" ? c.run.reason : "";
+}
+
+/// One group's heading, its findings, and any check that could not run.
+///
+/// `labelled` is false for the flat arrangement, where the single group
+/// is the whole list and a heading over it would name nothing.
+///
+/// A group whose check could not run renders its reason and NO findings,
+/// and the two states read differently on purpose (#846, #1291): "could
+/// not check" names the producer's own obstacle, while a check that ran
+/// and found nothing produces no group at all -- it is accounted for by
+/// the clean sentence below, which only a run in which every check
+/// completed is allowed to print. The failure this avoids is a by-check
+/// view where a producer that crashed and a producer that found nothing
+/// both render as an absence.
+function GroupSection({
+  group,
+  labelled,
+  repo,
+  activePath,
+  onSelectFile,
+}: {
+  group: AdviceGroup;
+  labelled: boolean;
+  repo: string;
+  activePath: string | undefined;
+  onSelectFile: (path: string) => void;
+}) {
+  // Shortened against the repository root when the label leads with a
+  // path, whatever the subject kind -- a directory has a path to shorten
+  // and deliberately no file to open, so `file !== null` is the wrong
+  // test. A by-check label has no path and is printed as written.
+  const heading =
+    group.pathLength === 0
+      ? group.label
+      : shown(group.label.slice(0, group.pathLength), repo) + group.label.slice(group.pathLength);
+  return (
+    <section className={labelled ? "border-l border-[#21262d] pl-2" : undefined}>
+      {labelled ? (
+        <h3 className="break-words text-[11px] font-semibold text-[#8b949e]">
+          {heading}
+          {/* The count is of findings only. An Unknown check is not a
+              finding, and counting it as one would say the producer
+              found something when it could not look. */}
+          {group.findings.length > 0 ? ` (${group.findings.length})` : ""}
+        </h3>
+      ) : null}
+
+      {group.unknownChecks.length > 0 ? (
+        <ul className="mt-0.5 space-y-0.5">
+          {group.unknownChecks.map((c) => (
+            <li key={c.check} className="break-words text-[11px] text-[#d29922]">
+              [could not check] {reason(c)}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+
+      {group.findings.length > 0 ? (
+        <ul className="mt-1 space-y-2">
+          {group.findings.map((f, i) => (
+            <FindingRow
+              key={`${f.check}:${f.subject.path}:${i}`}
+              finding={f}
+              repo={repo}
+              activePath={activePath}
+              onSelectFile={onSelectFile}
+            />
+          ))}
+        </ul>
+      ) : null}
+    </section>
+  );
 }
 
 function FindingRow({

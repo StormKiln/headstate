@@ -47,11 +47,28 @@ describe("activeFilterCount", () => {
     expect(activeFilterCount({})).toBe(0);
   });
 
-  it("ignores the search and the sort", () => {
+  it("ignores the search and every arrangement key", () => {
     // The search field sits visibly beside the button and speaks for
-    // itself; sorting hides nothing. Counting either would make the
-    // badge argue with what the user can already see.
+    // itself; ordering or grouping a list hides none of it. Counting any
+    // of them would make the badge argue with what the user can already
+    // see -- a "(1)" over a bar that is filtering nothing.
+    //
+    // All THREE arrangement keys, not just `sort`: `readySort` (#1277)
+    // orders the ready strip and `adviceGrouping` (#1291) groups the
+    // advice list, and each was added to the interface separately. A key
+    // excluded in the implementation and untested here is one the next
+    // arrangement key gets added without.
     expect(activeFilterCount({ query: "auth", sort: "newest" })).toBe(0);
+    expect(activeFilterCount({ readySort: "newest-opened" })).toBe(0);
+    expect(activeFilterCount({ adviceGrouping: "file" })).toBe(0);
+    expect(
+      activeFilterCount({
+        query: "auth",
+        sort: "newest",
+        readySort: "newest-opened",
+        adviceGrouping: "check",
+      }),
+    ).toBe(0);
   });
 
   it("counts set flags and non-empty label lists", () => {
