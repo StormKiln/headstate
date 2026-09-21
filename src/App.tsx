@@ -52,6 +52,7 @@ import { ConnectionBanner } from "./components/ConnectionBanner";
 import { StaleRibbon } from "./components/StaleRibbon";
 import { IS_DESKTOP_BUILD, IS_MOBILE_BUILD } from "./lib/target";
 import { usePullToRefresh } from "./lib/usePullToRefresh";
+import { useStickyHeaderOffset } from "./lib/useStickyHeaderOffset";
 import { PullIndicator } from "./components/PullIndicator";
 import { Sheet, SheetContent, SheetTitle } from "./components/ui/sheet";
 import { applyFilters, hasActiveFilters, sortPrs } from "./lib/derive";
@@ -341,6 +342,10 @@ export default function App() {
   // The main panel is the scroll container for every view, so the reset
   // hangs off it rather than off each page.
   const mainRef = useRef<HTMLElement>(null);
+  // The app header is `sticky top-0` INSIDE that same scroll container,
+  // so every other sticky in it has to be offset by the header's height
+  // or it pins underneath and is painted over (#1278).
+  const appHeaderRef = useRef<HTMLElement>(null);
   // Pull-to-refresh, mobile build only. The desktop has `r` and the
   // tray's "Refresh now"; a phone has neither, and the poll loop that
   // would otherwise correct a stale list runs on the DESKTOP. Guarded
@@ -354,6 +359,9 @@ export default function App() {
   // already looking at. Pull to refresh has to mean "ask GitHub now".
   const refreshFromGesture = useRefreshFromGesture();
   const pull = usePullToRefresh(mainRef, refreshFromGesture, IS_MOBILE_BUILD);
+  // Publishes the app header's measured height onto `<main>` as
+  // `--app-header-h`, which is what the stickies below it use as `top`.
+  useStickyHeaderOffset(mainRef, appHeaderRef);
   // Every axis that changes WHAT is rendered, and nothing that merely
   // changes the data within it. A poll tick refreshing the same list
   // must not scroll the user away from what they are reading.
@@ -706,7 +714,14 @@ export default function App() {
             that is always the banner: it renders for every state
             including "unpaired", and returns null only on the desktop,
             where the inset is zero anyway. */}
-        <header className="sticky top-0 z-20 flex items-center gap-2 border-b border-[#30363d] bg-[#0d1117] px-4 py-3">
+        {/* `ref` so its height can be measured and published as
+            `--app-header-h`. This header is sticky INSIDE `<main>`, so
+            anything else that pins in this container has to clear it --
+            see `useStickyHeaderOffset` (#1278). */}
+        <header
+          ref={appHeaderRef}
+          className="sticky top-0 z-20 flex items-center gap-2 border-b border-[#30363d] bg-[#0d1117] px-4 py-3"
+        >
           {isMobile ? (
             <button
               type="button"
