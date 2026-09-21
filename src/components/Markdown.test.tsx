@@ -111,3 +111,139 @@ describe("vertical rhythm", () => {
     expect(container.querySelector("pre")?.className).toMatch(/my-\d/);
   });
 });
+
+/// #1279: every fenced code block rendered with its first line indented
+/// one space.
+///
+/// The `code` override applied the inline chip's `px-1 py-0.5`
+/// unconditionally. On an inline `<code>` that is right; inside a
+/// `<pre>` the element is still inline, so the horizontal padding lands
+/// at the start of the first line and after the last rather than around
+/// the box -- exactly one space of first-line indent, with the
+/// background and rounding doubled against the `<pre>`'s own.
+describe("code", () => {
+  /// The distinguishing assertion: the SAME class is right on one and
+  /// wrong on the other, so each direction has to be checked.
+  it("gives inline code the chip padding but a block none", () => {
+    const { container } = render(
+      <Markdown>{"Inline `bit` here.\n\n```\nblock line one\nblock line two\n```"}</Markdown>,
+    );
+    const [inline, block] = [...container.querySelectorAll("code")];
+    expect(inline?.className).toMatch(/px-1/);
+    expect(inline?.className).toMatch(/py-0\.5/);
+    expect(block?.className ?? "").not.toMatch(/px-1/);
+    expect(block?.className ?? "").not.toMatch(/py-0\.5/);
+  });
+
+  /// A fence with NO language tag is the case that rules out branching
+  /// on `language-*`: react-markdown passes no className at all there,
+  /// so it is indistinguishable from inline code by the props alone.
+  it("strips the chip from an untagged fence too", () => {
+    const { container } = render(<Markdown>{"```\nplain\n```"}</Markdown>);
+    const block = container.querySelector("pre code");
+    expect(block).toBeTruthy();
+    expect(block?.className ?? "").not.toMatch(/px-1/);
+  });
+
+  /// The block's own chrome must not double up either: the `<pre>`
+  /// already supplies the background, border and rounding.
+  it("leaves the block's background and rounding to the pre", () => {
+    const { container } = render(<Markdown>{"```\nplain\n```"}</Markdown>);
+    const cls = container.querySelector("pre code")?.className ?? "";
+    expect(cls).not.toMatch(/bg-/);
+    expect(cls).not.toMatch(/rounded/);
+    expect(container.querySelector("pre")?.className).toMatch(/bg-/);
+  });
+
+  /// Dropping the chip must not drop the language with it -- a
+  /// highlighter downstream reads that class.
+  it("keeps the fence's language class", () => {
+    const { container } = render(<Markdown>{"```js\nconst x = 1;\n```"}</Markdown>);
+    expect(container.querySelector("pre code")?.className).toContain("language-js");
+  });
+
+  /// A fenced block inside a blockquote goes through the same `pre`,
+  /// so it must be stripped there too.
+  it("strips the chip from a quoted block", () => {
+    const { container } = render(<Markdown>{"> quoted\n>\n> ```\n> qcode\n> ```"}</Markdown>);
+    const cls = container.querySelector("blockquote pre code")?.className ?? "";
+    expect(cls).not.toMatch(/px-1/);
+  });
+});
+
+/// Every component override spread react-markdown's props straight onto
+/// an intrinsic element. Those props include `node`, the hast AST node.
+/// React 19 does not recognise it, so it stringified it onto the DOM:
+/// every element this component styles carried a literal
+/// `node="[object Object]"`.
+describe("AST leak", () => {
+  it("does not emit the hast node as a DOM attribute", () => {
+    const md = "# H\n\npara\n\n- one\n\n> quote\n\n---\n\n| a |\n| - |\n| 1 |\n\n```\nc\n```";
+    const { container } = render(<Markdown>{md}</Markdown>);
+    expect(container.querySelectorAll("[node]")).toHaveLength(0);
+    expect(container.innerHTML).not.toContain("[object Object]");
+  });
+});
+
+/// A task item is a checkbox, not a bullet. GFM renders the marker as
+/// the `<input>` itself, so the list's `list-disc` gave it both.
+describe("task lists", () => {
+  it("suppresses the bullet on a task item", () => {
+    const { container } = render(<Markdown>{"- [ ] todo\n- [x] done"}</Markdown>);
+    const items = [...container.querySelectorAll("li")];
+    expect(items).toHaveLength(2);
+    expect(container.querySelectorAll("input[type=checkbox]")).toHaveLength(2);
+    for (const li of items) expect(li.className).toMatch(/list-none/);
+  });
+
+  /// GFM marks the LIST `contains-task-list` when even ONE item is a
+  /// task, so suppressing the marker list-wide would strip the bullet
+  /// from the ordinary items beside it.
+  it("keeps the bullet on a plain item in a mixed list", () => {
+    const { container } = render(<Markdown>{"- plain item\n- [ ] a task"}</Markdown>);
+    const [plain, task] = [...container.querySelectorAll("li")];
+    expect(plain?.className ?? "").not.toMatch(/list-none/);
+    expect(task?.className).toMatch(/list-none/);
+  });
+});
+
+/// A nested list sits inside its parent's `li`, so the outer list's
+/// `my-2` stacks on that item's own spacing and opens a gap in the
+/// middle of what should read as one block.
+describe("nested lists", () => {
+  it("drops the outer margin on a nested list", () => {
+    const { container } = render(<Markdown>{"- top\n  - nested"}</Markdown>);
+    const [outer, inner] = [...container.querySelectorAll("ul")];
+    expect(outer?.className).toMatch(/my-2/);
+    expect(inner?.className ?? "").not.toMatch(/my-2/);
+    expect(inner?.className).toMatch(/mt-1/);
+  });
+
+  it("still marks an ordered list with numbers", () => {
+    const { container } = render(<Markdown>{"1. one\n2. two"}</Markdown>);
+    expect(container.querySelector("ol")?.className).toMatch(/list-decimal/);
+  });
+
+  /// An `<ol>` that starts at `3.` carries a `start` attribute. The
+  /// list override computes its own className, so it must pass the
+  /// rest through rather than swallowing it and renumbering from 1.
+  it("preserves an ordered list's starting number", () => {
+    const { container } = render(<Markdown>{"3. three\n4. four"}</Markdown>);
+    expect(container.querySelector("ol")?.getAttribute("start")).toBe("3");
+  });
+});
+
+/// A comment body starts at whatever heading level its author felt
+/// like. Without an override, h4-h6 fall through to the CSS reset and
+/// render at body size and body weight.
+describe("deep headings", () => {
+  it("styles h4, h5 and h6 distinguishably from body text", () => {
+    const { container } = render(<Markdown>{"#### Four\n\n##### Five\n\n###### Six"}</Markdown>);
+    for (const tag of ["h4", "h5", "h6"]) {
+      const el = container.querySelector(tag);
+      expect(el, tag).toBeTruthy();
+      expect(el?.className, tag).toMatch(/font-semibold/);
+      expect(el?.className, tag).toMatch(/mt-\d/);
+    }
+  });
+});
