@@ -87,8 +87,9 @@ pub(super) fn locator(l: &Locator) -> String {
 fn suggestion(f: &Finding) -> String {
     match f.check {
         Check::Imports => format!(
-            "Edit the `@` import line named in the evidence, in `{}`, so it names a file \
-             that exists and is readable, or delete the line. Do not create a file to satisfy it.",
+            "Edit the `@` import line named in the evidence, in `{}`, so it names a readable \
+             file inside the repository within four hops of the CLAUDE.md, or delete the line. \
+             Do not create a file to satisfy it.",
             f.subject.path()
         ),
         Check::Toolchain => super::toolchain::suggestion(f),
@@ -137,6 +138,7 @@ fn suggestion(f: &Finding) -> String {
                  permission error, make that directory readable and run the check again."
             ),
         },
+        Check::Shape => super::shape::suggestion(f),
     }
 }
 
@@ -212,6 +214,16 @@ pub fn render_report(r: &Report) -> String {
             r.ran(),
             if r.ran() == 1 { "" } else { "s" }
         ));
+    }
+
+    // Judgement, attributed, and last: none of it has a mechanical test,
+    // so none of it is a finding and none of it counts toward the totals
+    // above.
+    out.push_str(
+        "\n## Guidance\n\nAdvice with no mechanical test, so none of it is a finding:\n\n",
+    );
+    for (text, source) in super::shape::GUIDANCE {
+        out.push_str(&format!("- {text} — {source}\n"));
     }
     out
 }
@@ -367,7 +379,53 @@ mod tests {
                  the API enforces it allows at most 64"
                     .into(),
             ),
+            Check::Shape => Finding::with_rule(
+                Check::Shape,
+                crate::claudemd::advice::shape::Rule::LineTarget.id(),
+                Severity::Advice,
+                Subject::ClaudeMd {
+                    path: FILE.into(),
+                    scope: Scope::Repo,
+                    section: None,
+                },
+                vec![Evidence {
+                    at: Locator::File {
+                        path: FILE.into(),
+                        line: Some(201),
+                    },
+                    measured: "312 lines; est. 3,100 tokens".into(),
+                }],
+                "the file runs to 312 lines; Anthropic's target is under 200".into(),
+            ),
         }
+    }
+
+    /// The guidance is the brief's last section, attributed per line, and
+    /// is never counted as a finding: a report with no findings still
+    /// says "nothing found" above it.
+    #[test]
+    fn the_report_ends_with_attributed_guidance_that_is_not_a_finding() {
+        let r = report(
+            vec![],
+            vec![CheckCoverage {
+                check: Check::Imports,
+                run: CheckRun::Ran { findings: 0 },
+            }],
+        );
+        let at = r.brief.find("\n## Guidance\n").expect("a guidance section");
+        assert!(
+            r.brief[..at].contains("nothing found"),
+            "nothing found comes before the guidance: {}",
+            r.brief
+        );
+        for (text, source) in crate::claudemd::advice::shape::GUIDANCE {
+            assert!(r.brief[at..].contains(text), "missing guidance: {text}");
+            assert!(
+                r.brief[at..].contains(source),
+                "unattributed guidance: {text}"
+            );
+        }
+        assert!(r.findings.is_empty(), "guidance is not a finding");
     }
 
     /// Every check's brief names the file it is about, so an agent handed

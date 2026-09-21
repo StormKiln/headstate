@@ -1,4 +1,4 @@
-use super::tokens;
+use super::{text, tokens};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -190,7 +190,9 @@ fn resolve_one(raw: &str, base: &Path, seen: &mut Vec<PathBuf>, home: Option<&Pa
         raw: format!("@{raw}"),
         path: Some(target.to_string_lossy().to_string()),
         bytes: text.len() as u64,
-        tokens: tokens::estimate(&text),
+        // Comments stripped, as for the CLAUDE.md itself (`tokens.rs`
+        // header says why, and the assumption it rests on for imports).
+        tokens: tokens::estimate(&text::strip_block_html_comments(&text)),
         problem: None,
         unreadable: false,
         children: resolve_tree_in(&target, seen, home),
@@ -206,21 +208,23 @@ fn resolve_one(raw: &str, base: &Path, seen: &mut Vec<PathBuf>, home: Option<&Pa
 ///
 /// - at the START of a line, optionally after whitespace
 /// - pointing at something with a file extension
-/// - and never inside a fenced code block, where `@` is somebody's
-///   syntax rather than an instruction
+/// - and never inside a fenced code block or an inline code span, where
+///   `@` is somebody's syntax rather than an instruction. The memory
+///   docs state the same: import parsing "skips Markdown code spans and
+///   fenced code blocks". Spans are blanked before the leading `@` is
+///   looked for, so the rule holds even if the line-start requirement
+///   above is ever relaxed to the docs' mid-line form.
+/// - and never inside a block-level HTML comment, which Claude Code
+///   strips before it parses anything.
+///
+/// Reads through `text::prose_lines`, so a ```` ``` ```` inside a `~~~`
+/// block is body rather than a toggle.
 pub fn parse_imports(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut in_fence = false;
 
-    for line in text.lines() {
+    for (_, line) in text::prose_lines(text) {
+        let line = text::blank_spans(line);
         let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
-            continue;
-        }
-        if in_fence {
-            continue;
-        }
         let Some(rest) = trimmed.strip_prefix('@') else {
             continue;
         };
@@ -246,6 +250,39 @@ pub fn parse_imports(text: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// The memory docs: import parsing "skips Markdown code spans and
+    /// fenced code blocks". A path in backticks is being TALKED ABOUT,
+    /// not imported, and a tree that listed it would send the reader to
+    /// a file that never loads.
+    #[test]
+    fn a_code_span_is_not_an_import() {
+        assert!(parse_imports("`@./not-an-import.md`\n").is_empty());
+        assert!(parse_imports("``@./not-an-import.md``\n").is_empty());
+        // The docs' own prose shape: the import syntax, quoted.
+        assert!(parse_imports("Write `@./rules.md` to import a file.\n").is_empty());
+        // And a real import beside a span still counts.
+        assert_eq!(
+            parse_imports("@./real.md is `not @./quoted.md`\n"),
+            vec!["./real.md"]
+        );
+    }
+
+    /// A ```` ``` ```` inside a `~~~` block is body, not a toggle. The
+    /// old toggle closed the fence there and read the line after it as
+    /// prose.
+    #[test]
+    fn a_backtick_fence_inside_a_tilde_fence_does_not_close_it() {
+        let text = "~~~\n```\n@./inside.md\n~~~\n@./outside.md\n";
+        assert_eq!(parse_imports(text), vec!["./outside.md"]);
+    }
+
+    /// A block-level HTML comment is stripped before Claude Code parses
+    /// anything, so an import inside one never loads.
+    #[test]
+    fn an_import_inside_an_html_comment_does_not_count() {
+        assert!(parse_imports("<!--\n@./hidden.md\n-->\n").is_empty());
+    }
 
     /// The shape actually found in the wild: `@AGENTS.md` alone on the
     /// first line, resolving to a sibling.

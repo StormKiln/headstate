@@ -52,6 +52,32 @@ fn stash_count(dir: &Path) -> Option<u64> {
 }
 
 pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let out = git_output(dir, args)?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// [`git_output_with`] over the resolved git binary.
+pub(crate) fn git_output(dir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+    git_output_with(crate::auth::git_program(), dir, args)
+}
+
+/// A bounded git call with its exit status kept, for a caller that reads
+/// it: `git check-ignore` exits 1 for "not ignored" and 128 for "not a
+/// repository", and [`git`] folds both into one `Err`. `Err` here means
+/// the call never ran or never answered -- a spawn that failed three
+/// times, or the timeout -- never a git that ran and said no.
+///
+/// `program` is a parameter so a test can prove what a missing binary
+/// produces without touching the resolved one.
+pub(crate) fn git_output_with(
+    program: &Path,
+    dir: &Path,
+    args: &[&str],
+) -> Result<std::process::Output, String> {
     // RETRIED on a spawn failure.
     //
     // Spawning git intermittently fails with ENOENT under process
@@ -70,7 +96,7 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     // a slow one.
     let mut spawned = None;
     for _ in 0..3 {
-        match Command::new(crate::auth::git_program())
+        match Command::new(program)
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -107,11 +133,7 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     match rx.recv_timeout(GIT_TIMEOUT) {
         Ok(Ok(out)) => {
             let _ = handle.join();
-            if out.status.success() {
-                Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-            } else {
-                Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-            }
+            Ok(out)
         }
         Ok(Err(e)) => Err(e.to_string()),
         // The thread is left running rather than detached-and-killed:

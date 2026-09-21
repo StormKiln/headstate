@@ -4,6 +4,24 @@
 /// English prose, and it is wrong for the code blocks and file paths that
 /// CLAUDE.md files are full of -- both tokenise denser than prose.
 ///
+/// # Count what is injected, not what is on disk
+///
+/// Claude Code strips block-level HTML comments from a CLAUDE.md before
+/// injecting it (changelog 2.1.72; memory docs, "Block-level HTML
+/// comments … are stripped before the content is injected"). A file
+/// whose maintainer notes live in comments costs the model nothing for
+/// them, so `claudemd::read_file_reporting` and the import resolver pass
+/// this function `text::strip_block_html_comments(&text)`, never the raw
+/// file. `ClaudeFile::bytes` stays the on-disk size: that is a different
+/// question, and the one the file browser answers. Pinned by
+/// `html_comments_do_not_count_toward_the_estimate` in `claudemd/mod.rs`.
+///
+/// The strip is applied to imported files as well, on the reading that
+/// the strip runs over the assembled memory content. The docs state the
+/// rule for CLAUDE.md files and say nothing about imports; if an
+/// imported file turns out to be injected verbatim, its comments are
+/// undercounted here. An estimate either way, and labelled so.
+///
 /// The alternative was a real BPE tokeniser, which means a new crate and
 /// its embedded vocabulary. That is a reasonable trade to make later; the
 /// requirement now is that the UI never presents this as a measurement.

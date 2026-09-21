@@ -16,6 +16,25 @@
 //! space) count. An indented `#` is a code block or a list continuation
 //! in CommonMark, and is not a heading here either.
 //!
+//! # Block-level HTML comments are invisible here, as they are to Claude
+//!
+//! Claude Code strips block-level HTML comments from a CLAUDE.md before
+//! injecting it (changelog 2.1.72; the memory docs: "Block-level HTML
+//! comments … are stripped before the content is injected … Comments
+//! inside code blocks are preserved"). A rule written inside a comment
+//! is therefore a rule Claude never reads, and a producer that counted
+//! it would report an instruction that does not exist. So the walker
+//! classifies a comment's lines as [`Kind::Comment`], and `sections`,
+//! `spans` and `prose_lines` all skip them. [`strip_block_html_comments`]
+//! is the same rule applied to the text as a whole, for the token
+//! estimate.
+//!
+//! Block-level means: a line whose first non-blank characters are `<!--`
+//! opens the comment, and it runs to the first line that ends (bar
+//! whitespace) with `-->`. A comment that opens and closes on one line
+//! with text after the `-->` is inline, and is kept: it is injected. A
+//! `<!--` inside a fence is code, and is kept.
+//!
 //! # Line numbers are 1-based
 //!
 //! So a producer can print `path:line` and an editor opens the right
@@ -68,6 +87,9 @@ enum Kind {
     Open(String),
     Body,
     Close,
+    /// A line of a block-level HTML comment, which Claude Code strips
+    /// before injection. Never inside a fence.
+    Comment,
 }
 
 /// Every line, numbered and classified.
@@ -75,19 +97,28 @@ enum Kind {
 /// A fence opens on a line whose first non-blank characters are three or
 /// more backticks or tildes, and closes on a line of the same character
 /// at least as long with nothing else on it. Requiring the same character
-/// is what `parse_imports`'s toggle does not do, and is the difference
-/// between a ```` ``` ```` inside a `~~~` block being body and being a
-/// close.
+/// is the difference between a ```` ``` ```` inside a `~~~` block being
+/// body and being a close. `parse_imports` reads through this walker for
+/// that reason.
 fn walk(text: &str) -> Vec<(usize, &str, Kind)> {
     let text = text.strip_suffix('\n').unwrap_or(text);
     let mut out = Vec::new();
     // The open fence's character and length, while inside one.
     let mut open: Option<(char, usize)> = None;
+    // Inside a block-level HTML comment that has not yet closed.
+    let mut in_comment = false;
 
     for (i, line) in text.split('\n').enumerate() {
         let line = line.strip_suffix('\r').unwrap_or(line);
         let n = i + 1;
         let trimmed = line.trim_start();
+        if in_comment {
+            if closes_comment(line) {
+                in_comment = false;
+            }
+            out.push((n, line, Kind::Comment));
+            continue;
+        }
         let marker = fence_marker(trimmed);
         match (open, marker) {
             (None, Some((ch, len))) => {
@@ -102,10 +133,53 @@ fn walk(text: &str) -> Vec<(usize, &str, Kind)> {
                 out.push((n, line, Kind::Close));
             }
             (Some(_), _) => out.push((n, line, Kind::Body)),
-            (None, None) => out.push((n, line, Kind::Prose)),
+            (None, None) => {
+                if let Some(closed) = opens_comment(trimmed) {
+                    in_comment = !closed;
+                    out.push((n, line, Kind::Comment));
+                } else {
+                    out.push((n, line, Kind::Prose));
+                }
+            }
         }
     }
     out
+}
+
+/// Whether a prose line opens a block-level HTML comment, and if so
+/// whether it also closes it. `None` for a line that is not a comment
+/// opener, including an inline `<!-- x --> text`, which is injected.
+fn opens_comment(trimmed: &str) -> Option<bool> {
+    let rest = trimmed.strip_prefix("<!--")?;
+    match rest.find("-->") {
+        // Closes on this line: block-level only when nothing follows.
+        Some(at) => rest[at + 3..].trim().is_empty().then_some(true),
+        None => Some(false),
+    }
+}
+
+/// Whether a line inside a comment closes it: `-->` with nothing but
+/// whitespace after.
+fn closes_comment(line: &str) -> bool {
+    line.trim_end().ends_with("-->")
+}
+
+/// The text with block-level HTML comments removed: what Claude Code
+/// injects, and therefore what `tokens::estimate` must count.
+///
+/// Lines are rejoined with `\n` (a CRLF file comes back LF), and the
+/// trailing newline is kept when the input had one. Comments inside
+/// fences are kept, as Claude Code keeps them.
+pub fn strip_block_html_comments(text: &str) -> String {
+    let mut out: Vec<&str> = walk(text)
+        .into_iter()
+        .filter(|(_, _, kind)| *kind != Kind::Comment)
+        .map(|(_, line, _)| line)
+        .collect();
+    if text.ends_with('\n') {
+        out.push("");
+    }
+    out.join("\n")
 }
 
 /// The fence character and run length at the start of a trimmed line,
@@ -154,6 +228,10 @@ pub fn sections(text: &str) -> Vec<Section> {
                 current = Some((Some(title.to_string()), level, n, Vec::new()));
                 continue;
             }
+        }
+        // Not injected, so not part of any section's text.
+        if kind == Kind::Comment {
+            continue;
         }
         match &mut current {
             Some((_, _, _, lines)) => lines.push(line),
@@ -206,8 +284,28 @@ pub fn spans(text: &str) -> Vec<Span> {
 }
 
 fn spans_in_line(line: &str) -> Vec<String> {
-    let mut out = Vec::new();
     let chars: Vec<char> = line.chars().collect();
+    span_bounds(&chars)
+        .into_iter()
+        .map(|(_, start, end, _)| {
+            let inner: String = chars[start..end].iter().collect();
+            // One space stripped from each side when both are present,
+            // so `` ` `X` ` `` yields `` `X` ``.
+            if inner.len() >= 2 && inner.starts_with(' ') && inner.ends_with(' ') {
+                inner[1..inner.len() - 1].to_string()
+            } else {
+                inner
+            }
+        })
+        .collect()
+}
+
+/// Every span on one line, as char indices: the first backtick of the
+/// opening run, the inner text's start and end, and one past the closing
+/// run. One algorithm for `spans` and [`blank_spans`], so the two cannot
+/// disagree about where a span is.
+fn span_bounds(chars: &[char]) -> Vec<(usize, usize, usize, usize)> {
+    let mut out = Vec::new();
     let mut i = 0;
     while i < chars.len() {
         if chars[i] != '`' {
@@ -233,21 +331,25 @@ fn spans_in_line(line: &str) -> Vec<String> {
         }
         match close {
             Some(end) => {
-                let inner: String = chars[start..end].iter().collect();
-                // One space stripped from each side when both are
-                // present, so `` ` `X` ` `` yields `` `X` ``.
-                let inner = if inner.len() >= 2 && inner.starts_with(' ') && inner.ends_with(' ') {
-                    inner[1..inner.len() - 1].to_string()
-                } else {
-                    inner
-                };
-                out.push(inner);
+                out.push((i, start, end, end + open_len));
                 i = end + open_len;
             }
             None => i = start,
         }
     }
     out
+}
+
+/// One line with every inline code span, backticks included, replaced by
+/// spaces of the same length. Positions are unchanged, and nothing that
+/// was inside a span can match a pattern afterwards. For
+/// `imports::parse_imports`, which must skip spans as Claude Code does.
+pub fn blank_spans(line: &str) -> String {
+    let mut chars: Vec<char> = line.chars().collect();
+    for (open, _, _, close) in span_bounds(&chars) {
+        chars[open..close].fill(' ');
+    }
+    chars.into_iter().collect()
 }
 
 /// Every fenced block, with its info string and body.
@@ -271,7 +373,7 @@ pub fn fences(text: &str) -> Vec<Fence> {
                     });
                 }
             }
-            Kind::Prose => {}
+            Kind::Prose | Kind::Comment => {}
         }
     }
     // An unclosed fence runs to the end of the file, as CommonMark
@@ -440,6 +542,61 @@ mod tests {
         assert_eq!(got, vec![(1, "a"), (5, "c")]);
     }
 
+    /// A block-level HTML comment is not injected (changelog 2.1.72), so
+    /// no reader here sees it: not as prose, not as a span, not in a
+    /// section. An inline comment and one inside a fence are kept, as
+    /// Claude Code keeps them.
+    #[test]
+    fn block_level_html_comments_are_invisible_to_every_reader() {
+        let text = "\
+# Rules
+<!-- maintainer note: NEVER read this -->
+kept `span`
+<!--
+a multi-line note with `hidden span`
+-->
+inline <!-- x --> stays `inline span`
+```
+<!-- code comment stays -->
+```
+";
+        assert_eq!(
+            prose_lines(text),
+            vec![
+                (1, "# Rules"),
+                (3, "kept `span`"),
+                (7, "inline <!-- x --> stays `inline span`")
+            ]
+        );
+        let found: Vec<String> = spans(text).into_iter().map(|s| s.text).collect();
+        assert_eq!(found, ["span", "inline span"]);
+        let s = sections(text);
+        assert_eq!(s.len(), 1);
+        assert!(!s[0].text.contains("NEVER"), "{}", s[0].text);
+        assert!(!s[0].text.contains("hidden"), "{}", s[0].text);
+        assert!(s[0].text.contains("inline <!-- x -->"), "{}", s[0].text);
+        // The fence keeps its comment.
+        assert_eq!(fences(text)[0].body, "<!-- code comment stays -->");
+    }
+
+    /// The stripped text is what the token estimate counts: the comment's
+    /// characters are gone, the rest is verbatim, and the trailing newline
+    /// survives.
+    #[test]
+    fn strip_block_html_comments_removes_only_the_comment_lines() {
+        let text =
+            "a\n<!-- gone -->\nb <!-- kept --> c\n<!--\ngone\n-->\n```\n<!-- kept -->\n```\n";
+        assert_eq!(
+            strip_block_html_comments(text),
+            "a\nb <!-- kept --> c\n```\n<!-- kept -->\n```\n"
+        );
+        assert_eq!(strip_block_html_comments("no comment"), "no comment");
+        assert_eq!(strip_block_html_comments(""), "");
+        // A comment left open runs to the end of the file, like an
+        // unclosed fence.
+        assert_eq!(strip_block_html_comments("a\n<!-- open\nb\n"), "a\n");
+    }
+
     const DOC: &str = "\
 intro line
 `intro span`
@@ -544,6 +701,17 @@ last
             texts,
             vec![(2, "intro span"), (6, "one"), (6, "two::three()")]
         );
+    }
+
+    /// Blanking keeps every position and removes every span, backticks
+    /// and all, whatever the run length.
+    #[test]
+    fn blank_spans_keeps_positions_and_removes_whole_spans() {
+        assert_eq!(blank_spans("a `b` c"), "a     c");
+        assert_eq!(blank_spans("``x`y`` z"), "        z");
+        assert_eq!(blank_spans("no span"), "no span");
+        // An unclosed backtick is literal, and stays.
+        assert_eq!(blank_spans("a ` b"), "a ` b");
     }
 
     #[test]
