@@ -18,7 +18,13 @@ import { QueryError, errorMessage } from "./QueryError";
 /// wire type without a label fails to compile.
 const CHECK_LABEL: Record<ClaudeMdAdviceCheck, string> = {
   imports: "imports",
+  toolchain: "toolchain coverage",
+  transcripts: "sessions",
+  gaps: "missing subdirectory files",
   placement: "placement",
+  rot: "rot",
+  skills: "skills",
+  shape: "content shape",
 };
 
 /// What each severity is called, and how it is coloured.

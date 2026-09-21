@@ -43,15 +43,17 @@
 //! panel shows a skeleton. `CheckRun` has exactly two states, ran and
 //! Unknown, because a third that nothing moves out of is #1042.
 //!
-//! # What the [`Context`] carries, and what it does not yet
+//! # What the [`Context`] carries
 //!
-//! `definitions` and `conn` are `Option` in this PR. The seed producer
-//! reads neither, and building a definitions inventory or opening the
-//! store for a run that would not read them is work paid for nothing on
-//! every open of the panel. The skills producer wires `definitions` and
-//! the transcripts producer wires `conn`; a producer that needs one and
+//! `definitions` and `conn` are `Option`: `claude_md_advice` builds the
+//! inventory and opens the store once per run, and [`report_in`] exists
+//! for the callers that have neither (tests, and a run over a bare
+//! checkout). The rot and skills producers read `definitions`; the
+//! transcripts producer reads `conn`, and the gaps producer reads the
+//! edited-directory signal through it. A producer that needs one and
 //! finds `None` returns `Err`, which is reported as Unknown with that
-//! reason rather than as a clean pass.
+//! reason rather than as a clean pass; one for which the missing input
+//! is only a weaker answer says so in a finding.
 //!
 //! `home` is `Option` for the same reason `claude_md_effective` tolerates
 //! a missing home: the repository scan is still a real answer. The scan's

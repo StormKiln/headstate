@@ -144,15 +144,24 @@ fn suggestion(f: &Finding) -> String {
 
 /// The gaps producer's suggestion, by the shape of its finding.
 ///
-/// Four shapes, told apart by what `gaps.rs` writes into the finding and
+/// Five shapes, told apart by what `gaps.rs` writes into the finding and
 /// pinned there by `the_brief_suggestion_follows_the_finding_shape`: an
-/// Unknown is a directory that could not be listed; a sentence opening
-/// with a count is a group whose members the evidence lists; "role name
-/// only" is a weak candidate; anything else is one strong directory. A
-/// helper rather than a nested `match` because the wildcard guard in
-/// `invariants.rs` reads every arm between the `Check` match's braces.
+/// Unknown opening "session-edit signal unavailable" is a store that
+/// could not be queried; any other Unknown is a directory that could
+/// not be listed; a sentence opening with a count is a group whose
+/// members the evidence lists; "role name only" is a weak candidate;
+/// anything else is one strong directory. A helper rather than a nested
+/// `match` because the wildcard guard in `invariants.rs` reads every arm
+/// between the `Check` match's braces.
 fn gaps_suggestion(f: &Finding) -> String {
     let dir = f.subject.path();
+    if f.severity == Severity::Unknown && f.finding.starts_with("session-edit signal unavailable") {
+        return "No edit. The directories above were judged without the session-edit signal, \
+                on their manifests, tests and roles alone; a directory sessions edit heavily \
+                may be missing from them. Make Headstate's store readable and run the advice \
+                again."
+            .to_string();
+    }
     if f.severity == Severity::Unknown {
         return format!(
             "Make `{dir}` listable, or add it to the CLAUDE.md walk's skip list if it holds no \

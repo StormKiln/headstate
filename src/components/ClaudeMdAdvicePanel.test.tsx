@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { ClaudeMdAdviceFinding, ClaudeMdAdviceReport } from "@/types/pr";
+import type { ClaudeMdAdviceCheck, ClaudeMdAdviceFinding, ClaudeMdAdviceReport } from "@/types/pr";
 
 const copyFn = vi.hoisted(() => vi.fn(() => Promise.resolve(null as string | null)));
 const toastFns = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn() }));
@@ -195,6 +195,41 @@ describe("ClaudeMdAdvicePanel", () => {
     for (const b of screen.getAllByRole("button", { name: "Copy brief" })) {
       expect(b.hasAttribute("aria-pressed")).toBe(false);
     }
+  });
+
+  /// Every check on the wire renders: one finding per check, and a
+  /// coverage row per check whose label is visible. Built as a `Record`
+  /// over the wire type, so a variant added to `ClaudeMdAdviceCheck`
+  /// fails to compile here until it has a label, the same way
+  /// `CHECK_LABEL` in the panel does.
+  it("renders a finding and a labelled coverage row for every check", () => {
+    const LABEL: Record<ClaudeMdAdviceCheck, string> = {
+      imports: "imports",
+      toolchain: "toolchain coverage",
+      transcripts: "sessions",
+      gaps: "missing subdirectory files",
+      placement: "placement",
+      rot: "rot",
+      skills: "skills",
+      shape: "content shape",
+    };
+    const checks = Object.keys(LABEL) as ClaudeMdAdviceCheck[];
+    state.data = report({
+      findings: checks.map((check) => finding({ check, finding: `a ${check} finding` })),
+      checks: checks.map((check) => ({
+        check,
+        run: { state: "unknown", reason: `${check} could not run` },
+      })),
+    });
+    open();
+    for (const check of checks) {
+      expect(screen.getByText(`a ${check} finding`)).toBeTruthy();
+      expect(screen.getAllByText(LABEL[check], { exact: true }).length).toBeGreaterThan(0);
+      expect(screen.getAllByText(new RegExp(`${check} could not run`)).length).toBeGreaterThan(0);
+    }
+    expect(screen.getByRole("alert").textContent).toContain(
+      `${checks.length} of ${checks.length} checks could not run`,
+    );
   });
 
   /// A locator with no line prints no line.
