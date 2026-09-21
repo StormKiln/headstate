@@ -1124,7 +1124,9 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             a.get("filter")?,
         )),
         "claude_md_effective" => res(commands::claude_md_effective(a.get("repoPath")?).await),
-        "claude_md_advice" => res(commands::claude_md_advice(a.get("repoPath")?).await),
+        "claude_md_advice" => {
+            res(commands::claude_md_advice(app.clone(), a.get("repoPath")?).await)
+        }
         "scan_claude_md" => res(commands::scan_claude_md(a.get("repoPath")?).await),
         // `async` since #1090: an unbounded `read_to_string` dispatched
         // inline held this listener for the length of the file.

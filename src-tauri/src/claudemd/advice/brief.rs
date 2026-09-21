@@ -21,7 +21,7 @@
 //! `invariants.rs` scans this file, with comment lines stripped, and fails
 //! on one. Every producer therefore writes its own suggestion.
 
-use super::{Check, CheckRun, Finding, Locator, Report, Subject};
+use super::{Check, CheckRun, Finding, Locator, Report, Severity, Subject};
 
 /// The brief for one finding.
 ///
@@ -92,6 +92,30 @@ fn suggestion(f: &Finding) -> String {
             f.subject.path()
         ),
         Check::Toolchain => super::toolchain::suggestion(f),
+        // Three shapes of finding share this check. An Unknown is a
+        // transcript that could not be read, and the remedy is not an
+        // edit. A finding that says the rule is already written is kept
+        // visible so the reader sees it working, and the edit is none.
+        // Everything else is a candidate rule: one line, in the file the
+        // sessions load, stating what they had to learn.
+        Check::Transcripts => match (&f.severity, &f.subject) {
+            (Severity::Unknown, _) => "No edit. Make the transcript named in the evidence \
+                 readable, or leave it: the findings above stand without it, as floors."
+                .to_string(),
+            (_, Subject::Directory { path }) => format!(
+                "If the evidence shows a rule the sessions had to learn, create \
+                 `{path}/CLAUDE.md` holding that one line: the command to run, the path to \
+                 read first, or the call not to make. If the finding is a count or says the \
+                 rule is already written, change nothing."
+            ),
+            (_, subject) => format!(
+                "If the evidence shows a rule the sessions had to learn, add one line to \
+                 `{}` stating it: the command to run, the path to read first, or the call not \
+                 to make. If the finding is a count or says the rule is already written, \
+                 change nothing.",
+                subject.path()
+            ),
+        },
     }
 }
 
@@ -176,6 +200,27 @@ mod tests {
                 }],
                 "make (Makefile at root) offers `build`, `test`; none of the 3 files read names \
                  `make build`"
+                    .into(),
+            ),
+            Check::Transcripts => Finding::new(
+                Check::Transcripts,
+                Severity::Advice,
+                Subject::ClaudeMd {
+                    path: FILE.into(),
+                    scope: Scope::Repo,
+                    section: None,
+                },
+                vec![Evidence {
+                    at: Locator::Session {
+                        session_id: "s1".into(),
+                        record: Some(12),
+                    },
+                    measured: "first `yarn lint` failed (eslint: command not found), then \
+                               `make lint` succeeded"
+                        .into(),
+                }],
+                "`yarn lint` failed and `make lint` followed it in 2 sessions under \
+                 `/home/octocat/hello-world/src-tauri`"
                     .into(),
             ),
         }
