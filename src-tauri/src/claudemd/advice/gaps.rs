@@ -89,12 +89,16 @@
 //! # The edited signal
 //!
 //! [`gaps`] takes `edited: &[PathBuf]`, the directories sessions edit
-//! heavily. The transcripts producer computes it as `edited_dirs` from
-//! its `cwd`-bearing records and tool-use paths; this producer never
-//! reads a transcript itself. The [`Producer`] impl passes an empty
-//! list today, and integration wires the two together. A path in the
-//! list is matched exactly against the directory, absolute or relative
-//! to the root.
+//! heavily. The transcripts producer computes it as
+//! `transcripts::edited_dirs` from the tool-use paths its pass already
+//! stored; this producer never reads a transcript itself. The
+//! [`Producer`] impl reads it through `Context::conn`. No store (`None`)
+//! is an empty signal and nothing to say: the candidates stand on their
+//! other signals, and "no edits recorded" is not "no edits". A store
+//! that could not be queried is a [`Severity::Unknown`] finding beside
+//! the candidates, never a signal quietly dropped (#1044). A path in
+//! the list is matched exactly against the directory, absolute or
+//! relative to the root.
 //!
 //! # Deliberately out of scope
 //!
@@ -130,9 +134,34 @@ impl Producer for Gaps {
     }
 
     fn run(&self, cx: &Context) -> Result<Vec<Finding>, String> {
-        // Empty until integration hands over the transcripts producer's
-        // `edited_dirs`; see the module docs.
-        gaps(&cx.scan.repo, &[])
+        // The edited signal, from the store when there is one. A query
+        // that fails is reported beside the candidates rather than
+        // treated as "nothing edited": the two look the same in a list.
+        let (edited, unavailable) = match cx.conn {
+            None => (Vec::new(), None),
+            Some(conn) => match super::transcripts::edited_dirs(conn, cx.repo) {
+                Ok(dirs) => (dirs, None),
+                Err(why) => (Vec::new(), Some(why)),
+            },
+        };
+        let mut out = gaps(&cx.scan.repo, &edited)?;
+        if let Some(why) = unavailable {
+            let repo = cx.repo.to_string_lossy().to_string();
+            out.push(Finding::new(
+                Check::Gaps,
+                Severity::Unknown,
+                Subject::Directory { path: repo.clone() },
+                vec![Evidence {
+                    at: Locator::File {
+                        path: repo,
+                        line: None,
+                    },
+                    measured: why.clone(),
+                }],
+                format!("session-edit signal unavailable: {why}"),
+            ));
+        }
+        Ok(out)
     }
 }
 
@@ -625,13 +654,17 @@ mod tests {
     }
 
     fn run_over(repo: &Path) -> Report {
+        run_with_store(repo, None)
+    }
+
+    fn run_with_store(repo: &Path, conn: Option<&rusqlite::Connection>) -> Report {
         let scan = scan_effective_opt(repo, None);
         let cx = Context {
             repo,
             home: None,
             scan: &scan,
             definitions: None,
-            conn: None,
+            conn,
         };
         super::super::run(&cx)
     }
@@ -1006,6 +1039,83 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(gap_findings(&report).is_empty());
+    }
+
+    /// The store's edited signal reaches the producer through
+    /// `Context::conn`: three edits under `docs/` recorded by a pass
+    /// upgrade the weak candidate. No store is an empty signal and no
+    /// finding. A store the query fails on is an Unknown finding beside
+    /// the candidates, in the query's own words, never a dropped signal.
+    #[test]
+    fn the_edited_signal_is_read_from_the_store_and_its_absence_is_reported() {
+        let t = fixture();
+        let docs = t.path().join("docs");
+
+        // No store: the weak candidate stays weak, and nothing is Unknown.
+        let none = run_over(t.path());
+        let found = gap_findings(&none);
+        assert!(
+            by_subject(&found, "docs")
+                .unwrap()
+                .finding
+                .contains("role name only"),
+            "{found:?}"
+        );
+        assert!(found.iter().all(|f| f.severity != Severity::Unknown));
+
+        // A store with three edits under docs/: the signal upgrades it.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::migrate(&conn).unwrap();
+        for i in 0..3 {
+            conn.execute(
+                "INSERT INTO claude_advice_signal (session_id, signal, dir, key)
+                 VALUES ('s1', 'edit', ?1, ?2)",
+                rusqlite::params![docs.to_string_lossy().into_owned(), format!("f{i}.md")],
+            )
+            .unwrap();
+        }
+        let with = run_with_store(t.path(), Some(&conn));
+        let found = gap_findings(&with);
+        let d = by_subject(&found, "docs").unwrap();
+        assert!(!d.finding.contains("role name only"), "{}", d.finding);
+        assert!(d.finding.contains("session edits"), "{}", d.finding);
+        assert!(found.iter().all(|f| f.severity != Severity::Unknown));
+
+        // A store the query fails on: the candidates stand on their other
+        // signals, and the missing signal is a finding.
+        let bare = rusqlite::Connection::open_in_memory().unwrap();
+        let failed = run_with_store(t.path(), Some(&bare));
+        let found = gap_findings(&failed);
+        assert_eq!(*coverage(&failed), CheckRun::Ran { findings: 4 });
+        let unknown = found
+            .iter()
+            .find(|f| f.severity == Severity::Unknown)
+            .expect("an Unknown for the signal");
+        assert!(
+            unknown
+                .finding
+                .starts_with("session-edit signal unavailable: "),
+            "{}",
+            unknown.finding
+        );
+        assert!(
+            unknown.finding.contains("no such table"),
+            "the query's own words: {}",
+            unknown.finding
+        );
+        assert_eq!(unknown.subject.path(), t.path().to_string_lossy());
+        assert!(
+            unknown.brief.contains("without the session-edit signal"),
+            "{}",
+            unknown.brief
+        );
+        assert!(
+            by_subject(&found, "docs")
+                .unwrap()
+                .finding
+                .contains("role name only"),
+            "the other signals still stand: {found:?}"
+        );
     }
 
     /// A repository with no root CLAUDE.md still has candidates: nothing

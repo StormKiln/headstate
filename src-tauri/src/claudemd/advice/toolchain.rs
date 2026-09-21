@@ -1474,6 +1474,18 @@ mod tests {
             .collect()
     }
 
+    /// This check's coverage row, found by check rather than position:
+    /// every producer runs, and the report lists them in `Check::ALL`
+    /// order.
+    fn coverage(r: &Report) -> CheckRun {
+        r.checks
+            .iter()
+            .find(|c| c.check == Check::Toolchain)
+            .expect("a coverage row for toolchain")
+            .run
+            .clone()
+    }
+
     fn yarn_app(repo: &Path) {
         fs::write(
             repo.join("package.json"),
@@ -1522,7 +1534,7 @@ mod tests {
             f.evidence
         );
         assert!(f.brief.contains("Suggested change: In `"), "{}", f.brief);
-        assert_eq!(report.checks[1].run, CheckRun::Ran { findings: 1 });
+        assert_eq!(coverage(&report), CheckRun::Ran { findings: 1 });
 
         // The negative can fail: naming the test script clears it.
         fs::write(
@@ -1874,7 +1886,7 @@ mod tests {
         fs::write(repo.join("CLAUDE.md"), "Nothing.\n").unwrap();
         let report = run_over(&repo, &home);
         assert!(toolchain_findings(&report).is_empty(), "{report:#?}");
-        assert_eq!(report.checks[1].run, CheckRun::Ran { findings: 0 });
+        assert_eq!(coverage(&report), CheckRun::Ran { findings: 0 });
     }
 
     /// The verb map, by name and by subcommand.
