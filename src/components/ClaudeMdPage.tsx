@@ -98,6 +98,11 @@ export function ClaudeMdPage() {
   const unreadablePaths = scan ? [...scan.unreadable_dirs, ...scan.unreadable_files] : [];
   const unreadable = unreadablePaths.length;
   const [selected, setSelected] = useState<string | undefined>(undefined);
+  /// Which tab is showing. Local rather than a persisted filter: it is
+  /// where you are right now, not a preference about how you read, and
+  /// coming back to the app on the Advice tab of a repository you have
+  /// not opened since is not what anyone asked for.
+  const [tab, setTab] = useState<"files" | "advice">("files");
   const isMobile = useIsMobile();
 
   // The selection falls back to the first file so the pane is never
@@ -132,25 +137,37 @@ export function ClaudeMdPage() {
       </p>
     );
   }
-  if (isLoading) {
-    return <p className="p-4 text-sm text-[#8b949e]">Looking for CLAUDE.md files…</p>;
-  }
-  // BEFORE the empty state (#846). With `data = []` on a rejection the
+  // # Why the scan's four outcomes are the FILES TAB rather than the page
+  //
+  // Each `return` below used to be the whole page, which was right when
+  // the page WAS the file browser. It is wrong now: a repository with no
+  // CLAUDE.md file is exactly the one whose advice is worth reading --
+  // the `gaps` and `skills` producers have plenty to say about it -- and
+  // returning early would put the Advice tab out of reach precisely
+  // there, and also unmount the query that selecting the repository
+  // started.
+  //
+  // So the chain is preserved EXACTLY, in order and in wording, and only
+  // its destination changes: `scanMessage` instead of `return`. The
+  // ordering reasoning each arm carries (#846, #972) is about which
+  // claim reaches the reader first and is unaffected by where the
+  // element is mounted. `null` is the fourth outcome -- a scan that read
+  // files -- and means the two panes below render as they always have.
+  const scanMessage = isLoading ? (
+    <p className="p-4 text-sm text-[#8b949e]">Looking for CLAUDE.md files…</p>
+  ) : // BEFORE the empty state (#846). With `data = []` on a rejection the
   // empty branch was reached first and claimed the repository had none,
   // so an error arm placed after it would be unreachable in exactly the
   // case it exists for.
-  if (isError) {
-    return (
-      <div className="p-4">
-        <QueryError
-          title="Could not look for CLAUDE.md files"
-          message={errorMessage(error)}
-          onRetry={() => void refetch()}
-        />
-      </div>
-    );
-  }
-  // The FOURTH answer, and the one #846's fix could not reach (#972).
+  isError ? (
+    <div className="p-4">
+      <QueryError
+        title="Could not look for CLAUDE.md files"
+        message={errorMessage(error)}
+        onRetry={() => void refetch()}
+      />
+    </div>
+  ) : // The FOURTH answer, and the one #846's fix could not reach (#972).
   //
   // That fix gave this page a correct `isError` arm ordered BEFORE the
   // empty arm. It is sound and untouched -- but the arm can only fire on
@@ -168,31 +185,113 @@ export function ClaudeMdPage() {
   // above is a rejection of the whole command; this is a walk that ran and
   // came back short, and a second identical walk will not read what the
   // first could not. The paths below are the action, not a button.
-  if (files.length === 0 && unreadable > 0) {
-    return (
-      <div className="p-4">
-        <p className="text-sm text-[#8b949e]">
-          No CLAUDE.md file could be read. The paths below explain why — this repository may well
-          have some.
-        </p>
-        <div className="mt-2">
-          <PartialScanNotice
-            unreadable={unreadablePaths}
-            consequence="no CLAUDE.md file could be read from them."
-          />
-        </div>
+  files.length === 0 && unreadable > 0 ? (
+    <div className="p-4">
+      <p className="text-sm text-[#8b949e]">
+        No CLAUDE.md file could be read. The paths below explain why — this repository may well
+        have some.
+      </p>
+      <div className="mt-2">
+        <PartialScanNotice
+          unreadable={unreadablePaths}
+          consequence="no CLAUDE.md file could be read from them."
+        />
       </div>
-    );
-  }
-  if (files.length === 0) {
+    </div>
+  ) : files.length === 0 ? (
     // Only a scan that read EVERYTHING gets to say this. The arm above has
     // already taken the partial case, so this is now a true statement
     // rather than #846's confident wrong answer.
-    return <p className="p-4 text-sm text-[#8b949e]">No CLAUDE.md files in this repository.</p>;
-  }
+    <p className="p-4 text-sm text-[#8b949e]">No CLAUDE.md files in this repository.</p>
+  ) : null;
 
   return (
-    <div className={isMobile ? "flex h-full min-h-0 flex-col" : "flex h-full min-h-0"}>
+    <div className="flex h-full min-h-0 flex-col">
+      {/* The two tabs (#1290).
+
+          Advice is a TAB rather than the rail panel it was, and the tab
+          is what the user switches to -- not what starts the fetch. The
+          fetch is started by selecting a repository, which is why
+          `ClaudeMdAdvicePanel` is mounted below whichever tab is
+          showing: unmounting it on the Files tab would make the tab the
+          trigger again and throw away a run in progress every time
+          someone looked at a file.
+
+          `hidden` rather than a conditional render, for the same
+          reason. */}
+      <div
+        className="flex shrink-0 gap-1 border-b border-[#30363d] px-3"
+        role="tablist"
+        aria-label="CLAUDE.md"
+      >
+        {(
+          [
+            // The COUNT only when there is a count. A scan still running
+            // or rejected has no number to print, and "Files (0)" over a
+            // failed scan is #846's confident wrong answer in a tab
+            // label -- the tab would say the repository has none while
+            // the panel under it says we could not look.
+            ["files", scanMessage === null ? `Files (${files.length})` : "Files"],
+            ["advice", "Advice"],
+          ] as const
+        ).map(([id, label]) => (
+          <button
+            key={id}
+            type="button"
+            role="tab"
+            aria-selected={tab === id}
+            onClick={() => setTab(id)}
+            className={`-mb-px border-b-2 px-3 py-1.5 text-sm ${
+              tab === id
+                ? "border-[#1f6feb] text-[#e6edf3]"
+                : "border-transparent text-[#8b949e] hover:text-[#e6edf3]"
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {/* The advice tab's body. Mounted unconditionally so the query
+          that a repository selection started keeps running while the
+          user reads a file, and hidden rather than unmounted so
+          switching back shows what it found instead of starting again.
+
+          A finding about a file selects it AND switches to the Files
+          tab, because selecting a file the user cannot see would look
+          like the click did nothing. On a phone that same selection is
+          what `showingList` keys on, so one click still lands on the
+          file. */}
+      <div
+        role="tabpanel"
+        aria-label="Advice"
+        hidden={tab !== "advice"}
+        className={tab === "advice" ? "min-h-0 flex-1 overflow-y-auto p-3" : "hidden"}
+      >
+        <ClaudeMdAdvicePanel
+          repo={repo}
+          activePath={active?.path}
+          onSelectFile={(path) => {
+            setSelected(path);
+            setTab("files");
+          }}
+        />
+      </div>
+
+      <div
+        role="tabpanel"
+        aria-label="Files"
+        hidden={tab !== "files"}
+        className={
+          tab !== "files"
+            ? "hidden"
+            : isMobile
+              ? "flex min-h-0 flex-1 flex-col"
+              : "flex min-h-0 flex-1"
+        }
+      >
+      {scanMessage ?? (
+        <>
       {/* The browser: every file, its own size, and what its whole tree
           costs.
 
@@ -272,11 +371,6 @@ export function ClaudeMdPage() {
             {effective.extra.length > 0 ? "every scope a session loads" : "this repository"}
           </p>
         ) : null}
-        {/* Advice, in the rail below the total so on a phone it is on the
-            list screen and reachable without a third screen. A finding
-            about a file selects it, which on a phone is the navigation
-            `showingList` keys on. */}
-        <ClaudeMdAdvicePanel repo={repo} activePath={active?.path} onSelectFile={setSelected} />
       </div>
 
       <div
@@ -340,6 +434,9 @@ export function ClaudeMdPage() {
         ) : (
           <p className="text-sm text-[#8b949e]">Choose a file to read it.</p>
         )}
+      </div>
+        </>
+      )}
       </div>
     </div>
   );

@@ -5,6 +5,7 @@ import type {
   ClaudeMdAdviceFinding,
   ClaudeMdAdviceLocator,
   ClaudeMdAdviceReport,
+  ClaudeMdAdviceResult,
   ClaudeMdAdviceSubject,
 } from "@/types/pr";
 import { current } from "@/lib/ariaCurrent";
@@ -17,6 +18,8 @@ import {
 } from "@/lib/adviceGrouping";
 import type { Filters } from "@/lib/derive";
 import { useActiveFilters, useFilters } from "@/store/filters";
+import { adviceState, needsRefresh, type AdviceState } from "@/lib/adviceState";
+import { freshnessLabel } from "@/lib/adviceFreshnessLabel";
 import { toast } from "sonner";
 import { PartialScanNotice } from "./PartialScanNotice";
 import { QueryError, errorMessage } from "./QueryError";
@@ -78,17 +81,43 @@ function copyBrief(text: string, what: string) {
   );
 }
 
-/// Advice about the CLAUDE.md files of one repository.
+/// Advice about the CLAUDE.md files of one repository, as the tab's body.
 ///
-/// Collapsed by default and fetched only while open, like
-/// `ConfigHealthPanel`, so the page's file list and content pane never
-/// wait on it. Everything shown comes off the wire in the backend's
-/// order: the panel maps over `report.findings` and `report.checks` and
-/// never filters, sorts or concatenates briefs -- `combinedTokens` in
-/// `ClaudeMdPage` is the hand-mirrored counter-example this avoids.
+/// # What changed in #1290, and what deliberately did not
 ///
-/// Nothing here has a fixed width. It inherits the rail's width, which at
-/// 390px is the whole screen, and breaks words rather than overflowing.
+/// This was a collapsed panel in the file rail, fetched only while open.
+/// It is now the body of a tab, and the fetch is started by SELECTING A
+/// REPOSITORY rather than by pressing anything -- so the advice is ready,
+/// or visibly building, by the time the user reaches the tab.
+///
+/// The reasoning the old `enabled` carried is preserved rather than
+/// discarded. The file list and the content pane still never wait on the
+/// producers: the advice queries are their own, the page renders its
+/// panes without reading them, and nothing here can block a file from
+/// appearing. What changed is the trigger, not the independence.
+///
+/// The distinction that `enabled` drew is preserved too, and it is the
+/// one most easily lost in this move. "Never asked" and "asked and came
+/// back with nothing" are different claims (#846), so a tab the user has
+/// not visited while the fetch is in flight is BUILDING, not empty, and
+/// `adviceState` keeps `"idle"` meaning only the never-asked case.
+///
+/// # Two queries, one surface
+///
+/// `mode: "cached"` always answers at cache speed. `mode: "fresh"` runs
+/// every producer, including a whole-body read of every session under the
+/// repository, and is therefore never what a repository click fires. The
+/// cached call leads; the fresh one is fired behind it only when the
+/// cached answer says `stale: true`, and `adviceState` composes the two
+/// into the "from cache, refreshing" state the backend deliberately
+/// cannot claim for itself (see `ClaudeMdAdviceFreshness`).
+///
+/// Everything shown comes off the wire in the backend's order: the panel
+/// maps over `report.findings` and `report.checks` and never filters,
+/// sorts or concatenates briefs.
+///
+/// Nothing here has a fixed width. At 390px it is the whole screen, and
+/// it breaks words rather than overflowing.
 export function ClaudeMdAdvicePanel({
   repo,
   activePath,
@@ -100,51 +129,213 @@ export function ClaudeMdAdvicePanel({
   /// Show this file. On a phone this navigates to the file screen.
   onSelectFile: (path: string) => void;
 }) {
-  const [open, setOpen] = useState(false);
-  const { data, isError, error, isFetching, refetch } = useClaudeMdAdvice(repo, open);
+  // The cached read, on as soon as there is a repository. This is the
+  // auto-fetch #1290 asks for, and it is the CHEAP one: `Mode::Cached`
+  // returns the stored report whenever one decodes and runs producers
+  // only on a miss.
+  const cached = useClaudeMdAdvice(repo, true, "cached");
+
+  // A manual Refresh, remembered per repository.
+  //
+  // Keyed by repo PATH rather than held as a bare boolean, because a
+  // boolean survives a repository switch: pressing Refresh on one
+  // repository and clicking to another would fire a full producer run
+  // against the new one that nobody asked for. Storing which repository
+  // was asked makes the flag false for every other repository by
+  // construction, with no effect to reset and no reset to forget.
+  const [refreshAsked, setRefreshAsked] = useState<string | null>(null);
+
+  // WHY the fresh call may run. Two reasons, and only two:
+  //
+  //  - the cached answer says a tracked input has changed (`stale`), so
+  //    there is a better report to be had; or
+  //  - the user pressed Refresh for THIS repository.
+  //
+  // `needsRefresh` is deliberately false for `"unverified"`: an input
+  // that could not be READ will not read on a second run either, so
+  // auto-firing there would spend the whole-body session read on every
+  // visit to a repository with one unreadable file and learn nothing.
+  // Refresh still works; what is refused is doing it unprompted.
+  //
+  // # Rapid repository switching
+  //
+  // This is why the trigger is derived from `cached.data` rather than
+  // held in state. `cached.data` is the CURRENT repository's cached
+  // result -- the query key carries the path, so switching repositories
+  // makes it `undefined` until that repository's own cached call lands.
+  // A fresh call can therefore only be enabled for a repository whose
+  // cached report is already in hand and already says `stale`, which a
+  // user clicking down a sidebar never reaches: each click invalidates
+  // the previous repository's `cached.data` before any fresh call for it
+  // is enabled. Clicking through ten repositories fires ten cached reads
+  // and no producer runs.
+  //
+  // And a fresh call that DID start keeps its own query key, so it can
+  // neither be mistaken for the new repository's answer nor race another
+  // run of itself: TanStack dedupes by key, so one repository has at
+  // most one fresh call in flight however many times the trigger
+  // re-evaluates.
+  const wantFresh = needsRefresh(cached.data) || refreshAsked === repo;
+  const fresh = useClaudeMdAdvice(repo, wantFresh, "fresh");
+
+  const state = adviceState(
+    { ...cached, enabled: true },
+    { ...fresh, enabled: wantFresh },
+  );
 
   return (
-    <div className="mt-3 border-t border-[#21262d] pt-2">
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        aria-expanded={open}
-        className="tap-target text-xs text-[#58a6ff] hover:underline"
-      >
-        {open ? "Hide advice" : "Show advice about these files"}
-      </button>
-      {/* Three renders, never collapsed. A rejection is an error with a
-          retry: the whole run failed. A missing report is a skeleton: not
-          measured yet. A report is rendered as what it says, including
-          the checks that could not run. */}
-      {!open ? null : isError ? (
-        <div className="mt-2">
+    <div className="space-y-2">
+      <AdviceBody
+        state={state}
+        repo={repo}
+        activePath={activePath}
+        onSelectFile={onSelectFile}
+        onRefresh={() => {
+          setRefreshAsked(repo);
+          // A repository already asked for a refresh needs the query
+          // re-run rather than re-enabled: the flag is already set, so
+          // nothing would change and the button would look inert.
+          if (refreshAsked === repo) void fresh.refetch();
+        }}
+        onRetry={() => {
+          if (cached.isError) void cached.refetch();
+          if (fresh.isError) void fresh.refetch();
+        }}
+      />
+    </div>
+  );
+}
+
+/// The five states, each rendered as itself.
+///
+/// Split out from the component above so the query wiring and the
+/// rendering are separately readable, and so a test can drive every arm
+/// from a plain `AdviceState` without standing up two queries.
+function AdviceBody({
+  state,
+  repo,
+  activePath,
+  onSelectFile,
+  onRefresh,
+  onRetry,
+}: {
+  state: AdviceState;
+  repo: string;
+  activePath: string | undefined;
+  onSelectFile: (path: string) => void;
+  onRefresh: () => void;
+  onRetry: () => void;
+}) {
+  switch (state.kind) {
+    // Never asked. Reachable only with no repository selected, which the
+    // page handles before it renders this -- but it is a real member of
+    // the union rather than folded into "building", because the whole
+    // point of keeping it is that it is not the same claim.
+    case "idle":
+      return <p className="text-xs text-[#8b949e]">Choose a repository to check its files.</p>;
+    case "building":
+      return <Skeleton />;
+    case "failed":
+      return (
+        <>
           <QueryError
             title="Could not check these files"
-            message={errorMessage(error)}
-            onRetry={() => void refetch()}
+            message={errorMessage(state.error)}
+            onRetry={onRetry}
           />
-        </div>
-      ) : !data ? (
-        <Skeleton />
-      ) : (
-        <ReportView
-          report={data.report}
-          repo={repo}
-          activePath={activePath}
-          onSelectFile={onSelectFile}
-          isFetching={isFetching}
-          onRecheck={() => void refetch()}
-        />
-      )}
+          {/* A refresh that failed over a report already on screen keeps
+              the report. The findings below were really computed, and
+              withdrawing them because the attempt to better them failed
+              would turn one failure into two. The error above says what
+              happened; the label on the report says how old it is. */}
+          {state.stale !== undefined ? (
+            <div className="mt-2">
+              <Freshness result={state.stale} refreshing={false} onRefresh={onRefresh} />
+              <ReportView
+                report={state.stale.report}
+                repo={repo}
+                activePath={activePath}
+                onSelectFile={onSelectFile}
+              />
+            </div>
+          ) : null}
+        </>
+      );
+    case "report":
+      return (
+        <>
+          <Freshness
+            result={state.result}
+            refreshing={state.refreshing}
+            onRefresh={onRefresh}
+          />
+          <ReportView
+            report={state.result.report}
+            repo={repo}
+            activePath={activePath}
+            onSelectFile={onSelectFile}
+          />
+        </>
+      );
+  }
+}
+
+/// Where this report came from, above the findings it qualifies.
+///
+/// ABOVE rather than beside or below: a reader who scrolls into a
+/// finding and acts on it has already passed this line, and a currency
+/// caveat placed after the thing it qualifies is one most readers never
+/// reach.
+///
+/// `aria-live="polite"` because the text CHANGES UNDER THE READER: the
+/// composed "showing the last check while a new one runs" is replaced by
+/// the fresh report's label when the fresh call lands, with no
+/// interaction to prompt it. A silent swap is the one case where a
+/// screen-reader user would be left acting on the older claim.
+function Freshness({
+  result,
+  refreshing,
+  onRefresh,
+}: {
+  result: ClaudeMdAdviceResult;
+  refreshing: boolean;
+  onRefresh: () => void;
+}) {
+  const label = freshnessLabel(result.freshness, result.computedAt, refreshing);
+  const tone = {
+    current: "text-[#3fb950]",
+    stale: "text-[#d29922]",
+    // The same amber as stale, not a muted grey. "Could not decide"
+    // rendered quietly is how an unchecked thing becomes a cleared one
+    // in a reader's head (#1042).
+    unknown: "text-[#d29922]",
+  }[label.tone];
+
+  return (
+    <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5" aria-live="polite">
+      <span className={`break-words text-[11px] ${tone}`}>{label.text}</span>
+      <span className="break-words text-[11px] text-[#8b949e]">{label.detail}</span>
+      <button
+        type="button"
+        onClick={onRefresh}
+        disabled={refreshing}
+        className="tap-target text-[11px] text-[#58a6ff] hover:underline disabled:text-[#6e7681]"
+      >
+        {refreshing ? "Re-checking…" : "Re-check"}
+      </button>
     </div>
   );
 }
 
 /// "Not measured yet", and nothing else. Never "no advice".
+///
+/// The state a tab the user has not visited is in while the first run is
+/// going -- which is why it says "Checking" rather than showing an empty
+/// box. `aria-busy` carries the same fact to a reader who cannot see the
+/// pulse.
 function Skeleton() {
   return (
-    <div className="mt-2" aria-busy="true">
+    <div aria-busy="true">
       <p className="text-xs text-[#8b949e]">Checking…</p>
       <ul className="mt-1 space-y-1">
         {[0, 1].map((i) => (
@@ -155,20 +346,23 @@ function Skeleton() {
   );
 }
 
+/// The report itself: what could not be checked, then what was found.
+///
+/// Currency is NOT this component's business -- `Freshness` above owns
+/// the "where did this come from" line and the Re-check button, so a
+/// report rendered from cache and the same report rendered fresh are
+/// byte-identical here. Two places rendering a currency claim is how the
+/// two come to disagree.
 function ReportView({
   report,
   repo,
   activePath,
   onSelectFile,
-  isFetching,
-  onRecheck,
 }: {
   report: ClaudeMdAdviceReport;
   repo: string;
   activePath: string | undefined;
   onSelectFile: (path: string) => void;
-  isFetching: boolean;
-  onRecheck: () => void;
 }) {
   // Which checks could not run, from the wire's own coverage list. Read
   // here for the notice; the rows below map over the full list.
@@ -187,7 +381,7 @@ function ReportView({
   const groups = groupFindings(report, grouping);
 
   return (
-    <div className="mt-2 space-y-2">
+    <div className="space-y-2">
       {/* The shortfall FIRST, and stated as the producer wrote it. The
           findings below are real; what is missing is the checks that
           could not vouch for anything. */}
@@ -262,8 +456,10 @@ function ReportView({
         </p>
       ) : null}
 
-      <div className="flex flex-wrap items-center gap-3">
-        {n > 0 ? (
+      {/* Re-check lives on the freshness line above, beside the claim it
+          acts on, rather than here. */}
+      {n > 0 ? (
+        <div className="flex flex-wrap items-center gap-3">
           <button
             type="button"
             onClick={() => copyBrief(report.brief, "All briefs")}
@@ -271,16 +467,8 @@ function ReportView({
           >
             Copy all briefs
           </button>
-        ) : null}
-        <button
-          type="button"
-          onClick={onRecheck}
-          disabled={isFetching}
-          className="tap-target text-xs text-[#58a6ff] hover:underline disabled:text-[#6e7681]"
-        >
-          {isFetching ? "Re-checking…" : "Re-check"}
-        </button>
-      </div>
+        </div>
+      ) : null}
     </div>
   );
 }

@@ -19,6 +19,7 @@ const state = vi.hoisted(() => ({
   // while the list beside it is fine.
   failed: false,
   textFailed: false,
+  adviceCalls: [] as { repo: string | undefined; enabled: boolean; mode: string }[],
 }));
 
 // The explicit retries the `retry: false` on both hooks is paired with
@@ -54,15 +55,20 @@ vi.mock("../api/hooks", () => ({
     error: "no such file or directory",
     refetch: refetchTextFn,
   }),
-  // The advice panel is collapsed by default and has its own test file;
-  // here it only has to mount without fetching.
-  useClaudeMdAdvice: () => ({
-    data: undefined,
-    isError: false,
-    error: undefined,
-    isFetching: false,
-    refetch: vi.fn(),
-  }),
+  // Advice is a tab with its own test file. Here the mock only has to
+  // RECORD what the page asked for -- selecting a repository is now the
+  // trigger (#1290), and "did the page enable the cached query without
+  // anyone pressing anything" is a page-level fact.
+  useClaudeMdAdvice: (repo: string | undefined, enabled: boolean, mode = "cached") => {
+    state.adviceCalls.push({ repo, enabled, mode });
+    return {
+      data: undefined,
+      isError: false,
+      error: undefined,
+      isFetching: false,
+      refetch: vi.fn(),
+    };
+  },
 }));
 vi.mock("../store/filters", () => ({ useActiveFilters: () => ({ repo: state.repo }) }));
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
@@ -104,6 +110,7 @@ beforeEach(() => {
   state.textFailed = false;
   refetchFn.mockClear();
   refetchTextFn.mockClear();
+  state.adviceCalls = [];
 });
 
 describe("ClaudeMdPage", () => {
@@ -391,6 +398,96 @@ describe("ClaudeMdPage browser", () => {
     fireEvent.click(screen.getByRole("button", { name: "Close menu" }));
     expect(screen.queryByRole("menuitem")).toBeNull();
     expect(copyFn).not.toHaveBeenCalled();
+  });
+});
+
+/// Advice is a TAB, and a repository selection is what starts it (#1290).
+describe("ClaudeMdPage advice tab", () => {
+  /// The acceptance criterion, asserted at the level it is written at:
+  /// no button was pressed, and the cached query is on.
+  it("starts the cached advice query on a repository selection, with no click", () => {
+    state.files = [file()];
+    render(<ClaudeMdPage />);
+    const cached = state.adviceCalls.filter((c) => c.mode === "cached");
+    expect(cached.length).toBeGreaterThan(0);
+    expect(cached.every((c) => c.enabled && c.repo === "/code/app")).toBe(true);
+  });
+
+  /// The FILES tab is where the page opens, and the advice query is
+  /// running underneath it. This is the "building, not empty" case: a
+  /// tab the user has not visited while a fetch is in flight.
+  it("opens on the files tab with advice already fetching behind it", () => {
+    state.files = [file()];
+    render(<ClaudeMdPage />);
+    expect(screen.getByRole("tab", { name: /^Files/ }).getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByRole("tab", { name: "Advice" }).getAttribute("aria-selected")).toBe("false");
+    expect(state.adviceCalls.some((c) => c.mode === "cached" && c.enabled)).toBe(true);
+  });
+
+  /// The file list and the content pane must still never wait on the
+  /// producers. With the advice query answering NOTHING -- exactly what
+  /// a run in flight looks like -- both panes are fully rendered.
+  it("renders the file list and the content pane while advice has answered nothing", () => {
+    state.files = [file()];
+    state.text = "# hello";
+    render(<ClaudeMdPage />);
+    expect(screen.getByRole("button", { name: /CLAUDE.md/ })).toBeTruthy();
+    expect(screen.getByText("hello")).toBeTruthy();
+  });
+
+  /// Switching tabs does not restart the fetch. The advice body stays
+  /// MOUNTED under the files tab -- unmounting it would make the tab the
+  /// trigger again, which is the shape #1290 is replacing, and would
+  /// throw away a run in progress every time someone looked at a file.
+  it("keeps the advice query enabled across a tab switch", () => {
+    state.files = [file()];
+    render(<ClaudeMdPage />);
+    fireEvent.click(screen.getByRole("tab", { name: "Advice" }));
+    fireEvent.click(screen.getByRole("tab", { name: /^Files/ }));
+    expect(state.adviceCalls.every((c) => c.mode !== "cached" || c.enabled)).toBe(true);
+  });
+
+  /// A repository with NO CLAUDE.md file still reaches the tab. That is
+  /// the repository whose advice is worth reading most -- the `gaps` and
+  /// `skills` producers have plenty to say about it -- and the old
+  /// whole-page early return would have put the tab out of reach there.
+  it("offers the advice tab when the repository has no CLAUDE.md files", () => {
+    state.files = [];
+    render(<ClaudeMdPage />);
+    expect(screen.getByText(/No CLAUDE.md files/)).toBeTruthy();
+    expect(screen.getByRole("tab", { name: "Advice" })).toBeTruthy();
+    expect(state.adviceCalls.some((c) => c.mode === "cached" && c.enabled)).toBe(true);
+  });
+
+  /// And so does a repository whose scan was REJECTED. The scan failing
+  /// says the file LIST is unknown; it says nothing about the advice,
+  /// and blanking the tab would be the page answering a second question
+  /// it was not asked (#846).
+  it("offers the advice tab when the scan was rejected", () => {
+    state.failed = true;
+    render(<ClaudeMdPage />);
+    expect(screen.getByText(/Could not look for CLAUDE.md files/)).toBeTruthy();
+    expect(screen.getByRole("tab", { name: "Advice" })).toBeTruthy();
+  });
+
+  /// The tab label carries a COUNT only when there is one. "Files (0)"
+  /// over a rejected scan would say the repository has none while the
+  /// panel under it says we could not look.
+  it("omits the file count from the tab label when the scan did not read", () => {
+    state.failed = true;
+    render(<ClaudeMdPage />);
+    expect(screen.getByRole("tab", { name: "Files" })).toBeTruthy();
+    expect(screen.queryByRole("tab", { name: "Files (0)" })).toBeNull();
+  });
+
+  /// No repository, nothing to ask. The query is never enabled, which is
+  /// the `"idle"` state -- not the same claim as a query that answered
+  /// nothing.
+  it("asks for nothing before a repository is selected", () => {
+    state.repo = undefined;
+    render(<ClaudeMdPage />);
+    expect(screen.getByText(/Choose a repository/)).toBeTruthy();
+    expect(state.adviceCalls).toEqual([]);
   });
 });
 
