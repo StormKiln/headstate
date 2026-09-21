@@ -104,13 +104,15 @@ describe("ClaudeMdPage on a phone", () => {
     expect(screen.getByText("docs/")).toBeTruthy();
   });
 
-  /// The advice panel lives in the rail, which on a phone IS the list
-  /// screen. A finding about a file is a button that selects it, and
-  /// selecting is what navigates to the file screen -- no third screen.
+  /// Advice is a TAB since #1290, and on a phone the tabs are the whole
+  /// width. A finding about a file is a button that selects it, and that
+  /// one tap has to land on the file: it switches back to the Files tab
+  /// AND, because `showingList` keys on the selection, straight onto the
+  /// file screen. Still no third screen, and still one tap.
   it("tapping a file-subject finding shows the file screen", () => {
     stubViewport(390);
     renderPage();
-    fireEvent.click(screen.getByRole("button", { name: /show advice/i }));
+    fireEvent.click(screen.getByRole("tab", { name: "Advice" }));
     expect(screen.queryByRole("button", { name: /all files/i })).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "docs/CLAUDE.md" }));

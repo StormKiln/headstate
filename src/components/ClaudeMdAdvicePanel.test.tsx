@@ -11,21 +11,43 @@ import type {
 const copyFn = vi.hoisted(() => vi.fn(() => Promise.resolve(null as string | null)));
 const toastFns = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn() }));
 const refetchFn = vi.hoisted(() => vi.fn());
+const freshRefetchFn = vi.hoisted(() => vi.fn());
+
+/// The harness mocks the CACHED and the FRESH call SEPARATELY (#1290).
+///
+/// One shared stub would make the composed "from cache, refreshing"
+/// state untestable: that state is precisely the cached call having
+/// answered while the fresh call has not, and a single stub answering
+/// both cannot express it. `enabledFor` records which modes the panel
+/// actually switched on, which is how the cost rule -- never auto-fire
+/// `"fresh"` -- is asserted rather than assumed.
 const state = vi.hoisted(() => ({
   data: undefined as unknown,
   isError: false,
   error: undefined as unknown,
   isFetching: false,
+  fresh: {
+    data: undefined as unknown,
+    isError: false,
+    error: undefined as unknown,
+    isFetching: false,
+  },
+  enabledFor: [] as { mode: string; repo: string | undefined; enabled: boolean }[],
 }));
 
 vi.mock("../api/hooks", () => ({
-  useClaudeMdAdvice: () => ({
-    data: state.data,
-    isError: state.isError,
-    error: state.error,
-    isFetching: state.isFetching,
-    refetch: refetchFn,
-  }),
+  useClaudeMdAdvice: (repo: string | undefined, enabled: boolean, mode = "cached") => {
+    state.enabledFor.push({ mode, repo, enabled });
+    return mode === "fresh"
+      ? { ...state.fresh, refetch: freshRefetchFn }
+      : {
+          data: state.data,
+          isError: state.isError,
+          error: state.error,
+          isFetching: state.isFetching,
+          refetch: refetchFn,
+        };
+  },
 }));
 vi.mock("sonner", () => ({ toast: toastFns }));
 vi.mock("../lib/clipboard", () => ({ copyText: copyFn }));
@@ -82,10 +104,12 @@ const report = (over: Partial<ClaudeMdAdviceReport> = {}): ClaudeMdAdviceResult 
   computedAt: "2026-01-01T00:00:00Z",
 });
 
+/// Render the tab body. There is nothing to press: selecting the
+/// repository is what starts the fetch since #1290, and the panel is
+/// mounted with one already selected.
 function open(activePath?: string) {
   const onSelectFile = vi.fn();
   render(<ClaudeMdAdvicePanel repo={REPO} activePath={activePath} onSelectFile={onSelectFile} />);
-  fireEvent.click(screen.getByRole("button", { name: /show advice/i }));
   return onSelectFile;
 }
 
@@ -95,10 +119,13 @@ beforeEach(() => {
   toastFns.success.mockClear();
   toastFns.error.mockClear();
   refetchFn.mockClear();
+  freshRefetchFn.mockClear();
   state.data = undefined;
   state.isError = false;
   state.error = undefined;
   state.isFetching = false;
+  state.fresh = { data: undefined, isError: false, error: undefined, isFetching: false };
+  state.enabledFor = [];
   // The advice panel renders on the `claude-md` view, which is where its
   // grouping preference is stored.
   useFilters.setState({ filtersByView: { ...EMPTY }, view: "claude-md" });
@@ -114,43 +141,159 @@ function group(label: string) {
 }
 
 describe("ClaudeMdAdvicePanel", () => {
-  /// The panel renders the same report whichever freshness it arrived
-  /// with, and claims NOTHING about currency either way (#1293).
+  /// The FINDING renders identically whatever the freshness, and the
+  /// freshness is reported SEPARATELY from it (#1290).
   ///
-  /// The panel is deliberately unchanged by the cache: #1290 to #1292
-  /// own the advice surface and will render the freshness. What must
-  /// hold in the meantime is that serving from cache did not silently
-  /// change what the panel shows, AND that the panel does not start
-  /// asserting currency it was never given -- an "up to date" badge
-  /// added here over an `unverified` result would be the exact lie the
-  /// three states exist to prevent.
-  ///
-  /// Every member of the union is constructed, so a member removed or
-  /// renamed on the wire fails to compile here rather than silently
-  /// ceasing to be handled.
-  it.each<[string, ClaudeMdAdviceFreshness]>([
-    ["computed now", { state: "fresh", recomputed: true }],
-    ["verified current", { state: "fresh", recomputed: false }],
-    ["from cache, stale", { state: "cached", stale: true }],
-    ["from cache, could not verify", { state: "unverified", reason: "x: Permission denied", recomputed: false }],
-  ])("renders the finding the same way when the report is %s", (_label, freshness) => {
+  /// Both halves matter. The report's content must not change with where
+  /// it came from -- a cached finding and a fresh one are the same
+  /// finding -- and the currency claim must not be folded into the
+  /// findings, where it would have to be repeated per row and could
+  /// drift. Every member of the union is constructed, so a member
+  /// removed or renamed on the wire fails to compile here rather than
+  /// silently ceasing to be handled.
+  it.each<[string, ClaudeMdAdviceFreshness, RegExp]>([
+    ["computed now", { state: "fresh", recomputed: true }, /Up to date/],
+    ["verified current", { state: "fresh", recomputed: false }, /Up to date/],
+    ["from cache, unchanged", { state: "cached", stale: false }, /From the last check/],
+    ["from cache, stale", { state: "cached", stale: true }, /Out of date/],
+    [
+      "from cache, could not verify",
+      { state: "unverified", reason: "x: Permission denied", recomputed: false },
+      /Currency unknown/,
+    ],
+  ])("renders the finding and says it is %s", (_label, freshness, claim) => {
     state.data = { ...report({ findings: [finding()] }), freshness };
     open();
     expect(screen.getByText(/does not resolve/)).toBeTruthy();
-    // No currency claim, in either direction. The panel neither says
-    // the report is up to date nor says it is out of date, because it
-    // does not render the freshness at all yet.
-    expect(screen.queryByText(/up to date|out of date|current/i)).toBeNull();
+    expect(screen.getByText(claim)).toBeTruthy();
   });
 
-  /// Collapsed by default, and nothing is claimed while closed.
-  it("is collapsed by default", () => {
+  /// `"unverified"` is NOT "fresh with a footnote" (#1042).
+  ///
+  /// The word "current" must not appear in its claim at all. A matching
+  /// fingerprint proves nothing there, because it omitted something both
+  /// times -- so anything that reads as a currency assertion, however
+  /// softened, is the exact lie the three states exist to prevent. The
+  /// producer's own reason is shown instead, verbatim.
+  it("never calls an unverified report current, and gives the reason", () => {
+    state.data = {
+      ...report({ findings: [finding()] }),
+      freshness: { state: "unverified", reason: "~/.claude: Permission denied", recomputed: true },
+    };
+    open();
+    expect(screen.getByText(/Currency unknown/)).toBeTruthy();
+    expect(screen.getByText(/Permission denied/)).toBeTruthy();
+    expect(screen.queryByText(/Up to date/)).toBeNull();
+    // Not the merely-cached phrasing either: "from the last check" reads
+    // as a report whose inputs were all seen, which is what did not
+    // happen here.
+    expect(screen.queryByText(/From the last check/)).toBeNull();
+  });
+
+  /// THE composed state, and the core of #1290.
+  ///
+  /// A stale cached report is SHOWN -- withholding a real previous
+  /// answer to make the user wait is the failure the cache exists to
+  /// avoid -- and the fresh run happening behind it is stated as this
+  /// client's own in-flight request. The backend has no `"refreshing"`
+  /// freshness to hand out, so this sentence exists only because two
+  /// facts are composed here.
+  it("shows a stale cached report while a fresh run is in flight", () => {
+    state.data = { ...report({ findings: [finding()] }), freshness: { state: "cached", stale: true } };
+    state.fresh.isFetching = true;
+    open();
+    expect(screen.getByText(/does not resolve/)).toBeTruthy();
+    expect(screen.getByText(/showing the last check while a new one runs/)).toBeTruthy();
+    expect(screen.queryByText("Checking…")).toBeNull();
+  });
+
+  /// And when the fresh report lands it REPLACES the cached one, with the
+  /// refreshing sentence gone. A swap that left the old claim standing
+  /// would leave the user reading "out of date" over a current report.
+  it("swaps to the fresh report when it lands", () => {
+    state.data = {
+      ...report({ findings: [finding({ finding: "the stale finding" })] }),
+      freshness: { state: "cached", stale: true },
+    };
+    state.fresh.data = {
+      ...report({ findings: [finding({ finding: "the fresh finding" })] }),
+      freshness: { state: "fresh", recomputed: true },
+    };
+    open();
+    expect(screen.getByText("the fresh finding")).toBeTruthy();
+    expect(screen.queryByText("the stale finding")).toBeNull();
+    expect(screen.getByText(/Up to date/)).toBeTruthy();
+    expect(screen.queryByText(/showing the last check/)).toBeNull();
+  });
+
+  /// Selecting a repository starts the CACHED call and only the cached
+  /// call (#1290's cost rule).
+  ///
+  /// `mode: "fresh"` runs every producer, including a whole-body read of
+  /// every session under the repository. Auto-firing that on a click
+  /// would make the page slower, which is the opposite of this issue.
+  it("fetches on mount in cached mode, and does not auto-fire a fresh run", () => {
+    state.data = report({ findings: [finding()] });
+    open();
+    const cached = state.enabledFor.filter((c) => c.mode === "cached");
+    const fresh = state.enabledFor.filter((c) => c.mode === "fresh");
+    expect(cached.every((c) => c.enabled)).toBe(true);
+    expect(cached.length).toBeGreaterThan(0);
+    expect(fresh.length).toBeGreaterThan(0);
+    expect(fresh.some((c) => c.enabled)).toBe(false);
+  });
+
+  /// A STALE cached answer is the one thing that fires a fresh run
+  /// unprompted, because it is the one case where the backend has said a
+  /// better report exists to be computed.
+  it("enables the fresh call only when the cached answer says stale", () => {
+    state.data = { ...report(), freshness: { state: "cached", stale: true } };
+    open();
+    expect(state.enabledFor.some((c) => c.mode === "fresh" && c.enabled)).toBe(true);
+  });
+
+  /// `"unverified"` must NOT auto-fire one. The input that could not be
+  /// read will not read on a second run, so an automatic refresh there
+  /// spends the full producer cost on every visit and learns nothing.
+  it("does not auto-fire a fresh run for an unverified report", () => {
+    state.data = {
+      ...report(),
+      freshness: { state: "unverified", reason: "x: Permission denied", recomputed: false },
+    };
+    open();
+    expect(state.enabledFor.some((c) => c.mode === "fresh" && c.enabled)).toBe(false);
+  });
+
+  /// Re-check is the manual path, and it is what an unverified or a
+  /// current report is refreshed by. Pressing it enables the fresh call.
+  it("enables the fresh call when Re-check is pressed", () => {
     state.data = report();
-    render(<ClaudeMdAdvicePanel repo={REPO} activePath={undefined} onSelectFile={vi.fn()} />);
+    open();
+    expect(state.enabledFor.some((c) => c.mode === "fresh" && c.enabled)).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Re-check" }));
+    expect(state.enabledFor.some((c) => c.mode === "fresh" && c.enabled)).toBe(true);
+  });
+
+  /// A refresh that was REJECTED over a report already on screen keeps
+  /// the report, and says the refresh failed (#846).
+  ///
+  /// Two claims that must both survive: the findings were really
+  /// computed and withdrawing them because the attempt to better them
+  /// failed would turn one failure into two; and a failed refresh is a
+  /// failure, never silently rewritten as "from cache".
+  it("keeps the served report when a refresh is rejected, and reports the failure", () => {
+    state.data = {
+      ...report({ findings: [finding()] }),
+      freshness: { state: "cached", stale: true },
+    };
+    state.fresh.isError = true;
+    state.fresh.error = "the blocking task panicked";
+    open();
+    expect(screen.getByText(/Could not check these files/)).toBeTruthy();
+    expect(screen.getByText("the blocking task panicked")).toBeTruthy();
+    // The report is still there.
+    expect(screen.getByText(/does not resolve/)).toBeTruthy();
     expect(screen.queryByText(/nothing found/)).toBeNull();
-    expect(screen.getByRole("button", { name: /show advice/i }).getAttribute("aria-expanded")).toBe(
-      "false",
-    );
   });
 
   /// "Not measured yet" is a skeleton. Never "no advice", and never
