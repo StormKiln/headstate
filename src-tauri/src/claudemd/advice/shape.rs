@@ -1101,10 +1101,10 @@ mod tests {
             })
             .collect();
         assert!(
-            paths[0].ends_with("home/.claude/CLAUDE.md"),
+            Path::new(paths[0]).ends_with("home/.claude/CLAUDE.md"),
             "global first: {paths:?}"
         );
-        assert!(paths[1].ends_with("repo/CLAUDE.md"), "{paths:?}");
+        assert!(Path::new(paths[1]).ends_with("repo/CLAUDE.md"), "{paths:?}");
         assert!(
             paths[2].ends_with("shared.md"),
             "then its import: {paths:?}"
@@ -1350,7 +1350,7 @@ ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
         );
         assert!(f.finding.contains("`pnpm` and `yarn`"), "{}", f.finding);
         assert!(
-            f.subject.path().ends_with("repo/CLAUDE.md"),
+            Path::new(f.subject.path()).ends_with("repo/CLAUDE.md"),
             "the later file: {:?}",
             f.subject
         );
