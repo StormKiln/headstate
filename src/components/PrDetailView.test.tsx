@@ -1005,6 +1005,44 @@ describe("PrDetailView and the session that wrote the PR", () => {
     expect(st.view).toBe("claude-code");
   });
 
+  // The shape the BACKEND actually serialises, not the shape this file
+  // believes it does (#1288).
+  //
+  // Every other fixture here hand-writes `session_id` / `first_seen_at`,
+  // which is exactly why the whole suite stayed green while v7.1.0
+  // shipped a crash: `PrLink` carried `#[serde(rename_all =
+  // "camelCase")]`, the wire sent `sessionId` / `firstSeenAt`, and
+  // `l.session_id.slice(0, 8)` threw `undefined is not an object` on
+  // every pull request with a linked Claude session. A fixture that
+  // encodes the frontend's assumption can only ever confirm it.
+  //
+  // This test feeds the camelCase spelling the old backend really sent.
+  // It must NOT render a session, because after the fix that spelling is
+  // not what the backend emits and a component that accepted both would
+  // be hiding the contract rather than honouring it. What it pins is
+  // that the component reads `session_id` and nothing else -- so that
+  // reintroducing `rename_all` on `PrLink` breaks a test here as well as
+  // the Rust guard, and cannot throw at a user first.
+  it("does not silently accept the camelCase spelling that #1288 shipped", () => {
+    state.prSessions = [
+      {
+        sessionId: "ca5ece11-0000-0000-0000-000000000000",
+        repo: "acme/api",
+        number: 7,
+        url: "https://github.com/acme/api/pull/7",
+        firstSeenAt: "2026-09-01",
+      },
+      // Cast at the boundary on purpose: this is the one place that
+      // must describe the WIRE rather than `ClaudePrLink`, and typing it
+      // as `ClaudePrLink` would re-assert the very belief under test.
+    ] as unknown as typeof state.prSessions;
+
+    // Rendering must not throw. Before the fix this exact input is what
+    // reached `PrDetailView` and `.slice` was called on `undefined`.
+    expect(() => view()).not.toThrow();
+    expect(screen.queryByRole("button", { name: "ca5ece11" })).toBeNull();
+  });
+
   it("lists every session when more than one produced it", () => {
     // A PR can be the work of several sessions — a first pass and a
     // fix-up after review is the common shape.

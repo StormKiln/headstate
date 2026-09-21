@@ -3312,4 +3312,439 @@ fn suggestion(f: &Finding) -> String {
         assert_eq!(offenders.len(), 3, "{offenders:?}");
         assert!(offenders[0].starts_with("5: "), "{offenders:?}");
     }
+
+    /// A `Mirrors `rust::path::Type`` doc comment is a claim about the
+    /// WIRE, and this holds it to one (#1288).
+    ///
+    /// # The defect
+    ///
+    /// `claude::subagent::PrLink` carried `#[serde(rename_all =
+    /// "camelCase")]`, so it serialised `sessionId` / `firstSeenAt`,
+    /// while `ClaudePrLink` in `src/types/pr.ts` -- whose own doc says
+    /// "Mirrors `claude::subagent::PrLink`" -- declared `session_id` /
+    /// `first_seen_at`. `PrDetailView` then read `l.session_id.slice(0,
+    /// 8)` off `undefined` and every PR with a linked Claude session
+    /// threw. It shipped in v7.1.0 and no test saw it, because every
+    /// fixture hand-writes the TypeScript spelling: the suite asserted
+    /// the frontend's BELIEF about the wire, never the wire.
+    ///
+    /// That is the founding observation of this module in its purest
+    /// form. A TypeScript interface is an unchecked assertion about a
+    /// Rust struct; `tsc` cannot see across the boundary, so the two
+    /// sides can drift for a release with both halves green.
+    ///
+    /// # What is asserted
+    ///
+    /// For each TS interface whose doc comment names a Rust type, the
+    /// Rust struct's fields are read, its serde container attribute is
+    /// applied to derive the keys it ACTUALLY emits, and that key set
+    /// must equal the interface's declared key set.
+    ///
+    /// # Derived, not enumerated
+    ///
+    /// The pairs are discovered from the `Mirrors` doc comments already
+    /// in `src/types/`, so a new mirrored type is covered the moment
+    /// someone writes the sentence this codebase already writes. A
+    /// hand-listed set is the thing #844, #842 and #847 each proved
+    /// cannot work.
+    ///
+    /// # What this cannot see, stated rather than glossed
+    ///
+    /// - **Only struct-to-interface pairs.** A Rust `enum` mirrored by a
+    ///   TS union (`Subject`, `Locator`) has no field list to compare, so
+    ///   it is skipped and counted as skipped. Those are checked by
+    ///   reading, and the camelCase-on-both-sides pairs in
+    ///   `claudemd::advice` were confirmed consistent by hand for #1288.
+    /// - **Names, not types.** `number` against `u64` is not checked. The
+    ///   defect class here is the KEY, which is what silently becomes
+    ///   `undefined`.
+    /// - **`#[serde(skip)]` and field-level `rename`** are honoured,
+    ///   because ignoring them would report correct code as defective --
+    ///   `Finding::rule` is `skip`ped and rightly absent from TypeScript.
+    /// - **Optional TS members** (`pull_requests?:`) compare by name; the
+    ///   `?` is stripped. Whether `Option<T>` and `?` agree is a
+    ///   different question from whether the key is spelled the same.
+    #[test]
+    fn every_mirrored_type_agrees_with_its_rust_wire_spelling() {
+        /// Rust type paths whose TS mirror is a union or alias rather
+        /// than an interface with a field list, with why each is here.
+        ///
+        /// Named, not pattern-matched: an exemption nobody can read is
+        /// how a guard quietly stops covering things.
+        const NOT_STRUCTS: &[(&str, &str)] = &[
+            (
+                "claudemd::advice::Check",
+                "enum; TS mirror is a string union",
+            ),
+            (
+                "claudemd::advice::Subject",
+                "tagged enum; TS mirror is a discriminated union",
+            ),
+            (
+                "claudemd::advice::Locator",
+                "tagged enum; TS mirror is a discriminated union",
+            ),
+            ("worktrees::model::Lock", "enum; TS mirror is a union"),
+            ("ArtifactKind", "enum; TS mirror is a string union"),
+        ];
+
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let ts_dir = manifest.join("../src/types");
+        let rust_root = manifest.join("src");
+
+        // Every Rust source in this crate, concatenated once. The struct
+        // is found by NAME across the tree rather than by resolving the
+        // module path, because the doc comments spell the path several
+        // ways (`claude::subagent::PrLink`, `RepoScan` in
+        // `src-tauri/src/worktrees/scan.rs`) and a resolver that
+        // understood only one spelling would silently skip the others.
+        let mut rust_sources: Vec<(String, String)> = Vec::new();
+        for f in rust_files(&rust_root) {
+            let rel = f
+                .strip_prefix(&rust_root)
+                .unwrap_or(&f)
+                .display()
+                .to_string();
+            if rel.contains("invariants.rs") {
+                continue;
+            }
+            if let Ok(s) = std::fs::read_to_string(&f) {
+                rust_sources.push((rel, s));
+            }
+        }
+        assert!(
+            rust_sources.len() > 20,
+            "only {} Rust source(s) read; the crate walk is broken, not the code",
+            rust_sources.len()
+        );
+
+        let mut ts_sources: Vec<(String, String)> = Vec::new();
+        for e in std::fs::read_dir(&ts_dir).expect("src/types must be readable") {
+            let p = e.expect("dir entry").path();
+            if p.extension().and_then(|x| x.to_str()) != Some("ts") {
+                continue;
+            }
+            let name = p
+                .file_name()
+                .and_then(|x| x.to_str())
+                .unwrap_or("?")
+                .to_string();
+            if let Ok(s) = std::fs::read_to_string(&p) {
+                ts_sources.push((name, s));
+            }
+        }
+        assert!(
+            !ts_sources.is_empty(),
+            "no TypeScript type modules read from src/types; the scan is broken"
+        );
+
+        let mut checked = 0usize;
+        let mut skipped = 0usize;
+        let mut mismatched = Vec::new();
+
+        for (ts_file, ts_src) in &ts_sources {
+            for (iface, rust_ty, ts_keys) in mirrored_interfaces(ts_src) {
+                if NOT_STRUCTS.iter().any(|(n, _)| rust_ty.ends_with(n)) {
+                    skipped += 1;
+                    continue;
+                }
+                // The interface's OWN name first, then the type its prose
+                // names. `BoardPr`'s doc reads "Mirrors `MergedPr` so the
+                // scoped outliers render through the SAME `Outliers`
+                // component" -- a claim about component reuse, not about
+                // the wire, and the Rust `BoardPr` repeats the same
+                // sentence. Resolving that prose literally compared
+                // `BoardPr` against `MergedPr`, which has no `author`, and
+                // reported a correct pair as broken. The interface's own
+                // name is the stronger signal whenever a struct carries it.
+                let ts_name = iface.strip_prefix("Claude").unwrap_or(&iface);
+                let Some((rust_file, rename_all, fields)) = find_struct(&rust_sources, &iface)
+                    .or_else(|| find_struct(&rust_sources, ts_name))
+                    .or_else(|| find_struct(&rust_sources, &rust_ty))
+                else {
+                    skipped += 1;
+                    continue;
+                };
+                let wire: std::collections::BTreeSet<String> = fields
+                    .iter()
+                    .map(|(name, explicit)| match explicit {
+                        Some(r) => r.clone(),
+                        None if rename_all => to_camel(name),
+                        None => name.clone(),
+                    })
+                    .collect();
+                checked += 1;
+                let declared: std::collections::BTreeSet<String> =
+                    ts_keys.iter().cloned().collect();
+                if wire != declared {
+                    let only_rust: Vec<&String> = wire.difference(&declared).collect();
+                    let only_ts: Vec<&String> = declared.difference(&wire).collect();
+                    mismatched.push(format!(
+                        "{ts_file}::{iface} (mirrors {rust_ty}, src/{rust_file}): \
+                         Rust emits {only_rust:?} that TypeScript does not declare; \
+                         TypeScript declares {only_ts:?} that Rust does not emit"
+                    ));
+                }
+            }
+        }
+
+        // Guards the guard, and it is the whole reason this test can be
+        // trusted: a scan that stopped matching the `Mirrors` sentence,
+        // or the `interface` block, or the `struct` block, would compare
+        // nothing at all and pass looking exactly like a clean run. That
+        // failure mode is what #869 is about, and every other invariant
+        // in this module carries the same floor.
+        //
+        // MEASURED at 7 struct pairs compared and 3 skipped today. Held
+        // below 7 so deleting one mirrored type -- a legitimate change --
+        // does not fail this, while losing sight of `src/types/pr.ts`
+        // does. Verified by sabotage: breaking the `Mirrors` matcher
+        // takes it to 0 and trips this assertion rather than passing
+        // clean.
+        assert!(
+            checked >= 5,
+            "only {checked} Rust/TypeScript struct pair(s) compared ({skipped} skipped); \
+             the scan is broken, not the code. `ClaudePrLink` mirroring \
+             `claude::subagent::PrLink` is one of them."
+        );
+        assert!(
+            mismatched.is_empty(),
+            "these TypeScript interfaces say they mirror a Rust type and declare different \
+             wire keys than that type serialises:\n  {}\n\n\
+             A `Mirrors` doc comment cannot enforce itself. #1288 shipped in v7.1.0 because \
+             `PrLink` carried `rename_all = \"camelCase\"` and `ClaudePrLink` declared \
+             snake_case, so `l.session_id` was `undefined` and every pull request with a \
+             linked Claude session threw. `tsc` cannot see across the boundary and every \
+             fixture hand-wrote the TypeScript spelling, so the whole suite was green \
+             against a shape the backend never sent.\n\n\
+             Fix the side that is wrong -- usually by matching the surrounding convention, \
+             which for `src/types/pr.ts` is snake_case -- rather than silencing this.",
+            mismatched.join("\n  ")
+        );
+    }
+
+    /// serde's `camelCase` rename, for one field name.
+    ///
+    /// The real rule for a snake_case Rust identifier: split on `_`,
+    /// capitalise every segment but the first. serde does more for
+    /// identifiers that are not snake_case, and nothing in this tree is.
+    fn to_camel(name: &str) -> String {
+        let mut out = String::new();
+        for (i, part) in name.split('_').enumerate() {
+            if i == 0 {
+                out.push_str(part);
+                continue;
+            }
+            let mut c = part.chars();
+            if let Some(f) = c.next() {
+                out.extend(f.to_uppercase());
+                out.push_str(c.as_str());
+            }
+        }
+        out
+    }
+
+    /// Every `export interface NAME` in `src` whose doc comment names a
+    /// Rust type, with that type path and the interface's member names.
+    ///
+    /// Returns `(interface, rust path, keys)`. The doc comment is the
+    /// run of `///` lines immediately above the `export interface` line,
+    /// which is how every type in `src/types/` is written.
+    fn mirrored_interfaces(src: &str) -> Vec<(String, String, Vec<String>)> {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let Some(rest) = line.trim_start().strip_prefix("export interface ") else {
+                continue;
+            };
+            let Some(iface) = rest.split_whitespace().next() else {
+                continue;
+            };
+            let iface = iface.trim_end_matches('{').to_string();
+            if iface.is_empty() {
+                continue;
+            }
+            // Walk UP the contiguous `///` block for the `Mirrors`
+            // sentence. It is not always the first line: several read
+            // "One pull request a session produced (#1132). Mirrors ...".
+            let mut doc = String::new();
+            let mut j = i;
+            while j > 0 {
+                let prev = lines[j - 1].trim_start();
+                if !prev.starts_with("///") {
+                    break;
+                }
+                let text = prev.strip_prefix("///").unwrap_or(prev).trim();
+                doc = format!("{text} {doc}");
+                j -= 1;
+            }
+            let Some(rust_ty) = mirrors_target(&doc) else {
+                continue;
+            };
+            // The member names, to the interface's closing brace at
+            // column zero. Only top-level `name:` / `name?:` lines: a
+            // nested object literal's keys are indented further and are
+            // not wire keys of THIS interface.
+            let mut keys = Vec::new();
+            for l in lines.iter().skip(i + 1) {
+                if l.starts_with('}') {
+                    break;
+                }
+                let t = l.trim_start();
+                if t.starts_with("///") || t.starts_with("//") || t.is_empty() {
+                    continue;
+                }
+                // Two spaces exactly: a top-level member of the block.
+                if !l.starts_with("  ") || l.starts_with("   ") {
+                    continue;
+                }
+                let Some(colon) = t.find(':') else { continue };
+                let name = t[..colon].trim().trim_end_matches('?');
+                if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    continue;
+                }
+                keys.push(name.to_string());
+            }
+            if keys.is_empty() {
+                continue;
+            }
+            out.push((iface, rust_ty, keys));
+        }
+        out
+    }
+
+    /// The Rust type path a `Mirrors `X`` doc comment names, if any.
+    ///
+    /// Matches the two spellings in the tree: `Mirrors `path::Type`` and
+    /// `Mirrors `Type` in `src-tauri/...``. A trailing `::field` form
+    /// (`Mirrors `Repo::default_ref``) names a FIELD, not a type, and is
+    /// rejected by the same rule that finds the struct: no `struct
+    /// default_ref` exists, so it falls out as skipped.
+    fn mirrors_target(doc: &str) -> Option<String> {
+        let at = doc.find("Mirrors `")?;
+        let rest = &doc[at + "Mirrors `".len()..];
+        let end = rest.find('`')?;
+        let ty = rest[..end].trim();
+        if ty.is_empty() {
+            return None;
+        }
+        Some(ty.to_string())
+    }
+
+    /// The named struct's file, whether it carries a container
+    /// `rename_all = "camelCase"`, and its public fields.
+    ///
+    /// `ty` is the path the doc comment wrote, in any of the spellings
+    /// the tree uses: `claude::subagent::PrLink`, or a bare `RepoScan`
+    /// whose sentence names the file separately. The MODULE PATH is
+    /// honoured, not just the last segment -- resolving by bare name
+    /// alone matched `claudemd::advice::Finding` against an unrelated
+    /// `Finding` in `confighealth.rs` and reported four correct types as
+    /// defects, which is the precise way a guard becomes noise and gets
+    /// switched off.
+    ///
+    /// A path whose module segments do not appear in the file's own path
+    /// is NOT a match, so an ambiguous bare name resolves only when
+    /// exactly one struct in the tree carries it.
+    ///
+    /// Each field is `(name, explicit rename)`. `#[serde(skip)]` fields
+    /// are dropped: they are deliberately not on the wire.
+    #[allow(clippy::type_complexity)]
+    fn find_struct(
+        sources: &[(String, String)],
+        ty: &str,
+    ) -> Option<(String, bool, Vec<(String, Option<String>)>)> {
+        let mut segs: Vec<&str> = ty.split("::").collect();
+        let name = segs.pop()?;
+        let needle = format!("pub struct {name} {{");
+
+        // Candidates: every file declaring a struct of this name whose
+        // path is consistent with the doc's module segments. `mod.rs`
+        // and a file named for the module both satisfy a segment, which
+        // is how `claudemd::advice::Finding` reaches
+        // `claudemd/advice/mod.rs`.
+        let mut hits: Vec<&(String, String)> = Vec::new();
+        for entry in sources {
+            if !entry.1.contains(&needle) {
+                continue;
+            }
+            let path = entry.0.replace('\\', "/");
+            if segs.iter().all(|seg| {
+                path.split('/')
+                    .any(|c| c == *seg || c == format!("{seg}.rs").as_str())
+            }) {
+                hits.push(entry);
+            }
+        }
+        // Ambiguous: two structs of this name equally consistent with
+        // the path. Reporting either would be a guess, so it is skipped
+        // and counted rather than compared against a coin flip.
+        if hits.len() != 1 {
+            return None;
+        }
+        for (file, src) in hits {
+            let Some(at) = src.find(&needle) else {
+                continue;
+            };
+            // The attribute block directly above the `pub struct` line.
+            let head = &src[..at];
+            let attrs: String = head
+                .lines()
+                .rev()
+                .take_while(|l| {
+                    let t = l.trim_start();
+                    t.starts_with('#') || t.starts_with("///") || t.starts_with("//")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let rename_all = attrs
+                .lines()
+                .filter(|l| l.trim_start().starts_with("#["))
+                .any(|l| l.contains("rename_all = \"camelCase\""));
+
+            let body_start = at + needle.len();
+            let rel = &src[body_start..];
+            let end = rel.find("\n}")?;
+            let body = &rel[..end];
+
+            let mut fields = Vec::new();
+            let mut pending: Option<String> = None;
+            let mut skip = false;
+            for l in body.lines() {
+                let t = l.trim_start();
+                if t.starts_with("#[") {
+                    if t.contains("serde(skip)") || t.contains("serde(skip_serializing)") {
+                        skip = true;
+                    }
+                    if let Some(r) = t.find("rename = \"") {
+                        let after = &t[r + "rename = \"".len()..];
+                        if let Some(q) = after.find('"') {
+                            pending = Some(after[..q].to_string());
+                        }
+                    }
+                    continue;
+                }
+                let Some(field) = t.strip_prefix("pub ") else {
+                    continue;
+                };
+                let Some(colon) = field.find(':') else {
+                    continue;
+                };
+                let fname = field[..colon].trim();
+                if fname.is_empty() || !fname.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    continue;
+                }
+                if !skip {
+                    fields.push((fname.to_string(), pending.clone()));
+                }
+                pending = None;
+                skip = false;
+            }
+            if fields.is_empty() {
+                continue;
+            }
+            return Some((file.clone(), rename_all, fields));
+        }
+        None
+    }
 }
