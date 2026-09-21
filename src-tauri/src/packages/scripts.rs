@@ -40,6 +40,30 @@ pub struct Target {
 /// GNU make's own search order.
 const MAKEFILES: &[&str] = &["GNUmakefile", "makefile", "Makefile"];
 
+/// The makefile GNU make would pick under `dir`, by its on-disk name.
+///
+/// Taken from the directory LISTING, not by probing each candidate with
+/// `is_file()`. On a case-insensitive filesystem the probe for
+/// `makefile` is answered by `Makefile`, so a repository with the usual
+/// `Makefile` was reported as `makefile` on macOS and as `Makefile` on
+/// Linux -- the same file, two names, and a test that pinned the name
+/// failed on exactly one platform. The listing returns the name as it is
+/// spelled on disk. A listing failure is `Err`: the directory holds an
+/// unknown number of makefiles, which is not "none".
+fn makefile_name(dir: &Path) -> Result<Option<&'static str>, String> {
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut present: Vec<&'static str> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if let Some(known) = MAKEFILES.iter().find(|m| name == **m) {
+            if entry.path().is_file() {
+                present.push(known);
+            }
+        }
+    }
+    Ok(MAKEFILES.iter().copied().find(|m| present.contains(m)))
+}
+
 /// The targets under `dir`, from the first makefile GNU make would pick
 /// plus a `justfile` when one exists.
 ///
@@ -50,7 +74,11 @@ pub fn targets(dir: &Path) -> Manifest<Vec<Target>> {
     let mut out = Vec::new();
     let mut any = false;
 
-    if let Some(name) = MAKEFILES.iter().find(|n| dir.join(n).is_file()) {
+    let makefile = match makefile_name(dir) {
+        Ok(name) => name,
+        Err(e) => return Manifest::Unreadable(e),
+    };
+    if let Some(name) = makefile {
         any = true;
         match std::fs::read_to_string(dir.join(name)) {
             Ok(text) => out.extend(make_targets(&text, name)),
@@ -289,6 +317,22 @@ lint.sh:
         fs::write(t.path().join("package.json"), "{ not json").unwrap();
         match scripts(t.path()) {
             Manifest::Unreadable(why) => assert!(why.starts_with("package.json: "), "{why}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The name a target cites is the one on disk. On a case-insensitive
+    /// filesystem a probe for `makefile` finds `Makefile`, and CI on macOS
+    /// reported the usual spelling under the unusual name.
+    #[test]
+    fn the_makefile_is_named_as_it_is_spelled_on_disk() {
+        let t = tempfile::tempdir().unwrap();
+        fs::write(t.path().join("Makefile"), "lint:\n\techo\n").unwrap();
+        match targets(t.path()) {
+            Manifest::Present(list) => {
+                assert_eq!(list.len(), 1);
+                assert_eq!(list[0].file, "Makefile");
+            }
             other => panic!("{other:?}"),
         }
     }
