@@ -337,18 +337,36 @@ export function PrDetailView({
           above the viewport and "View on GitHub" far below it, so
           approving meant scrolling to the top and opening it on GitHub
           meant scrolling to the bottom.
-          
-          `top-0` is safe: the app header above scrolls away with the
-          content rather than being sticky itself, so nothing overlaps.
+
           The scroll container is `<main>` in App, which is this
           element's scrolling ancestor -- that is what makes `sticky`
-          work here at all. */}
+          work here at all.
+
+          `top-0` was correct once and is NOT any more (#1278). This
+          comment used to read "the app header above scrolls away with
+          the content rather than being sticky itself, so nothing
+          overlaps"; #623 made that app header `sticky top-0 z-20` for
+          the phone layout, in this same scroll container. At `top-0`
+          this bar still pinned -- it just pinned to the exact band the
+          app header occupies, one z-layer down and behind its opaque
+          background. Sticky was never broken here; the bar was pinned
+          and invisible, which looks identical to not sticking at all.
+
+          `--app-header-h` is the app header's measured height, written
+          onto `<main>` by `useStickyHeaderOffset`. Measured rather than
+          hardcoded because the phone's header is taller than the
+          desktop's (a 44px `.tap-target` hamburger), so one number
+          would be wrong on one of the two layouts this component
+          serves. The fallback keeps the bar pinned somewhere sane if
+          the variable is ever missing -- in jsdom, for instance, where
+          nothing publishes it. */}
       <div
         className={
           isMobile
-            ? "sticky top-0 z-10 -mx-4 flex flex-wrap items-center gap-2 border-b border-[#30363d] bg-[#0d1117] px-4 py-2"
-            : "sticky top-0 z-10 -mx-4 flex items-center gap-2 border-b border-[#30363d] bg-[#0d1117] px-4 py-2"
+            ? "sticky z-10 -mx-4 flex flex-wrap items-center gap-2 border-b border-[#30363d] bg-[#0d1117] px-4 py-2"
+            : "sticky z-10 -mx-4 flex items-center gap-2 border-b border-[#30363d] bg-[#0d1117] px-4 py-2"
         }
+        style={{ top: "var(--app-header-h, 0px)" }}
       >
         <button
           type="button"

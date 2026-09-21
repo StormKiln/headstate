@@ -134,6 +134,81 @@ describe("PrDetailView layout", () => {
     expect(within(bar).getByRole("button", { name: /^merge$/i })).toBeTruthy();
   });
 
+  /// #1278, on BOTH layouts.
+  ///
+  /// What regressed was not `position: sticky` -- that always worked.
+  /// The app header in `App` is `sticky top-0 z-20` inside the same
+  /// `<main>` scroll container (since #623), so this bar at `top-0`
+  /// pinned to the identical band, one z-layer below an opaque
+  /// background, and was invisible. Offsetting `top` by the app
+  /// header's height is the whole fix.
+  ///
+  /// This asserts the STRUCTURE that makes it work, not the rendered
+  /// result: jsdom performs no layout, so `position: sticky` cannot be
+  /// observed here and a test claiming "the header is visible after
+  /// scrolling" would pass against any code at all. What it can prove
+  /// is that the bar is sticky, and that its `top` defers to the app
+  /// header's published height instead of being pinned to zero -- which
+  /// is precisely the thing that was wrong.
+  for (const [label, width] of [
+    ["phone", 390],
+    ["desktop", 1400],
+  ] as const) {
+    it(`offsets the sticky header below the app header on ${label}`, () => {
+      stubViewport(width);
+      viewer.current = "hubot";
+      const { container } = view();
+      const bar = container.querySelector(".sticky") as HTMLElement;
+      expect(bar).toBeTruthy();
+      // Still sticky, and still above the body it pins over.
+      expect(bar.className).toContain("sticky");
+      expect(bar.className).toContain("z-10");
+      // The regression in one assertion: `top-0` puts this bar exactly
+      // where the app header already is.
+      expect(bar.className).not.toContain("top-0");
+      // And the fix: `top` comes from the app header's measured height.
+      expect(bar.style.top).toContain("--app-header-h");
+    });
+  }
+
+  /// The other half of #1278: nothing may reintroduce a sticky-breaking
+  /// style between this bar and `<main>`. `overflow` other than
+  /// `visible`, or a `transform`/`filter`/`contain`/`will-change` on an
+  /// ancestor, would make the bar stop pinning for real -- a different
+  /// failure from #1278's, and one no `top` value could rescue.
+  ///
+  /// Checked on the inline styles and classes rather than on computed
+  /// values, because jsdom does not resolve Tailwind's stylesheet: the
+  /// classes ARE the declaration here.
+  it("puts no sticky-breaking style between the header and the scroll container", () => {
+    stubViewport(1400);
+    viewer.current = "hubot";
+    const { container } = view();
+    const bar = container.querySelector(".sticky") as HTMLElement;
+    // Matched as whole classes: Tailwind writes them bare, so anchoring
+    // on `^` or `:` (as a first pass did) matched nothing at all and the
+    // test passed against a deliberately broken ancestor.
+    const breaking =
+      /\b(overflow-(hidden|auto|scroll|clip)|transform|filter|blur|contain-\w+|will-change-\w+)\b/;
+    // Bounded by `container` INCLUSIVE -- `container` is RTL's own host
+    // div, and the element under test's outermost wrapper sits between
+    // it and the bar. Excluding it skipped the one ancestor this
+    // component actually owns.
+    const seen: string[] = [];
+    for (let el: HTMLElement | null = bar.parentElement; el; el = el.parentElement) {
+      seen.push(el.className);
+      expect
+        .soft(el.className, `ancestor <${el.tagName.toLowerCase()} class="${el.className}">`)
+        .not.toMatch(breaking);
+      expect.soft(el.style.transform, "inline transform").toBeFalsy();
+      expect.soft(el.style.overflow, "inline overflow").toBeFalsy();
+      if (el === container) break;
+    }
+    // The walk must actually have inspected something, or the two
+    // assertions above are vacuous.
+    expect(seen.length).toBeGreaterThan(0);
+  });
+
   it("still offers review, comment, threads and the footer actions on a phone", () => {
     stubViewport(390);
     viewer.current = "hubot";
@@ -416,14 +491,28 @@ describe("PrDetailView", () => {
     expect(within(bar).getByText(/github/i)).toBeTruthy();
   });
 
-  /// `top-0` only works because the app header above scrolls away. If
-  /// that ever changes, the two overlap and this is the reminder.
-  it("pins to the very top of the scroll container", () => {
+  /// This test used to assert `top-0`, and its own comment read:
+  /// "`top-0` only works because the app header above scrolls away. If
+  /// that ever changes, the two overlap and this is the reminder."
+  ///
+  /// That change duly happened -- #623 made the app header
+  /// `sticky top-0 z-20` in this same scroll container -- and the
+  /// reminder never fired, because it asserted the CLASS rather than
+  /// the condition the class depended on. `top-0` was still there, and
+  /// still wrong. That is #1278.
+  ///
+  /// So this now pins the condition instead: the bar clears whatever is
+  /// sticky above it, by deferring to the app header's published
+  /// height. If someone pins this back to zero, this fails.
+  it("pins below the app header rather than into it", () => {
     state.data = detail();
     const { container } = render(
       <PrDetailView repo="octocat/hello-world" number={42} onBack={vi.fn()} />,
     );
-    expect(container.querySelector(".sticky")?.className).toContain("top-0");
+    const bar = container.querySelector(".sticky") as HTMLElement;
+    expect(bar.className).toContain("sticky");
+    expect(bar.className).not.toContain("top-0");
+    expect(bar.style.top).toBe("var(--app-header-h, 0px)");
   });
 
   /// Requested after the first pass deliberately left it out. GitHub
