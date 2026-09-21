@@ -66,6 +66,7 @@ pub mod gaps;
 pub mod imports;
 pub mod placement;
 pub mod rot;
+pub mod skills;
 pub mod toolchain;
 pub mod transcripts;
 
@@ -109,6 +110,10 @@ pub enum Check {
     /// A reference in a CLAUDE.md that resolves to nothing, or a line
     /// past a file's end.
     Rot,
+    /// Skills beside the CLAUDE.md files: frontmatter over a documented
+    /// limit, a CLAUDE.md naming a skill no scope holds, a procedure a
+    /// skill already holds, and cost.
+    Skills,
 }
 
 impl Check {
@@ -120,6 +125,7 @@ impl Check {
         Check::Gaps,
         Check::Placement,
         Check::Rot,
+        Check::Skills,
     ];
 
     /// The check's name as the brief prints it.
@@ -131,6 +137,7 @@ impl Check {
             Check::Gaps => "gaps",
             Check::Placement => "placement",
             Check::Rot => "rot",
+            Check::Skills => "skills",
         }
     }
 }
@@ -366,6 +373,7 @@ pub static PRODUCERS: &[&dyn Producer] = &[
     &gaps::Gaps,
     &placement::Placement,
     &rot::Rot,
+    &skills::Skills,
 ];
 
 /// Run every registered producer and assemble the report.
@@ -433,9 +441,10 @@ fn run_with(cx: &Context, producers: &[&dyn Producer]) -> Report {
 /// is still a real answer, and the scan records the scope it could not
 /// look for.
 ///
-/// `definitions` is the inventory the command built, or `None` when it
-/// could not; a producer that needs one and finds `None` reports its
-/// references Unknown rather than missing.
+/// `definitions` is built by the command, once, for the same reason the
+/// scan is: the inventory walks the user, project and plugin roots. A
+/// producer that needs it and gets `None` reports itself Unknown, so a
+/// skill reference is then "could not check", never "missing".
 pub fn report_in(repo: &Path, home: Option<&Path>, definitions: Option<&Inventory>) -> Report {
     let scan = super::scan_effective_opt(repo, home);
     let cx = Context {

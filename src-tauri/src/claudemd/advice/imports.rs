@@ -92,11 +92,15 @@ mod tests {
 
     fn run_over(repo: &std::path::Path) -> Report {
         let scan = scan_effective_opt(repo, None);
+        // An empty inventory, so a producer that needs one runs and the
+        // report these tests inspect is not partial for a reason that
+        // has nothing to do with imports.
+        let inv = crate::claude::definitions::Inventory::default();
         let cx = Context {
             repo,
             home: None,
             scan: &scan,
-            definitions: None,
+            definitions: Some(&inv),
             conn: None,
         };
         // The whole run, narrowed to this check: the tests below assert
