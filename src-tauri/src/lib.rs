@@ -288,6 +288,8 @@ pub fn run() {
             commands::update_run_state,
             commands::claude_md_effective,
             commands::claude_md_advice,
+            commands::claude_md_advice_launch,
+            commands::claude_md_advice_launch_preview,
             commands::scan_claude_md,
             commands::read_claude_md,
             commands::claude_import_transcripts,

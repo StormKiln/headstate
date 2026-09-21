@@ -291,7 +291,16 @@ pub fn resume_command(session_id: &str, cwd: Option<&str>, state: &CwdState) -> 
 /// substitution. The user is pasting this into their own shell, so the
 /// bar is not "is the path trusted" but "does the pasted line do what
 /// the button said it would".
-fn shell_quote(path: &str) -> String {
+///
+/// `pub(crate)` so [`super::launch::prompt_command`] can reuse it rather
+/// than write a second quoter. A brief is far more hostile input than a
+/// path -- it is Markdown full of backticks and `$(...)` quoted from the
+/// user's own files -- and the whole argument for single quotes is that
+/// it is TOTAL: every character except `'` is literal inside them, so
+/// one correct implementation covers both callers. Two implementations
+/// would be two chances to get it wrong, and the brief is the one where
+/// getting it wrong is least likely to be noticed.
+pub(crate) fn shell_quote(path: &str) -> String {
     format!("'{}'", path.replace('\'', r"'\''"))
 }
 

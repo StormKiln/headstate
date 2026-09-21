@@ -241,6 +241,23 @@ const ROWS: Row[] = [
   // missing key and a `null` decode identically there. Sent rather than
   // dropped so the argument object has one shape for both callers.
   row(api.claudeMdAdvice, [repoPath], "claude_md_advice", { repoPath, mode: null }),
+  // Claudify (#1292). The target is an OBJECT naming which brief, never
+  // the prompt text: Rust looks the brief up from the stored report, so
+  // the text that runs is the text `brief::render` produced. A wrapper
+  // that flattened this to a string would be the first step back towards
+  // a prompt composed in TypeScript.
+  row(
+    api.claudeMdAdviceLaunch,
+    [repoPath, { kind: "finding", index: 2 }],
+    "claude_md_advice_launch",
+    { repoPath, target: { kind: "finding", index: 2 } },
+  ),
+  row(
+    api.claudeMdAdviceLaunchPreview,
+    [repoPath, { kind: "report" }],
+    "claude_md_advice_launch_preview",
+    { repoPath, target: { kind: "report" } },
+  ),
   row(api.scanClaudeMd, [repoPath], "scan_claude_md", { repoPath }),
   // The Claude Code cache, its session list and its aggregates (#914,
   // #917, #921). Three of these are argument-free: they operate on

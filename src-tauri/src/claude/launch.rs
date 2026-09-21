@@ -262,6 +262,74 @@ fn split_words(raw: &str) -> Result<Vec<String>, String> {
 /// child is deliberately not waited on: a terminal lives for as long as
 /// the user keeps it open, and waiting would hang the command for
 /// minutes or hours.
+/// The shell line that starts `claude` on a prompt, in a directory.
+///
+/// # Why this is built in Rust, next to `resume_command`
+///
+/// #1292 Claudifies an advice finding: the payload is `Finding.brief`,
+/// which `Finding::new` renders at construction precisely so "a `Finding`
+/// built by hand could carry a `brief` that names a different subject
+/// than its `subject` field". Building the command line here keeps that
+/// guarantee end to end -- the frontend passes a repository path and an
+/// index, never a command and never a prompt, so there is no point at
+/// which TypeScript could compose a line the backend then runs.
+///
+/// That is the same rule `claude_launch_worktree` states for itself:
+/// accepting a command string from the caller would make this "run
+/// whatever you are given in a terminal", which is a different and much
+/// larger capability.
+///
+/// # How a multi-line Markdown prompt reaches `claude`, verified
+///
+/// The open question in #1292 was whether it can at all: `claude
+/// --resume <id>` is the only line this repository had ever built, and a
+/// brief is multi-line Markdown thick with backticks, `$(...)` and
+/// apostrophes quoted out of the user's own files.
+///
+/// It can, and nothing has to be mangled to make it fit. `claude`'s
+/// usage line is `claude [options] [command] [prompt]` -- the prompt is
+/// a POSITIONAL ARGUMENT, so it is one argv slot and newlines in it are
+/// just bytes. There is no length limit short enough to matter and no
+/// escaping for Markdown to trip over.
+///
+/// Three layers each have to keep it in one piece, and each does:
+///
+/// 1. [`super::sessions::shell_quote`] wraps the brief in single quotes,
+///    where every character except `'` is literal. A brief containing
+///    `$(whoami)` is text, not a substitution -- the same property
+///    `resume_command` relies on for the session id.
+/// 2. The shell the template names (`bash -lc`, and the `-e`/`--` forms)
+///    parses that quoted word back into exactly one argument, newlines
+///    included.
+/// 3. [`Template::render`] puts the whole command string into ONE argv
+///    slot and never re-splits it, which is the invariant this module's
+///    header calls "the line that keeps `resume_command`'s quoting
+///    intact".
+///
+/// So the prompt `claude` receives is byte-for-byte the brief the
+/// clipboard would have carried. That is the bar: Copy and Run must hand
+/// over the same text, or the button that runs it is lying about what it
+/// runs.
+///
+/// # What this does NOT fix, and will not pretend to
+///
+/// `open -a Terminal {command}` -- the first preset in the settings
+/// panel -- does not run a command at all. `open -a` takes FILE PATHS,
+/// so it hands Terminal.app a filename and Terminal opens a window on
+/// the user's default shell. That is a pre-existing property of that
+/// template which `claude --resume` has always had too; this function
+/// neither causes it nor repairs it, and it is not this issue's to fix.
+/// It is called out here so nobody reads the paragraphs above as a
+/// promise that every configured terminal works.
+///
+/// The `cd` is always present and always quoted: a prompt is worthless
+/// in the wrong repository, and unlike a resume there is no "wherever
+/// you run it" fallback that would still be correct.
+pub fn prompt_command(prompt: &str, cwd: &str) -> String {
+    use super::sessions::shell_quote;
+    format!("cd {} && claude {}", shell_quote(cwd), shell_quote(prompt))
+}
+
 pub fn launch(template: &str, command: &str, cwd: Option<&str>) -> Result<(), LaunchError> {
     if template.trim().is_empty() {
         return Err(LaunchError::NotConfigured);
@@ -502,6 +570,136 @@ mod tests {
         assert_eq!(uniq.len(), msgs.len(), "two errors read the same: {msgs:?}");
         // And each names its own remedy rather than a generic failure.
         assert!(msgs[0].contains("Settings"), "{}", msgs[0]);
+    }
+
+    /// The property the whole Claudify feature rests on (#1292): a
+    /// multi-line Markdown brief reaches `claude` as ONE argument,
+    /// byte-for-byte.
+    ///
+    /// This is the question the issue asked and could not answer from
+    /// the code: every call site in this repository was `claude
+    /// --resume <id>`, a single short line, and nothing here had ever
+    /// passed a PROMPT. The answer is that `claude`'s prompt is a
+    /// positional argument, so newlines in it are just bytes -- and
+    /// this test is what keeps that true.
+    ///
+    /// The brief below is deliberately hostile in every way a real one
+    /// can be: it spans lines, it holds backticks and a `$(...)` that a
+    /// shell would substitute, and it holds an apostrophe, which is the
+    /// ONE character single quotes cannot pass through unescaped.
+    #[test]
+    fn a_multi_line_brief_survives_as_exactly_one_argument() {
+        let brief =
+            "## It names `src-tauri/` paths\n\nEvidence: `a.md:38` — $(whoami)\nDon't guess.\n";
+        // A REAL directory, because the `&&` below short-circuits on a
+        // failed `cd` -- which would leave the shell check asserting
+        // nothing at all while still passing.
+        let dir = std::env::temp_dir();
+        let command = prompt_command(brief, &dir.to_string_lossy());
+
+        // Through the template, into argv. `bash -lc` is the shape three
+        // of the five presets use.
+        let t = Template::parse("gnome-terminal -- bash -lc {command}").unwrap();
+        let (_p, argv) = t.render(&command);
+
+        // The command string is ONE argv slot, never re-split -- the
+        // invariant this module's header states. Counted rather than
+        // indexed at a fixed position: the template decides how many
+        // literal words precede it, and hardcoding that number tests
+        // the template rather than the property.
+        assert_eq!(
+            argv.iter().filter(|a| a.contains("claude")).count(),
+            1,
+            "{argv:?}"
+        );
+        assert_eq!(argv.last().unwrap(), &command);
+
+        // And that slot, parsed back by the shell it is handed to, is a
+        // `cd` plus `claude` plus the brief verbatim. Asserted by
+        // running the real shell rather than by re-implementing its
+        // quoting rules, which would only prove this test agrees with
+        // itself.
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(command.replacen("claude", "printf %s", 1))
+            .output()
+            .expect("sh");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            brief,
+            "the brief did not survive quoting"
+        );
+    }
+
+    /// A brief cannot break out of its quoting and become a command.
+    ///
+    /// The round-trip test above proves the brief ARRIVES intact; this
+    /// one proves the stronger property that nothing in it can ESCAPE.
+    /// They are different failures: a mangled prompt is a bug, and a
+    /// prompt that runs `touch` is a vulnerability.
+    ///
+    /// Asserted two ways, because each catches what the other misses.
+    /// The structural check would pass for a quoter that escaped nothing
+    /// but happened to produce a balanced string; the executed check
+    /// would pass for a payload that simply failed to trigger. A
+    /// canary file that is never created is the only direct evidence
+    /// that the breakout did not run.
+    #[test]
+    fn nothing_in_a_brief_can_escape_its_quoting() {
+        let dir = std::env::temp_dir();
+        let canary = dir.join("headstate-1292-canary");
+        let _ = std::fs::remove_file(&canary);
+
+        // Every shape a Markdown brief can legitimately contain, plus a
+        // deliberate quote-breakout attempt.
+        let payloads = [
+            "`backtick`",
+            "$(touch canary)",
+            "a'; touch canary; echo 'b",
+            "line one\nline two",
+            "$(whoami) && `id` ; rm -rf /",
+            "it's got an apostrophe",
+        ];
+
+        for p in payloads {
+            let brief = p.replace("canary", &canary.to_string_lossy());
+            let command = prompt_command(&brief, &dir.to_string_lossy());
+
+            // Structural: the prompt occupies exactly one single-quoted
+            // region, so the only `'` characters in it are the ones
+            // `shell_quote`'s `'\''` escape put there.
+            let prefix = format!("cd '{}' && claude '", dir.to_string_lossy());
+            assert!(command.starts_with(&prefix), "{command}");
+            assert!(command.ends_with('\''), "{command}");
+
+            // Executed: run the real thing with `claude` stubbed out,
+            // and require the payload back verbatim on stdout.
+            let out = Command::new("sh")
+                .arg("-c")
+                .arg(command.replacen("claude", "printf %s", 1))
+                .output()
+                .expect("sh");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                brief,
+                "payload did not arrive verbatim: {p:?}"
+            );
+            assert!(
+                !canary.exists(),
+                "a brief escaped its quoting and ran a command: {p:?}"
+            );
+        }
+        let _ = std::fs::remove_file(&canary);
+    }
+
+    /// The `cd` is quoted, so a repository path cannot inject.
+    ///
+    /// `resume_command` has this property and says why; a prompt command
+    /// must not be the place it is lost.
+    #[test]
+    fn the_working_directory_is_quoted() {
+        let c = prompt_command("hi", "/tmp/$(touch pwned)");
+        assert!(c.starts_with("cd '/tmp/$(touch pwned)' && claude "), "{c}");
     }
 
     #[test]

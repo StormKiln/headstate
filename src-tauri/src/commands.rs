@@ -2792,6 +2792,176 @@ pub async fn claude_launch_session_preview(
     preview_in_terminal(&app, &built.command, terms)
 }
 
+/// Which brief a Claudify acts on (#1292).
+///
+/// An index into `Report.findings`, or the whole report. Deliberately
+/// NOT the prompt text: the frontend names which finding it means and
+/// the backend looks the brief up, so the text that runs is the text
+/// `brief::render` produced. Letting the caller post a prompt would
+/// reintroduce exactly the disagreement `Finding::new` exists to
+/// prevent -- it renders the brief at construction because "a `Finding`
+/// built by hand could carry a `brief` that names a different subject
+/// than its `subject` field, and the panel copies the brief without
+/// reading it".
+///
+/// It is also the capability argument `claude_launch_worktree` makes:
+/// accepting arbitrary text to run in a terminal is a much larger thing
+/// than running the button the user pressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ClaudifyTarget {
+    /// One finding, by its position in `Report.findings` as served.
+    #[serde(rename_all = "camelCase")]
+    Finding { index: usize },
+    /// Every brief, plus a line per check that could not run.
+    Report,
+}
+
+/// The brief a target names, from the report the panel is showing.
+///
+/// Read from the CACHE (`Mode::Cached`), never by re-running the
+/// producers. Two reasons, and both matter:
+///
+/// - A full run is a whole-body read of every session under the
+///   repository (#1246). Pressing Claudify must not cost that.
+/// - A re-run could return DIFFERENT findings than the ones on screen,
+///   at which point `index` would address a different finding than the
+///   user clicked. Resolving against the stored report is what makes the
+///   index mean what the panel meant by it.
+///
+/// An index past the end is an error rather than a clamp: it means the
+/// panel and the store disagree about the report, and silently
+/// Claudifying the wrong finding is the failure this whole issue is
+/// written against.
+/// # Why `spawn_blocking`
+///
+/// The store read is `rusqlite`, which is synchronous, and both callers
+/// are `#[tauri::command] async`. `system_health_history` and
+/// `health_alerts` put the same `open_db` behind `spawn_blocking` for
+/// the reason #1090 records: a sync read on the async runtime blocks it,
+/// and `remote/surface.rs` would run it inline on the HTTP listener.
+///
+/// The row is small and indexed by repository, so this is not the
+/// whole-file shape the guard names -- but a decoded report is every
+/// finding and every brief, and doing it off the runtime costs nothing
+/// and matches what every neighbouring command already does.
+async fn claudify_brief(
+    app: &AppHandle,
+    repo_path: &str,
+    target: ClaudifyTarget,
+) -> Result<String, String> {
+    let repo = std::path::PathBuf::from(repo_path);
+    let db = db_path(app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&db).map_err(|e| e.to_string())?;
+        let cached = crate::claudemd::advice::cache::load(&conn, &repo)?.ok_or_else(|| {
+            "No advice report is stored for this repository yet. Open the Advice tab and let \
+             it finish, then try again."
+                .to_string()
+        })?;
+        brief_of(&cached.report, target)
+    })
+    .await
+    .map_err(|e| format!("could not read the stored report: {e}"))?
+}
+
+/// The brief a target names, from a report already in hand.
+///
+/// Split from [`claudify_brief`] so the resolution can be tested without
+/// an `AppHandle` or a database -- this is the half with the rule in it,
+/// and the half above is only where the report comes from.
+fn brief_of(
+    report: &crate::claudemd::advice::Report,
+    target: ClaudifyTarget,
+) -> Result<String, String> {
+    match target {
+        ClaudifyTarget::Report => Ok(report.brief.clone()),
+        // Out of range is an ERROR, never a clamp to the nearest
+        // finding. It means the panel and the store disagree about the
+        // report, and Claudifying whatever happens to sit at the last
+        // index would hand an agent a brief about a different file than
+        // the one the user clicked -- silently, because every brief is
+        // well-formed. That is the exact failure `Finding::new` renders
+        // the brief at construction to prevent, arriving by a different
+        // route.
+        ClaudifyTarget::Finding { index } => report
+            .findings
+            .get(index)
+            .map(|f| f.brief.clone())
+            .ok_or_else(|| {
+                format!(
+                    "That finding is no longer in the stored report ({} finding{}), so there \
+                     is nothing to Claudify. Re-check and try again.",
+                    report.findings.len(),
+                    if report.findings.len() == 1 { "" } else { "s" }
+                )
+            }),
+    }
+}
+
+#[tauri::command]
+/// Open the configured terminal on `claude` started on a brief (#1292).
+///
+/// `Class::Local`, for the reason [`claude_launch_worktree`] states: it
+/// opens a window on THIS machine, which a paired phone cannot see.
+///
+/// The prompt is looked up here rather than passed in -- see
+/// [`ClaudifyTarget`] -- and built into a shell line by
+/// [`crate::claude::launch::prompt_command`], whose docs record how a
+/// multi-line Markdown brief survives quoting into one argv slot.
+///
+/// The repository is the working directory, stated rather than defaulted
+/// silently: a brief names absolute paths, but `claude` still has to
+/// start somewhere, and the repository the advice is ABOUT is the only
+/// defensible choice. `launch` refuses with `CwdMissing` if it is gone,
+/// which is the right answer -- a prompt about a repository that is not
+/// there should not open a session anywhere else.
+pub async fn claude_md_advice_launch(
+    app: AppHandle,
+    repo_path: String,
+    target: ClaudifyTarget,
+) -> Result<(), String> {
+    let prompt = claudify_brief(&app, &repo_path, target).await?;
+    let command = crate::claude::launch::prompt_command(&prompt, &repo_path);
+    let template = read_ui_prefs(&app).terminal_command;
+    let cwd = repo_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::claude::launch::launch(&template, &command, Some(&cwd)).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("terminal launch did not run: {e}"))?
+}
+
+#[tauri::command]
+/// The exact argv [`claude_md_advice_launch`] would spawn (#1292).
+///
+/// `Class::Local`, beside the launch it previews. #1214 established that
+/// a spawn path must show the line first -- "a spawn path takes away
+/// what the clipboard gave for free: the chance to read the line before
+/// it runs" -- and a Claudify that silently opened a terminal would be a
+/// worse version of a thing this app already does properly.
+///
+/// It matters more here than for a resume, not less. A resume command is
+/// one short line a reader can take in at a glance; this one carries a
+/// whole Markdown brief, so seeing it is the only way to know what the
+/// session will be asked to do.
+///
+/// The SAME `prompt_command` render the launch uses, not a display
+/// string built alongside it -- a preview that is assembled separately
+/// is a preview that can disagree with what runs.
+pub async fn claude_md_advice_launch_preview(
+    app: AppHandle,
+    repo_path: String,
+    target: ClaudifyTarget,
+) -> Result<LaunchPreview, String> {
+    let prompt = claudify_brief(&app, &repo_path, target).await?;
+    let command = crate::claude::launch::prompt_command(&prompt, &repo_path);
+    let template = read_ui_prefs(&app).terminal_command;
+    let parsed = crate::claude::launch::Template::parse(&template).map_err(|e| e.to_string())?;
+    let (program, args) = parsed.render(&command);
+    Ok(LaunchPreview { program, args })
+}
+
 /// Read the live registry and probe the pids it names, NOW.
 ///
 /// Shared by [`claude_propose_stop`] and [`claude_stop_session`] so the
@@ -6540,6 +6710,84 @@ pub async fn claude_permission_ownership(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[cfg(test)]
+mod claudify_tests {
+    use super::{brief_of, ClaudifyTarget};
+    use crate::claudemd::advice::{Check, Evidence, Finding, Locator, Report, Severity, Subject};
+
+    fn finding(text: &str, path: &str) -> Finding {
+        Finding::new(
+            Check::Imports,
+            Severity::Problem,
+            Subject::ClaudeMd {
+                path: path.to_string(),
+                scope: crate::claudemd::Scope::Repo,
+                section: None,
+            },
+            vec![Evidence {
+                at: Locator::File {
+                    path: path.to_string(),
+                    line: None,
+                },
+                measured: "m".to_string(),
+            }],
+            text.to_string(),
+        )
+    }
+
+    fn report(findings: Vec<Finding>) -> Report {
+        Report {
+            repo: "/r".to_string(),
+            findings,
+            checks: vec![],
+            brief: "# the whole document".to_string(),
+        }
+    }
+
+    /// An index resolves to THAT finding's brief, rendered by
+    /// `brief::render` -- not to anything composed here.
+    #[test]
+    fn an_index_resolves_to_that_findings_own_brief() {
+        let r = report(vec![
+            finding("first", "/r/a.md"),
+            finding("second", "/r/b.md"),
+        ]);
+        let got = brief_of(&r, ClaudifyTarget::Finding { index: 1 }).unwrap();
+        assert_eq!(got, r.findings[1].brief);
+        // And it really is the SECOND one, not merely some brief.
+        assert!(got.contains("second"), "{got}");
+        assert!(got.contains("/r/b.md"), "{got}");
+    }
+
+    /// The whole report resolves to `Report.brief`, which the backend
+    /// rendered. Nothing is concatenated at the call site.
+    #[test]
+    fn the_report_target_resolves_to_the_reports_own_brief() {
+        let r = report(vec![finding("only", "/r/a.md")]);
+        assert_eq!(
+            brief_of(&r, ClaudifyTarget::Report).unwrap(),
+            "# the whole document"
+        );
+    }
+
+    /// An index past the end REFUSES rather than clamping.
+    ///
+    /// Clamping would hand an agent a well-formed brief about a
+    /// different file than the user clicked, with nothing anywhere
+    /// saying so -- which is why this is an error and why the message
+    /// says what to do about it.
+    #[test]
+    fn an_index_past_the_end_refuses_rather_than_clamping() {
+        let r = report(vec![finding("only", "/r/a.md")]);
+        let e = brief_of(&r, ClaudifyTarget::Finding { index: 7 }).unwrap_err();
+        assert!(e.contains("1 finding"), "{e}");
+        assert!(e.to_lowercase().contains("re-check"), "{e}");
+        // An empty report refuses too, rather than returning nothing
+        // that reads as success.
+        assert!(brief_of(&report(vec![]), ClaudifyTarget::Finding { index: 0 }).is_err());
+    }
 }
 
 #[cfg(test)]
