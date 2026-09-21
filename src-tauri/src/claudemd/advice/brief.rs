@@ -61,7 +61,7 @@ fn subject(s: &Subject) -> String {
 /// A line is printed ONLY when the producer recorded one. `path:0` or a
 /// guessed line would send the agent to the wrong place with a confident
 /// number, which is the one thing this document must never do.
-fn locator(l: &Locator) -> String {
+pub(super) fn locator(l: &Locator) -> String {
     match l {
         Locator::File {
             path,
@@ -117,6 +117,7 @@ fn suggestion(f: &Finding) -> String {
             ),
         },
         Check::Gaps => gaps_suggestion(f),
+        Check::Placement => super::placement::suggestion(f),
     }
 }
 
@@ -282,6 +283,34 @@ mod tests {
                 }],
                 "`crates/octocat-core/` has own `Cargo.toml`, `Cargo.lock` and no CLAUDE.md \
                  between it and the root"
+                    .into(),
+            ),
+            Check::Placement => Finding::new(
+                Check::Placement,
+                Severity::Advice,
+                Subject::ClaudeMd {
+                    path: FILE.into(),
+                    scope: Scope::Repo,
+                    section: Some("## Platform".into()),
+                },
+                vec![
+                    Evidence {
+                        at: Locator::File {
+                            path: FILE.into(),
+                            line: Some(38),
+                        },
+                        measured: "2 of 2 paths resolve under src-tauri/src/".into(),
+                    },
+                    Evidence {
+                        at: Locator::File {
+                            path: "/home/octocat/hello-world/src-tauri/src/CLAUDE.md".into(),
+                            line: None,
+                        },
+                        measured: "does not exist".into(),
+                    },
+                ],
+                "Section \"Platform\" (~40 est. tokens) names only paths under src-tauri/src/: \
+                 src-tauri/src/a.rs, src-tauri/src/b.rs"
                     .into(),
             ),
         }
