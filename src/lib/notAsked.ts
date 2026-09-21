@@ -28,3 +28,18 @@
 /// So this file is down to the constant and its cross-language
 /// assertion, which is all it was ever uniquely for.
 export const NOT_ASKED = "headstate:not-asked";
+
+/// The marker a failure carries when GitHub REJECTED the token we sent,
+/// rather than one never being asked for (#1230). Must match
+/// `AUTH_EXPIRED` in `src-tauri/src/commands.rs`.
+///
+/// EXPORTED for the same reason `NOT_ASKED` is: so the agreement is
+/// asserted against that Rust source by `mirroredConstants.test.ts`
+/// rather than restated here. A hand-written second copy is exactly the
+/// drift `cancelled.ts` records, and a marker that has drifted does not
+/// fail -- it silently stops classifying, and the remedy quietly
+/// disappears from the banner with every test on both sides passing.
+///
+/// Read in one place only, `commandError` in `errorKind.ts`, which
+/// strips it. It must never reach the screen.
+export const AUTH_EXPIRED = "headstate:expired-token";

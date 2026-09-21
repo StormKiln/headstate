@@ -1,4 +1,4 @@
-import { NOT_ASKED } from "./notAsked";
+import { AUTH_EXPIRED, NOT_ASKED } from "./notAsked";
 
 /// The kind of a command rejection, as the remote wire now carries it
 /// (#1202).
@@ -13,7 +13,7 @@ import { NOT_ASKED } from "./notAsked";
 /// `mirroredConstants.test.ts` asserts this list equals the `ErrorKind`
 /// variants in `src-tauri/src/remote/error_kind.rs`, in BOTH directions,
 /// so adding a kind on either side alone fails the suite.
-export const ERROR_KINDS = ["not-asked", "other"] as const;
+export const ERROR_KINDS = ["not-asked", "expired-token", "other"] as const;
 
 export type ErrorKind = (typeof ERROR_KINDS)[number];
 
@@ -90,6 +90,19 @@ export function commandError(error: unknown): CommandError {
   const message = error instanceof Error ? error.message : String(error);
   if (message.startsWith(NOT_ASKED)) {
     return { kind: "not-asked", message: message.slice(NOT_ASKED.length).trim() };
+  }
+  // GitHub answered and refused the credential (#1230). Third sentence
+  // after "we did not ask" and "GitHub did not answer", and the only one
+  // of the three whose remedy a retry cannot reach.
+  //
+  // Decided in Rust on `octocrab::Error::GitHub`'s `status_code` and
+  // carried here by the marker, exactly as `NOT_ASKED` is. What this
+  // replaces is `AuthGate.tsx` running
+  // `/401|unauthorized|bad credentials/i` over the banner's prose --
+  // which never matched a real HTTP 401, because octocrab renders that
+  // error as the bare word "GitHub".
+  if (message.startsWith(AUTH_EXPIRED)) {
+    return { kind: "expired-token", message: message.slice(AUTH_EXPIRED.length).trim() };
   }
   return { kind: "other", message };
 }

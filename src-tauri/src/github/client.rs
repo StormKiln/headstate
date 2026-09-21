@@ -50,6 +50,44 @@ pub enum ClientError {
     /// wait rather than implying a network fault the user might chase.
     #[error("GitHub rate limit reached — polling will resume automatically ({0})")]
     RateLimited(String),
+    /// GitHub refused the token: HTTP 401, or a GraphQL body saying so.
+    ///
+    /// # Why this is a variant rather than a message the UI recognises
+    ///
+    /// The token is read once at startup and held for the process
+    /// lifetime, so a revoked or expired one 401s forever with the list
+    /// silently going stale. The remedy is a relaunch, and the banner
+    /// has offered to say so since #1124 -- but it decided WHEN to say
+    /// it by running `/401|unauthorized|bad credentials/i` over the
+    /// prose, because the distinction existed nowhere else (#1230).
+    ///
+    /// That guess was not merely fragile, it was wrong. `ClientError::
+    /// Api`'s `Display` renders octocrab's `Error::GitHub` as the bare
+    /// word "GitHub", so a genuine HTTP 401 reached the screen as
+    /// "GitHub request failed: GitHub" and matched none of the three
+    /// alternatives. The remedy appeared only when GitHub happened to
+    /// word a GraphQL body "Bad credentials" -- the case the pattern
+    /// was least written for.
+    ///
+    /// Deciding it here, on `source.status_code`, is what makes the
+    /// remedy appear for the condition it names.
+    ///
+    /// # Not transient, and not a rate limit
+    ///
+    /// `is_transient` returns false: the next tick sends the same dead
+    /// token and fails identically, so waiting cannot help and the user
+    /// needs to know now. That is the same reasoning `RateLimited`
+    /// already records, and the opposite of a transport blip.
+    ///
+    /// # The marker
+    ///
+    /// `Display` leads with [`crate::commands::AUTH_EXPIRED`] because
+    /// this has to survive `poll-error`, which is a Tauri event
+    /// carrying a bare `String`. The frontend strips it before display,
+    /// so the sentence a user reads is GitHub's own message exactly as
+    /// before. See that constant for why a marker rather than a struct.
+    #[error("{marker} GitHub rejected the token: {said}", marker = crate::commands::AUTH_EXPIRED)]
+    TokenRejected { said: String },
 }
 
 impl ClientError {
@@ -78,6 +116,10 @@ impl ClientError {
             // The next identical request objects identically.
             ClientError::Graphql(_) => false,
             ClientError::RateLimited(_) => false,
+            // A dead token is the least transient thing there is: the
+            // next tick sends the same one. Retrying it quietly is how
+            // the list goes stale for an hour with a green status bar.
+            ClientError::TokenRejected { .. } => false,
             // Same reasoning as a parse failure from octocrab: the
             // server gave up rather than objected, so the next tick may
             // well succeed.
@@ -1317,6 +1359,37 @@ async fn graphql_partial_ok(
         octocrab::Error::Serde { .. } | octocrab::Error::Json { .. } => {
             ClientError::NotJson("non-JSON response".into())
         }
+        // THE point the 401 is first known (#1230). `status_code` is an
+        // `http::StatusCode` on octocrab's own error, so the condition
+        // is read off a typed value rather than out of GitHub's words --
+        // which is the whole difference between this and the regex it
+        // replaces.
+        //
+        // `.as_u16() == 401` rather than `== StatusCode::UNAUTHORIZED`:
+        // octocrab does not re-export `http`, and taking a direct
+        // dependency on it to name one constant would add a version we
+        // then have to keep in step with octocrab's for no gain. The
+        // sibling arm below already reads this same field through
+        // `is_server_error()`.
+        //
+        // It has to be caught here rather than left to `ClientError::
+        // Api`, because `Api`'s `Display` renders this variant as the
+        // bare word "GitHub": the status is thrown away the moment it is
+        // formatted, and every layer above sees "GitHub request failed:
+        // GitHub". That is why the banner's `/401|unauthorized|bad
+        // credentials/i` never fired on a real 401.
+        //
+        // 401 ONLY, deliberately. A 403 is GitHub refusing this
+        // particular request -- a scope the token lacks, an org behind
+        // SAML, secondary rate limiting -- and `gh auth login` plus a
+        // relaunch is not the remedy for any of those. Telling a user
+        // their token expired when it did not is the same class of
+        // mistake as not telling them when it did.
+        octocrab::Error::GitHub { source, .. } if source.status_code.as_u16() == 401 => {
+            ClientError::TokenRejected {
+                said: source.message.clone(),
+            }
+        }
         _ => ClientError::Api(e),
     })?;
 
@@ -1416,6 +1489,22 @@ async fn graphql_partial_ok(
             // user cannot tell from a network problem or a bad token.
             if msg.to_lowercase().contains("rate limit") {
                 return Err(ClientError::RateLimited(msg));
+            }
+            // The OTHER shape a refused token arrives in, and the only
+            // one the old banner regex ever caught: GitHub answers 200
+            // with `data: null` and "Bad credentials" in the errors
+            // array rather than an HTTP 401. Both are the same condition
+            // with the same remedy, so both produce the same variant --
+            // the point of typing it is that the consumer stops caring
+            // which shape it came in.
+            //
+            // This one IS a string test, and it is here rather than in
+            // the UI for the reason `RateLimited` above is: it is the
+            // point the condition is first known, GitHub's body is the
+            // only evidence that exists at this shape, and it is decided
+            // once rather than re-derived at every consumer.
+            if msg.to_lowercase().contains("bad credentials") {
+                return Err(ClientError::TokenRejected { said: msg });
             }
             Err(ClientError::Graphql(if msg.is_empty() {
                 "GraphQL request failed".to_string()
@@ -2250,6 +2339,136 @@ mod tests {
         let err = client_for(&server).await.fetch_prs().await.unwrap_err();
         assert!(matches!(err, ClientError::RateLimited(_)), "got {err:?}");
         assert!(err.to_string().contains("resume automatically"));
+    }
+
+    /// An HTTP 401 is the condition the relaunch remedy names, and it
+    /// must be recognised from the STATUS rather than from the words
+    /// (#1230).
+    ///
+    /// This is the case the deleted regex existed for and could not
+    /// see: `ClientError::Api` renders octocrab's `Error::GitHub` as the
+    /// bare word "GitHub", so this response reached the banner as
+    /// "GitHub request failed: GitHub" and
+    /// `/401|unauthorized|bad credentials/i` matched none of it. The
+    /// remedy never appeared for a real expired token.
+    ///
+    /// Asserted through the real client against a real 401 response, so
+    /// what it proves is the path -- octocrab's error shape, the arm
+    /// that reads `status_code`, and the marker on the way out -- and
+    /// not a hand-built error value that could agree with a broken arm.
+    #[tokio::test]
+    async fn a_401_is_a_rejected_token_read_off_the_status_not_the_prose() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "message": "Bad credentials",
+                "documentation_url": "https://docs.github.com/graphql"
+            })))
+            .mount(&server)
+            .await;
+
+        let err = client_for(&server).await.fetch_prs().await.unwrap_err();
+        assert!(
+            matches!(err, ClientError::TokenRejected { .. }),
+            "a 401 must be a rejected token, got {err:?}"
+        );
+        // The marker, because `poll-error` carries a bare string and it
+        // is the only thing that crosses.
+        assert!(
+            err.to_string().starts_with(crate::commands::AUTH_EXPIRED),
+            "the marker must lead the message: {err}"
+        );
+        // Not transient, which is what makes `poll::should_surface`
+        // raise the banner on the FIRST failure rather than waiting for
+        // a second opinion. Waiting is wrong here: the next tick sends
+        // the same dead token.
+        assert!(!err.is_transient());
+    }
+
+    /// GitHub answering 200 with "Bad credentials" in the body is the
+    /// same condition in the other shape, and must produce the same
+    /// variant.
+    ///
+    /// This is the ONLY shape the deleted regex ever caught, so it is
+    /// the one that must not regress.
+    #[tokio::test]
+    async fn bad_credentials_in_a_graphql_body_is_the_same_rejected_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": null,
+                "errors": [{ "message": "Bad credentials" }]
+            })))
+            .mount(&server)
+            .await;
+
+        let err = client_for(&server).await.fetch_prs().await.unwrap_err();
+        assert!(
+            matches!(err, ClientError::TokenRejected { .. }),
+            "got {err:?}"
+        );
+        assert!(err.to_string().starts_with(crate::commands::AUTH_EXPIRED));
+    }
+
+    /// A 403 is NOT an expired token, and must not offer its remedy.
+    ///
+    /// The half that costs a wrong answer rather than a missing one.
+    /// GitHub returns 403 for a scope the token lacks, an organisation
+    /// behind SAML, and secondary rate limiting -- none of which
+    /// `gh auth login` and a relaunch fixes. Telling a user their token
+    /// expired when it did not sends them to re-authenticate against a
+    /// problem that will still be there afterwards.
+    ///
+    /// Paired with the 401 test deliberately: an arm written
+    /// `is_client_error()` instead of `== 401` passes that one and fails
+    /// this one, and nothing else in the suite would notice.
+    #[tokio::test]
+    async fn a_403_is_not_a_rejected_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+                "message": "Resource protected by organization SAML enforcement."
+            })))
+            .mount(&server)
+            .await;
+
+        let err = client_for(&server).await.fetch_prs().await.unwrap_err();
+        assert!(
+            !matches!(err, ClientError::TokenRejected { .. }),
+            "a 403 must not claim the token expired, got {err:?}"
+        );
+        assert!(
+            !err.to_string().contains(crate::commands::AUTH_EXPIRED),
+            "the marker must not be on a 403: {err}"
+        );
+    }
+
+    /// A 5xx is not a rejected token either, and stays transient.
+    ///
+    /// `server_gave_up` and `is_transient` both already depend on the
+    /// 5xx arm of this same match; a new arm placed above them that
+    /// swallowed server errors would turn every 502 into a permanent
+    /// "your token expired" banner.
+    #[tokio::test]
+    async fn a_502_is_still_a_transient_server_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(502).set_body_json(json!({
+                "message": "Bad gateway"
+            })))
+            .mount(&server)
+            .await;
+
+        let err = client_for(&server).await.fetch_prs().await.unwrap_err();
+        assert!(
+            !matches!(err, ClientError::TokenRejected { .. }),
+            "got {err:?}"
+        );
+        assert!(err.is_transient(), "a 502 must stay transient: {err:?}");
     }
 
     /// A mutation that GitHub refuses must NOT report success.

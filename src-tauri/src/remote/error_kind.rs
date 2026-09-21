@@ -21,7 +21,17 @@
 //! This is the last regex. It lives in one place, next to the constant
 //! it matches, in the crate that defines it.
 //!
-//! # Two kinds, not three
+//! # Which kinds are here
+//!
+//! `NotAsked` and `ExpiredToken` are the two conditions with a remedy
+//! that a retry cannot reach, and `Other` is everything else.
+//!
+//! `ExpiredToken` was added by #1230, which is the case this enum did
+//! not cover and no type on either side did: `AuthError` in `auth.rs`
+//! distinguishes "gh is missing", "gh is not logged in", "gh would not
+//! run" and "the client would not build" -- every way of never GETTING
+//! a token -- and has no variant for one that was valid and has since
+//! been refused. So the UI guessed it back out of the banner's prose.
 //!
 //! `Cancelled` is deliberately absent. `headstate:cancelled` is
 //! produced by `src-mobile`'s OWN commands (`companion.rs`), a
@@ -53,6 +63,24 @@ pub enum ErrorKind {
     /// retry a failure banner offers cannot work. Nothing about
     /// pressing "Try again" makes a token appear.
     NotAsked,
+    /// GitHub refused the token we sent (#1230).
+    ///
+    /// The opposite end of `NotAsked` and a third sentence again: "we
+    /// did not ask", "GitHub did not answer", and "GitHub answered, and
+    /// said no to the credential". Only the last has a remedy, and it
+    /// is one a retry cannot reach -- the token is read once at startup
+    /// and held for the process lifetime, so the fix is `gh auth login`
+    /// and a relaunch.
+    ///
+    /// Decided in `github::client` on `octocrab::Error::GitHub`'s
+    /// `status_code`, and carried here by
+    /// [`crate::commands::AUTH_EXPIRED`]. Before #1230 this distinction
+    /// was typed on NEITHER side: `AuthError` has no variant meaning
+    /// "the token was valid and has now expired", so `AuthGate.tsx` ran
+    /// `/401|unauthorized|bad credentials/i` over the banner's prose to
+    /// recover it -- and got it wrong, because a real 401's `Display`
+    /// is "GitHub request failed: GitHub".
+    ExpiredToken,
     /// Anything else. The message carries the detail, as it always has.
     Other,
 }
@@ -84,6 +112,11 @@ impl CommandError {
         let message = message.into();
         let kind = if message.starts_with(crate::commands::NOT_ASKED) {
             ErrorKind::NotAsked
+        } else if message.starts_with(crate::commands::AUTH_EXPIRED) {
+            // Same prefix rule as `NOT_ASKED` above, for the same
+            // reason: a message that merely QUOTES the marker later on
+            // is prose about a rejection, not one.
+            ErrorKind::ExpiredToken
         } else {
             ErrorKind::Other
         };

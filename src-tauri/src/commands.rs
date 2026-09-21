@@ -81,6 +81,57 @@ pub const AUTH_ERR_TEXT: &str = "not authenticated: run `gh auth login`";
 /// to a reader to check.
 pub const AUTH_ERR: &str = "headstate:not-asked not authenticated: run `gh auth login`";
 
+/// The marker a failure carries when GitHub REJECTED the token we sent,
+/// as opposed to never being asked for one at all (#1230).
+///
+/// # What it marks, and where that is decided
+///
+/// It is prepended by [`crate::github::client`] when a request comes
+/// back `401 Unauthorized`, or when GraphQL answers "Bad credentials" in
+/// a body. The decision is made on a TYPED value at the point the
+/// condition is first known -- `octocrab::Error::GitHub`'s `status_code`
+/// is an `http::StatusCode`, and the arm tests it for 401. Nothing reads
+/// English to reach that decision.
+///
+/// # Why a marker rather than a struct on the wire
+///
+/// Exactly `NOT_ASKED`'s reason, and established by measurement rather
+/// than assumed: #1230's tier-2 work read all three transports and
+/// found that the `{kind, message}` object #1202 put on the remote wire
+/// reaches the webview on NEITHER. The desktop's `poll-error` is a
+/// Tauri event carrying a bare `String`; the phone's `remote_call` is
+/// `Result<Value, String>`, and the companion's proxy reads `message`
+/// and drops `kind` one process early. A marker embedded in the prose
+/// is the only classification this codebase has that crosses, which is
+/// why `NOT_ASKED` was never superseded.
+///
+/// The kind is still the type: [`crate::remote::error_kind::ErrorKind`]
+/// gains `ExpiredToken`, asserted against the TypeScript union in both
+/// directions by `mirroredConstants.test.ts`. This constant is only its
+/// transport.
+///
+/// # Why this is not the old regex moved across the boundary
+///
+/// A marker is a fixed string this crate emits and matches as a prefix
+/// against its own constant. The regex it replaces --
+/// `/401|unauthorized|bad credentials/i` run over the banner's prose in
+/// `AuthGate.tsx` -- was English matched against a pattern that hoped
+/// GitHub kept wording things the same way, and it was already wrong:
+/// octocrab's `Display` for `Error::GitHub` is the bare word "GitHub",
+/// so a real HTTP 401 reached the banner as "GitHub request failed:
+/// GitHub" and the regex did not match it. The remedy never appeared
+/// for the case it was written for; it fired only when GitHub happened
+/// to put "Bad credentials" in a GraphQL body. Deciding on the status
+/// code fixes that as a consequence of typing it, which is the argument
+/// for typing it.
+///
+/// # Prefix, not a replacement
+///
+/// The marker is prepended to whatever the error already said and
+/// stripped before display, so the sentence the user reads is
+/// unchanged. Only how the remedy is DECIDED changed.
+pub const AUTH_EXPIRED: &str = "headstate:expired-token";
+
 /// Bound the history window.
 ///
 /// The UI only offers 7/14/30, but a Tauri command is a public surface: an

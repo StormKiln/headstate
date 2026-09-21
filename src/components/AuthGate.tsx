@@ -187,8 +187,28 @@ export function AuthGate({ children }: { children: ReactNode }) {
                 lifetime, so a revoked or expired one 401s forever with the
                 list silently going stale. A relaunch is the actual fix;
                 saying so beats an opaque message the user cannot act on.
-                Refreshing the token in-process is tracked separately. */}
-            {/401|unauthorized|bad credentials/i.test(pollError) ? (
+                Refreshing the token in-process is tracked separately.
+
+                Branches on a KIND (#1230). This read
+                `/401|unauthorized|bad credentials/i` over the banner's
+                prose, which is the last of the three guesses #1202
+                named -- and unlike the other two it had no type to stop
+                guessing at: `AuthError` in `auth.rs` covers every way of
+                never GETTING a token and has no variant for one that was
+                valid and has since been refused. So the variant came
+                first, at the point the condition is known.
+
+                It was also wrong, which is the argument for typing it
+                rather than tidying it. `ClientError::Api` renders
+                octocrab's `Error::GitHub` as the bare word "GitHub", so
+                a real HTTP 401 reached this line as "GitHub request
+                failed: GitHub" and matched none of the three
+                alternatives. The remedy never appeared for the case it
+                was written for; it fired only when GitHub happened to
+                word a GraphQL body "Bad credentials".
+                `github::client` now decides on `status_code` and both
+                shapes arrive as one kind. */}
+            {pollErr.kind === "expired-token" ? (
               <span className="ml-1">
                 Your GitHub token may have expired — run <code>gh auth login</code> and
                 restart Headstate.

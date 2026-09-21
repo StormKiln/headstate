@@ -4,7 +4,7 @@ import { emit } from "@tauri-apps/api/event";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import { afterEach, describe, expect, it } from "vitest";
 import { AuthGate } from "./AuthGate";
-import { NOT_ASKED } from "@/lib/notAsked";
+import { AUTH_EXPIRED, NOT_ASKED } from "@/lib/notAsked";
 
 afterEach(() => {
   // See src/api/hooks.test.tsx: unmount before clearing the mocked Tauri
@@ -99,6 +99,87 @@ describe("AuthGate", () => {
     // The marker is a wire detail. `cancelled.ts` exists because one
     // reached a user's screen.
     expect(screen.queryByText(new RegExp(NOT_ASKED))).toBeNull();
+  });
+
+  /// A refused token renders the relaunch remedy, decided by KIND
+  /// rather than by a regex over the prose (#1230).
+  ///
+  /// The message here is what `ClientError::TokenRejected` actually
+  /// formats for a real HTTP 401 -- the marker, then GitHub's own words
+  /// -- put on the same Tauri event the Rust side emits it on, so this
+  /// exercises the whole path: status read in `github::client`, marker
+  /// prepended by `Display`, carried by an event channel that has no
+  /// typed field, stripped and classified once by `commandError`, and
+  /// branched on here.
+  ///
+  /// Note what the OLD regex would have made of this string. It ran
+  /// `/401|unauthorized|bad credentials/i` over the raw prose, and a
+  /// genuine 401 reaches this banner as "GitHub request failed: GitHub"
+  /// because octocrab renders that error as the bare word "GitHub" --
+  /// none of the three alternatives is in it. The remedy did not
+  /// appear for the condition it was written for.
+  it("offers the relaunch remedy for a refused token", async () => {
+    renderGated({ ok: true, message: "" });
+    await screen.findByText("protected content");
+
+    await emit("poll-error", `${AUTH_EXPIRED} GitHub rejected the token: Bad credentials`);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Your GitHub token may have expired/)).toBeTruthy();
+    });
+    // The prose is unchanged from before the kind existed: only how it
+    // is decided changed.
+    expect(screen.getByText(/run/)).toBeTruthy();
+    expect(
+      screen.getByText((_, el) => el?.tagName === "CODE" && el.textContent === "gh auth login"),
+    ).toBeTruthy();
+    // Still a failure, so still red and still an alert -- a dead token
+    // is not the "we never asked" case.
+    expect(screen.getByRole("alert")).toBeTruthy();
+    // GitHub's own words survive beside the remedy.
+    expect(screen.getByText(/GitHub rejected the token: Bad credentials/)).toBeTruthy();
+    // The marker is a wire detail and must never reach the screen.
+    expect(screen.queryByText(new RegExp(AUTH_EXPIRED))).toBeNull();
+  });
+
+  /// The half that costs a WRONG answer rather than a missing one: a
+  /// failure that is not a refused token must not offer the remedy.
+  ///
+  /// The message is chosen to be the one the old regex got right by
+  /// accident and a naive classifier would get wrong -- it contains
+  /// "401" as part of GitHub's prose without being a refused token. A
+  /// classifier that still reads the words, on either side of the
+  /// boundary, fails here; one that reads the kind does not. That is
+  /// the difference between typing the distinction and moving the regex
+  /// across the boundary.
+  it("does not offer the relaunch remedy for an ordinary failure", async () => {
+    renderGated({ ok: true, message: "" });
+    await screen.findByText("protected content");
+
+    await emit("poll-error", "GitHub could not answer (it returned a 401 rather than data)");
+
+    await waitFor(() => {
+      expect(screen.getByText(/Background refresh failed/)).toBeTruthy();
+    });
+    expect(screen.queryByText(/Your GitHub token may have expired/)).toBeNull();
+  });
+
+  /// And a declined poll is neither. Three conditions, three sentences:
+  /// asserted together so a classifier that collapses any two of them
+  /// fails here rather than in whichever one happens to be tested next.
+  it("keeps a declined poll distinct from a refused token", async () => {
+    renderGated({ ok: true, message: "" });
+    await screen.findByText("protected content");
+
+    await emit("poll-error", `${NOT_ASKED} not authenticated: run \`gh auth login\``);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Not refreshing in the background/)).toBeTruthy();
+    });
+    // "we did not ask" is not "GitHub refused the credential", even
+    // though both end at `gh auth login`: one has a token that GitHub
+    // rejected and one has no token at all.
+    expect(screen.queryByText(/Your GitHub token may have expired/)).toBeNull();
   });
 
   /// And the other direction, which is the half that costs a remedy: an
