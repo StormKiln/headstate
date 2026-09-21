@@ -62,6 +62,7 @@
 //! text for an agent, and its last line is the read-only policy.
 
 pub mod brief;
+pub mod gaps;
 pub mod imports;
 pub mod toolchain;
 pub mod transcripts;
@@ -96,11 +97,19 @@ pub enum Check {
     /// corrected command, a user correction, a denial, a repeated search
     /// or error -- and whether a CLAUDE.md on the path already states it.
     Transcripts,
+    /// A directory with a toolchain, tests or role of its own and no
+    /// CLAUDE.md between it and the root.
+    Gaps,
 }
 
 impl Check {
     /// Every check, in the order a report lists them.
-    pub const ALL: &'static [Check] = &[Check::Imports, Check::Toolchain, Check::Transcripts];
+    pub const ALL: &'static [Check] = &[
+        Check::Imports,
+        Check::Toolchain,
+        Check::Transcripts,
+        Check::Gaps,
+    ];
 
     /// The check's name as the brief prints it.
     pub fn name(self) -> &'static str {
@@ -108,6 +117,7 @@ impl Check {
             Check::Imports => "imports",
             Check::Toolchain => "toolchain",
             Check::Transcripts => "transcripts",
+            Check::Gaps => "gaps",
         }
     }
 }
@@ -340,6 +350,7 @@ pub static PRODUCERS: &[&dyn Producer] = &[
     &imports::Imports,
     &toolchain::Coverage,
     &transcripts::Transcripts,
+    &gaps::Gaps,
 ];
 
 /// Run every registered producer and assemble the report.

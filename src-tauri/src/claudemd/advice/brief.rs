@@ -116,7 +116,49 @@ fn suggestion(f: &Finding) -> String {
                 subject.path()
             ),
         },
+        Check::Gaps => gaps_suggestion(f),
     }
+}
+
+/// The gaps producer's suggestion, by the shape of its finding.
+///
+/// Four shapes, told apart by what `gaps.rs` writes into the finding and
+/// pinned there by `the_brief_suggestion_follows_the_finding_shape`: an
+/// Unknown is a directory that could not be listed; a sentence opening
+/// with a count is a group whose members the evidence lists; "role name
+/// only" is a weak candidate; anything else is one strong directory. A
+/// helper rather than a nested `match` because the wildcard guard in
+/// `invariants.rs` reads every arm between the `Check` match's braces.
+fn gaps_suggestion(f: &Finding) -> String {
+    let dir = f.subject.path();
+    if f.severity == Severity::Unknown {
+        return format!(
+            "Make `{dir}` listable, or add it to the CLAUDE.md walk's skip list if it holds no \
+             source, then run the advice again. Nothing under it has been assessed."
+        );
+    }
+    let grouped = f.finding.chars().next().is_some_and(|c| c.is_ascii_digit());
+    if grouped {
+        return format!(
+            "Add `{dir}/CLAUDE.md` covering the conventions shared by the members the evidence \
+             lists: how they are built and tested, what they are for and which side depends \
+             on them, and the rules from the root file that apply here with a different \
+             twist. Keep it to what is true only here; a per-member file is for a member that \
+             carried a signal of its own."
+        );
+    }
+    if f.finding.contains("role name only") {
+        return format!(
+            "Add `{dir}/CLAUDE.md` only if a convention is true only here: what the directory \
+             is for, and any rule from the root file that applies here with a different \
+             twist. A role name alone is not a gap, so leave it if there is nothing to say."
+        );
+    }
+    format!(
+        "Add `{dir}/CLAUDE.md` covering: how it is built and tested on its own (the evidence \
+         lists what it has); what it is for and which side depends on it; the rules from the \
+         root file that apply here with a different twist. Keep it to what is true only here."
+    )
 }
 
 /// The combined document for a report.
@@ -221,6 +263,25 @@ mod tests {
                 }],
                 "`yarn lint` failed and `make lint` followed it in 2 sessions under \
                  `/home/octocat/hello-world/src-tauri`"
+                    .into(),
+            ),
+            Check::Gaps => Finding::new(
+                Check::Gaps,
+                Severity::Advice,
+                Subject::Directory {
+                    path: "/home/octocat/hello-world/crates/octocat-core".into(),
+                },
+                vec![Evidence {
+                    at: Locator::File {
+                        path: "/home/octocat/hello-world/crates/octocat-core".into(),
+                        line: None,
+                    },
+                    measured:
+                        "own `Cargo.toml`, `Cargo.lock`; no CLAUDE.md between it and the root"
+                            .into(),
+                }],
+                "`crates/octocat-core/` has own `Cargo.toml`, `Cargo.lock` and no CLAUDE.md \
+                 between it and the root"
                     .into(),
             ),
         }

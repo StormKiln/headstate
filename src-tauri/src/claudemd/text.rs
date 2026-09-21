@@ -22,6 +22,8 @@
 //! line. `Section::line` is the heading's line; the preamble before the
 //! first heading is a section at line 1 with no heading.
 
+use std::path::Path;
+
 /// One section: a heading and the text under it, up to the next heading.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Section {
@@ -294,6 +296,136 @@ pub fn prose_lines(text: &str) -> Vec<(usize, &str)> {
         .filter(|(_, _, kind)| *kind == Kind::Prose)
         .map(|(n, line, _)| (n, line))
         .collect()
+}
+
+/// The headings that name a directory, with their lines.
+///
+/// Owned by the gaps producer (missing subdirectory CLAUDE.md), which
+/// SUPPRESSES a finding on a hit: a parent file with a `## crates`
+/// section already has a place for that directory's rules. The
+/// placement producer (content in the wrong file) judges whether such a
+/// section belongs in the parent, and reads through this same helper
+/// rather than matching headings a second way.
+///
+/// A heading names `dir` when one of its whitespace-separated words,
+/// with the backticks and punctuation prose wraps it in stripped and a
+/// trailing `/` dropped, is exactly `dir`. `## packages`,
+/// ``## The `packages/` directory`` and `## packages:` all name
+/// `packages`; `## packaging` and `## packages/octocat-a` do not. `dir`
+/// is a path relative to the file's own directory, so
+/// `crates/headstate-stepup` matches a heading that writes the whole
+/// path and not one that writes `crates` -- naming an ancestor is the
+/// caller's separate question.
+pub fn sections_naming(text: &str, dir: &str) -> Vec<(String, usize)> {
+    let dir = dir.trim_end_matches('/');
+    sections(text)
+        .into_iter()
+        .filter_map(|s| {
+            let heading = s.heading?;
+            heading
+                .split_whitespace()
+                .any(|w| strip_word(w) == dir)
+                .then_some((heading, s.line))
+        })
+        .collect()
+}
+
+/// The path-shaped words in prose that name a directory or something
+/// under it, with their lines.
+///
+/// The gaps producer's other half: a hit DOWNGRADES rather than
+/// suppresses, because a parent file that writes `docs/mobile-*.md` has
+/// referred to the directory without giving it a section. Prose lines
+/// only, so a path inside a fenced command is not a reference, and
+/// `Path::starts_with` for the prefix test, so `docs-old/x` does not
+/// name `docs`. A leading `./` is dropped first.
+pub fn paths_naming(text: &str, dir: &str) -> Vec<(String, usize)> {
+    let dir = Path::new(dir.trim_end_matches('/'));
+    let mut out = Vec::new();
+    for (n, line) in prose_lines(text) {
+        for word in line.split_whitespace() {
+            let word = strip_word(word);
+            let word = word.strip_prefix("./").unwrap_or(word);
+            if !word.is_empty() && Path::new(word).starts_with(dir) {
+                out.push((word.to_string(), n));
+            }
+        }
+    }
+    out
+}
+
+/// A word with the backticks and punctuation prose wraps it in stripped,
+/// and a trailing `/` dropped. A leading `.` is kept: `.github` is a
+/// name, not punctuation.
+fn strip_word(word: &str) -> &str {
+    word.trim_start_matches(['`', '*', '_', '(', '"', '\'', '['])
+        .trim_end_matches(['`', '*', '_', ')', ',', '.', ':', ';', '"', '\'', ']'])
+        .trim_end_matches('/')
+}
+
+#[cfg(test)]
+mod naming_tests {
+    use super::*;
+
+    const ROOT: &str = "\
+# Headstate
+
+Anything narrower lives in that directory's own `CLAUDE.md`.
+See `docs/mobile-pairing-walkthrough.md` and (`./scripts/release.sh`).
+
+## packages
+
+Shared by every member.
+
+## The `crates/` directory:
+
+```bash
+cat docs/README.md
+```
+";
+
+    /// A heading names a directory by an exact word, whatever wraps it.
+    #[test]
+    fn a_heading_naming_the_directory_is_found_with_its_line() {
+        assert_eq!(
+            sections_naming(ROOT, "packages"),
+            vec![("packages".to_string(), 6)]
+        );
+        assert_eq!(
+            sections_naming(ROOT, "crates/"),
+            vec![("The `crates/` directory:".to_string(), 10)]
+        );
+    }
+
+    /// `## packages` names `packages`, not `packages/octocat-a`, and not
+    /// `packaging`: an ancestor or a prefix is the caller's question.
+    #[test]
+    fn a_heading_names_only_the_exact_directory() {
+        assert!(sections_naming(ROOT, "packages/octocat-a").is_empty());
+        assert!(sections_naming(ROOT, "packag").is_empty());
+        assert!(sections_naming("## packaging\n", "packages").is_empty());
+    }
+
+    /// A path in prose references the directory it starts in, with the
+    /// line; one in a fence does not, and a prefix of the name is not a
+    /// component match.
+    #[test]
+    fn a_path_reference_is_found_outside_fences_by_component() {
+        assert_eq!(
+            paths_naming(ROOT, "docs"),
+            vec![("docs/mobile-pairing-walkthrough.md".to_string(), 4)]
+        );
+        assert_eq!(
+            paths_naming(ROOT, "scripts"),
+            vec![("scripts/release.sh".to_string(), 4)],
+            "a leading ./ and wrapping parentheses are stripped"
+        );
+        assert!(
+            paths_naming("see docs-old/x.md\n", "docs").is_empty(),
+            "`docs-old` is not under `docs`"
+        );
+        assert!(paths_naming("`.github/workflows/ci.yml`\n", ".github/workflows").len() == 1);
+    }
 }
 
 #[cfg(test)]

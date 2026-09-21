@@ -237,7 +237,11 @@ fn manifests(project: &Path, root: &toml::Value, scan: &mut FileScan) -> Vec<Pat
 }
 
 /// The `members` list from a `[workspace]` table.
-fn members(root: &toml::Value) -> Vec<String> {
+///
+/// `pub(crate)` for `claudemd::scan_repo`, which records workspace
+/// membership per directory as it walks; a second `[workspace]` reader
+/// there would be the one that drifts.
+pub(crate) fn members(root: &toml::Value) -> Vec<String> {
     root.get("workspace")
         .and_then(|w| w.get("members"))
         .and_then(|m| m.as_array())
@@ -257,7 +261,7 @@ fn members(root: &toml::Value) -> Vec<String> {
 /// as a literal path, which simply will not exist and is therefore
 /// dropped rather than mis-expanded. Reporting a subset beats inventing
 /// directories.
-fn expand_member(project: &Path, member: &str, scan: &mut FileScan) -> Vec<PathBuf> {
+pub(crate) fn expand_member(project: &Path, member: &str, scan: &mut FileScan) -> Vec<PathBuf> {
     let Some((prefix, last)) = member.rsplit_once('/') else {
         // No slash: either a plain directory name or a bare `*`.
         return expand_segment(project, member, scan);
@@ -795,7 +799,7 @@ pub fn parse_index(body: &str) -> Vec<IndexVersion> {
 /// and malformed into one `None`, and only the first of those is an
 /// ordinary answer -- so a caller given `None` had no way to tell "this is
 /// not a Cargo project" from "we could not look".
-enum ManifestError {
+pub(crate) enum ManifestError {
     /// No such file. An ordinary answer, not a failure.
     Absent,
     /// It exists and cannot be used: a permission wall, or a syntax error
@@ -805,7 +809,7 @@ enum ManifestError {
 }
 
 /// Read and parse one manifest, saying WHY when it cannot.
-fn read_manifest_reporting(path: &Path) -> Result<toml::Value, ManifestError> {
+pub(crate) fn read_manifest_reporting(path: &Path) -> Result<toml::Value, ManifestError> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(ManifestError::Absent),
