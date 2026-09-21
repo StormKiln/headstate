@@ -320,89 +320,94 @@ pub fn scan_effective_opt(repo: &Path, home: Option<&Path>) -> EffectiveScan {
     }
 }
 
+/// Directories the CLAUDE.md walk never enters. Shared with
+/// `advice::rot`, whose suffix search over the tree must skip exactly
+/// what this walk skips, or a path the walk cannot see would resolve.
+///
+/// WORKTREES are the important entries here.
+///
+/// Every worktree is a checkout of the same repository, so each holds
+/// its own copy of the same CLAUDE.md. Measured on a real repo: 11
+/// files found, 10 of them inside worktree directories, 3 distinct
+/// contents. The view was showing one file eleven times.
+///
+/// A worktree's copy CAN differ, and on a branch that edits it that
+/// difference is real -- but near-duplicates at that ratio make the
+/// view unusable for the question it answers, and the checkout's own
+/// file is the one being asked about.
+///
+/// # Why this list is longer than it was (#1236)
+///
+/// The config health sweep cost 4.7 s over 39 repositories and 99.8%
+/// of it was this walk. Measured, the walk listed **22,265
+/// directories to find 42 CLAUDE.md files**, and the directories were
+/// overwhelmingly dependency and build output that this list simply
+/// did not happen to name:
+///
+/// ```text
+/// .venv        6953 dirs      Pods          4796 dirs
+/// __pycache__  1797 dirs      .mypy_cache    364 dirs
+/// ```
+///
+/// Naming them is not a new policy. It is the SAME policy as
+/// `node_modules` and `target` -- a directory that holds installed or
+/// generated artifacts rather than a project's own instructions --
+/// applied to the ecosystems that were missed. Python, CocoaPods and
+/// the JS metaframework caches were the gaps.
+///
+/// # This is lossless, and that is the point
+///
+/// Verified against this machine's real `~/code`: the extended list
+/// finds **all 42 files while listing 9,682 directories instead of
+/// 22,265** -- 57% fewer, zero files lost.
+///
+/// That property is what makes this the right fix rather than a
+/// depth limit. A bounded walk was measured first and rejected: no
+/// depth reached full coverage (four repositories were still
+/// truncated at depth 12), so every workable bound turned most
+/// repositories into `Verdict::Unknown` -- trading a slow honest
+/// answer for a fast non-answer. Skipping a directory that provably
+/// holds no instructions costs no coverage at all, so nothing
+/// downstream has to be re-labelled unknown.
+///
+/// `vendor` is deliberately ABSENT despite saving 33 directories: a
+/// real `vendor/CLAUDE.md` exists on this machine. A vendored tree is
+/// checked-in source someone may well document, unlike the entries
+/// above, which are all reproducible from a lockfile.
+pub(crate) const SKIP: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    ".terraform",
+    "dist",
+    "build",
+    ".worktrees",
+    "worktrees",
+    // Python: virtualenvs and tool caches.
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    // Swift/iOS: CocoaPods installs and Xcode build output.
+    "Pods",
+    "DerivedData",
+    // JS/TS metaframework and toolchain caches. `node_modules` was
+    // already here; these sit BESIDE it rather than inside it.
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".turbo",
+    ".parcel-cache",
+    ".nx",
+    ".yarn",
+    ".gradle",
+    ".cache",
+];
+
 pub fn scan_repo(repo: &Path) -> Scan {
-    // WORKTREES are the important entries here.
-    //
-    // Every worktree is a checkout of the same repository, so each holds
-    // its own copy of the same CLAUDE.md. Measured on a real repo: 11
-    // files found, 10 of them inside worktree directories, 3 distinct
-    // contents. The view was showing one file eleven times.
-    //
-    // A worktree's copy CAN differ, and on a branch that edits it that
-    // difference is real -- but near-duplicates at that ratio make the
-    // view unusable for the question it answers, and the checkout's own
-    // file is the one being asked about.
-    //
-    // # Why this list is longer than it was (#1236)
-    //
-    // The config health sweep cost 4.7 s over 39 repositories and 99.8%
-    // of it was this walk. Measured, the walk listed **22,265
-    // directories to find 42 CLAUDE.md files**, and the directories were
-    // overwhelmingly dependency and build output that this list simply
-    // did not happen to name:
-    //
-    // ```text
-    // .venv        6953 dirs      Pods          4796 dirs
-    // __pycache__  1797 dirs      .mypy_cache    364 dirs
-    // ```
-    //
-    // Naming them is not a new policy. It is the SAME policy as
-    // `node_modules` and `target` -- a directory that holds installed or
-    // generated artifacts rather than a project's own instructions --
-    // applied to the ecosystems that were missed. Python, CocoaPods and
-    // the JS metaframework caches were the gaps.
-    //
-    // # This is lossless, and that is the point
-    //
-    // Verified against this machine's real `~/code`: the extended list
-    // finds **all 42 files while listing 9,682 directories instead of
-    // 22,265** -- 57% fewer, zero files lost.
-    //
-    // That property is what makes this the right fix rather than a
-    // depth limit. A bounded walk was measured first and rejected: no
-    // depth reached full coverage (four repositories were still
-    // truncated at depth 12), so every workable bound turned most
-    // repositories into `Verdict::Unknown` -- trading a slow honest
-    // answer for a fast non-answer. Skipping a directory that provably
-    // holds no instructions costs no coverage at all, so nothing
-    // downstream has to be re-labelled unknown.
-    //
-    // `vendor` is deliberately ABSENT despite saving 33 directories: a
-    // real `vendor/CLAUDE.md` exists on this machine. A vendored tree is
-    // checked-in source someone may well document, unlike the entries
-    // above, which are all reproducible from a lockfile.
-    const SKIP: &[&str] = &[
-        ".git",
-        "node_modules",
-        "target",
-        ".terraform",
-        "dist",
-        "build",
-        ".worktrees",
-        "worktrees",
-        // Python: virtualenvs and tool caches.
-        ".venv",
-        "venv",
-        "__pycache__",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".ruff_cache",
-        ".tox",
-        // Swift/iOS: CocoaPods installs and Xcode build output.
-        "Pods",
-        "DerivedData",
-        // JS/TS metaframework and toolchain caches. `node_modules` was
-        // already here; these sit BESIDE it rather than inside it.
-        ".next",
-        ".nuxt",
-        ".svelte-kit",
-        ".turbo",
-        ".parcel-cache",
-        ".nx",
-        ".yarn",
-        ".gradle",
-        ".cache",
-    ];
     let mut scan = Scan::default();
     let mut stack = vec![repo.to_path_buf()];
     // Member directory -> the manifest that lists it. Filled when a

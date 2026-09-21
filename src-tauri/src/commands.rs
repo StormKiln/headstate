@@ -1817,30 +1817,62 @@ pub async fn claude_md_effective(
 /// the command stays `Class::Read`. A store that cannot be opened is not
 /// a rejection: `conn` is `None`, that one producer reports itself
 /// Unknown, and the producers that need no store still answer (#1044).
-/// The whole run sits on ONE `spawn_blocking`, because the transcript
-/// pass is a whole-body read of every session under the repository and
-/// must never run on the async runtime or on the live pass (#1246).
+///
+/// The definitions inventory is built the way `claude_definitions`
+/// builds it -- user root, this repository's `.claude`, installed
+/// plugins -- so a skill a CLAUDE.md names is checked against every
+/// scope Claude Code would load it from. Each root that could not be
+/// resolved is a `ScopeRefusal` in the inventory rather than a reason
+/// to drop the whole thing: the rot producer reads those refusals and
+/// reports a skill it cannot find as Unknown, not missing.
+///
+/// The scan, the inventory and the store are each built ONCE here and
+/// every producer sees the same three; `advice::report_in` exists for
+/// the store-less callers (tests, and a run over a bare checkout). The
+/// whole run sits on ONE `spawn_blocking`, because the transcript pass
+/// is a whole-body read of every session under the repository and must
+/// never run on the async runtime or on the live pass (#1246).
 #[tauri::command]
 pub async fn claude_md_advice(
     app: AppHandle,
     repo_path: String,
 ) -> Result<crate::claudemd::advice::Report, String> {
+    use crate::claude::definitions as defs;
     let db = db_path(&app);
     tauri::async_runtime::spawn_blocking(move || {
         let repo = std::path::PathBuf::from(&repo_path);
         let home = crate::claudemd::home();
+        // The definitions inventory, built once here for every producer
+        // that reads it: the user root, THIS repository's `.claude` and
+        // every installed plugin, the roots `claude_definitions` walks
+        // minus the other repositories. A plugin list that could not be
+        // read is a refusal inside the inventory, as it is there.
+        let user = defs::user_root();
+        let (plugins, plugin_refusal) = installed_plugin_roots();
+        let roots = defs::roots(user.clone(), std::slice::from_ref(&repo), &plugins);
+        let mut inv = defs::scan_scopes(&roots);
+        if user.is_none() {
+            inv.unreadable.push(defs::ScopeRefusal {
+                source: defs::Source::User,
+                detail: "~/.claude: no home directory is set".to_string(),
+            });
+        }
+        if let Some(detail) = plugin_refusal {
+            inv.unreadable.push(defs::ScopeRefusal {
+                source: defs::Source::Plugin {
+                    name: String::new(),
+                    path: String::new(),
+                },
+                detail,
+            });
+        }
         let conn = open_db(&db).ok();
-        // The `Context` is built here rather than through
-        // `advice::report_in`, which exists for the store-less callers
-        // (tests, and any producer run over a bare checkout): the scan
-        // happens once, the store is opened once, and every producer
-        // sees the same two.
         let scan = crate::claudemd::scan_effective_opt(&repo, home.as_deref());
         let cx = crate::claudemd::advice::Context {
             repo: &repo,
             home: home.as_deref(),
             scan: &scan,
-            definitions: None,
+            definitions: Some(&inv),
             conn: conn.as_ref(),
         };
         crate::claudemd::advice::run(&cx)
