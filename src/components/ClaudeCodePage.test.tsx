@@ -1287,39 +1287,59 @@ describe("the list at the real corpus size", () => {
       }),
     );
 
-  /// A cap that STATES the total. Never a silently short list, which is
-  /// the same defect class as an empty list on a failed read.
-  it("caps the rendered rows and says how many there really are", () => {
+  /// The list is virtualized, and the TOTAL is still stated (#1200).
+  ///
+  /// This replaces "caps the rendered rows and says how many there
+  /// really are". The cap is gone, so "showing the 200 most recent of
+  /// 1,438" is no longer true and asserting it would pin a sentence the
+  /// page must not print. What has to survive is the half that was
+  /// never about the cap: the corpus size is still on screen, so the
+  /// reader still knows how much there is.
+  it("virtualizes the rows and still states the whole corpus size", () => {
     state.list = listOf(many(1438));
     renderView();
-    expect(screen.getByText(/showing the 200 most recent of 1,438/i)).toBeTruthy();
     expect(screen.getByText(/1,438 sessions/i)).toBeTruthy();
-    // `queryByText`, not `queryByRole(…, { name })` -- see the next test
-    // for the measurement. Row 500 is past the cap, so it must be absent.
+    // The cap's notice and its remedy are both gone, because nothing is
+    // withheld any more -- every row is reachable by scrolling.
+    expect(screen.queryByText(/showing the \d+ most recent/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: /show all/i })).toBeNull();
+    // `queryByText`, not `queryByRole(…, { name })` -- computing an
+    // accessible name per row is what made the old uncapped test take
+    // 6.5s. Row 500 is far outside the painted window, so it is absent
+    // from the DOM...
     expect(screen.queryByText("Session number 500")).toBeNull();
-    // ...and row 0 is present, so the absence above is the CAP rather
-    // than the list failing to render at all.
+    // ...and row 0 is present, so that absence is the WINDOW rather than
+    // the list failing to render at all.
     expect(screen.getByText("Session number 0")).toBeTruthy();
   });
 
-  /// The "show all" control genuinely renders the rest.
+  /// Scrolling reaches a row the first screenful does not paint.
   ///
-  /// Asserted with `getByText` rather than `getByRole(…, { name })`.
-  /// That is not cosmetic: `getByRole` with a name builds the
-  /// accessibility tree and computes an accessible name for every one of
-  /// 1,438 buttons, which measured **6.5s locally against 453ms** for the
-  /// capped case above -- and timed out at CI's 15s limit on a slower
-  /// runner, which is how this was found. `getByText` matches one text
-  /// node and costs milliseconds.
+  /// This replaces "shows every row when asked to", which clicked "Show
+  /// all" -- a control that no longer exists because there is no longer
+  /// anything to ask for. The property it was really asserting, that a
+  /// row deep in the corpus can be brought on screen, is the one kept
+  /// here; only the means changed, from a button to a scroll.
   ///
-  /// The assertion is unchanged in meaning: row 500 exists only when the
-  /// cap is lifted, and it is absent in the capped test above.
-  it("shows every row when asked to", () => {
+  /// jsdom has no layout, so the container's height is set explicitly
+  /// and the scroll is dispatched by hand. `virtualWindow.ts` records
+  /// why the window is arithmetic over an injected viewport rather than
+  /// a measured one -- this test is only possible because of it.
+  it("reaches a deep row by scrolling to it", () => {
     state.list = listOf(many(1438));
-    renderView();
-    fireEvent.click(screen.getByRole("button", { name: /show all 1,438/i }));
+    const { container } = renderView();
+    const scroller = container.querySelector(".overflow-y-auto") as HTMLElement;
+    Object.defineProperty(scroller, "clientHeight", { value: 900, configurable: true });
+
+    expect(screen.queryByText("Session number 500")).toBeNull();
+
+    scroller.scrollTop = 500 * 104;
+    fireEvent.scroll(scroller);
+
     expect(screen.getByText("Session number 500")).toBeTruthy();
-    expect(screen.queryByText(/showing the 200 most recent/i)).toBeNull();
+    // ...and the rows at the top are no longer painted, which is what
+    // makes this virtualization rather than a bigger cap.
+    expect(screen.queryByText("Session number 0")).toBeNull();
   });
 
   /// Search covers four fields, because titles are not unique: 286 of

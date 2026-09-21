@@ -47,64 +47,72 @@ import { AUTO_COMPACT_PRESSURE, subagentDisagreement } from "@/lib/subagentDisag
 import { relativeTime } from "@/lib/time";
 import { useIsMobile } from "@/lib/useIsMobile";
 import { useRowCursor } from "@/lib/useRowCursor";
+import { useVirtualList } from "@/lib/useVirtualList";
+import { ROW_HEIGHT } from "@/lib/virtualWindow";
 import {
   formatSize, pathBasename, safetyReason, sessionWorktree } from "@/lib/worktrees";
 import { type ClaudeSessionFilter, useFilters } from "@/store/filters";
 import { QueryError, errorMessage } from "./QueryError";
 import { ExternalLink } from "./ExternalLink";
 
-/// How many rows are drawn before the list stops and says so.
+/// The sessions list is virtualized, and this is the note that used to
+/// be `RENDER_CAP = 200` (#1200).
 ///
-/// # Why a cap at all, and why it is not truncation
+/// # What the cap was, and why it is gone
 ///
-/// 1,438 real sessions, measured. Every one is a button with a title, a
-/// path and a derived liveness, and drawing all of them costs a long
-/// first paint for a list nobody scrolls to the end of.
+/// The list drew 200 rows, stated the real total, and offered "Show
+/// all". That was honest -- it never lied about how much there was --
+/// but the remedy it offered was expensive. Measured on this machine's
+/// 2,561 transcripts:
 ///
-/// The house rule forbids quietly showing fewer rows than exist, so the
-/// footer states the real total and offers the rest. That is the
-/// difference between a cap and a truncation: a truncation lies about how
-/// much there is.
+/// | rows painted | expand | DOM nodes |
+/// |---|---|---|
+/// | 200 (the cap) | 53 ms | 3,418 |
+/// | 600 | 125 ms | 10,215 |
+/// | 1,200 | 303 ms | 20,415 |
+/// | 2,561 (Show all) | 627 ms | 43,552 |
 ///
-/// 200 rather than 50 because of how tightly the corpus clusters.
-/// Measured by last activity:
+/// So "Show all" was a button whose documented cost was a visibly frozen
+/// window, and the cap existed because that cost was real.
 ///
-/// ```text
-/// within  1 day    80
-/// within  3 days  276
-/// within  7 days  425
-/// within 30 days 1422   of 1,459
-/// ```
+/// Virtualizing pays it down: the window now paints a screenful plus
+/// overscan wherever the reader has scrolled to, so every row is
+/// reachable and the DOM stays the size of one screen. `virtualWindow.ts`
+/// carries the arithmetic and the measurement table.
 ///
-/// 97% of sessions are inside a month, so there is no cap that cleanly
-/// separates "recent" from "old" -- which is exactly why the cap is a
-/// RENDERING budget with the total stated, and not a filter pretending to
-/// be a useful cutoff. Search is what narrows this list; the cap only
-/// decides how much is drawn before the reader asks for the rest.
+/// # Why the "showing N of M" notice went with it
 ///
-/// 200 covers a full day's work several times over and the whole of
-/// yesterday, so the first screen is never missing something from this
-/// morning. It does NOT cover three days (276), and an earlier version of
-/// this comment claimed it did -- corrected by measurement rather than
-/// left as a plausible-sounding number, since a reader checking the claim
-/// is exactly who this paragraph is for.
+/// Because it would no longer be true. That notice exists under this
+/// project's rule that a partial render must say it is partial -- and
+/// the rendering IS still partial, in the sense that most rows are not
+/// in the DOM at any moment. What changed is that partial-ness is no
+/// longer something the reader has to act on: scrolling reaches every
+/// row, with no control to find and no second render cost to pay. A
+/// notice saying "showing 30 of 2,561" beside a list that scrolls
+/// through all 2,561 would be describing the implementation, not the
+/// user's situation, and telling someone their list is short when it is
+/// not is its own kind of wrong.
 ///
-/// # It is still only a rendering budget, and #985 kept it that way
+/// The counts above the list are unchanged and still carry the totals --
+/// "1,438 of 2,561 match", "2,561 sessions" -- so the corpus size is
+/// still stated on screen. What is gone is only the claim that some of
+/// it is being withheld, which is no longer the case.
 ///
-/// This cap says nothing about TRANSPORT, and never did -- the whole
-/// list arrives and this decides how much is painted. #985 found the
-/// transport cost that was never part of the design (1,474 rows, 1.35 MB,
-/// every ten seconds, over the pairing transport on the phone) and did
-/// NOT fix it by turning this into a server-side limit, which would have
-/// made the total a separate claim and quietly narrowed search to the
-/// first 200 rows.
+/// # What virtualization costs, stated plainly
 ///
-/// It split the ROW instead: the list carries what it draws, searches,
-/// filters and counts on, and the rest is fetched for the one selected
-/// session. 990 -> 315 bytes per row, measured, with this cap, the
-/// stated total and the four search fields all unchanged.
-/// `claude::sessions::SessionList` carries the breakdown.
-const RENDER_CAP = 200;
+/// A row that is not painted is not in the accessibility tree. Native
+/// `Cmd-F` cannot reach it, and neither can a screen reader's element
+/// list, until it scrolls in. That is a real regression against a fully
+/// painted list and it is the tradeoff #1200 was opened to decide.
+///
+/// It is acceptable here for one reason, which is the sequencing #1233
+/// established: find-over-data already covers every row rather than
+/// every painted row. The search box filters the whole array and the
+/// count is complete, so the question "is the session I want in here"
+/// is answered without painting anything. `findOverData.ts` states that
+/// contract. Native find-in-page could not answer it even under the old
+/// cap -- it only saw 200 rows -- so what is lost is find-in-page over a
+/// "Show all" list that cost 627 ms to produce.
 
 /// Claude Code sessions on this machine, and how to get one back.
 ///
@@ -584,20 +592,26 @@ export function ClaudeSessionColumn() {
   // drift this repo refuses elsewhere.
   const cursor = useFilters((f) => f.cursor);
   const setCursor = useFilters((f) => f.setCursor);
-  // Local, not in the store: unlike the query and the selection nothing
-  // outside this component reads it, and it is a statement about how much
-  // of ONE rendering of the list has been asked for.
-  const [showAll, setShowAll] = useState(false);
-
   // The rows `j`/`k`/`Enter` walk (#953). The longest list in the app --
   // ~1,474 rows with "Show all" pressed, each one a focusable button with
   // no roving tabindex -- and the one the issue measures as unusable by
   // Tab.
   //
-  // `capped`, not `matched.ordered`: the cursor must walk what is DRAWN.
-  // Below the "Show all" button the remaining rows are not in the DOM, so
-  // a cursor that could reach index 500 of 1,474 would highlight nothing
-  // and `Enter` would open a session the user cannot see.
+  // `matched.ordered` in full now, not a drawn slice (#1200).
+  //
+  // This INVERTED when the list was virtualized, and the inversion is
+  // the point. Under the cap the rows past 200 were not in the DOM and
+  // could not be scrolled to, so a cursor that reached index 500 would
+  // ring nothing and `Enter` would open a session the reader could not
+  // see -- which is why it was clamped to what was drawn.
+  //
+  // Virtualized, "drawn" is no longer a property of the row: it is a
+  // property of where the list happens to be scrolled, and it changes
+  // under the cursor as the cursor moves. Clamping to it would mean
+  // `j` stops at the bottom of the current screenful, which is a worse
+  // cursor than the capped one. So the cursor walks the whole matched
+  // list and `useVirtualList` scrolls the row into view, which is the
+  // "explicit scroll-into-view handling" #1200 names as implied work.
   //
   // No `toggle`: sessions have no bulk action, so `x` does nothing here
   // rather than inventing a selection with nothing to act on it. The
@@ -620,24 +634,37 @@ export function ClaudeSessionColumn() {
   // An empty array is the honest answer for both: there is no list to
   // walk, so the keys do nothing.
   const rowsDrawn = list.isLoading || list.isError ? [] : (matched?.ordered ?? []);
-  const visibleRows = showAll ? rowsDrawn : rowsDrawn.slice(0, RENDER_CAP);
   useRowCursor({
-    rows: () => visibleRows.length,
+    rows: () => rowsDrawn.length,
     open: (i) => {
-      const s = visibleRows[i];
+      const s = rowsDrawn[i];
       if (s) selectSession(s.session_id);
     },
   });
+  // The painted window, and the scroll that keeps the cursor inside it.
+  // Computed during render from scroll state -- `useVirtualList` states
+  // why it is never stored.
+  // Destructured rather than kept as one object. `react-hooks/refs`
+  // rejects reading a property off a value that also carries a ref
+  // during render -- it cannot tell `v.window` (a plain computed value)
+  // from `v.ref` (a ref) on the same object. Pulling them apart names
+  // the ref once, where it is only ever handed to JSX, and leaves the
+  // window an ordinary local.
+  const {
+    window: paintWindow,
+    ref: scrollRef,
+    onScroll: onListScroll,
+  } = useVirtualList(rowsDrawn.length, ROW_HEIGHT, cursor);
   // A cursor past the end of a newly-narrowed list points at nothing.
   // Clamped here for the reason `App.tsx` gives about the PR list:
   // clamping at render time keeps it correct for DRAWING -- the ring --
   // and not only for the next key press. Typing into the search box is
   // the common way this list shrinks under a cursor.
   useEffect(() => {
-    if (cursor !== null && cursor >= visibleRows.length) {
-      setCursor(visibleRows.length > 0 ? visibleRows.length - 1 : null);
+    if (cursor !== null && cursor >= rowsDrawn.length) {
+      setCursor(rowsDrawn.length > 0 ? rowsDrawn.length - 1 : null);
     }
-  }, [cursor, visibleRows.length, setCursor]);
+  }, [cursor, rowsDrawn.length, setCursor]);
 
   if (list.isLoading) {
     return <p className="p-3 text-xs text-[#8b949e]">Reading Claude Code sessions…</p>;
@@ -659,10 +686,12 @@ export function ClaudeSessionColumn() {
     );
   }
 
-  // `visibleRows` above, narrowed: `matched` is non-null past the error
-  // arm. One list, so the rows the cursor walks and the rows drawn cannot
-  // drift apart -- which is the whole hazard a registered cursor has.
-  const capped = visibleRows;
+  // `rowsDrawn` above, narrowed: `matched` is non-null past the error
+  // arm. One list, so the rows the cursor walks and the rows the window
+  // is computed over cannot drift apart -- which is the whole hazard a
+  // registered cursor has.
+  const rows = rowsDrawn;
+  const painted = rows.slice(paintWindow.start, paintWindow.end);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -781,7 +810,11 @@ export function ClaudeSessionColumn() {
           {matched.live.length > 0 ? ` · ${matched.live.length} running now` : ""}
         </p>
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto p-2">
+      <div
+        ref={scrollRef}
+        onScroll={onListScroll}
+        className="min-h-0 flex-1 overflow-y-auto p-2"
+      >
         {/* Only when the read SUCCEEDED, which the error arm above
             has already established. A machine that has never run
             Claude Code genuinely has none. */}
@@ -811,49 +844,45 @@ export function ClaudeSessionColumn() {
             <NoSessions imported={imported} />
           )
         ) : (
-          capped.map((s, i) => (
-            <SessionEntry
-              key={s.session_id}
-              session={s}
-              now={now}
-              active={s.session_id === selected}
-              // The keyboard cursor, drawn as a ring (#953). `PrList`
-              // passes it the same way and for the same reason: only the
-              // list knows a row's index, and the cursor is an index.
-              //
-              // DISTINCT from `active`, which is the selection. Both can
-              // be on at once and they mean different things -- the
-              // cursor is where the next `Enter` lands, the selection is
-              // what the detail pane is showing -- so the ring is drawn
-              // over the blue rather than instead of it.
-              cursored={cursor === i}
-              onSelect={() => selectSession(s.session_id)}
-            />
-          ))
+          // The painted window, with the unpainted rows above and below
+          // reserved as height (#1200). The spacers are what keep the
+          // scrollbar describing the whole list rather than the slice:
+          // without them a 2,561-row list would scroll like a 30-row one.
+          <>
+            <div style={{ height: paintWindow.padTop }} aria-hidden="true" />
+            {painted.map((s, offset) => {
+              // The row's index in the WHOLE list, not in the painted
+              // slice. `cursor` is an index into `rowsDrawn` -- that is
+              // what `useRowCursor` walks -- so comparing it against the
+              // slice offset would put the ring on the wrong row the
+              // moment the list is scrolled, and on row 0 of the screen
+              // whenever the cursor was at `window.start`.
+              const i = paintWindow.start + offset;
+              return (
+                <SessionEntry
+                  key={s.session_id}
+                  session={s}
+                  now={now}
+                  active={s.session_id === selected}
+                  // The keyboard cursor, drawn as a ring (#953). `PrList`
+                  // passes it the same way and for the same reason: only
+                  // the list knows a row's index, and the cursor is an
+                  // index.
+                  //
+                  // DISTINCT from `active`, which is the selection. Both
+                  // can be on at once and they mean different things --
+                  // the cursor is where the next `Enter` lands, the
+                  // selection is what the detail pane is showing -- so
+                  // the ring is drawn over the blue rather than instead
+                  // of it.
+                  cursored={cursor === i}
+                  onSelect={() => selectSession(s.session_id)}
+                />
+              );
+            })}
+            <div style={{ height: paintWindow.padBottom }} aria-hidden="true" />
+          </>
         )}
-        {/* A cap that STATES the total, never a silent short list.
-            The house rule (#846) is that showing fewer rows than
-            exist without saying so is the same defect as an empty
-            list on a failed read.
-
-            A DIFFERENT fact from the "N of M match" count above, which is
-            why both are rendered: one says how much the search removed,
-            the other how much of what survived is drawn. */}
-        {!showAll && matched.ordered.length > RENDER_CAP ? (
-          <div className="mt-2 rounded-md border border-[#30363d] bg-[#161b22] p-2 text-center">
-            <p className="text-[11px] text-[#8b949e]">
-              Showing the {RENDER_CAP} most recent of{" "}
-              {matched.ordered.length.toLocaleString()}.
-            </p>
-            <button
-              type="button"
-              onClick={() => setShowAll(true)}
-              className="tap-target mt-1 rounded px-2 text-xs text-[#58a6ff] hover:bg-[#21262d]"
-            >
-              Show all {matched.ordered.length.toLocaleString()}
-            </button>
-          </div>
-        ) : null}
       </div>
     </div>
   );

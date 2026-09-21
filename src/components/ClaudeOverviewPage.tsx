@@ -50,10 +50,9 @@ export const ACTIVITY_DAYS = 30;
 ///
 /// The sessions list one click away can show every row, and the two
 /// surfaces did not cross-link in either direction. The asymmetry is the
-/// evidence this was an omission: `ClaudeCodePage` caps at 200 and renders
-/// "Show all 1,474" under a comment stating the house rule that a short
-/// list must both STATE the total and offer the rest. This page satisfied
-/// the first half and dropped the second.
+/// evidence this was an omission: `ClaudeCodePage` states the total
+/// beside its list under the house rule that a list must say how much
+/// there is. This page satisfied that and dropped the cross-link.
 ///
 /// `onClick` is OPTIONAL, and a tile without one renders exactly as before
 /// -- a `div`, not a dead button. That is what keeps the rule below

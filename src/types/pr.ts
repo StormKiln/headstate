@@ -2484,8 +2484,8 @@ export interface ClaudeFollow {
 export interface ClaudeSessionList {
   /// EVERY stored session, always -- never a page or a window. The
   /// stated total is `sessions.length`, so there is no separate count
-  /// that could drift from the rows beside it. `RENDER_CAP` bounds what
-  /// is DRAWN and says so; nothing bounds what arrives.
+  /// that could drift from the rows beside it. The list view virtualizes
+  /// what is DRAWN (#1200); nothing bounds what arrives.
   sessions: ClaudeSession[];
   /// Why the live registry could not be listed. `null` means it was read
   /// -- so an absence of running sessions is a real answer.
