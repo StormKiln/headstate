@@ -227,6 +227,9 @@ beforeEach(() => {
     cache_read_tokens: 405_086_242,
     cache_creation_tokens: 4_971_059,
     models: [{ model: "claude-opus-5", messages: 994 }],
+    // The context floor (#1248), present because the phone renders the
+    // same panel the desktop does.
+    context_floor: { tokens: 33_807 },
     truncated: false,
     bytes_read: 183_237,
     file_bytes: 183_237,

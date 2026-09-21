@@ -445,6 +445,11 @@ const usage = (over: Partial<ClaudeUsage> = {}): ClaudeUsage => ({
   cache_read_tokens: 405_086_242,
   cache_creation_tokens: 4_971_059,
   models: [{ model: "claude-opus-5", messages: 994 }],
+  // The context floor (#1248): what loaded before the user typed. The
+  // real corpus median is in `claude/usage.rs`'s docs; this fixture just
+  // needs a number distinct from every other figure here so a test can
+  // tell them apart.
+  context_floor: { tokens: 33_807 },
   truncated: false,
   bytes_read: 183_237,
   file_bytes: 183_237,
@@ -2183,6 +2188,7 @@ describe("the subagent rollup is beside the parent's own usage, never inside it"
       cache_read_tokens: 300,
       cache_creation_tokens: 400,
       models: [],
+      context_floor: { tokens: 90 },
       recorded_cost: null,
       truncated: false,
       bytes_read: 10,
@@ -2500,6 +2506,70 @@ describe("how much work a session did", () => {
     open("HeadState GitHub issues filing");
     expect(screen.getByText(/records no token usage/i)).toBeTruthy();
     expect(screen.queryByText("Output tokens")).toBeNull();
+  });
+
+  /// The context floor is on the session detail, as one number (#1248).
+  ///
+  /// **Sabotage:** drop `cache_read_input_tokens` from the Rust sum and
+  /// the figure moves off 33,807; remove the `Field` and the label is
+  /// gone. Either fails this.
+  it("shows what the context cost before the user's first message", () => {
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.getByText(/context before your first message/i)).toBeTruthy();
+    expect(screen.getByText("33,807")).toBeTruthy();
+  });
+
+  /// **The sabotage test for the whole point of #1248.** #1242 ruled out
+  /// every route to a per-source breakdown, so nothing on this panel may
+  /// attribute the floor to the system prompt, the tool definitions or a
+  /// `CLAUDE.md`. A guess rendered beside a measurement is the failure
+  /// the issue exists to prevent, and it is worse than no figure because
+  /// a reader cannot tell the two apart from the numbers alone.
+  ///
+  /// Re-add a breakdown — a "CLAUDE.md" row, a "system prompt" row, or
+  /// the `ephemeral_1h`/`ephemeral_5m` split that #1242 measured as zero
+  /// sessions using both — and this fails.
+  it("attributes the context floor to no source at all", () => {
+    renderView();
+    open("HeadState GitHub issues filing");
+    // The floor itself is on screen, so this is not passing vacuously.
+    expect(screen.getByText(/context before your first message/i)).toBeTruthy();
+    for (const source of [
+      /claude\.md/i,
+      /system prompt/i,
+      /tool definitions/i,
+      /ephemeral/i,
+      /1h|5m/i,
+      /reminders/i,
+    ]) {
+      expect(screen.queryByText(source)).toBeNull();
+    }
+  });
+
+  /// A session with NO usage block has not been measured, and its floor
+  /// is absent rather than zero (#1248, #846).
+  ///
+  /// **Sabotage:** make the Rust side default `context_floor` to
+  /// `{ tokens: 0 }` and this fails — "0" appears under a label that
+  /// says the session started from no context at all, which cannot
+  /// happen, because every session loads a system prompt.
+  it("says the context floor was not measured rather than showing a zero", () => {
+    state.usage = usage({
+      messages: 0,
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_read_tokens: 0,
+      cache_creation_tokens: 0,
+      models: [],
+      context_floor: null,
+    });
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.queryByText(/context before your first message/i)).toBeNull();
+    expect(screen.getByText(/not measured rather than empty/i)).toBeTruthy();
+    // The absent case must not borrow the measured case's shape.
+    expect(screen.queryByText("0")).toBeNull();
   });
 
   /// A failed read and a session that used nothing have opposite
