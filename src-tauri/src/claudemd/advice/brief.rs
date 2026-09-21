@@ -118,6 +118,7 @@ fn suggestion(f: &Finding) -> String {
         },
         Check::Gaps => gaps_suggestion(f),
         Check::Placement => super::placement::suggestion(f),
+        Check::Rot => super::rot::suggestion(f),
     }
 }
 
@@ -312,6 +313,23 @@ mod tests {
                 "Section \"Platform\" (~40 est. tokens) names only paths under src-tauri/src/: \
                  src-tauri/src/a.rs, src-tauri/src/b.rs"
                     .into(),
+            ),
+            Check::Rot => Finding::new(
+                Check::Rot,
+                Severity::Problem,
+                Subject::ClaudeMd {
+                    path: FILE.into(),
+                    scope: Scope::Repo,
+                    section: Some("## Platform".into()),
+                },
+                vec![Evidence {
+                    at: Locator::File {
+                        path: FILE.into(),
+                        line: Some(15),
+                    },
+                    measured: "resolved against `src`, the repository root and a suffix match over 1200 tracked paths: 0 matches".into(),
+                }],
+                "`src/CLAUDE.md:15` names `src/lib/target.ts`, which does not exist in this repository".into(),
             ),
         }
     }

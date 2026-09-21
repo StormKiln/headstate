@@ -67,7 +67,9 @@ static PATH_TOKEN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_.
 static PATH_LINE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^([A-Za-z0-9_./-]+):(\d+)$").unwrap());
 static MAKE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^make ([A-Za-z0-9_-]+)$").unwrap());
-static YARN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^yarn (\S+)").unwrap());
+// `yarn run x` names the script `x`, so the optional `run` is skipped
+// rather than reported as a script called "run".
+static YARN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^yarn (?:run )?(\S+)").unwrap());
 static NPM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^npm run (\S+)").unwrap());
 static QUALIFIED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)+(?:\(\))?$").unwrap()
@@ -349,6 +351,24 @@ mod tests {
                 RefKind::Script {
                     runner: Runner::Npm,
                     name: "build".into()
+                },
+            ]
+        );
+    }
+
+    /// `yarn run x` and `yarn x` name the same script.
+    #[test]
+    fn yarn_run_names_the_script_after_run() {
+        assert_eq!(
+            kinds("`yarn run build` then `yarn vitest run`\n"),
+            vec![
+                RefKind::Script {
+                    runner: Runner::Yarn,
+                    name: "build".into()
+                },
+                RefKind::Script {
+                    runner: Runner::Yarn,
+                    name: "vitest".into()
                 },
             ]
         );

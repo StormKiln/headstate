@@ -65,6 +65,7 @@ pub mod brief;
 pub mod gaps;
 pub mod imports;
 pub mod placement;
+pub mod rot;
 pub mod toolchain;
 pub mod transcripts;
 
@@ -105,6 +106,9 @@ pub enum Check {
     /// content duplicated across the files one session loads, or an
     /// all-caps rule in a file that loads lazily.
     Placement,
+    /// A reference in a CLAUDE.md that resolves to nothing, or a line
+    /// past a file's end.
+    Rot,
 }
 
 impl Check {
@@ -115,6 +119,7 @@ impl Check {
         Check::Transcripts,
         Check::Gaps,
         Check::Placement,
+        Check::Rot,
     ];
 
     /// The check's name as the brief prints it.
@@ -125,6 +130,7 @@ impl Check {
             Check::Transcripts => "transcripts",
             Check::Gaps => "gaps",
             Check::Placement => "placement",
+            Check::Rot => "rot",
         }
     }
 }
@@ -359,6 +365,7 @@ pub static PRODUCERS: &[&dyn Producer] = &[
     &transcripts::Transcripts,
     &gaps::Gaps,
     &placement::Placement,
+    &rot::Rot,
 ];
 
 /// Run every registered producer and assemble the report.
@@ -425,13 +432,17 @@ fn run_with(cx: &Context, producers: &[&dyn Producer]) -> Report {
 /// tolerated the way `claude_md_effective` tolerates it -- the repo scan
 /// is still a real answer, and the scan records the scope it could not
 /// look for.
-pub fn report_in(repo: &Path, home: Option<&Path>) -> Report {
+///
+/// `definitions` is the inventory the command built, or `None` when it
+/// could not; a producer that needs one and finds `None` reports its
+/// references Unknown rather than missing.
+pub fn report_in(repo: &Path, home: Option<&Path>, definitions: Option<&Inventory>) -> Report {
     let scan = super::scan_effective_opt(repo, home);
     let cx = Context {
         repo,
         home,
         scan: &scan,
-        definitions: None,
+        definitions,
         conn: None,
     };
     run(&cx)

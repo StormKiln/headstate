@@ -859,7 +859,7 @@ mod tests {
         let t = octo(OCTO_SECTION);
         fs::write(t.path().join("octo").join("CLAUDE.md"), "# octo\n").unwrap();
 
-        let report = report_in(t.path(), None);
+        let report = report_in(t.path(), None, None);
         ran(&report);
         let found = placement(&report);
         assert_eq!(found.len(), 1, "{report:?}");
@@ -912,7 +912,7 @@ mod tests {
     fn a_missing_target_qualifies_the_suggestion() {
         let t = octo(OCTO_SECTION);
 
-        let report = report_in(t.path(), None);
+        let report = report_in(t.path(), None, None);
         let found = placement(&report);
         assert_eq!(found.len(), 1, "{report:?}");
         let f = found[0];
@@ -941,13 +941,13 @@ mod tests {
             octo("## Octo rules\n\nEdit `octo/a.rs` and `octo/b.rs`; run `Makefile` targets.\n");
         fs::write(t.path().join("Makefile"), "lint:\n").unwrap();
 
-        let report = report_in(t.path(), None);
+        let report = report_in(t.path(), None, None);
         ran(&report);
         assert!(placement(&report).is_empty(), "{report:?}");
 
         // The negative can fail: remove the stay vote and it fires.
         fs::remove_file(t.path().join("Makefile")).unwrap();
-        let report = report_in(t.path(), None);
+        let report = report_in(t.path(), None, None);
         assert_eq!(placement(&report).len(), 1, "{report:?}");
     }
 
@@ -955,12 +955,12 @@ mod tests {
     #[test]
     fn a_single_path_is_under_the_floor() {
         let t = octo("## Octo rules\n\nEdit `octo/a.rs` carefully.\n");
-        let report = report_in(t.path(), None);
+        let report = report_in(t.path(), None, None);
         ran(&report);
         assert!(placement(&report).is_empty(), "{report:?}");
 
         let t = octo("## Octo rules\n\nEdit `octo/a.rs` and `octo/a.rs` and `./octo/a.rs`.\n");
-        let report = report_in(t.path(), None);
+        let report = report_in(t.path(), None, None);
         assert!(
             placement(&report).is_empty(),
             "one file named three ways is one path: {report:?}"
@@ -975,7 +975,7 @@ mod tests {
         let t = octo(
             "## Octo rules\n\nEdit `octo/a.rs`.\n\n```bash\n# not a heading\nls octo/\n```\n\nAnd `octo/b.rs`.\n",
         );
-        let report = report_in(t.path(), None);
+        let report = report_in(t.path(), None, None);
         let found = placement(&report);
         assert_eq!(found.len(), 1, "{report:?}");
         assert!(
@@ -1006,7 +1006,7 @@ mod tests {
         fs::create_dir_all(&blocked).unwrap();
         fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
 
-        let report = report_in(t.path(), None);
+        let report = report_in(t.path(), None, None);
 
         fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -1036,7 +1036,7 @@ mod tests {
             !report
                 .findings
                 .iter()
-                .any(|f| f.severity == Severity::Advice),
+                .any(|f| f.check == Check::Placement && f.severity == Severity::Advice),
             "an unjudged section is never advice: {report:?}"
         );
     }
@@ -1046,7 +1046,7 @@ mod tests {
     #[test]
     fn a_missing_path_is_listed_and_does_not_vote() {
         let t = octo("## Octo rules\n\nEdit `octo/a.rs` and `claude/cli.rs:128`.\n");
-        let report = report_in(t.path(), None);
+        let report = report_in(t.path(), None, None);
         ran(&report);
         assert!(
             placement(&report).is_empty(),
@@ -1064,7 +1064,7 @@ mod tests {
         // With a second resolved path the finding fires and the
         // not-found list travels as evidence.
         let t = octo("## Octo rules\n\nEdit `octo/a.rs`, `octo/b.rs` and `claude/cli.rs:128`.\n");
-        let report = report_in(t.path(), None);
+        let report = report_in(t.path(), None, None);
         let found = placement(&report);
         assert_eq!(found.len(), 1, "{report:?}");
         assert!(
@@ -1092,7 +1092,7 @@ mod tests {
         )
         .unwrap();
 
-        let report = report_in(t.path(), None);
+        let report = report_in(t.path(), None, None);
         assert!(placement(&report).is_empty(), "{report:?}");
 
         // Remove the seam and the two remaining paths are one segment.
@@ -1101,7 +1101,7 @@ mod tests {
             "## Both tables\n\n`src-tauri/src/remote/surface.rs` and `src-tauri/src/invariants.rs`.\n",
         )
         .unwrap();
-        let report = report_in(t.path(), None);
+        let report = report_in(t.path(), None, None);
         let found = placement(&report);
         assert_eq!(found.len(), 1, "{report:?}");
         assert!(
@@ -1128,7 +1128,7 @@ mod tests {
         fs::write(t.path().join("src-tauri/src/invariants.rs"), "").unwrap();
         fs::write(t.path().join("CLAUDE.md"), root).unwrap();
 
-        let report = report_in(t.path(), None);
+        let report = report_in(t.path(), None, None);
         ran(&report);
         assert!(placement(&report).is_empty(), "{report:?}");
 
@@ -1179,7 +1179,7 @@ for either; the file exists because getting it wrong is easy.
         fs::write(t.path().join("src/lib/target.ts"), "").unwrap();
         fs::write(t.path().join("src").join("CLAUDE.md"), SECTION).unwrap();
 
-        let report = report_in(t.path(), None);
+        let report = report_in(t.path(), None, None);
         let found = placement(&report);
         assert_eq!(found.len(), 1, "{report:?}");
         let f = found[0];
@@ -1220,7 +1220,7 @@ for either; the file exists because getting it wrong is easy.
         )
         .unwrap();
 
-        let report = report_in(t.path(), None);
+        let report = report_in(t.path(), None, None);
         let found = placement(&report);
         assert_eq!(found.len(), 1, "{report:?}");
         let f = found[0];
@@ -1268,7 +1268,7 @@ for either; the file exists because getting it wrong is easy.
             )
             .unwrap();
         }
-        let report = report_in(t.path(), None);
+        let report = report_in(t.path(), None, None);
         assert!(placement(&report).is_empty(), "{report:?}");
     }
 
@@ -1285,7 +1285,7 @@ for either; the file exists because getting it wrong is easy.
         fs::write(home.join(".claude").join("CLAUDE.md"), block).unwrap();
         fs::write(repo.join("CLAUDE.md"), format!("# Root\n\n{block}")).unwrap();
 
-        let report = report_in(&repo, Some(&home));
+        let report = report_in(&repo, Some(&home), None);
         let found = placement(&report);
         assert_eq!(found.len(), 1, "{report:?}");
         assert_eq!(found[0].subject.path(), slashed(&repo.join("CLAUDE.md")));
@@ -1305,7 +1305,7 @@ for either; the file exists because getting it wrong is easy.
         )
         .unwrap();
 
-        let report = report_in(t.path(), None);
+        let report = report_in(t.path(), None, None);
         let found = placement(&report);
         assert_eq!(found.len(), 1, "{report:?}");
         let f = found[0];
@@ -1359,7 +1359,7 @@ for either; the file exists because getting it wrong is easy.
         )
         .unwrap();
 
-        let report = report_in(t.path(), None);
+        let report = report_in(t.path(), None, None);
         assert!(placement(&report).is_empty(), "{report:?}");
 
         // The negative can fail: one capitalised word in prose fires.
@@ -1368,7 +1368,7 @@ for either; the file exists because getting it wrong is easy.
             "# octo\n\nIMPORTANT: run the gate.\n",
         )
         .unwrap();
-        let report = report_in(t.path(), None);
+        let report = report_in(t.path(), None, None);
         assert_eq!(placement(&report).len(), 1, "{report:?}");
         assert!(placement(&report)[0].finding.contains("says IMPORTANT;"));
     }
