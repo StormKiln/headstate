@@ -63,6 +63,7 @@
 
 pub mod brief;
 pub mod imports;
+pub mod toolchain;
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -86,16 +87,21 @@ pub enum Check {
     /// A CLAUDE.md `@import` that is broken, circular or unreadable. The
     /// seed producer: it re-states `ImportNode::problem`.
     Imports,
+    /// A build system on disk whose build, test, lint, format, run or
+    /// deploy command no loaded CLAUDE.md names; and a code-style line a
+    /// formatter config already decides.
+    Toolchain,
 }
 
 impl Check {
     /// Every check, in the order a report lists them.
-    pub const ALL: &'static [Check] = &[Check::Imports];
+    pub const ALL: &'static [Check] = &[Check::Imports, Check::Toolchain];
 
     /// The check's name as the brief prints it.
     pub fn name(self) -> &'static str {
         match self {
             Check::Imports => "imports",
+            Check::Toolchain => "toolchain",
         }
     }
 }
@@ -324,7 +330,7 @@ pub trait Producer: Sync {
 }
 
 /// Every registered producer, in run order.
-pub static PRODUCERS: &[&dyn Producer] = &[&imports::Imports];
+pub static PRODUCERS: &[&dyn Producer] = &[&imports::Imports, &toolchain::Coverage];
 
 /// Run every registered producer and assemble the report.
 pub fn run(cx: &Context) -> Report {

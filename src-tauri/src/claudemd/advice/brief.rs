@@ -91,6 +91,7 @@ fn suggestion(f: &Finding) -> String {
              that exists and is readable, or delete the line. Do not create a file to satisfy it.",
             f.subject.path()
         ),
+        Check::Toolchain => super::toolchain::suggestion(f),
     }
 }
 
@@ -157,6 +158,25 @@ mod tests {
                     measured: "`@./missing.md`: file not found".into(),
                 }],
                 "`@./missing.md` in the file does not resolve: file not found".into(),
+            ),
+            Check::Toolchain => Finding::new(
+                Check::Toolchain,
+                Severity::Advice,
+                Subject::ClaudeMd {
+                    path: FILE.into(),
+                    scope: Scope::Repo,
+                    section: None,
+                },
+                vec![Evidence {
+                    at: Locator::File {
+                        path: "/home/octocat/hello-world/Makefile".into(),
+                        line: Some(118),
+                    },
+                    measured: "target `build`".into(),
+                }],
+                "make (Makefile at root) offers `build`, `test`; none of the 3 files read names \
+                 `make build`"
+                    .into(),
             ),
         }
     }
