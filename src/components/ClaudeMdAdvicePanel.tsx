@@ -18,6 +18,7 @@ import { QueryError, errorMessage } from "./QueryError";
 /// wire type without a label fails to compile.
 const CHECK_LABEL: Record<ClaudeMdAdviceCheck, string> = {
   imports: "imports",
+  placement: "placement",
 };
 
 /// What each severity is called, and how it is coloured.

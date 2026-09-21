@@ -64,6 +64,7 @@
 pub mod brief;
 pub mod gaps;
 pub mod imports;
+pub mod placement;
 pub mod toolchain;
 pub mod transcripts;
 
@@ -100,6 +101,10 @@ pub enum Check {
     /// A directory with a toolchain, tests or role of its own and no
     /// CLAUDE.md between it and the root.
     Gaps,
+    /// A section whose named paths all fall under one subdirectory,
+    /// content duplicated across the files one session loads, or an
+    /// all-caps rule in a file that loads lazily.
+    Placement,
 }
 
 impl Check {
@@ -109,6 +114,7 @@ impl Check {
         Check::Toolchain,
         Check::Transcripts,
         Check::Gaps,
+        Check::Placement,
     ];
 
     /// The check's name as the brief prints it.
@@ -118,6 +124,7 @@ impl Check {
             Check::Toolchain => "toolchain",
             Check::Transcripts => "transcripts",
             Check::Gaps => "gaps",
+            Check::Placement => "placement",
         }
     }
 }
@@ -351,6 +358,7 @@ pub static PRODUCERS: &[&dyn Producer] = &[
     &toolchain::Coverage,
     &transcripts::Transcripts,
     &gaps::Gaps,
+    &placement::Placement,
 ];
 
 /// Run every registered producer and assemble the report.

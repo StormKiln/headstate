@@ -1084,7 +1084,7 @@ export interface ClaudeMdEffectiveScan {
 
 /// Which advice producer made a finding. Mirrors `claudemd::advice::Check`;
 /// one member per producer.
-export type ClaudeMdAdviceCheck = "imports";
+export type ClaudeMdAdviceCheck = "imports" | "placement";
 
 /// What a finding is about. Mirrors `claudemd::advice::Subject`, tagged
 /// on `kind` because the skills producer's subject is not a CLAUDE.md.
