@@ -16,6 +16,7 @@ import type {
   WorktreeRepo,
 } from "@/types/pr";
 import { useFilters } from "@/store/filters";
+import type { PrQueryState } from "@/api/hooks";
 
 const copyFn = vi.hoisted(() => vi.fn(() => Promise.resolve(null as string | null)));
 const revealFn = vi.hoisted(() => vi.fn(() => Promise.resolve("/code/app")));
@@ -110,6 +111,20 @@ const state = vi.hoisted(() => ({
   /// Every session id the detail hook was asked for, so a test can
   /// assert it is fetched for ONE row rather than for the list.
   detailAskedFor: [] as (string | null)[],
+  /// What #1280's reverse lookup answers, as the FIVE-state value the
+  /// real hook returns.
+  ///
+  /// The state is set whole rather than derived from a flag, because the
+  /// whole feature is that these five do not collapse into one another:
+  /// `done` with no links ("we asked, nothing is recorded"), `failed`
+  /// ("the database did not answer") and `unresolved` ("we could not
+  /// tell which repository, so we never asked") are three different
+  /// sentences, and a fixture with one boolean could not express the
+  /// difference well enough to test it.
+  prQuery: { state: "off" } as PrQueryState,
+  /// Every query string the lookup hook was handed, so a test can assert
+  /// that ordinary prose never reaches it.
+  prQueriesSeen: [] as string[],
 }));
 
 vi.mock("../api/hooks", () => ({
@@ -187,6 +202,13 @@ vi.mock("../api/hooks", () => ({
       error: state.detailFailed ? "database is locked" : undefined,
       refetch: refetchFn,
     };
+  },
+  // #1280. The reverse lookup, which the column wires into the search
+  // box. Records the query so a test can assert that prose costs no
+  // backend call, and answers with the whole five-state value.
+  useClaudeSessionsForPrQuery: (query: string) => {
+    state.prQueriesSeen.push(query);
+    return state.prQuery;
   },
   // #982, now a FOLLOW (#1208). Records what it was asked for and whether
   // the disclosure was open, so a test can assert the read does not
@@ -347,6 +369,10 @@ const whole = (over: Partial<WholeSession> = {}): WholeSession => ({
   // about agent types.
   compactions: null,
   agent_types: null,
+  // #1132/#1280. Absent by default, which is the real default: most
+  // sessions open no pull request, and the panel is suppressed entirely
+  // when there are none.
+  pull_requests: undefined,
   ...over,
 });
 
@@ -390,6 +416,10 @@ const session = (over: Partial<WholeSession> = {}): ClaudeSession => {
     // single value here means a UI test cannot accidentally depend on the
     // row and the pane disagreeing.
     waiting: w.waiting,
+    // #1132/#1280. On the DETAIL half only -- the list row does not
+    // carry pull requests, which is why the grouping tests below have to
+    // select a session before they can see one.
+    pull_requests: w.pull_requests,
   });
   return {
     session_id: w.session_id,
@@ -553,6 +583,11 @@ beforeEach(() => {
   state.preview = preview();
   state.previewFailed = false;
   state.previewEnabledFor = [];
+  // #1280. `off` is the honest default: almost nothing typed into this
+  // box is a pull request reference, so the lookup is idle for every
+  // test that does not set it.
+  state.prQuery = { state: "off" };
+  state.prQueriesSeen = [];
   // #1208. A FOLLOWING follow that has read once, by default: the state
   // the pane is in for the overwhelming majority of the tests below, and
   // an explicit default so a test that cares about "idle" or "stopped"
@@ -4444,5 +4479,317 @@ describe("stopping a session", () => {
         }),
       ),
     );
+  });
+});
+
+/// #1280, part one. The panel is presentation only -- `ClaudePrLink`
+/// already carries `repo` and `number` -- so everything here is about
+/// what the reader sees, and `claudePrs.test.ts` pins the ordering rule
+/// itself.
+describe("a session's pull requests, grouped by repository", () => {
+  const link = (repo: string, number: number) => ({
+    session_id: "e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2",
+    repo,
+    number,
+    url: `https://github.com/${repo}/pull/${number}`,
+    first_seen_at: null,
+  });
+
+  /// Selecting is what makes the panel reachable: pull requests live on
+  /// the DETAIL half, and the list row does not carry them.
+  function open(prs: ReturnType<typeof link>[]) {
+    state.list = listOf([session({ name: "Kestrel", pull_requests: prs })]);
+    renderView();
+    fireEvent.click(screen.getByRole("button", { name: /Kestrel/i }));
+  }
+
+  /// **The one that matters.** Links interleaved across two repositories
+  /// come back grouped, with each group's numbers ascending.
+  ///
+  /// Asserted as the ORDER of the rendered link texts, not as a set: the
+  /// whole complaint is that the flat list was unordered, so a test that
+  /// only checked membership would pass against the defect.
+  ///
+  /// SABOTAGE: `groupPrsByRepo` returning `[{ repo: "", prs: [...prs] }]`
+  /// -- the flat list in one group -- fails this on the first element.
+  it("puts each repository's pull requests together, numbers ascending", () => {
+    open([
+      link("acme/api", 12),
+      link("acme/ui", 3),
+      link("acme/api", 4),
+      link("acme/ui", 9),
+      link("acme/api", 30),
+    ]);
+
+    const texts = screen
+      .getAllByRole("link")
+      .map((a) => a.textContent ?? "")
+      .filter((t) => t.includes("#"));
+    expect(texts).toEqual([
+      "acme/api#4",
+      "acme/api#12",
+      "acme/api#30",
+      "acme/ui#3",
+      "acme/ui#9",
+    ]);
+  });
+
+  /// The group order is decided, not inherited from the order the
+  /// backend sent. The same links in the reverse order render the same
+  /// way -- which an object keyed by repo and iterated in insertion
+  /// order would not give.
+  ///
+  /// SABOTAGE: drop the `groups.sort(...)` call in `groupPrsByRepo` and
+  /// this fails while the test above still passes, because that one's
+  /// input already arrives with `acme/api` first.
+  it("orders the repository groups the same way whatever order the links arrive in", () => {
+    const forward = [link("acme/zulu", 2), link("acme/alpha", 8), link("acme/mike", 5)];
+    open(forward);
+    const first = screen.getAllByTestId("pr-group-repo").map((e) => e.textContent);
+    expect(first).toEqual(["acme/alpha", "acme/mike", "acme/zulu"]);
+
+    cleanup();
+    open([...forward].reverse());
+    expect(screen.getAllByTestId("pr-group-repo").map((e) => e.textContent)).toEqual(first);
+  });
+
+  /// One repository gets no heading. It would say nothing the rows below
+  /// it do not already say, and this is most sessions.
+  it("does not head a single repository's list with its name", () => {
+    open([link("acme/api", 4), link("acme/api", 2)]);
+    expect(screen.queryAllByTestId("pr-group-repo")).toHaveLength(0);
+    expect(screen.getByRole("link", { name: "acme/api#2" })).toBeTruthy();
+  });
+
+  /// Unchanged from #1132, and re-pinned because the grouping rewrote
+  /// this component: no pull requests means no heading at all, not an
+  /// empty one.
+  it("is absent entirely for a session that opened none", () => {
+    open([]);
+    expect(screen.queryByText(/^Pull requests?$/)).toBeNull();
+  });
+});
+
+/// #1280, part two. The reverse lookup, wired into the search box.
+///
+/// The hook itself is mocked -- `hooks.test.ts` is not where this file
+/// reaches -- so these are assertions about the COLUMN: which sentence
+/// it renders for which outcome, and that a matched session appears in
+/// the list. `claudePrs.test.ts` pins which queries reach the hook at
+/// all.
+describe("searching for a pull request finds the session that produced it", () => {
+  const type = (q: string) =>
+    fireEvent.change(screen.getByLabelText(/search claude code sessions/i), {
+      target: { value: q },
+    });
+
+  const link = (session_id: string) => ({
+    session_id,
+    repo: "acme/api",
+    number: 1234,
+    url: "https://github.com/acme/api/pull/1234",
+    first_seen_at: null,
+  });
+
+  /// Two sessions whose titles and prompts share no text with `1234`, so
+  /// a row that appears can only have got there through the lookup.
+  function two() {
+    state.list = listOf([
+      session({ session_id: "owner-1", name: "Kestrel" }),
+      session({ session_id: "other-1", name: "Merlin" }),
+    ]);
+  }
+
+  /// **The one that matters.** A PR-shaped query surfaces the owning
+  /// session, and only that one.
+  ///
+  /// SABOTAGE: drop `|| prOwners.has(s.session_id)` from the filter in
+  /// `useMatchedSessions` and Kestrel disappears -- the list goes empty,
+  /// because neither title contains `1234`.
+  it("shows the session the link table attributes the pull request to", () => {
+    two();
+    state.prQuery = { state: "done", ref: "acme/api#1234", links: [link("owner-1")] };
+    renderView();
+    type("acme/api#1234");
+
+    expect(screen.getByRole("button", { name: /Kestrel/i })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Merlin/i })).toBeNull();
+    expect(screen.getByTestId("pr-query-note").textContent).toMatch(
+      /1 session produced acme\/api#1234/i,
+    );
+  });
+
+  /// The found sentence names the REPOSITORY, and reads it off the
+  /// links rather than off the query. A bare `#1234` was resolved
+  /// against the tracked pull requests, so the query itself never said
+  /// which repository answered -- and with two of them carrying that
+  /// number, "2 sessions produced #1234" would leave the reader unable
+  /// to tell which is which.
+  ///
+  /// SABOTAGE: render `q.ref` in place of `prRefsOf(q.links)` and this
+  /// fails on both repository names, because `ref` is `#1234`.
+  it("names the repository a bare number resolved to", () => {
+    state.list = listOf([
+      session({ session_id: "owner-1", name: "Kestrel" }),
+      session({ session_id: "owner-2", name: "Osprey" }),
+    ]);
+    state.prQuery = {
+      state: "done",
+      ref: "#1234",
+      links: [
+        { ...link("owner-1"), repo: "acme/api" },
+        { ...link("owner-2"), repo: "acme/ui" },
+      ],
+    };
+    renderView();
+    type("1234");
+
+    const note = screen.getByTestId("pr-query-note").textContent ?? "";
+    expect(note).toMatch(/2 sessions produced/i);
+    expect(note).toMatch(/acme\/api#1234/);
+    expect(note).toMatch(/acme\/ui#1234/);
+  });
+
+  /// The issue's second constraint: PR matching is an ADDITION. A query
+  /// that happens to contain a number still matches titles and prompts,
+  /// and a lookup that found nothing does not take those rows away.
+  ///
+  /// SABOTAGE: replace the `||` in the filter with `prOwners.has(...)`
+  /// alone and Harrier vanishes even though its title says `1234`.
+  it("does not replace plain-text search", () => {
+    state.list = listOf([
+      session({ session_id: "text-1", name: "Harrier 1234 notarization" }),
+      session({ session_id: "owner-1", name: "Kestrel" }),
+      session({ session_id: "other-1", name: "Merlin" }),
+    ]);
+    state.prQuery = { state: "done", ref: "#1234", links: [link("owner-1")] };
+    renderView();
+    type("1234");
+
+    expect(screen.getByRole("button", { name: /Harrier/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Kestrel/i })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Merlin/i })).toBeNull();
+  });
+
+  /// **The hard constraint.** Three outcomes, three sentences, and they
+  /// must stay different from one another.
+  ///
+  /// Each case is set up so that ONLY the arm under test can produce the
+  /// text: the list is the same in all three, and only `state.prQuery`
+  /// moves.
+  ///
+  /// SABOTAGE: word the `failed` arm as the `done`-and-empty one -- give
+  /// both "No session recorded for {ref}" -- and the disjointness
+  /// assertion below fails outright, naming the two that collapsed.
+  it("says something different for each of the three outcomes", () => {
+    two();
+
+    // 1. The lookup RAN and the link table holds nothing. A finding.
+    state.prQuery = { state: "done", ref: "acme/api#1234", links: [] };
+    renderView();
+    type("acme/api#1234");
+    const recorded = screen.getByTestId("pr-query-note").textContent ?? "";
+    expect(recorded).toMatch(/no session recorded for acme\/api#1234/i);
+    // And the empty-list sentence is the SEARCH's, still said separately.
+    const searchEmpty = screen.getByText(/no session matches that search/i).textContent ?? "";
+    cleanup();
+
+    // 2. The lookup FAILED. Not a finding at all.
+    state.prQuery = {
+      state: "failed",
+      ref: "acme/api#1234",
+      links: [],
+      error: "database is locked",
+    };
+    renderView();
+    type("acme/api#1234");
+    const failed = screen.getByTestId("pr-query-note").textContent ?? "";
+    expect(failed).toMatch(/could not look up/i);
+    expect(failed).toMatch(/database is locked/i);
+    // The explicit denial that the two are the same fact.
+    expect(failed).toMatch(/not the same as/i);
+    expect(failed).not.toMatch(/no session recorded/i);
+    cleanup();
+
+    // 3. The TEXT filter matched nothing, and there is no pull request
+    // in the query at all.
+    state.prQuery = { state: "off" };
+    renderView();
+    type("nothing matches this");
+    expect(screen.queryByTestId("pr-query-note")).toBeNull();
+    const noMatch = screen.getByText(/no session matches that search/i).textContent ?? "";
+
+    // The property, stated as a property: all three are distinct
+    // strings. A future edit that merges any two fails here by name
+    // rather than leaving one of them silently unreachable.
+    const three = [recorded, failed, noMatch];
+    expect(new Set(three).size).toBe(3);
+    // And the search's sentence is the same one in both readings of it,
+    // so case 1 did not quietly invent a fourth.
+    expect(searchEmpty).toBe(noMatch);
+  });
+
+  /// A fourth state, and also not any of the three: a bare number whose
+  /// repository could not be named. The lookup is keyed on
+  /// `(repo, number)`, so nothing was asked -- and "we did not ask" must
+  /// not be reported as "they did not answer" (#1050).
+  it("says it could not tell which repository a bare number is in", () => {
+    two();
+    state.prQuery = { state: "unresolved", number: 1234 };
+    renderView();
+    type("1234");
+
+    const note = screen.getByTestId("pr-query-note").textContent ?? "";
+    expect(note).toMatch(/could not tell which repository/i);
+    expect(note).not.toMatch(/no session recorded/i);
+    expect(note).not.toMatch(/could not look up/i);
+  });
+
+  /// Nothing is denied while the answer is still coming. "No session
+  /// recorded" flashing for one frame before the row arrives is the
+  /// Pending-as-Unknown collapse (#1042) at a smaller scale.
+  it("says nothing while the lookup is in flight", () => {
+    two();
+    state.prQuery = { state: "loading", ref: "acme/api#1234" };
+    renderView();
+    type("acme/api#1234");
+    expect(screen.queryByTestId("pr-query-note")).toBeNull();
+  });
+
+  /// PARTIAL is not nothing (#1044). One repository answered and another
+  /// rejected: the rows that were found still show, above a line saying
+  /// the lookup did not fully succeed.
+  it("keeps the links that did answer when another lookup failed", () => {
+    two();
+    state.prQuery = {
+      state: "failed",
+      ref: "#1234",
+      links: [link("owner-1")],
+      error: "database is locked",
+    };
+    renderView();
+    type("1234");
+
+    expect(screen.getByRole("button", { name: /Kestrel/i })).toBeTruthy();
+    expect(screen.getByTestId("pr-query-note").textContent).toMatch(/could not look up/i);
+  });
+
+  /// The #1200 highlighting keeps working: a session matched by pull
+  /// request has no matching text in the five searched fields, so its
+  /// row draws with nothing marked and still reads as a row.
+  ///
+  /// SABOTAGE: make `segments` throw on a non-matching field and this
+  /// fails; a row that could not render at all would fail the assertion
+  /// above it too, which is why both are here.
+  it("renders a row matched only by pull request with nothing highlighted", () => {
+    two();
+    state.prQuery = { state: "done", ref: "acme/api#1234", links: [link("owner-1")] };
+    const { container } = renderView();
+    type("acme/api#1234");
+
+    const row = screen.getByRole("button", { name: /Kestrel/i });
+    expect(row.textContent).toMatch(/Kestrel/);
+    expect(within(row).queryAllByRole("mark")).toHaveLength(0);
+    expect(container.querySelectorAll("mark")).toHaveLength(0);
   });
 });

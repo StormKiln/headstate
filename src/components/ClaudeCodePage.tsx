@@ -8,6 +8,7 @@ import type {
   ClaudeFileChange,
   ClaudePairing,
   ClaudePreviewBlock,
+  ClaudePrLink,
   ClaudeReread,
   ClaudeSession,
   ClaudeToolArgs,
@@ -26,6 +27,8 @@ import {
   useClaudeSessionUsage,
   useClaudeSubagentRollup,
   useClaudeSessions,
+  useClaudeSessionsForPrQuery,
+  type PrQueryState,
   useClaudeTranscriptFollow,
   useWorktrees,
   useUiPrefs,
@@ -40,6 +43,7 @@ import {
 } from "@/api/tauri";
 import { LaunchTermsPicker } from "./LaunchTermsPicker";
 import { current } from "@/lib/ariaCurrent";
+import { groupPrsByRepo } from "@/lib/claudePrs";
 import { copyText } from "@/lib/clipboard";
 import { segments } from "@/lib/findOverData";
 import { IS_MOBILE_BUILD } from "@/lib/target";
@@ -159,7 +163,7 @@ import { ExternalLink } from "./ExternalLink";
 /// it, and the big group still needs search to be usable. Search is
 /// therefore the primary navigation and grouping is not offered.
 ///
-/// # Why search covers four fields
+/// # Why search covers five fields
 ///
 /// `aiTitle` names 1,436 of 1,438 sessions, so title-first search is
 /// what makes the list usable -- "the one about notarization" is how
@@ -179,7 +183,21 @@ import { ExternalLink } from "./ExternalLink";
 /// anything at all would otherwise slide every relative time under
 /// unchanged data.
 ///
-/// # Absent is not zero: seven conditions, seven renderings
+/// # A sixth axis: the pull request the query names (#1280)
+///
+/// The five fields answer "which session was about X". They cannot
+/// answer "which session produced this pull request", which is the
+/// question asked when a PR breaks -- and it is the more useful
+/// direction, because that session holds the context to fix it.
+///
+/// `useClaudeSessionsForPrQuery` resolves a query shaped like `#1234`,
+/// `owner/repo#1234` or a pasted GitHub URL through the link table
+/// `claude_sessions_for_pr` reads, and its answer is UNIONED with the
+/// text hits rather than replacing them: a query of `1234` still matches
+/// every title and prompt containing those digits. `parsePrQuery`
+/// carries the full argument for which shapes trigger it.
+///
+/// # Absent is not zero: ten conditions, ten renderings
 ///
 /// | condition | rendering |
 /// |---|---|
@@ -190,6 +208,15 @@ import { ExternalLink } from "./ExternalLink";
 /// | the SEARCH matched nothing | "No session matches that search" -- about the query, not the machine |
 /// | the CHIP matched nothing | "No session is in this filter" (#949) -- about the control, not the machine |
 /// | genuinely nothing | `NoSessions` -- only when the read SUCCEEDED and nothing was narrowed |
+/// | the PR lookup ran and found nothing | "No session recorded for `owner/repo#1234`" (#1280) -- a finding about the link table |
+/// | the PR lookup FAILED | "Could not look up ..." -- not a finding at all, and never worded as the row above |
+/// | a bare `#1234` whose repo we cannot name | "Could not tell which repository ..." -- we never asked (#1050) |
+///
+/// The last three are `PrQueryNote`'s, which argues each wording where
+/// it is rendered. They are stated beside the COUNTS rather than in the
+/// empty list, because they are true whether or not the text filter also
+/// matched something -- a pull request with no recorded session and a
+/// search that matched forty rows is an ordinary combination.
 ///
 /// The count was "four" until #970 and stayed there through the fifth row
 /// it added; it is corrected here rather than left, since a heading that
@@ -424,6 +451,25 @@ function useMatchedSessions() {
   const query = useDeferredValue(typed);
   const filter = useFilters((f) => f.claudeFilter);
   const showSubagents = useFilters((f) => f.claudeShowSubagents);
+  // The reverse lookup, when the query names a pull request (#1280).
+  //
+  // The RAW query rather than the deferred one. `useDeferredValue` exists
+  // to keep the 1,474-row array pass off the typing path; this is not
+  // that pass, it is a command round trip with its own debounce, and
+  // layering the two would make the lookup lag the box by a deferred
+  // frame plus 250 ms for no benefit.
+  const prQuery = useClaudeSessionsForPrQuery(typed, true);
+  // The session ids the link table attributed to that pull request.
+  // A `Set` because this is consulted once per row in the filter below.
+  const prOwners = useMemo(
+    () =>
+      new Set(
+        prQuery.state === "done" || prQuery.state === "failed"
+          ? prQuery.links.map((l) => l.session_id)
+          : [],
+      ),
+    [prQuery],
+  );
 
   // NO `= []` default (#846). A rejected read must reach the caller's
   // error arm rather than arriving there as an empty list that reads as
@@ -447,13 +493,21 @@ function useMatchedSessions() {
     const visible = showSubagents ? all : all.filter((s) => s.kind.kind !== "subagent");
     const chipped = visible.filter((s) => matchesClaudeFilter(s, filter));
     const hits = q
-      ? chipped.filter((s) =>
-          // The opening prompt joins the searched fields (#1133): the
-          // thing a user remembers is often a phrase they typed, and
-          // the placeholder below says so.
-          [s.name, s.cwd, s.git_branch, s.session_id, s.opening_prompt].some((f) =>
-            f?.toLowerCase().includes(q),
-          ),
+      ? chipped.filter(
+          (s) =>
+            // The opening prompt joins the searched fields (#1133): the
+            // thing a user remembers is often a phrase they typed, and
+            // the placeholder below says so.
+            [s.name, s.cwd, s.git_branch, s.session_id, s.opening_prompt].some((f) =>
+              f?.toLowerCase().includes(q),
+            ) ||
+            // OR, never instead of (#1280). A query like `1234` still
+            // matches every title and prompt containing those digits;
+            // the pull request lookup only ADDS the session that opened
+            // it, which by construction has no matching text in the five
+            // fields above -- so a replacement here would make the
+            // feature lose rows rather than gain them.
+            prOwners.has(s.session_id),
         )
       : chipped;
     // Running first, then the backend's newest-activity-first order,
@@ -469,7 +523,7 @@ function useMatchedSessions() {
     const live = hits.filter((s) => s.liveness.state === "running");
     const rest = hits.filter((s) => s.liveness.state !== "running");
     return { live, rest, ordered: [...live, ...rest], chipped };
-  }, [all, query, filter, showSubagents]);
+  }, [all, query, filter, showSubagents, prOwners]);
 
   // Every chip's population, over the WHOLE list and not the current
   // subset (#949). A count that shrank to zero on every chip but the
@@ -504,7 +558,7 @@ function useMatchedSessions() {
     };
   }, [all, showSubagents]);
 
-  return { list, all, matched, counts };
+  return { list, all, matched, counts, prQuery };
 }
 
 /// The chips, in the order they are offered (#949).
@@ -571,9 +625,101 @@ const CLAUDE_CHIPS: ReadonlyArray<{
 /// simply blank. The arms are in #846's order for the reason the page's
 /// doc comment gives at length: the error arm BEFORE the empty arm, and no
 /// `= []` default, so a rejected read can never render as "no sessions".
+/// What the pull request lookup found, said as its own sentence (#1280).
+///
+/// # Three outcomes, three wordings, and why they may never be merged
+///
+/// | outcome | wording |
+/// |---|---|
+/// | the lookup ran and returned nothing | "No session recorded for `owner/repo#1234`." |
+/// | the lookup rejected | "Could not look up `owner/repo#1234` (reason)." |
+/// | the text filter matched nothing | "No session matches that search." -- rendered by the list below, not here |
+///
+/// The first two are about the PULL REQUEST and are stated here, beside
+/// the counts, because they are true whether or not the text filter also
+/// matched something. The third is about the QUERY and belongs with the
+/// empty list, which is where it has always been.
+///
+/// Collapsing any two of these is the defect #846 and #1044 are both
+/// about. "No session recorded for #1234" is a finding: we asked the
+/// link table and it holds nothing, which is the ordinary answer for a
+/// pull request opened by hand, by CI, or before this machine imported
+/// its transcripts. "Could not look up #1234" is not a finding at all --
+/// the database did not answer, and the pull request may well have a
+/// session we simply could not see. Rendering the second as the first
+/// would tell a user their session is gone on the strength of a failed
+/// read.
+///
+/// A fourth state exists and is also not any of the three: a bare
+/// `#1234` whose repository could not be named. The lookup is keyed on
+/// `(repo, number)`, so no query was issued -- and "we never asked" must
+/// not be reported as "they did not answer" (#1050).
+///
+/// Nothing is rendered while the lookup is in flight. A row that is
+/// about to appear must not first be denied: "No session recorded"
+/// flashing for 40 ms before the session arrives is the Pending-as-
+/// Unknown collapse (#1042) at a smaller scale.
+/// The pull requests a set of links names, as prose.
+///
+/// Read off the LINKS rather than off the query, because a bare
+/// `#1234` was resolved through the tracked pull request list and the
+/// query never said which repository answered. Almost always one; two
+/// only when two repositories both carry that number, and then naming
+/// both is the point.
+function prRefsOf(links: readonly ClaudePrLink[]): string {
+  const refs = [...new Set(links.map((l) => `${l.repo}#${l.number}`))].sort();
+  return refs.length <= 2 ? refs.join(" and ") : `${refs.slice(0, -1).join(", ")} and ${refs.at(-1)}`;
+}
+
+function PrQueryNote({ q }: { q: PrQueryState }) {
+  if (q.state === "off" || q.state === "loading") return null;
+  if (q.state === "unresolved") {
+    return (
+      <p className="mt-1 text-[11px] text-[#8b949e]" data-testid="pr-query-note">
+        Could not tell which repository #{q.number} is in, so no session was looked up. Search{" "}
+        <code className="text-[#e6edf3]">owner/repo#{q.number}</code> to ask directly.
+      </p>
+    );
+  }
+  if (q.state === "failed") {
+    return (
+      <p className="mt-1 text-[11px] text-[#d29922]" data-testid="pr-query-note">
+        Could not look up which session produced {q.ref} ({q.error}). This is not the same as no
+        session having produced it.
+      </p>
+    );
+  }
+  if (q.links.length === 0) {
+    return (
+      <p className="mt-1 text-[11px] text-[#8b949e]" data-testid="pr-query-note">
+        No session recorded for {q.ref}. It may have been opened by hand, by CI, or before this
+        machine imported its transcripts.
+      </p>
+    );
+  }
+  return (
+    <p className="mt-1 text-[11px] text-[#8b949e]" data-testid="pr-query-note">
+      {/* The rows are in the list below and carry NO highlight: a
+          session matched by pull request has no matching text in the
+          five searched fields, which #1200's find-over-data highlighting
+          correctly renders as nothing marked. This line is what tells
+          the reader why those rows are there. */}
+      {q.links.length === 1 ? "1 session" : `${q.links.length} sessions`} produced{" "}
+      {/* The REPOSITORY, from the links rather than from the query. A
+          bare `#1234` was resolved against the tracked pull requests, so
+          `q.ref` is `#1234` and does not say which repository answered
+          -- and "1 session produced #1234" leaves the reader unable to
+          tell which of two repositories' `#1234` they are looking at. */}
+      {prRefsOf(q.links)}, shown below.
+    </p>
+  );
+}
+
 export function ClaudeSessionColumn() {
-  // `counts` is #949's per-chip population.
-  const { list, all, matched, counts } = useMatchedSessions();
+  // `counts` is #949's per-chip population; `prQuery` is #1280's reverse
+  // lookup, carried out of the hook so the column can say which of the
+  // three outcomes it is looking at.
+  const { list, all, matched, counts, prQuery } = useMatchedSessions();
   // `imported` as well as `now` since #970/#978: the empty state has to say
   // WHY it is empty, and only the scan knows whether `~/.claude/projects`
   // is there. Same query as the page's, so this costs a cache hit.
@@ -702,7 +848,11 @@ export function ClaudeSessionColumn() {
             type="search"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search title, prompt, directory, branch or id"
+            // Names the pull request form as well (#1280), because a
+            // search shape nobody is told about is one nobody uses. The
+            // five text fields stay first: they are what the box is for,
+            // and the reference is the addition.
+            placeholder="Search title, prompt, directory, branch, id or owner/repo#123"
             aria-label="Search Claude Code sessions"
             className="min-w-0 flex-1 bg-transparent py-1.5 text-xs text-[#e6edf3] outline-none placeholder:text-[#8b949e]"
           />
@@ -809,6 +959,7 @@ export function ClaudeSessionColumn() {
               : `${matched.ordered.length.toLocaleString()} of ${all.length.toLocaleString()} sessions`}
           {matched.live.length > 0 ? ` · ${matched.live.length} running now` : ""}
         </p>
+        <PrQueryNote q={prQuery} />
       </div>
       <div
         ref={scrollRef}
@@ -4137,28 +4288,64 @@ function Resume({
   );
 }
 
-/// The pull requests one session produced (#1132).
+/// The pull requests one session produced (#1132), grouped by
+/// repository (#1280).
 ///
 /// Absent entirely when there are none, rather than an empty heading:
 /// most sessions open no pull request, and a permanent "Pull requests:
 /// none" would be noise on almost every row.
+///
+/// # Why grouped, and why ascending inside a group
+///
+/// A long-running session touches several repositories, and the flat
+/// list arrived in whatever order the link table yielded -- so the one
+/// question this panel is asked, "what did this session produce and
+/// where", took a scan to answer. `groupPrsByRepo` carries both
+/// arguments at length: alphabetical group order so the list does not
+/// re-order itself as new pull requests land, and ascending numbers
+/// inside a group because within ONE session they were opened in
+/// roughly that order and so read as the sequence of the work.
+///
+/// The repository heading is dropped when there is only one group, and
+/// the numbers then carry their repo as they always did. A session with
+/// one repository -- which is most of them -- would otherwise gain a
+/// heading that says nothing the rows below it do not already say.
 function SessionPullRequests({ detail }: { detail: ClaudeSessionDetail }) {
-  const prs = detail.pull_requests ?? [];
-  if (prs.length === 0) return null;
+  // The FIELD as the dependency, never `?? []`. A fresh `[]` on every
+  // render would make the memo re-run every time and defeat its own
+  // purpose -- which is what `react-hooks/exhaustive-deps` warns about
+  // here, and it is right.
+  const links = detail.pull_requests;
+  const groups = useMemo(() => groupPrsByRepo(links ?? []), [links]);
+  if (groups.length === 0) return null;
+  const total = groups.reduce((n, g) => n + g.prs.length, 0);
+  const grouped = groups.length > 1;
   return (
     <div className="mt-3">
       <p className="text-xs font-semibold text-[#e6edf3]">
-        Pull request{prs.length === 1 ? "" : "s"}
+        Pull request{total === 1 ? "" : "s"}
       </p>
-      <ul className="mt-1 space-y-0.5">
-        {prs.map((pr) => (
-          <li key={`${pr.repo}#${pr.number}`} className="text-xs">
-            <ExternalLink href={pr.url} className="text-[#58a6ff] hover:underline">
-              {pr.repo}#{pr.number}
-            </ExternalLink>
-          </li>
-        ))}
-      </ul>
+      {groups.map((g) => (
+        <div key={g.repo} className={grouped ? "mt-1.5" : "mt-1"}>
+          {grouped ? (
+            <p className="text-[11px] text-[#8b949e]" data-testid="pr-group-repo">
+              {g.repo}
+            </p>
+          ) : null}
+          <ul className={grouped ? "mt-0.5 space-y-0.5" : "space-y-0.5"}>
+            {g.prs.map((pr) => (
+              <li key={`${pr.repo}#${pr.number}`} className="text-xs">
+                <ExternalLink href={pr.url} className="text-[#58a6ff] hover:underline">
+                  {/* The repo stays on every row even under a heading.
+                      The link's text is what a reader copies out of here,
+                      and `#7` alone does not name a pull request. */}
+                  {pr.repo}#{pr.number}
+                </ExternalLink>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ))}
     </div>
   );
 }
