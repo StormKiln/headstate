@@ -39,6 +39,7 @@ import type {
   NetProcess,
   PrDetail,
   PullRequest,
+  ReviewState,
   Upstream,
   Venv,
   Worktree,
@@ -542,13 +543,117 @@ async function refreshPrs(qc: QueryClient): Promise<void> {
   return refreshInFlight;
 }
 
+/// The two cached lists that hold `PullRequest[]` rows.
+///
+/// Same pair, and the same reason, as `cachedRow` below: My PRs and To
+/// review are separate queries over overlapping pull requests, and a PR
+/// the user acted on can be in either or both. Patching one and not the
+/// other is how a row disappears from the list you are standing on and
+/// survives on the one you switch to.
+const LIST_KEYS = [["prs"], ["reviewing"]] as const;
+
+/// Write a CONFIRMED state change into the cached list rows now, so the
+/// list predicates see it without waiting for a whole-account refresh.
+///
+/// There is no rollback here, and that is the design rather than an
+/// omission. Every call site runs this in a mutation's SUCCESS arm,
+/// after the backend has verified the write landed -- so there is no
+/// "restore on failure" branch for it to need: on a rejection this code
+/// never runs, the rows are never touched, and the caller's
+/// `toast.error` carries GitHub's own refusal text ("base branch was
+/// modified", "already in the merge queue", a permissions refusal).
+/// The row is still there and the failure is stated, which is what
+/// #1276's honesty constraint asks for.
+///
+/// This is the boundary worth naming, in #846/#1042's terms. What is
+/// unconfirmed is only the READ-BACK: `refreshPrs` is a whole-account
+/// search, 7-17 seconds on the account that reported #742, and
+/// `["reviewing"]` is a second one. Writing the write's own outcome
+/// while those run is reporting a fact we have, not guessing at one we
+/// do not. Patching BEFORE the mutation resolved would be the other
+/// thing, and would silently drop a pull request the merge queue went
+/// on to refuse -- worse than the stale row, because the user would
+/// believe it was handled and never revisit it. So the patch is placed
+/// after the await, deliberately, on every path.
+///
+/// `listPatchFor` withholds the two actions whose success this still
+/// cannot honestly represent locally; see its own comment.
+function patchListRows(
+  qc: QueryClient,
+  repo: string,
+  number: number,
+  patch: Partial<PullRequest>,
+): void {
+  for (const key of LIST_KEYS) {
+    const rows = qc.getQueryData<PullRequest[]>(key);
+    if (rows === undefined) continue;
+    if (!rows.some((p) => p.repo === repo && p.number === number)) continue;
+    // New array and new row objects: React Query compares by reference,
+    // and mutating in place would leave the list rendering the old value
+    // -- the same trap `withOwnReview` documents.
+    qc.setQueryData<PullRequest[]>(
+      key,
+      rows.map((p) => (p.repo === repo && p.number === number ? { ...p, ...patch } : p)),
+    );
+  }
+}
+
+/// What each action claims about the list row, or `undefined` for an
+/// action whose effect the list cannot represent.
+///
+/// Only the fields the LIST predicates read, and only where the action's
+/// success settles them:
+///
+/// - `enqueue`/`dequeue` set `in_merge_queue`, which `readyForReview`
+///   and `readyToQueue` both test.
+/// - `draft`/`ready` set `is_draft`, which every strip predicate tests.
+/// - `merge` and `close` remove the pull request from the list
+///   altogether, and `undefined` here leaves them to `refreshPrs` --
+///   deliberately. A merge is irreversible and the existing comment on
+///   `useActOnPr` already refuses to render it before GitHub agrees;
+///   this change does not overturn that judgement.
+/// - `reopen` adds a pull request the list does not have, which no local
+///   patch can synthesise.
+function listPatchFor(action: PrActionName): Partial<PullRequest> | undefined {
+  switch (action) {
+    case "enqueue":
+      return { in_merge_queue: true };
+    case "dequeue":
+      return { in_merge_queue: false };
+    case "draft":
+      return { is_draft: true };
+    case "ready":
+      return { is_draft: false };
+    default:
+      return undefined;
+  }
+}
+
 /// Apply an action to a pull request, then refresh what it affected.
 ///
-/// NOT optimistic. Every list mutation elsewhere updates locally first,
-/// but a merge either happened or did not, and showing a PR as merged
-/// before GitHub agreed would be a lie about a state the user cannot
-/// undo. The Rust side wakes the poll loop on success, so the list
-/// catches up within a tick rather than after the full interval.
+/// The list row is patched only AFTER the mutation resolves, never
+/// before it (#1276). That is the narrow sense in which this is
+/// optimistic: GitHub has confirmed the WRITE, and what we have not
+/// confirmed is the read-back -- `refreshPrs` is a whole-account search
+/// that measured 7-17 seconds on the account that reported this, and
+/// `["reviewing"]` is a second search of comparable cost. Until one of
+/// them lands, the list keeps rendering the pre-action snapshot, which
+/// is what put an approved and queued pull request back in "Ready for
+/// review" and made the user re-scan the list to find their place.
+///
+/// The earlier comment here said "NOT optimistic ... a merge either
+/// happened or did not, and showing a PR as merged before GitHub agreed
+/// would be a lie about a state the user cannot undo". That judgement
+/// stands and is why `listPatchFor` returns `undefined` for `merge` and
+/// `close`: those two still wait for the refresh. What changed is the
+/// reversible middle -- enqueue, dequeue, draft, ready -- where the
+/// write has already been confirmed and only the read is behind.
+///
+/// On rejection nothing is patched at all: `.then`'s success arm does
+/// not run, so the row stays exactly where it was and `PrActions`'s
+/// `toast.error` states the failure in GitHub's own words. There is no
+/// rollback because there is nothing to roll back -- see
+/// `patchListRows` for why that is the shape rather than a gap.
 export function useActOnPr() {
   const qc = useQueryClient();
   return (
@@ -558,6 +663,8 @@ export function useActOnPr() {
     action: PrActionName,
   ) =>
     actOnPr(id, repo, number, action).then(async () => {
+      const patch = listPatchFor(action);
+      if (patch !== undefined) patchListRows(qc, repo, number, patch);
       void qc.invalidateQueries({ queryKey: ["pr-detail", repo, number] });
       void qc.invalidateQueries({ queryKey: ["reviewing"] });
       await refreshPrs(qc);
@@ -595,6 +702,26 @@ export function useRerunChecks() {
 export const REVIEW_STATE: Partial<Record<ReviewVerdictName, string>> = {
   approve: "APPROVED",
   request_changes: "CHANGES_REQUESTED",
+};
+
+/// The same verdict in the LIST row's vocabulary.
+///
+/// `PullRequest.review` is a lowercase `ReviewState`, not the uppercase
+/// GraphQL string `latest_reviews` carries, so this cannot reuse
+/// `REVIEW_STATE`. Both maps omit `comment` for the same reason: a
+/// COMMENT review changes no verdict, and writing one would invent a
+/// state change that did not happen.
+///
+/// Note this sets the pull request's AGGREGATE verdict from the
+/// viewer's own, which is exact for `approve` on the surface that
+/// motivated it -- `readyForReview` drops a row the moment `review` is
+/// `approved`, and one approval is what produces that -- and is at
+/// worst redundant for `request_changes`, where the aggregate was
+/// already blocked or is now correctly blocked. The refresh that
+/// follows overwrites it either way.
+const REVIEW_ROW_STATE: Partial<Record<ReviewVerdictName, ReviewState>> = {
+  approve: "approved",
+  request_changes: "changes_requested",
 };
 
 /// `detail` with the viewer's own review replaced by `state`.
@@ -684,6 +811,21 @@ export function useReviewPr() {
           prev === undefined ? prev : withOwnReview(prev, viewer, state),
         );
       }
+      // The LIST row's half of the same seed (#1276).
+      //
+      // Without this, approving a pull request left it sitting in
+      // "Ready for review" -- `readyForReview` tests `pr.review`, the
+      // detail seed above never touches the list, and the two refreshes
+      // below are whole-account searches. The user went "Back to list"
+      // to find the row they had just handled still there, which is the
+      // re-scanning the issue describes.
+      //
+      // No viewer check, unlike the seed above. That one attributes a
+      // review to a NAMED author and must not guess who; this one sets
+      // an aggregate verdict that does not name anyone, so a failed
+      // `useViewer` is not a reason to leave the list wrong.
+      const rowState = REVIEW_ROW_STATE[verdict];
+      if (rowState !== undefined) patchListRows(qc, repo, number, { review: rowState });
       // The REVIEW is not refetched here, and that is deliberate.
       //
       // The seed above writes the verdict we know landed. Immediately
@@ -2177,6 +2319,19 @@ export function useActOnPrs() {
   const qc = useQueryClient();
   return (prs: [string, string, number][], action: PrActionName) =>
     actOnPrs(prs, action).then(async (outcomes) => {
+      // Per OUTCOME, not per requested pull request (#1276). A batch
+      // fails partially as its normal case -- that is why `actOnPrs`
+      // returns an outcome each instead of throwing on the first
+      // rejection -- so patching all forty rows because the call
+      // resolved would drop rows for pull requests GitHub refused, and
+      // `BulkBar` would report those failures over a list that had
+      // already hidden them.
+      const patch = listPatchFor(action);
+      if (patch !== undefined) {
+        for (const o of outcomes) {
+          if (o.error === null) patchListRows(qc, o.repo, o.number, patch);
+        }
+      }
       void qc.invalidateQueries({ queryKey: ["reviewing"] });
       await refreshPrs(qc);
       return outcomes;
