@@ -1344,7 +1344,12 @@ fn pair(out: &mut Preview) {
 /// Handles both shapes the corpus actually carries -- a list of blocks
 /// (1,500 of 1,586 sampled messages) and a bare string (86) -- because a
 /// reader that assumed either one alone is wrong on the other.
-fn blocks_of(content: Option<&serde_json::Value>) -> Vec<Block> {
+///
+/// `pub(crate)` for `claudemd::advice::transcripts`, which reads every
+/// session under a repository through this same parser rather than
+/// carrying a second copy of the `tool_use`/`tool_result` shapes that
+/// would drift from this one.
+pub(crate) fn blocks_of(content: Option<&serde_json::Value>) -> Vec<Block> {
     match content {
         Some(serde_json::Value::String(s)) => vec![text_block(s)],
         Some(serde_json::Value::Array(items)) => items.iter().map(block_of).collect(),

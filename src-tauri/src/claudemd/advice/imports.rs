@@ -99,7 +99,15 @@ mod tests {
             definitions: None,
             conn: None,
         };
-        super::super::run(&cx)
+        // The whole run, narrowed to this check: the tests below assert
+        // on partiality and the "nothing found" line, and a sibling
+        // producer that needs a store or an inventory this context does
+        // not carry would make both about the sibling, not about imports.
+        let mut report = super::super::run(&cx);
+        report.findings.retain(|f| f.check == Check::Imports);
+        report.checks.retain(|c| c.check == Check::Imports);
+        report.brief = crate::claudemd::advice::brief::render_report(&report);
+        report
     }
 
     /// The founding case: a CLAUDE.md importing a file that does not

@@ -64,6 +64,7 @@
 pub mod brief;
 pub mod imports;
 pub mod toolchain;
+pub mod transcripts;
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -91,17 +92,22 @@ pub enum Check {
     /// deploy command no loaded CLAUDE.md names; and a code-style line a
     /// formatter config already decides.
     Toolchain,
+    /// What recurred in the sessions recorded under the repository -- a
+    /// corrected command, a user correction, a denial, a repeated search
+    /// or error -- and whether a CLAUDE.md on the path already states it.
+    Transcripts,
 }
 
 impl Check {
     /// Every check, in the order a report lists them.
-    pub const ALL: &'static [Check] = &[Check::Imports, Check::Toolchain];
+    pub const ALL: &'static [Check] = &[Check::Imports, Check::Toolchain, Check::Transcripts];
 
     /// The check's name as the brief prints it.
     pub fn name(self) -> &'static str {
         match self {
             Check::Imports => "imports",
             Check::Toolchain => "toolchain",
+            Check::Transcripts => "transcripts",
         }
     }
 }
@@ -330,7 +336,11 @@ pub trait Producer: Sync {
 }
 
 /// Every registered producer, in run order.
-pub static PRODUCERS: &[&dyn Producer] = &[&imports::Imports, &toolchain::Coverage];
+pub static PRODUCERS: &[&dyn Producer] = &[
+    &imports::Imports,
+    &toolchain::Coverage,
+    &transcripts::Transcripts,
+];
 
 /// Run every registered producer and assemble the report.
 pub fn run(cx: &Context) -> Report {

@@ -1758,14 +1758,41 @@ pub async fn claude_md_effective(
 /// `home()` is resolved here for `claude_md_effective`'s reason, and a
 /// missing home is tolerated the same way: the report still runs over
 /// the repository scan, which records the scope it could not look for.
+///
+/// The store is opened here, the way `claude_import_transcripts` opens
+/// it, and handed to the producers as `Context::conn`. The transcripts
+/// producer reads sessions through it and writes only Headstate's own
+/// cache (`claude_advice_ledger`, `claude_advice_signal`), which is why
+/// the command stays `Class::Read`. A store that cannot be opened is not
+/// a rejection: `conn` is `None`, that one producer reports itself
+/// Unknown, and the producers that need no store still answer (#1044).
+/// The whole run sits on ONE `spawn_blocking`, because the transcript
+/// pass is a whole-body read of every session under the repository and
+/// must never run on the async runtime or on the live pass (#1246).
 #[tauri::command]
 pub async fn claude_md_advice(
+    app: AppHandle,
     repo_path: String,
 ) -> Result<crate::claudemd::advice::Report, String> {
+    let db = db_path(&app);
     tauri::async_runtime::spawn_blocking(move || {
         let repo = std::path::PathBuf::from(&repo_path);
         let home = crate::claudemd::home();
-        crate::claudemd::advice::report_in(&repo, home.as_deref())
+        let conn = open_db(&db).ok();
+        // The `Context` is built here rather than through
+        // `advice::report_in`, which exists for the store-less callers
+        // (tests, and any producer run over a bare checkout): the scan
+        // happens once, the store is opened once, and every producer
+        // sees the same two.
+        let scan = crate::claudemd::scan_effective_opt(&repo, home.as_deref());
+        let cx = crate::claudemd::advice::Context {
+            repo: &repo,
+            home: home.as_deref(),
+            scan: &scan,
+            definitions: None,
+            conn: conn.as_ref(),
+        };
+        crate::claudemd::advice::run(&cx)
     })
     .await
     .map_err(|e| e.to_string())

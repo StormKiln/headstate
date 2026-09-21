@@ -1031,6 +1031,56 @@ const MIGRATIONS: &[&str] = &[
         corpus_sessions  INTEGER NOT NULL,
         last_pass_at     TEXT NOT NULL
      );",
+    // 24: transcript-derived CLAUDE.md advice (7.1, `claudemd::advice::
+    // transcripts`).
+    //
+    // The advice pass is a whole-body read of every transcript under one
+    // repository, the same shape as the plugin scan migration 16 caches
+    // (26 s cold on the real corpus) and for the same reason: a signal
+    // -- a failed command corrected, a denial, a repeated grep -- can sit
+    // anywhere in the file, so no head read finds it. Two tables, the
+    // `claude_index_ledger` split one migration up:
+    //
+    // `claude_advice_ledger` is the CHANGE KEY per session: `(size_bytes,
+    // mtime_ms)` as migration 16 argues for them -- a change key, never a
+    // claim about when something happened -- and `truncated` so a
+    // session read only to its first 8 MB stays labelled as a floor on
+    // every later open, not just the one that read it.
+    //
+    // `claude_advice_signal` holds the RAW rows the pass extracted, one
+    // per signal occurrence, keyed by session so a changed transcript
+    // replaces exactly its own rows. Thresholds and the "already
+    // written" test are applied at read time over these rows, never
+    // stored: a CLAUDE.md edited since the pass must change the answer
+    // without a re-read, and a threshold tuned later must not need a
+    // migration. `dir` is the attributed directory after agent-worktree
+    // re-rooting; which CLAUDE.md that maps to is decided against the
+    // repository scan at read time, because a CLAUDE.md added since the
+    // pass moves the finding.
+    //
+    // `detail` is the one column holding text a user typed or a tool
+    // printed, clamped to 300 characters by the writer. It is read only
+    // into one evidence row per finding and never logged.
+    "CREATE TABLE IF NOT EXISTS claude_advice_ledger (
+        session_id   TEXT PRIMARY KEY,
+        size_bytes   INTEGER NOT NULL,
+        mtime_ms     INTEGER NOT NULL,
+        truncated    INTEGER NOT NULL,
+        analysed_at  TEXT NOT NULL
+     );
+     CREATE TABLE IF NOT EXISTS claude_advice_signal (
+        session_id      TEXT NOT NULL,
+        signal          TEXT NOT NULL,
+        dir             TEXT NOT NULL,
+        key             TEXT NOT NULL,
+        aux             TEXT,
+        record_index    INTEGER,
+        record_index_2  INTEGER,
+        detail          TEXT,
+        tool_use_id     TEXT
+     );
+     CREATE INDEX IF NOT EXISTS claude_advice_signal_session
+        ON claude_advice_signal (session_id);",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
@@ -1317,6 +1367,76 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM claude_session", [], |r| r.get(0))
             .unwrap();
         assert_eq!(kept, 1, "an upgrade must not cost a stored session");
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+    }
+
+    /// Migration 24 adds the advice ledger and signal tables without
+    /// costing anything a v23 database held (7.1).
+    ///
+    /// Both tables are Headstate's own derived data -- losing them costs
+    /// one re-read of a repository's transcripts, not a fact -- but the
+    /// tables beside them hold observations that cannot be recovered,
+    /// and the upgrade path is the one every existing install takes.
+    #[test]
+    fn migration_24_adds_the_advice_tables_without_costing_sessions() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in MIGRATIONS.iter().take(23) {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 23i64).unwrap();
+        conn.execute(
+            "INSERT INTO claude_session (session_id, first_seen_at) VALUES ('s1', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO claude_index_ledger (session_id, size_bytes, mtime_ms, truncated, indexed_at)
+             VALUES ('s1', 1, 1, 0, '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO claude_advice_ledger (session_id, size_bytes, mtime_ms, truncated, analysed_at)
+             VALUES ('s1', 1, 1, 0, '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO claude_advice_signal
+                (session_id, signal, dir, key, aux, record_index, record_index_2, detail)
+             VALUES ('s1', 's1', '/home/octocat/hello-world', 'make lint', 'yarn lint', 4, 7, NULL)",
+            [],
+        )
+        .unwrap();
+        // A session's rows are addressable by session, which is how a
+        // changed transcript replaces exactly its own.
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claude_advice_signal WHERE session_id = 's1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+
+        let kept: i64 = conn
+            .query_row("SELECT COUNT(*) FROM claude_session", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 1, "an upgrade must not cost a stored session");
+        let kept_index: i64 = conn
+            .query_row("SELECT COUNT(*) FROM claude_index_ledger", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            kept_index, 1,
+            "an upgrade must not cost the search index's ledger"
+        );
 
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
