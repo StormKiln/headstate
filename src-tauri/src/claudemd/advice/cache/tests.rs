@@ -263,6 +263,27 @@ fn touching_without_editing_does_not_recompute() {
     );
 }
 
+/// A cache hit taken over a repository whose CLAUDE.md cannot be read,
+/// or `None` where that cannot be arranged (see `unreadable`).
+///
+/// A function returning `Option` rather than a `#[cfg]` on the whole
+/// test, so the two platform-independent states stay asserted on Windows
+/// instead of the whole acceptance test vanishing there.
+#[cfg(unix)]
+fn unverified_result() -> Option<AdviceResult> {
+    let f = Fixture::new();
+    f.seed(&[], "2026-01-01T00:00:00Z");
+    unreadable(&f.repo.join("CLAUDE.md"));
+    let got = f.serve(Mode::Cached, "2026-06-01T00:00:00Z");
+    restore(&f.repo.join("CLAUDE.md"));
+    Some(got)
+}
+
+#[cfg(not(unix))]
+fn unverified_result() -> Option<AdviceResult> {
+    None
+}
+
 /// ACCEPTANCE: the three freshness states are distinguishable.
 ///
 /// One test over all three, because the property is that they DIFFER --
@@ -290,43 +311,46 @@ fn the_three_freshness_states_are_distinguishable() {
     let c2 = stale.serve(Mode::Cached, "2026-06-01T00:00:00Z");
     assert_eq!(c2.freshness, Freshness::Cached { stale: true });
 
-    // 3: unverified. An unreadable tracked input, so currency is
-    // UNKNOWN -- and that is not state 1.
-    let unverified = Fixture::new();
-    unverified.seed(&[], "2026-01-01T00:00:00Z");
-    unreadable(&unverified.repo.join("CLAUDE.md"));
-    let c3 = unverified.serve(Mode::Cached, "2026-06-01T00:00:00Z");
-    restore(&unverified.repo.join("CLAUDE.md"));
-
-    match &c3.freshness {
-        Freshness::Unverified { reason, .. } => {
-            assert!(
-                reason.contains("CLAUDE.md"),
-                "the reason must name the input it could not read, got {reason:?}"
-            );
-        }
-        other => panic!("an unreadable tracked input reported {other:?}, not Unverified"),
-    }
-    // The states are PAIRWISE distinct, which is the actual property --
-    // three separate assertions of one value each would pass against a
+    // States 1 and 2 are pairwise distinct on every platform, which is
+    // the property -- assertions of one value each would pass against a
     // `serve` that returned the same variant for two situations.
+    assert_ne!(a.freshness, c2.freshness, "computed-now is not stale-cache");
     assert_ne!(
         b.freshness, c2.freshness,
         "verified-current is not stale-cache"
     );
-    assert_ne!(
-        b.freshness, c3.freshness,
-        "verified-current is not could-not-verify"
-    );
-    assert_ne!(
-        c2.freshness, c3.freshness,
-        "stale-cache is not could-not-verify"
-    );
-    assert_ne!(
-        c3.freshness,
-        Freshness::Fresh { recomputed: true },
-        "could-not-verify is not fresh, even when the producers just ran"
-    );
+
+    // 3: unverified. An unreadable tracked input, so currency is
+    // UNKNOWN -- and that is neither of the states above.
+    //
+    // Unix only, because only there can a file be LISTED by the scan and
+    // still refuse to be read; see `unreadable`. The two states above
+    // are asserted on every platform, so Windows still fails if they
+    // collapse into each other.
+    if let Some(c3) = unverified_result() {
+        match &c3.freshness {
+            Freshness::Unverified { reason, .. } => {
+                assert!(
+                    reason.contains("CLAUDE.md"),
+                    "the reason must name the input it could not read, got {reason:?}"
+                );
+            }
+            other => panic!("an unreadable tracked input reported {other:?}, not Unverified"),
+        }
+        assert_ne!(
+            b.freshness, c3.freshness,
+            "verified-current is not could-not-verify"
+        );
+        assert_ne!(
+            c2.freshness, c3.freshness,
+            "stale-cache is not could-not-verify"
+        );
+        assert_ne!(
+            c3.freshness,
+            Freshness::Fresh { recomputed: true },
+            "could-not-verify is not fresh, even when the producers just ran"
+        );
+    }
     // `a` is the fourth distinguishable thing: computed now, which a
     // caller tells from verified-current by `recomputed`.
     assert_ne!(
@@ -342,6 +366,7 @@ fn the_three_freshness_states_are_distinguishable() {
 /// fingerprint stored beside it still omits an input -- so the NEXT open
 /// cannot use it to prove anything either.
 #[test]
+#[cfg(unix)] // see `unreadable`: Windows cannot cheaply make a listed file unreadable
 fn a_recomputed_report_over_an_unreadable_input_is_unverified_not_fresh() {
     let f = Fixture::new();
     unreadable(&f.repo.join("CLAUDE.md"));
@@ -749,6 +774,7 @@ fn the_input_record_is_length_prefixed() {
 /// two would either serve the old report as current or would recompute
 /// and then call the result verified.
 #[test]
+#[cfg(unix)] // see `unreadable`: Windows cannot cheaply make a listed file unreadable
 fn an_unreadable_input_both_changes_the_digest_and_flags_it() {
     let f = Fixture::new();
     let before = f.fingerprint();
@@ -765,13 +791,23 @@ fn an_unreadable_input_both_changes_the_digest_and_flags_it() {
     }
 }
 
-/// Make a file unreadable, on the platforms where that is possible.
+/// Make a file that the scan CAN list and the fingerprint CANNOT read.
 ///
-/// `chmod 000` does nothing for root, and Windows has no equivalent, so
-/// both are skipped rather than faked: a test that pretended would pin
-/// nothing. The tests that call this assert on the RESULT of the read
-/// failing, so on a platform where it does not fail they assert the
-/// readable path, which is still true.
+/// Unix only, and the tests that need it are `#[cfg(unix)]` for that
+/// reason rather than being faked portably.
+///
+/// Deleting the file is NOT a substitute, and an earlier version of this
+/// helper got it wrong that way: these tests call `unreadable` before
+/// the scan runs, so a deleted file is simply not listed, the
+/// fingerprint never tries to read it, and the assertion that it reports
+/// `Unverified` fails -- which is exactly how this first went red on
+/// Windows. The state being pinned is specifically "the walk PROVED this
+/// file exists and could not read it" (`Scan::unreadable_files`), and
+/// `chmod 000` is the only cheap way to produce it.
+///
+/// Skipping on Windows loses real coverage there. That is stated rather
+/// than papered over: the logic under test is platform-independent, and
+/// a test that pretended would pin nothing on either platform.
 #[cfg(unix)]
 fn unreadable(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -783,17 +819,6 @@ fn restore(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644));
 }
-
-#[cfg(not(unix))]
-fn unreadable(path: &Path) {
-    // Deleting is the portable "cannot be read", and it is a real case:
-    // the scan listed the file and it was removed before the
-    // fingerprint read it.
-    std::fs::remove_file(path).unwrap();
-}
-
-#[cfg(not(unix))]
-fn restore(_path: &Path) {}
 
 /// A missing home directory is a STATED ABSENCE, not a failed read.
 ///
@@ -807,6 +832,7 @@ fn restore(_path: &Path) {}
 /// The two ARMS of the assertion are the test: with no home the run is
 /// Complete; with a home whose `.claude` cannot be listed it is not.
 #[test]
+#[cfg(unix)] // see `unreadable`: Windows cannot cheaply make a listed file unreadable
 fn a_missing_home_is_complete_and_an_unreadable_home_is_not() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
@@ -847,6 +873,7 @@ fn a_missing_home_is_complete_and_an_unreadable_home_is_not() {
 /// wall of every path is not readable. One verbatim, plus a count, is
 /// the shape the rest of this codebase uses for a floor.
 #[test]
+#[cfg(unix)] // see `unreadable`: Windows cannot cheaply make a listed file unreadable
 fn the_unverified_reason_names_one_input_and_counts_the_others() {
     let f = Fixture::new();
     std::fs::create_dir_all(f.repo.join("a")).unwrap();
