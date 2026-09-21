@@ -102,6 +102,71 @@ pub struct Scan {
     /// problem; it exists so the exclusion is visible and testable rather
     /// than invisible.
     pub skipped_dirs: usize,
+    /// What each directory the walk visited IS, for `advice::gaps`.
+    ///
+    /// Recorded inside the same loop that finds the CLAUDE.md files, from
+    /// the entry names it already has in hand, because a second traversal
+    /// would double the cost #1236 halved. `#[serde(skip)]`: the wire
+    /// shape of `Scan` is mirrored by `ClaudeMdScan` in `src/types/pr.ts`
+    /// and nothing on the frontend reads directory facts, so they stay off
+    /// the wire rather than widening a type the phone also compiles.
+    #[serde(skip)]
+    pub dir_facts: Vec<DirFacts>,
+}
+
+/// What one directory the walk visited is, recorded as it passed.
+///
+/// Every field is derived from the entry names `scan_repo` lists anyway,
+/// plus one file read for a `Cargo.toml` or `package.json` (to expand its
+/// workspace members). Nothing here lists a directory a second time:
+/// `packages::detect::ecosystems` was measured and rejected for this
+/// slot, because it lists the directory twice more and walks three levels
+/// under it for Terraform locks, which is a walk per directory.
+///
+/// A directory that could NOT be listed is recorded too, with
+/// `unreadable` set, so a consumer can tell "nothing under here" from
+/// "could not look under here" without parsing `unreadable_dirs` back
+/// into paths.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirFacts {
+    /// Absolute, as `ClaudeFile::path` is.
+    pub path: PathBuf,
+    /// Relative to the repository root. Empty for the root itself.
+    pub rel: PathBuf,
+    /// Why the directory could not be listed, when it could not. Every
+    /// other field is then meaningless and left at its default.
+    pub unreadable: Option<String>,
+    /// A `CLAUDE.md` entry is here, readable or not. An unreadable one
+    /// still exists and still covers the directories under it.
+    pub has_claude_md: bool,
+    /// Manifest files present, by name: `Cargo.toml`, `package.json`,
+    /// `pyproject.toml`, `go.mod`, `Package.swift`. Sorted.
+    pub manifests: Vec<String>,
+    /// Lockfiles and tool configs that mark a directory as built on its
+    /// own: `Cargo.lock`, `deny.toml`, `yarn.lock`, `uv.lock`, … Sorted.
+    pub markers: Vec<String>,
+    /// The manifest that lists this directory as a workspace member, when
+    /// one does: a `Cargo.toml` `[workspace].members` entry or a
+    /// `package.json` `workspaces` entry, globs expanded the way
+    /// `packages::cargo` expands them.
+    pub workspace_of: Option<PathBuf>,
+    /// This directory's own manifest declares members that could not be
+    /// read or expanded, with why. Membership of anything it names is
+    /// then UNKNOWN, not false: a `Cargo.toml` that will not parse still
+    /// has members, and reporting none would turn a syntax error into
+    /// "no members here".
+    pub workspace_unknown: Option<String>,
+    /// Direct entries named `*.test.*` or `*.spec.*`. Not recursive: a
+    /// count of what THIS directory holds, which is the question "does a
+    /// session working here have a test suite of its own".
+    pub test_files: usize,
+    /// Direct entries named `tests`, `__tests__` or `spec`.
+    pub test_dirs: usize,
+    /// A well-known role name, from the path alone: `src-*`,
+    /// `packages/*`, `crates/*`, `apps/*`, `docs`, `scripts`,
+    /// `.github/workflows`. Matched at the root level only, where these
+    /// conventions live.
+    pub role: Option<String>,
 }
 
 impl Scan {
@@ -340,8 +405,18 @@ pub fn scan_repo(repo: &Path) -> Scan {
     ];
     let mut scan = Scan::default();
     let mut stack = vec![repo.to_path_buf()];
+    // Member directory -> the manifest that lists it. Filled when a
+    // workspace root is visited, read when its members are: the stack
+    // pops a parent before any child it pushed, so a member's root has
+    // always been seen first.
+    let mut workspace_roots: std::collections::HashMap<PathBuf, PathBuf> =
+        std::collections::HashMap::new();
 
     while let Some(dir) = stack.pop() {
+        let rel = dir
+            .strip_prefix(repo)
+            .unwrap_or(Path::new(""))
+            .to_path_buf();
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(e) => {
@@ -351,8 +426,21 @@ pub fn scan_repo(repo: &Path) -> Scan {
                 // indistinguishable from it genuinely being empty.
                 scan.unreadable_dirs
                     .push(format!("{} ({e})", dir.display()));
+                scan.dir_facts.push(DirFacts {
+                    path: dir.clone(),
+                    rel,
+                    unreadable: Some(e.to_string()),
+                    ..Default::default()
+                });
                 continue;
             }
+        };
+        let mut facts = DirFacts {
+            path: dir.clone(),
+            role: role_of(&rel),
+            workspace_of: workspace_roots.get(&dir).cloned(),
+            rel,
+            ..Default::default()
         };
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
@@ -366,10 +454,19 @@ pub fn scan_repo(repo: &Path) -> Scan {
                     // missing rather than exactly one.
                     scan.unreadable_dirs
                         .push(format!("{} ({err})", e.path().display()));
+                    scan.dir_facts.push(DirFacts {
+                        path: e.path(),
+                        rel: facts.rel.join(&name),
+                        unreadable: Some(err.to_string()),
+                        ..Default::default()
+                    });
                     continue;
                 }
             };
             if meta.is_dir() {
+                if TEST_DIRS.contains(&name.as_str()) {
+                    facts.test_dirs += 1;
+                }
                 // `.claude/worktrees` needs the PARENT checked too:
                 // a directory literally named `worktrees` is caught by
                 // SKIP, but the agent-managed ones live one level down
@@ -387,9 +484,17 @@ pub fn scan_repo(repo: &Path) -> Scan {
                 }
                 continue;
             }
+            if MANIFESTS.contains(&name.as_str()) {
+                facts.manifests.push(name.clone());
+            } else if MARKERS.contains(&name.as_str()) {
+                facts.markers.push(name.clone());
+            } else if name.contains(".test.") || name.contains(".spec.") {
+                facts.test_files += 1;
+            }
             if !name.eq_ignore_ascii_case("CLAUDE.md") {
                 continue;
             }
+            facts.has_claude_md = true;
             match read_file_reporting(&e.path()) {
                 Ok(f) => scan.files.push(f),
                 Err(why) => {
@@ -402,13 +507,155 @@ pub fn scan_repo(repo: &Path) -> Scan {
                 }
             }
         }
+        facts.manifests.sort();
+        facts.markers.sort();
+        record_workspace(&dir, &mut facts, &mut workspace_roots);
+        scan.dir_facts.push(facts);
     }
 
     scan.files.sort_by(|a, b| a.path.cmp(&b.path));
     // Sorted so a rescan does not reshuffle what the page shows.
     scan.unreadable_dirs.sort();
     scan.unreadable_files.sort();
+    scan.dir_facts.sort_by(|a, b| a.path.cmp(&b.path));
     scan
+}
+
+/// Manifest names the walk records. The five the advice design names,
+/// which between them cover every ecosystem `packages::detect` knows
+/// plus Go, which it does not.
+const MANIFESTS: &[&str] = &[
+    "Cargo.toml",
+    "package.json",
+    "pyproject.toml",
+    "go.mod",
+    "Package.swift",
+];
+
+/// Lockfiles and tool configs that mark a directory as built on its own.
+/// `deny.toml` is here because `crates/headstate-stepup` in this
+/// repository is the worked example: its own lock and its own `cargo
+/// deny` run are what make it a toolchain of its own.
+const MARKERS: &[&str] = &[
+    "Cargo.lock",
+    "deny.toml",
+    "yarn.lock",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "uv.lock",
+    "poetry.lock",
+    "go.sum",
+    "Package.resolved",
+];
+
+/// Directory names that hold a test suite.
+const TEST_DIRS: &[&str] = &["tests", "__tests__", "spec"];
+
+/// A well-known role from a relative path, at the root level only.
+///
+/// `src-tauri`, `src-mobile` and the like are one component beginning
+/// `src-`; `packages/x`, `crates/x` and `apps/x` are two; `docs` and
+/// `scripts` are one exact name; `.github/workflows` is the one dotted
+/// pair. Deeper matches (`apps/web/packages/x`) are not roles here: the
+/// convention is a root-level layout, and a match at depth would name a
+/// role for a directory its own package already covers.
+fn role_of(rel: &Path) -> Option<String> {
+    let parts: Vec<&str> = rel
+        .components()
+        .map(|c| c.as_os_str().to_str().unwrap_or(""))
+        .collect();
+    match parts.as_slice() {
+        [one] if one.starts_with("src-") => Some("src-*".to_string()),
+        ["docs"] => Some("docs".to_string()),
+        ["scripts"] => Some("scripts".to_string()),
+        [".github", "workflows"] => Some(".github/workflows".to_string()),
+        [parent @ ("packages" | "crates" | "apps"), _] => Some(format!("{parent}/*")),
+        _ => None,
+    }
+}
+
+/// Read the workspace members a directory's own manifest declares, and
+/// register each member directory against that manifest.
+///
+/// One file read per `Cargo.toml` or `package.json` the walk passes,
+/// which is the whole added I/O of recording facts: this checkout has
+/// seven of them against 120 directories listed. A manifest that
+/// will not read or parse sets `workspace_unknown` rather than
+/// registering nothing, because nothing registered is what "no members"
+/// looks like.
+fn record_workspace(
+    dir: &Path,
+    facts: &mut DirFacts,
+    roots: &mut std::collections::HashMap<PathBuf, PathBuf>,
+) {
+    use crate::packages::cargo::{expand_member, members, read_manifest_reporting, ManifestError};
+
+    let mut unknown: Vec<String> = Vec::new();
+    let mut declared: Vec<(PathBuf, Vec<String>)> = Vec::new();
+
+    if facts.manifests.iter().any(|m| m == "Cargo.toml") {
+        let manifest = dir.join("Cargo.toml");
+        match read_manifest_reporting(&manifest) {
+            Ok(root) => declared.push((manifest, members(&root))),
+            Err(ManifestError::Unusable(why)) => {
+                unknown.push(format!("{}: {why}", manifest.display()));
+            }
+            // The entry was listed a moment ago, so this is a race with
+            // a deletion: still unknown, not "no members".
+            Err(ManifestError::Absent) => unknown.push(format!(
+                "{}: vanished between listing and reading",
+                manifest.display()
+            )),
+        }
+    }
+    if facts.manifests.iter().any(|m| m == "package.json") {
+        let manifest = dir.join("package.json");
+        match node_workspaces(&manifest) {
+            Ok(list) => declared.push((manifest, list)),
+            Err(why) => unknown.push(format!("{}: {why}", manifest.display())),
+        }
+    }
+
+    for (manifest, patterns) in declared {
+        // `expand_member` records a directory it could not list in the
+        // scan it is handed; that failure is this manifest's members
+        // being unknown, and travels with it.
+        let mut fs = crate::packages::model::FileScan::default();
+        for pattern in patterns {
+            for member in expand_member(dir, &pattern, &mut fs) {
+                roots.entry(member).or_insert_with(|| manifest.clone());
+            }
+        }
+        for failed in fs.unreadable {
+            unknown.push(format!("{}: {failed}", manifest.display()));
+        }
+    }
+
+    if !unknown.is_empty() {
+        facts.workspace_unknown = Some(unknown.join("; "));
+    }
+}
+
+/// The `workspaces` patterns of a `package.json`: either an array or the
+/// `{ "packages": [...] }` form yarn also accepts. Empty when the key is
+/// absent, which is the ordinary case; `Err` when the file will not read
+/// or parse, which is not.
+fn node_workspaces(manifest: &Path) -> Result<Vec<String>, String> {
+    let text = std::fs::read_to_string(manifest).map_err(|e| e.to_string())?;
+    let json: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("not valid JSON: {e}"))?;
+    let list = match json.get("workspaces") {
+        None => return Ok(Vec::new()),
+        Some(v) => v
+            .as_array()
+            .or_else(|| v.get("packages").and_then(|p| p.as_array()))
+            .cloned()
+            .unwrap_or_default(),
+    };
+    Ok(list
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect())
 }
 
 /// One file, with its imports resolved.
@@ -600,6 +847,164 @@ mod skip_tests {
             !scan.is_partial(),
             "a healthy repository must not report itself as incompletely scanned"
         );
+    }
+}
+
+#[cfg(test)]
+mod facts_tests {
+    use super::*;
+
+    fn write(path: &Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn facts<'a>(scan: &'a Scan, rel: &Path) -> &'a DirFacts {
+        scan.dir_facts
+            .iter()
+            .find(|f| f.rel == rel)
+            .unwrap_or_else(|| panic!("no facts for {}: {:?}", rel.display(), scan.dir_facts))
+    }
+
+    /// Every fact is read off the entry names the walk already lists:
+    /// manifests, markers, test files, test directories, the CLAUDE.md
+    /// itself, and the role from the path.
+    #[test]
+    fn the_walk_records_what_each_directory_holds() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        write(&r.join("CLAUDE.md"), "# root\n");
+        let crate_dir = r.join("crates").join("octocat-core");
+        write(&crate_dir.join("Cargo.toml"), "[package]\n");
+        write(&crate_dir.join("Cargo.lock"), "");
+        write(&crate_dir.join("deny.toml"), "");
+        write(&crate_dir.join("a.test.rs"), "");
+        write(&crate_dir.join("b.spec.ts"), "");
+        write(&crate_dir.join("c.rs"), "");
+        std::fs::create_dir_all(crate_dir.join("tests")).unwrap();
+        std::fs::create_dir_all(r.join(".github").join("workflows")).unwrap();
+
+        let scan = scan_repo(r);
+        let root = facts(&scan, Path::new(""));
+        assert!(root.has_claude_md);
+        assert_eq!(root.role, None);
+        assert_eq!(root.path, r);
+
+        let c = facts(&scan, &Path::new("crates").join("octocat-core"));
+        assert_eq!(c.manifests, ["Cargo.toml"]);
+        assert_eq!(c.markers, ["Cargo.lock", "deny.toml"]);
+        assert_eq!(c.test_files, 2);
+        assert_eq!(c.test_dirs, 1);
+        assert_eq!(c.role.as_deref(), Some("crates/*"));
+        assert!(!c.has_claude_md);
+        assert_eq!(c.workspace_of, None);
+        assert_eq!(c.unreadable, None);
+
+        assert_eq!(
+            facts(&scan, &Path::new(".github").join("workflows"))
+                .role
+                .as_deref(),
+            Some(".github/workflows")
+        );
+        assert_eq!(facts(&scan, Path::new("crates")).role, None);
+    }
+
+    /// `package.json` `workspaces` in both shapes, and a `Cargo.toml`
+    /// `[workspace]`, register their members against the manifest.
+    #[test]
+    fn workspace_members_are_registered_against_their_manifest() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        write(
+            &r.join("package.json"),
+            r#"{"workspaces":{"packages":["packages/*"]}}"#,
+        );
+        write(&r.join("packages").join("a").join("package.json"), "{}");
+        write(
+            &r.join("rust").join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/one\", \"crates/*\"]\n",
+        );
+        write(
+            &r.join("rust").join("crates").join("one").join("Cargo.toml"),
+            "",
+        );
+        write(
+            &r.join("rust").join("crates").join("two").join("Cargo.toml"),
+            "",
+        );
+        // Not a member: no manifest under a workspace does not make one.
+        std::fs::create_dir_all(r.join("packages").join(".hidden")).unwrap();
+
+        let scan = scan_repo(r);
+        assert_eq!(
+            facts(&scan, &Path::new("packages").join("a")).workspace_of,
+            Some(r.join("package.json"))
+        );
+        assert_eq!(
+            facts(&scan, &Path::new("rust").join("crates").join("two")).workspace_of,
+            Some(r.join("rust").join("Cargo.toml"))
+        );
+        assert_eq!(
+            facts(&scan, &Path::new("packages").join(".hidden")).workspace_of,
+            None,
+            "a glob never matches a hidden directory"
+        );
+        assert!(scan.dir_facts.iter().all(|f| f.workspace_unknown.is_none()));
+    }
+
+    /// A manifest that will not parse leaves membership UNKNOWN, with the
+    /// parser's reason, rather than registering no members.
+    #[test]
+    fn an_unparseable_manifest_is_unknown_for_membership_not_memberless() {
+        let t = tempfile::tempdir().unwrap();
+        write(&t.path().join("Cargo.toml"), "[workspace\nmembers = [");
+        let scan = scan_repo(t.path());
+        let root = facts(&scan, Path::new(""));
+        assert_eq!(root.manifests, ["Cargo.toml"], "presence is still a signal");
+        let why = root
+            .workspace_unknown
+            .as_deref()
+            .expect("membership is unknown");
+        assert!(why.contains("not valid TOML"), "{why}");
+    }
+
+    /// An unlistable directory is recorded as facts with `unreadable`
+    /// set, so a consumer can tell it from an empty one without parsing
+    /// `unreadable_dirs` back into paths.
+    #[cfg(unix)]
+    #[test]
+    fn an_unlistable_directory_is_recorded_as_unreadable_facts() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let locked = t.path().join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let scan = scan_repo(t.path());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let f = facts(&scan, Path::new("locked"));
+        assert!(
+            f.unreadable
+                .as_deref()
+                .is_some_and(|w| w.contains("ermission")),
+            "{f:?}"
+        );
+        assert_eq!(scan.unreadable_dirs.len(), 1);
+    }
+
+    /// The facts stay off the wire: `ClaudeMdScan` in `src/types/pr.ts`
+    /// mirrors `Scan`, and a field the frontend does not read must not
+    /// widen a type the phone also compiles.
+    #[test]
+    fn dir_facts_are_not_serialised() {
+        let t = tempfile::tempdir().unwrap();
+        write(&t.path().join("CLAUDE.md"), "# root\n");
+        let scan = scan_repo(t.path());
+        assert!(!scan.dir_facts.is_empty());
+        let json = serde_json::to_value(&scan).unwrap();
+        assert!(json.get("dir_facts").is_none(), "{json}");
+        let back: Scan = serde_json::from_value(json).unwrap();
+        assert!(back.dir_facts.is_empty());
+        assert_eq!(back.files, scan.files);
     }
 }
 
