@@ -66,6 +66,7 @@ pub mod gaps;
 pub mod imports;
 pub mod placement;
 pub mod rot;
+pub mod shape;
 pub mod skills;
 pub mod toolchain;
 pub mod transcripts;
@@ -114,6 +115,9 @@ pub enum Check {
     /// limit, a CLAUDE.md naming a skill no scope holds, a procedure a
     /// skill already holds, and cost.
     Skills,
+    /// Content shape: the rules from published guidance that a
+    /// deterministic check can enforce over one file or one launch set.
+    Shape,
 }
 
 impl Check {
@@ -126,6 +130,7 @@ impl Check {
         Check::Placement,
         Check::Rot,
         Check::Skills,
+        Check::Shape,
     ];
 
     /// The check's name as the brief prints it.
@@ -138,6 +143,7 @@ impl Check {
             Check::Placement => "placement",
             Check::Rot => "rot",
             Check::Skills => "skills",
+            Check::Shape => "shape",
         }
     }
 }
@@ -252,17 +258,49 @@ pub struct Finding {
     /// Markdown for an agent, rendered by [`brief::render`] at
     /// construction so it can never disagree with the fields above.
     pub brief: String,
+    /// The producer's own rule, when its check has more than one and the
+    /// brief's suggestion differs per rule (`shape` has ten). Set at
+    /// construction by [`Finding::with_rule`] and read only by
+    /// [`brief::render`]. Never on the wire: the panel keys on `check`,
+    /// and a rule id is an internal.
+    #[serde(skip)]
+    pub rule: Option<&'static str>,
 }
 
 impl Finding {
     /// Build a finding and render its brief.
     ///
-    /// The only constructor producers use: a `Finding` built by hand
+    /// The constructor producers use (with [`Finding::with_rule`] for a
+    /// producer that has more than one rule): a `Finding` built by hand
     /// could carry a `brief` that names a different subject than its
     /// `subject` field, and the panel copies the brief without reading
     /// it.
     pub fn new(
         check: Check,
+        severity: Severity,
+        subject: Subject,
+        evidence: Vec<Evidence>,
+        finding: String,
+    ) -> Finding {
+        Self::build(check, None, severity, subject, evidence, finding)
+    }
+
+    /// [`Finding::new`] carrying the producer's rule id, so the brief's
+    /// suggestion is the rule's rather than the check's.
+    pub fn with_rule(
+        check: Check,
+        rule: &'static str,
+        severity: Severity,
+        subject: Subject,
+        evidence: Vec<Evidence>,
+        finding: String,
+    ) -> Finding {
+        Self::build(check, Some(rule), severity, subject, evidence, finding)
+    }
+
+    fn build(
+        check: Check,
+        rule: Option<&'static str>,
         severity: Severity,
         subject: Subject,
         evidence: Vec<Evidence>,
@@ -275,6 +313,7 @@ impl Finding {
             evidence,
             finding,
             brief: String::new(),
+            rule,
         };
         out.brief = brief::render(&out);
         out
@@ -374,6 +413,7 @@ pub static PRODUCERS: &[&dyn Producer] = &[
     &placement::Placement,
     &rot::Rot,
     &skills::Skills,
+    &shape::Shape,
 ];
 
 /// Run every registered producer and assemble the report.

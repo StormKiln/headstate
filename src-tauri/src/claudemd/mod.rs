@@ -684,7 +684,10 @@ pub fn read_file(path: &Path) -> Option<ClaudeFile> {
 pub fn read_file_reporting(path: &Path) -> Result<ClaudeFile, String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let bytes = text.len() as u64;
-    let own = tokens::estimate(&text);
+    // The estimate counts what Claude Code injects, which is the file
+    // without its block-level HTML comments (`tokens.rs` header). The
+    // byte count above is the file as it is on disk.
+    let own = tokens::estimate(&text::strip_block_html_comments(&text));
     let imports = resolve_tree(path, &mut Vec::new());
     // The tree's tokens plus this file's own.
     let total = own + imports.iter().map(ImportNode::total_tokens).sum::<u64>();
@@ -1052,6 +1055,37 @@ mod effective_tests {
         assert!(
             !scan.repo.files.iter().any(|f| f.path.contains(".claude")),
             "the global file must not appear in the repo scan"
+        );
+    }
+
+    /// Block-level HTML comments are stripped before injection (changelog
+    /// 2.1.72), so a file's estimate counts the text without them. The
+    /// fixture's comment is longer than its prose, so an estimate over
+    /// the raw file would be more than double the right one.
+    #[test]
+    fn html_comments_do_not_count_toward_the_estimate() {
+        let t = tempfile::tempdir().unwrap();
+        let prose = "Run `make lint` before pushing.\n";
+        let comment = format!(
+            "<!--\n{}\n-->\n",
+            "maintainer notes that Claude never sees ".repeat(4)
+        );
+        let path = t.path().join("CLAUDE.md");
+        std::fs::write(&path, format!("{comment}{prose}")).unwrap();
+
+        let file = read_file_reporting(&path).unwrap();
+
+        assert_eq!(file.tokens, tokens::estimate(prose));
+        assert!(
+            file.tokens < tokens::estimate(&format!("{comment}{prose}")) / 2,
+            "the raw estimate would be more than double: {}",
+            file.tokens
+        );
+        // The byte count is still the file on disk: a different question.
+        assert_eq!(file.bytes, (comment.len() + prose.len()) as u64);
+        assert_eq!(
+            file.total_tokens, file.tokens,
+            "no imports, so the total is the file"
         );
     }
 
