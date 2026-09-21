@@ -59,8 +59,13 @@ beforeEach(() => {
   asked.length = 0;
   answer.value = [];
   answer.reject = null;
+  // `retry: false` matches what the hook sets per query. `gcTime` is
+  // left at react-query's DEFAULT rather than zeroed: the "returns to a
+  // reference" test below is about the cache surviving a detour, and a
+  // `gcTime: 0` client evicts on unmount and would make that test assert
+  // the opposite of what the app does.
   qc = new QueryClient({
-    defaultOptions: { queries: { retry: false, gcTime: 0 } },
+    defaultOptions: { queries: { retry: false } },
   });
 });
 
@@ -164,6 +169,33 @@ describe("useClaudeSessionsForPrQuery", () => {
     await settle();
     expect(asked).toEqual([]);
     expect(got()).toEqual({ state: "unresolved", number: 1234 });
+  });
+
+  /// Typing away from a reference and back again does not re-ask.
+  ///
+  /// `staleTime: Infinity` plus react-query's ordinary cache retention
+  /// means the second visit is served from cache -- and the timer
+  /// scheduled for the intermediate query is cleared rather than firing
+  /// late against a query that has moved on. Both halves matter: a
+  /// debounce that fired for `acme/api#99` after the user had already
+  /// gone back would ask about a pull request nobody is looking at.
+  it("does not ask again for a reference the user returns to", async () => {
+    answer.value = [];
+    const { rerender } = render(wrap(<Probe query="acme/api#1234" />));
+    await settle();
+    expect(asked).toEqual(["acme/api#1234"]);
+
+    // Away, briefly -- not long enough for the intermediate reference to
+    // settle -- and back.
+    rerender(wrap(<Probe query="acme/api#99" />));
+    act(() => {
+      vi.advanceTimersByTime(50);
+    });
+    rerender(wrap(<Probe query="acme/api#1234" />));
+    await settle();
+
+    expect(asked).toEqual(["acme/api#1234"]);
+    expect(got().state).toBe("done");
   });
 
   /// A query that stops being a reference goes back to `off` and takes
