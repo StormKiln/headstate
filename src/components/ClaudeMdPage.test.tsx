@@ -54,6 +54,15 @@ vi.mock("../api/hooks", () => ({
     error: "no such file or directory",
     refetch: refetchTextFn,
   }),
+  // The advice panel is collapsed by default and has its own test file;
+  // here it only has to mount without fetching.
+  useClaudeMdAdvice: () => ({
+    data: undefined,
+    isError: false,
+    error: undefined,
+    isFetching: false,
+    refetch: vi.fn(),
+  }),
 }));
 vi.mock("../store/filters", () => ({ useActiveFilters: () => ({ repo: state.repo }) }));
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));

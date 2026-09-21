@@ -65,6 +65,7 @@ import {
   backgroundHealth,
   claudeHooksInventory,
   claudeMdEffective,
+  claudeMdAdvice,
   claudeDefinitions,
   claudeEffectiveSettings,
   claudeConfigHealth,
@@ -1298,6 +1299,22 @@ export function useClaudeMdEffective(repoPath: string | undefined) {
     queryKey: ["claude-md-effective", repoPath],
     queryFn: () => claudeMdEffective(repoPath as string),
     enabled: Boolean(repoPath),
+    staleTime: 30_000,
+    retry: false,
+  });
+}
+
+/// Advice about a repository's CLAUDE.md files.
+///
+/// `enabled` is whether the panel is open: fetched only then, so the
+/// page's file list and content pane never wait on the producers. A
+/// closed panel shows no state at all, which is different from a query
+/// that was asked and failed.
+export function useClaudeMdAdvice(repoPath: string | undefined, enabled: boolean) {
+  return useQuery({
+    queryKey: ["claude-md-advice", repoPath],
+    queryFn: () => claudeMdAdvice(repoPath as string),
+    enabled: Boolean(repoPath) && enabled,
     staleTime: 30_000,
     retry: false,
   });

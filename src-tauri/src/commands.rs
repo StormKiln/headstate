@@ -1735,28 +1735,37 @@ pub async fn claude_md_effective(
         // `home()` here rather than inside the scan, so the scan itself
         // stays a pure function of its two paths and remains testable
         // without touching `$HOME` -- process-global state that would
-        // race every other test in the binary.
-        //
-        // No home is not a failure: the repo scan is still a real
-        // answer, and the combined figure simply has no global scope to
-        // include. An `unreadable` entry says so rather than the page
-        // silently omitting a scope it never looked for.
+        // race every other test in the binary. `scan_effective_opt`
+        // records a missing home as an unreadable scope.
         let repo = std::path::PathBuf::from(&repo_path);
-        match crate::claudemd::home() {
-            Some(home) => crate::claudemd::scan_effective_in(&repo, &home),
-            None => {
-                let mut scan = crate::claudemd::EffectiveScan {
-                    repo: crate::claudemd::scan_repo(&repo),
-                    ..Default::default()
-                };
-                scan.unreadable.push(
-                    "~/.claude/CLAUDE.md: no home directory is set, so the global scope \
-                     could not be read"
-                        .to_string(),
-                );
-                scan
-            }
-        }
+        let home = crate::claudemd::home();
+        crate::claudemd::scan_effective_opt(&repo, home.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Advice about a repository's CLAUDE.md files: every producer's
+/// findings, which checks ran, and a brief per finding.
+///
+/// One command for every producer rather than one per check: each
+/// command costs five wiring points twice over for the phone, and
+/// per-check results make "grouped by file" a frontend join. `Ok` is the
+/// only outcome for a run that RAN: a producer's failure is one check's
+/// `Unknown` coverage inside the report, never a rejection of the whole
+/// run (#1044). A rejection here is the blocking task itself failing.
+///
+/// `home()` is resolved here for `claude_md_effective`'s reason, and a
+/// missing home is tolerated the same way: the report still runs over
+/// the repository scan, which records the scope it could not look for.
+#[tauri::command]
+pub async fn claude_md_advice(
+    repo_path: String,
+) -> Result<crate::claudemd::advice::Report, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let repo = std::path::PathBuf::from(&repo_path);
+        let home = crate::claudemd::home();
+        crate::claudemd::advice::report_in(&repo, home.as_deref())
     })
     .await
     .map_err(|e| e.to_string())

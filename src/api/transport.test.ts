@@ -236,6 +236,7 @@ const ROWS: Row[] = [
   row(api.readLogTail, [4096], "read_log_tail", { maxBytes: 4096 }),
   row(api.revealLog, [], "reveal_log"),
   row(api.claudeMdEffective, [repoPath], "claude_md_effective", { repoPath }),
+  row(api.claudeMdAdvice, [repoPath], "claude_md_advice", { repoPath }),
   row(api.scanClaudeMd, [repoPath], "scan_claude_md", { repoPath }),
   // The Claude Code cache, its session list and its aggregates (#914,
   // #917, #921). Three of these are argument-free: they operate on

@@ -1082,6 +1082,62 @@ export interface ClaudeMdEffectiveScan {
   unreadable: string[];
 }
 
+/// Which advice producer made a finding. Mirrors `claudemd::advice::Check`;
+/// one member per producer.
+export type ClaudeMdAdviceCheck = "imports";
+
+/// What a finding is about. Mirrors `claudemd::advice::Subject`, tagged
+/// on `kind` because the skills producer's subject is not a CLAUDE.md.
+export type ClaudeMdAdviceSubject =
+  | { kind: "claudeMd"; path: string; scope: ClaudeMdScope; section: string | null }
+  | { kind: "directory"; path: string }
+  | { kind: "skill"; path: string; name: string };
+
+/// Where a piece of evidence is. Mirrors `claudemd::advice::Locator`. A
+/// file's `line` is null when the producer recorded none, and the panel
+/// prints none.
+export type ClaudeMdAdviceLocator =
+  | { kind: "file"; path: string; line: number | null }
+  | { kind: "session"; sessionId: string; record: number | null };
+
+interface ClaudeMdAdviceEvidence {
+  at: ClaudeMdAdviceLocator;
+  /// The producer's own measurement, verbatim.
+  measured: string;
+}
+
+/// One thing a producer found. Mirrors `claudemd::advice::Finding`.
+export interface ClaudeMdAdviceFinding {
+  check: ClaudeMdAdviceCheck;
+  /// Ranked by the backend: problem, advice, unknown. `unknown` is a
+  /// finding that could not be decided, never a clean one.
+  severity: "problem" | "advice" | "unknown";
+  subject: ClaudeMdAdviceSubject;
+  evidence: ClaudeMdAdviceEvidence[];
+  /// One sentence, a fact. The row.
+  finding: string;
+  /// Markdown for an agent, rendered in Rust. Copied, never rendered.
+  brief: string;
+}
+
+/// Whether a check ran. Mirrors `claudemd::advice::CheckRun`. There is no
+/// pending state: pending is the absence of the whole report.
+export interface ClaudeMdAdviceCoverage {
+  check: ClaudeMdAdviceCheck;
+  run: { state: "ran"; findings: number } | { state: "unknown"; reason: string };
+}
+
+/// One run of every advice producer. Mirrors `claudemd::advice::Report`.
+/// The findings are in the backend's rank order, `checks` lists every
+/// check exactly once, and `brief` is the combined document -- the panel
+/// recomputes none of these.
+export interface ClaudeMdAdviceReport {
+  repo: string;
+  findings: ClaudeMdAdviceFinding[];
+  checks: ClaudeMdAdviceCoverage[];
+  brief: string;
+}
+
 export interface ClaudeMdScan {
   /// What DID read. Never blanked because something else did not.
   files: ClaudeFile[];

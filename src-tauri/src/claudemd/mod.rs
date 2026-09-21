@@ -9,8 +9,22 @@
 //! rather than from what happened to exist locally.
 //!
 //! Nothing here talks to GitHub.
+//!
+//! ## Advice
+//!
+//! `advice/` is OPINION about these files and `claude/confighealth.rs` is
+//! not. `confighealth.rs:16-30` rules that module's findings are "CHECKS,
+//! never opinions … no heuristic, no style judgement", and a text match
+//! for `make test` is a heuristic by construction. So advice lives here
+//! as a sibling with a third severity, `Severity::Advice`, and
+//! `confighealth` stays what it is. `text.rs` and `refs.rs` are the
+//! parsers the advice producers share, landed with the model so no
+//! producer writes its own.
 
+pub mod advice;
 pub mod imports;
+pub mod refs;
+pub mod text;
 pub mod tokens;
 
 pub use imports::{resolve_tree, ImportNode};
@@ -213,6 +227,32 @@ pub fn scan_effective_in(repo: &Path, home: &Path) -> EffectiveScan {
         }
     }
     out
+}
+
+/// `scan_effective_in`, tolerating a machine with no home directory.
+///
+/// No home is not a failure: the repo scan is still a real answer, and
+/// the combined figure simply has no global scope to include. An
+/// `unreadable` entry says so rather than the page silently omitting a
+/// scope it never looked for. Shared by `claude_md_effective` and
+/// `advice::report_in`, so the two cannot disagree about what a missing
+/// home means.
+pub fn scan_effective_opt(repo: &Path, home: Option<&Path>) -> EffectiveScan {
+    match home {
+        Some(home) => scan_effective_in(repo, home),
+        None => {
+            let mut scan = EffectiveScan {
+                repo: scan_repo(repo),
+                ..Default::default()
+            };
+            scan.unreadable.push(
+                "~/.claude/CLAUDE.md: no home directory is set, so the global scope \
+                 could not be read"
+                    .to_string(),
+            );
+            scan
+        }
+    }
 }
 
 pub fn scan_repo(repo: &Path) -> Scan {
