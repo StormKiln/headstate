@@ -1163,7 +1163,9 @@ export type ClaudeMdAdviceMode = "cached" | "fresh";
 ///   and matched (`recomputed` false). Either way every tracked input
 ///   was read.
 /// - `"cached"` -- served from the store without a run. `stale` says
-///   whether a tracked input has changed since.
+///   whether a tracked input has changed since. A stale report is still
+///   SERVED, not withheld: a previous run is a real answer, and what the
+///   user is owed is being told rather than made to wait.
 /// - `"unverified"` -- an input could not be read, so currency is
 ///   UNKNOWN. This is NOT `"fresh"` with a footnote: a matching
 ///   fingerprint here proves nothing, because it omitted something both
@@ -1171,11 +1173,13 @@ export type ClaudeMdAdviceMode = "cached" | "fresh";
 ///   unverified run that just happened is the best available answer and
 ///   still not a current one.
 ///
-/// "From cache, refreshing" -- the epic's second state -- is this type
-/// plus the caller's own knowledge: a `"cached"` result held on screen
-/// while a `"fresh"` call is in flight. It is deliberately not a member
-/// here, because one synchronous call cannot be both the cached answer
-/// and the running one.
+/// "From cache, refreshing" -- the epic's second state -- is
+/// `{ state: "cached", stale: true }` plus what the caller is doing:
+/// show that report, fire a `"fresh"` call behind it, replace it when
+/// that lands. There is no `"refreshing"` member, because one
+/// synchronous call cannot be both the cached answer and the running
+/// one, and a backend claiming "a refresh is happening" would be a claim
+/// about a future it cannot observe.
 export type ClaudeMdAdviceFreshness =
   | { state: "fresh"; recomputed: boolean }
   | { state: "cached"; stale: boolean }

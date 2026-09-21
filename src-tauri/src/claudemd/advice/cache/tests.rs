@@ -133,6 +133,51 @@ impl Fixture {
     }
 }
 
+/// Assert the full contract for a CHANGED tracked input.
+///
+/// Three things, and all three matter:
+///
+/// 1. `Mode::Cached` still answers immediately, with the previous run.
+///    Withholding it would put the expensive pass back on the path
+///    #1293 exists to take it off.
+/// 2. That answer is LABELLED `cached { stale: true }` -- the change was
+///    detected. A stale report served as `fresh` is the failure this
+///    whole issue is about.
+/// 3. `Mode::Fresh` then actually re-runs the producers, proven by the
+///    sentinel being gone rather than by the flag the code sets.
+fn assert_change_is_detected_and_recomputes(f: &Fixture) {
+    let cached = f.serve(Mode::Cached, "2026-06-01T00:00:00Z");
+    assert!(
+        Fixture::has_sentinel(&cached),
+        "a previous run was withheld instead of being served and labelled"
+    );
+    assert_eq!(
+        cached.freshness,
+        Freshness::Cached { stale: true },
+        "a changed input was not reported as stale -- this is the #1293 failure"
+    );
+    assert_eq!(
+        cached.computed_at, "2026-01-01T00:00:00Z",
+        "a stale report must carry the time the PRODUCERS ran, not now"
+    );
+
+    let fresh = f.serve(Mode::Fresh, "2026-06-01T00:00:00Z");
+    assert!(
+        !Fixture::has_sentinel(&fresh),
+        "the refresh did not re-run the producers"
+    );
+    assert_eq!(fresh.freshness, Freshness::Fresh { recomputed: true });
+
+    // And the refresh REPLACED the entry, so the next open is a clean
+    // hit rather than a second stale answer.
+    let after = f.serve(Mode::Cached, "2026-07-01T00:00:00Z");
+    assert_eq!(
+        after.freshness,
+        Freshness::Fresh { recomputed: false },
+        "the refresh did not update the stored fingerprint"
+    );
+}
+
 /// ACCEPTANCE: a second open of an unchanged repository does not re-run
 /// the producers.
 ///
@@ -171,14 +216,7 @@ fn editing_a_claude_md_recomputes() {
     f.seed(&[], "2026-01-01T00:00:00Z");
 
     std::fs::write(f.repo.join("CLAUDE.md"), "# Root\n\nBuild with `just`.\n").unwrap();
-    let got = f.serve(Mode::Cached, "2026-06-01T00:00:00Z");
-
-    assert!(
-        !Fixture::has_sentinel(&got),
-        "an edited CLAUDE.md served the stored report"
-    );
-    assert_eq!(got.freshness, Freshness::Fresh { recomputed: true });
-    assert_eq!(got.computed_at, "2026-06-01T00:00:00Z");
+    assert_change_is_detected_and_recomputes(&f);
 }
 
 /// A NEW CLAUDE.md is a tracked input too, not only an edit to a known
@@ -191,12 +229,7 @@ fn adding_a_claude_md_recomputes() {
 
     std::fs::create_dir_all(f.repo.join("src")).unwrap();
     std::fs::write(f.repo.join("src/CLAUDE.md"), "# src\n").unwrap();
-    let got = f.serve(Mode::Cached, "2026-06-01T00:00:00Z");
-
-    assert!(
-        !Fixture::has_sentinel(&got),
-        "a new CLAUDE.md served the stored report"
-    );
+    assert_change_is_detected_and_recomputes(&f);
 }
 
 /// The other half of the content-hash choice: `touch` without an edit is
@@ -248,28 +281,24 @@ fn the_three_freshness_states_are_distinguishable() {
     let b = verified.serve(Mode::Cached, "2026-06-01T00:00:00Z");
     assert_eq!(b.freshness, Freshness::Fresh { recomputed: false });
 
-    // 2: cached-and-stale is what a CALLER composes "refreshing" from.
-    // `serve` never hands back a report it knows is out of date, so the
-    // state is observed on the fingerprint rather than on a result.
+    // 2: from cache, and known to be out of date. This is what a caller
+    // composes "from cache, refreshing" out of -- it shows this report
+    // and fires a `Mode::Fresh` call behind it.
     let stale = Fixture::new();
     stale.seed(&[], "2026-01-01T00:00:00Z");
-    let stored_digest = load(&stale.conn, &stale.repo).unwrap().unwrap().digest;
     std::fs::write(stale.repo.join("CLAUDE.md"), "# changed\n").unwrap();
-    assert_ne!(
-        stale.fingerprint().digest,
-        stored_digest,
-        "a changed input must make the stored digest disagree"
-    );
+    let c2 = stale.serve(Mode::Cached, "2026-06-01T00:00:00Z");
+    assert_eq!(c2.freshness, Freshness::Cached { stale: true });
 
     // 3: unverified. An unreadable tracked input, so currency is
     // UNKNOWN -- and that is not state 1.
     let unverified = Fixture::new();
     unverified.seed(&[], "2026-01-01T00:00:00Z");
     unreadable(&unverified.repo.join("CLAUDE.md"));
-    let c = unverified.serve(Mode::Cached, "2026-06-01T00:00:00Z");
+    let c3 = unverified.serve(Mode::Cached, "2026-06-01T00:00:00Z");
     restore(&unverified.repo.join("CLAUDE.md"));
 
-    match &c.freshness {
+    match &c3.freshness {
         Freshness::Unverified { reason, .. } => {
             assert!(
                 reason.contains("CLAUDE.md"),
@@ -278,15 +307,31 @@ fn the_three_freshness_states_are_distinguishable() {
         }
         other => panic!("an unreadable tracked input reported {other:?}, not Unverified"),
     }
+    // The states are PAIRWISE distinct, which is the actual property --
+    // three separate assertions of one value each would pass against a
+    // `serve` that returned the same variant for two situations.
     assert_ne!(
-        c.freshness,
-        Freshness::Fresh { recomputed: false },
-        "could-not-verify is not verified-current"
+        b.freshness, c2.freshness,
+        "verified-current is not stale-cache"
     );
     assert_ne!(
-        c.freshness,
+        b.freshness, c3.freshness,
+        "verified-current is not could-not-verify"
+    );
+    assert_ne!(
+        c2.freshness, c3.freshness,
+        "stale-cache is not could-not-verify"
+    );
+    assert_ne!(
+        c3.freshness,
         Freshness::Fresh { recomputed: true },
         "could-not-verify is not fresh, even when the producers just ran"
+    );
+    // `a` is the fourth distinguishable thing: computed now, which a
+    // caller tells from verified-current by `recomputed`.
+    assert_ne!(
+        a.freshness, b.freshness,
+        "computed-now is not verified-current"
     );
 }
 
@@ -495,11 +540,7 @@ fn a_new_session_under_the_repository_recomputes() {
         )
         .unwrap();
 
-    let got = f.serve(Mode::Cached, "2026-06-01T00:00:00Z");
-    assert!(
-        !Fixture::has_sentinel(&got),
-        "a new session under the repository served the stored report"
-    );
+    assert_change_is_detected_and_recomputes(&f);
 }
 
 /// A session that GREW is a tracked change, which is the `(size, mtime)`
@@ -523,11 +564,7 @@ fn a_grown_transcript_recomputes() {
 
     std::fs::write(&transcript, "{}\n{\"more\":true}\n").unwrap();
 
-    let got = f.serve(Mode::Cached, "2026-06-01T00:00:00Z");
-    assert!(
-        !Fixture::has_sentinel(&got),
-        "a grown transcript served the stored report"
-    );
+    assert_change_is_detected_and_recomputes(&f);
 }
 
 /// A definition added under the repository's `.claude` is a tracked

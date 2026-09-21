@@ -393,9 +393,10 @@ impl Report {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Mode {
-    /// Serve the stored report when the tracked inputs still match, else
-    /// run the producers. The default, and what a repository selection
-    /// uses.
+    /// Answer from the store when there is anything stored, labelled
+    /// `Fresh` or `Cached { stale }` according to the fingerprint, and
+    /// run the producers only on a miss. The default, and what a
+    /// repository selection uses: it always answers at cache speed.
     #[default]
     Cached,
     /// Run the producers regardless, and replace what is stored. What
@@ -429,14 +430,27 @@ pub enum Mode {
 /// when the fingerprint was taken. Calling that run "fresh" would be the
 /// same lie one open later.
 ///
-/// "From cache, refreshing" -- the epic's second state -- is the caller
-/// holding a [`Freshness::Cached`] result while a [`Mode::Fresh`] call
-/// is in flight. It is deliberately NOT a variant here: a single
+/// # Why a stale report is SERVED rather than withheld
+///
+/// [`Mode::Cached`] returns the stored report even when the fingerprint
+/// says it is out of date, labelled `Cached { stale: true }`. Silently
+/// recomputing instead would make this variant one no caller could ever
+/// observe -- the API would not in fact expose the epic's second state
+/// -- and it would put the expensive run back on the path #1293 exists
+/// to take it off, at the exact moment the panel most wants to show
+/// something: a repository whose CLAUDE.md was edited a second ago.
+///
+/// A previous run is a real answer. What the user is owed is not the
+/// withholding of it but being TOLD (#1044: partial is not nothing, and
+/// out of date is not nothing either).
+///
+/// "From cache, refreshing" -- the epic's second state -- is therefore
+/// this variant plus what the caller knows: it shows the
+/// `Cached { stale: true }` report and fires a [`Mode::Fresh`] call
+/// behind it. There is no `Refreshing` variant, because a single
 /// synchronous call cannot be both the cached answer and the running
-/// one, and a backend variant saying "a refresh is happening" would be a
-/// claim about a future this call cannot observe. What the backend owes
-/// the caller is the fact that it served cache and whether that cache
-/// is stale, and those are both here.
+/// one, and a backend variant claiming "a refresh is happening" would
+/// be a claim about a future this call cannot observe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum Freshness {

@@ -378,22 +378,29 @@ pub fn serve(cx: &Context, mode: Mode, now: &str) -> AdviceResult {
                     }
                 }
             };
-            // A STALE cached report is not served from here.
-            // `Mode::Cached` means "the cheapest CORRECT answer", not
-            // "the cheapest answer": the caller asked about the
-            // repository as it is, and we know this is not that.
-            // `Freshness::Cached { stale: true }` exists for the caller
-            // that chooses to keep a previous result on screen while a
-            // refresh runs -- that is the caller composing two calls,
-            // not something this function invents by handing back an
-            // answer it knows is out of date.
-            if !matches!(freshness, Freshness::Cached { stale: true }) {
-                return AdviceResult {
-                    report: hit.report,
-                    freshness,
-                    computed_at: hit.computed_at,
-                };
-            }
+            // The stored report is returned even when it is STALE, and
+            // that is the point of the label rather than a shortcut
+            // around it.
+            //
+            // The alternative -- recompute silently on a stale hit --
+            // makes `Freshness::Cached` a variant no caller can ever
+            // observe, which would mean the API does not in fact expose
+            // the epic's second state. It would also put the expensive
+            // run back on the path #1293 exists to take it off: a
+            // repository whose CLAUDE.md was edited a second ago is
+            // exactly when the panel most wants to show SOMETHING now.
+            //
+            // A previous run is a real answer (#1044: partial is not
+            // nothing, and out-of-date is not nothing either). What the
+            // user is owed is not the withholding of it -- it is being
+            // told. `stale: true` is that telling, and it is what a
+            // caller composes "from cache, refreshing" out of: show
+            // this, fire `Mode::Fresh`, replace it when that lands.
+            return AdviceResult {
+                report: hit.report,
+                freshness,
+                computed_at: hit.computed_at,
+            };
         }
     }
 
