@@ -119,6 +119,24 @@ fn suggestion(f: &Finding) -> String {
         Check::Gaps => gaps_suggestion(f),
         Check::Placement => super::placement::suggestion(f),
         Check::Rot => super::rot::suggestion(f),
+        Check::Skills => match &f.subject {
+            Subject::Skill { path, .. } => format!(
+                "Edit `{path}` at the line the evidence names: shorten or respell a value that \
+                 exceeds or misspells what the named surface documents, quote a description \
+                 YAML would read as more than one value, and move body text a reference file \
+                 could hold into one linked from SKILL.md. A cost figure alone needs no edit. \
+                 Do not rename the directory."
+            ),
+            Subject::ClaudeMd { path, .. } => format!(
+                "In `{path}`, correct or delete a reference to a skill that was not found, or \
+                 add that skill under `.claude/skills/<name>/SKILL.md`; move a procedure into \
+                 the skill the evidence names, leaving one line in `{path}` that names the skill."
+            ),
+            Subject::Directory { path } => format!(
+                "Nothing to edit for a count under `{path}`; where the evidence names a \
+                 permission error, make that directory readable and run the check again."
+            ),
+        },
     }
 }
 
@@ -330,6 +348,24 @@ mod tests {
                     measured: "resolved against `src`, the repository root and a suffix match over 1200 tracked paths: 0 matches".into(),
                 }],
                 "`src/CLAUDE.md:15` names `src/lib/target.ts`, which does not exist in this repository".into(),
+            ),
+            Check::Skills => Finding::new(
+                Check::Skills,
+                Severity::Advice,
+                Subject::Skill {
+                    path: "/home/octocat/hello-world/.claude/skills/verify/SKILL.md".into(),
+                    name: "verify".into(),
+                },
+                vec![Evidence {
+                    at: Locator::File {
+                        path: "/home/octocat/hello-world/.claude/skills/verify/SKILL.md".into(),
+                        line: Some(2),
+                    },
+                    measured: "`name:` is 70 characters".into(),
+                }],
+                "skill `verify`: `name` at line 2 is 70 characters; the Agent Skills spec as \
+                 the API enforces it allows at most 64"
+                    .into(),
             ),
         }
     }

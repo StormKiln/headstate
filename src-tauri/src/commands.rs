@@ -1823,8 +1823,8 @@ pub async fn claude_md_effective(
 /// plugins -- so a skill a CLAUDE.md names is checked against every
 /// scope Claude Code would load it from. Each root that could not be
 /// resolved is a `ScopeRefusal` in the inventory rather than a reason
-/// to drop the whole thing: the rot producer reads those refusals and
-/// reports a skill it cannot find as Unknown, not missing.
+/// to drop the whole thing: the rot and skills producers read those
+/// refusals and report a skill they cannot find as Unknown, not missing.
 ///
 /// The scan, the inventory and the store are each built ONCE here and
 /// every producer sees the same three; `advice::report_in` exists for
