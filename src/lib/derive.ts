@@ -1,4 +1,5 @@
 import type { PullRequest, Stats } from "../types/pr";
+import type { AdviceGrouping } from "./adviceGrouping";
 
 export const STALE_DAYS = 3;
 
@@ -39,6 +40,22 @@ export interface Filters {
   /// timestamp fetched anywhere, so this sorts on `created_at` and says so
   /// rather than implying an answer it does not have.
   readySort?: "oldest-opened" | "newest-opened";
+  /// How the CLAUDE.md advice list is organised (#1291). Defaults to
+  /// `"none"` -- the flat list -- when absent.
+  ///
+  /// Typed as `AdviceGrouping` from `@/lib/adviceGrouping`, imported as a
+  /// type so this module keeps no runtime dependency on it.
+  ///
+  /// Here rather than in `useState` beside the panel for the reason
+  /// `readySort` is: this is a view PREFERENCE, and the per-view store is
+  /// where every other one lives and where `partialize` persists it
+  /// without a second mechanism. Per-view rather than global because the
+  /// panel renders only on `claude-md`.
+  ///
+  /// SEPARATE from `sort` and `readySort`, which order pull requests.
+  /// Sharing a key with either would mean a grouping chosen on the advice
+  /// panel reaching a list whose values it is not even in the union of.
+  adviceGrouping?: AdviceGrouping;
   /// Safety verdicts to show on the Worktrees page (#1140).
   ///
   /// `undefined` and `[]` both mean "show everything", deliberately.
@@ -103,9 +120,11 @@ export interface Filters {
 /// that is filtering hard from one that is not filtering at all.
 ///
 /// `query` is excluded because the search field stays visible beside the
-/// button and speaks for itself, and `sort` and `readySort` because
-/// ordering a list is not hiding any of it -- counting any of them would
-/// make the badge argue with what the user can already see.
+/// button and speaks for itself, and `sort`, `readySort` and
+/// `adviceGrouping` because arranging a list is not hiding any of it --
+/// counting any of them would make the badge argue with what the user can
+/// already see. Grouping in particular shows every finding the flat list
+/// does, so a badge saying one filter was active would be a plain lie.
 ///
 /// The three `stats*` keys are excluded for the reason `repo` is excluded
 /// from the triage chips below: they are sidebar NAVIGATION, not filters
@@ -120,7 +139,13 @@ export function activeFilterCount(filters: Filters): number {
     "statsSubject",
   ]);
   return (Object.entries(filters) as [keyof Filters, unknown][]).filter(([key, value]) => {
-    if (key === "query" || key === "sort" || key === "readySort" || navigation.has(key))
+    if (
+      key === "query" ||
+      key === "sort" ||
+      key === "readySort" ||
+      key === "adviceGrouping" ||
+      navigation.has(key)
+    )
       return false;
     if (Array.isArray(value)) return value.length > 0;
     return value !== undefined && value !== false;

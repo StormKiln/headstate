@@ -31,8 +31,25 @@ vi.mock("sonner", () => ({ toast: toastFns }));
 vi.mock("../lib/clipboard", () => ({ copyText: copyFn }));
 
 import { ClaudeMdAdvicePanel } from "./ClaudeMdAdvicePanel";
+import { useFilters } from "@/store/filters";
 
 const REPO = "/home/octocat/hello-world";
+
+/// A filter store with a key per `View`, as `useActiveFilters` requires.
+const EMPTY = {
+  "my-prs": {},
+  "to-review": {},
+  worktrees: {},
+  branches: {},
+  docker: {},
+  artifacts: {},
+  packages: {},
+  "claude-md": {},
+  "claude-code": {},
+  "pr-stats": {},
+  repositories: {},
+  "system-health": {},
+} as const;
 
 const finding = (over: Partial<ClaudeMdAdviceFinding> = {}): ClaudeMdAdviceFinding => ({
   check: "imports",
@@ -82,7 +99,19 @@ beforeEach(() => {
   state.isError = false;
   state.error = undefined;
   state.isFetching = false;
+  // The advice panel renders on the `claude-md` view, which is where its
+  // grouping preference is stored.
+  useFilters.setState({ filtersByView: { ...EMPTY }, view: "claude-md" });
 });
+
+/// Pick a grouping through the control the user has, not by writing the
+/// store: the round trip through `setFilter` is half of what is being
+/// tested.
+function group(label: string) {
+  fireEvent.change(screen.getByLabelText("Group:"), {
+    target: { value: label },
+  });
+}
 
 describe("ClaudeMdAdvicePanel", () => {
   /// The panel renders the same report whichever freshness it arrived
@@ -299,5 +328,213 @@ describe("ClaudeMdAdvicePanel", () => {
     fireEvent.click(screen.getByRole("button", { name: /try again/i }));
     expect(refetchFn).toHaveBeenCalled();
     expect(screen.queryByText(/nothing found/)).toBeNull();
+  });
+
+  /// The flat list is the DEFAULT, and it is a default rather than a
+  /// value written on first render: a store key nobody chose would
+  /// persist and outlive a change to what the default should be. The
+  /// flat list is the backend's own ranking, the one arrangement in
+  /// which a row's position means exactly one thing.
+  it("defaults to the flat list without writing the store", () => {
+    state.data = report({
+      findings: [finding()],
+      checks: [{ check: "imports", run: { state: "ran", findings: 1 } }],
+    });
+    open();
+    expect((screen.getByLabelText("Group:") as HTMLSelectElement).value).toBe("none");
+    expect(useFilters.getState().filtersByView["claude-md"].adviceGrouping).toBeUndefined();
+  });
+
+  /// THE case #1291 pins: grouping by file must not let a critical
+  /// finding in a late-sorting file fall below a quiet one in a file that
+  /// sorts first. Alphabetical grouping inverts these, and that is
+  /// grouping silently becoming a re-ranking.
+  it("does not bury a problem in zzz.md under advice in aaa.md when grouped by file", () => {
+    state.data = report({
+      findings: [
+        finding({
+          severity: "problem",
+          subject: { kind: "claudeMd", path: `${REPO}/zzz.md`, scope: "repo", section: null },
+          finding: "the critical one",
+        }),
+        finding({
+          severity: "advice",
+          subject: { kind: "claudeMd", path: `${REPO}/aaa.md`, scope: "repo", section: null },
+          finding: "the quiet one",
+        }),
+      ],
+      checks: [{ check: "imports", run: { state: "ran", findings: 2 } }],
+    });
+    open();
+    group("file");
+    const text = document.body.textContent ?? "";
+    expect(text.indexOf("the critical one")).toBeGreaterThanOrEqual(0);
+    expect(text.indexOf("the critical one")).toBeLessThan(text.indexOf("the quiet one"));
+    expect(text.indexOf("zzz.md")).toBeLessThan(text.indexOf("aaa.md"));
+  });
+
+  /// Within a group the backend's order is kept exactly. Two findings
+  /// about the SAME file, fed out of rank order, must still render in
+  /// wire order -- the panel does not re-sort inside a group either.
+  it("keeps wire order within a group", () => {
+    state.data = report({
+      findings: [
+        finding({ severity: "advice", finding: "first on the wire" }),
+        finding({ severity: "problem", finding: "second on the wire" }),
+      ],
+      checks: [{ check: "imports", run: { state: "ran", findings: 2 } }],
+    });
+    open();
+    group("file");
+    const text = document.body.textContent ?? "";
+    expect(text.indexOf("first on the wire")).toBeLessThan(text.indexOf("second on the wire"));
+  });
+
+  /// All three `Subject` kinds appear under the file view, each labelled
+  /// as what it is. Dropping a `Skill` for not being a CLAUDE.md loses
+  /// the skills producer's whole output; rendering a `Directory` as a
+  /// file offers a click that opens nothing.
+  it("groups all three subject kinds by file, each labelled", () => {
+    state.data = report({
+      findings: [
+        finding({ subject: { kind: "claudeMd", path: `${REPO}/CLAUDE.md`, scope: "repo", section: null }, finding: "about the file" }),
+        finding({ subject: { kind: "directory", path: `${REPO}/src` }, finding: "about the directory" }),
+        finding({
+          subject: { kind: "skill", path: `${REPO}/.claude/skills/verify/SKILL.md`, name: "verify" },
+          finding: "about the skill",
+        }),
+      ],
+      checks: [{ check: "imports", run: { state: "ran", findings: 3 } }],
+    });
+    open();
+    group("file");
+    // Every finding is still on screen -- none went ungrouped.
+    expect(screen.getByText("about the file")).toBeTruthy();
+    expect(screen.getByText("about the directory")).toBeTruthy();
+    expect(screen.getByText("about the skill")).toBeTruthy();
+    // And each group is headed by what its subject IS.
+    const headings = screen.getAllByRole("heading").map((h) => h.textContent ?? "");
+    expect(headings.some((h) => h.startsWith("CLAUDE.md"))).toBe(true);
+    // The trailing slash is the signal that no file exists there yet.
+    expect(headings.some((h) => h.startsWith("src/"))).toBe(true);
+    // A skill carries the name it is invoked with, not just its path.
+    expect(headings.some((h) => h.includes("skill: verify"))).toBe(true);
+  });
+
+  /// #846 in the view organised by check: a check that could not run and
+  /// a check that ran clean must not read the same. The first names its
+  /// obstacle in the producer's own words; the second produces no group
+  /// at all and is spoken for by the coverage sentence.
+  it("distinguishes a check that could not run from one that found nothing", () => {
+    state.data = report({
+      findings: [finding({ check: "imports", finding: "an imports finding" })],
+      checks: [
+        { check: "imports", run: { state: "ran", findings: 1 } },
+        { check: "rot", run: { state: "ran", findings: 0 } },
+        { check: "skills", run: { state: "unknown", reason: "the skills directory could not be listed" } },
+      ],
+    });
+    open();
+    group("check");
+    const headings = screen.getAllByRole("heading").map((h) => h.textContent ?? "");
+    // The check that could not run has a group, and the reason sits
+    // INSIDE that group rather than only in the notice at the top -- the
+    // group is what the reader is looking at when they organise by
+    // check, and a heading with nothing under it reads as a clean run.
+    expect(headings.some((h) => h.startsWith("skills"))).toBe(true);
+    const skillsGroup = screen
+      .getAllByRole("heading")
+      .find((h) => (h.textContent ?? "").startsWith("skills"))?.parentElement;
+    expect(skillsGroup?.textContent).toContain("could not check");
+    expect(skillsGroup?.textContent).toContain("the skills directory could not be listed");
+    // The check that ran clean has no group -- it found nothing, which is
+    // a different claim and not a failure to report.
+    expect(headings.some((h) => h.startsWith("rot"))).toBe(false);
+    // And the clean sentence is still withheld: this run was partial.
+    expect(screen.queryByText(/nothing found/)).toBeNull();
+  });
+
+  /// A report whose ONLY content is checks that could not run still
+  /// offers the by-check view, and that view still shows them. This is
+  /// the report the grouping is most worth switching to, and the one
+  /// where letting an empty group vanish would show a blank panel.
+  it("shows unknown checks under the by-check view when there are no findings at all", () => {
+    state.data = report({
+      checks: [
+        { check: "imports", run: { state: "unknown", reason: "imports could not run" } },
+        { check: "skills", run: { state: "unknown", reason: "skills could not run" } },
+      ],
+    });
+    open();
+    group("check");
+    // Each reason under its own check's heading, not only in the notice.
+    for (const [check, why] of [
+      ["imports", "imports could not run"],
+      ["skills", "skills could not run"],
+    ]) {
+      const section = screen
+        .getAllByRole("heading")
+        .find((h) => (h.textContent ?? "").startsWith(check))?.parentElement;
+      expect(section?.textContent).toContain(why);
+      expect(section?.textContent).toContain("could not check");
+    }
+    expect(screen.queryByText(/nothing found/)).toBeNull();
+  });
+
+  /// The choice persists the way every other view preference does: into
+  /// `filtersByView` under the view the panel renders on, through the
+  /// generic `setFilter`. A `useState` here would be forgotten on every
+  /// navigation away.
+  it("persists the grouping into the per-view filter store", () => {
+    state.data = report({
+      findings: [finding()],
+      checks: [{ check: "imports", run: { state: "ran", findings: 1 } }],
+    });
+    open();
+    group("check");
+    expect(useFilters.getState().filtersByView["claude-md"].adviceGrouping).toBe("check");
+    // And it is stored per view, not leaked across them.
+    expect(useFilters.getState().filtersByView["to-review"].adviceGrouping).toBeUndefined();
+  });
+
+  /// The other half of the round trip: a grouping already in the store is
+  /// what the panel opens with.
+  it("honours a grouping already in the store", () => {
+    useFilters.setState({
+      filtersByView: { ...EMPTY, "claude-md": { adviceGrouping: "file" } },
+      view: "claude-md",
+    });
+    state.data = report({
+      findings: [finding({ finding: "already grouped" })],
+      checks: [{ check: "imports", run: { state: "ran", findings: 1 } }],
+    });
+    open();
+    expect((screen.getByLabelText("Group:") as HTMLSelectElement).value).toBe("file");
+    expect(screen.getAllByRole("heading").length).toBeGreaterThan(0);
+    expect(screen.getByText("already grouped")).toBeTruthy();
+  });
+
+  /// Grouping is an ARRANGEMENT, not a filter: every finding the flat
+  /// list shows is still shown in both groupings. A grouping that hid
+  /// anything would be a filter wearing a grouping's clothes.
+  it("shows every finding in all three arrangements", () => {
+    const texts = ["one", "two", "three"];
+    state.data = report({
+      findings: [
+        finding({ check: "imports", finding: "one", subject: { kind: "claudeMd", path: `${REPO}/a.md`, scope: "repo", section: null } }),
+        finding({ check: "shape", finding: "two", subject: { kind: "directory", path: `${REPO}/src` } }),
+        finding({ check: "skills", finding: "three", subject: { kind: "skill", path: `${REPO}/s/SKILL.md`, name: "s" } }),
+      ],
+      checks: [
+        { check: "imports", run: { state: "ran", findings: 1 } },
+        { check: "shape", run: { state: "ran", findings: 1 } },
+        { check: "skills", run: { state: "ran", findings: 1 } },
+      ],
+    });
+    open();
+    for (const g of ["none", "check", "file"]) {
+      group(g);
+      for (const t of texts) expect(screen.getByText(t)).toBeTruthy();
+    }
   });
 });

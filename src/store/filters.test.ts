@@ -207,6 +207,29 @@ describe("the Claude Code session filter", () => {
   });
 });
 
+/// The advice panel's grouping is a view PREFERENCE, so it survives a
+/// relaunch -- the other side of the `claudeFilter` test above (#1291).
+///
+/// Asserted rather than assumed. `partialize` persists `filtersByView`
+/// wholesale and strips only `query`, so a key added to `Filters` is
+/// persisted by default -- which is the RIGHT default here and the wrong
+/// one for a search box. Pinning it means a future change to what
+/// `partialize` keeps cannot silently drop this without a red test.
+describe("advice grouping persistence", () => {
+  it("survives partialize, per view", () => {
+    useFilters.setState({ view: "claude-md" });
+    useFilters.getState().setFilter("adviceGrouping", "file");
+    const partialize = useFilters.persist.getOptions().partialize!;
+    const kept = partialize(useFilters.getState()) as {
+      filtersByView: Record<string, { adviceGrouping?: string }>;
+    };
+    expect(kept.filtersByView["claude-md"].adviceGrouping).toBe("file");
+    // Per view, not global: a grouping chosen on the advice panel must
+    // not reach a view whose list it does not describe.
+    expect(kept.filtersByView["to-review"].adviceGrouping).toBeUndefined();
+  });
+});
+
 describe("persisted state migration", () => {
   // A store saved by v1 has a flat `filters` and a `view` enum that
   // conflated view with panel. Loading it into the new shape left
