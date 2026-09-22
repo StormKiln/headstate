@@ -94,3 +94,25 @@ a release at v5.4.0.
 
 See `docs/mobile-release-process.md` — do not restate it here. The build
 high-water mark is guarded by `scripts/check-mobile-build-mark.py`.
+
+## The macOS terminal presets: one check CI cannot make (#1309)
+
+CI proves the two macOS presets are `osascript` invocations that parse and
+dispatch, with the command arriving as a positional `argv` item a shell runs
+(`the_macos_presets_hand_the_command_to_a_script_osascript_can_run`, runs by
+default). That is what would have caught #1302, where `open -a` treated the
+whole command line as a filename.
+
+**It does not prove a window opens, or that the command lands in the right
+session.** That needs Terminal.app and iTerm driven for real, which needs a
+logged-in windowing session and a TCC Automation grant no runner has. So run
+it by hand on a Mac before a release that touched `launch.rs` or
+`terminalTemplate.ts`:
+
+```bash
+cargo test --manifest-path src-tauri/Cargo.toml the_macos_presets -- --ignored --nocapture
+```
+
+Expect two windows to open and `... ok`. It is flaky on repeated runs as
+windows accumulate — close them and re-run rather than reading one failure as
+a broken preset.
