@@ -6,7 +6,12 @@ import { ConfigHealthPanel } from "./ConfigHealthPanel";
 import { claudeRevealPath, type ClaudeHooksStatus, type UiPrefs } from "@/api/tauri";
 import { copyText } from "@/lib/clipboard";
 import { IS_MOBILE_BUILD } from "@/lib/target";
-import { PLACEHOLDER, PRESETS, templateProblem } from "@/lib/terminalTemplate";
+import {
+  PLACEHOLDER,
+  PRESETS,
+  brokenTemplateWarning,
+  templateProblem,
+} from "@/lib/terminalTemplate";
 
 /// One sentence saying what the file says, and what to do about it.
 ///
@@ -139,6 +144,15 @@ export function ClaudeIntegrationsPanel({
   /// the classic controlled-input bug, and `useUiPrefs` refetches.
   const [terminal, setTerminal] = useState(prefs?.terminal_command ?? "");
   const problem = templateProblem(terminal);
+  /// A template that PARSES but cannot run anything (#1302).
+  ///
+  /// Separate from `problem`, and shown even though the template is
+  /// well-formed, because the two need different handling: a malformed
+  /// template is refused at save, while this one is already saved in
+  /// the prefs of every user who clicked the old macOS preset. Blocking
+  /// the save would strand them -- they cannot clear a field they are
+  /// not editing -- so this warns and leaves the value alone.
+  const broken = problem === null ? brokenTemplateWarning(terminal) : null;
 
   /// Persist the template, unless it is obviously broken.
   ///
@@ -249,7 +263,11 @@ export function ClaudeIntegrationsPanel({
             onChange={(e) => setTerminal(e.target.value)}
             onBlur={() => saveTerminal()}
             onKeyDown={(e) => e.key === "Enter" && saveTerminal()}
-            placeholder={`open -a Terminal ${PLACEHOLDER}`}
+            // A shape that actually runs a command. The old placeholder
+            // was `open -a Terminal {command}`, which #1302 established
+            // runs nothing -- suggesting it in the empty field taught
+            // the broken form to anyone who typed their own.
+            placeholder={`gnome-terminal -- bash -lc ${PLACEHOLDER}`}
             aria-label="Terminal command"
             aria-invalid={problem !== null}
             className="rounded border border-[#30363d] bg-[#0d1117] px-2 py-1 font-mono text-xs text-[#e6edf3]"
@@ -260,6 +278,10 @@ export function ClaudeIntegrationsPanel({
           {problem ? (
             <p className="text-xs text-[#f85149]" role="alert">
               {problem}
+            </p>
+          ) : broken ? (
+            <p className="text-xs text-[#d29922]" role="alert">
+              {broken}
             </p>
           ) : (
             <p className="text-xs text-[#8b949e]">
