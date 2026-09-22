@@ -188,6 +188,8 @@ pub const SURFACE: &[(&str, Class)] = &[
     // inputs still match (#1293). Still Read with the cache: the only
     // thing it writes is Headstate's own derived report.
     ("claude_md_advice", Class::Read),
+    ("claude_md_advice_launch", Class::Local),
+    ("claude_md_advice_launch_preview", Class::Local),
     ("scan_claude_md", Class::Read),
     ("read_claude_md", Class::Read),
     // Rescan the DESKTOP's `~/.claude/projects` (#914). Read: it reads

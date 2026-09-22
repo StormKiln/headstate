@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useClaudeMdAdvice } from "@/api/hooks";
+import { useClaudeMdAdvice, useUiPrefs } from "@/api/hooks";
 import type {
   ClaudeMdAdviceCoverage,
   ClaudeMdAdviceFinding,
@@ -9,7 +9,6 @@ import type {
   ClaudeMdAdviceSubject,
 } from "@/types/pr";
 import { current } from "@/lib/ariaCurrent";
-import { copyText } from "@/lib/clipboard";
 import {
   CHECK_LABEL,
   type AdviceGroup,
@@ -20,7 +19,7 @@ import type { Filters } from "@/lib/derive";
 import { useActiveFilters, useFilters } from "@/store/filters";
 import { adviceState, needsRefresh, type AdviceState } from "@/lib/adviceState";
 import { freshnessLabel } from "@/lib/adviceFreshnessLabel";
-import { toast } from "sonner";
+import { ClaudifyAction } from "./ClaudifyAction";
 import { PartialScanNotice } from "./PartialScanNotice";
 import { QueryError, errorMessage } from "./QueryError";
 
@@ -66,19 +65,6 @@ function locatorText(at: ClaudeMdAdviceLocator, repo: string): string {
 /// The file a subject names, when it names one the page can open.
 function subjectFile(s: ClaudeMdAdviceSubject): string | null {
   return s.kind === "directory" ? null : s.path;
-}
-
-/// Copy a brief and say whether it happened, the `PathMenu` shape in
-/// `ClaudeMdPage`: `copyText` reports the no-clipboard case rather than
-/// doing nothing, and the toast is what makes the click visible.
-function copyBrief(text: string, what: string) {
-  void copyText(text).then((failure) =>
-    failure === null
-      ? toast.success(`${what} copied to the clipboard`, {
-          description: "Paste it into a Claude session to make the change.",
-        })
-      : toast.error(`Could not copy the ${what.toLowerCase()}`, { description: failure }),
-  );
 }
 
 /// Advice about the CLAUDE.md files of one repository, as the tab's body.
@@ -364,6 +350,24 @@ function ReportView({
   activePath: string | undefined;
   onSelectFile: (path: string) => void;
 }) {
+  // Whether Run can be offered at all (#1292). `terminal_command` is the
+  // configured terminal and therefore the thing that answers "if one is
+  // configured" -- the same setting `claude_launch_session` reads. There
+  // is deliberately no second shell setting.
+  const { prefs } = useUiPrefs();
+  const terminalConfigured = (prefs?.terminal_command ?? "").trim() !== "";
+
+  // Which position in `report.findings` a finding occupies.
+  //
+  // The INDEX is what a Claudify sends, and Rust resolves it against the
+  // stored report -- so it has to be the wire position, not the position
+  // within a group. `groupFindings` partitions the same objects rather
+  // than copying them, so identity is exactly the right lookup: it is
+  // true by construction for every arrangement, where a key built from
+  // `check` and `path` would collide whenever one file has two findings
+  // from the same check and silently Claudify the wrong one.
+  const wireIndex = (f: ClaudeMdAdviceFinding) => report.findings.indexOf(f);
+
   // Which checks could not run, from the wire's own coverage list. Read
   // here for the notice; the rows below map over the full list.
   const unknown = report.checks.filter((c) => c.run.state === "unknown");
@@ -444,6 +448,8 @@ function ReportView({
           repo={repo}
           activePath={activePath}
           onSelectFile={onSelectFile}
+          terminalConfigured={terminalConfigured}
+          wireIndex={wireIndex}
         />
       ))}
 
@@ -458,15 +464,20 @@ function ReportView({
 
       {/* Re-check lives on the freshness line above, beside the claim it
           acts on, rather than here. */}
+      {/* Claudify-all, on `Report.brief` -- "every finding's brief plus a
+          `_Could not check: {reason}_` line per Unknown check". The
+          whole-report equivalent of a finding's brief, and rendered by
+          the same backend for the same reason, so this concatenates
+          nothing. */}
       {n > 0 ? (
         <div className="flex flex-wrap items-center gap-3">
-          <button
-            type="button"
-            onClick={() => copyBrief(report.brief, "All briefs")}
-            className="tap-target rounded border border-[#30363d] px-2 py-1 text-xs text-[#e6edf3] hover:bg-[#161b22]"
-          >
-            Copy all briefs
-          </button>
+          <ClaudifyAction
+            brief={report.brief}
+            repo={repo}
+            target={{ kind: "report" }}
+            what="All briefs"
+            terminalConfigured={terminalConfigured}
+          />
         </div>
       ) : null}
     </div>
@@ -496,12 +507,19 @@ function GroupSection({
   repo,
   activePath,
   onSelectFile,
+  terminalConfigured,
+  wireIndex,
 }: {
   group: AdviceGroup;
   labelled: boolean;
   repo: string;
   activePath: string | undefined;
   onSelectFile: (path: string) => void;
+  terminalConfigured: boolean;
+  /// This finding's position in `report.findings`, which is what a
+  /// Claudify sends. Passed down rather than recomputed, because the
+  /// group does not hold the wire list.
+  wireIndex: (f: ClaudeMdAdviceFinding) => number;
 }) {
   // Shortened against the repository root when the label leads with a
   // path, whatever the subject kind -- a directory has a path to shorten
@@ -539,9 +557,11 @@ function GroupSection({
             <FindingRow
               key={`${f.check}:${f.subject.path}:${i}`}
               finding={f}
+              index={wireIndex(f)}
               repo={repo}
               activePath={activePath}
               onSelectFile={onSelectFile}
+              terminalConfigured={terminalConfigured}
             />
           ))}
         </ul>
@@ -552,14 +572,19 @@ function GroupSection({
 
 function FindingRow({
   finding,
+  index,
   repo,
   activePath,
   onSelectFile,
+  terminalConfigured,
 }: {
   finding: ClaudeMdAdviceFinding;
+  /// Position in `report.findings`. Claudify sends this, not the brief.
+  index: number;
   repo: string;
   activePath: string | undefined;
   onSelectFile: (path: string) => void;
+  terminalConfigured: boolean;
 }) {
   const severity = SEVERITY[finding.severity];
   const file = subjectFile(finding.subject);
@@ -598,15 +623,19 @@ function FindingRow({
           </li>
         ))}
       </ul>
-      {/* A plain button, not `aria-pressed`: copying is an action, not a
-          state. The brief itself is not rendered; it is for an agent. */}
-      <button
-        type="button"
-        onClick={() => copyBrief(finding.brief, "Brief")}
-        className="tap-target mt-0.5 text-[11px] text-[#58a6ff] hover:underline"
-      >
-        Copy brief
-      </button>
+      {/* Claudify (#1292): the brief, copied or run. Plain buttons, not
+          `aria-pressed` -- these are actions, not states. The brief
+          itself is still not rendered inline; it is for an agent, and
+          the Run panel shows it only as the argv that will carry it. */}
+      <div className="mt-0.5">
+        <ClaudifyAction
+          brief={finding.brief}
+          repo={repo}
+          target={{ kind: "finding", index }}
+          what="Brief"
+          terminalConfigured={terminalConfigured}
+        />
+      </div>
     </li>
   );
 }

@@ -1102,6 +1102,32 @@ export const claudeMdEffective = (repoPath: string) =>
 export const claudeMdAdvice = (repoPath: string, mode?: ClaudeMdAdviceMode) =>
   call<ClaudeMdAdviceResult>("claude_md_advice", { repoPath, mode: mode ?? null });
 
+/// Which brief a Claudify acts on (#1292).
+///
+/// An index into the findings the panel is showing, or the whole report
+/// — never the prompt text. The backend looks the brief up from the
+/// stored report, so what runs is what `brief::render` produced rather
+/// than anything TypeScript composed. `Finding::new` renders the brief
+/// at construction for exactly this reason, and templating a second
+/// prompt here would undo it.
+export type ClaudifyTarget = { kind: "finding"; index: number } | { kind: "report" };
+
+/// Open the configured terminal on `claude` started on a brief (#1292).
+///
+/// Desktop only. The prompt is a positional argument to `claude`, so a
+/// multi-line Markdown brief arrives in one argv slot intact; Rust's
+/// `prompt_command` records the quoting chain that makes that true.
+export const claudeMdAdviceLaunch = (repoPath: string, target: ClaudifyTarget) =>
+  call<void>("claude_md_advice_launch", { repoPath, target });
+
+/// The argv `claudeMdAdviceLaunch` would spawn, for the user to read.
+///
+/// The same render the launch uses. It matters more here than for a
+/// resume: the line carries a whole brief, so reading it is the only way
+/// to know what the session will be asked to do.
+export const claudeMdAdviceLaunchPreview = (repoPath: string, target: ClaudifyTarget) =>
+  call<LaunchPreview>("claude_md_advice_launch_preview", { repoPath, target });
+
 /// Every CLAUDE.md in a repository, with its import tree resolved, AND
 /// what the scan could not read (#972).
 export const scanClaudeMd = (repoPath: string) =>

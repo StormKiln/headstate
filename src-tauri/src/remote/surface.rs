@@ -313,6 +313,8 @@ pub const SURFACE: &[(&str, Class)] = &[
     // a command that changes something a user would not want changed by
     // a phone.
     ("claude_md_advice", Class::Read),
+    ("claude_md_advice_launch", Class::Local),
+    ("claude_md_advice_launch_preview", Class::Local),
     ("scan_claude_md", Class::Read),
     ("read_claude_md", Class::Read),
     // Rescan `~/.claude/projects` and upsert into our own cache (#914).

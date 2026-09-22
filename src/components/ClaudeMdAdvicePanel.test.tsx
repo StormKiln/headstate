@@ -13,6 +13,17 @@ const toastFns = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn() }));
 const refetchFn = vi.hoisted(() => vi.fn());
 const freshRefetchFn = vi.hoisted(() => vi.fn());
 
+/// Claudify's backend, stubbed (#1292).
+///
+/// `terminal` is what `terminal_command` holds, which is the ONLY thing
+/// that decides whether Run is offered -- there is deliberately no
+/// second setting, so the tests drive this one and nothing else.
+const claudify = vi.hoisted(() => ({
+  terminal: "",
+  preview: vi.fn(() => Promise.resolve({ program: "bash", args: ["-lc", "cd '/r' && claude 'B'"] })),
+  launch: vi.fn(() => Promise.resolve(undefined as void | undefined)),
+}));
+
 /// The harness mocks the CACHED and the FRESH call SEPARATELY (#1290).
 ///
 /// One shared stub would make the composed "from cache, refreshing"
@@ -36,6 +47,7 @@ const state = vi.hoisted(() => ({
 }));
 
 vi.mock("../api/hooks", () => ({
+  useUiPrefs: () => ({ prefs: { terminal_command: claudify.terminal } }),
   useClaudeMdAdvice: (repo: string | undefined, enabled: boolean, mode = "cached") => {
     state.enabledFor.push({ mode, repo, enabled });
     return mode === "fresh"
@@ -48,6 +60,10 @@ vi.mock("../api/hooks", () => ({
           refetch: refetchFn,
         };
   },
+}));
+vi.mock("../api/tauri", () => ({
+  claudeMdAdviceLaunch: claudify.launch,
+  claudeMdAdviceLaunchPreview: claudify.preview,
 }));
 vi.mock("sonner", () => ({ toast: toastFns }));
 vi.mock("../lib/clipboard", () => ({ copyText: copyFn }));
@@ -120,6 +136,16 @@ beforeEach(() => {
   toastFns.error.mockClear();
   refetchFn.mockClear();
   freshRefetchFn.mockClear();
+  // No terminal by DEFAULT, so every pre-existing test runs the
+  // copy-only shape and Run has to be opted into explicitly.
+  claudify.terminal = "";
+  claudify.preview.mockClear();
+  claudify.preview.mockResolvedValue({
+    program: "bash",
+    args: ["-lc", "cd '/r' && claude 'B'"],
+  });
+  claudify.launch.mockClear();
+  claudify.launch.mockResolvedValue(undefined);
   state.data = undefined;
   state.isError = false;
   state.error = undefined;
@@ -679,5 +705,189 @@ describe("ClaudeMdAdvicePanel", () => {
       group(g);
       for (const t of texts) expect(screen.getByText(t)).toBeTruthy();
     }
+  });
+
+  // ---- Claudify (#1292) ----
+
+  /// With NO terminal configured the panel says so in words.
+  ///
+  /// #1292 names this as a requirement rather than a nicety: "no
+  /// terminal configured must read as 'no terminal is configured', not
+  /// as a disabled button with no explanation and not as a silent
+  /// no-op". A greyed Run with no text is the failure -- the remedy is
+  /// invisible from it -- so the assertion is that the SENTENCE is
+  /// present and the button is absent, not merely that it is disabled.
+  it("says a terminal is not configured instead of disabling Run silently", () => {
+    claudify.terminal = "";
+    state.data = report({
+      findings: [finding()],
+      checks: [{ check: "imports", run: { state: "ran", findings: 1 } }],
+    });
+    open();
+    expect(screen.queryByRole("button", { name: /run in terminal/i })).toBeNull();
+    expect(screen.getAllByText(/no terminal is configured/i).length).toBeGreaterThan(0);
+    // And it names the remedy, not just the fact.
+    expect(screen.getAllByText(/settings/i).length).toBeGreaterThan(0);
+    // Copy is unaffected: it never needed a terminal.
+    expect(screen.getByRole("button", { name: "Copy brief" })).toBeTruthy();
+  });
+
+  /// Run appears only once a terminal IS configured.
+  it("offers Run when a terminal is configured", () => {
+    claudify.terminal = "open -a Terminal {command}";
+    state.data = report({
+      findings: [finding()],
+      checks: [{ check: "imports", run: { state: "ran", findings: 1 } }],
+    });
+    open();
+    // One per finding, plus Claudify-all's.
+    expect(screen.getAllByRole("button", { name: /run in terminal/i }).length).toBe(2);
+    expect(screen.queryByText(/no terminal is configured/i)).toBeNull();
+  });
+
+  /// The exact line is shown BEFORE anything runs (#1214's rule).
+  ///
+  /// And the index is the WIRE index: Rust resolves it against the
+  /// stored report, so a Claudify on the second finding must send 1.
+  it("shows the exact argv before running, for the finding that was clicked", async () => {
+    claudify.terminal = "open -a Terminal {command}";
+    claudify.preview.mockResolvedValue({
+      program: "bash",
+      args: ["-lc", "cd '/r' && claude '## second'"],
+    });
+    state.data = report({
+      findings: [finding({ finding: "first" }), finding({ finding: "second" })],
+      checks: [{ check: "imports", run: { state: "ran", findings: 2 } }],
+    });
+    open();
+    // The SECOND finding's Run.
+    fireEvent.click(screen.getAllByRole("button", { name: /run in terminal/i })[1]);
+    await waitFor(() =>
+      expect(claudify.preview).toHaveBeenCalledWith(REPO, { kind: "finding", index: 1 }),
+    );
+    // The argv is on screen, and nothing has been launched yet.
+    await waitFor(() => expect(screen.getByText(/cd '\/r' && claude '## second'/)).toBeTruthy());
+    expect(claudify.launch).not.toHaveBeenCalled();
+  });
+
+  /// A launch that FAILED says the launch failed, and never looks like
+  /// the prompt ran. No optimistic toast anywhere.
+  it("reports a failed launch as a failure, not as a run", async () => {
+    claudify.terminal = "open -a Terminal {command}";
+    claudify.launch.mockRejectedValue("The configured terminal is unusable: it is empty");
+    state.data = report({
+      findings: [finding()],
+      checks: [{ check: "imports", run: { state: "ran", findings: 1 } }],
+    });
+    open();
+    // The FIRST Run is the finding's; the last is Claudify-all's.
+    fireEvent.click(screen.getAllByRole("button", { name: /run in terminal/i })[0]);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Run it" })).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Run it" }));
+    await waitFor(() =>
+      expect(toastFns.error).toHaveBeenCalledWith(expect.stringMatching(/could not run/i), {
+        description: "The configured terminal is unusable: it is empty",
+      }),
+    );
+    // The success toast is the thing that must NOT have fired.
+    expect(toastFns.success).not.toHaveBeenCalled();
+  });
+
+  /// A launch that succeeded says so, and only after it resolved.
+  it("reports a successful launch only once it resolved", async () => {
+    claudify.terminal = "open -a Terminal {command}";
+    state.data = report({
+      findings: [finding()],
+      checks: [{ check: "imports", run: { state: "ran", findings: 1 } }],
+    });
+    open();
+    // The FIRST Run is the finding's; the last is Claudify-all's.
+    fireEvent.click(screen.getAllByRole("button", { name: /run in terminal/i })[0]);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Run it" })).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Run it" }));
+    await waitFor(() =>
+      expect(claudify.launch).toHaveBeenCalledWith(REPO, { kind: "finding", index: 0 }),
+    );
+    await waitFor(() => expect(toastFns.success).toHaveBeenCalled());
+    expect(toastFns.error).not.toHaveBeenCalled();
+  });
+
+  /// A preview that could not be built is shown as a refusal, and "Run
+  /// it" stays unpressable -- this is where "no terminal is configured"
+  /// surfaces from Rust as the backstop `LaunchError::NotConfigured`.
+  it("shows a preview refusal and refuses to run on it", async () => {
+    claudify.terminal = "open -a Terminal {command}";
+    claudify.preview.mockRejectedValue(
+      "No terminal is configured. Set one in Settings to open commands directly.",
+    );
+    state.data = report({
+      findings: [finding()],
+      checks: [{ check: "imports", run: { state: "ran", findings: 1 } }],
+    });
+    open();
+    fireEvent.click(screen.getAllByRole("button", { name: /run in terminal/i })[0]);
+    await waitFor(() =>
+      expect(screen.getByText(/No terminal is configured\./)).toBeTruthy(),
+    );
+    // "Run it" is present but UNPRESSABLE. Disabled is right here and
+    // wrong for the no-terminal case above, and the difference is the
+    // explanation: the refusal Rust gave is on screen directly beside
+    // this button, so the greyed control is not a dead end.
+    const run = screen.getByRole("button", { name: "Run it" });
+    expect(run.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(run);
+    expect(claudify.launch).not.toHaveBeenCalled();
+  });
+
+  /// Claudify-all sends the REPORT target, not a concatenation.
+  it("claudifies the whole report with the report target", async () => {
+    claudify.terminal = "open -a Terminal {command}";
+    state.data = report({
+      findings: [finding()],
+      checks: [{ check: "imports", run: { state: "ran", findings: 1 } }],
+      brief: "# the whole document",
+    });
+    open();
+    // The Claudify-all row is the last Run on the page.
+    const runs = screen.getAllByRole("button", { name: /run in terminal/i });
+    fireEvent.click(runs[runs.length - 1]);
+    await waitFor(() =>
+      expect(claudify.preview).toHaveBeenCalledWith(REPO, { kind: "report" }),
+    );
+  });
+
+  /// GROUPED, the index still addresses the wire position.
+  ///
+  /// This is the case a flat-list test cannot reach, and the bug it
+  /// guards is the quiet one: under a grouping, a finding's position
+  /// WITHIN its group is not its position in `report.findings`, and Rust
+  /// resolves the index against the stored report. Sending the
+  /// group-local index would Claudify a different finding than the one
+  /// clicked — with no error anywhere, because both indices are valid.
+  ///
+  /// Grouped by file, `b.md` sorts into its own group, so the finding at
+  /// wire index 2 is the FIRST in its group. A group-local index would
+  /// send 0 here and be wrong by two.
+  it("sends the wire index, not the position within a group", async () => {
+    claudify.terminal = "open -a Terminal {command}";
+    const sub = (p: string) =>
+      ({ kind: "claudeMd", path: `${REPO}/${p}`, scope: "repo", section: null }) as const;
+    state.data = report({
+      findings: [
+        finding({ finding: "first", subject: sub("a.md") }),
+        finding({ finding: "second", subject: sub("a.md") }),
+        finding({ finding: "third", subject: sub("b.md") }),
+      ],
+      checks: [{ check: "imports", run: { state: "ran", findings: 3 } }],
+    });
+    open();
+    group("file");
+    // The finding whose text is "third" — first in the `b.md` group,
+    // third on the wire.
+    const runs = screen.getAllByRole("button", { name: /run in terminal/i });
+    fireEvent.click(runs[2]);
+    await waitFor(() =>
+      expect(claudify.preview).toHaveBeenCalledWith(REPO, { kind: "finding", index: 2 }),
+    );
   });
 });

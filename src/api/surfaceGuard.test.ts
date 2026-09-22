@@ -112,6 +112,12 @@ describe("the remote surface's frontend half", () => {
       // that would open on the desktop, so a phone shown one would be
       // reading the preview of a button it cannot press.
       "claudeLaunchSessionPreview",
+      // Claudify (#1292). The launch opens a terminal window on the
+      // desktop; the preview describes that window's argv. Same class
+      // and same reason as the resume pair above -- a phone shown the
+      // preview would be reading the argv of a button it cannot press.
+      "claudeMdAdviceLaunch",
+      "claudeMdAdviceLaunchPreview",
       "claudeLaunchWorktree",
       // #1219's stop. `Class::Local` with NO dispatch arm, and the class
       // IS the safety property here rather than a rendering hint: a
