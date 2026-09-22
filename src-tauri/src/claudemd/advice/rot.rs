@@ -16,7 +16,13 @@
 //! - **path**: the CLAUDE.md's own directory, then the repository root,
 //!   then a unique suffix match over the tree, walked with the same
 //!   [`SKIP`] list `scan_repo` uses. Two matches is `Unknown`
-//!   ("ambiguous"), never a guess.
+//!   ("ambiguous"), never a guess. A path that lies UNDER a pruned
+//!   directory is `Unknown` naming the prune, never `Missing`: the walk
+//!   did not enter it, and #1299 is what one prune reading as absence
+//!   costs. Neither this walk nor `scan_repo` prunes `.claude` for
+//!   holding agent worktrees -- `SKIP` already prunes the `worktrees`
+//!   child by name, and the parent holds the rules and skills a
+//!   CLAUDE.md names.
 //! - **`path:line`**: the path as above, then the file's line count. A
 //!   line past the end is [`Verdict::LinePastEof`] at
 //!   [`Severity::Advice`]. A line WITHIN the file is silent, even when
@@ -64,8 +70,9 @@
 //! # Unknown is a verdict, not a pass
 //!
 //! A path that could not be stat'd, a suffix search whose walk could not
-//! list a directory, a manifest that exists and could not be read, an
-//! ambiguous suffix, a skill with no inventory: each is a
+//! list a directory or pruned the subtree the path lies under, a
+//! manifest that exists and could not be read, an ambiguous suffix, a
+//! skill with no inventory: each is a
 //! [`Severity::Unknown`] finding with the reason, and the file gets ONE
 //! [`Severity::Advice`] summary, "N references checked; K could not be
 //! checked (…)", only when K > 0. So a run that checked 0 of 41 reads
@@ -383,13 +390,37 @@ fn probe(p: &Path) -> Probe {
 struct Tree {
     paths: Vec<String>,
     unreadable: Vec<String>,
+    /// The [`SKIP`] directories the walk pruned, as relative paths.
+    ///
+    /// A pruned subtree is "we did not look", and #1299 is what happens
+    /// when that reads as "it is not there": one prune turned every
+    /// `.claude/**` reference in a repository into a confident Missing.
+    /// `Tree::pruning` reads this so a reference that LIES UNDER a prune
+    /// is `Unknown` with the prune named. Only such a reference: every
+    /// healthy repository prunes `node_modules` and `target`, and
+    /// letting any prune soften every miss would retire the check.
+    pruned: Vec<String>,
+}
+
+impl Tree {
+    /// The prune `clean` lies under, if any: the reference could only
+    /// have resolved inside a subtree the walk did not enter, so the
+    /// tree cannot say it is absent.
+    fn pruning(&self, clean: &str) -> Option<&str> {
+        self.pruned
+            .iter()
+            .find(|d| clean == d.as_str() || clean.starts_with(&format!("{d}/")))
+            .map(|d| d.as_str())
+    }
 }
 
 fn index_tree(repo: &Path) -> Tree {
     let mut tree = Tree {
         paths: Vec::new(),
         unreadable: Vec::new(),
+        pruned: Vec::new(),
     };
+    let mut skipped: Vec<PathBuf> = Vec::new();
     let mut stack = vec![repo.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
@@ -404,8 +435,18 @@ fn index_tree(repo: &Path) -> Tree {
             let name = e.file_name().to_string_lossy().to_string();
             let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
             if is_dir {
-                let agent_worktrees = name == ".claude" && e.path().join("worktrees").is_dir();
-                if SKIP.contains(&name.as_str()) || agent_worktrees {
+                // SKIP alone. It already carries `worktrees`, so the
+                // agent-managed checkouts under `.claude/worktrees` are
+                // pruned by their OWN name when the walk reaches them.
+                //
+                // This used to ALSO prune `.claude` for holding them,
+                // and with it every `.claude/rules/*.md` and
+                // `.claude/skills/**/SKILL.md` a CLAUDE.md names, which
+                // then matched 0 paths and read as Missing (#1299).
+                // `.claude` is worth walking. `scan_repo` carried the
+                // same parent-check and lost the same subtree.
+                if SKIP.contains(&name.as_str()) {
+                    skipped.push(e.path());
                     continue;
                 }
                 stack.push(e.path());
@@ -415,8 +456,10 @@ fn index_tree(repo: &Path) -> Tree {
             }
         }
     }
+    tree.pruned = skipped.iter().filter_map(|p| relative(repo, p)).collect();
     tree.paths.sort();
     tree.unreadable.sort();
+    tree.pruned.sort();
     tree
 }
 
@@ -687,6 +730,15 @@ impl<'a> Resolver<'a> {
             .collect();
         match matches.len() {
             1 => Ok(repo.join(matches[0])),
+            // Ordered before the Missing arm on purpose: a reference
+            // under a pruned subtree was never looked for, and #1299 is
+            // the cost of calling that absent.
+            0 if tree.pruning(clean).is_some() => {
+                let pruned = tree.pruning(clean).expect("matched just above");
+                Err(unknown(format!(
+                    "`{clean}` lies under `{pruned}`, which the tree walk does not enter, so whether it exists was not checked"
+                )))
+            }
             0 if tree.unreadable.is_empty() => Err((
                 Verdict::Missing,
                 format!(
@@ -1458,6 +1510,99 @@ Run `yarn paw`, not `yarn nope`. Use the `tentacle` skill, not the `ink` skill.
             other => panic!("{other:?}"),
         }
         assert_eq!(rot.unchecked.len(), 1);
+    }
+
+    /// #1299: a repository with `.claude/worktrees/` must still have its
+    /// `.claude/**` content indexed. The prune is for the agent-managed
+    /// checkouts one level down, not for their parent, which holds the
+    /// rules and skills a CLAUDE.md names. Before the fix every
+    /// `.claude/**` reference in such a repository was Missing.
+    #[test]
+    fn claude_worktrees_prunes_itself_and_not_the_rest_of_dot_claude() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        fs::create_dir_all(root.join(".claude").join("rules")).unwrap();
+        fs::write(
+            root.join(".claude").join("rules").join("unit-testing.md"),
+            "rule\n",
+        )
+        .unwrap();
+        let skill = root.join(".claude").join("skills").join("tentacle");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "---\nname: tentacle\n---\nbody\n").unwrap();
+        // The agent-managed checkouts, which must stay out of the index:
+        // they are copies, and indexing them makes suffix matches
+        // ambiguous.
+        let wt = root.join(".claude").join("worktrees").join("wt1");
+        fs::create_dir_all(&wt).unwrap();
+        fs::write(wt.join("copied.md"), "copy\n").unwrap();
+
+        let tree = index_tree(root);
+        let has = |p: &str| tree.paths.iter().any(|x| x == p);
+        assert!(
+            has(".claude/rules/unit-testing.md"),
+            "the rules live one level up from the prune: {:?}",
+            tree.paths
+        );
+        assert!(
+            has(".claude/skills/tentacle/SKILL.md"),
+            "the skills do too: {:?}",
+            tree.paths
+        );
+        assert!(
+            !tree
+                .paths
+                .iter()
+                .any(|p| p.starts_with(".claude/worktrees/")),
+            "the agent checkouts stay out: {:?}",
+            tree.paths
+        );
+
+        // End to end: the references resolve, so nothing is Missing.
+        fs::write(
+            root.join("CLAUDE.md"),
+            "see `.claude/rules/unit-testing.md` and `.claude/skills/tentacle/SKILL.md`\n",
+        )
+        .unwrap();
+        let rot = check_one(root, None);
+        assert_eq!(rot.refs_checked, 2, "{rot:?}");
+        assert!(rot.findings.is_empty(), "no finding at all: {rot:?}");
+    }
+
+    /// #1299's general lesson: a reference that could only live inside a
+    /// pruned subtree was never looked for, so it is Unknown naming the
+    /// prune, not Missing. A path outside every prune is still Missing --
+    /// softening those would retire the check.
+    #[test]
+    fn a_path_under_a_pruned_directory_is_unknown_and_names_the_prune() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        fs::create_dir_all(root.join("node_modules").join("left")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("CLAUDE.md"),
+            "patched in `node_modules/left/index.js`, unlike `src/gone.rs`\n",
+        )
+        .unwrap();
+
+        let rot = check_one(root, None);
+        let v = verdicts(&rot);
+        let pruned = v
+            .iter()
+            .find(|(raw, _)| *raw == "node_modules/left/index.js")
+            .expect("the pruned reference is a finding");
+        match pruned.1 {
+            Verdict::Unknown(why) => assert!(
+                why.contains("node_modules") && why.contains("does not enter"),
+                "the prune is named: {why}"
+            ),
+            other => panic!("never Missing: {other:?}"),
+        }
+        assert!(
+            v.iter()
+                .any(|(raw, verd)| *raw == "src/gone.rs" && **verd == Verdict::Missing),
+            "a genuine miss outside every prune is still Missing: {v:?}"
+        );
     }
 
     /// A subtree the walk cannot list is Unknown, not Missing, and the
