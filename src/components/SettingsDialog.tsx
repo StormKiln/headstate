@@ -155,12 +155,13 @@ export function SettingsDialog({
           Sizing to the tallest topic would also stop the jumping, but
           pads every short topic with dead space and changes again the
           moment a setting is added. A fixed frame does not. */}
-      {/* `sm:max-w-3xl` as well as `max-w-3xl`: the base
-          `DialogContent` carries `sm:max-w-sm`, and tailwind-merge
-          treats a responsive variant as a different key -- so a bare
-          `max-w-3xl` loses to it above 640px and the dialog would come
-          out NARROWER than the 32rem it started at. Verified against
-          twMerge rather than assumed. */}
+      {/* Spelt ONCE. This used to carry `sm:max-w-3xl` alongside
+          `max-w-3xl` (and `sm:max-w-none` alongside `max-w-none`),
+          because the base `DialogContent` carried a `sm:max-w-sm` that
+          tailwind-merge keyed separately from a bare `max-w-*` and that
+          won above 640px -- so the bare form came out NARROWER than the
+          32rem this dialog started at. #1306 moved the base's cap onto
+          the callers' own key, so the plain form applies. */}
       {/* On a phone: nearly full height, and the nav rail stacks ABOVE
           the content rather than beside it. `h-[32rem]` is a hard 512px
           slab with 144px of that spent on a fixed-width rail, leaving
@@ -172,8 +173,8 @@ export function SettingsDialog({
       <DialogContent
         className={
           isMobile
-            ? "flex h-[calc(100dvh-4rem)] max-w-none flex-col sm:max-w-none"
-            : "flex h-[32rem] max-w-3xl flex-col sm:max-w-3xl"
+            ? "flex h-[calc(100dvh-4rem)] max-w-none flex-col"
+            : "flex h-[32rem] max-w-3xl flex-col"
         }
       >
         <DialogTitle>Settings</DialogTitle>

@@ -487,12 +487,16 @@ describe("the settings sections", () => {
 
     expect(cls).toMatch(/\bh-\[32rem\]/);
     expect(cls).toMatch(/\bmax-w-3xl\b/);
-    // The base DialogContent carries `sm:max-w-sm`, and tailwind-merge
-    // keeps a responsive variant alongside a bare one -- so without an
-    // explicit `sm:` override the dialog is NARROWER above 640px than
-    // before this change.
-    expect(cls).toMatch(/\bsm:max-w-3xl\b/);
-    expect(cls).not.toMatch(/\bsm:max-w-sm\b/);
+    // The base DialogContent's default cap used to be `sm:max-w-sm`,
+    // which tailwind-merge keyed separately from a bare `max-w-3xl` and
+    // which therefore won above 640px -- so this dialog carried an
+    // explicit `sm:max-w-3xl` to beat it. #1306 moved the base's cap
+    // onto the callers' own key, so the bare form applies and the
+    // doubled spelling is gone. Assert the cap is not merely absent but
+    // REPLACED: a `max-w-3xl` sitting beside any surviving cap is the
+    // bug this dialog was the first to hit.
+    expect(cls).not.toMatch(/\bsm:max-w-/);
+    expect(cls).not.toMatch(/(^|\s)max-w-sm(\s|$)/);
   });
 
   it("marks the chosen topic as current", () => {
