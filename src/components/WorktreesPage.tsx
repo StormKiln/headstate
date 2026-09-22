@@ -2776,7 +2776,30 @@ export function WorktreesPage() {
           would say so anyway, which is why there is no second check. */}
       {launching !== null ? (
         <Dialog open onOpenChange={() => setLaunching(null)}>
-          <DialogContent className="max-w-lg">
+          {/* Wider than the `max-w-lg` the other confirmations use
+              (#1303). This is the only dialog in the app that renders a
+              built argv, and one of its words is the ENTIRE
+              `cd '<path>' && claude '<assessment prompt>'` line -- tens
+              of lines of prompt in a single box. `ArgvPreview` wraps it
+              so nothing runs off the right edge, but wrapping a line
+              that long at `lg` leaves a tall column of short rows that
+              is technically readable and practically not.
+
+              SPELT TWICE, and the `sm:` half is the one that works.
+              `DialogContent`'s base carries `sm:max-w-sm`, and `cn` is
+              `twMerge`, which keys `max-w-*` and `sm:max-w-*`
+              SEPARATELY -- so a bare `max-w-2xl` does not replace the
+              base, it sits beside it, and above 640px the media-query
+              rule wins. Measured in a browser: `max-w-2xl` alone
+              computes to 384px, `sm:max-w-2xl` to 672px. The unprefixed
+              half still carries the narrow viewport below `sm`.
+
+              This is the same tailwind-merge trap `dialog.test.ts`
+              documents for the side margin, one key over. Every other
+              dialog in the app passes the bare form and is therefore
+              also 384px wide; that is a pre-existing bug beyond this
+              issue's scope, filed as #1306 rather than fixed here. */}
+          <DialogContent className="max-w-2xl sm:max-w-2xl">
             <DialogTitle>Hand {pathBasename(launching.worktree.path)} to Claude Code</DialogTitle>
             <p className="text-sm text-[#8b949e]">
               This opens the terminal you configured in Settings and starts Claude Code on the

@@ -8,6 +8,7 @@ import {
 import { copyText } from "@/lib/clipboard";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { toast } from "sonner";
+import { ArgvPreview } from "./ArgvPreview";
 
 /// Turning one advice finding — or a whole report — into a prompt (#1292).
 ///
@@ -131,24 +132,6 @@ export function ClaudifyAction({
   );
 }
 
-/// One argv word, rendered so its boundaries are visible.
-///
-/// Borrowed deliberately from `LaunchTermsPicker`: each word is its own
-/// chip rather than a space-joined line, because "could something in
-/// here become a second command" is a question about where the word
-/// boundaries are, and a joined string answers it by hiding them.
-///
-/// A brief is a MULTI-LINE word, and showing it as one chip is the
-/// visible form of the property `prompt_command` guarantees: the whole
-/// prompt occupies exactly one argv slot, newlines included.
-function ArgvWord({ word }: { word: string }) {
-  return (
-    <code className="block max-h-40 overflow-auto whitespace-pre-wrap break-words rounded border border-[#30363d] bg-[#0d1117] px-1 py-0.5 font-mono text-[11px] text-[#e6edf3]">
-      {word === "" ? <span className="text-[#8b949e]">(empty)</span> : word}
-    </code>
-  );
-}
-
 /// The exact line, and the button that runs it.
 function RunPanel({
   repo,
@@ -199,15 +182,7 @@ function RunPanel({
         <span className="mt-1 block text-[11px] text-[#8b949e]">Building the command line…</span>
       ) : (
         <>
-          <span className="mt-1 flex flex-col gap-1">
-            <ArgvWord word={built.program} />
-            {built.args.map((a, i) => (
-              // The index is the key on purpose: these are positional
-              // argv slots, two of which can legitimately be the same
-              // string, and the position IS the identity.
-              <ArgvWord key={i} word={a} />
-            ))}
-          </span>
+          <ArgvPreview as="span" program={built.program} args={built.args} />
           <span className="mt-1 block text-[11px] text-[#8b949e]">
             Each box is one argument. The whole brief is a single argument, newlines included,
             so nothing in it is read as a command.
