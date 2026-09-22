@@ -5,6 +5,7 @@ import {
   type LaunchTermOptions,
   type LaunchTerms,
 } from "@/api/tauri";
+import { ArgvPreview } from "./ArgvPreview";
 
 /// Choosing which model and how much autonomy, and reading the line
 /// that will run before it runs (#1214).
@@ -37,22 +38,6 @@ import {
 /// from its repo, path and branch; a session from its id and cwd -- and
 /// this component knows about neither.
 export type PreviewFn = (terms: LaunchTerms) => Promise<LaunchPreview>;
-
-/// One argv word, rendered so its boundaries are visible.
-///
-/// Each word is its own chip rather than a space-joined line, which is
-/// the whole point: "could a `;` in this path become a second command"
-/// is a question about where the word boundaries are, and a joined
-/// string answers it by hiding them. A path containing a space shows as
-/// ONE chip, which is the visible form of the property `launch.rs`
-/// guarantees.
-function ArgvWord({ word }: { word: string }) {
-  return (
-    <code className="rounded border border-[#30363d] bg-[#0d1117] px-1 py-0.5 font-mono text-[11px] text-[#e6edf3]">
-      {word === "" ? <span className="text-[#8b949e]">(empty)</span> : word}
-    </code>
-  );
-}
 
 export function LaunchTermsPicker({
   terms,
@@ -202,15 +187,7 @@ export function LaunchTermsPicker({
           <p className="mt-1 text-[11px] text-[#8b949e]">Building the command line…</p>
         ) : (
           <>
-            <div className="mt-1 flex flex-wrap items-center gap-1">
-              <ArgvWord word={built.program} />
-              {built.args.map((a, i) => (
-                // The index is the key on purpose: these are positional
-                // argv slots, two of which can legitimately be the same
-                // string, and the position IS the identity.
-                <ArgvWord key={i} word={a} />
-              ))}
-            </div>
+            <ArgvPreview program={built.program} args={built.args} />
             <p className="mt-1 text-[11px] text-[#8b949e]">
               Each box is one argument. Nothing is passed through a shell, so a space or a{" "}
               <code className="font-mono">;</code> inside a box stays inside it.

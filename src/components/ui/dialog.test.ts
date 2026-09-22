@@ -84,3 +84,42 @@ describe("safe-area insets survive the classes callers pass", () => {
   });
 });
 
+/// The OTHER half of the same tailwind-merge trap, found in a browser
+/// while fixing #1303.
+///
+/// The base carries `sm:max-w-sm`, and `twMerge` keys `max-w-*` and
+/// `sm:max-w-*` SEPARATELY -- so a caller passing a bare `max-w-2xl`
+/// does not replace the base's cap, it sits beside it, and above the
+/// `sm` breakpoint the media-query rule wins. Measured in Chrome at
+/// 1280px: `sm:max-w-sm max-w-2xl` computes to 384px, not 672px.
+///
+/// Which means every dialog in the app that passes only the bare form is
+/// 384px wide on the desktop, whatever width it asked for. That is a
+/// pre-existing bug wider than #1303 and is NOT fixed here -- it is
+/// filed as #1306. This records the mechanism, and pins the spelling the
+/// one dialog that needs its width to apply actually uses.
+describe("a caller's width only applies if it is spelt for the breakpoint", () => {
+  it("keeps the base's sm cap beside a bare max-w, which is the trap", () => {
+    const out = cn(BASE, "max-w-2xl");
+    // BOTH survive, and at >=640px the sm one is the one that renders.
+    expect(out).toContain("sm:max-w-sm");
+    expect(out).toContain("max-w-2xl");
+  });
+
+  it("replaces the base's sm cap when the caller prefixes it too", () => {
+    const out = cn(BASE, "max-w-2xl sm:max-w-2xl");
+    // This is the spelling that actually widens the dialog.
+    expect(out).not.toContain("sm:max-w-sm");
+    expect(out).toContain("sm:max-w-2xl");
+    // The unprefixed half stays, for viewports below `sm`.
+    expect(out).toContain("max-w-2xl");
+  });
+
+  it("is the spelling the Claudify launch dialog ships", async () => {
+    // #1303's dialog is the one that renders a built argv, so it is the
+    // one whose width had to actually take effect. Pinned against the
+    // source so a revert to the bare form fails here.
+    const source = await import("../WorktreesPage.tsx?raw");
+    expect(source.default).toContain('className="max-w-2xl sm:max-w-2xl"');
+  });
+});

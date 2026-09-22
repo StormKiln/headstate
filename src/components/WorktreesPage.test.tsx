@@ -1309,6 +1309,56 @@ describe("WorktreesPage", () => {
         expect(launchWorktree).not.toHaveBeenCalled();
       });
 
+      /// #1303: the preview in THIS dialog ran off the right edge.
+      ///
+      /// The word above is short; a real one is the whole assessment
+      /// prompt -- `cd '<path>' && claude '<tens of lines>'` -- in one
+      /// argv slot, inside a dialog with a fixed maximum width. Rendered
+      /// with no wrapping it grew a horizontal scrollbar and most of the
+      /// text became unreadable.
+      ///
+      /// jsdom applies no stylesheets and lays nothing out, so this
+      /// cannot assert that it fits; it asserts the classes that make
+      /// overflowing impossible, on the box the text is actually in, and
+      /// that the argument boundary survived the wrap. What it looks like
+      /// is recorded from a browser in the PR.
+      it("wraps a long brief inside its box rather than overflowing the dialog", async () => {
+        const brief =
+          "cd '/Users/somebody/code/a-long-repository/.worktrees/some-branch' && claude '## Assess\n\nWhat does this change?\n\nDo not push anything.'";
+        launchPreview.mockResolvedValueOnce({
+          program: "open",
+          args: ["-a", "Terminal", brief],
+        });
+        state.terminal = "open -a Terminal {command}";
+        state.classified = [wt({ safety: { kind: "dirty", detail: 2 } })];
+        render(<WorktreesPage />);
+        fireEvent.click(screen.getByRole("button", { name: /claudify/i }));
+
+        // The box whose OWN text is the brief -- not an ancestor of it,
+        // and not a whitespace-normalised match, either of which could
+        // pass against a rendering that had lost the newlines or merged
+        // two arguments.
+        const box = await vi.waitFor(() => {
+          const found = Array.from(document.querySelectorAll("code")).filter(
+            (c) => c.textContent === brief,
+          );
+          expect(found.length).toBe(1);
+          return found[0];
+        });
+        expect(box.className).toContain("whitespace-pre-wrap");
+        expect(box.className).toContain("break-words");
+        expect(box.className).toContain("overflow-x-hidden");
+
+        // And the boundary the boxes exist to show: `-a` and `Terminal`
+        // are still their own arguments, not swept into the long one.
+        // Scoped to the box's own container, because the sentence under
+        // the preview contains a literal `<code>;</code>` -- which is,
+        // fittingly, the very character this rendering exists to keep
+        // inside one box.
+        const boxes = Array.from(box.parentElement?.children ?? []).map((c) => c.textContent);
+        expect(boxes).toEqual(["open", "-a", "Terminal", brief]);
+      });
+
       /// The terms the user picked are the terms that travel.
       it("sends the chosen terms as tokens", async () => {
         state.terminal = "open -a Terminal {command}";
