@@ -47,8 +47,33 @@ function DialogContent({
       <DialogPrimitive.Popup
         data-slot="dialog-content"
         className={cn(
+          // WIDTH IS TWO CLASSES, AND THEY ARE BOTH UNPREFIXED ON PURPOSE.
+          //
           // `w-[calc(100%-2rem)]` carries the side margin, NOT `max-w-`.
-          // The cap used to live on `max-w-[calc(100%-2rem)]`, and
+          // `max-w-sm` is the default cap, and it is deliberately NOT
+          // spelt `sm:max-w-sm` (#1306). `twMerge` keys `max-w-*` and
+          // `sm:max-w-*` SEPARATELY, so a `sm:`-prefixed cap here is not
+          // replaced by a caller's bare `max-w-2xl` -- it survives
+          // beside it, and above 640px the media-query rule wins on
+          // specificity. Every one of the ~25 call sites passed the bare
+          // form, so every dialog in the app rendered at 384px whatever
+          // width it asked for: measured in Chrome at 1280px, `max-w-lg`,
+          // `max-w-2xl` and `max-w-md` all computed to 384px, as did
+          // `UpdateWizard`'s `w-[min(46rem,92vw)]`, which sets no
+          // `max-w-` at all.
+          //
+          // Keeping the cap on the SAME key the callers use is what
+          // disarms it: `cn("max-w-sm", "max-w-2xl")` is `"max-w-2xl"`,
+          // so a caller's plain spelling simply works and there is no
+          // longer a breakpoint-keyed cap for a third caller to lose to.
+          // The `sm:` prefix also bought nothing below 640px -- the
+          // `w-*` margin is narrower than 24rem on any phone, so the cap
+          // never applied there anyway (measured: 358px at a 390px
+          // viewport, cap inactive).
+          //
+          // Why the MARGIN is on `w-*` and not `max-w-*`, which is the
+          // same trap one key over and the reason this comment exists:
+          // the margin used to live on `max-w-[calc(100%-2rem)]`, and
           // `twMerge` treats `max-w-*` as one conflict key -- so all 18
           // call sites, every one of which passes its own `max-w-lg` or
           // `max-w-2xl`, REMOVED it rather than combining with it. At
@@ -61,7 +86,7 @@ function DialogContent({
           // the status bar and the home indicator instead of scrolling its
           // first row underneath them (#648). `env()` is zero on the
           // desktop, where this reduces to the original calc.
-          "fixed top-1/2 left-1/2 z-50 grid max-h-[calc(100dvh-2rem-env(safe-area-inset-top)-env(safe-area-inset-bottom))] w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 gap-4 overflow-y-auto overscroll-contain rounded-xl bg-popover p-4 text-sm text-popover-foreground ring-1 ring-foreground/10 duration-100 outline-none sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
+          "fixed top-1/2 left-1/2 z-50 grid max-h-[calc(100dvh-2rem-env(safe-area-inset-top)-env(safe-area-inset-bottom))] w-[calc(100%-2rem)] max-w-sm -translate-x-1/2 -translate-y-1/2 gap-4 overflow-y-auto overscroll-contain rounded-xl bg-popover p-4 text-sm text-popover-foreground ring-1 ring-foreground/10 duration-100 outline-none data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
           className
         )}
         {...props}

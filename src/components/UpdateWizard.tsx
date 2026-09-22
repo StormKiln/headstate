@@ -173,7 +173,16 @@ export function UpdateWizard({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[80vh] w-[min(46rem,92vw)] overflow-y-auto">
+      {/* `max-w-none` as well as the `w-[min(...)]`: this is the one
+          dialog that sizes itself with `w-*` rather than a `max-w-*`,
+          so it never overrode `DialogContent`'s default cap and was
+          held at 384px instead of the 46rem it asks for -- the
+          package rows (name, current, available, a checkbox) were
+          rendering in a third of their width. #1306 reported this
+          dialog as UNAFFECTED for exactly that reason: it passes no
+          `max-w-*`, so nothing looked wrong at the call site. Measured
+          in Chrome at 1280px: 384px before, 736px after. */}
+      <DialogContent className="max-h-[80vh] w-[min(46rem,92vw)] max-w-none overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Update packages in a worktree</DialogTitle>
         </DialogHeader>

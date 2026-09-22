@@ -19,7 +19,7 @@ import { cn } from "@/lib/utils";
 
 /// The width classes `DialogContent` actually ships, kept in step with
 /// `dialog.tsx` by the last test below.
-const BASE = "w-[calc(100%-2rem)] sm:max-w-sm";
+const BASE = "w-[calc(100%-2rem)] max-w-sm";
 
 /// Every override passed by a real call site.
 const CALLER_WIDTHS = ["max-w-lg", "max-w-2xl", "max-w-3xl sm:max-w-3xl"];
@@ -47,9 +47,23 @@ describe("the dialog's side margin", () => {
   it("matches the classes dialog.tsx actually ships", async () => {
     // Guards the fixture above: a `BASE` that had drifted from the
     // component would make every assertion here meaningless.
+    //
+    // Matched as WHOLE CLASS NAMES, not as substrings. `toContain` was
+    // the original spelling and it is too weak for exactly the class
+    // this file is now about: `max-w-sm` is a substring of
+    // `sm:max-w-sm`, so a base that regressed to the prefixed form
+    // still satisfied a `toContain("max-w-sm")` and the drift guard
+    // passed while the fixture described a component that no longer
+    // existed. Verified by reverting `dialog.tsx` and watching this
+    // test stay green.
     const source = await import("./dialog.tsx?raw");
+    const shipped = new Set(
+      (source.default.match(/"fixed top-1\/2[^"]*"/)?.[0] ?? "")
+        .replace(/"/g, "")
+        .split(/\s+/),
+    );
     for (const cls of BASE.split(" ")) {
-      expect(source.default).toContain(cls);
+      expect(shipped).toContain(cls);
     }
   });
 });
@@ -84,42 +98,154 @@ describe("safe-area insets survive the classes callers pass", () => {
   });
 });
 
-/// The OTHER half of the same tailwind-merge trap, found in a browser
-/// while fixing #1303.
+/// The OTHER half of the same tailwind-merge trap (#1306), and the
+/// reason the base's cap is spelt `max-w-sm` rather than `sm:max-w-sm`.
 ///
-/// The base carries `sm:max-w-sm`, and `twMerge` keys `max-w-*` and
-/// `sm:max-w-*` SEPARATELY -- so a caller passing a bare `max-w-2xl`
-/// does not replace the base's cap, it sits beside it, and above the
-/// `sm` breakpoint the media-query rule wins. Measured in Chrome at
-/// 1280px: `sm:max-w-sm max-w-2xl` computes to 384px, not 672px.
+/// The base USED to carry `sm:max-w-sm`. `twMerge` keys `max-w-*` and
+/// `sm:max-w-*` SEPARATELY, so a caller's bare `max-w-2xl` did not
+/// replace that cap -- it sat beside it, and above the `sm` breakpoint
+/// the media-query rule won on specificity. Every one of the ~25 call
+/// sites passed the bare form, so every dialog in the app rendered at
+/// 384px whatever width it asked for. Measured in Chrome at a 1280px
+/// viewport, through the real component: `max-w-lg`, `max-w-2xl` and
+/// `max-w-md` all computed to 384px.
 ///
-/// Which means every dialog in the app that passes only the bare form is
-/// 384px wide on the desktop, whatever width it asked for. That is a
-/// pre-existing bug wider than #1303 and is NOT fixed here -- it is
-/// filed as #1306. This records the mechanism, and pins the spelling the
-/// one dialog that needs its width to apply actually uses.
-describe("a caller's width only applies if it is spelt for the breakpoint", () => {
-  it("keeps the base's sm cap beside a bare max-w, which is the trap", () => {
+/// Two call sites had already worked around it by spelling the width
+/// twice (`max-w-3xl sm:max-w-3xl`), which is the evidence that a
+/// workaround does not scale: the trap stayed armed for everyone who
+/// had not yet been bitten, and the next author had no way to know.
+///
+/// The fix is to keep the default cap on the SAME conflict key the
+/// callers use. Then a caller's plain `max-w-2xl` simply replaces it,
+/// and there is no breakpoint-keyed cap left to silently beat a third
+/// caller. The `sm:` prefix bought nothing anyway: below 640px the
+/// `w-[calc(100%-2rem)]` margin is already narrower than 24rem on any
+/// phone, so the cap never applied there (measured: 358px at a 390px
+/// viewport, with the cap inactive).
+describe("a caller's width applies without having to be spelt twice", () => {
+  /// The property the fix exists to provide, asserted for every width a
+  /// real call site passes. This is the test that fails if the base's
+  /// cap ever moves back onto a `sm:`-prefixed key.
+  it("lets a bare max-w from a caller replace the base's cap", () => {
+    for (const width of ["max-w-md", "max-w-lg", "max-w-2xl", "max-w-3xl"]) {
+      const out = cn(BASE, width);
+      expect(out).toContain(width);
+      // The cap it replaced is GONE, not sitting beside it waiting to
+      // win at >=640px. `toContain` on the whole string would be
+      // satisfied by `max-w-sm` inside `sm:max-w-sm`, so match a word.
+      expect(out).not.toMatch(/(^|\s|:)max-w-sm(\s|$)/);
+    }
+  });
+
+  /// The side margin is the other thing on the same element, and the
+  /// earlier bug in this file was the margin being deleted by these
+  /// exact class names. Both properties have to hold at once.
+  it("keeps the side margin while the caller's width applies", () => {
     const out = cn(BASE, "max-w-2xl");
-    // BOTH survive, and at >=640px the sm one is the one that renders.
-    expect(out).toContain("sm:max-w-sm");
+    expect(out).toContain("w-[calc(100%-2rem)]");
     expect(out).toContain("max-w-2xl");
   });
 
-  it("replaces the base's sm cap when the caller prefixes it too", () => {
-    const out = cn(BASE, "max-w-2xl sm:max-w-2xl");
-    // This is the spelling that actually widens the dialog.
-    expect(out).not.toContain("sm:max-w-sm");
-    expect(out).toContain("sm:max-w-2xl");
-    // The unprefixed half stays, for viewports below `sm`.
-    expect(out).toContain("max-w-2xl");
+  /// `UpdateWizard` is the one dialog that sizes itself with `w-*` and
+  /// passes NO `max-w-*`, so nothing at its call site overrode the
+  /// default cap and it was held at 384px while asking for 46rem.
+  /// #1306 reported it as unaffected for that reason. It needs
+  /// `max-w-none` explicitly, and that is easy to drop in a later edit.
+  it("still caps a caller that sets only a width, unless it opts out", () => {
+    const sized = "max-h-[80vh] w-[min(46rem,92vw)] overflow-y-auto";
+    expect(cn(BASE, sized)).toMatch(/(^|\s)max-w-sm(\s|$)/);
+    expect(cn(BASE, `${sized} max-w-none`)).toContain("max-w-none");
   });
 
-  it("is the spelling the Claudify launch dialog ships", async () => {
-    // #1303's dialog is the one that renders a built argv, so it is the
-    // one whose width had to actually take effect. Pinned against the
-    // source so a revert to the bare form fails here.
-    const source = await import("../WorktreesPage.tsx?raw");
-    expect(source.default).toContain('className="max-w-2xl sm:max-w-2xl"');
+  /// And the opt-out is actually THERE, pinned against the source.
+  ///
+  /// The assertion above is about `cn`, so it would pass just as
+  /// happily if `UpdateWizard` never opted out at all -- which is the
+  /// state #1306 found it in, and which sabotaging the call site
+  /// confirmed the `cn` test alone does not catch. Measured in Chrome
+  /// at 1280px: 384px without `max-w-none`, 736px with it.
+  it("opts UpdateWizard out, because it sets no max-w of its own", async () => {
+    const source = await import("../UpdateWizard.tsx?raw");
+    const tag = source.default.match(/<DialogContent[\s\S]*?>/)?.[0] ?? "";
+    expect(tag).toContain("w-[min(46rem,92vw)]");
+    expect(tag).toContain("max-w-none");
+  });
+});
+
+/// The guard: no call site may carry a breakpoint-prefixed `max-w-*`.
+///
+/// The three tests above are assertions about `cn`, which is a thin
+/// `twMerge` wrapper -- they pin the MECHANISM, and the first of them
+/// does fail if `dialog.tsx`'s base regresses (via the `BASE` fixture
+/// and the drift test that pins it to the source). But none of them can
+/// see a NEW call site, and a new call site is how this bug reached ~25
+/// dialogs in the first place.
+///
+/// So this scans every component's source the way `emptyStateGuard`
+/// does, for the same stated reason: the property is about every call
+/// site rather than about one, and a list of imports is exactly the
+/// enumeration that lets the next one be forgotten.
+///
+/// What it cannot see, stated rather than glossed:
+/// - A width built at runtime (a variable, a template literal). Every
+///   current call site passes a literal or a ternary of literals; a
+///   computed one would be invisible here.
+/// - Whether the width CHOSEN is the right one for the content. That is
+///   a judgement, and the browser is where it was made.
+const componentSources = import.meta.glob("../**/*.tsx", {
+  query: "?raw",
+  import: "default",
+  eager: true,
+}) as Record<string, string>;
+
+describe("no call site re-arms the breakpoint trap", () => {
+  /// A `sm:`/`md:`/`lg:` prefixed `max-w-*` anywhere near a
+  /// `DialogContent` is the broken spelling: it means the author is
+  /// either working around a cap that no longer exists, or has
+  /// reintroduced one. Either way the next reader learns the wrong rule.
+  it("passes no breakpoint-prefixed max-w to a DialogContent", () => {
+    const offenders: string[] = [];
+    for (const [path, source] of Object.entries(componentSources)) {
+      if (path.includes(".test.")) continue;
+      if (!source.includes("<DialogContent")) continue;
+      // Every `<DialogContent ...>` opening tag, attributes included.
+      for (const tag of source.match(/<DialogContent[\s\S]*?>/g) ?? []) {
+        for (const hit of tag.match(/\b[a-z]+:max-w-[\w[\]().,%-]+/g) ?? []) {
+          offenders.push(`${path}: ${hit}`);
+        }
+      }
+    }
+    // `DialogContent`'s cap is unprefixed, so a prefixed width from a
+    // caller does not replace it -- it wins above the breakpoint and
+    // loses below, which is never what anyone means.
+    expect(offenders).toEqual([]);
+  });
+
+  /// Guards the guard. A scan that silently stopped finding call sites
+  /// would report zero offenders forever, which is the failure mode of
+  /// every source scan and the reason `emptyStateGuard` self-checks too.
+  it("is actually looking at the app's dialogs", () => {
+    const withDialogs = Object.entries(componentSources).filter(
+      ([path, source]) =>
+        !path.includes(".test.") && source.includes("<DialogContent"),
+    );
+    expect(withDialogs.length).toBeGreaterThanOrEqual(12);
+    const paths = withDialogs.map(([p]) => p).join("\n");
+    for (const known of ["WorktreesPage", "SettingsDialog", "UpdateWizard"]) {
+      expect(paths).toContain(known);
+    }
+  });
+
+  /// The base itself, read from the source rather than from the `BASE`
+  /// fixture, so a regression in `dialog.tsx` fails here even if someone
+  /// updates the fixture to match it.
+  it("keeps the default cap off a breakpoint key in dialog.tsx", async () => {
+    const source = await import("./dialog.tsx?raw");
+    const tag = source.default.match(/data-slot="dialog-content"[\s\S]*?\bclassName=\{cn\([\s\S]*?\n\s*\)/)?.[0];
+    expect(tag).toBeTruthy();
+    // The class list lives on the one long string literal in that call.
+    const classes = tag!.match(/"fixed top-1\/2[^"]*"/)?.[0] ?? "";
+    expect(classes).toMatch(/(^|\s)max-w-sm(\s|")/);
+    expect(classes).not.toContain("sm:max-w-");
   });
 });
