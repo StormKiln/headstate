@@ -472,17 +472,27 @@ pub fn scan_repo(repo: &Path) -> Scan {
                 if TEST_DIRS.contains(&name.as_str()) {
                     facts.test_dirs += 1;
                 }
-                // `.claude/worktrees` needs the PARENT checked too:
-                // a directory literally named `worktrees` is caught by
-                // SKIP, but the agent-managed ones live one level down
-                // inside `.claude`, which is otherwise worth walking.
-                let agent_worktrees = name == ".claude" && e.path().join("worktrees").is_dir();
-                if SKIP.contains(&name.as_str()) || agent_worktrees {
+                // SKIP alone. It already carries `worktrees`, so the
+                // agent-managed checkouts under `.claude/worktrees` are
+                // pruned by their OWN name one level down, and the
+                // near-duplicate CLAUDE.md copies this list exists to
+                // keep out (see the note above: 11 files, 3 distinct
+                // contents) stay out.
+                //
+                // This used to ALSO prune `.claude` itself for holding
+                // them, which walked back the very thing the comment
+                // claimed -- that `.claude` is "otherwise worth
+                // walking". It silently dropped `.claude/CLAUDE.md`,
+                // which `advice::shape` reads as a root-scope file
+                // (`at_root` accepts a parent of `<repo>/.claude`), on
+                // exactly those repositories that have agent worktrees
+                // (#1299).
+                if SKIP.contains(&name.as_str()) {
                     // DELIBERATE. Counted, not listed as unreadable: the
-                    // SKIP list and the worktree prune are documented
-                    // decisions above, and letting them reach
-                    // `is_partial()` would make every healthy repository
-                    // report itself as incompletely scanned.
+                    // SKIP list is a documented decision above, and
+                    // letting it reach `is_partial()` would make every
+                    // healthy repository report itself as incompletely
+                    // scanned.
                     scan.skipped_dirs += 1;
                 } else {
                     stack.push(e.path());
@@ -854,6 +864,54 @@ mod skip_tests {
         assert!(
             !scan.is_partial(),
             "a healthy repository must not report itself as incompletely scanned"
+        );
+    }
+
+    /// #1299: `.claude/worktrees` is pruned by its OWN name, not by
+    /// pruning `.claude`. The agent-managed copies stay out -- that is
+    /// what the prune is for -- while `.claude/CLAUDE.md`, which
+    /// `advice::shape` reads as a root-scope file, is still found. The
+    /// old parent-check dropped it on exactly the repositories that
+    /// have agent worktrees.
+    #[test]
+    fn a_dot_claude_with_worktrees_keeps_its_own_claude_md_and_drops_the_copies() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        std::fs::write(root.join("CLAUDE.md"), "root\n").unwrap();
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::fs::write(root.join(".claude").join("CLAUDE.md"), "dot claude\n").unwrap();
+        let wt = root.join(".claude").join("worktrees").join("wt1");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join("CLAUDE.md"), "copy\n").unwrap();
+
+        let scan = scan_repo(root);
+        let rel: Vec<String> = scan
+            .files
+            .iter()
+            .map(|f| {
+                Path::new(&f.path)
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert!(
+            rel.iter().any(|p| p == ".claude/CLAUDE.md"),
+            "`.claude` is worth walking: {rel:?}"
+        );
+        assert!(
+            rel.iter().any(|p| p == "CLAUDE.md"),
+            "the root file is still found: {rel:?}"
+        );
+        assert!(
+            !rel.iter().any(|p| p.contains("worktrees")),
+            "the agent checkouts' copies stay out: {rel:?}"
+        );
+        assert!(
+            scan.skipped_dirs >= 1,
+            "the prune is counted, not silent: {}",
+            scan.skipped_dirs
         );
     }
 }
