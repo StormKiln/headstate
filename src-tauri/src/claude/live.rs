@@ -43,6 +43,41 @@
 //! already pairs `(pid, start_time)` for the same reason and is the
 //! precedent this follows.
 //!
+//! # The session Headstate starts and cannot see (#1304)
+//!
+//! A user asked whether two Claudify "Run in terminal" clicks had left
+//! orphaned sessions behind, and Headstate could not answer. Measured on
+//! this machine, launching the shipped osascript preset with the exact
+//! line `prompt_command` builds:
+//!
+//! ```text
+//! process:  pid 47661, `claude '<prompt>'`, alive for minutes
+//! ~/.claude/sessions/47661.json          ABSENT
+//! ~/.claude/sessions/47661.<hash>.key    PRESENT
+//! claude_run rows for pid 47661          0   (492 before, 492 after)
+//! ```
+//!
+//! Repeated for an interactive `claude` with no prompt: same result. Five
+//! live `claude` processes on the machine, and the registry published a
+//! `.json` for three of them.
+//!
+//! So the gap is NOT that a launch is untracked because the pid Headstate
+//! spawns is the terminal's. It is that **Claude Code itself publishes no
+//! session record for these processes** -- only the `.key`. Every
+//! downstream count keys on the `.json`: `crash.rs::record_running`
+//! synthesizes the `claude_run` row from a registry sweep, so no `.json`
+//! means no run row, which means the orphan predicate can never match and
+//! the session is `never_observed` forever.
+//!
+//! Nothing here can invent the missing record. What it CAN do is stop
+//! discarding the one piece of evidence that does exist: the `.key`
+//! carries `procStart`, which is exactly the pid-reuse guard the `.json`
+//! path already relies on. So a `.key` whose pid is confirmed alive is
+//! reported through `unreadable` -- "running is at least N" -- rather than
+//! being skipped as though nothing were there. That is the honest claim
+//! and it is the whole extent of the claim: see [`key_only`] for why a
+//! `.key` can never be promoted into a session, an orphan, or a run.
+//!
 //! # The format trap in `procStart`
 //!
 //! `procStart` is written as `Mon DD HH:MM:SS YYYY` in **UTC**, while
@@ -129,7 +164,7 @@ pub fn parse_proc_start(text: &str) -> Option<i64> {
 }
 
 /// Read every registry record.
-fn read_registry(dir: &Path) -> (Vec<Entry>, Option<String>, Vec<String>) {
+fn read_registry(dir: &Path) -> (Vec<Entry>, Option<String>, Vec<String>, Vec<KeyOnly>) {
     let listing = match std::fs::read_dir(dir) {
         Ok(l) => l,
         // A missing directory is NOT a failure: Claude Code creates it
@@ -137,12 +172,13 @@ fn read_registry(dir: &Path) -> (Vec<Entry>, Option<String>, Vec<String>) {
         // running sessions is the correct, settled answer "nothing is
         // running". Any other error is a failure we must report.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return (Vec::new(), None, Vec::new())
+            return (Vec::new(), None, Vec::new(), Vec::new())
         }
         Err(e) => {
             return (
                 Vec::new(),
                 Some(format!("could not read {}: {e}", dir.display())),
+                Vec::new(),
                 Vec::new(),
             )
         }
@@ -150,6 +186,7 @@ fn read_registry(dir: &Path) -> (Vec<Entry>, Option<String>, Vec<String>) {
 
     let mut entries = Vec::new();
     let mut unreadable = Vec::new();
+    let mut key_candidates = Vec::new();
     // NOT `listing.flatten()`: that discards a per-entry error, and a
     // directory entry we could not read hides a session whose state we
     // then silently report as "not running".
@@ -162,9 +199,17 @@ fn read_registry(dir: &Path) -> (Vec<Entry>, Option<String>, Vec<String>) {
             }
         };
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            // The `.key` companion files are not records. Skipped
-            // silently and deliberately: they are not sessions, so they
-            // are not sessions we failed to read.
+            // A `.key` beside its own `.json` is a companion file and
+            // nothing more -- that is the case this used to skip
+            // silently, and it is still skipped. But a `.key` with NO
+            // sibling `.json` is a session Claude Code started and never
+            // published a record for (#1304), which is not the same
+            // thing at all. [`key_only`] tells the two apart; this loop
+            // only collects the names, because deciding requires the
+            // process table and that is [`running_ids`]'s job.
+            if let Some(candidate) = key_only(&path, dir) {
+                key_candidates.push(candidate);
+            }
             continue;
         }
         let text = match std::fs::read_to_string(&path) {
@@ -198,7 +243,77 @@ fn read_registry(dir: &Path) -> (Vec<Entry>, Option<String>, Vec<String>) {
                 .and_then(parse_proc_start),
         });
     }
-    (entries, None, unreadable)
+    (entries, None, unreadable, key_candidates)
+}
+
+/// A session that published a `.key` and no `.json` (#1304).
+///
+/// Named for what it IS rather than for what it might mean: the only
+/// two facts here are the pid the filename carries and the `procStart`
+/// inside the file. There is deliberately no `session_id` field,
+/// because the `.key` does not contain one -- see [`key_only`].
+struct KeyOnly {
+    pid: u32,
+    /// `None` when the file carried no parseable `procStart`, which
+    /// makes the record unusable rather than merely uninteresting: a
+    /// pid with no start time cannot be checked against pid reuse.
+    proc_start: Option<i64>,
+    /// For the message, so a reader can go and look at the file.
+    path: PathBuf,
+}
+
+/// Classify one non-`.json` registry file.
+///
+/// Returns `Some` only for a `.key` whose `<pid>.json` sibling does NOT
+/// exist. The filename is `<pid>.<hash>.key`, so the pid is the first
+/// dot-separated component.
+///
+/// # Why a `.key` cannot be promoted into a session, ever
+///
+/// **It carries no `sessionId`.** Measured (#1304): the whole file is
+///
+/// ```text
+/// {"peerToken":"…","procStart":"Tue Sep 22 17:45:40 2026","pidDomain":"darwin"}
+/// ```
+///
+/// That is the constraint that makes this change safe, and it is worth
+/// stating as a guarantee rather than an accident. Every downstream
+/// claim Headstate makes about a session -- resumable, archived,
+/// orphaned -- is keyed by session id. Without one, a `.key` record
+/// *cannot* reach `claude_run`, cannot be counted as an orphan, and
+/// cannot move a session out of `never_observed`. So the honesty rules
+/// in #1304 are enforced by the data rather than by our restraint: the
+/// worst this can do is say "something is running that we cannot
+/// name", which is the true statement.
+fn key_only(path: &Path, dir: &Path) -> Option<KeyOnly> {
+    if path.extension().and_then(|e| e.to_str()) != Some("key") {
+        return None;
+    }
+    let name = path.file_name()?.to_str()?;
+    let pid_text = name.split('.').next()?;
+    // A non-numeric leading component is not a pid, so it is not one of
+    // these records at all -- skipped rather than reported, the same way
+    // an unrelated file in the directory always has been.
+    let pid: u32 = pid_text.parse().ok()?;
+    if dir.join(format!("{pid}.json")).exists() {
+        // The companion case: its session is already a full record and
+        // is counted from the `.json`. Reporting it here would double
+        // count the sessions that work.
+        return None;
+    }
+    let proc_start = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| {
+            v.get("procStart")
+                .and_then(|p| p.as_str())
+                .and_then(parse_proc_start)
+        });
+    Some(KeyOnly {
+        pid,
+        proc_start,
+        path: path.to_path_buf(),
+    })
 }
 
 /// The start time the OS reports for a pid, in epoch seconds.
@@ -262,6 +377,8 @@ impl Probe for SysinfoProbe {
 /// | pid + `procStart` | not found | not running (the orphan: a crash) |
 /// | pid, no `procStart` | either | not running, and `unreadable` says why |
 /// | — | probe errored | not running, and `unreadable` says why |
+/// | `.key`, no `.json` | found, start times agree | **running but unnameable**, and `unreadable` says so (#1304) |
+/// | `.key`, no `.json` | not found, or start times differ | nothing said: it ended and left the file |
 ///
 /// Every "not running" here is a claim only about THIS set. The set is
 /// used to subtract live sessions from the resumable count, so the
@@ -271,7 +388,7 @@ impl Probe for SysinfoProbe {
 /// the page renders that as "could not tell what is running" above the
 /// counts, rather than letting the counts look settled.
 pub fn running_ids<P: Probe>(entries_dir: &Path, probe_for: impl FnOnce(&[u32]) -> P) -> Live {
-    let (entries, failure, mut unreadable) = read_registry(entries_dir);
+    let (entries, failure, mut unreadable, key_only) = read_registry(entries_dir);
     if failure.is_some() {
         return Live {
             ids: HashSet::new(),
@@ -280,7 +397,14 @@ pub fn running_ids<P: Probe>(entries_dir: &Path, probe_for: impl FnOnce(&[u32]) 
         };
     }
 
-    let pids: Vec<u32> = entries.iter().map(|e| e.pid).collect();
+    // Both sets of pids in one probe: `SysinfoProbe::for_pids` refreshes
+    // exactly the pids it is given, so asking for them separately would
+    // mean two scans of the process table for one answer.
+    let pids: Vec<u32> = entries
+        .iter()
+        .map(|e| e.pid)
+        .chain(key_only.iter().map(|k| k.pid))
+        .collect();
     let probe = probe_for(&pids);
 
     let mut ids = HashSet::new();
@@ -305,6 +429,52 @@ pub fn running_ids<P: Probe>(entries_dir: &Path, probe_for: impl FnOnce(&[u32]) 
             Err(e) => unreadable.push(format!(
                 "could not check pid {} for session {}: {e}",
                 entry.pid, entry.session_id
+            )),
+        }
+    }
+
+    // A `.key` with no `.json` is a session that IS running and that
+    // nothing downstream can name (#1304). It goes in `unreadable`
+    // rather than in `ids` for a reason that is the whole point of this
+    // change: `ids` is a set of SESSION IDS, and this record has none,
+    // so there is nothing to insert. `unreadable` is already defined as
+    // "a session whose state cannot be stated", and the page already
+    // renders it as "running is at least N rather than exactly N" --
+    // which is exactly the claim this evidence supports.
+    //
+    // The same `procStart` guard as above, and for the sharper reason:
+    // a bare pid with no start-time check would report whatever process
+    // happens to hold that number as a leaked Claude session, and a
+    // reader told "this is a leaked session" may go and kill it. A miss
+    // is recoverable; that is not.
+    for rec in key_only {
+        let Some(recorded) = rec.proc_start else {
+            unreadable.push(format!(
+                "{}: a session record with no readable procStart, so whether \
+                 pid {} is still that session cannot be checked",
+                rec.path.display(),
+                rec.pid
+            ));
+            continue;
+        };
+        match probe.start_time(rec.pid) {
+            Ok(Some(actual)) if (actual - recorded).abs() <= START_TOLERANCE_SECS => {
+                unreadable.push(format!(
+                    "pid {} is running a Claude Code session that published no \
+                     session id, so it is not counted in any figure below",
+                    rec.pid
+                ));
+            }
+            // A pid the file names that now belongs to something else,
+            // or to nothing: the session ended and left its `.key`
+            // behind. Not reported -- it is not running, so it is not
+            // hiding from the running count, and saying anything here
+            // would turn "we cleaned up" into a warning.
+            Ok(Some(_)) | Ok(None) => {}
+            Err(e) => unreadable.push(format!(
+                "could not check pid {} from {}: {e}",
+                rec.pid,
+                rec.path.display()
             )),
         }
     }
@@ -574,12 +744,13 @@ mod tests {
             live.failure, None,
             "the registry directory is readable here"
         );
-        assert!(
-            live.unreadable.is_empty(),
-            "a real registry entry that could not be used points at the \
-             procStart format trap: {:?}",
-            live.unreadable
-        );
+        // NOT asserted empty any more, and the reason is the measurement
+        // in the module header: a machine with a Claudify-launched
+        // session running has a `.key` with no `.json`, which is now
+        // reported here on purpose. Printed so the format trap is still
+        // visible to a reader -- a run with zero ids and a list full of
+        // procStart complaints is the failure this test exists to show.
+        println!("unreadable: {:#?}", live.unreadable);
     }
 
     /// The `.key` companion files are not sessions we failed to read.
@@ -597,6 +768,142 @@ mod tests {
         });
         assert_eq!(live.ids.len(), 1);
         assert!(live.unreadable.is_empty(), "a key file is not a session");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The whole of #1304, in the shape the machine produced it.
+    ///
+    /// A Claudify launch leaves a `.key` and no `.json` while the process
+    /// runs. Before this change the file was skipped and the session was
+    /// invisible in every figure; now it is reported as an unreadable
+    /// record, which the page renders as "running is at least N".
+    ///
+    /// Sabotage: restoring the unconditional `continue` for a non-`.json`
+    /// file drops `unreadable` to empty and this fails.
+    #[test]
+    fn a_key_file_with_no_record_is_reported_while_its_process_lives() {
+        let dir = tmp("keyonly-live");
+        write(
+            &dir,
+            "4242.deadbeef.key",
+            r#"{"peerToken":"x","procStart":"Fri Sep 11 09:43:48 2026","pidDomain":"darwin"}"#,
+        );
+        let live = running_ids(&dir, |_| {
+            Fake([(4242u32, Ok(Some(1789119828)))].into_iter().collect())
+        });
+        assert!(
+            live.ids.is_empty(),
+            "a .key carries no sessionId, so there is no id to report as running"
+        );
+        assert_eq!(live.unreadable.len(), 1, "{:?}", live.unreadable);
+        assert!(
+            live.unreadable[0].contains("4242"),
+            "the pid is what a reader can act on: {:?}",
+            live.unreadable
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A reissued pid must NOT be reported as a live session.
+    ///
+    /// The honesty constraint #1304 states most sharply: telling a user
+    /// "pid N is a leaked Claude session" invites them to kill it, so a
+    /// false positive here is worse than a miss. The `.key` path gets the
+    /// same `procStart` guard as the `.json` path.
+    ///
+    /// Sabotage: dropping the start-time comparison from the `.key` arm
+    /// reports this unrelated process and the test fails.
+    #[test]
+    fn a_key_file_whose_pid_was_reissued_is_not_reported() {
+        let dir = tmp("keyonly-recycled");
+        write(
+            &dir,
+            "4242.deadbeef.key",
+            r#"{"procStart":"Fri Sep 11 09:43:48 2026"}"#,
+        );
+        let live = running_ids(&dir, |_| {
+            // Days later: a different process wearing the same number.
+            Fake([(4242u32, Ok(Some(1789500000)))].into_iter().collect())
+        });
+        assert!(
+            live.unreadable.is_empty(),
+            "an unrelated process must not be named as a leaked session: {:?}",
+            live.unreadable
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `.key` left behind by a session that ended says nothing.
+    ///
+    /// The common case once a launched session exits. It is not running,
+    /// so it is not hiding from the running count, and reporting it would
+    /// turn ordinary cleanup into a standing warning.
+    #[test]
+    fn a_key_file_whose_process_is_gone_is_not_reported() {
+        let dir = tmp("keyonly-gone");
+        write(
+            &dir,
+            "4242.deadbeef.key",
+            r#"{"procStart":"Fri Sep 11 09:43:48 2026"}"#,
+        );
+        let live = running_ids(&dir, |_| Fake([(4242u32, Ok(None))].into_iter().collect()));
+        assert!(live.unreadable.is_empty(), "{:?}", live.unreadable);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `.key` with no readable `procStart` cannot be checked, and says so.
+    ///
+    /// The `.json` path already refuses to call such a record running,
+    /// because pid reuse cannot be ruled out. This is the same refusal:
+    /// reported as something we could not check rather than silently
+    /// dropped OR asserted as a live session.
+    ///
+    /// Sabotage: treating a missing `procStart` as a match reports it as
+    /// a live session, and the message this asserts changes.
+    #[test]
+    fn a_key_file_with_no_proc_start_is_reported_as_uncheckable() {
+        let dir = tmp("keyonly-noproc");
+        write(&dir, "4242.deadbeef.key", r#"{"peerToken":"x"}"#);
+        let live = running_ids(&dir, |_| {
+            Fake([(4242u32, Ok(Some(1789119828)))].into_iter().collect())
+        });
+        assert_eq!(live.unreadable.len(), 1, "{:?}", live.unreadable);
+        assert!(
+            live.unreadable[0].contains("procStart"),
+            "it must say WHY it could not be checked: {:?}",
+            live.unreadable
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `.key` beside its own `.json` is still just a companion.
+    ///
+    /// The regression guard for the change itself: the sessions that work
+    /// must not start being reported as problems. Sabotage: removing the
+    /// sibling-`.json` check reports pid 100 alongside its own healthy
+    /// record, double counting every working session on the machine.
+    #[test]
+    fn a_key_file_beside_its_record_is_never_reported() {
+        let dir = tmp("keyonly-companion");
+        write(
+            &dir,
+            "100.json",
+            r#"{"pid":100,"sessionId":"a","procStart":"Fri Sep 11 09:43:48 2026"}"#,
+        );
+        write(
+            &dir,
+            "100.abc.key",
+            r#"{"procStart":"Fri Sep 11 09:43:48 2026"}"#,
+        );
+        let live = running_ids(&dir, |_| {
+            Fake([(100u32, Ok(Some(1789119828)))].into_iter().collect())
+        });
+        assert_eq!(live.ids.len(), 1, "the session is running and named");
+        assert!(
+            live.unreadable.is_empty(),
+            "its record was read fine: {:?}",
+            live.unreadable
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
