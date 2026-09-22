@@ -58,10 +58,63 @@ export function templateProblem(raw: string): string | null {
 /// is guessed: macOS has no default-terminal concept, so a machine with
 /// both Terminal.app and iTerm gives no way to know which the user
 /// wants. Picking from a list is the user answering that question once.
+/// The two macOS presets drive the app with AppleScript rather than
+/// `open -a` (#1302).
+///
+/// `open -a Terminal {command}` and `open -a iTerm {command}` -- the
+/// presets these replace -- could not run a command at all. `open -a`
+/// takes FILE PATHS, so it treated the whole `cd … && claude …` line as
+/// a filename, printed "The file … does not exist" and exited 1 without
+/// opening anything. Both shipped; the iTerm one is what #1302 was
+/// reported against.
+///
+/// `osascript` is the smallest thing that actually works. Each was run
+/// on a real machine against a canary file before being written here,
+/// which is the only check that would have caught the bug being fixed:
+/// the broken `open -a` templates were plausible strings and passed
+/// every string-level test in the repository.
+///
+/// The first `-e` opens an `on run argv` handler, so the command
+/// arrives as a POSITIONAL ARGUMENT rather than being pasted into the
+/// script text. That matters for the same reason `Template::render`
+/// keeps it in one argv slot: a brief full of quotes and `$(…)` reaches
+/// the shell byte-for-byte, and nothing in it is ever parsed as
+/// AppleScript.
 export const PRESETS: { label: string; template: string }[] = [
-  { label: "Terminal (macOS)", template: `open -a Terminal ${PLACEHOLDER}` },
-  { label: "iTerm (macOS)", template: `open -a iTerm ${PLACEHOLDER}` },
+  {
+    label: "Terminal (macOS)",
+    template: `/usr/bin/osascript -e 'on run argv' -e 'tell application "Terminal"' -e 'do script (item 1 of argv)' -e 'activate' -e 'end tell' -e 'end run' ${PLACEHOLDER}`,
+  },
+  {
+    label: "iTerm (macOS)",
+    template: `/usr/bin/osascript -e 'on run argv' -e 'tell application "iTerm"' -e 'activate' -e 'tell (create window with default profile) to tell current session to write text (item 1 of argv)' -e 'end tell' -e 'end run' ${PLACEHOLDER}`,
+  },
   { label: "GNOME Terminal", template: `gnome-terminal -- bash -lc ${PLACEHOLDER}` },
   { label: "Konsole", template: `konsole -e bash -lc ${PLACEHOLDER}` },
   { label: "WezTerm", template: `wezterm start -- bash -lc ${PLACEHOLDER}` },
 ];
+
+/// Templates that are known not to run a command, and why (#1302).
+///
+/// A user who picked the old macOS preset has the broken string SAVED
+/// in their prefs. Replacing the preset list above does not rewrite it:
+/// they would keep pressing Run and keep seeing nothing, and the error
+/// the launcher now raises would tell them the terminal "exited
+/// immediately" without saying that their setting is the cause.
+///
+/// Detect-and-warn rather than silent migration. Rewriting a user's
+/// stored setting behind their back is the kind of thing this app
+/// should not do -- the template is a field they typed into, some users
+/// will have edited it, and a migration that guessed wrong would be
+/// undebuggable. Naming the problem next to the field, with a preset
+/// one click away, leaves the change theirs to make.
+export function brokenTemplateWarning(raw: string): string | null {
+  const t = raw.trim();
+  if (t === "") return null;
+  // `open -a <App> {command}`, however it is spelled: an absolute path
+  // to `open` or a bare `open`, and any application name.
+  if (/(^|\/)open(\s+-[a-zA-Z]+)*\s+-a\b/.test(t) && t.includes(PLACEHOLDER)) {
+    return "`open -a` takes file paths, not commands, so this opens a terminal without running anything. Pick a preset below.";
+  }
+  return null;
+}

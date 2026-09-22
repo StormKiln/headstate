@@ -83,6 +83,23 @@ pub enum LaunchError {
     CwdMissing { path: String },
     /// The terminal program could not be started.
     Spawn { why: String },
+    /// The program started and then exited non-zero almost at once, so
+    /// no terminal was opened (#1302).
+    ///
+    /// Distinct from [`Self::Spawn`], which is "the binary could not be
+    /// executed at all". This one ran and then refused -- `open -a iTerm
+    /// 'cd … && claude'` is the case that motivated it: `open` takes
+    /// file paths, so it reports "the file … does not exist" on stderr
+    /// and exits 1, having opened nothing. Before this arm existed the
+    /// launcher called that a success and the user saw nothing happen.
+    ExitedImmediately {
+        /// The exit status as the OS reported it, for the case where
+        /// the program printed nothing at all.
+        status: String,
+        /// Whatever the program wrote to stderr, trimmed. Often the
+        /// only part that says what is actually wrong.
+        stderr: String,
+    },
 }
 
 impl std::fmt::Display for LaunchError {
@@ -98,6 +115,21 @@ impl std::fmt::Display for LaunchError {
                 "The directory this command would open in is gone ({path}), so nothing was launched."
             ),
             Self::Spawn { why } => write!(f, "Could not start the configured terminal: {why}"),
+            Self::ExitedImmediately { status, stderr } => {
+                // The stderr line is what actually names the problem
+                // ("The file … does not exist"), so it leads when there
+                // is one. The status is the fallback for a program that
+                // failed silently, which would otherwise render as an
+                // error with no content at all.
+                write!(
+                    f,
+                    "The configured terminal exited immediately ({status}) without opening a window"
+                )?;
+                if !stderr.is_empty() {
+                    write!(f, ": {stderr}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -311,16 +343,20 @@ fn split_words(raw: &str) -> Result<Vec<String>, String> {
 /// over the same text, or the button that runs it is lying about what it
 /// runs.
 ///
-/// # What this does NOT fix, and will not pretend to
+/// # The `open -a` presets that could not run anything (#1302)
 ///
-/// `open -a Terminal {command}` -- the first preset in the settings
-/// panel -- does not run a command at all. `open -a` takes FILE PATHS,
-/// so it hands Terminal.app a filename and Terminal opens a window on
-/// the user's default shell. That is a pre-existing property of that
-/// template which `claude --resume` has always had too; this function
-/// neither causes it nor repairs it, and it is not this issue's to fix.
-/// It is called out here so nobody reads the paragraphs above as a
-/// promise that every configured terminal works.
+/// This paragraph used to say that `open -a Terminal {command}` does not
+/// run a command at all -- `open -a` takes FILE PATHS, so it hands
+/// Terminal.app a filename -- and that repairing it was not this
+/// function's job. The same defect was in the `iTerm` preset, uncovered
+/// by that note, and it is what #1302 was reported against: the user
+/// pressed Run and saw nothing at all.
+///
+/// Both presets now drive the app with `osascript` instead, and
+/// [`watch_briefly`] makes an instant failure an error the user can
+/// read rather than a silent success. Writing the defect down was not
+/// enough to keep it from shipping twice, so the note has been replaced
+/// by the fix.
 ///
 /// The `cd` is always present and always quoted: a prompt is worthless
 /// in the wrong repository, and unlike a resume there is no "wherever
@@ -348,13 +384,109 @@ pub fn launch(template: &str, command: &str, cwd: Option<&str>) -> Result<(), La
     }
 
     let (program, args) = parsed.render(command);
-    Command::new(&program)
+    let mut child = Command::new(&program)
         .args(&args)
+        // Captured so an instant failure has something to SAY. `open`'s
+        // "The file … does not exist" goes here, and inheriting the
+        // stream would send it to a stdout nobody is reading -- this
+        // app has no console -- which is how the failure stayed
+        // invisible.
+        .stderr(std::process::Stdio::piped())
         .spawn()
-        .map(|_child| ())
         .map_err(|e| LaunchError::Spawn {
             why: format!("{program}: {e}"),
-        })
+        })?;
+
+    watch_briefly(&mut child)
+}
+
+/// How long to give a launcher to fail before calling it launched.
+///
+/// The number is a judgment, so it is written down rather than inlined:
+/// long enough that a program which is going to fail instantly has
+/// finished doing so (`open` reports a bad path in single-digit
+/// milliseconds), short enough that a user who pressed a button does not
+/// notice the wait.
+///
+/// It is NOT a timeout on the terminal. See [`watch_briefly`].
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Report a child that has ALREADY failed, without waiting on one that
+/// has not (#1302).
+///
+/// # Why this cannot hang on a real terminal
+///
+/// This is the property the module header calls load-bearing: a terminal
+/// lives for as long as the user keeps it open, so waiting for it would
+/// block the command for hours.
+///
+/// It is preserved by polling rather than waiting. `try_wait` never
+/// blocks -- it asks whether the child has exited and returns
+/// immediately either way. The loop runs for at most [`SETTLE`] and then
+/// RETURNS OK regardless of what the child is doing. A terminal that is
+/// still running after 400ms is the expected case, and it is left alone:
+/// nothing here ever calls `wait`, and no code path waits on the child
+/// for longer than [`SETTLE`], whatever the child does.
+///
+/// The child is not killed or reaped on the success path either. It is
+/// dropped still running, which is exactly what the previous `spawn()`
+/// did.
+///
+/// # Why exit status zero is a success
+///
+/// A launcher that exits 0 has handed off to a terminal that is now its
+/// own process -- `osascript` driving iTerm does precisely this, and
+/// returns as soon as the window exists. Treating a quick clean exit as
+/// failure would break every correct preset.
+fn watch_briefly(child: &mut std::process::Child) -> Result<(), LaunchError> {
+    let deadline = std::time::Instant::now() + SETTLE;
+    loop {
+        match child.try_wait() {
+            // Still running: this is a terminal doing its job.
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    return Ok(());
+                }
+                // Short enough to stay responsive, long enough not to
+                // spin. The exact figure does not matter; that the loop
+                // is bounded by `deadline` does.
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    use std::io::Read;
+                    let mut buf = Vec::new();
+                    // Best effort: the status alone is still a usable
+                    // error, so a failure to read the pipe must not
+                    // replace "it exited 1" with "could not read a pipe".
+                    let _ = pipe.read_to_end(&mut buf);
+                    stderr = String::from_utf8_lossy(&buf).trim().to_string();
+                }
+                return Err(LaunchError::ExitedImmediately {
+                    status: describe(&status),
+                    stderr,
+                });
+            }
+            // `try_wait` itself failed. Nothing is known about the
+            // child, and inventing a failure would be as wrong as
+            // inventing a success -- but the child WAS spawned, so the
+            // launch is reported as done rather than as an error the
+            // user cannot act on.
+            Err(_) => return Ok(()),
+        }
+    }
+}
+
+/// An exit status in words the error message can carry.
+fn describe(status: &std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(c) => format!("exit status {c}"),
+        // Killed by a signal: `code()` is None and the Display impl is
+        // the only thing that says which.
+        None => status.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -365,8 +497,14 @@ mod tests {
     /// the parser is exercised against real shapes rather than shapes
     /// invented to suit it.
     const REAL: &[(&str, &str)] = &[
-        ("open -a Terminal", "open -a Terminal {command}"),
-        ("iterm", "/usr/bin/open -a iTerm {command}"),
+        (
+            "Terminal via osascript",
+            "/usr/bin/osascript -e 'on run argv' -e 'tell application \"Terminal\"' -e 'do script (item 1 of argv)' -e 'activate' -e 'end tell' -e 'end run' {command}",
+        ),
+        (
+            "iTerm via osascript",
+            "/usr/bin/osascript -e 'on run argv' -e 'tell application \"iTerm\"' -e 'activate' -e 'tell (create window with default profile) to tell current session to write text (item 1 of argv)' -e 'end tell' -e 'end run' {command}",
+        ),
         ("gnome", "gnome-terminal -- bash -c {command}"),
         ("konsole", "konsole -e {command}"),
         ("wezterm", "wezterm start -- bash -lc {command}"),
@@ -709,5 +847,236 @@ mod tests {
         let t = Template::parse("t \"\" {command}").unwrap();
         let (_p, argv) = t.render("C");
         assert_eq!(argv, vec![String::new(), "C".to_string()]);
+    }
+
+    /// A launcher that fails instantly is an ERROR, not a success
+    /// (#1302).
+    ///
+    /// The bug this is the regression test for: `open -a iTerm 'cd … &&
+    /// claude'` exits 1 in milliseconds having opened nothing, and
+    /// `spawn().map(|_| ())` called that a successful launch. The user
+    /// pressed Run and could not tell whether anything had happened.
+    ///
+    /// `false` stands in for `open` because it is the same shape --
+    /// runs, fails, exits at once -- without depending on a GUI app, a
+    /// TCC grant, or a windowing session, none of which exist in CI.
+    #[test]
+    fn a_program_that_exits_non_zero_at_once_is_reported_not_called_success() {
+        let dir = std::env::temp_dir();
+        let e = launch(
+            "/usr/bin/false {command}",
+            "c",
+            Some(&dir.to_string_lossy()),
+        )
+        .unwrap_err();
+        match &e {
+            LaunchError::ExitedImmediately { status, .. } => {
+                assert!(status.contains('1'), "expected exit 1, got {status:?}")
+            }
+            other => panic!("expected ExitedImmediately, got {other:?}"),
+        }
+        // And it reads as something a user can act on.
+        assert!(e.to_string().contains("exited immediately"), "{e}");
+    }
+
+    /// Whatever the failing program said is carried to the user.
+    ///
+    /// The status alone would have told the #1302 reporter only that
+    /// something exited 1. `open`'s "The file … does not exist" is the
+    /// line that actually explains it, and it was being written to a
+    /// stderr nobody read.
+    #[test]
+    fn the_stderr_of_an_instant_failure_reaches_the_message() {
+        let dir = std::env::temp_dir();
+        let e = launch(
+            "/bin/sh -c 'echo headstate-1302-marker >&2; exit 3' {command}",
+            "c",
+            Some(&dir.to_string_lossy()),
+        )
+        .unwrap_err();
+        match &e {
+            LaunchError::ExitedImmediately { stderr, status } => {
+                assert!(stderr.contains("headstate-1302-marker"), "{stderr:?}");
+                assert!(status.contains('3'), "{status:?}");
+            }
+            other => panic!("expected ExitedImmediately, got {other:?}"),
+        }
+        assert!(e.to_string().contains("headstate-1302-marker"), "{e}");
+    }
+
+    /// A launcher that exits 0 immediately is a SUCCESS.
+    ///
+    /// `osascript` driving iTerm does exactly this: it returns as soon
+    /// as the window exists, long before the user closes it. Treating a
+    /// quick clean exit as failure would break every working preset,
+    /// which is why the check is on the status and not on the speed.
+    #[test]
+    fn a_launcher_that_hands_off_and_exits_zero_is_a_success() {
+        let dir = std::env::temp_dir();
+        launch("/usr/bin/true {command}", "c", Some(&dir.to_string_lossy()))
+            .expect("a clean instant exit is a handoff, not a failure");
+    }
+
+    /// The property the module header calls load-bearing: a real
+    /// terminal, which stays open for hours, must not be waited on.
+    ///
+    /// Asserted on the CLOCK rather than on the code, because "it
+    /// returns" is not the claim -- the claim is that it returns
+    /// PROMPTLY while the child is still running. A `wait()` that
+    /// slipped back in would hang here for 60 seconds and fail on the
+    /// elapsed-time assertion, which is the regression that matters.
+    #[test]
+    fn a_terminal_that_stays_open_is_not_waited_on() {
+        let dir = std::env::temp_dir();
+        let start = std::time::Instant::now();
+        // 60s stands in for "as long as the user keeps it open". Long
+        // enough that waiting on it is unmistakable in the timing. The
+        // command goes to `sh -c`, which ignores it as `$0`, so the
+        // template still carries the placeholder it must.
+        launch(
+            "/bin/sh -c 'sleep 60' {command}",
+            "c",
+            Some(&dir.to_string_lossy()),
+        )
+        .expect("a still-running terminal is a successful launch");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < SETTLE * 4,
+            "launch waited {elapsed:?} on a child that stays open -- it must return after ~{SETTLE:?}"
+        );
+    }
+
+    /// The presets the panel offers actually RUN A COMMAND on this
+    /// machine (#1302).
+    ///
+    /// This is the test the issue asked for by name, and the only kind
+    /// that would have caught the bug. `open -a iTerm {command}` was a
+    /// plausible string that parsed, rendered into one argv slot, and
+    /// passed every assertion in this file -- while running nothing at
+    /// all. A string-level test cannot tell the difference; a canary
+    /// file can.
+    ///
+    /// # Why it is `#[ignore]`d rather than run by default
+    ///
+    /// It drives real GUI applications through AppleScript, which needs
+    /// macOS, the app installed, a logged-in windowing session, and a
+    /// TCC Automation grant that cannot be given non-interactively.
+    /// None of that holds in CI.
+    ///
+    /// It is also genuinely flaky when run repeatedly: observed passing
+    /// twice and failing on a third consecutive `cargo test` run on the
+    /// development machine, with `osascript` still exiting 0. Each run
+    /// leaves its windows open, and the AppleEvent gets slower as they
+    /// accumulate. That is a property of driving a real GUI app, not of
+    /// the templates -- run by hand against a fresh Terminal the same
+    /// invocation succeeds every time -- but a test that fails one run
+    /// in three would be worse than useless in the `Race check` job,
+    /// which runs the suite three times precisely to catch flakes.
+    ///
+    /// So it is opt-in, the way `transcripts::real_corpus` is for the
+    /// same reason: run deliberately by a developer on a Mac, with the
+    /// result recorded in the PR. That is where the claim "I observed
+    /// this preset work" has to be made, and it cannot be made by a
+    /// string comparison.
+    ///
+    ///     cargo test --manifest-path src-tauri/Cargo.toml \
+    ///         the_macos_presets -- --ignored --nocapture
+    #[test]
+    #[ignore = "drives real GUI apps: needs macOS, a windowing session and a TCC grant"]
+    fn the_macos_presets_actually_run_a_command_here() {
+        // Read from the SAME file the settings panel offers, so a
+        // preset that drifts is a preset this test stops covering --
+        // rather than a second copy here that passes while the real
+        // one is broken. That second-copy failure is exactly how the
+        // iTerm preset shipped broken.
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("src")
+                .join("lib")
+                .join("terminalTemplate.ts"),
+        )
+        .expect("terminalTemplate.ts is where the panel's presets live");
+
+        let mut checked = 0usize;
+        for line in src.lines() {
+            let Some((_, rest)) = line.split_once("template: `") else {
+                continue;
+            };
+            let Some((tpl, _)) = rest.split_once('`') else {
+                continue;
+            };
+            let tpl = tpl.replace("${PLACEHOLDER}", PLACEHOLDER);
+            // Only the two that drive an app present on this machine.
+            // `gnome-terminal` and friends are Linux and cannot be run
+            // here; claiming to have checked them would be the lie this
+            // test exists to prevent.
+            //
+            // Matched on the app NAME anywhere in the template, not on
+            // the quoted `"iTerm"` an AppleScript `tell` happens to
+            // use. Keying on the quotes was itself a version of the bug
+            // under test: restoring the broken `open -a iTerm
+            // {command}` preset left it unquoted, so it matched
+            // nothing, was skipped, and the test went green on exactly
+            // the template #1302 was filed about.
+            let app = if tpl.contains("iTerm") {
+                "iTerm"
+            } else if tpl.contains("Terminal") {
+                "Terminal"
+            } else {
+                continue;
+            };
+            if !std::path::Path::new(&format!("/Applications/{app}.app")).exists()
+                && !std::path::Path::new(&format!("/System/Applications/Utilities/{app}.app"))
+                    .exists()
+            {
+                eprintln!("SKIP {app}: not installed");
+                continue;
+            }
+
+            let canary = std::env::temp_dir().join(format!("headstate-1302-canary-{app}"));
+            let _ = std::fs::remove_file(&canary);
+            let command = format!(
+                "touch {}",
+                super::super::sessions::shell_quote(&canary.to_string_lossy(),)
+            );
+
+            launch(
+                &tpl,
+                &command,
+                Some(&std::env::temp_dir().to_string_lossy()),
+            )
+            .unwrap_or_else(|e| panic!("{app} preset failed to launch: {e}"));
+
+            // The terminal runs the line asynchronously once its window
+            // exists, so the canary appears strictly after `launch`
+            // returns. Polled to a deadline rather than slept on a
+            // fixed guess: a fast machine should not wait, and a slow
+            // one should not fail.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !canary.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            assert!(
+                canary.exists(),
+                "{app} preset opened without running the command -- \
+                 this is the #1302 bug: {tpl}"
+            );
+            let _ = std::fs::remove_file(&canary);
+            checked += 1;
+        }
+
+        // BOTH macOS presets, not merely "at least one". `checked > 0`
+        // was the guard here first and it passed while the iTerm preset
+        // was being skipped entirely -- the test reported success for a
+        // list in which the #1302 template had been restored. A count
+        // that cannot tell "all of them worked" from "the one I looked
+        // at worked" is the vacuous-pass failure this whole test exists
+        // to avoid.
+        assert_eq!(
+            checked, 2,
+            "expected both macOS presets to be exercised, checked {checked} -- \
+             a preset that is skipped is a preset nothing is verifying"
+        );
     }
 }
