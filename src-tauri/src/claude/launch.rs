@@ -857,18 +857,55 @@ mod tests {
     /// `spawn().map(|_| ())` called that a successful launch. The user
     /// pressed Run and could not tell whether anything had happened.
     ///
-    /// `false` stands in for `open` because it is the same shape --
-    /// runs, fails, exits at once -- without depending on a GUI app, a
-    /// TCC grant, or a windowing session, none of which exist in CI.
+    /// A template that runs the COMMAND in a shell, on either platform.
+    ///
+    /// The four tests below need a child with a chosen exit status and a
+    /// chosen lifetime. They get one by putting the payload where a real
+    /// launch puts it -- in the `{command}` slot -- so the template keeps
+    /// the shape a preset has (`<shell> <flag> {command}`, which three of
+    /// the five presets use) and the payload is one argv element.
+    ///
+    /// `sh` is spelled WITHOUT a path and is not gated behind
+    /// `#[cfg(unix)]`. The first CI run of this PR failed on Windows
+    /// because these tests named `/usr/bin/false` and `/bin/sh`, which
+    /// `windows-latest` does not have:
+    ///
+    /// ```text
+    /// expected ExitedImmediately, got Spawn { why: "/usr/bin/false:
+    ///   The system cannot find the path specified. (os error 3)" }
+    /// ```
+    ///
+    /// A bare `sh` does resolve there -- `windows-latest` ships Git for
+    /// Windows on PATH -- which is not an assumption but an observation:
+    /// `a_multi_line_brief_survives_as_exactly_one_argument` and
+    /// `nothing_in_a_brief_can_escape_its_quoting` already spawn
+    /// `Command::new("sh")` and both PASSED on the Windows leg of that
+    /// same run.
+    ///
+    /// Keeping these on Windows rather than gating them matters:
+    /// `watch_briefly` is the launcher's only guarantee and is not
+    /// platform-specific, so skipping it there would leave a shipped
+    /// platform unverified.
+    const SHELL: &str = "sh -c {command}";
+
+    /// Exit at once with a chosen non-zero status.
+    const FAILS_FAST: &str = "exit 1";
+
+    /// Write a known marker to stderr, then exit 3.
+    const TALKS_THEN_FAILS: &str = "echo headstate-1302-marker >&2; exit 3";
+
+    /// Exit 0 at once, the way a launcher that has handed off does.
+    const HANDS_OFF: &str = "exit 0";
+
+    /// Stay running, the way a terminal the user keeps open does. 60s
+    /// stands in for "as long as the user keeps it open": long enough
+    /// that waiting on it is unmistakable in the timing.
+    const STAYS_OPEN: &str = "sleep 60";
+
     #[test]
     fn a_program_that_exits_non_zero_at_once_is_reported_not_called_success() {
         let dir = std::env::temp_dir();
-        let e = launch(
-            "/usr/bin/false {command}",
-            "c",
-            Some(&dir.to_string_lossy()),
-        )
-        .unwrap_err();
+        let e = launch(SHELL, FAILS_FAST, Some(&dir.to_string_lossy())).unwrap_err();
         match &e {
             LaunchError::ExitedImmediately { status, .. } => {
                 assert!(status.contains('1'), "expected exit 1, got {status:?}")
@@ -888,12 +925,7 @@ mod tests {
     #[test]
     fn the_stderr_of_an_instant_failure_reaches_the_message() {
         let dir = std::env::temp_dir();
-        let e = launch(
-            "/bin/sh -c 'echo headstate-1302-marker >&2; exit 3' {command}",
-            "c",
-            Some(&dir.to_string_lossy()),
-        )
-        .unwrap_err();
+        let e = launch(SHELL, TALKS_THEN_FAILS, Some(&dir.to_string_lossy())).unwrap_err();
         match &e {
             LaunchError::ExitedImmediately { stderr, status } => {
                 assert!(stderr.contains("headstate-1302-marker"), "{stderr:?}");
@@ -913,7 +945,7 @@ mod tests {
     #[test]
     fn a_launcher_that_hands_off_and_exits_zero_is_a_success() {
         let dir = std::env::temp_dir();
-        launch("/usr/bin/true {command}", "c", Some(&dir.to_string_lossy()))
+        launch(SHELL, HANDS_OFF, Some(&dir.to_string_lossy()))
             .expect("a clean instant exit is a handoff, not a failure");
     }
 
@@ -929,16 +961,8 @@ mod tests {
     fn a_terminal_that_stays_open_is_not_waited_on() {
         let dir = std::env::temp_dir();
         let start = std::time::Instant::now();
-        // 60s stands in for "as long as the user keeps it open". Long
-        // enough that waiting on it is unmistakable in the timing. The
-        // command goes to `sh -c`, which ignores it as `$0`, so the
-        // template still carries the placeholder it must.
-        launch(
-            "/bin/sh -c 'sleep 60' {command}",
-            "c",
-            Some(&dir.to_string_lossy()),
-        )
-        .expect("a still-running terminal is a successful launch");
+        launch(SHELL, STAYS_OPEN, Some(&dir.to_string_lossy()))
+            .expect("a still-running terminal is a successful launch");
         let elapsed = start.elapsed();
         assert!(
             elapsed < SETTLE * 4,
