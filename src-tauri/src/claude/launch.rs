@@ -970,6 +970,171 @@ mod tests {
         );
     }
 
+    /// Read the macOS presets out of the file the settings panel offers
+    /// them from.
+    ///
+    /// Shared by the two tests below so there is exactly one place that
+    /// knows how a preset is spelled. A copy in each would let one drift
+    /// while the other kept passing, which is the failure mode that put
+    /// the broken `open -a iTerm` preset in a shipped release.
+    ///
+    /// Returns `(app_name, template)` for every preset naming a macOS
+    /// terminal, with `${PLACEHOLDER}` already interpolated.
+    ///
+    /// The app is matched on its name ANYWHERE in the template, not on
+    /// the quoted `"iTerm"` that an AppleScript `tell` happens to use.
+    /// Keying on the quotes was itself a version of the bug under test:
+    /// restoring the broken `open -a iTerm {command}` preset left the
+    /// name unquoted, so it matched nothing, was skipped, and the test
+    /// went green on exactly the template #1302 was filed about.
+    fn macos_presets() -> Vec<(&'static str, String)> {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("src")
+                .join("lib")
+                .join("terminalTemplate.ts"),
+        )
+        .expect("terminalTemplate.ts is where the panel's presets live");
+
+        let mut out = Vec::new();
+        for line in src.lines() {
+            let Some((_, rest)) = line.split_once("template: `") else {
+                continue;
+            };
+            let Some((tpl, _)) = rest.split_once('`') else {
+                continue;
+            };
+            let tpl = tpl.replace("${PLACEHOLDER}", PLACEHOLDER);
+            // `iTerm` first: "iTerm" does not contain "Terminal", but a
+            // future iTerm template that mentioned both would otherwise
+            // be filed under the wrong app.
+            let app = if tpl.contains("iTerm") {
+                "iTerm"
+            } else if tpl.contains("Terminal") {
+                "Terminal"
+            } else {
+                continue;
+            };
+            out.push((app, tpl));
+        }
+        out
+    }
+
+    /// Both macOS presets are an `osascript` invocation whose AppleScript
+    /// body receives the command as `item 1 of argv` -- proven by
+    /// running the real thing (#1309).
+    ///
+    /// # What this is, and what it is not
+    ///
+    /// This is the automatable half of the canary test below. That one
+    /// drives Terminal.app and iTerm for real, which is the strongest
+    /// possible evidence and also why it cannot run in CI: it needs a
+    /// logged-in windowing session and a TCC Automation grant, and it
+    /// was measured failing one run in three as windows accumulate.
+    /// Left as the only coverage, the presets were verified by a manual
+    /// run recorded in a PR body and by nothing a future edit would
+    /// have to satisfy.
+    ///
+    /// So this asserts one layer down: that `osascript` PARSES AND
+    /// DISPATCHES the script the preset generates, with the command
+    /// arriving as a positional `argv` item the script can run. Only
+    /// the GUI target is swapped out -- the `tell application …` block
+    /// becomes `do shell script`, which needs no app, no window and no
+    /// automation grant. The program, the `on run argv` / `end run`
+    /// wrapper, the `-e` argument structure and the `{command}` slot
+    /// are the shipped preset's own, and the whole thing goes through
+    /// the real [`launch`].
+    ///
+    /// It is strictly weaker than driving the app: a preset that opens
+    /// a window but writes the command into the wrong session would
+    /// pass here. It is also enough to have caught the actual shipped
+    /// bug, which is the point -- `open -a iTerm {command}` has no
+    /// AppleScript body to retarget at all, so it cannot reach this
+    /// test's assertion, and the refusal below is what fails.
+    ///
+    /// # Why a preset it does not understand is a FAILURE, not a skip
+    ///
+    /// The first version of the canary test skipped a template it could
+    /// not match and passed with nothing checked. Here an unrecognised
+    /// preset panics by name. A preset this test stops understanding is
+    /// a preset nothing is verifying, and that has to be loud: it is
+    /// precisely what a regression to `open -a` looks like from in
+    /// here.
+    #[test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "osascript is macOS-only; the presets it checks are too"
+    )]
+    fn the_macos_presets_hand_the_command_to_a_script_osascript_can_run() {
+        let presets = macos_presets();
+        // Without this the test passes vacuously the moment the preset
+        // spelling changes and the scan finds nothing.
+        assert_eq!(
+            presets.len(),
+            2,
+            "expected the two macOS presets, found {presets:?}"
+        );
+
+        for (app, tpl) in presets {
+            // Retarget the AppleScript, and NOTHING else.
+            //
+            // A preset is `/usr/bin/osascript -e 'on run argv' <body…>
+            // -e 'end run' {command}`. The body is the part that names
+            // the GUI app; everything around it is the structure under
+            // test. Rebuilt by keeping the head and the tail of the
+            // real template verbatim and substituting one `-e`.
+            let head = "-e 'on run argv' ";
+            let tail = " -e 'end run' {command}";
+            let (before, _after) = tpl.split_once(head).unwrap_or_else(|| {
+                panic!(
+                    "{app} preset is not an `osascript … on run argv` invocation, \
+                     so this test cannot check that osascript runs it. That is what \
+                     the #1302 `open -a {app} {{command}}` preset looks like from \
+                     here, and it is a failure, not something to skip: {tpl}"
+                )
+            });
+            assert!(
+                tpl.ends_with(tail),
+                "{app} preset does not end in `{tail}` -- the command must reach the \
+                 script as a positional argv item, not be pasted into it: {tpl}"
+            );
+            let retargeted = format!("{before}{head}-e 'do shell script (item 1 of argv)'{tail}");
+
+            let canary = std::env::temp_dir().join(format!("headstate-1309-dispatch-{app}"));
+            let _ = std::fs::remove_file(&canary);
+            let command = format!(
+                "touch {}",
+                super::super::sessions::shell_quote(&canary.to_string_lossy())
+            );
+
+            // Through the real launcher, so `watch_briefly` gets a say:
+            // `open -a` exits 1 in milliseconds and this is now an
+            // `ExitedImmediately` error rather than a silent success.
+            launch(
+                &retargeted,
+                &command,
+                Some(&std::env::temp_dir().to_string_lossy()),
+            )
+            .unwrap_or_else(|e| panic!("{app} preset shape failed to launch: {e}\n{retargeted}"));
+
+            // `do shell script` is synchronous inside `osascript`, but
+            // `launch` deliberately does not wait on its child, so the
+            // file can appear just after it returns. Polled to a
+            // deadline rather than slept on a fixed guess.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !canary.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(
+                canary.exists(),
+                "{app} preset's script shape did not run the command -- osascript \
+                 accepted it but the command never reached a shell: {retargeted}"
+            );
+            let _ = std::fs::remove_file(&canary);
+        }
+    }
+
     /// The presets the panel offers actually RUN A COMMAND on this
     /// machine (#1302).
     ///
@@ -1005,51 +1170,46 @@ mod tests {
     ///
     ///     cargo test --manifest-path src-tauri/Cargo.toml \
     ///         the_macos_presets -- --ignored --nocapture
+    ///
+    /// # What covers the presets when this does not run (#1309)
+    ///
+    /// Being the only check meant the presets were verified by a manual
+    /// run recorded in a PR body and by nothing a future edit had to
+    /// satisfy. [`the_macos_presets_hand_the_command_to_a_script_osascript_can_run`]
+    /// now runs in CI and asserts the layer beneath this one: that
+    /// `osascript` parses and dispatches the script each preset builds,
+    /// with the command arriving as a positional `argv` item a shell
+    /// runs. It retargets the `tell application` block and changes
+    /// nothing else, so it needs no app, no window and no TCC grant.
+    ///
+    /// What it does NOT cover, and what this test is still the only
+    /// evidence for: that the AppleScript addressed at Terminal.app and
+    /// iTerm opens a window and writes the command into the right
+    /// session. A preset that dispatched cleanly into the wrong session
+    /// would pass in CI and fail here. That gap is real and is why this
+    /// test is still worth running by hand before a release.
     #[test]
     #[ignore = "drives real GUI apps: needs macOS, a windowing session and a TCC grant"]
     fn the_macos_presets_actually_run_a_command_here() {
-        // Read from the SAME file the settings panel offers, so a
-        // preset that drifts is a preset this test stops covering --
-        // rather than a second copy here that passes while the real
-        // one is broken. That second-copy failure is exactly how the
-        // iTerm preset shipped broken.
-        let src = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("src")
-                .join("lib")
-                .join("terminalTemplate.ts"),
-        )
-        .expect("terminalTemplate.ts is where the panel's presets live");
+        // Read from the SAME file the settings panel offers, via the
+        // same helper the CI-runnable test uses, so a preset that
+        // drifts is a preset BOTH tests stop covering -- rather than a
+        // second copy here that passes while the real one is broken.
+        // That second-copy failure is exactly how the iTerm preset
+        // shipped broken.
+        let presets = macos_presets();
+        assert_eq!(
+            presets.len(),
+            2,
+            "expected the two macOS presets, found {presets:?}"
+        );
 
         let mut checked = 0usize;
-        for line in src.lines() {
-            let Some((_, rest)) = line.split_once("template: `") else {
-                continue;
-            };
-            let Some((tpl, _)) = rest.split_once('`') else {
-                continue;
-            };
-            let tpl = tpl.replace("${PLACEHOLDER}", PLACEHOLDER);
-            // Only the two that drive an app present on this machine.
-            // `gnome-terminal` and friends are Linux and cannot be run
-            // here; claiming to have checked them would be the lie this
-            // test exists to prevent.
-            //
-            // Matched on the app NAME anywhere in the template, not on
-            // the quoted `"iTerm"` an AppleScript `tell` happens to
-            // use. Keying on the quotes was itself a version of the bug
-            // under test: restoring the broken `open -a iTerm
-            // {command}` preset left it unquoted, so it matched
-            // nothing, was skipped, and the test went green on exactly
-            // the template #1302 was filed about.
-            let app = if tpl.contains("iTerm") {
-                "iTerm"
-            } else if tpl.contains("Terminal") {
-                "Terminal"
-            } else {
-                continue;
-            };
+        for (app, tpl) in presets {
+            // Only the apps actually present on this machine.
+            // `gnome-terminal` and friends are Linux and are already
+            // filtered out by `macos_presets`; claiming to have checked
+            // them would be the lie this test exists to prevent.
             if !std::path::Path::new(&format!("/Applications/{app}.app")).exists()
                 && !std::path::Path::new(&format!("/System/Applications/Utilities/{app}.app"))
                     .exists()
