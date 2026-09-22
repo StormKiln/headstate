@@ -16,6 +16,15 @@
 //! 100 files and `false` 355, so a bare word proves nothing; only
 //! `A::b`, `name()` and `SCREAMING_CASE` (with at least one underscore,
 //! so `ALL` and `README` do not qualify) are symbols. `-D warnings`,
+//! A `/slash-command` is a skill invocation, not a path. `PATH_TOKEN`
+//! matches `/stacked-prs` happily and the resolver joined it onto an
+//! anchor, where a leading `/` discards the anchor and probes the real
+//! filesystem root -- so it was reported missing from the repository it
+//! was never looked for in (#1300). A leading `/` followed by a
+//! kebab-case word is the invocation shape and nothing else, so it is
+//! classified as a skill and resolved against the definitions inventory,
+//! which already knows every skill name in every scope.
+//!
 //! `\r\n` and `format!("{}/…")` are not paths: a path is a single token of
 //! `[A-Za-z0-9_./-]` that contains a `/`, ends in a known extension, or is
 //! a known extensionless manifest name. `~/` paths are outside the
@@ -49,7 +58,8 @@ pub enum RefKind {
     Script { runner: Runner, name: String },
     /// Any `cargo …` invocation. Counted, never resolved.
     Cargo,
-    /// A skill, named as `` `X` `` skill or as a `## Skills` list item.
+    /// A skill, named as `` `X` `` skill, as a `## Skills` list item,
+    /// or as a `/slash-command` invocation.
     Skill { name: String },
     /// A qualified symbol: the last segment is what a grep resolves.
     Symbol { last: String },
@@ -79,6 +89,12 @@ static CALL: LazyLock<Regex> =
 static SCREAMING: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$").unwrap());
 static ISSUE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^#(\d+)$").unwrap());
+// `/stacked-prs`, and the `/plugin:skill` form a plugin's command takes.
+// Lower-case kebab only: `/Users/me/notes.md` and `/usr/bin` carry an
+// upper-case segment or a second slash and are not invocations.
+static SLASH_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^/(?:[a-z0-9]+(?:-[a-z0-9]+)*:)?[a-z0-9]+(?:-[a-z0-9]+)*$").unwrap()
+});
 
 /// File extensions a span can carry to count as a path without a `/`.
 const EXTENSIONS: &[&str] = &[
@@ -141,6 +157,13 @@ fn classify(text: &str) -> Option<RefKind> {
     }
     if let Some(c) = ISSUE.captures(text) {
         return c[1].parse().ok().map(|number| RefKind::Issue { number });
+    }
+    // Before the path arms: `PATH_TOKEN` matches a slash command, and
+    // the resolver would probe the filesystem root for it (#1300).
+    if SLASH_COMMAND.is_match(text) {
+        return Some(RefKind::Skill {
+            name: text.trim_start_matches('/').to_string(),
+        });
     }
     if let Some(c) = PATH_LINE.captures(text) {
         if is_path(&c[1]) {
@@ -418,6 +441,48 @@ Use the `verify` skill before pushing. Skillful `prose` is not one.
                 },
                 RefKind::Skill {
                     name: "guard".into()
+                },
+            ]
+        );
+    }
+
+    /// A slash command is a skill invocation, not a path (#1300).
+    /// `PATH_TOKEN` matches `/stacked-prs`, and the resolver probed the
+    /// real filesystem root for it.
+    #[test]
+    fn a_slash_command_is_a_skill_not_a_path() {
+        assert_eq!(
+            kinds("Run `/stacked-prs`, then `/figma-sync` and `/pr:review`.\n"),
+            vec![
+                RefKind::Skill {
+                    name: "stacked-prs".into()
+                },
+                RefKind::Skill {
+                    name: "figma-sync".into()
+                },
+                RefKind::Skill {
+                    name: "pr:review".into()
+                },
+            ]
+        );
+    }
+
+    /// An absolute path is not an invocation: a second slash, a dot or
+    /// an upper-case segment all rule it out, so `/etc/hosts` stays a
+    /// path and `/Users/me` stays outside the invocation shape.
+    #[test]
+    fn an_absolute_path_is_not_a_slash_command() {
+        assert_eq!(
+            kinds("`/etc/hosts` `/README.md` `/Users/me/notes.md`\n"),
+            vec![
+                RefKind::Path {
+                    path: "/etc/hosts".into()
+                },
+                RefKind::Path {
+                    path: "/README.md".into()
+                },
+                RefKind::Path {
+                    path: "/Users/me/notes.md".into()
                 },
             ]
         );

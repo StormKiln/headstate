@@ -22,7 +22,18 @@
 //!   costs. Neither this walk nor `scan_repo` prunes `.claude` for
 //!   holding agent worktrees -- `SKIP` already prunes the `worktrees`
 //!   child by name, and the parent holds the rules and skills a
-//!   CLAUDE.md names.
+//!   CLAUDE.md names. A single-segment token that resolves to no file
+//!   is then looked up in the `package.json` dependency tables before
+//!   it is called missing: `chart.js` is a declared dependency, not a
+//!   file, and shape cannot separate the two, since plenty of real
+//!   files are named `something.js` (#1300). A declared dependency
+//!   resolves and is silent. A manifest that EXISTS and could not be
+//!   read makes it `Unknown`, because "not declared" was never
+//!   established. A token that no readable manifest declares and no
+//!   file matches is still `Missing`: whether it is a typo'd package
+//!   name or a deleted file, nothing of that name exists here, so the
+//!   verdict is not the confident wrong number -- only its label would
+//!   be, and the reader is pointed at the same line either way.
 //! - **`path:line`**: the path as above, then the file's line count. A
 //!   line past the end is [`Verdict::LinePastEof`] at
 //!   [`Severity::Advice`]. A line WITHIN the file is silent, even when
@@ -43,7 +54,12 @@
 //! - **skill**: `Kind::Skill` names across every scope in the
 //!   definitions inventory. With no inventory in the [`Context`] a skill
 //!   reference is `Unknown` "no definitions inventory", never `Missing`:
-//!   "we did not look" must not read as "it is not there" (#1050).
+//!   "we did not look" must not read as "it is not there" (#1050). A
+//!   `/slash-command` is a skill invocation and is extracted as one;
+//!   before #1300 `PATH_TOKEN` matched it, the resolver joined it onto
+//!   an anchor -- where a leading `/` discards the anchor -- and probed
+//!   the real filesystem root, so `/stacked-prs` was reported missing
+//!   from a repository it was never looked for in.
 //! - **symbol**: a whole-word grep of the last segment over `src/`,
 //!   `src-tauri/src/`, `src-mobile/src/` AND the CLAUDE.md's own
 //!   directory, files with a source or config extension only, `SKIP`
@@ -371,6 +387,45 @@ enum Probe {
     Refused(String),
 }
 
+/// What the `package.json` manifests said about a bare token.
+enum DependencyLookup {
+    /// A declared dependency. Not a path, and not a finding.
+    Declared,
+    /// A manifest was read and does not declare it.
+    NotDeclared,
+    /// No `package.json` beside the file or at the root.
+    NoManifest,
+    /// A `package.json` exists and could not be read or parsed, so
+    /// "not declared" was never established.
+    Unknown(String),
+}
+
+/// What a path reference resolved TO.
+enum Resolved {
+    /// A real file or directory.
+    File(PathBuf),
+    /// Not a file: a package this project declares. It has no lines to
+    /// count and no place on disk to cite.
+    Package,
+}
+
+/// Whether a token could be an npm package name rather than a path.
+///
+/// One segment only: a token with a `/` is a path, except the one form
+/// `@scope/name` that npm itself uses. `.` and `..` never reach here.
+fn package_shaped(token: &str) -> bool {
+    let bare = match token.strip_prefix('@') {
+        Some(rest) => match rest.split_once('/') {
+            Some((scope, name)) if !scope.is_empty() && !name.is_empty() => {
+                return !name.contains('/')
+            }
+            _ => return false,
+        },
+        None => token,
+    };
+    !bare.contains('/')
+}
+
 fn probe(p: &Path) -> Probe {
     use std::io::ErrorKind;
     match std::fs::metadata(p) {
@@ -663,6 +718,7 @@ pub struct Resolver<'a> {
     tree: Option<Tree>,
     makefiles: HashMap<PathBuf, Manifest<Vec<Target>>>,
     packages: HashMap<PathBuf, Manifest<Vec<String>>>,
+    dependencies: HashMap<PathBuf, Manifest<Vec<String>>>,
     symbols: SymbolSearch,
 }
 
@@ -681,6 +737,7 @@ impl<'a> Resolver<'a> {
             tree: None,
             makefiles: HashMap::new(),
             packages: HashMap::new(),
+            dependencies: HashMap::new(),
             symbols: search_symbols(repo, symbols, dirs),
         }
     }
@@ -702,16 +759,62 @@ impl<'a> Resolver<'a> {
         out
     }
 
+    /// Whether `token` is a package this project declares, and what the
+    /// manifests said.
+    ///
+    /// A CLAUDE.md line reading "Charts: `chart.js` only via the
+    /// `libs/ui/…` components" names a DEPENDENCY. `chart.js` ends in a
+    /// known extension, so the extractor calls it a path and the
+    /// resolver called it missing (#1300). Shape cannot separate the two
+    /// -- plenty of real files are named `something.js` -- so the
+    /// manifest is the signal: a token that is a declared dependency is
+    /// a package reference, and reporting it as a missing file is wrong.
+    ///
+    /// A scoped `@scope/name` is looked up whole; only the bare token is
+    /// ever tried, so `src/chart.js` is a path and stays one.
+    fn declared_package(&mut self, dir: &Path, token: &str) -> DependencyLookup {
+        let mut unreadable: Vec<String> = Vec::new();
+        let mut any_manifest = false;
+        for anchor in self.anchors(dir) {
+            let manifest = self
+                .dependencies
+                .entry(anchor.clone())
+                .or_insert_with(|| scripts::dependencies(&anchor))
+                .clone();
+            match manifest {
+                Manifest::Absent => {}
+                Manifest::Unreadable(why) => unreadable.push(format!(
+                    "{why} in `{}`",
+                    display(self.repo, &anchor.to_string_lossy())
+                )),
+                Manifest::Present(names) => {
+                    any_manifest = true;
+                    if names.iter().any(|n| n == token) {
+                        return DependencyLookup::Declared;
+                    }
+                }
+            }
+        }
+        if !unreadable.is_empty() {
+            return DependencyLookup::Unknown(unreadable.join("; "));
+        }
+        if any_manifest {
+            DependencyLookup::NotDeclared
+        } else {
+            DependencyLookup::NoManifest
+        }
+    }
+
     /// A path reference, resolved to where it lives.
-    fn path(&mut self, dir: &Path, path: &str) -> Result<PathBuf, Refused> {
+    fn path(&mut self, dir: &Path, path: &str) -> Result<Resolved, Refused> {
         let clean = path.trim_start_matches("./").trim_end_matches('/');
         if clean.is_empty() {
-            return Ok(self.repo.to_path_buf());
+            return Ok(Resolved::File(self.repo.to_path_buf()));
         }
         for anchor in self.anchors(dir) {
             let candidate = anchor.join(clean);
             match probe(&candidate) {
-                Probe::Found => return Ok(candidate),
+                Probe::Found => return Ok(Resolved::File(candidate)),
                 Probe::Absent => {}
                 Probe::Refused(e) => {
                     return Err(unknown(format!(
@@ -722,35 +825,63 @@ impl<'a> Resolver<'a> {
             }
         }
         let repo = self.repo.to_path_buf();
-        let tree = self.tree();
-        let matches: Vec<&String> = tree
-            .paths
-            .iter()
-            .filter(|p| p.as_str() == clean || p.ends_with(&format!("/{clean}")))
-            .collect();
+        // Owned, so the tree borrow ends here: the 0-match arm consults
+        // the dependency manifests, which needs `&mut self`.
+        let (matches, tracked, unreadable, pruned) = {
+            let tree = self.tree();
+            let matches: Vec<String> = tree
+                .paths
+                .iter()
+                .filter(|p| p.as_str() == clean || p.ends_with(&format!("/{clean}")))
+                .cloned()
+                .collect();
+            (
+                matches,
+                tree.paths.len(),
+                tree.unreadable.clone(),
+                tree.pruning(clean).map(str::to_string),
+            )
+        };
         match matches.len() {
-            1 => Ok(repo.join(matches[0])),
+            1 => Ok(Resolved::File(repo.join(&matches[0]))),
             // Ordered before the Missing arm on purpose: a reference
             // under a pruned subtree was never looked for, and #1299 is
             // the cost of calling that absent.
-            0 if tree.pruning(clean).is_some() => {
-                let pruned = tree.pruning(clean).expect("matched just above");
+            0 if pruned.is_some() => {
+                let pruned = pruned.expect("matched just above");
                 Err(unknown(format!(
                     "`{clean}` lies under `{pruned}`, which the tree walk does not enter, so whether it exists was not checked"
                 )))
             }
-            0 if tree.unreadable.is_empty() => Err((
-                Verdict::Missing,
-                format!(
-                    "resolved against `{}`, the repository root and a suffix match over {} tracked paths: 0 matches",
-                    display(&repo, &dir.to_string_lossy()),
-                    tree.paths.len()
-                ),
-            )),
+            // Nothing on disk, and the walk did enter everywhere it
+            // would have looked. Before calling it missing, ask the
+            // manifests: a bare `chart.js` is a declared dependency far
+            // more often than it is a deleted file, and shape cannot
+            // tell them apart (#1300).
+            0 if unreadable.is_empty() => {
+                if package_shaped(clean) {
+                    match self.declared_package(dir, clean) {
+                        DependencyLookup::Declared => return Ok(Resolved::Package),
+                        DependencyLookup::Unknown(why) => {
+                            return Err(unknown(format!(
+                                "`{clean}` is not a file, and whether it is a declared dependency could not be established: {why}"
+                            )))
+                        }
+                        DependencyLookup::NotDeclared | DependencyLookup::NoManifest => {}
+                    }
+                }
+                Err((
+                    Verdict::Missing,
+                    format!(
+                        "resolved against `{}`, the repository root and a suffix match over {tracked} tracked paths: 0 matches",
+                        display(&repo, &dir.to_string_lossy()),
+                    ),
+                ))
+            }
             0 => Err(unknown(format!(
                 "`{clean}` matches nothing in the readable tree, and {} could not be listed: {}",
-                count(tree.unreadable.len(), "directory", "directories"),
-                tree.unreadable.join("; ")
+                count(unreadable.len(), "directory", "directories"),
+                unreadable.join("; ")
             ))),
             n => Err(unknown(format!(
                 "`{clean}` is ambiguous: it matches {n} paths ({})",
@@ -765,7 +896,12 @@ impl<'a> Resolver<'a> {
     }
 
     fn path_line(&mut self, dir: &Path, path: &str, line: u32) -> Result<(), Refused> {
-        let target = self.path(dir, path)?;
+        let target = match self.path(dir, path)? {
+            Resolved::File(p) => p,
+            // `chart.js:12` on a declared dependency: the package is
+            // real, and it has no file in this repository to count.
+            Resolved::Package => return Ok(()),
+        };
         if target.is_dir() {
             return Err(unknown(format!(
                 "`{path}` is a directory, so it has no line {line}"
@@ -1365,6 +1501,164 @@ Run `yarn paw`, not `yarn nope`. Use the `tentacle` skill, not the `ink` skill.
         assert_eq!(rot.unresolvable, 2, "`cargo test` and `#123`");
         assert!(rot.unchecked.is_empty(), "{:?}", rot.unchecked);
         assert!(rot.shape.is_empty(), "{:?}", rot.shape);
+    }
+
+    /// The #1300 fixture, built from the real report: a CLAUDE.md naming
+    /// an npm dependency, a slash command, and a file that really is
+    /// gone.
+    fn rot_1300(body: &str, package_json: Option<&str>, skill: Option<&str>) -> tempfile::TempDir {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        fs::write(root.join("CLAUDE.md"), body).unwrap();
+        fs::create_dir_all(root.join("libs/ui/src/lib/charts")).unwrap();
+        if let Some(json) = package_json {
+            fs::write(root.join("package.json"), json).unwrap();
+        }
+        if let Some(name) = skill {
+            let dir = root.join(".claude").join("skills").join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: stack them\n---\nbody\n"),
+            )
+            .unwrap();
+        }
+        t
+    }
+
+    /// The user's line, verbatim in shape: `chart.js` is a declared
+    /// dependency, not a missing file (#1300).
+    #[test]
+    fn a_declared_npm_dependency_is_not_a_missing_file() {
+        let t = rot_1300(
+            "Charts: `chart.js` only via the `libs/ui/src/lib/charts/` components (ng2-charts)\n",
+            Some(r#"{"dependencies":{"chart.js":"^4.5.1"}}"#),
+            None,
+        );
+        let rot = check_one(t.path(), None);
+        assert_eq!(verdicts(&rot), vec![], "{rot:?}");
+        assert_eq!(rot.refs_checked, 2, "{rot:?}");
+    }
+
+    /// devDependencies count, and so does a scoped name.
+    #[test]
+    fn a_dev_dependency_and_a_scoped_package_resolve_too() {
+        let t = rot_1300(
+            "Use `vitest.config.ts` via `@types/node` and `chart.js`.\n",
+            Some(
+                r#"{"devDependencies":{"chart.js":"^4.5.1","@types/node":"^20"},"dependencies":{}}"#,
+            ),
+            None,
+        );
+        let rot = check_one(t.path(), None);
+        let missing: Vec<&str> = rot
+            .findings
+            .iter()
+            .filter(|f| f.verdict == Verdict::Missing)
+            .map(|f| f.r.raw.as_str())
+            .collect();
+        assert_eq!(missing, vec!["vitest.config.ts"], "{rot:?}");
+    }
+
+    /// No manifest entry and no file: nothing of that name exists here,
+    /// so the verdict stays Missing. A typo'd package and a deleted file
+    /// send the reader to the same line.
+    #[test]
+    fn an_undeclared_package_shaped_token_is_still_missing() {
+        let t = rot_1300(
+            "Charts: `chart.js` only via the `libs/ui/src/lib/charts/` components\n",
+            Some(r#"{"dependencies":{"react":"^18"}}"#),
+            None,
+        );
+        let rot = check_one(t.path(), None);
+        assert_eq!(
+            verdicts(&rot),
+            vec![("chart.js", &Verdict::Missing)],
+            "{rot:?}"
+        );
+    }
+
+    /// The required negative: a `.js` file that really is gone is still
+    /// Missing, manifest or no manifest.
+    #[test]
+    fn a_genuinely_missing_js_file_is_still_missing() {
+        for manifest in [None, Some(r#"{"dependencies":{"chart.js":"^4.5.1"}}"#)] {
+            let t = rot_1300(
+                "The entry is `src/gone.js`, and `also-gone.js` beside it.\n",
+                manifest,
+                None,
+            );
+            let rot = check_one(t.path(), None);
+            assert_eq!(
+                verdicts(&rot),
+                vec![
+                    ("src/gone.js", &Verdict::Missing),
+                    ("also-gone.js", &Verdict::Missing),
+                ],
+                "manifest={manifest:?} {rot:?}"
+            );
+        }
+    }
+
+    /// A `package.json` that exists and will not parse never established
+    /// "not declared", so the token is Unknown, not Missing.
+    #[test]
+    fn an_unreadable_manifest_makes_a_package_shaped_token_unknown() {
+        let t = rot_1300("Charts: `chart.js` only.\n", Some("{ not json"), None);
+        let rot = check_one(t.path(), None);
+        assert_eq!(rot.findings.len(), 1, "{rot:?}");
+        match &rot.findings[0].verdict {
+            Verdict::Unknown(why) => assert!(
+                why.contains("declared dependency") && why.contains("package.json"),
+                "{why}"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `/stacked-prs` is a skill invocation, not a path, and resolves
+    /// against the definitions inventory (#1300).
+    #[test]
+    fn a_slash_command_resolves_against_the_skill_inventory() {
+        let t = rot_1300("Run `/stacked-prs` to stack.\n", None, Some("stacked-prs"));
+        let inv = inventory(t.path());
+        let rot = check_one(t.path(), Some(&inv));
+        assert_eq!(verdicts(&rot), vec![], "{rot:?}");
+        assert_eq!(rot.refs_checked, 1, "{rot:?}");
+    }
+
+    /// With no inventory, "we did not look" must not read as "it is not
+    /// there" (#1050): Unknown, never Missing.
+    #[test]
+    fn a_slash_command_with_no_inventory_is_unknown_not_missing() {
+        let t = rot_1300("Run `/stacked-prs` to stack.\n", None, Some("stacked-prs"));
+        let rot = check_one(t.path(), None);
+        assert_eq!(rot.findings.len(), 1, "{rot:?}");
+        match &rot.findings[0].verdict {
+            Verdict::Unknown(why) => assert!(why.contains("no definitions inventory"), "{why}"),
+            other => panic!("a slash command with no inventory must be Unknown: {other:?}"),
+        }
+    }
+
+    /// A slash command with an inventory that does not hold it is
+    /// Missing as a SKILL, with the skill sentence, not as a file.
+    #[test]
+    fn an_unbacked_slash_command_is_a_missing_skill_not_a_missing_file() {
+        let t = rot_1300("Run `/stacked-prs` to stack.\n", None, Some("other"));
+        let inv = inventory(t.path());
+        let report = run_over(t.path(), Some(&inv));
+        let problems: Vec<&str> = report
+            .findings
+            .iter()
+            .filter(|f| f.severity == Severity::Problem)
+            .map(|f| f.finding.as_str())
+            .collect();
+        assert_eq!(
+            problems,
+            vec![
+                "`CLAUDE.md:1` names `/stacked-prs`, and no skill of that name was found in any scope"
+            ]
+        );
     }
 
     /// The same fixture through the producer: severities, sentences and

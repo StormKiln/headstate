@@ -203,6 +203,56 @@ pub fn scripts(dir: &Path) -> Manifest<Vec<String>> {
     )
 }
 
+/// The dependency tables npm resolves a bare import against, in the
+/// order it resolves them. `peerDependencies` is included because a
+/// CLAUDE.md naming a peer names something the project really does
+/// depend on; a peer that is not also installed is npm's problem, not
+/// a rot finding.
+const DEPENDENCY_TABLES: &[&str] = &[
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+    "peerDependencies",
+];
+
+/// The package names `dir/package.json` declares, across every
+/// dependency table.
+///
+/// Exists because a CLAUDE.md naming `chart.js` names a DEPENDENCY, and
+/// the rot check had no way to tell that from a file called `chart.js`
+/// and called it missing (#1300). The manifest is the signal: a token
+/// that is a declared dependency is a package reference, not a path.
+///
+/// Three-state for the same reason [`scripts`] is: a `package.json` that
+/// exists and will not parse declares an UNKNOWN set of packages, and a
+/// caller handed an empty list would call every named package rot.
+pub fn dependencies(dir: &Path) -> Manifest<Vec<String>> {
+    let path = dir.join("package.json");
+    if !path.is_file() {
+        return Manifest::Absent;
+    }
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => return Manifest::Unreadable(format!("package.json: {e}")),
+    };
+    let json: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => return Manifest::Unreadable(format!("package.json: {e}")),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for table in DEPENDENCY_TABLES {
+        let Some(o) = json.get(table).and_then(|t| t.as_object()) else {
+            continue;
+        };
+        for name in o.keys() {
+            if !out.iter().any(|n| n == name) {
+                out.push(name.clone());
+            }
+        }
+    }
+    Manifest::Present(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,6 +405,44 @@ lint.sh:
         match got {
             Manifest::Unreadable(why) => assert!(why.starts_with("Makefile: "), "{why}"),
             other => panic!("an unreadable manifest must not be an empty list: {other:?}"),
+        }
+    }
+
+    /// The real shape from #1300: `chart.js` is a dependency, not a file.
+    #[test]
+    fn dependencies_are_read_from_every_table() {
+        let t = tempfile::tempdir().unwrap();
+        fs::write(
+            t.path().join("package.json"),
+            r#"{"dependencies":{"chart.js":"^4.5.1"},"devDependencies":{"vitest":"~1"},"optionalDependencies":{"fsevents":"*"},"peerDependencies":{"react":"^18"}}"#,
+        )
+        .unwrap();
+        match dependencies(t.path()) {
+            Manifest::Present(got) => {
+                assert_eq!(got, vec!["chart.js", "vitest", "fsevents", "react"]);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Absent is not "declares nothing", and a manifest with no
+    /// dependency table really does declare nothing.
+    #[test]
+    fn an_absent_manifest_declares_nothing_knowably() {
+        let t = tempfile::tempdir().unwrap();
+        assert_eq!(dependencies(t.path()), Manifest::Absent);
+        fs::write(t.path().join("package.json"), r#"{"name":"x"}"#).unwrap();
+        assert_eq!(dependencies(t.path()), Manifest::Present(vec![]));
+    }
+
+    /// A manifest that will not parse declares an unknown set.
+    #[test]
+    fn a_malformed_package_json_has_unknown_dependencies() {
+        let t = tempfile::tempdir().unwrap();
+        fs::write(t.path().join("package.json"), "{ not json").unwrap();
+        match dependencies(t.path()) {
+            Manifest::Unreadable(why) => assert!(why.starts_with("package.json: "), "{why}"),
+            other => panic!("{other:?}"),
         }
     }
 }
