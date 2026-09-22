@@ -52,6 +52,33 @@ Measuring and asserting is the honest first step; if this guard starts
 firing on steady state alone, THAT is the evidence that automation is
 warranted, and it will arrive with numbers attached.
 
+ASKED AGAIN IN #1107, and the answer is still no, now with the numbers
+the paragraph above asked for. Measured 2026-09-22 across six release
+tags (v6.0.0, v6.0.1, v7.0.0, v7.1.0, v7.2.0, v7.2.1):
+
+  - rust-cache entries on ANY tag: 2, both on v6.0.0, both created
+    2026-09-19, together 1.39GB. v6.0.0 was the LAST release cut before
+    #1204 removed tags from `save-if`. Every release since has written
+    ZERO rust-cache entries. The recurring leak is already closed at the
+    source, and 1.39GB of one-off residue drains on its own clock.
+
+  - What each release still leaves is 10.6MB: a `setup-ruby` bundler
+    cache from `lewagon/wait-on-check-action`, which runs inside the
+    release gate and caches its own Ruby deps. Six tags hold 63.5MB
+    between them -- 0.6% of the quota.
+
+A deletion loop with a token, able to race a release build still holding
+the entry it is about to delete, is not a proportionate answer to 0.6%
+that GitHub already reclaims after seven idle days. The pruning this
+issue imagined would, today, correctly identify 1.39GB of v6.0.0 residue
+and then have nothing left to do on any subsequent run.
+
+What WAS broken is the accounting, and that is what #1107 fixed: the
+guard could not see tag-held entries at all (see `_is_tag`), so it
+reported 7.49GB "within budget" while the repository held 8.88GB. A
+budget that excludes a real consumer keeps passing while CI degrades --
+which is the actual failure this issue describes.
+
 ---- Why this one may skip, when the others may not ----
 
 Unlike every other guard in `lint-deps`, this one needs the network and a
@@ -154,9 +181,35 @@ def job_class(key: str) -> str | None:
 BASE_REF = "refs/heads/main"
 
 
+def _is_tag(ref: str) -> bool:
+    """Is this cache entry pinned to a release tag?
+
+    MEASURED, not assumed, and the reason this function exists at all.
+    The Actions cache API does not report a tag's ref as `refs/tags/v6.0.0`;
+    it reports
+
+        refs/heads/refs/tags/v6.0.0
+
+    -- the tag ref nested under `refs/heads/`. So the obvious
+    `ref.startswith("refs/tags/")` is DEAD CODE that never matched once,
+    and every tag-held entry fell through to `leftovers()` instead of
+    being budgeted. That is how the guard reported 7.49GB "within budget"
+    on a day the repository was actually holding 8.88GB against an 8.5GB
+    ceiling: the 1.39GB it was not counting was real, resident and
+    counting against the quota the whole time (#1107).
+
+    Both spellings are accepted. The nested one is what the API returns
+    today; the flat one is what the documentation implies, and pinning
+    only the observed spelling would leave this silently broken again if
+    GitHub ever normalised it.
+    """
+    tail = ref[len("refs/heads/") :] if ref.startswith("refs/heads/") else ref
+    return tail.startswith("refs/tags/")
+
+
 def _is_base(entry: dict) -> bool:
     ref = entry.get("ref", "")
-    return ref == BASE_REF or ref.startswith("refs/tags/")
+    return ref == BASE_REF or _is_tag(ref)
 
 
 def verdict(entries: list[dict]) -> tuple[list[str], list[str]]:
@@ -219,10 +272,34 @@ def verdict(entries: list[dict]) -> tuple[list[str], list[str]]:
         # AMBIENT: the sum of what the repository is holding right now.
         # A branch cannot evict an entry.
         ambient.append(
-            f"`{BASE_REF}` holds {total:.2f}GB, over the {TOTAL_BUDGET_GIB}GB budget "
+            f"the budgeted refs hold {total:.2f}GB, over the {TOTAL_BUDGET_GIB}GB budget "
             f"(GitHub's quota is {QUOTA_GIB}GB for the whole repository, and over it "
             f"entries are evicted least-recently-used -- which is how a 562s job "
             f"became 1716s in #901)"
+        )
+
+    # THE QUOTA, on EVERYTHING -- including the entries no budget covers.
+    #
+    # The budget is a ceiling someone chose; the quota is the one GitHub
+    # enforces, and eviction obeys the second. An entry outside every
+    # budgeted class still occupies the same 10GB: the `setup-ruby`
+    # entries that `lewagon/wait-on-check-action` leaves on each release
+    # tag are only ~11MB apiece, but `job_class()` returns None for them
+    # and nothing was adding them up at all.
+    #
+    # Without this, a budget that excludes a real consumer keeps
+    # reporting "within budget" while the repository evicts -- which is
+    # precisely #1107's third question, and precisely what this guard
+    # printed on the day it was filed.
+    quota_used = sum(e["size_in_bytes"] for e in entries) / GIB
+    if quota_used > QUOTA_GIB:
+        # AMBIENT: over the real ceiling, and nothing a branch can do.
+        ambient.append(
+            f"the repository holds {quota_used:.2f}GB in total, over GitHub's "
+            f"{QUOTA_GIB}GB quota. Eviction is happening NOW, least-recently-used, "
+            f"so a run can evict the entry the next run needs (#901). This counts "
+            f"every entry, including any no budget covers -- the quota does not "
+            f"care which class an entry belongs to"
         )
 
     # Group by class so both "one entry grew" and "two generations are
@@ -234,8 +311,27 @@ def verdict(entries: list[dict]) -> tuple[list[str], list[str]]:
             by_class.setdefault(cls, []).append(e)
 
     for cls, rows in sorted(by_class.items()):
+        # Does this class exist ONLY on a tag? Tags are budgeted because
+        # they consume the quota, but nothing on a tag follows from the
+        # diff under test: `save-if` stopped tags writing rust-cache
+        # entries (#1204), so any that remain are residue from a release
+        # cut before that landed, draining on the seven-day idle clock.
+        # Routing them to `blocking` would fail every branch for a state
+        # no branch caused and none can clear -- the cry-wolf shape this
+        # guard's whole ambient/blocking split exists to avoid (#1107).
+        tag_only = all(_is_tag(r.get("ref", "")) for r in rows)
+
         if cls not in CLASS_BUDGET_GIB:
             size = sum(r["size_in_bytes"] for r in rows) / GIB
+            if tag_only:
+                # AMBIENT: a stale release's entry, not a new job class.
+                ambient.append(
+                    f"`{cls}` has no budget ({size:.2f}GB measured) and exists only on "
+                    f"a release tag. That is residue from a release cut before tags "
+                    f"stopped saving (#1204) -- it counts against the quota until its "
+                    f"seven-day idle window expires, and no branch can clear it sooner"
+                )
+                continue
             # BLOCKING: a job class only appears because a diff added
             # one, and the fix is in this file.
             blocking.append(
@@ -252,16 +348,33 @@ def verdict(entries: list[dict]) -> tuple[list[str], list[str]]:
             # AMBIENT: the old generation was left resident by a bump
             # that has already merged. It drains on its own; a branch
             # can neither cause nor cure it.
+            # Name the refs rather than asserting `main`. Now that tags
+            # are counted, "2 live generations" can mean one on `main`
+            # and one pinned to a tag, which is a DIFFERENT fact with a
+            # different remedy -- and the old wording stated the wrong
+            # one confidently.
+            where = ", ".join(sorted({r.get("ref", "?") for r in rows}))
             ambient.append(
-                f"`{cls}` has {len(rows)} live generations on `{BASE_REF}` totalling "
-                f"{size:.2f}GB. Two generations of one class on the base ref is the "
-                f"state that evicts (#901), and it means a dependency bump left the "
-                f"old generation resident -- the budget must fit 2x or the old one "
+                f"`{cls}` has {len(rows)} live generations totalling {size:.2f}GB "
+                f"across {where}. Two generations of one class on a ref that is "
+                f"restored from is the state that evicts (#901) -- either a "
+                f"dependency bump left the old generation resident, or a release "
+                f"tag is still holding one; the budget must fit 2x or the old one "
                 f"must go"
             )
         for r in rows:
             size = r["size_in_bytes"] / GIB
             if size > budget:
+                if _is_tag(r.get("ref", "")):
+                    # AMBIENT: a tag's entry is frozen at whatever the
+                    # release measured. No diff can shrink it.
+                    ambient.append(
+                        f"`{cls}` is {size:.2f}GB on {r['ref']}, over its {budget}GB "
+                        f"ceiling ({r['key']}). It is pinned to a release tag, so it "
+                        f"is frozen at what that release measured and drains on the "
+                        f"idle clock rather than by anyone's edit"
+                    )
+                    continue
                 # BLOCKING: either what this job caches grew -- which a
                 # diff can do -- or the ceiling is wrong. Both are
                 # decided here.
@@ -358,9 +471,9 @@ def main() -> int:
     # Reported either way, because it is the number that explains a
     # surprising eviction even when the budget itself is fine.
     if held:
-        print("Caches held by refs other than the base (not budgeted; they drain")
-        print("on merge or after seven idle days, but they DO count against the")
-        print(f"{QUOTA_GIB}GB quota):")
+        print("Caches held by pull-request and other non-release refs (not")
+        print("budgeted; they drain on merge or after seven idle days, but they")
+        print(f"DO count against the {QUOTA_GIB}GB quota):")
         for ref, gb in held.items():
             print(f"  {gb:.2f}GB  {ref}")
         print()
@@ -369,7 +482,10 @@ def main() -> int:
     # is the state that explains a surprising eviction -- and printed as
     # a NOTICE, because a branch cannot act on it (#1107).
     if ambient:
-        print(f"The repository's cache is outside its budget ({base_total:.2f}GB on the base ref):")
+        print(
+            f"The repository's cache is outside its budget "
+            f"({base_total:.2f}GB on `main` and release tags, {total:.2f}GB in total):"
+        )
         for p in ambient:
             print(f"  {p}")
         print()
@@ -397,16 +513,20 @@ def main() -> int:
         print("outgrown its ceiling -- and both are decided in this file.")
         return 1
 
+    # Only claim "within budget" when it IS. Before #1107 this line
+    # printed unconditionally whenever nothing BLOCKED, so a run that had
+    # just reported an over-budget notice signed off with "within
+    # budget: 8.88GB of 8.5GB" -- a self-contradicting summary, and the
+    # last line is the one people read. Ambient findings are not
+    # failures, but they are not a clean bill of health either.
+    if ambient:
+        print(f"Measured {len(measured)} entries, {total:.2f}GB in total against a")
+        print(f"{QUOTA_GIB}GB quota. Not blocking this branch; see the notice above.")
+        return 0
+
     print(f"The Actions cache is within budget: {base_total:.2f}GB of {TOTAL_BUDGET_GIB}GB")
-    print(f"on the base ref ({len(measured)} entries and {total:.2f}GB in total;")
-    print(f"GitHub's quota is {QUOTA_GIB}GB).")
-    if total > QUOTA_GIB:
-        # Worth saying out loud: the budget is met and the repository is
-        # STILL over quota, so eviction is happening anyway. That is the
-        # leftovers above, and it is information rather than a verdict.
-        print()
-        print(f"NOTE: the repository is nonetheless over the {QUOTA_GIB}GB quota, so")
-        print("eviction is still possible. The excess is on the refs listed above.")
+    print(f"on `main` and release tags ({len(measured)} entries and {total:.2f}GB in")
+    print(f"total; GitHub's quota is {QUOTA_GIB}GB).")
     return 0
 
 
