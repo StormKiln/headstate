@@ -154,6 +154,87 @@ if any(r.startswith("refs/heads/main") for r in held):
 if guard.leftovers([entry("v0-rust-lint-Darwin-arm64-141c753f-1ef731a7", 0.4, "refs/tags/v5.14.0")]):
     failures.append("a tag ref is steady state and must not be reported as a leftover")
 
+# ...AND IN THE SPELLING THE API ACTUALLY USES, which is the whole of
+# #1107's third question.
+#
+# The assertion above passes for the wrong reason: it uses the idealised
+# `refs/tags/v5.14.0`, and `_is_base` matched that. The live API returns
+# the tag ref NESTED under refs/heads:
+#
+#     refs/heads/refs/tags/v6.0.0
+#
+# which `startswith("refs/tags/")` never matched, so every real tag entry
+# fell out of the budget and into `leftovers()`. The guard then reported
+# 7.49GB "within budget" while the repository held 8.88GB against an
+# 8.5GB ceiling -- 1.39GB uncounted, resident, and consuming the quota.
+#
+# Testing only the tidy spelling is what let that ship, so both are
+# pinned here.
+NESTED_TAG = "refs/heads/refs/tags/v6.0.0"
+if guard.leftovers([entry("v0-rust-lint-Darwin-arm64-141c753f-1ef731a7", 0.4, NESTED_TAG)]):
+    failures.append(
+        "a tag in the API's real ref shape must be budgeted, not filed as a leftover"
+    )
+if not guard._is_base({"ref": NESTED_TAG}):
+    failures.append(f"_is_base must recognise the API's real tag shape {NESTED_TAG!r}")
+
+# A tag entry must COUNT toward the total, which is the consequence that
+# actually matters: an entry nobody adds up still occupies the quota.
+_blocking, _amb = guard.verdict(MEASURED + [entry("v0-rust-lint-Darwin-arm64-141c753f-99999999", 1.3, NESTED_TAG)])
+if not any("over the" in a and "budget" in a for a in _amb):
+    failures.append(
+        "a tag-held entry pushing the total over budget must raise an ambient notice"
+    )
+
+# But a tag-only class must NOT block. Nothing on a tag follows from the
+# diff under test and no branch can delete it, so blocking would be the
+# cry-wolf shape the ambient/blocking split exists to prevent.
+ambient_only(
+    "an unbudgeted class that exists ONLY on a tag is reported, not blocked on",
+    MEASURED + [entry("v0-rust-build-Windows_NT-x64-cca5e066-eeeeeeee", 0.67, NESTED_TAG)],
+)
+
+# The same unbudgeted class on `main` still BLOCKS. This is the guard
+# against "fix the noise by making everything ambient": if tag-routing
+# had been written as a blanket downgrade, this case would go quiet too.
+checks(
+    "the same unbudgeted class on `main` still blocks",
+    MEASURED + [entry("v0-rust-build-Windows_NT-x64-cca5e066-eeeeeeee", 0.67)],
+    False,
+)
+
+# THE QUOTA, counted over EVERY entry including ones no job class covers.
+# The `setup-ruby` entries that wait-on-check-action leaves on each
+# release tag return None from `job_class()`, so no per-class rule sees
+# them -- but GitHub evicts on the quota, which does not care.
+# Constructed so ONLY the quota rule can fire: the unclassified entry sits
+# on a PULL-REQUEST ref, so it is outside the budgeted set entirely and the
+# base-ref budget stays under its 8.5GB ceiling. The repository is
+# nonetheless over the 10GB quota, and nothing but the quota rule sees it.
+# Asserting on the distinctive wording rather than the word "quota" (which
+# the budget notice also contains) is what makes this test able to fail.
+_over_quota = MEASURED + [
+    entry("setup-ruby-bundler-cache-v6-ubuntu-24.04-x64", 3.0, "refs/pull/9/merge")
+]
+_base_gb = sum(e["size_in_bytes"] for e in _over_quota if guard._is_base(e)) / GB
+_all_gb = sum(e["size_in_bytes"] for e in _over_quota) / GB
+if _base_gb > guard.TOTAL_BUDGET_GIB:
+    failures.append(
+        f"the quota fixture must keep the BUDGET satisfied to isolate the quota "
+        f"rule, but the base ref holds {_base_gb:.2f}GB"
+    )
+if _all_gb <= guard.QUOTA_GIB:
+    failures.append(f"the quota fixture must exceed the quota, got {_all_gb:.2f}GB")
+
+_blocking, _amb = guard.verdict(_over_quota)
+if not any("in total, over GitHub's" in a for a in _amb):
+    failures.append(
+        "an unclassified entry pushing the repository over quota must be reported "
+        f"even while the budget is satisfied; got {_amb!r}"
+    )
+if _blocking:
+    failures.append(f"an unclassified entry must not block, got {_blocking!r}")
+
 # A single job class that GREW past its own ceiling, one entry only. This
 # is the `cache-targets`/second-root direction: no duplication, just a
 # bigger entry, which is what #889 would have done.
