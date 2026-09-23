@@ -34,6 +34,18 @@
 //!   name or a deleted file, nothing of that name exists here, so the
 //!   verdict is not the confident wrong number -- only its label would
 //!   be, and the reader is pointed at the same line either way.
+//!
+//!   Nothing outside the repository root is ever stat'd. Each anchored
+//!   candidate has its `.` and `..` folded lexically first, and one that
+//!   climbs out of the root is not tried. A `../`-prefixed token that
+//!   does not resolve from the file's own directory is relative to a
+//!   base the line does not state -- measured, `../../fixtures` in a
+//!   nested CLAUDE.md is an import specifier written from a spec file
+//!   two levels down -- and a suffix match can never hit a `..`
+//!   segment, so before #1317 it was always Missing. Now, stripped of
+//!   its leading `../` segments, a remainder that matches exactly one
+//!   path under the file's own directory resolves; anything else is
+//!   `Unknown` ("relative to an unstated base"), never `Missing`.
 //! - **`path:line`**: the path as above, then the file's line count. A
 //!   line past the end is [`Verdict::LinePastEof`] at
 //!   [`Severity::Advice`]. A line WITHIN the file is silent, even when
@@ -549,6 +561,37 @@ fn relative(repo: &Path, p: &Path) -> Option<String> {
     )
 }
 
+/// `anchor` joined with the `/`-separated `rel`, with `.` and `..`
+/// folded lexically, or `None` when the result is not under `repo`.
+///
+/// Lexical on purpose: it decides what may be stat'd, so it must not
+/// stat anything to decide it. `..` is folded here rather than by the
+/// filesystem, so no candidate outside the repository is ever probed
+/// (#1317).
+fn contained(repo: &Path, anchor: &Path, rel: &str) -> Option<PathBuf> {
+    let mut out = anchor.to_path_buf();
+    for seg in rel.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            s => out.push(s),
+        }
+    }
+    out.starts_with(repo).then_some(out)
+}
+
+/// Whether the relative tree path `p` lies under the relative directory
+/// `own`; everything lies under the root, which is `""`.
+fn under(own: &str, p: &str) -> bool {
+    own.is_empty()
+        || p.strip_prefix(own)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// A path for a finding sentence: relative to the repository when it is
 /// under it, absolute otherwise.
 fn display(repo: &Path, path: &str) -> String {
@@ -860,7 +903,12 @@ impl<'a> Resolver<'a> {
             self.anchors(dir)
         };
         for anchor in anchors {
-            let candidate = anchor.join(clean);
+            // A candidate that climbs out of the repository is never
+            // tried: `repo/../../fixtures` is somewhere on the host, and
+            // a verdict read there depends on the machine (#1317).
+            let Some(candidate) = contained(self.repo, &anchor, clean) else {
+                continue;
+            };
             match probe(&candidate) {
                 Probe::Found => return Ok(Resolved::File(candidate)),
                 Probe::Absent => {}
@@ -871,6 +919,9 @@ impl<'a> Resolver<'a> {
                     )))
                 }
             }
+        }
+        if clean.split('/').any(|s| s == "..") {
+            return self.parent_relative(dir, path, clean);
         }
         let repo = self.repo.to_path_buf();
         // Owned, so the tree borrow ends here: the 0-match arm consults
@@ -939,6 +990,55 @@ impl<'a> Resolver<'a> {
                     .map(|m| format!("`{m}`"))
                     .collect::<Vec<_>>()
                     .join(", ")
+            ))),
+        }
+    }
+
+    /// A `../` path that did not resolve from the file's own directory.
+    ///
+    /// It is relative to something the line does not state: measured,
+    /// `../../fixtures` in a nested CLAUDE.md is an import specifier,
+    /// written from a spec file two levels below it. A suffix match can
+    /// never hit a `..` segment, so before #1317 it was always Missing.
+    /// The check did not establish absence, so it is Unknown -- unless,
+    /// stripped of its leading `../` segments, what remains matches
+    /// exactly one path under the file's own directory. That one hit is
+    /// unambiguous and resolves; two or none are Unknown.
+    fn parent_relative(
+        &mut self,
+        dir: &Path,
+        path: &str,
+        clean: &str,
+    ) -> Result<Resolved, Refused> {
+        let own = relative(self.repo, dir).unwrap_or_default();
+        let shown = if own.is_empty() {
+            "the repository root".to_string()
+        } else {
+            format!("`{own}`")
+        };
+        let mut rest = clean;
+        while let Some(r) = rest.strip_prefix("../") {
+            rest = r;
+        }
+        let rest = rest.trim_start_matches("./");
+        if rest.is_empty() || rest == ".." || rest.split('/').any(|s| s == "..") {
+            return Err(unknown(format!(
+                "`{path}` is relative to an unstated base: it does not resolve from {shown}"
+            )));
+        }
+        let repo = self.repo.to_path_buf();
+        let matches: Vec<String> = self
+            .tree()
+            .paths
+            .iter()
+            .filter(|p| under(&own, p) && (p.as_str() == rest || p.ends_with(&format!("/{rest}"))))
+            .cloned()
+            .collect();
+        match matches.len() {
+            1 => Ok(Resolved::File(repo.join(&matches[0]))),
+            n => Err(unknown(format!(
+                "`{path}` is relative to an unstated base: it does not resolve from {shown}, and `{rest}` matches {} under it",
+                count(n, "path", "paths")
             ))),
         }
     }
@@ -1505,6 +1605,15 @@ Run `yarn paw`, not `yarn nope`. Use the `tentacle` skill, not the `ink` skill.
             })
             .collect();
         let mut res = Resolver::new(repo, definitions, &symbols, &[repo.to_path_buf()]);
+        check_file(repo, &file, &text, &mut res)
+    }
+
+    /// [`check_one`] for a nested CLAUDE.md, `rel` from the root.
+    fn check_nested(repo: &Path, rel: &str) -> FileRot {
+        let file = rel.split('/').fold(repo.to_path_buf(), |p, s| p.join(s));
+        let text = fs::read_to_string(&file).unwrap();
+        let dir = file.parent().unwrap().to_path_buf();
+        let mut res = Resolver::new(repo, None, &BTreeSet::new(), &[dir]);
         check_file(repo, &file, &text, &mut res)
     }
 
@@ -2411,6 +2520,76 @@ Run `yarn paw`, not `yarn nope`. Use the `tentacle` skill, not the `ink` skill.
         );
         assert_eq!(rot.refs_checked, 2, "{rot:?}");
         assert_eq!(rot.unresolvable, 0, "{rot:?}");
+    }
+
+    /// #1317: `../../fixtures` in a nested CLAUDE.md is an import
+    /// specifier, relative to a spec file somewhere below. Stripped of
+    /// its `../` segments, it has one match under the file's own
+    /// directory, so it resolves; one with no such match is Unknown,
+    /// never Missing.
+    #[test]
+    fn a_parent_relative_path_resolves_under_its_own_subtree_or_is_unknown() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        fs::create_dir_all(root.join("sub").join("src").join("fixtures")).unwrap();
+        fs::write(
+            root.join("sub").join("CLAUDE.md"),
+            "imports one level deeper: `../../fixtures`, `../helpers`\n",
+        )
+        .unwrap();
+        let rot = check_nested(root, "sub/CLAUDE.md");
+        assert_eq!(rot.findings.len(), 1, "{rot:?}");
+        assert_eq!(rot.findings[0].r.raw, "../helpers");
+        match &rot.findings[0].verdict {
+            Verdict::Unknown(why) => assert!(why.contains("unstated base"), "{why}"),
+            other => panic!("never Missing: {other:?}"),
+        }
+        assert_eq!(rot.refs_checked, 1, "`../../fixtures` resolved: {rot:?}");
+    }
+
+    /// #1317's containment half: a `../` path that would climb out of
+    /// the repository is never probed. A directory of that name beside
+    /// the repository must not make it resolve; nothing inside matches,
+    /// so it is Unknown.
+    #[test]
+    fn a_parent_relative_path_never_probes_outside_the_repository() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path().join("repo");
+        fs::create_dir_all(repo.join("sub")).unwrap();
+        // `repo/sub/../../fixtures` is exactly this directory.
+        fs::create_dir_all(t.path().join("fixtures")).unwrap();
+        fs::write(repo.join("sub").join("CLAUDE.md"), "see `../../fixtures`\n").unwrap();
+        let rot = check_nested(&repo, "sub/CLAUDE.md");
+        assert_eq!(rot.findings.len(), 1, "{rot:?}");
+        match &rot.findings[0].verdict {
+            Verdict::Unknown(why) => assert!(why.contains("unstated base"), "{why}"),
+            other => panic!("resolved or Missing from outside the repository: {other:?}"),
+        }
+        assert_eq!(rot.refs_checked, 0, "{rot:?}");
+    }
+
+    /// A `../` path that DOES resolve inside the repository from the
+    /// file's own directory still resolves, and a gone one from there
+    /// is Unknown rather than Missing: the base was never stated.
+    #[test]
+    fn a_parent_relative_path_inside_the_repository_still_resolves() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        fs::create_dir_all(root.join("apps").join("web")).unwrap();
+        fs::create_dir_all(root.join("apps").join("api")).unwrap();
+        fs::write(root.join("apps").join("api").join("main.py"), "").unwrap();
+        fs::write(
+            root.join("apps").join("web").join("CLAUDE.md"),
+            "the API is `../api/main.py`; not `../api/gone.py`\n",
+        )
+        .unwrap();
+        let rot = check_nested(root, "apps/web/CLAUDE.md");
+        assert_eq!(rot.refs_checked, 1, "{rot:?}");
+        assert_eq!(rot.findings.len(), 1, "{rot:?}");
+        assert!(
+            matches!(rot.findings[0].verdict, Verdict::Unknown(_)),
+            "{rot:?}"
+        );
     }
 
     /// This repository's own CLAUDE.md files, measured: zero certain
