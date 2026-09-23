@@ -11,6 +11,7 @@ const result = (freshness: ClaudeMdAdviceFreshness, tag = "x"): ClaudeMdAdviceRe
   },
   freshness,
   computedAt: "2026-01-01T00:00:00Z",
+  build: "7.4.0",
 });
 
 const q = (over: Partial<AdviceQuery> = {}): AdviceQuery => ({

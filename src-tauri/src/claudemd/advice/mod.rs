@@ -500,6 +500,11 @@ pub struct AdviceResult {
     /// For a cached result this is older than now, which is the whole
     /// point of showing it.
     pub computed_at: String,
+    /// The Headstate version that computed the report (#1333), so "is
+    /// this current?" can be answered from the screen. On a cache hit it
+    /// is the STORED build, which the cache only serves when it is this
+    /// one; see `cache::Build`.
+    pub build: String,
 }
 
 /// What every producer may read. Built once per run, so the CLAUDE.md

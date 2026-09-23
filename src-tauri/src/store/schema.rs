@@ -1150,6 +1150,16 @@ const MIGRATIONS: &[&str] = &[
     // than a one-off `DELETE`, so the next rule change is a constant bump
     // and not another migration.
     "ALTER TABLE claude_advice_ledger ADD COLUMN rule_version INTEGER NOT NULL DEFAULT 0;",
+    // 27: the build that computed a stored advice report (#1333).
+    //
+    // `build` is the version shown beside `computed_at`; `build_id` is
+    // what the cache compares, and it is stricter (see
+    // `advice::cache::Build`). A report computed by another build is a
+    // miss. Nullable, and existing rows keep NULL: a row that records no
+    // build is a miss too, rather than a report attributed to whichever
+    // build reads it.
+    "ALTER TABLE claude_advice_report ADD COLUMN build TEXT;
+     ALTER TABLE claude_advice_report ADD COLUMN build_id TEXT;",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
@@ -1631,6 +1641,42 @@ mod tests {
             "the current rule must not match a pre-26 row"
         );
 
+        let schema: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(schema, MIGRATIONS.len() as i64);
+    }
+
+    /// Migration 27 records the computing build on the advice report
+    /// (#1333): a row from before it is kept, with no build, which the
+    /// cache reads as a miss.
+    #[test]
+    fn migration_27_adds_the_build_and_keeps_existing_reports() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in MIGRATIONS.iter().take(26) {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 26i64).unwrap();
+        conn.execute(
+            "INSERT INTO claude_advice_report
+                (repo, payload_version, digest, payload, unverified, computed_at)
+             VALUES ('/home/octocat/hello-world', 2, 'abc', '{}', NULL, '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let (kept, build, build_id): (i64, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(build), MAX(build_id) FROM claude_advice_report",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(kept, 1, "an upgrade must not cost the stored report");
+        assert_eq!(build, None, "a pre-27 row names no build");
+        assert_eq!(build_id, None);
         let schema: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();

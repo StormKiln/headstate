@@ -118,6 +118,7 @@ const report = (over: Partial<ClaudeMdAdviceReport> = {}): ClaudeMdAdviceResult 
   },
   freshness: { state: "fresh", recomputed: true },
   computedAt: "2026-01-01T00:00:00Z",
+  build: "7.4.0",
 });
 
 /// Render the tab body. There is nothing to press: selecting the
@@ -192,6 +193,15 @@ describe("ClaudeMdAdvicePanel", () => {
     open();
     expect(screen.getByText(/does not resolve/)).toBeTruthy();
     expect(screen.getByText(claim)).toBeTruthy();
+  });
+
+  /// The build that computed the report is on screen beside when it ran
+  /// (#1333), so "did this regenerate under the new release?" is
+  /// answered by looking rather than by asking.
+  it("names the build that computed the report", () => {
+    state.data = { ...report(), build: "9.8.7" };
+    open();
+    expect(screen.getByText(/Headstate 9\.8\.7/)).toBeTruthy();
   });
 
   /// `"unverified"` is NOT "fresh with a footnote" (#1042).
