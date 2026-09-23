@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
+import { toast } from "sonner";
 import { useClaudeMdAdvice, useUiPrefs } from "@/api/hooks";
 import type {
   ClaudeMdAdviceCoverage,
@@ -21,6 +22,7 @@ import type { Filters } from "@/lib/derive";
 import { useActiveFilters, useFilters } from "@/store/filters";
 import { adviceState, needsRefresh, type AdviceState } from "@/lib/adviceState";
 import { freshnessLabel } from "@/lib/adviceFreshnessLabel";
+import { recheckSummary } from "@/lib/adviceRecheck";
 import { IS_DESKTOP_BUILD } from "@/lib/target";
 import { ClaudifyAction, ClaudifyButton, CopyBriefButton, RunPanel } from "./ClaudifyAction";
 import { PartialScanNotice } from "./PartialScanNotice";
@@ -175,6 +177,9 @@ export function ClaudeMdAdvicePanel({
     { ...fresh, enabled: wantFresh },
   );
 
+  // Which Re-check click is the latest, so only its run reports.
+  const recheckRun = useRef(0);
+
   return (
     <div className="space-y-2">
       <AdviceBody
@@ -183,11 +188,25 @@ export function ClaudeMdAdvicePanel({
         activePath={activePath}
         onSelectFile={onSelectFile}
         onRefresh={() => {
+          // EVERY click starts a run (#1343). Setting the flag alone was a
+          // no-op twice over: over a stale report the fresh call was
+          // already enabled, so the flag changed nothing; and within
+          // `staleTime` re-enabling serves TanStack's cached answer rather
+          // than running. `refetch` runs regardless of both; the flag
+          // keeps the query enabled so its result is the one shown.
           setRefreshAsked(repo);
-          // A repository already asked for a refresh needs the query
-          // re-run rather than re-enabled: the flag is already set, so
-          // nothing would change and the button would look inert.
-          if (refreshAsked === repo) void fresh.refetch();
+          const replaced = shownReport(state);
+          const run = ++recheckRun.current;
+          void fresh.refetch().then((r) => {
+            // A later click superseded this run; that one reports.
+            if (run !== recheckRun.current) return;
+            if (r.status === "error") {
+              toast.error("Re-check failed", { description: errorMessage(r.error) });
+            } else if (r.data !== undefined) {
+              const s = recheckSummary(replaced, r.data.report);
+              toast.success(s.title, { description: s.description });
+            }
+          });
         }}
         onRetry={() => {
           if (cached.isError) void cached.refetch();
@@ -196,6 +215,13 @@ export function ClaudeMdAdvicePanel({
       />
     </div>
   );
+}
+
+/// The report on screen, which a Re-check's result is compared against.
+function shownReport(state: AdviceState): ClaudeMdAdviceReport | undefined {
+  if (state.kind === "report") return state.result.report;
+  if (state.kind === "failed") return state.stale?.report;
+  return undefined;
 }
 
 /// The five states, each rendered as itself.

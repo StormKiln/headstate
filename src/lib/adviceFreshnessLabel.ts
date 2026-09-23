@@ -39,10 +39,10 @@ export interface FreshnessLabel {
 ///   times, so the tone is `"unknown"` and the word "current" does not
 ///   appear in it at all.
 ///
-/// `refreshing` is only ever true for a stale cached report, because
-/// that is the only state this app fires an automatic refresh for -- but
-/// it is honoured wherever it is passed, so a future manual Refresh over
-/// any state reads correctly rather than silently dropping the fact.
+/// `refreshing` is true while a fresh run is in flight: the automatic one
+/// behind a stale cached report, or a Re-check over any state (#1343).
+/// It is honoured wherever it is passed, so no state silently drops the
+/// fact that a run is going.
 export function freshnessLabel(
   freshness: ClaudeMdAdviceFreshness,
   computedAt: string,

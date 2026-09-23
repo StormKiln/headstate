@@ -136,7 +136,8 @@ beforeEach(() => {
   toastFns.success.mockClear();
   toastFns.error.mockClear();
   refetchFn.mockClear();
-  freshRefetchFn.mockClear();
+  freshRefetchFn.mockReset();
+  freshRefetchFn.mockResolvedValue({ status: "success", data: report() });
   // No terminal by DEFAULT, so every pre-existing test runs the
   // copy-only shape and Run has to be opted into explicitly.
   claudify.terminal = "";
@@ -308,6 +309,65 @@ describe("ClaudeMdAdvicePanel", () => {
     expect(state.enabledFor.some((c) => c.mode === "fresh" && c.enabled)).toBe(false);
     fireEvent.click(screen.getByRole("button", { name: "Re-check" }));
     expect(state.enabledFor.some((c) => c.mode === "fresh" && c.enabled)).toBe(true);
+  });
+
+  // ---- Re-check (#1343) ----
+
+  /// In a stale-report state the fresh call is ALREADY enabled, so the
+  /// old handler's first click only set a flag that changed nothing.
+  /// Every click must start a run.
+  it("starts a run on the first click over a stale report", () => {
+    state.data = { ...report(), freshness: { state: "cached", stale: true } };
+    freshRefetchFn.mockResolvedValue({ status: "success", data: report() });
+    open();
+    fireEvent.click(screen.getByRole("button", { name: "Re-check" }));
+    expect(freshRefetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it("starts a run on every click", () => {
+    state.data = report();
+    freshRefetchFn.mockResolvedValue({ status: "success", data: report() });
+    open();
+    fireEvent.click(screen.getByRole("button", { name: "Re-check" }));
+    fireEvent.click(screen.getByRole("button", { name: "Re-check" }));
+    expect(freshRefetchFn).toHaveBeenCalledTimes(2);
+  });
+
+  /// Completion says what the run found and how it compares with the
+  /// report it replaced, so "nothing changed" never looks like "nothing
+  /// happened".
+  it("toasts the count and the change when the run completes", async () => {
+    state.data = report({
+      findings: [finding({ finding: "a" }), finding({ finding: "b" })],
+      checks: [{ check: "imports", run: { state: "ran", findings: 2 } }],
+    });
+    freshRefetchFn.mockResolvedValue({
+      status: "success",
+      data: report({
+        findings: [finding({ finding: "a" })],
+        checks: [{ check: "imports", run: { state: "ran", findings: 1 } }],
+      }),
+    });
+    open();
+    fireEvent.click(screen.getByRole("button", { name: "Re-check" }));
+    await waitFor(() =>
+      expect(toastFns.success).toHaveBeenCalledWith("Re-checked: 1 finding", {
+        description: "1 fewer than the report it replaced.",
+      }),
+    );
+  });
+
+  it("toasts the failure, with the reason, when the run fails", async () => {
+    state.data = report();
+    freshRefetchFn.mockResolvedValue({ status: "error", error: "the blocking task panicked" });
+    open();
+    fireEvent.click(screen.getByRole("button", { name: "Re-check" }));
+    await waitFor(() =>
+      expect(toastFns.error).toHaveBeenCalledWith("Re-check failed", {
+        description: "the blocking task panicked",
+      }),
+    );
+    expect(toastFns.success).not.toHaveBeenCalled();
   });
 
   /// A refresh that was REJECTED over a report already on screen keeps
