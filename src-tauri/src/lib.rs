@@ -56,6 +56,62 @@ fn mark_focus(focused: &AtomicBool, is_focused: bool) {
     focused.store(is_focused, Ordering::Relaxed);
 }
 
+/// The three window calls that bring the main window back. A trait only so
+/// `reveal`'s order and failure handling can be tested without a Tauri
+/// runtime, which this crate has no mock of.
+trait Reveal {
+    fn reveal_show(&self) -> tauri::Result<()>;
+    fn reveal_unminimize(&self) -> tauri::Result<()>;
+    fn reveal_focus(&self) -> tauri::Result<()>;
+}
+
+impl<R: tauri::Runtime> Reveal for tauri::WebviewWindow<R> {
+    fn reveal_show(&self) -> tauri::Result<()> {
+        self.show()
+    }
+    fn reveal_unminimize(&self) -> tauri::Result<()> {
+        self.unminimize()
+    }
+    fn reveal_focus(&self) -> tauri::Result<()> {
+        self.set_focus()
+    }
+}
+
+/// Show, unminimise, then focus. Each step is attempted even if an earlier
+/// one fails, and a failure is logged rather than surfaced: there is no
+/// window to surface it in.
+///
+/// Deliberately does NOT touch the `Focused` flag or wake the poll loop.
+/// `set_focus` makes the platform deliver `WindowEvent::Focused(true)`,
+/// and that handler already does both. Doing it here too would notify the
+/// waker twice, and `Notify` stores the second as a permit, so the loop
+/// would run a second, needless tick straight after the first. And if the
+/// platform refuses focus (focus-stealing prevention on Linux), the window
+/// is not focused, so the background cadence is the right one until the
+/// user clicks it -- at which point the same event fires.
+fn reveal(window: &impl Reveal) {
+    if let Err(e) = window.reveal_show() {
+        log::warn!("could not show the main window: {e}");
+    }
+    if let Err(e) = window.reveal_unminimize() {
+        log::warn!("could not unminimise the main window: {e}");
+    }
+    if let Err(e) = window.reveal_focus() {
+        log::warn!("could not focus the main window: {e}");
+    }
+}
+
+/// Bring the main window back from wherever it went: hidden by
+/// close-to-tray, or minimised. The ONE path for this, shared by the tray's
+/// "Show Headstate" item and the macOS Dock-icon reopen (#1345), so the two
+/// cannot drift.
+pub(crate) fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    match app.get_webview_window("main") {
+        Some(window) => reveal(&window),
+        None => log::warn!("asked to show the main window, but there is no main window"),
+    }
+}
+
 /// Show one battery alert (#720).
 ///
 /// A sibling of `poll::notify_breakage` rather than a call into it:
@@ -1006,8 +1062,28 @@ pub fn run() {
             }
             _ => {}
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        // `build` + `App::run` rather than `Builder::run`, which is exactly
+        // this with a no-op callback -- so nothing else changes. The
+        // callback is the only place app-level events arrive; macOS sends
+        // the Dock-icon click there as `Reopen`, and with no callback a
+        // window closed to the tray could never come back from the Dock
+        // (#1345). Nothing after this call relies on it returning.
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // Only when nothing is visible: with a window already on
+            // screen, a Dock click is the platform's to handle.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen {
+                has_visible_windows: false,
+                ..
+            } = event
+            {
+                show_main_window(app);
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
+        });
 }
 
 #[cfg(test)]
@@ -1090,5 +1166,65 @@ mod tests {
 
         // The clone `poll::spawn` was given observes the same store.
         assert!(!focused.load(Ordering::Relaxed));
+    }
+
+    /// Records every call `reveal` makes, in order, and fails the ones it
+    /// is told to. Stands in for a `WebviewWindow` because there is no
+    /// Tauri mock runtime in this crate (see `tray::setup_tray`'s docs).
+    struct FakeWindow {
+        calls: std::cell::RefCell<Vec<&'static str>>,
+        failing: &'static [&'static str],
+    }
+
+    impl FakeWindow {
+        fn new(failing: &'static [&'static str]) -> Self {
+            Self {
+                calls: std::cell::RefCell::new(Vec::new()),
+                failing,
+            }
+        }
+
+        fn record(&self, call: &'static str) -> tauri::Result<()> {
+            self.calls.borrow_mut().push(call);
+            if self.failing.contains(&call) {
+                Err(tauri::Error::InvalidWindowHandle)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl Reveal for FakeWindow {
+        fn reveal_show(&self) -> tauri::Result<()> {
+            self.record("show")
+        }
+        fn reveal_unminimize(&self) -> tauri::Result<()> {
+            self.record("unminimize")
+        }
+        fn reveal_focus(&self) -> tauri::Result<()> {
+            self.record("set_focus")
+        }
+    }
+
+    /// A window closed to the tray is hidden, and one the user minimised
+    /// is minimised: showing alone leaves the second in the Dock, and
+    /// focusing before showing has nothing to focus. So all three, and
+    /// focus last -- it is the call that makes the platform deliver the
+    /// `Focused(true)` that restores the foreground cadence (#1345).
+    #[test]
+    fn revealing_shows_then_unminimises_then_focuses() {
+        let window = FakeWindow::new(&[]);
+        reveal(&window);
+        assert_eq!(*window.calls.borrow(), ["show", "unminimize", "set_focus"]);
+    }
+
+    /// One refused call must not strand the window: a failed `show` on a
+    /// window that was only minimised would otherwise skip the
+    /// `unminimize` that brings it back.
+    #[test]
+    fn a_failed_step_does_not_skip_the_rest() {
+        let window = FakeWindow::new(&["show", "unminimize"]);
+        reveal(&window);
+        assert_eq!(*window.calls.borrow(), ["show", "unminimize", "set_focus"]);
     }
 }
