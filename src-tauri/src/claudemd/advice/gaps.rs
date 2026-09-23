@@ -32,8 +32,9 @@
 //!
 //! # Candidate, strong, weak
 //!
-//! A candidate is a directory, not the root, with at least one signal and
-//! no CLAUDE.md on the path from it up to (excluding) the root. The root
+//! A candidate is a directory, not the root, with at least one signal,
+//! no CLAUDE.md on the path from it up to (excluding) the root, and no
+//! rule whose `paths:` scopes it (below). The root
 //! file covers nothing below it by itself, or every repository with one
 //! root file would pass. A directory the walk could not list, or anything
 //! under one, is never a candidate: it is an Unknown finding instead.
@@ -100,16 +101,33 @@
 //! the list is matched exactly against the directory, absolute or
 //! relative to the root.
 //!
+//! # A path-scoped rule covers what its `paths:` scope
+//!
+//! A rule in `.claude/rules/` with `paths:` frontmatter loads when a
+//! session reads a matching file, so it is a place for a directory's
+//! knowledge as a nested CLAUDE.md is (#1340). A candidate some rule
+//! scopes (`claudemd::rules::Rule::scopes`: a pattern that reaches the
+//! directory and does not open with `**` or a bare `*`) is covered and
+//! no finding. A rule with no `paths:` loads at launch like the root file
+//! and covers nothing below it by itself, nor does `**/*.ts`. The glob
+//! support is small and documented in `claudemd::rules`. When there are
+//! rules, each row says how many were read. A rule directory or rule
+//! that exists and could not be read withholds every candidate a rule
+//! did not already cover, as one [`Severity::Unknown`] naming them: any
+//! of them might be covered by the rule that was not read.
+//!
 //! # Deliberately out of scope
 //!
-//! `.claude/rules/` and `AGENTS.md` both change what "covered" means --
-//! path-scoped rules load on read, and `AGENTS.md` is read only where
-//! none of the three CLAUDE.md files exists -- and neither is consulted
-//! here. A follow-up. Go's `_test.go` and Python's `test_*.py` are not
+//! `AGENTS.md` changes what "covered" means -- it is read only where
+//! none of the three CLAUDE.md files exists -- and is not consulted
+//! here. Docs linked from a CLAUDE.md by an ordinary markdown link are
+//! not coverage: they are not loaded into a session, so they instruct
+//! nothing until read. Go's `_test.go` and Python's `test_*.py` are not
 //! counted as test files: the pattern is the design's `*.test.*`, and a
 //! wider one is a measured change, not a default.
 
 use super::{Check, Context, Evidence, Finding, Locator, Producer, Severity, Subject};
+use crate::claudemd::rules::{self, Rules};
 use crate::claudemd::{text, DirFacts, Scan};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -205,7 +223,8 @@ pub struct Gap {
     pub downgraded_by: Option<Mention>,
 }
 
-/// Every candidate, in path order, before grouping.
+/// Every candidate, in path order, before grouping and before the
+/// `.claude/rules` coverage that [`gaps`] applies.
 ///
 /// `Err` when the root itself could not be listed or its CLAUDE.md
 /// exists and could not be read: without the root file, whether any
@@ -399,6 +418,28 @@ pub fn gaps(scan: &Scan, edited: &[PathBuf]) -> Result<Vec<Finding>, String> {
     let found = candidates(scan, edited)?;
     let mut out = Vec::new();
 
+    // #1340: a candidate a rule's `paths:` scopes is covered. `candidates`
+    // has already proven the root is in the facts.
+    let root = scan
+        .dir_facts
+        .iter()
+        .find(|f| f.rel.as_os_str().is_empty())
+        .map(|f| f.path.clone())
+        .unwrap_or_default();
+    let rules = rules::read(&root);
+    let found: Vec<Gap> = found
+        .into_iter()
+        .filter(|g| !rules.files.iter().any(|r| r.scopes(&g.rel)))
+        .collect();
+    if !rules.unreadable.is_empty() && !found.is_empty() {
+        out.push(rules_unknown(&root, &rules, &found));
+    }
+    let found: Vec<Gap> = if rules.unreadable.is_empty() {
+        found
+    } else {
+        Vec::new()
+    };
+
     // Keyed by parent, signal set and mention, in first-seen order of the
     // sorted candidates so the output order is the path order.
     let mut groups: BTreeMap<GroupKey, Vec<&Gap>> = BTreeMap::new();
@@ -412,12 +453,35 @@ pub fn gaps(scan: &Scan, edited: &[PathBuf]) -> Result<Vec<Finding>, String> {
             .or_default()
             .push(g);
     }
+    // What the rules were measured to say, on every row, when there are
+    // any: the row's claim now rests on them too.
+    let ruled = (!rules.files.is_empty()).then(|| Evidence {
+        at: Locator::File {
+            path: root
+                .join(".claude")
+                .join("rules")
+                .to_string_lossy()
+                .to_string(),
+            line: None,
+        },
+        measured: format!(
+            "{} rule{} read; no `paths:` scopes it",
+            rules.files.len(),
+            if rules.files.len() == 1 { "" } else { "s" }
+        ),
+    });
     let mut rows: Vec<Finding> = Vec::new();
     for ((parent, signals, mention), members) in groups {
         if members.len() >= GROUP_AT {
-            rows.push(grouped(&parent, &signals, mention.as_ref(), &members));
+            rows.push(grouped(
+                &parent,
+                &signals,
+                mention.as_ref(),
+                &members,
+                ruled.clone(),
+            ));
         } else {
-            rows.extend(members.into_iter().map(single));
+            rows.extend(members.into_iter().map(|g| single(g, ruled.clone())));
         }
     }
     // A group's row sorts where its parent does, beside the singles.
@@ -485,7 +549,7 @@ fn rel_display(rel: &Path) -> String {
     }
 }
 
-fn single(g: &Gap) -> Finding {
+fn single(g: &Gap, ruled: Option<Evidence>) -> Finding {
     let dir = g.dir.to_string_lossy().to_string();
     // "role name only (`docs`)", not "role name only (role name `docs`)".
     let joined = if g.role_only {
@@ -522,6 +586,7 @@ fn single(g: &Gap) -> Finding {
         sentence.push_str(&format!(", though the root CLAUDE.md {}", m.what));
         evidence.push(mention_evidence(m));
     }
+    evidence.extend(ruled);
     Finding::new(
         Check::Gaps,
         Severity::Advice,
@@ -536,6 +601,7 @@ fn grouped(
     signals: &[String],
     mention: Option<&Mention>,
     members: &[&Gap],
+    ruled: Option<Evidence>,
 ) -> Finding {
     // The parent's absolute path, from the member's: the parent may be
     // the root, which has no candidate of its own.
@@ -580,6 +646,10 @@ fn grouped(
         sentence.push_str(&format!(", though the root CLAUDE.md {}", m.what));
         evidence.push(mention_evidence(m));
     }
+    evidence.extend(ruled.map(|mut e| {
+        e.measured = e.measured.replace("scopes it", "scopes them");
+        e
+    }));
     Finding::new(
         Check::Gaps,
         Severity::Advice,
@@ -588,6 +658,53 @@ fn grouped(
         },
         evidence,
         sentence,
+    )
+}
+
+/// The Unknown for candidates a rule that could not be read might cover:
+/// each candidate is withheld, never stated (#1340).
+fn rules_unknown(root: &Path, rules: &Rules, found: &[Gap]) -> Finding {
+    let dir = root.join(".claude").join("rules");
+    let names: Vec<String> = found.iter().map(|g| format!("`{}/`", g.rel)).collect();
+    let mut evidence: Vec<Evidence> = rules
+        .unreadable
+        .iter()
+        .map(|u| Evidence {
+            at: Locator::File {
+                path: u.clone(),
+                line: None,
+            },
+            measured: "not readable".to_string(),
+        })
+        .collect();
+    evidence.push(Evidence {
+        at: Locator::File {
+            path: root.to_string_lossy().to_string(),
+            line: None,
+        },
+        measured: format!("withheld: {}", names.join(", ")),
+    });
+    Finding::new(
+        Check::Gaps,
+        Severity::Unknown,
+        Subject::Directory {
+            path: dir.to_string_lossy().to_string(),
+        },
+        evidence,
+        format!(
+            "`{}` holds rules that could not be read ({}), so whether a path-scoped rule \
+             covers {} candidate director{} ({}) is unknown",
+            dir.to_string_lossy(),
+            rules
+                .unreadable
+                .iter()
+                .map(|u| format!("`{u}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            found.len(),
+            if found.len() == 1 { "y" } else { "ies" },
+            names.join(", ")
+        ),
     )
 }
 
@@ -1134,6 +1251,66 @@ mod tests {
         fs::remove_file(t.path().join("CLAUDE.md")).unwrap();
         let report = run_over(t.path());
         assert_eq!(gap_findings(&report).len(), 3);
+    }
+
+    /// #1340's test: a candidate a rule's `paths:` scopes is covered and
+    /// no finding; a rule reaching everywhere scopes nothing; the rows
+    /// that remain say how many rules were read.
+    #[test]
+    fn a_rule_scoping_a_candidate_covers_it() {
+        let t = fixture();
+        let rules = t.path().join(".claude").join("rules");
+        write(&rules.join("any.md"), "---\npaths: \"**/*.ts\"\n---\nx\n");
+        let report = run_over(t.path());
+        assert_eq!(gap_findings(&report).len(), 3, "{report:#?}");
+
+        write(
+            &rules.join("area").join("tests.md"),
+            "---\npaths:\n  - \"tests/**/*.ts\"\n---\nRun the suite.\n",
+        );
+        let report = run_over(t.path());
+        let found = gap_findings(&report);
+        assert_eq!(found.len(), 2, "{found:#?}");
+        assert!(by_subject(&found, "tests").is_none(), "{found:#?}");
+        let docs = by_subject(&found, "docs").expect("docs still a candidate");
+        assert!(
+            docs.evidence
+                .iter()
+                .any(|e| e.measured == "2 rules read; no `paths:` scopes it"),
+            "{:?}",
+            docs.evidence
+        );
+    }
+
+    /// A rule that exists and cannot be read leaves every remaining
+    /// candidate undecided: one Unknown naming the rule and the
+    /// candidates, and no Advice row.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_rule_withholds_the_candidates_as_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = fixture();
+        let rule = t.path().join(".claude").join("rules").join("tests.md");
+        write(&rule, "---\npaths: tests/**\n---\nx\n");
+        fs::set_permissions(&rule, fs::Permissions::from_mode(0o000)).unwrap();
+        let report = run_over(t.path());
+        fs::set_permissions(&rule, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let found = gap_findings(&report);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        let f = found[0];
+        assert_eq!(f.severity, Severity::Unknown);
+        assert!(
+            f.finding.contains("tests.md (")
+                && f.finding.ends_with(
+                    "so whether a path-scoped rule covers 5 candidate directories \
+                     (`docs/`, `packages/octocat-a/`, `packages/octocat-b/`, \
+                     `packages/octocat-c/`, `tests/`) is unknown"
+                ),
+            "{}",
+            f.finding
+        );
+        assert!(f.brief.contains("Make the rules named"), "{}", f.brief);
     }
 
     /// The threshold is a boundary: nine test files is no signal, ten is

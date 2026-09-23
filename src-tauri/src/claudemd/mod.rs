@@ -24,6 +24,7 @@
 pub mod advice;
 pub mod imports;
 pub mod refs;
+pub mod rules;
 pub mod text;
 pub mod tokens;
 

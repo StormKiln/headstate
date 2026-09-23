@@ -183,6 +183,29 @@ fn just_recipes(text: &str) -> Vec<Target> {
 /// A file that will not parse is `Unreadable` with serde's error, for the
 /// same reason as a permission wall: the number of scripts is unknown.
 pub fn scripts(dir: &Path) -> Manifest<Vec<String>> {
+    match script_bodies(dir) {
+        Manifest::Present(list) => Manifest::Present(list.into_iter().map(|s| s.name).collect()),
+        Manifest::Unreadable(e) => Manifest::Unreadable(e),
+        Manifest::Absent => Manifest::Absent,
+    }
+}
+
+/// One `package.json` script: its name and the command line it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Script {
+    pub name: String,
+    /// The command line, verbatim. A value that is not a string (npm
+    /// will not run one) is empty, so it maps to nothing.
+    pub body: String,
+}
+
+/// The scripts in `dir/package.json` with their bodies, in the file's
+/// order.
+///
+/// A sibling of [`scripts`], not a change to it: the rot producer wants
+/// names only, and the toolchain reads a body only when a script's name
+/// maps to no verb (#1341). Three-state for the same reason.
+pub fn script_bodies(dir: &Path) -> Manifest<Vec<Script>> {
     let path = dir.join("package.json");
     if !path.is_file() {
         return Manifest::Absent;
@@ -198,7 +221,14 @@ pub fn scripts(dir: &Path) -> Manifest<Vec<String>> {
     Manifest::Present(
         json.get("scripts")
             .and_then(|s| s.as_object())
-            .map(|o| o.keys().cloned().collect())
+            .map(|o| {
+                o.iter()
+                    .map(|(name, body)| Script {
+                        name: name.clone(),
+                        body: body.as_str().unwrap_or_default().to_string(),
+                    })
+                    .collect()
+            })
             .unwrap_or_default(),
     )
 }
@@ -351,6 +381,32 @@ lint.sh:
             scripts(t.path()),
             Manifest::Present(vec!["test".into(), "lint".into()])
         );
+    }
+
+    /// #1341: the bodies come with the names, in the file's order, and a
+    /// value that is not a string is an empty body.
+    #[test]
+    fn package_json_script_bodies_are_read_in_order() {
+        let t = tempfile::tempdir().unwrap();
+        fs::write(
+            t.path().join("package.json"),
+            r#"{"scripts":{"verify":"eslint . && vitest run","odd":7}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            script_bodies(t.path()),
+            Manifest::Present(vec![
+                Script {
+                    name: "verify".into(),
+                    body: "eslint . && vitest run".into()
+                },
+                Script {
+                    name: "odd".into(),
+                    body: String::new()
+                },
+            ])
+        );
+        assert_eq!(script_bodies(&t.path().join("absent")), Manifest::Absent);
     }
 
     #[test]
