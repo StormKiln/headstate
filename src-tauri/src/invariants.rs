@@ -178,7 +178,22 @@ mod tests {
     /// false positive somebody reads, not a silent gap. The `checked`
     /// self-guard at the bottom of each test is what catches the other
     /// direction.
-    fn production(src: &str) -> String {
+    ///
+    /// # Why it takes the file's PATH (#1331)
+    ///
+    /// A test module declared out of line -- `#[cfg(test)] mod tests;` in
+    /// `cache.rs`, its body in `cache/tests.rs` -- carries no
+    /// `#[cfg(test)]` in its own text: the gate is in the PARENT. Reading
+    /// the file alone, every line of it looked like production, and a
+    /// fixture's `remove_dir_all` failed the recursive-delete guard until
+    /// the test was rewritten around it. So the file is looked up in
+    /// [`test_only_files`] first, and a module its parent gates has no
+    /// production text at all. Taking the path as a parameter is what
+    /// stops the next walk from forgetting to ask.
+    fn production(file: &Path, src: &str) -> String {
+        if test_only_files().contains(&canonical(file)) {
+            return String::new();
+        }
         let mut out = String::new();
         // `Some(true)` while the skipped item's own header line
         // (`mod tests {`, `fn helper() {`) is still to be consumed: that
@@ -214,6 +229,157 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    /// `path` canonicalised when it can be, so the same file reached as
+    /// `src/../src/x.rs` or through a `#[path]` compares equal. Both sides
+    /// of every comparison go through this, which is what makes Windows'
+    /// verbatim `\\?\C:\` form harmless here.
+    fn canonical(path: &Path) -> PathBuf {
+        path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    /// Every file in this repository's crates that only a test build
+    /// compiles, derived once. See [`test_only_files_under`].
+    fn test_only_files() -> &'static std::collections::BTreeSet<PathBuf> {
+        static SET: std::sync::OnceLock<std::collections::BTreeSet<PathBuf>> =
+            std::sync::OnceLock::new();
+        SET.get_or_init(|| {
+            crate_roots()
+                .iter()
+                .flat_map(|(_, root)| test_only_files_under(root))
+                .collect()
+        })
+    }
+
+    /// The files under `root` that are test-only BY DECLARATION: named by
+    /// a `#[cfg(test)] mod name;` in their parent, or declared (gated or
+    /// not) by a file that is itself test-only (#1331). Canonical paths.
+    ///
+    /// # Why declarations and not file names
+    ///
+    /// `tests.rs` is the usual name, and a guess on it would be right
+    /// today and wrong the day someone ships a `tests.rs` that is not one
+    /// -- or gates a module called `loopback_tests` or `mirrored`, both of
+    /// which exist. The parent's declaration is what the compiler obeys,
+    /// so it is what this reads.
+    ///
+    /// # Where a declared module's file is
+    ///
+    /// Rust's own rule. `#[path = "..."]` wins, relative to the declaring
+    /// file's directory. Otherwise a `mod.rs`, `lib.rs` or `main.rs`
+    /// resolves `mod name;` beside itself, and any other `parent.rs`
+    /// resolves it under `parent/`; either way as `name.rs` or
+    /// `name/mod.rs`.
+    ///
+    /// # What it does not see, and which way that fails
+    ///
+    /// Only column-0 declarations are read, so an out-of-line `mod x;`
+    /// inside an inline `mod a { }` is not resolved, and only a literal
+    /// `#[cfg(test)]` counts as the gate -- the same marker [`production`]
+    /// strips on. Neither occurs in this tree, and both fail toward
+    /// scanning MORE code: a false positive somebody reads, never a
+    /// module silently skipped.
+    fn test_only_files_under(root: &Path) -> std::collections::BTreeSet<PathBuf> {
+        let mut children: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
+        let mut pending: Vec<PathBuf> = Vec::new();
+        for file in rust_files(root) {
+            let Ok(src) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let file = canonical(&file);
+            for (module, gated) in declared_modules(&file, &src) {
+                if gated {
+                    pending.push(module.clone());
+                }
+                children.entry(file.clone()).or_default().push(module);
+            }
+        }
+        // Transitively: whatever a test-only file declares is compiled
+        // only when it is.
+        let mut out = std::collections::BTreeSet::new();
+        while let Some(f) = pending.pop() {
+            if out.insert(f.clone()) {
+                pending.extend(children.get(&f).into_iter().flatten().cloned());
+            }
+        }
+        out
+    }
+
+    /// The out-of-line modules `file` declares, each resolved to the file
+    /// that exists and paired with whether `#[cfg(test)]` gates it.
+    ///
+    /// The attributes are found by walking UP from the `mod name;` line
+    /// over attribute and comment lines, so `#[path]` above or below the
+    /// gate and a doc comment between them all read the same.
+    fn declared_modules(file: &Path, src: &str) -> Vec<(PathBuf, bool)> {
+        // `\r\n` first: every line below is compared whole.
+        let src = src.replace("\r\n", "\n");
+        let lines: Vec<&str> = src.lines().collect();
+        let Some(dir) = file.parent() else {
+            return Vec::new();
+        };
+        let at_root = file
+            .file_name()
+            .is_some_and(|n| n == "mod.rs" || n == "lib.rs" || n == "main.rs");
+        let mut out = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let Some(name) = out_of_line_mod(line) else {
+                continue;
+            };
+            let mut gated = false;
+            let mut path_attr: Option<&str> = None;
+            for above in lines[..i].iter().rev() {
+                let t = above.trim();
+                if t == "#[cfg(test)]" {
+                    gated = true;
+                } else if let Some(rest) = t.strip_prefix("#[path") {
+                    path_attr = rest.split('"').nth(1);
+                } else if !(t.starts_with("#[") || t.starts_with("//")) {
+                    break;
+                }
+            }
+            let candidates = match path_attr {
+                Some(p) => vec![p.split('/').fold(dir.to_path_buf(), |d, s| d.join(s))],
+                None => {
+                    let base = if at_root {
+                        dir.to_path_buf()
+                    } else {
+                        let Some(stem) = file.file_stem() else {
+                            continue;
+                        };
+                        dir.join(stem)
+                    };
+                    vec![
+                        base.join(format!("{name}.rs")),
+                        base.join(name).join("mod.rs"),
+                    ]
+                }
+            };
+            if let Some(found) = candidates.into_iter().find(|c| c.is_file()) {
+                out.push((canonical(&found), gated));
+            }
+        }
+        out
+    }
+
+    /// The module name if `line` is a column-0 `mod name;` -- a module
+    /// whose body is in another file -- with any visibility.
+    fn out_of_line_mod(line: &str) -> Option<&str> {
+        let mut rest = line;
+        if let Some(r) = rest.strip_prefix("pub") {
+            rest = match r.strip_prefix('(') {
+                Some(r) => r.split_once(')')?.1,
+                None => r,
+            }
+            .trim_start();
+        }
+        let name = rest
+            .strip_prefix("mod ")?
+            .trim_end()
+            .strip_suffix(';')?
+            .trim();
+        (!name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')).then_some(name)
     }
 
     /// Whether a line begins a top-level Rust item.
@@ -258,6 +424,123 @@ mod tests {
     fn is_comment(line: &str) -> bool {
         let t = line.trim_start();
         t.starts_with("//") || t.starts_with("*") || t.starts_with("#!")
+    }
+
+    /// A module a parent gates with `#[cfg(test)] mod name;` has no
+    /// production code, in every spelling of where its file can live --
+    /// and a module declared WITHOUT the gate is still production (#1331).
+    ///
+    /// Both directions matter. Missing the first is the defect: an
+    /// out-of-line test file was judged by production rules, and a test
+    /// had to bend around the false positive. Getting the second wrong
+    /// would be worse -- a guard blind to a real module -- so the fixture
+    /// names its production modules `tests.rs` and `testing.rs` on
+    /// purpose: a file-name guess would call them test-only, and this
+    /// asserts they are not.
+    #[test]
+    fn a_test_gated_out_of_line_module_is_test_only_and_nothing_else_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let write = |rel: &str, body: &str| {
+            let p = rel.split('/').fold(root.to_path_buf(), |p, s| p.join(s));
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, body).unwrap();
+        };
+        // A crate root: `lib.rs` resolves children beside itself.
+        write(
+            "lib.rs",
+            "pub mod shipped;\n\
+             /// Doc between the gate and the item.\n\
+             #[cfg(test)]\n\
+             mod gated;\n\
+             #[cfg(test)]\n\
+             #[path = \"elsewhere/named.rs\"]\n\
+             mod pathed;\n\
+             #[path = \"other/later.rs\"]\n\
+             #[cfg(test)]\n\
+             pub(crate) mod gate_after_path;\n\
+             #[cfg(test)]\n\
+             mod dir_form;\n\
+             pub mod tests;\n",
+        );
+        // A non-root file: its children live under `shipped/`.
+        write(
+            "shipped.rs",
+            "#[cfg(test)]\r\nmod tests;\r\nmod testing;\r\n",
+        );
+        write("shipped/tests.rs", "fn t() {}\n");
+        write("shipped/testing.rs", "fn p() {}\n");
+        write("gated.rs", "mod helper;\n");
+        // A child of a test-only module is test-only, gated or not.
+        write("gated/helper.rs", "fn h() {}\n");
+        write("elsewhere/named.rs", "fn n() {}\n");
+        write("other/later.rs", "fn l() {}\n");
+        write("dir_form/mod.rs", "fn d() {}\n");
+        write("tests.rs", "fn not_a_test() {}\n");
+
+        let got: std::collections::BTreeSet<String> = test_only_files_under(root)
+            .iter()
+            .map(|p| {
+                p.strip_prefix(root.canonicalize().unwrap())
+                    .unwrap()
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "dir_form/mod.rs",
+                "elsewhere/named.rs",
+                "gated.rs",
+                "gated/helper.rs",
+                "other/later.rs",
+                "shipped/tests.rs",
+            ]
+            .map(String::from)
+            .into(),
+            "the test-only set is wrong: `shipped/testing.rs` and the root `tests.rs` are \
+             declared without `#[cfg(test)]` and must stay production whatever they are called"
+        );
+    }
+
+    /// The live tree, both directions: an out-of-line test module has no
+    /// production text, and an out-of-line production module keeps all
+    /// of it (#1331).
+    ///
+    /// `claudemd/advice/cache/tests.rs` is the file that surfaced the
+    /// defect. `claudemd/advice/cache.rs` is itself out of line -- `mod
+    /// cache;` in `advice/mod.rs`, with no gate -- so it is the negative:
+    /// if the set over-reached, its `fn serve` would vanish from every
+    /// guard.
+    #[test]
+    fn the_live_tree_strips_an_out_of_line_test_module_and_keeps_its_parent() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let tests = src
+            .join("claudemd")
+            .join("advice")
+            .join("cache")
+            .join("tests.rs");
+        let body = std::fs::read_to_string(&tests).expect("read cache/tests.rs");
+        assert!(
+            body.contains("#[test]"),
+            "the fixture moved; repoint this guard"
+        );
+        assert_eq!(
+            production(&tests, &body),
+            "",
+            "cache/tests.rs is declared `#[cfg(test)] mod tests;` by cache.rs, so none of \
+             it is production"
+        );
+
+        let parent = src.join("claudemd").join("advice").join("cache.rs");
+        let body = std::fs::read_to_string(&parent).expect("read cache.rs");
+        assert!(
+            production(&parent, &body).contains("fn serve"),
+            "cache.rs is an ungated out-of-line module and must still be scanned"
+        );
     }
 
     /// The body of the function containing byte offset `at`, as text.
@@ -364,7 +647,7 @@ mod tests {
                 let Ok(src) = std::fs::read_to_string(&file) else {
                     continue;
                 };
-                let prod = &production(&src);
+                let prod = &production(&file, &src);
                 let rel = file.strip_prefix(&root).unwrap_or(&file).display();
                 let mut at = 0usize;
                 while let Some(i) = prod[at..].find("remove_dir_all(") {
@@ -522,7 +805,7 @@ mod tests {
                 let Ok(src) = std::fs::read_to_string(&file) else {
                     continue;
                 };
-                let prod = &production(&src);
+                let prod = &production(&file, &src);
                 let rel = file.strip_prefix(&root).unwrap_or(&file).display();
                 let mut at = 0usize;
                 while let Some(i) = prod[at..].find(REF) {
@@ -685,7 +968,7 @@ mod tests {
                 let Ok(src) = std::fs::read_to_string(&file) else {
                     continue;
                 };
-                for line in production(&src).lines() {
+                for line in production(&file, &src).lines() {
                     if is_comment(line) {
                         continue;
                     }
@@ -1703,7 +1986,7 @@ mod tests {
         // otherwise carry a trailing `\r`, which changes nothing for
         // `contains` here but is the house rule for any line-oriented scan
         // and costs nothing to keep.
-        let body: String = production(&src.replace("\r\n", "\n"))
+        let body: String = production(&path, &src.replace("\r\n", "\n"))
             .lines()
             .filter(|l| !is_comment(l))
             .collect::<Vec<_>>()
@@ -1781,7 +2064,7 @@ mod tests {
     fn the_claude_crash_notifier_is_wired_and_reads_first_observations() {
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
         let lib = std::fs::read_to_string(manifest.join("src/lib.rs")).expect("read lib.rs");
-        let body = production(&lib);
+        let body = production(&manifest.join("src/lib.rs"), &lib);
 
         assert!(
             body.contains("fn notify_claude_crash"),
@@ -1932,7 +2215,11 @@ mod tests {
                     && !p.ends_with("invariants.rs")
                     && !p.ends_with("remote/surface.rs")
             })
-            .filter_map(|p| std::fs::read_to_string(&p).ok().map(|src| production(&src)))
+            .filter_map(|p| {
+                std::fs::read_to_string(&p)
+                    .ok()
+                    .map(|src| production(&p, &src))
+            })
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -2250,7 +2537,7 @@ mod tests {
         // Production only: the test module's `EXPANDED` fixture names
         // events the epic proposes but does not install, and they have no
         // business being required here.
-        let installed_src = production(&install);
+        let installed_src = production(&manifest.join("src/claude/install.rs"), &install);
         let decl = installed_src
             .split_once("pub const EVENTS: &[&str] = &[")
             .map(|(_, rest)| rest)
@@ -2940,7 +3227,7 @@ mod tests {
                 let Ok(src) = std::fs::read_to_string(&file) else {
                     continue;
                 };
-                let prod = &production(&src);
+                let prod = &production(&file, &src);
                 let rel = file.strip_prefix(&root).unwrap_or(&file).display();
                 let mut at = 0usize;
                 // The UNWRAP specifically: `.ok_or_else(` is what makes
@@ -2998,7 +3285,10 @@ mod tests {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands.rs"),
         )
         .expect("commands.rs is readable");
-        let prod = &production(&src);
+        let prod = &production(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands.rs"),
+            &src,
+        );
 
         // The calls that start a walk. Each is a real entry point into
         // `worktrees::scan`, `artifacts::scan` or `caches`, and each one
@@ -3254,7 +3544,10 @@ mod tests {
         let on_check = |s: &str| s.ends_with(".check") || s == "check" || s.contains("Check");
 
         let brief = read("src/claudemd/advice/brief.rs");
-        let (seen, offenders) = wildcard_arms(&production(&brief), on_check);
+        let (seen, offenders) = wildcard_arms(
+            &production(&manifest.join("src/claudemd/advice/brief.rs"), &brief),
+            on_check,
+        );
         assert!(
             seen > 0,
             "no `match` on Check was found in brief.rs, so the shape this guard depends \
@@ -3270,7 +3563,10 @@ mod tests {
         // Negative proof: a real match with no wildcard is seen and
         // passes.
         let health = read("src/claude/confighealth.rs");
-        let (seen, offenders) = wildcard_arms(&production(&health), |s| s == "self");
+        let (seen, offenders) = wildcard_arms(
+            &production(&manifest.join("src/claude/confighealth.rs"), &health),
+            |s| s == "self",
+        );
         assert!(
             seen > 0,
             "confighealth.rs's `match self` must be visible to the scanner"
@@ -3284,13 +3580,19 @@ mod tests {
         // Scoping proof: a real `_ =>` on a tuple is flagged when the
         // scanner is unscoped, and silent under the Check scope.
         let markdown = read("src/packages/markdown.rs");
-        let (_, unscoped) = wildcard_arms(&production(&markdown), |_| true);
+        let (_, unscoped) = wildcard_arms(
+            &production(&manifest.join("src/packages/markdown.rs"), &markdown),
+            |_| true,
+        );
         assert!(
             !unscoped.is_empty(),
             "the scanner cannot see `Filter::admits`'s `_ => false`, so it could not see one \
              in brief.rs either"
         );
-        let (seen, scoped) = wildcard_arms(&production(&markdown), on_check);
+        let (seen, scoped) = wildcard_arms(
+            &production(&manifest.join("src/packages/markdown.rs"), &markdown),
+            on_check,
+        );
         assert_eq!(seen, 0);
         assert!(scoped.is_empty());
 
