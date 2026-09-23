@@ -103,7 +103,12 @@ use crate::claudemd::EffectiveScan;
 /// nastier case: a report that still decodes but no longer MEANS the
 /// same thing, because a producer's rule changed. A row at a different
 /// version is a miss, the same as a decode failure.
-pub const PAYLOAD_VERSION: i64 = 1;
+///
+/// 2: the transcripts producer re-roots every linked worktree and no
+/// longer counts a read of a file the session edits (#1324). A report
+/// stored before it fingerprints identically -- no tracked input moved --
+/// and would otherwise be served as current with the old findings.
+pub const PAYLOAD_VERSION: i64 = 2;
 
 /// Whether a fingerprint is a statement about every tracked input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -539,8 +544,9 @@ pub fn store(
 /// `(session_id, size_bytes, mtime_ms)` for every session recorded under
 /// `repo`, in a stable order.
 ///
-/// The same `claude_session` rows and the same agent-worktree re-rooting
-/// the transcripts producer selects by, so the fingerprint covers
+/// The same `claude_session` rows and the same worktree re-rooting
+/// (`transcripts::reroot_cwd`, one resolver per fingerprint) the
+/// transcripts producer selects by, so the fingerprint covers
 /// exactly the set that producer will read. A session row with no
 /// transcript path contributes its id alone: it is still an input (the
 /// producer reports it unreadable) and it can gain a path later.
@@ -563,10 +569,11 @@ fn session_keys(conn: &Connection, repo: &Path) -> Result<Vec<(String, i64, i64)
         })
         .map_err(|e| format!("claude_session: {e}"))?;
 
+    let mut worktrees = super::transcripts::Worktrees::new(repo);
     let mut out = Vec::new();
     for row in rows {
         let (session_id, cwd, transcript_path) = row.map_err(|e| format!("claude_session: {e}"))?;
-        if !super::transcripts::reroot_cwd(&cwd).starts_with(repo) {
+        if !super::transcripts::reroot_cwd(&cwd, &mut worktrees).starts_with(repo) {
             continue;
         }
         // A transcript we cannot stat is NOT a refusal that makes the

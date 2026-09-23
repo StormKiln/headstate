@@ -1066,6 +1066,14 @@ mod tests {
         // A store with three edits under docs/: the signal upgrades it.
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::store::migrate(&conn).unwrap();
+        // Rows count only under a ledger entry at the current rule.
+        conn.execute(
+            "INSERT INTO claude_advice_ledger
+                (session_id, size_bytes, mtime_ms, truncated, analysed_at, rule_version)
+             VALUES ('s1', 1, 1, 0, '2026-01-01T00:00:00Z', ?1)",
+            [super::super::transcripts::RULE_VERSION],
+        )
+        .unwrap();
         for i in 0..3 {
             conn.execute(
                 "INSERT INTO claude_advice_signal (session_id, signal, dir, key)

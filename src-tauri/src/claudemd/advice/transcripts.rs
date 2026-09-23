@@ -16,7 +16,7 @@
 //! | S1 corrected command | Bash A with `is_error: true` (or stderr and no stdout), then within the next [`CORRECTION_LOOKAHEAD`] Bash calls a B whose head differs, shares a non-flag token, and has `is_error: false` | same A-head → B-head in ≥ [`MIN_SESSIONS_CORRECTED`] sessions |
 //! | S2 user correction | a `user` text record whose first 6 words hold a word from [`NEGATIONS`], within [`CORRECTION_WINDOW`] records after a `tool_use` | same tool + head/path in ≥ [`MIN_SESSIONS_USER_CORRECTION`] sessions |
 //! | S3 denied call | `is_error: true` whose text carries one of [`DENIAL_PHRASES`], plus `claude_hook_event` `PermissionDenied` rows | same tool + head in ≥ [`MIN_SESSIONS_DENIED`] sessions |
-//! | S4 repeated search | identical Grep/Glob `pattern`, or a `Read` within the first [`EARLY_CALLS`] tool calls | ≥ [`MIN_SESSIONS_SEARCH`] sessions |
+//! | S4 repeated search | identical Grep/Glob `pattern`, or a `Read` within the first [`EARLY_CALLS`] tool calls of a file the session does not also Edit, Write or MultiEdit | ≥ [`MIN_SESSIONS_SEARCH`] sessions |
 //! | S5 repeated error | `is_error: true` text normalised by [`normalise_error`] | identical first [`ERROR_KEY_CHARS`] chars in ≥ [`MIN_SESSIONS_ERROR`] sessions |
 //! | S6 task census | sessions per attributed directory, from `claude_session` | always, as a count |
 //!
@@ -32,12 +32,17 @@
 //! A tool call's absolute `file_path` places the finding on the deepest
 //! CLAUDE.md-bearing ancestor directory from the repository scan, else
 //! the repository root; a Bash command has no path and attributes to the
-//! record's `cwd`. An agent-worktree path `<repo>/.claude/worktrees/
-//! agent-<id>/…` re-roots to `<repo>/…`, the shape
-//! `subagent::Kind::classify` matches. The stored row carries the
-//! attributed DIRECTORY, and which CLAUDE.md it maps to is decided at
-//! read time against the current scan, so a CLAUDE.md added since the
-//! pass moves the finding without a re-read.
+//! record's `cwd`. A path inside a linked git worktree of the repository
+//! re-roots to the repository: `<wt>/src/a.ts` is `<repo>/src/a.ts` for
+//! attribution, and a file path under the repository is keyed relative
+//! to it (`src/a.ts`), so the same file read in two worktrees is one key
+//! and a finding never names a disposable worktree. A worktree is
+//! identified by its `.git` file, not its directory name; [`Worktrees`]
+//! carries the rule, including what happens once the worktree has been
+//! deleted. The stored row carries the attributed DIRECTORY, and which
+//! CLAUDE.md it maps to is decided at read time against the current
+//! scan, so a CLAUDE.md added since the pass moves the finding without a
+//! re-read.
 //!
 //! # Already written is not a gap
 //!
@@ -58,7 +63,10 @@
 //! most [`SESSIONS_PER_PASS`] transcripts are READ per pass; a session
 //! whose `(size_bytes, mtime_ms)` matches `claude_advice_ledger` is
 //! served from `claude_advice_signal` without being opened, so a re-open
-//! re-reads only what changed. This runs on demand behind the panel, on
+//! re-reads only what changed. The ledger row also carries
+//! [`RULE_VERSION`]; a row from an older extraction rule is a miss, so a
+//! rule change re-reads every session once rather than serving rows the
+//! new rule would not have stored. This runs on demand behind the panel, on
 //! the command's `spawn_blocking`, and never on the live pass (#1246).
 //!
 //! # Coverage travels as findings
@@ -83,7 +91,6 @@
 
 use super::{Check, Context, Evidence, Finding, Locator, Producer, Severity, Subject};
 use crate::claude::preview::{blocks_of, Block, ToolArgs};
-use crate::claude::subagent::Kind;
 use crate::claudemd::{EffectiveScan, ImportNode, Scope};
 use rusqlite::Connection;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -100,6 +107,17 @@ pub const BUDGET_BYTES: u64 = crate::claude::search::INDEX_BUDGET_BYTES;
 /// seconds; a repository with more changed sessions than this answers
 /// with a floor and finishes on the next open.
 pub const SESSIONS_PER_PASS: usize = 200;
+
+/// The extraction rule's version, stored on every `claude_advice_ledger`
+/// row. A ledger row at any other version is a miss: its session is
+/// re-read and its signal rows replaced, because rows extracted under an
+/// older rule still decode and no longer mean the same thing. Bump it
+/// whenever [`extract`] would store different rows for the same bytes.
+///
+/// 1: worktree paths re-rooted structurally and keyed repo-relative; S4
+/// no longer counts a read of a file the session changes (#1324).
+/// Before it, every row is version 0 (migration 26's default).
+pub const RULE_VERSION: i64 = 1;
 
 /// S1: sessions showing the same A-head → B-head correction.
 const MIN_SESSIONS_CORRECTED: usize = 2;
@@ -169,7 +187,7 @@ impl Producer for Transcripts {
 /// One session under the repository, as `claude_session` holds it.
 struct SessionRow {
     session_id: String,
-    /// The recorded cwd, re-rooted out of an agent worktree.
+    /// The recorded cwd, re-rooted out of a linked worktree.
     dir: PathBuf,
     transcript_path: Option<String>,
     has_prompt: bool,
@@ -202,7 +220,9 @@ struct Row {
 /// `cap` transcripts, and assemble the findings.
 fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, String> {
     let repo = cx.repo;
-    let sessions = sessions_under(conn, repo)?;
+    // One resolver for the pass, so each worktree root is probed once.
+    let mut worktrees = Worktrees::new(repo);
+    let sessions = sessions_under(conn, repo, &mut worktrees)?;
     let root_subject = subject_for(repo, cx.scan);
 
     if sessions.is_empty() {
@@ -226,13 +246,17 @@ fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, 
 
     // The ledger, read once. A session whose transcript is unchanged is
     // served from its stored rows without being opened.
+    // A row written under another rule version is not known.
     let mut known: HashMap<String, (i64, i64, bool)> = HashMap::new();
     {
         let mut q = conn
-            .prepare("SELECT session_id, size_bytes, mtime_ms, truncated FROM claude_advice_ledger")
+            .prepare(
+                "SELECT session_id, size_bytes, mtime_ms, truncated FROM claude_advice_ledger
+                  WHERE rule_version = ?1",
+            )
             .map_err(|e| format!("claude_advice_ledger: {e}"))?;
         let rows = q
-            .query_map([], |r| {
+            .query_map([RULE_VERSION], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, i64>(1)?,
@@ -300,7 +324,7 @@ fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, 
                 continue;
             }
         };
-        let rows = extract(&s.session_id, &s.dir, &body, repo);
+        let rows = extract(&s.session_id, &s.dir, &body, &mut worktrees);
         if let Err(e) = store_rows(conn, &s.session_id, &rows, size, mtime, cut, &now) {
             unreadable.push((
                 s.session_id.clone(),
@@ -379,22 +403,26 @@ fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, 
 /// producer: a directory sessions keep editing is one whose missing
 /// CLAUDE.md matters more than an untouched one's.
 ///
-/// Reads only what a pass already stored. A repository no pass has run
+/// Reads only what a pass already stored, and only rows stored under the
+/// current [`RULE_VERSION`]: a row from an older rule may carry a
+/// worktree directory that re-roots now. A repository no pass has run
 /// over yields an empty list, which is "no edits recorded", not "no
 /// edits".
 pub fn edited_dirs(conn: &Connection, repo: &Path) -> Result<Vec<PathBuf>, String> {
     let mut q = conn
         .prepare(
-            "SELECT dir, COUNT(*) FROM claude_advice_signal
-              WHERE signal = ?1
-              GROUP BY dir HAVING COUNT(*) >= ?2
-              ORDER BY dir",
+            "SELECT s.dir, COUNT(*) FROM claude_advice_signal s
+               JOIN claude_advice_ledger l ON l.session_id = s.session_id
+              WHERE s.signal = ?1 AND l.rule_version = ?3
+              GROUP BY s.dir HAVING COUNT(*) >= ?2
+              ORDER BY s.dir",
         )
         .map_err(|e| format!("claude_advice_signal: {e}"))?;
     let rows = q
-        .query_map(rusqlite::params![SIG_EDIT, MIN_EDITS_PER_DIR as i64], |r| {
-            r.get::<_, String>(0)
-        })
+        .query_map(
+            rusqlite::params![SIG_EDIT, MIN_EDITS_PER_DIR as i64, RULE_VERSION],
+            |r| r.get::<_, String>(0),
+        )
         .map_err(|e| format!("claude_advice_signal: {e}"))?;
     let mut out = Vec::new();
     for row in rows {
@@ -406,10 +434,14 @@ pub fn edited_dirs(conn: &Connection, repo: &Path) -> Result<Vec<PathBuf>, Strin
     Ok(out)
 }
 
-/// The sessions whose recorded cwd is under `repo`, agent worktrees
-/// re-rooted first so a session run in `<repo>/.claude/worktrees/
-/// agent-x` counts as the repository's own.
-fn sessions_under(conn: &Connection, repo: &Path) -> Result<Vec<SessionRow>, String> {
+/// The sessions whose recorded cwd is under `repo`, linked worktrees
+/// re-rooted first so a session run in `<repo>/.worktrees/t1` is
+/// attributed to the repository itself.
+fn sessions_under(
+    conn: &Connection,
+    repo: &Path,
+    worktrees: &mut Worktrees,
+) -> Result<Vec<SessionRow>, String> {
     let mut q = conn
         .prepare(
             "SELECT session_id, cwd, transcript_path, opening_prompt
@@ -432,7 +464,7 @@ fn sessions_under(conn: &Connection, repo: &Path) -> Result<Vec<SessionRow>, Str
     for row in rows {
         let (session_id, cwd, transcript_path, prompt) =
             row.map_err(|e| format!("claude_session: {e}"))?;
-        let dir = reroot_cwd(&cwd);
+        let dir = reroot_cwd(&cwd, worktrees);
         // `Path::starts_with` is by component, so `<repo>2` is not under
         // `<repo>`, and it is the same test on Windows separators.
         if !dir.starts_with(repo) {
@@ -448,50 +480,200 @@ fn sessions_under(conn: &Connection, repo: &Path) -> Result<Vec<SessionRow>, Str
     Ok(out)
 }
 
-/// A session's cwd, re-rooted when it is an agent worktree root: the
-/// last three components `.claude/worktrees/agent-<id>` are stripped, the
-/// exact shape `Kind::classify` matches and nothing looser.
+/// A session's cwd, re-rooted when it lies in a linked worktree of the
+/// repository (see [`Worktrees`]).
 ///
 /// `pub(super)` so `cache::session_keys` selects the same session set
 /// this producer will read. Two copies of this rule would be two answers
 /// to "is this session under the repository", and the fingerprint would
-/// cover a set the producer does not read.
-pub(super) fn reroot_cwd(cwd: &str) -> PathBuf {
-    let p = Path::new(cwd);
-    if Kind::classify(Some(cwd)).is_subagent() {
-        if let Some(root) = p.parent().and_then(Path::parent).and_then(Path::parent) {
-            return root.to_path_buf();
-        }
-    }
-    p.to_path_buf()
+/// cover a set the producer does not read. Only paths already under the
+/// repository are re-rooted, and they re-root to paths still under it,
+/// so the set is decided by the recorded cwd alone -- a worktree deleted
+/// since does not move a session in or out of it.
+pub(super) fn reroot_cwd(cwd: &str, worktrees: &mut Worktrees) -> PathBuf {
+    worktrees.reroot(Path::new(cwd))
 }
 
-/// A tool call's path, re-rooted when it lies under an agent worktree
-/// anywhere in its ancestry: `<repo>/.claude/worktrees/agent-x/src/a.rs`
-/// is `<repo>/src/a.rs` for attribution.
-fn reroot_path(path: &Path) -> PathBuf {
-    let comps: Vec<std::path::Component> = path.components().collect();
-    let names: Vec<String> = comps
-        .iter()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect();
-    for i in 0..names.len().saturating_sub(2) {
-        if names[i] == ".claude"
-            && names[i + 1] == "worktrees"
-            && names[i + 2]
-                .strip_prefix("agent-")
-                .is_some_and(|id| !id.is_empty())
-        {
-            let mut out = PathBuf::new();
-            for (j, c) in comps.iter().enumerate() {
-                if j < i || j > i + 2 {
-                    out.push(c);
-                }
-            }
-            return out;
+/// What probing one directory established about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Probe {
+    /// Its `.git` is a file naming `<repo>/.git/worktrees/<name>`.
+    Worktree,
+    /// It exists and is not a linked worktree of this repository: no
+    /// `.git`, a `.git` directory, a submodule's `.git` file, or a
+    /// worktree of a different repository.
+    NotWorktree,
+    /// It could not be probed: it no longer exists (a worktree removed
+    /// after its branch merged), or its `.git` would not read.
+    Unprobeable,
+}
+
+/// The linked git worktrees of one repository, identified structurally
+/// and cached per directory for the life of one pass.
+///
+/// A linked worktree's root holds a `.git` FILE reading `gitdir:
+/// <repo>/.git/worktrees/<name>`; that is how git itself finds its way
+/// back, and it is what is tested here, so no directory name is guessed.
+/// A path `<wt>/<rel>` inside one re-roots to `<repo>/<rel>`.
+///
+/// Only directories strictly under the repository are probed. A
+/// worktree kept outside it (`../repo-t1`) is not a path this producer
+/// selects sessions by, and resolving it would make the session set
+/// depend on whether that directory still exists.
+///
+/// A worktree that has since been deleted cannot be probed. Then, and
+/// only then, Claude Code's own layout `<repo>/.claude/worktrees/<name>/`
+/// re-roots by shape, which is what this rule did for `agent-<id>`
+/// before it was structural. Any other deleted worktree (`.worktrees/t1`)
+/// is left as its absolute path and keyed as such: visibly not
+/// re-rooted, never guessed.
+pub(super) struct Worktrees<'a> {
+    repo: &'a Path,
+    /// `repo` canonicalized, once, for a `gitdir:` that spells the
+    /// repository differently (a symlinked home, `/private/var`).
+    canonical: Option<Option<PathBuf>>,
+    probed: HashMap<PathBuf, Probe>,
+}
+
+impl<'a> Worktrees<'a> {
+    pub(super) fn new(repo: &'a Path) -> Worktrees<'a> {
+        Worktrees {
+            repo,
+            canonical: None,
+            probed: HashMap::new(),
         }
     }
-    path.to_path_buf()
+
+    /// `path` re-rooted out of the deepest linked worktree holding it,
+    /// else unchanged.
+    fn reroot(&mut self, path: &Path) -> PathBuf {
+        let Ok(rel) = path.strip_prefix(self.repo) else {
+            return path.to_path_buf();
+        };
+        let comps: Vec<std::path::Component> = rel.components().collect();
+        // Deepest first, so a worktree nested inside another resolves to
+        // the path relative to the inner one.
+        let mut unprobeable = vec![false; comps.len() + 1];
+        for k in (1..=comps.len()).rev() {
+            let root = comps[..k]
+                .iter()
+                .fold(self.repo.to_path_buf(), |p, c| p.join(c));
+            match self.probe(&root) {
+                Probe::Worktree => {
+                    return comps[k..]
+                        .iter()
+                        .fold(self.repo.to_path_buf(), |p, c| p.join(c));
+                }
+                Probe::NotWorktree => {}
+                Probe::Unprobeable => unprobeable[k] = true,
+            }
+        }
+        // The fallback for a deleted worktree in Claude Code's layout.
+        for i in (0..comps.len().saturating_sub(2)).rev() {
+            let name = |j: usize| comps[j].as_os_str().to_string_lossy();
+            if name(i) == ".claude"
+                && name(i + 1) == "worktrees"
+                && !name(i + 2).is_empty()
+                && unprobeable[i + 3]
+            {
+                return comps[..i]
+                    .iter()
+                    .chain(&comps[i + 3..])
+                    .fold(self.repo.to_path_buf(), |p, c| p.join(c));
+            }
+        }
+        path.to_path_buf()
+    }
+
+    fn probe(&mut self, dir: &Path) -> Probe {
+        if let Some(p) = self.probed.get(dir) {
+            return *p;
+        }
+        let p = self.probe_uncached(dir);
+        self.probed.insert(dir.to_path_buf(), p);
+        p
+    }
+
+    fn probe_uncached(&mut self, dir: &Path) -> Probe {
+        match std::fs::metadata(dir) {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => return Probe::NotWorktree,
+            Err(_) => return Probe::Unprobeable,
+        }
+        let dot_git = dir.join(".git");
+        match std::fs::symlink_metadata(&dot_git) {
+            Ok(m) if m.is_file() => {}
+            Ok(_) => return Probe::NotWorktree,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Probe::NotWorktree,
+            Err(_) => return Probe::Unprobeable,
+        }
+        let Ok(text) = std::fs::read_to_string(&dot_git) else {
+            return Probe::Unprobeable;
+        };
+        let Some(target) = text.trim().strip_prefix("gitdir:").map(str::trim) else {
+            return Probe::NotWorktree;
+        };
+        // Relative since git 2.48's `worktree.useRelativePaths`.
+        let target = lexical(&dir.join(target));
+        let is_worktree_dir = |p: &Path| {
+            let name = |p: Option<&Path>| p.and_then(Path::file_name).map(|n| n.to_os_string());
+            let parent = p.parent();
+            let grandparent = parent.and_then(Path::parent);
+            p.file_name().is_some()
+                && name(parent).as_deref() == Some(std::ffi::OsStr::new("worktrees"))
+                && name(grandparent).as_deref() == Some(std::ffi::OsStr::new(".git"))
+        };
+        if !is_worktree_dir(&target) {
+            return Probe::NotWorktree;
+        }
+        let Some(owner) = target
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+        else {
+            return Probe::NotWorktree;
+        };
+        if owner == self.repo {
+            return Probe::Worktree;
+        }
+        let repo = self.repo;
+        let canonical = self
+            .canonical
+            .get_or_insert_with(|| std::fs::canonicalize(repo).ok());
+        match (canonical.as_deref(), std::fs::canonicalize(owner).ok()) {
+            (Some(r), Some(o)) if r == o => Probe::Worktree,
+            _ => Probe::NotWorktree,
+        }
+    }
+}
+
+/// `..` and `.` resolved by component, without touching the filesystem.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// A file path's dedup key: relative to the repository with `/`
+/// separators when under it, so the same file read in two worktrees, or
+/// on two platforms, is one key; absolute otherwise.
+fn path_key(path: &Path, repo: &Path) -> String {
+    match path.strip_prefix(repo) {
+        Ok(rel) if rel.components().next().is_some() => rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
+        _ => path.to_string_lossy().into_owned(),
+    }
 }
 
 /// Read up to `budget` bytes of a transcript, reading one more so the
@@ -545,7 +727,12 @@ impl Outcome {
 }
 
 /// Extract every signal occurrence from one transcript body.
-fn extract(session_id: &str, session_dir: &Path, body: &str, repo: &Path) -> Vec<Row> {
+fn extract(
+    session_id: &str,
+    session_dir: &Path,
+    body: &str,
+    worktrees: &mut Worktrees,
+) -> Vec<Row> {
     let mut calls: Vec<Call> = Vec::new();
     let mut outcomes: HashMap<String, Outcome> = HashMap::new();
     let mut user_texts: Vec<(u64, String)> = Vec::new();
@@ -563,7 +750,7 @@ fn extract(session_id: &str, session_dir: &Path, body: &str, repo: &Path) -> Vec
             .get("cwd")
             .and_then(|c| c.as_str())
             .filter(|c| !c.is_empty())
-            .map(reroot_cwd)
+            .map(|c| reroot_cwd(c, worktrees))
             .unwrap_or_else(|| session_dir.to_path_buf());
         let Some(message) = rec.get("message") else {
             continue;
@@ -572,7 +759,7 @@ fn extract(session_id: &str, session_dir: &Path, body: &str, repo: &Path) -> Vec
             "assistant" => {
                 for b in blocks_of(message.get("content")) {
                     if let Block::ToolUse { name, id, args } = b {
-                        calls.push(call_of(record, name, id, args, &dir, repo));
+                        calls.push(call_of(record, name, id, args, &dir, worktrees));
                     }
                 }
             }
@@ -730,11 +917,20 @@ fn extract(session_id: &str, session_dir: &Path, body: &str, repo: &Path) -> Vec
         }
     }
 
-    // S4 -- repeated search, and the edit census for `edited_dirs`.
+    // S4 -- repeated search, and the edit census for `edited_dirs`. A
+    // file the session also changes, before or after the read, is one it
+    // was working on, not one it had to go looking for (#1324).
+    let changed: HashSet<&str> = calls
+        .iter()
+        .filter(|c| is_change(&c.name))
+        .map(|c| c.key.as_str())
+        .collect();
     for (i, c) in calls.iter().enumerate() {
         match c.name.as_str() {
             "Grep" | "Glob" => rows.push(row(SIG_SEARCH, c, c.key.clone())),
-            "Read" if i < EARLY_CALLS => rows.push(row(SIG_SEARCH, c, c.key.clone())),
+            "Read" if i < EARLY_CALLS && !changed.contains(c.key.as_str()) => {
+                rows.push(row(SIG_SEARCH, c, c.key.clone()))
+            }
             "Edit" | "Write" | "MultiEdit" => rows.push(row(SIG_EDIT, c, c.key.clone())),
             _ => {}
         }
@@ -749,23 +945,9 @@ fn call_of(
     id: Option<String>,
     args: ToolArgs,
     cwd: &Path,
-    repo: &Path,
+    worktrees: &mut Worktrees,
 ) -> Call {
-    let file_key = |file_path: &str| -> (String, PathBuf) {
-        let p = reroot_path(Path::new(file_path));
-        let dir = p
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| cwd.to_path_buf());
-        // A path outside the repository attributes to the record's cwd:
-        // there is no CLAUDE.md under the repository for it.
-        let dir = if dir.starts_with(repo) {
-            dir
-        } else {
-            cwd.to_path_buf()
-        };
-        (p.to_string_lossy().into_owned(), dir)
-    };
+    let repo = worktrees.repo;
     let (key, dir, tokens) = match &args {
         ToolArgs::Bash { command, .. } => {
             let (head, tokens) = command_head(command);
@@ -777,13 +959,24 @@ fn call_of(
         | ToolArgs::Read { file_path, .. }
             if !file_path.is_empty() =>
         {
-            let (k, d) = file_key(file_path);
-            (k, d, Vec::new())
+            let p = worktrees.reroot(Path::new(file_path));
+            let dir = p
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| cwd.to_path_buf());
+            // A path outside the repository attributes to the record's
+            // cwd: there is no CLAUDE.md under the repository for it.
+            let dir = if dir.starts_with(repo) {
+                dir
+            } else {
+                cwd.to_path_buf()
+            };
+            (path_key(&p, repo), dir, Vec::new())
         }
         ToolArgs::Grep { pattern, path, .. } | ToolArgs::Glob { pattern, path } => {
             let dir = path
                 .as_deref()
-                .map(|p| reroot_path(Path::new(p)))
+                .map(|p| worktrees.reroot(Path::new(p)))
                 .filter(|p| p.starts_with(repo))
                 .unwrap_or_else(|| cwd.to_path_buf());
             (pattern.clone(), dir, Vec::new())
@@ -838,6 +1031,11 @@ fn command_head(command: &str) -> (String, Vec<String>) {
         .filter(|t| !t.starts_with('-') && t.len() >= 2 && !matches!(t.as_str(), "&&" | "||"))
         .collect();
     (head, shared)
+}
+
+/// Whether a tool call changes the file it names.
+fn is_change(tool: &str) -> bool {
+    matches!(tool, "Edit" | "Write" | "MultiEdit")
 }
 
 /// Whether a result's text is one of Claude Code's denial phrasings.
@@ -958,11 +1156,12 @@ fn store_rows(
         )?;
     }
     tx.execute(
-        "INSERT INTO claude_advice_ledger (session_id, size_bytes, mtime_ms, truncated, analysed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO claude_advice_ledger
+            (session_id, size_bytes, mtime_ms, truncated, analysed_at, rule_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(session_id) DO UPDATE SET
-            size_bytes = ?2, mtime_ms = ?3, truncated = ?4, analysed_at = ?5",
-        rusqlite::params![session_id, size, mtime, truncated as i64, now],
+            size_bytes = ?2, mtime_ms = ?3, truncated = ?4, analysed_at = ?5, rule_version = ?6",
+        rusqlite::params![session_id, size, mtime, truncated as i64, now, RULE_VERSION],
     )?;
     tx.commit()
 }
@@ -1596,14 +1795,16 @@ mod tests {
             "{out:#?}"
         );
 
-        assert_eq!(reroot_cwd(&wt_s), repo);
-        assert_eq!(reroot_cwd(&cwd), repo);
-        // A bare `agent-` is not a worktree, exactly as `Kind::classify`
-        // rules, and a file path under one re-roots the same way.
-        let bare = repo.join(".claude").join("worktrees").join("agent-");
-        assert_eq!(reroot_cwd(&bare.to_string_lossy()), bare);
+        // The worktree directory does not exist here, which is the
+        // deleted-worktree fallback for Claude Code's own layout.
+        let mut w = Worktrees::new(repo);
+        assert_eq!(reroot_cwd(&wt_s, &mut w), repo);
+        assert_eq!(reroot_cwd(&cwd, &mut w), repo);
+        // `.claude/worktrees` itself names no worktree.
+        let bare = repo.join(".claude").join("worktrees");
+        assert_eq!(reroot_cwd(&bare.to_string_lossy(), &mut w), bare);
         assert_eq!(
-            reroot_path(&wt.join("src").join("a.rs")),
+            w.reroot(&wt.join("src").join("a.rs")),
             repo.join("src").join("a.rs")
         );
     }
@@ -2048,7 +2249,7 @@ mod tests {
     }
 
     fn rows_of(body: &str, cwd: &str, repo: &Path) -> Vec<Row> {
-        extract("s", Path::new(cwd), body, repo)
+        extract("s", Path::new(cwd), body, &mut Worktrees::new(repo))
     }
 
     /// S2: a negation in the first six words, within five records of a
@@ -2240,10 +2441,14 @@ mod tests {
         assert_eq!(search[0].key, "fn main");
         assert_eq!(search[0].aux.as_deref(), Some("Grep"));
         assert!(
-            search.iter().all(|r| r.key != format!("{cwd}/README.md")),
+            search.iter().all(|r| r.key != "README.md"),
             "the late read is not orientation"
         );
         assert_eq!(search[1].dir, repo.join("src"));
+        assert_eq!(
+            search[1].key, "src/f0.rs",
+            "keyed relative to the repository"
+        );
         let err: Vec<&Row> = rows.iter().filter(|r| r.signal == SIG_ERROR).collect();
         assert_eq!(err.len(), 1);
         assert_eq!(
@@ -2399,6 +2604,262 @@ mod tests {
             placement(&refs, &claude_dirs(&context(repo, &scan, &conn)), repo),
             repo
         );
+    }
+
+    /// A linked worktree of `repo` at `repo/<rel>`, as `git worktree
+    /// add` leaves it: a `.git` FILE naming `<repo>/.git/worktrees/<name>`.
+    fn worktree(repo: &Path, rel: &[&str], name: &str) -> PathBuf {
+        let wt = rel.iter().fold(repo.to_path_buf(), |p, c| p.join(c));
+        fs::create_dir_all(wt.join("src")).unwrap();
+        let admin = repo.join(".git").join("worktrees").join(name);
+        fs::create_dir_all(&admin).unwrap();
+        fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", admin.to_string_lossy()),
+        )
+        .unwrap();
+        wt
+    }
+
+    fn early_reads(findings: &[Finding]) -> Vec<&Finding> {
+        findings
+            .iter()
+            .filter(|f| f.finding.contains("was read within the first"))
+            .collect()
+    }
+
+    /// #1324: three sessions that each read a file early and then edit
+    /// it were working on it, not searching for it. No S4 finding, and
+    /// the edit census still sees the edits, re-rooted out of the
+    /// worktree.
+    #[test]
+    fn a_read_of_a_file_the_session_edits_is_not_a_search() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path();
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let wt = worktree(repo, &[".wt", "t1"], "t1");
+        let file = wt.join("src").join("a.ts");
+        let wt_s = wt.to_string_lossy().into_owned();
+        let conn = db();
+        for n in [1, 2, 3] {
+            let body = [
+                tool_use(
+                    &wt_s,
+                    &format!("r{n}"),
+                    "Read",
+                    serde_json::json!({"file_path":file.to_string_lossy()}),
+                ),
+                tool_use(
+                    &wt_s,
+                    &format!("e{n}"),
+                    "Edit",
+                    serde_json::json!({"file_path":file.to_string_lossy(),"old_string":"a","new_string":"b"}),
+                ),
+            ]
+            .join("\n");
+            let p = write(repo, &format!("s{n}.jsonl"), &body);
+            insert_session(&conn, &format!("s{n}"), &wt_s, Some(&p), None);
+        }
+        let scan = scan_effective_opt(repo, None);
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        assert!(early_reads(&out).is_empty(), "{out:#?}");
+        assert_eq!(edited_dirs(&conn, repo).unwrap(), vec![repo.join("src")]);
+        // The census re-roots the worktree cwd to the repository.
+        assert!(
+            out.iter().any(|f| f.finding
+                == format!(
+                    "3 sessions recorded under `{}`; 0 with an opening prompt, 3 analysed",
+                    repo.display()
+                )),
+            "{out:#?}"
+        );
+
+        // The control: the same reads without the edits are a finding.
+        let only = |n: usize| {
+            tool_use(
+                &wt_s,
+                &format!("r{n}"),
+                "Read",
+                serde_json::json!({"file_path":file.to_string_lossy()}),
+            )
+        };
+        for n in [1, 2, 3] {
+            write(repo, &format!("s{n}.jsonl"), &only(n));
+        }
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        assert_eq!(early_reads(&out).len(), 1, "{out:#?}");
+    }
+
+    /// #1324: the same file read early in two worktrees and in the
+    /// repository itself is ONE key, `src/a.ts`, counted over three
+    /// sessions and placed on the repository, never on a worktree.
+    #[test]
+    fn early_reads_in_two_worktrees_and_the_repository_are_one_key() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path();
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let w1 = worktree(repo, &[".wt", "t1"], "t1");
+        let w2 = worktree(repo, &[".wt", "t2"], "t2");
+        let conn = db();
+        for (n, root) in [(1, &w1), (2, &w2), (3, &repo.to_path_buf())] {
+            let cwd = root.to_string_lossy().into_owned();
+            let file = root.join("src").join("a.ts");
+            let body = tool_use(
+                &cwd,
+                &format!("r{n}"),
+                "Read",
+                serde_json::json!({"file_path":file.to_string_lossy()}),
+            );
+            let p = write(repo, &format!("s{n}.jsonl"), &body);
+            insert_session(&conn, &format!("s{n}"), &cwd, Some(&p), None);
+        }
+        let scan = scan_effective_opt(repo, None);
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        let hits = early_reads(&out);
+        assert_eq!(hits.len(), 1, "{out:#?}");
+        assert_eq!(
+            hits[0].finding,
+            format!(
+                "`src/a.ts` was read within the first {EARLY_CALLS} tool calls in 3 sessions under `{}`",
+                repo.display()
+            )
+        );
+        assert_eq!(hits[0].evidence.len(), 3);
+        assert!(
+            out.iter().all(|f| !f.finding.contains(".wt")),
+            "no finding names a worktree: {out:#?}"
+        );
+    }
+
+    /// A worktree is what its `.git` file says, not what its directory is
+    /// called: a relative `gitdir:` counts, a submodule, a worktree of
+    /// another repository and a plain directory do not, and the deepest
+    /// worktree wins.
+    #[test]
+    fn a_worktree_is_identified_by_its_git_file_not_its_name() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let rel = |root: &Path| root.join("src").join("a.rs");
+        let mut w = Worktrees::new(&repo);
+
+        let named = worktree(&repo, &[".worktrees", "t1"], "t1");
+        assert_eq!(w.reroot(&rel(&named)), rel(&repo));
+        assert_eq!(w.reroot(&named), repo, "the root itself re-roots");
+
+        let relative = repo.join("trees").join("t2");
+        fs::create_dir_all(&relative).unwrap();
+        fs::write(relative.join(".git"), "gitdir: ../../.git/worktrees/t2\n").unwrap();
+        assert_eq!(w.reroot(&rel(&relative)), rel(&repo));
+
+        let submodule = repo.join("vendor").join("lib");
+        fs::create_dir_all(&submodule).unwrap();
+        fs::write(submodule.join(".git"), "gitdir: ../../.git/modules/lib\n").unwrap();
+        assert_eq!(w.reroot(&rel(&submodule)), rel(&submodule));
+
+        let foreign = repo.join(".worktrees").join("t3");
+        fs::create_dir_all(&foreign).unwrap();
+        let other = t
+            .path()
+            .join("other")
+            .join(".git")
+            .join("worktrees")
+            .join("t3");
+        fs::write(
+            foreign.join(".git"),
+            format!("gitdir: {}\n", other.to_string_lossy()),
+        )
+        .unwrap();
+        assert_eq!(w.reroot(&rel(&foreign)), rel(&foreign));
+
+        // Claude Code's layout, present but not a worktree: the structure
+        // says no, and the shape fallback does not overrule it.
+        let plain = repo.join(".claude").join("worktrees").join("t4");
+        fs::create_dir_all(&plain).unwrap();
+        assert_eq!(w.reroot(&rel(&plain)), rel(&plain));
+
+        let inner = worktree(
+            &repo,
+            &[".worktrees", "t1", ".claude", "worktrees", "t5"],
+            "t5",
+        );
+        assert_eq!(w.reroot(&rel(&inner)), rel(&repo));
+
+        // Outside the repository nothing is probed or re-rooted.
+        let outside = t.path().join("elsewhere").join("a.rs");
+        assert_eq!(w.reroot(&outside), outside);
+    }
+
+    /// A worktree deleted since the session ran cannot be probed. Claude
+    /// Code's own layout re-roots by shape; any other layout is left as
+    /// its absolute path rather than guessed. And a root, once probed,
+    /// keeps its answer for the rest of the pass.
+    #[test]
+    fn a_deleted_worktree_falls_back_to_the_known_layout_only() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path();
+        let mut w = Worktrees::new(repo);
+        let gone = repo
+            .join(".claude")
+            .join("worktrees")
+            .join("t6")
+            .join("src")
+            .join("a.rs");
+        assert_eq!(w.reroot(&gone), repo.join("src").join("a.rs"));
+        let unknown = repo.join(".worktrees").join("t7").join("src").join("a.rs");
+        assert_eq!(w.reroot(&unknown), unknown);
+        assert_eq!(path_key(&unknown, repo), ".worktrees/t7/src/a.rs");
+
+        // Probed once per pass: deleting the worktree mid-pass does not
+        // change this resolver's answer, and a new pass sees it gone.
+        let wt = worktree(repo, &[".worktrees", "t8"], "t8");
+        let file = wt.join("src").join("a.rs");
+        assert_eq!(w.reroot(&file), repo.join("src").join("a.rs"));
+        fs::remove_dir_all(&wt).unwrap();
+        assert_eq!(w.reroot(&file), repo.join("src").join("a.rs"));
+        assert_eq!(Worktrees::new(repo).reroot(&file), file);
+    }
+
+    /// Rows stored under an older extraction rule are not served: the
+    /// session is re-read even though its transcript has not moved, and
+    /// its rows are replaced.
+    #[test]
+    fn a_ledger_row_from_an_older_rule_is_re_read() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path();
+        let cwd = repo.to_string_lossy().into_owned();
+        let conn = db();
+        let s1 = write(repo, "s1.jsonl", &corrected_pair(&cwd, 1));
+        insert_session(&conn, "s1", &cwd, Some(&s1), None);
+        let scan = scan_effective_opt(repo, None);
+        let cx = context(repo, &scan, &conn);
+        analyse(&conn, &cx, SESSIONS_PER_PASS).unwrap();
+
+        // What an older build left behind: the same (size, mtime), an
+        // old key, and no rule version.
+        conn.execute_batch(
+            "UPDATE claude_advice_ledger SET rule_version = 0, analysed_at = 'old';
+             UPDATE claude_advice_signal SET key = 'stale';",
+        )
+        .unwrap();
+        analyse(&conn, &cx, SESSIONS_PER_PASS).unwrap();
+        let (version, at): (i64, String) = conn
+            .query_row(
+                "SELECT rule_version, analysed_at FROM claude_advice_ledger WHERE session_id = 's1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(version, RULE_VERSION);
+        assert_ne!(at, "old", "the session was not re-read");
+        let stale: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claude_advice_signal WHERE key = 'stale'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale, 0, "the old rule's rows were replaced");
     }
 
     /// Measured over this machine's real corpus: wall time cold and warm,
