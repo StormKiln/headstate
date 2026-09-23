@@ -15,8 +15,13 @@
 //!
 //! - **path**: the CLAUDE.md's own directory, then the repository root,
 //!   then a unique suffix match over the tree, walked with the same
-//!   [`SKIP`] list `scan_repo` uses. Two matches is `Unknown`
-//!   ("ambiguous"), never a guess. A path that lies UNDER a pruned
+//!   [`SKIP`] list `scan_repo` uses. A nested CLAUDE.md describes its
+//!   own directory, so when any suffix match lies under that directory
+//!   only those count: measured, a nested e2e file's `helpers/` matched
+//!   7 paths across sibling apps and exactly one under its own (#1319).
+//!   With none under it, the whole tree counts; for the root file the
+//!   two are the same. Two matches is `Unknown` ("ambiguous"), never a
+//!   guess. A path that lies UNDER a pruned
 //!   directory is `Unknown` naming the prune, never `Missing`: the walk
 //!   did not enter it, and #1299 is what one prune reading as absence
 //!   costs. Neither this walk nor `scan_repo` prunes `.claude` for
@@ -1184,6 +1189,14 @@ impl<'a> Resolver<'a> {
                 tree.pruning(clean).map(str::to_string),
             )
         };
+        // A nested CLAUDE.md describes its own directory (#1319): when
+        // any match lies under it, only those are candidates. One
+        // resolves; two are still ambiguous. None falls back to the
+        // whole tree. For the root file the own directory is the
+        // repository, so this changes nothing there.
+        let own = relative(&repo, dir).unwrap_or_default();
+        let mine: Vec<String> = matches.iter().filter(|m| under(&own, m)).cloned().collect();
+        let matches = if mine.is_empty() { matches } else { mine };
         match matches.len() {
             1 => Ok(Resolved::File(repo.join(&matches[0]))),
             // Ordered before the Missing arm on purpose: a reference
@@ -2842,6 +2855,51 @@ Run `yarn paw`, not `yarn nope`. Use the `tentacle` skill, not the `ink` skill.
             matches!(rot.findings[0].verdict, Verdict::Unknown(_)),
             "{rot:?}"
         );
+    }
+
+    /// #1319: a nested CLAUDE.md describes its own directory. A suffix
+    /// with one match under it resolves, whatever sibling apps hold.
+    #[test]
+    fn an_ambiguous_suffix_resolves_by_its_one_match_in_the_own_subtree() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        fs::create_dir_all(root.join("a").join("src").join("helpers")).unwrap();
+        fs::create_dir_all(root.join("b").join("src").join("helpers")).unwrap();
+        fs::write(
+            root.join("a").join("CLAUDE.md"),
+            "shared code in `helpers/`\n",
+        )
+        .unwrap();
+        let rot = check_nested(root, "a/CLAUDE.md");
+        assert!(rot.findings.is_empty(), "{rot:?}");
+        assert_eq!(rot.refs_checked, 1, "{rot:?}");
+    }
+
+    /// Two matches under the own directory is still ambiguous. Never a
+    /// guess.
+    #[test]
+    fn two_matches_in_the_own_subtree_are_still_ambiguous() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        fs::create_dir_all(root.join("a").join("x").join("helpers")).unwrap();
+        fs::create_dir_all(root.join("a").join("y").join("helpers")).unwrap();
+        fs::create_dir_all(root.join("b").join("helpers")).unwrap();
+        fs::write(
+            root.join("a").join("CLAUDE.md"),
+            "shared code in `helpers/`\n",
+        )
+        .unwrap();
+        let rot = check_nested(root, "a/CLAUDE.md");
+        assert_eq!(rot.findings.len(), 1, "{rot:?}");
+        match &rot.findings[0].verdict {
+            Verdict::Unknown(why) => assert!(
+                why.contains("ambiguous")
+                    && why.contains("a/x/helpers")
+                    && !why.contains("b/helpers"),
+                "the own-subtree matches are named: {why}"
+            ),
+            other => panic!("{other:?}"),
+        }
     }
 
     fn git_init(dir: &Path) {
