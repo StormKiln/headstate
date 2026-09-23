@@ -506,7 +506,14 @@ const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 ///
 /// Every failure is `Err`, never an empty set: a git that did not answer
 /// did not say "not ignored" (#1050).
-fn check_ignored(git: &Path, repo: &Path, paths: &[String]) -> Result<BTreeSet<String>, String> {
+///
+/// `pub(super)` so the transcripts producer asks git the same way when
+/// it tests whether a deleted session directory was ignored (#1335).
+pub(super) fn check_ignored(
+    git: &Path,
+    repo: &Path,
+    paths: &[String],
+) -> Result<BTreeSet<String>, String> {
     use std::io::Write;
     use std::process::{Command, Stdio};
     let mut child = Command::new(git)
