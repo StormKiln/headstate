@@ -36,7 +36,8 @@
 //! and the repository's `.claude/rules/*.md` (`claudemd::rules`, #1340),
 //! path-scoped or not: a rule loads when a session works where its
 //! `paths:` point, as a nested CLAUDE.md does. The sentence counts the two
-//! apart ("none of the 4 files read or 10 rules names …"). Docs linked
+//! apart ("none of the 4 files read or 10 rules names …"). A file two
+//! CLAUDE.md files both import is one file read, not two (#1350). Docs linked
 //! from a CLAUDE.md by an ordinary markdown link are not searched: they
 //! are not loaded into a session, so they instruct nothing until read.
 //!
@@ -1352,8 +1353,9 @@ impl Search {
 }
 
 /// Every file a session loads from this scan: the CLAUDE.md files and
-/// every import that resolved and read. An import the resolver could not
-/// read is not listed; it is already an unreadable path.
+/// every import that resolved and read, each once, in walk order. An
+/// import the resolver could not read is not listed; it is already an
+/// unreadable path.
 fn loaded_files(scan: &EffectiveScan) -> Vec<PathBuf> {
     fn imports(nodes: &[ImportNode], out: &mut Vec<PathBuf>) {
         for n in nodes {
@@ -1374,7 +1376,10 @@ fn loaded_files(scan: &EffectiveScan) -> Vec<PathBuf> {
         out.push(PathBuf::from(&s.file.path));
         imports(&s.file.imports, &mut out);
     }
-    out.dedup();
+    // By path, keeping the first: a file two CLAUDE.md files import is
+    // not consecutive in walk order, so `Vec::dedup` kept both (#1350).
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|p| seen.insert(p.clone()));
     out
 }
 
@@ -2036,6 +2041,48 @@ mod tests {
             "no negative is stated while a loaded file is unreadable: {found:#?}"
         );
         assert!(test.brief.contains("no edit to `"), "{}", test.brief);
+    }
+
+    /// #1350: a file imported by two CLAUDE.md files is read once and
+    /// counted once. The walk order is root, its import, the nested file,
+    /// its import, so the repeat is not consecutive and `Vec::dedup`
+    /// kept it.
+    #[test]
+    fn a_shared_import_is_counted_once() {
+        let (_t, repo, home) = fixture();
+        fs::write(repo.join("Makefile"), "test:\n\ttrue\n").unwrap();
+        let shared = repo.join("shared.md");
+        fs::write(&shared, "Be careful.\n").unwrap();
+        let at = format!("@{}\n", shared.to_string_lossy());
+        fs::write(repo.join("CLAUDE.md"), &at).unwrap();
+        let sub = repo.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("CLAUDE.md"), &at).unwrap();
+
+        let report = run_over(&repo, &home);
+        let found = toolchain_findings(&report);
+        assert_eq!(found.len(), 1, "{report:#?}");
+        assert_eq!(
+            found[0].finding,
+            "make (Makefile at root) offers `test`; none of the 3 files read names `make test`"
+        );
+        let searched = found[0]
+            .evidence
+            .iter()
+            .find(|e| e.measured.contains("files read"))
+            .expect("the search evidence");
+        assert!(
+            searched.measured.starts_with("3 files read"),
+            "{}",
+            searched.measured
+        );
+        let shared = shared.to_string_lossy().to_string();
+        assert_eq!(
+            searched.measured.matches(shared.as_str()).count(),
+            1,
+            "{}",
+            searched.measured
+        );
     }
 
     /// #1340's test: a `make test` named only in `.claude/rules/testing.md`
