@@ -32,7 +32,7 @@
 //! | [`Rule::HardSkip`] | memory docs "loads a CLAUDE.md file of up to 4 MiB in full and skips a larger file" | 4 MiB, on-disk bytes | Problem |
 //! | [`Rule::Secret`] | cclint's secret rule; changelog: the feedback share uploads "the system prompt (which includes your CLAUDE.md instructions)" | `sk-ant-`, `ghp_`, `github_pat_`, a PEM private-key header, `AKIA` + 16; placeholders (`xxx`, `your`, `example`, one repeated character) skipped. The finding carries the line and a masked prefix, never the value | Problem |
 //! | [`Rule::Emphasis`] | best-practices "add emphasis such as 'IMPORTANT' to that line alone. If you emphasize many lines, none of them stands out." | 2 or more prose lines in one file carrying all-caps `IMPORTANT`, `YOU MUST`, `NEVER` or `ALWAYS`. Caps only: bold prose does not count, or this repository's own house style would trip it | Advice |
-//! | [`Rule::HookRule`] | memory docs: Claude treats CLAUDE.md as "context, not enforced configuration … use a PreToolUse hook instead"; features-overview "Put guardrails in hooks" | a prose line with `never`, `must not` or `always` AND a tool verb (`edit`, `write`, `delete`, `rm`, `commit`, `push`, `force`), any case, in the prose outside inline code spans. A hyphenated compound counts only when every part is a tool verb (`force-push` fires; `slow-write`, `write-ahead` do not), and a word directly after `@` is a tag, not an action (#1322). Whether the modal governs the verb is not parsed | Advice |
+//! | [`Rule::HookRule`] | memory docs: Claude treats CLAUDE.md as "context, not enforced configuration … use a PreToolUse hook instead"; features-overview "Put guardrails in hooks" | a prose line with `never`, `must not` or `always` AND a tool verb (`edit`, `write`, `delete`, `rm`, `commit`, `push`, `force`), any case, in the prose outside inline code spans. A hyphenated compound counts only when every part is a tool verb (`force-push` fires; `slow-write`, `write-ahead` do not), and a word directly after `@` is a tag, not an action. A code span counts only when it is itself a tool-action command, by its first words: `git <verb>` names the verb, `rm` names `rm`; any other span (`8 write`) names nothing (#1322). Whether the modal governs the verb is not parsed | Advice |
 //! | [`Rule::Conflict`] | memory docs "if two rules contradict each other, Claude may pick one arbitrarily"; UFMG: conflicting instructions in 28% | two files in one launch set whose named package managers (`npm`/`pnpm`/`yarn`/`bun`), lint entry points (`make lint` vs `yarn lint` …) or default branches are non-empty and disjoint | Advice |
 //! | [`Rule::TreeListing`] | `/doctor` "cuts content Claude can derive from the codebase, such as directory layouts"; best-practices' exclude table | a fenced block with 3 or more lines starting `├`, `└` or `│` | Advice |
 //! | [`Rule::InitSkeleton`] | UFMG: init fossilization in 24%; `/doctor` removes architecture overviews; best-practices "There's no required format" | the `/init` skeleton headings `Project Overview`, `Development Commands` and `Architecture` all present | Advice |
@@ -751,26 +751,47 @@ fn per_file(cx: &Context, l: &Loaded, out: &mut Vec<Finding>) {
     }
 }
 
-/// The first tool action a prose line names, as written.
+fn is_tool_verb(word: &str) -> bool {
+    TOOL_VERBS.iter().any(|v| word.eq_ignore_ascii_case(v))
+}
+
+/// The first tool action a prose line names, as written: from the
+/// sentence first, then from a code span that is itself a command.
 ///
-/// Inline code spans are blanked first: what is in one is somebody's
-/// syntax (a command, a config value, a worker-pool spec), and the rule
-/// is about the sentence. Then each word or hyphenated compound counts
-/// only when every part of it is a tool verb, so `force-push` is the
-/// action itself while `slow-write` and `write-ahead` name something
-/// else. A word directly after `@` is a tag or an address (`@write`),
-/// not an action.
+/// Inline code spans are blanked for the sentence: what is in one is
+/// somebody's syntax (a config value, a worker-pool spec), not a word
+/// of the rule. Then each word or hyphenated compound counts only when
+/// every part of it is a tool verb, so `force-push` is the action itself
+/// while `slow-write` and `write-ahead` name something else. A word
+/// directly after `@` is a tag or an address (`@write`), not an action.
 fn tool_action(line: &str) -> Option<String> {
-    let line = text::blank_spans(line);
-    COMPOUND
-        .find_iter(&line)
-        .filter(|m| !line[..m.start()].ends_with('@'))
-        .find(|m| {
-            m.as_str()
-                .split('-')
-                .all(|part| TOOL_VERBS.iter().any(|v| part.eq_ignore_ascii_case(v)))
-        })
-        .map(|m| m.as_str().to_string())
+    let prose = text::blank_spans(line);
+    let in_prose = COMPOUND
+        .find_iter(&prose)
+        .filter(|m| !prose[..m.start()].ends_with('@'))
+        .find(|m| m.as_str().split('-').all(is_tool_verb))
+        .map(|m| m.as_str().to_string());
+    in_prose.or_else(|| {
+        text::spans(line)
+            .iter()
+            .find_map(|s| command_action(&s.text))
+    })
+}
+
+/// The tool action a code span performs when it is a shell command
+/// that is one: `git <verb> …` names the git verb, and `rm …` names
+/// `rm`. Structural, by the span's first words only; any other span
+/// (`8 write`, `@write`) names nothing.
+fn command_action(span: &str) -> Option<String> {
+    let mut words = span.split_whitespace();
+    match words.next()? {
+        "rm" => Some("rm".to_string()),
+        "git" => words
+            .next()
+            .filter(|verb| is_tool_verb(verb))
+            .map(str::to_string),
+        _ => None,
+    }
 }
 
 /// A placeholder rather than a value: `xxx`, `your`, `example`, or a tail
@@ -1342,9 +1363,10 @@ ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
         );
     }
 
-    /// #1322: a tool verb inside a code span, directly after `@`, or in
-    /// a hyphenated compound with a word that is not a tool verb names
-    /// something else (a worker pool, a test tag), not a tool action.
+    /// #1322: a tool verb inside a code span that is not a tool-action
+    /// command, directly after `@`, or in a hyphenated compound with a
+    /// word that is not a tool verb names something else (a worker pool,
+    /// a test tag), not a tool action.
     #[test]
     fn a_tool_verb_in_a_code_span_a_tag_or_a_compound_is_not_a_hook_rule() {
         let (_t, _home, repo) = fixture();
@@ -1352,7 +1374,7 @@ ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
             repo.join("CLAUDE.md"),
             "Worker pools: `8 read / 4 write / 2 slow-write`; never override them in a spec.\n\
              `@write` specs need `ALLOW_WRITES`; never set it in a local payload.\n\
-             Never `git push --force` to the default branch.\n\
+             `8 write` workers; never change it.\n\
              Tag them @write; never run them locally.\n\
              The slow-write pool is never resized.\n\
              Never disable the write-ahead log.\n",
@@ -1367,6 +1389,8 @@ ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
     /// a code span, a compound made only of tool verbs (`force-push`) is
     /// the tool action itself, a `--force` flag is not a compound, and a
     /// skipped `@write` tag does not hide a real verb later on the line.
+    /// A code span that is itself a tool-action command (`git push`,
+    /// `rm`) names that action.
     #[test]
     fn a_tool_verb_in_prose_or_a_verb_only_compound_still_fires() {
         let (_t, _home, repo) = fixture();
@@ -1376,16 +1400,26 @@ ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
              Never push `--force` to main.\n\
              Never commit `.env`.\n\
              Always run the gate; never use --force.\n\
-             Tag them @write; always delete scratch files.\n",
+             Tag them @write; always delete scratch files.\n\
+             Never `git push --force` to the default branch.\n\
+             Never `rm -rf` the cache.\n",
         )
         .unwrap();
         let found = shape(&repo, None);
         let hits = by_rule(&found, Rule::HookRule);
         let sentences: Vec<&str> = hits.iter().map(|f| f.finding.as_str()).collect();
-        assert_eq!(hits.len(), 5, "{sentences:?}");
-        for (i, verb) in ["force-push", "push", "commit", "force", "delete"]
-            .iter()
-            .enumerate()
+        assert_eq!(hits.len(), 7, "{sentences:?}");
+        for (i, verb) in [
+            "force-push",
+            "push",
+            "commit",
+            "force",
+            "delete",
+            "push",
+            "rm",
+        ]
+        .iter()
+        .enumerate()
         {
             assert!(
                 sentences[i].contains(&format!("line {}", i + 1)),
