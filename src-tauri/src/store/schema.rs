@@ -1133,6 +1133,23 @@ const MIGRATIONS: &[&str] = &[
         unverified       TEXT,
         computed_at      TEXT NOT NULL
      );",
+    // 26: the transcripts producer's extraction rule, versioned (#1324).
+    //
+    // Migration 24's ledger keys a session on `(size_bytes, mtime_ms)`
+    // alone, so a rule change never reached a transcript that had not
+    // moved: its stored rows, extracted under the OLD rule, kept being
+    // served. #1324 changed the rule (worktree paths re-root, and a read
+    // of a file the session edits is not a search), and a stored row
+    // keyed on `<repo>/.worktrees/t1/src/a.ts` would otherwise outlive
+    // the fix on every machine that had run the pass before it.
+    //
+    // `rule_version` is written by the producer from its own constant; a
+    // row at any other version is a miss, re-read and replaced. Existing
+    // rows default to 0, so every one of them is re-read once after this
+    // migration, within the producer's per-open budget. A column rather
+    // than a one-off `DELETE`, so the next rule change is a constant bump
+    // and not another migration.
+    "ALTER TABLE claude_advice_ledger ADD COLUMN rule_version INTEGER NOT NULL DEFAULT 0;",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
@@ -1578,6 +1595,46 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, MIGRATIONS.len() as i64);
+    }
+
+    /// Migration 26 versions the transcripts ledger (#1324): a row from
+    /// before it is kept, and reads as version 0, so the producer re-reads
+    /// its session rather than serving rows from the old rule.
+    #[test]
+    fn migration_26_versions_the_advice_ledger_and_keeps_its_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in MIGRATIONS.iter().take(25) {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 25i64).unwrap();
+        conn.execute(
+            "INSERT INTO claude_advice_ledger (session_id, size_bytes, mtime_ms, truncated, analysed_at)
+             VALUES ('s1', 1, 1, 0, '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let (kept, version): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(rule_version) FROM claude_advice_ledger",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kept, 1, "an upgrade must not cost the ledger");
+        assert_eq!(version, 0, "a pre-26 row is from the pre-26 rule");
+        assert_ne!(
+            version,
+            crate::claudemd::advice::transcripts::RULE_VERSION,
+            "the current rule must not match a pre-26 row"
+        );
+
+        let schema: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(schema, MIGRATIONS.len() as i64);
     }
 
     /// Migration 16 adds the plugin scan cache without costing history.

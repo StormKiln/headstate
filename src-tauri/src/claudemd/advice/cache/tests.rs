@@ -568,6 +568,55 @@ fn a_new_session_under_the_repository_recomputes() {
     assert_change_is_detected_and_recomputes(&f);
 }
 
+/// The fingerprint's session set is the transcripts producer's, worktrees
+/// included (#1324): a session in a linked worktree under the repository
+/// is in it, one outside is not, and deleting the worktree after the
+/// session ran moves nothing in or out -- the set must not depend on
+/// what the filesystem still holds.
+#[test]
+fn worktree_sessions_are_in_the_set_and_stay_there_once_the_worktree_is_gone() {
+    let f = Fixture::new();
+    let wt = f.repo.join(".worktrees").join("t1");
+    std::fs::create_dir_all(&wt).unwrap();
+    std::fs::write(
+        wt.join(".git"),
+        format!(
+            "gitdir: {}\n",
+            f.repo
+                .join(".git")
+                .join("worktrees")
+                .join("t1")
+                .to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let cwds = [
+        ("s1", wt.clone()),
+        ("s2", f.repo.join(".claude").join("worktrees").join("t2")),
+        ("s3", f.repo.with_file_name("elsewhere")),
+    ];
+    for (id, cwd) in &cwds {
+        f.conn
+            .execute(
+                "INSERT INTO claude_session (session_id, cwd, first_seen_at)
+                 VALUES (?1, ?2, '2026-01-01T00:00:00Z')",
+                rusqlite::params![id, cwd.to_string_lossy().to_string()],
+            )
+            .unwrap();
+    }
+    let ids = || -> Vec<String> {
+        session_keys(&f.conn, &f.repo)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect()
+    };
+    assert_eq!(ids(), ["s1", "s2"]);
+    std::fs::remove_file(wt.join(".git")).unwrap();
+    std::fs::remove_dir(&wt).unwrap();
+    assert_eq!(ids(), ["s1", "s2"]);
+}
+
 /// A session that GREW is a tracked change, which is the `(size, mtime)`
 /// key doing its job on an append-mostly log.
 #[test]
