@@ -149,6 +149,13 @@
 //! is neither an `@` import nor conditioned by "when", "if", "for" or
 //! "before". Both remedies are real and the brief offers both: an `@`
 //! import loads the file in every session; a condition keeps it lazy.
+//! "topic → path" (or `->`) with text before the arrow is a condition
+//! too: it is the index form of "read this when the topic comes up". A
+//! file under `.claude/rules/` is never blind: it loads itself, at launch
+//! or when a file its `paths:` matches is read, and the `@` import the
+//! brief would offer defeats that scoping. One line naming several
+//! documents is ONE finding with each document as its own evidence,
+//! not a row per path (#1320).
 //! *Dated facts* are a line with an absolute date or a version number
 //! AND "as of", "before", "after" or "until": the statement was true on
 //! a date, and the brief quotes the line rather than judging it. Both are
@@ -203,9 +210,9 @@ pub struct Rotten {
 /// A rule from the content-shape research, fired on one line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Shape {
-    /// A document path named with "see"/"read"/"consult", not imported
-    /// and not conditioned.
-    BlindReference { line: usize, path: String },
+    /// Document paths named with "see"/"read"/"consult" on one line, not
+    /// imported and not conditioned. One per line, in line order.
+    BlindReference { line: usize, paths: Vec<String> },
     /// A date or version beside "as of"/"before"/"after"/"until".
     DatedFact { line: usize, quoted: String },
 }
@@ -365,6 +372,8 @@ pub fn check_file(repo: &Path, file: &Path, text: &str, res: &mut Resolver) -> F
     let mut resolved_paths: Vec<(usize, String)> = Vec::new();
 
     for r in refs::extract(text) {
+        // Where a path reference resolved to, when it is a file.
+        let mut landed: Option<PathBuf> = None;
         let outcome = match &r.kind {
             RefKind::Cargo | RefKind::Issue { .. } => {
                 out.unresolvable += 1;
@@ -376,7 +385,11 @@ pub fn check_file(repo: &Path, file: &Path, text: &str, res: &mut Resolver) -> F
                 out.unresolvable += 1;
                 continue;
             }
-            RefKind::Path { path } => res.path(&dir, path).map(|_| ()),
+            RefKind::Path { path } => res.path(&dir, path).map(|to| {
+                if let Resolved::File(p) = to {
+                    landed = Some(p);
+                }
+            }),
             RefKind::PathLine { path, line } => res.path_line(&dir, path, *line),
             RefKind::MakeTarget { name } => res.make_target(&dir, name),
             RefKind::Script { runner, name } => res.script(&dir, *runner, name),
@@ -386,8 +399,13 @@ pub fn check_file(repo: &Path, file: &Path, text: &str, res: &mut Resolver) -> F
         match outcome {
             Ok(()) => {
                 out.refs_checked += 1;
+                // A `.claude/rules` file loads itself, so naming it is
+                // never blind (#1320).
+                let rule = landed.as_deref().is_some_and(|p| is_rule_file(repo, p));
                 if let RefKind::Path { path } = &r.kind {
-                    resolved_paths.push((r.line, path.clone()));
+                    if !rule {
+                        resolved_paths.push((r.line, path.clone()));
+                    }
                 }
             }
             Err((verdict @ Verdict::Unknown(_), measured)) => {
@@ -1560,6 +1578,29 @@ static DATE: LazyLock<Regex> = LazyLock::new(|| {
 static VERSION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(?:v\d+(?:\.\d+)+|\d+\.\d+\.\d+)\b").unwrap());
 
+/// Whether `p` is under a `.claude/rules` directory. Such a file loads
+/// itself: at launch without `paths:` frontmatter, or when a file its
+/// `paths:` matches is read. An `@` import would load it in every
+/// session, defeating the scoping, so naming one is never blind.
+fn is_rule_file(repo: &Path, p: &Path) -> bool {
+    relative(repo, p)
+        .is_some_and(|r| r.starts_with(".claude/rules/") || r.contains("/.claude/rules/"))
+}
+
+/// Whether the line states a topic before an arrow: "auth roles →
+/// `docs/a.md`" says when to read the target, in the index form. An
+/// arrow with nothing before it but a list marker states no topic.
+fn topic_arrow(line: &str) -> bool {
+    ["→", "->"].iter().any(|arrow| {
+        line.find(arrow).is_some_and(|at| {
+            !line[..at]
+                .trim_start_matches(|c: char| c.is_whitespace() || c == '-' || c == '*')
+                .trim()
+                .is_empty()
+        })
+    })
+}
+
 /// Document extensions, and a `docs/` component, for the blind-reference
 /// rule.
 fn is_document(path: &str) -> bool {
@@ -1578,17 +1619,23 @@ fn shape_rules(text: &str, resolved_paths: &[(usize, String)]) -> Vec<Shape> {
     let normalised = text.replace("\r\n", "\n");
     let mut out = Vec::new();
     for (n, line) in text::prose_lines(&normalised) {
-        for (_, path) in resolved_paths.iter().filter(|(l, _)| *l == n) {
-            if !is_document(path) {
-                continue;
+        let conditioned = CONDITION.is_match(line) || topic_arrow(line);
+        let mut blind: Vec<String> = Vec::new();
+        if CUE.is_match(line) && !conditioned {
+            for (_, path) in resolved_paths.iter().filter(|(l, _)| *l == n) {
+                let imported = line.contains(&format!("@{path}"));
+                if is_document(path) && !imported && !blind.contains(path) {
+                    blind.push(path.clone());
+                }
             }
-            let imported = line.contains(&format!("@{path}"));
-            if !imported && CUE.is_match(line) && !CONDITION.is_match(line) {
-                out.push(Shape::BlindReference {
-                    line: n,
-                    path: path.clone(),
-                });
-            }
+        }
+        // One finding per line, however many documents it names: three
+        // near-identical rows for one line is noise (#1320).
+        if !blind.is_empty() {
+            out.push(Shape::BlindReference {
+                line: n,
+                paths: blind,
+            });
         }
         if TEMPORAL.is_match(line) && (DATE.is_match(line) || VERSION.is_match(line)) {
             out.push(Shape::DatedFact {
@@ -1674,28 +1721,41 @@ fn findings_for(repo: &Path, path: &str, scope: Scope, text: &str, rot: &FileRot
     }
 
     for s in &rot.shape {
-        let (line, sentence, measured) = match s {
-            Shape::BlindReference { line, path: p } => (
+        let (line, sentence, measured): (usize, String, Vec<String>) = match s {
+            Shape::BlindReference { line, paths } => (
                 *line,
-                format!("`{shown}:{line}` names `{p}`{BLIND}"),
                 format!(
-                    "line {line} names `{p}` with see/read/consult; no `@{p}` import and no when/if/for/before on the line"
+                    "`{shown}:{line}` names {}{BLIND}",
+                    paths
+                        .iter()
+                        .map(|p| format!("`{p}`"))
+                        .collect::<Vec<_>>()
+                        .join(" and ")
                 ),
+                paths
+                    .iter()
+                    .map(|p| format!(
+                        "line {line} names `{p}` with see/read/consult; no `@{p}` import, no when/if/for/before and no topic → on the line"
+                    ))
+                    .collect(),
             ),
             Shape::DatedFact { line, quoted } => (
                 *line,
                 format!("`{shown}:{line}`{DATED}\"{quoted}\""),
-                "a date or version number beside as of/before/after/until".to_string(),
+                vec!["a date or version number beside as of/before/after/until".to_string()],
             ),
         };
         out.push(Finding::new(
             Check::Rot,
             Severity::Advice,
             subject(line),
-            vec![Evidence {
-                at: at(line),
-                measured,
-            }],
+            measured
+                .into_iter()
+                .map(|measured| Evidence {
+                    at: at(line),
+                    measured,
+                })
+                .collect(),
             sentence,
         ));
     }
@@ -2626,6 +2686,80 @@ Run `yarn paw`, not `yarn nope`. Use the `tentacle` skill, not the `ink` skill.
         // The missing document is reported as Missing, once, not as
         // blind.
         assert_eq!(verdicts(&rot), vec![("docs/gone.md", &Verdict::Missing)]);
+    }
+
+    /// #1320: a `.claude/rules` file loads itself -- at launch, or when
+    /// a file its `paths:` matches is read -- so offering an `@` import
+    /// for it is wrong, and naming it is not blind.
+    #[test]
+    fn a_claude_rules_file_is_never_a_blind_reference() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        fs::create_dir_all(root.join(".claude").join("rules")).unwrap();
+        fs::write(root.join(".claude").join("rules").join("x.md"), "rule").unwrap();
+        fs::write(root.join("CLAUDE.md"), "See `.claude/rules/x.md`.\n").unwrap();
+        let rot = check_one(root, None);
+        assert!(rot.findings.is_empty(), "{rot:?}");
+        assert!(rot.shape.is_empty(), "{:?}", rot.shape);
+    }
+
+    /// #1320: "topic → path" states when to read the target, in the
+    /// index form; `->` too. An arrow with nothing before it states no
+    /// topic and conditions nothing.
+    #[test]
+    fn a_topic_arrow_is_a_condition() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("docs").join("a.md"), "a").unwrap();
+        fs::write(
+            root.join("CLAUDE.md"),
+            "- auth roles, seed model → see `docs/a.md`\n\
+             - evidence -> read `docs/a.md`\n\
+             → see `docs/a.md`\n",
+        )
+        .unwrap();
+        let rot = check_one(root, None);
+        let lines: Vec<usize> = rot
+            .shape
+            .iter()
+            .filter_map(|s| match s {
+                Shape::BlindReference { line, .. } => Some(*line),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines, vec![3], "{:?}", rot.shape);
+    }
+
+    /// #1320: one blind line naming two documents is ONE finding, with
+    /// each document as its own evidence.
+    #[test]
+    fn one_blind_line_naming_two_documents_is_one_finding() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("docs").join("a.md"), "a").unwrap();
+        fs::write(root.join("docs").join("b.md"), "b").unwrap();
+        fs::write(root.join("CLAUDE.md"), "See `docs/a.md` and `docs/b.md`.\n").unwrap();
+        let report = run_over(root, None);
+        let blind: Vec<&Finding> = report
+            .findings
+            .iter()
+            .filter(|f| f.finding.contains("by name; not imported, no condition"))
+            .collect();
+        assert_eq!(blind.len(), 1, "{report:?}");
+        assert_eq!(
+            blind[0].finding,
+            "`CLAUDE.md:1` names `docs/a.md` and `docs/b.md` by name; not imported, no condition"
+        );
+        let measured: Vec<&str> = blind[0]
+            .evidence
+            .iter()
+            .map(|e| e.measured.as_str())
+            .collect();
+        assert_eq!(measured.len(), 2, "{measured:?}");
+        assert!(measured[0].contains("`docs/a.md`"), "{measured:?}");
+        assert!(measured[1].contains("`docs/b.md`"), "{measured:?}");
     }
 
     /// A date or a version beside "as of"/"before"/"after"/"until" is a
