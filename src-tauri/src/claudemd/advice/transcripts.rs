@@ -143,7 +143,10 @@ pub const SESSIONS_PER_PASS: usize = 200;
 /// 4: the ledger carries the session's task fingerprint (migration 28),
 /// so replays of one task count once (#1337). A row stored before it has
 /// none, and would count every replay again.
-pub const RULE_VERSION: i64 = 4;
+///
+/// 5: an S5 row carries the failing call's key (migration 29), so the
+/// finding can name the file a `Read` failed on (#1338).
+pub const RULE_VERSION: i64 = 5;
 
 /// S1: sessions showing the same A-head → B-head correction.
 const MIN_SESSIONS_CORRECTED: usize = 2;
@@ -242,6 +245,10 @@ struct Row {
     /// S3: the denied call's `tool_use.id`, so a hook row for the same
     /// call is not counted twice.
     tool_use_id: Option<String>,
+    /// S5: the failing call's own key -- a path, a command head, a
+    /// pattern -- beside the normalised error text that groups it
+    /// (#1338). A `Read`'s path is in its input, never its error text.
+    call_key: Option<String>,
 }
 
 /// Run the pass over the sessions under `cx.repo`, reading at most
@@ -984,6 +991,7 @@ fn extract(
         record_2: None,
         detail: None,
         tool_use_id: None,
+        call_key: None,
     };
 
     // S1 -- corrected command.
@@ -1026,6 +1034,7 @@ fn extract(
                 record_2: Some(b.record),
                 detail: Some(clamp(&outcome.text)),
                 tool_use_id: None,
+                call_key: None,
             });
             break;
         }
@@ -1068,6 +1077,7 @@ fn extract(
             let mut r = row(SIG_ERROR, c, error_key(&o.text));
             r.record = Some(o.record);
             r.detail = Some(clamp(&o.text));
+            r.call_key = Some(c.key.clone());
             rows.push(r);
         }
     }
@@ -1341,8 +1351,9 @@ fn store_rows(
     for r in rows {
         tx.execute(
             "INSERT INTO claude_advice_signal
-                (session_id, signal, dir, key, aux, record_index, record_index_2, detail, tool_use_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                (session_id, signal, dir, key, aux, record_index, record_index_2, detail,
+                 tool_use_id, call_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 r.session_id,
                 r.signal,
@@ -1353,6 +1364,7 @@ fn store_rows(
                 r.record_2.map(|v| v as i64),
                 r.detail,
                 r.tool_use_id,
+                r.call_key,
             ],
         )?;
     }
@@ -1409,7 +1421,8 @@ fn load_tasks(
 fn load_rows(conn: &Connection, analysed: &HashSet<String>) -> Result<Vec<Row>, String> {
     let mut q = conn
         .prepare(
-            "SELECT session_id, signal, dir, key, aux, record_index, record_index_2, detail, tool_use_id
+            "SELECT session_id, signal, dir, key, aux, record_index, record_index_2, detail,
+                    tool_use_id, call_key
                FROM claude_advice_signal
               ORDER BY session_id, record_index",
         )
@@ -1426,12 +1439,13 @@ fn load_rows(conn: &Connection, analysed: &HashSet<String>) -> Result<Vec<Row>, 
                 r.get::<_, Option<i64>>(6)?,
                 r.get::<_, Option<String>>(7)?,
                 r.get::<_, Option<String>>(8)?,
+                r.get::<_, Option<String>>(9)?,
             ))
         })
         .map_err(|e| format!("claude_advice_signal: {e}"))?;
     let mut out = Vec::new();
     for row in rows {
-        let (session_id, signal, dir, key, aux, record, record_2, detail, tool_use_id) =
+        let (session_id, signal, dir, key, aux, record, record_2, detail, tool_use_id, call_key) =
             row.map_err(|e| format!("claude_advice_signal: {e}"))?;
         if !analysed.contains(&session_id) {
             continue;
@@ -1457,6 +1471,7 @@ fn load_rows(conn: &Connection, analysed: &HashSet<String>) -> Result<Vec<Row>, 
             record_2: record_2.map(|v| v as u64),
             detail,
             tool_use_id,
+            call_key,
         });
     }
     Ok(out)
@@ -1695,6 +1710,7 @@ fn emit(
                 record_2: None,
                 detail: None,
                 tool_use_id: id.clone(),
+                call_key: None,
             });
     }
 
@@ -1791,10 +1807,20 @@ fn emit(
                         )
                     }
                 }
-                _ => (
-                    format!("the same `{aux}` error was recorded in {sessions_phrase}: `{key}`"),
-                    key.clone(),
-                ),
+                _ => {
+                    // The failing call, when every session failed on the
+                    // same one (#1338). The grouping stays the error text.
+                    let mut calls = by_session.values().map(|r| r.call_key.as_deref());
+                    let first = calls.next().flatten();
+                    let on = match first {
+                        Some(c) if calls.all(|k| k == Some(c)) => format!(" on `{c}`"),
+                        _ => String::new(),
+                    };
+                    (
+                        format!("the same `{aux}` error{on} was recorded in {sessions_phrase}: `{key}`"),
+                        key.clone(),
+                    )
+                }
             };
             let sentence = match written_in(&dedup_key, &dir, cx, &mut cache) {
                 Some(file) => format!("`{dedup_key}` is already written in `{file}` ({sentence})"),
@@ -1834,9 +1860,13 @@ fn emit(
                         Some(after) => format!("`{aux}` `{key}`, after {after}"),
                         None => format!("`{aux}` `{key}`"),
                     },
-                    _ => match (first, &r.detail) {
-                        (true, Some(d)) => format!("error text: {d}"),
-                        _ => "the same error, after normalisation".to_string(),
+                    _ => match (&r.call_key, first, &r.detail) {
+                        (Some(c), true, Some(d)) => format!("`{aux}` `{c}`: {d}"),
+                        (Some(c), _, _) => {
+                            format!("`{aux}` `{c}`: the same error, after normalisation")
+                        }
+                        (None, true, Some(d)) => format!("error text: {d}"),
+                        (None, _, _) => "the same error, after normalisation".to_string(),
                     },
                 };
                 if group.len() > 1 {
@@ -3630,6 +3660,80 @@ mod tests {
         assert_eq!(nulls, 3);
         assert_eq!(task_fingerprint("a  b\n c"), task_fingerprint("a b c"));
         assert_ne!(task_fingerprint("a b"), task_fingerprint("a c"));
+    }
+
+    /// #1338: an error cluster keeps the failing call's key. A Read's path
+    /// is in the call's input, not the error text, so without it the
+    /// finding could not say which file. Every evidence row names the
+    /// call, and when every session failed on the same one, so does the
+    /// sentence.
+    #[test]
+    fn an_error_cluster_names_the_failing_call() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path();
+        let cwd = repo.to_string_lossy().into_owned();
+        let failing_read = |n: usize, file: &str| {
+            [
+                tool_use(
+                    &cwd,
+                    &format!("r{n}"),
+                    "Read",
+                    serde_json::json!({"file_path":repo.join("src").join(file).to_string_lossy()}),
+                ),
+                tool_result(&cwd, &format!("r{n}"), Some(true), "File does not exist."),
+            ]
+            .join("\n")
+        };
+        let conn = db();
+        for n in [1, 2, 3] {
+            let p = write(repo, &format!("s{n}.jsonl"), &failing_read(n, "gone.ts"));
+            insert_session(&conn, &format!("s{n}"), &cwd, Some(&p), None);
+        }
+        let scan = scan_effective_opt(repo, None);
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        let hits: Vec<&Finding> = out
+            .iter()
+            .filter(|f| f.finding.starts_with("the same `Read` error"))
+            .collect();
+        assert_eq!(hits.len(), 1, "{out:#?}");
+        assert_eq!(
+            hits[0].finding,
+            format!(
+                "the same `Read` error on `src/gone.ts` was recorded in 3 sessions under `{}`: `File does not exist.`",
+                repo.display()
+            )
+        );
+        assert_eq!(
+            hits[0].evidence[0].measured,
+            "`Read` `src/gone.ts`: File does not exist."
+        );
+        for e in &hits[0].evidence[1..] {
+            assert_eq!(
+                e.measured,
+                "`Read` `src/gone.ts`: the same error, after normalisation"
+            );
+        }
+
+        // Different files: the sentence cannot name one, the rows still do.
+        write(repo, "s3.jsonl", &failing_read(3, "other.ts"));
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        let hit = out
+            .iter()
+            .find(|f| f.finding.starts_with("the same `Read` error"))
+            .expect("the error cluster");
+        assert!(
+            hit.finding
+                .starts_with("the same `Read` error was recorded in 3 sessions"),
+            "{}",
+            hit.finding
+        );
+        assert!(
+            hit.evidence[2]
+                .measured
+                .starts_with("`Read` `src/other.ts`: "),
+            "{}",
+            hit.evidence[2].measured
+        );
     }
 
     /// Rows stored under an older extraction rule are not served: the

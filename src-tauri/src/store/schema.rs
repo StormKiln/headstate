@@ -1181,6 +1181,21 @@ const MIGRATIONS: &[&str] = &[
     // from before this migration is NULL too, but it is also at an older
     // `rule_version` (migration 26), so it is re-read before it is used.
     "ALTER TABLE claude_advice_ledger ADD COLUMN task_fingerprint TEXT;",
+    // 29: the failing call's key on a transcripts signal row (#1338).
+    //
+    // An S5 row's `key` is the NORMALISED error text, which is what
+    // groups a cluster, and normalisation removes paths. For a `Read`
+    // the path was never in the error text at all -- it is in the call's
+    // input -- so "the same `Read` error was recorded in 7 sessions:
+    // `File does not exist.`" could not say which file. `call_key` is
+    // the call's own key (a path, a command head, a pattern), kept
+    // beside the grouping key rather than folded into it, so the
+    // grouping is unchanged and every evidence row can name the call.
+    //
+    // NULL for a row that has no call key to keep, and for every row
+    // from before this migration; those sessions are at an older
+    // `rule_version` (migration 26) and are re-read before use.
+    "ALTER TABLE claude_advice_signal ADD COLUMN call_key TEXT;",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
@@ -1739,6 +1754,40 @@ mod tests {
             crate::claudemd::advice::transcripts::RULE_VERSION,
             "a row with no fingerprint must be re-read under the current rule"
         );
+        let schema: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(schema, MIGRATIONS.len() as i64);
+    }
+
+    /// Migration 29 gives each transcripts signal row the failing call's
+    /// key (#1338). Existing rows are kept, with no key: their sessions
+    /// are at an older rule version and are re-read before they are used.
+    #[test]
+    fn migration_29_adds_the_call_key_and_keeps_the_signal_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in MIGRATIONS.iter().take(28) {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 28i64).unwrap();
+        conn.execute(
+            "INSERT INTO claude_advice_signal (session_id, signal, dir, key)
+             VALUES ('s1', 'error', '/r', 'File does not exist.')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let (kept, call_key): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(call_key) FROM claude_advice_signal",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kept, 1, "an upgrade must not cost the signal rows");
+        assert_eq!(call_key, None);
         let schema: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
