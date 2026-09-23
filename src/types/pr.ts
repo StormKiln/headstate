@@ -1117,9 +1117,11 @@ interface ClaudeMdAdviceEvidence {
 /// One thing a producer found. Mirrors `claudemd::advice::Finding`.
 export interface ClaudeMdAdviceFinding {
   check: ClaudeMdAdviceCheck;
-  /// Ranked by the backend: problem, advice, unknown. `unknown` is a
-  /// finding that could not be decided, never a clean one.
-  severity: "problem" | "advice" | "unknown";
+  /// Ranked by the backend: problem, advice, unknown, note. `unknown` is
+  /// a finding that could not be decided, never a clean one. `note` is an
+  /// observation with no recommendation (#1339): never counted as advice,
+  /// and never a clean pass either.
+  severity: "problem" | "advice" | "unknown" | "note";
   subject: ClaudeMdAdviceSubject;
   evidence: ClaudeMdAdviceEvidence[];
   /// One sentence, a fact. The row.

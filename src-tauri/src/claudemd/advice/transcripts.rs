@@ -65,9 +65,10 @@
 //! the repository's `.claude/rules` a session in that directory would
 //! load (`claudemd::rules`: unconditional, or `paths:` reaching it). A
 //! file that cannot be read is no hit, and the finding then claims
-//! nothing about where the key is written. A hit is
-//! kept visible as a finding worded "already written in `<file>`", so the
-//! reader sees the rule doing its job. A paraphrased rule is missed by
+//! nothing about where the key is written. A hit is kept visible as a
+//! [`Severity::Note`] worded "already written in `<file>`", so the reader
+//! sees the rule doing its job without being told to change anything
+//! (#1339). A paraphrased rule is missed by
 //! this; semantic matching is #1198.
 //!
 //! # Bounds
@@ -90,12 +91,13 @@
 //! The report model has no per-check coverage struct beyond
 //! [`super::CheckRun`], so what the spec calls `Coverage` travels here as
 //! findings: one [`Severity::Unknown`] per transcript that could not be
-//! read (`<path>: <why>`), one [`Severity::Advice`] stating "analysed N
+//! read (`<path>: <why>`), one [`Severity::Note`] stating "analysed N
 //! of M sessions under `<repo>`; K truncated at 8 MB" whenever the pass
 //! is short or a read was cut, and one stating "no Claude Code sessions
 //! were recorded under `<repo>`" when there are none -- never an empty
 //! list, because no sessions is not "nothing went wrong". While the pass
-//! is short, every count says "at least".
+//! is short, every count says "at least". These and the S6 census are
+//! Notes: they state what was measured and recommend nothing (#1339).
 //!
 //! # Privacy
 //!
@@ -290,7 +292,7 @@ fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, 
     if sessions.is_empty() {
         return Ok(vec![Finding::new(
             Check::Transcripts,
-            Severity::Advice,
+            Severity::Note,
             root_subject,
             vec![Evidence {
                 at: Locator::File {
@@ -430,7 +432,7 @@ fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, 
         }
         out.push(Finding::new(
             Check::Transcripts,
-            Severity::Advice,
+            Severity::Note,
             root_subject.clone(),
             vec![Evidence {
                 at: Locator::File {
@@ -1822,9 +1824,14 @@ fn emit(
                     )
                 }
             };
-            let sentence = match written_in(&dedup_key, &dir, cx, &mut cache) {
-                Some(file) => format!("`{dedup_key}` is already written in `{file}` ({sentence})"),
-                None => sentence,
+            // Already written is an observation, not advice (#1339): the
+            // rule is doing its job and there is nothing to change.
+            let (sentence, severity) = match written_in(&dedup_key, &dir, cx, &mut cache) {
+                Some(file) => (
+                    format!("`{dedup_key}` is already written in `{file}` ({sentence})"),
+                    Severity::Note,
+                ),
+                None => (sentence, Severity::Advice),
             };
 
             let mut evidence = Vec::new();
@@ -1882,7 +1889,7 @@ fn emit(
             }
             out.push(Finding::new(
                 Check::Transcripts,
-                Severity::Advice,
+                severity,
                 subject,
                 evidence,
                 sentence,
@@ -1956,7 +1963,7 @@ fn emit(
             .collect();
         out.push(Finding::new(
             Check::Transcripts,
-            Severity::Advice,
+            Severity::Note,
             subject,
             evidence,
             format!(
@@ -2129,12 +2136,13 @@ mod tests {
             f.finding
         );
         assert!(!f.finding.contains("already written"));
-        // The census is always there, as a count.
-        assert!(
-            two.iter()
-                .any(|f| f.finding.starts_with("2 sessions recorded under")),
-            "{two:#?}"
-        );
+        // The census is always there, as a count -- an observation, not
+        // advice (#1339).
+        let census = two
+            .iter()
+            .find(|f| f.finding.starts_with("2 sessions recorded under"))
+            .unwrap_or_else(|| panic!("the census: {two:#?}"));
+        assert_eq!(census.severity, Severity::Note);
     }
 
     /// A session whose cwd is an agent worktree of the repository counts
@@ -2221,9 +2229,11 @@ mod tests {
             "{}",
             hits[0].finding
         );
-        assert_eq!(hits[0].severity, Severity::Advice);
+        // Kept visible, as an observation: the rule is doing its job,
+        // and there is nothing to change (#1339).
+        assert_eq!(hits[0].severity, Severity::Note);
         assert!(
-            hits[0].brief.contains("change nothing"),
+            !hits[0].brief.contains("Suggested change"),
             "{}",
             hits[0].brief
         );
@@ -2373,6 +2383,7 @@ mod tests {
             .iter()
             .find(|f| f.finding.starts_with("analysed 2 of 3 sessions under"))
             .expect("the coverage finding");
+        assert_eq!(coverage.severity, Severity::Note);
         assert!(
             coverage.finding.ends_with("; 0 truncated at 8 MB"),
             "{}",
@@ -2400,7 +2411,7 @@ mod tests {
                 repo.display()
             )
         );
-        assert_eq!(out[0].severity, Severity::Advice);
+        assert_eq!(out[0].severity, Severity::Note);
         assert_eq!(
             out[0].subject,
             Subject::Directory {
@@ -2509,6 +2520,7 @@ mod tests {
             .iter()
             .find(|f| f.finding.starts_with("analysed 2 of 2 sessions under"))
             .expect("the coverage finding");
+        assert_eq!(coverage.severity, Severity::Note);
         assert!(
             coverage.finding.ends_with("; 1 truncated at 8 MB"),
             "{}",
@@ -2613,6 +2625,7 @@ mod tests {
             .iter()
             .find(|f| f.finding.starts_with("analysed 1 of 2 sessions under"))
             .expect("the coverage finding");
+        assert_eq!(coverage.severity, Severity::Note);
         assert!(
             coverage
                 .finding

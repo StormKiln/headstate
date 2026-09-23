@@ -41,7 +41,7 @@ export interface Filters {
   /// rather than implying an answer it does not have.
   readySort?: "oldest-opened" | "newest-opened";
   /// How the CLAUDE.md advice list is organised (#1291). Defaults to
-  /// `"none"` -- the flat list -- when absent.
+  /// `"check"` -- by-check tables (#1344) -- when absent.
   ///
   /// Typed as `AdviceGrouping` from `@/lib/adviceGrouping`, imported as a
   /// type so this module keeps no runtime dependency on it.

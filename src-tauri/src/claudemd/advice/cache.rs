@@ -171,7 +171,11 @@ use crate::claudemd::EffectiveScan;
 /// longer counts a read of a file the session edits (#1324). A report
 /// stored before it fingerprints identically -- no tracked input moved --
 /// and would otherwise be served as current with the old findings.
-pub const PAYLOAD_VERSION: i64 = 2;
+///
+/// 3: the transcripts producer's coverage counts, census and "already
+/// written" hits are `Severity::Note`, not `Advice` (#1339). A stored
+/// report still decodes, and would render those rows as advice.
+pub const PAYLOAD_VERSION: i64 = 3;
 
 /// The build of Headstate a report was computed by (#1333).
 ///

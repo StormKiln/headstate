@@ -5,7 +5,7 @@ import type {
   ClaudeMdAdviceReport,
   ClaudeMdAdviceSubject,
 } from "@/types/pr";
-import { CHECK_LABEL, groupFindings } from "./adviceGrouping";
+import { CHECK_LABEL, OBSERVATIONS_KEY, groupFindings } from "./adviceGrouping";
 
 const REPO = "/home/octocat/hello-world";
 
@@ -277,5 +277,55 @@ describe("groupFindings", () => {
     const checks = Object.keys(CHECK_LABEL) as ClaudeMdAdviceCheck[];
     expect(checks.length).toBeGreaterThan(0);
     for (const c of checks) expect(typeof CHECK_LABEL[c]).toBe("string");
+  });
+
+  /// A Note is an observation, not advice (#1339). In every arrangement
+  /// it leaves the advice groups and lands in one trailing Observations
+  /// group, so a count never sits among the things to change -- and a
+  /// check whose only output is Notes does not get an advice group.
+  it.each(["none", "check", "file"] as const)(
+    "moves notes into one trailing Observations group under %s",
+    (grouping) => {
+      const advice = finding({ check: "transcripts", finding: "advice" });
+      const note = finding({ check: "transcripts", severity: "note", finding: "a count" });
+      const unknown = finding({ check: "rot", severity: "unknown", finding: "could not" });
+      const groups = groupFindings(report({ findings: [advice, unknown, note] }), grouping);
+      const last = groups[groups.length - 1];
+      expect(last.key).toBe(OBSERVATIONS_KEY);
+      expect(last.label).toBe("Observations");
+      expect(last.findings).toEqual([note]);
+      for (const g of groups.slice(0, -1)) expect(g.findings).not.toContain(note);
+      expect(groups.flatMap((g) => g.findings)).toHaveLength(3);
+    },
+  );
+
+  it("adds no Observations group when there are no notes", () => {
+    for (const grouping of ["none", "check", "file"] as const) {
+      const groups = groupFindings(report({ findings: [finding()] }), grouping);
+      expect(groups.map((g) => g.key)).not.toContain(OBSERVATIONS_KEY);
+    }
+  });
+
+  /// A report of only Notes has no advice at all, so the flat
+  /// arrangement must not render an empty unlabelled advice group above
+  /// the observations.
+  it("drops the empty flat group when every finding is a note", () => {
+    const note = finding({ severity: "note" });
+    const groups = groupFindings(report({ findings: [note] }), "none");
+    expect(groups.map((g) => g.key)).toEqual([OBSERVATIONS_KEY]);
+  });
+
+  /// ...but a check that could not run keeps its by-check group even
+  /// when every finding is a note: dropping it would hide an Unknown.
+  it("keeps an unknown check's group when every finding is a note", () => {
+    const note = finding({ severity: "note" });
+    const groups = groupFindings(
+      report({
+        findings: [note],
+        checks: [{ check: "rot", run: { state: "unknown", reason: "no listing" } }],
+      }),
+      "check",
+    );
+    expect(groups.map((g) => g.key)).toEqual(["check:rot", OBSERVATIONS_KEY]);
   });
 });

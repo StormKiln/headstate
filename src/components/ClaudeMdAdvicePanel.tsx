@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
+import { toast } from "sonner";
 import { useClaudeMdAdvice, useUiPrefs } from "@/api/hooks";
 import type {
   ClaudeMdAdviceCoverage,
@@ -11,15 +12,19 @@ import type {
 import { current } from "@/lib/ariaCurrent";
 import {
   CHECK_LABEL,
+  OBSERVATIONS_KEY,
   type AdviceGroup,
   type AdviceGrouping,
   groupFindings,
+  isAdvice,
 } from "@/lib/adviceGrouping";
 import type { Filters } from "@/lib/derive";
 import { useActiveFilters, useFilters } from "@/store/filters";
 import { adviceState, needsRefresh, type AdviceState } from "@/lib/adviceState";
 import { freshnessLabel } from "@/lib/adviceFreshnessLabel";
-import { ClaudifyAction } from "./ClaudifyAction";
+import { recheckSummary } from "@/lib/adviceRecheck";
+import { IS_DESKTOP_BUILD } from "@/lib/target";
+import { ClaudifyAction, ClaudifyButton, CopyBriefButton, RunPanel } from "./ClaudifyAction";
 import { PartialScanNotice } from "./PartialScanNotice";
 import { QueryError, errorMessage } from "./QueryError";
 
@@ -28,11 +33,11 @@ import { QueryError, errorMessage } from "./QueryError";
 /// "Flat" is named rather than left as a bare "off", because it is a real
 /// arrangement -- the backend's severity ranking, worst first -- and a
 /// user who has grouped needs to be able to name the thing they are going
-/// back to.
+/// back to. By check leads because it is the default (#1344).
 const GROUPING_OPTIONS: { value: AdviceGrouping; label: string }[] = [
-  { value: "none", label: "Flat (worst first)" },
   { value: "check", label: "By check" },
   { value: "file", label: "By file" },
+  { value: "none", label: "Flat (worst first)" },
 ];
 
 /// What each severity is called, and how it is coloured.
@@ -44,6 +49,9 @@ const SEVERITY: Record<ClaudeMdAdviceFinding["severity"], { label: string; class
   problem: { label: "problem", className: "text-[#f85149]" },
   advice: { label: "advice", className: "text-[#d29922]" },
   unknown: { label: "could not decide", className: "text-[#d29922]" },
+  // Grey: an observation is neither a warning nor a pass (#1339). Green
+  // would read as "all clear", amber as something to act on.
+  note: { label: "observation", className: "text-[#8b949e]" },
 };
 
 /// A path as the row shows it: relative to the repository when it is
@@ -169,6 +177,9 @@ export function ClaudeMdAdvicePanel({
     { ...fresh, enabled: wantFresh },
   );
 
+  // Which Re-check click is the latest, so only its run reports.
+  const recheckRun = useRef(0);
+
   return (
     <div className="space-y-2">
       <AdviceBody
@@ -177,11 +188,25 @@ export function ClaudeMdAdvicePanel({
         activePath={activePath}
         onSelectFile={onSelectFile}
         onRefresh={() => {
+          // EVERY click starts a run (#1343). Setting the flag alone was a
+          // no-op twice over: over a stale report the fresh call was
+          // already enabled, so the flag changed nothing; and within
+          // `staleTime` re-enabling serves TanStack's cached answer rather
+          // than running. `refetch` runs regardless of both; the flag
+          // keeps the query enabled so its result is the one shown.
           setRefreshAsked(repo);
-          // A repository already asked for a refresh needs the query
-          // re-run rather than re-enabled: the flag is already set, so
-          // nothing would change and the button would look inert.
-          if (refreshAsked === repo) void fresh.refetch();
+          const replaced = shownReport(state);
+          const run = ++recheckRun.current;
+          void fresh.refetch().then((r) => {
+            // A later click superseded this run; that one reports.
+            if (run !== recheckRun.current) return;
+            if (r.status === "error") {
+              toast.error("Re-check failed", { description: errorMessage(r.error) });
+            } else if (r.data !== undefined) {
+              const s = recheckSummary(replaced, r.data.report);
+              toast.success(s.title, { description: s.description });
+            }
+          });
         }}
         onRetry={() => {
           if (cached.isError) void cached.refetch();
@@ -190,6 +215,13 @@ export function ClaudeMdAdvicePanel({
       />
     </div>
   );
+}
+
+/// The report on screen, which a Re-check's result is compared against.
+function shownReport(state: AdviceState): ClaudeMdAdviceReport | undefined {
+  if (state.kind === "report") return state.result.report;
+  if (state.kind === "failed") return state.stale?.report;
+  return undefined;
 }
 
 /// The five states, each rendered as itself.
@@ -373,17 +405,35 @@ function ReportView({
   // here for the notice; the rows below map over the full list.
   const unknown = report.checks.filter((c) => c.run.state === "unknown");
   const everyRan = report.checks.every((c) => c.run.state === "ran");
-  const n = report.findings.length;
+  // Advice only. A Note is an observation, never counted as advice
+  // (#1339), so it neither swells the count nor blocks "no advice".
+  const n = report.findings.filter(isAdvice).length;
+  const notes = report.findings.length - n;
 
   // The grouping preference, from the per-view filter store where every
-  // other view preference lives (#1291). Absent means the flat list.
+  // other view preference lives (#1291). Absent means by check, the
+  // default since #1344: a flat stream of a thousand findings is the
+  // thing that issue says is unusable.
   const { adviceGrouping } = useActiveFilters();
   const setFilter = useFilters((s) => s.setFilter);
-  const grouping: AdviceGrouping = adviceGrouping ?? "none";
+  const grouping: AdviceGrouping = adviceGrouping ?? "check";
 
   // Partitioned, never re-sorted within a group. `groupFindings` states
   // the two orderings and why they differ.
   const groups = groupFindings(report, grouping);
+
+  // More than a screenful opens as headings (#1344): a thousand findings
+  // become eight lines to choose from rather than a wall to scroll. A
+  // group the user opened or closed stays that way; the default only
+  // decides the first render.
+  const long = report.findings.length > COLLAPSE_OVER;
+  const [toggled, setToggled] = useState<Record<string, boolean>>({});
+
+  // The Claudify column exists only where Claudify can: never on the
+  // phone (`IS_MOBILE_BUILD`, a capability), and not without a terminal,
+  // where one sentence above the tables says why instead of a column of
+  // the same sentence.
+  const claudifyColumn = IS_DESKTOP_BUILD && terminalConfigured;
 
   return (
     <div className="space-y-2">
@@ -435,31 +485,47 @@ function ReportView({
             </option>
           ))}
         </select>
+        {IS_DESKTOP_BUILD && !terminalConfigured && n > 0 ? (
+          <span className="text-[11px] text-[#8b949e]">
+            No terminal is configured, so briefs can only be copied. Set one in Settings › Claude
+            Code to Claudify them.
+          </span>
+        ) : null}
       </div>
 
       {/* One render path for all three arrangements: `"none"` is a single
           unlabelled group holding the wire list verbatim. Within a group
           the order is the backend's; between groups it is worst-first, so
           grouping can never bury a problem under a quiet file. */}
-      {groups.map((g) => (
-        <GroupSection
-          key={g.key}
-          group={g}
-          labelled={grouping !== "none"}
-          repo={repo}
-          activePath={activePath}
-          onSelectFile={onSelectFile}
-          terminalConfigured={terminalConfigured}
-          wireIndex={wireIndex}
-        />
-      ))}
+      {groups.map((g) => {
+        const labelled = grouping !== "none" || g.key === OBSERVATIONS_KEY;
+        return (
+          <GroupSection
+            key={g.key}
+            group={g}
+            labelled={labelled}
+            // An unlabelled group has no heading to reopen it from, so it
+            // is never collapsed.
+            open={!labelled || (toggled[g.key] ?? !long)}
+            onToggle={() => setToggled((t) => ({ ...t, [g.key]: !(t[g.key] ?? !long) }))}
+            repo={repo}
+            activePath={activePath}
+            onSelectFile={onSelectFile}
+            claudifyColumn={claudifyColumn}
+            wireIndex={wireIndex}
+          />
+        );
+      })}
 
       {/* Only a run in which EVERY check completed may say this. The
-          partial arm above has already spoken for the other case. */}
+          partial arm above has already spoken for the other case. With
+          observations on screen the run found something, so it may not
+          say "nothing found" -- and it is not a clean pass either, so it
+          is not green. */}
       {n === 0 && everyRan ? (
-        <p className="text-xs text-[#3fb950]">
-          {report.checks.length} {report.checks.length === 1 ? "check" : "checks"} ran; nothing
-          found.
+        <p className={`text-xs ${notes === 0 ? "text-[#3fb950]" : "text-[#8b949e]"}`}>
+          {report.checks.length} {report.checks.length === 1 ? "check" : "checks"} ran;{" "}
+          {notes === 0 ? "nothing found." : "no advice."}
         </p>
       ) : null}
 
@@ -485,11 +551,28 @@ function ReportView({
   );
 }
 
+/// How many findings a report may hold before its groups open collapsed
+/// (#1344). Roughly a screenful of rows at the panel's density; past it,
+/// the headings are the useful first view.
+const COLLAPSE_OVER = 25;
+
 function reason(c: ClaudeMdAdviceCoverage): string {
   return c.run.state === "unknown" ? c.run.reason : "";
 }
 
-/// One group's heading, its findings, and any check that could not run.
+/// The order a group's heading counts severities in: worst first, the
+/// same rank the backend sorts by.
+const SEVERITY_ORDER: ClaudeMdAdviceFinding["severity"][] = ["problem", "advice", "unknown", "note"];
+
+/// "1 problem", "2 advice", "3 could not decide", "4 observations".
+function severityCount(severity: ClaudeMdAdviceFinding["severity"], count: number): string {
+  const label = SEVERITY[severity].label;
+  const plural = count !== 1 && (severity === "problem" || severity === "note");
+  return `${count} ${label}${plural ? "s" : ""}`;
+}
+
+/// One group: a heading that opens and closes it, any check that could
+/// not run, and its findings as a table.
 ///
 /// `labelled` is false for the flat arrangement, where the single group
 /// is the whole list and a heading over it would name nothing.
@@ -505,18 +588,22 @@ function reason(c: ClaudeMdAdviceCoverage): string {
 function GroupSection({
   group,
   labelled,
+  open,
+  onToggle,
   repo,
   activePath,
   onSelectFile,
-  terminalConfigured,
+  claudifyColumn,
   wireIndex,
 }: {
   group: AdviceGroup;
   labelled: boolean;
+  open: boolean;
+  onToggle: () => void;
   repo: string;
   activePath: string | undefined;
   onSelectFile: (path: string) => void;
-  terminalConfigured: boolean;
+  claudifyColumn: boolean;
   /// This finding's position in `report.findings`, which is what a
   /// Claudify sends. Passed down rather than recomputed, because the
   /// group does not hold the wire list.
@@ -530,18 +617,38 @@ function GroupSection({
     group.pathLength === 0
       ? group.label
       : shown(group.label.slice(0, group.pathLength), repo) + group.label.slice(group.pathLength);
+  // The counts are of findings only. An Unknown check is not a finding,
+  // and counting it as one would say the producer found something when it
+  // could not look.
+  const counts = SEVERITY_ORDER.map(
+    (s) => [s, group.findings.filter((f) => f.severity === s).length] as const,
+  ).filter(([, c]) => c > 0);
   return (
-    <section className={labelled ? "border-l border-[#21262d] pl-2" : undefined}>
+    <section className={labelled ? "@container border-l border-[#21262d] pl-2" : "@container"}>
       {labelled ? (
-        <h3 className="break-words text-[11px] font-semibold text-[#8b949e]">
-          {heading}
-          {/* The count is of findings only. An Unknown check is not a
-              finding, and counting it as one would say the producer
-              found something when it could not look. */}
-          {group.findings.length > 0 ? ` (${group.findings.length})` : ""}
+        <h3 className="text-[11px] font-semibold text-[#8b949e]">
+          <button
+            type="button"
+            onClick={onToggle}
+            aria-expanded={open}
+            className="tap-target flex w-full items-center gap-x-1.5 text-left hover:text-[#e6edf3]"
+          >
+            <Chevron open={open} />
+            <span className="flex min-w-0 flex-wrap items-baseline gap-x-2">
+              <span className="break-words">{heading}</span>
+              {counts.map(([s, c], i) => (
+                <span key={s} className={`font-normal ${SEVERITY[s].className}`}>
+                  {severityCount(s, c)}
+                  {i < counts.length - 1 ? "," : ""}
+                </span>
+              ))}
+            </span>
+          </button>
         </h3>
       ) : null}
 
+      {/* Shown collapsed or not: a heading with nothing under it reads
+          as a clean check, and this one could not look (#846). */}
       {group.unknownChecks.length > 0 ? (
         <ul className="mt-0.5 space-y-0.5">
           {group.unknownChecks.map((c) => (
@@ -552,22 +659,101 @@ function GroupSection({
         </ul>
       ) : null}
 
-      {group.findings.length > 0 ? (
-        <ul className="mt-1 space-y-2">
-          {group.findings.map((f, i) => (
-            <FindingRow
-              key={`${f.check}:${f.subject.path}:${i}`}
-              finding={f}
-              index={wireIndex(f)}
-              repo={repo}
-              activePath={activePath}
-              onSelectFile={onSelectFile}
-              terminalConfigured={terminalConfigured}
-            />
-          ))}
-        </ul>
+      {open && group.findings.length > 0 ? (
+        <FindingTable
+          caption={labelled ? heading : "Findings"}
+          findings={group.findings}
+          repo={repo}
+          activePath={activePath}
+          onSelectFile={onSelectFile}
+          claudifyColumn={claudifyColumn}
+          wireIndex={wireIndex}
+        />
       ) : null}
     </section>
+  );
+}
+
+/// A drawn chevron rather than a glyph, so the heading's text -- which
+/// is its accessible name -- is the label and the counts alone.
+function Chevron({ open }: { open: boolean }) {
+  return (
+    <svg
+      aria-hidden="true"
+      viewBox="0 0 16 16"
+      className={`size-3 shrink-0 fill-current motion-safe:transition-transform ${open ? "rotate-90" : ""}`}
+    >
+      <path d="M6 4l4 4-4 4z" />
+    </svg>
+  );
+}
+
+/// One group's findings as a table (#1344).
+///
+/// # Phone width
+///
+/// Nothing here scrolls sideways. The table is `table-fixed` at full
+/// width, and under a narrow CONTAINER (not viewport: the desktop pane
+/// can be narrow too) each row stops being a table row and wraps: the
+/// severity and the sentence on one line, where it is on the next, the
+/// actions after. The header row is kept for a screen reader and hidden
+/// from sight there, where it would label columns that no longer line up.
+function FindingTable({
+  caption,
+  findings,
+  repo,
+  activePath,
+  onSelectFile,
+  claudifyColumn,
+  wireIndex,
+}: {
+  caption: string;
+  findings: ClaudeMdAdviceFinding[];
+  repo: string;
+  activePath: string | undefined;
+  onSelectFile: (path: string) => void;
+  claudifyColumn: boolean;
+  wireIndex: (f: ClaudeMdAdviceFinding) => number;
+}) {
+  const th = "px-1 py-1 font-normal";
+  return (
+    <table className="mt-1 w-full table-fixed border-collapse text-left text-[11px] @max-xl:block">
+      <caption className="sr-only">{caption}</caption>
+      <thead className="text-[#8b949e] @max-xl:sr-only">
+        <tr>
+          <th scope="col" className={`${th} w-28`}>
+            Severity
+          </th>
+          <th scope="col" className={th}>
+            Finding
+          </th>
+          <th scope="col" className={`${th} w-[28%]`}>
+            Where
+          </th>
+          <th scope="col" className={`${th} w-20`}>
+            Copy brief
+          </th>
+          {claudifyColumn ? (
+            <th scope="col" className={`${th} w-20`}>
+              Claudify
+            </th>
+          ) : null}
+        </tr>
+      </thead>
+      <tbody className="@max-xl:block">
+        {findings.map((f, i) => (
+          <FindingRow
+            key={`${f.check}:${f.subject.path}:${i}`}
+            finding={f}
+            index={wireIndex(f)}
+            repo={repo}
+            activePath={activePath}
+            onSelectFile={onSelectFile}
+            claudifyColumn={claudifyColumn}
+          />
+        ))}
+      </tbody>
+    </table>
   );
 }
 
@@ -577,7 +763,7 @@ function FindingRow({
   repo,
   activePath,
   onSelectFile,
-  terminalConfigured,
+  claudifyColumn,
 }: {
   finding: ClaudeMdAdviceFinding;
   /// Position in `report.findings`. Claudify sends this, not the brief.
@@ -585,58 +771,106 @@ function FindingRow({
   repo: string;
   activePath: string | undefined;
   onSelectFile: (path: string) => void;
-  terminalConfigured: boolean;
+  claudifyColumn: boolean;
 }) {
+  const [showEvidence, setShowEvidence] = useState(false);
+  const [showRun, setShowRun] = useState(false);
   const severity = SEVERITY[finding.severity];
   const file = subjectFile(finding.subject);
+  const td = "px-1 py-1 align-top";
+  const columns = claudifyColumn ? 5 : 4;
   return (
-    <li className="break-words text-xs">
-      <p>
+    <>
+      <tr className="border-t border-[#21262d] @max-xl:flex @max-xl:flex-wrap @max-xl:items-baseline @max-xl:gap-x-2">
         {/* Severity in TEXT as well as colour: colour alone is not an
             answer for a reader who cannot see it. */}
-        <span className={`mr-1 ${severity.className}`}>[{severity.label}]</span>
-        <span className="text-[#e6edf3]">{finding.finding}</span>
-      </p>
-      {/* The subject. A file is a button that shows it, carrying
-          `aria-current` when it is the one on screen -- navigation, not
-          a toggle. A directory has no file to show. */}
-      {file !== null ? (
-        <button
-          type="button"
-          onClick={() => onSelectFile(file)}
-          aria-current={current(file === activePath)}
-          className={`tap-target mt-0.5 rounded px-1 text-left font-mono text-[11px] ${
-            file === activePath ? "bg-[#1f6feb] text-white" : "text-[#58a6ff] hover:bg-[#161b22]"
-          }`}
-        >
-          {shown(file, repo)}
-          {finding.subject.kind === "claudeMd" && finding.subject.section !== null
-            ? ` ${finding.subject.section}`
-            : ""}
-        </button>
-      ) : (
-        <p className="mt-0.5 font-mono text-[11px] text-[#8b949e]">{shown(finding.subject.path, repo)}/</p>
-      )}
-      <ul className="mt-0.5 space-y-0.5">
-        {finding.evidence.map((e, i) => (
-          <li key={i} className="text-[11px] text-[#8b949e]">
-            <span className="font-mono">{locatorText(e.at, repo)}</span> — {e.measured}
-          </li>
-        ))}
-      </ul>
-      {/* Claudify (#1292): the brief, copied or run. Plain buttons, not
-          `aria-pressed` -- these are actions, not states. The brief
-          itself is still not rendered inline; it is for an agent, and
-          the Run panel shows it only as the argv that will carry it. */}
-      <div className="mt-0.5">
-        <ClaudifyAction
-          brief={finding.brief}
-          repo={repo}
-          target={{ kind: "finding", index }}
-          what="Brief"
-          terminalConfigured={terminalConfigured}
-        />
-      </div>
-    </li>
+        <td className={`${td} ${severity.className}`}>[{severity.label}]</td>
+        <td className={`${td} break-words @max-xl:min-w-0 @max-xl:flex-1`}>
+          <span className="text-xs text-[#e6edf3]">{finding.finding}</span>
+          {finding.evidence.length > 0 ? (
+            <>
+              {" "}
+              <button
+                type="button"
+                onClick={() => setShowEvidence((v) => !v)}
+                aria-expanded={showEvidence}
+                className="text-[11px] whitespace-nowrap text-[#58a6ff] hover:underline"
+              >
+                Evidence ({finding.evidence.length})
+              </button>
+              {showEvidence ? (
+                <ul className="mt-0.5 space-y-0.5">
+                  {finding.evidence.map((e, i) => (
+                    <li key={i} className="wrap-anywhere text-[#8b949e]">
+                      <span className="font-mono">{locatorText(e.at, repo)}</span> — {e.measured}
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+            </>
+          ) : null}
+        </td>
+        {/* The subject. A file is a button that shows it, carrying
+            `aria-current` when it is the one on screen -- navigation, not
+            a toggle. A directory has no file to show. */}
+        <td className={`${td} @max-xl:basis-full`}>
+          {file !== null ? (
+            <button
+              type="button"
+              onClick={() => onSelectFile(file)}
+              aria-current={current(file === activePath)}
+              className={`tap-target wrap-anywhere rounded px-1 text-left font-mono ${
+                file === activePath ? "bg-[#1f6feb] text-white" : "text-[#58a6ff] hover:bg-[#161b22]"
+              }`}
+            >
+              {shown(file, repo)}
+              {finding.subject.kind === "claudeMd" && finding.subject.section !== null
+                ? ` ${finding.subject.section}`
+                : ""}
+            </button>
+          ) : (
+            <span className="wrap-anywhere font-mono text-[#8b949e]">
+              {shown(finding.subject.path, repo)}/
+            </span>
+          )}
+        </td>
+        {/* Claudify (#1292): the brief, copied or run. Plain buttons, not
+            `aria-pressed` -- these are actions, not states. The brief
+            itself is still not rendered inline; it is for an agent. */}
+        <td className={td}>
+          <CopyBriefButton brief={finding.brief} what="Brief" />
+        </td>
+        {/* An observation's brief recommends nothing (#1339), so there
+            is nothing to hand a session: the cell says so rather than
+            offering a run that could only be told to change nothing. */}
+        {claudifyColumn ? (
+          <td className={td}>
+            {finding.severity === "note" ? (
+              <span className="text-[#8b949e]">Nothing to change</span>
+            ) : (
+              <ClaudifyButton
+                open={showRun}
+                onToggle={() => setShowRun((v) => !v)}
+                terminalConfigured
+              />
+            )}
+          </td>
+        ) : null}
+      </tr>
+      {/* The command line needs the table's whole width to be readable,
+          so it opens in a row of its own beneath the finding. */}
+      {showRun ? (
+        <tr className="@max-xl:block">
+          <td colSpan={columns} className="px-1 pb-2 @max-xl:block">
+            <RunPanel
+              repo={repo}
+              target={{ kind: "finding", index }}
+              what="Brief"
+              onDone={() => setShowRun(false)}
+            />
+          </td>
+        </tr>
+      ) : null}
+    </>
   );
 }

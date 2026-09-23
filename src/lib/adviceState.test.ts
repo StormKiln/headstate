@@ -113,6 +113,18 @@ describe("adviceState", () => {
     });
   });
 
+  /// A Re-check over a fresh report is a run in flight too (#1343): the
+  /// report stays, and says a new check is running rather than looking
+  /// as if nothing happened.
+  it("says a re-check is running over a fresh report", () => {
+    const fresh = result({ state: "fresh", recomputed: true });
+    expect(adviceState(q(), q({ data: fresh, isFetching: true }))).toEqual({
+      kind: "report",
+      result: fresh,
+      refreshing: true,
+    });
+  });
+
   /// A rejected first read is a failure with nothing underneath (#846),
   /// never an empty report.
   it("is a failure when the cached call was rejected with nothing served", () => {

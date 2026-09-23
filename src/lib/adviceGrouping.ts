@@ -8,12 +8,12 @@ import type {
 
 /// How the advice list is organised (#1291).
 ///
-/// `"none"` is the flat list the panel has always rendered, and it is the
-/// DEFAULT: it is the backend's own `Severity::rank` order end to end,
-/// the one arrangement in which position means exactly one thing. Every
-/// grouping necessarily reorders -- a critical finding stops being the
-/// first row and becomes the first row of some group -- so grouping is a
-/// question the user asks, never one the panel answers for them.
+/// `"none"` is the flat list: the backend's own `Severity::rank` order end
+/// to end, the one arrangement in which position means exactly one thing.
+/// `"check"` is the DEFAULT since #1344, because for most repositories the
+/// flat list is hundreds of rows and unusable. Every grouping reorders --
+/// a critical finding becomes the first row of some group -- which is why
+/// groups are ordered worst-first below, so a problem still leads.
 export type AdviceGrouping = "none" | "check" | "file";
 
 /// Severity rank, mirroring `Severity::rank` in
@@ -32,7 +32,24 @@ const RANK: Record<ClaudeMdAdviceFinding["severity"], number> = {
   problem: 0,
   advice: 1,
   unknown: 2,
+  note: 3,
 };
+
+/// The key of the Observations group: every `note` finding, in every
+/// arrangement, and always last (#1339).
+///
+/// A Note is an observation with no recommendation -- a count of what a
+/// check covered, a rule found already written. Left in its check's or
+/// its file's group it would sit among the things to change and read as
+/// one, which is the defect #1339 names. So it is partitioned out before
+/// grouping, and an arrangement is only ever an arrangement of advice.
+export const OBSERVATIONS_KEY = "observations";
+
+/// Whether a finding is advice at all, as opposed to an observation.
+/// What the panel counts, and what every advice group holds.
+export function isAdvice(f: ClaudeMdAdviceFinding): boolean {
+  return f.severity !== "note";
+}
 
 /// One group of findings, and the coverage rows that belong to it.
 export interface AdviceGroup {
@@ -158,6 +175,34 @@ function fileGroupOf(subject: ClaudeMdAdviceSubject): Omit<AdviceGroup, "finding
 /// `"none"` returns a single unlabelled group, which is the flat list.
 /// One code path renders every mode.
 export function groupFindings(report: ClaudeMdAdviceReport, grouping: AdviceGrouping): AdviceGroup[] {
+  // Partitioned, not sorted: each half is a subsequence of the wire. With
+  // no Notes the advice half IS the wire array, untouched.
+  const notes = report.findings.filter((f) => !isAdvice(f));
+  const advice = notes.length === 0 ? report.findings : report.findings.filter(isAdvice);
+  const observations: AdviceGroup[] =
+    notes.length === 0
+      ? []
+      : [
+          {
+            key: OBSERVATIONS_KEY,
+            label: "Observations",
+            pathLength: 0,
+            file: null,
+            findings: notes,
+            unknownChecks: [],
+          },
+        ];
+  // A report of only Notes has no advice to list, and an empty flat
+  // group above the observations would be read as the clean list.
+  if (grouping === "none" && advice.length === 0 && notes.length > 0) return observations;
+  return [...groupAdvice(report, advice, grouping), ...observations];
+}
+
+function groupAdvice(
+  report: ClaudeMdAdviceReport,
+  findings: ClaudeMdAdviceFinding[],
+  grouping: AdviceGrouping,
+): AdviceGroup[] {
   if (grouping === "none") {
     return [
       {
@@ -165,7 +210,7 @@ export function groupFindings(report: ClaudeMdAdviceReport, grouping: AdviceGrou
         label: "",
         pathLength: 0,
         file: null,
-        findings: report.findings,
+        findings,
         unknownChecks: [],
       },
     ];
@@ -179,7 +224,7 @@ export function groupFindings(report: ClaudeMdAdviceReport, grouping: AdviceGrou
   // list -- an ordering the map could not express on its own.
   const firstSeen = new Map<string, number>();
 
-  for (const [i, f] of report.findings.entries()) {
+  for (const [i, f] of findings.entries()) {
     const shell =
       grouping === "check"
         ? { key: `check:${f.check}`, label: CHECK_LABEL[f.check], pathLength: 0, file: null }
@@ -222,7 +267,7 @@ export function groupFindings(report: ClaudeMdAdviceReport, grouping: AdviceGrou
         // so it has no rank to compare -- but it must not be sorted away
         // either, and `worstRank` below treats an empty group as worse
         // than nothing so it stays visible among the results.
-        firstSeen.set(key, report.findings.length + report.checks.indexOf(c));
+        firstSeen.set(key, findings.length + report.checks.indexOf(c));
       }
       group.unknownChecks.push(c);
     }

@@ -105,7 +105,10 @@ export function needsRefresh(result: ClaudeMdAdviceResult | undefined): boolean 
 ///    `"idle"` only the never-asked one.
 export function adviceState(cached: AdviceQuery, fresh: AdviceQuery): AdviceState {
   if (fresh.data !== undefined) {
-    return { kind: "report", result: fresh.data, refreshing: false };
+    // A Re-check over a fresh report re-runs this same query, and that
+    // run is in flight exactly as a first refresh is (#1343). Reporting
+    // `false` here made the second and every later Re-check invisible.
+    return { kind: "report", result: fresh.data, refreshing: fresh.enabled && fresh.isFetching };
   }
   if (cached.data !== undefined) {
     // `isFetching` rather than `isLoading`, because the fresh query may

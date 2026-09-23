@@ -162,20 +162,29 @@ pub enum Severity {
     Advice,
     /// Could not be decided. The evidence says why not.
     Unknown,
+    /// An observation with no recommendation: a count of what a check
+    /// covered, or a rule it found already written (#1339). Never
+    /// counted as advice, and its brief recommends nothing. Not a clean
+    /// pass either: it says what was measured, and nothing about
+    /// whether what was measured is good.
+    Note,
 }
 
 impl Severity {
-    /// Sort order, worst first: Problem, then Advice, then Unknown.
+    /// Sort order, worst first: Problem, then Advice, then Unknown, then
+    /// Note.
     ///
     /// Unknown ranks ABOVE nothing and never among clean: an Unknown
     /// sorted after the findings would read as the least important
     /// thing on the list, when it is the one thing the list cannot
-    /// vouch for.
+    /// vouch for. Note ranks after it because it is not a finding about
+    /// anything to change; it is what the checks saw on the way.
     pub fn rank(self) -> u8 {
         match self {
             Severity::Problem => 0,
             Severity::Advice => 1,
             Severity::Unknown => 2,
+            Severity::Note => 3,
         }
     }
 }
@@ -805,6 +814,7 @@ mod tests {
         let repo = Path::new("/home/octocat/hello-world");
         let cx = context(repo, &scan);
         let emitted = vec![
+            finding(Severity::Note, "note one"),
             finding(Severity::Advice, "advice one"),
             finding(Severity::Unknown, "unknown"),
             finding(Severity::Problem, "problem"),
@@ -814,7 +824,18 @@ mod tests {
 
         let report = run_with(&cx, &producers);
         let order: Vec<&str> = report.findings.iter().map(|f| f.finding.as_str()).collect();
-        assert_eq!(order, ["problem", "advice one", "advice two", "unknown"]);
+        assert_eq!(
+            order,
+            ["problem", "advice one", "advice two", "unknown", "note one"]
+        );
+    }
+
+    /// A Note is an observation, and travels as `"note"`: the panel keys
+    /// its Observations group on that string.
+    #[test]
+    fn a_note_ranks_after_unknown_and_travels_as_note() {
+        assert!(Severity::Note.rank() > Severity::Unknown.rank());
+        assert_eq!(serde_json::to_value(Severity::Note).unwrap(), "note");
     }
 
     /// The wire shape the TypeScript mirror is written against: camelCase
