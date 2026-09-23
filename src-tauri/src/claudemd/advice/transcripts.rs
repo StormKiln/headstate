@@ -2052,6 +2052,28 @@ mod tests {
         p
     }
 
+    /// Replace a session file the ledger has already seen, and make the
+    /// change visible to it. The ledger's change key is `(size_bytes,
+    /// mtime_ms)`; a rewrite of the same length inside the same
+    /// millisecond is invisible to it, which the module docs accept for
+    /// real transcripts (append-mostly, written by another process) but
+    /// which made a test flaky: `{"command":"git status"}` and
+    /// `{"pattern":"**/ci*.yml"}` are both 22 bytes, so a fast rewrite
+    /// served the stale rows. Moving mtime a full second past the old one
+    /// makes the rewrite a change on every filesystem's granularity.
+    fn rewrite(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let p = dir.join(name);
+        let before = fs::metadata(&p).unwrap().modified().unwrap();
+        fs::write(&p, body).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(before + std::time::Duration::from_secs(1))
+            .unwrap();
+        p
+    }
+
     fn context<'a>(repo: &'a Path, scan: &'a EffectiveScan, conn: &'a Connection) -> Context<'a> {
         Context {
             repo,
@@ -3138,7 +3160,7 @@ mod tests {
             .join("\n")
         };
         for n in [1, 2, 3] {
-            write(repo, &format!("s{n}.jsonl"), &only(n));
+            rewrite(repo, &format!("s{n}.jsonl"), &only(n));
         }
         let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
         assert_eq!(early_reads(&out).len(), 1, "{out:#?}");
@@ -3510,7 +3532,7 @@ mod tests {
                 read(n),
             ]
             .join("\n");
-            write(repo, &format!("s{n}.jsonl"), &body);
+            rewrite(repo, &format!("s{n}.jsonl"), &body);
         }
         let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
         let hits = early_reads(&out);
