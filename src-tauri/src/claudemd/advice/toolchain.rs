@@ -37,6 +37,20 @@
 //! that maps to nothing is listed as "other" in the evidence and is never
 //! counted for or against a verb.
 //!
+//! A package.json script whose name maps to nothing is mapped by its body
+//! instead (#1341: a `verify` script running prettier, eslint and vitest
+//! was listed as "other", and format reported undocumented). The body is
+//! split at `&&`, `||`, `;` and `|`, leading `NAME=value` assignments are
+//! skipped, a launcher is read through, and the tool maps: `prettier` and
+//! `biome format` to format, `eslint` and `biome lint` to lint, `vitest`,
+//! `jest`, `mocha` and `playwright test` to test, `tsc` and `vite build`
+//! to build. A command running another script (`npm run <s>`) maps `<s>`
+//! by name, else by its body, one level only. One script can offer
+//! several verbs, and a loaded file naming it names all of them. The tool
+//! map applies to bodies only: a loaded file naming `npx prettier` still
+//! names no script. Makefile and justfile recipes are not read this way:
+//! their bodies are shell and the target parser does not read them.
+//!
 //! A JS launcher is read through to the tool it runs (#1323): `npx`,
 //! `bunx`, `pnpm exec`, `bun x` and `pnpm nx` name what follows them, and
 //! `pnpm`/`bun` run scripts as `yarn` does. An `nx` command's verbs come
@@ -101,7 +115,7 @@ impl Producer for Coverage {
 
     fn run(&self, cx: &Context) -> Result<Vec<Finding>, String> {
         let detection = detect(cx.repo);
-        let search = documented(cx.scan);
+        let search = documented(cx.scan, &detection.script_verbs);
         let subject = subject_for(cx.repo, cx.scan);
         let mut out = Vec::new();
 
@@ -515,6 +529,98 @@ fn tool_verb(args: &[&str]) -> Option<Verb> {
     }
 }
 
+/// The package.json script a JS command runs, when it runs one: `npm run
+/// <s>`, `npm test`, `yarn <s>`, `pnpm run <s>`, `bun run <s>`.
+fn script_run<'a>(manager: &str, args: &[&'a str]) -> Option<&'a str> {
+    let first = args.first().copied();
+    match manager {
+        "yarn" | "pnpm" | "bun" => match first {
+            Some("run") => args.get(1).copied(),
+            s => s,
+        },
+        "npm" => match first {
+            Some("run" | "run-script") => args.get(1).copied(),
+            s @ Some("test" | "start") => s,
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The verb a JS tool run from a script body names (#1341). Only in a
+/// body: a loaded file naming `npx prettier` is not naming a script.
+fn js_tool_verb(tool: &str, args: &[&str]) -> Option<Verb> {
+    let first = args.first().copied();
+    match tool {
+        "prettier" => Some(Verb::Format),
+        "eslint" => Some(Verb::Lint),
+        "biome" => match first {
+            Some("lint") => Some(Verb::Lint),
+            Some("format") => Some(Verb::Format),
+            _ => None,
+        },
+        "vitest" | "jest" | "mocha" => Some(Verb::Test),
+        "playwright" if first == Some("test") => Some(Verb::Test),
+        "tsc" => Some(Verb::Build),
+        "vite" if first == Some("build") => Some(Verb::Build),
+        _ => None,
+    }
+}
+
+/// The verbs a package.json script's body runs (#1341), in order, each
+/// once. The body is split at `&&`, `||`, `;` and `|`; leading `NAME=value`
+/// assignments are skipped and a launcher is read through
+/// ([`unwrap_launcher`]). A command running another script maps it by name,
+/// else, when `follow` is set, by that script's own body with `follow`
+/// cleared: one level, so a cycle cannot loop and a chain is not chased.
+fn body_verbs(body: &str, bodies: &BTreeMap<&str, &str>, follow: bool) -> Vec<Verb> {
+    let mut out = Vec::new();
+    for segment in split_chain(body) {
+        let tokens: Vec<&str> = segment
+            .split_whitespace()
+            .skip_while(|t| is_assignment(t))
+            .collect();
+        let Some(first) = tokens.first() else {
+            continue;
+        };
+        let (tool, args) = unwrap_launcher(first, &tokens[1..]);
+        let found: Vec<Verb> = if let Some(v) = js_tool_verb(tool, args) {
+            vec![v]
+        } else if tool == "nx" {
+            nx_verbs(args)
+        } else if let Some(s) = script_run(tool, args) {
+            match verb_by_name(s) {
+                Some(v) => vec![v],
+                None if follow => bodies
+                    .get(s)
+                    .map(|b| body_verbs(b, bodies, false))
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        for v in found {
+            if !out.contains(&v) {
+                out.push(v);
+            }
+        }
+    }
+    out
+}
+
+/// `NAME=value` before a command: an environment assignment.
+fn is_assignment(token: &str) -> bool {
+    match token.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && !name.starts_with(|c: char| c.is_ascii_digit())
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        None => false,
+    }
+}
+
 // ---------------------------------------------------------------------
 // Detection
 // ---------------------------------------------------------------------
@@ -642,6 +748,11 @@ pub struct Detection {
     pub unreadable_dirs: Vec<(PathBuf, String)>,
     /// Formatter configs found, for the lint-leakage rule.
     pub formatter_configs: Vec<PathBuf>,
+    /// The verbs a package.json script named for no verb runs, by
+    /// script name, so a loaded file naming `npm run verify` names what
+    /// `verify` runs (#1341). A name two manifests share takes the union
+    /// of what either runs.
+    pub script_verbs: BTreeMap<String, Vec<Verb>>,
 }
 
 /// The same bound and the same exclusions as `detect::projects`, so the
@@ -763,23 +874,55 @@ pub fn detect(repo: &Path) -> Detection {
                         repo,
                         &dir,
                     );
-                    match scripts::scripts(&dir) {
+                    match scripts::script_bodies(&dir) {
                         Manifest::Present(list) => {
-                            for s in list {
-                                match verb_by_name(&s) {
-                                    Some(verb) => t.offers.push(Offer {
+                            let bodies: BTreeMap<&str, &str> = list
+                                .iter()
+                                .map(|s| (s.name.as_str(), s.body.as_str()))
+                                .collect();
+                            for s in &list {
+                                let name = &s.name;
+                                let command = if *eco == Ecosystem::Yarn {
+                                    format!("yarn {name}")
+                                } else {
+                                    format!("npm run {name}")
+                                };
+                                // By name first; by body only when the
+                                // name maps to nothing (#1341).
+                                let (verbs, measured) = match verb_by_name(name) {
+                                    Some(verb) => (vec![verb], format!("script `{name}`")),
+                                    None => {
+                                        let verbs = body_verbs(&s.body, &bodies, true);
+                                        if !verbs.is_empty() {
+                                            let known =
+                                                out.script_verbs.entry(name.clone()).or_default();
+                                            for v in &verbs {
+                                                if !known.contains(v) {
+                                                    known.push(*v);
+                                                }
+                                            }
+                                        }
+                                        (
+                                            verbs,
+                                            format!(
+                                                "script `{name}` runs `{}`",
+                                                clamp(s.body.trim(), 80)
+                                            ),
+                                        )
+                                    }
+                                };
+                                if verbs.is_empty() {
+                                    t.other.push(name.clone());
+                                }
+                                for verb in verbs {
+                                    t.offers.push(Offer {
                                         verb,
-                                        command: if *eco == Ecosystem::Yarn {
-                                            format!("yarn {s}")
-                                        } else {
-                                            format!("npm run {s}")
-                                        },
-                                        what: s.clone(),
+                                        command: command.clone(),
+                                        what: name.clone(),
                                         file: t.manifest.clone(),
                                         line: None,
-                                        measured: format!("script `{s}`"),
-                                    }),
-                                    None => t.other.push(s),
+                                        measured: measured.clone(),
+                                    });
                                 }
                             }
                         }
@@ -1195,7 +1338,7 @@ fn loaded_files(scan: &EffectiveScan) -> Vec<PathBuf> {
 }
 
 /// What the loaded files name, through `text::spans` and `text::fences`.
-pub fn documented(scan: &EffectiveScan) -> Search {
+pub fn documented(scan: &EffectiveScan, script_verbs: &BTreeMap<String, Vec<Verb>>) -> Search {
     let mut out = Search::default();
     for path in loaded_files(scan) {
         let text = match std::fs::read_to_string(&path) {
@@ -1208,7 +1351,7 @@ pub fn documented(scan: &EffectiveScan) -> Search {
         };
         for s in text::spans(&text) {
             out.spans += 1;
-            for (manager, verb) in commands_in(&s.text) {
+            for (manager, verb) in commands_with(&s.text, script_verbs) {
                 out.named.push(Named {
                     manager,
                     verb,
@@ -1224,7 +1367,7 @@ pub fn documented(scan: &EffectiveScan) -> Search {
                     continue;
                 }
                 out.fenced_lines += 1;
-                for (manager, verb) in commands_in(line) {
+                for (manager, verb) in commands_with(line, script_verbs) {
                     out.named.push(Named {
                         manager,
                         verb,
@@ -1240,10 +1383,17 @@ pub fn documented(scan: &EffectiveScan) -> Search {
     out
 }
 
+/// [`commands_with`] and no script bodies.
+#[cfg(test)]
+fn commands_in(text: &str) -> Vec<(String, Verb)> {
+    commands_with(text, &BTreeMap::new())
+}
+
 /// The verbs one span or one fenced line names. A line can chain
 /// commands (`cd src-tauri && cargo test --lib`), so each segment is read
-/// on its own; a `$ ` prompt is stripped.
-fn commands_in(text: &str) -> Vec<(String, Verb)> {
+/// on its own; a `$ ` prompt is stripped. A script whose name maps to no
+/// verb names what its body runs, from `script_verbs` (#1341).
+fn commands_with(text: &str, script_verbs: &BTreeMap<String, Vec<Verb>>) -> Vec<(String, Verb)> {
     let mut out = Vec::new();
     for segment in split_chain(text) {
         let segment = segment.trim();
@@ -1261,6 +1411,8 @@ fn commands_in(text: &str) -> Vec<(String, Verb)> {
             out.extend(nx_verbs(args).into_iter().map(|v| ("nx".to_string(), v)));
         } else if let Some(verb) = verb_of(manager, args) {
             out.push((manager.to_string(), verb));
+        } else if let Some(verbs) = script_run(manager, args).and_then(|s| script_verbs.get(s)) {
+            out.extend(verbs.iter().map(|v| (manager.to_string(), *v)));
         }
     }
     out
@@ -2142,6 +2294,96 @@ mod tests {
         let gaps = test_gaps("Run `cargo test`.\n");
         assert_eq!(gaps.len(), 1, "{gaps:?}");
         assert!(gaps[0].ends_with("`yarn test`"), "{gaps:?}");
+    }
+
+    /// #1341: a script body maps by the tools it runs, split at `&&`,
+    /// `;` and `|`, through launchers and env assignments; `npm run <s>`
+    /// is followed once and no further.
+    #[test]
+    fn a_script_body_maps_by_the_tools_it_runs() {
+        let bodies: BTreeMap<&str, &str> = [
+            ("a", "npm run b"),
+            ("b", "npm run c"),
+            ("c", "eslint ."),
+            ("self", "npm run self"),
+        ]
+        .into_iter()
+        .collect();
+        let v = |body: &str| body_verbs(body, &bodies, true);
+        assert_eq!(
+            v("prettier --check $(git diff --name-only) && eslint . && vitest run"),
+            vec![Verb::Format, Verb::Lint, Verb::Test]
+        );
+        assert_eq!(v("echo hi"), vec![]);
+        assert_eq!(
+            v("CI=1 npx jest; tsc -p . | tee out"),
+            vec![Verb::Test, Verb::Build]
+        );
+        assert_eq!(
+            v("biome lint . && playwright test && vite build && mocha"),
+            vec![Verb::Lint, Verb::Test, Verb::Build]
+        );
+        assert_eq!(v("biome format --write ."), vec![Verb::Format]);
+        assert_eq!(v("playwright install && vite"), vec![]);
+        // A script named for its verb maps by name, without a body.
+        assert_eq!(v("yarn lint && npm test"), vec![Verb::Lint, Verb::Test]);
+        // Followed once: `b` is read, and what `b` runs through `c` is
+        // not.
+        assert_eq!(v("npm run c"), vec![Verb::Lint]);
+        assert_eq!(v("npm run a"), vec![]);
+        assert_eq!(v("pnpm run self"), vec![]);
+        assert_eq!(v("npm run missing"), vec![]);
+    }
+
+    /// #1341's test: `verify` runs prettier, eslint and vitest, and a
+    /// CLAUDE.md naming `npm run verify` names Format, Lint and Test. The
+    /// same script running `echo hi` names nothing and is listed as not
+    /// mapped.
+    #[test]
+    fn a_script_named_for_no_verb_is_mapped_by_its_body() {
+        let (_t, repo, home) = fixture();
+        let manifest = |verify: &str| {
+            format!(
+                r#"{{"scripts":{{"format":"prettier --write .","lint":"eslint .","test":"vitest","verify":"{verify}"}}}}"#
+            )
+        };
+        fs::write(
+            repo.join("package.json"),
+            manifest("prettier --check $(git diff --name-only) && eslint . && vitest run"),
+        )
+        .unwrap();
+        fs::write(
+            repo.join("CLAUDE.md"),
+            "Run `npm run verify` before pushing.\n",
+        )
+        .unwrap();
+
+        let report = run_over(&repo, &home);
+        assert!(toolchain_findings(&report).is_empty(), "{report:#?}");
+
+        // `verify` is offered for each verb it runs, and is a candidate.
+        let detection = detect(&repo);
+        let npm = &detection.toolchains[0];
+        let verify: Vec<Verb> = npm
+            .offers
+            .iter()
+            .filter(|o| o.what == "verify")
+            .map(|o| o.verb)
+            .collect();
+        assert_eq!(verify, vec![Verb::Format, Verb::Lint, Verb::Test]);
+        assert!(npm.other.is_empty(), "{:?}", npm.other);
+
+        fs::write(repo.join("package.json"), manifest("echo hi")).unwrap();
+        let report = run_over(&repo, &home);
+        let found = toolchain_findings(&report);
+        assert_eq!(found.len(), 3, "{report:#?}");
+        assert!(
+            found.iter().all(|f| f
+                .evidence
+                .iter()
+                .any(|e| e.measured == "not mapped to a verb, not counted: `verify`")),
+            "{report:#?}"
+        );
     }
 
     /// Detection over the added markers, each read through this module's
