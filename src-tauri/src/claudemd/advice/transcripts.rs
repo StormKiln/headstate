@@ -49,7 +49,11 @@
 //! Before a finding is emitted its dedup key is tested verbatim, with
 //! whitespace collapsed and case kept, against every CLAUDE.md from the
 //! repository root to the attributed directory, their resolved imports,
-//! and the global and local scopes the effective scan carries. A hit is
+//! the global and local scopes the effective scan carries, and each of
+//! the repository's `.claude/rules` a session in that directory would
+//! load (`claudemd::rules`: unconditional, or `paths:` reaching it). A
+//! file that cannot be read is no hit, and the finding then claims
+//! nothing about where the key is written. A hit is
 //! kept visible as a finding worded "already written in `<file>`", so the
 //! reader sees the rule doing its job. A paraphrased rule is missed by
 //! this; semantic matching is #1198.
@@ -1299,7 +1303,8 @@ fn placement(dirs: &[&Path], candidates: &[PathBuf], repo: &Path) -> PathBuf {
 }
 
 /// Which CLAUDE.md on the path from the root to `dir`, its imports, or
-/// the global and local scopes already holds `key` verbatim.
+/// the global and local scopes, or a rule that applies there already
+/// holds `key` verbatim.
 fn written_in(
     key: &str,
     dir: &Path,
@@ -1326,6 +1331,14 @@ fn written_in(
     for (path, imports) in files {
         queue.push(path);
         collect_imports(imports, &mut queue);
+    }
+    // #1340: the repository's rules a session in `dir` would load.
+    let rel = dir.strip_prefix(cx.repo).unwrap_or(dir);
+    let rel = rel.to_string_lossy().replace('\\', "/");
+    for rule in crate::claudemd::rules::read(cx.repo).files {
+        if rule.applies_to(&rel) {
+            queue.push(rule.path.to_string_lossy().into_owned());
+        }
     }
     for path in queue {
         let content = cache
@@ -1885,6 +1898,39 @@ mod tests {
                 .contains(&format!("already written in `{}`", global.display())),
             "{}",
             corrected(&out)[0].finding
+        );
+    }
+
+    /// #1340: the dedup looks through the repository's `.claude/rules`,
+    /// but only a rule a session in the attributed directory would load.
+    #[test]
+    fn dedup_looks_through_the_rules_that_apply() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path();
+        write(repo, "CLAUDE.md", "# rules\n");
+        let rules = repo.join(".claude").join("rules");
+        fs::create_dir_all(&rules).unwrap();
+        let rule = write(&rules, "lint.md", "---\npaths: web/**\n---\nmake lint\n");
+        let cwd = repo.to_string_lossy().into_owned();
+        let conn = db();
+        for n in [1, 2] {
+            let p = write(repo, &format!("s{n}.jsonl"), &corrected_pair(&cwd, n));
+            insert_session(&conn, &format!("s{n}"), &cwd, Some(&p), None);
+        }
+        let scan = scan_effective_opt(repo, None);
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        let f = &corrected(&out)[0].finding;
+        assert!(!f.contains("already written"), "scoped to web/: {f}");
+
+        write(&rules, "lint.md", "Always make lint.\n");
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        let f = &corrected(&out)[0].finding;
+        assert!(
+            f.starts_with(&format!(
+                "`make lint` is already written in `{}`",
+                rule.display()
+            )),
+            "{f}"
         );
     }
 

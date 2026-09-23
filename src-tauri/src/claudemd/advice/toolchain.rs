@@ -32,6 +32,14 @@
 //! never "recommends". A manager token inside a path (`src-tauri/Cargo.toml`)
 //! fails the first-token rule and counts for nothing.
 //!
+//! The files searched are every CLAUDE.md the scan loaded, their imports,
+//! and the repository's `.claude/rules/*.md` (`claudemd::rules`, #1340),
+//! path-scoped or not: a rule loads when a session works where its
+//! `paths:` point, as a nested CLAUDE.md does. The sentence counts the two
+//! apart ("none of the 4 files read or 10 rules names …"). Docs linked
+//! from a CLAUDE.md by an ordinary markdown link are not searched: they
+//! are not loaded into a session, so they instruct nothing until read.
+//!
 //! The target-to-verb map is by name (`test*`, `lint*`, `fmt*|format*`,
 //! `build*`, `dev|run|start|serve`, `deploy|release|publish`). A target
 //! that maps to nothing is listed as "other" in the evidence and is never
@@ -75,7 +83,8 @@
 //! else was unreadable. A negative ("nothing names `make build`") is an
 //! [`Severity::Advice`] finding only when every file a session would load
 //! was read: no unreadable scope, directory or file in the scan, no
-//! unreadable import, and no file this producer failed to re-read.
+//! unreadable import, no file this producer failed to re-read, and no
+//! `.claude/rules` directory or rule that exists and could not be read.
 //! Otherwise the same (toolchain, verb) is a [`Severity::Unknown`] finding
 //! naming what could not be read. `skipped_dirs` qualifies nothing; it is
 //! a documented exclusion.
@@ -97,6 +106,7 @@
 //! how [`suggestion`] tells the two kinds apart.
 
 use super::{Check, Context, Evidence, Finding, Locator, Producer, Severity, Subject};
+use crate::claudemd::rules::{self, Rules};
 use crate::claudemd::{text, EffectiveScan, ImportNode, Scope};
 use crate::packages::detect::projects;
 use crate::packages::scripts::{self, Manifest};
@@ -115,7 +125,8 @@ impl Producer for Coverage {
 
     fn run(&self, cx: &Context) -> Result<Vec<Finding>, String> {
         let detection = detect(cx.repo);
-        let search = documented(cx.scan, &detection.script_verbs);
+        let rules = rules::read(cx.repo);
+        let search = documented(cx.scan, &detection.script_verbs, &rules);
         let subject = subject_for(cx.repo, cx.scan);
         let mut out = Vec::new();
 
@@ -132,6 +143,10 @@ impl Producer for Coverage {
             unreadable_imports(&s.file.imports, &mut unreadable);
         }
         unreadable.extend(search.unreadable.iter().cloned());
+        unreadable.extend(rules.unreadable.iter().cloned());
+        // A walled `.claude/rules` is both a directory the scan could not
+        // list and the rules reader's; name it once.
+        let unreadable = dedup(unreadable);
 
         for (dir, why) in &detection.unreadable_dirs {
             out.push(Finding::new(
@@ -244,14 +259,27 @@ impl Producer for Coverage {
                     measured: search.measured(),
                 });
 
-                let nothing_names = match search.files.len() {
-                    0 => format!(
+                let plural = |n: usize| if n == 1 { "" } else { "s" };
+                let nothing_names = match (search.files.len(), search.rules.len()) {
+                    (0, 0) => format!(
                         "no CLAUDE.md loads for this repository, so nothing names {}",
                         or_list(&candidates)
                     ),
-                    n => format!(
+                    (0, r) => format!(
+                        "no CLAUDE.md loads for this repository, and none of the {r} rule{} \
+                         names {}",
+                        plural(r),
+                        or_list(&candidates)
+                    ),
+                    (n, 0) => format!(
                         "none of the {n} file{} read names {}",
-                        if n == 1 { "" } else { "s" },
+                        plural(n),
+                        or_list(&candidates)
+                    ),
+                    (n, r) => format!(
+                        "none of the {n} file{} read or {r} rule{} names {}",
+                        plural(n),
+                        plural(r),
                         or_list(&candidates)
                     ),
                 };
@@ -1278,6 +1306,9 @@ pub struct Search {
     /// Every file read: each CLAUDE.md the scan loaded and each import
     /// it resolved.
     pub files: Vec<PathBuf>,
+    /// Every `.claude/rules` file read (#1340), counted apart from
+    /// `files` so the sentence can say which is which.
+    pub rules: Vec<PathBuf>,
     pub spans: usize,
     pub fenced_lines: usize,
     /// Files the scan listed and this producer could not re-read.
@@ -1287,21 +1318,31 @@ pub struct Search {
 impl Search {
     /// The count and how it was counted, for the evidence.
     fn measured(&self) -> String {
-        let n = self.files.len();
-        let list = self
-            .files
-            .iter()
-            .map(|f| format!("`{}`", f.to_string_lossy()))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let listed = |what: &str, paths: &[PathBuf]| {
+            let n = paths.len();
+            let list = paths
+                .iter()
+                .map(|f| format!("`{}`", f.to_string_lossy()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "{n} {what}{} read{}",
+                if n == 1 { "" } else { "s" },
+                if n == 0 {
+                    String::new()
+                } else {
+                    format!(" ({list})")
+                }
+            )
+        };
+        let rules = if self.rules.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", listed("rule", &self.rules))
+        };
         format!(
-            "{n} file{} read{}, {} span{} and {} fenced line{} searched",
-            if n == 1 { "" } else { "s" },
-            if n == 0 {
-                String::new()
-            } else {
-                format!(" ({list})")
-            },
+            "{}{rules}, {} span{} and {} fenced line{} searched",
+            listed("file", &self.files),
             self.spans,
             if self.spans == 1 { "" } else { "s" },
             self.fenced_lines,
@@ -1337,8 +1378,14 @@ fn loaded_files(scan: &EffectiveScan) -> Vec<PathBuf> {
     out
 }
 
-/// What the loaded files name, through `text::spans` and `text::fences`.
-pub fn documented(scan: &EffectiveScan, script_verbs: &BTreeMap<String, Vec<Verb>>) -> Search {
+/// What the loaded files and the repository's rules name, through
+/// `text::spans` and `text::fences`. A rule the reader could not read is
+/// already in `rules.unreadable`, which the caller counts.
+pub fn documented(
+    scan: &EffectiveScan,
+    script_verbs: &BTreeMap<String, Vec<Verb>>,
+    rules: &Rules,
+) -> Search {
     let mut out = Search::default();
     for path in loaded_files(scan) {
         let text = match std::fs::read_to_string(&path) {
@@ -1349,38 +1396,52 @@ pub fn documented(scan: &EffectiveScan, script_verbs: &BTreeMap<String, Vec<Verb
                 continue;
             }
         };
-        for s in text::spans(&text) {
-            out.spans += 1;
-            for (manager, verb) in commands_with(&s.text, script_verbs) {
+        search_text(&mut out, &path, &text, script_verbs);
+        out.files.push(path);
+    }
+    for rule in &rules.files {
+        search_text(&mut out, &rule.path, &rule.text, script_verbs);
+        out.rules.push(rule.path.clone());
+    }
+    out
+}
+
+/// One file's spans and fenced lines into `out`.
+fn search_text(
+    out: &mut Search,
+    path: &Path,
+    text: &str,
+    script_verbs: &BTreeMap<String, Vec<Verb>>,
+) {
+    for s in text::spans(text) {
+        out.spans += 1;
+        for (manager, verb) in commands_with(&s.text, script_verbs) {
+            out.named.push(Named {
+                manager,
+                verb,
+                file: path.to_path_buf(),
+                line: u32::try_from(s.line).unwrap_or(u32::MAX),
+                text: s.text.clone(),
+            });
+        }
+    }
+    for f in text::fences(text) {
+        for (i, line) in f.body.split('\n').enumerate() {
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {
+                continue;
+            }
+            out.fenced_lines += 1;
+            for (manager, verb) in commands_with(line, script_verbs) {
                 out.named.push(Named {
                     manager,
                     verb,
-                    file: path.clone(),
-                    line: u32::try_from(s.line).unwrap_or(u32::MAX),
-                    text: s.text.clone(),
+                    file: path.to_path_buf(),
+                    line: u32::try_from(f.line + 1 + i).unwrap_or(u32::MAX),
+                    text: line.to_string(),
                 });
             }
         }
-        for f in text::fences(&text) {
-            for (i, line) in f.body.split('\n').enumerate() {
-                if line.trim().is_empty() || line.trim_start().starts_with('#') {
-                    continue;
-                }
-                out.fenced_lines += 1;
-                for (manager, verb) in commands_with(line, script_verbs) {
-                    out.named.push(Named {
-                        manager,
-                        verb,
-                        file: path.clone(),
-                        line: u32::try_from(f.line + 1 + i).unwrap_or(u32::MAX),
-                        text: line.to_string(),
-                    });
-                }
-            }
-        }
-        out.files.push(path);
     }
-    out
 }
 
 /// [`commands_with`] and no script bodies.
@@ -1975,6 +2036,96 @@ mod tests {
             "no negative is stated while a loaded file is unreadable: {found:#?}"
         );
         assert!(test.brief.contains("no edit to `"), "{}", test.brief);
+    }
+
+    /// #1340's test: a `make test` named only in `.claude/rules/testing.md`
+    /// is not a gap, and the gap that remains counts the rules it read.
+    #[test]
+    fn a_command_named_in_a_rule_counts_and_the_rules_are_counted() {
+        let (_t, repo, home) = fixture();
+        fs::write(repo.join("Makefile"), "test:\n\ttrue\nlint:\n\ttrue\n").unwrap();
+        fs::write(repo.join("CLAUDE.md"), "Nothing here.\n").unwrap();
+        let rules = repo.join(".claude").join("rules");
+        fs::create_dir_all(&rules).unwrap();
+        fs::write(rules.join("testing.md"), "Run `make test`.\n").unwrap();
+        fs::write(
+            rules.join("style.md"),
+            "---\npaths: src/**\n---\nBe terse.\n",
+        )
+        .unwrap();
+
+        let report = run_over(&repo, &home);
+        let found = toolchain_findings(&report);
+        assert_eq!(found.len(), 1, "{report:#?}");
+        assert_eq!(found[0].severity, Severity::Advice);
+        assert_eq!(
+            found[0].finding,
+            "make (Makefile at root) offers `test`, `lint`; none of the 1 file read or 2 rules \
+             names `make lint`"
+        );
+        let searched = found[0]
+            .evidence
+            .iter()
+            .find(|e| e.measured.contains("files read") || e.measured.contains("file read"))
+            .expect("the search evidence");
+        assert!(
+            searched.measured.contains("2 rules read")
+                && searched
+                    .measured
+                    .contains(&rules.join("testing.md").to_string_lossy().to_string()),
+            "{}",
+            searched.measured
+        );
+    }
+
+    /// A rule that exists and cannot be read makes every negative
+    /// Unknown, never "no rules". (A walled `.claude/rules` directory is
+    /// already an unreadable directory in the scan and is said once; a
+    /// walled rule file is what only the rules reader sees.)
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_rule_makes_the_negative_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_t, repo, home) = fixture();
+        fs::write(repo.join("Makefile"), "test:\n\ttrue\n").unwrap();
+        fs::write(repo.join("CLAUDE.md"), "Nothing here.\n").unwrap();
+        let rules = repo.join(".claude").join("rules");
+        fs::create_dir_all(&rules).unwrap();
+        let rule = rules.join("testing.md");
+        fs::write(&rule, "Run `make lint`.\n").unwrap();
+        fs::set_permissions(&rule, fs::Permissions::from_mode(0o000)).unwrap();
+        let report = run_over(&repo, &home);
+        fs::set_permissions(&rule, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let found = toolchain_findings(&report);
+        assert_eq!(found.len(), 1, "{report:#?}");
+        assert_eq!(found[0].severity, Severity::Unknown, "{}", found[0].finding);
+        assert!(
+            found[0].finding.contains("testing.md (")
+                && found[0].finding.ends_with("` not readable"),
+            "{}",
+            found[0].finding
+        );
+
+        // The walled directory: Unknown, and named once.
+        fs::set_permissions(&rules, fs::Permissions::from_mode(0o000)).unwrap();
+        let report = run_over(&repo, &home);
+        fs::set_permissions(&rules, fs::Permissions::from_mode(0o755)).unwrap();
+        let found = toolchain_findings(&report);
+        assert_eq!(found[0].severity, Severity::Unknown, "{}", found[0].finding);
+        assert_eq!(
+            found[0].finding.matches("not readable").count(),
+            1,
+            "{}",
+            found[0].finding
+        );
+        assert_eq!(
+            found[0].finding.matches("`, `").count(),
+            0,
+            "{}",
+            found[0].finding
+        );
     }
 
     /// Fixture 5: an unreadable `package.json` is Unknown with the io
