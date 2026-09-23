@@ -32,7 +32,7 @@
 //! | [`Rule::HardSkip`] | memory docs "loads a CLAUDE.md file of up to 4 MiB in full and skips a larger file" | 4 MiB, on-disk bytes | Problem |
 //! | [`Rule::Secret`] | cclint's secret rule; changelog: the feedback share uploads "the system prompt (which includes your CLAUDE.md instructions)" | `sk-ant-`, `ghp_`, `github_pat_`, a PEM private-key header, `AKIA` + 16; placeholders (`xxx`, `your`, `example`, one repeated character) skipped. The finding carries the line and a masked prefix, never the value | Problem |
 //! | [`Rule::Emphasis`] | best-practices "add emphasis such as 'IMPORTANT' to that line alone. If you emphasize many lines, none of them stands out." | 2 or more prose lines in one file carrying all-caps `IMPORTANT`, `YOU MUST`, `NEVER` or `ALWAYS`. Caps only: bold prose does not count, or this repository's own house style would trip it | Advice |
-//! | [`Rule::HookRule`] | memory docs: Claude treats CLAUDE.md as "context, not enforced configuration … use a PreToolUse hook instead"; features-overview "Put guardrails in hooks" | a prose line with `never`, `must not` or `always` AND a tool verb (`edit`, `write`, `delete`, `rm`, `commit`, `push`, `force`), whole words, any case | Advice |
+//! | [`Rule::HookRule`] | memory docs: Claude treats CLAUDE.md as "context, not enforced configuration … use a PreToolUse hook instead"; features-overview "Put guardrails in hooks" | a prose line with `never`, `must not` or `always` AND a tool verb (`edit`, `write`, `delete`, `rm`, `commit`, `push`, `force`), any case, in the prose outside inline code spans. A hyphenated compound counts only when every part is a tool verb (`force-push` fires; `slow-write`, `write-ahead` do not), and a word directly after `@` is a tag, not an action (#1322). Whether the modal governs the verb is not parsed | Advice |
 //! | [`Rule::Conflict`] | memory docs "if two rules contradict each other, Claude may pick one arbitrarily"; UFMG: conflicting instructions in 28% | two files in one launch set whose named package managers (`npm`/`pnpm`/`yarn`/`bun`), lint entry points (`make lint` vs `yarn lint` …) or default branches are non-empty and disjoint | Advice |
 //! | [`Rule::TreeListing`] | `/doctor` "cuts content Claude can derive from the codebase, such as directory layouts"; best-practices' exclude table | a fenced block with 3 or more lines starting `├`, `└` or `│` | Advice |
 //! | [`Rule::InitSkeleton`] | UFMG: init fossilization in 24%; `/doctor` removes architecture overviews; best-practices "There's no required format" | the `/init` skeleton headings `Project Overview`, `Development Commands` and `Architecture` all present | Advice |
@@ -116,8 +116,12 @@ static EMPHASIS: LazyLock<Regex> =
 static MODAL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(never|must not|always)\b").unwrap());
 /// A tool action a `PreToolUse` hook can block.
-static TOOL_VERB: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\b(edit|write|delete|rm|commit|push|force)\b").unwrap());
+const TOOL_VERBS: [&str; 7] = ["edit", "write", "delete", "rm", "commit", "push", "force"];
+/// A word, or words joined by single hyphens (`slow-write`,
+/// `force-push`): the unit a tool verb is judged as. Leftmost-longest,
+/// so a compound is never matched as its parts, and a leading `--` is
+/// not a join (`--force` is the word `force`).
+static COMPOUND: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\w+(?:-\w+)*").unwrap());
 static PACKAGE_MANAGER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(npm|pnpm|yarn|bun)\b").unwrap());
 static LINT_ENTRY: LazyLock<Regex> = LazyLock::new(|| {
@@ -675,7 +679,7 @@ fn per_file(cx: &Context, l: &Loaded, out: &mut Vec<Finding>) {
         if !MODAL.is_match(line) {
             continue;
         }
-        let Some(verb) = TOOL_VERB.find(line) else {
+        let Some(verb) = tool_action(line) else {
             continue;
         };
         out.push(emit(
@@ -683,10 +687,7 @@ fn per_file(cx: &Context, l: &Loaded, out: &mut Vec<Finding>) {
             Severity::Advice,
             subject(l),
             vec![evidence(path, Some(*n), clamp(line.trim(), 160))],
-            format!(
-                "`{name}` line {n} states a never/always rule naming a tool action (`{}`)",
-                verb.as_str()
-            ),
+            format!("`{name}` line {n} states a never/always rule naming a tool action (`{verb}`)"),
         ));
     }
 
@@ -748,6 +749,28 @@ fn per_file(cx: &Context, l: &Loaded, out: &mut Vec<Finding>) {
             format!("`{name}` carries all three `/init` skeleton headings"),
         ));
     }
+}
+
+/// The first tool action a prose line names, as written.
+///
+/// Inline code spans are blanked first: what is in one is somebody's
+/// syntax (a command, a config value, a worker-pool spec), and the rule
+/// is about the sentence. Then each word or hyphenated compound counts
+/// only when every part of it is a tool verb, so `force-push` is the
+/// action itself while `slow-write` and `write-ahead` name something
+/// else. A word directly after `@` is a tag or an address (`@write`),
+/// not an action.
+fn tool_action(line: &str) -> Option<String> {
+    let line = text::blank_spans(line);
+    COMPOUND
+        .find_iter(&line)
+        .filter(|m| !line[..m.start()].ends_with('@'))
+        .find(|m| {
+            m.as_str()
+                .split('-')
+                .all(|part| TOOL_VERBS.iter().any(|v| part.eq_ignore_ascii_case(v)))
+        })
+        .map(|m| m.as_str().to_string())
 }
 
 /// A placeholder rather than a value: `xxx`, `your`, `example`, or a tail
@@ -1317,6 +1340,62 @@ ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
             "{}",
             hits[0].brief
         );
+    }
+
+    /// #1322: a tool verb inside a code span, directly after `@`, or in
+    /// a hyphenated compound with a word that is not a tool verb names
+    /// something else (a worker pool, a test tag), not a tool action.
+    #[test]
+    fn a_tool_verb_in_a_code_span_a_tag_or_a_compound_is_not_a_hook_rule() {
+        let (_t, _home, repo) = fixture();
+        fs::write(
+            repo.join("CLAUDE.md"),
+            "Worker pools: `8 read / 4 write / 2 slow-write`; never override them in a spec.\n\
+             `@write` specs need `ALLOW_WRITES`; never set it in a local payload.\n\
+             Never `git push --force` to the default branch.\n\
+             Tag them @write; never run them locally.\n\
+             The slow-write pool is never resized.\n\
+             Never disable the write-ahead log.\n",
+        )
+        .unwrap();
+        let found = shape(&repo, None);
+        let hits = by_rule(&found, Rule::HookRule);
+        assert!(hits.is_empty(), "{hits:?}");
+    }
+
+    /// The other direction of #1322: a verb in prose still fires beside
+    /// a code span, a compound made only of tool verbs (`force-push`) is
+    /// the tool action itself, a `--force` flag is not a compound, and a
+    /// skipped `@write` tag does not hide a real verb later on the line.
+    #[test]
+    fn a_tool_verb_in_prose_or_a_verb_only_compound_still_fires() {
+        let (_t, _home, repo) = fixture();
+        fs::write(
+            repo.join("CLAUDE.md"),
+            "Never force-push to main.\n\
+             Never push `--force` to main.\n\
+             Never commit `.env`.\n\
+             Always run the gate; never use --force.\n\
+             Tag them @write; always delete scratch files.\n",
+        )
+        .unwrap();
+        let found = shape(&repo, None);
+        let hits = by_rule(&found, Rule::HookRule);
+        let sentences: Vec<&str> = hits.iter().map(|f| f.finding.as_str()).collect();
+        assert_eq!(hits.len(), 5, "{sentences:?}");
+        for (i, verb) in ["force-push", "push", "commit", "force", "delete"]
+            .iter()
+            .enumerate()
+        {
+            assert!(
+                sentences[i].contains(&format!("line {}", i + 1)),
+                "{sentences:?}"
+            );
+            assert!(
+                sentences[i].contains(&format!("(`{verb}`)")),
+                "{sentences:?}"
+            );
+        }
     }
 
     /// Two launch-set files naming different package managers conflict;
