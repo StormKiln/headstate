@@ -46,6 +46,21 @@
 //!   its leading `../` segments, a remainder that matches exactly one
 //!   path under the file's own directory resolves; anything else is
 //!   `Unknown` ("relative to an unstated base"), never `Missing`.
+//!
+//!   The walk reads the working tree on disk, not git, so an absent
+//!   path is asked about before it is called missing: a file git
+//!   ignores is expected to be absent from a checkout. Measured,
+//!   `tools/stack/.env` is a secrets file each developer creates, and
+//!   before #1318 it passed on a laptop that had one and was Missing on
+//!   a fresh clone. One `git check-ignore --no-index --stdin` answers
+//!   every path candidate in the run. An ignored path with a template
+//!   beside it (`.example`, `.sample`, `.template`, `.dist`) resolves
+//!   and is silent; one with no template is
+//!   [`Verdict::IgnoredWithoutTemplate`] at [`Severity::Advice`]. A
+//!   repository with no `.git` has no ignore rules, so nothing in it is
+//!   ignored and the verdict stays `Missing`. With a `.git`, a git that
+//!   cannot run or that fails makes the path `Unknown`: it never said
+//!   "not ignored".
 //! - **`path:line`**: the path as above, then the file's line count. A
 //!   line past the end is [`Verdict::LinePastEof`] at
 //!   [`Severity::Advice`]. A line WITHIN the file is silent, even when
@@ -110,7 +125,8 @@
 //! A path that could not be stat'd, a suffix search whose walk could not
 //! list a directory or pruned the subtree the path lies under, a
 //! manifest that exists and could not be read, an ambiguous suffix, a
-//! skill with no inventory: each is a
+//! `../` path relative to an unstated base, an absent path git could not
+//! be asked about, a skill with no inventory: each is a
 //! [`Severity::Unknown`] finding with the reason, and the file gets ONE
 //! [`Severity::Advice`] summary, "N references checked; K could not be
 //! checked (…)", only when K > 0. So a run that checked 0 of 41 reads
@@ -161,6 +177,9 @@ pub enum Verdict {
     Missing,
     /// The file exists and has fewer lines than the reference cites.
     LinePastEof { lines: u64 },
+    /// Absent, and git ignores it, so a checkout is expected not to have
+    /// it; but no template sits beside it to create it from.
+    IgnoredWithoutTemplate,
     /// Could not be decided, with why.
     Unknown(String),
 }
@@ -207,6 +226,7 @@ pub struct FileRot {
 const MISSING: &str = ", which does not exist in this repository";
 const SKILL_MISSING: &str = ", and no skill of that name was found in any scope";
 const PAST_EOF: &str = "; the file has ";
+const IGNORED: &str = ", which git ignores, and no template (`.example`, `.sample`, `.template` or `.dist`) sits beside it";
 const UNKNOWN: &str = ", which could not be checked: ";
 const SUMMARY: &str = " references checked; ";
 const BLIND: &str = " by name; not imported, no condition";
@@ -312,6 +332,11 @@ pub fn analyse(cx: &Context) -> Vec<Analysed> {
         .filter_map(|(p, _, _)| Path::new(p).parent().map(Path::to_path_buf))
         .collect();
     let mut resolver = Resolver::new(cx.repo, cx.definitions, &symbols, &dirs);
+    for (p, _, t) in &texts {
+        if let Ok(t) = t {
+            resolver.plan(Path::new(p).parent().unwrap_or(cx.repo), t);
+        }
+    }
 
     texts
         .into_iter()
@@ -439,6 +464,74 @@ enum Resolved {
     /// Not a file: a package this project declares. It has no lines to
     /// count and no place on disk to cite.
     Package,
+    /// A file git ignores, absent here as a checkout expects, with a
+    /// template beside it. It has no lines to count either.
+    Ignored,
+}
+
+/// Suffixes of a committed template for an ignored local file:
+/// `.env.example` beside `.env`.
+const TEMPLATE_SUFFIXES: &[&str] = &[".example", ".sample", ".template", ".dist"];
+
+/// How long one `git check-ignore` may take before its answer is
+/// Unknown. The same bound the worktree scan gives one git call.
+const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Which of `paths`, relative to `repo`, git ignores: ONE process for
+/// the lot, fed on stdin. `--no-index` so a tracked file is judged by
+/// the patterns too; only absent paths are ever asked about.
+///
+/// Every failure is `Err`, never an empty set: a git that did not answer
+/// did not say "not ignored" (#1050).
+fn check_ignored(git: &Path, repo: &Path, paths: &[String]) -> Result<BTreeSet<String>, String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(git)
+        .arg("-C")
+        .arg(repo)
+        .args(["check-ignore", "--no-index", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("git check-ignore could not run: {e}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "git check-ignore could not run: no stdin".to_string())?;
+    let input = paths.join("\n") + "\n";
+    // Written from its own thread, so a git that fills its stdout pipe
+    // before reading all of stdin cannot deadlock against this one.
+    let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // The receiver is gone on timeout; that is expected.
+        let _ = tx.send(child.wait_with_output());
+    });
+    let output = match rx.recv_timeout(GIT_TIMEOUT) {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return Err(format!("git check-ignore could not run: {e}")),
+        Err(_) => {
+            return Err(format!(
+                "git check-ignore did not respond within {}s",
+                GIT_TIMEOUT.as_secs()
+            ))
+        }
+    };
+    let _ = writer.join();
+    match output.status.code() {
+        // 0: some are ignored, and stdout names them. 1: none are.
+        Some(0) | Some(1) => Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|l| l.trim_end_matches('\r').to_string())
+            .filter(|l| !l.is_empty())
+            .collect()),
+        code => Err(format!(
+            "git check-ignore exit status {}: {}",
+            code.map(|c| c.to_string()).unwrap_or_else(|| "none".into()),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
 }
 
 /// Whether a token could be an npm package name rather than a path.
@@ -783,6 +876,15 @@ pub struct Resolver<'a> {
     packages: HashMap<PathBuf, Manifest<Vec<String>>>,
     dependencies: HashMap<PathBuf, Manifest<Vec<String>>>,
     symbols: SymbolSearch,
+    /// The git binary `check-ignore` runs as.
+    git: PathBuf,
+    /// Every repository-relative candidate the run may ask git about,
+    /// planned up front so the first question asks them all at once.
+    ignore_plan: BTreeSet<String>,
+    /// What git said, per candidate.
+    ignored: HashMap<String, bool>,
+    /// Why git could not be asked, once it could not.
+    ignore_failed: Option<String>,
 }
 
 impl<'a> Resolver<'a> {
@@ -802,7 +904,148 @@ impl<'a> Resolver<'a> {
             packages: HashMap::new(),
             dependencies: HashMap::new(),
             symbols: search_symbols(repo, symbols, dirs),
+            git: crate::auth::git_program().to_path_buf(),
+            ignore_plan: BTreeSet::new(),
+            ignored: HashMap::new(),
+            ignore_failed: None,
         }
+    }
+
+    /// The same resolver with another git binary, so a test can prove
+    /// what one that cannot run produces.
+    pub fn with_git(mut self, git: &Path) -> Self {
+        self.git = git.to_path_buf();
+        self
+    }
+
+    /// Record every path candidate `text` could ask git about, so a run
+    /// over many files spawns one `git check-ignore`, not one per path.
+    pub fn plan(&mut self, dir: &Path, text: &str) {
+        for r in refs::extract(text) {
+            if let RefKind::Path { path } | RefKind::PathLine { path, .. } = &r.kind {
+                if !is_placeholder(path) && !is_outside_absolute(self.repo, path) {
+                    let c = self.candidates(dir, path);
+                    self.ignore_plan.extend(c);
+                }
+            }
+        }
+    }
+
+    /// The repository-relative places an anchored path reference could
+    /// be: under the file's directory, then under the root; never one
+    /// outside the repository.
+    fn candidates(&self, dir: &Path, path: &str) -> Vec<String> {
+        let (anchors, rel) = if path.starts_with('/') {
+            match relative(self.repo, Path::new(path)) {
+                Some(rel) => (vec![self.repo.to_path_buf()], rel),
+                None => return Vec::new(),
+            }
+        } else {
+            (self.anchors(dir), path.to_string())
+        };
+        let clean = rel.trim_start_matches("./").trim_end_matches('/');
+        let mut out: Vec<String> = Vec::new();
+        for a in anchors {
+            if let Some(rel) = contained(self.repo, &a, clean).and_then(|c| relative(self.repo, &c))
+            {
+                if !rel.is_empty() && !out.contains(&rel) {
+                    out.push(rel);
+                }
+            }
+        }
+        out
+    }
+
+    /// The first of `rels` git ignores, if any.
+    ///
+    /// A repository with no `.git` has no ignore rules, so nothing in it
+    /// is ignored: that is established by the stat, not assumed. With a
+    /// `.git`, git is asked -- once, for every planned candidate not yet
+    /// answered -- and a git that could not answer is `Err`, never "not
+    /// ignored".
+    fn ignored_among(&mut self, rels: &[String]) -> Result<Option<String>, String> {
+        if let Some(why) = &self.ignore_failed {
+            return Err(why.clone());
+        }
+        let need: Vec<&String> = rels
+            .iter()
+            .filter(|r| !self.ignored.contains_key(*r))
+            .collect();
+        if !need.is_empty() {
+            let mut query: BTreeSet<String> = need.into_iter().cloned().collect();
+            query.extend(
+                self.ignore_plan
+                    .iter()
+                    .filter(|r| !self.ignored.contains_key(*r))
+                    .cloned(),
+            );
+            let query: Vec<String> = query.into_iter().collect();
+            let answer = match probe(&self.repo.join(".git")) {
+                Probe::Absent => Ok(BTreeSet::new()),
+                Probe::Refused(e) => Err(format!("`.git` could not be checked: {e}")),
+                Probe::Found => check_ignored(&self.git, self.repo, &query),
+            };
+            match answer {
+                Ok(set) => {
+                    for q in query {
+                        let hit = set.contains(&q);
+                        self.ignored.insert(q, hit);
+                    }
+                }
+                Err(why) => {
+                    self.ignore_failed = Some(why.clone());
+                    return Err(why);
+                }
+            }
+        }
+        Ok(rels
+            .iter()
+            .find(|r| self.ignored.get(*r) == Some(&true))
+            .cloned())
+    }
+
+    /// An absent path that no manifest declares: `Missing`, unless git
+    /// ignores it (#1318). An ignored path is expected to be absent from
+    /// a checkout -- `tools/stack/.env` is a secrets file each developer
+    /// creates -- so with a template beside it it resolves, and without
+    /// one it is Advice. The tree walk reads the disk, not git, so
+    /// without this the verdict for such a file depended on the machine.
+    fn absent(&mut self, dir: &Path, path: &str, measured: String) -> Result<Resolved, Refused> {
+        let candidates = self.candidates(dir, path);
+        let rel = match self.ignored_among(&candidates) {
+            Ok(None) => return Err((Verdict::Missing, measured)),
+            Ok(Some(rel)) => rel,
+            Err(why) => {
+                return Err(unknown(format!(
+                    "`{path}` matches nothing in the working tree, and whether git ignores it could not be established: {why}"
+                )))
+            }
+        };
+        for suffix in TEMPLATE_SUFFIXES {
+            let Some(t) = contained(self.repo, self.repo, &format!("{rel}{suffix}")) else {
+                continue;
+            };
+            match probe(&t) {
+                Probe::Found => return Ok(Resolved::Ignored),
+                Probe::Absent => {}
+                Probe::Refused(e) => {
+                    return Err(unknown(format!(
+                        "`{rel}` is ignored by git, and its template `{rel}{suffix}` could not be checked: {e}"
+                    )))
+                }
+            }
+        }
+        Err((
+            Verdict::IgnoredWithoutTemplate,
+            format!(
+                "`git check-ignore` ignores `{rel}`; no {} beside it",
+                TEMPLATE_SUFFIXES
+                    .iter()
+                    .map(|s| format!("`{rel}{s}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ))
     }
 
     fn tree(&mut self) -> &Tree {
@@ -926,7 +1169,7 @@ impl<'a> Resolver<'a> {
         let repo = self.repo.to_path_buf();
         // Owned, so the tree borrow ends here: the 0-match arm consults
         // the dependency manifests, which needs `&mut self`.
-        let (matches, tracked, unreadable, pruned) = {
+        let (matches, walked, unreadable, pruned) = {
             let tree = self.tree();
             let matches: Vec<String> = tree
                 .paths
@@ -969,13 +1212,11 @@ impl<'a> Resolver<'a> {
                         DependencyLookup::NotDeclared | DependencyLookup::NoManifest => {}
                     }
                 }
-                Err((
-                    Verdict::Missing,
-                    format!(
-                        "resolved against `{}`, the repository root and a suffix match over {tracked} tracked paths: 0 matches",
-                        display(&repo, &dir.to_string_lossy()),
-                    ),
-                ))
+                let measured = format!(
+                    "resolved against `{}`, the repository root and a suffix match over {walked} paths in the working tree: 0 matches",
+                    display(&repo, &dir.to_string_lossy()),
+                );
+                self.absent(dir, path, measured)
             }
             0 => Err(unknown(format!(
                 "`{clean}` matches nothing in the readable tree, and {} could not be listed: {}",
@@ -1049,6 +1290,8 @@ impl<'a> Resolver<'a> {
             // `chart.js:12` on a declared dependency: the package is
             // real, and it has no file in this repository to count.
             Resolved::Package => return Ok(()),
+            // An ignored local file with a template: absent by design.
+            Resolved::Ignored => return Ok(()),
         };
         if target.is_dir() {
             return Err(unknown(format!(
@@ -1396,6 +1639,10 @@ fn findings_for(repo: &Path, path: &str, scope: Scope, text: &str, rot: &FileRot
                 Severity::Advice,
                 format!("`{shown}:{line}` cites `{raw}`{PAST_EOF}{lines} lines"),
             ),
+            Verdict::IgnoredWithoutTemplate => (
+                Severity::Advice,
+                format!("`{shown}:{line}` names `{raw}`{IGNORED}"),
+            ),
             Verdict::Unknown(why) => (
                 Severity::Unknown,
                 format!("`{shown}:{line}` names `{raw}`{UNKNOWN}{why}"),
@@ -1508,6 +1755,11 @@ pub(super) fn suggestion(f: &Finding) -> String {
         format!(
             "Edit {line}: replace the reference with the current name of what it points at, or \
              delete the sentence. Do not create a file, target, script or symbol to satisfy it."
+        )
+    } else if s.contains(IGNORED) {
+        format!(
+            "Edit {line}: say that each developer creates this file, or commit a template beside \
+             it (`<path>.example`) and name that too. Do not commit the ignored file itself."
         )
     } else if s.contains(PAST_EOF) {
         format!(
@@ -2590,6 +2842,119 @@ Run `yarn paw`, not `yarn nope`. Use the `tentacle` skill, not the `ink` skill.
             matches!(rot.findings[0].verdict, Verdict::Unknown(_)),
             "{rot:?}"
         );
+    }
+
+    fn git_init(dir: &Path) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["init", "-q"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "git init");
+    }
+
+    /// The #1318 fixture: a git repository ignoring `**/.env`, with the
+    /// committed template beside where the local file would be.
+    fn ignored_env_fixture() -> tempfile::TempDir {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        git_init(root);
+        fs::write(root.join(".gitignore"), "**/.env\n").unwrap();
+        fs::create_dir_all(root.join("tools").join("stack")).unwrap();
+        fs::write(
+            root.join("tools").join("stack").join(".env.example"),
+            "DB_PASSWORD=\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("CLAUDE.md"),
+            "Needs `tools/stack/.env` (DB password); `tools/stack/gone.rs` is gone.\n",
+        )
+        .unwrap();
+        t
+    }
+
+    /// #1318: a gitignored local file is expected to be absent from a
+    /// checkout. With a template beside it, it is silent; the genuinely
+    /// gone file on the same line is still a Problem.
+    #[test]
+    fn an_ignored_file_with_a_template_beside_it_is_not_missing() {
+        let t = ignored_env_fixture();
+        let report = run_over(t.path(), None);
+        let problems: Vec<&str> = report
+            .findings
+            .iter()
+            .filter(|f| f.severity == Severity::Problem)
+            .map(|f| f.finding.as_str())
+            .collect();
+        assert_eq!(
+            problems,
+            vec!["`CLAUDE.md:1` names `tools/stack/gone.rs`, which does not exist in this repository"],
+            "{report:?}"
+        );
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.finding.contains("tools/stack/.env`")),
+            "{report:?}"
+        );
+        // The measurement names what it walked, not "tracked" paths.
+        let gone = report
+            .findings
+            .iter()
+            .find(|f| f.severity == Severity::Problem)
+            .unwrap();
+        assert!(
+            gone.evidence[0]
+                .measured
+                .contains("paths in the working tree")
+                && !gone.evidence[0].measured.contains("tracked"),
+            "{}",
+            gone.evidence[0].measured
+        );
+    }
+
+    /// Delete the template, and the ignored file is Advice -- a
+    /// developer has nothing to copy it from -- never a Problem.
+    #[test]
+    fn an_ignored_file_with_no_template_is_advice_not_a_problem() {
+        let t = ignored_env_fixture();
+        fs::remove_file(t.path().join("tools").join("stack").join(".env.example")).unwrap();
+        let report = run_over(t.path(), None);
+        let env: Vec<&Finding> = report
+            .findings
+            .iter()
+            .filter(|f| f.finding.contains("`tools/stack/.env`"))
+            .collect();
+        assert_eq!(env.len(), 1, "{report:?}");
+        assert_eq!(env[0].severity, Severity::Advice);
+        assert!(env[0].finding.contains("git ignores"), "{}", env[0].finding);
+        assert!(env[0].brief.contains("template"), "{}", env[0].brief);
+    }
+
+    /// A git that cannot run never establishes "not ignored", so the
+    /// absent file is Unknown, not Missing.
+    #[test]
+    fn a_git_that_cannot_run_makes_an_absent_path_unknown() {
+        let t = ignored_env_fixture();
+        let root = t.path();
+        let file = root.join("CLAUDE.md");
+        let text = fs::read_to_string(&file).unwrap();
+        let mut res = Resolver::new(root, None, &BTreeSet::new(), &[root.to_path_buf()])
+            .with_git(Path::new("/home/octocat/no-such-git"));
+        let rot = check_file(root, &file, &text, &mut res);
+        assert_eq!(rot.findings.len(), 2, "{rot:?}");
+        for r in &rot.findings {
+            match &r.verdict {
+                Verdict::Unknown(why) => {
+                    assert!(why.contains("git check-ignore could not run"), "{why}")
+                }
+                other => panic!("{}: never Missing: {other:?}", r.r.raw),
+            }
+        }
     }
 
     /// This repository's own CLAUDE.md files, measured: zero certain
