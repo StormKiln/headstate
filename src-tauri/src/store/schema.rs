@@ -1160,6 +1160,27 @@ const MIGRATIONS: &[&str] = &[
     // build reads it.
     "ALTER TABLE claude_advice_report ADD COLUMN build TEXT;
      ALTER TABLE claude_advice_report ADD COLUMN build_id TEXT;",
+    // 28: a fingerprint of each session's TASK, on the transcripts ledger
+    // (#1337).
+    //
+    // The producer counts DISTINCT SESSIONS, and an automated `claude -p`
+    // task replayed seven times is seven sessions: it cleared every
+    // threshold alone, and one root cause became four findings. Sessions
+    // that share a fingerprint now count once.
+    //
+    // The fingerprint is SHA256 of the session's first user text record,
+    // whitespace-collapsed, as the producer reads it from the transcript
+    // -- not `claude_session.opening_prompt`, which is clamped to 300
+    // characters and would fold two long prompts that differ past it.
+    // It lives on the LEDGER, not on each signal row, because a session
+    // served from its stored rows is never re-opened, and its task must
+    // be known without the read.
+    //
+    // NULL is "no opening prompt was recorded", and each such session is
+    // its own task: absent is not a value two sessions can share. A row
+    // from before this migration is NULL too, but it is also at an older
+    // `rule_version` (migration 26), so it is re-read before it is used.
+    "ALTER TABLE claude_advice_ledger ADD COLUMN task_fingerprint TEXT;",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
@@ -1677,6 +1698,47 @@ mod tests {
         assert_eq!(kept, 1, "an upgrade must not cost the stored report");
         assert_eq!(build, None, "a pre-27 row names no build");
         assert_eq!(build_id, None);
+        let schema: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(schema, MIGRATIONS.len() as i64);
+    }
+
+    /// Migration 28 fingerprints each session's task on the transcripts
+    /// ledger (#1337): a row from before it is kept, and its fingerprint
+    /// is NULL -- not known, never "no opening prompt" -- until the
+    /// producer re-reads it under the bumped rule.
+    #[test]
+    fn migration_28_adds_the_task_fingerprint_and_keeps_the_ledger() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in MIGRATIONS.iter().take(27) {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 27i64).unwrap();
+        conn.execute(
+            "INSERT INTO claude_advice_ledger
+                (session_id, size_bytes, mtime_ms, truncated, analysed_at, rule_version)
+             VALUES ('s1', 1, 1, 0, '2026-01-01T00:00:00Z', 1)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let (kept, fingerprint, version): (i64, Option<String>, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(task_fingerprint), MAX(rule_version) FROM claude_advice_ledger",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(kept, 1, "an upgrade must not cost the ledger");
+        assert_eq!(fingerprint, None);
+        assert_ne!(
+            version,
+            crate::claudemd::advice::transcripts::RULE_VERSION,
+            "a row with no fingerprint must be re-read under the current rule"
+        );
         let schema: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();

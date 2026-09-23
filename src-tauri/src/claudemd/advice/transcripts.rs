@@ -20,9 +20,17 @@
 //! | S5 repeated error | `is_error: true` text normalised by [`normalise_error`] | identical first [`ERROR_KEY_CHARS`] chars in ≥ [`MIN_SESSIONS_ERROR`] sessions |
 //! | S6 task census | sessions per attributed directory, from `claude_session` | always, as a count |
 //!
-//! A count is DISTINCT SESSIONS, never records. `is_error` absent is not
-//! `false`: a result that did not say is neither a failure (for A) nor a
-//! success (for B), and a test below pins both directions. The
+//! A count is DISTINCT TASKS, never records: distinct sessions, with the
+//! sessions that share an opening prompt counted once (#1337), because
+//! an automated `claude -p` task replayed seven times is one task, not
+//! seven sessions agreeing. The fingerprint is [`task_fingerprint`] of
+//! the first user text, stored on the ledger; a session with no opening
+//! prompt is its own task, and the finding says how many runs it folded
+//! ("3 sessions (9 runs; replays of one task counted once)").
+//!
+//! `is_error` absent is not `false`: a result that did not say is
+//! neither a failure (for A) nor a success (for B), and a test below
+//! pins both directions. The
 //! thresholds are unvalidated on a real corpus -- this machine holds one
 //! session -- and are constants so a corpus can move them without a
 //! migration.
@@ -131,7 +139,11 @@ pub const SESSIONS_PER_PASS: usize = 200;
 ///
 /// 3: an S4 early read is stored only when a Grep, a Glob or a failed
 /// Read came before it in the session, and carries that call (#1336).
-pub const RULE_VERSION: i64 = 3;
+///
+/// 4: the ledger carries the session's task fingerprint (migration 28),
+/// so replays of one task count once (#1337). A row stored before it has
+/// none, and would count every replay again.
+pub const RULE_VERSION: i64 = 4;
 
 /// S1: sessions showing the same A-head → B-head correction.
 const MIN_SESSIONS_CORRECTED: usize = 2;
@@ -367,8 +379,14 @@ fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, 
                 continue;
             }
         };
-        let rows = extract(&s.session_id, &s.dir, &body, &mut worktrees);
-        if let Err(e) = store_rows(conn, &s.session_id, &rows, size, mtime, cut, &now) {
+        let (rows, task) = extract(&s.session_id, &s.dir, &body, &mut worktrees);
+        let stored = Ledger {
+            size,
+            mtime,
+            truncated: cut,
+            task: task.as_deref(),
+        };
+        if let Err(e) = store_rows(conn, &s.session_id, &rows, &stored, &now) {
             unreadable.push((
                 s.session_id.clone(),
                 format!("{path}: could not record its signals: {e}"),
@@ -382,10 +400,11 @@ fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, 
     }
 
     let stored = load_rows(conn, &analysed)?;
+    let tasks = load_tasks(conn, &analysed)?;
     let denials = hook_denials(conn, &sessions)?;
 
     let short = analysed.len() < sessions.len() || !unreadable.is_empty();
-    let mut out = emit(&stored, &denials, &sessions, &analysed, cx, short);
+    let mut out = emit(&stored, &tasks, &denials, &sessions, &analysed, cx, short);
     out.extend(checkout_unknown);
 
     if short || truncated > 0 {
@@ -860,13 +879,15 @@ impl Outcome {
     }
 }
 
-/// Extract every signal occurrence from one transcript body.
+/// Extract every signal occurrence from one transcript body, and the
+/// fingerprint of the session's task: its first user text, as
+/// [`task_fingerprint`] hashes it, or `None` when it recorded none.
 fn extract(
     session_id: &str,
     session_dir: &Path,
     body: &str,
     worktrees: &mut Worktrees,
-) -> Vec<Row> {
+) -> (Vec<Row>, Option<String>) {
     let mut calls: Vec<Call> = Vec::new();
     let mut outcomes: HashMap<String, Outcome> = HashMap::new();
     let mut user_texts: Vec<(u64, String)> = Vec::new();
@@ -1091,7 +1112,24 @@ fn extract(
             _ => {}
         }
     }
-    rows
+    let task = user_texts.first().map(|(_, text)| task_fingerprint(text));
+    (rows, task)
+}
+
+/// A session's task, for counting replays of one task once (#1337):
+/// SHA256 of its opening prompt with whitespace collapsed, as hex. The
+/// prompt is the first user text record the extractor keeps -- not an
+/// injected `<command>` record or an `isMeta` one, which many unrelated
+/// sessions share.
+fn task_fingerprint(prompt: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(collapse(prompt).as_bytes())
+        .iter()
+        .fold(String::new(), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 /// A `tool_use` block as a [`Call`], with its key and attributed directory.
@@ -1276,6 +1314,15 @@ fn collapse(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// What one session's `claude_advice_ledger` row records beside its id.
+struct Ledger<'a> {
+    size: i64,
+    mtime: i64,
+    truncated: bool,
+    /// [`task_fingerprint`] of its opening prompt; `None` when it had none.
+    task: Option<&'a str>,
+}
+
 /// Replace a session's stored rows and its ledger entry, in one
 /// transaction so a reader never sees a session with a ledger entry and
 /// half its rows.
@@ -1283,9 +1330,7 @@ fn store_rows(
     conn: &Connection,
     session_id: &str,
     rows: &[Row],
-    size: i64,
-    mtime: i64,
-    truncated: bool,
+    ledger: &Ledger,
     now: &str,
 ) -> Result<(), rusqlite::Error> {
     let tx = conn.unchecked_transaction()?;
@@ -1313,13 +1358,51 @@ fn store_rows(
     }
     tx.execute(
         "INSERT INTO claude_advice_ledger
-            (session_id, size_bytes, mtime_ms, truncated, analysed_at, rule_version)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            (session_id, size_bytes, mtime_ms, truncated, analysed_at, rule_version,
+             task_fingerprint)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(session_id) DO UPDATE SET
-            size_bytes = ?2, mtime_ms = ?3, truncated = ?4, analysed_at = ?5, rule_version = ?6",
-        rusqlite::params![session_id, size, mtime, truncated as i64, now, RULE_VERSION],
+            size_bytes = ?2, mtime_ms = ?3, truncated = ?4, analysed_at = ?5, rule_version = ?6,
+            task_fingerprint = ?7",
+        rusqlite::params![
+            session_id,
+            ledger.size,
+            ledger.mtime,
+            ledger.truncated as i64,
+            now,
+            RULE_VERSION,
+            ledger.task
+        ],
     )?;
     tx.commit()
+}
+
+/// The task fingerprint of every analysed session that recorded an
+/// opening prompt. A session absent from the map had none, and is its
+/// own task.
+fn load_tasks(
+    conn: &Connection,
+    analysed: &HashSet<String>,
+) -> Result<HashMap<String, String>, String> {
+    let mut q = conn
+        .prepare(
+            "SELECT session_id, task_fingerprint FROM claude_advice_ledger
+              WHERE rule_version = ?1 AND task_fingerprint IS NOT NULL",
+        )
+        .map_err(|e| format!("claude_advice_ledger: {e}"))?;
+    let rows = q
+        .query_map([RULE_VERSION], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .map_err(|e| format!("claude_advice_ledger: {e}"))?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (id, task) = row.map_err(|e| format!("claude_advice_ledger: {e}"))?;
+        if analysed.contains(&id) {
+            out.insert(id, task);
+        }
+    }
+    Ok(out)
 }
 
 /// Every stored row for the analysed sessions.
@@ -1547,6 +1630,7 @@ fn resolves_to_nothing(path: &Path) -> bool {
 /// group, and render the findings.
 fn emit(
     stored: &[Row],
+    tasks: &HashMap<String, String>,
     denials: &[(String, String, Option<String>)],
     sessions: &[SessionRow],
     analysed: &HashSet<String>,
@@ -1627,7 +1711,24 @@ fn emit(
             if *sig != signal {
                 continue;
             }
-            let n = by_session.len();
+            // Replays of one task count once (#1337): sessions sharing a
+            // task fingerprint are one run group, in the order of their
+            // first session; a session with no opening prompt is its own.
+            let mut runs: Vec<Vec<&Row>> = Vec::new();
+            let mut index: HashMap<(bool, &str), usize> = HashMap::new();
+            for (sid, r) in by_session {
+                let task = match tasks.get(sid) {
+                    Some(t) => (true, t.as_str()),
+                    None => (false, sid.as_str()),
+                };
+                let i = *index.entry(task).or_insert_with(|| {
+                    runs.push(Vec::new());
+                    runs.len() - 1
+                });
+                runs[i].push(r);
+            }
+            let n = runs.len();
+            let total = by_session.len();
             let min = match signal {
                 SIG_CORRECTED => MIN_SESSIONS_CORRECTED,
                 SIG_USER_CORRECTION => MIN_SESSIONS_USER_CORRECTION,
@@ -1651,11 +1752,16 @@ fn emit(
             let dirs: Vec<&Path> = by_session.values().map(|r| r.dir.as_path()).collect();
             let dir = placement(&dirs, &candidates, cx.repo);
             let subject = subject_for(&dir, cx.scan);
-            let sessions_phrase = format!(
+            let mut sessions_phrase = format!(
                 "{at_least}{n} session{} under `{}`",
                 plural(n),
                 dir.display()
             );
+            if total > n {
+                sessions_phrase.push_str(&format!(
+                    " ({total} runs; replays of one task counted once)"
+                ));
+            }
             let (sentence, dedup_key) = match signal {
                 SIG_CORRECTED => (
                     format!("`{aux}` failed and `{key}` followed it in {sessions_phrase}"),
@@ -1696,9 +1802,10 @@ fn emit(
             };
 
             let mut evidence = Vec::new();
-            for (i, r) in by_session.values().take(MAX_EVIDENCE).enumerate() {
+            for (i, group) in runs.iter().take(MAX_EVIDENCE).enumerate() {
+                let r = group[0];
                 let first = i == 0;
-                let measured = match signal {
+                let mut measured = match signal {
                     SIG_CORRECTED => {
                         let mut m = format!("first `{aux}` failed");
                         if let (true, Some(d)) = (first, &r.detail) {
@@ -1732,6 +1839,9 @@ fn emit(
                         _ => "the same error, after normalisation".to_string(),
                     },
                 };
+                if group.len() > 1 {
+                    measured.push_str(&format!("; {} runs of one task", group.len()));
+                }
                 evidence.push(Evidence {
                     at: Locator::Session {
                         session_id: r.session_id.clone(),
@@ -1880,10 +1990,11 @@ mod tests {
         tool_use(cwd, id, "Bash", serde_json::json!({"command":command}))
     }
 
-    /// The founding pair: `yarn lint` fails, `make lint` succeeds.
+    /// The founding pair: `yarn lint` fails, `make lint` succeeds. Each
+    /// `n` opens with its own prompt, so each is its own task (#1337).
     fn corrected_pair(cwd: &str, n: usize) -> String {
         [
-            user_text(cwd, "run the linter"),
+            user_text(cwd, &format!("run the linter, take {n}")),
             bash(cwd, &format!("a{n}"), "yarn lint"),
             tool_result(
                 cwd,
@@ -2524,7 +2635,7 @@ mod tests {
     }
 
     fn rows_of(body: &str, cwd: &str, repo: &Path) -> Vec<Row> {
-        extract("s", Path::new(cwd), body, &mut Worktrees::new(repo))
+        extract("s", Path::new(cwd), body, &mut Worktrees::new(repo)).0
     }
 
     /// S2: a negation in the first six words, within five records of a
@@ -3397,6 +3508,128 @@ mod tests {
                 .all(|r| r.key != ".github/workflows/ci.yml"),
             "{silent}"
         );
+    }
+
+    /// A session that opens with `prompt` and whose one Bash call fails
+    /// with the same error every time.
+    fn failing_task(cwd: &str, prompt: &str, n: usize) -> String {
+        [
+            user_text(cwd, prompt),
+            bash(cwd, &format!("b{n}"), "curl localhost"),
+            tool_result(
+                cwd,
+                &format!("b{n}"),
+                Some(true),
+                "curl: (7) Failed to connect",
+            ),
+        ]
+        .join("\n")
+    }
+
+    fn errors(findings: &[Finding]) -> Vec<&Finding> {
+        findings
+            .iter()
+            .filter(|f| f.finding.starts_with("the same `Bash` error"))
+            .collect()
+    }
+
+    /// #1337: seven automated replays of one task are one task. Sessions
+    /// sharing an opening prompt count once toward a threshold, so seven
+    /// with the same prompt and the same error give no S5 finding (1 <
+    /// 3), and three with different prompts give one.
+    #[test]
+    fn replays_of_one_task_count_once() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path();
+        let cwd = repo.to_string_lossy().into_owned();
+        let conn = db();
+        for n in 1..=7 {
+            // Whitespace differs; the task does not.
+            let prompt = if n % 2 == 0 {
+                "check  the\nservice"
+            } else {
+                "check the service"
+            };
+            let p = write(repo, &format!("s{n}.jsonl"), &failing_task(&cwd, prompt, n));
+            insert_session(&conn, &format!("s{n}"), &cwd, Some(&p), Some(prompt));
+        }
+        let scan = scan_effective_opt(repo, None);
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        assert!(errors(&out).is_empty(), "one task, seven runs: {out:#?}");
+        let stored: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT task_fingerprint) FROM claude_advice_ledger",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 1, "the fingerprint is on the ledger");
+
+        // Two more tasks with the same error: three independent tasks.
+        for (n, prompt) in [(8, "deploy the app"), (9, "why is the build red")] {
+            let p = write(repo, &format!("s{n}.jsonl"), &failing_task(&cwd, prompt, n));
+            insert_session(&conn, &format!("s{n}"), &cwd, Some(&p), Some(prompt));
+        }
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        let hits = errors(&out);
+        assert_eq!(hits.len(), 1, "{out:#?}");
+        assert!(
+            hits[0].finding.contains(&format!(
+                "in 3 sessions under `{}` (9 runs; replays of one task counted once)",
+                repo.display()
+            )),
+            "{}",
+            hits[0].finding
+        );
+        // One evidence row per task, the replayed one saying so.
+        assert_eq!(hits[0].evidence.len(), 3, "{:#?}", hits[0].evidence);
+        assert!(
+            hits[0].evidence[0]
+                .measured
+                .ends_with("; 7 runs of one task"),
+            "{}",
+            hits[0].evidence[0].measured
+        );
+        assert!(!hits[0].evidence[1].measured.contains("runs of one task"));
+    }
+
+    /// #1337: a session with no opening prompt is its own task, never
+    /// folded with another that has none. Absent is not a shared value.
+    #[test]
+    fn sessions_without_an_opening_prompt_are_each_their_own_task() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path();
+        let cwd = repo.to_string_lossy().into_owned();
+        let conn = db();
+        for n in 1..=3 {
+            let body = [
+                bash(&cwd, &format!("b{n}"), "curl localhost"),
+                tool_result(
+                    &cwd,
+                    &format!("b{n}"),
+                    Some(true),
+                    "curl: (7) Failed to connect",
+                ),
+            ]
+            .join("\n");
+            let p = write(repo, &format!("s{n}.jsonl"), &body);
+            insert_session(&conn, &format!("s{n}"), &cwd, Some(&p), None);
+        }
+        let scan = scan_effective_opt(repo, None);
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        let hits = errors(&out);
+        assert_eq!(hits.len(), 1, "{out:#?}");
+        assert!(!hits[0].finding.contains("runs"), "{}", hits[0].finding);
+        let nulls: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claude_advice_ledger WHERE task_fingerprint IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(nulls, 3);
+        assert_eq!(task_fingerprint("a  b\n c"), task_fingerprint("a b c"));
+        assert_ne!(task_fingerprint("a b"), task_fingerprint("a c"));
     }
 
     /// Rows stored under an older extraction rule are not served: the
