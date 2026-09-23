@@ -366,7 +366,7 @@ mod tests {
                         path: FILE.into(),
                         line: Some(15),
                     },
-                    measured: "resolved against `src`, the repository root and a suffix match over 1200 tracked paths: 0 matches".into(),
+                    measured: "resolved against `src`, the repository root and a suffix match over 1200 paths in the working tree: 0 matches".into(),
                 }],
                 "`src/CLAUDE.md:15` names `src/lib/target.ts`, which does not exist in this repository".into(),
             ),

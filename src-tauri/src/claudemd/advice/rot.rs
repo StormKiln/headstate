@@ -15,8 +15,13 @@
 //!
 //! - **path**: the CLAUDE.md's own directory, then the repository root,
 //!   then a unique suffix match over the tree, walked with the same
-//!   [`SKIP`] list `scan_repo` uses. Two matches is `Unknown`
-//!   ("ambiguous"), never a guess. A path that lies UNDER a pruned
+//!   [`SKIP`] list `scan_repo` uses. A nested CLAUDE.md describes its
+//!   own directory, so when any suffix match lies under that directory
+//!   only those count: measured, a nested e2e file's `helpers/` matched
+//!   7 paths across sibling apps and exactly one under its own (#1319).
+//!   With none under it, the whole tree counts; for the root file the
+//!   two are the same. Two matches is `Unknown` ("ambiguous"), never a
+//!   guess. A path that lies UNDER a pruned
 //!   directory is `Unknown` naming the prune, never `Missing`: the walk
 //!   did not enter it, and #1299 is what one prune reading as absence
 //!   costs. Neither this walk nor `scan_repo` prunes `.claude` for
@@ -34,6 +39,33 @@
 //!   name or a deleted file, nothing of that name exists here, so the
 //!   verdict is not the confident wrong number -- only its label would
 //!   be, and the reader is pointed at the same line either way.
+//!
+//!   Nothing outside the repository root is ever stat'd. Each anchored
+//!   candidate has its `.` and `..` folded lexically first, and one that
+//!   climbs out of the root is not tried. A `../`-prefixed token that
+//!   does not resolve from the file's own directory is relative to a
+//!   base the line does not state -- measured, `../../fixtures` in a
+//!   nested CLAUDE.md is an import specifier written from a spec file
+//!   two levels down -- and a suffix match can never hit a `..`
+//!   segment, so before #1317 it was always Missing. Now, stripped of
+//!   its leading `../` segments, a remainder that matches exactly one
+//!   path under the file's own directory resolves; anything else is
+//!   `Unknown` ("relative to an unstated base"), never `Missing`.
+//!
+//!   The walk reads the working tree on disk, not git, so an absent
+//!   path is asked about before it is called missing: a file git
+//!   ignores is expected to be absent from a checkout. Measured,
+//!   `tools/stack/.env` is a secrets file each developer creates, and
+//!   before #1318 it passed on a laptop that had one and was Missing on
+//!   a fresh clone. One `git check-ignore --no-index --stdin` answers
+//!   every path candidate in the run. An ignored path with a template
+//!   beside it (`.example`, `.sample`, `.template`, `.dist`) resolves
+//!   and is silent; one with no template is
+//!   [`Verdict::IgnoredWithoutTemplate`] at [`Severity::Advice`]. A
+//!   repository with no `.git` has no ignore rules, so nothing in it is
+//!   ignored and the verdict stays `Missing`. With a `.git`, a git that
+//!   cannot run or that fails makes the path `Unknown`: it never said
+//!   "not ignored".
 //! - **`path:line`**: the path as above, then the file's line count. A
 //!   line past the end is [`Verdict::LinePastEof`] at
 //!   [`Severity::Advice`]. A line WITHIN the file is silent, even when
@@ -80,6 +112,16 @@
 //!   or `example` names a shape, not a file, and a `Missing` verdict on
 //!   it would be the confident wrong number (qualify, or suppress).
 //!
+//! - **an absolute path**: one under the repository root is a
+//!   repository path with the root spelled out, and resolves from the
+//!   root alone. One anywhere else -- `/api/v1` is a URL route the
+//!   dev-server proxy backs, `/etc/hosts` a host file -- is not a
+//!   repository path: counted, never resolved, and never stat'd. Before
+//!   #1316 the resolver joined it onto an anchor, where a leading `/`
+//!   discards the anchor, and probed the host filesystem root; the
+//!   suffix match then looked for `//api/v1`, which nothing can end
+//!   with, so the verdict was a guaranteed Missing.
+//!
 //! A bare `lint-rust` in prose is not extracted, so it is not checked;
 //! `refs.rs` says why. Commit SHAs and tags (`v5.20.0`) are not checked.
 //!
@@ -88,7 +130,8 @@
 //! A path that could not be stat'd, a suffix search whose walk could not
 //! list a directory or pruned the subtree the path lies under, a
 //! manifest that exists and could not be read, an ambiguous suffix, a
-//! skill with no inventory: each is a
+//! `../` path relative to an unstated base, an absent path git could not
+//! be asked about, a skill with no inventory: each is a
 //! [`Severity::Unknown`] finding with the reason, and the file gets ONE
 //! [`Severity::Advice`] summary, "N references checked; K could not be
 //! checked (…)", only when K > 0. So a run that checked 0 of 41 reads
@@ -106,6 +149,13 @@
 //! is neither an `@` import nor conditioned by "when", "if", "for" or
 //! "before". Both remedies are real and the brief offers both: an `@`
 //! import loads the file in every session; a condition keeps it lazy.
+//! "topic → path" (or `->`) with text before the arrow is a condition
+//! too: it is the index form of "read this when the topic comes up". A
+//! file under `.claude/rules/` is never blind: it loads itself, at launch
+//! or when a file its `paths:` matches is read, and the `@` import the
+//! brief would offer defeats that scoping. One line naming several
+//! documents is ONE finding with each document as its own evidence,
+//! not a row per path (#1320).
 //! *Dated facts* are a line with an absolute date or a version number
 //! AND "as of", "before", "after" or "until": the statement was true on
 //! a date, and the brief quotes the line rather than judging it. Both are
@@ -139,6 +189,9 @@ pub enum Verdict {
     Missing,
     /// The file exists and has fewer lines than the reference cites.
     LinePastEof { lines: u64 },
+    /// Absent, and git ignores it, so a checkout is expected not to have
+    /// it; but no template sits beside it to create it from.
+    IgnoredWithoutTemplate,
     /// Could not be decided, with why.
     Unknown(String),
 }
@@ -157,9 +210,9 @@ pub struct Rotten {
 /// A rule from the content-shape research, fired on one line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Shape {
-    /// A document path named with "see"/"read"/"consult", not imported
-    /// and not conditioned.
-    BlindReference { line: usize, path: String },
+    /// Document paths named with "see"/"read"/"consult" on one line, not
+    /// imported and not conditioned. One per line, in line order.
+    BlindReference { line: usize, paths: Vec<String> },
     /// A date or version beside "as of"/"before"/"after"/"until".
     DatedFact { line: usize, quoted: String },
 }
@@ -173,8 +226,8 @@ pub struct FileRot {
     pub refs_checked: usize,
     /// Why each `Unknown` could not be checked, deduplicated.
     pub unchecked: Vec<String>,
-    /// `cargo` commands, issue numbers and placeholder paths: counted,
-    /// never resolved.
+    /// `cargo` commands, issue numbers, placeholder paths and absolute
+    /// paths outside the repository: counted, never resolved.
     pub unresolvable: usize,
     pub shape: Vec<Shape>,
 }
@@ -185,6 +238,7 @@ pub struct FileRot {
 const MISSING: &str = ", which does not exist in this repository";
 const SKILL_MISSING: &str = ", and no skill of that name was found in any scope";
 const PAST_EOF: &str = "; the file has ";
+const IGNORED: &str = ", which git ignores, and no template (`.example`, `.sample`, `.template` or `.dist`) sits beside it";
 const UNKNOWN: &str = ", which could not be checked: ";
 const SUMMARY: &str = " references checked; ";
 const BLIND: &str = " by name; not imported, no condition";
@@ -290,6 +344,11 @@ pub fn analyse(cx: &Context) -> Vec<Analysed> {
         .filter_map(|(p, _, _)| Path::new(p).parent().map(Path::to_path_buf))
         .collect();
     let mut resolver = Resolver::new(cx.repo, cx.definitions, &symbols, &dirs);
+    for (p, _, t) in &texts {
+        if let Ok(t) = t {
+            resolver.plan(Path::new(p).parent().unwrap_or(cx.repo), t);
+        }
+    }
 
     texts
         .into_iter()
@@ -313,16 +372,24 @@ pub fn check_file(repo: &Path, file: &Path, text: &str, res: &mut Resolver) -> F
     let mut resolved_paths: Vec<(usize, String)> = Vec::new();
 
     for r in refs::extract(text) {
+        // Where a path reference resolved to, when it is a file.
+        let mut landed: Option<PathBuf> = None;
         let outcome = match &r.kind {
             RefKind::Cargo | RefKind::Issue { .. } => {
                 out.unresolvable += 1;
                 continue;
             }
-            RefKind::Path { path } | RefKind::PathLine { path, .. } if is_placeholder(path) => {
+            RefKind::Path { path } | RefKind::PathLine { path, .. }
+                if is_placeholder(path) || is_outside_absolute(repo, path) =>
+            {
                 out.unresolvable += 1;
                 continue;
             }
-            RefKind::Path { path } => res.path(&dir, path).map(|_| ()),
+            RefKind::Path { path } => res.path(&dir, path).map(|to| {
+                if let Resolved::File(p) = to {
+                    landed = Some(p);
+                }
+            }),
             RefKind::PathLine { path, line } => res.path_line(&dir, path, *line),
             RefKind::MakeTarget { name } => res.make_target(&dir, name),
             RefKind::Script { runner, name } => res.script(&dir, *runner, name),
@@ -332,8 +399,13 @@ pub fn check_file(repo: &Path, file: &Path, text: &str, res: &mut Resolver) -> F
         match outcome {
             Ok(()) => {
                 out.refs_checked += 1;
+                // A `.claude/rules` file loads itself, so naming it is
+                // never blind (#1320).
+                let rule = landed.as_deref().is_some_and(|p| is_rule_file(repo, p));
                 if let RefKind::Path { path } = &r.kind {
-                    resolved_paths.push((r.line, path.clone()));
+                    if !rule {
+                        resolved_paths.push((r.line, path.clone()));
+                    }
                 }
             }
             Err((verdict @ Verdict::Unknown(_), measured)) => {
@@ -368,6 +440,14 @@ const PLACEHOLDERS: &[&str] = &["foo", "bar", "baz", "qux", "example"];
 fn is_placeholder(path: &str) -> bool {
     path.split(['/', '.', '-', '_'])
         .any(|seg| PLACEHOLDERS.contains(&seg.to_ascii_lowercase().as_str()))
+}
+
+/// Whether a token is an absolute path that does not lie under the
+/// repository root: `/api/v1` is a URL route, `/etc/hosts` a host file.
+/// Neither is a repository path, and resolving one would stat the host
+/// filesystem, where the verdict depends on the machine (#1316).
+fn is_outside_absolute(repo: &Path, path: &str) -> bool {
+    path.starts_with('/') && !Path::new(path).starts_with(repo)
 }
 
 /// A resolution that decided against the reference: the verdict and
@@ -407,6 +487,74 @@ enum Resolved {
     /// Not a file: a package this project declares. It has no lines to
     /// count and no place on disk to cite.
     Package,
+    /// A file git ignores, absent here as a checkout expects, with a
+    /// template beside it. It has no lines to count either.
+    Ignored,
+}
+
+/// Suffixes of a committed template for an ignored local file:
+/// `.env.example` beside `.env`.
+const TEMPLATE_SUFFIXES: &[&str] = &[".example", ".sample", ".template", ".dist"];
+
+/// How long one `git check-ignore` may take before its answer is
+/// Unknown. The same bound the worktree scan gives one git call.
+const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Which of `paths`, relative to `repo`, git ignores: ONE process for
+/// the lot, fed on stdin. `--no-index` so a tracked file is judged by
+/// the patterns too; only absent paths are ever asked about.
+///
+/// Every failure is `Err`, never an empty set: a git that did not answer
+/// did not say "not ignored" (#1050).
+fn check_ignored(git: &Path, repo: &Path, paths: &[String]) -> Result<BTreeSet<String>, String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(git)
+        .arg("-C")
+        .arg(repo)
+        .args(["check-ignore", "--no-index", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("git check-ignore could not run: {e}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "git check-ignore could not run: no stdin".to_string())?;
+    let input = paths.join("\n") + "\n";
+    // Written from its own thread, so a git that fills its stdout pipe
+    // before reading all of stdin cannot deadlock against this one.
+    let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // The receiver is gone on timeout; that is expected.
+        let _ = tx.send(child.wait_with_output());
+    });
+    let output = match rx.recv_timeout(GIT_TIMEOUT) {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return Err(format!("git check-ignore could not run: {e}")),
+        Err(_) => {
+            return Err(format!(
+                "git check-ignore did not respond within {}s",
+                GIT_TIMEOUT.as_secs()
+            ))
+        }
+    };
+    let _ = writer.join();
+    match output.status.code() {
+        // 0: some are ignored, and stdout names them. 1: none are.
+        Some(0) | Some(1) => Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|l| l.trim_end_matches('\r').to_string())
+            .filter(|l| !l.is_empty())
+            .collect()),
+        code => Err(format!(
+            "git check-ignore exit status {}: {}",
+            code.map(|c| c.to_string()).unwrap_or_else(|| "none".into()),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
 }
 
 /// Whether a token could be an npm package name rather than a path.
@@ -527,6 +675,37 @@ fn relative(repo: &Path, p: &Path) -> Option<String> {
             .collect::<Vec<_>>()
             .join("/"),
     )
+}
+
+/// `anchor` joined with the `/`-separated `rel`, with `.` and `..`
+/// folded lexically, or `None` when the result is not under `repo`.
+///
+/// Lexical on purpose: it decides what may be stat'd, so it must not
+/// stat anything to decide it. `..` is folded here rather than by the
+/// filesystem, so no candidate outside the repository is ever probed
+/// (#1317).
+fn contained(repo: &Path, anchor: &Path, rel: &str) -> Option<PathBuf> {
+    let mut out = anchor.to_path_buf();
+    for seg in rel.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            s => out.push(s),
+        }
+    }
+    out.starts_with(repo).then_some(out)
+}
+
+/// Whether the relative tree path `p` lies under the relative directory
+/// `own`; everything lies under the root, which is `""`.
+fn under(own: &str, p: &str) -> bool {
+    own.is_empty()
+        || p.strip_prefix(own)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// A path for a finding sentence: relative to the repository when it is
@@ -720,6 +899,15 @@ pub struct Resolver<'a> {
     packages: HashMap<PathBuf, Manifest<Vec<String>>>,
     dependencies: HashMap<PathBuf, Manifest<Vec<String>>>,
     symbols: SymbolSearch,
+    /// The git binary `check-ignore` runs as.
+    git: PathBuf,
+    /// Every repository-relative candidate the run may ask git about,
+    /// planned up front so the first question asks them all at once.
+    ignore_plan: BTreeSet<String>,
+    /// What git said, per candidate.
+    ignored: HashMap<String, bool>,
+    /// Why git could not be asked, once it could not.
+    ignore_failed: Option<String>,
 }
 
 impl<'a> Resolver<'a> {
@@ -739,7 +927,148 @@ impl<'a> Resolver<'a> {
             packages: HashMap::new(),
             dependencies: HashMap::new(),
             symbols: search_symbols(repo, symbols, dirs),
+            git: crate::auth::git_program().to_path_buf(),
+            ignore_plan: BTreeSet::new(),
+            ignored: HashMap::new(),
+            ignore_failed: None,
         }
+    }
+
+    /// The same resolver with another git binary, so a test can prove
+    /// what one that cannot run produces.
+    pub fn with_git(mut self, git: &Path) -> Self {
+        self.git = git.to_path_buf();
+        self
+    }
+
+    /// Record every path candidate `text` could ask git about, so a run
+    /// over many files spawns one `git check-ignore`, not one per path.
+    pub fn plan(&mut self, dir: &Path, text: &str) {
+        for r in refs::extract(text) {
+            if let RefKind::Path { path } | RefKind::PathLine { path, .. } = &r.kind {
+                if !is_placeholder(path) && !is_outside_absolute(self.repo, path) {
+                    let c = self.candidates(dir, path);
+                    self.ignore_plan.extend(c);
+                }
+            }
+        }
+    }
+
+    /// The repository-relative places an anchored path reference could
+    /// be: under the file's directory, then under the root; never one
+    /// outside the repository.
+    fn candidates(&self, dir: &Path, path: &str) -> Vec<String> {
+        let (anchors, rel) = if path.starts_with('/') {
+            match relative(self.repo, Path::new(path)) {
+                Some(rel) => (vec![self.repo.to_path_buf()], rel),
+                None => return Vec::new(),
+            }
+        } else {
+            (self.anchors(dir), path.to_string())
+        };
+        let clean = rel.trim_start_matches("./").trim_end_matches('/');
+        let mut out: Vec<String> = Vec::new();
+        for a in anchors {
+            if let Some(rel) = contained(self.repo, &a, clean).and_then(|c| relative(self.repo, &c))
+            {
+                if !rel.is_empty() && !out.contains(&rel) {
+                    out.push(rel);
+                }
+            }
+        }
+        out
+    }
+
+    /// The first of `rels` git ignores, if any.
+    ///
+    /// A repository with no `.git` has no ignore rules, so nothing in it
+    /// is ignored: that is established by the stat, not assumed. With a
+    /// `.git`, git is asked -- once, for every planned candidate not yet
+    /// answered -- and a git that could not answer is `Err`, never "not
+    /// ignored".
+    fn ignored_among(&mut self, rels: &[String]) -> Result<Option<String>, String> {
+        if let Some(why) = &self.ignore_failed {
+            return Err(why.clone());
+        }
+        let need: Vec<&String> = rels
+            .iter()
+            .filter(|r| !self.ignored.contains_key(*r))
+            .collect();
+        if !need.is_empty() {
+            let mut query: BTreeSet<String> = need.into_iter().cloned().collect();
+            query.extend(
+                self.ignore_plan
+                    .iter()
+                    .filter(|r| !self.ignored.contains_key(*r))
+                    .cloned(),
+            );
+            let query: Vec<String> = query.into_iter().collect();
+            let answer = match probe(&self.repo.join(".git")) {
+                Probe::Absent => Ok(BTreeSet::new()),
+                Probe::Refused(e) => Err(format!("`.git` could not be checked: {e}")),
+                Probe::Found => check_ignored(&self.git, self.repo, &query),
+            };
+            match answer {
+                Ok(set) => {
+                    for q in query {
+                        let hit = set.contains(&q);
+                        self.ignored.insert(q, hit);
+                    }
+                }
+                Err(why) => {
+                    self.ignore_failed = Some(why.clone());
+                    return Err(why);
+                }
+            }
+        }
+        Ok(rels
+            .iter()
+            .find(|r| self.ignored.get(*r) == Some(&true))
+            .cloned())
+    }
+
+    /// An absent path that no manifest declares: `Missing`, unless git
+    /// ignores it (#1318). An ignored path is expected to be absent from
+    /// a checkout -- `tools/stack/.env` is a secrets file each developer
+    /// creates -- so with a template beside it it resolves, and without
+    /// one it is Advice. The tree walk reads the disk, not git, so
+    /// without this the verdict for such a file depended on the machine.
+    fn absent(&mut self, dir: &Path, path: &str, measured: String) -> Result<Resolved, Refused> {
+        let candidates = self.candidates(dir, path);
+        let rel = match self.ignored_among(&candidates) {
+            Ok(None) => return Err((Verdict::Missing, measured)),
+            Ok(Some(rel)) => rel,
+            Err(why) => {
+                return Err(unknown(format!(
+                    "`{path}` matches nothing in the working tree, and whether git ignores it could not be established: {why}"
+                )))
+            }
+        };
+        for suffix in TEMPLATE_SUFFIXES {
+            let Some(t) = contained(self.repo, self.repo, &format!("{rel}{suffix}")) else {
+                continue;
+            };
+            match probe(&t) {
+                Probe::Found => return Ok(Resolved::Ignored),
+                Probe::Absent => {}
+                Probe::Refused(e) => {
+                    return Err(unknown(format!(
+                        "`{rel}` is ignored by git, and its template `{rel}{suffix}` could not be checked: {e}"
+                    )))
+                }
+            }
+        }
+        Err((
+            Verdict::IgnoredWithoutTemplate,
+            format!(
+                "`git check-ignore` ignores `{rel}`; no {} beside it",
+                TEMPLATE_SUFFIXES
+                    .iter()
+                    .map(|s| format!("`{rel}{s}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ))
     }
 
     fn tree(&mut self) -> &Tree {
@@ -807,12 +1136,45 @@ impl<'a> Resolver<'a> {
 
     /// A path reference, resolved to where it lives.
     fn path(&mut self, dir: &Path, path: &str) -> Result<Resolved, Refused> {
+        // An absolute token names one place. Under the repository it is
+        // a repository path with the root spelled out, so it resolves
+        // from the root alone and by nothing looser; anywhere else it is
+        // not a repository path and is never stat'd (#1316). `check_file`
+        // counts the second kind before it gets here; this arm keeps the
+        // resolver honest for any other caller.
+        let absolute = path.starts_with('/');
+        let stripped;
+        let path = if absolute {
+            match relative(self.repo, Path::new(path)) {
+                Some(rel) => {
+                    stripped = rel;
+                    stripped.as_str()
+                }
+                None => {
+                    return Err(unknown(format!(
+                        "`{path}` is an absolute path outside the repository, so it was not checked"
+                    )))
+                }
+            }
+        } else {
+            path
+        };
         let clean = path.trim_start_matches("./").trim_end_matches('/');
         if clean.is_empty() {
             return Ok(Resolved::File(self.repo.to_path_buf()));
         }
-        for anchor in self.anchors(dir) {
-            let candidate = anchor.join(clean);
+        let anchors = if absolute {
+            vec![self.repo.to_path_buf()]
+        } else {
+            self.anchors(dir)
+        };
+        for anchor in anchors {
+            // A candidate that climbs out of the repository is never
+            // tried: `repo/../../fixtures` is somewhere on the host, and
+            // a verdict read there depends on the machine (#1317).
+            let Some(candidate) = contained(self.repo, &anchor, clean) else {
+                continue;
+            };
             match probe(&candidate) {
                 Probe::Found => return Ok(Resolved::File(candidate)),
                 Probe::Absent => {}
@@ -824,15 +1186,18 @@ impl<'a> Resolver<'a> {
                 }
             }
         }
+        if clean.split('/').any(|s| s == "..") {
+            return self.parent_relative(dir, path, clean);
+        }
         let repo = self.repo.to_path_buf();
         // Owned, so the tree borrow ends here: the 0-match arm consults
         // the dependency manifests, which needs `&mut self`.
-        let (matches, tracked, unreadable, pruned) = {
+        let (matches, walked, unreadable, pruned) = {
             let tree = self.tree();
             let matches: Vec<String> = tree
                 .paths
                 .iter()
-                .filter(|p| p.as_str() == clean || p.ends_with(&format!("/{clean}")))
+                .filter(|p| p.as_str() == clean || (!absolute && p.ends_with(&format!("/{clean}"))))
                 .cloned()
                 .collect();
             (
@@ -842,6 +1207,14 @@ impl<'a> Resolver<'a> {
                 tree.pruning(clean).map(str::to_string),
             )
         };
+        // A nested CLAUDE.md describes its own directory (#1319): when
+        // any match lies under it, only those are candidates. One
+        // resolves; two are still ambiguous. None falls back to the
+        // whole tree. For the root file the own directory is the
+        // repository, so this changes nothing there.
+        let own = relative(&repo, dir).unwrap_or_default();
+        let mine: Vec<String> = matches.iter().filter(|m| under(&own, m)).cloned().collect();
+        let matches = if mine.is_empty() { matches } else { mine };
         match matches.len() {
             1 => Ok(Resolved::File(repo.join(&matches[0]))),
             // Ordered before the Missing arm on purpose: a reference
@@ -870,13 +1243,11 @@ impl<'a> Resolver<'a> {
                         DependencyLookup::NotDeclared | DependencyLookup::NoManifest => {}
                     }
                 }
-                Err((
-                    Verdict::Missing,
-                    format!(
-                        "resolved against `{}`, the repository root and a suffix match over {tracked} tracked paths: 0 matches",
-                        display(&repo, &dir.to_string_lossy()),
-                    ),
-                ))
+                let measured = format!(
+                    "resolved against `{}`, the repository root and a suffix match over {walked} paths in the working tree: 0 matches",
+                    display(&repo, &dir.to_string_lossy()),
+                );
+                self.absent(dir, path, measured)
             }
             0 => Err(unknown(format!(
                 "`{clean}` matches nothing in the readable tree, and {} could not be listed: {}",
@@ -895,12 +1266,63 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    /// A `../` path that did not resolve from the file's own directory.
+    ///
+    /// It is relative to something the line does not state: measured,
+    /// `../../fixtures` in a nested CLAUDE.md is an import specifier,
+    /// written from a spec file two levels below it. A suffix match can
+    /// never hit a `..` segment, so before #1317 it was always Missing.
+    /// The check did not establish absence, so it is Unknown -- unless,
+    /// stripped of its leading `../` segments, what remains matches
+    /// exactly one path under the file's own directory. That one hit is
+    /// unambiguous and resolves; two or none are Unknown.
+    fn parent_relative(
+        &mut self,
+        dir: &Path,
+        path: &str,
+        clean: &str,
+    ) -> Result<Resolved, Refused> {
+        let own = relative(self.repo, dir).unwrap_or_default();
+        let shown = if own.is_empty() {
+            "the repository root".to_string()
+        } else {
+            format!("`{own}`")
+        };
+        let mut rest = clean;
+        while let Some(r) = rest.strip_prefix("../") {
+            rest = r;
+        }
+        let rest = rest.trim_start_matches("./");
+        if rest.is_empty() || rest == ".." || rest.split('/').any(|s| s == "..") {
+            return Err(unknown(format!(
+                "`{path}` is relative to an unstated base: it does not resolve from {shown}"
+            )));
+        }
+        let repo = self.repo.to_path_buf();
+        let matches: Vec<String> = self
+            .tree()
+            .paths
+            .iter()
+            .filter(|p| under(&own, p) && (p.as_str() == rest || p.ends_with(&format!("/{rest}"))))
+            .cloned()
+            .collect();
+        match matches.len() {
+            1 => Ok(Resolved::File(repo.join(&matches[0]))),
+            n => Err(unknown(format!(
+                "`{path}` is relative to an unstated base: it does not resolve from {shown}, and `{rest}` matches {} under it",
+                count(n, "path", "paths")
+            ))),
+        }
+    }
+
     fn path_line(&mut self, dir: &Path, path: &str, line: u32) -> Result<(), Refused> {
         let target = match self.path(dir, path)? {
             Resolved::File(p) => p,
             // `chart.js:12` on a declared dependency: the package is
             // real, and it has no file in this repository to count.
             Resolved::Package => return Ok(()),
+            // An ignored local file with a template: absent by design.
+            Resolved::Ignored => return Ok(()),
         };
         if target.is_dir() {
             return Err(unknown(format!(
@@ -1156,6 +1578,29 @@ static DATE: LazyLock<Regex> = LazyLock::new(|| {
 static VERSION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(?:v\d+(?:\.\d+)+|\d+\.\d+\.\d+)\b").unwrap());
 
+/// Whether `p` is under a `.claude/rules` directory. Such a file loads
+/// itself: at launch without `paths:` frontmatter, or when a file its
+/// `paths:` matches is read. An `@` import would load it in every
+/// session, defeating the scoping, so naming one is never blind.
+fn is_rule_file(repo: &Path, p: &Path) -> bool {
+    relative(repo, p)
+        .is_some_and(|r| r.starts_with(".claude/rules/") || r.contains("/.claude/rules/"))
+}
+
+/// Whether the line states a topic before an arrow: "auth roles →
+/// `docs/a.md`" says when to read the target, in the index form. An
+/// arrow with nothing before it but a list marker states no topic.
+fn topic_arrow(line: &str) -> bool {
+    ["→", "->"].iter().any(|arrow| {
+        line.find(arrow).is_some_and(|at| {
+            !line[..at]
+                .trim_start_matches(|c: char| c.is_whitespace() || c == '-' || c == '*')
+                .trim()
+                .is_empty()
+        })
+    })
+}
+
 /// Document extensions, and a `docs/` component, for the blind-reference
 /// rule.
 fn is_document(path: &str) -> bool {
@@ -1174,17 +1619,23 @@ fn shape_rules(text: &str, resolved_paths: &[(usize, String)]) -> Vec<Shape> {
     let normalised = text.replace("\r\n", "\n");
     let mut out = Vec::new();
     for (n, line) in text::prose_lines(&normalised) {
-        for (_, path) in resolved_paths.iter().filter(|(l, _)| *l == n) {
-            if !is_document(path) {
-                continue;
+        let conditioned = CONDITION.is_match(line) || topic_arrow(line);
+        let mut blind: Vec<String> = Vec::new();
+        if CUE.is_match(line) && !conditioned {
+            for (_, path) in resolved_paths.iter().filter(|(l, _)| *l == n) {
+                let imported = line.contains(&format!("@{path}"));
+                if is_document(path) && !imported && !blind.contains(path) {
+                    blind.push(path.clone());
+                }
             }
-            let imported = line.contains(&format!("@{path}"));
-            if !imported && CUE.is_match(line) && !CONDITION.is_match(line) {
-                out.push(Shape::BlindReference {
-                    line: n,
-                    path: path.clone(),
-                });
-            }
+        }
+        // One finding per line, however many documents it names: three
+        // near-identical rows for one line is noise (#1320).
+        if !blind.is_empty() {
+            out.push(Shape::BlindReference {
+                line: n,
+                paths: blind,
+            });
         }
         if TEMPORAL.is_match(line) && (DATE.is_match(line) || VERSION.is_match(line)) {
             out.push(Shape::DatedFact {
@@ -1248,6 +1699,10 @@ fn findings_for(repo: &Path, path: &str, scope: Scope, text: &str, rot: &FileRot
                 Severity::Advice,
                 format!("`{shown}:{line}` cites `{raw}`{PAST_EOF}{lines} lines"),
             ),
+            Verdict::IgnoredWithoutTemplate => (
+                Severity::Advice,
+                format!("`{shown}:{line}` names `{raw}`{IGNORED}"),
+            ),
             Verdict::Unknown(why) => (
                 Severity::Unknown,
                 format!("`{shown}:{line}` names `{raw}`{UNKNOWN}{why}"),
@@ -1266,28 +1721,41 @@ fn findings_for(repo: &Path, path: &str, scope: Scope, text: &str, rot: &FileRot
     }
 
     for s in &rot.shape {
-        let (line, sentence, measured) = match s {
-            Shape::BlindReference { line, path: p } => (
+        let (line, sentence, measured): (usize, String, Vec<String>) = match s {
+            Shape::BlindReference { line, paths } => (
                 *line,
-                format!("`{shown}:{line}` names `{p}`{BLIND}"),
                 format!(
-                    "line {line} names `{p}` with see/read/consult; no `@{p}` import and no when/if/for/before on the line"
+                    "`{shown}:{line}` names {}{BLIND}",
+                    paths
+                        .iter()
+                        .map(|p| format!("`{p}`"))
+                        .collect::<Vec<_>>()
+                        .join(" and ")
                 ),
+                paths
+                    .iter()
+                    .map(|p| format!(
+                        "line {line} names `{p}` with see/read/consult; no `@{p}` import, no when/if/for/before and no topic → on the line"
+                    ))
+                    .collect(),
             ),
             Shape::DatedFact { line, quoted } => (
                 *line,
                 format!("`{shown}:{line}`{DATED}\"{quoted}\""),
-                "a date or version number beside as of/before/after/until".to_string(),
+                vec!["a date or version number beside as of/before/after/until".to_string()],
             ),
         };
         out.push(Finding::new(
             Check::Rot,
             Severity::Advice,
             subject(line),
-            vec![Evidence {
-                at: at(line),
-                measured,
-            }],
+            measured
+                .into_iter()
+                .map(|measured| Evidence {
+                    at: at(line),
+                    measured,
+                })
+                .collect(),
             sentence,
         ));
     }
@@ -1315,7 +1783,7 @@ fn findings_for(repo: &Path, path: &str, scope: Scope, text: &str, rot: &FileRot
                     line: None,
                 },
                 measured: format!(
-                    "{} found: {} resolved, {unknown} unknown, {} never resolved (`cargo` commands, issue numbers and placeholder paths)",
+                    "{} found: {} resolved, {unknown} unknown, {} never resolved (`cargo` commands, issue numbers, placeholder paths and absolute paths outside the repository)",
                     count(rot.refs_checked + unknown + rot.unresolvable, "reference", "references"),
                     rot.refs_checked,
                     rot.unresolvable
@@ -1360,6 +1828,11 @@ pub(super) fn suggestion(f: &Finding) -> String {
         format!(
             "Edit {line}: replace the reference with the current name of what it points at, or \
              delete the sentence. Do not create a file, target, script or symbol to satisfy it."
+        )
+    } else if s.contains(IGNORED) {
+        format!(
+            "Edit {line}: say that each developer creates this file, or commit a template beside \
+             it (`<path>.example`) and name that too. Do not commit the ignored file itself."
         )
     } else if s.contains(PAST_EOF) {
         format!(
@@ -1457,6 +1930,15 @@ Run `yarn paw`, not `yarn nope`. Use the `tentacle` skill, not the `ink` skill.
             })
             .collect();
         let mut res = Resolver::new(repo, definitions, &symbols, &[repo.to_path_buf()]);
+        check_file(repo, &file, &text, &mut res)
+    }
+
+    /// [`check_one`] for a nested CLAUDE.md, `rel` from the root.
+    fn check_nested(repo: &Path, rel: &str) -> FileRot {
+        let file = rel.split('/').fold(repo.to_path_buf(), |p, s| p.join(s));
+        let text = fs::read_to_string(&file).unwrap();
+        let dir = file.parent().unwrap().to_path_buf();
+        let mut res = Resolver::new(repo, None, &BTreeSet::new(), &[dir]);
         check_file(repo, &file, &text, &mut res)
     }
 
@@ -2206,6 +2688,80 @@ Run `yarn paw`, not `yarn nope`. Use the `tentacle` skill, not the `ink` skill.
         assert_eq!(verdicts(&rot), vec![("docs/gone.md", &Verdict::Missing)]);
     }
 
+    /// #1320: a `.claude/rules` file loads itself -- at launch, or when
+    /// a file its `paths:` matches is read -- so offering an `@` import
+    /// for it is wrong, and naming it is not blind.
+    #[test]
+    fn a_claude_rules_file_is_never_a_blind_reference() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        fs::create_dir_all(root.join(".claude").join("rules")).unwrap();
+        fs::write(root.join(".claude").join("rules").join("x.md"), "rule").unwrap();
+        fs::write(root.join("CLAUDE.md"), "See `.claude/rules/x.md`.\n").unwrap();
+        let rot = check_one(root, None);
+        assert!(rot.findings.is_empty(), "{rot:?}");
+        assert!(rot.shape.is_empty(), "{:?}", rot.shape);
+    }
+
+    /// #1320: "topic → path" states when to read the target, in the
+    /// index form; `->` too. An arrow with nothing before it states no
+    /// topic and conditions nothing.
+    #[test]
+    fn a_topic_arrow_is_a_condition() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("docs").join("a.md"), "a").unwrap();
+        fs::write(
+            root.join("CLAUDE.md"),
+            "- auth roles, seed model → see `docs/a.md`\n\
+             - evidence -> read `docs/a.md`\n\
+             → see `docs/a.md`\n",
+        )
+        .unwrap();
+        let rot = check_one(root, None);
+        let lines: Vec<usize> = rot
+            .shape
+            .iter()
+            .filter_map(|s| match s {
+                Shape::BlindReference { line, .. } => Some(*line),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines, vec![3], "{:?}", rot.shape);
+    }
+
+    /// #1320: one blind line naming two documents is ONE finding, with
+    /// each document as its own evidence.
+    #[test]
+    fn one_blind_line_naming_two_documents_is_one_finding() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("docs").join("a.md"), "a").unwrap();
+        fs::write(root.join("docs").join("b.md"), "b").unwrap();
+        fs::write(root.join("CLAUDE.md"), "See `docs/a.md` and `docs/b.md`.\n").unwrap();
+        let report = run_over(root, None);
+        let blind: Vec<&Finding> = report
+            .findings
+            .iter()
+            .filter(|f| f.finding.contains("by name; not imported, no condition"))
+            .collect();
+        assert_eq!(blind.len(), 1, "{report:?}");
+        assert_eq!(
+            blind[0].finding,
+            "`CLAUDE.md:1` names `docs/a.md` and `docs/b.md` by name; not imported, no condition"
+        );
+        let measured: Vec<&str> = blind[0]
+            .evidence
+            .iter()
+            .map(|e| e.measured.as_str())
+            .collect();
+        assert_eq!(measured.len(), 2, "{measured:?}");
+        assert!(measured[0].contains("`docs/a.md`"), "{measured:?}");
+        assert!(measured[1].contains("`docs/b.md`"), "{measured:?}");
+    }
+
     /// A date or a version beside "as of"/"before"/"after"/"until" is a
     /// dated fact, quoted; a date alone or a temporal word alone is not.
     #[test]
@@ -2295,6 +2851,302 @@ Run `yarn paw`, not `yarn nope`. Use the `tentacle` skill, not the `ink` skill.
         };
         let report = super::super::run_with(&cx, &[&Rot]);
         assert!(report.findings.is_empty(), "{report:?}");
+    }
+
+    /// #1316: `/api/v1` is a URL route, not a file. An absolute token
+    /// outside the repository is never resolved against the host
+    /// filesystem: counted, never a finding, and never Missing.
+    #[test]
+    fn an_absolute_token_outside_the_repository_is_counted_not_missing() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        fs::write(
+            root.join("CLAUDE.md"),
+            "dev server, proxied at `/api/v1` → `localhost:8000`\n",
+        )
+        .unwrap();
+        let rot = check_one(root, None);
+        assert!(rot.findings.is_empty(), "{rot:?}");
+        assert_eq!(rot.refs_checked, 0, "{rot:?}");
+        assert_eq!(rot.unresolvable, 1, "{rot:?}");
+    }
+
+    /// #1316's companion: whether the HOST has a file must not move a
+    /// verdict. One absolute path outside the repository exists on disk
+    /// and one does not; both are counted the same way, so neither was
+    /// stat'd. `/etc/hosts` is the real-world shape of the first.
+    #[cfg(unix)]
+    #[test]
+    fn an_absolute_path_outside_the_repository_is_never_read() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path().join("repo");
+        let outside = t.path().join("outside");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("real.md"), "host file\n").unwrap();
+        let body = format!(
+            "see `{}`, `{}:3` and `/etc/hosts`\n",
+            outside.join("real.md").display(),
+            outside.join("gone.md").display()
+        );
+        fs::write(repo.join("CLAUDE.md"), &body).unwrap();
+        let rot = check_one(&repo, None);
+        assert!(rot.findings.is_empty(), "{body}: {rot:?}");
+        assert_eq!(rot.refs_checked, 0, "nothing outside was resolved: {rot:?}");
+        assert_eq!(rot.unresolvable, 3, "{rot:?}");
+    }
+
+    /// An absolute path that lies UNDER the repository is a repository
+    /// path: its prefix is stripped and it resolves as a relative one,
+    /// so a real file is silent and a gone one is still Missing.
+    #[cfg(unix)]
+    #[test]
+    fn an_absolute_path_under_the_repository_resolves_as_relative() {
+        let t = fixture();
+        let root = t.path();
+        let body = format!(
+            "`{}` and `{}`\n",
+            root.join("src").join("octo.rs").display(),
+            root.join("src").join("gone.rs").display()
+        );
+        fs::write(root.join("CLAUDE.md"), &body).unwrap();
+        let rot = check_one(root, None);
+        let gone = root.join("src").join("gone.rs").display().to_string();
+        assert_eq!(
+            verdicts(&rot),
+            vec![(gone.as_str(), &Verdict::Missing)],
+            "{rot:?}"
+        );
+        assert_eq!(rot.refs_checked, 2, "{rot:?}");
+        assert_eq!(rot.unresolvable, 0, "{rot:?}");
+    }
+
+    /// #1317: `../../fixtures` in a nested CLAUDE.md is an import
+    /// specifier, relative to a spec file somewhere below. Stripped of
+    /// its `../` segments, it has one match under the file's own
+    /// directory, so it resolves; one with no such match is Unknown,
+    /// never Missing.
+    #[test]
+    fn a_parent_relative_path_resolves_under_its_own_subtree_or_is_unknown() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        fs::create_dir_all(root.join("sub").join("src").join("fixtures")).unwrap();
+        fs::write(
+            root.join("sub").join("CLAUDE.md"),
+            "imports one level deeper: `../../fixtures`, `../helpers`\n",
+        )
+        .unwrap();
+        let rot = check_nested(root, "sub/CLAUDE.md");
+        assert_eq!(rot.findings.len(), 1, "{rot:?}");
+        assert_eq!(rot.findings[0].r.raw, "../helpers");
+        match &rot.findings[0].verdict {
+            Verdict::Unknown(why) => assert!(why.contains("unstated base"), "{why}"),
+            other => panic!("never Missing: {other:?}"),
+        }
+        assert_eq!(rot.refs_checked, 1, "`../../fixtures` resolved: {rot:?}");
+    }
+
+    /// #1317's containment half: a `../` path that would climb out of
+    /// the repository is never probed. A directory of that name beside
+    /// the repository must not make it resolve; nothing inside matches,
+    /// so it is Unknown.
+    #[test]
+    fn a_parent_relative_path_never_probes_outside_the_repository() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path().join("repo");
+        fs::create_dir_all(repo.join("sub")).unwrap();
+        // `repo/sub/../../fixtures` is exactly this directory.
+        fs::create_dir_all(t.path().join("fixtures")).unwrap();
+        fs::write(repo.join("sub").join("CLAUDE.md"), "see `../../fixtures`\n").unwrap();
+        let rot = check_nested(&repo, "sub/CLAUDE.md");
+        assert_eq!(rot.findings.len(), 1, "{rot:?}");
+        match &rot.findings[0].verdict {
+            Verdict::Unknown(why) => assert!(why.contains("unstated base"), "{why}"),
+            other => panic!("resolved or Missing from outside the repository: {other:?}"),
+        }
+        assert_eq!(rot.refs_checked, 0, "{rot:?}");
+    }
+
+    /// A `../` path that DOES resolve inside the repository from the
+    /// file's own directory still resolves, and a gone one from there
+    /// is Unknown rather than Missing: the base was never stated.
+    #[test]
+    fn a_parent_relative_path_inside_the_repository_still_resolves() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        fs::create_dir_all(root.join("apps").join("web")).unwrap();
+        fs::create_dir_all(root.join("apps").join("api")).unwrap();
+        fs::write(root.join("apps").join("api").join("main.py"), "").unwrap();
+        fs::write(
+            root.join("apps").join("web").join("CLAUDE.md"),
+            "the API is `../api/main.py`; not `../api/gone.py`\n",
+        )
+        .unwrap();
+        let rot = check_nested(root, "apps/web/CLAUDE.md");
+        assert_eq!(rot.refs_checked, 1, "{rot:?}");
+        assert_eq!(rot.findings.len(), 1, "{rot:?}");
+        assert!(
+            matches!(rot.findings[0].verdict, Verdict::Unknown(_)),
+            "{rot:?}"
+        );
+    }
+
+    /// #1319: a nested CLAUDE.md describes its own directory. A suffix
+    /// with one match under it resolves, whatever sibling apps hold.
+    #[test]
+    fn an_ambiguous_suffix_resolves_by_its_one_match_in_the_own_subtree() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        fs::create_dir_all(root.join("a").join("src").join("helpers")).unwrap();
+        fs::create_dir_all(root.join("b").join("src").join("helpers")).unwrap();
+        fs::write(
+            root.join("a").join("CLAUDE.md"),
+            "shared code in `helpers/`\n",
+        )
+        .unwrap();
+        let rot = check_nested(root, "a/CLAUDE.md");
+        assert!(rot.findings.is_empty(), "{rot:?}");
+        assert_eq!(rot.refs_checked, 1, "{rot:?}");
+    }
+
+    /// Two matches under the own directory is still ambiguous. Never a
+    /// guess.
+    #[test]
+    fn two_matches_in_the_own_subtree_are_still_ambiguous() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        fs::create_dir_all(root.join("a").join("x").join("helpers")).unwrap();
+        fs::create_dir_all(root.join("a").join("y").join("helpers")).unwrap();
+        fs::create_dir_all(root.join("b").join("helpers")).unwrap();
+        fs::write(
+            root.join("a").join("CLAUDE.md"),
+            "shared code in `helpers/`\n",
+        )
+        .unwrap();
+        let rot = check_nested(root, "a/CLAUDE.md");
+        assert_eq!(rot.findings.len(), 1, "{rot:?}");
+        match &rot.findings[0].verdict {
+            Verdict::Unknown(why) => assert!(
+                why.contains("ambiguous")
+                    && why.contains("a/x/helpers")
+                    && !why.contains("b/helpers"),
+                "the own-subtree matches are named: {why}"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn git_init(dir: &Path) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["init", "-q"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "git init");
+    }
+
+    /// The #1318 fixture: a git repository ignoring `**/.env`, with the
+    /// committed template beside where the local file would be.
+    fn ignored_env_fixture() -> tempfile::TempDir {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        git_init(root);
+        fs::write(root.join(".gitignore"), "**/.env\n").unwrap();
+        fs::create_dir_all(root.join("tools").join("stack")).unwrap();
+        fs::write(
+            root.join("tools").join("stack").join(".env.example"),
+            "DB_PASSWORD=\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("CLAUDE.md"),
+            "Needs `tools/stack/.env` (DB password); `tools/stack/gone.rs` is gone.\n",
+        )
+        .unwrap();
+        t
+    }
+
+    /// #1318: a gitignored local file is expected to be absent from a
+    /// checkout. With a template beside it, it is silent; the genuinely
+    /// gone file on the same line is still a Problem.
+    #[test]
+    fn an_ignored_file_with_a_template_beside_it_is_not_missing() {
+        let t = ignored_env_fixture();
+        let report = run_over(t.path(), None);
+        let problems: Vec<&str> = report
+            .findings
+            .iter()
+            .filter(|f| f.severity == Severity::Problem)
+            .map(|f| f.finding.as_str())
+            .collect();
+        assert_eq!(
+            problems,
+            vec!["`CLAUDE.md:1` names `tools/stack/gone.rs`, which does not exist in this repository"],
+            "{report:?}"
+        );
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.finding.contains("tools/stack/.env`")),
+            "{report:?}"
+        );
+        // The measurement names what it walked, not "tracked" paths.
+        let gone = report
+            .findings
+            .iter()
+            .find(|f| f.severity == Severity::Problem)
+            .unwrap();
+        assert!(
+            gone.evidence[0]
+                .measured
+                .contains("paths in the working tree")
+                && !gone.evidence[0].measured.contains("tracked"),
+            "{}",
+            gone.evidence[0].measured
+        );
+    }
+
+    /// Delete the template, and the ignored file is Advice -- a
+    /// developer has nothing to copy it from -- never a Problem.
+    #[test]
+    fn an_ignored_file_with_no_template_is_advice_not_a_problem() {
+        let t = ignored_env_fixture();
+        fs::remove_file(t.path().join("tools").join("stack").join(".env.example")).unwrap();
+        let report = run_over(t.path(), None);
+        let env: Vec<&Finding> = report
+            .findings
+            .iter()
+            .filter(|f| f.finding.contains("`tools/stack/.env`"))
+            .collect();
+        assert_eq!(env.len(), 1, "{report:?}");
+        assert_eq!(env[0].severity, Severity::Advice);
+        assert!(env[0].finding.contains("git ignores"), "{}", env[0].finding);
+        assert!(env[0].brief.contains("template"), "{}", env[0].brief);
+    }
+
+    /// A git that cannot run never establishes "not ignored", so the
+    /// absent file is Unknown, not Missing.
+    #[test]
+    fn a_git_that_cannot_run_makes_an_absent_path_unknown() {
+        let t = ignored_env_fixture();
+        let root = t.path();
+        let file = root.join("CLAUDE.md");
+        let text = fs::read_to_string(&file).unwrap();
+        let mut res = Resolver::new(root, None, &BTreeSet::new(), &[root.to_path_buf()])
+            .with_git(Path::new("/home/octocat/no-such-git"));
+        let rot = check_file(root, &file, &text, &mut res);
+        assert_eq!(rot.findings.len(), 2, "{rot:?}");
+        for r in &rot.findings {
+            match &r.verdict {
+                Verdict::Unknown(why) => {
+                    assert!(why.contains("git check-ignore could not run"), "{why}")
+                }
+                other => panic!("{}: never Missing: {other:?}", r.r.raw),
+            }
+        }
     }
 
     /// This repository's own CLAUDE.md files, measured: zero certain
