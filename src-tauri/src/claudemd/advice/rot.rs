@@ -80,6 +80,16 @@
 //!   or `example` names a shape, not a file, and a `Missing` verdict on
 //!   it would be the confident wrong number (qualify, or suppress).
 //!
+//! - **an absolute path**: one under the repository root is a
+//!   repository path with the root spelled out, and resolves from the
+//!   root alone. One anywhere else -- `/api/v1` is a URL route the
+//!   dev-server proxy backs, `/etc/hosts` a host file -- is not a
+//!   repository path: counted, never resolved, and never stat'd. Before
+//!   #1316 the resolver joined it onto an anchor, where a leading `/`
+//!   discards the anchor, and probed the host filesystem root; the
+//!   suffix match then looked for `//api/v1`, which nothing can end
+//!   with, so the verdict was a guaranteed Missing.
+//!
 //! A bare `lint-rust` in prose is not extracted, so it is not checked;
 //! `refs.rs` says why. Commit SHAs and tags (`v5.20.0`) are not checked.
 //!
@@ -173,8 +183,8 @@ pub struct FileRot {
     pub refs_checked: usize,
     /// Why each `Unknown` could not be checked, deduplicated.
     pub unchecked: Vec<String>,
-    /// `cargo` commands, issue numbers and placeholder paths: counted,
-    /// never resolved.
+    /// `cargo` commands, issue numbers, placeholder paths and absolute
+    /// paths outside the repository: counted, never resolved.
     pub unresolvable: usize,
     pub shape: Vec<Shape>,
 }
@@ -318,7 +328,9 @@ pub fn check_file(repo: &Path, file: &Path, text: &str, res: &mut Resolver) -> F
                 out.unresolvable += 1;
                 continue;
             }
-            RefKind::Path { path } | RefKind::PathLine { path, .. } if is_placeholder(path) => {
+            RefKind::Path { path } | RefKind::PathLine { path, .. }
+                if is_placeholder(path) || is_outside_absolute(repo, path) =>
+            {
                 out.unresolvable += 1;
                 continue;
             }
@@ -368,6 +380,14 @@ const PLACEHOLDERS: &[&str] = &["foo", "bar", "baz", "qux", "example"];
 fn is_placeholder(path: &str) -> bool {
     path.split(['/', '.', '-', '_'])
         .any(|seg| PLACEHOLDERS.contains(&seg.to_ascii_lowercase().as_str()))
+}
+
+/// Whether a token is an absolute path that does not lie under the
+/// repository root: `/api/v1` is a URL route, `/etc/hosts` a host file.
+/// Neither is a repository path, and resolving one would stat the host
+/// filesystem, where the verdict depends on the machine (#1316).
+fn is_outside_absolute(repo: &Path, path: &str) -> bool {
+    path.starts_with('/') && !Path::new(path).starts_with(repo)
 }
 
 /// A resolution that decided against the reference: the verdict and
@@ -807,11 +827,39 @@ impl<'a> Resolver<'a> {
 
     /// A path reference, resolved to where it lives.
     fn path(&mut self, dir: &Path, path: &str) -> Result<Resolved, Refused> {
+        // An absolute token names one place. Under the repository it is
+        // a repository path with the root spelled out, so it resolves
+        // from the root alone and by nothing looser; anywhere else it is
+        // not a repository path and is never stat'd (#1316). `check_file`
+        // counts the second kind before it gets here; this arm keeps the
+        // resolver honest for any other caller.
+        let absolute = path.starts_with('/');
+        let stripped;
+        let path = if absolute {
+            match relative(self.repo, Path::new(path)) {
+                Some(rel) => {
+                    stripped = rel;
+                    stripped.as_str()
+                }
+                None => {
+                    return Err(unknown(format!(
+                        "`{path}` is an absolute path outside the repository, so it was not checked"
+                    )))
+                }
+            }
+        } else {
+            path
+        };
         let clean = path.trim_start_matches("./").trim_end_matches('/');
         if clean.is_empty() {
             return Ok(Resolved::File(self.repo.to_path_buf()));
         }
-        for anchor in self.anchors(dir) {
+        let anchors = if absolute {
+            vec![self.repo.to_path_buf()]
+        } else {
+            self.anchors(dir)
+        };
+        for anchor in anchors {
             let candidate = anchor.join(clean);
             match probe(&candidate) {
                 Probe::Found => return Ok(Resolved::File(candidate)),
@@ -832,7 +880,7 @@ impl<'a> Resolver<'a> {
             let matches: Vec<String> = tree
                 .paths
                 .iter()
-                .filter(|p| p.as_str() == clean || p.ends_with(&format!("/{clean}")))
+                .filter(|p| p.as_str() == clean || (!absolute && p.ends_with(&format!("/{clean}"))))
                 .cloned()
                 .collect();
             (
@@ -1315,7 +1363,7 @@ fn findings_for(repo: &Path, path: &str, scope: Scope, text: &str, rot: &FileRot
                     line: None,
                 },
                 measured: format!(
-                    "{} found: {} resolved, {unknown} unknown, {} never resolved (`cargo` commands, issue numbers and placeholder paths)",
+                    "{} found: {} resolved, {unknown} unknown, {} never resolved (`cargo` commands, issue numbers, placeholder paths and absolute paths outside the repository)",
                     count(rot.refs_checked + unknown + rot.unresolvable, "reference", "references"),
                     rot.refs_checked,
                     rot.unresolvable
@@ -2295,6 +2343,74 @@ Run `yarn paw`, not `yarn nope`. Use the `tentacle` skill, not the `ink` skill.
         };
         let report = super::super::run_with(&cx, &[&Rot]);
         assert!(report.findings.is_empty(), "{report:?}");
+    }
+
+    /// #1316: `/api/v1` is a URL route, not a file. An absolute token
+    /// outside the repository is never resolved against the host
+    /// filesystem: counted, never a finding, and never Missing.
+    #[test]
+    fn an_absolute_token_outside_the_repository_is_counted_not_missing() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        fs::write(
+            root.join("CLAUDE.md"),
+            "dev server, proxied at `/api/v1` → `localhost:8000`\n",
+        )
+        .unwrap();
+        let rot = check_one(root, None);
+        assert!(rot.findings.is_empty(), "{rot:?}");
+        assert_eq!(rot.refs_checked, 0, "{rot:?}");
+        assert_eq!(rot.unresolvable, 1, "{rot:?}");
+    }
+
+    /// #1316's companion: whether the HOST has a file must not move a
+    /// verdict. One absolute path outside the repository exists on disk
+    /// and one does not; both are counted the same way, so neither was
+    /// stat'd. `/etc/hosts` is the real-world shape of the first.
+    #[cfg(unix)]
+    #[test]
+    fn an_absolute_path_outside_the_repository_is_never_read() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path().join("repo");
+        let outside = t.path().join("outside");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("real.md"), "host file\n").unwrap();
+        let body = format!(
+            "see `{}`, `{}:3` and `/etc/hosts`\n",
+            outside.join("real.md").display(),
+            outside.join("gone.md").display()
+        );
+        fs::write(repo.join("CLAUDE.md"), &body).unwrap();
+        let rot = check_one(&repo, None);
+        assert!(rot.findings.is_empty(), "{body}: {rot:?}");
+        assert_eq!(rot.refs_checked, 0, "nothing outside was resolved: {rot:?}");
+        assert_eq!(rot.unresolvable, 3, "{rot:?}");
+    }
+
+    /// An absolute path that lies UNDER the repository is a repository
+    /// path: its prefix is stripped and it resolves as a relative one,
+    /// so a real file is silent and a gone one is still Missing.
+    #[cfg(unix)]
+    #[test]
+    fn an_absolute_path_under_the_repository_resolves_as_relative() {
+        let t = fixture();
+        let root = t.path();
+        let body = format!(
+            "`{}` and `{}`\n",
+            root.join("src").join("octo.rs").display(),
+            root.join("src").join("gone.rs").display()
+        );
+        fs::write(root.join("CLAUDE.md"), &body).unwrap();
+        let rot = check_one(root, None);
+        let gone = root.join("src").join("gone.rs").display().to_string();
+        assert_eq!(
+            verdicts(&rot),
+            vec![(gone.as_str(), &Verdict::Missing)],
+            "{rot:?}"
+        );
+        assert_eq!(rot.refs_checked, 2, "{rot:?}");
+        assert_eq!(rot.unresolvable, 0, "{rot:?}");
     }
 
     /// This repository's own CLAUDE.md files, measured: zero certain
