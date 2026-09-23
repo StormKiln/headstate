@@ -129,17 +129,19 @@ fn suggestion(f: &Finding) -> String {
                 "Edit `{path}` at the line the evidence names: shorten or respell a value that \
                  exceeds or misspells what the named surface documents, quote a description \
                  YAML would read as more than one value, and move body text a reference file \
-                 could hold into one linked from SKILL.md. A cost figure alone needs no edit. \
-                 Do not rename the directory."
+                 could hold into one linked from SKILL.md. Do not rename the directory."
             ),
             Subject::ClaudeMd { path, .. } => format!(
                 "In `{path}`, correct or delete a reference to a skill that was not found, or \
                  add that skill under `.claude/skills/<name>/SKILL.md`; move a procedure into \
                  the skill the evidence names, leaving one line in `{path}` that names the skill."
             ),
+            // A scope's total is a Note and has no suggestion (#1354);
+            // what reaches here is a scope that could not be read.
             Subject::Directory { path } => format!(
-                "Nothing to edit for a count under `{path}`; where the evidence names a \
-                 permission error, make that directory readable and run the check again."
+                "No edit to a skill. Make the path the evidence names under `{path}` \
+                 readable and run the check again; until then this scope's skills are not \
+                 known."
             ),
         },
         Check::Shape => super::shape::suggestion(f),

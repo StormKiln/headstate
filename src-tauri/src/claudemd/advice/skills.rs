@@ -66,6 +66,16 @@
 //! here, and `None` produces no finding at all: "no call observed" is not
 //! "unused", and #1207 is what a plain zero did last time.
 //!
+//! # A cost figure is a Note
+//!
+//! Each skill's cost (body lines and est. tokens, description est.
+//! tokens) and each scope's description total are [`Severity::Note`]:
+//! they state what was measured and recommend nothing, so their brief
+//! asks for no edit (#1354). No cost threshold turns one into Advice.
+//! The only measured limit on size is the authoring page's 500 body
+//! lines, which is its own Advice finding; a figure is never kept as
+//! Advice because it is large.
+//!
 //! # Unknown
 //!
 //! No inventory at all is `Err`, and the whole check is Unknown. A scope
@@ -714,10 +724,16 @@ fn cost(s: &SkillFile, out: &mut Vec<Finding>) {
                 .to_string(),
         ),
     };
-    out.push(advice(
-        s,
-        Some(s.fm.body_start),
-        measured,
+    // A figure, not a recommendation (#1354): a body over the authoring
+    // page's limit is its own Advice finding, [`BODY_MAX_LINES`].
+    out.push(Finding::new(
+        Check::Skills,
+        Severity::Note,
+        s.subject(),
+        vec![Evidence {
+            at: s.at(Some(s.fm.body_start)),
+            measured,
+        }],
         format!(
             "skill `{}`: its body is {lines} lines (~{body} est. tokens), paid when the skill \
              is invoked; {per_session}",
@@ -789,7 +805,7 @@ fn scope_totals(skills: &[SkillFile], inv: &Inventory, out: &mut Vec<Finding>) {
         let skills_dir = root.join("skills");
         out.push(Finding::new(
             Check::Skills,
-            Severity::Advice,
+            Severity::Note,
             Subject::Directory {
                 path: root.to_string_lossy().to_string(),
             },
@@ -1282,20 +1298,25 @@ mod tests {
             .unwrap_or_else(|| panic!("{got:?}"));
         assert!(long.contains("under 500 lines"), "{long}");
 
-        // Every finding about the skill is advice, and its brief names
-        // the file. The scope total is about the directory, not the
-        // skill.
+        // Every finding about the skill names the file in its brief. The
+        // scope total is about the directory, not the skill. The cost
+        // figure and the scope total are Notes (#1354); the rest is
+        // advice.
         for f in skills_findings(&report) {
             if matches!(f.subject, Subject::Skill { .. }) {
                 assert!(f.brief.contains(&*path), "{}", f.brief);
             }
         }
-        assert!(
-            skills_findings(&report)
-                .iter()
-                .all(|f| f.severity == Severity::Advice),
-            "{got:?}"
-        );
+        for f in skills_findings(&report) {
+            let figure = f.finding.contains("), paid when the skill is invoked")
+                || f.finding.starts_with("project scope");
+            let want = if figure {
+                Severity::Note
+            } else {
+                Severity::Advice
+            };
+            assert_eq!(f.severity, want, "{}", f.finding);
+        }
         assert!(
             got.iter().all(|s| !s.contains("unused")),
             "never 'unused': {got:?}"
@@ -1344,6 +1365,45 @@ mod tests {
             got[1]
         );
         assert_eq!(skills_run(&report), &CheckRun::Ran { findings: 2 });
+    }
+
+    /// #1354: a cost figure and a scope total are observations. Two
+    /// small skills give no Advice from this check: a Note per skill and
+    /// one for the scope, whose briefs ask for no edit.
+    #[test]
+    fn cost_figures_and_the_scope_total_are_notes() {
+        let t = tempfile::tempdir().unwrap();
+        skill(t.path(), "octocat-verify", GOOD);
+        skill(
+            t.path(),
+            "octocat-lint",
+            GOOD.replace("octocat-verify", "octocat-lint").as_str(),
+        );
+        write(
+            &t.path().join("CLAUDE.md"),
+            "# hello-world\n\nUse the `octocat-verify` skill and the `octocat-lint` skill.\n",
+        );
+
+        let report = run_over(t.path());
+        let found = skills_findings(&report);
+        assert!(
+            found.iter().all(|f| f.severity != Severity::Advice),
+            "{found:#?}"
+        );
+        let per_skill = found
+            .iter()
+            .filter(|f| f.severity == Severity::Note && matches!(f.subject, Subject::Skill { .. }))
+            .count();
+        let scope = found
+            .iter()
+            .filter(|f| {
+                f.severity == Severity::Note && matches!(f.subject, Subject::Directory { .. })
+            })
+            .count();
+        assert_eq!((per_skill, scope, found.len()), (2, 1, 3), "{found:#?}");
+        for f in &found {
+            assert!(f.brief.contains("Observation only"), "{}", f.brief);
+        }
     }
 
     /// (b) A CLAUDE.md naming a skill no scope holds is a Problem that
@@ -1465,9 +1525,11 @@ mod tests {
         fs::set_permissions(&hidden, fs::Permissions::from_mode(0o644)).unwrap();
 
         let got = sentences(&report);
+        // The refusal also opens "project scope"; the total is the one
+        // that counts tokens.
         let total = got
             .iter()
-            .find(|s| s.starts_with("project scope"))
+            .find(|s| s.starts_with("project scope") && s.contains("est. tokens"))
             .unwrap_or_else(|| panic!("{got:?}"));
         assert!(
             total.contains(&format!(
