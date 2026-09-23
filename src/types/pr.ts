@@ -1194,6 +1194,10 @@ export interface ClaudeMdAdviceResult {
   /// For a cached result this is older than now, which is the point of
   /// showing it.
   computedAt: string;
+  /// The Headstate version that computed the report (#1333): `7.4.0`,
+  /// or `0.1.0-debug` from a debug build. The cache serves a report only
+  /// to the build that computed it.
+  build: string;
 }
 
 export interface ClaudeMdScan {

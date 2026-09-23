@@ -27,6 +27,34 @@ fn db() -> Connection {
     conn
 }
 
+/// Run git in `dir` with a fixed identity, and say whether it succeeded.
+fn git(dir: &Path, args: &[&str]) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "user.name=octocat",
+            "-c",
+            "user.email=octocat@invalid",
+        ])
+        .args(["-c", "commit.gpgsign=false"])
+        .args(args)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn git_init(dir: &Path) {
+    assert!(git(dir, &["init", "-q"]), "git init");
+}
+
+/// Commit everything in the tree, so a later edit shows as tracked.
+fn commit_all(dir: &Path) {
+    assert!(git(dir, &["add", "-A"]), "git add");
+    assert!(git(dir, &["commit", "-q", "-m", "fixture"]), "git commit");
+}
+
 /// A sentence no producer in the tree emits, so its survival through a
 /// `serve` proves the producers did not run.
 const SENTINEL: &str = "SENTINEL: this sentence is written only by the cache tests";
@@ -87,6 +115,10 @@ impl Fixture {
     fn new() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().to_path_buf();
+        // A git repository, because the fingerprint asks git for the
+        // tree's state (#1334) and a directory git cannot answer for is
+        // unverified by design.
+        git_init(&repo);
         std::fs::write(repo.join("CLAUDE.md"), "# Root\n\nBuild with `make`.\n").unwrap();
         Fixture {
             _dir: dir,
@@ -745,6 +777,7 @@ fn an_unchanged_repository_fingerprints_identically() {
 #[test]
 fn no_store_is_a_complete_fingerprint_not_an_unverified_one() {
     let dir = tempfile::tempdir().unwrap();
+    git_init(dir.path());
     std::fs::write(dir.path().join("CLAUDE.md"), "# Root\n").unwrap();
     let scan = scan_effective_opt(dir.path(), None);
 
@@ -885,6 +918,7 @@ fn a_missing_home_is_complete_and_an_unreadable_home_is_not() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
+    git_init(&repo);
     std::fs::write(repo.join("CLAUDE.md"), "# Root\n").unwrap();
     let conn = db();
 
@@ -967,6 +1001,8 @@ fn the_wire_shape_matches_the_typescript_interface() {
     assert!(!obj.contains_key("computed_at"), "{v}");
     assert!(obj.contains_key("report"));
     assert!(obj.contains_key("freshness"));
+    // The build that computed the report (#1333), a plain string.
+    assert_eq!(obj["build"], Build::current().label, "{v}");
 
     // `Freshness` is internally tagged on `state`, which is what the
     // TypeScript discriminated union switches on.
@@ -1009,4 +1045,383 @@ fn the_wire_shape_matches_the_typescript_interface() {
         serde_json::from_value::<Mode>(serde_json::json!("fresh")).unwrap(),
         Mode::Fresh
     );
+}
+
+// ---------------------------------------------------------------------
+// #1333: the build that computed a report is an input, and is shown.
+// ---------------------------------------------------------------------
+
+/// A build identity for a test, so two builds can be compared in one
+/// process without rebuilding it.
+fn build(label: &str, id: &str) -> Build {
+    Build {
+        label: label.to_string(),
+        id: id.to_string(),
+        refusal: None,
+    }
+}
+
+impl Fixture {
+    fn fingerprint_as(&self, b: &Build) -> Fingerprint {
+        let scan = scan_effective_opt(&self.repo, None);
+        Fingerprint::of_with(
+            b,
+            crate::auth::git_program(),
+            &self.repo,
+            None,
+            &scan,
+            None,
+            Some(&self.conn),
+        )
+    }
+
+    fn serve_as(&self, mode: Mode, now: &str, b: &Build) -> AdviceResult {
+        let scan = scan_effective_opt(&self.repo, None);
+        let cx = Context {
+            repo: &self.repo,
+            home: None,
+            scan: &scan,
+            definitions: None,
+            conn: Some(&self.conn),
+        };
+        serve_with(&cx, mode, now, b, crate::auth::git_program())
+    }
+
+    /// `seed`, stamped as computed by build `b`.
+    fn seed_as(&self, b: &Build, at: &str) {
+        let fp = self.fingerprint_as(b);
+        store(
+            &self.conn,
+            &self.repo,
+            &sentinel_report(&self.repo, &[]),
+            &fp,
+            at,
+        )
+        .unwrap();
+    }
+}
+
+/// Two fingerprints identical in every input but the build differ.
+///
+/// Without this a release that changed what a producer reports would
+/// serve the previous release's findings as current, unless someone
+/// remembered to bump `PAYLOAD_VERSION` -- which in 7.3.0 one PR of five
+/// did.
+#[test]
+fn fingerprints_differ_by_build_identity_alone() {
+    let f = Fixture::new();
+    let a = f.fingerprint_as(&build("7.3.0", "7.3.0+a"));
+    let b = f.fingerprint_as(&build("7.4.0", "7.4.0+a"));
+    let a_again = f.fingerprint_as(&build("7.3.0", "7.3.0+a"));
+    assert_eq!(a.digest, a_again.digest, "precondition: stable per build");
+    assert_ne!(a.digest, b.digest, "the build is not in the fingerprint");
+
+    // The same version rebuilt from changed code is a different build too:
+    // the identity, not only the label, is hashed.
+    let rebuilt = f.fingerprint_as(&build("7.3.0", "7.3.0+b"));
+    assert_ne!(
+        a.digest, rebuilt.digest,
+        "a rebuild hashed as the same build"
+    );
+}
+
+/// A stored row from another build is a MISS: the producers run, and the
+/// old report is not served even labelled stale. It is the case
+/// `PAYLOAD_VERSION` exists for, a report whose findings were produced by
+/// other rules, now caught for every build rather than for the ones
+/// someone remembered.
+#[test]
+fn a_stored_row_from_another_build_is_a_miss() {
+    let f = Fixture::new();
+    let old = build("7.3.0", "7.3.0+a");
+    let new = build("7.4.0", "7.4.0+a");
+    f.seed_as(&old, "2026-01-01T00:00:00Z");
+    // Precondition: the same build would have been a hit.
+    assert!(Fixture::has_sentinel(&f.serve_as(
+        Mode::Cached,
+        "2026-06-01T00:00:00Z",
+        &old
+    )));
+
+    let got = f.serve_as(Mode::Cached, "2026-06-01T00:00:00Z", &new);
+    assert!(
+        !Fixture::has_sentinel(&got),
+        "a report computed by another build was served"
+    );
+    assert_eq!(got.freshness, Freshness::Fresh { recomputed: true });
+    assert_eq!(got.build, "7.4.0");
+}
+
+/// The result names the build that COMPUTED it: on a hit the stored one,
+/// on a run the running one. Proven on a hit by storing a label the
+/// running build does not have while the identity matches.
+#[test]
+fn the_result_names_the_build_that_computed_it() {
+    let f = Fixture::new();
+    let running = build("7.4.0", "same");
+    let fresh = f.serve_as(Mode::Fresh, "2026-01-01T00:00:00Z", &running);
+    assert_eq!(fresh.build, "7.4.0");
+    assert_eq!(load(&f.conn, &f.repo).unwrap().unwrap().build, "7.4.0");
+
+    f.conn
+        .execute("UPDATE claude_advice_report SET build = 'stored-label'", [])
+        .unwrap();
+    let hit = f.serve_as(Mode::Cached, "2026-06-01T00:00:00Z", &running);
+    assert_eq!(hit.freshness, Freshness::Fresh { recomputed: false });
+    assert_eq!(
+        hit.build, "stored-label",
+        "a hit must name the build that stored it, not the one reading it"
+    );
+}
+
+/// A row stored before builds were recorded (a NULL build) is a miss, not
+/// a report attributed to the reading build.
+#[test]
+fn a_row_with_no_recorded_build_is_a_miss() {
+    let f = Fixture::new();
+    f.seed(&[], "2026-01-01T00:00:00Z");
+    f.conn
+        .execute(
+            "UPDATE claude_advice_report SET build = NULL, build_id = NULL",
+            [],
+        )
+        .unwrap();
+    assert!(load(&f.conn, &f.repo).unwrap().is_none());
+}
+
+/// A build whose identity could not be established is unverified, with
+/// the reason, and never Complete.
+#[test]
+fn an_unknown_build_identity_is_unverified() {
+    let f = Fixture::new();
+    let b = Build {
+        label: "7.4.0".into(),
+        id: "7.4.0+<unknown>".into(),
+        refusal: Some("the running executable: No such file".into()),
+    };
+    match f.fingerprint_as(&b).verification {
+        Verification::Unverified { reason } => {
+            assert!(reason.contains("running executable"), "{reason}")
+        }
+        Verification::Complete => panic!("an unknown build hashed as complete"),
+    }
+}
+
+/// The running build has a label, and an identity that is stable within
+/// one process.
+#[test]
+fn the_current_build_is_labelled_by_version() {
+    let b = Build::current();
+    assert!(
+        b.label.starts_with(env!("CARGO_PKG_VERSION")),
+        "{}",
+        b.label
+    );
+    assert_eq!(b, Build::current());
+}
+
+// ---------------------------------------------------------------------
+// #1334: the repository tree, manifests, .gitignore and .claude/rules.
+// ---------------------------------------------------------------------
+
+/// A committed repository with a CLAUDE.md naming a script and a Makefile.
+fn committed_fixture() -> Fixture {
+    let f = Fixture::new();
+    std::fs::create_dir_all(f.repo.join("scripts")).unwrap();
+    std::fs::write(f.repo.join("scripts/check.sh"), "#!/bin/sh\n").unwrap();
+    std::fs::write(f.repo.join("Makefile"), "lint:\n\techo lint\n").unwrap();
+    commit_all(&f.repo);
+    f
+}
+
+/// ACCEPTANCE: deleting a tracked file a CLAUDE.md names is a change.
+/// Rot resolves paths against the tree; without the tree in the
+/// fingerprint the cached report still says the file exists.
+#[test]
+fn deleting_a_tracked_file_recomputes() {
+    let f = committed_fixture();
+    f.seed(&[], "2026-01-01T00:00:00Z");
+    std::fs::remove_file(f.repo.join("scripts/check.sh")).unwrap();
+    assert_change_is_detected_and_recomputes(&f);
+}
+
+/// ACCEPTANCE: a new Makefile target is a change.
+#[test]
+fn adding_a_makefile_target_recomputes() {
+    let f = committed_fixture();
+    f.seed(&[], "2026-01-01T00:00:00Z");
+    std::fs::write(
+        f.repo.join("Makefile"),
+        "lint:\n\techo lint\n\ntest:\n\techo test\n",
+    )
+    .unwrap();
+    assert_change_is_detected_and_recomputes(&f);
+}
+
+/// A SECOND edit to a file that is already modified is a change.
+///
+/// The case a digest of `git status` alone misses: the line reads
+/// ` M Makefile` before and after, so the dirty files' bytes must be
+/// hashed too.
+#[test]
+fn editing_an_already_modified_file_again_recomputes() {
+    let f = committed_fixture();
+    std::fs::write(f.repo.join("Makefile"), "lint:\n\techo one\n").unwrap();
+    f.seed(&[], "2026-01-01T00:00:00Z");
+    std::fs::write(f.repo.join("Makefile"), "lint:\n\techo two\n").unwrap();
+    assert_change_is_detected_and_recomputes(&f);
+}
+
+/// A second new file inside an untracked directory is a change. With
+/// untracked files collapsed to their directory, `?? tools/` reads the
+/// same before and after.
+#[test]
+fn a_new_file_in_an_untracked_directory_recomputes() {
+    let f = committed_fixture();
+    std::fs::create_dir_all(f.repo.join("tools")).unwrap();
+    std::fs::write(f.repo.join("tools/a.sh"), "a\n").unwrap();
+    f.seed(&[], "2026-01-01T00:00:00Z");
+    std::fs::write(f.repo.join("tools/b.sh"), "b\n").unwrap();
+    assert_change_is_detected_and_recomputes(&f);
+}
+
+/// A change to `.gitignore` is a change: rot consults it (#1318).
+#[test]
+fn editing_the_gitignore_recomputes() {
+    let f = committed_fixture();
+    std::fs::write(f.repo.join(".gitignore"), "*.log\n").unwrap();
+    commit_all(&f.repo);
+    f.seed(&[], "2026-01-01T00:00:00Z");
+    std::fs::write(f.repo.join(".gitignore"), "*.log\n.env\n").unwrap();
+    assert_change_is_detected_and_recomputes(&f);
+}
+
+/// A commit is a change even when the tree is clean before and after:
+/// HEAD moved.
+#[test]
+fn a_new_commit_recomputes() {
+    let f = committed_fixture();
+    f.seed(&[], "2026-01-01T00:00:00Z");
+    std::fs::write(f.repo.join("scripts/new.sh"), "#!/bin/sh\n").unwrap();
+    commit_all(&f.repo);
+    assert_change_is_detected_and_recomputes(&f);
+}
+
+/// `.claude/rules/` is hashed by its own listing and bytes, not only
+/// through git: a repository that ignores `.claude/` still has its rules
+/// probed by placement (#1321).
+#[test]
+fn editing_a_rule_under_an_ignored_claude_dir_recomputes() {
+    let f = committed_fixture();
+    std::fs::write(f.repo.join(".gitignore"), ".claude/\n").unwrap();
+    std::fs::create_dir_all(f.repo.join(".claude/rules")).unwrap();
+    std::fs::write(f.repo.join(".claude/rules/api.md"), "one\n").unwrap();
+    commit_all(&f.repo);
+    f.seed(&[], "2026-01-01T00:00:00Z");
+    std::fs::write(f.repo.join(".claude/rules/api.md"), "two\n").unwrap();
+    assert_change_is_detected_and_recomputes(&f);
+}
+
+/// Adding a rule file is a change, by the same route.
+#[test]
+fn adding_a_rule_under_an_ignored_claude_dir_recomputes() {
+    let f = committed_fixture();
+    std::fs::write(f.repo.join(".gitignore"), ".claude/\n").unwrap();
+    commit_all(&f.repo);
+    f.seed(&[], "2026-01-01T00:00:00Z");
+    std::fs::create_dir_all(f.repo.join(".claude/rules")).unwrap();
+    std::fs::write(f.repo.join(".claude/rules/api.md"), "one\n").unwrap();
+    assert_change_is_detected_and_recomputes(&f);
+}
+
+/// The stated gap, pinned so it cannot become a silent claim: an IGNORED
+/// file changing does not invalidate. If this starts failing, the docs'
+/// "What is tracked" section is out of date.
+#[test]
+fn an_ignored_file_changing_does_not_recompute() {
+    let f = committed_fixture();
+    std::fs::write(f.repo.join(".gitignore"), ".env\n").unwrap();
+    commit_all(&f.repo);
+    std::fs::write(f.repo.join(".env"), "A=1\n").unwrap();
+    let before = f.fingerprint();
+    std::fs::write(f.repo.join(".env"), "A=2\n").unwrap();
+    assert_eq!(before.digest, f.fingerprint().digest);
+}
+
+/// ACCEPTANCE: a git that cannot run gives Unverified, with the reason.
+#[test]
+fn a_git_that_cannot_run_is_unverified() {
+    let f = Fixture::new();
+    let scan = scan_effective_opt(&f.repo, None);
+    let fp = Fingerprint::of_with(
+        &Build::current(),
+        Path::new("/home/octocat/no-such-git"),
+        &f.repo,
+        None,
+        &scan,
+        None,
+        Some(&f.conn),
+    );
+    match fp.verification {
+        Verification::Unverified { reason } => assert!(reason.contains("git"), "{reason}"),
+        Verification::Complete => panic!("a git that never ran hashed as complete"),
+    }
+}
+
+/// A directory git does not answer for -- not a repository -- is
+/// unverified too, not a tree with nothing in it.
+#[test]
+fn a_directory_that_is_not_a_repository_is_unverified() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("CLAUDE.md"), "# Root\n").unwrap();
+    let scan = scan_effective_opt(dir.path(), None);
+    let fp = Fingerprint::of(dir.path(), None, &scan, None, None);
+    match fp.verification {
+        Verification::Unverified { reason } => assert!(reason.contains("git"), "{reason}"),
+        Verification::Complete => panic!("a non-repository hashed as a complete tree"),
+    }
+}
+
+/// A repository with no commits yet is a complete statement: HEAD is
+/// unborn, which git states, and the untracked files are all listed.
+#[test]
+fn a_repository_with_no_commits_is_complete() {
+    let f = Fixture::new();
+    assert_eq!(f.fingerprint().verification, Verification::Complete);
+}
+
+/// A nested repository -- a linked worktree kept under the checkout, the
+/// shape this repository itself has -- is one `?? dir/` entry: git does
+/// not descend into it, so its files are neither listed nor read. This
+/// is what keeps the fingerprint's cost bounded by THIS tree.
+#[test]
+fn a_nested_repository_is_not_descended() {
+    let f = committed_fixture();
+    let inner = f.repo.join("nested");
+    std::fs::create_dir_all(&inner).unwrap();
+    git_init(&inner);
+    std::fs::write(inner.join("a.txt"), "a\n").unwrap();
+    let before = f.fingerprint();
+    std::fs::write(inner.join("a.txt"), "changed\n").unwrap();
+    std::fs::write(inner.join("b.txt"), "b\n").unwrap();
+    let after = f.fingerprint();
+    assert_eq!(before.digest, after.digest);
+    assert_eq!(after.verification, Verification::Complete);
+}
+
+/// An unreadable file counted by the scan and listed by git is ONE
+/// refusal, not two: the count in the reason must not inflate.
+#[test]
+#[cfg(unix)] // see `unreadable`
+fn an_input_seen_twice_is_one_refusal() {
+    let f = Fixture::new();
+    unreadable(&f.repo.join("CLAUDE.md"));
+    let fp = f.fingerprint();
+    restore(&f.repo.join("CLAUDE.md"));
+    match fp.verification {
+        Verification::Unverified { reason } => {
+            assert!(!reason.contains("more inputs"), "{reason}")
+        }
+        Verification::Complete => panic!("an unreadable input hashed as complete"),
+    }
 }

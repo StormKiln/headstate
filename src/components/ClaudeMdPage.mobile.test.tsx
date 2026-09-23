@@ -54,6 +54,7 @@ vi.mock("../api/hooks", async (orig) => ({
       },
       freshness: { state: "fresh", recomputed: true },
       computedAt: "2026-01-01T00:00:00Z",
+      build: "7.4.0",
     },
     isError: false,
     error: undefined,

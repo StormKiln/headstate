@@ -971,6 +971,10 @@ pub fn run() {
             // and manages the desktop identity it reads.
             app.manage(remote::pairing::new_state(handle.clone()));
 
+            // Identify this build's executable now, before an update can
+            // replace it on disk (#1333; see `advice::cache::Build`).
+            let _ = crate::claudemd::advice::cache::Build::current();
+
             log::info!(
                 "headstate v{} starting (authenticated: {})",
                 env!("CARGO_PKG_VERSION"),

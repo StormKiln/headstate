@@ -301,6 +301,7 @@ function Freshness({
     <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5" aria-live="polite">
       <span className={`break-words text-[11px] ${tone}`}>{label.text}</span>
       <span className="break-words text-[11px] text-[#8b949e]">{label.detail}</span>
+      <span className="break-words text-[11px] text-[#8b949e]">by Headstate {result.build}</span>
       <button
         type="button"
         onClick={onRefresh}
