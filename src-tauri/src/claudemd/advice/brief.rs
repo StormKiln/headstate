@@ -38,6 +38,13 @@ pub fn render(f: &Finding) -> String {
     for e in &f.evidence {
         out.push_str(&format!("Evidence: {} — {}\n", locator(&e.at), e.measured));
     }
+    // A Note is an observation (#1339): it says what was measured and
+    // recommends nothing, so it carries no suggestion and asks for no
+    // diff. The last line still keeps an agent handed it read-only.
+    if f.severity == Severity::Note {
+        out.push_str("Observation only: nothing to change. Do not edit any file for this.\n");
+        return out;
+    }
     out.push_str(&format!("Suggested change: {}\n", suggestion(f)));
     out.push_str("Change only the file named above. Show me the diff and let me decide.\n");
     out
@@ -93,12 +100,11 @@ fn suggestion(f: &Finding) -> String {
             f.subject.path()
         ),
         Check::Toolchain => super::toolchain::suggestion(f),
-        // Three shapes of finding share this check. An Unknown is a
-        // transcript that could not be read, and the remedy is not an
-        // edit. A finding that says the rule is already written is kept
-        // visible so the reader sees it working, and the edit is none.
-        // Everything else is a candidate rule: one line, in the file the
-        // sessions load, stating what they had to learn.
+        // Two shapes of finding reach this: an Unknown is a transcript
+        // that could not be read, and the remedy is not an edit; an
+        // Advice is a candidate rule: one line, in the file the sessions
+        // load, stating what they had to learn. The counts and the
+        // "already written" hits are Notes (#1339) and never get here.
         Check::Transcripts => match (&f.severity, &f.subject) {
             (Severity::Unknown, _) => "No edit. Make the transcript named in the evidence \
                  readable, or leave it: the findings above stand without it, as floors."
@@ -106,14 +112,12 @@ fn suggestion(f: &Finding) -> String {
             (_, Subject::Directory { path }) => format!(
                 "If the evidence shows a rule the sessions had to learn, create \
                  `{path}/CLAUDE.md` holding that one line: the command to run, the path to \
-                 read first, or the call not to make. If the finding is a count or says the \
-                 rule is already written, change nothing."
+                 read first, or the call not to make."
             ),
             (_, subject) => format!(
                 "If the evidence shows a rule the sessions had to learn, add one line to \
                  `{}` stating it: the command to run, the path to read first, or the call not \
-                 to make. If the finding is a count or says the rule is already written, \
-                 change nothing.",
+                 to make.",
                 subject.path()
             ),
         },
@@ -222,12 +226,22 @@ pub fn render_report(r: &Report) -> String {
         }
     }
 
-    if r.findings.is_empty() && !r.is_partial() {
-        out.push_str(&format!(
-            "\n{} check{} ran; nothing found.\n",
-            r.ran(),
-            if r.ran() == 1 { "" } else { "s" }
-        ));
+    // A Note is not advice, so a report of only Notes has none -- but it
+    // did find something, so it may not say "nothing found" either.
+    let advice = r
+        .findings
+        .iter()
+        .filter(|f| f.severity != Severity::Note)
+        .count();
+    if advice == 0 && !r.is_partial() {
+        let checks = format!("{} check{}", r.ran(), if r.ran() == 1 { "" } else { "s" });
+        if r.findings.is_empty() {
+            out.push_str(&format!("\n{checks} ran; nothing found.\n"));
+        } else {
+            out.push_str(&format!(
+                "\n{checks} ran; no advice, only the observations above.\n"
+            ));
+        }
     }
 
     // Judgement, attributed, and last: none of it has a mechanical test,
@@ -565,6 +579,50 @@ mod tests {
             r.brief
         );
         assert!(!r.brief.contains("Could not check"));
+    }
+
+    /// A Note's brief says what was measured and recommends nothing
+    /// (#1339): no "Suggested change", and no request for a diff.
+    #[test]
+    fn a_note_brief_recommends_nothing() {
+        let mut f = fixture(Check::Transcripts);
+        f.severity = Severity::Note;
+        let brief = render(&f);
+        assert!(brief.starts_with(&format!("## {}\n", f.finding)), "{brief}");
+        assert!(
+            brief.contains("Evidence: session `s1` record 12 —"),
+            "{brief}"
+        );
+        assert!(!brief.contains("Suggested change"), "{brief}");
+        assert!(!brief.contains("Show me the diff"), "{brief}");
+        assert!(
+            brief.contains("Observation only: nothing to change."),
+            "{brief}"
+        );
+    }
+
+    /// A report whose only findings are Notes does not say "nothing
+    /// found" -- it found something, which is the observations -- and
+    /// does not imply advice either.
+    #[test]
+    fn a_report_of_only_notes_says_there_is_nothing_to_change() {
+        let mut f = fixture(Check::Transcripts);
+        f.severity = Severity::Note;
+        f.brief = render(&f);
+        let r = report(
+            vec![f],
+            vec![CheckCoverage {
+                check: Check::Transcripts,
+                run: CheckRun::Ran { findings: 1 },
+            }],
+        );
+        assert!(!r.brief.contains("nothing found"), "{}", r.brief);
+        assert!(
+            r.brief
+                .contains("1 check ran; no advice, only the observations above."),
+            "{}",
+            r.brief
+        );
     }
 
     /// The combined document carries every brief in the report's order.

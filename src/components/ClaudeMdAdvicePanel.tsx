@@ -11,9 +11,11 @@ import type {
 import { current } from "@/lib/ariaCurrent";
 import {
   CHECK_LABEL,
+  OBSERVATIONS_KEY,
   type AdviceGroup,
   type AdviceGrouping,
   groupFindings,
+  isAdvice,
 } from "@/lib/adviceGrouping";
 import type { Filters } from "@/lib/derive";
 import { useActiveFilters, useFilters } from "@/store/filters";
@@ -44,6 +46,9 @@ const SEVERITY: Record<ClaudeMdAdviceFinding["severity"], { label: string; class
   problem: { label: "problem", className: "text-[#f85149]" },
   advice: { label: "advice", className: "text-[#d29922]" },
   unknown: { label: "could not decide", className: "text-[#d29922]" },
+  // Grey: an observation is neither a warning nor a pass (#1339). Green
+  // would read as "all clear", amber as something to act on.
+  note: { label: "observation", className: "text-[#8b949e]" },
 };
 
 /// A path as the row shows it: relative to the repository when it is
@@ -373,7 +378,10 @@ function ReportView({
   // here for the notice; the rows below map over the full list.
   const unknown = report.checks.filter((c) => c.run.state === "unknown");
   const everyRan = report.checks.every((c) => c.run.state === "ran");
-  const n = report.findings.length;
+  // Advice only. A Note is an observation, never counted as advice
+  // (#1339), so it neither swells the count nor blocks "no advice".
+  const n = report.findings.filter(isAdvice).length;
+  const notes = report.findings.length - n;
 
   // The grouping preference, from the per-view filter store where every
   // other view preference lives (#1291). Absent means the flat list.
@@ -445,7 +453,7 @@ function ReportView({
         <GroupSection
           key={g.key}
           group={g}
-          labelled={grouping !== "none"}
+          labelled={grouping !== "none" || g.key === OBSERVATIONS_KEY}
           repo={repo}
           activePath={activePath}
           onSelectFile={onSelectFile}
@@ -456,10 +464,13 @@ function ReportView({
 
       {/* Only a run in which EVERY check completed may say this. The
           partial arm above has already spoken for the other case. */}
+      {/* With observations on screen the run found something, so it may
+          not say "nothing found" -- and it is not a clean pass either, so
+          it is not green. */}
       {n === 0 && everyRan ? (
-        <p className="text-xs text-[#3fb950]">
-          {report.checks.length} {report.checks.length === 1 ? "check" : "checks"} ran; nothing
-          found.
+        <p className={`text-xs ${notes === 0 ? "text-[#3fb950]" : "text-[#8b949e]"}`}>
+          {report.checks.length} {report.checks.length === 1 ? "check" : "checks"} ran;{" "}
+          {notes === 0 ? "nothing found." : "no advice."}
         </p>
       ) : null}
 

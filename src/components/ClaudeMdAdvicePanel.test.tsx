@@ -367,6 +367,43 @@ describe("ClaudeMdAdvicePanel", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
+  /// A Note is an observation (#1339): it renders under its own
+  /// Observations heading, apart from the advice, labelled as what it is,
+  /// and the advice count ignores it.
+  it("renders notes as observations, apart from advice and not counted", () => {
+    state.data = report({
+      findings: [
+        finding({ check: "transcripts", severity: "advice", finding: "a rule to add" }),
+        finding({ check: "transcripts", severity: "note", finding: "137 sessions recorded" }),
+      ],
+      checks: [{ check: "transcripts", run: { state: "unknown", reason: "one session unreadable" } }],
+    });
+    open();
+    const observations = screen
+      .getAllByRole("heading")
+      .find((h) => (h.textContent ?? "").startsWith("Observations"))?.parentElement;
+    expect(observations?.textContent).toContain("137 sessions recorded");
+    expect(observations?.textContent).not.toContain("a rule to add");
+    expect(observations?.textContent).toContain("[observation]");
+    // The notice counts ONE finding, the advice; the note is not one.
+    expect(screen.getByRole("alert").textContent).toContain("the finding below is at least");
+  });
+
+  /// A run of only Notes has no advice, and says so -- neither "nothing
+  /// found" (it observed something) nor a Copy-all offer for advice that
+  /// does not exist.
+  it("says no advice, not nothing found, when every finding is a note", () => {
+    state.data = report({
+      findings: [finding({ check: "transcripts", severity: "note", finding: "2 sessions recorded" })],
+      checks: [{ check: "transcripts", run: { state: "ran", findings: 1 } }],
+    });
+    open();
+    expect(screen.queryByText(/nothing found/)).toBeNull();
+    expect(screen.getByText(/1 check ran; no advice\./)).toBeTruthy();
+    expect(screen.getByText("2 sessions recorded")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Copy all briefs" })).toBeNull();
+  });
+
   /// The backend ranks; the panel renders in wire order. Fed OUT of rank
   /// order, the DOM must still match the wire -- re-sorting here would be
   /// a second ordering to keep in step with `Severity::rank`.
