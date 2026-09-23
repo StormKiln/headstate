@@ -51,6 +51,29 @@ Do not re-run the release, delete the tag, or force anything past the gate.
 Fix the cause, land it, and cut the **next patch version**. Leave the stranded
 tag; the issue documents why.
 
+## A burned head commit is caught before tagging
+
+The same rule applies to a commit that has not been tagged yet: `filter=all`
+must show `success` and nothing else **before** the tag is pushed. A
+`cancelled` counts against it just as a `failure` does. A job that runs past its
+`timeout-minutes` ends as `cancelled`, not as a failure, so a hang on the head
+of `main` quietly makes that commit unreleasable.
+
+Measured at 7.4.0: `653b6a1` had 19 successes and 1 `cancelled`. `supply-chain`
+hung inside `./.github/actions/setup` for its full 20 minutes (#1361), and the
+job log was gone (`BlobNotFound`), so which step hung is unknown.
+
+- Nothing superseded that run, so it was not a concurrency cancellation. Those
+  are normal on `main`: each push cancels the previous push's run.
+- A re-run cannot help. It adds a passing attempt and never removes the
+  cancelled one.
+- Wait until the check-runs are **complete** before reading them. An
+  in-progress run shows as `null`, which also means not yet releasable.
+
+The way out is a new commit. Land the next real change, even a docs change like
+this one, and tag that commit once its own runs are all `success`. Do not tag
+the burned commit, and do not invent a CI fix for a cause you have not seen.
+
 ## Verify the artifacts, never the green check
 
 Reading a green check as success is this pipeline's characteristic bug class —
