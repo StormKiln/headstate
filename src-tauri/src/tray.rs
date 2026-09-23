@@ -106,12 +106,8 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
         .icon_as_template(cfg!(target_os = "macos"))
         .menu(&menu)
         .on_menu_event(|app, event| match event.id().as_ref() {
-            "show" => {
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.set_focus();
-                }
-            }
+            // Shared with the macOS Dock-icon reopen (#1345).
+            "show" => crate::show_main_window(app),
             "refresh" => {
                 // Wake the Rust poll loop, which persists the snapshot,
                 // emits `prs-updated`, and repaints the badge. The event
