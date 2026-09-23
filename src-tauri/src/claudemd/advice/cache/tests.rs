@@ -612,8 +612,7 @@ fn worktree_sessions_are_in_the_set_and_stay_there_once_the_worktree_is_gone() {
             .collect()
     };
     assert_eq!(ids(), ["s1", "s2"]);
-    std::fs::remove_file(wt.join(".git")).unwrap();
-    std::fs::remove_dir(&wt).unwrap();
+    std::fs::remove_dir_all(&wt).unwrap();
     assert_eq!(ids(), ["s1", "s2"]);
 }
 
