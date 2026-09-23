@@ -16,7 +16,7 @@
 //! | S1 corrected command | Bash A with `is_error: true` (or stderr and no stdout), then within the next [`CORRECTION_LOOKAHEAD`] Bash calls a B whose head differs, shares a non-flag token, and has `is_error: false` | same A-head → B-head in ≥ [`MIN_SESSIONS_CORRECTED`] sessions |
 //! | S2 user correction | a `user` text record whose first 6 words hold a word from [`NEGATIONS`], within [`CORRECTION_WINDOW`] records after a `tool_use` | same tool + head/path in ≥ [`MIN_SESSIONS_USER_CORRECTION`] sessions |
 //! | S3 denied call | `is_error: true` whose text carries one of [`DENIAL_PHRASES`], plus `claude_hook_event` `PermissionDenied` rows | same tool + head in ≥ [`MIN_SESSIONS_DENIED`] sessions |
-//! | S4 repeated search | identical Grep/Glob `pattern`, or a `Read` within the first [`EARLY_CALLS`] tool calls of a file the session does not also Edit, Write or MultiEdit | ≥ [`MIN_SESSIONS_SEARCH`] sessions |
+//! | S4 repeated search | identical Grep/Glob `pattern`, or a `Read` within the first [`EARLY_CALLS`] tool calls, after a Grep, Glob or failed Read, of a file the session does not also Edit, Write or MultiEdit | ≥ [`MIN_SESSIONS_SEARCH`] sessions |
 //! | S5 repeated error | `is_error: true` text normalised by [`normalise_error`] | identical first [`ERROR_KEY_CHARS`] chars in ≥ [`MIN_SESSIONS_ERROR`] sessions |
 //! | S6 task census | sessions per attributed directory, from `claude_session` | always, as a count |
 //!
@@ -128,7 +128,10 @@ pub const SESSIONS_PER_PASS: usize = 200;
 ///
 /// 2: a path under a deleted checkout that the sessions' own cwds
 /// identify, and the repository's git ignores, re-roots too (#1335).
-pub const RULE_VERSION: i64 = 2;
+///
+/// 3: an S4 early read is stored only when a Grep, a Glob or a failed
+/// Read came before it in the session, and carries that call (#1336).
+pub const RULE_VERSION: i64 = 3;
 
 /// S1: sessions showing the same A-head → B-head correction.
 const MIN_SESSIONS_CORRECTED: usize = 2;
@@ -220,7 +223,9 @@ struct Row {
     record: Option<u64>,
     /// S1: the correcting call's record.
     record_2: Option<u64>,
-    /// User or error text, clamped to [`DETAIL_CHARS`].
+    /// User or error text, clamped to [`DETAIL_CHARS`]. For an S4 early
+    /// read, the search that preceded it instead (#1336): a key, not
+    /// text anyone typed, so it is shown in every evidence row.
     detail: Option<String>,
     /// S3: the denied call's `tool_use.id`, so a hook row for the same
     /// call is not counted twice.
@@ -1048,17 +1053,39 @@ fn extract(
 
     // S4 -- repeated search, and the edit census for `edited_dirs`. A
     // file the session also changes, before or after the read, is one it
-    // was working on, not one it had to go looking for (#1324).
+    // was working on, not one it had to go looking for (#1324). And an
+    // early read is evidence of a missing pointer only when the session
+    // had to LOOK first: a Grep, a Glob, or a failed Read before it
+    // (#1336). Reading a CI workflow during a CI task is the work, not a
+    // detour. The nearest such call rides on the row as its `detail`.
     let changed: HashSet<&str> = calls
         .iter()
         .filter(|c| is_change(&c.name))
         .map(|c| c.key.as_str())
         .collect();
+    let mut looked: Option<String> = None;
     for (i, c) in calls.iter().enumerate() {
         match c.name.as_str() {
-            "Grep" | "Glob" => rows.push(row(SIG_SEARCH, c, c.key.clone())),
-            "Read" if i < EARLY_CALLS && !changed.contains(c.key.as_str()) => {
-                rows.push(row(SIG_SEARCH, c, c.key.clone()))
+            "Grep" | "Glob" => {
+                rows.push(row(SIG_SEARCH, c, c.key.clone()));
+                looked = Some(format!("`{}` `{}`", c.name, c.key));
+            }
+            "Read" => {
+                if i < EARLY_CALLS && !changed.contains(c.key.as_str()) {
+                    if let Some(after) = &looked {
+                        let mut r = row(SIG_SEARCH, c, c.key.clone());
+                        r.detail = Some(after.clone());
+                        rows.push(r);
+                    }
+                }
+                // A recorded failure, not an absent verdict.
+                let failed =
+                    c.id.as_ref()
+                        .and_then(|id| outcomes.get(id))
+                        .is_some_and(|o| o.is_error == Some(true));
+                if failed {
+                    looked = Some(format!("a failed `Read` of `{}`", c.key));
+                }
             }
             "Edit" | "Write" | "MultiEdit" => rows.push(row(SIG_EDIT, c, c.key.clone())),
             _ => {}
@@ -1696,7 +1723,10 @@ fn emit(
                         (true, Some(d)) => format!("denied: {d}"),
                         _ => "denied".to_string(),
                     },
-                    SIG_SEARCH => format!("`{aux}` `{key}`"),
+                    SIG_SEARCH => match &r.detail {
+                        Some(after) => format!("`{aux}` `{key}`, after {after}"),
+                        None => format!("`{aux}` `{key}`"),
+                    },
                     _ => match (first, &r.detail) {
                         (true, Some(d)) => format!("error text: {d}"),
                         _ => "the same error, after normalisation".to_string(),
@@ -2814,12 +2844,21 @@ mod tests {
         // It exists: a path that resolves to nothing is not advice (#1335).
         fs::write(&file, "").unwrap();
         for n in [1, 2, 3] {
-            let body = [tool_use(
-                &cwd,
-                &format!("r{n}"),
-                "Read",
-                serde_json::json!({"file_path":file.to_string_lossy()}),
-            )]
+            // A search first: an early read counts only after one (#1336).
+            let body = [
+                tool_use(
+                    &cwd,
+                    &format!("g{n}"),
+                    "Glob",
+                    serde_json::json!({"pattern":"**/lib.rs"}),
+                ),
+                tool_use(
+                    &cwd,
+                    &format!("r{n}"),
+                    "Read",
+                    serde_json::json!({"file_path":file.to_string_lossy()}),
+                ),
+            ]
             .join("\n");
             let p = write(repo, &format!("s{n}.jsonl"), &body);
             insert_session(&conn, &format!("s{n}"), &cwd, Some(&p), None);
@@ -2889,8 +2928,17 @@ mod tests {
         let file = wt.join("src").join("a.ts");
         let wt_s = wt.to_string_lossy().into_owned();
         let conn = db();
+        let glob = |n: usize| {
+            tool_use(
+                &wt_s,
+                &format!("g{n}"),
+                "Glob",
+                serde_json::json!({"pattern":"**/a.ts"}),
+            )
+        };
         for n in [1, 2, 3] {
             let body = [
+                glob(n),
                 tool_use(
                     &wt_s,
                     &format!("r{n}"),
@@ -2924,12 +2972,16 @@ mod tests {
 
         // The control: the same reads without the edits are a finding.
         let only = |n: usize| {
-            tool_use(
-                &wt_s,
-                &format!("r{n}"),
-                "Read",
-                serde_json::json!({"file_path":file.to_string_lossy()}),
-            )
+            [
+                glob(n),
+                tool_use(
+                    &wt_s,
+                    &format!("r{n}"),
+                    "Read",
+                    serde_json::json!({"file_path":file.to_string_lossy()}),
+                ),
+            ]
+            .join("\n")
         };
         for n in [1, 2, 3] {
             write(repo, &format!("s{n}.jsonl"), &only(n));
@@ -2952,13 +3004,7 @@ mod tests {
         let conn = db();
         for (n, root) in [(1, &w1), (2, &w2), (3, &repo.to_path_buf())] {
             let cwd = root.to_string_lossy().into_owned();
-            let file = root.join("src").join("a.ts");
-            let body = tool_use(
-                &cwd,
-                &format!("r{n}"),
-                "Read",
-                serde_json::json!({"file_path":file.to_string_lossy()}),
-            );
+            let body = searched_then_read(root, n);
             let p = write(repo, &format!("s{n}.jsonl"), &body);
             insert_session(&conn, &format!("s{n}"), &cwd, Some(&p), None);
         }
@@ -3261,6 +3307,96 @@ mod tests {
         w.learn_deleted_checkouts([root.as_path()]);
         assert_eq!(w.unknown, None);
         assert_eq!(w.reroot(&root.join("a.ts")), root.join("a.ts"));
+    }
+
+    /// #1336: reading a file early is not evidence a pointer is missing
+    /// unless the session had to look for it first. Three sessions that
+    /// read `ci.yml` as their second call with no search before it give
+    /// no finding; three that Glob and then read it give one, with the
+    /// Glob in every evidence row. A failed Read counts as looking too.
+    #[test]
+    fn an_early_read_counts_only_after_a_search() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path();
+        let workflows = repo.join(".github").join("workflows");
+        fs::create_dir_all(&workflows).unwrap();
+        let ci = write(&workflows, "ci.yml", "on: push\n");
+        let cwd = repo.to_string_lossy().into_owned();
+        let read = |n: usize| {
+            tool_use(
+                &cwd,
+                &format!("r{n}"),
+                "Read",
+                serde_json::json!({"file_path":ci.to_string_lossy()}),
+            )
+        };
+        let conn = db();
+        for n in [1, 2, 3] {
+            let body = [bash(&cwd, &format!("b{n}"), "git status"), read(n)].join("\n");
+            let p = write(repo, &format!("s{n}.jsonl"), &body);
+            insert_session(&conn, &format!("s{n}"), &cwd, Some(&p), None);
+        }
+        let scan = scan_effective_opt(repo, None);
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        assert!(
+            early_reads(&out).is_empty(),
+            "no search came first: {out:#?}"
+        );
+
+        for n in [1, 2, 3] {
+            let body = [
+                tool_use(
+                    &cwd,
+                    &format!("g{n}"),
+                    "Glob",
+                    serde_json::json!({"pattern":"**/ci*.yml"}),
+                ),
+                read(n),
+            ]
+            .join("\n");
+            write(repo, &format!("s{n}.jsonl"), &body);
+        }
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        let hits = early_reads(&out);
+        assert_eq!(hits.len(), 1, "{out:#?}");
+        assert_eq!(hits[0].evidence.len(), 3);
+        for e in &hits[0].evidence {
+            assert_eq!(
+                e.measured,
+                "`Read` `.github/workflows/ci.yml`, after `Glob` `**/ci*.yml`"
+            );
+        }
+
+        // A failed Read before it is looking, too.
+        let failed = [
+            tool_use(
+                &cwd,
+                "x",
+                "Read",
+                serde_json::json!({"file_path":repo.join("ci.yml").to_string_lossy()}),
+            ),
+            tool_result(&cwd, "x", Some(true), "File does not exist."),
+            read(1),
+        ]
+        .join("\n");
+        let rows = rows_of(&failed, &cwd, repo);
+        let early: Vec<&Row> = rows
+            .iter()
+            .filter(|r| r.signal == SIG_SEARCH && r.key == ".github/workflows/ci.yml")
+            .collect();
+        assert_eq!(early.len(), 1, "{rows:?}");
+        assert_eq!(
+            early[0].detail.as_deref(),
+            Some("a failed `Read` of `ci.yml`")
+        );
+        // An absent verdict is not a failure: no search came first.
+        let silent = failed.replace(",\"is_error\":true", "");
+        assert!(
+            rows_of(&silent, &cwd, repo)
+                .iter()
+                .all(|r| r.key != ".github/workflows/ci.yml"),
+            "{silent}"
+        );
     }
 
     /// Rows stored under an older extraction rule are not served: the
