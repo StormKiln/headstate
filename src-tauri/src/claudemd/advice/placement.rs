@@ -47,6 +47,23 @@
 //! example path is under the floor. All three are suppressed, and the
 //! root file scores clean, which the design requires.
 //!
+//! # A repository with path-scoped rules is offered one
+//!
+//! A nested CLAUDE.md is not the only lazily loaded target: a rule in
+//! `.claude/rules/` with `paths:` frontmatter loads when a session reads
+//! a matching file. A repository that keeps such a directory may have
+//! retired nested CLAUDE.md files on purpose, so when the repository's
+//! `.claude/rules/` is a directory the suggestion offers a rule whose
+//! `paths:` names `<dir>/**`, beside the nested file when it exists and
+//! instead of it when it does not (#1321). The finding itself is
+//! unchanged: the token cost it measures is real either way. Both targets
+//! load lazily, so the suggestion keeps the caveat that the content does
+//! not hold before a session reads a file there. Only the directory's
+//! existence is read, never the rules in it. A probe that fails with
+//! anything but not-found is not "no rules directory": the current
+//! wording stands and the brief says the question could not be checked.
+//! A file outside the repository is not probed.
+//!
 //! # Not found is not Unknown
 //!
 //! A path that does not exist has nothing to place, so it is listed and
@@ -78,9 +95,11 @@
 //! `brief::render` runs at construction with nothing but the [`Finding`],
 //! so what the suggestion needs travels in it: the target `CLAUDE.md` and
 //! whether it exists is a `Locator::File` evidence entry with no line,
-//! and the token figure is read back from the finding sentence this
-//! module wrote. A figure that cannot be read back is omitted, never
-//! guessed.
+//! as is the repository's `.claude/rules` directory when the probe found
+//! it or failed (absent, it is no entry). The token figure and the
+//! directory for a rule's `paths:` glob are read back from the finding
+//! sentence this module wrote. A value that cannot be read back is
+//! omitted, never guessed.
 
 use super::{Check, Context, Evidence, Finding, Locator, Producer, Severity, Subject};
 use crate::claudemd::imports::parse_imports;
@@ -192,6 +211,39 @@ static CODE_SPAN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`[^`]*`").unwr
 /// [`suggestion`] to tell the three rules apart.
 const DUPLICATE_MARK: &str = " carry the same ";
 const LAZY_MARK: &str = "; this file loads only after a Read in ";
+
+/// What the `.claude/rules` probe measured, when it has something to say.
+/// Absent (or not a directory) is `None`: the current wording stands.
+const RULES_EXIST: &str = "exists";
+const RULES_UNREADABLE: &str = "could not be read: ";
+
+/// Probe the repository's `.claude/rules/` for the suggestion. A
+/// not-found is no evidence; any other io error is evidence that the
+/// question could not be answered, never "no rules directory".
+fn rules_evidence(repo: &Path) -> Option<Evidence> {
+    let dir = repo.join(".claude").join("rules");
+    let measured = match std::fs::metadata(&dir) {
+        Ok(m) if m.is_dir() => RULES_EXIST.to_string(),
+        Ok(_) => return None,
+        Err(e) if e.kind() == ErrorKind::NotFound || e.kind() == ErrorKind::NotADirectory => {
+            return None
+        }
+        Err(e) => format!("{RULES_UNREADABLE}{e}"),
+    };
+    Some(Evidence {
+        at: Locator::File {
+            path: slashed(&dir),
+            line: None,
+        },
+        measured,
+    })
+}
+
+/// Whether an evidence path is the `.claude/rules` probe's. `slashed`
+/// writes `/` on every platform, so the suffix is stable.
+fn is_rules_dir(path: &str) -> bool {
+    path.ends_with("/.claude/rules")
+}
 
 /// The path candidates a section names, deduplicated, `:line` stripped.
 ///
@@ -443,6 +495,9 @@ fn assess(file: &Loaded, repo: &Path, home: Option<&Path>) -> Vec<Finding> {
     let repo_root = file_dir.starts_with(repo).then_some(repo);
     let path = slashed(&file.path);
     let mut out = Vec::new();
+    // Path-scoped rules are the repository's; a file outside it is not
+    // probed, which is "not asked", never "none".
+    let rules = repo_root.and_then(rules_evidence);
 
     for section in text::sections(&file.text) {
         let votes = assess_section(&section, file_dir, repo_root, home);
@@ -521,6 +576,7 @@ fn assess(file: &Loaded, repo: &Path, home: Option<&Path>) -> Vec<Finding> {
                 "does not exist".to_string()
             },
         });
+        evidence.extend(rules.clone());
 
         out.push(Finding::new(
             Check::Placement,
@@ -740,11 +796,31 @@ fn est_tokens(sentence: &str) -> Option<&str> {
 /// `CLAUDE.md` and what was measured about it.
 fn other_file(f: &Finding) -> Option<(&str, &str)> {
     f.evidence.iter().find_map(|e| match &e.at {
-        Locator::File { path, line: None } if path != f.subject.path() => {
+        Locator::File { path, line: None } if path != f.subject.path() && !is_rules_dir(path) => {
             Some((path.as_str(), e.measured.as_str()))
         }
         _ => None,
     })
+}
+
+/// The `.claude/rules` probe's evidence, when the finding carries one:
+/// the directory and what was measured about it.
+fn rules_probe(f: &Finding) -> Option<(&str, &str)> {
+    f.evidence.iter().find_map(|e| match &e.at {
+        Locator::File { path, line: None } if is_rules_dir(path) => {
+            Some((path.as_str(), e.measured.as_str()))
+        }
+        _ => None,
+    })
+}
+
+/// The `<dir>` in "names only paths under <dir>/: ", read back from the
+/// sentence this module wrote. The last occurrence, so a heading that
+/// happens to contain the phrase does not shadow it.
+fn under_dir(sentence: &str) -> Option<&str> {
+    let (_, rest) = sentence.rsplit_once(" names only paths under ")?;
+    let (d, _) = rest.split_once("/: ")?;
+    (!d.is_empty()).then_some(d)
 }
 
 /// The brief's "Suggested change" for a placement finding.
@@ -796,8 +872,46 @@ pub(crate) fn suggestion(f: &Finding) -> String {
              instead of every time `{subject}` loads."
         ),
     };
-    match other_file(f) {
-        Some((target, measured)) if measured.starts_with("does not exist") => format!(
+    let target = other_file(f);
+    let target_missing = target.is_some_and(|(_, m)| m.starts_with("does not exist"));
+
+    // #1321: a repository that keeps path-scoped rules is offered one,
+    // beside or instead of a nested CLAUDE.md it may have retired.
+    if let Some((rules, measured)) = rules_probe(f) {
+        if measured == RULES_EXIST {
+            let glob = match under_dir(&f.finding) {
+                Some(d) => format!("naming `{d}/**`"),
+                None => "naming the directory the finding names".to_string(),
+            };
+            let rule = format!(
+                "a rule file in `{rules}/` with `paths:` frontmatter {glob}, the path-scoped \
+                 mechanism this repository already uses"
+            );
+            let caveat = format!(
+                "A path-scoped rule, like a nested CLAUDE.md, loads lazily: it does not hold \
+                 before a session reads a file there. If the section must hold from launch, \
+                 leave it in `{subject}`."
+            );
+            return match target {
+                Some((target, _)) if target_missing => format!(
+                    "Cut the section from `{subject}` and put it in {rule}. A nested `{target}` \
+                     does not exist and is not needed for this; whether to create one is the \
+                     missing-subdirectory-CLAUDE.md check's call. {saving} {caveat}"
+                ),
+                Some((target, _)) => format!(
+                    "Cut the section from `{subject}` and add it to `{target}`, which exists, or \
+                     put it in {rule}. {saving} {caveat}"
+                ),
+                None => format!(
+                    "Cut the section from `{subject}` and put it in {rule}, or in the \
+                     `CLAUDE.md` of the directory the finding names. {saving} {caveat}"
+                ),
+            };
+        }
+    }
+
+    let base = match target {
+        Some((target, _)) if target_missing => format!(
             "Moving this section would need `{target}`, which does not exist. Whether to \
              create one is the missing-subdirectory-CLAUDE.md check's call, not this one's; \
              until it exists, leave the section in `{subject}`."
@@ -811,6 +925,14 @@ pub(crate) fn suggestion(f: &Finding) -> String {
             "Cut the section from `{subject}` and add it to the `CLAUDE.md` of the directory \
              the finding names. {saving}"
         ),
+    };
+    match rules_probe(f) {
+        // The probe failed: not "no rules directory". Say so.
+        Some((rules, measured)) => format!(
+            "{base} Whether this repository keeps path-scoped rules in `{rules}/`, which would \
+             be another place for this section, could not be checked: {measured}."
+        ),
+        None => base,
     }
 }
 
@@ -931,6 +1053,125 @@ mod tests {
             f.brief
         );
         assert!(!f.brief.contains("Cut the section"), "{}", f.brief);
+        assert!(
+            !f.brief.contains("paths:"),
+            "no rules directory, no rule offered: {}",
+            f.brief
+        );
+    }
+
+    /// (b2) #1321: the same section in a repository that keeps
+    /// path-scoped rules in `.claude/rules/`. The finding stands -- the
+    /// token cost is real either way -- but the suggestion offers a rule
+    /// with `paths:` frontmatter, not only a nested CLAUDE.md, and keeps
+    /// the caveat that a lazily loaded rule does not hold before a
+    /// session touches those files.
+    #[test]
+    fn a_rules_directory_offers_a_path_scoped_rule() {
+        let t = octo(OCTO_SECTION);
+        let rules = t.path().join(".claude").join("rules");
+        fs::create_dir_all(&rules).unwrap();
+
+        let report = report_in(t.path(), None, None);
+        let found = placement(&report);
+        assert_eq!(found.len(), 1, "{report:?}");
+        let f = found[0];
+        assert_eq!(f.severity, Severity::Advice, "the finding itself stays");
+        assert!(f.finding.contains("names only paths under octo/"));
+        let rules_path = slashed(&rules);
+        assert!(
+            f.evidence.iter().any(|e| e.at
+                == Locator::File {
+                    path: rules_path.clone(),
+                    line: None
+                }
+                && e.measured == "exists"),
+            "the rules directory travels as evidence: {:?}",
+            f.evidence
+        );
+        assert!(f.brief.contains(&format!("`{rules_path}/`")), "{}", f.brief);
+        assert!(f.brief.contains("`paths:`"), "{}", f.brief);
+        assert!(f.brief.contains("`octo/**`"), "{}", f.brief);
+        assert!(
+            f.brief.contains("before a session reads a file there"),
+            "the lazy-load caveat is kept: {}",
+            f.brief
+        );
+        assert!(
+            !f.brief.contains("until it exists, leave the section"),
+            "a missing nested CLAUDE.md is no longer the only way out: {}",
+            f.brief
+        );
+
+        // With the nested CLAUDE.md present, both targets are offered.
+        fs::write(t.path().join("octo").join("CLAUDE.md"), "# octo\n").unwrap();
+        let report = report_in(t.path(), None, None);
+        let found = placement(&report);
+        assert_eq!(found.len(), 1, "{report:?}");
+        let brief = &found[0].brief;
+        let target = slashed(&t.path().join("octo").join("CLAUDE.md"));
+        assert!(
+            brief.contains(&format!("`{target}`, which exists")),
+            "{brief}"
+        );
+        assert!(brief.contains("`paths:`"), "{brief}");
+        assert!(brief.contains("`octo/**`"), "{brief}");
+    }
+
+    /// (b3) A `.claude/rules` probe that fails with anything but
+    /// not-found is not "no rules directory": the current wording stands
+    /// and the brief says the question could not be answered. Unix only,
+    /// for `chmod 000`, and not as root (see (f)).
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_rules_probe_is_stated_not_assumed_absent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let t = octo(OCTO_SECTION);
+        let dot_claude = t.path().join(".claude");
+        fs::create_dir_all(dot_claude.join("rules")).unwrap();
+        fs::set_permissions(&dot_claude, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let report = report_in(t.path(), None, None);
+
+        fs::set_permissions(&dot_claude, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let found = placement(&report);
+        assert_eq!(found.len(), 1, "{report:?}");
+        let f = found[0];
+        assert_eq!(f.severity, Severity::Advice);
+        let rules_path = slashed(&dot_claude.join("rules"));
+        let probe = f
+            .evidence
+            .iter()
+            .find(|e| {
+                e.at == Locator::File {
+                    path: rules_path.clone(),
+                    line: None,
+                }
+            })
+            .unwrap_or_else(|| panic!("the failed probe is evidence: {:?}", f.evidence));
+        assert!(
+            probe.measured.starts_with("could not be read: "),
+            "{}",
+            probe.measured
+        );
+        assert!(
+            probe.measured.to_lowercase().contains("permission"),
+            "the io error travels: {}",
+            probe.measured
+        );
+        assert!(
+            f.brief.contains("which does not exist"),
+            "the current wording stands: {}",
+            f.brief
+        );
+        assert!(
+            f.brief.contains("could not be checked"),
+            "and the uncertainty is said: {}",
+            f.brief
+        );
+        assert!(!f.brief.contains("`octo/**`"), "{}", f.brief);
     }
 
     /// (c) A path at the file's own level is a stay vote, and one stay
@@ -1452,5 +1693,25 @@ for either; the file exists because getting it wrong is easy.
         );
         assert_eq!(est_tokens("Section \"X\" (~lots est. tokens) names"), None);
         assert_eq!(est_tokens("no figure"), None);
+    }
+
+    /// The directory for a rule's `paths:` glob is read back from the
+    /// sentence, the last occurrence winning over a heading's text.
+    #[test]
+    fn under_dir_reads_back_only_its_own_shape() {
+        assert_eq!(
+            under_dir(
+                "Section \"X\" (~9 est. tokens) names only paths under apps/web/: apps/web/a.ts"
+            ),
+            Some("apps/web")
+        );
+        assert_eq!(
+            under_dir(
+                "Section \"names only paths under acme/: \" (~9 est. tokens) names only paths \
+                 under octo/: octo/a.rs"
+            ),
+            Some("octo")
+        );
+        assert_eq!(under_dir("no directory here"), None);
     }
 }
