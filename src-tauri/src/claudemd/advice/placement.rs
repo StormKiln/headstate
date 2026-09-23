@@ -62,7 +62,9 @@
 //! existence is read, never the rules in it. A probe that fails with
 //! anything but not-found is not "no rules directory": the current
 //! wording stands and the brief says the question could not be checked.
-//! A file outside the repository is not probed.
+//! A file outside the repository is not probed. The probe and the rule's
+//! wording are `pub(crate)` and shared with the gaps check (#1352), so
+//! the two agree on whether a repository uses path-scoped rules.
 //!
 //! # Not found is not Unknown
 //!
@@ -220,7 +222,11 @@ const RULES_UNREADABLE: &str = "could not be read: ";
 /// Probe the repository's `.claude/rules/` for the suggestion. A
 /// not-found is no evidence; any other io error is evidence that the
 /// question could not be answered, never "no rules directory".
-fn rules_evidence(repo: &Path) -> Option<Evidence> {
+///
+/// Shared with the gaps check (#1352), so the two cannot disagree about
+/// whether a repository uses path-scoped rules: an empty directory
+/// counts for both.
+pub(crate) fn rules_evidence(repo: &Path) -> Option<Evidence> {
     let dir = repo.join(".claude").join("rules");
     let measured = match std::fs::metadata(&dir) {
         Ok(m) if m.is_dir() => RULES_EXIST.to_string(),
@@ -804,14 +810,51 @@ fn other_file(f: &Finding) -> Option<(&str, &str)> {
 }
 
 /// The `.claude/rules` probe's evidence, when the finding carries one:
-/// the directory and what was measured about it.
-fn rules_probe(f: &Finding) -> Option<(&str, &str)> {
+/// the directory and what was measured about it. Only the probe's own
+/// two readings count; the gaps check also cites the directory with a
+/// count of the rules it read, which is not a probe.
+pub(crate) fn rules_probe(f: &Finding) -> Option<(&str, &str)> {
     f.evidence.iter().find_map(|e| match &e.at {
-        Locator::File { path, line: None } if is_rules_dir(path) => {
+        Locator::File { path, line: None }
+            if is_rules_dir(path)
+                && (e.measured == RULES_EXIST || e.measured.starts_with(RULES_UNREADABLE)) =>
+        {
             Some((path.as_str(), e.measured.as_str()))
         }
         _ => None,
     })
+}
+
+/// Whether a probe reading is "the directory exists".
+pub(crate) fn rules_exist(measured: &str) -> bool {
+    measured == RULES_EXIST
+}
+
+/// The offered rule (#1321), shared with gaps (#1352): a rule file in
+/// `rules` whose `paths:` names `<dir>/**`, or the finding's directory
+/// when `dir` is not known.
+pub(crate) fn rule_file(rules: &str, dir: Option<&str>) -> String {
+    let glob = match dir {
+        Some(d) => format!("naming `{d}/**`"),
+        None => "naming the directory the finding names".to_string(),
+    };
+    format!(
+        "a rule file in `{rules}/` with `paths:` frontmatter {glob}, the path-scoped \
+         mechanism this repository already uses"
+    )
+}
+
+/// Both lazily loaded targets share this caveat.
+pub(crate) const RULE_LOADS_LAZILY: &str = "A path-scoped rule, like a nested CLAUDE.md, \
+     loads lazily: it does not hold before a session reads a file there.";
+
+/// A probe that failed is not "no rules directory": say the question
+/// could not be checked. `what` is what the rule would hold.
+pub(crate) fn rules_unchecked(rules: &str, measured: &str, what: &str) -> String {
+    format!(
+        "Whether this repository keeps path-scoped rules in `{rules}/`, which would be \
+         another place for {what}, could not be checked: {measured}."
+    )
 }
 
 /// The `<dir>` in "names only paths under <dir>/: ", read back from the
@@ -878,19 +921,11 @@ pub(crate) fn suggestion(f: &Finding) -> String {
     // #1321: a repository that keeps path-scoped rules is offered one,
     // beside or instead of a nested CLAUDE.md it may have retired.
     if let Some((rules, measured)) = rules_probe(f) {
-        if measured == RULES_EXIST {
-            let glob = match under_dir(&f.finding) {
-                Some(d) => format!("naming `{d}/**`"),
-                None => "naming the directory the finding names".to_string(),
-            };
-            let rule = format!(
-                "a rule file in `{rules}/` with `paths:` frontmatter {glob}, the path-scoped \
-                 mechanism this repository already uses"
-            );
+        if rules_exist(measured) {
+            let rule = rule_file(rules, under_dir(&f.finding));
             let caveat = format!(
-                "A path-scoped rule, like a nested CLAUDE.md, loads lazily: it does not hold \
-                 before a session reads a file there. If the section must hold from launch, \
-                 leave it in `{subject}`."
+                "{RULE_LOADS_LAZILY} If the section must hold from launch, leave it in \
+                 `{subject}`."
             );
             return match target {
                 Some((target, _)) if target_missing => format!(
@@ -929,8 +964,8 @@ pub(crate) fn suggestion(f: &Finding) -> String {
     match rules_probe(f) {
         // The probe failed: not "no rules directory". Say so.
         Some((rules, measured)) => format!(
-            "{base} Whether this repository keeps path-scoped rules in `{rules}/`, which would \
-             be another place for this section, could not be checked: {measured}."
+            "{base} {}",
+            rules_unchecked(rules, measured, "this section")
         ),
         None => base,
     }

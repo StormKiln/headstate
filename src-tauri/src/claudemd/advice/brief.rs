@@ -180,27 +180,67 @@ fn gaps_suggestion(f: &Finding) -> String {
         );
     }
     let grouped = f.finding.chars().next().is_some_and(|c| c.is_ascii_digit());
-    if grouped {
-        return format!(
+    let body = if grouped {
+        format!(
             "Add `{dir}/CLAUDE.md` covering the conventions shared by the members the evidence \
              lists: how they are built and tested, what they are for and which side depends \
              on them, and the rules from the root file that apply here with a different \
              twist. Keep it to what is true only here; a per-member file is for a member that \
              carried a signal of its own."
-        );
-    }
-    if f.finding.contains("role name only") {
-        return format!(
+        )
+    } else if f.finding.contains("role name only") {
+        format!(
             "Add `{dir}/CLAUDE.md` only if a convention is true only here: what the directory \
              is for, and any rule from the root file that applies here with a different \
              twist. A role name alone is not a gap, so leave it if there is nothing to say."
-        );
+        )
+    } else {
+        format!(
+            "Add `{dir}/CLAUDE.md` covering: how it is built and tested on its own (the evidence \
+             lists what it has); what it is for and which side depends on it; the rules from the \
+             root file that apply here with a different twist. Keep it to what is true only here."
+        )
+    };
+    match gaps_rule_offer(f, grouped) {
+        Some(offer) => format!("{body} {offer}"),
+        None => body,
     }
-    format!(
-        "Add `{dir}/CLAUDE.md` covering: how it is built and tested on its own (the evidence \
-         lists what it has); what it is for and which side depends on it; the rules from the \
-         root file that apply here with a different twist. Keep it to what is true only here."
-    )
+}
+
+/// #1352: what a repository with `.claude/rules/` is also offered, in
+/// placement's words (#1321): a rule whose `paths:` names the directory,
+/// with the lazy-load caveat. A probe that failed says the question could
+/// not be checked; no probe (no rules directory) adds nothing.
+///
+/// Read from the finding alone: placement's `.claude/rules` probe in the
+/// evidence, and the directory from the sentence (`` `docs/` has … `` or
+/// "… under `packages/` …"). No rule is offered for the root: a
+/// root-wide glob scopes nothing (`claudemd::rules::Rule::scopes`).
+fn gaps_rule_offer(f: &Finding, grouped: bool) -> Option<String> {
+    use super::placement::{
+        rule_file, rules_exist, rules_probe, rules_unchecked, RULE_LOADS_LAZILY,
+    };
+    let rel = if grouped {
+        f.finding
+            .split_once(" under `")
+            .and_then(|(_, r)| r.split_once("/`"))
+            .map(|(d, _)| d)
+    } else {
+        f.finding
+            .strip_prefix('`')
+            .and_then(|r| r.split_once("/`"))
+            .map(|(d, _)| d)
+    }
+    .filter(|d| !d.is_empty())?;
+    let (rules, measured) = rules_probe(f)?;
+    Some(if rules_exist(measured) {
+        format!(
+            "Or put the same in {}, instead of the nested file. {RULE_LOADS_LAZILY}",
+            rule_file(rules, Some(rel))
+        )
+    } else {
+        rules_unchecked(rules, measured, "this directory's conventions")
+    })
 }
 
 /// The combined document for a report.
