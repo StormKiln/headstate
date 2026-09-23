@@ -111,7 +111,13 @@
 //! no finding. A rule with no `paths:` loads at launch like the root file
 //! and covers nothing below it by itself, nor does `**/*.ts`. The glob
 //! support is small and documented in `claudemd::rules`. When there are
-//! rules, each row says how many were read. A rule directory or rule
+//! rules, each row says how many were read. When `.claude/rules/` is a
+//! directory, even an empty one, each row carries placement's probe of
+//! it, and the brief offers a rule whose `paths:` names the directory
+//! beside the nested CLAUDE.md, in placement's words and with its
+//! lazy-load caveat (#1352, as #1321 did for placement). A directory
+//! at the root is offered no rule: a root-wide `paths:` scopes nothing.
+//! A rule directory or rule
 //! that exists and could not be read withholds every candidate a rule
 //! did not already cover, as one [`Severity::Unknown`] naming them: any
 //! of them might be covered by the rule that was not read.
@@ -470,6 +476,10 @@ pub fn gaps(scan: &Scan, edited: &[PathBuf]) -> Result<Vec<Finding>, String> {
             if rules.files.len() == 1 { "" } else { "s" }
         ),
     });
+    // #1352: placement's `.claude/rules` probe, so the suggestion can
+    // offer a path-scoped rule. Existence, not a count: an empty rules
+    // directory is still a repository that uses rules.
+    let probe = super::placement::rules_evidence(&root);
     let mut rows: Vec<Finding> = Vec::new();
     for ((parent, signals, mention), members) in groups {
         if members.len() >= GROUP_AT {
@@ -478,10 +488,14 @@ pub fn gaps(scan: &Scan, edited: &[PathBuf]) -> Result<Vec<Finding>, String> {
                 &signals,
                 mention.as_ref(),
                 &members,
-                ruled.clone(),
+                ruled.iter().chain(&probe).cloned().collect(),
             ));
         } else {
-            rows.extend(members.into_iter().map(|g| single(g, ruled.clone())));
+            rows.extend(
+                members
+                    .into_iter()
+                    .map(|g| single(g, ruled.iter().chain(&probe).cloned().collect())),
+            );
         }
     }
     // A group's row sorts where its parent does, beside the singles.
@@ -549,7 +563,7 @@ fn rel_display(rel: &Path) -> String {
     }
 }
 
-fn single(g: &Gap, ruled: Option<Evidence>) -> Finding {
+fn single(g: &Gap, ruled: Vec<Evidence>) -> Finding {
     let dir = g.dir.to_string_lossy().to_string();
     // "role name only (`docs`)", not "role name only (role name `docs`)".
     let joined = if g.role_only {
@@ -601,7 +615,7 @@ fn grouped(
     signals: &[String],
     mention: Option<&Mention>,
     members: &[&Gap],
-    ruled: Option<Evidence>,
+    ruled: Vec<Evidence>,
 ) -> Finding {
     // The parent's absolute path, from the member's: the parent may be
     // the root, which has no candidate of its own.
@@ -646,7 +660,7 @@ fn grouped(
         sentence.push_str(&format!(", though the root CLAUDE.md {}", m.what));
         evidence.push(mention_evidence(m));
     }
-    evidence.extend(ruled.map(|mut e| {
+    evidence.extend(ruled.into_iter().map(|mut e| {
         e.measured = e.measured.replace("scopes it", "scopes them");
         e
     }));
@@ -1395,6 +1409,60 @@ mod tests {
             tests.brief
         );
         assert!(tests.brief.contains("Keep it to what is true only here."));
+    }
+
+    /// #1352: a repository with `.claude/rules/` is offered a path-scoped
+    /// rule for the directory, beside the nested CLAUDE.md, in every
+    /// shape, as placement is (#1321). The directory's existence is the
+    /// fact, carried in the evidence, so an EMPTY rules directory counts:
+    /// the two checks must not disagree. Without it the wording is
+    /// unchanged.
+    #[test]
+    fn a_repository_with_rules_is_offered_a_path_scoped_rule() {
+        let t = fixture();
+        let report = run_over(t.path());
+        for f in gap_findings(&report) {
+            assert!(!f.brief.contains("paths:"), "{}", f.brief);
+        }
+
+        let rules = t.path().join(".claude").join("rules");
+        fs::create_dir_all(&rules).unwrap();
+        let report = run_over(t.path());
+        let found = gap_findings(&report);
+        assert_eq!(found.len(), 3, "{found:#?}");
+        for (subject, glob) in [
+            ("packages", "packages/**"),
+            ("docs", "docs/**"),
+            ("tests", "tests/**"),
+        ] {
+            let f = by_subject(&found, subject).unwrap();
+            assert!(
+                f.evidence.iter().any(|e| e.measured == "exists"
+                    && matches!(&e.at, Locator::File { path, .. } if path.ends_with("/.claude/rules"))),
+                "{:?}",
+                f.evidence
+            );
+            assert!(
+                f.brief.contains("with `paths:` frontmatter")
+                    && f.brief.contains(&format!("naming `{glob}`")),
+                "{}",
+                f.brief
+            );
+            assert!(
+                f.brief.contains(&format!(
+                    "Add `{}/CLAUDE.md`",
+                    t.path().join(subject).to_string_lossy()
+                )),
+                "the nested file is still offered: {}",
+                f.brief
+            );
+            assert!(
+                f.brief.contains("Or put the same in a rule file in `")
+                    && f.brief.contains("loads lazily"),
+                "{}",
+                f.brief
+            );
+        }
     }
 
     /// The Cargo side of membership, on this repository's own shape: a
