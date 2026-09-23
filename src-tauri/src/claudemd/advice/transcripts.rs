@@ -50,8 +50,8 @@
 //! deleted: a deleted checkout is identified by the sessions' own cwds
 //! and the repository's git ignore rules (#1335). A path-keyed finding
 //! whose path no longer exists after re-rooting is not advice: it is left
-//! out and counted in one coverage finding ("N findings named paths that
-//! no longer exist"). The stored row carries the attributed DIRECTORY,
+//! out and counted in one coverage [`Severity::Note`] ("N findings named
+//! paths that no longer exist"; a count, not advice, #1354). The stored row carries the attributed DIRECTORY,
 //! and which CLAUDE.md it maps to is decided at read time against the
 //! current scan, so a CLAUDE.md added since the pass moves the finding
 //! without a re-read.
@@ -1926,7 +1926,7 @@ fn emit(
             .collect();
         out.push(Finding::new(
             Check::Transcripts,
-            Severity::Advice,
+            Severity::Note,
             subject_for(cx.repo, cx.scan),
             evidence,
             sentence,
@@ -3391,6 +3391,8 @@ mod tests {
         assert!(early_reads(&out).is_empty(), "{out:#?}");
         let gone = gone_paths(&out);
         assert_eq!(gone.len(), 1, "{out:#?}");
+        // A count, not advice (#1354).
+        assert_eq!(gone[0].severity, Severity::Note, "{}", gone[0].finding);
         assert_eq!(
             gone[0].finding,
             format!(
