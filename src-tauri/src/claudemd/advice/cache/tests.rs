@@ -605,9 +605,22 @@ fn a_new_session_under_the_repository_recomputes() {
 /// is in it, one outside is not, and deleting the worktree after the
 /// session ran moves nothing in or out -- the set must not depend on
 /// what the filesystem still holds.
+///
+/// #1335: a deleted checkout the repository ignores (`.wt/t4`) re-roots
+/// in the producer once it has learned it, and the set agrees with the
+/// producer's resolver after that learning, not only before it.
 #[test]
 fn worktree_sessions_are_in_the_set_and_stay_there_once_the_worktree_is_gone() {
     let f = Fixture::new();
+    let ok = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&f.repo)
+        .args(["init", "-q"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(ok, "git init");
+    std::fs::write(f.repo.join(".gitignore"), ".wt/\n").unwrap();
     let wt = f.repo.join(".worktrees").join("t1");
     std::fs::create_dir_all(&wt).unwrap();
     std::fs::write(
@@ -626,6 +639,7 @@ fn worktree_sessions_are_in_the_set_and_stay_there_once_the_worktree_is_gone() {
         ("s1", wt.clone()),
         ("s2", f.repo.join(".claude").join("worktrees").join("t2")),
         ("s3", f.repo.with_file_name("elsewhere")),
+        ("s4", f.repo.join(".wt").join("t4")),
     ];
     for (id, cwd) in &cwds {
         f.conn
@@ -643,9 +657,29 @@ fn worktree_sessions_are_in_the_set_and_stay_there_once_the_worktree_is_gone() {
             .map(|(id, _, _)| id)
             .collect()
     };
-    assert_eq!(ids(), ["s1", "s2"]);
+    assert_eq!(ids(), ["s1", "s2", "s4"]);
     std::fs::remove_dir_all(&wt).unwrap();
-    assert_eq!(ids(), ["s1", "s2"]);
+    assert_eq!(ids(), ["s1", "s2", "s4"]);
+
+    // The producer's resolver, after learning the deleted checkouts
+    // from every cwd as `sessions_under` does, selects the same set --
+    // and it did learn one, so this is not the rule-free case again.
+    let mut w = super::super::transcripts::Worktrees::new(&f.repo);
+    w.learn_deleted_checkouts(cwds.iter().map(|(_, c)| c.as_path()));
+    let t4 = cwds[3].1.join("src");
+    assert_eq!(
+        super::super::transcripts::reroot_cwd(&t4.to_string_lossy(), &mut w),
+        f.repo.join("src"),
+        "the producer re-roots the deleted checkout"
+    );
+    let producer: Vec<&str> = cwds
+        .iter()
+        .filter(|(_, c)| {
+            super::super::transcripts::reroot_cwd(&c.to_string_lossy(), &mut w).starts_with(&f.repo)
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    assert_eq!(ids(), producer);
 }
 
 /// A session that GREW is a tracked change, which is the `(size, mtime)`

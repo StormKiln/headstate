@@ -39,10 +39,14 @@
 //! and a finding never names a disposable worktree. A worktree is
 //! identified by its `.git` file, not its directory name; [`Worktrees`]
 //! carries the rule, including what happens once the worktree has been
-//! deleted. The stored row carries the attributed DIRECTORY, and which
-//! CLAUDE.md it maps to is decided at read time against the current
-//! scan, so a CLAUDE.md added since the pass moves the finding without a
-//! re-read.
+//! deleted: a deleted checkout is identified by the sessions' own cwds
+//! and the repository's git ignore rules (#1335). A path-keyed finding
+//! whose path no longer exists after re-rooting is not advice: it is left
+//! out and counted in one coverage finding ("N findings named paths that
+//! no longer exist"). The stored row carries the attributed DIRECTORY,
+//! and which CLAUDE.md it maps to is decided at read time against the
+//! current scan, so a CLAUDE.md added since the pass moves the finding
+//! without a re-read.
 //!
 //! # Already written is not a gap
 //!
@@ -121,7 +125,10 @@ pub const SESSIONS_PER_PASS: usize = 200;
 /// 1: worktree paths re-rooted structurally and keyed repo-relative; S4
 /// no longer counts a read of a file the session changes (#1324).
 /// Before it, every row is version 0 (migration 26's default).
-pub const RULE_VERSION: i64 = 1;
+///
+/// 2: a path under a deleted checkout that the sessions' own cwds
+/// identify, and the repository's git ignores, re-roots too (#1335).
+pub const RULE_VERSION: i64 = 2;
 
 /// S1: sessions showing the same A-head → B-head correction.
 const MIN_SESSIONS_CORRECTED: usize = 2;
@@ -228,6 +235,33 @@ fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, 
     let mut worktrees = Worktrees::new(repo);
     let sessions = sessions_under(conn, repo, &mut worktrees)?;
     let root_subject = subject_for(repo, cx.scan);
+    // Git could not say whether some deleted cwds were checkouts: their
+    // paths stay absolute, and the reader is told why (#1335).
+    let checkout_unknown = worktrees.unknown.clone().map(|(n, why)| {
+        let what = if n == 1 {
+            "1 deleted session directory was a checkout".to_string()
+        } else {
+            format!("{n} deleted session directories were checkouts")
+        };
+        let sentence = format!("could not tell whether {what} of this repository: {why}");
+        Finding::new(
+            Check::Transcripts,
+            Severity::Unknown,
+            root_subject.clone(),
+            vec![Evidence {
+                at: Locator::File {
+                    path: repo.to_string_lossy().into_owned(),
+                    line: None,
+                },
+                measured: format!(
+                    "{n} recorded cwd{} under this path no longer exist{}; their paths are not re-rooted",
+                    if n == 1 { "" } else { "s" },
+                    if n == 1 { "s" } else { "" }
+                ),
+            }],
+            sentence,
+        )
+    });
 
     if sessions.is_empty() {
         return Ok(vec![Finding::new(
@@ -347,6 +381,7 @@ fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, 
 
     let short = analysed.len() < sessions.len() || !unreadable.is_empty();
     let mut out = emit(&stored, &denials, &sessions, &analysed, cx, short);
+    out.extend(checkout_unknown);
 
     if short || truncated > 0 {
         let mut sentence = format!(
@@ -441,6 +476,9 @@ pub fn edited_dirs(conn: &Connection, repo: &Path) -> Result<Vec<PathBuf>, Strin
 /// The sessions whose recorded cwd is under `repo`, linked worktrees
 /// re-rooted first so a session run in `<repo>/.worktrees/t1` is
 /// attributed to the repository itself.
+///
+/// Every cwd is read before any is re-rooted, so the resolver learns the
+/// deleted checkouts (#1335) from the whole set in one git call.
 fn sessions_under(
     conn: &Connection,
     repo: &Path,
@@ -464,10 +502,12 @@ fn sessions_under(
             ))
         })
         .map_err(|e| format!("claude_session: {e}"))?;
+    let rows = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("claude_session: {e}"))?;
+    worktrees.learn_deleted_checkouts(rows.iter().map(|(_, cwd, _, _)| Path::new(cwd)));
     let mut out = Vec::new();
-    for row in rows {
-        let (session_id, cwd, transcript_path, prompt) =
-            row.map_err(|e| format!("claude_session: {e}"))?;
+    for (session_id, cwd, transcript_path, prompt) in rows {
         let dir = reroot_cwd(&cwd, worktrees);
         // `Path::starts_with` is by component, so `<repo>2` is not under
         // `<repo>`, and it is the same test on Windows separators.
@@ -493,7 +533,11 @@ fn sessions_under(
 /// cover a set the producer does not read. Only paths already under the
 /// repository are re-rooted, and they re-root to paths still under it,
 /// so the set is decided by the recorded cwd alone -- a worktree deleted
-/// since does not move a session in or out of it.
+/// since does not move a session in or out of it. That is also why
+/// `session_keys` does not call [`Worktrees::learn_deleted_checkouts`]:
+/// a deleted checkout (#1335) moves a session's DIRECTORY, never its
+/// membership, so the fingerprint would pay a git process to select the
+/// same set.
 pub(super) fn reroot_cwd(cwd: &str, worktrees: &mut Worktrees) -> PathBuf {
     worktrees.reroot(Path::new(cwd))
 }
@@ -525,18 +569,39 @@ enum Probe {
 /// selects sessions by, and resolving it would make the session set
 /// depend on whether that directory still exists.
 ///
-/// A worktree that has since been deleted cannot be probed. Then, and
-/// only then, Claude Code's own layout `<repo>/.claude/worktrees/<name>/`
-/// re-roots by shape, which is what this rule did for `agent-<id>`
-/// before it was structural. Any other deleted worktree (`.worktrees/t1`)
-/// is left as its absolute path and keyed as such: visibly not
-/// re-rooted, never guessed.
+/// A worktree that has since been deleted cannot be probed, and the
+/// advice usually runs after the merge that deleted it (#1335). Two rules
+/// then apply, in order:
+///
+/// 1. **A deleted checkout the sessions themselves identify.** A
+///    session's recorded cwd that lies strictly under the repository, no
+///    longer exists, and is ignored by the repository's git was a
+///    checkout root: Claude Code ran there, and the repository ignores
+///    it. [`Worktrees::learn_deleted_checkouts`] asks git about every
+///    such cwd in ONE `git check-ignore --stdin`, with a trailing `/`
+///    because a cwd was a directory and a pattern like `/trees/*/` only
+///    matches one git knows is a directory. No directory name is
+///    guessed. A repository with no `.git` has no ignore rules, so
+///    nothing is ignored; a git that cannot answer leaves every such cwd
+///    un-rooted and is recorded in [`Worktrees::unknown`], never taken as
+///    "not ignored".
+/// 2. **Claude Code's own layout.** `<repo>/.claude/worktrees/<name>/`
+///    re-roots by shape, which is what this rule did for `agent-<id>`
+///    before it was structural.
+///
+/// Anything else deleted is left as its absolute path and keyed as such:
+/// visibly not re-rooted. A finding naming such a path is not advice,
+/// and `emit` leaves it out and counts it.
 pub(super) struct Worktrees<'a> {
     repo: &'a Path,
     /// `repo` canonicalized, once, for a `gitdir:` that spells the
     /// repository differently (a symlinked home, `/private/var`).
     canonical: Option<Option<PathBuf>>,
     probed: HashMap<PathBuf, Probe>,
+    /// Deleted checkout roots, learned from the sessions' cwds (rule 1).
+    deleted_checkouts: Vec<PathBuf>,
+    /// How many deleted cwds git could not be asked about, and why.
+    pub(super) unknown: Option<(usize, String)>,
 }
 
 impl<'a> Worktrees<'a> {
@@ -545,6 +610,59 @@ impl<'a> Worktrees<'a> {
             repo,
             canonical: None,
             probed: HashMap::new(),
+            deleted_checkouts: Vec::new(),
+            unknown: None,
+        }
+    }
+
+    /// Learn which of `cwds` were checkout roots since deleted: strictly
+    /// under the repository, not re-rooted by any other rule, gone from
+    /// disk, and ignored by the repository's git. One git process for
+    /// the lot.
+    ///
+    /// A cwd whose absence could not be established (a stat refused for
+    /// another reason) is not asked about: "could not look" is not "gone".
+    pub(super) fn learn_deleted_checkouts<'p>(&mut self, cwds: impl IntoIterator<Item = &'p Path>) {
+        let mut rels: BTreeMap<String, PathBuf> = BTreeMap::new();
+        for cwd in cwds {
+            let Ok(rel) = cwd.strip_prefix(self.repo) else {
+                continue;
+            };
+            if rel.components().next().is_none() || self.reroot(cwd) != cwd {
+                continue;
+            }
+            let gone = matches!(
+                std::fs::metadata(cwd),
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory)
+            );
+            if gone {
+                rels.insert(path_key(cwd, self.repo) + "/", cwd.to_path_buf());
+            }
+        }
+        if rels.is_empty() {
+            return;
+        }
+        let answer = match std::fs::symlink_metadata(self.repo.join(".git")) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => Err(format!("`.git` could not be checked: {e}")),
+            Ok(_) => {
+                let query: Vec<String> = rels.keys().cloned().collect();
+                super::rot::check_ignored(crate::auth::git_program(), self.repo, &query)
+            }
+        };
+        match answer {
+            Ok(ignored) => {
+                for (rel, cwd) in rels {
+                    if ignored.contains(&rel) && !self.deleted_checkouts.contains(&cwd) {
+                        self.deleted_checkouts.push(cwd);
+                    }
+                }
+                // Deepest first, so a nested root wins, as it does for a
+                // live worktree.
+                self.deleted_checkouts
+                    .sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+            }
+            Err(why) => self.unknown = Some((rels.len(), why)),
         }
     }
 
@@ -572,7 +690,14 @@ impl<'a> Worktrees<'a> {
                 Probe::Unprobeable => unprobeable[k] = true,
             }
         }
-        // The fallback for a deleted worktree in Claude Code's layout.
+        // Rule 1: a deleted checkout the sessions identified.
+        if let Some(root) = self.deleted_checkouts.iter().find(|r| path.starts_with(r)) {
+            let rest = path.strip_prefix(root).unwrap_or(Path::new(""));
+            return rest
+                .components()
+                .fold(self.repo.to_path_buf(), |p, c| p.join(c));
+        }
+        // Rule 2: a deleted worktree in Claude Code's layout.
         for i in (0..comps.len().saturating_sub(2)).rev() {
             let name = |j: usize| comps[j].as_os_str().to_string_lossy();
             if name(i) == ".claude"
@@ -1362,6 +1487,35 @@ fn collect_imports(nodes: &[ImportNode], out: &mut Vec<String>) {
     }
 }
 
+/// The path a group's key names, when it names one: a file tool's key
+/// under S2, S3 or S4. A key relative to the repository is joined onto
+/// it component by component; an absolute one stands. `None` for a
+/// pattern, a command head, an error text, or a call with no path (its
+/// key is its tool name).
+fn named_path(signal: &str, key: &str, tool: &str, repo: &Path) -> Option<PathBuf> {
+    let path_signal = matches!(signal, SIG_SEARCH | SIG_USER_CORRECTION | SIG_DENIED);
+    if !path_signal || !(tool == "Read" || is_change(tool)) || key == tool || key.is_empty() {
+        return None;
+    }
+    let p = Path::new(key);
+    Some(if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        key.split('/')
+            .filter(|c| !c.is_empty())
+            .fold(repo.to_path_buf(), |acc, c| acc.join(c))
+    })
+}
+
+/// Whether `path` is established to name nothing. A stat refused for any
+/// other reason is not "nothing there": it could not be looked at.
+fn resolves_to_nothing(path: &Path) -> bool {
+    matches!(
+        std::fs::metadata(path),
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory)
+    )
+}
+
 /// Group the stored rows, apply the thresholds, place and dedup each
 /// group, and render the findings.
 fn emit(
@@ -1433,6 +1587,7 @@ fn emit(
             });
     }
 
+    let mut gone: Vec<(PathBuf, String, usize)> = Vec::new();
     let order = [
         SIG_CORRECTED,
         SIG_USER_CORRECTION,
@@ -1457,6 +1612,14 @@ fn emit(
             // not shown.
             if n < min {
                 continue;
+            }
+            // A path that resolves to nothing cannot become a CLAUDE.md
+            // pointer (#1335). It is left out, and counted below.
+            if let Some(path) = named_path(signal, key, aux, cx.repo) {
+                if resolves_to_nothing(&path) {
+                    gone.push((path, aux.clone(), n));
+                    continue;
+                }
             }
             let dirs: Vec<&Path> = by_session.values().map(|r| r.dir.as_path()).collect();
             let dir = placement(&dirs, &candidates, cx.repo);
@@ -1555,6 +1718,42 @@ fn emit(
                 sentence,
             ));
         }
+    }
+
+    if !gone.is_empty() {
+        let k = gone.len();
+        let sentence = if k == 1 {
+            format!(
+                "1 finding named a path that no longer exists under `{}` and was left out",
+                cx.repo.display()
+            )
+        } else {
+            format!(
+                "{k} findings named paths that no longer exist under `{}` and were left out",
+                cx.repo.display()
+            )
+        };
+        let evidence = gone
+            .iter()
+            .take(MAX_EVIDENCE)
+            .map(|(path, tool, n)| Evidence {
+                at: Locator::File {
+                    path: path.to_string_lossy().into_owned(),
+                    line: None,
+                },
+                measured: format!(
+                    "`{tool}` of a path that no longer exists, in {at_least}{n} session{}",
+                    plural(*n)
+                ),
+            })
+            .collect();
+        out.push(Finding::new(
+            Check::Transcripts,
+            Severity::Advice,
+            subject_for(cx.repo, cx.scan),
+            evidence,
+            sentence,
+        ));
     }
 
     // S6 -- the census: sessions per attributed directory, always.
@@ -2612,6 +2811,8 @@ mod tests {
         let cwd = repo.to_string_lossy().into_owned();
         let conn = db();
         let file = repo.join("src-tauri").join("src").join("lib.rs");
+        // It exists: a path that resolves to nothing is not advice (#1335).
+        fs::write(&file, "").unwrap();
         for n in [1, 2, 3] {
             let body = [tool_use(
                 &cwd,
@@ -2683,6 +2884,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let repo = t.path();
         fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src").join("a.ts"), "").unwrap();
         let wt = worktree(repo, &[".wt", "t1"], "t1");
         let file = wt.join("src").join("a.ts");
         let wt_s = wt.to_string_lossy().into_owned();
@@ -2744,6 +2946,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let repo = t.path();
         fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src").join("a.ts"), "").unwrap();
         let w1 = worktree(repo, &[".wt", "t1"], "t1");
         let w2 = worktree(repo, &[".wt", "t2"], "t2");
         let conn = db();
@@ -2864,6 +3067,200 @@ mod tests {
         fs::remove_dir_all(&wt).unwrap();
         assert_eq!(w.reroot(&file), repo.join("src").join("a.rs"));
         assert_eq!(Worktrees::new(repo).reroot(&file), file);
+    }
+
+    fn git_init(dir: &Path) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["init", "-q"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "git init");
+    }
+
+    /// A session opening with a Glob and then reading `<root>/src/a.ts`,
+    /// so the read is an early read whatever S4 asks of it.
+    fn searched_then_read(root: &Path, n: usize) -> String {
+        let cwd = root.to_string_lossy().into_owned();
+        [
+            tool_use(
+                &cwd,
+                &format!("g{n}"),
+                "Glob",
+                serde_json::json!({"pattern":"**/a.ts"}),
+            ),
+            tool_use(
+                &cwd,
+                &format!("r{n}"),
+                "Read",
+                serde_json::json!({"file_path":root.join("src").join("a.ts").to_string_lossy()}),
+            ),
+        ]
+        .join("\n")
+    }
+
+    fn gone_paths(findings: &[Finding]) -> Vec<&Finding> {
+        findings
+            .iter()
+            .filter(|f| f.finding.contains("no longer exist"))
+            .collect()
+    }
+
+    /// #1335: a deleted checkout outside `.claude/worktrees` is re-rooted
+    /// by the session's own cwd -- it no longer exists and the
+    /// repository's git ignores it -- so three sessions in t1, t2 and t3
+    /// fold onto `src/a.ts`, and no finding names `.wt`.
+    #[test]
+    fn a_deleted_ignored_checkout_re_roots_by_the_sessions_own_cwd() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path();
+        git_init(repo);
+        write(repo, ".gitignore", ".wt/\n");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        write(&repo.join("src"), "a.ts", "export {}\n");
+        let conn = db();
+        for n in [1, 2, 3] {
+            let root = repo.join(".wt").join(format!("t{n}"));
+            let p = write(repo, &format!("s{n}.jsonl"), &searched_then_read(&root, n));
+            insert_session(
+                &conn,
+                &format!("s{n}"),
+                &root.to_string_lossy(),
+                Some(&p),
+                None,
+            );
+        }
+        let scan = scan_effective_opt(repo, None);
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        let hits = early_reads(&out);
+        assert_eq!(hits.len(), 1, "{out:#?}");
+        assert!(
+            hits[0].finding.starts_with(&format!(
+                "`src/a.ts` was read within the first {EARLY_CALLS} tool calls in 3 sessions under `{}`",
+                repo.display()
+            )),
+            "{}",
+            hits[0].finding
+        );
+        assert!(
+            out.iter().all(|f| !f.finding.contains(".wt")),
+            "no finding names a deleted checkout: {out:#?}"
+        );
+        assert!(gone_paths(&out).is_empty(), "{out:#?}");
+        // The census folds the three cwds onto the repository too.
+        assert!(
+            out.iter()
+                .any(|f| f.finding.starts_with("3 sessions recorded under")),
+            "{out:#?}"
+        );
+    }
+
+    /// #1335: the same deleted directory, NOT ignored, is not known to
+    /// have been a checkout. Its paths stay absolute, and a path-keyed
+    /// finding naming a path that no longer exists is left out and
+    /// counted, never advised.
+    #[test]
+    fn a_deleted_directory_git_does_not_ignore_stays_absolute_and_is_dropped() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path();
+        git_init(repo);
+        fs::create_dir_all(repo.join("src")).unwrap();
+        write(&repo.join("src"), "a.ts", "export {}\n");
+        let root = repo.join(".wt").join("t1");
+        let file = root.join("src").join("a.ts");
+        let mut w = Worktrees::new(repo);
+        w.learn_deleted_checkouts([root.as_path()]);
+        assert_eq!(w.reroot(&file), file, "not ignored: not re-rooted");
+        assert_eq!(w.unknown, None);
+
+        let conn = db();
+        for n in [1, 2, 3] {
+            let p = write(repo, &format!("s{n}.jsonl"), &searched_then_read(&root, n));
+            insert_session(
+                &conn,
+                &format!("s{n}"),
+                &root.to_string_lossy(),
+                Some(&p),
+                None,
+            );
+        }
+        let scan = scan_effective_opt(repo, None);
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        assert!(early_reads(&out).is_empty(), "{out:#?}");
+        let gone = gone_paths(&out);
+        assert_eq!(gone.len(), 1, "{out:#?}");
+        assert_eq!(
+            gone[0].finding,
+            format!(
+                "1 finding named a path that no longer exists under `{}` and was left out",
+                repo.display()
+            )
+        );
+        assert_eq!(
+            gone[0].evidence[0].at,
+            Locator::File {
+                path: file.to_string_lossy().into_owned(),
+                line: None
+            }
+        );
+        assert_eq!(
+            gone[0].evidence[0].measured,
+            "`Read` of a path that no longer exists, in 3 sessions"
+        );
+        // The Glob is not a path, and still stands.
+        assert!(
+            out.iter()
+                .any(|f| f.finding.starts_with("`**/a.ts` was searched with Glob")),
+            "{out:#?}"
+        );
+    }
+
+    /// #1335: a repository whose git cannot answer leaves a deleted
+    /// directory un-rooted and says why, as Unknown. It never guesses
+    /// "not ignored".
+    #[test]
+    fn a_git_that_cannot_answer_is_unknown_not_a_guess() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path();
+        // A `.git` directory git does not accept as a repository.
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let root = repo.join(".wt").join("t1");
+        let mut w = Worktrees::new(repo);
+        w.learn_deleted_checkouts([root.as_path()]);
+        let file = root.join("src").join("a.ts");
+        assert_eq!(w.reroot(&file), file);
+        let (n, why) = w.unknown.clone().expect("git's failure is recorded");
+        assert_eq!(n, 1);
+        assert!(why.contains("git check-ignore"), "{why}");
+
+        let conn = db();
+        let p = write(repo, "s1.jsonl", &searched_then_read(&root, 1));
+        insert_session(&conn, "s1", &root.to_string_lossy(), Some(&p), None);
+        let scan = scan_effective_opt(repo, None);
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        let unknown: Vec<&Finding> = out
+            .iter()
+            .filter(|f| f.severity == Severity::Unknown)
+            .collect();
+        assert_eq!(unknown.len(), 1, "{out:#?}");
+        assert!(
+            unknown[0].finding.starts_with(
+                "could not tell whether 1 deleted session directory was a checkout of this repository: "
+            ),
+            "{}",
+            unknown[0].finding
+        );
+
+        // No `.git` at all is no ignore rules: nothing is ignored, which
+        // is established, not Unknown.
+        let bare = tempfile::tempdir().unwrap();
+        let root = bare.path().join(".wt").join("t1");
+        let mut w = Worktrees::new(bare.path());
+        w.learn_deleted_checkouts([root.as_path()]);
+        assert_eq!(w.unknown, None);
+        assert_eq!(w.reroot(&root.join("a.ts")), root.join("a.ts"));
     }
 
     /// Rows stored under an older extraction rule are not served: the
