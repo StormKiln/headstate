@@ -37,6 +37,24 @@
 //! that maps to nothing is listed as "other" in the evidence and is never
 //! counted for or against a verb.
 //!
+//! A JS launcher is read through to the tool it runs (#1323): `npx`,
+//! `bunx`, `pnpm exec`, `bun x` and `pnpm nx` name what follows them, and
+//! `pnpm`/`bun` run scripts as `yarn` does. An `nx` command's verbs come
+//! from its targets by the same name map: `run web:test`, `web:test`,
+//! `nx test web`, or `affected`/`run-many` with `-t lint,test`.
+//!
+//! # Which named command covers which toolchain
+//!
+//! A verb is covered for a toolchain when a command naming it is run by
+//! one of that toolchain's own managers, with two widenings. `npm` and
+//! `yarn` accept the whole JS family (`npm`, `yarn`, `pnpm`, `bun`,
+//! `npx`, `bunx`, `nx`), which run the same scripts and tools. `make` and
+//! `just` accept any manager: a target fronts some other tool, so once
+//! anything names the verb the target is an alternative, not a gap. The
+//! widening stops there on purpose: `cargo test` covers `make test`, but
+//! never a package.json `test` script, because a Rust suite being named
+//! says nothing about whether the JS suite is.
+//!
 //! # A negative needs a complete scan
 //!
 //! A positive ("`make lint` is named at `CLAUDE.md:13`") stands whatever
@@ -167,7 +185,7 @@ impl Producer for Coverage {
                 let named = search
                     .named
                     .iter()
-                    .any(|n| n.verb == verb && kind.managers().contains(&n.manager.as_str()));
+                    .any(|n| n.verb == verb && kind.covered_by(&n.manager));
                 if named {
                     continue;
                 }
@@ -395,7 +413,8 @@ fn verb_of(manager: &str, args: &[&str]) -> Option<Verb> {
     let first = args.first().copied();
     match manager {
         "make" | "just" => first.and_then(verb_by_name),
-        "yarn" => match first {
+        // All three run a package.json script without `run`.
+        "yarn" | "pnpm" | "bun" => match first {
             Some("run") => args.get(1).copied().and_then(verb_by_name),
             Some(s) => verb_by_name(s),
             None => None,
@@ -560,7 +579,25 @@ impl Toolchain {
             Toolchain::PyprojectUnknown => &["pytest", "ruff"],
         }
     }
+
+    /// Whether a command named with `manager` counts for this toolchain's
+    /// verb. Its own managers always do. A JS toolchain also takes any of
+    /// [`JS_FAMILY`], since they all run the same package.json scripts and
+    /// the same tools. A task runner (`make`, `just`) takes any manager:
+    /// its targets front other tools, so once any command names the verb
+    /// the target is an alternative, not a gap (#1323).
+    fn covered_by(self, manager: &str) -> bool {
+        match self {
+            Toolchain::Make | Toolchain::Just => true,
+            Toolchain::Ecosystem(Ecosystem::Npm | Ecosystem::Yarn) => JS_FAMILY.contains(&manager),
+            _ => self.managers().contains(&manager),
+        }
+    }
 }
+
+/// The first tokens (after [`unwrap_launcher`]) that run a package.json
+/// script or a JS workspace tool.
+const JS_FAMILY: &[&str] = &["npm", "yarn", "pnpm", "bun", "npx", "bunx", "nx"];
 
 /// One command a toolchain offers for one verb.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1081,7 +1118,8 @@ fn pyproject_tools(path: &Path) -> Result<Vec<Offer>, String> {
 /// One command a loaded file names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Named {
-    /// The first token, normalised: `./gradlew` is `gradle`.
+    /// The first token, normalised: `./gradlew` is `gradle`, and a
+    /// launcher is read through, so `npx nx run web:test` is `nx`.
     pub manager: String,
     pub verb: Verb,
     pub file: PathBuf,
@@ -1218,11 +1256,88 @@ fn commands_in(text: &str) -> Vec<(String, Verb)> {
             "./gradlew" | "gradlew" => "gradle",
             other => other,
         };
-        if let Some(verb) = verb_of(manager, &tokens[1..]) {
+        let (manager, args) = unwrap_launcher(manager, &tokens[1..]);
+        if manager == "nx" {
+            out.extend(nx_verbs(args).into_iter().map(|v| ("nx".to_string(), v)));
+        } else if let Some(verb) = verb_of(manager, args) {
             out.push((manager.to_string(), verb));
         }
     }
     out
+}
+
+/// The tool a JS launcher runs, and its arguments: `npx nx …`, `bunx nx
+/// …`, `pnpm exec nx …`, `yarn dlx nx …`, `bun x nx …` and `pnpm nx …`
+/// all run `nx`. Launcher flags (`-y`, `--`) before the tool are skipped
+/// and an `@version` suffix is dropped. Anything else comes back as it
+/// went in.
+fn unwrap_launcher<'a>(manager: &'a str, args: &'a [&'a str]) -> (&'a str, &'a [&'a str]) {
+    let rest: &[&str] = match (manager, args.first().copied()) {
+        ("npx" | "bunx", _) => args,
+        ("pnpm" | "yarn" | "npm", Some("exec" | "dlx")) | ("bun", Some("x")) => &args[1..],
+        ("pnpm" | "yarn" | "bun", Some("nx")) => args,
+        _ => return (manager, args),
+    };
+    match rest.iter().position(|a| !a.starts_with('-')) {
+        Some(i) => {
+            let tool = rest[i];
+            let tool = match tool.rfind('@') {
+                Some(at) if at > 0 => &tool[..at],
+                _ => tool,
+            };
+            (tool, &rest[i + 1..])
+        }
+        None => ("", &[]),
+    }
+}
+
+/// The verbs an `nx` command names, from its targets mapped by
+/// [`verb_by_name`]: `-t`/`--target`/`--targets` (comma- or
+/// space-separated, as `nx affected` and `nx run-many` take them), else
+/// `run <project>:<target>`, `<project>:<target>`, the legacy
+/// `affected:<target>`, `format:write`, or `nx <target> <project>`.
+fn nx_verbs(args: &[&str]) -> Vec<Verb> {
+    let mut targets: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if let Some(v) = ["--targets=", "--target=", "-t="]
+            .iter()
+            .find_map(|p| a.strip_prefix(p))
+        {
+            targets.extend(v.split(','));
+        } else if matches!(a, "-t" | "--target" | "--targets") {
+            while let Some(v) = args.get(i + 1).filter(|v| !v.starts_with('-')) {
+                targets.extend(v.split(','));
+                i += 1;
+            }
+        }
+        i += 1;
+    }
+    if targets.is_empty() {
+        let mut positional = args.iter().copied().filter(|a| !a.starts_with('-'));
+        match positional.next() {
+            Some("run") => {
+                if let Some(t) = positional.next().and_then(|p| p.split(':').nth(1)) {
+                    targets.push(t);
+                }
+            }
+            // Both take their targets through `-t` only.
+            Some("affected" | "run-many") | None => {}
+            Some(p) => match p.split_once(':') {
+                Some(("affected", t)) => targets.push(t),
+                Some(("format", _)) | None => targets.push(p),
+                Some((_project, t)) => targets.push(t.split(':').next().unwrap_or(t)),
+            },
+        }
+    }
+    let mut verbs = Vec::new();
+    for v in targets.into_iter().filter_map(verb_by_name) {
+        if !verbs.contains(&v) {
+            verbs.push(v);
+        }
+    }
+    verbs
 }
 
 /// A line split at `&&`, `||`, `;` and `|`, in order.
@@ -1933,6 +2048,100 @@ mod tests {
             vec![("make".into(), Verb::Format), ("make".into(), Verb::Test)]
         );
         assert_eq!(commands_in("src-tauri/Cargo.toml"), vec![]);
+    }
+
+    /// Launchers (#1323): `npx`, `bunx`, `pnpm`, `pnpm exec`, `bun run`
+    /// and `nx` name a verb. An nx target comes from `run <project>:`,
+    /// `<project>:<target>`, `nx <target>`, or `-t`/`--target(s)`, and
+    /// one `-t lint,test` names both.
+    #[test]
+    fn launchers_and_nx_targets_name_a_verb() {
+        assert_eq!(
+            commands_in("npx nx run web:test --include=src"),
+            vec![("nx".into(), Verb::Test)]
+        );
+        assert_eq!(
+            commands_in("npx -y nx run web:build:production"),
+            vec![("nx".into(), Verb::Build)]
+        );
+        assert_eq!(
+            commands_in("nx affected -t lint"),
+            vec![("nx".into(), Verb::Lint)]
+        );
+        assert_eq!(
+            commands_in("bunx nx affected --targets=lint,test"),
+            vec![("nx".into(), Verb::Lint), ("nx".into(), Verb::Test)]
+        );
+        assert_eq!(
+            commands_in("nx run-many --target build"),
+            vec![("nx".into(), Verb::Build)]
+        );
+        assert_eq!(
+            commands_in("pnpm exec nx format:write"),
+            vec![("nx".into(), Verb::Format)]
+        );
+        assert_eq!(
+            commands_in("pnpm nx web:serve"),
+            vec![("nx".into(), Verb::Run)]
+        );
+        assert_eq!(commands_in("nx test web"), vec![("nx".into(), Verb::Test)]);
+        assert_eq!(commands_in("pnpm test"), vec![("pnpm".into(), Verb::Test)]);
+        assert_eq!(
+            commands_in("pnpm run lint"),
+            vec![("pnpm".into(), Verb::Lint)]
+        );
+        assert_eq!(commands_in("bun run dev"), vec![("bun".into(), Verb::Run)]);
+        // A launcher with nothing verb-shaped after it names nothing.
+        assert_eq!(commands_in("npx prettier --write ."), vec![]);
+        assert_eq!(commands_in("pnpm install"), vec![]);
+        assert_eq!(commands_in("nx graph"), vec![]);
+        assert_eq!(commands_in("npx"), vec![]);
+    }
+
+    /// #1323's test: a command naming the verb through a JS launcher
+    /// clears the Makefile's `test-unit` gap, whichever manager offers the
+    /// target. The cover stops at the family: `cargo test` clears the
+    /// make gap too, but never a package.json script's.
+    #[test]
+    fn a_launcher_command_covers_the_verb_for_make_and_the_js_family() {
+        let (_t, repo, home) = fixture();
+        fs::write(repo.join("Makefile"), "test-unit:\n\ttrue\n").unwrap();
+        fs::write(
+            repo.join("package.json"),
+            r#"{"scripts":{"test":"vitest"}}"#,
+        )
+        .unwrap();
+        fs::write(repo.join("yarn.lock"), "").unwrap();
+        fs::write(repo.join("Cargo.toml"), "[package]\nname = \"octocat\"\n").unwrap();
+
+        let test_gaps = |body: &str| -> Vec<String> {
+            fs::write(repo.join("CLAUDE.md"), body).unwrap();
+            toolchain_findings(&run_over(&repo, &home))
+                .iter()
+                .map(|f| f.finding.clone())
+                .filter(|s| {
+                    s.ends_with("`make test-unit`")
+                        || s.ends_with("`yarn test`")
+                        || s.ends_with("`cargo test`")
+                })
+                .collect()
+        };
+
+        // Nothing named: all three are gaps. The negative can fail.
+        assert_eq!(test_gaps("Nothing.\n").len(), 3);
+
+        for body in [
+            "Run `npx nx run web:test` and `cargo test`.\n",
+            "Run `pnpm test` and `cargo test`.\n",
+        ] {
+            let gaps = test_gaps(body);
+            assert!(gaps.is_empty(), "{body}: {gaps:?}");
+        }
+
+        // `cargo test` alone covers make's test target, not yarn's.
+        let gaps = test_gaps("Run `cargo test`.\n");
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(gaps[0].ends_with("`yarn test`"), "{gaps:?}");
     }
 
     /// Detection over the added markers, each read through this module's
