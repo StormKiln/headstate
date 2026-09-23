@@ -106,6 +106,16 @@ fn suggestion(f: &Finding) -> String {
         // load, stating what they had to learn. The counts and the
         // "already written" hits are Notes (#1339) and never get here.
         Check::Transcripts => match (&f.severity, &f.subject) {
+            // #1351: the sessions were read; a file that might already
+            // hold the rule was not.
+            (Severity::Unknown, _)
+                if f.finding.contains("already written could not be checked") =>
+            {
+                "No edit yet. Make the file the evidence names readable and run the advice \
+                 again: it may already state this rule, and adding the rule again would \
+                 duplicate it."
+                    .to_string()
+            }
             (Severity::Unknown, _) => "No edit. Make the transcript named in the evidence \
                  readable, or leave it: the findings above stand without it, as floors."
                 .to_string(),

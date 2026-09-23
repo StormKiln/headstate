@@ -64,8 +64,16 @@
 //! the global and local scopes the effective scan carries, and each of
 //! the repository's `.claude/rules` a session in that directory would
 //! load (`claudemd::rules`: unconditional, or `paths:` reaching it). A
-//! file that cannot be read is no hit, and the finding then claims
-//! nothing about where the key is written. A hit is kept visible as a
+//! file that does not exist holds nothing. A file that exists and could
+//! not be read, or a rule `claudemd::rules` could not read (whose
+//! `paths:` are unknown too), is not "not written" (#1351): when no
+//! readable file holds the key, the finding is [`Severity::Unknown`],
+//! its sentence ends "whether `<key>` is already written could not be
+//! checked", and its evidence names each such file with its io error.
+//! Unknown rather than a qualified Advice, because the file that was not
+//! read is exactly where the rule would be written: the advice to add it
+//! may be wrong, and a possibly-wrong claim is suppressed, not
+//! qualified. A hit in a readable file still settles it. A hit is kept visible as a
 //! [`Severity::Note`] worded "already written in `<file>`", so the reader
 //! sees the rule doing its job without being told to change anything
 //! (#1339). A paraphrased rule is missed by
@@ -1554,18 +1562,36 @@ fn placement(dirs: &[&Path], candidates: &[PathBuf], repo: &Path) -> PathBuf {
         .unwrap_or_else(|| repo.to_path_buf())
 }
 
+/// What the "already written" test found for one key.
+#[derive(Debug, PartialEq, Eq)]
+enum Written {
+    /// This file holds the key verbatim.
+    In(String),
+    /// No file read holds it. Settled: every file in the corpus was read.
+    No,
+    /// No file read holds it, and these `(path, io error)` could not be
+    /// read, so any of them might (#1351).
+    Unchecked(Vec<(String, String)>),
+}
+
 /// Which CLAUDE.md on the path from the root to `dir`, its imports, or
 /// the global and local scopes, or a rule that applies there already
 /// holds `key` verbatim.
+///
+/// A file that does not exist holds nothing, so not-found is a miss. Any
+/// other read error is not a miss (#1351): if no readable file holds the
+/// key, the answer is [`Written::Unchecked`] naming each such file. A
+/// rule `claudemd::rules` could not read is one of those whatever its
+/// `paths:`, which were not read either.
 fn written_in(
     key: &str,
     dir: &Path,
     cx: &Context,
-    cache: &mut HashMap<String, Option<String>>,
-) -> Option<String> {
+    cache: &mut HashMap<String, Result<String, String>>,
+) -> Written {
     let needle = collapse(key);
     if needle.is_empty() {
-        return None;
+        return Written::No;
     }
     let mut files: Vec<(String, &[ImportNode])> = Vec::new();
     for f in &cx.scan.repo.files {
@@ -1587,20 +1613,49 @@ fn written_in(
     // #1340: the repository's rules a session in `dir` would load.
     let rel = dir.strip_prefix(cx.repo).unwrap_or(dir);
     let rel = rel.to_string_lossy().replace('\\', "/");
-    for rule in crate::claudemd::rules::read(cx.repo).files {
+    let rules = crate::claudemd::rules::read(cx.repo);
+    for rule in &rules.files {
         if rule.applies_to(&rel) {
             queue.push(rule.path.to_string_lossy().into_owned());
         }
     }
+    // `Rules::unreadable` is `path (io error)`; the path runs to the first
+    // ` (`, and the error is what is inside the outer parentheses.
+    let mut unread: Vec<(String, String)> = rules
+        .unreadable
+        .iter()
+        .map(|u| match u.split_once(" (") {
+            Some((path, err)) => (
+                path.to_string(),
+                err.strip_suffix(')').unwrap_or(err).to_string(),
+            ),
+            None => (u.clone(), "could not be read".to_string()),
+        })
+        .collect();
     for path in queue {
-        let content = cache
-            .entry(path.clone())
-            .or_insert_with(|| std::fs::read_to_string(&path).ok().map(|c| collapse(&c)));
-        if content.as_deref().is_some_and(|c| c.contains(&needle)) {
-            return Some(path);
+        let content =
+            cache
+                .entry(path.clone())
+                .or_insert_with(|| match std::fs::read_to_string(&path) {
+                    Ok(c) => Ok(collapse(&c)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+                    Err(e) => Err(e.to_string()),
+                });
+        match content {
+            Ok(c) if c.contains(&needle) => return Written::In(path),
+            Ok(_) => {}
+            Err(e) => {
+                if !unread.iter().any(|(p, _)| *p == path) {
+                    unread.push((path, e.clone()));
+                }
+            }
         }
     }
-    None
+    if unread.is_empty() {
+        Written::No
+    } else {
+        Written::Unchecked(unread)
+    }
 }
 
 fn collect_imports(nodes: &[ImportNode], out: &mut Vec<String>) {
@@ -1655,7 +1710,7 @@ fn emit(
     short: bool,
 ) -> Vec<Finding> {
     let candidates = claude_dirs(cx);
-    let mut cache: HashMap<String, Option<String>> = HashMap::new();
+    let mut cache: HashMap<String, Result<String, String>> = HashMap::new();
     let mut out = Vec::new();
     let at_least = if short { "at least " } else { "" };
     let plural = |n: usize| if n == 1 { "" } else { "s" };
@@ -1825,13 +1880,26 @@ fn emit(
                 }
             };
             // Already written is an observation, not advice (#1339): the
-            // rule is doing its job and there is nothing to change.
+            // rule is doing its job and there is nothing to change. Not
+            // found while a corpus file could not be read is not "not
+            // written": the finding is Unknown and names each file (#1351).
+            let mut unchecked = Vec::new();
             let (sentence, severity) = match written_in(&dedup_key, &dir, cx, &mut cache) {
-                Some(file) => (
+                Written::In(file) => (
                     format!("`{dedup_key}` is already written in `{file}` ({sentence})"),
                     Severity::Note,
                 ),
-                None => (sentence, Severity::Advice),
+                Written::No => (sentence, Severity::Advice),
+                Written::Unchecked(files) => {
+                    unchecked = files;
+                    (
+                        format!(
+                            "{sentence}; whether `{dedup_key}` is already written could not be \
+                             checked"
+                        ),
+                        Severity::Unknown,
+                    )
+                }
             };
 
             let mut evidence = Vec::new();
@@ -1885,6 +1953,14 @@ fn emit(
                         record: r.record,
                     },
                     measured,
+                });
+            }
+            for (path, err) in unchecked {
+                evidence.push(Evidence {
+                    measured: format!(
+                        "could not check whether it is already written: `{path}` ({err})"
+                    ),
+                    at: Locator::File { path, line: None },
                 });
             }
             out.push(Finding::new(
@@ -2311,6 +2387,103 @@ mod tests {
                 rule.display()
             )),
             "{f}"
+        );
+    }
+
+    /// #1351: a corpus file that could not be read is not "not written".
+    /// With the key only in an unreadable import, the finding is Unknown,
+    /// never Advice, and names the file and its io error. A hit in a
+    /// readable file still settles it.
+    ///
+    /// Unix-only: the wall is a permission bit.
+    #[test]
+    #[cfg(unix)]
+    fn an_unreadable_import_makes_already_written_unknown_not_advice() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path();
+        write(repo, "CLAUDE.md", "@./shared.md\n");
+        let shared = write(repo, "shared.md", "always run make lint\n");
+        let cwd = repo.to_string_lossy().into_owned();
+        let conn = db();
+        for n in [1, 2] {
+            let p = write(repo, &format!("s{n}.jsonl"), &corrected_pair(&cwd, n));
+            insert_session(&conn, &format!("s{n}"), &cwd, Some(&p), None);
+        }
+        let scan = scan_effective_opt(repo, None);
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o000)).unwrap();
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let hits = corrected(&out);
+        assert_eq!(hits.len(), 1, "{out:#?}");
+        let f = hits[0];
+        assert_eq!(f.severity, Severity::Unknown, "{}", f.finding);
+        assert!(
+            f.finding
+                .contains("whether `make lint` is already written could not be checked"),
+            "{}",
+            f.finding
+        );
+        let named = f
+            .evidence
+            .iter()
+            .find(|e| {
+                e.measured
+                    .starts_with("could not check whether it is already written: `")
+            })
+            .unwrap_or_else(|| panic!("{:?}", f.evidence));
+        assert!(
+            named.measured.contains("shared.md` (") && named.measured.ends_with(')'),
+            "{}",
+            named.measured
+        );
+        assert!(!f.brief.contains("transcript named"), "{}", f.brief);
+
+        // A readable file holding the key settles it, unreadable import
+        // or not.
+        write(repo, "CLAUDE.md", "@./shared.md\n\nmake lint\n");
+        let scan = scan_effective_opt(repo, None);
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o000)).unwrap();
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(corrected(&out)[0].severity, Severity::Note, "{out:#?}");
+    }
+
+    /// #1351: a `.claude/rules` rule that could not be read might be the
+    /// one that holds the key, so it makes the finding Unknown too, and
+    /// is named with its error (the `Rules::unreadable` gap).
+    #[test]
+    #[cfg(unix)]
+    fn an_unreadable_rule_makes_already_written_unknown_not_advice() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path();
+        write(repo, "CLAUDE.md", "# rules\n");
+        let rules = repo.join(".claude").join("rules");
+        fs::create_dir_all(&rules).unwrap();
+        let rule = write(&rules, "lint.md", "make lint\n");
+        let cwd = repo.to_string_lossy().into_owned();
+        let conn = db();
+        for n in [1, 2] {
+            let p = write(repo, &format!("s{n}.jsonl"), &corrected_pair(&cwd, n));
+            insert_session(&conn, &format!("s{n}"), &cwd, Some(&p), None);
+        }
+        let scan = scan_effective_opt(repo, None);
+        fs::set_permissions(&rule, fs::Permissions::from_mode(0o000)).unwrap();
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        fs::set_permissions(&rule, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let f = corrected(&out)[0];
+        assert_eq!(f.severity, Severity::Unknown, "{}", f.finding);
+        assert!(
+            f.evidence.iter().any(|e| e.measured
+                == format!(
+                    "could not check whether it is already written: `{}` (Permission denied (os error 13))",
+                    rule.display()
+                )),
+            "{:?}",
+            f.evidence
         );
     }
 
