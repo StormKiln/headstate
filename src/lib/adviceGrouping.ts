@@ -8,12 +8,12 @@ import type {
 
 /// How the advice list is organised (#1291).
 ///
-/// `"none"` is the flat list the panel has always rendered, and it is the
-/// DEFAULT: it is the backend's own `Severity::rank` order end to end,
-/// the one arrangement in which position means exactly one thing. Every
-/// grouping necessarily reorders -- a critical finding stops being the
-/// first row and becomes the first row of some group -- so grouping is a
-/// question the user asks, never one the panel answers for them.
+/// `"none"` is the flat list: the backend's own `Severity::rank` order end
+/// to end, the one arrangement in which position means exactly one thing.
+/// `"check"` is the DEFAULT since #1344, because for most repositories the
+/// flat list is hundreds of rows and unusable. Every grouping reorders --
+/// a critical finding becomes the first row of some group -- which is why
+/// groups are ordered worst-first below, so a problem still leads.
 export type AdviceGrouping = "none" | "check" | "file";
 
 /// Severity rank, mirroring `Severity::rank` in

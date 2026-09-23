@@ -80,60 +80,84 @@ export function ClaudifyAction({
 
   return (
     <span className="inline-flex flex-wrap items-center gap-2">
-      <button
-        type="button"
-        onClick={() => {
-          // `copyText` reports the no-clipboard case rather than doing
-          // nothing, and the toast is what makes the click visible. The
-          // error arm is NOT a fallback that pretends it worked.
-          void copyText(brief).then((failure) =>
-            failure === null
-              ? toast.success(`${what} copied to the clipboard`, {
-                  description: "Paste it into a Claude session to make the change.",
-                })
-              : toast.error(`Could not copy the ${what.toLowerCase()}`, { description: failure }),
-          );
-        }}
-        className="tap-target text-[11px] text-[#58a6ff] hover:underline"
-      >
-        Copy {what.toLowerCase()}
-      </button>
-
-      {/* Run is desktop-only: it opens a terminal WINDOW on this machine,
-          which is `Class::Local`'s stated test. A phone is shown Copy
-          alone rather than a control it could never complete. */}
-      {IS_MOBILE_BUILD ? null : terminalConfigured ? (
-        <button
-          type="button"
-          onClick={() => setShowRun((v) => !v)}
-          aria-expanded={showRun}
-          className="tap-target text-[11px] text-[#58a6ff] hover:underline"
-        >
-          {showRun ? "Cancel" : "Run in terminal…"}
-        </button>
-      ) : (
-        // The sentence, not a disabled button. It names the remedy,
-        // because "Run" greyed out with no text is a dead end.
-        <span className="text-[11px] text-[#8b949e]">
-          No terminal is configured, so this can only be copied. Set one in Settings › Claude
-          Code to run it.
-        </span>
-      )}
-
+      <CopyBriefButton brief={brief} what={what} />
+      <ClaudifyButton
+        open={showRun}
+        onToggle={() => setShowRun((v) => !v)}
+        terminalConfigured={terminalConfigured}
+      />
       {showRun ? (
-        <RunPanel
-          repo={repo}
-          target={target}
-          what={what}
-          onDone={() => setShowRun(false)}
-        />
+        <RunPanel repo={repo} target={target} what={what} onDone={() => setShowRun(false)} />
       ) : null}
     </span>
   );
 }
 
+/// Copy, on its own. The advice table gives it a column (#1344).
+export function CopyBriefButton({ brief, what }: { brief: string; what: string }) {
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        // `copyText` reports the no-clipboard case rather than doing
+        // nothing, and the toast is what makes the click visible. The
+        // error arm is NOT a fallback that pretends it worked.
+        void copyText(brief).then((failure) =>
+          failure === null
+            ? toast.success(`${what} copied to the clipboard`, {
+                description: "Paste it into a Claude session to make the change.",
+              })
+            : toast.error(`Could not copy the ${what.toLowerCase()}`, { description: failure }),
+        );
+      }}
+      className="tap-target text-left text-[11px] text-[#58a6ff] hover:underline"
+    >
+      Copy {what.toLowerCase()}
+    </button>
+  );
+}
+
+/// The Claudify toggle, on its own. The advice table gives it a column
+/// and opens the `RunPanel` in a full-width row beneath, because a cell
+/// is too narrow to read the command line in (#1344).
+///
+/// Run is desktop-only: it opens a terminal WINDOW on this machine, which
+/// is `Class::Local`'s stated test. A phone gets nothing here rather than
+/// a control it could never complete, and Copy stands alone.
+export function ClaudifyButton({
+  open,
+  onToggle,
+  terminalConfigured,
+}: {
+  open: boolean;
+  onToggle: () => void;
+  terminalConfigured: boolean;
+}) {
+  if (IS_MOBILE_BUILD) return null;
+  if (!terminalConfigured) {
+    // The sentence, not a disabled button. It names the remedy, because
+    // "Claudify" greyed out with no text is a dead end.
+    return (
+      <span className="text-[11px] text-[#8b949e]">
+        No terminal is configured, so this can only be copied. Set one in Settings › Claude Code
+        to run it.
+      </span>
+    );
+  }
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-expanded={open}
+      className="tap-target text-left text-[11px] text-[#58a6ff] hover:underline"
+    >
+      {open ? "Cancel" : "Claudify"}
+    </button>
+  );
+}
+
 /// The exact line, and the button that runs it.
-function RunPanel({
+export function RunPanel({
   repo,
   target,
   what,

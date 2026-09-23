@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   ClaudeMdAdviceCheck,
@@ -416,7 +416,7 @@ describe("ClaudeMdAdvicePanel", () => {
       checks: [{ check: "imports", run: { state: "ran", findings: 2 } }],
     });
     open();
-    const rows = screen.getAllByRole("listitem").map((li) => li.textContent ?? "");
+    const rows = screen.getAllByRole("row").map((tr) => tr.textContent ?? "");
     const first = rows.findIndex((t) => t.includes("first on the wire"));
     const second = rows.findIndex((t) => t.includes("second on the wire"));
     expect(first).toBeGreaterThanOrEqual(0);
@@ -546,19 +546,158 @@ describe("ClaudeMdAdvicePanel", () => {
     expect(screen.queryByText(/nothing found/)).toBeNull();
   });
 
-  /// The flat list is the DEFAULT, and it is a default rather than a
-  /// value written on first render: a store key nobody chose would
-  /// persist and outlive a change to what the default should be. The
-  /// flat list is the backend's own ranking, the one arrangement in
-  /// which a row's position means exactly one thing.
-  it("defaults to the flat list without writing the store", () => {
+  /// By check is the DEFAULT since #1344, and it is a default rather than
+  /// a value written on first render: a store key nobody chose would
+  /// persist and outlive a change to what the default should be.
+  it("defaults to by-check groups without writing the store", () => {
     state.data = report({
       findings: [finding()],
       checks: [{ check: "imports", run: { state: "ran", findings: 1 } }],
     });
     open();
-    expect((screen.getByLabelText("Group:") as HTMLSelectElement).value).toBe("none");
+    expect((screen.getByLabelText("Group:") as HTMLSelectElement).value).toBe("check");
     expect(useFilters.getState().filtersByView["claude-md"].adviceGrouping).toBeUndefined();
+    expect(screen.getByRole("heading", { name: /^imports/ })).toBeTruthy();
+  });
+
+  // ---- Tables (#1344) ----
+
+  /// Each group is a table with the five named columns, one row per
+  /// finding, and the severity in text.
+  it("renders each group as a table with the named columns", () => {
+    claudify.terminal = "open -a Terminal {command}";
+    state.data = report({
+      findings: [finding({ finding: "one" }), finding({ check: "rot", severity: "advice", finding: "two" })],
+      checks: [
+        { check: "imports", run: { state: "ran", findings: 1 } },
+        { check: "rot", run: { state: "ran", findings: 1 } },
+      ],
+    });
+    open();
+    const tables = screen.getAllByRole("table");
+    expect(tables).toHaveLength(2);
+    const headers = within(tables[0])
+      .getAllByRole("columnheader")
+      .map((h) => h.textContent);
+    expect(headers).toEqual(["Severity", "Finding", "Where", "Copy brief", "Claudify"]);
+    const row = within(tables[0]).getByRole("row", { name: /one/ });
+    expect(within(row).getByText("[problem]")).toBeTruthy();
+    expect(within(row).getByRole("button", { name: "CLAUDE.md" })).toBeTruthy();
+    expect(within(row).getByRole("button", { name: "Copy brief" })).toBeTruthy();
+    expect(within(row).getByRole("button", { name: "Claudify" })).toBeTruthy();
+  });
+
+  /// The heading names the check and counts by severity, worst first.
+  it("counts each group by severity, worst first", () => {
+    state.data = report({
+      findings: [
+        finding({ severity: "problem" }),
+        finding({ severity: "advice" }),
+        finding({ severity: "advice" }),
+      ],
+      checks: [{ check: "imports", run: { state: "ran", findings: 3 } }],
+    });
+    open();
+    expect(screen.getByRole("heading", { name: /^imports/ }).textContent).toMatch(
+      /1 problem.*2 advice/,
+    );
+  });
+
+  /// Evidence is disclosed on demand, not always shown.
+  it("shows a finding's evidence only when asked", () => {
+    state.data = report({
+      findings: [finding()],
+      checks: [{ check: "imports", run: { state: "ran", findings: 1 } }],
+    });
+    open();
+    expect(screen.queryByText(/`@\.\/x\.md`: file not found/)).toBeNull();
+    const toggle = screen.getByRole("button", { name: /evidence \(1\)/i });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByText(/`@\.\/x\.md`: file not found/)).toBeTruthy();
+  });
+
+  /// A thousand findings open as headings, not a thousand rows; a
+  /// heading expands its group.
+  it("opens a long report with every group collapsed", () => {
+    const checks: ClaudeMdAdviceCheck[] = ["imports", "rot", "shape", "gaps"];
+    state.data = report({
+      findings: Array.from({ length: 1000 }, (_, i) =>
+        finding({ check: checks[i % 4], severity: "advice", finding: `finding ${i}` }),
+      ),
+      checks: [
+        ...checks.map((check) => ({ check, run: { state: "ran", findings: 250 } }) as const),
+        { check: "skills", run: { state: "unknown", reason: "the skills directory could not be listed" } },
+      ],
+    });
+    open();
+    expect(screen.queryAllByRole("table")).toHaveLength(0);
+    // A collapsed group whose check could not run still says so.
+    const skills = screen
+      .getAllByRole("heading")
+      .find((h) => (h.textContent ?? "").startsWith("skills"))?.parentElement;
+    expect(skills?.textContent).toContain("the skills directory could not be listed");
+    const toggles = screen.getAllByRole("button", { expanded: false });
+    const rot = toggles.find((b) => (b.textContent ?? "").startsWith("rot"));
+    expect(rot).toBeTruthy();
+    fireEvent.click(rot!);
+    expect(rot!.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getAllByRole("table")).toHaveLength(1);
+    expect(screen.getByText("finding 1")).toBeTruthy();
+  });
+
+  /// An observation recommends nothing, so its row offers no Claudify.
+  it("offers no Claudify on an observation", () => {
+    claudify.terminal = "open -a Terminal {command}";
+    state.data = report({
+      findings: [finding({ check: "transcripts", severity: "note", finding: "a count" })],
+      checks: [{ check: "transcripts", run: { state: "ran", findings: 1 } }],
+    });
+    open();
+    const row = screen.getByRole("row", { name: /a count/ });
+    expect(within(row).queryByRole("button", { name: "Claudify" })).toBeNull();
+    expect(within(row).getByText("Nothing to change")).toBeTruthy();
+    expect(within(row).getByRole("button", { name: "Copy brief" })).toBeTruthy();
+  });
+
+  /// A short report opens expanded: collapsing three findings would hide
+  /// them behind a click for nothing.
+  it("opens a short report expanded", () => {
+    state.data = report({
+      findings: [finding()],
+      checks: [{ check: "imports", run: { state: "ran", findings: 1 } }],
+    });
+    open();
+    expect(screen.getByRole("button", { name: /^imports/ }).getAttribute("aria-expanded")).toBe(
+      "true",
+    );
+    expect(screen.getAllByRole("table")).toHaveLength(1);
+  });
+
+  /// By check re-orders the groups, and the Claudify column still sends
+  /// the WIRE index. The problem in `shape` is second on the wire and
+  /// first on screen; its Claudify must send 1, not 0.
+  it("sends the wire index from the Claudify column under the by-check default", async () => {
+    claudify.terminal = "open -a Terminal {command}";
+    state.data = report({
+      findings: [
+        finding({ check: "imports", severity: "advice", finding: "first on the wire" }),
+        finding({ check: "shape", severity: "problem", finding: "second on the wire" }),
+      ],
+      checks: [
+        { check: "imports", run: { state: "ran", findings: 1 } },
+        { check: "shape", run: { state: "ran", findings: 1 } },
+      ],
+    });
+    open();
+    const row = screen.getByRole("row", { name: /second on the wire/ });
+    const text = document.body.textContent ?? "";
+    expect(text.indexOf("second on the wire")).toBeLessThan(text.indexOf("first on the wire"));
+    fireEvent.click(within(row).getByRole("button", { name: "Claudify" }));
+    await waitFor(() =>
+      expect(claudify.preview).toHaveBeenCalledWith(REPO, { kind: "finding", index: 1 }),
+    );
   });
 
   /// THE case #1291 pins: grouping by file must not let a critical
@@ -771,7 +910,7 @@ describe("ClaudeMdAdvicePanel", () => {
       checks: [{ check: "imports", run: { state: "ran", findings: 1 } }],
     });
     open();
-    expect(screen.queryByRole("button", { name: /run in terminal/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Claudify" })).toBeNull();
     expect(screen.getAllByText(/no terminal is configured/i).length).toBeGreaterThan(0);
     // And it names the remedy, not just the fact.
     expect(screen.getAllByText(/settings/i).length).toBeGreaterThan(0);
@@ -788,7 +927,7 @@ describe("ClaudeMdAdvicePanel", () => {
     });
     open();
     // One per finding, plus Claudify-all's.
-    expect(screen.getAllByRole("button", { name: /run in terminal/i }).length).toBe(2);
+    expect(screen.getAllByRole("button", { name: "Claudify" }).length).toBe(2);
     expect(screen.queryByText(/no terminal is configured/i)).toBeNull();
   });
 
@@ -808,7 +947,7 @@ describe("ClaudeMdAdvicePanel", () => {
     });
     open();
     // The SECOND finding's Run.
-    fireEvent.click(screen.getAllByRole("button", { name: /run in terminal/i })[1]);
+    fireEvent.click(screen.getAllByRole("button", { name: "Claudify" })[1]);
     await waitFor(() =>
       expect(claudify.preview).toHaveBeenCalledWith(REPO, { kind: "finding", index: 1 }),
     );
@@ -828,7 +967,7 @@ describe("ClaudeMdAdvicePanel", () => {
     });
     open();
     // The FIRST Run is the finding's; the last is Claudify-all's.
-    fireEvent.click(screen.getAllByRole("button", { name: /run in terminal/i })[0]);
+    fireEvent.click(screen.getAllByRole("button", { name: "Claudify" })[0]);
     await waitFor(() => expect(screen.getByRole("button", { name: "Run it" })).toBeTruthy());
     fireEvent.click(screen.getByRole("button", { name: "Run it" }));
     await waitFor(() =>
@@ -849,7 +988,7 @@ describe("ClaudeMdAdvicePanel", () => {
     });
     open();
     // The FIRST Run is the finding's; the last is Claudify-all's.
-    fireEvent.click(screen.getAllByRole("button", { name: /run in terminal/i })[0]);
+    fireEvent.click(screen.getAllByRole("button", { name: "Claudify" })[0]);
     await waitFor(() => expect(screen.getByRole("button", { name: "Run it" })).toBeTruthy());
     fireEvent.click(screen.getByRole("button", { name: "Run it" }));
     await waitFor(() =>
@@ -872,7 +1011,7 @@ describe("ClaudeMdAdvicePanel", () => {
       checks: [{ check: "imports", run: { state: "ran", findings: 1 } }],
     });
     open();
-    fireEvent.click(screen.getAllByRole("button", { name: /run in terminal/i })[0]);
+    fireEvent.click(screen.getAllByRole("button", { name: "Claudify" })[0]);
     await waitFor(() =>
       expect(screen.getByText(/No terminal is configured\./)).toBeTruthy(),
     );
@@ -896,7 +1035,7 @@ describe("ClaudeMdAdvicePanel", () => {
     });
     open();
     // The Claudify-all row is the last Run on the page.
-    const runs = screen.getAllByRole("button", { name: /run in terminal/i });
+    const runs = screen.getAllByRole("button", { name: "Claudify" });
     fireEvent.click(runs[runs.length - 1]);
     await waitFor(() =>
       expect(claudify.preview).toHaveBeenCalledWith(REPO, { kind: "report" }),
@@ -931,7 +1070,7 @@ describe("ClaudeMdAdvicePanel", () => {
     group("file");
     // The finding whose text is "third" — first in the `b.md` group,
     // third on the wire.
-    const runs = screen.getAllByRole("button", { name: /run in terminal/i });
+    const runs = screen.getAllByRole("button", { name: "Claudify" });
     fireEvent.click(runs[2]);
     await waitFor(() =>
       expect(claudify.preview).toHaveBeenCalledWith(REPO, { kind: "finding", index: 2 }),
