@@ -11,22 +11,75 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { ExternalLink } from "./ExternalLink";
+import { type ReadyTone, readyAge, useNow } from "@/lib/readyAge";
 
 /// Both labels name the FIELD, not just the direction (#1277).
 ///
 /// "Oldest first" is ambiguous between "opened longest ago" and "waiting
 /// for review longest", and on anything that spent time as a draft those
-/// are different pull requests. The app has only `created_at` to sort on,
-/// so the label says `opened` and the reader can tell which question they
-/// are being answered. Renaming these back to bare directions would put
-/// the ambiguity straight back.
+/// are different pull requests. Since #1407 the strip sorts on when each
+/// became READY, so the labels say `ready`. Renaming these back to bare
+/// directions would put the ambiguity straight back.
+///
+/// The values keep their persisted `-opened` spelling; see `readySort`.
 const READY_SORT_OPTIONS: {
   value: NonNullable<Filters["readySort"]>;
   label: string;
 }[] = [
-  { value: "oldest-opened", label: "Oldest opened first" },
-  { value: "newest-opened", label: "Newest opened first" },
+  { value: "oldest-opened", label: "Oldest ready first" },
+  { value: "newest-opened", label: "Newest ready first" },
 ];
+
+/// The palette the app already uses for success, warning and failure,
+/// plus its muted grey for "we do not know". Literal class strings so
+/// Tailwind's scanner sees every one.
+const TONE_CLASS: Record<ReadyTone, string> = {
+  fresh: "border-[#3fb950]/40 text-[#3fb950]",
+  aging: "border-[#d29922]/40 text-[#d29922]",
+  stale: "border-[#f85149]/40 text-[#f85149]",
+  unknown: "border-[#8b949e]/40 text-[#8b949e]",
+};
+
+/// Re-read the clock once a minute. The coarsest unit shown is minutes,
+/// and a threshold crossing is at most this late.
+const AGE_TICK_MS = 60_000;
+
+/// How long a row has been ready for review (#1407).
+///
+/// The TEXT carries the age, so colour is never the only signal. The
+/// exact time is in the `title` for a pointer and in visually hidden text
+/// for a screen reader, which reads it as part of the row's name.
+///
+/// Unknown renders as a neutral "age unknown" -- never green, never a
+/// number. Absent is not zero.
+function ReadyAgeChip({ readyAt, now }: { readyAt: PullRequest["ready_at"]; now: Date }) {
+  const age = readyAge(readyAt, now);
+  const chip = `shrink-0 whitespace-nowrap rounded-full border px-1.5 py-0.5 text-xs tabular-nums ${TONE_CLASS[age.tone]}`;
+  if (age.since === null) {
+    return (
+      <>
+        <span data-ready-age={age.tone} title="Ready-for-review time unknown" className={chip} aria-hidden="true">
+          {age.text}
+        </span>
+        <span className="sr-only">, ready-for-review time unknown</span>
+      </>
+    );
+  }
+  const since = age.since.toLocaleString();
+  return (
+    <>
+      <time
+        data-ready-age={age.tone}
+        dateTime={readyAt ?? undefined}
+        title={`Ready for review since ${since}`}
+        className={chip}
+      >
+        {age.text}
+      </time>
+      <span className="sr-only">, ready for review since {since}</span>
+    </>
+  );
+}
 
 /// Pinned above the review queue: what is ready to review right now.
 ///
@@ -43,12 +96,15 @@ const READY_SORT_OPTIONS: {
 /// attention strip: a section that shouts when there is nothing in it
 /// stops being read, and then it fails on the day it matters.
 ///
-/// Ordered OLDEST OPENED FIRST by default (#1277). Working top to bottom
-/// through a review queue should mean working through it in the order the
-/// pull requests arrived, and newest-first buries the three-day-old one
-/// whose author is blocked. The sort control offers the other order, and
-/// `sortReadyForReview` documents why `created_at` and not a
-/// ready-for-review timestamp.
+/// Ordered OLDEST READY FIRST by default (#1277, #1407). Working top to
+/// bottom through a review queue should mean working through it in the
+/// order the pull requests became reviewable, and newest-first buries the
+/// three-day-old one whose author is blocked. The sort control offers the
+/// other order, and `sortReadyForReview` documents why `ready_at` and not
+/// `created_at`.
+///
+/// Each row carries its age since it became ready (`ReadyAgeChip`), kept
+/// current by a once-a-minute clock rather than a re-fetch.
 ///
 /// The preference lives in the per-view filter store under `readySort`,
 /// where every other view preference already lives and where `partialize`
@@ -69,6 +125,7 @@ export function ReadyStrip({
   // care.
   const { readySort } = useActiveFilters();
   const setFilter = useFilters((s) => s.setFilter);
+  const now = useNow(AGE_TICK_MS);
 
   const ready = sortReadyForReview(prs.filter(readyForReview), readySort);
 
@@ -127,21 +184,27 @@ export function ReadyStrip({
                     onOpen(pr);
                   }
                 }}
-                className="cursor-pointer px-4 py-2 hover:bg-[#3fb950]/10"
+                className="flex cursor-pointer items-baseline gap-3 px-4 py-2 hover:bg-[#3fb950]/10"
               >
-                <span className="text-[#e6edf3]">{pr.title}</span>
-                <span className="ml-2 text-xs text-[#8b949e]">
-                  {pr.repo}#{pr.number} · {pr.author}
+                <span className="min-w-0 flex-1">
+                  <span className="text-[#e6edf3]">{pr.title}</span>
+                  <span className="ml-2 text-xs text-[#8b949e]">
+                    {pr.repo}#{pr.number} · {pr.author}
+                  </span>
                 </span>
+                <ReadyAgeChip readyAt={pr.ready_at} now={now} />
               </div>
             ) : (
-              <div className="px-4 py-2">
-                <ExternalLink href={pr.url} className="text-[#e6edf3] hover:text-[#4493f8]">
-                  {pr.title}
-                </ExternalLink>
-                <span className="ml-2 text-xs text-[#8b949e]">
-                  {pr.repo}#{pr.number} · {pr.author}
+              <div className="flex items-baseline gap-3 px-4 py-2">
+                <span className="min-w-0 flex-1">
+                  <ExternalLink href={pr.url} className="text-[#e6edf3] hover:text-[#4493f8]">
+                    {pr.title}
+                  </ExternalLink>
+                  <span className="ml-2 text-xs text-[#8b949e]">
+                    {pr.repo}#{pr.number} · {pr.author}
+                  </span>
                 </span>
+                <ReadyAgeChip readyAt={pr.ready_at} now={now} />
               </div>
             )}
           </li>

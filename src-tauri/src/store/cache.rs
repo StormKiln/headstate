@@ -280,6 +280,10 @@ mod tests {
         assert_eq!(prs[0].unresolved_threads, 0);
         assert!(prs[0].id.is_empty());
         assert!(prs[0].head_oid.is_empty());
+        // #1407: a snapshot from before `ready_at` existed has no ready
+        // time. Unknown, never `created_at` -- the row might have spent a
+        // week in draft -- and never "now".
+        assert_eq!(prs[0].ready_at, None);
     }
 
     /// The two lists must not overwrite each other.

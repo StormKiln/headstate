@@ -466,6 +466,27 @@ fn labels(node: &Value) -> Vec<Label> {
         .unwrap_or_default()
 }
 
+/// When the pull request became ready for review. See `PullRequest::ready_at`.
+///
+/// The query asks for `last: 1` of `READY_FOR_REVIEW_EVENT` only, so the
+/// one node, if any, is the latest time it left draft.
+///
+/// Three different answers, kept apart:
+/// - an EMPTY list is "never a draft", so `created_at` -- the same moment;
+/// - a MISSING connection is unknown, not empty: reading it as
+///   never-drafted would date a pull request marked ready an hour ago
+///   from the week it spent in draft;
+/// - an event whose time does not parse is unknown, never "now".
+fn ready_at(node: &Value, created_at: DateTime<Utc>, is_draft: bool) -> Option<DateTime<Utc>> {
+    if is_draft {
+        return None;
+    }
+    match node["timelineItems"]["nodes"].as_array()?.last() {
+        None => Some(created_at),
+        Some(event) => ts(event, "createdAt"),
+    }
+}
+
 fn map_node(node: &Value) -> Option<PullRequest> {
     // Bound ahead of the struct literal so each total can default to the
     // length of the list it describes without mapping anything twice --
@@ -474,6 +495,8 @@ fn map_node(node: &Value) -> Option<PullRequest> {
     let assignees = logins(&node["assignees"]);
     let latest_reviews = latest_reviews(node);
     let labels = labels(node);
+    let created_at = ts(node, "createdAt")?;
+    let is_draft = node["isDraft"].as_bool().unwrap_or(false);
 
     Some(PullRequest {
         id: node["id"].as_str().unwrap_or_default().to_string(),
@@ -485,12 +508,13 @@ fn map_node(node: &Value) -> Option<PullRequest> {
             .as_str()
             .unwrap_or("unknown")
             .to_string(),
-        is_draft: node["isDraft"].as_bool().unwrap_or(false),
+        is_draft,
         head_ref: node["headRefName"].as_str().unwrap_or_default().to_string(),
         head_oid: node["headRefOid"].as_str().unwrap_or_default().to_string(),
         head_ref_id: node["headRef"]["id"].as_str().map(str::to_string),
         base_ref: node["baseRefName"].as_str().unwrap_or_default().to_string(),
-        created_at: ts(node, "createdAt")?,
+        ready_at: ready_at(node, created_at, is_draft),
+        created_at,
         updated_at: ts(node, "updatedAt")?,
         ci: ci_state(node),
         merge: merge_state(node),
@@ -1730,5 +1754,84 @@ mod tests {
         // Still counted for volume: the PR merged, we just cannot time it.
         assert_eq!(d.sample_size, 1);
         assert_eq!(d.additions, 1);
+    }
+
+    /// One open pull request with the given ready-for-review timeline, for
+    /// the `ready_at` tests below. `timeline` is the `timelineItems` value
+    /// exactly as the list query selects it.
+    fn with_timeline(is_draft: bool, timeline: Value) -> Value {
+        json!({"search": {"nodes": [{
+            "number": 1, "title": "t", "url": "u", "isDraft": is_draft,
+            "createdAt": "2026-08-01T09:00:00Z", "updatedAt": "2026-08-20T10:00:00Z",
+            "repository": {"nameWithOwner": "octocat/hello-world"},
+            "timelineItems": timeline
+        }]}})
+    }
+
+    /// #1407: a pull request that sat in draft is measured from when it
+    /// was marked ready, not from when it was opened.
+    #[test]
+    fn ready_at_is_the_ready_for_review_event() {
+        let v = with_timeline(
+            false,
+            json!({"nodes": [{"createdAt": "2026-08-19T15:30:00Z"}]}),
+        );
+        let pr = &map_list(&v, "search")[0];
+        assert_eq!(
+            pr.ready_at,
+            Some(ts(&json!({"t": "2026-08-19T15:30:00Z"}), "t").unwrap())
+        );
+        assert_ne!(pr.ready_at, Some(pr.created_at));
+    }
+
+    /// No event means it was never a draft, so it became reviewable the
+    /// moment it was opened: the same instant, not a guess.
+    #[test]
+    fn ready_at_without_an_event_is_when_it_was_opened() {
+        let v = with_timeline(false, json!({"nodes": []}));
+        let pr = &map_list(&v, "search")[0];
+        assert_eq!(pr.ready_at, Some(pr.created_at));
+    }
+
+    /// Present but unreadable is UNKNOWN, never "now" and never the
+    /// opened time: either would print a confident age that is wrong.
+    #[test]
+    fn an_unparseable_ready_time_is_unknown() {
+        for bad in [json!("yesterday"), json!(""), json!(null), json!(7)] {
+            let v = with_timeline(false, json!({"nodes": [{"createdAt": bad}]}));
+            assert_eq!(map_list(&v, "search")[0].ready_at, None, "{bad}");
+        }
+    }
+
+    /// A connection GitHub did not return is not "no event". Reading it
+    /// as never-a-draft would date a PR marked ready an hour ago from
+    /// the week it spent in draft.
+    #[test]
+    fn a_missing_timeline_is_unknown_not_never_drafted() {
+        for missing in [json!(null), json!({}), json!({"nodes": null})] {
+            let v = with_timeline(false, missing.clone());
+            assert_eq!(map_list(&v, "search")[0].ready_at, None, "{missing}");
+        }
+        // And a node shaped without the field at all, as a cached or
+        // partial response would be.
+        let mut v = with_timeline(false, json!({"nodes": []}));
+        v["search"]["nodes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("timelineItems");
+        assert_eq!(map_list(&v, "search")[0].ready_at, None);
+    }
+
+    /// A draft is not ready for review, whatever its history: one marked
+    /// ready and then converted back still has the old event.
+    #[test]
+    fn a_draft_has_no_ready_time() {
+        let v = with_timeline(
+            true,
+            json!({"nodes": [{"createdAt": "2026-08-19T15:30:00Z"}]}),
+        );
+        assert_eq!(map_list(&v, "search")[0].ready_at, None);
+        let v = with_timeline(true, json!({"nodes": []}));
+        assert_eq!(map_list(&v, "search")[0].ready_at, None);
     }
 }

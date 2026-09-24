@@ -38,6 +38,26 @@ query($q: String!, $first: Int!, $after: String) {
     nodes {
       ... on PullRequest {
         id number title url isDraft createdAt updatedAt
+        # When it became ready for review (#1407), which is `createdAt`
+        # only for a pull request that was never a draft. Filtered to the
+        # one event type and paged `last: 1`, because `map.rs`'s
+        # `ready_at` reads the LAST node as the ready time.
+        #
+        # No `totalCount`: the page is the latest event by construction,
+        # so there is no truncation to report.
+        #
+        # MEASURED free, 2026-09-24, this document extracted with its `#`
+        # comment lines stripped, `gh api graphql -F first=25`, before
+        # and after adding this line, three runs each: cost 2 before and
+        # 2 after on `author:@me`, `review-requested:@me`,
+        # `repo:kubernetes/kubernetes` and `repo:vercel/next.js`, and 2
+        # and 2 on those two repositories plus rust-lang/rust and
+        # microsoft/vscode in one search. Wall clock moved within the
+        # run-to-run spread (6.8-8.8s after against 7.4-8.8s before on
+        # kubernetes/kubernetes). `MEASURED_COST` in `poll.rs` stands.
+        timelineItems(itemTypes: [READY_FOR_REVIEW_EVENT], last: 1) {
+          nodes { ... on ReadyForReviewEvent { createdAt } }
+        }
         headRefName headRefOid baseRefName
         headRef { id }
         author { login }
@@ -953,7 +973,11 @@ mod tests {
         // `commits`/`contexts` carry no count the UI renders, and the
         // check list's own total is selected in the DETAIL query where it
         // is shown.
-        const EXEMPT: [&str; 3] = ["reviewThreads", "commits", "contexts"];
+        //
+        // `timelineItems` is `last: 1` of one event type (#1407): the page
+        // IS the answer, the latest ready-for-review event, so there is no
+        // truncation for a count to reveal.
+        const EXEMPT: [&str; 4] = ["reviewThreads", "commits", "contexts", "timelineItems"];
 
         let mut rest = nodes;
         let mut checked = 0;
@@ -1552,6 +1576,58 @@ mod tests {
              qualifies. If the document genuinely needs none, add it to \
              NO_SHAPE_GUARD with a reason (#854).",
             unguarded.join("\n  ")
+        );
+    }
+
+    /// #1407: the list query asks for what `ready_at` reads, and ONLY the
+    /// ready-for-review event.
+    ///
+    /// The mapper tests feed `json!` literals that supply `timelineItems`
+    /// themselves, so dropping it from the document would leave them green
+    /// while every row read as UNKNOWN -- the #847 hole. And the mapper
+    /// takes the LAST node as "when it became ready", which is only true
+    /// while the connection is filtered to `READY_FOR_REVIEW_EVENT` and
+    /// paged `last: 1`: widen `itemTypes` and the last node could be a
+    /// label or a comment, dating the PR from that instead.
+    #[test]
+    fn the_list_query_asks_for_the_ready_for_review_event_only() {
+        let doc: String = PRS_QUERY
+            .replace("\r\n", "\n")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let nodes = doc
+            .split_once("... on PullRequest {")
+            .expect("the node selection")
+            .1;
+        for f in fields_read_by(&["ready_at"]) {
+            assert!(
+                nodes.contains(&f),
+                "`ready_at` reads `{f}` and PRS_QUERY does not select it; every \
+                 row would read as age unknown"
+            );
+        }
+        let args = nodes
+            .split_once("timelineItems(")
+            .expect("timelineItems is asked for")
+            .1
+            .split_once(')')
+            .expect("the connection closes")
+            .0;
+        assert!(
+            args.contains("itemTypes: [READY_FOR_REVIEW_EVENT]"),
+            "`timelineItems({args})` must be filtered to READY_FOR_REVIEW_EVENT \
+             alone: the mapper reads the last node as the ready time"
+        );
+        assert!(
+            args.contains("last: 1"),
+            "`timelineItems({args})` must take the LATEST event: a pull request \
+             marked ready, drafted again and re-marked became ready the second time"
+        );
+        assert!(
+            nodes.contains("... on ReadyForReviewEvent { createdAt }"),
+            "the event's own `createdAt` must be selected on the event fragment"
         );
     }
 }
