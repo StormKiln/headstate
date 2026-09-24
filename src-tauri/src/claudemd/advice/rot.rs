@@ -891,14 +891,19 @@ fn display(repo: &Path, path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
-/// Every symbol's whole-word hit count over the search roots, plus how
-/// many files were searched and what could not be listed.
-struct SymbolSearch {
-    hits: HashMap<String, usize>,
-    files_searched: usize,
-    unreadable: Vec<String>,
+/// Every symbol's whole-word hits over the search roots, plus how many
+/// files were searched and what could not be listed.
+///
+/// Shared with the placement check (#1398), which asks WHERE a name is
+/// used rather than whether it is, so the hits are the files, not a
+/// count.
+pub(crate) struct SymbolSearch {
+    /// Symbol -> every searched file with a whole-word hit, absolute.
+    pub(crate) files: HashMap<String, Vec<PathBuf>>,
+    pub(crate) files_searched: usize,
+    pub(crate) unreadable: Vec<String>,
     /// The roots walked, as named in a reason.
-    roots: Vec<String>,
+    pub(crate) roots: Vec<String>,
 }
 
 const SOURCE_ROOTS: &[&str] = &["src", "src-tauri/src", "src-mobile/src"];
@@ -916,9 +921,13 @@ const SOURCE_FILE_BOUND: u64 = 4 * 1024 * 1024;
 
 /// `dirs` are the directories of the CLAUDE.md files in the run. A root
 /// inside another root is dropped, so one tree is walked once.
-fn search_symbols(repo: &Path, names: &BTreeSet<String>, dirs: &[PathBuf]) -> SymbolSearch {
+pub(crate) fn search_symbols(
+    repo: &Path,
+    names: &BTreeSet<String>,
+    dirs: &[PathBuf],
+) -> SymbolSearch {
     let mut out = SymbolSearch {
-        hits: names.iter().map(|n| (n.clone(), 0)).collect(),
+        files: names.iter().map(|n| (n.clone(), Vec::new())).collect(),
         files_searched: 0,
         unreadable: Vec::new(),
         roots: Vec::new(),
@@ -994,9 +1003,9 @@ fn search_symbols(repo: &Path, names: &BTreeSet<String>, dirs: &[PathBuf]) -> Sy
                 }
             };
             out.files_searched += 1;
-            for (sym, n) in out.hits.iter_mut() {
+            for (sym, files) in out.files.iter_mut() {
                 if has_whole_word(&text, sym) {
-                    *n += 1;
+                    files.push(e.path());
                 }
             }
         }
@@ -1701,7 +1710,7 @@ impl<'a> Resolver<'a> {
 
     fn symbol(&mut self, last: &str) -> Result<(), Refused> {
         let s = &self.symbols;
-        let hits = s.hits.get(last).copied().unwrap_or(0);
+        let hits = s.files.get(last).map_or(0, Vec::len);
         if hits > 0 {
             return Ok(());
         }
