@@ -183,6 +183,12 @@ fn gaps_suggestion(f: &Finding) -> String {
                 again; until then no CLAUDE.md or rule is suggested for the directories listed."
             .to_string();
     }
+    if f.severity == Severity::Unknown && f.finding.contains("whether git ignores") {
+        return "No edit. Make git runnable in this repository and run the advice again; until \
+                then no CLAUDE.md is suggested for the directories listed, since any of them \
+                may be build output git ignores."
+            .to_string();
+    }
     if f.severity == Severity::Unknown {
         return format!(
             "Make `{dir}` listable, or add it to the CLAUDE.md walk's skip list if it holds no \

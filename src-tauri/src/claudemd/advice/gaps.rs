@@ -18,8 +18,9 @@
 //! Every fact comes from [`DirFacts`], which `claudemd::scan_repo` records
 //! inside the loop that finds the CLAUDE.md files. There is no second
 //! walk: #1236 halved that walk's cost once, and this producer adds one
-//! file read per `Cargo.toml` or `package.json` it passes and nothing
-//! else. `packages::detect::ecosystems` was the intended source of the
+//! file read per `Cargo.toml` or `package.json` it passes, and one git
+//! process per run for what git ignores (below), and nothing else.
+//! `packages::detect::ecosystems` was the intended source of the
 //! manifest signal and was rejected after reading and measuring it: per
 //! directory it lists the directory twice more (`has_project_file`,
 //! `has_xcode_spm`) and walks three levels under it for Terraform locks.
@@ -33,8 +34,9 @@
 //! # Candidate, strong, weak
 //!
 //! A candidate is a directory, not the root, with at least one signal,
-//! no CLAUDE.md on the path from it up to (excluding) the root, and no
-//! rule whose `paths:` scopes it (below). The root
+//! no CLAUDE.md on the path from it up to (excluding) the root, no rule
+//! whose `paths:` scopes it, and not under a directory git ignores (both
+//! below). The root
 //! file covers nothing below it by itself, or every repository with one
 //! root file would pass. A directory the walk could not list, or anything
 //! under one, is never a candidate: it is an Unknown finding instead.
@@ -122,6 +124,27 @@
 //! did not already cover, as one [`Severity::Unknown`] naming them: any
 //! of them might be covered by the rule that was not read.
 //!
+//! # A directory git ignores is no candidate
+//!
+//! A build cache can hold a manifest: `.angular/cache/<version>/<app>/
+//! vite/deps/` holds a `package.json`, and was suggested a CLAUDE.md on a
+//! real repository (#1377). The walk's `SKIP` names known heavy
+//! directories to save walk cost; it cannot name every tool's cache, and
+//! adding names to it is not how this is decided. [`ignored_dirs`] asks
+//! git once per run (`git ls-files --others --ignored --exclude-standard
+//! --directory`, through the worktree scan's runner and its timeout), and
+//! a candidate that is, or is under, a listed directory is dropped. A
+//! directory git ignores but that holds a tracked file is not listed, so
+//! it stays a candidate: tracked content is source.
+//!
+//! A root with no `.git` has no ignore rules, and git is not asked: the
+//! candidates are what they were. A git that could not run, did not
+//! answer in time, failed, or answered and complained on stderr leaves
+//! every candidate undecided, since any of them might be ignored: they
+//! are withheld as one [`Severity::Unknown`] naming them, as an
+//! unreadable rule withholds them, never stated as if git had said
+//! "nothing is ignored" (#1050).
+//!
 //! # Deliberately out of scope
 //!
 //! `AGENTS.md` changes what "covered" means -- it is read only where
@@ -158,35 +181,122 @@ impl Producer for Gaps {
     }
 
     fn run(&self, cx: &Context) -> Result<Vec<Finding>, String> {
-        // The edited signal, from the store when there is one. A query
-        // that fails is reported beside the candidates rather than
-        // treated as "nothing edited": the two look the same in a list.
-        let (edited, unavailable) = match cx.conn {
-            None => (Vec::new(), None),
-            Some(conn) => match super::transcripts::edited_dirs(conn, cx.repo) {
-                Ok(dirs) => (dirs, None),
-                Err(why) => (Vec::new(), Some(why)),
-            },
-        };
-        let mut out = gaps(&cx.scan.repo, &edited)?;
-        if let Some(why) = unavailable {
-            let repo = cx.repo.to_string_lossy().to_string();
-            out.push(Finding::new(
-                Check::Gaps,
-                Severity::Unknown,
-                Subject::Directory { path: repo.clone() },
-                vec![Evidence {
-                    at: Locator::File {
-                        path: repo,
-                        line: None,
-                    },
-                    measured: why.clone(),
-                }],
-                format!("session-edit signal unavailable: {why}"),
-            ));
-        }
-        Ok(out)
+        run_with_git(cx, crate::auth::git_program())
     }
+}
+
+/// [`Producer::run`] with the git binary injected, so a test can prove
+/// what a git that cannot answer produces.
+fn run_with_git(cx: &Context, git: &Path) -> Result<Vec<Finding>, String> {
+    // The edited signal, from the store when there is one. A query
+    // that fails is reported beside the candidates rather than
+    // treated as "nothing edited": the two look the same in a list.
+    let (edited, unavailable) = match cx.conn {
+        None => (Vec::new(), None),
+        Some(conn) => match super::transcripts::edited_dirs(conn, cx.repo) {
+            Ok(dirs) => (dirs, None),
+            Err(why) => (Vec::new(), Some(why)),
+        },
+    };
+    let ignored = ignored_dirs(git, cx.repo);
+    let mut out = gaps(&cx.scan.repo, &edited, &ignored)?;
+    if let Some(why) = unavailable {
+        let repo = cx.repo.to_string_lossy().to_string();
+        out.push(Finding::new(
+            Check::Gaps,
+            Severity::Unknown,
+            Subject::Directory { path: repo.clone() },
+            vec![Evidence {
+                at: Locator::File {
+                    path: repo,
+                    line: None,
+                },
+                measured: why.clone(),
+            }],
+            format!("session-edit signal unavailable: {why}"),
+        ));
+    }
+    Ok(out)
+}
+
+/// What git says the repository ignores, asked once per scan (#1377).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ignored {
+    /// No `.git` at the root: there are no ignore rules to honour, and
+    /// git is never asked.
+    NotARepository,
+    /// The directories git ignores, relative to the root, with `/`
+    /// separators and no trailing slash.
+    Dirs(Vec<String>),
+    /// Git was asked and could not say, in its own words.
+    Unknown(String),
+}
+
+impl Ignored {
+    /// Whether `rel` is, or is under, a directory git ignores.
+    fn covers(&self, rel: &str) -> bool {
+        match self {
+            Ignored::Dirs(dirs) => dirs.iter().any(|d| Path::new(rel).starts_with(d)),
+            Ignored::NotARepository | Ignored::Unknown(_) => false,
+        }
+    }
+}
+
+/// The directories git ignores under `root`: ONE `git ls-files --others
+/// --ignored --exclude-standard --directory`, through the worktree scan's
+/// runner and its timeout. `--directory` lists an ignored directory once
+/// rather than every file in it, so a large `node_modules` costs a line.
+///
+/// Every way git can fail to answer is [`Ignored::Unknown`], never an
+/// empty list: a git that did not answer did not say "nothing is
+/// ignored" (#1050). A listing that succeeded and complained on stderr
+/// ("could not open directory") listed less than the tree holds, and is
+/// Unknown too.
+pub fn ignored_dirs(git: &Path, root: &Path) -> Ignored {
+    use crate::worktrees::scan::git_output_with;
+    // A file for a linked worktree, a directory otherwise.
+    match root.join(".git").try_exists() {
+        Ok(false) => return Ignored::NotARepository,
+        Ok(true) => {}
+        Err(e) => return Ignored::Unknown(format!("whether `.git` exists could not be read: {e}")),
+    }
+    let out = match git_output_with(
+        git,
+        root,
+        &[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+        ],
+    ) {
+        Ok(out) => out,
+        Err(e) => return Ignored::Unknown(format!("git ls-files could not run: {e}")),
+    };
+    if !out.status.success() || !out.stderr.is_empty() {
+        return Ignored::Unknown(format!(
+            "git ls-files exit status {}: {}",
+            out.status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "none".into()),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ignored::Dirs(
+        out.stdout
+            .split(|b| *b == 0)
+            .filter_map(|entry| {
+                // A directory ends in `/`; an ignored FILE is listed too,
+                // and is no directory to drop.
+                let entry = String::from_utf8_lossy(entry);
+                entry.strip_suffix('/').map(str::to_string)
+            })
+            .filter(|d| !d.is_empty())
+            .collect(),
+    )
 }
 
 /// How sure a candidate is.
@@ -418,11 +528,19 @@ fn signals_of(f: &DirFacts, root: &Path, edited: &[PathBuf]) -> (Vec<String>, Op
 /// Unknown per directory the walk could not list and per manifest whose
 /// members could not be read.
 ///
-/// `edited` is the transcripts producer's `edited_dirs`; see the module
-/// docs.
-pub fn gaps(scan: &Scan, edited: &[PathBuf]) -> Result<Vec<Finding>, String> {
+/// `edited` is the transcripts producer's `edited_dirs`, and `ignored`
+/// is [`ignored_dirs`]; see the module docs.
+pub fn gaps(scan: &Scan, edited: &[PathBuf], ignored: &Ignored) -> Result<Vec<Finding>, String> {
     let found = candidates(scan, edited)?;
     let mut out = Vec::new();
+
+    // #1377: a directory git ignores is build output or a tool's cache,
+    // not a place a session works. Dropped before anything else is said
+    // about it.
+    let found: Vec<Gap> = found
+        .into_iter()
+        .filter(|g| !ignored.covers(&g.rel))
+        .collect();
 
     // #1340: a candidate a rule's `paths:` scopes is covered. `candidates`
     // has already proven the root is in the facts.
@@ -440,7 +558,15 @@ pub fn gaps(scan: &Scan, edited: &[PathBuf]) -> Result<Vec<Finding>, String> {
     if !rules.unreadable.is_empty() && !found.is_empty() {
         out.push(rules_unknown(&root, &rules, &found));
     }
-    let found: Vec<Gap> = if rules.unreadable.is_empty() {
+    // A git that could not list what it ignores leaves every candidate
+    // undecided: any of them might be a build cache (#1377).
+    if let Ignored::Unknown(why) = ignored {
+        if !found.is_empty() {
+            out.push(ignored_unknown(&root, why, &found));
+        }
+    }
+    let found: Vec<Gap> = if rules.unreadable.is_empty() && !matches!(ignored, Ignored::Unknown(_))
+    {
         found
     } else {
         Vec::new()
@@ -715,6 +841,41 @@ fn rules_unknown(root: &Path, rules: &Rules, found: &[Gap]) -> Finding {
                 .map(|u| format!("`{u}`"))
                 .collect::<Vec<_>>()
                 .join(", "),
+            found.len(),
+            if found.len() == 1 { "y" } else { "ies" },
+            names.join(", ")
+        ),
+    )
+}
+
+/// The Unknown for candidates git could not say it ignores: each is
+/// withheld, never stated (#1377).
+fn ignored_unknown(root: &Path, why: &str, found: &[Gap]) -> Finding {
+    let names: Vec<String> = found.iter().map(|g| format!("`{}/`", g.rel)).collect();
+    let at = root.to_string_lossy().to_string();
+    Finding::new(
+        Check::Gaps,
+        Severity::Unknown,
+        Subject::Directory { path: at.clone() },
+        vec![
+            Evidence {
+                at: Locator::File {
+                    path: at.clone(),
+                    line: None,
+                },
+                measured: why.to_string(),
+            },
+            Evidence {
+                at: Locator::File {
+                    path: at,
+                    line: None,
+                },
+                measured: format!("withheld: {}", names.join(", ")),
+            },
+        ],
+        format!(
+            "git could not list the directories it ignores ({why}), so whether git ignores \
+             {} candidate director{} ({}) is unknown",
             found.len(),
             if found.len() == 1 { "y" } else { "ies" },
             names.join(", ")
@@ -1071,7 +1232,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let found = gaps(&scan, &[]).unwrap();
+        let found = gaps(&scan, &[], &Ignored::NotARepository).unwrap();
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].severity, Severity::Unknown);
         assert!(candidates(&scan, &[]).unwrap().is_empty());
@@ -1325,6 +1486,104 @@ mod tests {
             f.finding
         );
         assert!(f.brief.contains("Make the rules named"), "{}", f.brief);
+    }
+
+    /// A git repository whose `.angular/` is ignored and whose `libs/y/`
+    /// is not: one manifest under each, in a tree with no root file.
+    /// `.angular` and not the issue's `.cache`: `.cache` is in the walk's
+    /// `SKIP`, so it never reaches this check and could prove nothing.
+    fn ignored_fixture() -> tempfile::TempDir {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        write(
+            &r.join(".angular")
+                .join("cache")
+                .join("x")
+                .join("package.json"),
+            "{}",
+        );
+        write(&r.join("libs").join("y").join("package.json"), "{}");
+        write(&r.join(".gitignore"), ".angular/\n");
+        let ok = std::process::Command::new(crate::auth::git_program())
+            .arg("-C")
+            .arg(r)
+            .args(["init", "-q"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "git init");
+        t
+    }
+
+    fn gaps_with_git(repo: &Path, git: &Path) -> Vec<Finding> {
+        let scan = scan_effective_opt(repo, None);
+        let cx = Context {
+            repo,
+            home: None,
+            scan: &scan,
+            definitions: None,
+            conn: None,
+        };
+        run_with_git(&cx, git).unwrap()
+    }
+
+    /// #1377's test: a directory git ignores is a build cache, not a
+    /// place a session works, and is no candidate; an unignored sibling
+    /// with the same manifest still is. Sabotage-proven: with the
+    /// ignored filter dropped, `.angular/cache/x/` is a strong finding.
+    #[test]
+    fn a_directory_git_ignores_is_never_a_gap() {
+        let t = ignored_fixture();
+        // Without git's answer the cache IS a candidate, so what follows
+        // is the filter's doing and not the walk's.
+        let scan = scan_effective_opt(t.path(), None);
+        let unfiltered = gaps(&scan.repo, &[], &Ignored::NotARepository).unwrap();
+        assert_eq!(unfiltered.len(), 2, "{unfiltered:#?}");
+
+        let found = gaps_with_git(t.path(), crate::auth::git_program());
+        let paths: Vec<&str> = found.iter().map(|f| f.subject.path()).collect();
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(paths[0].ends_with("y"), "{paths:?}");
+        assert_eq!(found[0].severity, Severity::Advice);
+    }
+
+    /// A git that cannot answer does not say "nothing is ignored": every
+    /// candidate is withheld as one Unknown naming them, and no Advice
+    /// row is stated (#1050).
+    #[test]
+    fn a_git_that_cannot_list_ignored_directories_withholds_the_candidates() {
+        let t = ignored_fixture();
+        let missing = t.path().join("no-such-git");
+        let found = gaps_with_git(t.path(), &missing);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        let f = &found[0];
+        assert_eq!(f.severity, Severity::Unknown);
+        assert!(
+            f.finding.ends_with(
+                "so whether git ignores 2 candidate directories (`.angular/cache/x/`, \
+                 `libs/y/`) \
+                 is unknown"
+            ),
+            "{}",
+            f.finding
+        );
+        assert!(
+            f.brief
+                .contains("Suggested change: No edit. Make git runnable"),
+            "{}",
+            f.brief
+        );
+    }
+
+    /// A repository with no `.git` has no ignore rules, so git is never
+    /// asked: a git that would fail changes nothing.
+    #[test]
+    fn a_directory_without_git_never_asks_git() {
+        let t = fixture();
+        let missing = t.path().join("no-such-git");
+        let found = gaps_with_git(t.path(), &missing);
+        assert_eq!(found.len(), 3, "{found:#?}");
+        assert!(found.iter().all(|f| f.severity == Severity::Advice));
     }
 
     /// The threshold is a boundary: nine test files is no signal, ten is
