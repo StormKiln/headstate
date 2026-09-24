@@ -34,6 +34,15 @@ export interface PullRequest {
   head_ref_id: string | null;
   base_ref: string;
   created_at: string;
+  /// When it became ready for review (#1407): the latest ready-for-review
+  /// event, or `created_at` for one that was never a draft -- the same
+  /// moment, not a fallback.
+  ///
+  /// `null` is UNKNOWN (current draft, a time GitHub did not return or
+  /// that did not parse). OPTIONAL because a snapshot cached by an older
+  /// build, or a payload from an older desktop to the companion, has no
+  /// such key. Both render as "age unknown", never as zero.
+  ready_at?: string | null;
   updated_at: string;
   ci: CiState;
   merge: MergeState;
