@@ -1,10 +1,9 @@
-import { useRef, useState } from "react";
+import { type ReactNode, useRef, useState } from "react";
 import { toast } from "sonner";
 import { useClaudeMdAdvice, useUiPrefs } from "@/api/hooks";
 import type {
   ClaudeMdAdviceCoverage,
   ClaudeMdAdviceFinding,
-  ClaudeMdAdviceLocator,
   ClaudeMdAdviceReport,
   ClaudeMdAdviceResult,
   ClaudeMdAdviceSubject,
@@ -15,11 +14,19 @@ import {
   OBSERVATIONS_KEY,
   type AdviceGroup,
   type AdviceGrouping,
-  REPOSITORY_ROOT,
   groupFindings,
   isAdvice,
-  isRepositoryRoot,
 } from "@/lib/adviceGrouping";
+import {
+  SEVERITY_LABEL,
+  groupCounts,
+  groupHeading,
+  locatorText,
+  severityCount,
+  subjectText,
+} from "@/lib/adviceText";
+import { groupMarkdown, reportMarkdown } from "@/lib/adviceMarkdown";
+import { copyText } from "@/lib/clipboard";
 import type { Filters } from "@/lib/derive";
 import { useActiveFilters, useFilters } from "@/store/filters";
 import { adviceState, needsRefresh, type AdviceState } from "@/lib/adviceState";
@@ -42,54 +49,22 @@ const GROUPING_OPTIONS: { value: AdviceGrouping; label: string }[] = [
   { value: "none", label: "Flat (worst first)" },
 ];
 
-/// What each severity is called, and how it is coloured.
+/// How each severity is coloured. What it is CALLED is `SEVERITY_LABEL`,
+/// shared with the markdown the panel copies (#1399). Paths are shortened
+/// by `adviceText` too, for the same reason: one implementation, so the
+/// paste reads as the panel does.
 ///
-/// `unknown` gets its own word and its own colour, never a muted version
-/// of anything: "could not decide" rendered quietly is how an unchecked
-/// thing becomes a cleared one in a reader's head (#1042).
-const SEVERITY: Record<ClaudeMdAdviceFinding["severity"], { label: string; className: string }> = {
-  problem: { label: "problem", className: "text-[#f85149]" },
-  advice: { label: "advice", className: "text-[#d29922]" },
-  unknown: { label: "could not decide", className: "text-[#d29922]" },
+/// `unknown` gets its own colour, never a muted version of anything:
+/// "could not decide" rendered quietly is how an unchecked thing becomes
+/// a cleared one in a reader's head (#1042).
+const SEVERITY_CLASS: Record<ClaudeMdAdviceFinding["severity"], string> = {
+  problem: "text-[#f85149]",
+  advice: "text-[#d29922]",
+  unknown: "text-[#d29922]",
   // Grey: an observation is neither a warning nor a pass (#1339). Green
   // would read as "all clear", amber as something to act on.
-  note: { label: "observation", className: "text-[#8b949e]" },
+  note: "text-[#8b949e]",
 };
-
-/// A path as the row shows it: relative to the repository when it is
-/// inside it, absolute otherwise. Display only; the wire keeps absolute
-/// paths, and the brief prints them as the backend rendered them.
-///
-/// The repository itself is [`REPOSITORY_ROOT`], never the empty string
-/// its shortening would leave (#1366).
-function shown(path: string, repo: string): string {
-  if (isRepositoryRoot(path, repo)) return REPOSITORY_ROOT;
-  // Inside the repository only at a separator boundary (#1387). A bare
-  // prefix test shortened `<repo>-other/CLAUDE.md`, a sibling that merely
-  // shares the name, to the fragment `-other/CLAUDE.md`. Either separator,
-  // because a Windows root arrives with `\`.
-  const base = repo.replace(/[/\\]+$/, "");
-  const rest = path.slice(base.length);
-  return base !== "" && path.startsWith(base) && /^[/\\]/.test(rest)
-    ? rest.replace(/^[/\\]+/, "")
-    : path;
-}
-
-/// A directory subject as the row shows it: shortened, with the trailing
-/// slash that says no file exists there yet -- except the repository
-/// itself, which would otherwise read as a bare `/` (#1366).
-function shownDir(path: string, repo: string): string {
-  return isRepositoryRoot(path, repo) ? REPOSITORY_ROOT : `${shown(path, repo)}/`;
-}
-
-function locatorText(at: ClaudeMdAdviceLocator, repo: string): string {
-  if (at.kind === "file") {
-    // A line ONLY when the backend recorded one. `:0` or a guessed line
-    // would send the reader to a confident wrong place.
-    return at.line === null ? shown(at.path, repo) : `${shown(at.path, repo)}:${at.line}`;
-  }
-  return at.record === null ? `session ${at.sessionId}` : `session ${at.sessionId} record ${at.record}`;
-}
 
 /// The file a subject names, when it names one the page can open.
 function subjectFile(s: ClaudeMdAdviceSubject): string | null {
@@ -265,6 +240,19 @@ function AdviceBody({
   onRefresh: () => void;
   onRetry: () => void;
 }) {
+  const grouping = useAdviceGrouping();
+  // "Copy all as markdown" (#1399), on the top line of any report on
+  // screen -- including one kept over a failed refresh, whose findings
+  // are real. It copies what is shown, in the arrangement shown, with the
+  // same currency claim the line beside it makes.
+  const copyAll = (result: ClaudeMdAdviceResult, refreshing: boolean) => (
+    <CopyMarkdownButton
+      label="Copy all as markdown"
+      findings={result.report.findings.length}
+      unknownChecks={result.report.checks.filter((c) => c.run.state === "unknown").length}
+      markdown={() => reportMarkdown(result, repo, grouping, refreshing)}
+    />
+  );
   switch (state.kind) {
     // Never asked. Reachable only with no repository selected, which the
     // page handles before it renders this -- but it is a real member of
@@ -289,7 +277,12 @@ function AdviceBody({
               happened; the label on the report says how old it is. */}
           {state.stale !== undefined ? (
             <div className="mt-2">
-              <Freshness result={state.stale} refreshing={false} onRefresh={onRefresh} />
+              <Freshness
+                result={state.stale}
+                refreshing={false}
+                onRefresh={onRefresh}
+                copy={copyAll(state.stale, false)}
+              />
               <ReportView
                 report={state.stale.report}
                 repo={repo}
@@ -307,6 +300,7 @@ function AdviceBody({
             result={state.result}
             refreshing={state.refreshing}
             onRefresh={onRefresh}
+            copy={copyAll(state.result, state.refreshing)}
           />
           <ReportView
             report={state.result.report}
@@ -335,10 +329,13 @@ function Freshness({
   result,
   refreshing,
   onRefresh,
+  copy,
 }: {
   result: ClaudeMdAdviceResult;
   refreshing: boolean;
   onRefresh: () => void;
+  /// "Copy all as markdown", beside Re-check.
+  copy: ReactNode;
 }) {
   const label = freshnessLabel(result.freshness, result.computedAt, refreshing);
   const tone = {
@@ -363,6 +360,7 @@ function Freshness({
       >
         {refreshing ? "Re-checking…" : "Re-check"}
       </button>
+      {copy}
     </div>
   );
 }
@@ -431,13 +429,8 @@ function ReportView({
   const n = report.findings.filter(isAdvice).length;
   const notes = report.findings.length - n;
 
-  // The grouping preference, from the per-view filter store where every
-  // other view preference lives (#1291). Absent means by check, the
-  // default since #1344: a flat stream of a thousand findings is the
-  // thing that issue says is unusable.
-  const { adviceGrouping } = useActiveFilters();
   const setFilter = useFilters((s) => s.setFilter);
-  const grouping: AdviceGrouping = adviceGrouping ?? "check";
+  const grouping = useAdviceGrouping();
 
   // Partitioned, never re-sorted within a group. `groupFindings` states
   // the two orderings and why they differ.
@@ -572,6 +565,69 @@ function ReportView({
   );
 }
 
+/// The grouping preference, from the per-view filter store where every
+/// other view preference lives (#1291). Absent means by check, the
+/// default since #1344: a flat stream of a thousand findings is the
+/// thing that issue says is unusable.
+///
+/// A hook rather than a line in `ReportView` because "Copy all as
+/// markdown" sits above it and copies in the same arrangement (#1399).
+function useAdviceGrouping(): AdviceGrouping {
+  return useActiveFilters().adviceGrouping ?? "check";
+}
+
+/// Copy some of the report as markdown (#1399): a whole group, or all of
+/// it. The same look as Copy brief and Re-check.
+///
+/// The markdown is built on click, not on render: a report of a thousand
+/// findings is rendered far more often than it is copied. `copyText`
+/// reports the no-clipboard case, and the toast is what makes the click
+/// visible either way -- never a silent failure.
+function CopyMarkdownButton({
+  label,
+  accessibleName,
+  findings,
+  unknownChecks,
+  markdown,
+  className = "",
+}: {
+  label: string;
+  /// Only where `label` alone would be ambiguous. It must START with the
+  /// visible label, so a voice user can say what they see.
+  accessibleName?: string;
+  findings: number;
+  unknownChecks: number;
+  markdown: () => string;
+  className?: string;
+}) {
+  return (
+    <button
+      type="button"
+      aria-label={accessibleName}
+      onClick={() => {
+        void copyText(markdown()).then((failure) => {
+          if (failure !== null) {
+            toast.error("Could not copy the markdown", { description: failure });
+            return;
+          }
+          // A check that could not run is part of what was copied, and
+          // "0 findings" alone would read as a clean result.
+          const unrun =
+            unknownChecks === 0
+              ? ""
+              : ` ${unknownChecks === 1 ? "One check" : `${unknownChecks} checks`} that could not run ${unknownChecks === 1 ? "is" : "are"} included.`;
+          toast.success(`Copied ${findings} ${findings === 1 ? "finding" : "findings"} as markdown`, {
+            description: `Paste it into a Claude session to review it.${unrun}`,
+          });
+        });
+      }}
+      className={`tap-target text-left text-[11px] text-[#58a6ff] hover:underline ${className}`}
+    >
+      {label}
+    </button>
+  );
+}
+
 /// How many findings a report may hold before its groups open collapsed
 /// (#1344). Roughly a screenful of rows at the panel's density; past it,
 /// the headings are the useful first view.
@@ -579,17 +635,6 @@ const COLLAPSE_OVER = 25;
 
 function reason(c: ClaudeMdAdviceCoverage): string {
   return c.run.state === "unknown" ? c.run.reason : "";
-}
-
-/// The order a group's heading counts severities in: worst first, the
-/// same rank the backend sorts by.
-const SEVERITY_ORDER: ClaudeMdAdviceFinding["severity"][] = ["problem", "advice", "unknown", "note"];
-
-/// "1 problem", "2 advice", "3 could not decide", "4 observations".
-function severityCount(severity: ClaudeMdAdviceFinding["severity"], count: number): string {
-  const label = SEVERITY[severity].label;
-  const plural = count !== 1 && (severity === "problem" || severity === "note");
-  return `${count} ${label}${plural ? "s" : ""}`;
 }
 
 /// One group: a heading that opens and closes it, any check that could
@@ -630,24 +675,18 @@ function GroupSection({
   /// group does not hold the wire list.
   wireIndex: (f: ClaudeMdAdviceFinding) => number;
 }) {
-  // Shortened against the repository root when the label leads with a
-  // path, whatever the subject kind -- a directory has a path to shorten
-  // and deliberately no file to open, so `file !== null` is the wrong
-  // test. A by-check label has no path and is printed as written.
-  const heading =
-    group.pathLength === 0
-      ? group.label
-      : shown(group.label.slice(0, group.pathLength), repo) + group.label.slice(group.pathLength);
-  // The counts are of findings only. An Unknown check is not a finding,
-  // and counting it as one would say the producer found something when it
-  // could not look.
-  const counts = SEVERITY_ORDER.map(
-    (s) => [s, group.findings.filter((f) => f.severity === s).length] as const,
-  ).filter(([, c]) => c > 0);
+  const heading = groupHeading(group, repo);
+  const counts = groupCounts(group);
   return (
-    <section className={labelled ? "@container border-l border-[#21262d] pl-2" : "@container"}>
+    <section
+      className={labelled ? "@container relative border-l border-[#21262d] pl-2" : "@container"}
+    >
       {labelled ? (
-        <h3 className="text-[11px] font-semibold text-[#8b949e]">
+        // Room on the right for the copy button, which sits BESIDE the
+        // toggle rather than inside it: inside, a click on it would also
+        // open or close the group, and its text would join the heading's
+        // accessible name.
+        <h3 className="pr-36 text-[11px] font-semibold text-[#8b949e]">
           <button
             type="button"
             onClick={onToggle}
@@ -658,7 +697,7 @@ function GroupSection({
             <span className="flex min-w-0 flex-wrap items-baseline gap-x-2">
               <span className="break-words">{heading}</span>
               {counts.map(([s, c], i) => (
-                <span key={s} className={`font-normal ${SEVERITY[s].className}`}>
+                <span key={s} className={`font-normal ${SEVERITY_CLASS[s]}`}>
                   {severityCount(s, c)}
                   {i < counts.length - 1 ? "," : ""}
                 </span>
@@ -666,6 +705,20 @@ function GroupSection({
             </span>
           </button>
         </h3>
+      ) : null}
+      {labelled ? (
+        // "Copy group as markdown" (#1399). After the heading in the DOM,
+        // so a screen reader meets the group's name first; drawn at the
+        // heading's right. Named with the group, because a list of eight
+        // identically named buttons tells a screen-reader user nothing.
+        <CopyMarkdownButton
+          label="Copy group as markdown"
+          accessibleName={`Copy group as markdown: ${heading}`}
+          findings={group.findings.length}
+          unknownChecks={group.unknownChecks.length}
+          markdown={() => groupMarkdown(group, repo)}
+          className="absolute top-0 right-0 whitespace-nowrap"
+        />
       ) : null}
 
       {/* Shown collapsed or not: a heading with nothing under it reads
@@ -796,7 +849,6 @@ function FindingRow({
 }) {
   const [showEvidence, setShowEvidence] = useState(false);
   const [showRun, setShowRun] = useState(false);
-  const severity = SEVERITY[finding.severity];
   const file = subjectFile(finding.subject);
   const td = "px-1 py-1 align-top";
   const columns = claudifyColumn ? 5 : 4;
@@ -805,7 +857,9 @@ function FindingRow({
       <tr className="border-t border-[#21262d] @max-xl:flex @max-xl:flex-wrap @max-xl:items-baseline @max-xl:gap-x-2">
         {/* Severity in TEXT as well as colour: colour alone is not an
             answer for a reader who cannot see it. */}
-        <td className={`${td} ${severity.className}`}>[{severity.label}]</td>
+        <td className={`${td} ${SEVERITY_CLASS[finding.severity]}`}>
+          [{SEVERITY_LABEL[finding.severity]}]
+        </td>
         <td className={`${td} break-words @max-xl:min-w-0 @max-xl:flex-1`}>
           <span className="text-xs text-[#e6edf3]">{finding.finding}</span>
           {finding.evidence.length > 0 ? (
@@ -844,14 +898,11 @@ function FindingRow({
                 file === activePath ? "bg-[#1f6feb] text-white" : "text-[#58a6ff] hover:bg-[#161b22]"
               }`}
             >
-              {shown(file, repo)}
-              {finding.subject.kind === "claudeMd" && finding.subject.section !== null
-                ? ` ${finding.subject.section}`
-                : ""}
+              {subjectText(finding.subject, repo)}
             </button>
           ) : (
             <span className="wrap-anywhere font-mono text-[#8b949e]">
-              {shownDir(finding.subject.path, repo)}
+              {subjectText(finding.subject, repo)}
             </span>
           )}
         </td>
