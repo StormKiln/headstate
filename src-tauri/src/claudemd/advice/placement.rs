@@ -47,6 +47,26 @@
 //! example path is under the floor. All three are suppressed, and the
 //! root file scores clean, which the design requires.
 //!
+//! # Patterns vote for what they spell literally
+//!
+//! A token with `<placeholder>` segments or `{a,b}` braces is a path
+//! pattern, which `refs` does not classify as a path; dropping it
+//! silently claimed "only" on an incomplete set (#1373). The handling is
+//! confined to this module, so rot and skills read `refs` unchanged.
+//! Braces expand one level into ordinary candidates (`tools/{a,b}.mjs`
+//! is `tools/a.mjs` and `tools/b.mjs`). A `<placeholder>` segment votes
+//! for its literal prefix as a directory (`apps/<app>/x.json` votes
+//! `apps/`), never for anything under the placeholder. A path-shaped
+//! token that still cannot be judged -- a placeholder with no literal
+//! prefix, nested, unbalanced or comma-less braces -- means the section
+//! is not "only" anything, and the finding is suppressed. `<…>` that is
+//! not a well-formed `<name>` segment (HTML, generics) is not a pattern
+//! and is ignored, as before. Globs (`*`) are not read as patterns.
+//!
+//! The suggestion also says what a path-scoped placement fits: guidance
+//! tied to editing those files, not a rule for a situation such as "when
+//! a check fails". It is said, not detected.
+//!
 //! # A repository with path-scoped rules is offered one
 //!
 //! A nested CLAUDE.md is not the only lazily loaded target: a rule in
@@ -251,16 +271,35 @@ fn is_rules_dir(path: &str) -> bool {
     path.ends_with("/.claude/rules")
 }
 
-/// The path candidates a section names, deduplicated, `:line` stripped.
+/// The path candidates a section names, deduplicated, `:line` stripped,
+/// and the path-shaped tokens that could not be judged (#1373).
 ///
-/// Three sources: spans classified as paths by `refs::extract` (a span
+/// Four sources: spans classified as paths by `refs::extract` (a span
 /// must look like a path; `make lint` is not one), `@imports` through
-/// `parse_imports`, and bare prose tokens containing a `/`.
-fn path_candidates(section: &Section) -> Vec<String> {
+/// `parse_imports`, bare prose tokens containing a `/`, and pattern
+/// tokens -- a span or a bare token with `<placeholder>` segments or
+/// `{a,b}` braces, which `refs` does not classify as a path.
+fn path_candidates(section: &Section) -> (Vec<String>, Vec<String>) {
     let mut out: Vec<String> = Vec::new();
+    let mut unjudged: Vec<String> = Vec::new();
     let mut push = |c: String| {
         if !c.is_empty() && !out.contains(&c) {
             out.push(c);
+        }
+    };
+    let mut take_pattern = |token: &str, push: &mut dyn FnMut(String)| -> bool {
+        match pattern(token) {
+            Some(Pattern::Candidates(cs)) => {
+                cs.into_iter().for_each(&mut *push);
+                true
+            }
+            Some(Pattern::Unjudged) => {
+                if !unjudged.iter().any(|u| u == token) {
+                    unjudged.push(token.to_string());
+                }
+                true
+            }
+            None => false,
         }
     };
     for r in refs::extract(&section.text) {
@@ -269,17 +308,139 @@ fn path_candidates(section: &Section) -> Vec<String> {
             _ => {}
         }
     }
+    for span in text::spans(&section.text) {
+        take_pattern(&span.text, &mut push);
+    }
     for import in parse_imports(&section.text) {
         push(import);
     }
     for (_, line) in text::prose_lines(&section.text) {
         for token in line.split_whitespace() {
+            let t = token
+                .trim_start_matches(['(', '[', '"', '\'', '*', '_'])
+                .trim_end_matches([')', ']', '"', '\'', '*', '_', ',', '.', ';', ':', '!', '?']);
+            if take_pattern(t, &mut push) {
+                continue;
+            }
             if let Some(c) = bare_path(token) {
                 push(c);
             }
         }
     }
-    out
+    (out, unjudged)
+}
+
+/// What a pattern token contributes to a section's votes (#1373).
+#[derive(Debug, PartialEq, Eq)]
+enum Pattern {
+    /// Brace alternatives as ordinary paths, and for a placeholder the
+    /// literal prefix before it, as a directory.
+    Candidates(Vec<String>),
+    /// Path-shaped, but nothing a vote can be cast for: the section is
+    /// not "only" anything.
+    Unjudged,
+}
+
+/// The characters a pattern token is spelled with: a path's, plus
+/// `<>{},` and a trailing `:line`.
+static PATTERN_TOKEN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_./:<>{},-]+$").unwrap());
+/// One path segment whose `<…>` are all well-formed placeholders.
+static PLACEHOLDER_SEGMENT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_.-]*(?:<[A-Za-z0-9_-]+>[A-Za-z0-9_.-]*)+$").unwrap());
+/// More alternatives than this is not a path list anybody wrote.
+const MAX_ALTERNATIVES: usize = 64;
+
+/// A token with `<placeholder>` segments or `{a,b}` braces, read as a
+/// path pattern. `None` when it is not one: no pattern characters, no
+/// `/`, a URL, or `<…>` that is not a well-formed placeholder (HTML,
+/// generics), so prose that only looks like markup is never judged.
+fn pattern(token: &str) -> Option<Pattern> {
+    if !token.contains(['<', '>', '{', '}'])
+        || !token.contains('/')
+        || token.contains("//")
+        || !PATTERN_TOKEN.is_match(token)
+    {
+        return None;
+    }
+    let alternatives = match expand_braces(token) {
+        Some(a) => a,
+        // Braces that do not expand one level: path-shaped, unjudged.
+        None => {
+            return token
+                .split('/')
+                .all(placeholders_well_formed)
+                .then_some(Pattern::Unjudged)
+        }
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut unjudged = false;
+    for alt in alternatives {
+        let alt = strip_line(&alt);
+        let segments: Vec<&str> = alt.split('/').collect();
+        if !segments.iter().all(|s| placeholders_well_formed(s)) {
+            return None;
+        }
+        let candidate = match segments.iter().position(|s| s.contains('<')) {
+            None => alt.clone(),
+            Some(i) => {
+                let prefix = segments[..i].join("/");
+                if prefix.trim_matches('/').is_empty() || prefix == "." || prefix == ".." {
+                    unjudged = true;
+                    continue;
+                }
+                format!("{prefix}/")
+            }
+        };
+        if !out.contains(&candidate) {
+            out.push(candidate);
+        }
+    }
+    Some(if unjudged {
+        Pattern::Unjudged
+    } else {
+        Pattern::Candidates(out)
+    })
+}
+
+/// A segment with no `<>`, or whose `<>` are all `<name>` placeholders.
+fn placeholders_well_formed(segment: &str) -> bool {
+    !segment.contains(['<', '>']) || PLACEHOLDER_SEGMENT.is_match(segment)
+}
+
+/// Every `{a,b}` group expanded, one level: `None` for a nested,
+/// unbalanced or comma-less group, or too many alternatives.
+fn expand_braces(token: &str) -> Option<Vec<String>> {
+    let mut out = vec![String::new()];
+    let mut rest = token;
+    while let Some(open) = rest.find(['{', '}']) {
+        if rest[open..].starts_with('}') {
+            return None;
+        }
+        let literal = &rest[..open];
+        let after = &rest[open + 1..];
+        let close = after.find(['{', '}'])?;
+        if after[close..].starts_with('{') {
+            return None;
+        }
+        let group: Vec<&str> = after[..close].split(',').collect();
+        if group.len() < 2 {
+            return None;
+        }
+        out = out
+            .iter()
+            .flat_map(|head| group.iter().map(move |g| format!("{head}{literal}{g}")))
+            .collect();
+        if out.len() > MAX_ALTERNATIVES {
+            return None;
+        }
+        rest = &after[close + 1..];
+    }
+    Some(
+        out.into_iter()
+            .map(|head| format!("{head}{rest}"))
+            .collect(),
+    )
 }
 
 /// A bare prose token that is a path: contains a `/`, is spelled like
@@ -430,6 +591,9 @@ struct Votes {
     elsewhere: Vec<String>,
     not_found: Vec<String>,
     unreadable: Vec<String>,
+    /// Path-shaped pattern tokens that could not be judged (#1373). Any
+    /// one of them means the section is not "only" anything.
+    unjudged: Vec<String>,
     /// How many distinct paths resolved, across every vote.
     distinct: usize,
 }
@@ -442,7 +606,9 @@ fn assess_section(
 ) -> Votes {
     let mut votes = Votes::default();
     let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
-    for candidate in path_candidates(section) {
+    let (candidates, unjudged) = path_candidates(section);
+    votes.unjudged = unjudged;
+    for candidate in candidates {
         match resolve(&candidate, file_dir, repo_root, home) {
             Resolved::Under { segment, path } => {
                 if seen.insert(path) {
@@ -542,7 +708,7 @@ fn assess(file: &Loaded, repo: &Path, home: Option<&Path>) -> Vec<Finding> {
         if votes.distinct < 2 || votes.under.len() != 1 {
             continue;
         }
-        if !votes.stay.is_empty() || !votes.elsewhere.is_empty() {
+        if !votes.stay.is_empty() || !votes.elsewhere.is_empty() || !votes.unjudged.is_empty() {
             continue;
         }
         let (segment, named) = votes.under.iter().next().expect("one segment");
@@ -848,6 +1014,13 @@ pub(crate) fn rule_file(rules: &str, dir: Option<&str>) -> String {
 pub(crate) const RULE_LOADS_LAZILY: &str = "A path-scoped rule, like a nested CLAUDE.md, \
      loads lazily: it does not hold before a session reads a file there.";
 
+/// What a path-scoped placement fits (#1373). Said, never detected:
+/// whether a rule is about editing those files or about a situation is
+/// the reader's call.
+const SCOPE_FITS: &str = "A path-scoped rule fits guidance tied to editing those files, not \
+     a rule for a situation such as \"when a check fails\", which has to hold wherever a \
+     session is working.";
+
 /// A probe that failed is not "no rules directory": say the question
 /// could not be checked. `what` is what the rule would hold.
 pub(crate) fn rules_unchecked(rules: &str, measured: &str, what: &str) -> String {
@@ -924,8 +1097,8 @@ pub(crate) fn suggestion(f: &Finding) -> String {
         if rules_exist(measured) {
             let rule = rule_file(rules, under_dir(&f.finding));
             let caveat = format!(
-                "{RULE_LOADS_LAZILY} If the section must hold from launch, leave it in \
-                 `{subject}`."
+                "{RULE_LOADS_LAZILY} {SCOPE_FITS} If the section must hold from launch, leave \
+                 it in `{subject}`."
             );
             return match target {
                 Some((target, _)) if target_missing => format!(
@@ -949,16 +1122,17 @@ pub(crate) fn suggestion(f: &Finding) -> String {
         Some((target, _)) if target_missing => format!(
             "Moving this section would need `{target}`, which does not exist. Whether to \
              create one is the missing-subdirectory-CLAUDE.md check's call, not this one's; \
-             until it exists, leave the section in `{subject}`."
+             until it exists, leave the section in `{subject}`. {SCOPE_FITS}"
         ),
         Some((target, _)) => {
             format!(
-                "Cut the section from `{subject}` and add it to `{target}`, which exists. {saving}"
+                "Cut the section from `{subject}` and add it to `{target}`, which exists. \
+                 {saving} {SCOPE_FITS}"
             )
         }
         None => format!(
             "Cut the section from `{subject}` and add it to the `CLAUDE.md` of the directory \
-             the finding names. {saving}"
+             the finding names. {saving} {SCOPE_FITS}"
         ),
     };
     match rules_probe(f) {
@@ -1706,6 +1880,145 @@ for either; the file exists because getting it wrong is easy.
         );
     }
 
+    /// A repository with `apps/web/`, `tools/a.mjs`, `tools/b.mjs` and
+    /// the root `CLAUDE.md` given.
+    fn apps_and_tools(claude_md: &str) -> tempfile::TempDir {
+        let t = tempfile::tempdir().unwrap();
+        fs::create_dir_all(t.path().join("apps").join("web")).unwrap();
+        fs::create_dir_all(t.path().join("tools")).unwrap();
+        fs::write(t.path().join("tools").join("a.mjs"), "").unwrap();
+        fs::write(t.path().join("tools").join("b.mjs"), "").unwrap();
+        fs::write(t.path().join("CLAUDE.md"), claude_md).unwrap();
+        t
+    }
+
+    /// #1373: a `<placeholder>` token with `{a,b,c}` braces votes for its
+    /// literal prefix, so a section naming it beside two `tools/` files
+    /// is not "only" `tools/`. The same section without it still fires,
+    /// and its suggestion says what a path-scoped rule fits.
+    #[test]
+    fn a_placeholder_pattern_votes_for_its_literal_prefix() {
+        let md = "# Root\n\n## Baselines\n\n`apps/<app>/scripts/{a,b,c}-baseline.json` are \
+                  the baselines; never loosen one. The checks are `tools/a.mjs` and \
+                  `tools/b.mjs`.\n";
+        let t = apps_and_tools(md);
+
+        let report = report_in(t.path(), None, None);
+        ran(&report);
+        assert!(placement(&report).is_empty(), "{report:?}");
+        let sections = text::sections(md);
+        let votes = assess_section(&sections[1], t.path(), Some(t.path()), None);
+        assert_eq!(
+            votes.under.keys().collect::<Vec<_>>(),
+            vec!["apps", "tools"],
+            "{votes:?}"
+        );
+        assert_eq!(
+            votes.under["apps"],
+            vec!["apps/"],
+            "the prefix, never below it"
+        );
+
+        // The negative can fail: without the pattern, `tools/` only.
+        let t = apps_and_tools(
+            "# Root\n\n## Baselines\n\nThe checks are `tools/a.mjs` and `tools/b.mjs`.\n",
+        );
+        let report = report_in(t.path(), None, None);
+        let found = placement(&report);
+        assert_eq!(found.len(), 1, "{report:?}");
+        assert!(found[0].finding.contains("names only paths under tools/"));
+        assert!(
+            found[0]
+                .brief
+                .contains("guidance tied to editing those files")
+                && found[0].brief.contains("\"when a check fails\""),
+            "{}",
+            found[0].brief
+        );
+    }
+
+    /// #1373: a path-shaped token that still cannot be judged -- a
+    /// placeholder with no literal prefix, nested braces -- means the
+    /// section is not "only" anything, in prose or in a span.
+    #[test]
+    fn an_unjudgeable_pattern_suppresses_the_finding() {
+        for token in [
+            "`<app>/scripts/x.json`",
+            "`octo/{a,{b,c}}.rs`",
+            "<app>/x.json",
+        ] {
+            let md = format!("## Octo rules\n\nEdit `octo/a.rs` and `octo/b.rs`; see {token}.\n");
+            let t = octo(&md);
+            let report = report_in(t.path(), None, None);
+            ran(&report);
+            assert!(placement(&report).is_empty(), "{token}: {report:?}");
+            let section = &text::sections(&md)[0];
+            let votes = assess_section(section, t.path(), Some(t.path()), None);
+            assert_eq!(votes.unjudged.len(), 1, "{token}: {votes:?}");
+        }
+    }
+
+    /// #1373: braces expand one level into ordinary candidates, which
+    /// resolve and vote like any other path.
+    #[test]
+    fn brace_alternatives_are_candidates() {
+        let t = octo("## Octo rules\n\nEdit `octo/{a,b}.rs` together.\n");
+        let report = report_in(t.path(), None, None);
+        let found = placement(&report);
+        assert_eq!(found.len(), 1, "{report:?}");
+        assert!(
+            found[0]
+                .finding
+                .ends_with("names only paths under octo/: octo/a.rs, octo/b.rs"),
+            "{}",
+            found[0].finding
+        );
+    }
+
+    /// What a pattern token contributes, and what is not a pattern at
+    /// all: HTML, format strings and generics are not path-shaped.
+    #[test]
+    fn pattern_tokens_expand_prefix_or_are_unjudged() {
+        let c = |v: &[&str]| {
+            Some(Pattern::Candidates(
+                v.iter().map(|s| s.to_string()).collect(),
+            ))
+        };
+        assert_eq!(pattern("apps/<app>/scripts/{a,b}-x.json"), c(&["apps/"]));
+        assert_eq!(pattern("apps/<app>/x.rs:12"), c(&["apps/"]));
+        assert_eq!(pattern("src/lib/<name>.ts"), c(&["src/lib/"]));
+        assert_eq!(
+            pattern("tools/{a,b}.mjs"),
+            c(&["tools/a.mjs", "tools/b.mjs"])
+        );
+        assert_eq!(
+            pattern("{docs,tools}/x.md"),
+            c(&["docs/x.md", "tools/x.md"])
+        );
+        for unjudged in [
+            "<app>/x",
+            "./<app>/x",
+            "/<app>/x",
+            "a/{b,{c,d}}",
+            "a/{b}",
+            "a/{b,c",
+            "a/b}",
+        ] {
+            assert_eq!(pattern(unjudged), Some(Pattern::Unjudged), "{unjudged}");
+        }
+        for not_a_pattern in [
+            "</details>",
+            "<br/>",
+            "format!(\"{}/…\")",
+            "Vec<String>",
+            "plain/path.rs",
+            "cargo run -- <arg>/x",
+            "https://example.invalid/<x>",
+        ] {
+            assert_eq!(pattern(not_a_pattern), None, "{not_a_pattern}");
+        }
+    }
+
     /// Candidates: spans that look like paths, `@imports`, bare `/`
     /// tokens; `:line` stripped; commands and symbols are not paths.
     #[test]
@@ -1715,7 +2028,7 @@ for either; the file exists because getting it wrong is easy.
              https://example.invalid/x and and/or.\n@./shared.md\n```\nfenced/path.rs\n```\n",
         )[0];
         assert_eq!(
-            path_candidates(s),
+            path_candidates(s).0,
             vec!["octo/a.rs", "./shared.md", "bare/token.rs", "and/or"]
         );
     }

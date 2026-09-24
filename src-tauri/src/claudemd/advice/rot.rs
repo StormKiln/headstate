@@ -20,8 +20,16 @@
 //!   only those count: measured, a nested e2e file's `helpers/` matched
 //!   7 paths across sibling apps and exactly one under its own (#1319).
 //!   With none under it, the whole tree counts; for the root file the
-//!   two are the same. Two matches is `Unknown` ("ambiguous"), never a
-//!   guess. A path that lies UNDER a pruned
+//!   two are the same. Two or more matches left are then settled by the
+//!   reference's own line, or its list item when it sits in one (#1372):
+//!   measured, "c specs and `src/testing`" matched 4 paths, and the
+//!   prose word `c` is a segment of only `apps/c/src/testing`. Only
+//!   prose words count -- another code span is another reference -- and
+//!   only a candidate's segments before the shared suffix; a word every
+//!   candidate has settles nothing. When the words hit exactly one
+//!   candidate it resolves, and any finding it goes on to produce names
+//!   the word in its evidence. None or several is `Unknown`
+//!   ("ambiguous"), never a guess. A path that lies UNDER a pruned
 //!   directory is `Unknown` naming the prune, never `Missing`: the walk
 //!   did not enter it, and #1299 is what one prune reading as absence
 //!   costs. Neither this walk nor `scan_repo` prunes `.claude` for
@@ -133,9 +141,11 @@
 //! `../` path relative to an unstated base, an absent path git could not
 //! be asked about, a skill with no inventory: each is a
 //! [`Severity::Unknown`] finding with the reason, and the file gets ONE
-//! [`Severity::Advice`] summary, "N references checked; K could not be
+//! [`Severity::Note`] summary, "N references checked; K could not be
 //! checked (…)", only when K > 0. So a run that checked 0 of 41 reads
-//! differently from a clean one (absent is not zero, #846). The whole
+//! differently from a clean one (absent is not zero, #846). It is a Note
+//! because it counts the Unknown rows and recommends nothing: as Advice
+//! it restated each of them a second time (#1372). The whole
 //! check is `Err`, and so `CheckRun::Unknown`, only when the scan read no
 //! CLAUDE.md at all AND could not list a directory: the file it did not
 //! find may be behind that wall.
@@ -146,11 +156,24 @@
 //! "reference external documents … without explaining when that resource
 //! becomes relevant", at 16 % prevalence. Here that is a prose line
 //! naming an existing document path with "see", "read" or "consult" that
-//! is neither an `@` import nor conditioned by "when", "if", "for" or
-//! "before". Both remedies are real and the brief offers both: an `@`
-//! import loads the file in every session; a condition keeps it lazy.
-//! "topic → path" (or `->`) with text before the arrow is a condition
-//! too: it is the index form of "read this when the topic comes up". A
+//! is neither an `@` import nor conditioned by "when", "if", "for",
+//! "before", "on demand" or "as needed" ("when relevant" and "if needed"
+//! by their first word, #1375). Both remedies are real and the brief
+//! offers both, the condition first: a condition keeps the document
+//! lazy, while an `@` import loads it in every session, and the brief
+//! prices that -- "`@docs/a.md` would load ~N est. tokens in every
+//! session" -- with [`tokens::estimate`] over the document as injected
+//! plus what it imports in turn ("at least" when one of those could not
+//! be read). Measured, a repository that ratchets its instruction-token
+//! budget down in CI would have failed that check on the import the
+//! brief offered. A document that cannot be read has no figure, never
+//! 0. "topic → path" (or `->`) with text before the arrow is a condition
+//! too: it is the index form of "read this when the topic comes up". So
+//! is a short label before a colon that names a document list ("Docs:",
+//! "Reference:", "Further reading:", "Docs, read on demand:"): at most
+//! four words, no code span. "See `docs/gate.md`" inside the paragraph
+//! about that gate stays a finding; the rule stays narrow, and the price
+//! lets the reader decide. A
 //! file under `.claude/rules/` is never blind: it loads itself, at launch
 //! or when a file its `paths:` matches is read, and the `@` import the
 //! brief would offer defeats that scoping. One line naming several
@@ -173,7 +196,7 @@
 use super::{Check, Context, Evidence, Finding, Locator, Producer, Severity, Subject};
 use crate::claude::definitions::{Inventory, Kind};
 use crate::claudemd::refs::{self, Ref, RefKind, Runner};
-use crate::claudemd::{text, Scope, SKIP};
+use crate::claudemd::{imports, text, tokens, Scope, SKIP};
 use crate::packages::scripts::{self, Manifest, Target};
 use regex::Regex;
 use std::collections::{BTreeSet, HashMap};
@@ -212,9 +235,29 @@ pub struct Rotten {
 pub enum Shape {
     /// Document paths named with "see"/"read"/"consult" on one line, not
     /// imported and not conditioned. One per line, in line order.
-    BlindReference { line: usize, paths: Vec<String> },
+    BlindReference { line: usize, paths: Vec<Blind> },
     /// A date or version beside "as of"/"before"/"after"/"until".
     DatedFact { line: usize, quoted: String },
+}
+
+/// One document a blind line names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Blind {
+    pub path: String,
+    /// How an ambiguous suffix was settled, when it was (#1372).
+    pub settled: Option<String>,
+    /// What an `@` import of it would load, when that could be weighed.
+    /// `None` is "could not be read", never zero (#1375).
+    pub cost: Option<Cost>,
+}
+
+/// The estimated tokens an `@` import of one document would load: the
+/// document and everything it imports in turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cost {
+    pub tokens: u64,
+    /// Something beneath it could not be read, so `tokens` is a floor.
+    pub floor: bool,
 }
 
 /// One file's result.
@@ -242,6 +285,7 @@ const IGNORED: &str = ", which git ignores, and no template (`.example`, `.sampl
 const UNKNOWN: &str = ", which could not be checked: ";
 const SUMMARY: &str = " references checked; ";
 const BLIND: &str = " by name; not imported, no condition";
+const COST: &str = " est. tokens in every session";
 const DATED: &str = " states a dated fact: ";
 
 impl Producer for Rot {
@@ -369,11 +413,15 @@ pub fn check_file(repo: &Path, file: &Path, text: &str, res: &mut Resolver) -> F
     let mut out = FileRot::default();
     let mut unchecked: BTreeSet<String> = BTreeSet::new();
     // Path references that resolved, for the blind-reference rule.
-    let mut resolved_paths: Vec<(usize, String)> = Vec::new();
+    let mut resolved_paths: Vec<Named> = Vec::new();
+    let lines: Vec<&str> = text.lines().collect();
 
     for r in refs::extract(text) {
-        // Where a path reference resolved to, when it is a file.
+        // Where a path reference resolved to, when it is a file, and the
+        // word that settled it when its suffix was ambiguous.
         let mut landed: Option<PathBuf> = None;
+        let mut settled: Option<String> = None;
+        let words = item_words(&lines, r.line);
         let outcome = match &r.kind {
             RefKind::Cargo | RefKind::Issue { .. } => {
                 out.unresolvable += 1;
@@ -385,12 +433,15 @@ pub fn check_file(repo: &Path, file: &Path, text: &str, res: &mut Resolver) -> F
                 out.unresolvable += 1;
                 continue;
             }
-            RefKind::Path { path } => res.path(&dir, path).map(|to| {
-                if let Resolved::File(p) = to {
-                    landed = Some(p);
+            RefKind::Path { path } => res.path(&dir, path, &words).map(|to| match to {
+                Resolved::File(p) => landed = Some(p),
+                Resolved::Settled { path, by } => {
+                    landed = Some(path);
+                    settled = Some(by);
                 }
+                Resolved::Package | Resolved::Ignored => {}
             }),
-            RefKind::PathLine { path, line } => res.path_line(&dir, path, *line),
+            RefKind::PathLine { path, line } => res.path_line(&dir, path, *line, &words),
             RefKind::MakeTarget { name } => res.make_target(&dir, name),
             RefKind::Script { runner, name } => res.script(&dir, *runner, name),
             RefKind::Skill { name } => res.skill(name),
@@ -404,7 +455,12 @@ pub fn check_file(repo: &Path, file: &Path, text: &str, res: &mut Resolver) -> F
                 let rule = landed.as_deref().is_some_and(|p| is_rule_file(repo, p));
                 if let RefKind::Path { path } = &r.kind {
                     if !rule {
-                        resolved_paths.push((r.line, path.clone()));
+                        resolved_paths.push(Named {
+                            line: r.line,
+                            path: path.clone(),
+                            file: landed,
+                            settled,
+                        });
                     }
                 }
             }
@@ -458,6 +514,113 @@ fn unknown(why: String) -> Refused {
     (Verdict::Unknown(why.clone()), why)
 }
 
+/// A path reference that resolved, for the blind-reference rule.
+struct Named {
+    line: usize,
+    path: String,
+    /// Where it landed, when that is a file on disk.
+    file: Option<PathBuf>,
+    /// How an ambiguous suffix was settled, when it was (#1372).
+    settled: Option<String>,
+}
+
+/// Whether a line opens a list item: `- `, `* `, `+ `, `1. ` or `1) `.
+fn is_list_item(line: &str) -> bool {
+    let t = line.trim_start();
+    if ["- ", "* ", "+ "].iter().any(|m| t.starts_with(m)) {
+        return true;
+    }
+    let digits = t.chars().take_while(char::is_ascii_digit).count();
+    digits > 0 && (t[digits..].starts_with(". ") || t[digits..].starts_with(") "))
+}
+
+static WORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[A-Za-z0-9_][A-Za-z0-9_-]*").unwrap());
+
+/// The lowercased words of 1-based `line`, widened to its whole list
+/// item when it is in one: the item's opening line and its indented
+/// continuation lines, up to a blank line or the next item. A line in no
+/// list item is itself alone.
+///
+/// Prose words only: inline code spans are blanked first. Another span
+/// on the line is another reference, and its segments say where IT
+/// points: "`crates/a/only.rs` and `lib.rs`" does not make `lib.rs` the
+/// one under `a`.
+fn item_words(lines: &[&str], line: usize) -> BTreeSet<String> {
+    let Some(at) = line.checked_sub(1).filter(|i| *i < lines.len()) else {
+        return BTreeSet::new();
+    };
+    let continuation =
+        |l: &str| l.starts_with([' ', '\t']) && !l.trim().is_empty() && !is_list_item(l);
+    let mut start = at;
+    if !is_list_item(lines[at]) {
+        while start > 0 && continuation(lines[start]) {
+            start -= 1;
+        }
+        if !is_list_item(lines[start]) {
+            start = at;
+        }
+    }
+    let mut end = at;
+    if is_list_item(lines[start]) {
+        while end + 1 < lines.len() && continuation(lines[end + 1]) {
+            end += 1;
+        }
+    }
+    lines[start..=end]
+        .iter()
+        .map(|l| text::blank_spans(l))
+        .flat_map(|l| {
+            WORD.find_iter(&l)
+                .map(|m| m.as_str().to_ascii_lowercase())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The one candidate of an ambiguous suffix match that the words of its
+/// line settle, and the words that settled it (#1372).
+///
+/// Only a candidate's segments BEFORE the suffix are compared: the
+/// suffix is what every candidate shares. A word equal to such a segment
+/// of every candidate carries nothing and is ignored. The candidates the
+/// remaining words hit must be exactly one; none or several is `None`,
+/// and the reference stays Unknown, never a guess.
+fn settle(clean: &str, matches: &[String], words: &BTreeSet<String>) -> Option<(String, String)> {
+    let prefixes: Vec<Vec<String>> = matches
+        .iter()
+        .map(|m| {
+            m.strip_suffix(clean)
+                .unwrap_or("")
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .map(str::to_ascii_lowercase)
+                .collect()
+        })
+        .collect();
+    let mut hit: BTreeSet<usize> = BTreeSet::new();
+    let mut by: Vec<&str> = Vec::new();
+    for w in words {
+        let hits: Vec<usize> = (0..matches.len())
+            .filter(|i| prefixes[*i].iter().any(|s| s == w))
+            .collect();
+        if hits.is_empty() || hits.len() == matches.len() {
+            continue;
+        }
+        hit.extend(hits);
+        by.push(w);
+    }
+    if hit.len() != 1 {
+        return None;
+    }
+    let one = *hit.iter().next().expect("one, checked above");
+    let by = by
+        .iter()
+        .map(|w| format!("`{w}`"))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    Some((matches[one].clone(), by))
+}
+
 /// What a `metadata` call said about a path.
 enum Probe {
     Found,
@@ -484,6 +647,11 @@ enum DependencyLookup {
 enum Resolved {
     /// A real file or directory.
     File(PathBuf),
+    /// A real file or directory, chosen from an ambiguous suffix match by
+    /// a word on the reference's own line or list item (#1372). `by` is
+    /// the measurement, naming the word, for any finding the reference
+    /// goes on to produce.
+    Settled { path: PathBuf, by: String },
     /// Not a file: a package this project declares. It has no lines to
     /// count and no place on disk to cite.
     Package,
@@ -1141,8 +1309,15 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    /// A path reference, resolved to where it lives.
-    fn path(&mut self, dir: &Path, path: &str) -> Result<Resolved, Refused> {
+    /// A path reference, resolved to where it lives. `words` are the
+    /// words of the reference's own line or list item, which may settle
+    /// an ambiguous suffix match (#1372).
+    fn path(
+        &mut self,
+        dir: &Path,
+        path: &str,
+        words: &BTreeSet<String>,
+    ) -> Result<Resolved, Refused> {
         // An absolute token names one place. Under the repository it is
         // a repository path with the root spelled out, so it resolves
         // from the root alone and by nothing looser; anywhere else it is
@@ -1222,6 +1397,17 @@ impl<'a> Resolver<'a> {
         let own = relative(&repo, dir).unwrap_or_default();
         let mine: Vec<String> = matches.iter().filter(|m| under(&own, m)).cloned().collect();
         let matches = if mine.is_empty() { matches } else { mine };
+        if matches.len() > 1 {
+            if let Some((one, by)) = settle(clean, &matches, words) {
+                return Ok(Resolved::Settled {
+                    path: repo.join(&one),
+                    by: format!(
+                        "`{clean}` matches {} paths; {by} on the same line or list item is a segment of only `{one}`",
+                        matches.len()
+                    ),
+                });
+            }
+        }
         match matches.len() {
             1 => Ok(Resolved::File(repo.join(&matches[0]))),
             // Ordered before the Missing arm on purpose: a reference
@@ -1322,9 +1508,16 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    fn path_line(&mut self, dir: &Path, path: &str, line: u32) -> Result<(), Refused> {
-        let target = match self.path(dir, path)? {
-            Resolved::File(p) => p,
+    fn path_line(
+        &mut self,
+        dir: &Path,
+        path: &str,
+        line: u32,
+        words: &BTreeSet<String>,
+    ) -> Result<(), Refused> {
+        let (target, settled) = match self.path(dir, path, words)? {
+            Resolved::File(p) => (p, None),
+            Resolved::Settled { path, by } => (path, Some(by)),
             // `chart.js:12` on a declared dependency: the package is
             // real, and it has no file in this repository to count.
             Resolved::Package => return Ok(()),
@@ -1356,8 +1549,9 @@ impl<'a> Resolver<'a> {
             return Err((
                 Verdict::LinePastEof { lines },
                 format!(
-                    "`{}` has {lines} lines",
-                    display(self.repo, &target.to_string_lossy())
+                    "`{}` has {lines} lines{}",
+                    display(self.repo, &target.to_string_lossy()),
+                    settled.map(|by| format!("; {by}")).unwrap_or_default()
                 ),
             ));
         }
@@ -1572,8 +1766,9 @@ fn count(n: usize, one: &str, many: &str) -> String {
 }
 
 static CUE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(see|read|consult)\b").unwrap());
+/// "when relevant" and "if needed" are here by their first word.
 static CONDITION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\b(when|if|for|before)\b").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)\b(when|if|for|before|on demand|as needed)\b").unwrap());
 static TEMPORAL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(as of|before|after|until)\b").unwrap());
 static DATE: LazyLock<Regex> = LazyLock::new(|| {
@@ -1608,6 +1803,67 @@ fn topic_arrow(line: &str) -> bool {
     })
 }
 
+/// Words that make a short label before a colon a document index:
+/// "Docs:", "Reference:", "Further reading:".
+const INDEX_WORDS: &[&str] = &[
+    "doc",
+    "docs",
+    "documentation",
+    "reference",
+    "references",
+    "reading",
+];
+
+/// Whether the line opens with a document-index label before a colon
+/// (#1375). An index says "these are here for when the topic comes up",
+/// which is a condition. Narrow on purpose: the label is at most four
+/// words, holds no code span, and names a document list; "read this:"
+/// is not one.
+fn index_label(line: &str) -> bool {
+    let Some((before, _)) = line.split_once(':') else {
+        return false;
+    };
+    if before.contains('`') {
+        return false;
+    }
+    let words: Vec<String> = before
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty() && !w.chars().all(|c| c.is_ascii_digit()))
+        .map(str::to_lowercase)
+        .collect();
+    words.len() <= 4 && words.iter().any(|w| INDEX_WORDS.contains(&w.as_str()))
+}
+
+/// What an `@` import of `file` would load, estimated: the file as
+/// injected (block HTML comments stripped, as `tokens::estimate` says)
+/// plus everything it imports. `None` when it is not a readable file:
+/// the figure is then left out, never written as zero.
+fn import_cost(file: &Path) -> Option<Cost> {
+    if !file.is_file() {
+        return None;
+    }
+    let body = std::fs::read_to_string(file).ok()?;
+    let children = imports::resolve_tree(file, &mut Vec::new());
+    Some(Cost {
+        tokens: tokens::estimate(&text::strip_block_html_comments(&body))
+            + children
+                .iter()
+                .map(imports::ImportNode::total_tokens)
+                .sum::<u64>(),
+        floor: children.iter().any(imports::ImportNode::total_partial),
+    })
+}
+
+/// The evidence clause pricing an import, ending in [`COST`] so the
+/// brief can lift it back out.
+fn cost_clause(path: &str, cost: Cost) -> String {
+    format!(
+        "`@{path}` would load {}~{}{COST}",
+        if cost.floor { "at least " } else { "" },
+        cost.tokens
+    )
+}
+
 /// Document extensions, and a `docs/` component, for the blind-reference
 /// rule.
 fn is_document(path: &str) -> bool {
@@ -1622,17 +1878,22 @@ fn is_document(path: &str) -> bool {
 /// The two rules the content-shape research hands to this producer,
 /// over prose lines only. `resolved_paths` are path references that
 /// resolved: a missing one is already a `Missing` finding.
-fn shape_rules(text: &str, resolved_paths: &[(usize, String)]) -> Vec<Shape> {
+fn shape_rules(text: &str, resolved_paths: &[Named]) -> Vec<Shape> {
     let normalised = text.replace("\r\n", "\n");
     let mut out = Vec::new();
     for (n, line) in text::prose_lines(&normalised) {
-        let conditioned = CONDITION.is_match(line) || topic_arrow(line);
-        let mut blind: Vec<String> = Vec::new();
+        let conditioned = CONDITION.is_match(line) || topic_arrow(line) || index_label(line);
+        let mut blind: Vec<Blind> = Vec::new();
         if CUE.is_match(line) && !conditioned {
-            for (_, path) in resolved_paths.iter().filter(|(l, _)| *l == n) {
+            for named in resolved_paths.iter().filter(|p| p.line == n) {
+                let path = &named.path;
                 let imported = line.contains(&format!("@{path}"));
-                if is_document(path) && !imported && !blind.contains(path) {
-                    blind.push(path.clone());
+                if is_document(path) && !imported && !blind.iter().any(|b| &b.path == path) {
+                    blind.push(Blind {
+                        path: path.clone(),
+                        settled: named.settled.clone(),
+                        cost: named.file.as_deref().and_then(import_cost),
+                    });
                 }
             }
         }
@@ -1735,15 +1996,26 @@ fn findings_for(repo: &Path, path: &str, scope: Scope, text: &str, rot: &FileRot
                     "`{shown}:{line}` names {}{BLIND}",
                     paths
                         .iter()
-                        .map(|p| format!("`{p}`"))
+                        .map(|b| format!("`{}`", b.path))
                         .collect::<Vec<_>>()
                         .join(" and ")
                 ),
                 paths
                     .iter()
-                    .map(|p| format!(
-                        "line {line} names `{p}` with see/read/consult; no `@{p}` import, no when/if/for/before and no topic → on the line"
-                    ))
+                    .map(|b| {
+                        let p = &b.path;
+                        let mut m = format!(
+                            "line {line} names `{p}` with see/read/consult; no `@{p}` import, no when/if/for/before/on demand/as needed, no topic → and no index label on the line"
+                        );
+                        if let Some(by) = &b.settled {
+                            m.push_str(&format!("; {by}"));
+                        }
+                        // Last, so the brief can lift it back out.
+                        if let Some(cost) = b.cost {
+                            m.push_str(&format!("; {}", cost_clause(p, cost)));
+                        }
+                        m
+                    })
                     .collect(),
             ),
             Shape::DatedFact { line, quoted } => (
@@ -1769,7 +2041,8 @@ fn findings_for(repo: &Path, path: &str, scope: Scope, text: &str, rot: &FileRot
 
     // One summary per file, ONLY when something could not be checked:
     // a clean file gets no row, and a file that checked 0 of 41 gets a
-    // row that says so.
+    // row that says so. A Note (#1372): it counts the Unknown rows above
+    // and recommends nothing, so as Advice it restated each one twice.
     if !rot.unchecked.is_empty() {
         let unknown = rot
             .findings
@@ -1778,7 +2051,7 @@ fn findings_for(repo: &Path, path: &str, scope: Scope, text: &str, rot: &FileRot
             .count();
         out.push(Finding::new(
             Check::Rot,
-            Severity::Advice,
+            Severity::Note,
             Subject::ClaudeMd {
                 path: path.to_string(),
                 scope,
@@ -1819,14 +2092,10 @@ pub(super) fn suggestion(f: &Finding) -> String {
         })
         .map(|l| format!("line {l} of `{file}`"))
         .unwrap_or_else(|| format!("`{file}`"));
+    // The per-file summary is a Note (#1372) and never gets here: the
+    // brief renders a Note with no suggestion.
     let s = f.finding.as_str();
-    if s.contains(SUMMARY) {
-        format!(
-            "Nothing to edit in `{file}` for this row. Make the listed inputs readable, or open the \
-             definitions page, and re-run the check; the references it could not check are neither \
-             confirmed nor rot."
-        )
-    } else if s.contains(SKILL_MISSING) {
+    if s.contains(SKILL_MISSING) {
         format!(
             "Edit {line}: name a skill that exists in the user, project or plugin scope, or delete \
              the reference. Do not create a skill to satisfy it."
@@ -1847,10 +2116,24 @@ pub(super) fn suggestion(f: &Finding) -> String {
              line number and cite the file alone."
         )
     } else if s.contains(BLIND) {
+        // The condition first: it costs nothing per session. The import
+        // is priced, per document, from the evidence (#1375); a document
+        // that could not be weighed has no figure rather than zero.
+        let costs: Vec<&str> = f
+            .evidence
+            .iter()
+            .filter_map(|e| e.measured.rsplit_once("; ").map(|(_, c)| c))
+            .filter(|c| c.ends_with(COST))
+            .collect();
+        let import = if costs.is_empty() {
+            ", which loads it in every session".to_string()
+        } else {
+            format!(": {}", costs.join("; "))
+        };
         format!(
-            "Either import the document, by adding `@<path>` on its own line in `{file}`, which \
-             loads it in every session, or keep it lazy by stating on {line} when to read it \
-             (\"when …\", \"before …\", \"if …\"). One or the other; not both."
+            "Either keep it lazy by stating on {line} when to read it (\"when …\", \"before …\", \
+             \"if …\", \"on demand\"), or import the document by adding `@<path>` on its own line \
+             in `{file}`{import}. One or the other; not both."
         )
     } else if s.contains(DATED) {
         format!(
@@ -2437,7 +2720,14 @@ Run `yarn paw`, not `yarn nope`. Use the `tentacle` skill, not the `ink` skill.
             .iter()
             .find(|f| f.finding.contains("references checked;"))
             .expect("a summary row when K > 0");
-        assert_eq!(summary.severity, Severity::Advice);
+        // #1372: the summary counts; it recommends nothing, and restating
+        // the Unknown row as advice showed it twice.
+        assert_eq!(summary.severity, Severity::Note);
+        assert!(
+            summary.brief.contains("Observation only") && !summary.brief.contains("Suggested"),
+            "{}",
+            summary.brief
+        );
         assert!(
             summary
                 .finding
@@ -2736,6 +3026,104 @@ Run `yarn paw`, not `yarn nope`. Use the `tentacle` skill, not the `ink` skill.
             })
             .collect();
         assert_eq!(lines, vec![3], "{:?}", rot.shape);
+    }
+
+    /// #1375: "on demand", "as needed", "when relevant" and "if needed"
+    /// are conditions, and so is a document-index label before a colon.
+    /// A colon after an ordinary phrase is not an index.
+    #[test]
+    fn on_demand_as_needed_and_a_document_index_are_conditions() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("docs").join("a.md"), "a").unwrap();
+        fs::write(root.join("docs").join("b.md"), "b").unwrap();
+        fs::write(
+            root.join("CLAUDE.md"),
+            "Docs, read on demand: `docs/a.md`, `docs/b.md`\n\
+             Read `docs/a.md` as needed.\n\
+             See `docs/a.md` when relevant.\n\
+             Read `docs/b.md` if needed.\n\
+             - Reference: see `docs/a.md`\n\
+             **Further reading:** read `docs/b.md`\n\
+             Docs: see `docs/a.md`\n\
+             See `docs/a.md`.\n\
+             Run the gate, then read this: `docs/b.md`\n",
+        )
+        .unwrap();
+        let rot = check_one(root, None);
+        let lines: Vec<usize> = rot
+            .shape
+            .iter()
+            .filter_map(|s| match s {
+                Shape::BlindReference { line, .. } => Some(*line),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines, vec![8, 9], "{:?}", rot.shape);
+    }
+
+    /// #1375: the brief offers the condition first, and prices the
+    /// import with the token estimate of the target and what IT imports.
+    #[test]
+    fn a_blind_reference_brief_offers_the_condition_first_and_prices_the_import() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        let docs = root.join("docs");
+        fs::create_dir_all(&docs).unwrap();
+        // 400 characters: 100 est. tokens.
+        fs::write(docs.join("x.md"), "x".repeat(400)).unwrap();
+        // "@y.md\n" is 6 characters (2 tokens), and y.md 40 (10 tokens).
+        fs::write(docs.join("z.md"), "@y.md\n").unwrap();
+        fs::write(docs.join("y.md"), "y".repeat(40)).unwrap();
+        fs::write(
+            root.join("CLAUDE.md"),
+            "See `docs/x.md`.\nSee `docs/z.md`.\n",
+        )
+        .unwrap();
+        let report = run_over(root, None);
+        let blind: Vec<&Finding> = report
+            .findings
+            .iter()
+            .filter(|f| f.finding.contains(BLIND))
+            .collect();
+        assert_eq!(blind.len(), 2, "{report:?}");
+        let x = &blind[0].brief;
+        assert!(
+            x.contains("`@docs/x.md` would load ~100 est. tokens in every session"),
+            "{x}"
+        );
+        let lazy = x.find("keep it lazy").expect("the condition is offered");
+        let import = x.find("`@<path>`").expect("the import is offered");
+        assert!(lazy < import, "the condition comes first: {x}");
+        assert!(
+            blind[1]
+                .brief
+                .contains("`@docs/z.md` would load ~12 est. tokens in every session"),
+            "what the target imports loads too: {}",
+            blind[1].brief
+        );
+    }
+
+    /// #1375: a target that cannot be read for the estimate has no
+    /// figure. Never 0: a directory weighs something unmeasured.
+    #[test]
+    fn a_blind_reference_with_no_readable_target_states_no_figure() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        fs::create_dir_all(root.join("docs").join("guide")).unwrap();
+        fs::write(root.join("CLAUDE.md"), "See `docs/guide/`.\n").unwrap();
+        let report = run_over(root, None);
+        let blind: Vec<&Finding> = report
+            .findings
+            .iter()
+            .filter(|f| f.finding.contains(BLIND))
+            .collect();
+        assert_eq!(blind.len(), 1, "{report:?}");
+        let brief = &blind[0].brief;
+        assert!(!brief.contains("est. tokens"), "{brief}");
+        assert!(!brief.contains("~0"), "{brief}");
+        assert!(brief.contains("`@<path>`"), "{brief}");
     }
 
     /// #1320: one blind line naming two documents is ONE finding, with
@@ -3041,6 +3429,75 @@ Run `yarn paw`, not `yarn nope`. Use the `tentacle` skill, not the `ink` skill.
             ),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A tree where `src/testing` lies under three apps and a library,
+    /// so the suffix alone is ambiguous.
+    fn four_projects() -> tempfile::TempDir {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        for p in [["apps", "a"], ["apps", "b"], ["apps", "c"], ["libs", "d"]] {
+            let testing = root.join(p[0]).join(p[1]).join("src").join("testing");
+            fs::create_dir_all(&testing).unwrap();
+            fs::write(testing.join("main.rs"), "one\n").unwrap();
+        }
+        t
+    }
+
+    /// #1372: an ambiguous suffix is settled by a word on the same line
+    /// that equals a path segment of exactly one candidate. A line
+    /// naming none of them, or two, stays Unknown: never a guess.
+    #[test]
+    fn a_word_on_the_line_settles_an_ambiguous_suffix_or_it_stays_unknown() {
+        let t = four_projects();
+        let root = t.path();
+        fs::write(
+            root.join("CLAUDE.md"),
+            "- c specs and `src/testing`\n\
+             - shared specs in `src/testing`\n\
+             - a and c both use `src/testing`\n",
+        )
+        .unwrap();
+        let rot = check_one(root, None);
+        let lines: Vec<usize> = rot.findings.iter().map(|f| f.r.line).collect();
+        assert_eq!(lines, vec![2, 3], "line 1 is settled by `c`: {rot:?}");
+        for f in &rot.findings {
+            match &f.verdict {
+                Verdict::Unknown(why) => assert!(why.contains("ambiguous"), "{why}"),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(rot.refs_checked, 1, "{rot:?}");
+    }
+
+    /// #1372: the settling word may sit on a continuation line of the
+    /// same list item, and a word every candidate shares settles
+    /// nothing. The evidence names the word that settled it.
+    #[test]
+    fn a_settled_suffix_names_the_word_in_its_evidence() {
+        let t = four_projects();
+        let root = t.path();
+        fs::write(
+            root.join("CLAUDE.md"),
+            "- the entry is `src/testing/main.rs:9`\n  for project c\n\
+             - something else in `src/testing`\n",
+        )
+        .unwrap();
+        let rot = check_one(root, None);
+        assert_eq!(rot.findings.len(), 2, "{rot:?}");
+        let past = &rot.findings[0];
+        assert_eq!(past.verdict, Verdict::LinePastEof { lines: 1 }, "{rot:?}");
+        assert!(
+            past.measured.contains("`c`") && past.measured.contains("apps/c/src/testing/main.rs"),
+            "the settling word is named: {}",
+            past.measured
+        );
+        // The second item's words do not reach back into the first, and
+        // the first item's `c` does not reach forward.
+        assert!(
+            matches!(rot.findings[1].verdict, Verdict::Unknown(_)),
+            "{rot:?}"
+        );
     }
 
     fn git_init(dir: &Path) {
