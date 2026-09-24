@@ -23,6 +23,7 @@ import {
   groupHeading,
   locatorText,
   severityCount,
+  shortfallConsequence,
   subjectText,
 } from "@/lib/adviceText";
 import { groupMarkdown, reportMarkdown } from "@/lib/adviceMarkdown";
@@ -456,7 +457,8 @@ function ReportView({
           could not vouch for anything. */}
       <PartialScanNotice
         unreadable={unknown.map((c) => `${CHECK_LABEL[c.check]}: ${reason(c)}`)}
-        consequence={`the ${n === 1 ? "finding" : `${n} findings`} below ${n === 1 ? "is" : "are"} at least the findings; ${unknown.length} of ${report.checks.length} checks could not run.`}
+        checks={{ total: report.checks.length }}
+        consequence={shortfallConsequence(n)}
       />
 
       {/* The flat list keeps its own coverage list, because there is no
