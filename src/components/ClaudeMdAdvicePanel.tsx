@@ -861,13 +861,19 @@ function FindingRow({
         <td className={td}>
           <CopyBriefButton brief={finding.brief} what="Brief" />
         </td>
-        {/* An observation's brief recommends nothing (#1339), so there
-            is nothing to hand a session: the cell says so rather than
-            offering a run that could only be told to change nothing. */}
+        {/* Claudify hands a session a change to make, so it is offered only
+            where a finding recommends one: Problem and Advice. An
+            observation's brief recommends nothing (#1339). An Unknown is
+            "checked, could not decide" (#1389): its remedy is to let the
+            check decide, not an edit. Each cell says which, rather than
+            offering a run that has nothing to change. Copy brief stays on
+            every row. */}
         {claudifyColumn ? (
           <td className={td}>
             {finding.severity === "note" ? (
               <span className="text-[#8b949e]">Nothing to change</span>
+            ) : finding.severity === "unknown" ? (
+              <span className="text-[#8b949e]">Could not decide</span>
             ) : (
               <ClaudifyButton
                 open={showRun}
