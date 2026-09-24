@@ -35,8 +35,14 @@
 //! The files searched are every CLAUDE.md the scan loaded, their imports,
 //! and the repository's `.claude/rules/*.md` (`claudemd::rules`, #1340),
 //! path-scoped or not: a rule loads when a session works where its
-//! `paths:` point, as a nested CLAUDE.md does. The sentence counts the two
-//! apart ("none of the 4 files read or 10 rules names …"). A file two
+//! `paths:` point, as a nested CLAUDE.md does. So are the skills
+//! (`claudemd::skill_files`, #1394): every `SKILL.md` under the
+//! repository's `.claude/skills` and the user's `~/.claude/skills`, the
+//! walk the transcripts producer's "already written" corpus uses (#1370).
+//! A gate documented in a skill the root CLAUDE.md points at is
+//! documented; plugin skills are out of scope (#1365). The sentence counts
+//! the three apart ("none of the 7 files read, 2 rules or 4 skills names
+//! …"). A file two
 //! CLAUDE.md files both import is one file read, not two (#1350). Docs linked
 //! from a CLAUDE.md by an ordinary markdown link are not searched: they
 //! are not loaded into a session, so they instruct nothing until read.
@@ -136,8 +142,10 @@
 //! else was unreadable. A negative ("nothing names `make build`") is an
 //! [`Severity::Advice`] finding only when every file a session would load
 //! was read: no unreadable scope, directory or file in the scan, no
-//! unreadable import, no file this producer failed to re-read, and no
-//! `.claude/rules` directory or rule that exists and could not be read.
+//! unreadable import, no file this producer failed to re-read, no
+//! `.claude/rules` directory or rule that exists and could not be read,
+//! and no skills directory or `SKILL.md` that exists and could not be
+//! read (#1394).
 //! Otherwise the same (toolchain, verb) is a [`Severity::Unknown`] finding
 //! naming what could not be read. `skipped_dirs` qualifies nothing; it is
 //! a documented exclusion.
@@ -160,7 +168,7 @@
 
 use super::{Check, Context, Evidence, Finding, Locator, Producer, Severity, Subject};
 use crate::claudemd::rules::{self, Rules};
-use crate::claudemd::{text, EffectiveScan, ImportNode, Scope};
+use crate::claudemd::{skill_files, text, EffectiveScan, ImportNode, Scope};
 use crate::packages::detect::projects;
 use crate::packages::scripts::{self, Manifest, Target};
 use crate::packages::Ecosystem;
@@ -179,7 +187,8 @@ impl Producer for Coverage {
     fn run(&self, cx: &Context) -> Result<Vec<Finding>, String> {
         let detection = detect(cx.repo);
         let rules = rules::read(cx.repo);
-        let search = documented(cx.scan, &detection, &rules);
+        let skills = skill_files::read(cx.repo, cx.home);
+        let search = documented(cx.scan, &detection, &rules, &skills);
         let subject = subject_for(cx.repo, cx.scan);
         let mut out = Vec::new();
 
@@ -329,30 +338,7 @@ impl Producer for Coverage {
                     measured: search.measured(),
                 });
 
-                let plural = |n: usize| if n == 1 { "" } else { "s" };
-                let nothing_names = match (search.files.len(), search.rules.len()) {
-                    (0, 0) => format!(
-                        "no CLAUDE.md loads for this repository, so nothing names {}",
-                        or_list(&candidates)
-                    ),
-                    (0, r) => format!(
-                        "no CLAUDE.md loads for this repository, and none of the {r} rule{} \
-                         names {}",
-                        plural(r),
-                        or_list(&candidates)
-                    ),
-                    (n, 0) => format!(
-                        "none of the {n} file{} read names {}",
-                        plural(n),
-                        or_list(&candidates)
-                    ),
-                    (n, r) => format!(
-                        "none of the {n} file{} read or {r} rule{} names {}",
-                        plural(n),
-                        plural(r),
-                        or_list(&candidates)
-                    ),
-                };
+                let nothing_names = search.nothing_names(&candidates);
 
                 if unreadable.is_empty() && blockers.is_empty() {
                     out.push(Finding::new(
@@ -1626,6 +1612,8 @@ pub struct Search {
     /// Every `.claude/rules` file read (#1340), counted apart from
     /// `files` so the sentence can say which is which.
     pub rules: Vec<PathBuf>,
+    /// Every `SKILL.md` read (#1394), counted apart from both.
+    pub skills: Vec<PathBuf>,
     pub spans: usize,
     pub fenced_lines: usize,
     /// Files the scan listed and this producer could not re-read.
@@ -1647,6 +1635,37 @@ pub struct Unfollowed {
 }
 
 impl Search {
+    /// "none of the 7 files read, 2 rules or 4 skills names `x`": what was
+    /// searched, each kind counted apart (#1340, #1394), and a kind with
+    /// none left out.
+    fn nothing_names(&self, candidates: &[String]) -> String {
+        let plural = |n: usize| if n == 1 { "" } else { "s" };
+        let mut others: Vec<String> = Vec::new();
+        if !self.rules.is_empty() {
+            let r = self.rules.len();
+            others.push(format!("{r} rule{}", plural(r)));
+        }
+        if !self.skills.is_empty() {
+            let k = self.skills.len();
+            others.push(format!("{k} skill{}", plural(k)));
+        }
+        let named = or_list(candidates);
+        match self.files.len() {
+            0 if others.is_empty() => {
+                format!("no CLAUDE.md loads for this repository, so nothing names {named}")
+            }
+            0 => format!(
+                "no CLAUDE.md loads for this repository, and none of the {} names {named}",
+                or_list(&others)
+            ),
+            n => {
+                let mut all = vec![format!("{n} file{} read", plural(n))];
+                all.extend(others);
+                format!("none of the {} names {named}", or_list(&all))
+            }
+        }
+    }
+
     /// The count and how it was counted, for the evidence.
     fn measured(&self) -> String {
         let listed = |what: &str, paths: &[PathBuf]| {
@@ -1666,11 +1685,13 @@ impl Search {
                 }
             )
         };
-        let rules = if self.rules.is_empty() {
-            String::new()
-        } else {
-            format!(", {}", listed("rule", &self.rules))
-        };
+        let mut rules = String::new();
+        if !self.rules.is_empty() {
+            rules.push_str(&format!(", {}", listed("rule", &self.rules)));
+        }
+        if !self.skills.is_empty() {
+            rules.push_str(&format!(", {}", listed("skill", &self.skills)));
+        }
         format!(
             "{}{rules}, {} span{} and {} fenced line{} searched",
             listed("file", &self.files),
@@ -1713,10 +1734,17 @@ fn loaded_files(scan: &EffectiveScan) -> Vec<PathBuf> {
     out
 }
 
-/// What the loaded files and the repository's rules name, through
-/// `text::spans` and `text::fences`. A rule the reader could not read is
-/// already in `rules.unreadable`, which the caller counts.
-pub fn documented(scan: &EffectiveScan, detection: &Detection, rules: &Rules) -> Search {
+/// What the loaded files, the repository's rules and the skills name,
+/// through `text::spans` and `text::fences`. A rule the reader could not
+/// read is already in `rules.unreadable`, which the caller counts; a
+/// skill that could not be read, or a skills directory that could not be
+/// listed, goes in [`Search::unreadable`] (#1394).
+pub fn documented(
+    scan: &EffectiveScan,
+    detection: &Detection,
+    rules: &Rules,
+    skills: &skill_files::Skills,
+) -> Search {
     let scripts = Scripts {
         verbs: &detection.script_verbs,
         unknown: &detection.script_unknown,
@@ -1740,6 +1768,21 @@ pub fn documented(scan: &EffectiveScan, detection: &Detection, rules: &Rules) ->
     for rule in &rules.files {
         search_text(&mut out, &rule.path, &rule.text, &scripts);
         out.rules.push(rule.path.clone());
+    }
+    for (dir, e) in &skills.unreadable {
+        out.unreadable.push(format!("{dir} ({e})"));
+    }
+    for (path, _) in &skills.files {
+        let path = PathBuf::from(path);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                search_text(&mut out, &path, &text, &scripts);
+                out.skills.push(path);
+            }
+            Err(e) => out
+                .unreadable
+                .push(format!("{} ({e})", path.to_string_lossy())),
+        }
     }
     out
 }
@@ -2727,6 +2770,97 @@ mod tests {
         assert_eq!(
             found[0].finding.matches("`, `").count(),
             0,
+            "{}",
+            found[0].finding
+        );
+    }
+
+    /// #1394's test: a `make test` named only in a repository skill is
+    /// not a gap, nor is a `make fmt` named only in a user skill, and
+    /// the gap that remains counts the skills apart from the files and
+    /// rules it read.
+    #[test]
+    fn a_command_named_in_a_skill_counts_and_the_skills_are_counted() {
+        let (_t, repo, home) = fixture();
+        fs::write(
+            repo.join("Makefile"),
+            "test:\n\ttrue\nlint:\n\ttrue\nfmt:\n\ttrue\n",
+        )
+        .unwrap();
+        fs::write(repo.join("CLAUDE.md"), "Nothing here.\n").unwrap();
+        let gate = repo.join(".claude").join("skills").join("gate");
+        fs::create_dir_all(&gate).unwrap();
+        fs::write(
+            gate.join("SKILL.md"),
+            "---\nname: gate\n---\nRun `make test`.\n",
+        )
+        .unwrap();
+        let mine = home.join(".claude").join("skills").join("tidy");
+        fs::create_dir_all(&mine).unwrap();
+        fs::write(mine.join("SKILL.md"), "```\nmake fmt\n```\n").unwrap();
+        let rules = repo.join(".claude").join("rules");
+        fs::create_dir_all(&rules).unwrap();
+        fs::write(rules.join("style.md"), "Be terse.\n").unwrap();
+
+        let report = run_over(&repo, &home);
+        let found = toolchain_findings(&report);
+        assert_eq!(found.len(), 1, "{report:#?}");
+        assert_eq!(found[0].severity, Severity::Advice);
+        assert_eq!(
+            found[0].finding,
+            "make (Makefile at root) offers `lint`; none of the 1 file read, 1 rule or 2 skills \
+             names `make lint`"
+        );
+        let searched = found[0]
+            .evidence
+            .iter()
+            .find(|e| e.measured.contains("file read"))
+            .expect("the search evidence");
+        assert!(
+            searched.measured.contains("2 skills read")
+                && searched
+                    .measured
+                    .contains(&gate.join("SKILL.md").to_string_lossy().to_string()),
+            "{}",
+            searched.measured
+        );
+
+        // The negative can fail: without the skills, test and fmt are
+        // gaps again.
+        fs::remove_dir_all(repo.join(".claude").join("skills")).unwrap();
+        fs::remove_dir_all(home.join(".claude").join("skills")).unwrap();
+        assert_eq!(toolchain_findings(&run_over(&repo, &home)).len(), 3);
+    }
+
+    /// A skill that exists and cannot be read makes the negative Unknown,
+    /// never "not named" (#1351's rule, #1394).
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_skill_makes_the_negative_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_t, repo, home) = fixture();
+        fs::write(repo.join("Makefile"), "test:\n\ttrue\n").unwrap();
+        fs::write(repo.join("CLAUDE.md"), "Nothing here.\n").unwrap();
+        let gate = repo.join(".claude").join("skills").join("gate");
+        fs::create_dir_all(&gate).unwrap();
+        let skill = gate.join("SKILL.md");
+        fs::write(&skill, "Run `make lint`.\n").unwrap();
+        let report = run_over(&repo, &home);
+        assert_eq!(
+            toolchain_findings(&report)[0].severity,
+            Severity::Advice,
+            "{report:#?}"
+        );
+
+        fs::set_permissions(&skill, fs::Permissions::from_mode(0o000)).unwrap();
+        let report = run_over(&repo, &home);
+        fs::set_permissions(&skill, fs::Permissions::from_mode(0o644)).unwrap();
+        let found = toolchain_findings(&report);
+        assert_eq!(found.len(), 1, "{report:#?}");
+        assert_eq!(found[0].severity, Severity::Unknown, "{}", found[0].finding);
+        assert!(
+            found[0].finding.contains("SKILL.md (") && found[0].finding.ends_with("` not readable"),
             "{}",
             found[0].finding
         );

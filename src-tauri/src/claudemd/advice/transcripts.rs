@@ -199,7 +199,7 @@
 
 use super::{Check, Context, Evidence, Finding, Locator, Producer, Severity, Subject};
 use crate::claude::preview::{blocks_of, Block, ToolArgs};
-use crate::claudemd::{EffectiveScan, ImportNode, Scope};
+use crate::claudemd::{skill_files, EffectiveScan, ImportNode, Scope};
 use rusqlite::Connection;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
@@ -1746,7 +1746,7 @@ fn written_in(
     key: &str,
     dir: &Path,
     cx: &Context,
-    skills: &Skills,
+    skills: &skill_files::Skills,
     cache: &mut HashMap<String, Result<String, String>>,
 ) -> Written {
     let needle = collapse(key);
@@ -1828,71 +1828,6 @@ fn written_in(
         Written::No
     } else {
         Written::Unchecked(unread)
-    }
-}
-
-/// The skills a session under the repository can load, for the "already
-/// written" corpus (#1370): every `SKILL.md` under the repository's
-/// `.claude/skills` and the user's `~/.claude/skills`, at any depth.
-/// Plugin skills are out of scope: they are not the repository owner's
-/// to change. Walked once per pass.
-struct Skills {
-    /// `(path, name)`, the name being the directory holding the file.
-    files: Vec<(String, String)>,
-    /// `(path, io error)` for a skills directory that exists and could
-    /// not be listed: it might hold the key (#1351).
-    unreadable: Vec<(String, String)>,
-}
-
-/// How deep a skills walk goes, so a symlink cycle ends.
-const SKILL_DEPTH: usize = 8;
-
-fn skills_of(repo: &Path, home: Option<&Path>) -> Skills {
-    let mut out = Skills {
-        files: Vec::new(),
-        unreadable: Vec::new(),
-    };
-    let roots = std::iter::once(repo).chain(home);
-    for root in roots {
-        walk_skills(&root.join(".claude").join("skills"), 0, &mut out);
-    }
-    out
-}
-
-fn walk_skills(dir: &Path, depth: usize, out: &mut Skills) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        // Absent holds nothing.
-        Err(e) if is_gone(&e) => return,
-        Err(e) => {
-            out.unreadable
-                .push((dir.to_string_lossy().into_owned(), e.to_string()));
-            return;
-        }
-    };
-    let mut paths: Vec<PathBuf> = Vec::new();
-    for entry in entries {
-        match entry {
-            Ok(e) => paths.push(e.path()),
-            Err(e) => {
-                out.unreadable
-                    .push((dir.to_string_lossy().into_owned(), e.to_string()));
-            }
-        }
-    }
-    paths.sort();
-    for path in paths {
-        if path.is_dir() {
-            if depth < SKILL_DEPTH {
-                walk_skills(&path, depth + 1, out);
-            }
-        } else if path.file_name() == Some(std::ffi::OsStr::new("SKILL.md")) {
-            let name = dir
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            out.files.push((path.to_string_lossy().into_owned(), name));
-        }
     }
 }
 
@@ -2119,7 +2054,7 @@ fn emit(
 ) -> Vec<Finding> {
     let candidates = claude_dirs(cx);
     let mut cache: HashMap<String, Result<String, String>> = HashMap::new();
-    let skills = skills_of(cx.repo, cx.home);
+    let skills = skill_files::read(cx.repo, cx.home);
     let mut out = Vec::new();
     let at_least = if short { "at least " } else { "" };
     let plural = |n: usize| if n == 1 { "" } else { "s" };
