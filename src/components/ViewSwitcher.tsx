@@ -331,23 +331,22 @@ export function ViewSwitcher({ counts }: { counts?: Partial<Record<View, number>
                 role="group"
                 aria-labelledby={headingId}
               >
-                {/* Rendered only on the wide layout (#1020). Five headings
-                    cost five rows of vertical space, and the phone's sheet
-                    has 288px of it -- the labels are worth less there than
-                    the entries they would push off-screen. The heading id
-                    stays on the element either way: `aria-labelledby`
-                    pointing at a `hidden` element still resolves, so the
-                    group keeps its accessible name on the phone even
-                    though the text is not painted.
+                {/* Painted on every layout (#1403). #1020 hid these on the
+                    narrow layout, reasoning that "the phone's sheet has
+                    288px" of vertical space for five headings to crowd --
+                    but 288px is the sheet's WIDTH (`w-72` in `App.tsx`); a
+                    left sheet spans the full viewport height. Five headings
+                    cost ~100px of it, and they are what makes a 13-entry
+                    menu scannable, most of all on a phone.
 
-                    `useIsMobile()` rather than `IS_MOBILE_BUILD`, per the
-                    rule of thumb in `lib/target.ts`: the answer changes
-                    when a desktop user drags the window narrower, so this
-                    is a layout question and not a capability one. */}
+                    Slightly tighter on the narrow layout -- less space above
+                    each heading -- which is the one part of #1020's instinct
+                    worth keeping. `useIsMobile()` rather than
+                    `IS_MOBILE_BUILD`, per `lib/target.ts`: this is layout,
+                    and a desktop window dragged narrow gets the same. */}
                 <h3
                   id={headingId}
-                  hidden={isMobile}
-                  className="px-2 pb-0.5 pt-1.5 text-xs font-semibold uppercase tracking-wide text-[#8b949e]"
+                  className={`px-2 pb-0.5 ${isMobile ? "pt-1" : "pt-1.5"} text-xs font-semibold uppercase tracking-wide text-[#8b949e]`}
                 >
                   {groupLabel}
                 </h3>

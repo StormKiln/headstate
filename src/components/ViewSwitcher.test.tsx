@@ -357,27 +357,30 @@ describe("ViewSwitcher grouping", () => {
     }
   });
 
-  /// #1020: the headings are not painted on the phone.
+  /// #1403: the headings ARE painted on the phone. #1020 hid them on the
+  /// premise that the sheet "has 288px" of vertical space -- but `w-72`
+  /// is the sheet's WIDTH; a left sheet spans the full height.
   ///
   /// The viewport is stubbed at 390px and ASSERTED to be narrow, because
   /// a test that mocks the build flag without `matchMedia` runs at
   /// desktop width while claiming to be a phone -- and would pass against
   /// a component that ignored the width entirely.
-  it("hides the group headings at phone width but keeps the group labelled", () => {
+  it("shows every group heading at phone width, each labelling its group", () => {
     const viewport = stubViewport(390);
     expect(window.matchMedia(`(max-width: ${MOBILE_BREAKPOINT - 1}px)`).matches).toBe(true);
     expect(viewport).toBeTruthy();
     render(<ViewSwitcher />);
     fireEvent.click(screen.getByRole("button", { name: /my pull requests/i }));
-    const heading = document.getElementById("view-group-pull-requests");
-    expect(heading).not.toBeNull();
-    expect(heading?.hasAttribute("hidden")).toBe(true);
-    // The group keeps its accessible name: `aria-labelledby` resolves
-    // against a hidden element, so the phone loses the pixels and not
-    // the semantics.
+    const groups = screen.getAllByRole("group");
+    expect(groups.length).toBeGreaterThan(1);
+    for (const group of groups) {
+      const heading = document.getElementById(group.getAttribute("aria-labelledby") ?? "");
+      expect(heading).not.toBeNull();
+      expect(heading?.hasAttribute("hidden")).toBe(false);
+      expect(heading?.textContent?.trim()).not.toBe("");
+    }
+    // The group keeps its accessible name, and the entries are still there.
     expect(screen.getByRole("group", { name: /pull requests/i })).toBeTruthy();
-    // And the entries themselves are still there -- hiding the label must
-    // not hide what it labels.
     expect(screen.getByRole("menuitem", { name: /my pull requests/i })).toBeTruthy();
   });
 
