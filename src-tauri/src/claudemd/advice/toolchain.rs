@@ -12,6 +12,16 @@
 //! `Gemfile`, Gradle, an Xcode bundle whether or not SPM is resolved, and
 //! a `pyproject.toml` no recognised tool owns.
 //!
+//! An Xcode project under `<app>/gen/apple`, or a Gradle build under
+//! `<app>/gen/android`, where `<app>` holds a Tauri config
+//! (`tauri.conf.json`, `tauri.conf.json5` or `Tauri.toml`), is not a
+//! toolchain (#1396). It is the project `tauri ios init` or `tauri android
+//! init` generates, and the Tauri CLI drives it (`tauri ios build`);
+//! nobody runs `xcodebuild` on it directly, so offering `xcodebuild build`
+//! for it was a gap nobody could close. The rule is exactly Tauri's
+//! documented layout and no wider: a hand-made Xcode project elsewhere,
+//! or a `gen/apple` with no Tauri config beside `gen`, is still detected.
+//!
 //! Two of `detect.rs`'s helpers swallow read errors (`has_xcode_spm` and
 //! `has_project_file` return `false` when `read_dir` fails, and an
 //! unreadable `pyproject.toml` with no lockfile falls through to nothing).
@@ -1568,6 +1578,7 @@ pub fn detect(repo: &Path) -> Detection {
         ]
         .into_iter()
         .find(|g| has(g))
+        .filter(|_| !tauri_generated(dir, "android"))
         {
             let m = dir.join(g);
             let manager = if has("gradlew") {
@@ -1589,11 +1600,15 @@ pub fn detect(repo: &Path) -> Detection {
             });
         }
 
-        if let Some(bundle) = names.iter().find(|n| {
-            Path::new(n)
-                .extension()
-                .is_some_and(|x| x == "xcodeproj" || x == "xcworkspace")
-        }) {
+        if let Some(bundle) = names
+            .iter()
+            .find(|n| {
+                Path::new(n)
+                    .extension()
+                    .is_some_and(|x| x == "xcodeproj" || x == "xcworkspace")
+            })
+            .filter(|_| !tauri_generated(dir, "apple"))
+        {
             let m = dir.join(bundle);
             out.toolchains.push(DetectedToolchain {
                 toolchain: Toolchain::Xcode,
@@ -1645,6 +1660,21 @@ pub fn detect(repo: &Path) -> Detection {
     out.toolchains
         .sort_by(|a, b| a.toolchain.cmp(&b.toolchain).then(a.dir.cmp(&b.dir)));
     out
+}
+
+/// The config files Tauri 2 reads from an app directory.
+const TAURI_CONFIGS: &[&str] = &["tauri.conf.json", "tauri.conf.json5", "Tauri.toml"];
+
+/// Whether `dir` is `<app>/gen/<platform>` for a Tauri app `<app>`: the
+/// project `tauri ios init` or `tauri android init` generates, which the
+/// Tauri CLI drives (#1396). Nothing else is excluded.
+fn tauri_generated(dir: &Path, platform: &str) -> bool {
+    dir.file_name().is_some_and(|n| n == platform)
+        && dir
+            .parent()
+            .filter(|g| g.file_name().is_some_and(|n| n == "gen"))
+            .and_then(Path::parent)
+            .is_some_and(|app| TAURI_CONFIGS.iter().any(|c| app.join(c).is_file()))
 }
 
 /// The tools a `pyproject.toml` configures: `[tool.pytest…]` offers
@@ -3949,6 +3979,60 @@ mod tests {
         );
     }
 
+    /// #1396's test: an Xcode project under `<dir>/gen/apple` and a
+    /// Gradle build under `<dir>/gen/android`, where `<dir>` holds a
+    /// `tauri.conf.json`, are Tauri's generated projects, not toolchains.
+    /// The rule is that narrow: a hand-made project elsewhere, or a
+    /// `gen/apple` with no Tauri config beside `gen`, is still detected.
+    #[test]
+    fn tauri_generated_mobile_projects_are_not_toolchains() {
+        let (_t, repo, _home) = fixture();
+        let app = repo.join("app");
+        fs::create_dir_all(app.join("gen").join("apple").join("x.xcodeproj")).unwrap();
+        fs::create_dir_all(app.join("gen").join("android")).unwrap();
+        fs::write(app.join("gen").join("android").join("build.gradle.kts"), "").unwrap();
+        fs::write(app.join("tauri.conf.json"), "{}").unwrap();
+        fs::create_dir_all(repo.join("ios").join("x.xcodeproj")).unwrap();
+        // Not beside a Tauri config: `other` has none.
+        fs::create_dir_all(
+            repo.join("other")
+                .join("gen")
+                .join("apple")
+                .join("y.xcodeproj"),
+        )
+        .unwrap();
+
+        let d = detect(&repo);
+        // By directory, not label: a label's separator is the platform's.
+        let dirs = |k: Toolchain| -> Vec<PathBuf> {
+            d.toolchains
+                .iter()
+                .filter(|t| t.toolchain == k)
+                .map(|t| t.dir.clone())
+                .collect()
+        };
+        assert_eq!(
+            dirs(Toolchain::Xcode),
+            vec![
+                repo.join("ios"),
+                repo.join("other").join("gen").join("apple")
+            ]
+        );
+        assert!(dirs(Toolchain::Gradle).is_empty(), "{d:#?}");
+
+        // The negative can fail: without the config, both are detected.
+        fs::remove_file(app.join("tauri.conf.json")).unwrap();
+        let d = detect(&repo);
+        assert_eq!(
+            d.toolchains
+                .iter()
+                .filter(|t| t.dir.starts_with(&app))
+                .count(),
+            2,
+            "{d:#?}"
+        );
+    }
+
     /// A Cargo workspace is one toolchain whose label counts its
     /// members, and `cargo run` is offered only where a binary exists.
     #[test]
@@ -4045,5 +4129,10 @@ mod tests {
         assert!(!run[0].contains("headstate-stepup"), "{}", run[0]);
         // The verify skill is read (#1394).
         assert!(run[0].contains(" skills names "), "{}", run[0]);
+        // `src-mobile/gen/apple` is Tauri's generated project (#1396).
+        assert!(
+            !sentences.iter().any(|s| s.contains("xcodebuild")),
+            "{sentences:#?}"
+        );
     }
 }
