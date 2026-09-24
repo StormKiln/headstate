@@ -2087,22 +2087,28 @@ fn commands_with(text: &str, scripts: &Scripts) -> Vec<(String, Verb)> {
 /// directory (`-C`, `-f`, `--justfile`): those are not this makefile's
 /// targets.
 fn target_args<'a>(manager: &str, args: &[&'a str]) -> Vec<&'a str> {
-    const ELSEWHERE: &[&str] = &[
-        "-C",
-        "-f",
-        "--file",
-        "--makefile",
-        "--directory",
-        "--justfile",
-        "--working-directory",
-        "-d",
-    ];
+    // Per manager (#1415): `-d` is just's working directory but make's
+    // DEBUG flag, so one shared list read `make -d lint` as another
+    // directory and stopped following it.
+    let elsewhere: &[&str] = match manager {
+        "make" => &["-C", "-f", "--file", "--makefile", "--directory"],
+        "just" => &["-f", "-d", "--justfile", "--working-directory"],
+        _ => &[],
+    };
     if args.iter().any(|a| {
-        ELSEWHERE.contains(a)
-            || ELSEWHERE
-                .iter()
-                .any(|f| f.starts_with("--") && a.starts_with(&format!("{f}=")))
-            || (a.starts_with("-C") && a.len() > 2)
+        elsewhere.contains(a)
+            || elsewhere.iter().any(|f| {
+                if f.starts_with("--") {
+                    a.starts_with(&format!("{f}="))
+                } else {
+                    // An attached short value (`-Csub`, `-fother.mk`,
+                    // `-dsub`). Only `-C` was caught before #1415, so
+                    // `make -fother.mk lint` was followed through THIS
+                    // directory's makefile -- coverage credited from a file
+                    // the command never runs.
+                    a.len() > f.len() && a.starts_with(f)
+                }
+            })
     }) {
         return Vec::new();
     }
@@ -3582,6 +3588,37 @@ mod tests {
         assert_eq!(
             commands_with("make -C sub lint", &scripts),
             vec![("make".into(), Verb::Lint)]
+        );
+        // #1415: make's `-d` is DEBUG, not a directory, so it is followed.
+        assert_eq!(
+            commands_with("make -d lint", &scripts),
+            vec![("make".into(), Verb::Lint), ("cargo".into(), Verb::Lint)]
+        );
+        // #1415: an attached `-fFILE` runs another makefile -- named, never
+        // followed through THIS directory's makefile (which would credit
+        // coverage from a file the command never runs).
+        assert_eq!(
+            commands_with("make -fother.mk lint", &scripts),
+            vec![("make".into(), Verb::Lint)]
+        );
+        // just's `-d` IS its working directory: named, not followed.
+        let just_runs: TargetRuns = [(
+            ("just".to_string(), "lint".to_string()),
+            vec![("cargo".to_string(), Verb::Lint)],
+        )]
+        .into_iter()
+        .collect();
+        let just_scripts = Scripts {
+            targets: &just_runs,
+            ..scripts
+        };
+        assert_eq!(
+            commands_with("just -d sub lint", &just_scripts),
+            vec![("just".into(), Verb::Lint)]
+        );
+        assert_eq!(
+            commands_with("just -dsub lint", &just_scripts),
+            vec![("just".into(), Verb::Lint)]
         );
     }
 
