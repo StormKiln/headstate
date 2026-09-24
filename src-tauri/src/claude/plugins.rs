@@ -86,6 +86,13 @@
 //! whose results are persisted per session, re-reading only transcripts
 //! whose mtime moved. Migration 16 holds the table.
 //!
+//! # Every install is listed; only some apply to a repository
+//!
+//! [`parse_inventory`] keeps every entry, which is what this page shows.
+//! The CLAUDE.md advice asks a narrower question -- what Claude Code
+//! loads in ONE repository -- and [`for_repository`] answers it from the
+//! same rows (#1364). That filter is never applied to this page.
+//!
 //! # Absent is not zero, and here it is the whole point
 //!
 //! This page is an argument about value: its output is the input to
@@ -126,8 +133,14 @@ pub struct InstalledPlugin {
     pub name: String,
     /// Where it came from: the `@<marketplace>` half of the key.
     pub marketplace: String,
-    /// `"user"` or `"project"`.
+    /// `"managed"`, `"user"`, `"project"` or `"local"`: the four
+    /// Claude Code's own schema for this file enumerates.
     pub scope: Option<String>,
+    /// The repository a `project` or `local` install is for: the
+    /// `projectPath` key, which Claude Code's schema describes as
+    /// "required for project/local scopes" and leaves out for `user` and
+    /// `managed`. See [`for_repository`].
+    pub project_path: Option<String>,
     pub version: Option<String>,
     pub install_path: Option<String>,
     /// RFC 3339.
@@ -920,6 +933,10 @@ pub fn parse_inventory(body: &str) -> Result<Vec<InstalledPlugin>, String> {
                 name: name.clone(),
                 marketplace: marketplace.clone(),
                 scope: e.get("scope").and_then(|v| v.as_str()).map(str::to_string),
+                project_path: e
+                    .get("projectPath")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
                 version: e
                     .get("version")
                     .and_then(|v| v.as_str())
@@ -939,6 +956,193 @@ pub fn parse_inventory(body: &str) -> Result<Vec<InstalledPlugin>, String> {
     }
     out.sort_by(|a, b| a.name.cmp(&b.name).then(a.scope.cmp(&b.scope)));
     Ok(out)
+}
+
+/// The installs that apply to one repository, and the ones whose
+/// applicability could not be decided.
+#[derive(Debug, Default)]
+pub struct ForRepository {
+    /// At most one install per plugin (`name@marketplace`): the most
+    /// specific scope that applies.
+    pub applied: Vec<InstalledPlugin>,
+    /// Installs that might apply and could not be checked, each with why:
+    /// a recorded project path that exists and would not read, or a
+    /// scope this code does not know. Never counted as applying.
+    pub undecided: Vec<(InstalledPlugin, String)>,
+}
+
+/// How specific a scope is, for choosing between a plugin's installs:
+/// `local` over `project` over `user` over `managed`. `None` for a scope
+/// Claude Code's schema does not list.
+fn scope_rank(scope: Option<&str>) -> Option<u8> {
+    match scope? {
+        "managed" => Some(0),
+        "user" => Some(1),
+        "project" => Some(2),
+        "local" => Some(3),
+        _ => None,
+    }
+}
+
+/// The repository a checkout belongs to: the main checkout's canonical
+/// root for a linked worktree, else the checkout's own canonical path.
+///
+/// A linked worktree's root holds a `.git` FILE reading `gitdir:
+/// <repo>/.git/worktrees/<name>`, which is how git finds its way back and
+/// what `advice::transcripts` tests too; no directory name is guessed.
+///
+/// `Ok(None)` when the path does not exist: a checkout that is gone is
+/// not any repository. `Err` when it exists and could not be read, which
+/// is "could not look", not "no".
+fn checkout_identity(path: &Path) -> Result<Option<PathBuf>, String> {
+    let shown = |e: std::io::Error| format!("{}: {e}", path.display());
+    match std::fs::metadata(path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(shown(e)),
+    }
+    let dot_git = path.join(".git");
+    let owner = match std::fs::symlink_metadata(&dot_git) {
+        Ok(m) if m.is_file() => {
+            let text = std::fs::read_to_string(&dot_git).map_err(shown)?;
+            text.trim()
+                .strip_prefix("gitdir:")
+                .map(|t| lexical(&path.join(t.trim())))
+                .filter(|t| {
+                    let name = |p: Option<&Path>| p.and_then(Path::file_name).map(|n| n.to_owned());
+                    let parent = t.parent();
+                    t.file_name().is_some()
+                        && name(parent).as_deref() == Some(std::ffi::OsStr::new("worktrees"))
+                        && name(parent.and_then(Path::parent)).as_deref()
+                            == Some(std::ffi::OsStr::new(".git"))
+                })
+                .and_then(|t| t.ancestors().nth(3).map(Path::to_path_buf))
+        }
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(shown(e)),
+    };
+    // A `.git` file that is not a linked worktree's (a submodule's) leaves
+    // the checkout as its own repository.
+    let root = owner.unwrap_or_else(|| path.to_path_buf());
+    std::fs::canonicalize(&root).map(Some).map_err(shown)
+}
+
+/// `..` and `.` resolved by component, without touching the filesystem.
+/// A relative `gitdir:` is written that way since git 2.48.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The installs that apply when Claude Code runs in `repo` (#1364).
+///
+/// `installed_plugins.json` lists every install on the machine, and one
+/// plugin can hold several: a project-scope install for another
+/// repository, an older version still recorded. Analysing all of them for
+/// every repository reported on plugins the repository never loads.
+///
+/// # The rule, and where it comes from
+///
+/// Read from Claude Code 2.1.281's own bundle, not guessed: its schema
+/// for an entry is `scope: managed|user|project|local` plus
+/// `projectPath`, "Project path (required for project/local scopes)",
+/// and its applicability test is, verbatim in effect: `user` or
+/// `managed` applies everywhere; otherwise it applies when `projectPath`
+/// is the working directory, or when both resolve to the same
+/// repository; and an entry with no `projectPath` applies nowhere.
+///
+/// Here "the same repository" is [`checkout_identity`]: the main
+/// checkout's root, so a linked worktree of `repo` matches, and so does
+/// `repo`'s main checkout when `repo` is itself a worktree.
+///
+/// - A `project` or `local` entry with no `projectPath` is left out. Not
+///   "applies everywhere": Claude Code does not load it anywhere.
+/// - A recorded path that no longer exists is left out. It is not this
+///   repository, because this one exists.
+/// - A recorded path that exists and could not be read, or a `repo` that
+///   could not be, is UNDECIDED: returned with why, never applied. The
+///   caller reports it, so the advice says what it could not check
+///   rather than silently answering without it.
+/// - A scope outside the four is undecided too. A future scope's rule is
+///   not known here, and guessing it either way could be wrong.
+///
+/// # One install per plugin
+///
+/// Of a plugin's applying installs the most specific scope wins
+/// ([`scope_rank`]): a project install for this repository replaces the
+/// user install, which is what installing at project scope is for. Two
+/// at the same scope (the main checkout and a worktree both recorded)
+/// keep the one recorded for `repo` exactly, else the first listed.
+///
+/// Only the advice calls this. The Plugins and Definitions pages list
+/// every install, which is the question they answer.
+pub fn for_repository(installed: Vec<InstalledPlugin>, repo: &Path) -> ForRepository {
+    let mut repo_identity: Option<Result<Option<PathBuf>, String>> = None;
+    let mut out = ForRepository::default();
+    // (rank, exact) of the install kept for each plugin, and its index.
+    let mut kept: BTreeMap<(String, String), ((u8, bool), usize)> = BTreeMap::new();
+    for p in installed {
+        let Some(rank) = scope_rank(p.scope.as_deref()) else {
+            let why = format!(
+                "{}: scope `{}` is not one this version knows, so whether it applies here \
+                 was not decided",
+                p.install_path.as_deref().unwrap_or(&p.name),
+                p.scope.as_deref().unwrap_or("(none)")
+            );
+            out.undecided.push((p, why));
+            continue;
+        };
+        let exact = p
+            .project_path
+            .as_deref()
+            .is_some_and(|pp| Path::new(pp) == repo);
+        let applies = if rank <= 1 || exact {
+            true
+        } else {
+            match p.project_path.as_deref().filter(|pp| !pp.is_empty()) {
+                None => false,
+                Some(pp) => {
+                    let mine = repo_identity
+                        .get_or_insert_with(|| checkout_identity(repo))
+                        .clone();
+                    match (mine, checkout_identity(Path::new(pp))) {
+                        (Ok(Some(a)), Ok(Some(b))) => a == b,
+                        (_, Ok(None)) | (Ok(None), _) => false,
+                        (Err(why), _) | (_, Err(why)) => {
+                            out.undecided.push((p, why));
+                            continue;
+                        }
+                    }
+                }
+            }
+        };
+        if !applies {
+            continue;
+        }
+        let key = (p.name.clone(), p.marketplace.clone());
+        match kept.get(&key) {
+            Some((best, _)) if *best >= (rank, exact) => {}
+            Some(&(_, i)) => {
+                out.applied[i] = p;
+                kept.insert(key, ((rank, exact), i));
+            }
+            None => {
+                kept.insert(key, ((rank, exact), out.applied.len()));
+                out.applied.push(p);
+            }
+        }
+    }
+    out
 }
 
 /// What a plugin ships, read from its install path.
@@ -1585,6 +1789,183 @@ mod tests {
         // An install path that does not exist is not a claim that the
         // plugin ships nothing.
         assert!(!got[0].contribution.read);
+    }
+
+    /// An `installed_plugins.json` with the given entries for
+    /// `octo-plugin@acme`, each `(scope, version, projectPath)`.
+    fn manifest(entries: &[(&str, &str, Option<&Path>)]) -> String {
+        let list: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|(scope, version, project)| {
+                let mut e = serde_json::json!({
+                    "scope": scope,
+                    "version": version,
+                    "installPath": format!("/cache/acme/octo-plugin/{version}"),
+                });
+                if let Some(p) = project {
+                    e["projectPath"] = p.to_string_lossy().to_string().into();
+                }
+                e
+            })
+            .collect();
+        serde_json::json!({"version": 2, "plugins": {"octo-plugin@acme": list}}).to_string()
+    }
+
+    fn versions(installs: &[InstalledPlugin]) -> Vec<&str> {
+        installs
+            .iter()
+            .filter_map(|p| p.version.as_deref())
+            .collect()
+    }
+
+    /// #1364's fixture: a user install at v2, a project install for
+    /// ANOTHER repository at v1 and one for this repository at v3. Only
+    /// v3 is analysed: project beats user for the same plugin, and the
+    /// other repository's install is nothing here.
+    #[test]
+    fn only_this_repositorys_most_specific_install_applies() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path().join("repo");
+        let other = t.path().join("other");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let body = manifest(&[
+            ("user", "2.0.0", None),
+            ("project", "1.0.0", Some(&other)),
+            ("project", "3.0.0", Some(&repo)),
+        ]);
+        let got = for_repository(parse_inventory(&body).unwrap(), &repo);
+        assert_eq!(versions(&got.applied), ["3.0.0"]);
+        assert!(got.undecided.is_empty(), "{:?}", got.undecided);
+        assert_eq!(
+            got.applied[0].project_path.as_deref(),
+            Some(&*repo.to_string_lossy())
+        );
+
+        // And the roots the advice's inventory is built from hold v3 only.
+        let plugins: Vec<(String, String)> = got
+            .applied
+            .into_iter()
+            .filter_map(|p| p.install_path.map(|ip| (p.name, ip)))
+            .collect();
+        let roots = crate::claude::definitions::roots(None, &[], &plugins);
+        let paths: Vec<PathBuf> = roots.into_iter().map(|(_, p)| p).collect();
+        assert_eq!(paths, [PathBuf::from("/cache/acme/octo-plugin/3.0.0")]);
+
+        // From the other repository, its own install wins instead.
+        let got = for_repository(parse_inventory(&body).unwrap(), &other);
+        assert_eq!(versions(&got.applied), ["1.0.0"]);
+    }
+
+    /// With no project install for this repository, the user install is
+    /// what applies -- the filter does not drop user scope.
+    #[test]
+    fn a_user_install_applies_to_every_repository() {
+        let t = tempfile::tempdir().unwrap();
+        let other = t.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let body = manifest(&[("project", "1.0.0", Some(&other)), ("user", "2.0.0", None)]);
+        let got = for_repository(parse_inventory(&body).unwrap(), &t.path().join("repo"));
+        assert_eq!(versions(&got.applied), ["2.0.0"]);
+    }
+
+    /// A project install recorded in a linked worktree applies to the
+    /// main checkout, and one recorded in the main checkout applies when
+    /// the advice runs on the worktree. `local` beats `project`.
+    #[test]
+    fn a_linked_worktree_is_the_same_repository() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path().join("repo");
+        let wt = t.path().join("repo-t1");
+        let admin = repo.join(".git").join("worktrees").join("t1");
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", admin.to_string_lossy()),
+        )
+        .unwrap();
+
+        let body = manifest(&[("project", "3.0.0", Some(&wt))]);
+        let got = for_repository(parse_inventory(&body).unwrap(), &repo);
+        assert_eq!(versions(&got.applied), ["3.0.0"]);
+
+        let body = manifest(&[
+            ("project", "3.0.0", Some(&repo)),
+            ("local", "4.0.0", Some(&repo)),
+        ]);
+        let got = for_repository(parse_inventory(&body).unwrap(), &wt);
+        assert_eq!(versions(&got.applied), ["4.0.0"]);
+
+        // A relative `gitdir:` (git 2.48+) resolves the same way.
+        std::fs::write(wt.join(".git"), "gitdir: ../repo/.git/worktrees/t1\n").unwrap();
+        let body = manifest(&[("project", "3.0.0", Some(&wt))]);
+        let got = for_repository(parse_inventory(&body).unwrap(), &repo);
+        assert_eq!(versions(&got.applied), ["3.0.0"]);
+    }
+
+    /// A project install with no `projectPath`, or one naming a path
+    /// that is gone, is not "applies everywhere": Claude Code loads it
+    /// nowhere, and a gone path is not this repository.
+    #[test]
+    fn an_unplaceable_project_install_applies_nowhere() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let body = manifest(&[
+            ("project", "1.0.0", None),
+            ("local", "1.1.0", Some(&t.path().join("gone"))),
+        ]);
+        let got = for_repository(parse_inventory(&body).unwrap(), &repo);
+        assert!(got.applied.is_empty(), "{:?}", got.applied);
+        assert!(got.undecided.is_empty(), "{:?}", got.undecided);
+    }
+
+    /// A recorded path that exists and cannot be read is undecided, with
+    /// why: "could not look" is neither "applies" nor "does not".
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_project_path_is_undecided() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path().join("repo");
+        let locked = t.path().join("locked");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads through any mode; the case cannot be staged there.
+        if std::fs::read_dir(&locked).is_ok() {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let body = manifest(&[("user", "2.0.0", None), ("project", "3.0.0", Some(&locked))]);
+        let got = for_repository(parse_inventory(&body).unwrap(), &repo);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(versions(&got.applied), ["2.0.0"]);
+        assert_eq!(got.undecided.len(), 1, "{:?}", got.undecided);
+        assert_eq!(got.undecided[0].0.version.as_deref(), Some("3.0.0"));
+        assert!(
+            got.undecided[0].1.starts_with(&*locked.to_string_lossy()),
+            "{:?}",
+            got.undecided
+        );
+    }
+
+    /// A scope this code does not know is undecided -- reported, never
+    /// applied and never silently dropped. `managed` applies everywhere,
+    /// as `user` does.
+    #[test]
+    fn an_unknown_scope_is_undecided_and_managed_applies() {
+        let t = tempfile::tempdir().unwrap();
+        let body = manifest(&[("team", "1.0.0", None), ("managed", "2.0.0", None)]);
+        let got = for_repository(parse_inventory(&body).unwrap(), t.path());
+        assert_eq!(versions(&got.applied), ["2.0.0"]);
+        assert_eq!(got.undecided.len(), 1);
+        assert!(
+            got.undecided[0].1.contains("scope `team`"),
+            "{:?}",
+            got.undecided
+        );
     }
 
     /// A document we cannot understand is a failure, not an empty list.

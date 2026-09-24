@@ -1822,7 +1822,11 @@ pub async fn claude_md_effective(
 /// The definitions inventory is built the way `claude_definitions`
 /// builds it -- user root, this repository's `.claude`, installed
 /// plugins -- so a skill a CLAUDE.md names is checked against every
-/// scope Claude Code would load it from. Each root that could not be
+/// scope Claude Code would load it from. Unlike there, the plugins are
+/// only the installs that apply to this repository
+/// (`plugins::for_repository`, #1364): another repository's project
+/// install, or a version a more specific scope replaces, is not loaded
+/// here and is not analysed here. Each root that could not be
 /// resolved is a `ScopeRefusal` in the inventory rather than a reason
 /// to drop the whole thing: the rot and skills producers read those
 /// refusals and report a skill they cannot find as Unknown, not missing.
@@ -1863,13 +1867,27 @@ pub async fn claude_md_advice(
         let home = crate::claudemd::home();
         // The definitions inventory, built once here for every producer
         // that reads it: the user root, THIS repository's `.claude` and
-        // every installed plugin, the roots `claude_definitions` walks
-        // minus the other repositories. A plugin list that could not be
-        // read is a refusal inside the inventory, as it is there.
+        // the plugin installs that apply to THIS repository (#1364) --
+        // not every install `claude_definitions` lists, which includes
+        // other repositories' project installs and superseded versions.
+        // A plugin list that could not be read is a refusal inside the
+        // inventory, as it is there, and so is an install whose
+        // applicability could not be decided.
         let user = defs::user_root();
-        let (plugins, plugin_refusal) = installed_plugin_roots();
+        let (installed, plugin_refusal) = installed_plugins();
+        let installed = crate::claude::plugins::for_repository(installed, &repo);
+        let plugins = plugin_roots(installed.applied);
         let roots = defs::roots(user.clone(), std::slice::from_ref(&repo), &plugins);
         let mut inv = defs::scan_scopes(&roots);
+        for (p, detail) in installed.undecided {
+            inv.unreadable.push(defs::ScopeRefusal {
+                source: defs::Source::Plugin {
+                    name: p.name,
+                    path: p.install_path.unwrap_or_default(),
+                },
+                detail,
+            });
+        }
         if user.is_none() {
             inv.unreadable.push(defs::ScopeRefusal {
                 source: defs::Source::User,
@@ -5814,7 +5832,8 @@ pub async fn claude_definitions(
     // `list_worktrees` states. It surfaces as a `ScopeRefusal` below.
     tauri::async_runtime::spawn_blocking(move || {
         let (repos, repo_refusals) = defs::project_roots(&dirs);
-        let (plugins, plugin_refusal) = installed_plugin_roots();
+        let (installed, plugin_refusal) = installed_plugins();
+        let plugins = plugin_roots(installed);
         let roots = defs::roots(Some(user), &repos, &plugins);
         let mut out = defs::scan_scopes(&roots);
         // A directory we could not even walk LOOKING for a `.claude` can
@@ -5844,16 +5863,13 @@ pub async fn claude_definitions(
     .map_err(|e| e.to_string())
 }
 
-/// Installed plugins as `(name, install_path)`, plus why the inventory
+/// Every install in `installed_plugins.json`, plus why the inventory
 /// could not be read.
 ///
 /// Reads the same `installed_plugins.json` `claude_plugins` does, via
 /// `plugins::parse_inventory`, so the two pages name plugins
-/// identically. A plugin with no recorded install path is SKIPPED rather
-/// than guessed at: `plugins.rs`'s ownership table records what a
-/// derived path rule costs, and inventing one here would attribute a
-/// stranger's definitions to a plugin.
-fn installed_plugin_roots() -> (Vec<(String, String)>, Option<String>) {
+/// identically.
+fn installed_plugins() -> (Vec<crate::claude::plugins::InstalledPlugin>, Option<String>) {
     let Some(dir) = crate::claude::plugins::plugins_dir() else {
         // Unreachable in practice -- the caller already refused without a
         // home -- but stated rather than unwrapped.
@@ -5870,14 +5886,21 @@ fn installed_plugin_roots() -> (Vec<(String, String)>, Option<String>) {
         Err(e) => return (Vec::new(), Some(format!("{}: {e}", path.display()))),
     };
     match crate::claude::plugins::parse_inventory(&body) {
-        Ok(list) => (
-            list.into_iter()
-                .filter_map(|p| p.install_path.map(|ip| (p.name, ip)))
-                .collect(),
-            None,
-        ),
+        Ok(list) => (list, None),
         Err(e) => (Vec::new(), Some(format!("{}: {e}", path.display()))),
     }
+}
+
+/// Installs as the `(name, install_path)` roots `definitions::roots`
+/// takes. A plugin with no recorded install path is SKIPPED rather than
+/// guessed at: `plugins.rs`'s ownership table records what a derived
+/// path rule costs, and inventing one here would attribute a stranger's
+/// definitions to a plugin.
+fn plugin_roots(installed: Vec<crate::claude::plugins::InstalledPlugin>) -> Vec<(String, String)> {
+    installed
+        .into_iter()
+        .filter_map(|p| p.install_path.map(|ip| (p.name, ip)))
+        .collect()
 }
 
 #[tauri::command]
