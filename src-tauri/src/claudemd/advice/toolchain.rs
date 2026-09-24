@@ -42,6 +42,15 @@
 //! never "recommends". A manager token inside a path (`src-tauri/Cargo.toml`)
 //! fails the first-token rule and counts for nothing.
 //!
+//! Leading `NAME=value` environment assignments are skipped before the
+//! first token, as in a script body (#1412: `CI=1 yarn test` names yarn's
+//! test). For `make` and `just` the target is the first positional word:
+//! options are skipped, and so is the value of one that takes a value
+//! (`-C dir`, `-f file`, `--justfile file`, a number after `-j`), so
+//! `make -j4 lint` names lint and `make -C lint` names nothing. A target
+//! run with `-C` or `-f` names its verb, but its recipe is not followed
+//! (below).
+//!
 //! The files searched are every CLAUDE.md the scan loaded, their imports,
 //! and the repository's `.claude/rules/*.md` (`claudemd::rules`, #1340),
 //! path-scoped or not: a rule loads when a session works where its
@@ -132,8 +141,11 @@
 //! open-ended (`scripts::makefile_is_open_ended`: an `include` or a `%`
 //! pattern rule), when that target might be defined where the parser
 //! cannot see: the gaps the named target might cover are
-//! [`Severity::Unknown`], naming the target, for every toolchain. A target
-//! name two makefiles share takes the union of what either runs.
+//! [`Severity::Unknown`], naming the target, for every toolchain. So are
+//! they when whether the makefile is open-ended could not be read (#1411):
+//! the Unknown names the makefile and the io error, because a failed read
+//! is not a closed makefile. A target name two makefiles share takes the
+//! union of what either runs.
 //!
 //! A JS launcher is read through to the tool it runs (#1323): `npx`,
 //! `bunx`, `pnpm exec`, `bun x` and `pnpm nx` name what follows them, and
@@ -653,7 +665,10 @@ fn verb_by_name(name: &str) -> Option<Verb> {
 fn verb_of(manager: &str, args: &[&str]) -> Option<Verb> {
     let first = args.first().copied();
     match manager {
-        "make" | "just" => first.and_then(verb_by_name),
+        "make" | "just" => positional_args(manager, args)
+            .first()
+            .copied()
+            .and_then(verb_by_name),
         // All three run a package.json script without `run`.
         "yarn" | "pnpm" | "bun" => match first {
             Some("run") => args.get(1).copied().and_then(verb_by_name),
@@ -858,10 +873,7 @@ fn body_verbs(
 ) -> Body {
     let mut out = Body::default();
     for segment in split_chain(body) {
-        let tokens: Vec<&str> = segment
-            .split_whitespace()
-            .skip_while(|t| is_assignment(t))
-            .collect();
+        let tokens = command_words(segment);
         let Some(first) = tokens.first() else {
             continue;
         };
@@ -967,6 +979,17 @@ fn read_script_file(file: &str, at: &Files) -> Result<String, (PathBuf, String)>
         return Err(outside(&path));
     }
     std::fs::read_to_string(&real).map_err(unreadable)
+}
+
+/// The words of one command, less the `NAME=value` environment
+/// assignments before it (#1341, #1412): `CI=1 yarn test` is `yarn test`.
+/// Shared by a loaded file's commands and a script body's, so the two
+/// cannot disagree about which word is the manager.
+fn command_words(segment: &str) -> Vec<&str> {
+    segment
+        .split_whitespace()
+        .skip_while(|t| is_assignment(t))
+        .collect()
 }
 
 /// `NAME=value` before a command: an environment assignment.
@@ -1491,7 +1514,7 @@ pub fn detect(repo: &Path) -> Detection {
                     let open = if kind == Toolchain::Make {
                         scripts::makefile_is_open_ended(dir)
                     } else {
-                        None
+                        Ok(None)
                     };
                     let no_targets = BTreeMap::new();
                     let no_unknown = BTreeMap::new();
@@ -1505,8 +1528,14 @@ pub fn detect(repo: &Path) -> Detection {
                     let found: Vec<_> = mine
                         .iter()
                         .map(|target| {
-                            let (runs, unknown) =
-                                recipe_runs(manager, &target.name, &mine, &t.manifest, open, &cx);
+                            let (runs, unknown) = recipe_runs(
+                                manager,
+                                &target.name,
+                                &mine,
+                                &t.manifest,
+                                open.as_ref().copied().map_err(String::as_str),
+                                &cx,
+                            );
                             (target.name.clone(), runs, unknown)
                         })
                         .collect();
@@ -2017,7 +2046,7 @@ fn commands_with(text: &str, scripts: &Scripts) -> Vec<(String, Verb)> {
     for segment in split_chain(text) {
         let segment = segment.trim();
         let segment = segment.strip_prefix("$ ").unwrap_or(segment);
-        let tokens: Vec<&str> = segment.split_whitespace().collect();
+        let tokens = command_words(segment);
         let Some(first) = tokens.first() else {
             continue;
         };
@@ -2040,7 +2069,7 @@ fn commands_with(text: &str, scripts: &Scripts) -> Vec<(String, Verb)> {
         }
         // A named target names what its recipe runs, too (#1393).
         if matches!(manager, "make" | "just") {
-            for target in target_args(args) {
+            for target in target_args(manager, args) {
                 if let Some(runs) = scripts
                     .targets
                     .get(&(manager.to_string(), target.to_string()))
@@ -2053,11 +2082,11 @@ fn commands_with(text: &str, scripts: &Scripts) -> Vec<(String, Verb)> {
     out
 }
 
-/// The targets a `make` or `just` command runs: its positional
-/// arguments, less flags, their values and `NAME=value` assignments.
-/// Nothing when a flag points it at another file or directory (`-C`,
-/// `-f`, `--justfile`): those are not this makefile's targets.
-fn target_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
+/// The targets a `make` or `just` command runs: its
+/// [`positional_args`]. Nothing when a flag points it at another file or
+/// directory (`-C`, `-f`, `--justfile`): those are not this makefile's
+/// targets.
+fn target_args<'a>(manager: &str, args: &[&'a str]) -> Vec<&'a str> {
     const ELSEWHERE: &[&str] = &[
         "-C",
         "-f",
@@ -2077,10 +2106,67 @@ fn target_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
     }) {
         return Vec::new();
     }
-    args.iter()
-        .copied()
-        .filter(|a| !a.starts_with('-') && !is_assignment(a))
-        .collect()
+    positional_args(manager, args)
+}
+
+/// The positional words of a `make` or `just` command, in order: its
+/// targets (for just, a recipe and its arguments), less options, the
+/// value of an option that takes one, and `NAME=value` overrides
+/// (#1412: `make -j4 lint` runs `lint`, `make -C sub lint` runs `lint`
+/// in `sub`, and `make -C lint` runs no named target). Whether the
+/// command runs this directory's makefile is [`target_args`]' question,
+/// not this one's.
+fn positional_args<'a>(manager: &str, args: &[&'a str]) -> Vec<&'a str> {
+    let takes_value = |flag: &str| match manager {
+        "make" => matches!(
+            flag,
+            "-C" | "-f"
+                | "-I"
+                | "-o"
+                | "-W"
+                | "--directory"
+                | "--file"
+                | "--makefile"
+                | "--include-dir"
+                | "--old-file"
+                | "--assume-old"
+                | "--new-file"
+                | "--assume-new"
+                | "--what-if"
+        ),
+        "just" => matches!(
+            flag,
+            "-f" | "-d"
+                | "--justfile"
+                | "--working-directory"
+                | "--dotenv-filename"
+                | "--dotenv-path"
+                | "--shell"
+                | "--color"
+        ),
+        _ => false,
+    };
+    // `-j` and `-l` take a number, or nothing: `make -j lint` runs lint.
+    let takes_number =
+        |flag: &str| manager == "make" && matches!(flag, "-j" | "-l" | "--jobs" | "--load-average");
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        i += 1;
+        if a.starts_with('-') {
+            if takes_value(a)
+                || (takes_number(a) && args.get(i).is_some_and(|n| n.parse::<f64>().is_ok()))
+            {
+                i += 1;
+            }
+            continue;
+        }
+        if !is_assignment(a) {
+            out.push(a);
+        }
+    }
+    out
 }
 
 /// The make and just targets one span or fenced line runs, with the
@@ -2090,9 +2176,9 @@ fn targets_named(text: &str) -> Vec<(String, String)> {
     for segment in split_chain(text) {
         let segment = segment.trim();
         let segment = segment.strip_prefix("$ ").unwrap_or(segment);
-        let tokens: Vec<&str> = segment.split_whitespace().collect();
+        let tokens = command_words(segment);
         if let Some(manager @ ("make" | "just")) = tokens.first().copied() {
-            for t in target_args(&tokens[1..]) {
+            for t in target_args(manager, &tokens[1..]) {
                 out.push((manager.to_string(), t.to_string()));
             }
         }
@@ -2118,21 +2204,23 @@ fn targets_named(text: &str) -> Vec<(String, String)> {
 /// `check`) credits whatever each command maps to.
 ///
 /// A target the file does not define is a file prerequisite, unless the
-/// makefile is open-ended (`open`): then it might be defined where the
-/// parser cannot see, and it is Unknown, never nothing.
+/// makefile is open-ended (`open` is `Ok(Some(why))`): then it might be
+/// defined where the parser cannot see, and it is Unknown, never nothing.
+/// So is it when whether the makefile is open-ended could not be read
+/// (`open` is `Err`, #1411): a failed read is not "closed".
 fn recipe_runs(
     manager: &str,
     name: &str,
     targets: &[&Target],
     manifest: &Path,
-    open: Option<&str>,
+    open: Result<Option<&str>, &str>,
     scripts: &Scripts,
 ) -> (Vec<(String, Verb)>, Vec<Unfollowed>) {
     struct Walk<'a> {
         manager: &'a str,
         targets: &'a [&'a Target],
         manifest: &'a Path,
-        open: Option<&'a str>,
+        open: Result<Option<&'a str>, &'a str>,
         scripts: &'a Scripts<'a>,
         /// The named target's own verb, when its name maps to one.
         verb: Option<Verb>,
@@ -2145,16 +2233,21 @@ fn recipe_runs(
             return;
         }
         let Some(target) = w.targets.iter().find(|t| t.name == name) else {
-            if let Some(why) = w.open {
+            let why = match w.open {
+                Ok(None) => None,
+                Ok(Some(why)) => Some(format!(
+                    "target `{name}` is not one the parser can see, and `{}` {why}",
+                    w.manifest.to_string_lossy()
+                )),
+                Err(e) => Some(format!(
+                    "target `{name}` is not one the parser can see, and whether `{}` includes other files could not be read: {e}",
+                    w.manifest.to_string_lossy()
+                )),
+            };
+            if let Some(why) = why {
                 w.unknown.push(Unfollowed {
                     manager: None,
-                    reasons: vec![(
-                        w.manifest.to_path_buf(),
-                        format!(
-                            "target `{name}` is not one the parser can see, and `{}` {why}",
-                            w.manifest.to_string_lossy()
-                        ),
-                    )],
+                    reasons: vec![(w.manifest.to_path_buf(), why)],
                 });
             }
             return;
@@ -2177,7 +2270,7 @@ fn recipe_runs(
                     continue;
                 }
                 if *head == w.manager {
-                    for t in target_args(&tokens[1..]) {
+                    for t in target_args(w.manager, &tokens[1..]) {
                         visit(w, t);
                     }
                 }
@@ -2241,7 +2334,7 @@ fn scripts_named(text: &str) -> Vec<(String, String)> {
     for segment in split_chain(text) {
         let segment = segment.trim();
         let segment = segment.strip_prefix("$ ").unwrap_or(segment);
-        let tokens: Vec<&str> = segment.split_whitespace().collect();
+        let tokens = command_words(segment);
         let Some(first) = tokens.first() else {
             continue;
         };
@@ -3414,6 +3507,84 @@ mod tests {
         );
     }
 
+    /// #1412: a leading `NAME=value` is an environment assignment, not
+    /// the manager, in a loaded file as in a script body.
+    #[test]
+    fn a_leading_assignment_is_skipped_before_the_manager() {
+        assert_eq!(
+            commands_in("CI=1 yarn test"),
+            vec![("yarn".into(), Verb::Test)]
+        );
+        assert_eq!(
+            commands_in("$ CI=1 RUST_LOG=debug cargo test --lib"),
+            vec![("cargo".into(), Verb::Test)]
+        );
+        // An assignment alone runs nothing.
+        assert_eq!(commands_in("CI=1"), vec![]);
+        // What `unfollowed` reads sees the same command.
+        assert_eq!(
+            scripts_named("CI=1 yarn verify"),
+            vec![("yarn".to_string(), "verify".to_string())]
+        );
+        assert_eq!(
+            targets_named("CI=1 make lint"),
+            vec![("make".to_string(), "lint".to_string())]
+        );
+    }
+
+    /// #1412: options before a make or just target are skipped, and so is
+    /// the value of an option that takes one. A `-C`/`-f` target names
+    /// its verb but its recipe is not followed (#1408's rule).
+    #[test]
+    fn options_before_a_make_or_just_target_are_skipped() {
+        assert_eq!(
+            commands_in("make -j4 lint"),
+            vec![("make".into(), Verb::Lint)]
+        );
+        assert_eq!(
+            commands_in("make -k V=1 test"),
+            vec![("make".into(), Verb::Test)]
+        );
+        assert_eq!(
+            commands_in("just --dry-run test"),
+            vec![("just".into(), Verb::Test)]
+        );
+        assert_eq!(
+            commands_in("make -f other.mk build"),
+            vec![("make".into(), Verb::Build)]
+        );
+        assert_eq!(
+            commands_in("just --justfile other.just fmt"),
+            vec![("just".into(), Verb::Format)]
+        );
+        // `-C lint` is a directory called lint, not the lint target.
+        assert_eq!(commands_in("make -C lint"), vec![]);
+
+        let runs: TargetRuns = [(
+            ("make".to_string(), "lint".to_string()),
+            vec![("cargo".to_string(), Verb::Lint)],
+        )]
+        .into_iter()
+        .collect();
+        let scripts = Scripts {
+            verbs: &BTreeMap::new(),
+            unknown: &BTreeMap::new(),
+            names: &BTreeSet::new(),
+            targets: &runs,
+            target_unknown: &BTreeMap::new(),
+        };
+        // Followed: the flag no longer hides the target.
+        assert_eq!(
+            commands_with("make -j4 lint", &scripts),
+            vec![("make".into(), Verb::Lint), ("cargo".into(), Verb::Lint)]
+        );
+        // Named, not followed: `-C sub` is another makefile.
+        assert_eq!(
+            commands_with("make -C sub lint", &scripts),
+            vec![("make".into(), Verb::Lint)]
+        );
+    }
+
     /// #1392's test: a CLAUDE.md naming `yarn vitest run` covers yarn's
     /// `test` script, and `npx prettier --check .` covers `format`.
     /// `yarn install` still names nothing, so the negative can fail.
@@ -3718,7 +3889,8 @@ mod tests {
              check: loop\n\t@$(MAKE) --no-print-directory inner\n\t$(DYN) build\n\
              loop: check\n\
              inner:\n\tVITE_TARGET=x $(CARGO) test && yarn vitest run\n\
-             elsewhere:\n\t$(MAKE) -C sub fmt\n",
+             elsewhere:\n\t$(MAKE) -C sub fmt\n\
+             fmt:\n\tcargo fmt\n",
         )
         .unwrap();
         let d = detect(&repo);
@@ -3734,8 +3906,12 @@ mod tests {
                 ("yarn".to_string(), Verb::Test),
             ])
         );
-        // `-C sub` is another makefile's target: not followed.
-        assert_eq!(runs("elsewhere"), None);
+        // `-C sub` is another makefile's target: mapped by name (#1412),
+        // not followed into this file's `fmt`, so no `cargo fmt`.
+        assert_eq!(
+            runs("elsewhere"),
+            Some(vec![("make".to_string(), Verb::Format)])
+        );
         assert!(d.target_unknown.is_empty(), "{:?}", d.target_unknown);
     }
 
@@ -3826,6 +4002,82 @@ mod tests {
         assert!(
             found.iter().all(|f| f.severity == Severity::Advice),
             "{found:#?}"
+        );
+    }
+
+    /// #1411: when whether the makefile is open-ended could not be read,
+    /// a prerequisite the parser cannot see is Unknown, naming the
+    /// makefile and the error: never a file, never nothing.
+    #[test]
+    fn a_missing_prerequisite_when_openness_is_unreadable_is_unknown() {
+        let lint = Target {
+            name: "lint".to_string(),
+            file: "Makefile".to_string(),
+            line: 1,
+            prereqs: vec!["lint-rust".to_string()],
+            recipe: Vec::new(),
+        };
+        let targets = [&lint];
+        let cx = Scripts {
+            verbs: &BTreeMap::new(),
+            unknown: &BTreeMap::new(),
+            names: &BTreeSet::new(),
+            targets: &BTreeMap::new(),
+            target_unknown: &BTreeMap::new(),
+        };
+        let (runs, unknown) = recipe_runs(
+            "make",
+            "lint",
+            &targets,
+            Path::new("Makefile"),
+            Err("Makefile: Permission denied"),
+            &cx,
+        );
+        assert!(runs.is_empty(), "{runs:?}");
+        assert_eq!(unknown.len(), 1, "{unknown:?}");
+        let (at, why) = &unknown[0].reasons[0];
+        assert_eq!(at, Path::new("Makefile"));
+        assert!(
+            why.contains("`lint-rust`") && why.contains("Permission denied"),
+            "{why}"
+        );
+    }
+
+    /// #1411: an unreadable makefile is Unknown with the io error, never
+    /// "nothing names" a target in it.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_makefile_is_unknown_not_unnamed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_t, repo, home) = fixture();
+        fs::write(repo.join("Cargo.toml"), "[package]\nname = \"octocat\"\n").unwrap();
+        let makefile = repo.join("Makefile");
+        fs::write(&makefile, "lint: lint-rust\n\ttrue\n").unwrap();
+        fs::write(repo.join("CLAUDE.md"), "Run `make nope`.\n").unwrap();
+        fs::set_permissions(&makefile, fs::Permissions::from_mode(0o000)).unwrap();
+        let blocked = fs::read(&makefile).is_err();
+        let report = run_over(&repo, &home);
+        fs::set_permissions(&makefile, fs::Permissions::from_mode(0o644)).unwrap();
+        if !blocked {
+            eprintln!("skipped: mode 0o000 did not block the read (running as root?)");
+            return;
+        }
+
+        let found = toolchain_findings(&report);
+        assert!(
+            found.iter().any(|f| f.severity == Severity::Unknown
+                && f.evidence
+                    .iter()
+                    .any(|e| e.measured.contains("Makefile")
+                        && e.measured.contains("Permission denied"))),
+            "{found:#?}"
+        );
+        assert!(
+            !found
+                .iter()
+                .any(|f| f.severity == Severity::Advice && f.finding.contains("`make ")),
+            "a target in an unreadable makefile is never reported unnamed: {found:#?}"
         );
     }
 

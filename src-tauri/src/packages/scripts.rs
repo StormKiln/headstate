@@ -289,25 +289,31 @@ fn recipe_command(
 /// `include` line pulls targets from a file the parser did not read, and
 /// a `%` pattern rule matches names no list can hold. Shared by the rot
 /// and toolchain producers (#1393).
-pub fn makefile_is_open_ended(dir: &Path) -> Option<&'static str> {
-    for name in ["GNUmakefile", "makefile", "Makefile"] {
-        let p = dir.join(name);
-        if !p.is_file() {
-            continue;
+///
+/// Three answers, not two (#1411): `Ok(Some(why))` is open-ended,
+/// `Ok(None)` is closed (or there is no makefile), and `Err` is a
+/// makefile that exists and could not be read, or a directory that could
+/// not be listed, with the file name and the io error. A failed read is
+/// not "closed": a caller treating it so would call a target missing from
+/// a file it never read. The makefile is the one [`targets`] reads, picked
+/// from the directory listing by [`makefile_name`].
+pub fn makefile_is_open_ended(dir: &Path) -> Result<Option<&'static str>, String> {
+    let Some(name) = makefile_name(dir)? else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(dir.join(name))
+        .map_err(|e| format!("{name}: {e}"))?
+        .replace("\r\n", "\n");
+    for line in text.lines() {
+        let t = line.trim_start_matches(['-', 's']);
+        if t.starts_with("include ") || t.starts_with("include\t") {
+            return Ok(Some("includes other files"));
         }
-        let text = std::fs::read_to_string(&p).ok()?.replace("\r\n", "\n");
-        for line in text.lines() {
-            let t = line.trim_start_matches(['-', 's']);
-            if t.starts_with("include ") || t.starts_with("include\t") {
-                return Some("includes other files");
-            }
-            if !line.starts_with([' ', '\t', '#']) && line.contains('%') && line.contains(':') {
-                return Some("has pattern rules");
-            }
+        if !line.starts_with([' ', '\t', '#']) && line.contains('%') && line.contains(':') {
+            return Ok(Some("has pattern rules"));
         }
-        return None;
     }
-    None
+    Ok(None)
 }
 
 /// The name before the `:` on a target line, when the line is one.
@@ -630,14 +636,45 @@ specific: FOO = bar
     fn an_include_or_a_pattern_rule_is_open_ended() {
         let t = tempfile::tempdir().unwrap();
         fs::write(t.path().join("Makefile"), "lint:\n\techo\n").unwrap();
-        assert_eq!(makefile_is_open_ended(t.path()), None);
+        assert_eq!(makefile_is_open_ended(t.path()), Ok(None));
         fs::write(t.path().join("Makefile"), "include rules.mk\nlint:\n").unwrap();
         assert_eq!(
             makefile_is_open_ended(t.path()),
-            Some("includes other files")
+            Ok(Some("includes other files"))
         );
         fs::write(t.path().join("Makefile"), "%.o: %.c\n\tcc\n").unwrap();
-        assert_eq!(makefile_is_open_ended(t.path()), Some("has pattern rules"));
+        assert_eq!(
+            makefile_is_open_ended(t.path()),
+            Ok(Some("has pattern rules"))
+        );
+        // No makefile at all is closed: nothing to be open-ended.
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(makefile_is_open_ended(empty.path()), Ok(None));
+    }
+
+    /// #1411: a makefile that exists and cannot be read is neither open
+    /// nor closed. The answer is the io error, naming the file, never
+    /// `Ok(None)`. Unix-only: the wall is a permission bit, and as root
+    /// it does not bite, so the test says so and stops.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_makefile_is_neither_open_nor_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("Makefile");
+        fs::write(&p, "lint:\n\techo\n").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o000)).unwrap();
+        let blocked = fs::read(&p).is_err();
+        let got = makefile_is_open_ended(t.path());
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+        if !blocked {
+            eprintln!("skipped: mode 0o000 did not block the read (running as root?)");
+            return;
+        }
+        match got {
+            Err(why) => assert!(why.starts_with("Makefile: "), "{why}"),
+            other => panic!("an unreadable makefile is not an answer: {other:?}"),
+        }
     }
 
     /// Absent is not unreadable, and neither is an empty list.
