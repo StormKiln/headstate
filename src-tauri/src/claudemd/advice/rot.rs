@@ -20,8 +20,16 @@
 //!   only those count: measured, a nested e2e file's `helpers/` matched
 //!   7 paths across sibling apps and exactly one under its own (#1319).
 //!   With none under it, the whole tree counts; for the root file the
-//!   two are the same. Two matches is `Unknown` ("ambiguous"), never a
-//!   guess. A path that lies UNDER a pruned
+//!   two are the same. Two or more matches left are then settled by the
+//!   reference's own line, or its list item when it sits in one (#1372):
+//!   measured, "c specs and `src/testing`" matched 4 paths, and the
+//!   prose word `c` is a segment of only `apps/c/src/testing`. Only
+//!   prose words count -- another code span is another reference -- and
+//!   only a candidate's segments before the shared suffix; a word every
+//!   candidate has settles nothing. When the words hit exactly one
+//!   candidate it resolves, and any finding it goes on to produce names
+//!   the word in its evidence. None or several is `Unknown`
+//!   ("ambiguous"), never a guess. A path that lies UNDER a pruned
 //!   directory is `Unknown` naming the prune, never `Missing`: the walk
 //!   did not enter it, and #1299 is what one prune reading as absence
 //!   costs. Neither this walk nor `scan_repo` prunes `.claude` for
@@ -133,9 +141,11 @@
 //! `../` path relative to an unstated base, an absent path git could not
 //! be asked about, a skill with no inventory: each is a
 //! [`Severity::Unknown`] finding with the reason, and the file gets ONE
-//! [`Severity::Advice`] summary, "N references checked; K could not be
+//! [`Severity::Note`] summary, "N references checked; K could not be
 //! checked (…)", only when K > 0. So a run that checked 0 of 41 reads
-//! differently from a clean one (absent is not zero, #846). The whole
+//! differently from a clean one (absent is not zero, #846). It is a Note
+//! because it counts the Unknown rows and recommends nothing: as Advice
+//! it restated each of them a second time (#1372). The whole
 //! check is `Err`, and so `CheckRun::Unknown`, only when the scan read no
 //! CLAUDE.md at all AND could not list a directory: the file it did not
 //! find may be behind that wall.
@@ -212,9 +222,17 @@ pub struct Rotten {
 pub enum Shape {
     /// Document paths named with "see"/"read"/"consult" on one line, not
     /// imported and not conditioned. One per line, in line order.
-    BlindReference { line: usize, paths: Vec<String> },
+    BlindReference { line: usize, paths: Vec<Blind> },
     /// A date or version beside "as of"/"before"/"after"/"until".
     DatedFact { line: usize, quoted: String },
+}
+
+/// One document a blind line names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Blind {
+    pub path: String,
+    /// How an ambiguous suffix was settled, when it was (#1372).
+    pub settled: Option<String>,
 }
 
 /// One file's result.
@@ -369,11 +387,15 @@ pub fn check_file(repo: &Path, file: &Path, text: &str, res: &mut Resolver) -> F
     let mut out = FileRot::default();
     let mut unchecked: BTreeSet<String> = BTreeSet::new();
     // Path references that resolved, for the blind-reference rule.
-    let mut resolved_paths: Vec<(usize, String)> = Vec::new();
+    let mut resolved_paths: Vec<Named> = Vec::new();
+    let lines: Vec<&str> = text.lines().collect();
 
     for r in refs::extract(text) {
-        // Where a path reference resolved to, when it is a file.
+        // Where a path reference resolved to, when it is a file, and the
+        // word that settled it when its suffix was ambiguous.
         let mut landed: Option<PathBuf> = None;
+        let mut settled: Option<String> = None;
+        let words = item_words(&lines, r.line);
         let outcome = match &r.kind {
             RefKind::Cargo | RefKind::Issue { .. } => {
                 out.unresolvable += 1;
@@ -385,12 +407,15 @@ pub fn check_file(repo: &Path, file: &Path, text: &str, res: &mut Resolver) -> F
                 out.unresolvable += 1;
                 continue;
             }
-            RefKind::Path { path } => res.path(&dir, path).map(|to| {
-                if let Resolved::File(p) = to {
-                    landed = Some(p);
+            RefKind::Path { path } => res.path(&dir, path, &words).map(|to| match to {
+                Resolved::File(p) => landed = Some(p),
+                Resolved::Settled { path, by } => {
+                    landed = Some(path);
+                    settled = Some(by);
                 }
+                Resolved::Package | Resolved::Ignored => {}
             }),
-            RefKind::PathLine { path, line } => res.path_line(&dir, path, *line),
+            RefKind::PathLine { path, line } => res.path_line(&dir, path, *line, &words),
             RefKind::MakeTarget { name } => res.make_target(&dir, name),
             RefKind::Script { runner, name } => res.script(&dir, *runner, name),
             RefKind::Skill { name } => res.skill(name),
@@ -404,7 +429,11 @@ pub fn check_file(repo: &Path, file: &Path, text: &str, res: &mut Resolver) -> F
                 let rule = landed.as_deref().is_some_and(|p| is_rule_file(repo, p));
                 if let RefKind::Path { path } = &r.kind {
                     if !rule {
-                        resolved_paths.push((r.line, path.clone()));
+                        resolved_paths.push(Named {
+                            line: r.line,
+                            path: path.clone(),
+                            settled,
+                        });
                     }
                 }
             }
@@ -458,6 +487,111 @@ fn unknown(why: String) -> Refused {
     (Verdict::Unknown(why.clone()), why)
 }
 
+/// A path reference that resolved, for the blind-reference rule.
+struct Named {
+    line: usize,
+    path: String,
+    /// How an ambiguous suffix was settled, when it was (#1372).
+    settled: Option<String>,
+}
+
+/// Whether a line opens a list item: `- `, `* `, `+ `, `1. ` or `1) `.
+fn is_list_item(line: &str) -> bool {
+    let t = line.trim_start();
+    if ["- ", "* ", "+ "].iter().any(|m| t.starts_with(m)) {
+        return true;
+    }
+    let digits = t.chars().take_while(char::is_ascii_digit).count();
+    digits > 0 && (t[digits..].starts_with(". ") || t[digits..].starts_with(") "))
+}
+
+static WORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[A-Za-z0-9_][A-Za-z0-9_-]*").unwrap());
+
+/// The lowercased words of 1-based `line`, widened to its whole list
+/// item when it is in one: the item's opening line and its indented
+/// continuation lines, up to a blank line or the next item. A line in no
+/// list item is itself alone.
+///
+/// Prose words only: inline code spans are blanked first. Another span
+/// on the line is another reference, and its segments say where IT
+/// points: "`crates/a/only.rs` and `lib.rs`" does not make `lib.rs` the
+/// one under `a`.
+fn item_words(lines: &[&str], line: usize) -> BTreeSet<String> {
+    let Some(at) = line.checked_sub(1).filter(|i| *i < lines.len()) else {
+        return BTreeSet::new();
+    };
+    let continuation =
+        |l: &str| l.starts_with([' ', '\t']) && !l.trim().is_empty() && !is_list_item(l);
+    let mut start = at;
+    if !is_list_item(lines[at]) {
+        while start > 0 && continuation(lines[start]) {
+            start -= 1;
+        }
+        if !is_list_item(lines[start]) {
+            start = at;
+        }
+    }
+    let mut end = at;
+    if is_list_item(lines[start]) {
+        while end + 1 < lines.len() && continuation(lines[end + 1]) {
+            end += 1;
+        }
+    }
+    lines[start..=end]
+        .iter()
+        .map(|l| text::blank_spans(l))
+        .flat_map(|l| {
+            WORD.find_iter(&l)
+                .map(|m| m.as_str().to_ascii_lowercase())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The one candidate of an ambiguous suffix match that the words of its
+/// line settle, and the words that settled it (#1372).
+///
+/// Only a candidate's segments BEFORE the suffix are compared: the
+/// suffix is what every candidate shares. A word equal to such a segment
+/// of every candidate carries nothing and is ignored. The candidates the
+/// remaining words hit must be exactly one; none or several is `None`,
+/// and the reference stays Unknown, never a guess.
+fn settle(clean: &str, matches: &[String], words: &BTreeSet<String>) -> Option<(String, String)> {
+    let prefixes: Vec<Vec<String>> = matches
+        .iter()
+        .map(|m| {
+            m.strip_suffix(clean)
+                .unwrap_or("")
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .map(str::to_ascii_lowercase)
+                .collect()
+        })
+        .collect();
+    let mut hit: BTreeSet<usize> = BTreeSet::new();
+    let mut by: Vec<&str> = Vec::new();
+    for w in words {
+        let hits: Vec<usize> = (0..matches.len())
+            .filter(|i| prefixes[*i].iter().any(|s| s == w))
+            .collect();
+        if hits.is_empty() || hits.len() == matches.len() {
+            continue;
+        }
+        hit.extend(hits);
+        by.push(w);
+    }
+    if hit.len() != 1 {
+        return None;
+    }
+    let one = *hit.iter().next().expect("one, checked above");
+    let by = by
+        .iter()
+        .map(|w| format!("`{w}`"))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    Some((matches[one].clone(), by))
+}
+
 /// What a `metadata` call said about a path.
 enum Probe {
     Found,
@@ -484,6 +618,11 @@ enum DependencyLookup {
 enum Resolved {
     /// A real file or directory.
     File(PathBuf),
+    /// A real file or directory, chosen from an ambiguous suffix match by
+    /// a word on the reference's own line or list item (#1372). `by` is
+    /// the measurement, naming the word, for any finding the reference
+    /// goes on to produce.
+    Settled { path: PathBuf, by: String },
     /// Not a file: a package this project declares. It has no lines to
     /// count and no place on disk to cite.
     Package,
@@ -1141,8 +1280,15 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    /// A path reference, resolved to where it lives.
-    fn path(&mut self, dir: &Path, path: &str) -> Result<Resolved, Refused> {
+    /// A path reference, resolved to where it lives. `words` are the
+    /// words of the reference's own line or list item, which may settle
+    /// an ambiguous suffix match (#1372).
+    fn path(
+        &mut self,
+        dir: &Path,
+        path: &str,
+        words: &BTreeSet<String>,
+    ) -> Result<Resolved, Refused> {
         // An absolute token names one place. Under the repository it is
         // a repository path with the root spelled out, so it resolves
         // from the root alone and by nothing looser; anywhere else it is
@@ -1222,6 +1368,17 @@ impl<'a> Resolver<'a> {
         let own = relative(&repo, dir).unwrap_or_default();
         let mine: Vec<String> = matches.iter().filter(|m| under(&own, m)).cloned().collect();
         let matches = if mine.is_empty() { matches } else { mine };
+        if matches.len() > 1 {
+            if let Some((one, by)) = settle(clean, &matches, words) {
+                return Ok(Resolved::Settled {
+                    path: repo.join(&one),
+                    by: format!(
+                        "`{clean}` matches {} paths; {by} on the same line or list item is a segment of only `{one}`",
+                        matches.len()
+                    ),
+                });
+            }
+        }
         match matches.len() {
             1 => Ok(Resolved::File(repo.join(&matches[0]))),
             // Ordered before the Missing arm on purpose: a reference
@@ -1322,9 +1479,16 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    fn path_line(&mut self, dir: &Path, path: &str, line: u32) -> Result<(), Refused> {
-        let target = match self.path(dir, path)? {
-            Resolved::File(p) => p,
+    fn path_line(
+        &mut self,
+        dir: &Path,
+        path: &str,
+        line: u32,
+        words: &BTreeSet<String>,
+    ) -> Result<(), Refused> {
+        let (target, settled) = match self.path(dir, path, words)? {
+            Resolved::File(p) => (p, None),
+            Resolved::Settled { path, by } => (path, Some(by)),
             // `chart.js:12` on a declared dependency: the package is
             // real, and it has no file in this repository to count.
             Resolved::Package => return Ok(()),
@@ -1356,8 +1520,9 @@ impl<'a> Resolver<'a> {
             return Err((
                 Verdict::LinePastEof { lines },
                 format!(
-                    "`{}` has {lines} lines",
-                    display(self.repo, &target.to_string_lossy())
+                    "`{}` has {lines} lines{}",
+                    display(self.repo, &target.to_string_lossy()),
+                    settled.map(|by| format!("; {by}")).unwrap_or_default()
                 ),
             ));
         }
@@ -1622,17 +1787,21 @@ fn is_document(path: &str) -> bool {
 /// The two rules the content-shape research hands to this producer,
 /// over prose lines only. `resolved_paths` are path references that
 /// resolved: a missing one is already a `Missing` finding.
-fn shape_rules(text: &str, resolved_paths: &[(usize, String)]) -> Vec<Shape> {
+fn shape_rules(text: &str, resolved_paths: &[Named]) -> Vec<Shape> {
     let normalised = text.replace("\r\n", "\n");
     let mut out = Vec::new();
     for (n, line) in text::prose_lines(&normalised) {
         let conditioned = CONDITION.is_match(line) || topic_arrow(line);
-        let mut blind: Vec<String> = Vec::new();
+        let mut blind: Vec<Blind> = Vec::new();
         if CUE.is_match(line) && !conditioned {
-            for (_, path) in resolved_paths.iter().filter(|(l, _)| *l == n) {
+            for named in resolved_paths.iter().filter(|p| p.line == n) {
+                let path = &named.path;
                 let imported = line.contains(&format!("@{path}"));
-                if is_document(path) && !imported && !blind.contains(path) {
-                    blind.push(path.clone());
+                if is_document(path) && !imported && !blind.iter().any(|b| &b.path == path) {
+                    blind.push(Blind {
+                        path: path.clone(),
+                        settled: named.settled.clone(),
+                    });
                 }
             }
         }
@@ -1735,15 +1904,22 @@ fn findings_for(repo: &Path, path: &str, scope: Scope, text: &str, rot: &FileRot
                     "`{shown}:{line}` names {}{BLIND}",
                     paths
                         .iter()
-                        .map(|p| format!("`{p}`"))
+                        .map(|b| format!("`{}`", b.path))
                         .collect::<Vec<_>>()
                         .join(" and ")
                 ),
                 paths
                     .iter()
-                    .map(|p| format!(
-                        "line {line} names `{p}` with see/read/consult; no `@{p}` import, no when/if/for/before and no topic → on the line"
-                    ))
+                    .map(|b| {
+                        let p = &b.path;
+                        let mut m = format!(
+                            "line {line} names `{p}` with see/read/consult; no `@{p}` import, no when/if/for/before and no topic → on the line"
+                        );
+                        if let Some(by) = &b.settled {
+                            m.push_str(&format!("; {by}"));
+                        }
+                        m
+                    })
                     .collect(),
             ),
             Shape::DatedFact { line, quoted } => (
@@ -1769,7 +1945,8 @@ fn findings_for(repo: &Path, path: &str, scope: Scope, text: &str, rot: &FileRot
 
     // One summary per file, ONLY when something could not be checked:
     // a clean file gets no row, and a file that checked 0 of 41 gets a
-    // row that says so.
+    // row that says so. A Note (#1372): it counts the Unknown rows above
+    // and recommends nothing, so as Advice it restated each one twice.
     if !rot.unchecked.is_empty() {
         let unknown = rot
             .findings
@@ -1778,7 +1955,7 @@ fn findings_for(repo: &Path, path: &str, scope: Scope, text: &str, rot: &FileRot
             .count();
         out.push(Finding::new(
             Check::Rot,
-            Severity::Advice,
+            Severity::Note,
             Subject::ClaudeMd {
                 path: path.to_string(),
                 scope,
@@ -1819,14 +1996,10 @@ pub(super) fn suggestion(f: &Finding) -> String {
         })
         .map(|l| format!("line {l} of `{file}`"))
         .unwrap_or_else(|| format!("`{file}`"));
+    // The per-file summary is a Note (#1372) and never gets here: the
+    // brief renders a Note with no suggestion.
     let s = f.finding.as_str();
-    if s.contains(SUMMARY) {
-        format!(
-            "Nothing to edit in `{file}` for this row. Make the listed inputs readable, or open the \
-             definitions page, and re-run the check; the references it could not check are neither \
-             confirmed nor rot."
-        )
-    } else if s.contains(SKILL_MISSING) {
+    if s.contains(SKILL_MISSING) {
         format!(
             "Edit {line}: name a skill that exists in the user, project or plugin scope, or delete \
              the reference. Do not create a skill to satisfy it."
@@ -2437,7 +2610,14 @@ Run `yarn paw`, not `yarn nope`. Use the `tentacle` skill, not the `ink` skill.
             .iter()
             .find(|f| f.finding.contains("references checked;"))
             .expect("a summary row when K > 0");
-        assert_eq!(summary.severity, Severity::Advice);
+        // #1372: the summary counts; it recommends nothing, and restating
+        // the Unknown row as advice showed it twice.
+        assert_eq!(summary.severity, Severity::Note);
+        assert!(
+            summary.brief.contains("Observation only") && !summary.brief.contains("Suggested"),
+            "{}",
+            summary.brief
+        );
         assert!(
             summary
                 .finding
@@ -3041,6 +3221,75 @@ Run `yarn paw`, not `yarn nope`. Use the `tentacle` skill, not the `ink` skill.
             ),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A tree where `src/testing` lies under three apps and a library,
+    /// so the suffix alone is ambiguous.
+    fn four_projects() -> tempfile::TempDir {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        for p in [["apps", "a"], ["apps", "b"], ["apps", "c"], ["libs", "d"]] {
+            let testing = root.join(p[0]).join(p[1]).join("src").join("testing");
+            fs::create_dir_all(&testing).unwrap();
+            fs::write(testing.join("main.rs"), "one\n").unwrap();
+        }
+        t
+    }
+
+    /// #1372: an ambiguous suffix is settled by a word on the same line
+    /// that equals a path segment of exactly one candidate. A line
+    /// naming none of them, or two, stays Unknown: never a guess.
+    #[test]
+    fn a_word_on_the_line_settles_an_ambiguous_suffix_or_it_stays_unknown() {
+        let t = four_projects();
+        let root = t.path();
+        fs::write(
+            root.join("CLAUDE.md"),
+            "- c specs and `src/testing`\n\
+             - shared specs in `src/testing`\n\
+             - a and c both use `src/testing`\n",
+        )
+        .unwrap();
+        let rot = check_one(root, None);
+        let lines: Vec<usize> = rot.findings.iter().map(|f| f.r.line).collect();
+        assert_eq!(lines, vec![2, 3], "line 1 is settled by `c`: {rot:?}");
+        for f in &rot.findings {
+            match &f.verdict {
+                Verdict::Unknown(why) => assert!(why.contains("ambiguous"), "{why}"),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(rot.refs_checked, 1, "{rot:?}");
+    }
+
+    /// #1372: the settling word may sit on a continuation line of the
+    /// same list item, and a word every candidate shares settles
+    /// nothing. The evidence names the word that settled it.
+    #[test]
+    fn a_settled_suffix_names_the_word_in_its_evidence() {
+        let t = four_projects();
+        let root = t.path();
+        fs::write(
+            root.join("CLAUDE.md"),
+            "- the entry is `src/testing/main.rs:9`\n  for project c\n\
+             - something else in `src/testing`\n",
+        )
+        .unwrap();
+        let rot = check_one(root, None);
+        assert_eq!(rot.findings.len(), 2, "{rot:?}");
+        let past = &rot.findings[0];
+        assert_eq!(past.verdict, Verdict::LinePastEof { lines: 1 }, "{rot:?}");
+        assert!(
+            past.measured.contains("`c`") && past.measured.contains("apps/c/src/testing/main.rs"),
+            "the settling word is named: {}",
+            past.measured
+        );
+        // The second item's words do not reach back into the first, and
+        // the first item's `c` does not reach forward.
+        assert!(
+            matches!(rot.findings[1].verdict, Verdict::Unknown(_)),
+            "{rot:?}"
+        );
     }
 
     fn git_init(dir: &Path) {
