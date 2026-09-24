@@ -1232,4 +1232,94 @@ describe("ClaudeMdAdvicePanel", () => {
       expect(claudify.preview).toHaveBeenCalledWith(REPO, { kind: "finding", index: 2 }),
     );
   });
+
+  /// What the last click put on the clipboard.
+  const copied = () => (copyFn.mock.calls as unknown as string[][]).at(-1)?.[0] ?? "";
+
+  /// "Copy as markdown" (#1399): a report of two groups, one of which
+  /// is a check that could not run.
+  const twoGroups = () =>
+    report({
+      findings: [
+        finding({ check: "imports", finding: "an imports finding" }),
+        finding({ check: "rot", severity: "advice", finding: "a rot finding", evidence: [] }),
+      ],
+      checks: [
+        { check: "imports", run: { state: "ran", findings: 1 } },
+        { check: "rot", run: { state: "ran", findings: 1 } },
+        { check: "skills", run: { state: "unknown", reason: "the skills directory could not be listed" } },
+      ],
+    });
+
+  it("copies only its own group, beside the heading rather than inside it", async () => {
+    state.data = twoGroups();
+    open();
+    const button = screen.getByRole("button", { name: "Copy group as markdown: rot" });
+    // Not inside the heading: a click on it must not toggle the group.
+    expect(button.closest("h3")).toBeNull();
+    const toggle = screen.getAllByRole("button", { expanded: true }).find((b) =>
+      (b.textContent ?? "").startsWith("rot"),
+    );
+    fireEvent.click(button);
+    expect(toggle?.getAttribute("aria-expanded")).toBe("true");
+    const md = copied();
+    expect(md).toMatch(/^### rot \(1 advice\)/);
+    expect(md).toContain("a rot finding");
+    expect(md).not.toContain("an imports finding");
+    await waitFor(() =>
+      expect(toastFns.success).toHaveBeenCalledWith("Copied 1 finding as markdown", expect.anything()),
+    );
+  });
+
+  it("offers a group copy on a check that could not run, and says it is included", async () => {
+    state.data = twoGroups();
+    open();
+    fireEvent.click(screen.getByRole("button", { name: "Copy group as markdown: skills" }));
+    expect(copied()).toContain("the skills directory could not be listed");
+    await waitFor(() =>
+      expect(toastFns.success).toHaveBeenCalledWith("Copied 0 findings as markdown", {
+        description: expect.stringContaining("One check that could not run is included"),
+      }),
+    );
+  });
+
+  it("copies the whole report as markdown from the top line", async () => {
+    state.data = twoGroups();
+    open();
+    fireEvent.click(screen.getByRole("button", { name: "Copy all as markdown" }));
+    const md = copied();
+    expect(md).toContain(`## CLAUDE.md advice for \`${REPO}\``);
+    expect(md).toContain("by Headstate 7.4.0");
+    expect(md).toContain("### imports (1 problem)");
+    expect(md).toContain("### rot (1 advice)");
+    expect(md).toContain("### skills (could not check)");
+    // The reader's report, not the agent's.
+    expect(md).not.toContain("the brief");
+    await waitFor(() =>
+      expect(toastFns.success).toHaveBeenCalledWith("Copied 2 findings as markdown", expect.anything()),
+    );
+  });
+
+  it("copies in the grouping on screen", () => {
+    state.data = twoGroups();
+    open();
+    group("file");
+    fireEvent.click(screen.getByRole("button", { name: "Copy all as markdown" }));
+    const md = copied();
+    expect(md).toContain("### CLAUDE.md (1 problem, 1 advice)");
+    expect(md).toContain("### Could not check");
+  });
+
+  it("toasts the reason when the markdown could not be copied", async () => {
+    state.data = twoGroups();
+    copyFn.mockResolvedValue("This window has no clipboard access.");
+    open();
+    fireEvent.click(screen.getByRole("button", { name: "Copy all as markdown" }));
+    await waitFor(() =>
+      expect(toastFns.error).toHaveBeenCalledWith("Could not copy the markdown", {
+        description: "This window has no clipboard access.",
+      }),
+    );
+    expect(toastFns.success).not.toHaveBeenCalled();
+  });
 });
