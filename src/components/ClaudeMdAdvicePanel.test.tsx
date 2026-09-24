@@ -836,6 +836,39 @@ describe("ClaudeMdAdvicePanel", () => {
     expect(headings.some((h) => h.includes("skill: verify"))).toBe(true);
   });
 
+  /// #1366: a finding about the repository itself is labelled "repository
+  /// root" everywhere the panel shortens a path -- the by-file heading,
+  /// the Where column and an evidence locator -- and never `/` or an
+  /// empty string, which read as the filesystem root or as nothing.
+  it("labels the repository itself as the repository root, never / or empty", () => {
+    state.data = report({
+      findings: [
+        finding({
+          check: "gaps",
+          severity: "unknown",
+          subject: { kind: "directory", path: REPO },
+          evidence: [{ at: { kind: "file", path: REPO, line: null }, measured: "the measured fact" }],
+          finding: "about the root",
+        }),
+      ],
+      checks: [{ check: "gaps", run: { state: "ran", findings: 1 } }],
+    });
+    open();
+    group("file");
+    const headings = screen.getAllByRole("heading").map((h) => h.textContent ?? "");
+    expect(headings.some((h) => h.startsWith("repository root"))).toBe(true);
+    expect(headings.some((h) => h.startsWith("/") || h.startsWith("repository root/"))).toBe(false);
+    // The Where column.
+    const cells = screen.getAllByRole("cell").map((c) => c.textContent ?? "");
+    expect(cells).toContain("repository root");
+    expect(cells.some((c) => c === "/" || c === "")).toBe(false);
+    // The evidence locator.
+    fireEvent.click(screen.getByRole("button", { name: "Evidence (1)" }));
+    expect(screen.getByText("the measured fact", { exact: false }).textContent).toBe(
+      "repository root — the measured fact",
+    );
+  });
+
   /// #846 in the view organised by check: a check that could not run and
   /// a check that ran clean must not read the same. The first names its
   /// obstacle in the producer's own words; the second produces no group

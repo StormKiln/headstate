@@ -5,7 +5,7 @@ import type {
   ClaudeMdAdviceReport,
   ClaudeMdAdviceSubject,
 } from "@/types/pr";
-import { CHECK_LABEL, OBSERVATIONS_KEY, groupFindings } from "./adviceGrouping";
+import { CHECK_LABEL, OBSERVATIONS_KEY, REPOSITORY_ROOT, groupFindings } from "./adviceGrouping";
 
 const REPO = "/home/octocat/hello-world";
 
@@ -153,6 +153,33 @@ describe("groupFindings", () => {
       expect(g.label.slice(0, g.pathLength).startsWith(REPO)).toBe(true);
       expect(g.label.slice(0, g.pathLength).endsWith("/")).toBe(false);
     }
+  });
+
+  /// #1366: a directory finding whose subject IS the repository reads as
+  /// the repository root. Shortened against the root it was `""` plus the
+  /// trailing slash, a bare `/` that reads as the filesystem root. The
+  /// label carries no path to shorten, so `pathLength` is 0.
+  it("labels a directory finding about the repository itself as the repository root", () => {
+    for (const path of [REPO, `${REPO}/`]) {
+      const groups = groupFindings(
+        report({
+          findings: [finding({ check: "gaps", subject: { kind: "directory", path } })],
+          checks: [{ check: "gaps", run: { state: "ran", findings: 1 } }],
+        }),
+        "file",
+      );
+      expect(groups).toHaveLength(1);
+      expect(groups[0].label).toBe(REPOSITORY_ROOT);
+      expect(groups[0].label).toBe("repository root");
+      expect(groups[0].pathLength).toBe(0);
+      expect(groups[0].file).toBeNull();
+    }
+    // A directory elsewhere keeps its path and its slash.
+    const [other] = groupFindings(
+      report({ findings: [finding({ subject: { kind: "directory", path: `${REPO}-other` } })] }),
+      "file",
+    );
+    expect(other.label).toBe(`${REPO}-other/`);
   });
 
   /// Three DIFFERENT subjects that happen to share a path are three

@@ -15,8 +15,10 @@ import {
   OBSERVATIONS_KEY,
   type AdviceGroup,
   type AdviceGrouping,
+  REPOSITORY_ROOT,
   groupFindings,
   isAdvice,
+  isRepositoryRoot,
 } from "@/lib/adviceGrouping";
 import type { Filters } from "@/lib/derive";
 import { useActiveFilters, useFilters } from "@/store/filters";
@@ -57,8 +59,19 @@ const SEVERITY: Record<ClaudeMdAdviceFinding["severity"], { label: string; class
 /// A path as the row shows it: relative to the repository when it is
 /// inside it, absolute otherwise. Display only; the wire keeps absolute
 /// paths, and the brief prints them as the backend rendered them.
+///
+/// The repository itself is [`REPOSITORY_ROOT`], never the empty string
+/// its shortening would leave (#1366).
 function shown(path: string, repo: string): string {
+  if (isRepositoryRoot(path, repo)) return REPOSITORY_ROOT;
   return path.startsWith(repo) ? path.slice(repo.length).replace(/^\//, "") : path;
+}
+
+/// A directory subject as the row shows it: shortened, with the trailing
+/// slash that says no file exists there yet -- except the repository
+/// itself, which would otherwise read as a bare `/` (#1366).
+function shownDir(path: string, repo: string): string {
+  return isRepositoryRoot(path, repo) ? REPOSITORY_ROOT : `${shown(path, repo)}/`;
 }
 
 function locatorText(at: ClaudeMdAdviceLocator, repo: string): string {
@@ -830,7 +843,7 @@ function FindingRow({
             </button>
           ) : (
             <span className="wrap-anywhere font-mono text-[#8b949e]">
-              {shown(finding.subject.path, repo)}/
+              {shownDir(finding.subject.path, repo)}
             </span>
           )}
         </td>
