@@ -20,6 +20,28 @@
 //! | S5 repeated error | `is_error: true` text normalised by [`normalise_error`] | identical first [`ERROR_KEY_CHARS`] chars in ≥ [`MIN_SESSIONS_ERROR`] sessions |
 //! | S6 task census | sessions per attributed directory, from `claude_session` | always, as a count |
 //!
+//! S1, S2 and S3 are [`Severity::Advice`]: each carries a rule a session
+//! had to learn -- the command that worked after the one that failed,
+//! the user's stated fix, the call not to make. S4 and S5 are
+//! [`Severity::Note`]s: observations, not advice. S5 (#1368), worded
+//! "recurring error: `<tool>` on `<key>`: …", shows only that something
+//! failed repeatedly, which is often nothing CLAUDE.md wording controls
+//! (a sub-agent's schema, a search tool's timeout). An error that a later
+//! call in the same session corrected is already S1, and that stays
+//! Advice. S4 (#1369) shows where sessions spent their first calls; a CI
+//! task that globs `.github/workflows/*.yml` and reads one is doing its
+//! job, and nothing links the count to a line a CLAUDE.md could hold. A
+//! Note carries no suggestion and no Claudify, and whether its key is
+//! already written cannot make it wrong, so an unreadable corpus file
+//! leaves it a Note rather than Unknown.
+//!
+//! Every count states its denominator (#1369): "in 3 of 137 analysed
+//! sessions under `<repo>`", qualified "at least 3" while the pass is
+//! short. The denominator is in the numerator's unit -- distinct tasks
+//! among the analysed sessions -- and is the repository's, so a finding
+//! placed on a subdirectory says ", attributed to `<dir>`" rather than
+//! implying the sessions ran there.
+//!
 //! A count is DISTINCT TASKS, never records: distinct sessions, with the
 //! sessions that share an opening prompt counted once (#1337), because
 //! an automated `claude -p` task replayed seven times is one task, not
@@ -56,14 +78,64 @@
 //! current scan, so a CLAUDE.md added since the pass moves the finding
 //! without a re-read.
 //!
+//! # Only sessions under the current CLAUDE.md count
+//!
+//! A session that ran under an older CLAUDE.md says nothing about the
+//! current one (#1371). For each finding, only sessions that STARTED
+//! (`claude_session.first_seen_at`) at or after the attributed CLAUDE.md
+//! last changed count toward the threshold and the denominator; older
+//! ones are mentioned, not counted: "3 of 40 analysed sessions under
+//! `<repo>` since `CLAUDE.md` last changed on <date> (5 more before
+//! it)", and only they are evidence. The dates come from one batched
+//! `git status` and one `git log --name-only` over every CLAUDE.md in
+//! the scan, per pass ([`versions_of`]); the date is the newest commit's
+//! committer time, the moment the change landed in this history.
+//!
+//! - A finding that reaches its threshold only with older sessions is
+//!   held back, and one Note per file counts them ("N findings on
+//!   `CLAUDE.md` reach their thresholds only with sessions from before it
+//!   last changed on <date>"), each held finding's sentence as evidence.
+//!   Never dropped silently.
+//! - A CLAUDE.md git lists as modified, staged or untracked changed
+//!   "now": no session has run under it yet, so every session is older,
+//!   and the Note says so.
+//! - If git cannot date the file -- no `.git` at the repository, a git
+//!   that fails, a file with no commit -- nothing is filtered. Every
+//!   session counts, the finding ends "could not tell which version of
+//!   `<file>` these sessions ran under", and one Note per file carries
+//!   git's words. A session whose start does not parse is counted and
+//!   qualified the same way.
+//! - A finding placed on a directory with no CLAUDE.md has no version to
+//!   filter by, and counts every session.
+//!
+//! The report cache needs no new input for this. A file's commit date is
+//! a function of the history `HEAD` names, which [`super::cache`] hashes
+//! (#1334); an uncommitted change is in the `git status` bytes it hashes,
+//! and the CLAUDE.md's own bytes are hashed besides. A new or changed
+//! session moves its `(size, mtime)`. What is not covered is a session's
+//! `first_seen_at` moving earlier without its transcript changing (a
+//! late hook row), which can move a session across the line; stated,
+//! not hidden. No stored signal row changes, so [`RULE_VERSION`] does
+//! not move.
+//!
 //! # Already written is not a gap
 //!
 //! Before a finding is emitted its dedup key is tested verbatim, with
 //! whitespace collapsed and case kept, against every CLAUDE.md from the
 //! repository root to the attributed directory, their resolved imports,
-//! the global and local scopes the effective scan carries, and each of
+//! the global and local scopes the effective scan carries, each of
 //! the repository's `.claude/rules` a session in that directory would
-//! load (`claudemd::rules`: unconditional, or `paths:` reaching it). A
+//! load (`claudemd::rules`: unconditional, or `paths:` reaching it), and
+//! every skill: `SKILL.md` at any depth under the repository's
+//! `.claude/skills` and the user's `~/.claude/skills` (#1370). A path a
+//! skill runs is the skill doing its job, and a hit names it: "already
+//! written in skill `<name>` (`<path>`)", the name being the directory
+//! holding the file. Plugin skills are out of scope; they are not the
+//! repository owner's to change. The report cache sees these files
+//! through the definitions inventory (one level under each `skills/`)
+//! and, for the repository's, through git's HEAD and status; a user
+//! skill nested deeper than one level is not a cache input, so editing
+//! one alone does not invalidate a cached report. A
 //! file that does not exist holds nothing. A file that exists and could
 //! not be read, or a rule `claudemd::rules` could not read (whose
 //! `paths:` are unknown too), is not "not written" (#1351): when no
@@ -98,14 +170,24 @@
 //!
 //! The report model has no per-check coverage struct beyond
 //! [`super::CheckRun`], so what the spec calls `Coverage` travels here as
-//! findings: one [`Severity::Unknown`] per transcript that could not be
-//! read (`<path>: <why>`), one [`Severity::Note`] stating "analysed N
-//! of M sessions under `<repo>`; K truncated at 8 MB" whenever the pass
-//! is short or a read was cut, and one stating "no Claude Code sessions
-//! were recorded under `<repo>`" when there are none -- never an empty
-//! list, because no sessions is not "nothing went wrong". While the pass
-//! is short, every count says "at least". These and the S6 census are
-//! Notes: they state what was measured and recommend nothing (#1339).
+//! findings: one [`Severity::Note`] stating "analysed N of M sessions
+//! under `<repo>`; K truncated at 8 MB" whenever the pass is short or a
+//! read was cut, and one stating "no Claude Code sessions were recorded
+//! under `<repo>`" when there are none -- never an empty list, because
+//! no sessions is not "nothing went wrong". While the pass is short,
+//! every count says "at least". These and the S6 census are Notes: they
+//! state what was measured and recommend nothing (#1339).
+//!
+//! A session whose transcript is not on disk -- no path recorded, or a
+//! path that is `NotFound` because its worktree's project directory was
+//! deleted after the merge -- is gone, and says nothing about any
+//! CLAUDE.md (#1367). It is counted in that coverage Note ("K had no
+//! transcript on disk and were skipped"), with a sample of the sessions
+//! as its evidence. A transcript that exists and could not be read
+//! (permission, I/O) is different: it might hold a signal. Those are ONE
+//! [`Severity::Unknown`] listing the sessions and their io errors, never
+//! one row per session, whose brief says what to make readable. Both
+//! make the pass short, so the "at least" stays.
 //!
 //! # Privacy
 //!
@@ -230,6 +312,10 @@ struct SessionRow {
     dir: PathBuf,
     transcript_path: Option<String>,
     has_prompt: bool,
+    /// When it started, as Unix seconds: `claude_session.first_seen_at`,
+    /// the earliest record. `None` when that does not parse, which is
+    /// "could not tell", never "long ago" (#1371).
+    started: Option<i64>,
 }
 
 /// One extracted signal occurrence: the row shape of `claude_advice_signal`.
@@ -344,13 +430,18 @@ fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, 
         }
     }
 
+    // A transcript that is not on disk is a session that is gone, not a
+    // question about a CLAUDE.md (#1367): `missing`, counted in the
+    // coverage Note. Any other failure to read one is `unreadable`, and
+    // the pass reports those as ONE grouped Unknown.
     let mut unreadable: Vec<(String, String)> = Vec::new();
+    let mut missing: Vec<(String, String)> = Vec::new();
     let mut analysed: HashSet<String> = HashSet::new();
     let mut truncated = 0usize;
     let mut todo: Vec<(&SessionRow, i64, i64)> = Vec::new();
     for s in &sessions {
         let Some(path) = &s.transcript_path else {
-            unreadable.push((
+            missing.push((
                 s.session_id.clone(),
                 "no transcript path is recorded for this session".into(),
             ));
@@ -366,6 +457,10 @@ fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, 
         });
         let (size, mtime) = match meta {
             Ok(v) => v,
+            Err(e) if is_gone(&e) => {
+                missing.push((s.session_id.clone(), format!("{path}: no longer exists")));
+                continue;
+            }
             Err(e) => {
                 unreadable.push((
                     s.session_id.clone(),
@@ -391,6 +486,11 @@ fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, 
         let path = s.transcript_path.as_deref().unwrap_or("");
         let (body, cut) = match read_bounded(Path::new(path), BUDGET_BYTES) {
             Ok(v) => v,
+            // Deleted between the stat and the open: gone, not unreadable.
+            Err(_) if resolves_to_nothing(Path::new(path)) => {
+                missing.push((s.session_id.clone(), format!("{path}: no longer exists")));
+                continue;
+            }
             Err(e) => {
                 unreadable.push((s.session_id.clone(), e));
                 continue;
@@ -420,8 +520,15 @@ fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, 
     let tasks = load_tasks(conn, &analysed)?;
     let denials = hook_denials(conn, &sessions)?;
 
-    let short = analysed.len() < sessions.len() || !unreadable.is_empty();
-    let mut out = emit(&stored, &tasks, &denials, &sessions, &analysed, cx, short);
+    // Skipped sessions make the pass short too: every "at least" stays.
+    let short = analysed.len() < sessions.len() || !unreadable.is_empty() || !missing.is_empty();
+    // #1371: when each of the repository's CLAUDE.md files last changed,
+    // in one batched git call rather than one per file or per finding.
+    let files: Vec<String> = cx.scan.repo.files.iter().map(|f| f.path.clone()).collect();
+    let versions = versions_of(crate::auth::git_program(), repo, &files);
+    let mut out = emit(
+        &stored, &tasks, &denials, &sessions, &analysed, &versions, cx, short,
+    );
     out.extend(checkout_unknown);
 
     if short || truncated > 0 {
@@ -433,49 +540,94 @@ fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, 
             truncated,
             BUDGET_BYTES / (1024 * 1024)
         );
+        if !missing.is_empty() {
+            sentence.push_str(&format!(
+                "; {} had no transcript on disk and {} skipped",
+                missing.len(),
+                if missing.len() == 1 { "was" } else { "were" }
+            ));
+        }
         if remaining > 0 {
             sentence.push_str(&format!(
                 "; {remaining} not yet read (at most {cap} are read per open)"
             ));
         }
+        let mut evidence = vec![Evidence {
+            at: Locator::File {
+                path: repo.to_string_lossy().into_owned(),
+                line: None,
+            },
+            measured: format!(
+                "{} sessions analysed, {} unreadable, {} without a transcript on disk, {} not \
+                 yet read, {} read only to {} MB",
+                analysed.len(),
+                unreadable.len(),
+                missing.len(),
+                remaining,
+                truncated,
+                BUDGET_BYTES / (1024 * 1024)
+            ),
+        }];
+        // A sample behind the skipped count; the sentence carries it all.
+        evidence.extend(session_rows(&missing));
         out.push(Finding::new(
             Check::Transcripts,
             Severity::Note,
             root_subject.clone(),
-            vec![Evidence {
-                at: Locator::File {
-                    path: repo.to_string_lossy().into_owned(),
-                    line: None,
-                },
-                measured: format!(
-                    "{} sessions analysed, {} unreadable, {} not yet read, {} read only to {} MB",
-                    analysed.len(),
-                    unreadable.len(),
-                    remaining,
-                    truncated,
-                    BUDGET_BYTES / (1024 * 1024)
-                ),
-            }],
+            evidence,
             sentence,
         ));
     }
 
-    for (session_id, why) in unreadable {
+    // Transcripts that exist and could not be read: ONE Unknown listing
+    // them (#1367), never one row per session.
+    if !unreadable.is_empty() {
+        let k = unreadable.len();
+        let sentence = if k == 1 {
+            format!(
+                "1 transcript under `{}` could not be read; the counts here are floors without it",
+                repo.display()
+            )
+        } else {
+            format!(
+                "{k} transcripts under `{}` could not be read; the counts here are floors \
+                 without them",
+                repo.display()
+            )
+        };
         out.push(Finding::new(
             Check::Transcripts,
             Severity::Unknown,
             root_subject.clone(),
-            vec![Evidence {
-                at: Locator::Session {
-                    session_id: session_id.clone(),
-                    record: None,
-                },
-                measured: why.clone(),
-            }],
-            format!("session `{session_id}` could not be read: {why}"),
+            session_rows(&unreadable),
+            sentence,
         ));
     }
     Ok(out)
+}
+
+/// One evidence row per `(session, why)`: the first [`MAX_EVIDENCE`],
+/// since the sentence beside them carries the full count.
+fn session_rows(list: &[(String, String)]) -> Vec<Evidence> {
+    list.iter()
+        .take(MAX_EVIDENCE)
+        .map(|(session_id, why)| Evidence {
+            at: Locator::Session {
+                session_id: session_id.clone(),
+                record: None,
+            },
+            measured: why.clone(),
+        })
+        .collect()
+}
+
+/// Whether an io error establishes that the path names nothing. Any
+/// other error is "could not look", which is not "gone".
+fn is_gone(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
 }
 
 /// Directories under `repo` with at least [`MIN_EDITS_PER_DIR`] Edit or
@@ -527,7 +679,7 @@ fn sessions_under(
 ) -> Result<Vec<SessionRow>, String> {
     let mut q = conn
         .prepare(
-            "SELECT session_id, cwd, transcript_path, opening_prompt
+            "SELECT session_id, cwd, transcript_path, opening_prompt, first_seen_at
                FROM claude_session
               WHERE cwd IS NOT NULL
               ORDER BY session_id",
@@ -540,15 +692,16 @@ fn sessions_under(
                 r.get::<_, String>(1)?,
                 r.get::<_, Option<String>>(2)?,
                 r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
             ))
         })
         .map_err(|e| format!("claude_session: {e}"))?;
     let rows = rows
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("claude_session: {e}"))?;
-    worktrees.learn_deleted_checkouts(rows.iter().map(|(_, cwd, _, _)| Path::new(cwd)));
+    worktrees.learn_deleted_checkouts(rows.iter().map(|(_, cwd, _, _, _)| Path::new(cwd)));
     let mut out = Vec::new();
-    for (session_id, cwd, transcript_path, prompt) in rows {
+    for (session_id, cwd, transcript_path, prompt, first_seen) in rows {
         let dir = reroot_cwd(&cwd, worktrees);
         // `Path::starts_with` is by component, so `<repo>2` is not under
         // `<repo>`, and it is the same test on Windows separators.
@@ -560,6 +713,10 @@ fn sessions_under(
             dir,
             transcript_path,
             has_prompt: prompt.is_some_and(|p| !p.trim().is_empty()),
+            started: first_seen
+                .as_deref()
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.timestamp()),
         });
     }
     Ok(out)
@@ -1565,7 +1722,8 @@ fn placement(dirs: &[&Path], candidates: &[PathBuf], repo: &Path) -> PathBuf {
 /// What the "already written" test found for one key.
 #[derive(Debug, PartialEq, Eq)]
 enum Written {
-    /// This file holds the key verbatim.
+    /// This file holds the key verbatim, as the sentence names it:
+    /// `` `<path>` ``, or `` skill `<name>` (`<path>`) `` for a skill.
     In(String),
     /// No file read holds it. Settled: every file in the corpus was read.
     No,
@@ -1582,11 +1740,13 @@ enum Written {
 /// other read error is not a miss (#1351): if no readable file holds the
 /// key, the answer is [`Written::Unchecked`] naming each such file. A
 /// rule `claudemd::rules` could not read is one of those whatever its
-/// `paths:`, which were not read either.
+/// `paths:`, which were not read either. So is a skill, and a skills
+/// directory that could not be listed (#1370).
 fn written_in(
     key: &str,
     dir: &Path,
     cx: &Context,
+    skills: &Skills,
     cache: &mut HashMap<String, Result<String, String>>,
 ) -> Written {
     let needle = collapse(key);
@@ -1610,6 +1770,13 @@ fn written_in(
         queue.push(path);
         collect_imports(imports, &mut queue);
     }
+    // #1370: a skill is where a procedure is written down. Its name, for
+    // the sentence, keyed by path.
+    let mut skill_names: HashMap<&str, &str> = HashMap::new();
+    for (path, name) in &skills.files {
+        queue.push(path.clone());
+        skill_names.insert(path.as_str(), name.as_str());
+    }
     // #1340: the repository's rules a session in `dir` would load.
     let rel = dir.strip_prefix(cx.repo).unwrap_or(dir);
     let rel = rel.to_string_lossy().replace('\\', "/");
@@ -1632,6 +1799,7 @@ fn written_in(
             None => (u.clone(), "could not be read".to_string()),
         })
         .collect();
+    unread.extend(skills.unreadable.iter().cloned());
     for path in queue {
         let content =
             cache
@@ -1642,7 +1810,12 @@ fn written_in(
                     Err(e) => Err(e.to_string()),
                 });
         match content {
-            Ok(c) if c.contains(&needle) => return Written::In(path),
+            Ok(c) if c.contains(&needle) => {
+                return Written::In(match skill_names.get(path.as_str()) {
+                    Some(name) => format!("skill `{name}` (`{path}`)"),
+                    None => format!("`{path}`"),
+                })
+            }
             Ok(_) => {}
             Err(e) => {
                 if !unread.iter().any(|(p, _)| *p == path) {
@@ -1655,6 +1828,71 @@ fn written_in(
         Written::No
     } else {
         Written::Unchecked(unread)
+    }
+}
+
+/// The skills a session under the repository can load, for the "already
+/// written" corpus (#1370): every `SKILL.md` under the repository's
+/// `.claude/skills` and the user's `~/.claude/skills`, at any depth.
+/// Plugin skills are out of scope: they are not the repository owner's
+/// to change. Walked once per pass.
+struct Skills {
+    /// `(path, name)`, the name being the directory holding the file.
+    files: Vec<(String, String)>,
+    /// `(path, io error)` for a skills directory that exists and could
+    /// not be listed: it might hold the key (#1351).
+    unreadable: Vec<(String, String)>,
+}
+
+/// How deep a skills walk goes, so a symlink cycle ends.
+const SKILL_DEPTH: usize = 8;
+
+fn skills_of(repo: &Path, home: Option<&Path>) -> Skills {
+    let mut out = Skills {
+        files: Vec::new(),
+        unreadable: Vec::new(),
+    };
+    let roots = std::iter::once(repo).chain(home);
+    for root in roots {
+        walk_skills(&root.join(".claude").join("skills"), 0, &mut out);
+    }
+    out
+}
+
+fn walk_skills(dir: &Path, depth: usize, out: &mut Skills) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        // Absent holds nothing.
+        Err(e) if is_gone(&e) => return,
+        Err(e) => {
+            out.unreadable
+                .push((dir.to_string_lossy().into_owned(), e.to_string()));
+            return;
+        }
+    };
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(e) => paths.push(e.path()),
+            Err(e) => {
+                out.unreadable
+                    .push((dir.to_string_lossy().into_owned(), e.to_string()));
+            }
+        }
+    }
+    paths.sort();
+    for path in paths {
+        if path.is_dir() {
+            if depth < SKILL_DEPTH {
+                walk_skills(&path, depth + 1, out);
+            }
+        } else if path.file_name() == Some(std::ffi::OsStr::new("SKILL.md")) {
+            let name = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            out.files.push((path.to_string_lossy().into_owned(), name));
+        }
     }
 }
 
@@ -1692,28 +1930,218 @@ fn named_path(signal: &str, key: &str, tool: &str, repo: &Path) -> Option<PathBu
 /// Whether `path` is established to name nothing. A stat refused for any
 /// other reason is not "nothing there": it could not be looked at.
 fn resolves_to_nothing(path: &Path) -> bool {
-    matches!(
-        std::fs::metadata(path),
-        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory)
-    )
+    matches!(std::fs::metadata(path), Err(e) if is_gone(&e))
+}
+
+/// Which version of a CLAUDE.md the sessions ran under, as far as git
+/// can say (#1371).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Version {
+    /// Last committed at this Unix time, and unchanged in the working
+    /// tree since.
+    Since(i64),
+    /// Modified, staged or untracked: it changed "now", so no session
+    /// has run under this version yet.
+    Uncommitted,
+    /// Git could not say, in its words. Nothing is filtered.
+    Unknown(String),
+}
+
+/// When each of `files` (absolute, as the scan holds them) last changed:
+/// one `git status` and one `git log` for the lot.
+///
+/// A file git lists as changed is [`Version::Uncommitted`] whatever its
+/// history. Otherwise the newest commit that touched it dates it. A
+/// repository with no `.git` has no history to ask, and a git that
+/// fails, or has no commit of a file it does not list as changed, is
+/// [`Version::Unknown`] -- never a guessed date.
+fn versions_of(git: &Path, repo: &Path, files: &[String]) -> HashMap<String, Version> {
+    use crate::worktrees::scan::git_output_with;
+    let rels: Vec<(String, String)> = files
+        .iter()
+        .filter(|f| Path::new(f).starts_with(repo))
+        .map(|f| (f.clone(), path_key(Path::new(f), repo)))
+        .collect();
+    let mut out = HashMap::new();
+    if rels.is_empty() {
+        return out;
+    }
+    let unknown = |why: String| -> HashMap<String, Version> {
+        rels.iter()
+            .map(|(f, _)| (f.clone(), Version::Unknown(why.clone())))
+            .collect()
+    };
+    // Checked first so a repository nested in another's working tree is
+    // not answered for by the outer one.
+    match std::fs::symlink_metadata(repo.join(".git")) {
+        Err(e) if is_gone(&e) => {
+            return unknown(format!("`{}` is not a git repository", repo.display()))
+        }
+        Err(e) => return unknown(format!("`.git` could not be checked: {e}")),
+        Ok(_) => {}
+    }
+    let refusal = |what: &str, o: &std::process::Output| {
+        format!(
+            "{what} exit status {}: {}",
+            o.status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "none".into()),
+            String::from_utf8_lossy(&o.stderr).trim()
+        )
+    };
+    let paths: Vec<&str> = rels.iter().map(|(_, r)| r.as_str()).collect();
+
+    let mut args = vec![
+        "--literal-pathspecs",
+        "--no-optional-locks",
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--",
+    ];
+    args.extend(&paths);
+    let status = match git_output_with(git, repo, &args) {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => return unknown(refusal("git status", &o)),
+        Err(e) => return unknown(format!("git status could not run: {e}")),
+    };
+    let mut changed: HashSet<String> = HashSet::new();
+    let mut fields = status.stdout.split(|b| *b == 0).filter(|f| !f.is_empty());
+    while let Some(entry) = fields.next() {
+        let (Some(xy), Some(rel)) = (entry.get(..2), entry.get(3..)) else {
+            continue;
+        };
+        // A rename or copy is followed by its source path.
+        if xy.iter().any(|c| matches!(c, b'R' | b'C')) {
+            fields.next();
+        }
+        changed.insert(String::from_utf8_lossy(rel).into_owned());
+    }
+
+    let mut args = vec![
+        "--literal-pathspecs",
+        "-c",
+        "core.quotePath=false",
+        "log",
+        "--relative",
+        "--format=%x00%ct",
+        "--name-only",
+        "--",
+    ];
+    args.extend(&paths);
+    let log = match git_output_with(git, repo, &args) {
+        Ok(o) if o.status.success() => Ok(o.stdout),
+        Ok(o) => Err(refusal("git log", &o)),
+        Err(e) => Err(format!("git log could not run: {e}")),
+    };
+    let mut newest: HashMap<String, i64> = HashMap::new();
+    if let Ok(stdout) = &log {
+        for chunk in String::from_utf8_lossy(stdout).split('\0') {
+            let mut lines = chunk.lines();
+            let Some(Ok(at)) = lines.next().map(|l| l.trim().parse::<i64>()) else {
+                continue;
+            };
+            for name in lines.map(str::trim).filter(|l| !l.is_empty()) {
+                let e = newest.entry(name.to_string()).or_insert(at);
+                *e = (*e).max(at);
+            }
+        }
+    }
+    for (file, rel) in &rels {
+        let v = if changed.contains(rel) {
+            Version::Uncommitted
+        } else if let Some(at) = newest.get(rel) {
+            Version::Since(*at)
+        } else {
+            match &log {
+                Err(why) => Version::Unknown(why.clone()),
+                Ok(_) => Version::Unknown("git records no commit of it".to_string()),
+            }
+        };
+        out.insert(file.clone(), v);
+    }
+    out
+}
+
+/// Whether a session counts against a CLAUDE.md at `version` (#1371).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Under {
+    /// It started after the file last changed, or nothing dates it.
+    Counted,
+    /// Counted because which version it ran under could not be told.
+    Undated,
+    /// It started before the file last changed: mentioned, not counted.
+    Before,
+}
+
+fn under(started: Option<i64>, version: Option<&Version>) -> Under {
+    match (version, started) {
+        (None, _) => Under::Counted,
+        (Some(Version::Unknown(_)), _) => Under::Undated,
+        (Some(Version::Uncommitted), _) => Under::Before,
+        (Some(Version::Since(at)), Some(s)) if s >= *at => Under::Counted,
+        (Some(Version::Since(_)), Some(_)) => Under::Before,
+        (Some(Version::Since(_)), None) => Under::Undated,
+    }
+}
+
+/// A Unix time as the day it fell on, UTC.
+fn day(at: i64) -> String {
+    chrono::DateTime::from_timestamp(at, 0)
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| at.to_string())
+}
+
+/// Whether a signal is an observation -- what recurred, with no stated
+/// fix -- rather than advice. Only a correction that worked (S1) or a
+/// user's stated fix (S2), and a denial (S3), carry a rule to write.
+/// S5 shows only that something failed repeatedly (#1368); S4 only where
+/// sessions spent their first calls, which a session's own task explains
+/// as often as a missing pointer does (#1369).
+fn is_observation(signal: &str) -> bool {
+    matches!(signal, SIG_ERROR | SIG_SEARCH)
 }
 
 /// Group the stored rows, apply the thresholds, place and dedup each
 /// group, and render the findings.
+#[allow(clippy::too_many_arguments)]
 fn emit(
     stored: &[Row],
     tasks: &HashMap<String, String>,
     denials: &[(String, String, Option<String>)],
     sessions: &[SessionRow],
     analysed: &HashSet<String>,
+    versions: &HashMap<String, Version>,
     cx: &Context,
     short: bool,
 ) -> Vec<Finding> {
     let candidates = claude_dirs(cx);
     let mut cache: HashMap<String, Result<String, String>> = HashMap::new();
+    let skills = skills_of(cx.repo, cx.home);
     let mut out = Vec::new();
     let at_least = if short { "at least " } else { "" };
     let plural = |n: usize| if n == 1 { "" } else { "s" };
+    // A session's task: replays of one task count once (#1337), and a
+    // session with no opening prompt is its own.
+    let task_of = |sid: &'_ str| -> (bool, String) {
+        match tasks.get(sid) {
+            Some(t) => (true, t.clone()),
+            None => (false, sid.to_string()),
+        }
+    };
+    let started: HashMap<&str, Option<i64>> = sessions
+        .iter()
+        .map(|s| (s.session_id.as_str(), s.started))
+        .collect();
+    let under_of =
+        |sid: &str, version: Option<&Version>| under(started.get(sid).copied().flatten(), version);
+    // Findings held back by #1371, per attributed file: its version, its
+    // subject, and each held finding's sentence.
+    let mut held: BTreeMap<String, (Version, Subject, Vec<String>)> = BTreeMap::new();
+    // CLAUDE.md files git could not date that qualified a finding.
+    let mut undated: BTreeMap<String, (Subject, String)> = BTreeMap::new();
 
     // (signal, key, aux) -> session -> first row. BTreeMaps so the order
     // a reader sees is the order the keys sort in, run after run.
@@ -1784,24 +2212,6 @@ fn emit(
             if *sig != signal {
                 continue;
             }
-            // Replays of one task count once (#1337): sessions sharing a
-            // task fingerprint are one run group, in the order of their
-            // first session; a session with no opening prompt is its own.
-            let mut runs: Vec<Vec<&Row>> = Vec::new();
-            let mut index: HashMap<(bool, &str), usize> = HashMap::new();
-            for (sid, r) in by_session {
-                let task = match tasks.get(sid) {
-                    Some(t) => (true, t.as_str()),
-                    None => (false, sid.as_str()),
-                };
-                let i = *index.entry(task).or_insert_with(|| {
-                    runs.push(Vec::new());
-                    runs.len() - 1
-                });
-                runs[i].push(r);
-            }
-            let n = runs.len();
-            let total = by_session.len();
             let min = match signal {
                 SIG_CORRECTED => MIN_SESSIONS_CORRECTED,
                 SIG_USER_CORRECTION => MIN_SESSIONS_USER_CORRECTION,
@@ -1809,31 +2219,110 @@ fn emit(
                 SIG_SEARCH => MIN_SESSIONS_SEARCH,
                 _ => MIN_SESSIONS_ERROR,
             };
-            // Below threshold is not shown at lower confidence; it is
-            // not shown.
-            if n < min {
+            // Below threshold over every session, whatever it ran under,
+            // is not shown at lower confidence; it is not shown.
+            let every = by_session
+                .keys()
+                .map(|sid| task_of(sid))
+                .collect::<HashSet<_>>()
+                .len();
+            if every < min {
                 continue;
             }
             // A path that resolves to nothing cannot become a CLAUDE.md
             // pointer (#1335). It is left out, and counted below.
             if let Some(path) = named_path(signal, key, aux, cx.repo) {
                 if resolves_to_nothing(&path) {
-                    gone.push((path, aux.clone(), n));
+                    gone.push((path, aux.clone(), every));
                     continue;
                 }
             }
             let dirs: Vec<&Path> = by_session.values().map(|r| r.dir.as_path()).collect();
             let dir = placement(&dirs, &candidates, cx.repo);
             let subject = subject_for(&dir, cx.scan);
+            // #1371: only sessions that started after the attributed
+            // CLAUDE.md last changed count; older ones are mentioned.
+            let file = match &subject {
+                Subject::ClaudeMd { path, .. } => Some(path.clone()),
+                _ => None,
+            };
+            let version = file.as_ref().and_then(|f| versions.get(f));
+            let rel = file
+                .as_deref()
+                .map(|f| path_key(Path::new(f), cx.repo))
+                .unwrap_or_default();
+
+            // Replays of one task count once (#1337): sessions sharing a
+            // task fingerprint are one run group, in the order of their
+            // first session.
+            let mut runs: Vec<Vec<&Row>> = Vec::new();
+            let mut index: HashMap<(bool, String), usize> = HashMap::new();
+            let mut before: HashSet<(bool, String)> = HashSet::new();
+            let mut qualified = false;
+            let mut total = 0usize;
+            for (sid, r) in by_session {
+                match under_of(sid, version) {
+                    Under::Before => {
+                        before.insert(task_of(sid));
+                        continue;
+                    }
+                    Under::Undated => qualified = true,
+                    Under::Counted => {}
+                }
+                total += 1;
+                let i = *index.entry(task_of(sid)).or_insert_with(|| {
+                    runs.push(Vec::new());
+                    runs.len() - 1
+                });
+                runs[i].push(r);
+            }
+            let n = runs.len();
+            // A task replayed both before and since is counted, once.
+            let b = before.iter().filter(|t| !index.contains_key(*t)).count();
+            // Every count carries its denominator (#1369), in the same
+            // unit: distinct tasks among the analysed sessions this
+            // version of the file could have shaped.
+            let denominator = analysed
+                .iter()
+                .filter(|sid| under_of(sid, version) != Under::Before)
+                .map(|sid| task_of(sid))
+                .collect::<HashSet<_>>()
+                .len();
             let mut sessions_phrase = format!(
-                "{at_least}{n} session{} under `{}`",
-                plural(n),
-                dir.display()
+                "{at_least}{n} of {denominator} analysed session{} under `{}`",
+                plural(denominator),
+                cx.repo.display()
             );
+            match version {
+                Some(Version::Since(at)) => sessions_phrase
+                    .push_str(&format!(" since `{rel}` last changed on {}", day(*at))),
+                Some(Version::Uncommitted) => {
+                    sessions_phrase.push_str(&format!(" since `{rel}`'s uncommitted changes"))
+                }
+                _ => {}
+            }
+            if b > 0 {
+                sessions_phrase.push_str(&format!(" ({b} more before it)"));
+            }
             if total > n {
                 sessions_phrase.push_str(&format!(
                     " ({total} runs; replays of one task counted once)"
                 ));
+            }
+            if dir != cx.repo {
+                sessions_phrase.push_str(&format!(", attributed to `{}`", dir.display()));
+            }
+            // Git could not say: nothing is dropped, and the finding says
+            // so (#1371).
+            if qualified {
+                sessions_phrase.push_str(&format!(
+                    "; could not tell which version of `{rel}` these sessions ran under"
+                ));
+                if let (Some(f), Some(Version::Unknown(why))) = (&file, version) {
+                    undated
+                        .entry(f.clone())
+                        .or_insert_with(|| (subject.clone(), why.clone()));
+                }
             }
             let (sentence, dedup_key) = match signal {
                 SIG_CORRECTED => (
@@ -1874,21 +2363,40 @@ fn emit(
                         _ => String::new(),
                     };
                     (
-                        format!("the same `{aux}` error{on} was recorded in {sessions_phrase}: `{key}`"),
+                        format!("recurring error: `{aux}`{on}: `{key}`, in {sessions_phrase}"),
                         key.clone(),
                     )
                 }
             };
+            // Reaches its threshold only with sessions from before the
+            // file last changed: held back, and counted in one Note per
+            // file, never dropped silently (#1371).
+            if n < min {
+                if let (Some(f), Some(v)) = (&file, version) {
+                    held.entry(f.clone())
+                        .or_insert_with(|| (v.clone(), subject.clone(), Vec::new()))
+                        .2
+                        .push(sentence);
+                }
+                continue;
+            }
             // Already written is an observation, not advice (#1339): the
             // rule is doing its job and there is nothing to change. Not
             // found while a corpus file could not be read is not "not
             // written": the finding is Unknown and names each file (#1351).
+            //
+            // An observation signal recommends nothing whatever the corpus
+            // holds, so it is a Note either way; an unread file cannot
+            // make a recommendation it never made possibly wrong.
+            let observation = is_observation(signal);
             let mut unchecked = Vec::new();
-            let (sentence, severity) = match written_in(&dedup_key, &dir, cx, &mut cache) {
+            let written = written_in(&dedup_key, &dir, cx, &skills, &mut cache);
+            let (sentence, severity) = match written {
                 Written::In(file) => (
-                    format!("`{dedup_key}` is already written in `{file}` ({sentence})"),
+                    format!("`{dedup_key}` is already written in {file} ({sentence})"),
                     Severity::Note,
                 ),
+                Written::No | Written::Unchecked(_) if observation => (sentence, Severity::Note),
                 Written::No => (sentence, Severity::Advice),
                 Written::Unchecked(files) => {
                     unchecked = files;
@@ -2009,6 +2517,73 @@ fn emit(
         ));
     }
 
+    // #1371: what the version filter held back, one Note per file.
+    for (file, (version, subject, sentences)) in held {
+        let rel = path_key(Path::new(&file), cx.repo);
+        let k = sentences.len();
+        let (findings, verb) = if k == 1 {
+            ("1 finding".to_string(), "is")
+        } else {
+            (format!("{k} findings"), "are")
+        };
+        let sentence = match version {
+            Version::Uncommitted => format!(
+                "`{rel}` has uncommitted changes, so no session has run under this version yet; \
+                 {findings} from sessions under an earlier version {verb} not shown"
+            ),
+            Version::Since(at) => format!(
+                "{findings} on `{rel}` {} only with sessions from before it last changed on {}, \
+                 and {verb} not shown",
+                if k == 1 {
+                    "reaches its threshold"
+                } else {
+                    "reach their thresholds"
+                },
+                day(at)
+            ),
+            // Unknown filters nothing, so holds nothing back.
+            Version::Unknown(_) => continue,
+        };
+        let evidence = sentences
+            .into_iter()
+            .take(MAX_EVIDENCE)
+            .map(|measured| Evidence {
+                at: Locator::File {
+                    path: file.clone(),
+                    line: None,
+                },
+                measured,
+            })
+            .collect();
+        out.push(Finding::new(
+            Check::Transcripts,
+            Severity::Note,
+            subject,
+            evidence,
+            sentence,
+        ));
+    }
+    // And why a finding's version could not be told, once per file.
+    for (file, (subject, why)) in undated {
+        let rel = path_key(Path::new(&file), cx.repo);
+        out.push(Finding::new(
+            Check::Transcripts,
+            Severity::Note,
+            subject,
+            vec![Evidence {
+                at: Locator::File {
+                    path: file.clone(),
+                    line: None,
+                },
+                measured: why,
+            }],
+            format!(
+                "could not tell which version of `{rel}` the sessions ran under, so every \
+                 session was counted"
+            ),
+        ));
+    }
+
     // S6 -- the census: sessions per attributed directory, always.
     let mut census: BTreeMap<PathBuf, Vec<&SessionRow>> = BTreeMap::new();
     for s in sessions {
@@ -2072,10 +2647,28 @@ mod tests {
         path: Option<&Path>,
         prompt: Option<&str>,
     ) {
+        insert_session_at(conn, id, cwd, path, prompt, "2026-01-01T00:00:00Z");
+    }
+
+    /// [`insert_session`] for a session that started at `started`.
+    fn insert_session_at(
+        conn: &Connection,
+        id: &str,
+        cwd: &str,
+        path: Option<&Path>,
+        prompt: Option<&str>,
+        started: &str,
+    ) {
         conn.execute(
             "INSERT INTO claude_session (session_id, cwd, transcript_path, first_seen_at, opening_prompt)
-             VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z', ?4)",
-            rusqlite::params![id, cwd, path.map(|p| p.to_string_lossy().into_owned()), prompt],
+             VALUES (?1, ?2, ?3, ?5, ?4)",
+            rusqlite::params![
+                id,
+                cwd,
+                path.map(|p| p.to_string_lossy().into_owned()),
+                prompt,
+                started
+            ],
         )
         .unwrap();
     }
@@ -2198,7 +2791,8 @@ mod tests {
         assert_eq!(
             f.finding,
             format!(
-                "`yarn lint` failed and `make lint` followed it in 2 sessions under `{}`",
+                "`yarn lint` failed and `make lint` followed it in 2 of 2 analysed sessions under \
+                 `{}`; could not tell which version of `CLAUDE.md` these sessions ran under",
                 repo.display()
             )
         );
@@ -2264,7 +2858,9 @@ mod tests {
         let hits = corrected(&out);
         assert_eq!(hits.len(), 1, "{out:#?}");
         assert!(
-            hits[0].finding.contains("in 3 sessions under"),
+            hits[0]
+                .finding
+                .contains("in 3 of 3 analysed sessions under"),
             "{}",
             hits[0].finding
         );
@@ -2472,6 +3068,136 @@ mod tests {
         assert_eq!(corrected(&out)[0].severity, Severity::Note, "{out:#?}");
     }
 
+    /// A context carrying a home directory, for the user scope.
+    fn context_home<'a>(
+        repo: &'a Path,
+        home: &'a Path,
+        scan: &'a EffectiveScan,
+        conn: &'a Connection,
+    ) -> Context<'a> {
+        Context {
+            home: Some(home),
+            ..context(repo, scan, conn)
+        }
+    }
+
+    /// #1370: a skill is where a procedure is written down, so a key a
+    /// skill holds is already written. The repository's
+    /// `.claude/skills/**/SKILL.md` and the user's
+    /// `~/.claude/skills/**/SKILL.md` count, nested ones too, and the hit
+    /// names the skill. Plugin skills do not: they are out of scope.
+    #[test]
+    fn dedup_looks_through_repository_and_user_skills() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path().join("repo");
+        let home = t.path().join("home");
+        fs::create_dir_all(&repo).unwrap();
+        write(&repo, "CLAUDE.md", "# rules\n");
+        let skill_dir = repo.join(".claude").join("skills").join("lint");
+        fs::create_dir_all(&skill_dir).unwrap();
+        let skill = write(
+            &skill_dir,
+            "SKILL.md",
+            "---\nname: lint\n---\nRun make lint.\n",
+        );
+        let cwd = repo.to_string_lossy().into_owned();
+        let conn = db();
+        for n in [1, 2] {
+            let p = write(&repo, &format!("s{n}.jsonl"), &corrected_pair(&cwd, n));
+            insert_session(&conn, &format!("s{n}"), &cwd, Some(&p), None);
+        }
+        let scan = scan_effective_opt(&repo, Some(&home));
+        let cx = context_home(&repo, &home, &scan, &conn);
+        let out = analyse(&conn, &cx, SESSIONS_PER_PASS).unwrap();
+        let f = corrected(&out)[0];
+        assert_eq!(
+            f.finding,
+            format!(
+                "`make lint` is already written in skill `lint` (`{}`) (`yarn lint` failed and \
+                 `make lint` followed it in 2 of 2 analysed sessions under `{}`; could not tell \
+                 which version of `CLAUDE.md` these sessions ran under)",
+                skill.display(),
+                repo.display()
+            )
+        );
+        assert_eq!(f.severity, Severity::Note);
+
+        // Only the user's skill holds it now, one directory deeper.
+        fs::remove_dir_all(repo.join(".claude")).unwrap();
+        let nested = home
+            .join(".claude")
+            .join("skills")
+            .join("tools")
+            .join("tidy");
+        fs::create_dir_all(&nested).unwrap();
+        let user_skill = write(&nested, "SKILL.md", "Always make lint first.\n");
+        // A plugin's skill holding it too is not consulted.
+        let plugin = home
+            .join(".claude")
+            .join("plugins")
+            .join("p")
+            .join("skills")
+            .join("x");
+        fs::create_dir_all(&plugin).unwrap();
+        write(&plugin, "SKILL.md", "make lint\n");
+        let out = analyse(&conn, &cx, SESSIONS_PER_PASS).unwrap();
+        let f = &corrected(&out)[0].finding;
+        assert!(
+            f.starts_with(&format!(
+                "`make lint` is already written in skill `tidy` (`{}`)",
+                user_skill.display()
+            )),
+            "{f}"
+        );
+
+        fs::remove_dir_all(home.join(".claude").join("skills")).unwrap();
+        let out = analyse(&conn, &cx, SESSIONS_PER_PASS).unwrap();
+        let f = corrected(&out)[0];
+        assert!(!f.finding.contains("already written"), "{}", f.finding);
+        assert_eq!(f.severity, Severity::Advice, "plugins are out of scope");
+    }
+
+    /// #1370 with #1351: a skill that could not be read might hold the
+    /// rule, so the finding is Unknown, never Advice, and names it.
+    #[test]
+    #[cfg(unix)]
+    fn an_unreadable_skill_makes_already_written_unknown_not_advice() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path();
+        write(repo, "CLAUDE.md", "# rules\n");
+        let skill_dir = repo.join(".claude").join("skills").join("lint");
+        fs::create_dir_all(&skill_dir).unwrap();
+        let skill = write(&skill_dir, "SKILL.md", "make lint\n");
+        let cwd = repo.to_string_lossy().into_owned();
+        let conn = db();
+        for n in [1, 2] {
+            let p = write(repo, &format!("s{n}.jsonl"), &corrected_pair(&cwd, n));
+            insert_session(&conn, &format!("s{n}"), &cwd, Some(&p), None);
+        }
+        let scan = scan_effective_opt(repo, None);
+        fs::set_permissions(&skill, fs::Permissions::from_mode(0o000)).unwrap();
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS);
+        fs::set_permissions(&skill, fs::Permissions::from_mode(0o644)).unwrap();
+        let out = out.unwrap();
+
+        let f = corrected(&out)[0];
+        if f.severity == Severity::Note {
+            eprintln!("skipped: mode 0o000 did not block the read (running as root?)");
+            return;
+        }
+        assert_eq!(f.severity, Severity::Unknown, "{}", f.finding);
+        assert!(
+            f.evidence.iter().any(|e| e.measured
+                == format!(
+                    "could not check whether it is already written: `{}` (Permission denied (os error 13))",
+                    skill.display()
+                )),
+            "{:?}",
+            f.evidence
+        );
+    }
+
     /// #1351: a `.claude/rules` rule that could not be read might be the
     /// one that holds the key, so it makes the finding Unknown too, and
     /// is named with its error (the `Rules::unreadable` gap).
@@ -2543,21 +3269,21 @@ mod tests {
         }
         assert_eq!(unknown.len(), 1, "{out:#?}");
         assert!(
-            unknown[0]
-                .finding
-                .starts_with("session `s4` could not be read: "),
+            unknown[0].finding.starts_with("1 transcript under `"),
             "{}",
             unknown[0].finding
         );
         assert!(
-            unknown[0].finding.contains("s4.jsonl"),
+            unknown[0].evidence[0].measured.contains("s4.jsonl"),
             "{}",
-            unknown[0].finding
+            unknown[0].evidence[0].measured
         );
         assert!(
-            unknown[0].finding.contains("Permission denied"),
+            unknown[0].evidence[0]
+                .measured
+                .contains("Permission denied"),
             "{}",
-            unknown[0].finding
+            unknown[0].evidence[0].measured
         );
         assert_eq!(
             unknown[0].evidence[0].at,
@@ -2570,7 +3296,9 @@ mod tests {
         let hits = corrected(&out);
         assert_eq!(hits.len(), 1, "{out:#?}");
         assert!(
-            hits[0].finding.contains("in at least 2 sessions"),
+            hits[0]
+                .finding
+                .contains("in at least 2 of 2 analysed sessions"),
             "{}",
             hits[0].finding
         );
@@ -2583,6 +3311,114 @@ mod tests {
             coverage.finding.ends_with("; 0 truncated at 8 MB"),
             "{}",
             coverage.finding
+        );
+    }
+
+    /// #1367: a transcript that is gone -- deleted with its worktree's
+    /// project directory, or never recorded -- is a session that no
+    /// longer exists, not a question about a CLAUDE.md. A hundred of them
+    /// are counted in ONE coverage Note, and two that exist but cannot be
+    /// read are ONE Unknown listing both: two rows, not a hundred and two.
+    #[test]
+    #[cfg(unix)]
+    fn missing_transcripts_are_counted_and_unreadable_ones_grouped() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path();
+        write(repo, "CLAUDE.md", "# rules\n");
+        let cwd = repo.to_string_lossy().into_owned();
+        let conn = db();
+        for n in 0..100 {
+            // Half recorded a path that has since been deleted, half
+            // recorded none.
+            let gone = repo.join("deleted").join(format!("g{n}.jsonl"));
+            let path = (n % 2 == 0).then_some(gone.as_path());
+            insert_session(&conn, &format!("g{n:03}"), &cwd, path, None);
+        }
+        let mut walled = Vec::new();
+        for n in [1, 2] {
+            let p = write(repo, &format!("w{n}.jsonl"), &corrected_pair(&cwd, n));
+            insert_session(&conn, &format!("w{n}"), &cwd, Some(&p), None);
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o000)).unwrap();
+            walled.push(p);
+        }
+        let scan = scan_effective_opt(repo, None);
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS);
+        for p in &walled {
+            fs::set_permissions(p, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let out = out.unwrap();
+
+        let unknown: Vec<&Finding> = out
+            .iter()
+            .filter(|f| f.severity == Severity::Unknown)
+            .collect();
+        if unknown.is_empty() {
+            eprintln!("skipped: mode 0o000 did not block the read (running as root?)");
+            return;
+        }
+        assert_eq!(unknown.len(), 1, "{out:#?}");
+        assert_eq!(
+            unknown[0].finding,
+            format!(
+                "2 transcripts under `{}` could not be read; the counts here are floors without them",
+                repo.display()
+            )
+        );
+        let listed: Vec<&Locator> = unknown[0].evidence.iter().map(|e| &e.at).collect();
+        assert_eq!(
+            listed,
+            [
+                &Locator::Session {
+                    session_id: "w1".into(),
+                    record: None
+                },
+                &Locator::Session {
+                    session_id: "w2".into(),
+                    record: None
+                }
+            ]
+        );
+        assert!(
+            unknown[0].evidence[0]
+                .measured
+                .contains("Permission denied"),
+            "{}",
+            unknown[0].evidence[0].measured
+        );
+        // Its brief says what to make readable, not what to edit.
+        assert!(
+            unknown[0]
+                .brief
+                .contains("Make the transcripts named in the evidence readable"),
+            "{}",
+            unknown[0].brief
+        );
+
+        let coverage: Vec<&Finding> = out
+            .iter()
+            .filter(|f| f.finding.starts_with("analysed "))
+            .collect();
+        assert_eq!(coverage.len(), 1, "{out:#?}");
+        assert_eq!(coverage[0].severity, Severity::Note);
+        assert_eq!(
+            coverage[0].finding,
+            format!(
+                "analysed 0 of 102 sessions under `{}`; 0 truncated at 8 MB; 100 had no \
+                 transcript on disk and were skipped",
+                repo.display()
+            )
+        );
+        // A sample behind the count, after the counts row.
+        assert_eq!(coverage[0].evidence.len(), 1 + MAX_EVIDENCE);
+        assert!(coverage[0].evidence[1..].iter().all(|e| {
+            e.measured == "no transcript path is recorded for this session"
+                || e.measured.ends_with(": no longer exists")
+        }));
+        // Nothing mentions a session one row at a time.
+        assert!(
+            !out.iter().any(|f| f.finding.starts_with("session `")),
+            "{out:#?}"
         );
     }
 
@@ -3005,7 +3841,9 @@ mod tests {
             })
             .expect("the head-keyed denial");
         assert!(
-            head_keyed.finding.contains("at least 3 sessions"),
+            head_keyed
+                .finding
+                .contains("at least 3 of 3 analysed sessions"),
             "{}",
             head_keyed.finding
         );
@@ -3021,13 +3859,29 @@ mod tests {
                 .any(|f| f.finding.contains("a `Bash` call was denied in")),
             "{out:#?}"
         );
-        // s4 has no transcript: Unknown, with the reason.
+        // s4 has no transcript: a session that is gone, counted in the
+        // coverage Note with its reason, never an Unknown (#1367).
         assert!(
-            out.iter().any(|f| f.severity == Severity::Unknown
-                && f.finding.contains("s4")
-                && f.finding.contains("no transcript path")),
+            !out.iter().any(|f| f.severity == Severity::Unknown),
             "{out:#?}"
         );
+        let coverage = out
+            .iter()
+            .find(|f| f.finding.starts_with("analysed 3 of 4 sessions"))
+            .unwrap_or_else(|| panic!("the coverage Note: {out:#?}"));
+        assert!(
+            coverage
+                .finding
+                .contains("; 1 had no transcript on disk and was skipped"),
+            "{}",
+            coverage.finding
+        );
+        assert!(coverage.evidence.iter().any(|e| e.at
+            == Locator::Session {
+                session_id: "s4".into(),
+                record: None
+            }
+            && e.measured == "no transcript path is recorded for this session"));
     }
 
     /// S4 and S5: identical patterns and early reads are searches; an
@@ -3224,12 +4078,23 @@ mod tests {
             "{}",
             read.finding
         );
-        assert!(
-            read.finding
-                .contains(&format!("under `{}`", repo.join("src-tauri").display())),
-            "{}",
-            read.finding
+        // The denominator is the repository's analysed sessions, and the
+        // attribution is said separately, so "3 of 3" is not read as
+        // three sessions run inside `src-tauri` (#1369).
+        assert_eq!(
+            read.finding,
+            format!(
+                "`src-tauri/src/lib.rs` was read within the first {EARLY_CALLS} tool calls in 3 \
+                 of 3 analysed sessions under `{}`, attributed to `{}`; could not tell which \
+                 version of `src-tauri/CLAUDE.md` these sessions ran under",
+                repo.display(),
+                repo.join("src-tauri").display()
+            )
         );
+        // An observation, not advice (#1369): an early read carries no
+        // stated fix.
+        assert_eq!(read.severity, Severity::Note);
+        assert!(!read.brief.contains("Suggested change"), "{}", read.brief);
 
         // A second group of the same key from the root's cwd sits above
         // both: the placement is the common ancestor.
@@ -3357,6 +4222,10 @@ mod tests {
             let p = write(repo, &format!("s{n}.jsonl"), &body);
             insert_session(&conn, &format!("s{n}"), &cwd, Some(&p), None);
         }
+        // A fourth session that read nothing: it is in the denominator
+        // and not the count (#1369).
+        let quiet = write(repo, "s4.jsonl", &user_text(&repo.to_string_lossy(), "hi"));
+        insert_session(&conn, "s4", &repo.to_string_lossy(), Some(&quiet), None);
         let scan = scan_effective_opt(repo, None);
         let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
         let hits = early_reads(&out);
@@ -3364,10 +4233,11 @@ mod tests {
         assert_eq!(
             hits[0].finding,
             format!(
-                "`src/a.ts` was read within the first {EARLY_CALLS} tool calls in 3 sessions under `{}`",
+                "`src/a.ts` was read within the first {EARLY_CALLS} tool calls in 3 of 4 analysed sessions under `{}`",
                 repo.display()
             )
         );
+        assert_eq!(hits[0].severity, Severity::Note);
         assert_eq!(hits[0].evidence.len(), 3);
         assert!(
             out.iter().all(|f| !f.finding.contains(".wt")),
@@ -3533,7 +4403,7 @@ mod tests {
         assert_eq!(hits.len(), 1, "{out:#?}");
         assert!(
             hits[0].finding.starts_with(&format!(
-                "`src/a.ts` was read within the first {EARLY_CALLS} tool calls in 3 sessions under `{}`",
+                "`src/a.ts` was read within the first {EARLY_CALLS} tool calls in 3 of 3 analysed sessions under `{}`",
                 repo.display()
             )),
             "{}",
@@ -3769,7 +4639,7 @@ mod tests {
     fn errors(findings: &[Finding]) -> Vec<&Finding> {
         findings
             .iter()
-            .filter(|f| f.finding.starts_with("the same `Bash` error"))
+            .filter(|f| f.finding.starts_with("recurring error: `Bash`"))
             .collect()
     }
 
@@ -3815,7 +4685,7 @@ mod tests {
         assert_eq!(hits.len(), 1, "{out:#?}");
         assert!(
             hits[0].finding.contains(&format!(
-                "in 3 sessions under `{}` (9 runs; replays of one task counted once)",
+                "in 3 of 3 analysed sessions under `{}` (9 runs; replays of one task counted once)",
                 repo.display()
             )),
             "{}",
@@ -3877,6 +4747,10 @@ mod tests {
     /// finding could not say which file. Every evidence row names the
     /// call, and when every session failed on the same one, so does the
     /// sentence.
+    ///
+    /// #1368: and it is an observation. Three sessions failing the same
+    /// way with no correction is a Note, with no suggestion; the same
+    /// failure followed by a call that worked is S1, which stays Advice.
     #[test]
     fn an_error_cluster_names_the_failing_call() {
         let t = tempfile::tempdir().unwrap();
@@ -3903,15 +4777,21 @@ mod tests {
         let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
         let hits: Vec<&Finding> = out
             .iter()
-            .filter(|f| f.finding.starts_with("the same `Read` error"))
+            .filter(|f| f.finding.starts_with("recurring error: `Read`"))
             .collect();
         assert_eq!(hits.len(), 1, "{out:#?}");
         assert_eq!(
             hits[0].finding,
             format!(
-                "the same `Read` error on `src/gone.ts` was recorded in 3 sessions under `{}`: `File does not exist.`",
+                "recurring error: `Read` on `src/gone.ts`: `File does not exist.`, in 3 of 3 analysed sessions under `{}`",
                 repo.display()
             )
+        );
+        assert_eq!(hits[0].severity, Severity::Note, "{}", hits[0].finding);
+        assert!(
+            !hits[0].brief.contains("Suggested change"),
+            "{}",
+            hits[0].brief
         );
         assert_eq!(
             hits[0].evidence[0].measured,
@@ -3925,15 +4805,16 @@ mod tests {
         }
 
         // Different files: the sentence cannot name one, the rows still do.
-        write(repo, "s3.jsonl", &failing_read(3, "other.ts"));
+        rewrite(repo, "s3.jsonl", &failing_read(3, "other.ts"));
         let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
         let hit = out
             .iter()
-            .find(|f| f.finding.starts_with("the same `Read` error"))
+            .find(|f| f.finding.starts_with("recurring error: `Read`"))
             .expect("the error cluster");
         assert!(
-            hit.finding
-                .starts_with("the same `Read` error was recorded in 3 sessions"),
+            hit.finding.starts_with(
+                "recurring error: `Read`: `File does not exist.`, in 3 of 3 analysed sessions"
+            ),
             "{}",
             hit.finding
         );
@@ -3943,6 +4824,200 @@ mod tests {
                 .starts_with("`Read` `src/other.ts`: "),
             "{}",
             hit.evidence[2].measured
+        );
+
+        // The control: the same kind of failure corrected by a call that
+        // worked is S1, and S1 is Advice. Its error is still observed.
+        for n in [1, 2, 3] {
+            rewrite(repo, &format!("s{n}.jsonl"), &corrected_pair(&cwd, n));
+        }
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        let s1 = corrected(&out);
+        assert_eq!(s1.len(), 1, "{out:#?}");
+        assert_eq!(s1[0].severity, Severity::Advice, "{}", s1[0].finding);
+        let s5 = errors(&out);
+        assert_eq!(s5.len(), 1, "{out:#?}");
+        assert_eq!(s5[0].severity, Severity::Note, "{}", s5[0].finding);
+    }
+
+    /// `git` in `dir` as octocat, with the commit dated `date`.
+    fn git_at(dir: &Path, args: &[&str], date: &str) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=octocat",
+                "-c",
+                "user.email=octocat@invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "git {args:?}");
+    }
+
+    fn held_back(findings: &[Finding]) -> Vec<&Finding> {
+        findings
+            .iter()
+            .filter(|f| f.finding.contains("not shown"))
+            .collect()
+    }
+
+    /// #1371: a session that ran under an older CLAUDE.md says nothing
+    /// about the current one. Only sessions that started after the
+    /// attributed file last changed count toward a threshold; older ones
+    /// are mentioned, not counted. A finding that reaches its threshold
+    /// only with older sessions is held back, and a Note says so; an
+    /// uncommitted change means no session has run under the file yet.
+    #[test]
+    fn only_sessions_since_the_claude_md_last_changed_count() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path();
+        git_init(repo);
+        write(repo, "CLAUDE.md", "# rules\n");
+        let changed = "2026-03-01T00:00:00Z";
+        git_at(repo, &["add", "CLAUDE.md"], changed);
+        git_at(repo, &["commit", "-q", "-m", "rules"], changed);
+        let cwd = repo.to_string_lossy().into_owned();
+        let conn = db();
+        for (n, started) in [
+            (1, "2026-01-01T00:00:00Z"),
+            (2, "2026-02-01T00:00:00Z"),
+            (3, "2026-04-01T00:00:00Z"),
+            (4, "2026-05-01T00:00:00Z"),
+        ] {
+            let p = write(repo, &format!("s{n}.jsonl"), &corrected_pair(&cwd, n));
+            insert_session_at(&conn, &format!("s{n}"), &cwd, Some(&p), None, started);
+        }
+        let scan = scan_effective_opt(repo, None);
+        let cx = context(repo, &scan, &conn);
+        let out = analyse(&conn, &cx, SESSIONS_PER_PASS).unwrap();
+        let hits = corrected(&out);
+        assert_eq!(hits.len(), 1, "{out:#?}");
+        assert_eq!(
+            hits[0].finding,
+            format!(
+                "`yarn lint` failed and `make lint` followed it in 2 of 2 analysed sessions \
+                 under `{}` since `CLAUDE.md` last changed on 2026-03-01 (2 more before it)",
+                repo.display()
+            )
+        );
+        assert_eq!(hits[0].severity, Severity::Advice);
+        let ids: Vec<&Locator> = hits[0].evidence.iter().map(|e| &e.at).collect();
+        assert_eq!(
+            ids,
+            [
+                &Locator::Session {
+                    session_id: "s3".into(),
+                    record: Some(2)
+                },
+                &Locator::Session {
+                    session_id: "s4".into(),
+                    record: Some(2)
+                }
+            ],
+            "only the counted sessions are evidence"
+        );
+        // S5 needs three: two since and two before is held back, and said.
+        let held = held_back(&out);
+        assert_eq!(held.len(), 1, "{out:#?}");
+        assert_eq!(held[0].severity, Severity::Note);
+        assert_eq!(
+            held[0].finding,
+            "1 finding on `CLAUDE.md` reaches its threshold only with sessions from before it \
+             last changed on 2026-03-01, and is not shown"
+        );
+        assert!(
+            held[0].evidence[0].measured.contains("(2 more before it)"),
+            "{}",
+            held[0].evidence[0].measured
+        );
+
+        // One session since: the correction is held back too.
+        conn.execute(
+            "UPDATE claude_session SET first_seen_at = '2026-01-15T00:00:00Z'
+              WHERE session_id = 's4'",
+            [],
+        )
+        .unwrap();
+        let out = analyse(&conn, &cx, SESSIONS_PER_PASS).unwrap();
+        assert!(corrected(&out).is_empty(), "{out:#?}");
+        let held = held_back(&out);
+        assert_eq!(held.len(), 1, "{out:#?}");
+        assert!(
+            held[0]
+                .finding
+                .starts_with("2 findings on `CLAUDE.md` reach"),
+            "{}",
+            held[0].finding
+        );
+
+        // An uncommitted change: no session has run under it yet.
+        write(repo, "CLAUDE.md", "# rules\n\nUse make.\n");
+        let scan = scan_effective_opt(repo, None);
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        assert!(corrected(&out).is_empty(), "{out:#?}");
+        let held = held_back(&out);
+        assert_eq!(held.len(), 1, "{out:#?}");
+        assert_eq!(
+            held[0].finding,
+            "`CLAUDE.md` has uncommitted changes, so no session has run under this version \
+             yet; 2 findings from sessions under an earlier version are not shown"
+        );
+    }
+
+    /// #1371: when git cannot say when the CLAUDE.md changed, no session
+    /// is dropped. Every one counts, and the finding says the version is
+    /// unknown; one Note carries why.
+    #[test]
+    fn a_claude_md_git_cannot_date_counts_every_session_and_says_so() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path();
+        write(repo, "CLAUDE.md", "# rules\n");
+        let cwd = repo.to_string_lossy().into_owned();
+        let conn = db();
+        for n in [1, 2] {
+            let p = write(repo, &format!("s{n}.jsonl"), &corrected_pair(&cwd, n));
+            insert_session(&conn, &format!("s{n}"), &cwd, Some(&p), None);
+        }
+        let scan = scan_effective_opt(repo, None);
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        let hits = corrected(&out);
+        assert_eq!(hits.len(), 1, "{out:#?}");
+        assert!(
+            hits[0].finding.ends_with(
+                "in 2 of 2 analysed sessions under `{}`; could not tell which version of \
+                 `CLAUDE.md` these sessions ran under"
+                    .replace("{}", &repo.display().to_string())
+                    .as_str()
+            ),
+            "{}",
+            hits[0].finding
+        );
+        assert_eq!(hits[0].severity, Severity::Advice);
+        let why = out
+            .iter()
+            .find(|f| {
+                f.finding
+                    .starts_with("could not tell which version of `CLAUDE.md`")
+            })
+            .unwrap_or_else(|| panic!("the reason: {out:#?}"));
+        assert_eq!(why.severity, Severity::Note);
+        assert!(
+            why.finding.contains("every session was counted"),
+            "{}",
+            why.finding
+        );
+        assert!(
+            why.evidence[0].measured.contains("not a git repository"),
+            "{}",
+            why.evidence[0].measured
         );
     }
 
