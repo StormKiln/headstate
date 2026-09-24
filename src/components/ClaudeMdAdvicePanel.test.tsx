@@ -836,6 +836,41 @@ describe("ClaudeMdAdvicePanel", () => {
     expect(headings.some((h) => h.includes("skill: verify"))).toBe(true);
   });
 
+  /// #1387: a path BESIDE the repository that shares its name as a
+  /// prefix (`<repo>-other/...`) is not inside it, so it is shown whole.
+  /// A bare `startsWith` shortened it to the fragment `-other/...`.
+  it("shows a sibling that shares the repository's prefix in full, never as a fragment", () => {
+    const sibling = `${REPO}-other/CLAUDE.md`;
+    state.data = report({
+      findings: [
+        finding({
+          subject: { kind: "claudeMd", path: sibling, scope: "global", section: null },
+          evidence: [{ at: { kind: "file", path: sibling, line: 3 }, measured: "beside, not inside" }],
+          finding: "about the sibling",
+        }),
+        finding({
+          subject: { kind: "claudeMd", path: `${REPO}/CLAUDE.md`, scope: "repo", section: null },
+          evidence: [],
+          finding: "about the inside file",
+        }),
+      ],
+      checks: [{ check: "imports", run: { state: "ran", findings: 2 } }],
+    });
+    open();
+    group("file");
+    const headings = screen.getAllByRole("heading").map((h) => h.textContent ?? "");
+    // The sibling keeps its whole path; nothing starts with the fragment.
+    expect(headings.some((h) => h.startsWith(sibling))).toBe(true);
+    expect(headings.some((h) => h.startsWith("-other"))).toBe(false);
+    // The evidence locator, behind its disclosure since #1344.
+    fireEvent.click(screen.getByRole("button", { name: "Evidence (1)" }));
+    expect(screen.getByText("beside, not inside", { exact: false }).textContent).toBe(
+      `${sibling}:3 — beside, not inside`,
+    );
+    // A file genuinely inside is still shortened.
+    expect(headings.some((h) => h.startsWith("CLAUDE.md"))).toBe(true);
+  });
+
   /// #1366: a finding about the repository itself is labelled "repository
   /// root" everywhere the panel shortens a path -- the by-file heading,
   /// the Where column and an evidence locator -- and never `/` or an

@@ -64,7 +64,15 @@ const SEVERITY: Record<ClaudeMdAdviceFinding["severity"], { label: string; class
 /// its shortening would leave (#1366).
 function shown(path: string, repo: string): string {
   if (isRepositoryRoot(path, repo)) return REPOSITORY_ROOT;
-  return path.startsWith(repo) ? path.slice(repo.length).replace(/^\//, "") : path;
+  // Inside the repository only at a separator boundary (#1387). A bare
+  // prefix test shortened `<repo>-other/CLAUDE.md`, a sibling that merely
+  // shares the name, to the fragment `-other/CLAUDE.md`. Either separator,
+  // because a Windows root arrives with `\`.
+  const base = repo.replace(/[/\\]+$/, "");
+  const rest = path.slice(base.length);
+  return base !== "" && path.startsWith(base) && /^[/\\]/.test(rest)
+    ? rest.replace(/^[/\\]+/, "")
+    : path;
 }
 
 /// A directory subject as the row shows it: shortened, with the trailing
