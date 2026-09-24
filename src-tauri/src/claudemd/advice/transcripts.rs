@@ -22,15 +22,25 @@
 //!
 //! S1, S2 and S3 are [`Severity::Advice`]: each carries a rule a session
 //! had to learn -- the command that worked after the one that failed,
-//! the user's stated fix, the call not to make. S5 is a
-//! [`Severity::Note`] (#1368), worded "recurring error: `<tool>` on
-//! `<key>`: …": it shows only that something failed repeatedly, which
-//! is often nothing CLAUDE.md wording controls (a sub-agent's schema, a
-//! search tool's timeout). An error that a later call in the same
-//! session corrected is already S1, and that stays Advice. A Note
-//! carries no suggestion and no Claudify, and whether its key is already
-//! written cannot make it wrong, so an unreadable corpus file leaves it
-//! a Note rather than Unknown.
+//! the user's stated fix, the call not to make. S4 and S5 are
+//! [`Severity::Note`]s: observations, not advice. S5 (#1368), worded
+//! "recurring error: `<tool>` on `<key>`: …", shows only that something
+//! failed repeatedly, which is often nothing CLAUDE.md wording controls
+//! (a sub-agent's schema, a search tool's timeout). An error that a later
+//! call in the same session corrected is already S1, and that stays
+//! Advice. S4 (#1369) shows where sessions spent their first calls; a CI
+//! task that globs `.github/workflows/*.yml` and reads one is doing its
+//! job, and nothing links the count to a line a CLAUDE.md could hold. A
+//! Note carries no suggestion and no Claudify, and whether its key is
+//! already written cannot make it wrong, so an unreadable corpus file
+//! leaves it a Note rather than Unknown.
+//!
+//! Every count states its denominator (#1369): "in 3 of 137 analysed
+//! sessions under `<repo>`", qualified "at least 3" while the pass is
+//! short. The denominator is in the numerator's unit -- distinct tasks
+//! among the analysed sessions -- and is the repository's, so a finding
+//! placed on a subdirectory says ", attributed to `<dir>`" rather than
+//! implying the sessions ran there.
 //!
 //! A count is DISTINCT TASKS, never records: distinct sessions, with the
 //! sessions that share an opening prompt counted once (#1337), because
@@ -1780,9 +1790,11 @@ fn resolves_to_nothing(path: &Path) -> bool {
 /// Whether a signal is an observation -- what recurred, with no stated
 /// fix -- rather than advice. Only a correction that worked (S1) or a
 /// user's stated fix (S2), and a denial (S3), carry a rule to write.
-/// S5 shows only that something failed repeatedly (#1368).
+/// S5 shows only that something failed repeatedly (#1368); S4 only where
+/// sessions spent their first calls, which a session's own task explains
+/// as often as a missing pointer does (#1369).
 fn is_observation(signal: &str) -> bool {
-    signal == SIG_ERROR
+    matches!(signal, SIG_ERROR | SIG_SEARCH)
 }
 
 /// Group the stored rows, apply the thresholds, place and dedup each
@@ -1801,6 +1813,17 @@ fn emit(
     let mut out = Vec::new();
     let at_least = if short { "at least " } else { "" };
     let plural = |n: usize| if n == 1 { "" } else { "s" };
+    // The denominator every count is stated against (#1369): the analysed
+    // sessions, with replays of one task counted once, as the numerator
+    // counts them (#1337).
+    let denominator = analysed
+        .iter()
+        .map(|sid| match tasks.get(sid) {
+            Some(t) => (true, t.as_str()),
+            None => (false, sid.as_str()),
+        })
+        .collect::<HashSet<_>>()
+        .len();
 
     // (signal, key, aux) -> session -> first row. BTreeMaps so the order
     // a reader sees is the order the keys sort in, run after run.
@@ -1912,15 +1935,20 @@ fn emit(
             let dirs: Vec<&Path> = by_session.values().map(|r| r.dir.as_path()).collect();
             let dir = placement(&dirs, &candidates, cx.repo);
             let subject = subject_for(&dir, cx.scan);
+            // Every count carries its denominator (#1369), in the same
+            // unit: distinct tasks among the analysed sessions.
             let mut sessions_phrase = format!(
-                "{at_least}{n} session{} under `{}`",
-                plural(n),
-                dir.display()
+                "{at_least}{n} of {denominator} analysed session{} under `{}`",
+                plural(denominator),
+                cx.repo.display()
             );
             if total > n {
                 sessions_phrase.push_str(&format!(
                     " ({total} runs; replays of one task counted once)"
                 ));
+            }
+            if dir != cx.repo {
+                sessions_phrase.push_str(&format!(", attributed to `{}`", dir.display()));
             }
             let (sentence, dedup_key) = match signal {
                 SIG_CORRECTED => (
@@ -2291,7 +2319,7 @@ mod tests {
         assert_eq!(
             f.finding,
             format!(
-                "`yarn lint` failed and `make lint` followed it in 2 sessions under `{}`",
+                "`yarn lint` failed and `make lint` followed it in 2 of 2 analysed sessions under `{}`",
                 repo.display()
             )
         );
@@ -2357,7 +2385,9 @@ mod tests {
         let hits = corrected(&out);
         assert_eq!(hits.len(), 1, "{out:#?}");
         assert!(
-            hits[0].finding.contains("in 3 sessions under"),
+            hits[0]
+                .finding
+                .contains("in 3 of 3 analysed sessions under"),
             "{}",
             hits[0].finding
         );
@@ -2663,7 +2693,9 @@ mod tests {
         let hits = corrected(&out);
         assert_eq!(hits.len(), 1, "{out:#?}");
         assert!(
-            hits[0].finding.contains("in at least 2 sessions"),
+            hits[0]
+                .finding
+                .contains("in at least 2 of 2 analysed sessions"),
             "{}",
             hits[0].finding
         );
@@ -3206,7 +3238,9 @@ mod tests {
             })
             .expect("the head-keyed denial");
         assert!(
-            head_keyed.finding.contains("at least 3 sessions"),
+            head_keyed
+                .finding
+                .contains("at least 3 of 3 analysed sessions"),
             "{}",
             head_keyed.finding
         );
@@ -3441,12 +3475,22 @@ mod tests {
             "{}",
             read.finding
         );
-        assert!(
-            read.finding
-                .contains(&format!("under `{}`", repo.join("src-tauri").display())),
-            "{}",
-            read.finding
+        // The denominator is the repository's analysed sessions, and the
+        // attribution is said separately, so "3 of 3" is not read as
+        // three sessions run inside `src-tauri` (#1369).
+        assert_eq!(
+            read.finding,
+            format!(
+                "`src-tauri/src/lib.rs` was read within the first {EARLY_CALLS} tool calls in 3 \
+                 of 3 analysed sessions under `{}`, attributed to `{}`",
+                repo.display(),
+                repo.join("src-tauri").display()
+            )
         );
+        // An observation, not advice (#1369): an early read carries no
+        // stated fix.
+        assert_eq!(read.severity, Severity::Note);
+        assert!(!read.brief.contains("Suggested change"), "{}", read.brief);
 
         // A second group of the same key from the root's cwd sits above
         // both: the placement is the common ancestor.
@@ -3574,6 +3618,10 @@ mod tests {
             let p = write(repo, &format!("s{n}.jsonl"), &body);
             insert_session(&conn, &format!("s{n}"), &cwd, Some(&p), None);
         }
+        // A fourth session that read nothing: it is in the denominator
+        // and not the count (#1369).
+        let quiet = write(repo, "s4.jsonl", &user_text(&repo.to_string_lossy(), "hi"));
+        insert_session(&conn, "s4", &repo.to_string_lossy(), Some(&quiet), None);
         let scan = scan_effective_opt(repo, None);
         let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
         let hits = early_reads(&out);
@@ -3581,10 +3629,11 @@ mod tests {
         assert_eq!(
             hits[0].finding,
             format!(
-                "`src/a.ts` was read within the first {EARLY_CALLS} tool calls in 3 sessions under `{}`",
+                "`src/a.ts` was read within the first {EARLY_CALLS} tool calls in 3 of 4 analysed sessions under `{}`",
                 repo.display()
             )
         );
+        assert_eq!(hits[0].severity, Severity::Note);
         assert_eq!(hits[0].evidence.len(), 3);
         assert!(
             out.iter().all(|f| !f.finding.contains(".wt")),
@@ -3750,7 +3799,7 @@ mod tests {
         assert_eq!(hits.len(), 1, "{out:#?}");
         assert!(
             hits[0].finding.starts_with(&format!(
-                "`src/a.ts` was read within the first {EARLY_CALLS} tool calls in 3 sessions under `{}`",
+                "`src/a.ts` was read within the first {EARLY_CALLS} tool calls in 3 of 3 analysed sessions under `{}`",
                 repo.display()
             )),
             "{}",
@@ -4032,7 +4081,7 @@ mod tests {
         assert_eq!(hits.len(), 1, "{out:#?}");
         assert!(
             hits[0].finding.contains(&format!(
-                "in 3 sessions under `{}` (9 runs; replays of one task counted once)",
+                "in 3 of 3 analysed sessions under `{}` (9 runs; replays of one task counted once)",
                 repo.display()
             )),
             "{}",
@@ -4130,7 +4179,7 @@ mod tests {
         assert_eq!(
             hits[0].finding,
             format!(
-                "recurring error: `Read` on `src/gone.ts`: `File does not exist.`, in 3 sessions under `{}`",
+                "recurring error: `Read` on `src/gone.ts`: `File does not exist.`, in 3 of 3 analysed sessions under `{}`",
                 repo.display()
             )
         );
@@ -4159,8 +4208,9 @@ mod tests {
             .find(|f| f.finding.starts_with("recurring error: `Read`"))
             .expect("the error cluster");
         assert!(
-            hit.finding
-                .starts_with("recurring error: `Read`: `File does not exist.`, in 3 sessions"),
+            hit.finding.starts_with(
+                "recurring error: `Read`: `File does not exist.`, in 3 of 3 analysed sessions"
+            ),
             "{}",
             hit.finding
         );
