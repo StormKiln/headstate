@@ -107,3 +107,18 @@ export function groupHeading(group: AdviceGroup, repo: string): string {
     ? group.label
     : shown(group.label.slice(0, group.pathLength), repo) + group.label.slice(group.pathLength);
 }
+
+/// What the findings on screen are worth when some checks could not run
+/// (#1409) -- the clause after "N of M checks could not run, so". Shared
+/// by the panel's notice and the copied markdown so the two can never
+/// say different things about the same report.
+///
+/// Nothing found gets its own words: "the 0 findings below are at least
+/// the findings" read as a clean pass, which is the one reading a
+/// shortfall must not allow (absent is not zero, #846).
+export function shortfallConsequence(n: number): string {
+  if (n === 0) return "the empty list below is not a clean result.";
+  return n === 1
+    ? "the finding below is at least the findings."
+    : `the ${n} findings below are at least the findings.`;
+}

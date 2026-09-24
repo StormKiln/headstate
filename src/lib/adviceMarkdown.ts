@@ -14,6 +14,7 @@ import {
   groupHeading,
   locatorText,
   severityCount,
+  shortfallConsequence,
   subjectText,
 } from "./adviceText";
 
@@ -126,7 +127,7 @@ export function reportMarkdown(
   if (unknown.length > 0) {
     out.push(
       "",
-      `At least ${n} ${n === 1 ? "finding" : "findings"}; ${unknown.length} of ${report.checks.length} checks could not run.`,
+      `${unknown.length} of ${report.checks.length} checks could not run, so ${shortfallConsequence(n)}`,
     );
   } else if (n === 0) {
     const checks = `${report.checks.length} ${report.checks.length === 1 ? "check" : "checks"}`;

@@ -414,8 +414,15 @@ describe("ClaudeMdAdvicePanel", () => {
     open();
     expect(screen.getAllByText(/the repository could not be listed/).length).toBeGreaterThan(0);
     expect(screen.getByText(/could not check/)).toBeTruthy();
-    expect(screen.getByRole("alert").textContent).toContain("at least the findings");
     expect(screen.getByRole("alert").textContent).toContain("1 of 1 checks could not run");
+    // #1409: the entries are CHECKS. The notice once announced them as
+    // "1 path could not be read" and then restated the count as checks --
+    // and with nothing found it read "the 0 findings below are at least
+    // the findings", which is the empty-as-clean reading it exists to stop.
+    expect(screen.getByRole("alert").textContent).toMatch(
+      /^1 of 1 checks could not run, so the empty list below is not a clean result\./,
+    );
+    expect(screen.getByRole("alert").textContent).not.toMatch(/path/);
     expect(screen.queryByText(/nothing found/)).toBeNull();
   });
 
