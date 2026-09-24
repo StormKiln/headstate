@@ -156,11 +156,24 @@
 //! "reference external documents … without explaining when that resource
 //! becomes relevant", at 16 % prevalence. Here that is a prose line
 //! naming an existing document path with "see", "read" or "consult" that
-//! is neither an `@` import nor conditioned by "when", "if", "for" or
-//! "before". Both remedies are real and the brief offers both: an `@`
-//! import loads the file in every session; a condition keeps it lazy.
-//! "topic → path" (or `->`) with text before the arrow is a condition
-//! too: it is the index form of "read this when the topic comes up". A
+//! is neither an `@` import nor conditioned by "when", "if", "for",
+//! "before", "on demand" or "as needed" ("when relevant" and "if needed"
+//! by their first word, #1375). Both remedies are real and the brief
+//! offers both, the condition first: a condition keeps the document
+//! lazy, while an `@` import loads it in every session, and the brief
+//! prices that -- "`@docs/a.md` would load ~N est. tokens in every
+//! session" -- with [`tokens::estimate`] over the document as injected
+//! plus what it imports in turn ("at least" when one of those could not
+//! be read). Measured, a repository that ratchets its instruction-token
+//! budget down in CI would have failed that check on the import the
+//! brief offered. A document that cannot be read has no figure, never
+//! 0. "topic → path" (or `->`) with text before the arrow is a condition
+//! too: it is the index form of "read this when the topic comes up". So
+//! is a short label before a colon that names a document list ("Docs:",
+//! "Reference:", "Further reading:", "Docs, read on demand:"): at most
+//! four words, no code span. "See `docs/gate.md`" inside the paragraph
+//! about that gate stays a finding; the rule stays narrow, and the price
+//! lets the reader decide. A
 //! file under `.claude/rules/` is never blind: it loads itself, at launch
 //! or when a file its `paths:` matches is read, and the `@` import the
 //! brief would offer defeats that scoping. One line naming several
@@ -183,7 +196,7 @@
 use super::{Check, Context, Evidence, Finding, Locator, Producer, Severity, Subject};
 use crate::claude::definitions::{Inventory, Kind};
 use crate::claudemd::refs::{self, Ref, RefKind, Runner};
-use crate::claudemd::{text, Scope, SKIP};
+use crate::claudemd::{imports, text, tokens, Scope, SKIP};
 use crate::packages::scripts::{self, Manifest, Target};
 use regex::Regex;
 use std::collections::{BTreeSet, HashMap};
@@ -233,6 +246,18 @@ pub struct Blind {
     pub path: String,
     /// How an ambiguous suffix was settled, when it was (#1372).
     pub settled: Option<String>,
+    /// What an `@` import of it would load, when that could be weighed.
+    /// `None` is "could not be read", never zero (#1375).
+    pub cost: Option<Cost>,
+}
+
+/// The estimated tokens an `@` import of one document would load: the
+/// document and everything it imports in turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cost {
+    pub tokens: u64,
+    /// Something beneath it could not be read, so `tokens` is a floor.
+    pub floor: bool,
 }
 
 /// One file's result.
@@ -260,6 +285,7 @@ const IGNORED: &str = ", which git ignores, and no template (`.example`, `.sampl
 const UNKNOWN: &str = ", which could not be checked: ";
 const SUMMARY: &str = " references checked; ";
 const BLIND: &str = " by name; not imported, no condition";
+const COST: &str = " est. tokens in every session";
 const DATED: &str = " states a dated fact: ";
 
 impl Producer for Rot {
@@ -432,6 +458,7 @@ pub fn check_file(repo: &Path, file: &Path, text: &str, res: &mut Resolver) -> F
                         resolved_paths.push(Named {
                             line: r.line,
                             path: path.clone(),
+                            file: landed,
                             settled,
                         });
                     }
@@ -491,6 +518,8 @@ fn unknown(why: String) -> Refused {
 struct Named {
     line: usize,
     path: String,
+    /// Where it landed, when that is a file on disk.
+    file: Option<PathBuf>,
     /// How an ambiguous suffix was settled, when it was (#1372).
     settled: Option<String>,
 }
@@ -1737,8 +1766,9 @@ fn count(n: usize, one: &str, many: &str) -> String {
 }
 
 static CUE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(see|read|consult)\b").unwrap());
+/// "when relevant" and "if needed" are here by their first word.
 static CONDITION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\b(when|if|for|before)\b").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)\b(when|if|for|before|on demand|as needed)\b").unwrap());
 static TEMPORAL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(as of|before|after|until)\b").unwrap());
 static DATE: LazyLock<Regex> = LazyLock::new(|| {
@@ -1773,6 +1803,67 @@ fn topic_arrow(line: &str) -> bool {
     })
 }
 
+/// Words that make a short label before a colon a document index:
+/// "Docs:", "Reference:", "Further reading:".
+const INDEX_WORDS: &[&str] = &[
+    "doc",
+    "docs",
+    "documentation",
+    "reference",
+    "references",
+    "reading",
+];
+
+/// Whether the line opens with a document-index label before a colon
+/// (#1375). An index says "these are here for when the topic comes up",
+/// which is a condition. Narrow on purpose: the label is at most four
+/// words, holds no code span, and names a document list; "read this:"
+/// is not one.
+fn index_label(line: &str) -> bool {
+    let Some((before, _)) = line.split_once(':') else {
+        return false;
+    };
+    if before.contains('`') {
+        return false;
+    }
+    let words: Vec<String> = before
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty() && !w.chars().all(|c| c.is_ascii_digit()))
+        .map(str::to_lowercase)
+        .collect();
+    words.len() <= 4 && words.iter().any(|w| INDEX_WORDS.contains(&w.as_str()))
+}
+
+/// What an `@` import of `file` would load, estimated: the file as
+/// injected (block HTML comments stripped, as `tokens::estimate` says)
+/// plus everything it imports. `None` when it is not a readable file:
+/// the figure is then left out, never written as zero.
+fn import_cost(file: &Path) -> Option<Cost> {
+    if !file.is_file() {
+        return None;
+    }
+    let body = std::fs::read_to_string(file).ok()?;
+    let children = imports::resolve_tree(file, &mut Vec::new());
+    Some(Cost {
+        tokens: tokens::estimate(&text::strip_block_html_comments(&body))
+            + children
+                .iter()
+                .map(imports::ImportNode::total_tokens)
+                .sum::<u64>(),
+        floor: children.iter().any(imports::ImportNode::total_partial),
+    })
+}
+
+/// The evidence clause pricing an import, ending in [`COST`] so the
+/// brief can lift it back out.
+fn cost_clause(path: &str, cost: Cost) -> String {
+    format!(
+        "`@{path}` would load {}~{}{COST}",
+        if cost.floor { "at least " } else { "" },
+        cost.tokens
+    )
+}
+
 /// Document extensions, and a `docs/` component, for the blind-reference
 /// rule.
 fn is_document(path: &str) -> bool {
@@ -1791,7 +1882,7 @@ fn shape_rules(text: &str, resolved_paths: &[Named]) -> Vec<Shape> {
     let normalised = text.replace("\r\n", "\n");
     let mut out = Vec::new();
     for (n, line) in text::prose_lines(&normalised) {
-        let conditioned = CONDITION.is_match(line) || topic_arrow(line);
+        let conditioned = CONDITION.is_match(line) || topic_arrow(line) || index_label(line);
         let mut blind: Vec<Blind> = Vec::new();
         if CUE.is_match(line) && !conditioned {
             for named in resolved_paths.iter().filter(|p| p.line == n) {
@@ -1801,6 +1892,7 @@ fn shape_rules(text: &str, resolved_paths: &[Named]) -> Vec<Shape> {
                     blind.push(Blind {
                         path: path.clone(),
                         settled: named.settled.clone(),
+                        cost: named.file.as_deref().and_then(import_cost),
                     });
                 }
             }
@@ -1913,10 +2005,14 @@ fn findings_for(repo: &Path, path: &str, scope: Scope, text: &str, rot: &FileRot
                     .map(|b| {
                         let p = &b.path;
                         let mut m = format!(
-                            "line {line} names `{p}` with see/read/consult; no `@{p}` import, no when/if/for/before and no topic → on the line"
+                            "line {line} names `{p}` with see/read/consult; no `@{p}` import, no when/if/for/before/on demand/as needed, no topic → and no index label on the line"
                         );
                         if let Some(by) = &b.settled {
                             m.push_str(&format!("; {by}"));
+                        }
+                        // Last, so the brief can lift it back out.
+                        if let Some(cost) = b.cost {
+                            m.push_str(&format!("; {}", cost_clause(p, cost)));
                         }
                         m
                     })
@@ -2020,10 +2116,24 @@ pub(super) fn suggestion(f: &Finding) -> String {
              line number and cite the file alone."
         )
     } else if s.contains(BLIND) {
+        // The condition first: it costs nothing per session. The import
+        // is priced, per document, from the evidence (#1375); a document
+        // that could not be weighed has no figure rather than zero.
+        let costs: Vec<&str> = f
+            .evidence
+            .iter()
+            .filter_map(|e| e.measured.rsplit_once("; ").map(|(_, c)| c))
+            .filter(|c| c.ends_with(COST))
+            .collect();
+        let import = if costs.is_empty() {
+            ", which loads it in every session".to_string()
+        } else {
+            format!(": {}", costs.join("; "))
+        };
         format!(
-            "Either import the document, by adding `@<path>` on its own line in `{file}`, which \
-             loads it in every session, or keep it lazy by stating on {line} when to read it \
-             (\"when …\", \"before …\", \"if …\"). One or the other; not both."
+            "Either keep it lazy by stating on {line} when to read it (\"when …\", \"before …\", \
+             \"if …\", \"on demand\"), or import the document by adding `@<path>` on its own line \
+             in `{file}`{import}. One or the other; not both."
         )
     } else if s.contains(DATED) {
         format!(
@@ -2916,6 +3026,104 @@ Run `yarn paw`, not `yarn nope`. Use the `tentacle` skill, not the `ink` skill.
             })
             .collect();
         assert_eq!(lines, vec![3], "{:?}", rot.shape);
+    }
+
+    /// #1375: "on demand", "as needed", "when relevant" and "if needed"
+    /// are conditions, and so is a document-index label before a colon.
+    /// A colon after an ordinary phrase is not an index.
+    #[test]
+    fn on_demand_as_needed_and_a_document_index_are_conditions() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("docs").join("a.md"), "a").unwrap();
+        fs::write(root.join("docs").join("b.md"), "b").unwrap();
+        fs::write(
+            root.join("CLAUDE.md"),
+            "Docs, read on demand: `docs/a.md`, `docs/b.md`\n\
+             Read `docs/a.md` as needed.\n\
+             See `docs/a.md` when relevant.\n\
+             Read `docs/b.md` if needed.\n\
+             - Reference: see `docs/a.md`\n\
+             **Further reading:** read `docs/b.md`\n\
+             Docs: see `docs/a.md`\n\
+             See `docs/a.md`.\n\
+             Run the gate, then read this: `docs/b.md`\n",
+        )
+        .unwrap();
+        let rot = check_one(root, None);
+        let lines: Vec<usize> = rot
+            .shape
+            .iter()
+            .filter_map(|s| match s {
+                Shape::BlindReference { line, .. } => Some(*line),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines, vec![8, 9], "{:?}", rot.shape);
+    }
+
+    /// #1375: the brief offers the condition first, and prices the
+    /// import with the token estimate of the target and what IT imports.
+    #[test]
+    fn a_blind_reference_brief_offers_the_condition_first_and_prices_the_import() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        let docs = root.join("docs");
+        fs::create_dir_all(&docs).unwrap();
+        // 400 characters: 100 est. tokens.
+        fs::write(docs.join("x.md"), "x".repeat(400)).unwrap();
+        // "@y.md\n" is 6 characters (2 tokens), and y.md 40 (10 tokens).
+        fs::write(docs.join("z.md"), "@y.md\n").unwrap();
+        fs::write(docs.join("y.md"), "y".repeat(40)).unwrap();
+        fs::write(
+            root.join("CLAUDE.md"),
+            "See `docs/x.md`.\nSee `docs/z.md`.\n",
+        )
+        .unwrap();
+        let report = run_over(root, None);
+        let blind: Vec<&Finding> = report
+            .findings
+            .iter()
+            .filter(|f| f.finding.contains(BLIND))
+            .collect();
+        assert_eq!(blind.len(), 2, "{report:?}");
+        let x = &blind[0].brief;
+        assert!(
+            x.contains("`@docs/x.md` would load ~100 est. tokens in every session"),
+            "{x}"
+        );
+        let lazy = x.find("keep it lazy").expect("the condition is offered");
+        let import = x.find("`@<path>`").expect("the import is offered");
+        assert!(lazy < import, "the condition comes first: {x}");
+        assert!(
+            blind[1]
+                .brief
+                .contains("`@docs/z.md` would load ~12 est. tokens in every session"),
+            "what the target imports loads too: {}",
+            blind[1].brief
+        );
+    }
+
+    /// #1375: a target that cannot be read for the estimate has no
+    /// figure. Never 0: a directory weighs something unmeasured.
+    #[test]
+    fn a_blind_reference_with_no_readable_target_states_no_figure() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        fs::create_dir_all(root.join("docs").join("guide")).unwrap();
+        fs::write(root.join("CLAUDE.md"), "See `docs/guide/`.\n").unwrap();
+        let report = run_over(root, None);
+        let blind: Vec<&Finding> = report
+            .findings
+            .iter()
+            .filter(|f| f.finding.contains(BLIND))
+            .collect();
+        assert_eq!(blind.len(), 1, "{report:?}");
+        let brief = &blind[0].brief;
+        assert!(!brief.contains("est. tokens"), "{brief}");
+        assert!(!brief.contains("~0"), "{brief}");
+        assert!(brief.contains("`@<path>`"), "{brief}");
     }
 
     /// #1320: one blind line naming two documents is ONE finding, with
