@@ -160,13 +160,14 @@ fn suggestion(f: &Finding) -> String {
 
 /// The gaps producer's suggestion, by the shape of its finding.
 ///
-/// Five shapes, told apart by what `gaps.rs` writes into the finding and
+/// Four shapes, told apart by what `gaps.rs` writes into the finding and
 /// pinned there by `the_brief_suggestion_follows_the_finding_shape`: an
 /// Unknown opening "session-edit signal unavailable" is a store that
 /// could not be queried; any other Unknown is a directory that could
 /// not be listed; a sentence opening with a count is a group whose
-/// members the evidence lists; "role name only" is a weak candidate;
-/// anything else is one strong directory. A helper rather than a nested
+/// members the evidence lists; anything else is one strong directory.
+/// A "role name only" candidate is a Note (#1397), which [`render`]
+/// gives no suggestion, so it never reaches here. A helper rather than a nested
 /// `match` because the wildcard guard in `invariants.rs` reads every arm
 /// between the `Check` match's braces.
 fn gaps_suggestion(f: &Finding) -> String {
@@ -203,12 +204,6 @@ fn gaps_suggestion(f: &Finding) -> String {
              on them, and the rules from the root file that apply here with a different \
              twist. Keep it to what is true only here; a per-member file is for a member that \
              carried a signal of its own."
-        )
-    } else if f.finding.contains("role name only") {
-        format!(
-            "Add `{dir}/CLAUDE.md` only if a convention is true only here: what the directory \
-             is for, and any rule from the root file that applies here with a different \
-             twist. A role name alone is not a gap, so leave it if there is nothing to say."
         )
     } else {
         format!(

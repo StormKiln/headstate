@@ -47,9 +47,16 @@
 //! transcripts producer supplies that list. Weak signals: a well-known
 //! role name (`docs`, `scripts`, `crates/*`, …) or a `tests/`,
 //! `__tests__/` or `spec/` entry. A directory with only weak signals is a
-//! weak candidate, rendered as a suggestion: its finding says "role name
-//! only", and its brief says to add a file only if there is something
-//! true only there.
+//! weak candidate: its finding says "role name only" and is a
+//! [`Severity::Note`], not advice (#1397). A role name is a statistic
+//! about directory names, with no evidence that anything is true only
+//! there, which is what a Note is for (#1339): the row says what was
+//! measured and its brief recommends nothing. Three or more role-only
+//! siblings group into one row, and that row is a Note too.
+//!
+//! A strong candidate stays [`Severity::Advice`], including one the root
+//! file's mention downgraded to weak (below): its manifest, tests or
+//! edits are still evidence, and the mention is shown beside them.
 //!
 //! # The test-file threshold is 10
 //!
@@ -86,8 +93,8 @@
 //! distinct signal set (one that also holds two hundred tests) stays its
 //! own row. Measured on this checkout: 120 directories listed, six
 //! CLAUDE.md files, ten manifests, two candidates
-//! (`crates/headstate-stepup/` strong, `docs/` weak). That ratio is the
-//! target.
+//! (`crates/headstate-stepup/` strong and Advice, `docs/` weak and a
+//! Note). That ratio is the target.
 //!
 //! # The edited signal
 //!
@@ -689,6 +696,16 @@ fn rel_display(rel: &Path) -> String {
     }
 }
 
+/// A role name only is a Note; anything with a strong signal is Advice
+/// (#1397). See the module docs' "Candidate, strong, weak".
+fn severity_of(role_only: bool) -> Severity {
+    if role_only {
+        Severity::Note
+    } else {
+        Severity::Advice
+    }
+}
+
 fn single(g: &Gap, ruled: Vec<Evidence>) -> Finding {
     let dir = g.dir.to_string_lossy().to_string();
     // "role name only (`docs`)", not "role name only (role name `docs`)".
@@ -729,7 +746,7 @@ fn single(g: &Gap, ruled: Vec<Evidence>) -> Finding {
     evidence.extend(ruled);
     Finding::new(
         Check::Gaps,
-        Severity::Advice,
+        severity_of(g.role_only),
         Subject::Directory { path: dir },
         evidence,
         sentence,
@@ -790,9 +807,10 @@ fn grouped(
         e.measured = e.measured.replace("scopes it", "scopes them");
         e
     }));
+    // Members share their signal set, so they share `role_only`.
     Finding::new(
         Check::Gaps,
-        Severity::Advice,
+        severity_of(members[0].role_only),
         Subject::Directory {
             path: parent_dir.to_string_lossy().to_string(),
         },
@@ -1037,12 +1055,58 @@ mod tests {
         );
         assert_eq!(
             docs.severity,
-            Severity::Advice,
-            "weak is advice, never a problem"
+            Severity::Note,
+            "a role name alone is an observation, not advice (#1397)"
         );
 
         assert_eq!(found.len(), 3, "{found:?}");
         assert_eq!(*coverage(&report), CheckRun::Ran { findings: 3 });
+    }
+
+    /// #1397: a role name alone is no evidence that anything is true
+    /// only there, so it is a Note; a directory with its own manifest is
+    /// evidence, and stays Advice. Three role-only siblings group into
+    /// one row, and that row is a Note too.
+    ///
+    /// Sabotage-proven: with `single`'s severity back to `Advice`,
+    /// `docs/` is Advice and the first assertion fails; with `grouped`'s,
+    /// the `crates/` row is.
+    #[test]
+    fn a_role_name_only_is_a_note_and_a_manifest_is_advice() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        write(&r.join("CLAUDE.md"), "# hello-world\n");
+        write(&r.join("docs").join("README.md"), "docs\n");
+        write(&r.join("tool").join("Cargo.toml"), "[package]\n");
+        for m in ["octocat-a", "octocat-b", "octocat-c"] {
+            write(&r.join("crates").join(m).join("README.md"), "x\n");
+        }
+        let report = run_over(r);
+        let found = gap_findings(&report);
+
+        let docs = by_subject(&found, "docs").expect("a finding for docs/");
+        assert_eq!(docs.severity, Severity::Note, "{docs:#?}");
+        assert!(
+            docs.brief.contains("Observation only: nothing to change."),
+            "{}",
+            docs.brief
+        );
+
+        let tool = by_subject(&found, "tool").expect("a finding for tool/");
+        assert_eq!(tool.severity, Severity::Advice, "{tool:#?}");
+        assert!(
+            tool.brief.contains("Suggested change: Add `"),
+            "{}",
+            tool.brief
+        );
+
+        let crates = by_subject(&found, "crates").expect("one grouped row for crates/");
+        assert!(
+            crates.finding.starts_with("3 directories"),
+            "{}",
+            crates.finding
+        );
+        assert_eq!(crates.severity, Severity::Note, "{crates:#?}");
     }
 
     /// A `packages/CLAUDE.md` covers every member: the group disappears
@@ -1583,7 +1647,9 @@ mod tests {
         let missing = t.path().join("no-such-git");
         let found = gaps_with_git(t.path(), &missing);
         assert_eq!(found.len(), 3, "{found:#?}");
-        assert!(found.iter().all(|f| f.severity == Severity::Advice));
+        assert!(found
+            .iter()
+            .all(|f| matches!(f.severity, Severity::Advice | Severity::Note)));
     }
 
     /// The threshold is a boundary: nine test files is no signal, ten is
@@ -1652,10 +1718,12 @@ mod tests {
             "{}",
             group.brief
         );
+        // A role name only is a Note (#1397): its brief recommends
+        // nothing, so it suggests no file at all.
         let docs = by_subject(&found, "docs").unwrap();
+        assert!(!docs.brief.contains("Suggested change"), "{}", docs.brief);
         assert!(
-            docs.brief
-                .contains("only if a convention is true only here"),
+            docs.brief.contains("Observation only: nothing to change."),
             "{}",
             docs.brief
         );
@@ -1689,11 +1757,12 @@ mod tests {
         let report = run_over(t.path());
         let found = gap_findings(&report);
         assert_eq!(found.len(), 3, "{found:#?}");
-        for (subject, glob) in [
-            ("packages", "packages/**"),
-            ("docs", "docs/**"),
-            ("tests", "tests/**"),
-        ] {
+        // `docs/` is a Note (#1397) and its brief offers nothing, a rule
+        // included; the probe is still in its evidence.
+        let docs = by_subject(&found, "docs").unwrap();
+        assert_eq!(docs.severity, Severity::Note);
+        assert!(!docs.brief.contains("paths:"), "{}", docs.brief);
+        for (subject, glob) in [("packages", "packages/**"), ("tests", "tests/**")] {
             let f = by_subject(&found, subject).unwrap();
             assert!(
                 f.evidence.iter().any(|e| e.measured == "exists"
