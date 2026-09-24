@@ -50,6 +50,26 @@
 //! same line as `as of`, `before`, `after` or `until`, the page's own
 //! example being "before August 2025").
 //!
+//! # A plugin's skill is an observation, never advice (#1365)
+//!
+//! The advice panel is about what this repository's owner can change. A
+//! plugin's `SKILL.md` belongs to the plugin's author and lives in the
+//! plugin cache, which every update rewrites: 48 rows of advice on one
+//! such file, measured on a real machine, were rows the reader could act
+//! on only by forking someone else's plugin. So none of the content rules
+//! above -- frontmatter, body length, reference depth, dated facts --
+//! runs on a skill whose `Source` is `Plugin`, and nothing here emits
+//! Advice or Problem about one.
+//!
+//! What a plugin skill still gets is its cost, as the Note every skill
+//! gets, and its plugin's description total ("plugin `x`: N skills; ~M
+//! est. tokens ... paid by every session"). That is worth showing
+//! whatever its size, because disabling the plugin IS the reader's
+//! choice. A plugin skill still counts as held when a CLAUDE.md names it,
+//! and still counts when a CLAUDE.md section repeats its commands: both
+//! of those findings are about the CLAUDE.md, which is this
+//! repository's.
+//!
 //! # An absent `name` is not a finding
 //!
 //! Claude Code names the skill by its directory, and the inventory
@@ -147,10 +167,13 @@ impl Producer for Skills {
 
         let skills = read_skills(inv, &mut out);
         for s in &skills {
-            frontmatter_findings(s, &mut out);
-            body_findings(s, &mut out);
-            reference_chain(s, &mut out);
-            dated_facts(s, &mut out);
+            // A plugin's skill is observed, never advised on (#1365).
+            if !matches!(s.def.source, Source::Plugin { .. }) {
+                frontmatter_findings(s, &mut out);
+                body_findings(s, &mut out);
+                reference_chain(s, &mut out);
+                dated_facts(s, &mut out);
+            }
             cost(s, &mut out);
         }
         scope_totals(&skills, inv, &mut out);
@@ -1843,6 +1866,87 @@ mod tests {
             dated[0],
             &"skill `octocat-dated`: line 6 states a dated fact (`before … August 2025`); the skills authoring page says to avoid time-sensitive information"
         );
+    }
+
+    /// A SKILL.md that breaks every content rule: a 70-character name,
+    /// an unquoted `: `, a description in the first person, an unknown
+    /// boolean spelling, a 501-line body, a dated fact, and a reference
+    /// that links on further. Written under `root/skills/octo-bad/`.
+    fn every_rule_broken(root: &Path) -> PathBuf {
+        let name = "octo-bad-".to_string() + &"x".repeat(61);
+        let mut body = format!(
+            "---\nname: {name}\ndescription: I deploy things: fast\n\
+             disable-model-invocation: maybe\n---\n\nSee [ref](ref.md).\n\
+             As of January 2025 the gate is slow.\n"
+        );
+        for i in 1..=501 {
+            body.push_str(&format!("line {i}\n"));
+        }
+        let dir = root.join("skills").join("octo-bad");
+        write(&dir.join("ref.md"), "See [deeper](deeper.md).\n");
+        write(&dir.join("deeper.md"), "The end.\n");
+        let file = dir.join("SKILL.md");
+        write(&file, &body);
+        file
+    }
+
+    /// #1365: a plugin skill is the plugin author's, rewritten on every
+    /// update, so advice on its content is not actionable. However many
+    /// rules it breaks, it gets its cost Note and its plugin's total
+    /// Note and nothing else. The same file in this repository's
+    /// `.claude/skills/` still gets the advice.
+    #[test]
+    fn a_plugin_skill_gets_only_its_cost() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path().join("repo");
+        let plugin = t.path().join("cache").join("acme").join("octo-plugin");
+        let file = every_rule_broken(&plugin);
+        write(&repo.join("CLAUDE.md"), "# hello-world\n");
+
+        let inv = scan_scopes(&roots(
+            None,
+            &[],
+            &[(
+                "octo-plugin".to_string(),
+                plugin.to_string_lossy().to_string(),
+            )],
+        ));
+        let report = run_with_inventory(&repo, &inv);
+        let got = skills_findings(&report);
+        let about_it: Vec<&&Finding> = got
+            .iter()
+            .filter(
+                |f| matches!(&f.subject, Subject::Skill { path, .. } if Path::new(path) == file),
+            )
+            .collect();
+        assert_eq!(about_it.len(), 1, "{about_it:#?}");
+        assert!(
+            about_it[0]
+                .finding
+                .contains("), paid when the skill is invoked"),
+            "{}",
+            about_it[0].finding
+        );
+        for f in &got {
+            assert_eq!(f.severity, Severity::Note, "{}", f.finding);
+        }
+        assert!(
+            got.iter()
+                .any(|f| f.finding.starts_with("plugin `octo-plugin`: 1 skill;")),
+            "{got:#?}"
+        );
+
+        // The control: the same file as this repository's own skill.
+        let t = tempfile::tempdir().unwrap();
+        every_rule_broken(&t.path().join(".claude"));
+        let report = run_over(t.path());
+        let advice = skills_findings(&report)
+            .into_iter()
+            .filter(|f| {
+                f.severity == Severity::Advice && matches!(f.subject, Subject::Skill { .. })
+            })
+            .count();
+        assert!(advice >= 6, "{:#?}", sentences(&report));
     }
 
     /// (b) A project skill nothing names is advice, and says why it is
