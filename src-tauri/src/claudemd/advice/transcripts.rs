@@ -20,6 +20,18 @@
 //! | S5 repeated error | `is_error: true` text normalised by [`normalise_error`] | identical first [`ERROR_KEY_CHARS`] chars in ≥ [`MIN_SESSIONS_ERROR`] sessions |
 //! | S6 task census | sessions per attributed directory, from `claude_session` | always, as a count |
 //!
+//! S1, S2 and S3 are [`Severity::Advice`]: each carries a rule a session
+//! had to learn -- the command that worked after the one that failed,
+//! the user's stated fix, the call not to make. S5 is a
+//! [`Severity::Note`] (#1368), worded "recurring error: `<tool>` on
+//! `<key>`: …": it shows only that something failed repeatedly, which
+//! is often nothing CLAUDE.md wording controls (a sub-agent's schema, a
+//! search tool's timeout). An error that a later call in the same
+//! session corrected is already S1, and that stays Advice. A Note
+//! carries no suggestion and no Claudify, and whether its key is already
+//! written cannot make it wrong, so an unreadable corpus file leaves it
+//! a Note rather than Unknown.
+//!
 //! A count is DISTINCT TASKS, never records: distinct sessions, with the
 //! sessions that share an opening prompt counted once (#1337), because
 //! an automated `claude -p` task replayed seven times is one task, not
@@ -1765,6 +1777,14 @@ fn resolves_to_nothing(path: &Path) -> bool {
     matches!(std::fs::metadata(path), Err(e) if is_gone(&e))
 }
 
+/// Whether a signal is an observation -- what recurred, with no stated
+/// fix -- rather than advice. Only a correction that worked (S1) or a
+/// user's stated fix (S2), and a denial (S3), carry a rule to write.
+/// S5 shows only that something failed repeatedly (#1368).
+fn is_observation(signal: &str) -> bool {
+    signal == SIG_ERROR
+}
+
 /// Group the stored rows, apply the thresholds, place and dedup each
 /// group, and render the findings.
 fn emit(
@@ -1941,7 +1961,7 @@ fn emit(
                         _ => String::new(),
                     };
                     (
-                        format!("the same `{aux}` error{on} was recorded in {sessions_phrase}: `{key}`"),
+                        format!("recurring error: `{aux}`{on}: `{key}`, in {sessions_phrase}"),
                         key.clone(),
                     )
                 }
@@ -1950,12 +1970,18 @@ fn emit(
             // rule is doing its job and there is nothing to change. Not
             // found while a corpus file could not be read is not "not
             // written": the finding is Unknown and names each file (#1351).
+            //
+            // An observation signal recommends nothing whatever the corpus
+            // holds, so it is a Note either way; an unread file cannot
+            // make a recommendation it never made possibly wrong.
+            let observation = is_observation(signal);
             let mut unchecked = Vec::new();
             let (sentence, severity) = match written_in(&dedup_key, &dir, cx, &mut cache) {
                 Written::In(file) => (
                     format!("`{dedup_key}` is already written in `{file}` ({sentence})"),
                     Severity::Note,
                 ),
+                Written::No | Written::Unchecked(_) if observation => (sentence, Severity::Note),
                 Written::No => (sentence, Severity::Advice),
                 Written::Unchecked(files) => {
                     unchecked = files;
@@ -3960,7 +3986,7 @@ mod tests {
     fn errors(findings: &[Finding]) -> Vec<&Finding> {
         findings
             .iter()
-            .filter(|f| f.finding.starts_with("the same `Bash` error"))
+            .filter(|f| f.finding.starts_with("recurring error: `Bash`"))
             .collect()
     }
 
@@ -4068,6 +4094,10 @@ mod tests {
     /// finding could not say which file. Every evidence row names the
     /// call, and when every session failed on the same one, so does the
     /// sentence.
+    ///
+    /// #1368: and it is an observation. Three sessions failing the same
+    /// way with no correction is a Note, with no suggestion; the same
+    /// failure followed by a call that worked is S1, which stays Advice.
     #[test]
     fn an_error_cluster_names_the_failing_call() {
         let t = tempfile::tempdir().unwrap();
@@ -4094,15 +4124,21 @@ mod tests {
         let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
         let hits: Vec<&Finding> = out
             .iter()
-            .filter(|f| f.finding.starts_with("the same `Read` error"))
+            .filter(|f| f.finding.starts_with("recurring error: `Read`"))
             .collect();
         assert_eq!(hits.len(), 1, "{out:#?}");
         assert_eq!(
             hits[0].finding,
             format!(
-                "the same `Read` error on `src/gone.ts` was recorded in 3 sessions under `{}`: `File does not exist.`",
+                "recurring error: `Read` on `src/gone.ts`: `File does not exist.`, in 3 sessions under `{}`",
                 repo.display()
             )
+        );
+        assert_eq!(hits[0].severity, Severity::Note, "{}", hits[0].finding);
+        assert!(
+            !hits[0].brief.contains("Suggested change"),
+            "{}",
+            hits[0].brief
         );
         assert_eq!(
             hits[0].evidence[0].measured,
@@ -4116,15 +4152,15 @@ mod tests {
         }
 
         // Different files: the sentence cannot name one, the rows still do.
-        write(repo, "s3.jsonl", &failing_read(3, "other.ts"));
+        rewrite(repo, "s3.jsonl", &failing_read(3, "other.ts"));
         let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
         let hit = out
             .iter()
-            .find(|f| f.finding.starts_with("the same `Read` error"))
+            .find(|f| f.finding.starts_with("recurring error: `Read`"))
             .expect("the error cluster");
         assert!(
             hit.finding
-                .starts_with("the same `Read` error was recorded in 3 sessions"),
+                .starts_with("recurring error: `Read`: `File does not exist.`, in 3 sessions"),
             "{}",
             hit.finding
         );
@@ -4135,6 +4171,19 @@ mod tests {
             "{}",
             hit.evidence[2].measured
         );
+
+        // The control: the same kind of failure corrected by a call that
+        // worked is S1, and S1 is Advice. Its error is still observed.
+        for n in [1, 2, 3] {
+            rewrite(repo, &format!("s{n}.jsonl"), &corrected_pair(&cwd, n));
+        }
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        let s1 = corrected(&out);
+        assert_eq!(s1.len(), 1, "{out:#?}");
+        assert_eq!(s1[0].severity, Severity::Advice, "{}", s1[0].finding);
+        let s5 = errors(&out);
+        assert_eq!(s5.len(), 1, "{out:#?}");
+        assert_eq!(s5[0].severity, Severity::Note, "{}", s5[0].finding);
     }
 
     /// Rows stored under an older extraction rule are not served: the
