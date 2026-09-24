@@ -2231,6 +2231,7 @@ mod tests {
             author: "octocat".into(),
             is_draft: false,
             created_at: Utc::now(),
+            ready_at: None,
             updated_at: Utc::now(),
             ci: CiState::Success,
             merge,
@@ -2420,7 +2421,10 @@ mod tests {
         // has been measured, and its cost is accounted for in MEASURED_COST
         // below. Anything else nested here is REFUSED until somebody
         // measures it -- which is the whole inversion #842 asks for.
-        const APPROVED: [&str; 7] = [
+        const APPROVED: [&str; 8] = [
+            // #1407's ready-for-review time. Measured free: 2 before and
+            // 2 after, see the measurement beside it in `PRS_QUERY`.
+            "timelineItems(",
             "assignees(",
             "reviewRequests(",
             "latestReviews(",
@@ -2490,6 +2494,12 @@ mod tests {
         /// **cost 2**, 3 runs (2.47s, 2.63s, 2.68s), and 2 again against
         /// `repo:kubernetes/kubernetes` before and after. So this figure
         /// stands rather than being carried forward on faith.
+        ///
+        /// RE-MEASURED 2026-09-24 for #1407, same method, after adding
+        /// `timelineItems(itemTypes: [READY_FOR_REVIEW_EVENT], last: 1)`:
+        /// **cost 2** before and after, three runs each, on the authored
+        /// and review-requested searches and on four busy public
+        /// repositories.
         ///
         /// Why it did not move, which is the reusable part: GitHub prices
         /// the `first:` ARGUMENT, not the field or the page size
@@ -2956,6 +2966,7 @@ mod tests {
             head_ref_id: None,
             base_ref: "main".into(),
             created_at: t,
+            ready_at: Some(t),
             updated_at: t,
             ci,
             merge,

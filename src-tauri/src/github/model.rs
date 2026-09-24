@@ -110,6 +110,24 @@ pub struct PullRequest {
     pub base_ref: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// When the pull request became ready for review (#1407).
+    ///
+    /// The latest `ReadyForReviewEvent` when there is one. With NO such
+    /// event the pull request was never a draft, so it became reviewable
+    /// when it was opened: `created_at` is then the same moment, not a
+    /// fallback guess.
+    ///
+    /// `None` means UNKNOWN, and must never render as zero or as "just
+    /// now":
+    /// - the timeline connection did not arrive, which is not the same as
+    ///   arriving empty;
+    /// - the event's time did not parse;
+    /// - the pull request is a draft now, so it is not ready at all (an
+    ///   event from before it was converted back is stale);
+    /// - the snapshot was cached by a build older than this field, hence
+    ///   `#[serde(default)]` -- the reason every field above carries one.
+    #[serde(default)]
+    pub ready_at: Option<DateTime<Utc>>,
     pub ci: CiState,
     pub merge: MergeState,
     /// GitHub's own merge-readiness summary. See `MergeStateStatus`.
@@ -524,6 +542,7 @@ mod attention_tests {
             head_ref_id: None,
             base_ref: "main".into(),
             created_at: t,
+            ready_at: Some(t),
             updated_at: t,
             ci,
             merge,
