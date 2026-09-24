@@ -78,6 +78,46 @@
 //! current scan, so a CLAUDE.md added since the pass moves the finding
 //! without a re-read.
 //!
+//! # Only sessions under the current CLAUDE.md count
+//!
+//! A session that ran under an older CLAUDE.md says nothing about the
+//! current one (#1371). For each finding, only sessions that STARTED
+//! (`claude_session.first_seen_at`) at or after the attributed CLAUDE.md
+//! last changed count toward the threshold and the denominator; older
+//! ones are mentioned, not counted: "3 of 40 analysed sessions under
+//! `<repo>` since `CLAUDE.md` last changed on <date> (5 more before
+//! it)", and only they are evidence. The dates come from one batched
+//! `git status` and one `git log --name-only` over every CLAUDE.md in
+//! the scan, per pass ([`versions_of`]); the date is the newest commit's
+//! committer time, the moment the change landed in this history.
+//!
+//! - A finding that reaches its threshold only with older sessions is
+//!   held back, and one Note per file counts them ("N findings on
+//!   `CLAUDE.md` reach their thresholds only with sessions from before it
+//!   last changed on <date>"), each held finding's sentence as evidence.
+//!   Never dropped silently.
+//! - A CLAUDE.md git lists as modified, staged or untracked changed
+//!   "now": no session has run under it yet, so every session is older,
+//!   and the Note says so.
+//! - If git cannot date the file -- no `.git` at the repository, a git
+//!   that fails, a file with no commit -- nothing is filtered. Every
+//!   session counts, the finding ends "could not tell which version of
+//!   `<file>` these sessions ran under", and one Note per file carries
+//!   git's words. A session whose start does not parse is counted and
+//!   qualified the same way.
+//! - A finding placed on a directory with no CLAUDE.md has no version to
+//!   filter by, and counts every session.
+//!
+//! The report cache needs no new input for this. A file's commit date is
+//! a function of the history `HEAD` names, which [`super::cache`] hashes
+//! (#1334); an uncommitted change is in the `git status` bytes it hashes,
+//! and the CLAUDE.md's own bytes are hashed besides. A new or changed
+//! session moves its `(size, mtime)`. What is not covered is a session's
+//! `first_seen_at` moving earlier without its transcript changing (a
+//! late hook row), which can move a session across the line; stated,
+//! not hidden. No stored signal row changes, so [`RULE_VERSION`] does
+//! not move.
+//!
 //! # Already written is not a gap
 //!
 //! Before a finding is emitted its dedup key is tested verbatim, with
@@ -272,6 +312,10 @@ struct SessionRow {
     dir: PathBuf,
     transcript_path: Option<String>,
     has_prompt: bool,
+    /// When it started, as Unix seconds: `claude_session.first_seen_at`,
+    /// the earliest record. `None` when that does not parse, which is
+    /// "could not tell", never "long ago" (#1371).
+    started: Option<i64>,
 }
 
 /// One extracted signal occurrence: the row shape of `claude_advice_signal`.
@@ -478,7 +522,13 @@ fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, 
 
     // Skipped sessions make the pass short too: every "at least" stays.
     let short = analysed.len() < sessions.len() || !unreadable.is_empty() || !missing.is_empty();
-    let mut out = emit(&stored, &tasks, &denials, &sessions, &analysed, cx, short);
+    // #1371: when each of the repository's CLAUDE.md files last changed,
+    // in one batched git call rather than one per file or per finding.
+    let files: Vec<String> = cx.scan.repo.files.iter().map(|f| f.path.clone()).collect();
+    let versions = versions_of(crate::auth::git_program(), repo, &files);
+    let mut out = emit(
+        &stored, &tasks, &denials, &sessions, &analysed, &versions, cx, short,
+    );
     out.extend(checkout_unknown);
 
     if short || truncated > 0 {
@@ -629,7 +679,7 @@ fn sessions_under(
 ) -> Result<Vec<SessionRow>, String> {
     let mut q = conn
         .prepare(
-            "SELECT session_id, cwd, transcript_path, opening_prompt
+            "SELECT session_id, cwd, transcript_path, opening_prompt, first_seen_at
                FROM claude_session
               WHERE cwd IS NOT NULL
               ORDER BY session_id",
@@ -642,15 +692,16 @@ fn sessions_under(
                 r.get::<_, String>(1)?,
                 r.get::<_, Option<String>>(2)?,
                 r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
             ))
         })
         .map_err(|e| format!("claude_session: {e}"))?;
     let rows = rows
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("claude_session: {e}"))?;
-    worktrees.learn_deleted_checkouts(rows.iter().map(|(_, cwd, _, _)| Path::new(cwd)));
+    worktrees.learn_deleted_checkouts(rows.iter().map(|(_, cwd, _, _, _)| Path::new(cwd)));
     let mut out = Vec::new();
-    for (session_id, cwd, transcript_path, prompt) in rows {
+    for (session_id, cwd, transcript_path, prompt, first_seen) in rows {
         let dir = reroot_cwd(&cwd, worktrees);
         // `Path::starts_with` is by component, so `<repo>2` is not under
         // `<repo>`, and it is the same test on Windows separators.
@@ -662,6 +713,10 @@ fn sessions_under(
             dir,
             transcript_path,
             has_prompt: prompt.is_some_and(|p| !p.trim().is_empty()),
+            started: first_seen
+                .as_deref()
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.timestamp()),
         });
     }
     Ok(out)
@@ -1878,6 +1933,167 @@ fn resolves_to_nothing(path: &Path) -> bool {
     matches!(std::fs::metadata(path), Err(e) if is_gone(&e))
 }
 
+/// Which version of a CLAUDE.md the sessions ran under, as far as git
+/// can say (#1371).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Version {
+    /// Last committed at this Unix time, and unchanged in the working
+    /// tree since.
+    Since(i64),
+    /// Modified, staged or untracked: it changed "now", so no session
+    /// has run under this version yet.
+    Uncommitted,
+    /// Git could not say, in its words. Nothing is filtered.
+    Unknown(String),
+}
+
+/// When each of `files` (absolute, as the scan holds them) last changed:
+/// one `git status` and one `git log` for the lot.
+///
+/// A file git lists as changed is [`Version::Uncommitted`] whatever its
+/// history. Otherwise the newest commit that touched it dates it. A
+/// repository with no `.git` has no history to ask, and a git that
+/// fails, or has no commit of a file it does not list as changed, is
+/// [`Version::Unknown`] -- never a guessed date.
+fn versions_of(git: &Path, repo: &Path, files: &[String]) -> HashMap<String, Version> {
+    use crate::worktrees::scan::git_output_with;
+    let rels: Vec<(String, String)> = files
+        .iter()
+        .filter(|f| Path::new(f).starts_with(repo))
+        .map(|f| (f.clone(), path_key(Path::new(f), repo)))
+        .collect();
+    let mut out = HashMap::new();
+    if rels.is_empty() {
+        return out;
+    }
+    let unknown = |why: String| -> HashMap<String, Version> {
+        rels.iter()
+            .map(|(f, _)| (f.clone(), Version::Unknown(why.clone())))
+            .collect()
+    };
+    // Checked first so a repository nested in another's working tree is
+    // not answered for by the outer one.
+    match std::fs::symlink_metadata(repo.join(".git")) {
+        Err(e) if is_gone(&e) => {
+            return unknown(format!("`{}` is not a git repository", repo.display()))
+        }
+        Err(e) => return unknown(format!("`.git` could not be checked: {e}")),
+        Ok(_) => {}
+    }
+    let refusal = |what: &str, o: &std::process::Output| {
+        format!(
+            "{what} exit status {}: {}",
+            o.status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "none".into()),
+            String::from_utf8_lossy(&o.stderr).trim()
+        )
+    };
+    let paths: Vec<&str> = rels.iter().map(|(_, r)| r.as_str()).collect();
+
+    let mut args = vec![
+        "--literal-pathspecs",
+        "--no-optional-locks",
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--",
+    ];
+    args.extend(&paths);
+    let status = match git_output_with(git, repo, &args) {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => return unknown(refusal("git status", &o)),
+        Err(e) => return unknown(format!("git status could not run: {e}")),
+    };
+    let mut changed: HashSet<String> = HashSet::new();
+    let mut fields = status.stdout.split(|b| *b == 0).filter(|f| !f.is_empty());
+    while let Some(entry) = fields.next() {
+        let (Some(xy), Some(rel)) = (entry.get(..2), entry.get(3..)) else {
+            continue;
+        };
+        // A rename or copy is followed by its source path.
+        if xy.iter().any(|c| matches!(c, b'R' | b'C')) {
+            fields.next();
+        }
+        changed.insert(String::from_utf8_lossy(rel).into_owned());
+    }
+
+    let mut args = vec![
+        "--literal-pathspecs",
+        "-c",
+        "core.quotePath=false",
+        "log",
+        "--relative",
+        "--format=%x00%ct",
+        "--name-only",
+        "--",
+    ];
+    args.extend(&paths);
+    let log = match git_output_with(git, repo, &args) {
+        Ok(o) if o.status.success() => Ok(o.stdout),
+        Ok(o) => Err(refusal("git log", &o)),
+        Err(e) => Err(format!("git log could not run: {e}")),
+    };
+    let mut newest: HashMap<String, i64> = HashMap::new();
+    if let Ok(stdout) = &log {
+        for chunk in String::from_utf8_lossy(stdout).split('\0') {
+            let mut lines = chunk.lines();
+            let Some(Ok(at)) = lines.next().map(|l| l.trim().parse::<i64>()) else {
+                continue;
+            };
+            for name in lines.map(str::trim).filter(|l| !l.is_empty()) {
+                let e = newest.entry(name.to_string()).or_insert(at);
+                *e = (*e).max(at);
+            }
+        }
+    }
+    for (file, rel) in &rels {
+        let v = if changed.contains(rel) {
+            Version::Uncommitted
+        } else if let Some(at) = newest.get(rel) {
+            Version::Since(*at)
+        } else {
+            match &log {
+                Err(why) => Version::Unknown(why.clone()),
+                Ok(_) => Version::Unknown("git records no commit of it".to_string()),
+            }
+        };
+        out.insert(file.clone(), v);
+    }
+    out
+}
+
+/// Whether a session counts against a CLAUDE.md at `version` (#1371).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Under {
+    /// It started after the file last changed, or nothing dates it.
+    Counted,
+    /// Counted because which version it ran under could not be told.
+    Undated,
+    /// It started before the file last changed: mentioned, not counted.
+    Before,
+}
+
+fn under(started: Option<i64>, version: Option<&Version>) -> Under {
+    match (version, started) {
+        (None, _) => Under::Counted,
+        (Some(Version::Unknown(_)), _) => Under::Undated,
+        (Some(Version::Uncommitted), _) => Under::Before,
+        (Some(Version::Since(at)), Some(s)) if s >= *at => Under::Counted,
+        (Some(Version::Since(_)), Some(_)) => Under::Before,
+        (Some(Version::Since(_)), None) => Under::Undated,
+    }
+}
+
+/// A Unix time as the day it fell on, UTC.
+fn day(at: i64) -> String {
+    chrono::DateTime::from_timestamp(at, 0)
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| at.to_string())
+}
+
 /// Whether a signal is an observation -- what recurred, with no stated
 /// fix -- rather than advice. Only a correction that worked (S1) or a
 /// user's stated fix (S2), and a denial (S3), carry a rule to write.
@@ -1890,12 +2106,14 @@ fn is_observation(signal: &str) -> bool {
 
 /// Group the stored rows, apply the thresholds, place and dedup each
 /// group, and render the findings.
+#[allow(clippy::too_many_arguments)]
 fn emit(
     stored: &[Row],
     tasks: &HashMap<String, String>,
     denials: &[(String, String, Option<String>)],
     sessions: &[SessionRow],
     analysed: &HashSet<String>,
+    versions: &HashMap<String, Version>,
     cx: &Context,
     short: bool,
 ) -> Vec<Finding> {
@@ -1905,17 +2123,25 @@ fn emit(
     let mut out = Vec::new();
     let at_least = if short { "at least " } else { "" };
     let plural = |n: usize| if n == 1 { "" } else { "s" };
-    // The denominator every count is stated against (#1369): the analysed
-    // sessions, with replays of one task counted once, as the numerator
-    // counts them (#1337).
-    let denominator = analysed
+    // A session's task: replays of one task count once (#1337), and a
+    // session with no opening prompt is its own.
+    let task_of = |sid: &'_ str| -> (bool, String) {
+        match tasks.get(sid) {
+            Some(t) => (true, t.clone()),
+            None => (false, sid.to_string()),
+        }
+    };
+    let started: HashMap<&str, Option<i64>> = sessions
         .iter()
-        .map(|sid| match tasks.get(sid) {
-            Some(t) => (true, t.as_str()),
-            None => (false, sid.as_str()),
-        })
-        .collect::<HashSet<_>>()
-        .len();
+        .map(|s| (s.session_id.as_str(), s.started))
+        .collect();
+    let under_of =
+        |sid: &str, version: Option<&Version>| under(started.get(sid).copied().flatten(), version);
+    // Findings held back by #1371, per attributed file: its version, its
+    // subject, and each held finding's sentence.
+    let mut held: BTreeMap<String, (Version, Subject, Vec<String>)> = BTreeMap::new();
+    // CLAUDE.md files git could not date that qualified a finding.
+    let mut undated: BTreeMap<String, (Subject, String)> = BTreeMap::new();
 
     // (signal, key, aux) -> session -> first row. BTreeMaps so the order
     // a reader sees is the order the keys sort in, run after run.
@@ -1986,24 +2212,6 @@ fn emit(
             if *sig != signal {
                 continue;
             }
-            // Replays of one task count once (#1337): sessions sharing a
-            // task fingerprint are one run group, in the order of their
-            // first session; a session with no opening prompt is its own.
-            let mut runs: Vec<Vec<&Row>> = Vec::new();
-            let mut index: HashMap<(bool, &str), usize> = HashMap::new();
-            for (sid, r) in by_session {
-                let task = match tasks.get(sid) {
-                    Some(t) => (true, t.as_str()),
-                    None => (false, sid.as_str()),
-                };
-                let i = *index.entry(task).or_insert_with(|| {
-                    runs.push(Vec::new());
-                    runs.len() - 1
-                });
-                runs[i].push(r);
-            }
-            let n = runs.len();
-            let total = by_session.len();
             let min = match signal {
                 SIG_CORRECTED => MIN_SESSIONS_CORRECTED,
                 SIG_USER_CORRECTION => MIN_SESSIONS_USER_CORRECTION,
@@ -2011,29 +2219,91 @@ fn emit(
                 SIG_SEARCH => MIN_SESSIONS_SEARCH,
                 _ => MIN_SESSIONS_ERROR,
             };
-            // Below threshold is not shown at lower confidence; it is
-            // not shown.
-            if n < min {
+            // Below threshold over every session, whatever it ran under,
+            // is not shown at lower confidence; it is not shown.
+            let every = by_session
+                .keys()
+                .map(|sid| task_of(sid))
+                .collect::<HashSet<_>>()
+                .len();
+            if every < min {
                 continue;
             }
             // A path that resolves to nothing cannot become a CLAUDE.md
             // pointer (#1335). It is left out, and counted below.
             if let Some(path) = named_path(signal, key, aux, cx.repo) {
                 if resolves_to_nothing(&path) {
-                    gone.push((path, aux.clone(), n));
+                    gone.push((path, aux.clone(), every));
                     continue;
                 }
             }
             let dirs: Vec<&Path> = by_session.values().map(|r| r.dir.as_path()).collect();
             let dir = placement(&dirs, &candidates, cx.repo);
             let subject = subject_for(&dir, cx.scan);
+            // #1371: only sessions that started after the attributed
+            // CLAUDE.md last changed count; older ones are mentioned.
+            let file = match &subject {
+                Subject::ClaudeMd { path, .. } => Some(path.clone()),
+                _ => None,
+            };
+            let version = file.as_ref().and_then(|f| versions.get(f));
+            let rel = file
+                .as_deref()
+                .map(|f| path_key(Path::new(f), cx.repo))
+                .unwrap_or_default();
+
+            // Replays of one task count once (#1337): sessions sharing a
+            // task fingerprint are one run group, in the order of their
+            // first session.
+            let mut runs: Vec<Vec<&Row>> = Vec::new();
+            let mut index: HashMap<(bool, String), usize> = HashMap::new();
+            let mut before: HashSet<(bool, String)> = HashSet::new();
+            let mut qualified = false;
+            let mut total = 0usize;
+            for (sid, r) in by_session {
+                match under_of(sid, version) {
+                    Under::Before => {
+                        before.insert(task_of(sid));
+                        continue;
+                    }
+                    Under::Undated => qualified = true,
+                    Under::Counted => {}
+                }
+                total += 1;
+                let i = *index.entry(task_of(sid)).or_insert_with(|| {
+                    runs.push(Vec::new());
+                    runs.len() - 1
+                });
+                runs[i].push(r);
+            }
+            let n = runs.len();
+            // A task replayed both before and since is counted, once.
+            let b = before.iter().filter(|t| !index.contains_key(*t)).count();
             // Every count carries its denominator (#1369), in the same
-            // unit: distinct tasks among the analysed sessions.
+            // unit: distinct tasks among the analysed sessions this
+            // version of the file could have shaped.
+            let denominator = analysed
+                .iter()
+                .filter(|sid| under_of(sid, version) != Under::Before)
+                .map(|sid| task_of(sid))
+                .collect::<HashSet<_>>()
+                .len();
             let mut sessions_phrase = format!(
                 "{at_least}{n} of {denominator} analysed session{} under `{}`",
                 plural(denominator),
                 cx.repo.display()
             );
+            match version {
+                Some(Version::Since(at)) => sessions_phrase
+                    .push_str(&format!(" since `{rel}` last changed on {}", day(*at))),
+                Some(Version::Uncommitted) => {
+                    sessions_phrase.push_str(&format!(" since `{rel}`'s uncommitted changes"))
+                }
+                _ => {}
+            }
+            if b > 0 {
+                sessions_phrase.push_str(&format!(" ({b} more before it)"));
+            }
             if total > n {
                 sessions_phrase.push_str(&format!(
                     " ({total} runs; replays of one task counted once)"
@@ -2041,6 +2311,18 @@ fn emit(
             }
             if dir != cx.repo {
                 sessions_phrase.push_str(&format!(", attributed to `{}`", dir.display()));
+            }
+            // Git could not say: nothing is dropped, and the finding says
+            // so (#1371).
+            if qualified {
+                sessions_phrase.push_str(&format!(
+                    "; could not tell which version of `{rel}` these sessions ran under"
+                ));
+                if let (Some(f), Some(Version::Unknown(why))) = (&file, version) {
+                    undated
+                        .entry(f.clone())
+                        .or_insert_with(|| (subject.clone(), why.clone()));
+                }
             }
             let (sentence, dedup_key) = match signal {
                 SIG_CORRECTED => (
@@ -2086,6 +2368,18 @@ fn emit(
                     )
                 }
             };
+            // Reaches its threshold only with sessions from before the
+            // file last changed: held back, and counted in one Note per
+            // file, never dropped silently (#1371).
+            if n < min {
+                if let (Some(f), Some(v)) = (&file, version) {
+                    held.entry(f.clone())
+                        .or_insert_with(|| (v.clone(), subject.clone(), Vec::new()))
+                        .2
+                        .push(sentence);
+                }
+                continue;
+            }
             // Already written is an observation, not advice (#1339): the
             // rule is doing its job and there is nothing to change. Not
             // found while a corpus file could not be read is not "not
@@ -2223,6 +2517,73 @@ fn emit(
         ));
     }
 
+    // #1371: what the version filter held back, one Note per file.
+    for (file, (version, subject, sentences)) in held {
+        let rel = path_key(Path::new(&file), cx.repo);
+        let k = sentences.len();
+        let (findings, verb) = if k == 1 {
+            ("1 finding".to_string(), "is")
+        } else {
+            (format!("{k} findings"), "are")
+        };
+        let sentence = match version {
+            Version::Uncommitted => format!(
+                "`{rel}` has uncommitted changes, so no session has run under this version yet; \
+                 {findings} from sessions under an earlier version {verb} not shown"
+            ),
+            Version::Since(at) => format!(
+                "{findings} on `{rel}` {} only with sessions from before it last changed on {}, \
+                 and {verb} not shown",
+                if k == 1 {
+                    "reaches its threshold"
+                } else {
+                    "reach their thresholds"
+                },
+                day(at)
+            ),
+            // Unknown filters nothing, so holds nothing back.
+            Version::Unknown(_) => continue,
+        };
+        let evidence = sentences
+            .into_iter()
+            .take(MAX_EVIDENCE)
+            .map(|measured| Evidence {
+                at: Locator::File {
+                    path: file.clone(),
+                    line: None,
+                },
+                measured,
+            })
+            .collect();
+        out.push(Finding::new(
+            Check::Transcripts,
+            Severity::Note,
+            subject,
+            evidence,
+            sentence,
+        ));
+    }
+    // And why a finding's version could not be told, once per file.
+    for (file, (subject, why)) in undated {
+        let rel = path_key(Path::new(&file), cx.repo);
+        out.push(Finding::new(
+            Check::Transcripts,
+            Severity::Note,
+            subject,
+            vec![Evidence {
+                at: Locator::File {
+                    path: file.clone(),
+                    line: None,
+                },
+                measured: why,
+            }],
+            format!(
+                "could not tell which version of `{rel}` the sessions ran under, so every \
+                 session was counted"
+            ),
+        ));
+    }
+
     // S6 -- the census: sessions per attributed directory, always.
     let mut census: BTreeMap<PathBuf, Vec<&SessionRow>> = BTreeMap::new();
     for s in sessions {
@@ -2286,10 +2647,28 @@ mod tests {
         path: Option<&Path>,
         prompt: Option<&str>,
     ) {
+        insert_session_at(conn, id, cwd, path, prompt, "2026-01-01T00:00:00Z");
+    }
+
+    /// [`insert_session`] for a session that started at `started`.
+    fn insert_session_at(
+        conn: &Connection,
+        id: &str,
+        cwd: &str,
+        path: Option<&Path>,
+        prompt: Option<&str>,
+        started: &str,
+    ) {
         conn.execute(
             "INSERT INTO claude_session (session_id, cwd, transcript_path, first_seen_at, opening_prompt)
-             VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z', ?4)",
-            rusqlite::params![id, cwd, path.map(|p| p.to_string_lossy().into_owned()), prompt],
+             VALUES (?1, ?2, ?3, ?5, ?4)",
+            rusqlite::params![
+                id,
+                cwd,
+                path.map(|p| p.to_string_lossy().into_owned()),
+                prompt,
+                started
+            ],
         )
         .unwrap();
     }
@@ -2412,7 +2791,8 @@ mod tests {
         assert_eq!(
             f.finding,
             format!(
-                "`yarn lint` failed and `make lint` followed it in 2 of 2 analysed sessions under `{}`",
+                "`yarn lint` failed and `make lint` followed it in 2 of 2 analysed sessions under \
+                 `{}`; could not tell which version of `CLAUDE.md` these sessions ran under",
                 repo.display()
             )
         );
@@ -2734,7 +3114,8 @@ mod tests {
             f.finding,
             format!(
                 "`make lint` is already written in skill `lint` (`{}`) (`yarn lint` failed and \
-                 `make lint` followed it in 2 of 2 analysed sessions under `{}`)",
+                 `make lint` followed it in 2 of 2 analysed sessions under `{}`; could not tell \
+                 which version of `CLAUDE.md` these sessions ran under)",
                 skill.display(),
                 repo.display()
             )
@@ -3704,7 +4085,8 @@ mod tests {
             read.finding,
             format!(
                 "`src-tauri/src/lib.rs` was read within the first {EARLY_CALLS} tool calls in 3 \
-                 of 3 analysed sessions under `{}`, attributed to `{}`",
+                 of 3 analysed sessions under `{}`, attributed to `{}`; could not tell which \
+                 version of `src-tauri/CLAUDE.md` these sessions ran under",
                 repo.display(),
                 repo.join("src-tauri").display()
             )
@@ -4456,6 +4838,187 @@ mod tests {
         let s5 = errors(&out);
         assert_eq!(s5.len(), 1, "{out:#?}");
         assert_eq!(s5[0].severity, Severity::Note, "{}", s5[0].finding);
+    }
+
+    /// `git` in `dir` as octocat, with the commit dated `date`.
+    fn git_at(dir: &Path, args: &[&str], date: &str) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=octocat",
+                "-c",
+                "user.email=octocat@invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "git {args:?}");
+    }
+
+    fn held_back(findings: &[Finding]) -> Vec<&Finding> {
+        findings
+            .iter()
+            .filter(|f| f.finding.contains("not shown"))
+            .collect()
+    }
+
+    /// #1371: a session that ran under an older CLAUDE.md says nothing
+    /// about the current one. Only sessions that started after the
+    /// attributed file last changed count toward a threshold; older ones
+    /// are mentioned, not counted. A finding that reaches its threshold
+    /// only with older sessions is held back, and a Note says so; an
+    /// uncommitted change means no session has run under the file yet.
+    #[test]
+    fn only_sessions_since_the_claude_md_last_changed_count() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path();
+        git_init(repo);
+        write(repo, "CLAUDE.md", "# rules\n");
+        let changed = "2026-03-01T00:00:00Z";
+        git_at(repo, &["add", "CLAUDE.md"], changed);
+        git_at(repo, &["commit", "-q", "-m", "rules"], changed);
+        let cwd = repo.to_string_lossy().into_owned();
+        let conn = db();
+        for (n, started) in [
+            (1, "2026-01-01T00:00:00Z"),
+            (2, "2026-02-01T00:00:00Z"),
+            (3, "2026-04-01T00:00:00Z"),
+            (4, "2026-05-01T00:00:00Z"),
+        ] {
+            let p = write(repo, &format!("s{n}.jsonl"), &corrected_pair(&cwd, n));
+            insert_session_at(&conn, &format!("s{n}"), &cwd, Some(&p), None, started);
+        }
+        let scan = scan_effective_opt(repo, None);
+        let cx = context(repo, &scan, &conn);
+        let out = analyse(&conn, &cx, SESSIONS_PER_PASS).unwrap();
+        let hits = corrected(&out);
+        assert_eq!(hits.len(), 1, "{out:#?}");
+        assert_eq!(
+            hits[0].finding,
+            format!(
+                "`yarn lint` failed and `make lint` followed it in 2 of 2 analysed sessions \
+                 under `{}` since `CLAUDE.md` last changed on 2026-03-01 (2 more before it)",
+                repo.display()
+            )
+        );
+        assert_eq!(hits[0].severity, Severity::Advice);
+        let ids: Vec<&Locator> = hits[0].evidence.iter().map(|e| &e.at).collect();
+        assert_eq!(
+            ids,
+            [
+                &Locator::Session {
+                    session_id: "s3".into(),
+                    record: Some(2)
+                },
+                &Locator::Session {
+                    session_id: "s4".into(),
+                    record: Some(2)
+                }
+            ],
+            "only the counted sessions are evidence"
+        );
+        // S5 needs three: two since and two before is held back, and said.
+        let held = held_back(&out);
+        assert_eq!(held.len(), 1, "{out:#?}");
+        assert_eq!(held[0].severity, Severity::Note);
+        assert_eq!(
+            held[0].finding,
+            "1 finding on `CLAUDE.md` reaches its threshold only with sessions from before it \
+             last changed on 2026-03-01, and is not shown"
+        );
+        assert!(
+            held[0].evidence[0].measured.contains("(2 more before it)"),
+            "{}",
+            held[0].evidence[0].measured
+        );
+
+        // One session since: the correction is held back too.
+        conn.execute(
+            "UPDATE claude_session SET first_seen_at = '2026-01-15T00:00:00Z'
+              WHERE session_id = 's4'",
+            [],
+        )
+        .unwrap();
+        let out = analyse(&conn, &cx, SESSIONS_PER_PASS).unwrap();
+        assert!(corrected(&out).is_empty(), "{out:#?}");
+        let held = held_back(&out);
+        assert_eq!(held.len(), 1, "{out:#?}");
+        assert!(
+            held[0]
+                .finding
+                .starts_with("2 findings on `CLAUDE.md` reach"),
+            "{}",
+            held[0].finding
+        );
+
+        // An uncommitted change: no session has run under it yet.
+        write(repo, "CLAUDE.md", "# rules\n\nUse make.\n");
+        let scan = scan_effective_opt(repo, None);
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        assert!(corrected(&out).is_empty(), "{out:#?}");
+        let held = held_back(&out);
+        assert_eq!(held.len(), 1, "{out:#?}");
+        assert_eq!(
+            held[0].finding,
+            "`CLAUDE.md` has uncommitted changes, so no session has run under this version \
+             yet; 2 findings from sessions under an earlier version are not shown"
+        );
+    }
+
+    /// #1371: when git cannot say when the CLAUDE.md changed, no session
+    /// is dropped. Every one counts, and the finding says the version is
+    /// unknown; one Note carries why.
+    #[test]
+    fn a_claude_md_git_cannot_date_counts_every_session_and_says_so() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path();
+        write(repo, "CLAUDE.md", "# rules\n");
+        let cwd = repo.to_string_lossy().into_owned();
+        let conn = db();
+        for n in [1, 2] {
+            let p = write(repo, &format!("s{n}.jsonl"), &corrected_pair(&cwd, n));
+            insert_session(&conn, &format!("s{n}"), &cwd, Some(&p), None);
+        }
+        let scan = scan_effective_opt(repo, None);
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        let hits = corrected(&out);
+        assert_eq!(hits.len(), 1, "{out:#?}");
+        assert!(
+            hits[0].finding.ends_with(
+                "in 2 of 2 analysed sessions under `{}`; could not tell which version of \
+                 `CLAUDE.md` these sessions ran under"
+                    .replace("{}", &repo.display().to_string())
+                    .as_str()
+            ),
+            "{}",
+            hits[0].finding
+        );
+        assert_eq!(hits[0].severity, Severity::Advice);
+        let why = out
+            .iter()
+            .find(|f| {
+                f.finding
+                    .starts_with("could not tell which version of `CLAUDE.md`")
+            })
+            .unwrap_or_else(|| panic!("the reason: {out:#?}"));
+        assert_eq!(why.severity, Severity::Note);
+        assert!(
+            why.finding.contains("every session was counted"),
+            "{}",
+            why.finding
+        );
+        assert!(
+            why.evidence[0].measured.contains("not a git repository"),
+            "{}",
+            why.evidence[0].measured
+        );
     }
 
     /// Rows stored under an older extraction rule are not served: the
