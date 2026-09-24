@@ -305,9 +305,18 @@ pub fn makefile_is_open_ended(dir: &Path) -> Result<Option<&'static str>, String
         .map_err(|e| format!("{name}: {e}"))?
         .replace("\r\n", "\n");
     for line in text.lines() {
-        let t = line.trim_start_matches(['-', 's']);
-        if t.starts_with("include ") || t.starts_with("include\t") {
-            return Ok(Some("includes other files"));
+        // Exactly `include`, `-include` or `sinclude` then whitespace
+        // (#1415). `trim_start_matches(['-', 's'])` stripped ANY run of
+        // those characters, so `ssinclude` read as a directive. A
+        // tab-led line is a recipe command, never a directive.
+        if !line.starts_with('\t') {
+            let t = line.trim_start_matches(' ');
+            let rest = ["include", "-include", "sinclude"]
+                .iter()
+                .find_map(|d| t.strip_prefix(d));
+            if rest.is_some_and(|r| r.starts_with([' ', '\t'])) {
+                return Ok(Some("includes other files"));
+            }
         }
         if !line.starts_with([' ', '\t', '#']) && line.contains('%') && line.contains(':') {
             return Ok(Some("has pattern rules"));
@@ -650,6 +659,24 @@ specific: FOO = bar
         // No makefile at all is closed: nothing to be open-ended.
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(makefile_is_open_ended(empty.path()), Ok(None));
+        // #1415: exactly `include`, `-include` and `sinclude` -- a line
+        // that merely starts with more `-`/`s` characters is not one.
+        for directive in [
+            "-include rules.mk",
+            "sinclude rules.mk",
+            "  include rules.mk",
+        ] {
+            fs::write(t.path().join("Makefile"), format!("{directive}\nlint:\n")).unwrap();
+            assert_eq!(
+                makefile_is_open_ended(t.path()),
+                Ok(Some("includes other files")),
+                "{directive}"
+            );
+        }
+        for not_one in ["ssinclude rules.mk", "--include rules.mk", "sinclude_x: y"] {
+            fs::write(t.path().join("Makefile"), format!("{not_one}\nlint:\n")).unwrap();
+            assert_eq!(makefile_is_open_ended(t.path()), Ok(None), "{not_one}");
+        }
     }
 
     /// #1411: a makefile that exists and cannot be read is neither open
