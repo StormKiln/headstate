@@ -16,12 +16,44 @@
 //!
 //! # Where a section points, never where its rule applies
 //!
-//! The heuristic reads which paths a section names. It cannot know
-//! whether the rule those paths illustrate applies only there -- a rule
-//! for every component author whose implementation happens to live in
-//! `src/lib/` looks the same as a rule about `src/lib/`. So the finding
-//! says "names only paths under" and never "belongs in", the severity is
+//! The heuristic reads which paths a section names. From paths alone it
+//! cannot know whether the rule those paths illustrate applies only
+//! there -- a rule for every component author whose implementation
+//! happens to live in `src/lib/` looks the same as a rule about
+//! `src/lib/`. The identifiers the section names are the one signal it
+//! does read about that (below). Otherwise the finding says "names only
+//! paths under" and never "belongs in", the severity is
 //! [`Severity::Advice`], and the reader decides.
+//!
+//! # A section its callers need stays put
+//!
+//! One signal about where a rule applies is measurable (#1398): the
+//! identifiers a section names. A section naming `src/lib/useIsMobile.ts`
+//! and `src/lib/target.ts` names only paths under `src/lib/`, but it is
+//! about `useIsMobile()` and `IS_MOBILE_BUILD`, which those files define
+//! and code all over `src/` calls. Moving it into `src/lib/` would load
+//! it only when a session opens the definitions, which is exactly when
+//! nobody needs it.
+//!
+//! So before a "names only paths under X" finding is emitted, the
+//! section's code-span identifiers (`refs`' symbols: calls, qualified
+//! names and SCREAMING_CASE, by their last segment) are searched for as
+//! whole words, with rot's symbol search: its source roots plus the
+//! directories of the repository's CLAUDE.md files, one walk for the
+//! whole run. If any searched source file OUTSIDE X uses one, the
+//! section is guidance for callers and there is no finding. A section
+//! with no identifiers is judged by its paths alone, as before; one whose
+//! names are used only inside X is a finding, and says how many files
+//! were searched. A walk that read nothing, or could not read everything
+//! and found no use outside, cannot settle it: the finding stands,
+//! qualified in its evidence and its suggestion, never suppressed on a
+//! guess. A use that was read does suppress, whatever else could not be
+//! read. A section in a file outside the repository is not searched for:
+//! the repository's source says nothing about it.
+//!
+//! The search is whole-word, not semantic: a common name (`run`) used
+//! outside X for something else also suppresses. That errs toward
+//! silence, which is the cheaper mistake for advice.
 //!
 //! # Resolution is against two places, never by suffix
 //!
@@ -123,6 +155,7 @@
 //! sentence this module wrote. A value that cannot be read back is
 //! omitted, never guessed.
 
+use super::rot::{search_symbols, SymbolSearch};
 use super::{Check, Context, Evidence, Finding, Locator, Producer, Severity, Subject};
 use crate::claudemd::imports::parse_imports;
 use crate::claudemd::refs::{self, RefKind};
@@ -187,8 +220,17 @@ impl Producer for Placement {
             }
         }
 
-        for f in &loaded {
-            out.extend(assess(f, cx.repo, cx.home));
+        // Every file is assessed first, so the one caller search (#1398)
+        // covers every held section's names in a single walk.
+        let assessed: Vec<(Vec<Finding>, Vec<Held>)> =
+            loaded.iter().map(|f| assess(f, cx.repo, cx.home)).collect();
+        let search = caller_search(&assessed, &loaded, cx.repo);
+        for (f, (done, held)) in loaded.iter().zip(assessed) {
+            out.extend(done);
+            out.extend(
+                held.into_iter()
+                    .filter_map(|h| h.settle(search.as_ref(), cx.repo)),
+            );
             out.extend(always_rules(f, cx.repo));
         }
         out.extend(duplicates(&loaded, cx.repo));
@@ -233,6 +275,13 @@ static CODE_SPAN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`[^`]*`").unwr
 /// [`suggestion`] to tell the three rules apart.
 const DUPLICATE_MARK: &str = " carry the same ";
 const LAZY_MARK: &str = "; this file loads only after a Read in ";
+/// In a caller-search evidence line that could not be settled (#1398),
+/// read back by [`suggestion`] to add [`CALLERS_CAVEAT`].
+const CALLERS_UNSETTLED: &str = " could not be settled: ";
+const CALLERS_CAVEAT: &str = "Before moving it, check the identifiers the section names: \
+    whether code outside that directory uses them could not be fully searched (see the \
+    evidence), and if it does, the section is guidance for their callers and should stay \
+    where it is.";
 
 /// What the `.claude/rules` probe measured, when it has something to say.
 /// Absent (or not a directory) is `None`: the current wording stands.
@@ -656,10 +705,120 @@ fn line_of(n: usize) -> Option<u32> {
     u32::try_from(n).ok()
 }
 
-/// The placement findings for one file, one per section at most.
-fn assess(file: &Loaded, repo: &Path, home: Option<&Path>) -> Vec<Finding> {
+/// A "names only paths under" finding, held until the run's one caller
+/// search can say whether the section is guidance for callers (#1398).
+struct Held {
+    subject: Subject,
+    /// The section's heading line, where the caller evidence points.
+    at: Locator,
+    evidence: Vec<Evidence>,
+    sentence: String,
+    /// The directory every named path falls under, absolute.
+    dir: PathBuf,
+    /// `dir` as the sentence shows it.
+    shown: String,
+    /// The identifiers the section names in code spans: `refs`'
+    /// symbols, by their last segment.
+    names: BTreeSet<String>,
+}
+
+impl Held {
+    /// The finding, or `None` when a searched source file outside
+    /// [`Held::dir`] uses one of the section's names: the section is
+    /// then guidance for callers, not for that directory. See the
+    /// module docs' "A section its callers need stays put".
+    fn settle(mut self, search: Option<&SymbolSearch>, repo: &Path) -> Option<Finding> {
+        let search = search.filter(|_| !self.names.is_empty() && self.dir.starts_with(repo));
+        if let Some(search) = search {
+            let outside = self
+                .names
+                .iter()
+                .filter_map(|n| search.files.get(n))
+                .flatten()
+                .any(|f| !f.starts_with(&self.dir));
+            // A use that was read is a use, whatever else could not be
+            // read (#1044).
+            if outside {
+                return None;
+            }
+            let names: Vec<String> = self.names.iter().map(|n| format!("`{n}`")).collect();
+            let (names, verb) = (
+                names.join(", "),
+                if names.len() == 1 { "is" } else { "are" },
+            );
+            let roots = search.roots.join("`, `");
+            let d = &self.shown;
+            let measured = if search.files_searched == 0 {
+                format!(
+                    "whether {names} {verb} used outside {d}/{CALLERS_UNSETTLED}no source files \
+                     under `{roots}`"
+                )
+            } else if !search.unreadable.is_empty() {
+                format!(
+                    "whether {names} {verb} used outside {d}/{CALLERS_UNSETTLED}{} searched with \
+                     no use outside it, and {} could not be read: {}",
+                    count(search.files_searched, "source file", "source files"),
+                    count(search.unreadable.len(), "entry", "entries"),
+                    search.unreadable.join("; ")
+                )
+            } else {
+                format!(
+                    "{names} {verb} referenced by no source file outside {d}/ ({} searched \
+                     under `{roots}`)",
+                    count(search.files_searched, "source file", "source files"),
+                )
+            };
+            self.evidence.push(Evidence {
+                at: self.at.clone(),
+                measured,
+            });
+        }
+        Some(Finding::new(
+            Check::Placement,
+            Severity::Advice,
+            self.subject,
+            self.evidence,
+            self.sentence,
+        ))
+    }
+}
+
+fn count(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// The run's one caller search (#1398): every held section's names,
+/// whole-word, over rot's source roots and the directories of the
+/// repository's CLAUDE.md files. `None` when no held section in the
+/// repository names an identifier: there is nothing to look for.
+fn caller_search(
+    assessed: &[(Vec<Finding>, Vec<Held>)],
+    loaded: &[Loaded],
+    repo: &Path,
+) -> Option<SymbolSearch> {
+    let names: BTreeSet<String> = assessed
+        .iter()
+        .flat_map(|(_, held)| held)
+        .filter(|h| h.dir.starts_with(repo))
+        .flat_map(|h| h.names.iter().cloned())
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    let dirs: Vec<PathBuf> = loaded
+        .iter()
+        .filter_map(|f| f.path.parent())
+        .filter(|d| d.starts_with(repo))
+        .map(Path::to_path_buf)
+        .collect();
+    Some(search_symbols(repo, &names, &dirs))
+}
+
+/// The findings for one file that are final, and the "names only paths
+/// under" findings held for the caller search; one per section at most.
+fn assess(file: &Loaded, repo: &Path, home: Option<&Path>) -> (Vec<Finding>, Vec<Held>) {
     let Some(file_dir) = file.path.parent() else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     // The root fallback is for files inside the repository. A global
     // file naming `src/x.ts` is talking about every repository, and
@@ -667,6 +826,7 @@ fn assess(file: &Loaded, repo: &Path, home: Option<&Path>) -> Vec<Finding> {
     let repo_root = file_dir.starts_with(repo).then_some(repo);
     let path = slashed(&file.path);
     let mut out = Vec::new();
+    let mut held = Vec::new();
     // Path-scoped rules are the repository's; a file outside it is not
     // probed, which is "not asked", never "none".
     let rules = repo_root.and_then(rules_evidence);
@@ -750,18 +910,27 @@ fn assess(file: &Loaded, repo: &Path, home: Option<&Path>) -> Vec<Finding> {
         });
         evidence.extend(rules.clone());
 
-        out.push(Finding::new(
-            Check::Placement,
-            Severity::Advice,
+        let names = refs::extract(&section_source(&section))
+            .into_iter()
+            .filter_map(|r| match r.kind {
+                RefKind::Symbol { last } => Some(last),
+                _ => None,
+            })
+            .collect();
+        held.push(Held {
             subject,
+            at,
             evidence,
-            format!(
+            sentence: format!(
                 "Section \"{}\" (~{est} est. tokens) names only paths under {d}/: {list}",
                 heading_text(&section)
             ),
-        ));
+            dir,
+            shown: d,
+            names,
+        });
     }
-    out
+    (out, held)
 }
 
 /// The section a line falls in, for a subject.
@@ -1042,8 +1211,23 @@ fn under_dir(sentence: &str) -> Option<&str> {
 /// The brief's "Suggested change" for a placement finding.
 ///
 /// Called from `brief.rs`'s match on [`Check`], so the wording lives
-/// beside the rules it describes.
+/// beside the rules it describes. A caller search that could not be
+/// settled (#1398) adds its caveat to whatever the move suggestion is.
 pub(crate) fn suggestion(f: &Finding) -> String {
+    let base = move_suggestion(f);
+    if f.severity != Severity::Unknown
+        && f.evidence
+            .iter()
+            .any(|e| e.measured.starts_with("whether ") && e.measured.contains(CALLERS_UNSETTLED))
+    {
+        format!("{base} {CALLERS_CAVEAT}")
+    } else {
+        base
+    }
+}
+
+/// [`suggestion`] before the caller caveat.
+fn move_suggestion(f: &Finding) -> String {
     let subject = f.subject.path();
     if f.severity == Severity::Unknown {
         return format!(
@@ -1489,6 +1673,115 @@ mod tests {
                 .any(|f| f.check == Check::Placement && f.severity == Severity::Advice),
             "an unjudged section is never advice: {report:?}"
         );
+    }
+
+    /// A repository whose root `CLAUDE.md` has a section naming
+    /// `lib/a.ts`, `lib/b.ts` and the identifier `` `useThing()` ``,
+    /// which `lib/a.ts` defines. The caller, if any, is the test's.
+    fn lib_thing() -> tempfile::TempDir {
+        let t = tempfile::tempdir().unwrap();
+        fs::create_dir_all(t.path().join("lib")).unwrap();
+        fs::write(
+            t.path().join("lib").join("a.ts"),
+            "export function useThing() {}\n",
+        )
+        .unwrap();
+        fs::write(t.path().join("lib").join("b.ts"), "export const B = 1;\n").unwrap();
+        fs::write(
+            t.path().join("CLAUDE.md"),
+            "# Root\n\nrepo-wide.\n\n## Thing\n\nCall `useThing()`; it lives in \
+             `lib/a.ts`, beside `lib/b.ts`.\n",
+        )
+        .unwrap();
+        t
+    }
+
+    /// #1398: a section naming the files that define an identifier used
+    /// outside their directory is guidance for the callers, so it is no
+    /// finding. Sabotage-proven: with the caller check removed, the
+    /// section is a "names only paths under lib/" finding.
+    #[test]
+    fn a_section_whose_identifier_is_used_outside_is_no_finding() {
+        let t = lib_thing();
+        fs::create_dir_all(t.path().join("components")).unwrap();
+        fs::write(
+            t.path().join("components").join("x.tsx"),
+            "import { useThing } from '../lib/a';\nuseThing();\n",
+        )
+        .unwrap();
+
+        let report = report_in(t.path(), None, None);
+        ran(&report);
+        assert!(placement(&report).is_empty(), "{report:?}");
+    }
+
+    /// #1398: the same section whose identifier is used only inside
+    /// `lib/` still gives the finding, and says what was searched. A
+    /// name inside a longer word (`useThingy`) is not a use.
+    #[test]
+    fn a_section_whose_identifier_is_used_only_inside_is_a_finding() {
+        let t = lib_thing();
+        fs::write(t.path().join("lib").join("c.ts"), "useThing();\n").unwrap();
+        fs::create_dir_all(t.path().join("components")).unwrap();
+        fs::write(t.path().join("components").join("x.tsx"), "useThingy();\n").unwrap();
+
+        let report = report_in(t.path(), None, None);
+        let found = placement(&report);
+        assert_eq!(found.len(), 1, "{report:?}");
+        let f = found[0];
+        assert_eq!(f.severity, Severity::Advice);
+        assert!(
+            f.finding.contains("names only paths under lib/"),
+            "{}",
+            f.finding
+        );
+        assert!(
+            f.evidence.iter().any(|e| e
+                .measured
+                .starts_with("`useThing` is referenced by no source file outside lib/")),
+            "{:?}",
+            f.evidence
+        );
+    }
+
+    /// #1398: a use that could not be looked for is not "no use". With
+    /// a source directory walled and no caller found, the finding stands
+    /// but is qualified in its evidence and its suggestion; a caller
+    /// found beside the wall still suppresses it, because a use that was
+    /// read is a use. Unix only, as the other wall test is.
+    #[cfg(unix)]
+    #[test]
+    fn a_caller_search_that_could_not_finish_qualifies_and_a_hit_still_counts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let t = lib_thing();
+        let blocked = t.path().join("components").join("walled");
+        fs::create_dir_all(&blocked).unwrap();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+        let unsure = report_in(t.path(), None, None);
+        fs::write(t.path().join("components").join("x.tsx"), "useThing();\n").unwrap();
+        let used = report_in(t.path(), None, None);
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let found = placement(&unsure);
+        assert_eq!(found.len(), 1, "{unsure:?}");
+        let f = found[0];
+        assert_eq!(f.severity, Severity::Advice);
+        assert!(
+            f.evidence.iter().any(|e| e
+                .measured
+                .starts_with("whether `useThing` is used outside lib/ could not be settled")
+                && e.measured.contains("components/walled")),
+            "{:?}",
+            f.evidence
+        );
+        assert!(
+            f.brief.contains("guidance for their callers"),
+            "{}",
+            f.brief
+        );
+
+        assert!(placement(&used).is_empty(), "{used:?}");
     }
 
     /// (g) A path that does not exist is listed as not found and does
