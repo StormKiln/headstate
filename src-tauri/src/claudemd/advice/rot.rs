@@ -85,7 +85,10 @@
 //! - **make target**: `packages::scripts::targets` over the file's
 //!   directory, then the root. A makefile that `include`s another or
 //!   carries a `%` pattern rule can define a target the parser cannot
-//!   see, so a miss against such a file is `Unknown`, not `Missing`.
+//!   see, so a miss against such a file is `Unknown`, not `Missing`. A
+//!   makefile that could not be read, to list its targets or to look for
+//!   an `include`, is `Unknown` too, naming the file and the io error
+//!   (#1411).
 //! - **yarn/npm script**: `packages::scripts::scripts`, then
 //!   `node_modules/.bin/<x>`, which resolves as a binary and is not a
 //!   finding (`yarn vitest run` is this). A yarn CLI verb such as
@@ -1589,11 +1592,21 @@ impl<'a> Resolver<'a> {
                     if targets.iter().any(|t| t.name == name) {
                         return Ok(());
                     }
-                    if let Some(why) = scripts::makefile_is_open_ended(&anchor) {
-                        return Err(unknown(format!(
-                            "`make {name}` is not a target the parser can see, and the makefile in `{}` {why}",
-                            display(self.repo, &anchor.to_string_lossy())
-                        )));
+                    match scripts::makefile_is_open_ended(&anchor) {
+                        Ok(None) => {}
+                        Ok(Some(why)) => {
+                            return Err(unknown(format!(
+                                "`make {name}` is not a target the parser can see, and the makefile in `{}` {why}",
+                                display(self.repo, &anchor.to_string_lossy())
+                            )))
+                        }
+                        // #1411: a failed read is not "closed".
+                        Err(why) => {
+                            return Err(unknown(format!(
+                                "`make {name}` could not be checked: {why} in `{}`",
+                                display(self.repo, &anchor.to_string_lossy())
+                            )))
+                        }
                     }
                     total += targets.len();
                     let files: BTreeSet<&str> = targets.iter().map(|t| t.file.as_str()).collect();
@@ -2828,6 +2841,34 @@ Run `yarn paw`, not `yarn nope`. Use the `tentacle` skill, not the `ink` skill.
         );
         // And `make hello` still resolves.
         assert!(!rot.findings.iter().any(|r| r.r.raw == "make hello"));
+    }
+
+    /// #1411: a makefile that exists and cannot be read makes `make nope`
+    /// Unknown, naming the makefile and the error, never Missing.
+    #[cfg(unix)]
+    #[test]
+    fn a_make_target_against_an_unreadable_makefile_is_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = fixture();
+        let p = t.path().join("Makefile");
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o000)).unwrap();
+        let blocked = fs::read(&p).is_err();
+        let rot = check_one(t.path(), None);
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+        if !blocked {
+            eprintln!("skipped: mode 0o000 did not block the read (running as root?)");
+            return;
+        }
+        let nope = rot
+            .findings
+            .iter()
+            .find(|r| r.r.raw == "make nope")
+            .unwrap();
+        assert!(
+            matches!(&nope.verdict, Verdict::Unknown(why) if why.contains("Makefile")),
+            "{:?}",
+            nope.verdict
+        );
     }
 
     /// A symbol is a whole-word hit under the search roots; a symbol no

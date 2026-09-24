@@ -132,8 +132,11 @@
 //! open-ended (`scripts::makefile_is_open_ended`: an `include` or a `%`
 //! pattern rule), when that target might be defined where the parser
 //! cannot see: the gaps the named target might cover are
-//! [`Severity::Unknown`], naming the target, for every toolchain. A target
-//! name two makefiles share takes the union of what either runs.
+//! [`Severity::Unknown`], naming the target, for every toolchain. So are
+//! they when whether the makefile is open-ended could not be read (#1411):
+//! the Unknown names the makefile and the io error, because a failed read
+//! is not a closed makefile. A target name two makefiles share takes the
+//! union of what either runs.
 //!
 //! A JS launcher is read through to the tool it runs (#1323): `npx`,
 //! `bunx`, `pnpm exec`, `bun x` and `pnpm nx` name what follows them, and
@@ -1491,7 +1494,7 @@ pub fn detect(repo: &Path) -> Detection {
                     let open = if kind == Toolchain::Make {
                         scripts::makefile_is_open_ended(dir)
                     } else {
-                        None
+                        Ok(None)
                     };
                     let no_targets = BTreeMap::new();
                     let no_unknown = BTreeMap::new();
@@ -1505,8 +1508,14 @@ pub fn detect(repo: &Path) -> Detection {
                     let found: Vec<_> = mine
                         .iter()
                         .map(|target| {
-                            let (runs, unknown) =
-                                recipe_runs(manager, &target.name, &mine, &t.manifest, open, &cx);
+                            let (runs, unknown) = recipe_runs(
+                                manager,
+                                &target.name,
+                                &mine,
+                                &t.manifest,
+                                open.as_ref().copied().map_err(String::as_str),
+                                &cx,
+                            );
                             (target.name.clone(), runs, unknown)
                         })
                         .collect();
@@ -2118,21 +2127,23 @@ fn targets_named(text: &str) -> Vec<(String, String)> {
 /// `check`) credits whatever each command maps to.
 ///
 /// A target the file does not define is a file prerequisite, unless the
-/// makefile is open-ended (`open`): then it might be defined where the
-/// parser cannot see, and it is Unknown, never nothing.
+/// makefile is open-ended (`open` is `Ok(Some(why))`): then it might be
+/// defined where the parser cannot see, and it is Unknown, never nothing.
+/// So is it when whether the makefile is open-ended could not be read
+/// (`open` is `Err`, #1411): a failed read is not "closed".
 fn recipe_runs(
     manager: &str,
     name: &str,
     targets: &[&Target],
     manifest: &Path,
-    open: Option<&str>,
+    open: Result<Option<&str>, &str>,
     scripts: &Scripts,
 ) -> (Vec<(String, Verb)>, Vec<Unfollowed>) {
     struct Walk<'a> {
         manager: &'a str,
         targets: &'a [&'a Target],
         manifest: &'a Path,
-        open: Option<&'a str>,
+        open: Result<Option<&'a str>, &'a str>,
         scripts: &'a Scripts<'a>,
         /// The named target's own verb, when its name maps to one.
         verb: Option<Verb>,
@@ -2145,16 +2156,21 @@ fn recipe_runs(
             return;
         }
         let Some(target) = w.targets.iter().find(|t| t.name == name) else {
-            if let Some(why) = w.open {
+            let why = match w.open {
+                Ok(None) => None,
+                Ok(Some(why)) => Some(format!(
+                    "target `{name}` is not one the parser can see, and `{}` {why}",
+                    w.manifest.to_string_lossy()
+                )),
+                Err(e) => Some(format!(
+                    "target `{name}` is not one the parser can see, and whether `{}` includes other files could not be read: {e}",
+                    w.manifest.to_string_lossy()
+                )),
+            };
+            if let Some(why) = why {
                 w.unknown.push(Unfollowed {
                     manager: None,
-                    reasons: vec![(
-                        w.manifest.to_path_buf(),
-                        format!(
-                            "target `{name}` is not one the parser can see, and `{}` {why}",
-                            w.manifest.to_string_lossy()
-                        ),
-                    )],
+                    reasons: vec![(w.manifest.to_path_buf(), why)],
                 });
             }
             return;
@@ -3826,6 +3842,82 @@ mod tests {
         assert!(
             found.iter().all(|f| f.severity == Severity::Advice),
             "{found:#?}"
+        );
+    }
+
+    /// #1411: when whether the makefile is open-ended could not be read,
+    /// a prerequisite the parser cannot see is Unknown, naming the
+    /// makefile and the error: never a file, never nothing.
+    #[test]
+    fn a_missing_prerequisite_when_openness_is_unreadable_is_unknown() {
+        let lint = Target {
+            name: "lint".to_string(),
+            file: "Makefile".to_string(),
+            line: 1,
+            prereqs: vec!["lint-rust".to_string()],
+            recipe: Vec::new(),
+        };
+        let targets = [&lint];
+        let cx = Scripts {
+            verbs: &BTreeMap::new(),
+            unknown: &BTreeMap::new(),
+            names: &BTreeSet::new(),
+            targets: &BTreeMap::new(),
+            target_unknown: &BTreeMap::new(),
+        };
+        let (runs, unknown) = recipe_runs(
+            "make",
+            "lint",
+            &targets,
+            Path::new("Makefile"),
+            Err("Makefile: Permission denied"),
+            &cx,
+        );
+        assert!(runs.is_empty(), "{runs:?}");
+        assert_eq!(unknown.len(), 1, "{unknown:?}");
+        let (at, why) = &unknown[0].reasons[0];
+        assert_eq!(at, Path::new("Makefile"));
+        assert!(
+            why.contains("`lint-rust`") && why.contains("Permission denied"),
+            "{why}"
+        );
+    }
+
+    /// #1411: an unreadable makefile is Unknown with the io error, never
+    /// "nothing names" a target in it.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_makefile_is_unknown_not_unnamed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_t, repo, home) = fixture();
+        fs::write(repo.join("Cargo.toml"), "[package]\nname = \"octocat\"\n").unwrap();
+        let makefile = repo.join("Makefile");
+        fs::write(&makefile, "lint: lint-rust\n\ttrue\n").unwrap();
+        fs::write(repo.join("CLAUDE.md"), "Run `make nope`.\n").unwrap();
+        fs::set_permissions(&makefile, fs::Permissions::from_mode(0o000)).unwrap();
+        let blocked = fs::read(&makefile).is_err();
+        let report = run_over(&repo, &home);
+        fs::set_permissions(&makefile, fs::Permissions::from_mode(0o644)).unwrap();
+        if !blocked {
+            eprintln!("skipped: mode 0o000 did not block the read (running as root?)");
+            return;
+        }
+
+        let found = toolchain_findings(&report);
+        assert!(
+            found.iter().any(|f| f.severity == Severity::Unknown
+                && f.evidence
+                    .iter()
+                    .any(|e| e.measured.contains("Makefile")
+                        && e.measured.contains("Permission denied"))),
+            "{found:#?}"
+        );
+        assert!(
+            !found
+                .iter()
+                .any(|f| f.severity == Severity::Advice && f.finding.contains("`make ")),
+            "a target in an unreadable makefile is never reported unnamed: {found:#?}"
         );
     }
 
