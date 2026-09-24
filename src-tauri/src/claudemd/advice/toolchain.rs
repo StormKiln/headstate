@@ -60,6 +60,24 @@
 //! names no script. Makefile and justfile recipes are not read this way:
 //! their bodies are shell and the target parser does not read them.
 //!
+//! A body that runs a repository script file (`bash <file>`, `sh <file>`,
+//! `node <file>`, `./<file>`) is followed into it one level (#1376: a
+//! `verify` running `bash tools/verify.sh`, which ran prettier, was
+//! reported as naming no format command). The file resolves against the
+//! package's directory and must stay under the repository, checked
+//! lexically and again through symlinks; one outside it is never read.
+//! Its non-comment lines (`#`, `//`) are read with the same tool map, and
+//! a file it runs in turn is not followed. Lines are read by their first
+//! words, so a tool a `node` file spawns from inside a JS expression is
+//! not found. A file that could not be read, or lies outside the
+//! repository, makes that script's verbs Unknown, not uncovered: a gap a
+//! loaded file naming the script might cover is a [`Severity::Unknown`]
+//! finding naming the file, and the script is not listed as "other". A
+//! script nothing names changes nothing.
+//!
+//! A gap's sentence lists only the scripts, targets or subcommands offered
+//! for the verb it reports, not everything the toolchain offers (#1376).
+//!
 //! A JS launcher is read through to the tool it runs (#1323): `npx`,
 //! `bunx`, `pnpm exec`, `bun x` and `pnpm nx` name what follows them, and
 //! `pnpm`/`bun` run scripts as `yarn` does. An `nx` command's verbs come
@@ -127,7 +145,12 @@ impl Producer for Coverage {
     fn run(&self, cx: &Context) -> Result<Vec<Finding>, String> {
         let detection = detect(cx.repo);
         let rules = rules::read(cx.repo);
-        let search = documented(cx.scan, &detection.script_verbs, &rules);
+        let search = documented(
+            cx.scan,
+            &detection.script_verbs,
+            &detection.script_unknown,
+            &rules,
+        );
         let subject = subject_for(cx.repo, cx.scan);
         let mut out = Vec::new();
 
@@ -201,11 +224,6 @@ impl Producer for Coverage {
                     .collect::<Vec<_>>()
                     .join(", ")
             );
-            let offered: Vec<String> = dedup(
-                members
-                    .iter()
-                    .flat_map(|m| m.offers.iter().map(|o| format!("`{}`", o.what))),
-            );
             let mut verbs: BTreeSet<Verb> = BTreeSet::new();
             for m in members {
                 verbs.extend(m.offers.iter().map(|o| o.verb));
@@ -218,6 +236,28 @@ impl Producer for Coverage {
                     .any(|n| n.verb == verb && kind.covered_by(&n.manager));
                 if named {
                     continue;
+                }
+                // Only the scripts for this verb: a sentence about test
+                // lists the test scripts, not every script (#1376).
+                let offered: Vec<String> = dedup(members.iter().flat_map(|m| {
+                    m.offers
+                        .iter()
+                        .filter(|o| o.verb == verb)
+                        .map(|o| format!("`{}`", o.what))
+                }));
+                // A named script whose file could not be read might run
+                // this verb: Unknown, never uncovered (#1376).
+                let mut blockers: Vec<&(PathBuf, String)> = Vec::new();
+                for u in search
+                    .unfollowed
+                    .iter()
+                    .filter(|u| kind.covered_by(&u.manager))
+                {
+                    for r in &u.reasons {
+                        if !blockers.contains(&r) {
+                            blockers.push(r);
+                        }
+                    }
                 }
                 let candidates: Vec<String> = dedup(members.iter().flat_map(|m| {
                     m.offers
@@ -285,7 +325,7 @@ impl Producer for Coverage {
                     ),
                 };
 
-                if unreadable.is_empty() {
+                if unreadable.is_empty() && blockers.is_empty() {
                     out.push(Finding::new(
                         Check::Toolchain,
                         Severity::Advice,
@@ -293,7 +333,43 @@ impl Producer for Coverage {
                         evidence,
                         format!("{label} offers {}; {nothing_names}", offered.join(", ")),
                     ));
+                } else if unreadable.is_empty() {
+                    for (path, why) in &blockers {
+                        evidence.push(Evidence {
+                            at: Locator::File {
+                                path: path.to_string_lossy().to_string(),
+                                line: None,
+                            },
+                            measured: why.clone(),
+                        });
+                    }
+                    out.push(Finding::new(
+                        Check::Toolchain,
+                        Severity::Unknown,
+                        subject.clone(),
+                        evidence,
+                        format!(
+                            "{label} offers {}; whether any loaded file names {} could not be \
+                             decided: {}",
+                            offered.join(", "),
+                            or_list(&candidates),
+                            blockers
+                                .iter()
+                                .map(|(_, why)| why.as_str())
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        ),
+                    ));
                 } else {
+                    for (path, why) in &blockers {
+                        evidence.push(Evidence {
+                            at: Locator::File {
+                                path: path.to_string_lossy().to_string(),
+                                line: None,
+                            },
+                            measured: why.clone(),
+                        });
+                    }
                     for u in &unreadable {
                         evidence.push(Evidence {
                             at: Locator::File {
@@ -596,14 +672,40 @@ fn js_tool_verb(tool: &str, args: &[&str]) -> Option<Verb> {
     }
 }
 
+/// What a package.json script's body runs: its verbs, and the script
+/// files it runs that could not be read or lie outside the repository,
+/// each with the path and what was measured (#1376).
+#[derive(Debug, Default)]
+struct Body {
+    verbs: Vec<Verb>,
+    unknown: Vec<(PathBuf, String)>,
+}
+
+/// Where a script body runs: the package's directory, which a relative
+/// script file resolves against, and the repository it must stay under.
+struct Files<'a> {
+    dir: &'a Path,
+    repo: &'a Path,
+}
+
 /// The verbs a package.json script's body runs (#1341), in order, each
 /// once. The body is split at `&&`, `||`, `;` and `|`; leading `NAME=value`
 /// assignments are skipped and a launcher is read through
 /// ([`unwrap_launcher`]). A command running another script maps it by name,
 /// else, when `follow` is set, by that script's own body with `follow`
 /// cleared: one level, so a cycle cannot loop and a chain is not chased.
-fn body_verbs(body: &str, bodies: &BTreeMap<&str, &str>, follow: bool) -> Vec<Verb> {
-    let mut out = Vec::new();
+///
+/// With `files`, a command running a repository script file (`bash|sh
+/// <file>`, `node <file>`, `./<file>`) maps by that file's non-comment
+/// lines, read with `files` cleared: one level (#1376). A file that could
+/// not be read, or lies outside the repository, is in `unknown`.
+fn body_verbs(
+    body: &str,
+    bodies: &BTreeMap<&str, &str>,
+    follow: bool,
+    files: Option<&Files>,
+) -> Body {
+    let mut out = Body::default();
     for segment in split_chain(body) {
         let tokens: Vec<&str> = segment
             .split_whitespace()
@@ -620,22 +722,97 @@ fn body_verbs(body: &str, bodies: &BTreeMap<&str, &str>, follow: bool) -> Vec<Ve
         } else if let Some(s) = script_run(tool, args) {
             match verb_by_name(s) {
                 Some(v) => vec![v],
-                None if follow => bodies
-                    .get(s)
-                    .map(|b| body_verbs(b, bodies, false))
-                    .unwrap_or_default(),
+                None if follow => match bodies.get(s) {
+                    Some(b) => {
+                        let inner = body_verbs(b, bodies, false, files);
+                        out.unknown.extend(inner.unknown);
+                        inner.verbs
+                    }
+                    None => Vec::new(),
+                },
                 None => Vec::new(),
+            }
+        } else if let (Some(at), Some(file)) = (files, script_file(tool, args)) {
+            match read_script_file(file, at) {
+                Ok(text) => {
+                    let mut verbs = Vec::new();
+                    for line in text.replace("\r\n", "\n").split('\n') {
+                        let t = line.trim_start();
+                        if t.is_empty() || t.starts_with('#') || t.starts_with("//") {
+                            continue;
+                        }
+                        verbs.extend(body_verbs(line, bodies, false, None).verbs);
+                    }
+                    verbs
+                }
+                Err(unknown) => {
+                    out.unknown.push(unknown);
+                    Vec::new()
+                }
             }
         } else {
             Vec::new()
         };
         for v in found {
-            if !out.contains(&v) {
-                out.push(v);
+            if !out.verbs.contains(&v) {
+                out.verbs.push(v);
             }
         }
     }
     out
+}
+
+/// The repository script file a command runs, as written: the first
+/// non-flag argument of `bash`, `sh` or `node`, or a `./` command. `bash
+/// -c` runs a string, not a file.
+fn script_file<'a>(tool: &'a str, args: &[&'a str]) -> Option<&'a str> {
+    let file = match tool {
+        "bash" | "sh" if args.contains(&"-c") => None,
+        "bash" | "sh" | "node" => args.iter().copied().find(|a| !a.starts_with('-')),
+        t if t.len() > 2 && t.starts_with("./") => Some(t),
+        _ => None,
+    }?;
+    let file = file.trim_matches(['"', '\'']);
+    (!file.is_empty()).then_some(file)
+}
+
+/// Lexical normalisation: `.` dropped, `..` popped.
+fn normalise(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// A script file's text, when it is under the repository and readable.
+/// Otherwise the path and what was measured: a file outside the
+/// repository is not read at all, which is said as such, never as a
+/// read that failed. Checked lexically first, then through symlinks.
+fn read_script_file(file: &str, at: &Files) -> Result<String, (PathBuf, String)> {
+    let path = normalise(&at.dir.join(file));
+    let outside = |p: &Path| {
+        (
+            p.to_path_buf(),
+            format!("`{file}` is outside the repository, so it was not read"),
+        )
+    };
+    if Path::new(file).is_absolute() || !path.starts_with(normalise(at.repo)) {
+        return Err(outside(&path));
+    }
+    let unreadable = |e: std::io::Error| (path.clone(), format!("`{file}` could not be read: {e}"));
+    let real = std::fs::canonicalize(&path).map_err(unreadable)?;
+    let root = std::fs::canonicalize(at.repo).map_err(unreadable)?;
+    if !real.starts_with(&root) {
+        return Err(outside(&path));
+    }
+    std::fs::read_to_string(&real).map_err(unreadable)
 }
 
 /// `NAME=value` before a command: an environment assignment.
@@ -782,6 +959,12 @@ pub struct Detection {
     /// `verify` runs (#1341). A name two manifests share takes the union
     /// of what either runs.
     pub script_verbs: BTreeMap<String, Vec<Verb>>,
+    /// The script files a package.json script named for no verb runs and
+    /// that could not be read or lie outside the repository, by script
+    /// name, each with the file and what was measured (#1376). A loaded
+    /// file naming such a script names verbs nobody could read, so a gap
+    /// it might cover is Unknown.
+    pub script_unknown: BTreeMap<String, Vec<(PathBuf, String)>>,
 }
 
 /// The same bound and the same exclusions as `detect::projects`, so the
@@ -918,10 +1101,24 @@ pub fn detect(repo: &Path) -> Detection {
                                 };
                                 // By name first; by body only when the
                                 // name maps to nothing (#1341).
+                                let mut unknown = false;
                                 let (verbs, measured) = match verb_by_name(name) {
                                     Some(verb) => (vec![verb], format!("script `{name}`")),
                                     None => {
-                                        let verbs = body_verbs(&s.body, &bodies, true);
+                                        let at = Files { dir: &dir, repo };
+                                        let body = body_verbs(&s.body, &bodies, true, Some(&at));
+                                        if !body.unknown.is_empty() {
+                                            unknown = true;
+                                            let known =
+                                                out.script_unknown.entry(name.clone()).or_default();
+                                            for (path, why) in body.unknown {
+                                                let why = format!("script `{name}` runs {why}");
+                                                if !known.iter().any(|(_, w)| *w == why) {
+                                                    known.push((path, why));
+                                                }
+                                            }
+                                        }
+                                        let verbs = body.verbs;
                                         if !verbs.is_empty() {
                                             let known =
                                                 out.script_verbs.entry(name.clone()).or_default();
@@ -940,7 +1137,9 @@ pub fn detect(repo: &Path) -> Detection {
                                         )
                                     }
                                 };
-                                if verbs.is_empty() {
+                                // A script whose file could not be read is
+                                // Unknown, not "not mapped" (#1376).
+                                if verbs.is_empty() && !unknown {
                                     t.other.push(name.clone());
                                 }
                                 for verb in verbs {
@@ -1314,6 +1513,16 @@ pub struct Search {
     pub fenced_lines: usize,
     /// Files the scan listed and this producer could not re-read.
     pub unreadable: Vec<String>,
+    /// Named scripts whose script file could not be read (#1376).
+    pub unfollowed: Vec<Unfollowed>,
+}
+
+/// A command a loaded file names that runs a package.json script whose
+/// script file could not be read or lies outside the repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unfollowed {
+    pub manager: String,
+    pub reasons: Vec<(PathBuf, String)>,
 }
 
 impl Search {
@@ -1389,8 +1598,13 @@ fn loaded_files(scan: &EffectiveScan) -> Vec<PathBuf> {
 pub fn documented(
     scan: &EffectiveScan,
     script_verbs: &BTreeMap<String, Vec<Verb>>,
+    script_unknown: &BTreeMap<String, Vec<(PathBuf, String)>>,
     rules: &Rules,
 ) -> Search {
+    let scripts = Scripts {
+        verbs: script_verbs,
+        unknown: script_unknown,
+    };
     let mut out = Search::default();
     for path in loaded_files(scan) {
         let text = match std::fs::read_to_string(&path) {
@@ -1401,25 +1615,43 @@ pub fn documented(
                 continue;
             }
         };
-        search_text(&mut out, &path, &text, script_verbs);
+        search_text(&mut out, &path, &text, &scripts);
         out.files.push(path);
     }
     for rule in &rules.files {
-        search_text(&mut out, &rule.path, &rule.text, script_verbs);
+        search_text(&mut out, &rule.path, &rule.text, &scripts);
         out.rules.push(rule.path.clone());
     }
     out
 }
 
+/// What detection learned about package.json scripts, for the search.
+struct Scripts<'a> {
+    verbs: &'a BTreeMap<String, Vec<Verb>>,
+    unknown: &'a BTreeMap<String, Vec<(PathBuf, String)>>,
+}
+
+impl Scripts<'_> {
+    /// The named scripts in one span or fenced line whose script file
+    /// could not be read, into `out`.
+    fn unfollowed(&self, text: &str, out: &mut Vec<Unfollowed>) {
+        for (manager, script) in scripts_named(text) {
+            if let Some(reasons) = self.unknown.get(&script) {
+                out.push(Unfollowed {
+                    manager,
+                    reasons: reasons.clone(),
+                });
+            }
+        }
+    }
+}
+
 /// One file's spans and fenced lines into `out`.
-fn search_text(
-    out: &mut Search,
-    path: &Path,
-    text: &str,
-    script_verbs: &BTreeMap<String, Vec<Verb>>,
-) {
+fn search_text(out: &mut Search, path: &Path, text: &str, scripts: &Scripts) {
+    let script_verbs = scripts.verbs;
     for s in text::spans(text) {
         out.spans += 1;
+        scripts.unfollowed(&s.text, &mut out.unfollowed);
         for (manager, verb) in commands_with(&s.text, script_verbs) {
             out.named.push(Named {
                 manager,
@@ -1436,6 +1668,7 @@ fn search_text(
                 continue;
             }
             out.fenced_lines += 1;
+            scripts.unfollowed(line, &mut out.unfollowed);
             for (manager, verb) in commands_with(line, script_verbs) {
                 out.named.push(Named {
                     manager,
@@ -1479,6 +1712,25 @@ fn commands_with(text: &str, script_verbs: &BTreeMap<String, Vec<Verb>>) -> Vec<
             out.push((manager.to_string(), verb));
         } else if let Some(verbs) = script_run(manager, args).and_then(|s| script_verbs.get(s)) {
             out.extend(verbs.iter().map(|v| (manager.to_string(), *v)));
+        }
+    }
+    out
+}
+
+/// The package.json scripts one span or fenced line runs, with the
+/// manager running each: the same segments [`commands_with`] reads.
+fn scripts_named(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for segment in split_chain(text) {
+        let segment = segment.trim();
+        let segment = segment.strip_prefix("$ ").unwrap_or(segment);
+        let tokens: Vec<&str> = segment.split_whitespace().collect();
+        let Some(first) = tokens.first() else {
+            continue;
+        };
+        let (manager, args) = unwrap_launcher(first, &tokens[1..]);
+        if let Some(s) = script_run(manager, args) {
+            out.push((manager.to_string(), s.to_string()));
         }
     }
     out
@@ -1847,8 +2099,8 @@ mod tests {
         assert_eq!(f.severity, Severity::Advice);
         assert_eq!(
             f.finding,
-            "yarn (package.json + yarn.lock at root) offers `test`, `lint`; none of the 1 file \
-             read names `yarn test`"
+            "yarn (package.json + yarn.lock at root) offers `test`; none of the 1 file read \
+             names `yarn test`"
         );
         assert_eq!(f.subject.path(), repo.join("CLAUDE.md").to_string_lossy());
         assert!(
@@ -1902,9 +2154,9 @@ mod tests {
         assert_eq!(
             sentences,
             vec![
-                "make (Makefile at root) offers `test`, `lint`; none of the 1 file read names \
+                "make (Makefile at root) offers `test`; none of the 1 file read names \
                  `make test`",
-                "make (Makefile at root) offers `test`, `lint`; none of the 1 file read names \
+                "make (Makefile at root) offers `lint`; none of the 1 file read names \
                  `make lint`",
             ]
         );
@@ -2107,8 +2359,8 @@ mod tests {
         assert_eq!(found[0].severity, Severity::Advice);
         assert_eq!(
             found[0].finding,
-            "make (Makefile at root) offers `test`, `lint`; none of the 1 file read or 2 rules \
-             names `make lint`"
+            "make (Makefile at root) offers `lint`; none of the 1 file read or 2 rules names \
+             `make lint`"
         );
         let searched = found[0]
             .evidence
@@ -2507,7 +2759,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let v = |body: &str| body_verbs(body, &bodies, true);
+        let v = |body: &str| body_verbs(body, &bodies, true, None).verbs;
         assert_eq!(
             v("prettier --check $(git diff --name-only) && eslint . && vitest run"),
             vec![Verb::Format, Verb::Lint, Verb::Test]
@@ -2582,6 +2834,146 @@ mod tests {
                 .any(|e| e.measured == "not mapped to a verb, not counted: `verify`")),
             "{report:#?}"
         );
+    }
+
+    /// A package.json whose `verify` runs `body`, beside `test`,
+    /// `test:unit`, `lint` and `lint:fix` scripts, and a CLAUDE.md naming
+    /// `npm run verify` only.
+    fn verify_app(repo: &Path, body: &str) {
+        fs::write(
+            repo.join("package.json"),
+            format!(
+                r#"{{"scripts":{{"test":"vitest","test:unit":"vitest run","lint":"eslint .","lint:fix":"eslint --fix .","verify":"{body}"}}}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            repo.join("CLAUDE.md"),
+            "Run `npm run verify` before pushing.\n",
+        )
+        .unwrap();
+    }
+
+    /// #1376's test: `verify` runs `bash tools/v.sh`, which runs prettier
+    /// and eslint, so naming `npm run verify` covers format and lint. The
+    /// one finding, for test, lists only the test scripts; a comment line
+    /// in the file maps nothing.
+    #[test]
+    fn a_script_body_is_followed_into_a_repository_script_file() {
+        let (_t, repo, home) = fixture();
+        verify_app(&repo, "bash tools/v.sh");
+        fs::create_dir_all(repo.join("tools")).unwrap();
+        fs::write(
+            repo.join("tools").join("v.sh"),
+            "#!/bin/sh\nset -e\n# npx vitest run\nnpx prettier --check $(git diff --name-only)\neslint .\n",
+        )
+        .unwrap();
+
+        let report = run_over(&repo, &home);
+        let found = toolchain_findings(&report);
+        assert_eq!(found.len(), 1, "{report:#?}");
+        assert_eq!(found[0].severity, Severity::Advice);
+        assert_eq!(
+            found[0].finding,
+            "npm (package.json at root) offers `test`, `test:unit`; none of the 1 file read \
+             names `npm run test` or `npm run test:unit`"
+        );
+
+        // The negative can fail: without the file, `verify` maps to
+        // nothing it can be shown to run, and format is not offered.
+        let detection = detect(&repo);
+        let verify: Vec<Verb> = detection.toolchains[0]
+            .offers
+            .iter()
+            .filter(|o| o.what == "verify")
+            .map(|o| o.verb)
+            .collect();
+        assert_eq!(verify, vec![Verb::Format, Verb::Lint]);
+    }
+
+    /// The launchers followed, each one level: `sh`, `node` and `./`. A
+    /// file the followed file runs is not read.
+    #[test]
+    fn script_files_are_followed_one_level_by_each_launcher() {
+        let (_t, repo, _home) = fixture();
+        let tools = repo.join("tools");
+        fs::create_dir_all(&tools).unwrap();
+        fs::write(tools.join("f.sh"), "prettier --write .\n").unwrap();
+        fs::write(tools.join("t.mjs"), "// eslint .\nvitest run\n").unwrap();
+        fs::write(tools.join("outer.sh"), "bash tools/f.sh\n").unwrap();
+        let bodies = BTreeMap::new();
+        let at = Files {
+            dir: &repo,
+            repo: &repo,
+        };
+        let v = |body: &str| body_verbs(body, &bodies, true, Some(&at));
+        assert_eq!(v("sh tools/f.sh").verbs, vec![Verb::Format]);
+        assert_eq!(v("bash -e \"tools/f.sh\"").verbs, vec![Verb::Format]);
+        assert_eq!(
+            v("./tools/f.sh && node tools/t.mjs").verbs,
+            vec![Verb::Format, Verb::Test]
+        );
+        assert_eq!(v("bash tools/outer.sh").verbs, vec![]);
+        assert!(v("bash tools/outer.sh").unknown.is_empty());
+        assert_eq!(v("bash -c 'prettier .'").verbs, vec![]);
+        assert!(v("bash -c 'prettier .'").unknown.is_empty());
+
+        // A symlink under the repository to a file outside it is not
+        // read: the check is made through symlinks too.
+        #[cfg(unix)]
+        {
+            let outside = _t.path().join("outside.sh");
+            fs::write(&outside, "eslint .\n").unwrap();
+            std::os::unix::fs::symlink(&outside, tools.join("link.sh")).unwrap();
+            let body = v("bash tools/link.sh");
+            assert_eq!(body.verbs, vec![]);
+            assert!(
+                body.unknown[0].1.contains("outside the repository"),
+                "{:?}",
+                body.unknown
+            );
+        }
+    }
+
+    /// A script file that cannot be read, or lies outside the repository,
+    /// makes the named script's verbs Unknown, never uncovered; the
+    /// outside file is not read. A script nothing names changes nothing.
+    #[test]
+    fn an_unreadable_or_outside_script_file_is_unknown_not_uncovered() {
+        for (body, says) in [
+            ("bash tools/missing.sh", "could not be read"),
+            ("bash ../outside.sh", "outside the repository"),
+        ] {
+            let (t, repo, home) = fixture();
+            // Readable, and would cover lint and test if it were read.
+            fs::write(t.path().join("outside.sh"), "eslint .\nvitest\n").unwrap();
+            verify_app(&repo, body);
+
+            let report = run_over(&repo, &home);
+            let found = toolchain_findings(&report);
+            assert_eq!(found.len(), 2, "{body}: {report:#?}");
+            for f in &found {
+                assert_eq!(f.severity, Severity::Unknown, "{body}: {f:#?}");
+                assert!(f.finding.contains("could not be decided"), "{}", f.finding);
+                assert!(
+                    f.evidence.iter().any(
+                        |e| e.measured.contains("script `verify`") && e.measured.contains(says)
+                    ),
+                    "{body}: {:?}",
+                    f.evidence
+                );
+            }
+
+            // Nothing names `verify`: its file cannot cover anything.
+            fs::write(repo.join("CLAUDE.md"), "Be careful.\n").unwrap();
+            let report = run_over(&repo, &home);
+            let found = toolchain_findings(&report);
+            assert_eq!(found.len(), 2, "{body}: {report:#?}");
+            assert!(
+                found.iter().all(|f| f.severity == Severity::Advice),
+                "{body}: {report:#?}"
+            );
+        }
     }
 
     /// Detection over the added markers, each read through this module's
