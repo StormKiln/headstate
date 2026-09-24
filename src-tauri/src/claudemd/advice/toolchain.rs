@@ -42,10 +42,10 @@
 //! A gate documented in a skill the root CLAUDE.md points at is
 //! documented; plugin skills are out of scope (#1365). The sentence counts
 //! the three apart ("none of the 7 files read, 2 rules or 4 skills names
-//! …"). A file two
-//! CLAUDE.md files both import is one file read, not two (#1350). Docs linked
-//! from a CLAUDE.md by an ordinary markdown link are not searched: they
-//! are not loaded into a session, so they instruct nothing until read.
+//! …"). A file two CLAUDE.md files both import is one file read, not two
+//! (#1350). Docs linked from a CLAUDE.md by an ordinary markdown link are
+//! not searched: they are not loaded into a session, so they instruct
+//! nothing until read.
 //!
 //! The target-to-verb map is by name (`test*`, `lint*`, `fmt*|format*`,
 //! `build*`, `dev|run|start|serve`, `deploy|release|publish`). A target
@@ -62,29 +62,6 @@
 //! to build. A command running another script (`npm run <s>`) maps `<s>`
 //! by name, else by its body, one level only. One script can offer
 //! several verbs, and a loaded file naming it names all of them.
-//!
-//! A make or just target a loaded file names also names what its recipe
-//! runs (#1393: `make lint` ran `cargo clippy` through `lint-rust`, and
-//! the cargo lint gap was reported anyway). `packages::scripts` reads each
-//! target's prerequisites and recipe lines from the file the target was
-//! parsed from; the target is followed through its prerequisites and any
-//! recipe line calling the same manager (`$(MAKE) <t>`, `make <t>`, `just
-//! <t>`), recursively, each target once. `-C`, `-f` and `--justfile` point
-//! at another file, which is not followed. Each recipe command is mapped
-//! as a loaded file's would be, split at `&&`, `||`, `;` and `|`, with
-//! `NAME=value` assignments and shell keywords (`do`, `then`) skipped: `cd
-//! a && cargo clippy` is cargo's lint and `yarn vitest run` yarn's test. A
-//! makefile variable assigned a literal (`CARGO := cargo`) is read; a
-//! command still starting with any other variable reference is not a
-//! literal and is skipped. Every verb a command maps to is credited, not
-//! only the target's own: on this repository `make lint` runs `lint-ui`,
-//! whose `yarn tsc -b` is the tool map's build. A recipe reaching a target
-//! the file does not define is reaching a file, unless the makefile is
-//! open-ended (`scripts::makefile_is_open_ended`: an `include` or a `%`
-//! pattern rule), when that target might be defined where the parser
-//! cannot see: the gaps the named target might cover are
-//! [`Severity::Unknown`], naming the target, for every toolchain. A target
-//! name two makefiles share takes the union of what either runs.
 //!
 //! The same tool map reads a binary a loaded file runs through a manager
 //! (#1392): `yarn vitest run`, `npx prettier --check .`, `pnpm exec
@@ -113,10 +90,32 @@
 //! repository, makes that script's verbs Unknown, not uncovered: a gap a
 //! loaded file naming the script might cover is a [`Severity::Unknown`]
 //! finding naming the file, and the script is not listed as "other". A
-//! script nothing names changes nothing.
+//! script nothing names changes nothing. A script file is followed from a
+//! package.json body only: a make recipe running one (`./scripts/x.sh`)
+//! maps by its first word, which names nothing.
 //!
-//! A gap's sentence lists only the scripts, targets or subcommands offered
-//! for the verb it reports, not everything the toolchain offers (#1376).
+//! A make or just target a loaded file names also names what its recipe
+//! runs (#1393: `make lint` ran `cargo clippy` through `lint-rust`, and
+//! the cargo lint gap was reported anyway). `packages::scripts` reads each
+//! target's prerequisites and recipe lines from the file the target was
+//! parsed from; the target is followed through its prerequisites and any
+//! recipe line calling the same manager (`$(MAKE) <t>`, `make <t>`, `just
+//! <t>`), recursively, each target once. `-C`, `-f` and `--justfile` point
+//! at another file, which is not followed. Each recipe command is mapped
+//! as a loaded file's would be, split at `&&`, `||`, `;` and `|`, with
+//! `NAME=value` assignments and shell keywords (`do`, `then`) skipped: `cd
+//! a && cargo clippy` is cargo's lint and `yarn vitest run` yarn's test. A
+//! makefile variable assigned a literal (`CARGO := cargo`) is read; a
+//! command still starting with any other variable reference is not a
+//! literal and is skipped. Every verb a command maps to is credited, not
+//! only the target's own: on this repository `make lint` runs `lint-ui`,
+//! whose `yarn tsc -b` is the tool map's build. A recipe reaching a target
+//! the file does not define is reaching a file, unless the makefile is
+//! open-ended (`scripts::makefile_is_open_ended`: an `include` or a `%`
+//! pattern rule), when that target might be defined where the parser
+//! cannot see: the gaps the named target might cover are
+//! [`Severity::Unknown`], naming the target, for every toolchain. A target
+//! name two makefiles share takes the union of what either runs.
 //!
 //! A JS launcher is read through to the tool it runs (#1323): `npx`,
 //! `bunx`, `pnpm exec`, `bun x` and `pnpm nx` name what follows them, and
@@ -136,6 +135,33 @@
 //! never a package.json `test` script, because a Rust suite being named
 //! says nothing about whether the JS suite is.
 //!
+//! A binary a JS manager runs (#1392) is credited to that manager, so
+//! `npx prettier` covers the JS family's format and nothing else. What a
+//! named target's recipe runs (#1393) is credited to the manager that
+//! runs it in the recipe, not to `make`: `make lint` reaching `cargo
+//! clippy` covers cargo's lint, as `cargo clippy` named directly would,
+//! and make's own lint by name as before.
+//!
+//! # One finding per verb
+//!
+//! Each uncovered verb is one finding, listing every toolchain that offers
+//! it and nothing covers (#1395): on this repository `make dev` is `yarn
+//! tauri dev`, which builds and runs the Rust side, and `yarn dev`, `cargo
+//! run` and `make dev` were three findings for one workflow. The sentence
+//! names each toolchain with only the members offering the verb ("cargo
+//! (Cargo.toml at src-tauri) offers `run`"), then what each offers, then
+//! every command nothing names; the evidence cites each offer where it was
+//! found. Only the scripts, targets or subcommands for that verb are
+//! listed, not everything a toolchain offers (#1376). Whether a toolchain
+//! is covered is still decided per toolchain, by the rule above; this
+//! changes only how the uncovered ones are grouped. A toolchain whose
+//! negative cannot be decided is not folded into the Advice finding: the
+//! same verb gets a second, [`Severity::Unknown`], finding for those.
+//!
+//! `cargo run` is offered only for a crate with a binary target:
+//! `src/main.rs`, `src/bin/`, or `[[bin]]` in `Cargo.toml`. A library
+//! crate cannot be run.
+//!
 //! # A negative needs a complete scan
 //!
 //! A positive ("`make lint` is named at `CLAUDE.md:13`") stands whatever
@@ -145,8 +171,7 @@
 //! unreadable import, no file this producer failed to re-read, no
 //! `.claude/rules` directory or rule that exists and could not be read,
 //! and no skills directory or `SKILL.md` that exists and could not be
-//! read (#1394).
-//! Otherwise the same (toolchain, verb) is a [`Severity::Unknown`] finding
+//! read (#1394). Otherwise the verb's finding is [`Severity::Unknown`],
 //! naming what could not be read. `skipped_dirs` qualifies nothing; it is
 //! a documented exclusion.
 //!
@@ -251,23 +276,27 @@ impl Producer for Coverage {
         for t in &detection.toolchains {
             groups.entry(t.toolchain).or_default().push(t);
         }
+        let verbs: BTreeSet<Verb> = detection
+            .toolchains
+            .iter()
+            .flat_map(|t| t.offers.iter().map(|o| o.verb))
+            .collect();
 
-        for (kind, members) in &groups {
-            let label = format!(
-                "{} ({})",
-                kind.name(),
-                members
+        // One finding per uncovered verb, listing every toolchain that
+        // offers it and nothing covers (#1395). Whether each toolchain is
+        // covered is #1327's rule, unchanged. A toolchain whose negative
+        // cannot be decided goes in a second, Unknown, finding for the
+        // same verb: Advice and Unknown are different states.
+        for verb in verbs {
+            let mut decided: Vec<Gap> = Vec::new();
+            let mut undecided: Vec<Gap> = Vec::new();
+            for (kind, members) in &groups {
+                if !members
                     .iter()
-                    .map(|m| m.label.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            let mut verbs: BTreeSet<Verb> = BTreeSet::new();
-            for m in members {
-                verbs.extend(m.offers.iter().map(|o| o.verb));
-            }
-
-            for verb in verbs {
+                    .any(|m| m.offers.iter().any(|o| o.verb == verb))
+                {
+                    continue;
+                }
                 let named = search
                     .named
                     .iter()
@@ -275,16 +304,9 @@ impl Producer for Coverage {
                 if named {
                     continue;
                 }
-                // Only the scripts for this verb: a sentence about test
-                // lists the test scripts, not every script (#1376).
-                let offered: Vec<String> = dedup(members.iter().flat_map(|m| {
-                    m.offers
-                        .iter()
-                        .filter(|o| o.verb == verb)
-                        .map(|o| format!("`{}`", o.what))
-                }));
-                // A named script whose file could not be read might run
-                // this verb: Unknown, never uncovered (#1376).
+                // A named script or target whose file could not be read
+                // might run this verb: Unknown, never uncovered (#1376,
+                // #1393).
                 let mut blockers: Vec<&(PathBuf, String)> = Vec::new();
                 for u in search
                     .unfollowed
@@ -297,127 +319,184 @@ impl Producer for Coverage {
                         }
                     }
                 }
-                let candidates: Vec<String> = dedup(members.iter().flat_map(|m| {
-                    m.offers
-                        .iter()
-                        .filter(|o| o.verb == verb)
-                        .map(|o| format!("`{}`", o.command))
-                }));
-                let mut evidence: Vec<Evidence> = members
-                    .iter()
-                    .flat_map(|m| m.offers.iter().filter(|o| o.verb == verb))
-                    .map(|o| Evidence {
-                        at: Locator::File {
-                            path: o.file.to_string_lossy().to_string(),
-                            line: o.line,
-                        },
-                        measured: o.measured.clone(),
-                    })
-                    .collect();
-                for m in members.iter().filter(|m| !m.other.is_empty()) {
-                    evidence.push(Evidence {
-                        at: Locator::File {
-                            path: m.manifest.to_string_lossy().to_string(),
-                            line: None,
-                        },
-                        measured: format!(
-                            "not mapped to a verb, not counted: {}",
-                            m.other
-                                .iter()
-                                .map(|o| format!("`{o}`"))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ),
-                    });
-                }
-                evidence.push(Evidence {
-                    at: Locator::File {
-                        path: subject.path().to_string(),
-                        line: None,
-                    },
-                    measured: search.measured(),
-                });
-
-                let nothing_names = search.nothing_names(&candidates);
-
-                if unreadable.is_empty() && blockers.is_empty() {
-                    out.push(Finding::new(
-                        Check::Toolchain,
-                        Severity::Advice,
-                        subject.clone(),
-                        evidence,
-                        format!("{label} offers {}; {nothing_names}", offered.join(", ")),
-                    ));
-                } else if unreadable.is_empty() {
-                    for (path, why) in &blockers {
-                        evidence.push(Evidence {
-                            at: Locator::File {
-                                path: path.to_string_lossy().to_string(),
-                                line: None,
-                            },
-                            measured: why.clone(),
-                        });
-                    }
-                    out.push(Finding::new(
-                        Check::Toolchain,
-                        Severity::Unknown,
-                        subject.clone(),
-                        evidence,
-                        format!(
-                            "{label} offers {}; whether any loaded file names {} could not be \
-                             decided: {}",
-                            offered.join(", "),
-                            or_list(&candidates),
-                            blockers
-                                .iter()
-                                .map(|(_, why)| why.as_str())
-                                .collect::<Vec<_>>()
-                                .join("; ")
-                        ),
-                    ));
+                let gap = Gap {
+                    kind: *kind,
+                    members,
+                    blockers,
+                };
+                if unreadable.is_empty() && gap.blockers.is_empty() {
+                    decided.push(gap);
                 } else {
-                    for (path, why) in &blockers {
-                        evidence.push(Evidence {
-                            at: Locator::File {
-                                path: path.to_string_lossy().to_string(),
-                                line: None,
-                            },
-                            measured: why.clone(),
-                        });
-                    }
-                    for u in &unreadable {
-                        evidence.push(Evidence {
-                            at: Locator::File {
-                                path: u.clone(),
-                                line: None,
-                            },
-                            measured: "not readable".to_string(),
-                        });
-                    }
-                    out.push(Finding::new(
-                        Check::Toolchain,
-                        Severity::Unknown,
-                        subject.clone(),
-                        evidence,
-                        format!(
-                            "{label} offers {}; whether any loaded file names {} could not be \
-                             decided: {} not readable",
-                            offered.join(", "),
-                            or_list(&candidates),
-                            unreadable
-                                .iter()
-                                .map(|u| format!("`{u}`"))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ),
-                    ));
+                    undecided.push(gap);
                 }
+            }
+            if !decided.is_empty() {
+                out.push(gap_finding(verb, &decided, &search, &subject, &[]));
+            }
+            if !undecided.is_empty() {
+                out.push(gap_finding(
+                    verb,
+                    &undecided,
+                    &search,
+                    &subject,
+                    &unreadable,
+                ));
             }
         }
 
         out.extend(lint_leakage(cx.repo, cx.scan, &detection.formatter_configs));
         Ok(out)
     }
+}
+
+/// One toolchain that offers a verb nothing covers.
+struct Gap<'a> {
+    kind: Toolchain,
+    /// Every member of the kind; only those offering the verb are named.
+    members: &'a [&'a DetectedToolchain],
+    /// What a named command reaches and could not be read.
+    blockers: Vec<&'a (PathBuf, String)>,
+}
+
+/// The one finding for `verb` over `gaps` (#1395): each toolchain and
+/// the members offering it, what each offers, and the commands nothing
+/// names. Advice when `unreadable` is empty and no gap has blockers;
+/// otherwise Unknown, naming what could not be read.
+fn gap_finding(
+    verb: Verb,
+    gaps: &[Gap],
+    search: &Search,
+    subject: &Subject,
+    unreadable: &[String],
+) -> Finding {
+    let offers = |g: &Gap| -> Vec<Offer> {
+        g.members
+            .iter()
+            .flat_map(|m| m.offers.iter().filter(|o| o.verb == verb).cloned())
+            .collect()
+    };
+    let mut clauses: Vec<String> = Vec::new();
+    let mut candidates: Vec<String> = Vec::new();
+    let mut evidence: Vec<Evidence> = Vec::new();
+    let mut blockers: Vec<&(PathBuf, String)> = Vec::new();
+    for g in gaps {
+        // Only the members offering this verb: a library crate is not
+        // named in a sentence about `cargo run` (#1395).
+        let labels: Vec<&str> = g
+            .members
+            .iter()
+            .filter(|m| m.offers.iter().any(|o| o.verb == verb))
+            .map(|m| m.label.as_str())
+            .collect();
+        // Only the scripts for this verb, not every script (#1376).
+        let offered = dedup(offers(g).iter().map(|o| format!("`{}`", o.what)));
+        clauses.push(format!(
+            "{} ({}) offers {}",
+            g.kind.name(),
+            labels.join(", "),
+            offered.join(", ")
+        ));
+        for c in offers(g).iter().map(|o| format!("`{}`", o.command)) {
+            if !candidates.contains(&c) {
+                candidates.push(c);
+            }
+        }
+        evidence.extend(offers(g).into_iter().map(|o| Evidence {
+            at: Locator::File {
+                path: o.file.to_string_lossy().to_string(),
+                line: o.line,
+            },
+            measured: o.measured,
+        }));
+        for m in g.members.iter().filter(|m| !m.other.is_empty()) {
+            evidence.push(Evidence {
+                at: Locator::File {
+                    path: m.manifest.to_string_lossy().to_string(),
+                    line: None,
+                },
+                measured: format!(
+                    "not mapped to a verb, not counted: {}",
+                    m.other
+                        .iter()
+                        .map(|o| format!("`{o}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        }
+        for b in &g.blockers {
+            if !blockers.contains(b) {
+                blockers.push(b);
+            }
+        }
+    }
+    evidence.push(Evidence {
+        at: Locator::File {
+            path: subject.path().to_string(),
+            line: None,
+        },
+        measured: search.measured(),
+    });
+    for (path, why) in &blockers {
+        evidence.push(Evidence {
+            at: Locator::File {
+                path: path.to_string_lossy().to_string(),
+                line: None,
+            },
+            measured: why.clone(),
+        });
+    }
+    for u in unreadable {
+        evidence.push(Evidence {
+            at: Locator::File {
+                path: u.clone(),
+                line: None,
+            },
+            measured: "not readable".to_string(),
+        });
+    }
+
+    let offered = and_list(&clauses);
+    let (severity, sentence) = if unreadable.is_empty() && blockers.is_empty() {
+        (
+            Severity::Advice,
+            format!("{offered}; {}", search.nothing_names(&candidates)),
+        )
+    } else if unreadable.is_empty() {
+        (
+            Severity::Unknown,
+            format!(
+                "{offered}; whether any loaded file names {} could not be decided: {}",
+                or_list(&candidates),
+                blockers
+                    .iter()
+                    .map(|(_, why)| why.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        )
+    } else {
+        (
+            Severity::Unknown,
+            format!(
+                "{offered}; whether any loaded file names {} could not be decided: {} not \
+                 readable",
+                or_list(&candidates),
+                unreadable
+                    .iter()
+                    .map(|u| format!("`{u}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
+    };
+    Finding::new(
+        Check::Toolchain,
+        severity,
+        subject.clone(),
+        evidence,
+        sentence,
+    )
 }
 
 /// The brief's suggestion for one of this producer's findings.
@@ -496,10 +575,19 @@ fn dedup<I: IntoIterator<Item = String>>(items: I) -> Vec<String> {
 
 /// `a`, `a or b`, `a, b or c`.
 fn or_list(items: &[String]) -> String {
+    joined(items, "or")
+}
+
+/// `a`, `a and b`, `a, b and c`.
+fn and_list(items: &[String]) -> String {
+    joined(items, "and")
+}
+
+fn joined(items: &[String], word: &str) -> String {
     match items.len() {
         0 => String::new(),
         1 => items[0].clone(),
-        n => format!("{} or {}", items[..n - 1].join(", "), items[n - 1]),
+        n => format!("{} {word} {}", items[..n - 1].join(", "), items[n - 1]),
     }
 }
 
@@ -1264,11 +1352,15 @@ pub fn detect(repo: &Path) -> Detection {
                     t.offers.push(fixed(Verb::Test, "cargo", "test", &m));
                     t.offers.push(fixed(Verb::Lint, "cargo", "clippy", &m));
                     t.offers.push(fixed(Verb::Format, "cargo", "fmt", &m));
-                    // `cargo run` only where there is a binary to run.
+                    // `cargo run` only where there is a binary to run:
+                    // `[[bin]]`, `src/main.rs` or `src/bin/` (#1395). A
+                    // library crate offers none.
+                    let src = dir.join("src");
                     let has_bin = doc.get("bin").is_some()
                         || names_of
-                            .get(dir.join("src").as_path())
-                            .is_some_and(|ns| ns.iter().any(|n| n == "main.rs"));
+                            .get(src.as_path())
+                            .is_some_and(|ns| ns.iter().any(|n| n == "main.rs"))
+                        || src.join("bin").is_dir();
                     if has_bin {
                         t.offers.push(fixed(Verb::Run, "cargo", "run", &m));
                     }
@@ -2494,44 +2586,41 @@ mod tests {
         fs::write(repo.join("CLAUDE.md"), "Be careful.\n").unwrap();
 
         let report = run_over(&repo, &home);
-        let make: Vec<&Finding> = toolchain_findings(&report)
-            .into_iter()
-            .filter(|f| f.finding.starts_with("make ("))
-            .collect();
-        let sentences: Vec<&str> = make.iter().map(|f| f.finding.as_str()).collect();
+        let found = toolchain_findings(&report);
+        let sentences: Vec<&str> = found.iter().map(|f| f.finding.as_str()).collect();
+        // One finding per verb, each listing yarn's script and make's
+        // target (#1395).
         assert_eq!(
             sentences,
             vec![
-                "make (Makefile at root) offers `test`; none of the 1 file read names \
-                 `make test`",
-                "make (Makefile at root) offers `lint`; none of the 1 file read names \
-                 `make lint`",
+                "yarn (package.json + yarn.lock at root) offers `test` and make (Makefile at \
+                 root) offers `test`; none of the 1 file read names `yarn test` or `make test`",
+                "yarn (package.json + yarn.lock at root) offers `lint` and make (Makefile at \
+                 root) offers `lint`; none of the 1 file read names `yarn lint` or `make lint`",
             ]
         );
         let makefile = repo.join("Makefile").to_string_lossy().to_string();
         assert!(
-            make[0]
+            found[0]
                 .brief
                 .contains(&format!("`{makefile}:2` — target `test`")),
             "{}",
-            make[0].brief
+            found[0].brief
         );
         assert!(
-            make[1]
+            found[1]
                 .brief
                 .contains(&format!("`{makefile}:5` — target `lint`")),
             "{}",
-            make[1].brief
+            found[1].brief
         );
-        // The yarn gaps are there too: four findings in all.
-        assert_eq!(toolchain_findings(&report).len(), 4, "{report:#?}");
 
         fs::remove_file(repo.join("CLAUDE.md")).unwrap();
         let report = run_over(&repo, &home);
         let found = toolchain_findings(&report);
         let f = found
             .iter()
-            .find(|f| f.finding.ends_with("`make test`"))
+            .find(|f| f.finding.contains("`make test`"))
             .expect("the make test gap");
         assert_eq!(
             f.subject,
@@ -2540,8 +2629,10 @@ mod tests {
             }
         );
         assert!(
-            f.finding
-                .ends_with("no CLAUDE.md loads for this repository, so nothing names `make test`"),
+            f.finding.ends_with(
+                "no CLAUDE.md loads for this repository, so nothing names `yarn test` or \
+                 `make test`"
+            ),
             "{}",
             f.finding
         );
@@ -2923,10 +3014,7 @@ mod tests {
 
         // Prose: the lint gap stands.
         let prose = gaps("Run make lint before pushing.\n");
-        assert!(
-            prose.iter().any(|s| s.ends_with("names `make lint`")),
-            "{prose:?}"
-        );
+        assert!(prose.iter().any(|s| s.contains("`make lint`")), "{prose:?}");
 
         // Fenced: cleared.
         let fenced = gaps("```bash\nmake lint\n```\n");
@@ -2949,10 +3037,7 @@ mod tests {
         // A path whose token is a manager counts for nothing.
         let path = gaps("Edit `src-tauri/Cargo.toml` and `cargo/test`.\n");
         assert!(path.iter().any(|s| s.contains("`cargo test`")), "{path:?}");
-        assert!(
-            path.iter().any(|s| s.ends_with("names `make lint`")),
-            "{path:?}"
-        );
+        assert!(path.iter().any(|s| s.contains("`make lint`")), "{path:?}");
     }
 
     /// Lint leakage: a style line with a formatter config that sets it is
@@ -3159,16 +3244,17 @@ mod tests {
         fs::write(repo.join("yarn.lock"), "").unwrap();
         fs::write(repo.join("Cargo.toml"), "[package]\nname = \"octocat\"\n").unwrap();
 
+        // The test commands the one test finding lists (#1395).
         let test_gaps = |body: &str| -> Vec<String> {
             fs::write(repo.join("CLAUDE.md"), body).unwrap();
-            toolchain_findings(&run_over(&repo, &home))
+            let found = toolchain_findings(&run_over(&repo, &home))
                 .iter()
                 .map(|f| f.finding.clone())
-                .filter(|s| {
-                    s.ends_with("`make test-unit`")
-                        || s.ends_with("`yarn test`")
-                        || s.ends_with("`cargo test`")
-                })
+                .collect::<Vec<_>>();
+            ["`make test-unit`", "`yarn test`", "`cargo test`"]
+                .into_iter()
+                .filter(|c| found.iter().any(|s| s.contains(c)))
+                .map(str::to_string)
                 .collect()
         };
 
@@ -3186,7 +3272,7 @@ mod tests {
         // `cargo test` alone covers make's test target, not yarn's.
         let gaps = test_gaps("Run `cargo test`.\n");
         assert_eq!(gaps.len(), 1, "{gaps:?}");
-        assert!(gaps[0].ends_with("`yarn test`"), "{gaps:?}");
+        assert_eq!(gaps[0], "`yarn test`", "{gaps:?}");
     }
 
     /// #1392: a manager running a binary names what the binary does,
@@ -3674,6 +3760,195 @@ mod tests {
         assert!(by(Toolchain::Bundler).offers.is_empty());
     }
 
+    /// Four build toolchains: yarn with a `build` script, a binary
+    /// crate, a Makefile `build` target and a hand-made Xcode project.
+    fn four_builds(repo: &Path) {
+        fs::write(
+            repo.join("package.json"),
+            r#"{"scripts":{"build":"vite build"}}"#,
+        )
+        .unwrap();
+        fs::write(repo.join("yarn.lock"), "").unwrap();
+        fs::write(repo.join("Cargo.toml"), "[package]\nname = \"octocat\"\n").unwrap();
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src").join("main.rs"), "fn main() {}\n").unwrap();
+        fs::write(repo.join("Makefile"), "build:\n\tyarn build\n").unwrap();
+        fs::create_dir_all(repo.join("ios").join("App.xcodeproj")).unwrap();
+    }
+
+    /// #1395's test: four toolchains offering `build` and nothing named
+    /// is ONE build finding listing four offers, with each toolchain's
+    /// evidence. #1327's coverage rules still decide what is listed:
+    /// `cargo build` named covers cargo and make (a task runner takes any
+    /// manager), and the finding lists the other two.
+    #[test]
+    fn one_finding_per_uncovered_verb_lists_every_toolchains_offers() {
+        let (_t, repo, home) = fixture();
+        four_builds(&repo);
+        fs::write(repo.join("CLAUDE.md"), "Nothing.\n").unwrap();
+
+        let report = run_over(&repo, &home);
+        let found = toolchain_findings(&report);
+        let build: Vec<&&Finding> = found
+            .iter()
+            .filter(|f| f.finding.contains("`build`"))
+            .collect();
+        assert_eq!(build.len(), 1, "{found:#?}");
+        let f = build[0];
+        assert_eq!(f.severity, Severity::Advice);
+        assert_eq!(
+            f.finding,
+            "yarn (package.json + yarn.lock at root) offers `build`, cargo (Cargo.toml at root) \
+             offers `build`, make (Makefile at root) offers `build` and xcode (App.xcodeproj at \
+             ios) offers `build`; none of the 1 file read names `yarn build`, `cargo build`, \
+             `make build` or `xcodebuild build`"
+        );
+        for manifest in ["package.json", "Cargo.toml", "Makefile", "App.xcodeproj"] {
+            assert!(
+                f.evidence.iter().any(|e| matches!(
+                    &e.at,
+                    Locator::File { path, .. } if path.ends_with(manifest)
+                )),
+                "{manifest}: {:?}",
+                f.evidence
+            );
+        }
+        // One finding per verb in all: build, test, lint, fmt and run.
+        assert_eq!(found.len(), 5, "{found:#?}");
+
+        fs::write(repo.join("CLAUDE.md"), "Run `cargo build`.\n").unwrap();
+        let report = run_over(&repo, &home);
+        let found = toolchain_findings(&report);
+        let build: Vec<&&Finding> = found
+            .iter()
+            .filter(|f| f.finding.contains("`build`"))
+            .collect();
+        assert_eq!(build.len(), 1, "{found:#?}");
+        assert!(
+            build[0].finding.starts_with(
+                "yarn (package.json + yarn.lock at root) offers `build` and xcode \
+                 (App.xcodeproj at ios) offers `build`;"
+            ),
+            "{}",
+            build[0].finding
+        );
+    }
+
+    /// #1395: within one verb, a toolchain whose negative can be decided
+    /// and one whose cannot are two findings, Advice and Unknown, never
+    /// one: the npm test gap depends on a script file nobody could read,
+    /// the cargo one does not.
+    #[test]
+    fn decided_and_undecided_toolchains_are_not_merged() {
+        let (_t, repo, home) = fixture();
+        verify_app(&repo, "bash tools/missing.sh");
+        fs::write(repo.join("Cargo.toml"), "[package]\nname = \"octocat\"\n").unwrap();
+        let report = run_over(&repo, &home);
+        let test: Vec<&Finding> = toolchain_findings(&report)
+            .into_iter()
+            .filter(|f| f.finding.contains("`cargo test`") || f.finding.contains("`npm run test`"))
+            .collect();
+        assert_eq!(test.len(), 2, "{test:#?}");
+        let advice = test
+            .iter()
+            .find(|f| f.severity == Severity::Advice)
+            .unwrap();
+        let unknown = test
+            .iter()
+            .find(|f| f.severity == Severity::Unknown)
+            .unwrap();
+        assert!(
+            advice.finding.starts_with("cargo (") && !advice.finding.contains("npm"),
+            "{}",
+            advice.finding
+        );
+        assert!(
+            unknown.finding.starts_with("npm (") && !unknown.finding.contains("cargo"),
+            "{}",
+            unknown.finding
+        );
+    }
+
+    /// #1395: `cargo run` is offered only for a crate with a binary
+    /// target (`src/main.rs`, `src/bin/`, `[[bin]]`), and a finding's
+    /// label names only the crates that offer its verb.
+    #[test]
+    fn a_library_crate_offers_no_run_and_is_not_labelled_for_it() {
+        let (_t, repo, home) = fixture();
+        for (dir, manifest, file) in [
+            (
+                "app",
+                "[package]\nname = \"app\"\n",
+                Some(("src", "main.rs")),
+            ),
+            (
+                "tool",
+                "[package]\nname = \"tool\"\n",
+                Some(("src/bin", "x.rs")),
+            ),
+            (
+                "declared",
+                "[package]\nname = \"d\"\n[[bin]]\nname = \"d\"\n",
+                None,
+            ),
+            (
+                "lib",
+                "[package]\nname = \"lib\"\n",
+                Some(("src", "lib.rs")),
+            ),
+        ] {
+            let d = repo.join(dir);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("Cargo.toml"), manifest).unwrap();
+            if let Some((sub, name)) = file {
+                let at = sub.split('/').fold(d.clone(), |p, c| p.join(c));
+                fs::create_dir_all(&at).unwrap();
+                fs::write(at.join(name), "").unwrap();
+            }
+        }
+        fs::write(repo.join("CLAUDE.md"), "Nothing.\n").unwrap();
+
+        let d = detect(&repo);
+        let runs: Vec<String> = d
+            .toolchains
+            .iter()
+            .filter(|t| t.offers.iter().any(|o| o.verb == Verb::Run))
+            .map(|t| t.label.clone())
+            .collect();
+        assert_eq!(
+            runs,
+            vec![
+                "Cargo.toml at app",
+                "Cargo.toml at declared",
+                "Cargo.toml at tool"
+            ]
+        );
+
+        let report = run_over(&repo, &home);
+        let found = toolchain_findings(&report);
+        let run = found
+            .iter()
+            .find(|f| f.finding.contains("`cargo run`"))
+            .expect("the run gap");
+        assert!(
+            run.finding.starts_with(
+                "cargo (Cargo.toml at app, Cargo.toml at declared, Cargo.toml at tool) offers \
+                 `run`;"
+            ),
+            "{}",
+            run.finding
+        );
+        let build = found
+            .iter()
+            .find(|f| f.finding.contains("`cargo build`"))
+            .expect("the build gap");
+        assert!(
+            build.finding.contains("Cargo.toml at lib"),
+            "{}",
+            build.finding
+        );
+    }
+
     /// A Cargo workspace is one toolchain whose label counts its
     /// members, and `cargo run` is offered only where a binary exists.
     #[test]
@@ -3749,5 +4024,26 @@ mod tests {
                 found.iter().map(|f| &f.finding).collect::<Vec<_>>()
             );
         }
+        // Build and dev are each ONE finding listing every offer (#1395),
+        // and the step-up crate, a library, offers no `cargo run`.
+        let sentences: Vec<&String> = found.iter().map(|f| &f.finding).collect();
+        let build: Vec<&&String> = sentences
+            .iter()
+            .filter(|s| s.contains("`cargo build`"))
+            .collect();
+        assert_eq!(build.len(), 1, "{sentences:#?}");
+        let run: Vec<&&String> = sentences
+            .iter()
+            .filter(|s| s.contains("`make dev`"))
+            .collect();
+        assert_eq!(run.len(), 1, "{sentences:#?}");
+        assert!(
+            run[0].contains("`yarn dev`") && run[0].contains("`cargo run`"),
+            "{}",
+            run[0]
+        );
+        assert!(!run[0].contains("headstate-stepup"), "{}", run[0]);
+        // The verify skill is read (#1394).
+        assert!(run[0].contains(" skills names "), "{}", run[0]);
     }
 }
