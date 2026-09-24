@@ -61,8 +61,9 @@ export interface AdviceGroup {
   /// of it is that path.
   label: string;
   /// How many leading characters of `label` are the absolute path, or 0
-  /// when the label holds no path at all (every by-check group, and the
-  /// flat arrangement's single group).
+  /// when the label holds no path at all (every by-check group, the flat
+  /// arrangement's single group, and a directory group for the
+  /// repository itself, labelled [`REPOSITORY_ROOT`]).
   ///
   /// Here rather than left to the panel because the panel would have to
   /// re-derive it from the subject -- a second copy of the rule that a
@@ -102,6 +103,23 @@ export const CHECK_LABEL: Record<ClaudeMdAdviceCheck, string> = {
   shape: "content shape",
 };
 
+/// What a path that IS the repository is called, wherever a path is
+/// shown shortened against the repository (#1366).
+///
+/// Shortening strips the repository prefix, so the repository itself
+/// shortens to the empty string, and a directory's trailing slash then
+/// makes it a bare `/` -- which reads as the filesystem root. A name
+/// rather than the repository's basename, which a subdirectory of the
+/// same name would be indistinguishable from.
+export const REPOSITORY_ROOT = "repository root";
+
+/// Whether `path` is the repository `repo` itself, allowing a trailing
+/// slash on either. A prefix is not enough: `repo-other` is not `repo`.
+export function isRepositoryRoot(path: string, repo: string): boolean {
+  const trim = (p: string) => p.replace(/\/+$/, "");
+  return repo !== "" && trim(path) === trim(repo);
+}
+
 /// The group a subject belongs to under the by-file grouping.
 ///
 /// Every `Subject` kind gets an arm and a label of its own. The switch is
@@ -117,13 +135,18 @@ export const CHECK_LABEL: Record<ClaudeMdAdviceCheck, string> = {
 /// - `directory` -- "a finding about a file that does not exist yet", so
 ///   the label says the directory, with a trailing `/`, and carries NO
 ///   file: offering to open a file that is not there is a dead click.
+///   The repository itself is labelled [`REPOSITORY_ROOT`] with no path
+///   to shorten, never `/` (#1366).
 /// - `skill` -- a `SKILL.md`, named by the name it is INVOKED with as
 ///   well as its path. Dropping these for not being CLAUDE.md would lose
 ///   the skills producer's whole output from the file view.
 ///
 /// Keyed by kind AND path, so a directory `docs/` and a CLAUDE.md that
 /// happens to live at `docs/` could never collide into one group.
-function fileGroupOf(subject: ClaudeMdAdviceSubject): Omit<AdviceGroup, "findings" | "unknownChecks"> {
+function fileGroupOf(
+  subject: ClaudeMdAdviceSubject,
+  repo: string,
+): Omit<AdviceGroup, "findings" | "unknownChecks"> {
   const pathLength = subject.path.length;
   switch (subject.kind) {
     case "claudeMd":
@@ -138,6 +161,9 @@ function fileGroupOf(subject: ClaudeMdAdviceSubject): Omit<AdviceGroup, "finding
       // file is missing from rather than a file that was read. `file` is
       // null because there is nothing to open -- a button here would be
       // a dead click on a path that does not exist.
+      if (isRepositoryRoot(subject.path, repo)) {
+        return { key: `directory:${subject.path}`, label: REPOSITORY_ROOT, pathLength: 0, file: null };
+      }
       return {
         key: `directory:${subject.path}`,
         label: `${subject.path}/`,
@@ -228,7 +254,7 @@ function groupAdvice(
     const shell =
       grouping === "check"
         ? { key: `check:${f.check}`, label: CHECK_LABEL[f.check], pathLength: 0, file: null }
-        : fileGroupOf(f.subject);
+        : fileGroupOf(f.subject, report.repo);
     let group = groups.get(shell.key);
     if (group === undefined) {
       group = { ...shell, findings: [], unknownChecks: [] };
