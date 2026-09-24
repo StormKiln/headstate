@@ -83,9 +83,19 @@
 //! Before a finding is emitted its dedup key is tested verbatim, with
 //! whitespace collapsed and case kept, against every CLAUDE.md from the
 //! repository root to the attributed directory, their resolved imports,
-//! the global and local scopes the effective scan carries, and each of
+//! the global and local scopes the effective scan carries, each of
 //! the repository's `.claude/rules` a session in that directory would
-//! load (`claudemd::rules`: unconditional, or `paths:` reaching it). A
+//! load (`claudemd::rules`: unconditional, or `paths:` reaching it), and
+//! every skill: `SKILL.md` at any depth under the repository's
+//! `.claude/skills` and the user's `~/.claude/skills` (#1370). A path a
+//! skill runs is the skill doing its job, and a hit names it: "already
+//! written in skill `<name>` (`<path>`)", the name being the directory
+//! holding the file. Plugin skills are out of scope; they are not the
+//! repository owner's to change. The report cache sees these files
+//! through the definitions inventory (one level under each `skills/`)
+//! and, for the repository's, through git's HEAD and status; a user
+//! skill nested deeper than one level is not a cache input, so editing
+//! one alone does not invalidate a cached report. A
 //! file that does not exist holds nothing. A file that exists and could
 //! not be read, or a rule `claudemd::rules` could not read (whose
 //! `paths:` are unknown too), is not "not written" (#1351): when no
@@ -1657,7 +1667,8 @@ fn placement(dirs: &[&Path], candidates: &[PathBuf], repo: &Path) -> PathBuf {
 /// What the "already written" test found for one key.
 #[derive(Debug, PartialEq, Eq)]
 enum Written {
-    /// This file holds the key verbatim.
+    /// This file holds the key verbatim, as the sentence names it:
+    /// `` `<path>` ``, or `` skill `<name>` (`<path>`) `` for a skill.
     In(String),
     /// No file read holds it. Settled: every file in the corpus was read.
     No,
@@ -1674,11 +1685,13 @@ enum Written {
 /// other read error is not a miss (#1351): if no readable file holds the
 /// key, the answer is [`Written::Unchecked`] naming each such file. A
 /// rule `claudemd::rules` could not read is one of those whatever its
-/// `paths:`, which were not read either.
+/// `paths:`, which were not read either. So is a skill, and a skills
+/// directory that could not be listed (#1370).
 fn written_in(
     key: &str,
     dir: &Path,
     cx: &Context,
+    skills: &Skills,
     cache: &mut HashMap<String, Result<String, String>>,
 ) -> Written {
     let needle = collapse(key);
@@ -1702,6 +1715,13 @@ fn written_in(
         queue.push(path);
         collect_imports(imports, &mut queue);
     }
+    // #1370: a skill is where a procedure is written down. Its name, for
+    // the sentence, keyed by path.
+    let mut skill_names: HashMap<&str, &str> = HashMap::new();
+    for (path, name) in &skills.files {
+        queue.push(path.clone());
+        skill_names.insert(path.as_str(), name.as_str());
+    }
     // #1340: the repository's rules a session in `dir` would load.
     let rel = dir.strip_prefix(cx.repo).unwrap_or(dir);
     let rel = rel.to_string_lossy().replace('\\', "/");
@@ -1724,6 +1744,7 @@ fn written_in(
             None => (u.clone(), "could not be read".to_string()),
         })
         .collect();
+    unread.extend(skills.unreadable.iter().cloned());
     for path in queue {
         let content =
             cache
@@ -1734,7 +1755,12 @@ fn written_in(
                     Err(e) => Err(e.to_string()),
                 });
         match content {
-            Ok(c) if c.contains(&needle) => return Written::In(path),
+            Ok(c) if c.contains(&needle) => {
+                return Written::In(match skill_names.get(path.as_str()) {
+                    Some(name) => format!("skill `{name}` (`{path}`)"),
+                    None => format!("`{path}`"),
+                })
+            }
             Ok(_) => {}
             Err(e) => {
                 if !unread.iter().any(|(p, _)| *p == path) {
@@ -1747,6 +1773,71 @@ fn written_in(
         Written::No
     } else {
         Written::Unchecked(unread)
+    }
+}
+
+/// The skills a session under the repository can load, for the "already
+/// written" corpus (#1370): every `SKILL.md` under the repository's
+/// `.claude/skills` and the user's `~/.claude/skills`, at any depth.
+/// Plugin skills are out of scope: they are not the repository owner's
+/// to change. Walked once per pass.
+struct Skills {
+    /// `(path, name)`, the name being the directory holding the file.
+    files: Vec<(String, String)>,
+    /// `(path, io error)` for a skills directory that exists and could
+    /// not be listed: it might hold the key (#1351).
+    unreadable: Vec<(String, String)>,
+}
+
+/// How deep a skills walk goes, so a symlink cycle ends.
+const SKILL_DEPTH: usize = 8;
+
+fn skills_of(repo: &Path, home: Option<&Path>) -> Skills {
+    let mut out = Skills {
+        files: Vec::new(),
+        unreadable: Vec::new(),
+    };
+    let roots = std::iter::once(repo).chain(home);
+    for root in roots {
+        walk_skills(&root.join(".claude").join("skills"), 0, &mut out);
+    }
+    out
+}
+
+fn walk_skills(dir: &Path, depth: usize, out: &mut Skills) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        // Absent holds nothing.
+        Err(e) if is_gone(&e) => return,
+        Err(e) => {
+            out.unreadable
+                .push((dir.to_string_lossy().into_owned(), e.to_string()));
+            return;
+        }
+    };
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(e) => paths.push(e.path()),
+            Err(e) => {
+                out.unreadable
+                    .push((dir.to_string_lossy().into_owned(), e.to_string()));
+            }
+        }
+    }
+    paths.sort();
+    for path in paths {
+        if path.is_dir() {
+            if depth < SKILL_DEPTH {
+                walk_skills(&path, depth + 1, out);
+            }
+        } else if path.file_name() == Some(std::ffi::OsStr::new("SKILL.md")) {
+            let name = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            out.files.push((path.to_string_lossy().into_owned(), name));
+        }
     }
 }
 
@@ -1810,6 +1901,7 @@ fn emit(
 ) -> Vec<Finding> {
     let candidates = claude_dirs(cx);
     let mut cache: HashMap<String, Result<String, String>> = HashMap::new();
+    let skills = skills_of(cx.repo, cx.home);
     let mut out = Vec::new();
     let at_least = if short { "at least " } else { "" };
     let plural = |n: usize| if n == 1 { "" } else { "s" };
@@ -2004,9 +2096,10 @@ fn emit(
             // make a recommendation it never made possibly wrong.
             let observation = is_observation(signal);
             let mut unchecked = Vec::new();
-            let (sentence, severity) = match written_in(&dedup_key, &dir, cx, &mut cache) {
+            let written = written_in(&dedup_key, &dir, cx, &skills, &mut cache);
+            let (sentence, severity) = match written {
                 Written::In(file) => (
-                    format!("`{dedup_key}` is already written in `{file}` ({sentence})"),
+                    format!("`{dedup_key}` is already written in {file} ({sentence})"),
                     Severity::Note,
                 ),
                 Written::No | Written::Unchecked(_) if observation => (sentence, Severity::Note),
@@ -2593,6 +2686,135 @@ mod tests {
         let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
         fs::set_permissions(&shared, fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(corrected(&out)[0].severity, Severity::Note, "{out:#?}");
+    }
+
+    /// A context carrying a home directory, for the user scope.
+    fn context_home<'a>(
+        repo: &'a Path,
+        home: &'a Path,
+        scan: &'a EffectiveScan,
+        conn: &'a Connection,
+    ) -> Context<'a> {
+        Context {
+            home: Some(home),
+            ..context(repo, scan, conn)
+        }
+    }
+
+    /// #1370: a skill is where a procedure is written down, so a key a
+    /// skill holds is already written. The repository's
+    /// `.claude/skills/**/SKILL.md` and the user's
+    /// `~/.claude/skills/**/SKILL.md` count, nested ones too, and the hit
+    /// names the skill. Plugin skills do not: they are out of scope.
+    #[test]
+    fn dedup_looks_through_repository_and_user_skills() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path().join("repo");
+        let home = t.path().join("home");
+        fs::create_dir_all(&repo).unwrap();
+        write(&repo, "CLAUDE.md", "# rules\n");
+        let skill_dir = repo.join(".claude").join("skills").join("lint");
+        fs::create_dir_all(&skill_dir).unwrap();
+        let skill = write(
+            &skill_dir,
+            "SKILL.md",
+            "---\nname: lint\n---\nRun make lint.\n",
+        );
+        let cwd = repo.to_string_lossy().into_owned();
+        let conn = db();
+        for n in [1, 2] {
+            let p = write(&repo, &format!("s{n}.jsonl"), &corrected_pair(&cwd, n));
+            insert_session(&conn, &format!("s{n}"), &cwd, Some(&p), None);
+        }
+        let scan = scan_effective_opt(&repo, Some(&home));
+        let cx = context_home(&repo, &home, &scan, &conn);
+        let out = analyse(&conn, &cx, SESSIONS_PER_PASS).unwrap();
+        let f = corrected(&out)[0];
+        assert_eq!(
+            f.finding,
+            format!(
+                "`make lint` is already written in skill `lint` (`{}`) (`yarn lint` failed and \
+                 `make lint` followed it in 2 of 2 analysed sessions under `{}`)",
+                skill.display(),
+                repo.display()
+            )
+        );
+        assert_eq!(f.severity, Severity::Note);
+
+        // Only the user's skill holds it now, one directory deeper.
+        fs::remove_dir_all(repo.join(".claude")).unwrap();
+        let nested = home
+            .join(".claude")
+            .join("skills")
+            .join("tools")
+            .join("tidy");
+        fs::create_dir_all(&nested).unwrap();
+        let user_skill = write(&nested, "SKILL.md", "Always make lint first.\n");
+        // A plugin's skill holding it too is not consulted.
+        let plugin = home
+            .join(".claude")
+            .join("plugins")
+            .join("p")
+            .join("skills")
+            .join("x");
+        fs::create_dir_all(&plugin).unwrap();
+        write(&plugin, "SKILL.md", "make lint\n");
+        let out = analyse(&conn, &cx, SESSIONS_PER_PASS).unwrap();
+        let f = &corrected(&out)[0].finding;
+        assert!(
+            f.starts_with(&format!(
+                "`make lint` is already written in skill `tidy` (`{}`)",
+                user_skill.display()
+            )),
+            "{f}"
+        );
+
+        fs::remove_dir_all(home.join(".claude").join("skills")).unwrap();
+        let out = analyse(&conn, &cx, SESSIONS_PER_PASS).unwrap();
+        let f = corrected(&out)[0];
+        assert!(!f.finding.contains("already written"), "{}", f.finding);
+        assert_eq!(f.severity, Severity::Advice, "plugins are out of scope");
+    }
+
+    /// #1370 with #1351: a skill that could not be read might hold the
+    /// rule, so the finding is Unknown, never Advice, and names it.
+    #[test]
+    #[cfg(unix)]
+    fn an_unreadable_skill_makes_already_written_unknown_not_advice() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path();
+        write(repo, "CLAUDE.md", "# rules\n");
+        let skill_dir = repo.join(".claude").join("skills").join("lint");
+        fs::create_dir_all(&skill_dir).unwrap();
+        let skill = write(&skill_dir, "SKILL.md", "make lint\n");
+        let cwd = repo.to_string_lossy().into_owned();
+        let conn = db();
+        for n in [1, 2] {
+            let p = write(repo, &format!("s{n}.jsonl"), &corrected_pair(&cwd, n));
+            insert_session(&conn, &format!("s{n}"), &cwd, Some(&p), None);
+        }
+        let scan = scan_effective_opt(repo, None);
+        fs::set_permissions(&skill, fs::Permissions::from_mode(0o000)).unwrap();
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS);
+        fs::set_permissions(&skill, fs::Permissions::from_mode(0o644)).unwrap();
+        let out = out.unwrap();
+
+        let f = corrected(&out)[0];
+        if f.severity == Severity::Note {
+            eprintln!("skipped: mode 0o000 did not block the read (running as root?)");
+            return;
+        }
+        assert_eq!(f.severity, Severity::Unknown, "{}", f.finding);
+        assert!(
+            f.evidence.iter().any(|e| e.measured
+                == format!(
+                    "could not check whether it is already written: `{}` (Permission denied (os error 13))",
+                    skill.display()
+                )),
+            "{:?}",
+            f.evidence
+        );
     }
 
     /// #1351: a `.claude/rules` rule that could not be read might be the
