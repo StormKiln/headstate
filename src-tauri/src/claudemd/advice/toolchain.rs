@@ -117,9 +117,17 @@
 //! a && cargo clippy` is cargo's lint and `yarn vitest run` yarn's test. A
 //! makefile variable assigned a literal (`CARGO := cargo`) is read; a
 //! command still starting with any other variable reference is not a
-//! literal and is skipped. Every verb a command maps to is credited, not
-//! only the target's own: on this repository `make lint` runs `lint-ui`,
-//! whose `yarn tsc -b` is the tool map's build. A recipe reaching a target
+//! literal and is skipped. A target named for a verb credits that verb
+//! and no other, to the toolchain each command runs: a command counts when
+//! it maps to that verb or to none (`yarn knip` under `lint` is yarn's
+//! lint), and a typecheck (`tsc`) under a lint target is lint. A command
+//! mapping only to another verb counts for nothing: on this repository
+//! `make lint` runs `lint-ui`, whose `yarn tsc -b` the tool map calls
+//! build, and a lint target does not document how to build the app, so
+//! crediting it would hide the build gap (a false negative, the defect
+//! #1393 fixed turned around). A target named for no verb (`verify`,
+//! `check`) credits whatever each command maps to: `tsc -b && vitest`
+//! there is build and test. A recipe reaching a target
 //! the file does not define is reaching a file, unless the makefile is
 //! open-ended (`scripts::makefile_is_open_ended`: an `include` or a `%`
 //! pattern rule), when that target might be defined where the parser
@@ -150,7 +158,8 @@
 //! named target's recipe runs (#1393) is credited to the manager that
 //! runs it in the recipe, not to `make`: `make lint` reaching `cargo
 //! clippy` covers cargo's lint, as `cargo clippy` named directly would,
-//! and make's own lint by name as before.
+//! and make's own lint by name as before. Which verb it credits is the
+//! target's own when its name has one (above).
 //!
 //! # One finding per verb
 //!
@@ -2101,6 +2110,13 @@ fn targets_named(text: &str) -> Vec<(String, String)> {
 /// skipped. A command that still starts with a variable reference is
 /// not a literal and is skipped.
 ///
+/// A target named for a verb (`lint`, `test-rust`) credits that verb and
+/// no other: a command counts when it maps to that verb, or to no verb at
+/// all (credited to its first token), and a typecheck (`tsc`) counts under
+/// a lint target. A command mapping only to another verb (`vite build`
+/// under `lint`) counts for nothing. A target named for no verb (`verify`,
+/// `check`) credits whatever each command maps to.
+///
 /// A target the file does not define is a file prerequisite, unless the
 /// makefile is open-ended (`open`): then it might be defined where the
 /// parser cannot see, and it is Unknown, never nothing.
@@ -2118,6 +2134,8 @@ fn recipe_runs(
         manifest: &'a Path,
         open: Option<&'a str>,
         scripts: &'a Scripts<'a>,
+        /// The named target's own verb, when its name maps to one.
+        verb: Option<Verb>,
         seen: BTreeSet<String>,
         runs: Vec<(String, Verb)>,
         unknown: Vec<Unfollowed>,
@@ -2164,7 +2182,22 @@ fn recipe_runs(
                     }
                 }
                 let command = tokens.join(" ");
-                for run in commands_with(&command, w.scripts) {
+                let mapped = commands_with(&command, w.scripts);
+                let credited: Vec<(String, Verb)> = match w.verb {
+                    None => mapped,
+                    Some(v) if mapped.iter().any(|(_, m)| *m == v) => {
+                        mapped.into_iter().filter(|(_, m)| *m == v).collect()
+                    }
+                    Some(v) if mapped.is_empty() || (v == Verb::Lint && is_typecheck(&tokens)) => {
+                        let first = match *head {
+                            "./gradlew" | "gradlew" => "gradle",
+                            other => other,
+                        };
+                        vec![(first.to_string(), v)]
+                    }
+                    Some(_) => Vec::new(),
+                };
+                for run in credited {
                     if !w.runs.contains(&run) {
                         w.runs.push(run);
                     }
@@ -2179,12 +2212,26 @@ fn recipe_runs(
         manifest,
         open,
         scripts,
+        verb: verb_by_name(name),
         seen: BTreeSet::new(),
         runs: Vec::new(),
         unknown: Vec::new(),
     };
     visit(&mut w, name);
     (w.runs, w.unknown)
+}
+
+/// Whether a command runs `tsc`, directly, through a launcher, or as
+/// `yarn|pnpm|bun [run] tsc`: a typecheck, which the tool map calls build
+/// and a lint target runs as lint.
+fn is_typecheck(tokens: &[&str]) -> bool {
+    let Some(first) = tokens.first() else {
+        return false;
+    };
+    let (tool, args) = unwrap_launcher(first, &tokens[1..]);
+    tool == "tsc"
+        || (matches!(tool, "yarn" | "pnpm" | "bun")
+            && matches!(args, ["tsc", ..] | ["run", "tsc", ..]))
 }
 
 /// The package.json scripts one span or fenced line runs, with the
@@ -3692,6 +3739,61 @@ mod tests {
         assert!(d.target_unknown.is_empty(), "{:?}", d.target_unknown);
     }
 
+    /// A target named for a verb credits only that verb: `make lint`
+    /// running `tsc -b` covers yarn's lint (a typecheck in a lint target
+    /// is lint) and not its build, and `vite build` there counts for
+    /// nothing. A target named for no verb falls back to each command's
+    /// own verb: `make verify` running `tsc -b && vitest` covers build and
+    /// test.
+    #[test]
+    fn a_verb_named_target_credits_only_its_own_verb() {
+        let (_t, repo, home) = fixture();
+        fs::write(
+            repo.join("package.json"),
+            r#"{"scripts":{"build":"tsc -b","test":"vitest","lint":"eslint ."}}"#,
+        )
+        .unwrap();
+        fs::write(repo.join("yarn.lock"), "").unwrap();
+        fs::write(
+            repo.join("Makefile"),
+            "lint:\n\tyarn tsc -b && npx vite build\nverify:\n\tnpx tsc -b && npx vitest\n",
+        )
+        .unwrap();
+        let yarn_gaps = |claude: &str| -> Vec<String> {
+            fs::write(repo.join("CLAUDE.md"), claude).unwrap();
+            let found: Vec<String> = toolchain_findings(&run_over(&repo, &home))
+                .iter()
+                .map(|f| f.finding.clone())
+                .collect();
+            ["`yarn build`", "`yarn test`", "`yarn lint`"]
+                .into_iter()
+                .filter(|c| found.iter().any(|s| s.contains(c)))
+                .map(str::to_string)
+                .collect()
+        };
+
+        assert_eq!(
+            yarn_gaps("Run `make lint`.\n"),
+            vec!["`yarn build`", "`yarn test`"]
+        );
+        assert_eq!(yarn_gaps("Run `make verify`.\n"), vec!["`yarn lint`"]);
+
+        let d = detect(&repo);
+        let runs = |t: &str| {
+            d.target_runs
+                .get(&("make".to_string(), t.to_string()))
+                .cloned()
+        };
+        assert_eq!(runs("lint"), Some(vec![("yarn".to_string(), Verb::Lint)]));
+        assert_eq!(
+            runs("verify"),
+            Some(vec![
+                ("npx".to_string(), Verb::Build),
+                ("npx".to_string(), Verb::Test)
+            ])
+        );
+    }
+
     /// A prerequisite the parser cannot see is a file when the makefile
     /// is closed, and Unknown when an `include` could define it: the
     /// negative it would decide becomes Unknown, never Advice.
@@ -4116,6 +4218,13 @@ mod tests {
             .filter(|s| s.contains("`cargo build`"))
             .collect();
         assert_eq!(build.len(), 1, "{sentences:#?}");
+        // `make lint` runs `yarn tsc -b`, a typecheck, which a lint target
+        // does not credit as build: the build gap stands.
+        assert!(
+            build[0].contains("`yarn build`") && build[0].contains("`make build`"),
+            "{}",
+            build[0]
+        );
         let run: Vec<&&String> = sentences
             .iter()
             .filter(|s| s.contains("`make dev`"))
