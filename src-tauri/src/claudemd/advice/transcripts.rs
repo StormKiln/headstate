@@ -98,14 +98,24 @@
 //!
 //! The report model has no per-check coverage struct beyond
 //! [`super::CheckRun`], so what the spec calls `Coverage` travels here as
-//! findings: one [`Severity::Unknown`] per transcript that could not be
-//! read (`<path>: <why>`), one [`Severity::Note`] stating "analysed N
-//! of M sessions under `<repo>`; K truncated at 8 MB" whenever the pass
-//! is short or a read was cut, and one stating "no Claude Code sessions
-//! were recorded under `<repo>`" when there are none -- never an empty
-//! list, because no sessions is not "nothing went wrong". While the pass
-//! is short, every count says "at least". These and the S6 census are
-//! Notes: they state what was measured and recommend nothing (#1339).
+//! findings: one [`Severity::Note`] stating "analysed N of M sessions
+//! under `<repo>`; K truncated at 8 MB" whenever the pass is short or a
+//! read was cut, and one stating "no Claude Code sessions were recorded
+//! under `<repo>`" when there are none -- never an empty list, because
+//! no sessions is not "nothing went wrong". While the pass is short,
+//! every count says "at least". These and the S6 census are Notes: they
+//! state what was measured and recommend nothing (#1339).
+//!
+//! A session whose transcript is not on disk -- no path recorded, or a
+//! path that is `NotFound` because its worktree's project directory was
+//! deleted after the merge -- is gone, and says nothing about any
+//! CLAUDE.md (#1367). It is counted in that coverage Note ("K had no
+//! transcript on disk and were skipped"), with a sample of the sessions
+//! as its evidence. A transcript that exists and could not be read
+//! (permission, I/O) is different: it might hold a signal. Those are ONE
+//! [`Severity::Unknown`] listing the sessions and their io errors, never
+//! one row per session, whose brief says what to make readable. Both
+//! make the pass short, so the "at least" stays.
 //!
 //! # Privacy
 //!
@@ -344,13 +354,18 @@ fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, 
         }
     }
 
+    // A transcript that is not on disk is a session that is gone, not a
+    // question about a CLAUDE.md (#1367): `missing`, counted in the
+    // coverage Note. Any other failure to read one is `unreadable`, and
+    // the pass reports those as ONE grouped Unknown.
     let mut unreadable: Vec<(String, String)> = Vec::new();
+    let mut missing: Vec<(String, String)> = Vec::new();
     let mut analysed: HashSet<String> = HashSet::new();
     let mut truncated = 0usize;
     let mut todo: Vec<(&SessionRow, i64, i64)> = Vec::new();
     for s in &sessions {
         let Some(path) = &s.transcript_path else {
-            unreadable.push((
+            missing.push((
                 s.session_id.clone(),
                 "no transcript path is recorded for this session".into(),
             ));
@@ -366,6 +381,10 @@ fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, 
         });
         let (size, mtime) = match meta {
             Ok(v) => v,
+            Err(e) if is_gone(&e) => {
+                missing.push((s.session_id.clone(), format!("{path}: no longer exists")));
+                continue;
+            }
             Err(e) => {
                 unreadable.push((
                     s.session_id.clone(),
@@ -391,6 +410,11 @@ fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, 
         let path = s.transcript_path.as_deref().unwrap_or("");
         let (body, cut) = match read_bounded(Path::new(path), BUDGET_BYTES) {
             Ok(v) => v,
+            // Deleted between the stat and the open: gone, not unreadable.
+            Err(_) if resolves_to_nothing(Path::new(path)) => {
+                missing.push((s.session_id.clone(), format!("{path}: no longer exists")));
+                continue;
+            }
             Err(e) => {
                 unreadable.push((s.session_id.clone(), e));
                 continue;
@@ -420,7 +444,8 @@ fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, 
     let tasks = load_tasks(conn, &analysed)?;
     let denials = hook_denials(conn, &sessions)?;
 
-    let short = analysed.len() < sessions.len() || !unreadable.is_empty();
+    // Skipped sessions make the pass short too: every "at least" stays.
+    let short = analysed.len() < sessions.len() || !unreadable.is_empty() || !missing.is_empty();
     let mut out = emit(&stored, &tasks, &denials, &sessions, &analysed, cx, short);
     out.extend(checkout_unknown);
 
@@ -433,49 +458,94 @@ fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, 
             truncated,
             BUDGET_BYTES / (1024 * 1024)
         );
+        if !missing.is_empty() {
+            sentence.push_str(&format!(
+                "; {} had no transcript on disk and {} skipped",
+                missing.len(),
+                if missing.len() == 1 { "was" } else { "were" }
+            ));
+        }
         if remaining > 0 {
             sentence.push_str(&format!(
                 "; {remaining} not yet read (at most {cap} are read per open)"
             ));
         }
+        let mut evidence = vec![Evidence {
+            at: Locator::File {
+                path: repo.to_string_lossy().into_owned(),
+                line: None,
+            },
+            measured: format!(
+                "{} sessions analysed, {} unreadable, {} without a transcript on disk, {} not \
+                 yet read, {} read only to {} MB",
+                analysed.len(),
+                unreadable.len(),
+                missing.len(),
+                remaining,
+                truncated,
+                BUDGET_BYTES / (1024 * 1024)
+            ),
+        }];
+        // A sample behind the skipped count; the sentence carries it all.
+        evidence.extend(session_rows(&missing));
         out.push(Finding::new(
             Check::Transcripts,
             Severity::Note,
             root_subject.clone(),
-            vec![Evidence {
-                at: Locator::File {
-                    path: repo.to_string_lossy().into_owned(),
-                    line: None,
-                },
-                measured: format!(
-                    "{} sessions analysed, {} unreadable, {} not yet read, {} read only to {} MB",
-                    analysed.len(),
-                    unreadable.len(),
-                    remaining,
-                    truncated,
-                    BUDGET_BYTES / (1024 * 1024)
-                ),
-            }],
+            evidence,
             sentence,
         ));
     }
 
-    for (session_id, why) in unreadable {
+    // Transcripts that exist and could not be read: ONE Unknown listing
+    // them (#1367), never one row per session.
+    if !unreadable.is_empty() {
+        let k = unreadable.len();
+        let sentence = if k == 1 {
+            format!(
+                "1 transcript under `{}` could not be read; the counts here are floors without it",
+                repo.display()
+            )
+        } else {
+            format!(
+                "{k} transcripts under `{}` could not be read; the counts here are floors \
+                 without them",
+                repo.display()
+            )
+        };
         out.push(Finding::new(
             Check::Transcripts,
             Severity::Unknown,
             root_subject.clone(),
-            vec![Evidence {
-                at: Locator::Session {
-                    session_id: session_id.clone(),
-                    record: None,
-                },
-                measured: why.clone(),
-            }],
-            format!("session `{session_id}` could not be read: {why}"),
+            session_rows(&unreadable),
+            sentence,
         ));
     }
     Ok(out)
+}
+
+/// One evidence row per `(session, why)`: the first [`MAX_EVIDENCE`],
+/// since the sentence beside them carries the full count.
+fn session_rows(list: &[(String, String)]) -> Vec<Evidence> {
+    list.iter()
+        .take(MAX_EVIDENCE)
+        .map(|(session_id, why)| Evidence {
+            at: Locator::Session {
+                session_id: session_id.clone(),
+                record: None,
+            },
+            measured: why.clone(),
+        })
+        .collect()
+}
+
+/// Whether an io error establishes that the path names nothing. Any
+/// other error is "could not look", which is not "gone".
+fn is_gone(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
 }
 
 /// Directories under `repo` with at least [`MIN_EDITS_PER_DIR`] Edit or
@@ -1692,10 +1762,7 @@ fn named_path(signal: &str, key: &str, tool: &str, repo: &Path) -> Option<PathBu
 /// Whether `path` is established to name nothing. A stat refused for any
 /// other reason is not "nothing there": it could not be looked at.
 fn resolves_to_nothing(path: &Path) -> bool {
-    matches!(
-        std::fs::metadata(path),
-        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory)
-    )
+    matches!(std::fs::metadata(path), Err(e) if is_gone(&e))
 }
 
 /// Group the stored rows, apply the thresholds, place and dedup each
@@ -2543,21 +2610,21 @@ mod tests {
         }
         assert_eq!(unknown.len(), 1, "{out:#?}");
         assert!(
-            unknown[0]
-                .finding
-                .starts_with("session `s4` could not be read: "),
+            unknown[0].finding.starts_with("1 transcript under `"),
             "{}",
             unknown[0].finding
         );
         assert!(
-            unknown[0].finding.contains("s4.jsonl"),
+            unknown[0].evidence[0].measured.contains("s4.jsonl"),
             "{}",
-            unknown[0].finding
+            unknown[0].evidence[0].measured
         );
         assert!(
-            unknown[0].finding.contains("Permission denied"),
+            unknown[0].evidence[0]
+                .measured
+                .contains("Permission denied"),
             "{}",
-            unknown[0].finding
+            unknown[0].evidence[0].measured
         );
         assert_eq!(
             unknown[0].evidence[0].at,
@@ -2583,6 +2650,114 @@ mod tests {
             coverage.finding.ends_with("; 0 truncated at 8 MB"),
             "{}",
             coverage.finding
+        );
+    }
+
+    /// #1367: a transcript that is gone -- deleted with its worktree's
+    /// project directory, or never recorded -- is a session that no
+    /// longer exists, not a question about a CLAUDE.md. A hundred of them
+    /// are counted in ONE coverage Note, and two that exist but cannot be
+    /// read are ONE Unknown listing both: two rows, not a hundred and two.
+    #[test]
+    #[cfg(unix)]
+    fn missing_transcripts_are_counted_and_unreadable_ones_grouped() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path();
+        write(repo, "CLAUDE.md", "# rules\n");
+        let cwd = repo.to_string_lossy().into_owned();
+        let conn = db();
+        for n in 0..100 {
+            // Half recorded a path that has since been deleted, half
+            // recorded none.
+            let gone = repo.join("deleted").join(format!("g{n}.jsonl"));
+            let path = (n % 2 == 0).then_some(gone.as_path());
+            insert_session(&conn, &format!("g{n:03}"), &cwd, path, None);
+        }
+        let mut walled = Vec::new();
+        for n in [1, 2] {
+            let p = write(repo, &format!("w{n}.jsonl"), &corrected_pair(&cwd, n));
+            insert_session(&conn, &format!("w{n}"), &cwd, Some(&p), None);
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o000)).unwrap();
+            walled.push(p);
+        }
+        let scan = scan_effective_opt(repo, None);
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS);
+        for p in &walled {
+            fs::set_permissions(p, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let out = out.unwrap();
+
+        let unknown: Vec<&Finding> = out
+            .iter()
+            .filter(|f| f.severity == Severity::Unknown)
+            .collect();
+        if unknown.is_empty() {
+            eprintln!("skipped: mode 0o000 did not block the read (running as root?)");
+            return;
+        }
+        assert_eq!(unknown.len(), 1, "{out:#?}");
+        assert_eq!(
+            unknown[0].finding,
+            format!(
+                "2 transcripts under `{}` could not be read; the counts here are floors without them",
+                repo.display()
+            )
+        );
+        let listed: Vec<&Locator> = unknown[0].evidence.iter().map(|e| &e.at).collect();
+        assert_eq!(
+            listed,
+            [
+                &Locator::Session {
+                    session_id: "w1".into(),
+                    record: None
+                },
+                &Locator::Session {
+                    session_id: "w2".into(),
+                    record: None
+                }
+            ]
+        );
+        assert!(
+            unknown[0].evidence[0]
+                .measured
+                .contains("Permission denied"),
+            "{}",
+            unknown[0].evidence[0].measured
+        );
+        // Its brief says what to make readable, not what to edit.
+        assert!(
+            unknown[0]
+                .brief
+                .contains("Make the transcripts named in the evidence readable"),
+            "{}",
+            unknown[0].brief
+        );
+
+        let coverage: Vec<&Finding> = out
+            .iter()
+            .filter(|f| f.finding.starts_with("analysed "))
+            .collect();
+        assert_eq!(coverage.len(), 1, "{out:#?}");
+        assert_eq!(coverage[0].severity, Severity::Note);
+        assert_eq!(
+            coverage[0].finding,
+            format!(
+                "analysed 0 of 102 sessions under `{}`; 0 truncated at 8 MB; 100 had no \
+                 transcript on disk and were skipped",
+                repo.display()
+            )
+        );
+        // A sample behind the count, after the counts row.
+        assert_eq!(coverage[0].evidence.len(), 1 + MAX_EVIDENCE);
+        assert!(coverage[0].evidence[1..].iter().all(|e| {
+            e.measured == "no transcript path is recorded for this session"
+                || e.measured.ends_with(": no longer exists")
+        }));
+        // Nothing mentions a session one row at a time.
+        assert!(
+            !out.iter().any(|f| f.finding.starts_with("session `")),
+            "{out:#?}"
         );
     }
 
@@ -3021,13 +3196,29 @@ mod tests {
                 .any(|f| f.finding.contains("a `Bash` call was denied in")),
             "{out:#?}"
         );
-        // s4 has no transcript: Unknown, with the reason.
+        // s4 has no transcript: a session that is gone, counted in the
+        // coverage Note with its reason, never an Unknown (#1367).
         assert!(
-            out.iter().any(|f| f.severity == Severity::Unknown
-                && f.finding.contains("s4")
-                && f.finding.contains("no transcript path")),
+            !out.iter().any(|f| f.severity == Severity::Unknown),
             "{out:#?}"
         );
+        let coverage = out
+            .iter()
+            .find(|f| f.finding.starts_with("analysed 3 of 4 sessions"))
+            .unwrap_or_else(|| panic!("the coverage Note: {out:#?}"));
+        assert!(
+            coverage
+                .finding
+                .contains("; 1 had no transcript on disk and was skipped"),
+            "{}",
+            coverage.finding
+        );
+        assert!(coverage.evidence.iter().any(|e| e.at
+            == Locator::Session {
+                session_id: "s4".into(),
+                record: None
+            }
+            && e.measured == "no transcript path is recorded for this session"));
     }
 
     /// S4 and S5: identical patterns and early reads are searches; an

@@ -116,8 +116,8 @@ fn suggestion(f: &Finding) -> String {
                  duplicate it."
                     .to_string()
             }
-            (Severity::Unknown, _) => "No edit. Make the transcript named in the evidence \
-                 readable, or leave it: the findings above stand without it, as floors."
+            (Severity::Unknown, _) => "No edit. Make the transcripts named in the evidence \
+                 readable, or leave them: the findings above stand without them, as floors."
                 .to_string(),
             (_, Subject::Directory { path }) => format!(
                 "If the evidence shows a rule the sessions had to learn, create \
