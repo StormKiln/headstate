@@ -32,7 +32,7 @@
 //! | [`Rule::HardSkip`] | memory docs "loads a CLAUDE.md file of up to 4 MiB in full and skips a larger file" | 4 MiB, on-disk bytes | Problem |
 //! | [`Rule::Secret`] | cclint's secret rule; changelog: the feedback share uploads "the system prompt (which includes your CLAUDE.md instructions)" | `sk-ant-`, `ghp_`, `github_pat_`, a PEM private-key header, `AKIA` + 16; placeholders (`xxx`, `your`, `example`, one repeated character) skipped. The finding carries the line and a masked prefix, never the value | Problem |
 //! | [`Rule::Emphasis`] | best-practices "add emphasis such as 'IMPORTANT' to that line alone. If you emphasize many lines, none of them stands out." | 2 or more prose lines in one file carrying all-caps `IMPORTANT`, `YOU MUST`, `NEVER` or `ALWAYS`. Caps only: bold prose does not count, or this repository's own house style would trip it | Advice |
-//! | [`Rule::HookRule`] | memory docs: Claude treats CLAUDE.md as "context, not enforced configuration … use a PreToolUse hook instead"; features-overview "Put guardrails in hooks" | a prose line with `never`, `must not` or `always` AND a tool verb (`edit`, `write`, `delete`, `rm`, `commit`, `push`, `force`), any case, in the prose outside inline code spans. A hyphenated compound counts only when every part is a tool verb (`force-push` fires; `slow-write`, `write-ahead` do not), and a word directly after `@` is a tag, not an action. A code span counts only when it is itself a tool-action command, by its first words: `git <verb>` names the verb, `rm` names `rm`; any other span (`8 write`) names nothing (#1322). Whether the modal governs the verb is not parsed | Advice |
+//! | [`Rule::HookRule`] | memory docs: Claude treats CLAUDE.md as "context, not enforced configuration … use a PreToolUse hook instead"; features-overview "Put guardrails in hooks" | a tool verb (`edit`, `write`, `delete`, `rm`, `commit`, `push`, `force`), any case, in the clause a modal opens: after `never`, `always`, `must not` or `do not`, before the next `;` or sentence-ending `.`, `!`, `?` on the same line (#1374). A tool verb before the modal or in another sentence ("fails any loosening edit. Never loosen a baseline.") is not the rule's verb. Words are read outside inline code spans. A hyphenated compound counts only when every part is a tool verb (`force-push` fires; `slow-write`, `write-ahead` do not), a word directly after `@` is a tag, and a word directly after a determiner, quantifier or possessive (`a`, `an`, `any`, `the`, `each`, `every`, `this`, `that`, `no`, `some`, `my`, `your`, `his`, `her`, `its`, `our`, `their`, `'s`) is a noun. A code span in the clause counts only when it is itself a tool-action command, by its first words: `git <verb>` names the verb, `rm` names `rm`; any other span (`8 write`) names nothing (#1322). Still not parsed: a noun after an adjective ("never make any loosening edit" fires), a verb in a subordinate clause ("always run the gate before you commit" fires), a rule wrapped across lines, `don't`, and an abbreviation's `.` read as a sentence break | Advice |
 //! | [`Rule::Conflict`] | memory docs "if two rules contradict each other, Claude may pick one arbitrarily"; UFMG: conflicting instructions in 28% | two files in one launch set whose named package managers (`npm`/`pnpm`/`yarn`/`bun`), lint entry points (`make lint` vs `yarn lint` …) or default branches are non-empty and disjoint | Advice |
 //! | [`Rule::TreeListing`] | `/doctor` "cuts content Claude can derive from the codebase, such as directory layouts"; best-practices' exclude table | a fenced block with 3 or more lines starting `├`, `└` or `│` | Advice |
 //! | [`Rule::InitSkeleton`] | UFMG: init fossilization in 24%; `/doctor` removes architecture overviews; best-practices "There's no required format" | the `/init` skeleton headings `Project Overview`, `Development Commands` and `Architecture` all present | Advice |
@@ -114,7 +114,7 @@ static EMPHASIS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(IMPORTANT|YOU MUST|NEVER|ALWAYS)\b").unwrap());
 /// A hard rule's modal, any case.
 static MODAL: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\b(never|must not|always)\b").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)\b(never|must not|do not|always)\b").unwrap());
 /// A tool action a `PreToolUse` hook can block.
 const TOOL_VERBS: [&str; 7] = ["edit", "write", "delete", "rm", "commit", "push", "force"];
 /// A word, or words joined by single hyphens (`slow-write`,
@@ -755,27 +755,90 @@ fn is_tool_verb(word: &str) -> bool {
     TOOL_VERBS.iter().any(|v| word.eq_ignore_ascii_case(v))
 }
 
-/// The first tool action a prose line names, as written: from the
-/// sentence first, then from a code span that is itself a command.
+/// The first tool action a prose line's rule governs, as written.
 ///
-/// Inline code spans are blanked for the sentence: what is in one is
-/// somebody's syntax (a config value, a worker-pool spec), not a word
-/// of the rule. Then each word or hyphenated compound counts only when
-/// every part of it is a tool verb, so `force-push` is the action itself
-/// while `slow-write` and `write-ahead` name something else. A word
-/// directly after `@` is a tag or an address (`@write`), not an action.
+/// Tied to the modal (#1374): for each `never`, `always`, `must not` or
+/// `do not` in the prose, only the clause it opens is read -- after the
+/// modal, up to the next sentence break (`;`, or `.`, `!`, `?` before
+/// whitespace or the end of the line). A tool verb before the modal, or
+/// in another sentence, is not the rule's verb.
+///
+/// Inside the clause, inline code spans are blanked for the words: what
+/// is in one is somebody's syntax (a config value, a worker-pool spec),
+/// not a word of the rule. Each word or hyphenated compound counts only
+/// when every part of it is a tool verb, so `force-push` is the action
+/// itself while `slow-write` and `write-ahead` name something else. A
+/// word directly after `@` is a tag or an address (`@write`), not an
+/// action; one directly after a determiner, quantifier or possessive
+/// (`any edit`, `the commit`, `their push`) is a noun. Then a code span
+/// in the clause counts when it is itself a command (#1322).
 fn tool_action(line: &str) -> Option<String> {
     let prose = text::blank_spans(line);
-    let in_prose = COMPOUND
-        .find_iter(&prose)
-        .filter(|m| !prose[..m.start()].ends_with('@'))
-        .find(|m| m.as_str().split('-').all(is_tool_verb))
-        .map(|m| m.as_str().to_string());
-    in_prose.or_else(|| {
-        text::spans(line)
+    for modal in MODAL.find_iter(&prose) {
+        let end = clause_end(&prose, modal.end());
+        let clause = &prose[modal.end()..end];
+        let mut previous: Option<&str> = None;
+        for m in COMPOUND.find_iter(clause) {
+            let before = &clause[..m.start()];
+            let word = m.as_str();
+            let noun = previous.is_some_and(is_noun_marker) || is_possessive(before);
+            if !before.ends_with('@') && !noun && word.split('-').all(is_tool_verb) {
+                return Some(word.to_string());
+            }
+            previous = Some(word);
+        }
+        // `blank_spans` keeps char positions, not byte positions, so the
+        // clause is cut from the original line by chars. A break is never
+        // inside a span (a span is blank in `prose`), so the cut holds
+        // whole spans only.
+        let from = prose[..modal.end()].chars().count();
+        let to = prose[..end].chars().count();
+        let original: String = line.chars().skip(from).take(to - from).collect();
+        if let Some(action) = text::spans(&original)
             .iter()
             .find_map(|s| command_action(&s.text))
-    })
+        {
+            return Some(action);
+        }
+    }
+    None
+}
+
+/// The byte where the clause starting at `from` ends: the next `;`, or
+/// `.`, `!` or `?` followed by whitespace or the end of the line.
+fn clause_end(prose: &str, from: usize) -> usize {
+    let rest = &prose[from..];
+    let mut chars = rest.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        let at_break = match c {
+            ';' => true,
+            '.' | '!' | '?' => chars.peek().is_none_or(|(_, n)| n.is_whitespace()),
+            _ => false,
+        };
+        if at_break {
+            return from + i;
+        }
+    }
+    prose.len()
+}
+
+/// Whether the text before a word ends in a possessive (`user's`,
+/// `users'`), straight or curly apostrophe.
+fn is_possessive(before: &str) -> bool {
+    let b = before.trim_end();
+    ["'s", "\u{2019}s", "s'", "s\u{2019}"]
+        .iter()
+        .any(|p| b.ends_with(p))
+}
+
+/// A word after which a tool verb is a noun: a determiner, a quantifier
+/// or a possessive pronoun. A possessive `'s` is [`is_possessive`].
+fn is_noun_marker(word: &str) -> bool {
+    const MARKERS: [&str; 17] = [
+        "a", "an", "any", "the", "each", "every", "this", "that", "no", "some", "my", "your",
+        "his", "her", "its", "our", "their",
+    ];
+    MARKERS.iter().any(|m| word.eq_ignore_ascii_case(m))
 }
 
 /// The tool action a code span performs when it is a shell command
@@ -1427,6 +1490,64 @@ ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
             );
             assert!(
                 sentences[i].contains(&format!("(`{verb}`)")),
+                "{sentences:?}"
+            );
+        }
+    }
+
+    /// #1374: the tool verb must be in the clause the modal opens --
+    /// after it, before a sentence break -- and not a noun after a
+    /// determiner, quantifier or possessive.
+    #[test]
+    fn a_tool_verb_outside_the_modals_clause_or_used_as_a_noun_is_not_a_hook_rule() {
+        let (_t, _home, repo) = fixture();
+        fs::write(
+            repo.join("CLAUDE.md"),
+            "The budget check fails any loosening edit. Never loosen a baseline.\n\
+             Commit early; never skip the gate.\n\
+             Never revert the edit.\n\
+             Never squash a commit or rewrite any push.\n\
+             Always keep each write small.\n\
+             Never undo the user's edit or their commit.\n\
+             Do not rewrite this push.\n\
+             Never use `git push` as a noun; it's `git push` the tool does.\n",
+        )
+        .unwrap();
+        let found = shape(&repo, None);
+        let hits = by_rule(&found, Rule::HookRule);
+        let sentences: Vec<&str> = hits.iter().map(|f| f.finding.as_str()).collect();
+        assert_eq!(hits.len(), 1, "{sentences:?}");
+        assert!(
+            sentences[0].contains("line 8") && sentences[0].contains("(`push`)"),
+            "a span command in the modal's clause still counts: {sentences:?}"
+        );
+    }
+
+    /// #1374, the other direction: the issue's firing cases, and `do not`
+    /// as a modal.
+    #[test]
+    fn a_tool_verb_the_modal_governs_still_fires() {
+        let (_t, _home, repo) = fixture();
+        fs::write(
+            repo.join("CLAUDE.md"),
+            "Never commit `.env`.\n\
+             Never force-push to main.\n\
+             Always run the gate; never `git push --force`.\n\
+             Do not edit generated files.\n\
+             The gate is slow. You must not delete its cache.\n",
+        )
+        .unwrap();
+        let found = shape(&repo, None);
+        let hits = by_rule(&found, Rule::HookRule);
+        let sentences: Vec<&str> = hits.iter().map(|f| f.finding.as_str()).collect();
+        assert_eq!(hits.len(), 5, "{sentences:?}");
+        for (i, verb) in ["commit", "force-push", "push", "edit", "delete"]
+            .iter()
+            .enumerate()
+        {
+            assert!(
+                sentences[i].contains(&format!("line {}", i + 1))
+                    && sentences[i].contains(&format!("(`{verb}`)")),
                 "{sentences:?}"
             );
         }
