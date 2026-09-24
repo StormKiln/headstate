@@ -1589,7 +1589,7 @@ impl<'a> Resolver<'a> {
                     if targets.iter().any(|t| t.name == name) {
                         return Ok(());
                     }
-                    if let Some(why) = makefile_is_open_ended(&anchor) {
+                    if let Some(why) = scripts::makefile_is_open_ended(&anchor) {
                         return Err(unknown(format!(
                             "`make {name}` is not a target the parser can see, and the makefile in `{}` {why}",
                             display(self.repo, &anchor.to_string_lossy())
@@ -1744,30 +1744,6 @@ fn script_display(runner: Runner, name: &str) -> String {
         Runner::Yarn => format!("yarn {name}"),
         Runner::Npm => format!("npm run {name}"),
     }
-}
-
-/// Why a miss against this directory's makefile is not certain: an
-/// `include` line pulls targets from a file the parser did not read, and
-/// a `%` pattern rule matches names no list can hold.
-fn makefile_is_open_ended(dir: &Path) -> Option<&'static str> {
-    for name in ["GNUmakefile", "makefile", "Makefile"] {
-        let p = dir.join(name);
-        if !p.is_file() {
-            continue;
-        }
-        let text = std::fs::read_to_string(&p).ok()?.replace("\r\n", "\n");
-        for line in text.lines() {
-            let t = line.trim_start_matches(['-', 's']);
-            if t.starts_with("include ") || t.starts_with("include\t") {
-                return Some("includes other files");
-            }
-            if !line.starts_with([' ', '\t', '#']) && line.contains('%') && line.contains(':') {
-                return Some("has pattern rules");
-            }
-        }
-        return None;
-    }
-    None
 }
 
 fn count(n: usize, one: &str, many: &str) -> String {
