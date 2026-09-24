@@ -721,6 +721,34 @@ describe("ClaudeMdAdvicePanel", () => {
     expect(within(row).getByRole("button", { name: "Copy brief" })).toBeTruthy();
   });
 
+  /// #1389: an Unknown is "checked, could not decide". Its remedy is to let
+  /// the check decide, not an edit a session can make, so it offers no
+  /// Claudify either -- only Problem and Advice, which recommend a change,
+  /// do. Copy brief stays on every row.
+  it("offers Claudify only on findings that recommend a change", () => {
+    claudify.terminal = "open -a Terminal {command}";
+    state.data = report({
+      findings: [
+        finding({ check: "transcripts", severity: "unknown", finding: "could not read three" }),
+        finding({ check: "rot", severity: "advice", finding: "an advice row" }),
+        finding({ check: "rot", severity: "problem", finding: "a problem row" }),
+      ],
+      checks: [
+        { check: "transcripts", run: { state: "ran", findings: 1 } },
+        { check: "rot", run: { state: "ran", findings: 2 } },
+      ],
+    });
+    open();
+    const unknown = screen.getByRole("row", { name: /could not read three/ });
+    expect(within(unknown).queryByRole("button", { name: "Claudify" })).toBeNull();
+    expect(within(unknown).getByText("Could not decide")).toBeTruthy();
+    expect(within(unknown).getByRole("button", { name: "Copy brief" })).toBeTruthy();
+    for (const name of [/an advice row/, /a problem row/]) {
+      const row = screen.getByRole("row", { name });
+      expect(within(row).getByRole("button", { name: "Claudify" })).toBeTruthy();
+    }
+  });
+
   /// A short report opens expanded: collapsing three findings would hide
   /// them behind a click for nothing.
   it("opens a short report expanded", () => {
