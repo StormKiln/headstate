@@ -247,3 +247,132 @@ describe("deep headings", () => {
     }
   });
 });
+
+/// #1456: CI comments nest large reports in `<details>`, and without
+/// raw-HTML parsing the sanitiser dropped the wrappers, so every level
+/// rendered as one always-open block.
+describe("details", () => {
+  const NESTED = [
+    "<details>",
+    "<summary>Level one</summary>",
+    "",
+    "Body one.",
+    "",
+    "<details>",
+    "<summary>Level two</summary>",
+    "",
+    "Body two.",
+    "",
+    "<details open>",
+    "<summary>Level three</summary>",
+    "",
+    "Body three.",
+    "",
+    "</details>",
+    "</details>",
+    "</details>",
+  ].join("\n");
+
+  function levels(container: HTMLElement): HTMLDetailsElement[] {
+    return [...container.querySelectorAll("details")];
+  }
+
+  it("renders three nested levels as real details elements", () => {
+    const { container } = render(<Markdown>{NESTED}</Markdown>);
+    const all = levels(container);
+    expect(all).toHaveLength(3);
+    // Each nested inside the previous, not flattened into siblings.
+    expect(all[1]?.parentElement?.closest("details")).toBe(all[0]);
+    expect(all[2]?.parentElement?.closest("details")).toBe(all[1]);
+    const summaries = [...container.querySelectorAll("summary")].map((s) => s.textContent);
+    expect(summaries).toEqual(["Level one", "Level two", "Level three"]);
+  });
+
+  /// Level three is written `<details open>`: an author's `open` must
+  /// not unfold anything on expand.
+  it("starts collapsed at every depth, whatever the author wrote", () => {
+    const { container } = render(<Markdown>{NESTED}</Markdown>);
+    for (const d of levels(container)) {
+      expect(d.open).toBe(false);
+      expect(d.hasAttribute("open")).toBe(false);
+    }
+  });
+
+  it("opens each level on its own", () => {
+    const { container } = render(<Markdown>{NESTED}</Markdown>);
+    const [one, two, three] = levels(container) as [
+      HTMLDetailsElement,
+      HTMLDetailsElement,
+      HTMLDetailsElement,
+    ];
+    const state = () => [one.open, two.open, three.open];
+    one.open = true;
+    expect(state()).toEqual([true, false, false]);
+    two.open = true;
+    expect(state()).toEqual([true, true, false]);
+    three.open = true;
+    one.open = false;
+    expect(state()).toEqual([false, true, true]);
+  });
+
+  it("keeps the summary when it shares a block with its details", () => {
+    const { container } = render(
+      <Markdown>{"<details><summary>Report</summary>\n\nContent here.\n\n</details>"}</Markdown>,
+    );
+    expect(container.querySelector("summary")?.textContent).toBe("Report");
+    expect(container.querySelector("details")?.textContent).toContain("Content here.");
+  });
+});
+
+/// Parsing raw HTML is what #1456 needed and exactly what a sanitiser
+/// exists for. Each of these would reach the webview if the sanitiser
+/// ran before `rehype-raw` rather than after it.
+describe("sanitising raw HTML", () => {
+  it("strips a script nested inside details", () => {
+    const { container } = render(
+      <Markdown>{"<details><summary>s</summary><script>window.evil=1</script></details>"}</Markdown>,
+    );
+    expect(container.querySelector("script")).toBeNull();
+    expect(container.innerHTML).not.toContain("window.evil");
+  });
+
+  it("strips event handlers from allowed elements", () => {
+    const md =
+      '<details ontoggle="window.evil=1"><summary onclick="window.evil=2">s</summary></details>' +
+      '\n\n<img src="https://example.com/a.png" onerror="window.evil=3">';
+    const { container } = render(<Markdown>{md}</Markdown>);
+    expect(container.querySelector("details")).toBeTruthy();
+    expect(container.innerHTML).not.toMatch(/on(toggle|click|error)/);
+    expect(container.innerHTML).not.toContain("window.evil");
+  });
+
+  it("refuses javascript: URLs in raw anchors", () => {
+    const { container } = render(<Markdown>{'<a href="javascript:window.evil=1">x</a>'}</Markdown>);
+    expect(container.innerHTML).not.toContain("javascript:");
+  });
+
+  it("strips style elements, contents included, and style attributes", () => {
+    const { container } = render(
+      <Markdown>{'<style>body{display:none}</style>\n\n<p style="position:fixed">styled</p>'}</Markdown>,
+    );
+    expect(container.querySelector("style")).toBeNull();
+    expect(container.textContent).not.toContain("display:none");
+    expect(container.innerHTML).not.toContain("position:fixed");
+    expect(container.textContent).toContain("styled");
+  });
+
+  it("strips a raw iframe", () => {
+    const { container } = render(
+      <Markdown>
+        {'<details><summary>s</summary><iframe src="https://example.com"></iframe></details>'}
+      </Markdown>,
+    );
+    expect(container.querySelector("iframe")).toBeNull();
+  });
+
+  it("does not render HTML comments", () => {
+    const { container } = render(<Markdown>{"<!-- bot-marker -->\n\nVisible."}</Markdown>);
+    expect(container.innerHTML).not.toContain("bot-marker");
+    expect(container.textContent).toContain("Visible.");
+  });
+});

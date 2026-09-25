@@ -1,7 +1,9 @@
 import { createContext, useContext } from "react";
 import type { ReactNode } from "react";
 import { ExternalLink } from "./ExternalLink";
-import rehypeSanitize from "rehype-sanitize";
+import rehypeRaw from "rehype-raw";
+import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
+import type { Options as SanitizeSchema } from "rehype-sanitize";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -33,6 +35,28 @@ function clean<P extends { node?: unknown }>(props: P): Omit<P, "node"> {
   return rest;
 }
 
+/// The sanitiser's schema: GitHub's own default, tightened in two ways.
+///
+/// - `open` is removed from every element. A `<details>` block must start
+///   COLLAPSED at every depth (#1456): CI bots nest large reports three
+///   levels deep, and an author's `<details open>` would unfold all of it
+///   the moment the comment is expanded. The reader opens what they want.
+/// - `<style>` is STRIPPED, contents and all. The default schema only
+///   unwraps an element it does not allow, which would print a style
+///   sheet's source as body text.
+///
+/// Everything else -- the tag allowlist, the `javascript:`-refusing
+/// protocol list, the absence of every `on*` and `style` attribute, the
+/// dropping of HTML comments -- is the default's, unchanged.
+const SCHEMA: SanitizeSchema = {
+  ...defaultSchema,
+  strip: [...(defaultSchema.strip ?? []), "style"],
+  attributes: {
+    ...defaultSchema.attributes,
+    "*": (defaultSchema.attributes?.["*"] ?? []).filter((a) => a !== "open"),
+  },
+};
+
 /// Renders untrusted Markdown from GitHub.
 ///
 /// Bodies and comments are written by other people, and this app holds a
@@ -40,6 +64,11 @@ function clean<P extends { node?: unknown }>(props: P): Omit<P, "node"> {
 ///
 /// - `rehype-sanitize` strips scripts, event handlers and iframes. A
 ///   maintained sanitiser, not a hand-rolled regex.
+/// - Raw HTML IS parsed (`rehype-raw`), so `<details>` and `<summary>`
+///   render as real collapsible elements (#1456). It runs BEFORE the
+///   sanitiser, so everything it produces passes through the same
+///   allowlist as markdown-generated HTML. The order is the security
+///   property: raw HTML parsed after sanitising would be unsanitised.
 /// - Links open in the SYSTEM BROWSER via the opener plugin, never in the
 ///   app webview, so a link can never navigate the app itself.
 /// - The token lives in Rust memory and is never exposed to the webview,
@@ -53,7 +82,7 @@ export function Markdown({ children }: { children: string }) {
     <div className="text-sm leading-relaxed text-[#e6edf3]">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        rehypePlugins={[rehypeSanitize]}
+        rehypePlugins={[rehypeRaw, [rehypeSanitize, SCHEMA]]}
         components={{
           // `href` is optional in react-markdown's props but required
           // by ExternalLink, and an anchor with no target is not a link
@@ -109,6 +138,17 @@ export function Markdown({ children }: { children: string }) {
           h5: (props) => <h5 {...clean(props)} className="mb-1 mt-4 text-sm font-semibold" />,
           h6: (props) => (
             <h6 {...clean(props)} className="mb-1 mt-4 text-sm font-semibold text-[#8b949e]" />
+          ),
+          // Collapsed by default: `open` is never passed, and the schema
+          // has already removed any the author wrote. The browser owns
+          // the toggle from there, so each level opens on its own.
+          details: ({ children }) => (
+            <details className="my-2 rounded border border-[#30363d] px-3 py-1">
+              {children}
+            </details>
+          ),
+          summary: ({ children }) => (
+            <summary className="cursor-pointer select-none py-1 font-semibold">{children}</summary>
           ),
           table: (props) => (
             // `border-collapse`, or every cell's border doubles against
