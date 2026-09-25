@@ -58,6 +58,9 @@ describe("isSafe", () => {
     // whole point of the fix, since treating it as never-pushed left
     // every merged worktree unremovable.
     expect(isSafe({ kind: "merged_upstream_deleted" })).toBe(true);
+    // #1439: merged content on a branch with no tracking config. Same
+    // evidence; it used to read "never pushed" and could not be removed.
+    expect(isSafe({ kind: "merged_no_upstream" })).toBe(true);
     // #819: a branchless checkout contained in the default branch. The
     // evidence is the same `merged_into` bar the two above clear --
     // ancestry or an exact patch-id match -- and what this row LACKS is a
@@ -201,6 +204,13 @@ describe("safetyReason", () => {
     expect(gone).toContain("upstream deleted");
     // It must NOT read like the state it was being confused with.
     expect(gone).not.toContain("only here");
+    // #1439: merged, and the branch has no tracking config. It must say
+    // merged and must not repeat the claim it replaced.
+    const untracked = safetyReason({ kind: "merged_no_upstream" });
+    expect(untracked).toContain("merged");
+    expect(untracked).toContain("no upstream");
+    expect(untracked).not.toContain("only here");
+    expect(untracked).not.toContain("never pushed");
   });
 
   // The bug in #701: a scratch branch was described as holding commits
@@ -433,6 +443,8 @@ describe("safetyTone", () => {
     expect(safetyTone({ kind: "never_pushed" })).not.toContain("3fb950");
     // Green, like `safe`: same verdict, different evidence (#732).
     expect(safetyTone({ kind: "merged_upstream_deleted" })).toContain("3fb950");
+    // #1439: in `isSafe`, so green.
+    expect(safetyTone({ kind: "merged_no_upstream" })).toContain("3fb950");
     // Green for the same reason again (#819). Green on this page means
     // one-click removable, `isSafe` includes this kind, and the two must
     // not disagree -- a green row with a disabled button, or a grey row

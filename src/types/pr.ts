@@ -286,6 +286,12 @@ export type Safety =
   /// `safe` so the row can say which evidence it used, because this one
   /// cannot be re-checked against a remote that no longer exists.
   | { kind: "merged_upstream_deleted" }
+  /// Merged, on a branch with no tracking config at all -- a
+  /// contributor's PR fetched locally, say (#1439). Removable: the work
+  /// is on the default branch. Not `never_pushed`, which claims commits
+  /// exist only here, and not `merged_upstream_deleted`, which claims a
+  /// tracking config outlived its remote branch; there was never one.
+  | { kind: "merged_no_upstream" }
   /// A branchless checkout whose HEAD is already contained in the default
   /// branch (#819). Removable.
   ///

@@ -16,6 +16,9 @@ import type { Worktree } from "@/types/pr";
 const FACETS: { kind: string; label: string }[] = [
   { kind: "safe", label: "Safe" },
   { kind: "merged_upstream_deleted", label: "Merged" },
+  // #1439. "No upstream", the words the row itself uses, so it cannot be
+  // mistaken for the red "Never pushed" facet it used to be counted under.
+  { kind: "merged_no_upstream", label: "No upstream" },
   { kind: "detached_merged", label: "Detached" },
   // "Uncommitted", not "Dirty": the ROW says "2 uncommitted files", and
   // a facet whose word appears nowhere in the rows it selects is how a

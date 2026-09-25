@@ -104,9 +104,10 @@ export function WorktreeKebab({
 
   // The gate, read here exactly as the primary button reads it (#770).
   //
-  // `isSafe` covers `safe`, `merged_upstream_deleted` and, since #819,
-  // `detached_merged`: all three mean the work is on the default branch
-  // and the tree is clean, so all three take the plain confirmed path.
+  // `isSafe` covers `safe`, `merged_upstream_deleted`, since #819
+  // `detached_merged`, and since #1439 `merged_no_upstream`: each means
+  // the work is on the default branch and the tree is clean, so each
+  // takes the plain confirmed path.
   // Everything else goes through `onForce`, which opens the confirmation
   // naming the specific loss.
   //

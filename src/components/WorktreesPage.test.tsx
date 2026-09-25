@@ -2764,7 +2764,7 @@ describe("WorktreesPage", () => {
     /// Safe and MergedUpstreamDeleted are offered PLAINLY: both mean
     /// the work is on the default branch and the tree is clean, so both
     /// take the ordinary confirmation rather than the override.
-    it.each([["safe"], ["merged_upstream_deleted"]] as const)(
+    it.each([["safe"], ["merged_upstream_deleted"], ["merged_no_upstream"]] as const)(
       "sends a %s row to the plain confirmation",
       (kind) => {
         state.classified = [wt({ safety: { kind } })];

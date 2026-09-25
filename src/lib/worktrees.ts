@@ -49,6 +49,9 @@ export function isSafe(s: Safety): boolean {
   return (
     s.kind === "safe" ||
     s.kind === "merged_upstream_deleted" ||
+    // #1439: the same `merged_into` evidence, on a branch that simply
+    // has no tracking config. An unmerged one is still `never_pushed`.
+    s.kind === "merged_no_upstream" ||
     s.kind === "detached_merged"
   );
 }
@@ -330,6 +333,12 @@ export function safetyReason(s: Safety): string {
       // prove it, and is the fact a user comparing this row against
       // GitHub would otherwise find missing.
       return "merged; upstream deleted — safe to delete";
+    case "merged_no_upstream":
+      // MERGED FIRST (#1439). This row used to read "never pushed —
+      // commits exist only here", which the merge check proves false.
+      // "No upstream configured" says only what was observed: the branch
+      // has no tracking config, not that nobody ever pushed it.
+      return "merged; no upstream configured — safe to delete";
     case "detached_merged":
       // MERGED FIRST, then the detachment (#819).
       //
@@ -770,9 +779,11 @@ export function safetyTone(s: Safety): string {
     // a different colour would imply a different degree of safety rather
     // than a different route to the same verdict (#732, and
     // `detached_merged` on the same argument in #819 -- green on this
-    // page means one-click removable, and all three are in `isSafe`).
+    // page means one-click removable, and every one is in `isSafe`; #1439
+    // added `merged_no_upstream` on the same argument).
     case "safe":
     case "merged_upstream_deleted":
+    case "merged_no_upstream":
     case "detached_merged":
       return "text-[#3fb950]";
     case "main_checkout":
