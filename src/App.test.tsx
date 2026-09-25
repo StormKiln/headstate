@@ -106,6 +106,7 @@ vi.mock("./api/hooks", () => ({
   useCommentOnPr: () => () => Promise.resolve(),
   useRerunChecks: () => () => Promise.resolve(),
   useViewer: () => ({ data: undefined }),
+  useReviewGates: () => ({ data: undefined }),
   // StatsPage owns these; this suite only asserts the shell's layout, so
   // they return a pending result rather than real figures. #826 replaced the
   // four `author:@me` hooks this block used to stub (`usePeriods`,

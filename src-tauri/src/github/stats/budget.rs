@@ -218,6 +218,44 @@ pub fn observed_remaining() -> Option<u64> {
     }
 }
 
+/// REST's own remaining figure, from the `X-RateLimit-Remaining` header
+/// (#1451, #1454).
+///
+/// # Why a second figure and not `OBSERVED_REMAINING`
+///
+/// GitHub meters REST and GraphQL from SEPARATE hourly pools. MEASURED
+/// 2026-09-25: `GET /repos/{o}/{r}/rules/branches/{b}` and
+/// `GET /repos/{o}/{r}/activity` both answer with
+/// `X-RateLimit-Resource: core`, while every document this module meters
+/// reports against `graphql`. Feeding a REST header into the GraphQL figure
+/// would let a handful of cheap REST reads look like the GraphQL hour
+/// running out (or, the other way round, hide a REST pool that genuinely
+/// is), and the poll loop that `RESERVE` protects runs on GraphQL alone.
+///
+/// The app's REST use is small and user-driven -- re-running CI, opening a
+/// pull request, and the review-gate reads on opening a detail view -- so
+/// nothing here needs a projection. What it does need is the same refusal
+/// shape the GraphQL gate has: [`Budget::permits_rest`] refuses when the
+/// pool is within [`RESERVE`] of empty, so a busy session does not spend
+/// the last of the core pool on advisory reads the user never asked for.
+///
+/// LATEST, not lowest, for the reason [`note_remaining`] gives.
+static OBSERVED_REST_REMAINING: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Record what a REST response's `X-RateLimit-Remaining` said.
+pub fn note_rest_remaining(remaining: u64) {
+    OBSERVED_REST_REMAINING.store(remaining, Ordering::Relaxed);
+}
+
+/// The latest REST remaining figure this process has read, or `None`
+/// before any REST response carried one -- a cold start, not zero.
+pub fn observed_rest_remaining() -> Option<u64> {
+    match OBSERVED_REST_REMAINING.load(Ordering::Relaxed) {
+        u64::MAX => None,
+        n => Some(n),
+    }
+}
+
 /// A per-test view of the observed figure, so the process-wide static stops
 /// being shared state between tests (#1079).
 ///
@@ -438,6 +476,13 @@ pub struct Budget {
     lowest_remaining: Arc<AtomicU64>,
     /// Requests that reported no cost -- see [`Budget::unmetered`].
     unmetered: Arc<AtomicU64>,
+    /// REST requests this load issued (#1451). Kept apart from `requests`
+    /// because they are priced from a different pool -- see
+    /// [`OBSERVED_REST_REMAINING`] -- and counting them there would make
+    /// `unmetered` or `points` misdescribe the GraphQL spend.
+    rest_requests: Arc<AtomicU64>,
+    /// The LOWEST REST `X-RateLimit-Remaining` this load saw, or `u64::MAX`.
+    rest_lowest_remaining: Arc<AtomicU64>,
     /// The LATEST `resetAt` seen, as epoch seconds, or 0.
     ///
     /// Latest rather than first for the same reason: if the window rolled
@@ -461,7 +506,58 @@ impl Budget {
             lowest_remaining: Arc::new(AtomicU64::new(u64::MAX)),
             unmetered: Arc::new(AtomicU64::new(0)),
             reset_at: Arc::new(AtomicU64::new(0)),
+            rest_requests: Arc::new(AtomicU64::new(0)),
+            rest_lowest_remaining: Arc::new(AtomicU64::new(u64::MAX)),
         }
+    }
+
+    /// Record one REST response (#1451).
+    ///
+    /// `remaining` is the `X-RateLimit-Remaining` header, `None` when the
+    /// response did not carry one. The request is counted either way, and
+    /// an absent header is NOT defaulted -- the same rule [`Self::record`]
+    /// applies to a missing `rateLimit`.
+    pub fn record_rest(&self, remaining: Option<u64>) {
+        self.rest_requests.fetch_add(1, Ordering::Relaxed);
+        if let Some(r) = remaining {
+            self.rest_lowest_remaining.fetch_min(r, Ordering::Relaxed);
+            note_rest_remaining(r);
+        }
+    }
+
+    /// REST requests this load issued.
+    pub fn rest_requests(&self) -> u64 {
+        self.rest_requests.load(Ordering::Relaxed)
+    }
+
+    /// Whether the REST pool has room for `requests` more.
+    ///
+    /// The same shape as [`Self::permits`] -- the lower of this load's and
+    /// the process's figure, `None` from both permitted as a cold start --
+    /// against the REST pool rather than the GraphQL one. Each REST request
+    /// costs exactly one from `core`, so `requests` is the projection.
+    pub fn permits_rest(&self, requests: u64) -> bool {
+        let local = match self.rest_lowest_remaining.load(Ordering::Relaxed) {
+            u64::MAX => None,
+            n => Some(n),
+        };
+        let floor = [local, observed_rest_remaining()]
+            .into_iter()
+            .flatten()
+            .min();
+        match floor {
+            None => true,
+            Some(remaining) => remaining.saturating_sub(requests) >= RESERVE,
+        }
+    }
+
+    /// A budget whose REST figure is seeded, touching nothing shared -- the
+    /// REST counterpart of [`Self::seeded_for_test`].
+    #[cfg(test)]
+    pub fn seeded_rest_for_test(remaining: u64) -> Self {
+        let b = Self::new();
+        b.rest_lowest_remaining.store(remaining, Ordering::Relaxed);
+        b
     }
 
     /// Record one response's `rateLimit` object.
@@ -821,6 +917,28 @@ pub(crate) mod tests {
         assert!(!Budget::new().permits(1));
 
         drop(restore);
+    }
+
+    /// A REST read is counted apart from the GraphQL spend (#1451): it adds
+    /// no points, is not "unmetered", and gates on its own pool.
+    ///
+    /// The recorded figure is deliberately HIGH. `record_rest` writes the
+    /// process-wide REST figure, and a low one would starve every other
+    /// test's REST gate -- the #1048 shape. The refusal half is proven on a
+    /// locally seeded budget, which touches nothing shared.
+    #[test]
+    fn rest_reads_are_counted_apart_and_gate_on_their_own_pool() {
+        let b = Budget::new();
+        b.record_rest(Some(4_999));
+        b.record_rest(None);
+        assert_eq!(b.rest_requests(), 2);
+        assert_eq!(b.requests(), 0, "a REST read is not a GraphQL request");
+        assert_eq!(b.spent(), 0);
+        assert_eq!(b.unmetered(), 0, "REST carries no rateLimit to miss");
+        assert!(b.permits_rest(1));
+
+        assert!(!Budget::seeded_rest_for_test(RESERVE).permits_rest(1));
+        assert!(Budget::seeded_rest_for_test(RESERVE + 1).permits_rest(1));
     }
 
     /// The load's OWN figure still wins when it is the lower of the two.

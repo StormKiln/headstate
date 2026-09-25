@@ -635,6 +635,11 @@ export interface PrDetail {
   /// click can tell GitHub which commit the user was looking at.
   head_oid: string;
   head_ref_id: string | null;
+  /// Where the head branch lives, `owner/name` (#1451): the fork for a
+  /// fork's pull request, null once the fork is deleted. Optional because
+  /// the seeded placeholder does not carry it -- the list query does not
+  /// select it -- and absent must not be read as "same repository".
+  head_repo?: string | null;
   base_ref: string;
   merge_status: string;
   review: string;
@@ -3900,4 +3905,34 @@ export interface PluginsReport {
   /// and came from the cache.
   scanned: number;
   elapsed_ms: number;
+}
+
+/// The base branch's ruleset requirements, or why they are not known
+/// (#1451, #1454). Mirrors `github::gates::BaseRules`.
+///
+/// `read` with a requirement `false` means no RULESET asks for it -- NOT
+/// that nothing does: classic branch protection is invisible to the
+/// endpoint without admin. Nothing renders "not required" from it.
+type BaseRules =
+  | {
+      state: "read";
+      require_last_push_approval: boolean;
+      required_review_thread_resolution: boolean;
+    }
+  /// We did not ask (budget, or nothing to ask about).
+  | { state: "declined"; reason: string }
+  /// We asked and GitHub did not answer usably.
+  | { state: "unreadable"; reason: string };
+
+/// Who pushed the head commit. Mirrors `github::gates::LastPusher`.
+type LastPusher =
+  | { state: "known"; login: string }
+  /// Not looked up: no readable rule makes it matter.
+  | { state: "not_needed" }
+  | { state: "declined"; reason: string }
+  | { state: "unknown"; reason: string };
+
+export interface ReviewGates {
+  rules: BaseRules;
+  last_pusher: LastPusher;
 }

@@ -493,6 +493,11 @@ query($owner: String!, $repo: String!, $number: Int!) {
       additions deletions changedFiles
       headRefName headRefOid baseRefName
         headRef { id }
+      # Where the head branch lives, so the review gates (#1451) ask the
+      # FORK who pushed a fork's head. An object, not a connection:
+      # MEASURED live 2026-09-25, this document costs 1 point with and
+      # without it.
+      headRepository { nameWithOwner }
       createdAt updatedAt
       # When it became ready for review (#1457): the list query's own
       # selection, read by the same `map.rs` `ready_at`, so the header

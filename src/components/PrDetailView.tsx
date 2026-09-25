@@ -7,9 +7,11 @@ import {
   useDeleteHeadBranch,
   usePrDetail,
   useRerunChecks,
+  useReviewGates,
   useReviewPr,
   useViewer,
 } from "../api/hooks";
+import { gateVerdict } from "../lib/reviewGates";
 import { useState } from "react";
 import type { ReviewVerdictName } from "../api/tauri";
 import type { ClaudePrLink } from "../types/pr";
@@ -185,6 +187,13 @@ export function PrDetailView({
   // ReviewBox reads that as "might not be mine" rather than "is mine",
   // so a failed viewer fetch never silently removes the approve button.
   const { data: viewer } = useViewer();
+  // The base branch's review rules (#1451, #1454). Undefined while pending
+  // and when unreadable alike -- both render nothing new -- so `gate` is
+  // all-null until a rule is actually READ.
+  const { data: gates } = useReviewGates(pr, isPlaceholderData);
+  const gate = pr
+    ? gateVerdict(gates, pr, viewer, isPlaceholderData)
+    : { approveBlocked: null, approveCaveat: null, mergeBlocked: null };
   const [reviewing, setReviewing] = useState<ReviewVerdictName | null>(null);
   const rerun = useRerunChecks();
   const [rerunning, setRerunning] = useState(false);
@@ -317,15 +326,15 @@ export function PrDetailView({
       {viewer !== undefined && viewer !== pr.author ? (
         <button
           type="button"
-          disabled={approvedByViewer || reviewing !== null}
+          disabled={approvedByViewer || reviewing !== null || gate.approveBlocked !== null}
           onClick={() => submitReview("approve", "")}
           title={
             approvedByViewer
               ? "You have already approved this pull request"
-              : "Approve without a comment"
+              : (gate.approveBlocked ?? "Approve without a comment")
           }
           className={`rounded px-2.5 py-1 text-sm font-medium ${
-            approvedByViewer || reviewing !== null
+            approvedByViewer || reviewing !== null || gate.approveBlocked !== null
               ? "border border-[#30363d] text-[#8b949e] opacity-50"
               : "bg-[#238636] text-white hover:bg-[#1a7f37]"
           }`}
@@ -337,7 +346,7 @@ export function PrDetailView({
               : "Approve"}
         </button>
       ) : null}
-      <PrActions pr={pr} compact />
+      <PrActions pr={pr} compact conversations={gate.mergeBlocked} />
     </>
   );
 
@@ -477,7 +486,7 @@ export function PrDetailView({
         </p>
       </div>
 
-      <PrActions pr={pr} />
+      <PrActions pr={pr} conversations={gate.mergeBlocked} />
 
       {/* Available on EVERY pull request, not only the review queue.
           Gating this on which list you arrived from would mean the same
@@ -489,6 +498,8 @@ export function PrDetailView({
         viewer={viewer}
         author={pr.author}
         latestReviews={pr.latest_reviews}
+        approveBlocked={gate.approveBlocked}
+        approveCaveat={gate.approveCaveat}
         busy={reviewing}
         onSubmit={submitReview}
       />

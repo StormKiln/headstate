@@ -65,6 +65,7 @@ import type {
   Periods,
   PrDetail,
   PullRequest,
+  ReviewGates,
   Stats,
   StatsBoard,
   StatsOutcome,
@@ -824,6 +825,18 @@ export type PrActionName =
 /// Everything the detail view shows for one pull request. Cost 1.
 export const getPrDetail = (repo: string, number: number) =>
   call<PrDetail>("get_pr_detail", { repo, number });
+
+/// The base branch's review rules and the head's last pusher (#1451,
+/// #1454). Two REST reads at most, the rules half cached per (repo, base).
+/// Never rejects for a GitHub failure -- those come back as states.
+export const getReviewGates = (
+  repo: string,
+  base: string,
+  headRepo: string | null,
+  headRef: string,
+  headOid: string,
+) =>
+  call<ReviewGates>("get_review_gates", { repo, base, headRepo, headRef, headOid });
 
 /// Disk sizes for one repo's worktrees, as `[path, bytes]` pairs.
 ///

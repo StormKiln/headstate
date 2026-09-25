@@ -752,6 +752,45 @@ impl GitHubClient {
         Ok(parsed)
     }
 
+    /// A REST GET, metered into `budget`, returning the parsed body (#1451).
+    ///
+    /// The app's first REST READ: base-branch rules and branch activity have
+    /// no GraphQL form that also names the pusher, so the review gates read
+    /// them here. Follows `rest_post_json`'s conventions -- raw response via
+    /// octocrab's underscore method, body read as text then parsed -- with
+    /// two differences a read needs:
+    ///
+    /// - **Non-2xx is an error.** `_get` hands back the raw response for
+    ///   any status, so a 404 on a repository the viewer cannot read would
+    ///   otherwise parse as `{"message": "Not Found"}` and look like an
+    ///   answer. `octocrab::map_github_error` turns it into the same
+    ///   `ClientError::Api` every other octocrab call produces.
+    /// - **Metered before the status is judged.** A refusal still spent a
+    ///   request from the `core` pool, and its `X-RateLimit-Remaining` is
+    ///   as true as a success's. REST reports no GraphQL `rateLimit`, so it
+    ///   is recorded with `Budget::record_rest` -- see
+    ///   `budget::OBSERVED_REST_REMAINING` for why the pools stay apart.
+    ///
+    /// A body that is not JSON is `ClientError::NotJson` rather than
+    /// `Null`: unlike the create-PR response, there is no "it probably
+    /// worked" reading of an unparseable read.
+    pub(super) async fn rest_get(
+        &self,
+        path: &str,
+        budget: &crate::github::stats::Budget,
+    ) -> Result<serde_json::Value, ClientError> {
+        let response = self.octocrab._get(path).await?;
+        let remaining = response
+            .headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        budget.record_rest(remaining);
+        let response = octocrab::map_github_error(response).await?;
+        let text = self.octocrab.body_to_string(response).await?;
+        serde_json::from_str(&text).map_err(|_| ClientError::NotJson("non-JSON body".into()))
+    }
+
     /// Like `graphql_mutation`, but hands back the `data` object.
     ///
     /// Most mutations only need "did it fail", so `graphql_mutation`

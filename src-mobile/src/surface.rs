@@ -69,6 +69,8 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("get_reviewing", Class::Read),
     ("count_reviewing", Class::Read),
     ("get_pr_detail", Class::Read),
+    // The review gates (#1451, #1454). A Read; two REST reads, advisory.
+    ("get_review_gates", Class::Read),
     ("get_viewer", Class::Read),
     ("build_target", Class::Read),
     ("latest_release", Class::Read),

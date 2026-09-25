@@ -136,6 +136,11 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("get_reviewing", Class::Read),
     ("count_reviewing", Class::Read),
     ("get_pr_detail", Class::Read),
+    // The review gates (#1451, #1454): two REST reads, base-branch rules and
+    // the head's last pusher. A Read -- it writes nothing -- and exposed,
+    // because the phone renders the same detail view and the same Approve
+    // and Merge buttons these gates qualify.
+    ("get_review_gates", Class::Read),
     ("get_viewer", Class::Read),
     ("build_target", Class::Read),
     ("latest_release", Class::Read),
@@ -1062,6 +1067,15 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "get_pr_detail" => {
             res(commands::get_pr_detail(app.state(), a.get("repo")?, a.get("number")?).await)
         }
+        "get_review_gates" => res(commands::get_review_gates(
+            app.state(),
+            a.get("repo")?,
+            a.get("base")?,
+            a.get("headRepo")?,
+            a.get("headRef")?,
+            a.get("headOid")?,
+        )
+        .await),
         "get_viewer" => res(commands::get_viewer(app.state()).await),
         "build_target" => ok(commands::build_target()),
         "latest_release" => ok(commands::latest_release(app.clone()).await),

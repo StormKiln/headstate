@@ -2,6 +2,7 @@
 //! mapping from raw GraphQL JSON to typed Rust.
 
 pub mod client;
+pub mod gates;
 pub mod map;
 pub mod model;
 pub mod mutate;
