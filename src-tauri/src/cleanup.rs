@@ -694,6 +694,13 @@ mod tests {
         }
 
         #[test]
+        fn a_merged_no_upstream_worktree_is_not_proposed() {
+            // #1439: merged, but there is no tracking config to say the
+            // branch was ever pushed. Another separate claim.
+            assert!(!worktree_eligible(&wt(Safety::MergedNoUpstream, false)));
+        }
+
+        #[test]
         fn a_detached_merged_worktree_is_not_proposed() {
             // No branch to have been merged at all.
             assert!(!worktree_eligible(&wt(

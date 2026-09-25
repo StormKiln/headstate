@@ -469,9 +469,11 @@ pub fn worktree_safety(
         return Safety::Empty;
     }
 
-    // No upstream means nothing was ever pushed: these commits exist only
-    // here. Checked BEFORE merge status, because a branch name that looks
-    // merged tells you nothing about commits that never left the machine.
+    // No upstream used to mean "nothing was ever pushed: these commits
+    // exist only here", checked BEFORE merge status. That was right about
+    // a branch NAME that looks merged and wrong about CONTENT that
+    // provably is: see #1439 below, where the merge question is now asked
+    // first on the no-tracking-config path.
     //
     // `has_upstream` is passed in rather than re-probed: the caller
     // already asked, and this was one of two identical `rev-parse @{u}`
@@ -565,8 +567,35 @@ pub fn worktree_safety(
         if wt.branch.is_empty() {
             return detached_safety(dir, default_branch);
         }
+        // Merge status BEFORE the missing tracking config, and the order
+        // is the whole of #1439.
+        //
+        // `was_ever_pushed` reads only `branch.<name>.remote`, and a
+        // missing key is weaker evidence than "commits exist only here"
+        // claims. A contributor's PR fetched with `git fetch origin
+        // pull/N/head:prN`, or any branch checked out without
+        // `--track`, has no such key, yet its work may be on the default
+        // branch already. On the reporting machine two such worktrees
+        // read in red "never pushed" weeks after their PRs were
+        // squash-merged; the aggregate diff of each had exactly the same
+        // `patch-id --stable` as its squash commit on main.
+        //
+        // This does NOT widen the gate. `merged_into` is the same check
+        // every other branch faces: ancestry, per-commit patch-ids, or
+        // an exact aggregate patch-id. The only rows that change are
+        // ones it has already proven are on the default branch. Anything
+        // it does not answer `Safe` for, whether unmerged or undecided,
+        // keeps the refusal it had before.
+        //
+        // Its own variant rather than `MergedUpstreamDeleted`. That label
+        // says the tracking config outlived the remote branch, and here
+        // there was never a tracking config: the same objection
+        // `detached_safety` makes for a branchless checkout.
         if !was_ever_pushed(dir) {
-            return Safety::NeverPushed;
+            return match merged_into(dir, default_branch) {
+                Safety::Safe => Safety::MergedNoUpstream,
+                _ => Safety::NeverPushed,
+            };
         }
         return match merged_into(dir, default_branch) {
             Safety::Safe => Safety::MergedUpstreamDeleted,
@@ -918,7 +947,8 @@ fn holder_is_running(holder: LockHolder) -> bool {
 ///
 /// This function therefore asks exactly the merge question and nothing
 /// else. There is no path from here to `NeverPushed`, `Unpushed`,
-/// `MergedUpstreamDeleted` or `Empty`, and that is the #776 property
+/// `MergedUpstreamDeleted`, `MergedNoUpstream` or `Empty`, and that is
+/// the #776 property
 /// stated as code rather than as a comment:
 ///
 /// - `NeverPushed` / `Unpushed` are claims about a branch's relationship
@@ -2519,6 +2549,7 @@ fn safety_label(s: &Safety) -> &'static str {
         Safety::Unpushed(_) => "unpushed",
         Safety::NeverPushed => "never_pushed",
         Safety::MergedUpstreamDeleted => "merged_upstream_deleted",
+        Safety::MergedNoUpstream => "merged_no_upstream",
         Safety::DetachedMerged(_) => "detached_merged",
         Safety::Empty => "empty",
         Safety::Unmerged => "unmerged",
@@ -3976,6 +4007,120 @@ prunable gitdir file points to non-existent location
             Safety::NeverPushed
         );
         let _ = repo;
+    }
+
+    /// A branch with no tracking config, built the way a contributor's
+    /// fetched PR is: commits of its own, never `--track`ed, never
+    /// `push -u`ed. When `squash` is true, main gains ONE commit holding
+    /// the branch's whole diff, as "Squash and merge" does; otherwise main
+    /// moves on without it.
+    ///
+    /// Two commits on the branch, not one, so per-commit `git cherry`
+    /// cannot match the squash and the aggregate patch-id is what proves
+    /// it. That is the shape #1439 measured.
+    fn untracked_branch_fixture(
+        squash: bool,
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let (tmp, repo, wt) = repo_with_worktree("contrib");
+        let run_in = |dir: &Path, args: &[&str]| {
+            let out = Command::new(crate::auth::git_program())
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .envs([
+                    ("GIT_AUTHOR_NAME", "octocat"),
+                    ("GIT_COMMITTER_NAME", "octocat"),
+                    ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+                    ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        std::fs::write(wt.join("a.txt"), "first half\n").unwrap();
+        run_in(&wt, &["add", "-A"]);
+        run_in(&wt, &["commit", "-q", "-m", "first half"]);
+        std::fs::write(wt.join("b.txt"), "second half\n").unwrap();
+        run_in(&wt, &["add", "-A"]);
+        run_in(&wt, &["commit", "-q", "-m", "second half"]);
+
+        if squash {
+            std::fs::write(repo.join("a.txt"), "first half\n").unwrap();
+            std::fs::write(repo.join("b.txt"), "second half\n").unwrap();
+            run_in(&repo, &["add", "-A"]);
+            run_in(&repo, &["commit", "-q", "-m", "both halves (#1)"]);
+        } else {
+            std::fs::write(repo.join("other.txt"), "unrelated\n").unwrap();
+            run_in(&repo, &["add", "-A"]);
+            run_in(&repo, &["commit", "-q", "-m", "something else"]);
+        }
+        (tmp, repo, wt)
+    }
+
+    /// #1439: a branch with no tracking config whose work was
+    /// squash-merged must not read "never pushed -- commits exist only
+    /// here". The content is on main, so it is merged and removable.
+    #[test]
+    fn a_merged_branch_with_no_tracking_config_is_not_never_pushed() {
+        let (_t, _repo, wt) = untracked_branch_fixture(true);
+
+        // The premises, or the test proves nothing: no config key, so
+        // `was_ever_pushed` answers false exactly as in the bug, and the
+        // tip is NOT an ancestor of main, so only the patch-id route can
+        // find the merge.
+        assert!(
+            !was_ever_pushed(&wt),
+            "fixture must have no tracking config"
+        );
+        assert!(
+            git(&wt, &["merge-base", "--is-ancestor", "HEAD", "main"]).is_err(),
+            "fixture must be a squash, not an ancestor"
+        );
+
+        let w = Worktree {
+            path: wt.to_string_lossy().into_owned(),
+            branch: "contrib".into(),
+            ..Default::default()
+        };
+        let s = worktree_safety(&w, "main", false, Some(0));
+        assert_eq!(s, Safety::MergedNoUpstream);
+        assert!(
+            s.is_safe(),
+            "merged content must be removable: {}",
+            s.reason()
+        );
+        assert!(s.reason().contains("merged"), "{}", s.reason());
+        assert!(
+            !s.reason().contains("only here"),
+            "the claim #1439 retracts: {}",
+            s.reason()
+        );
+    }
+
+    /// The other direction, and the one that protects work: with no
+    /// tracking config and commits main does not have, the branch is
+    /// still `NeverPushed`. Asking the merge question first must not
+    /// soften the refusal for content that did not land.
+    #[test]
+    fn an_unmerged_branch_with_no_tracking_config_is_still_never_pushed() {
+        let (_t, _repo, wt) = untracked_branch_fixture(false);
+        assert!(
+            !was_ever_pushed(&wt),
+            "fixture must have no tracking config"
+        );
+
+        let w = Worktree {
+            path: wt.to_string_lossy().into_owned(),
+            branch: "contrib".into(),
+            ..Default::default()
+        };
+        let s = worktree_safety(&w, "main", false, Some(0));
+        assert_eq!(s, Safety::NeverPushed);
+        assert!(!s.is_safe(), "unmerged local-only work must be refused");
     }
 
     /// `was_ever_pushed` reads the CHECKOUT's own branch. A detached
@@ -8832,6 +8977,7 @@ mod live {
                 Safety::Unpushed(_) => "unpushed",
                 Safety::NeverPushed => "never_pushed",
                 Safety::MergedUpstreamDeleted => "merged_upstream_deleted",
+                Safety::MergedNoUpstream => "merged_no_upstream",
                 // The tally that produced the #819 column of the
                 // measured table in `worktree_safety`. Counted
                 // separately from `safe` on purpose: the whole question

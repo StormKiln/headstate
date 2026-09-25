@@ -181,6 +181,29 @@ pub enum Safety {
     /// bug: a branch whose PR merged and whose remote was then deleted
     /// was reported as commits existing only on this machine.
     MergedUpstreamDeleted,
+    /// Merged, on a branch that has no tracking config at all (#1439).
+    /// Removable.
+    ///
+    /// A contributor's PR fetched with `git fetch origin pull/N/head:prN`,
+    /// or any branch checked out without `--track`, has no
+    /// `branch.<name>.remote`. That used to short-circuit to
+    /// `NeverPushed` before the merge check ran, so a branch whose work
+    /// was provably on the default branch read "commits exist only here".
+    ///
+    /// Distinct from `NeverPushed` because it is the opposite verdict:
+    /// `merged_into` found the content on the default branch, so nothing
+    /// exists only here, whatever the config says.
+    ///
+    /// Distinct from `MergedUpstreamDeleted` because that label says the
+    /// tracking config outlived the remote branch, and here there never
+    /// was one. The same objection `DetachedMerged` makes for a
+    /// branchless checkout.
+    ///
+    /// In `is_safe`: the evidence is `merged_into`'s, unchanged (ancestry
+    /// or an exact patch-id match), the identical bar `Safe` and
+    /// `MergedUpstreamDeleted` clear. An unmerged branch with no
+    /// tracking config is still `NeverPushed`.
+    MergedNoUpstream,
     /// A branchless checkout whose HEAD is already on the default
     /// branch (#819). Removable.
     ///
@@ -485,7 +508,10 @@ impl Safety {
         // side effect of a wording fix).
         matches!(
             self,
-            Safety::Safe | Safety::MergedUpstreamDeleted | Safety::DetachedMerged(_)
+            Safety::Safe
+                | Safety::MergedUpstreamDeleted
+                | Safety::MergedNoUpstream
+                | Safety::DetachedMerged(_)
         )
     }
 
@@ -523,6 +549,10 @@ impl Safety {
             }
             Safety::NeverPushed => "never pushed — commits exist only here".into(),
             Safety::MergedUpstreamDeleted => "merged; upstream deleted".into(),
+            // MERGED FIRST, then the missing config (#1439). "Never
+            // pushed" would repeat the claim this variant exists to
+            // retract; "no upstream" says only what was observed.
+            Safety::MergedNoUpstream => "merged; no upstream configured".into(),
             // MERGED FIRST, then the detachment (#819).
             //
             // The old wording for this row was "could not determine:
@@ -786,6 +816,9 @@ mod tests {
         for s in [
             Safety::Safe,
             Safety::MergedUpstreamDeleted,
+            // #1439: merged content on a branch with no tracking config.
+            // Same `merged_into` evidence as the two above.
+            Safety::MergedNoUpstream,
             Safety::DetachedMerged("detached at v1.13.0~30".into()),
         ] {
             assert!(s.is_safe(), "{s:?} is one of the merged states");
@@ -860,6 +893,7 @@ mod tests {
             Safety::Unpushed(2),
             Safety::NeverPushed,
             Safety::MergedUpstreamDeleted,
+            Safety::MergedNoUpstream,
             Safety::DetachedMerged("v1.0.0~3".into()),
             Safety::Empty,
             Safety::Orphaned,
@@ -886,6 +920,7 @@ mod tests {
                 | Safety::Unpushed(_)
                 | Safety::NeverPushed
                 | Safety::MergedUpstreamDeleted
+                | Safety::MergedNoUpstream
                 | Safety::DetachedMerged(_)
                 | Safety::Empty
                 | Safety::Orphaned

@@ -55,6 +55,9 @@
     "kind": "merged_upstream_deleted"
   },
   {
+    "kind": "merged_no_upstream"
+  },
+  {
     "kind": "detached_merged",
     "detail": "v1.0.0~3"
   },
