@@ -840,4 +840,95 @@ mod tests {
         assert_ne!(Safety::Pending.reason(), unknown.reason());
         assert!(!Safety::Pending.is_safe());
     }
+
+    /// One of every `Safety` variant, in the fixture's order.
+    ///
+    /// `InProgress` appears once per `GitOperation`, because the op name
+    /// is itself a wire string the frontend matches (`cherryPick`), and
+    /// once with an unreadable conflict count.
+    fn every_safety_variant() -> Vec<Safety> {
+        let in_progress = |op, conflicts| Safety::InProgress { op, conflicts };
+        let all = vec![
+            Safety::Safe,
+            Safety::MainCheckout,
+            Safety::Dirty(3),
+            in_progress(GitOperation::Rebase, Some(2)),
+            in_progress(GitOperation::Merge, Some(1)),
+            in_progress(GitOperation::CherryPick, Some(0)),
+            in_progress(GitOperation::Revert, None),
+            in_progress(GitOperation::Bisect, None),
+            Safety::Unpushed(2),
+            Safety::NeverPushed,
+            Safety::MergedUpstreamDeleted,
+            Safety::DetachedMerged("v1.0.0~3".into()),
+            Safety::Empty,
+            Safety::Orphaned,
+            Safety::Unmerged,
+            Safety::Locked(Lock {
+                reason: Some("some tool (pid 123)".into()),
+                age_days: Some(2),
+                holder_running: Some(false),
+                underlying: Box::new(Safety::Unmerged),
+            }),
+            Safety::Prunable("gitdir file points to non-existent location".into()),
+            Safety::Pending,
+            Safety::Unknown("git exited 128".into()),
+        ];
+        // Exhaustive on purpose, with no wildcard arm: a new variant
+        // fails to compile here until someone adds it to the list above
+        // -- and so to the fixture the frontend is tested against.
+        for s in &all {
+            match s {
+                Safety::Safe
+                | Safety::MainCheckout
+                | Safety::Dirty(_)
+                | Safety::InProgress { .. }
+                | Safety::Unpushed(_)
+                | Safety::NeverPushed
+                | Safety::MergedUpstreamDeleted
+                | Safety::DetachedMerged(_)
+                | Safety::Empty
+                | Safety::Orphaned
+                | Safety::Unmerged
+                | Safety::Locked(_)
+                | Safety::Prunable(_)
+                | Safety::Pending
+                | Safety::Unknown(_) => {}
+            }
+        }
+        all
+    }
+
+    /// The wire format of `Safety`, pinned to a checked-in fixture that
+    /// the frontend's own tests read (#1437).
+    ///
+    /// The two sides were each tested only against themselves: Rust
+    /// serialised `InProgress` as `in_progress` with its fields under
+    /// `detail`, the TS mirror declared `inProgress` with them
+    /// flattened, and every in-progress row rendered "could not
+    /// determine: [object Object]" from the day the state shipped.
+    /// `src/lib/worktrees.test.ts` feeds each entry of this fixture
+    /// through `safetyReason`, so a rename on either side now fails a
+    /// test on one side or the other.
+    ///
+    /// On a deliberate change, replace the fixture with the `actual`
+    /// this failure prints.
+    #[test]
+    fn safety_serialises_as_the_frontend_fixture_says() {
+        let actual = serde_json::to_string_pretty(&every_safety_variant()).unwrap();
+        // CRLF-normalised: a Windows checkout may convert line endings,
+        // and that is not a change to the wire format.
+        let fixture =
+            include_str!("../../tests/fixtures/safety_variants.json").replace("\r\n", "\n");
+        assert_eq!(
+            actual.trim(),
+            fixture.trim(),
+            "Safety's JSON no longer matches the fixture the frontend is tested \
+             against. actual:\n{actual}"
+        );
+        // And it reads back: the fixture is not merely a string that
+        // happens to match, it is a valid `Safety` list.
+        let back: Vec<Safety> = serde_json::from_str(&fixture).unwrap();
+        assert_eq!(back, every_safety_variant());
+    }
 }

@@ -1,0 +1,92 @@
+[
+  {
+    "kind": "safe"
+  },
+  {
+    "kind": "main_checkout"
+  },
+  {
+    "kind": "dirty",
+    "detail": 3
+  },
+  {
+    "kind": "in_progress",
+    "detail": {
+      "op": "rebase",
+      "conflicts": 2
+    }
+  },
+  {
+    "kind": "in_progress",
+    "detail": {
+      "op": "merge",
+      "conflicts": 1
+    }
+  },
+  {
+    "kind": "in_progress",
+    "detail": {
+      "op": "cherryPick",
+      "conflicts": 0
+    }
+  },
+  {
+    "kind": "in_progress",
+    "detail": {
+      "op": "revert",
+      "conflicts": null
+    }
+  },
+  {
+    "kind": "in_progress",
+    "detail": {
+      "op": "bisect",
+      "conflicts": null
+    }
+  },
+  {
+    "kind": "unpushed",
+    "detail": 2
+  },
+  {
+    "kind": "never_pushed"
+  },
+  {
+    "kind": "merged_upstream_deleted"
+  },
+  {
+    "kind": "detached_merged",
+    "detail": "v1.0.0~3"
+  },
+  {
+    "kind": "empty"
+  },
+  {
+    "kind": "orphaned"
+  },
+  {
+    "kind": "unmerged"
+  },
+  {
+    "kind": "locked",
+    "detail": {
+      "reason": "some tool (pid 123)",
+      "age_days": 2,
+      "holder_running": false,
+      "underlying": {
+        "kind": "unmerged"
+      }
+    }
+  },
+  {
+    "kind": "prunable",
+    "detail": "gitdir file points to non-existent location"
+  },
+  {
+    "kind": "pending"
+  },
+  {
+    "kind": "unknown",
+    "detail": "git exited 128"
+  }
+]

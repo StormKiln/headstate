@@ -2343,9 +2343,20 @@ const CLASSIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45)
 /// (#1136).
 ///
 /// Verified against real repositories rather than inferred: a conflicted
-/// `git rebase` leaves `REBASE_HEAD` and `rebase-merge/`, a conflicted
-/// `git merge` leaves `MERGE_HEAD`, and `git cherry-pick` leaves
-/// `CHERRY_PICK_HEAD`.
+/// `git merge` leaves `MERGE_HEAD`, `git cherry-pick` leaves
+/// `CHERRY_PICK_HEAD`, `git revert` leaves `REVERT_HEAD`, and a bisect
+/// leaves `BISECT_LOG`. Each of those is removed when its operation
+/// finishes -- by the commit or `--continue`, or by `bisect reset`.
+///
+/// A rebase is detected by its `rebase-merge/` or `rebase-apply/`
+/// DIRECTORY only, which is what git's own `wt-status.c` uses. NOT by
+/// `REBASE_HEAD` (#1438): a conflicted rebase writes it, but git 2.50.1
+/// leaves it behind once the rebase completes with `--continue` or
+/// `--skip`, and after an interactive rebase that stopped to edit. So
+/// `REBASE_HEAD` proves only that a rebase stopped at some point, and
+/// reading it as "in progress" classed every worktree ever rebased
+/// through a conflict as mid-rebase -- and so unremovable -- for the
+/// rest of its life.
 ///
 /// Paths are built with `PathBuf::join`, never `format!`: Windows
 /// `canonicalize` returns verbatim `\\?\C:\` paths and this has cost
@@ -2359,13 +2370,13 @@ fn operation_in_progress(dir: &Path) -> Option<GitOperation> {
     let git_dir = git(dir, &["rev-parse", "--absolute-git-dir"]).ok()?;
     let git_dir = Path::new(git_dir.trim());
 
-    // Ordered most- to least-specific. `rebase-merge` is checked
-    // alongside `REBASE_HEAD` because an interactive rebase stopped
-    // between commits has the directory without the ref.
+    // Ordered most- to least-specific. No `REBASE_HEAD`: it outlives a
+    // finished rebase (see above), and the directories cover every
+    // rebase that is actually running, including an interactive one
+    // stopped between commits, which has the directory without the ref.
     for (marker, op) in [
         ("rebase-merge", GitOperation::Rebase),
         ("rebase-apply", GitOperation::Rebase),
-        ("REBASE_HEAD", GitOperation::Rebase),
         ("MERGE_HEAD", GitOperation::Merge),
         ("CHERRY_PICK_HEAD", GitOperation::CherryPick),
         ("REVERT_HEAD", GitOperation::Revert),
@@ -10663,6 +10674,102 @@ mod in_progress_tests {
 
         assert_eq!(operation_in_progress(dir), None);
         assert_eq!(conflicted_files(dir), Some(0), "and nothing is conflicted");
+    }
+
+    /// #1438: a conflicted rebase that was FINISHED is not in progress.
+    ///
+    /// Git leaves `REBASE_HEAD` behind after `rebase --continue`, so a
+    /// marker list that included it reported this worktree as mid-rebase
+    /// forever -- and blocked its removal. The state had never been
+    /// modelled: every earlier test stopped at the conflict or aborted.
+    #[test]
+    fn a_finished_conflicted_rebase_is_not_in_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        conflicting(dir);
+        assert!(run(dir, &["checkout", "-q", "feat"]));
+        let _ = run(dir, &["rebase", "main"]);
+        assert_eq!(
+            operation_in_progress(dir),
+            Some(GitOperation::Rebase),
+            "precondition: stopped on the conflict"
+        );
+
+        std::fs::write(dir.join("f.txt"), "resolved\n").unwrap();
+        assert!(run(dir, &["add", "f.txt"]));
+        let continued = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rebase", "--continue"])
+            .envs(IDENT)
+            .env("GIT_EDITOR", "true")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(continued, "rebase --continue must succeed");
+        assert!(
+            !dir.join(".git").join("rebase-merge").exists(),
+            "precondition: the rebase finished"
+        );
+        // The residue that caused #1438. Not asserted, because a future
+        // git that tidies it up is not a failure of this code; but
+        // reported, since `None` below then passes without exercising it.
+        if !dir.join(".git").join("REBASE_HEAD").exists() {
+            eprintln!("this git does not leave REBASE_HEAD behind");
+        }
+
+        assert_eq!(operation_in_progress(dir), None);
+    }
+
+    /// The other markers ARE cleared when their operation finishes --
+    /// measured rather than assumed, because `REBASE_HEAD` showed that a
+    /// marker an operation writes need not be removed by it.
+    #[test]
+    fn finished_merge_cherry_pick_revert_and_bisect_are_not_in_progress() {
+        let resolve_and_commit = |dir: &Path| {
+            std::fs::write(dir.join("f.txt"), "resolved\n").unwrap();
+            assert!(run(dir, &["add", "f.txt"]));
+            assert!(run(dir, &["commit", "-q", "--no-edit"]));
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        conflicting(dir);
+        let _ = run(dir, &["merge", "feat"]);
+        assert_eq!(operation_in_progress(dir), Some(GitOperation::Merge));
+        resolve_and_commit(dir);
+        assert_eq!(operation_in_progress(dir), None, "merge committed");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        conflicting(dir);
+        let _ = run(dir, &["cherry-pick", "feat"]);
+        assert_eq!(operation_in_progress(dir), Some(GitOperation::CherryPick));
+        resolve_and_commit(dir);
+        assert_eq!(operation_in_progress(dir), None, "cherry-pick committed");
+
+        // Reverting a commit that a later one rewrote the same line of
+        // conflicts, which is the stopped state being finished here.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        conflicting(dir);
+        assert!(run(dir, &["checkout", "-q", "feat"]));
+        std::fs::write(dir.join("f.txt"), "later\n").unwrap();
+        assert!(run(dir, &["commit", "-q", "-am", "later"]));
+        let _ = run(dir, &["revert", "--no-edit", "HEAD~1"]);
+        assert_eq!(operation_in_progress(dir), Some(GitOperation::Revert));
+        resolve_and_commit(dir);
+        assert_eq!(operation_in_progress(dir), None, "revert committed");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        conflicting(dir);
+        assert!(run(dir, &["bisect", "start"]));
+        assert!(run(dir, &["bisect", "bad"]));
+        assert!(run(dir, &["bisect", "good", "HEAD~1"]));
+        assert_eq!(operation_in_progress(dir), Some(GitOperation::Bisect));
+        assert!(run(dir, &["bisect", "reset"]));
+        assert_eq!(operation_in_progress(dir), None, "bisect reset");
     }
 
     /// An ABORTED rebase leaves no markers, so the row goes back to
