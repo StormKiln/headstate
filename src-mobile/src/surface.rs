@@ -178,6 +178,12 @@ pub const SURFACE: &[(&str, Class)] = &[
     // anything -- Local is about what a command DOES, not about which
     // screen its caller sits on.
     ("claude_launch_terms", Class::Read),
+    // A pull request's Claudify (#1455): the copy command returns a
+    // string the phone can show (Read); the launch and its preview are a
+    // terminal window on the desktop and that window's argv (Local).
+    ("claudify_pr_command", Class::Read),
+    ("claude_launch_pr", Class::Local),
+    ("claude_launch_pr_preview", Class::Local),
     ("check_packages", Class::Read),
     ("packages_markdown", Class::Read),
     // Read: the effective context a session loads, across scopes

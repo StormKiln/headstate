@@ -562,6 +562,37 @@ export function prForWorktree(
   );
 }
 
+/// The main checkout of a pull request's repository, or null (#1455).
+///
+/// The reverse of `prForWorktree`: that one joins a directory to its
+/// pull request, this joins a pull request to the directory Claudify
+/// should start in. Matched on `identity`, which comes from the git
+/// REMOTE -- never the directory name, for the reason `WorktreeRepo`
+/// states.
+///
+/// Case-insensitive because GitHub's `owner/repo` is: a remote typed as
+/// `github.com/octocat/Hello-World` and a PR reporting `octocat/hello-world`
+/// are the same repository. Rust's `pr_checkout` applies the same rule,
+/// and it re-checks this choice before anything runs -- so this is a
+/// display join, not the gate.
+///
+/// A bare repository is skipped: it has no working tree for `claude` to
+/// start in. With several clones of one repository, the first by path
+/// wins, so the choice is stable across scans rather than following the
+/// walk's order.
+export function mainCheckoutFor(
+  repos: readonly WorktreeRepo[] | undefined,
+  prRepo: string,
+): string | null {
+  if (!repos || !prRepo) return null;
+  const want = prRepo.toLowerCase();
+  const paths = repos
+    .filter((r) => !r.bare && r.identity !== null && r.identity.toLowerCase() === want)
+    .map((r) => r.path)
+    .sort();
+  return paths[0] ?? null;
+}
+
 /// How much disk the removable worktrees are holding (#1181).
 ///
 /// # The join the app never made

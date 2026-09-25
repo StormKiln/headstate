@@ -181,6 +181,32 @@ const ROWS: Row[] = [
     },
   ),
   row(api.claudeLaunchTerms, [], "claude_launch_terms"),
+  // #1455. The prompt travels as TEXT and the directory as the page's
+  // choice; Rust re-checks the directory and builds the line.
+  row(
+    api.claudifyPrCommand,
+    [repoPath, "octocat/hello-world", "Review it"],
+    "claudify_pr_command",
+    { repoPath, prRepo: "octocat/hello-world", prompt: "Review it" },
+  ),
+  row(
+    api.claudeLaunchPr,
+    [repoPath, "octocat/hello-world", "Review it", { model: "opus", permissionMode: "plan" }],
+    "claude_launch_pr",
+    {
+      repoPath,
+      prRepo: "octocat/hello-world",
+      prompt: "Review it",
+      model: "opus",
+      permissionMode: "plan",
+    },
+  ),
+  row(
+    api.claudeLaunchPrPreview,
+    [repoPath, "octocat/hello-world", "Review it"],
+    "claude_launch_pr_preview",
+    { repoPath, prRepo: "octocat/hello-world", prompt: "Review it", model: null, permissionMode: null },
+  ),
   row(
     api.claudeLaunchWorktreePreview,
     [repoPath, worktreePath, branch, { model: "opus" }],

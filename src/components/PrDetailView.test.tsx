@@ -51,7 +51,33 @@ vi.mock("../api/hooks", () => ({
   // Controllable so the pinned Approve button, which is hidden on your
   // own pull request, can be exercised at all.
   useViewer: () => ({ data: viewer.current }),
+  // Claudify's inputs (#1455): the scan and the terminal setting.
+  useWorktrees: () => ({
+    data: claudifyState.repos,
+    unreadable: claudifyState.unreadable,
+    isError: claudifyState.scanError !== null,
+    error: claudifyState.scanError,
+  }),
+  useUiPrefs: () => ({ prefs: { terminal_command: claudifyState.terminal } }),
 }));
+
+/// What Claudify sees (#1455). Defaults: scanned, no checkout of the
+/// fixture's repository, no terminal -- the "copy the prompt" fallback.
+const claudifyState = vi.hoisted(() => ({
+  repos: [] as
+    | { identity: string | null; name: string; path: string; worktrees: never[]; bare?: boolean }[]
+    | undefined,
+  unreadable: [] as string[],
+  scanError: null as string | null,
+  terminal: "",
+}));
+const claudifyApi = vi.hoisted(() => ({
+  claudifyPrCommand: vi.fn(),
+  claudeLaunchPr: vi.fn(),
+  claudeLaunchPrPreview: vi.fn(),
+  claudeLaunchTerms: vi.fn(),
+}));
+vi.mock("../api/tauri", async (orig) => ({ ...(await orig<object>()), ...claudifyApi }));
 
 import { PrDetailView } from "./PrDetailView";
 
@@ -231,7 +257,7 @@ describe("PrDetailView layout", () => {
       ],
     });
     expect(screen.getByText(/view on github/i)).toBeTruthy();
-    expect(screen.getByRole("button", { name: /copy for agent/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /copy prompt/i })).toBeTruthy();
     expect(screen.getByRole("button", { name: /delete branch/i })).toBeTruthy();
     expect(screen.getByText("Why?")).toBeTruthy();
     // The review box and the thread reply box: both still there.
@@ -774,7 +800,7 @@ describe("PrDetailView", () => {
       state.data = { ...detail(), state: "MERGED", head_ref_id: "REF_1" };
       render(<PrDetailView repo="o/r" number={1} onBack={() => {}} />);
       const del = screen.getByRole("button", { name: /delete branch/i });
-      const agent = screen.getByRole("button", { name: /copy for agent/i });
+      const agent = screen.getByRole("button", { name: /copy prompt/i });
       expect(del.className).not.toBe(agent.className);
       // The red every other destructive control in the app uses.
       expect(del.className).toContain("#f85149");
@@ -1053,5 +1079,136 @@ describe("PrDetailView and the session that wrote the PR", () => {
     view();
     expect(screen.getByRole("button", { name: "aaaaaaaa" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "bbbbbbbb" })).toBeTruthy();
+  });
+});
+
+/// #1455: "Copy for agent" became Claudify, matching the Worktrees one.
+describe("PrDetailView Claudify", () => {
+  const CHECKOUT = "/code/hello-world";
+  const found = () => {
+    claudifyState.repos = [
+      // A different repository first, and the right one in a different
+      // case: the match is on the remote identity, case-insensitively.
+      { identity: "octocat/spoon-knife", name: "spoon-knife", path: "/code/spoon-knife", worktrees: [] },
+      { identity: "OctoCat/Hello-World", name: "hello-world", path: CHECKOUT, worktrees: [] },
+    ];
+  };
+
+  beforeEach(() => {
+    claudifyApi.claudeLaunchTerms.mockResolvedValue({ models: [], permissionModes: [], unattended: [] });
+    claudifyApi.claudeLaunchPrPreview.mockResolvedValue({ program: "term", args: ["-e", "x"] });
+    claudifyApi.claudeLaunchPr.mockResolvedValue(undefined);
+    claudifyApi.claudifyPrCommand.mockResolvedValue({
+      command: "cd '/code/hello-world' && claude 'x'",
+      claude_installed: true,
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    claudifyState.repos = [];
+    claudifyState.unreadable = [];
+    claudifyState.scanError = null;
+    claudifyState.terminal = "";
+    for (const f of Object.values(claudifyApi)) f.mockReset();
+  });
+
+  it("is a Claudify button that opens the terms dialog when a terminal and a checkout exist", async () => {
+    found();
+    claudifyState.terminal = "wezterm start -- bash -lc {command}";
+    view();
+    expect(screen.queryByRole("button", { name: /copy prompt/i })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /claudify/i }));
+    // The terms dialog (#1214), not a launch: nothing runs before the
+    // argv has been shown.
+    expect(await screen.findByText(/Hand octocat\/hello-world#42 to Claude Code/)).toBeTruthy();
+    expect(claudifyApi.claudeLaunchPr).not.toHaveBeenCalled();
+    await waitFor(() => expect(claudifyApi.claudeLaunchPrPreview).toHaveBeenCalled());
+    const [path, repo, prompt] = claudifyApi.claudeLaunchPrPreview.mock.calls[0] as [string, string, string];
+    expect(path).toBe(CHECKOUT);
+    expect(repo).toBe("octocat/hello-world");
+    // The prompt names the checkout and carries the adapted criteria.
+    expect(prompt).toContain(`created from the main checkout at ${CHECKOUT}`);
+    expect(prompt).toContain("Correctness and edge cases");
+    expect(prompt).toContain("The change is +100/-20 across 3 files.");
+
+    fireEvent.click(screen.getByRole("button", { name: /open in terminal/i }));
+    await waitFor(() => expect(claudifyApi.claudeLaunchPr).toHaveBeenCalled());
+    expect(claudifyApi.claudeLaunchPr.mock.calls[0].slice(0, 3)).toEqual([
+      CHECKOUT,
+      "octocat/hello-world",
+      prompt,
+    ]);
+  });
+
+  /// No terminal: still Claudify, and it copies the line Rust built --
+  /// the Worktrees fallback -- rather than launching anything.
+  it("copies the built command when no terminal is configured", async () => {
+    found();
+    const writeText = vi.fn<(text: string) => Promise<void>>(() => Promise.resolve());
+    Object.assign(navigator, { clipboard: { writeText } });
+    view();
+    fireEvent.click(screen.getByRole("button", { name: /claudify/i }));
+    await waitFor(() => expect(writeText).toHaveBeenCalled());
+    expect(writeText.mock.calls[0][0]).toBe("cd '/code/hello-world' && claude 'x'");
+    expect(claudifyApi.claudifyPrCommand.mock.calls[0].slice(0, 2)).toEqual([
+      CHECKOUT,
+      "octocat/hello-world",
+    ]);
+    expect(claudifyApi.claudeLaunchPr).not.toHaveBeenCalled();
+    expect(screen.queryByText(/Hand .* to Claude Code/)).toBeNull();
+  });
+
+  /// No checkout: SAY so, and copy the prompt alone. Never launch or
+  /// build a command somewhere that is not the repository.
+  it("says there is no local checkout instead of offering Claudify", async () => {
+    claudifyState.repos = [
+      { identity: "octocat/spoon-knife", name: "spoon-knife", path: "/code/spoon-knife", worktrees: [] },
+      // A bare clone of the right repository has no tree to start in.
+      {
+        identity: "octocat/hello-world",
+        name: "hello-world.git",
+        path: "/code/hw.git",
+        worktrees: [],
+        bare: true,
+      },
+    ];
+    claudifyState.terminal = "wezterm start -- bash -lc {command}";
+    const writeText = vi.fn<(text: string) => Promise<void>>(() => Promise.resolve());
+    Object.assign(navigator, { clipboard: { writeText } });
+    view();
+    expect(screen.queryByRole("button", { name: /claudify/i })).toBeNull();
+    expect(
+      screen.getByText(/No local checkout of octocat\/hello-world was found in the scanned folders/),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /copy prompt/i }));
+    await waitFor(() => expect(writeText).toHaveBeenCalled());
+    expect(writeText.mock.calls[0][0]).toMatch(/^Review octocat\/hello-world#42/);
+    expect(claudifyApi.claudifyPrCommand).not.toHaveBeenCalled();
+    expect(claudifyApi.claudeLaunchPrPreview).not.toHaveBeenCalled();
+  });
+
+  /// A partial scan makes "not found" a floor, so it is qualified.
+  it("qualifies 'no checkout' when part of the scan could not be read", () => {
+    claudifyState.unreadable = ["/code/locked: permission denied"];
+    view();
+    expect(screen.getByText(/in the folders that could be read \(1 could not\)/)).toBeTruthy();
+  });
+
+  /// Pending and failed are different states from "none".
+  it("distinguishes a scan in progress and a scan that failed from no checkout", () => {
+    claudifyState.repos = undefined;
+    view();
+    const pending = screen.getByRole("button", { name: /claudify/i });
+    expect((pending as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText(/Looking for a local checkout/)).toBeTruthy();
+    cleanup();
+
+    claudifyState.scanError = "walk refused";
+    view();
+    expect(screen.getByText(/Could not look for a local checkout/).textContent).toContain(
+      "walk refused",
+    );
+    expect(screen.queryByText(/No local checkout/)).toBeNull();
   });
 });

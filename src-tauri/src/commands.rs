@@ -2848,6 +2848,176 @@ pub async fn claude_launch_session_preview(
     preview_in_terminal(&app, &built.command, terms)
 }
 
+/// The main checkout a pull request's Claudify may start in (#1455).
+///
+/// The frontend names the directory it chose (from the same scan), and
+/// this CHECKS that choice rather than trusting it. Three conditions,
+/// each its own refusal because each has a different remedy:
+///
+/// - `repo_path` is one of the scanned repositories -- the rule
+///   [`scanned_repo_root`] states: without it, "start `claude` in the
+///   checkout" is "start `claude` in any directory the caller names".
+/// - That repository's `identity` (from its `origin` remote) is the
+///   pull request's `owner/repo`. Compared case-insensitively, because
+///   GitHub's names are, and `mainCheckoutFor` in `src/lib/worktrees.ts`
+///   applies the same rule to pick it.
+/// - It is not bare. A bare repository has no working tree to run in.
+///
+/// Compared on CANONICAL paths, for `scanned_repo_root`'s reason: two
+/// spellings of one directory must not read as two repositories. The
+/// path returned is the SCAN's spelling, which is the one the user saw.
+///
+/// Pure over the scan so it can be tested without an `AppHandle`.
+fn pr_checkout(
+    repos: &[crate::worktrees::Repo],
+    repo_path: &str,
+    pr_repo: &str,
+) -> Result<String, String> {
+    let want = std::path::Path::new(repo_path)
+        .canonicalize()
+        .map_err(|e| format!("{repo_path}: could not be read: {e}"))?;
+    let scanned = repos
+        .iter()
+        .find(|r| {
+            std::path::Path::new(&r.path)
+                .canonicalize()
+                .is_ok_and(|p| p == want)
+        })
+        .ok_or_else(|| format!("{repo_path} is no longer one of the scanned repositories"))?;
+    let same_repo = scanned
+        .identity
+        .as_deref()
+        .is_some_and(|id| id.eq_ignore_ascii_case(pr_repo));
+    if !same_repo {
+        return Err(format!(
+            "{repo_path} is a checkout of {}, not {pr_repo}",
+            scanned
+                .identity
+                .as_deref()
+                .unwrap_or("a repository with no origin remote")
+        ));
+    }
+    if scanned.bare {
+        return Err(format!(
+            "{repo_path} is a bare repository, so there is no checkout to start in"
+        ));
+    }
+    Ok(scanned.path.clone())
+}
+
+/// The line a pull request's Claudify runs: `cd <checkout> && claude <prompt>`.
+///
+/// Built HERE, by [`crate::claude::launch::prompt_command`], so the
+/// copy path and the launch path carry the same bytes and the quoting is
+/// the one that module's docs verify end to end.
+///
+/// # The prompt comes from the caller, and why that is bounded
+///
+/// Unlike `claude_launch_worktree` and `claude_md_advice_launch`, the
+/// prompt is composed by the frontend (`src/lib/agentPrompt.ts`) from
+/// the pull request it is showing -- the backend holds no copy of that
+/// fetch to rebuild it from. What keeps this from being "run whatever you
+/// are given" is that the prompt never becomes shell: `prompt_command`
+/// single-quotes it into ONE argv slot of `claude`, the directory is
+/// re-derived by [`pr_checkout`], and the launch is `Class::Local` with
+/// the whole argv shown before it runs (#1214). An empty prompt, or one
+/// with a NUL byte no argv can carry, is refused rather than launched.
+fn pr_claude_command(prompt: &str, checkout: &str) -> Result<String, String> {
+    if prompt.trim().is_empty() {
+        return Err("there is no prompt to start Claude Code on".to_string());
+    }
+    if prompt.contains('\0') {
+        return Err("the prompt contains a NUL byte, which no command line can carry".to_string());
+    }
+    Ok(crate::claude::launch::prompt_command(prompt, checkout))
+}
+
+/// [`pr_checkout`] against the LIVE scan, then the line to run.
+///
+/// Re-scanned rather than read from a cache, for `scanned_repo_root`'s
+/// reason: a selection the page made minutes ago must not authorise a
+/// directory that has since gone.
+async fn pr_claudify_line(
+    app: AppHandle,
+    repo_path: &str,
+    pr_repo: &str,
+    prompt: &str,
+) -> Result<(String, String), String> {
+    let scan = list_worktrees(app).await?;
+    let checkout = pr_checkout(&scan.repos, repo_path, pr_repo)?;
+    let line = pr_claude_command(prompt, &checkout)?;
+    Ok((checkout, line))
+}
+
+#[tauri::command]
+/// The command that hands a pull request to Claude Code, for copying (#1455).
+///
+/// `Class::Read`, like `claudify_command`: it returns a string and runs
+/// nothing, and a phone can show it to be typed at the desktop.
+/// `claude_installed` is advisory, exactly as there -- the line is
+/// returned either way.
+pub async fn claudify_pr_command(
+    app: AppHandle,
+    repo_path: String,
+    pr_repo: String,
+    prompt: String,
+) -> Result<ClaudifyCommand, String> {
+    let (_, command) = pr_claudify_line(app, &repo_path, &pr_repo, &prompt).await?;
+    // `find_claude` walks PATH and the fallback directories; off the
+    // runtime for #1090's reason.
+    let claude_installed = tauri::async_runtime::spawn_blocking(crate::auth::find_claude)
+        .await
+        .map_err(|e| format!("could not look for Claude Code: {e}"))?
+        .is_some();
+    Ok(ClaudifyCommand {
+        command,
+        claude_installed,
+    })
+}
+
+#[tauri::command]
+/// Open the configured terminal on Claude Code in a pull request's main
+/// checkout (#1455).
+///
+/// `Class::Local`, for the reason [`claude_launch_worktree`] states: it
+/// opens a window on THIS machine. The terms are tokens refused before
+/// anything is built, exactly as there, and the checkout is the launch's
+/// working directory, so `launch`'s gone-directory refusal covers a
+/// checkout deleted since the scan.
+pub async fn claude_launch_pr(
+    app: AppHandle,
+    repo_path: String,
+    pr_repo: String,
+    prompt: String,
+    model: Option<String>,
+    permission_mode: Option<String>,
+) -> Result<(), String> {
+    let terms = crate::claude::terms::Terms::parse(model.as_deref(), permission_mode.as_deref())
+        .map_err(|e| e.to_string())?;
+    let (checkout, line) = pr_claudify_line(app.clone(), &repo_path, &pr_repo, &prompt).await?;
+    launch_in_terminal(&app, line, terms, Some(checkout)).await
+}
+
+#[tauri::command]
+/// The exact argv `claude_launch_pr` would spawn (#1214, #1455).
+///
+/// `Class::Local`, for the reason [`claude_launch_worktree_preview`]
+/// states. The same [`pr_claudify_line`] as the launch, so the preview
+/// cannot describe a different line from the one that runs.
+pub async fn claude_launch_pr_preview(
+    app: AppHandle,
+    repo_path: String,
+    pr_repo: String,
+    prompt: String,
+    model: Option<String>,
+    permission_mode: Option<String>,
+) -> Result<LaunchPreview, String> {
+    let terms = crate::claude::terms::Terms::parse(model.as_deref(), permission_mode.as_deref())
+        .map_err(|e| e.to_string())?;
+    let (_, line) = pr_claudify_line(app.clone(), &repo_path, &pr_repo, &prompt).await?;
+    preview_in_terminal(&app, &line, terms)
+}
+
 /// Which brief a Claudify acts on (#1292).
 ///
 /// An index into `Report.findings`, or the whole report. Deliberately
@@ -6771,6 +6941,108 @@ pub async fn claude_permission_ownership(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[cfg(test)]
+mod pr_claudify_tests {
+    use super::{pr_checkout, pr_claude_command};
+    use crate::worktrees::Repo;
+
+    fn repo(identity: Option<&str>, path: &std::path::Path, bare: bool) -> Repo {
+        Repo {
+            identity: identity.map(str::to_string),
+            name: "r".to_string(),
+            path: path.to_string_lossy().into_owned(),
+            bare,
+            ..Repo::default()
+        }
+    }
+
+    /// The scanned checkout of the PR's repository is accepted, matched
+    /// case-insensitively, and returned in the SCAN's spelling.
+    #[test]
+    fn a_scanned_checkout_of_the_prs_repository_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let repos = vec![
+            repo(Some("octocat/spoon-knife"), other.path(), false),
+            repo(Some("OctoCat/Hello-World"), dir.path(), false),
+        ];
+        let got =
+            pr_checkout(&repos, &dir.path().to_string_lossy(), "octocat/hello-world").unwrap();
+        assert_eq!(got, dir.path().to_string_lossy());
+    }
+
+    /// A directory the scan does not hold is refused, even when it
+    /// exists: otherwise the caller chooses where `claude` starts.
+    #[test]
+    fn a_directory_outside_the_scan_is_refused() {
+        let scanned = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let repos = vec![repo(Some("octocat/hello-world"), scanned.path(), false)];
+        let e = pr_checkout(
+            &repos,
+            &elsewhere.path().to_string_lossy(),
+            "octocat/hello-world",
+        )
+        .unwrap_err();
+        assert!(e.contains("no longer one of the scanned"), "{e}");
+    }
+
+    /// A scanned checkout of a DIFFERENT repository is refused, as is a
+    /// bare clone of the right one and a checkout with no remote.
+    #[test]
+    fn a_checkout_of_another_repository_or_a_bare_clone_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+
+        let other = vec![repo(Some("octocat/spoon-knife"), dir.path(), false)];
+        let e = pr_checkout(&other, &path, "octocat/hello-world").unwrap_err();
+        assert!(e.contains("octocat/spoon-knife"), "{e}");
+
+        let none = vec![repo(None, dir.path(), false)];
+        let e = pr_checkout(&none, &path, "octocat/hello-world").unwrap_err();
+        assert!(e.contains("no origin remote"), "{e}");
+
+        let bare = vec![repo(Some("octocat/hello-world"), dir.path(), true)];
+        let e = pr_checkout(&bare, &path, "octocat/hello-world").unwrap_err();
+        assert!(e.contains("bare"), "{e}");
+    }
+
+    /// `cd <checkout> && claude <prompt>`, with both quoted so neither a
+    /// path nor a prompt can become a second shell word.
+    #[test]
+    fn the_line_cds_into_the_checkout_and_quotes_the_prompt() {
+        let line = pr_claude_command(
+            "Review octocat/hello-world#42\n\n  git fetch origin 'x'\\''y'\n$(whoami)",
+            "/code/it's here",
+        )
+        .unwrap();
+        assert_eq!(
+            line,
+            "cd '/code/it'\\''s here' && claude 'Review octocat/hello-world#42\n\n  \
+             git fetch origin '\\''x'\\''\\'\\'''\\''y'\\''\n$(whoami)'"
+        );
+    }
+
+    /// An empty prompt or one no argv can carry is refused, not launched.
+    #[test]
+    fn an_empty_or_nul_prompt_is_refused() {
+        assert!(pr_claude_command("  \n", "/code/r").is_err());
+        assert!(pr_claude_command("a\0b", "/code/r").is_err());
+    }
+
+    /// The terms dialog's flags (#1214) land after `claude`, before the
+    /// prompt -- the line is one `splice` recognises, not a new shape.
+    #[test]
+    fn the_chosen_terms_land_between_claude_and_the_prompt() {
+        let line = pr_claude_command("Review it", "/code/r").unwrap();
+        let terms = crate::claude::terms::Terms::parse(Some("opus"), None).unwrap();
+        assert_eq!(
+            terms.splice(&line),
+            "cd '/code/r' && claude --model opus 'Review it'"
+        );
+    }
 }
 
 #[cfg(test)]

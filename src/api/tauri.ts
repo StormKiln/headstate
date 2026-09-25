@@ -687,6 +687,48 @@ export const claudeLaunchSessionPreview = (
     permissionMode: terms.permissionMode ?? null,
   });
 
+/// The command that hands a pull request to Claude Code, for copying
+/// (#1455): `cd <main checkout> && claude <prompt>`.
+///
+/// `repoPath` is the checkout this page chose (`mainCheckoutFor`); Rust
+/// RE-CHECKS it against the live scan and against `prRepo` before
+/// building anything, so a stale or foreign path is refused rather than
+/// used. The line is built in Rust, with Rust's quoting, so copy and
+/// launch carry the same bytes.
+export const claudifyPrCommand = (repoPath: string, prRepo: string, prompt: string) =>
+  call<ClaudifyCommand>("claudify_pr_command", { repoPath, prRepo, prompt });
+
+/// Open the configured terminal on Claude Code in a pull request's main
+/// checkout (#1455). Desktop only -- `Class::Local`.
+export const claudeLaunchPr = (
+  repoPath: string,
+  prRepo: string,
+  prompt: string,
+  terms: LaunchTerms = {},
+) =>
+  call<void>("claude_launch_pr", {
+    repoPath,
+    prRepo,
+    prompt,
+    model: terms.model ?? null,
+    permissionMode: terms.permissionMode ?? null,
+  });
+
+/// The argv `claudeLaunchPr` would spawn, for the user to read (#1214).
+export const claudeLaunchPrPreview = (
+  repoPath: string,
+  prRepo: string,
+  prompt: string,
+  terms: LaunchTerms = {},
+) =>
+  call<LaunchPreview>("claude_launch_pr_preview", {
+    repoPath,
+    prRepo,
+    prompt,
+    model: terms.model ?? null,
+    permissionMode: terms.permissionMode ?? null,
+  });
+
 /// Propose stopping live sessions, with the evidence (#1219).
 ///
 /// Signals nothing. It re-reads the live registry and re-probes the

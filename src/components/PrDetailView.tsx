@@ -1,5 +1,5 @@
 import { ExternalLink } from "./ExternalLink";
-import { ArrowLeft, Trash2, Bot, Check, CircleDot, CircleSlash, ExternalLink as ExternalLinkIcon, X } from "lucide-react";
+import { ArrowLeft, Trash2, Check, CircleDot, CircleSlash, ExternalLink as ExternalLinkIcon, X } from "lucide-react";
 import { toast } from "sonner";
 import {
   useClaudeSessionsForPr,
@@ -14,11 +14,10 @@ import { useState } from "react";
 import type { ReviewVerdictName } from "../api/tauri";
 import type { ClaudePrLink } from "../types/pr";
 import { useFilters } from "../store/filters";
-import { agentPrompt, toAgentContext } from "../lib/agentPrompt";
 import { rerunnableRun } from "../lib/rerun";
 import { useIsMobile } from "../lib/useIsMobile";
 import { Markdown } from "./Markdown";
-import { copyText } from "../lib/clipboard";
+import { PrClaudifyButton } from "./PrClaudify";
 import { CommentRow } from "./CommentRow";
 import { ReviewThreads } from "./ReviewThreads";
 import { Section } from "./Section";
@@ -654,27 +653,11 @@ export function PrDetailView({
           <ExternalLinkIcon className="h-3.5 w-3.5" aria-hidden="true" />
           View on GitHub
         </ExternalLink>
-        {/* Worth more here than on a row: this view has the per-check
-            names and URLs, so the prompt names the jobs that actually
-            failed rather than saying the checks were not loaded. */}
-        <button
-          type="button"
-          onClick={() =>
-            void copyText(agentPrompt(toAgentContext(pr))).then((failure) =>
-              failure === null
-                ? toast.success("Prompt copied — paste it to an agent")
-                : // The REASON, which the previous version discarded.
-                  // "Could not copy" alone leaves the user with nothing
-                  // to act on, and an absent clipboard did not even
-                  // reach this handler.
-                  toast.error("Could not copy the prompt", { description: failure }),
-            )
-          }
-          className="flex w-fit items-center gap-1.5 rounded border border-[#30363d] px-3 py-1.5 text-sm hover:bg-[#161b22]"
-        >
-          <Bot className="h-3.5 w-3.5" aria-hidden="true" />
-          Copy for agent
-        </button>
+        {/* Claudify (#1455), which replaced "Copy for agent". Worth more
+            here than on a row: this view has the per-check names and
+            URLs, the size and the description, so the prompt names the
+            jobs that actually failed and adapts its review criteria. */}
+        <PrClaudifyButton pr={pr} />
 
         {/* Only once the PR has MERGED, and only while the branch still
             exists. 31 of the last 60 merged PRs on a real account still
