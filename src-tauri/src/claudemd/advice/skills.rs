@@ -36,7 +36,19 @@
 //! both behind the egress proxy), and `definitions::frontmatter` accepts
 //! the line, so the inventory is no evidence either way. The finding
 //! names the line and the YAML rule, and never says "Claude Code will
-//! reject this".
+//! reject this". A block scalar (`description: >-` and the indented
+//! lines under it) is not a plain scalar, so a `: ` in one is legal and
+//! not this warning.
+//!
+//! # A block scalar is its indented lines (#1419)
+//!
+//! `description: >-` is a header, not a value: the value is the
+//! more-indented lines under it. Both readers -- `parse_frontmatter`
+//! here and `definitions::frontmatter`, whose description the cost Notes
+//! and plugin totals measure -- read it through the one
+//! `definitions::block_scalar`, which documents what YAML it still does
+//! not read. Read as the header, a nine-line description was ~1 est.
+//! token "paid by every session".
 //!
 //! # Rules taken from the skills authoring page
 //!
@@ -108,7 +120,7 @@
 //! ones; `definitions.rs` says why the second is not this module's call.
 
 use super::{Check, Context, Evidence, Finding, Locator, Producer, Severity, Subject};
-use crate::claude::definitions::{Definition, Inventory, Kind, ScopeRefusal, Source};
+use crate::claude::definitions::{block_scalar, Definition, Inventory, Kind, ScopeRefusal, Source};
 use crate::claudemd::{refs, text, tokens, Scope};
 use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet};
@@ -195,9 +207,13 @@ struct Field {
     /// The value with one pair of surrounding quotes stripped, as
     /// `definitions::frontmatter` strips them.
     value: String,
-    /// Whether the value was written in quotes. An unquoted value is the
-    /// one YAML reads as a plain scalar.
+    /// Whether the value was written in quotes. An unquoted value that
+    /// is not `block` is the one YAML reads as a plain scalar.
     quoted: bool,
+    /// Whether the value is a block scalar (`>-`, `|`, ...): the
+    /// indented lines under the key, read by [`block_scalar`] (#1419).
+    /// `line` is still the key's line.
+    block: bool,
 }
 
 /// What the top of a SKILL.md holds, parsed no further than the checks
@@ -227,9 +243,13 @@ fn parse_frontmatter(text: &str) -> Frontmatter {
     // An unclosed frontmatter runs to the end of the file, and the body
     // is then empty.
     fm.body_start = lines.len() + 1;
-    for (i, line) in lines.iter().enumerate().skip(1) {
+    let mut i = 1;
+    while i < lines.len() {
+        let line = lines[i];
+        // `i` is now the 1-based number of `line`.
+        i += 1;
         if line.trim() == "---" {
-            fm.body_start = i + 2;
+            fm.body_start = i + 1;
             break;
         }
         if line.starts_with([' ', '\t']) {
@@ -240,19 +260,31 @@ fn parse_frontmatter(text: &str) -> Frontmatter {
         let Some((key, raw)) = line.split_once(':') else {
             continue;
         };
-        let raw = raw.trim();
-        let quoted = raw.len() >= 2
-            && ((raw.starts_with('"') && raw.ends_with('"'))
-                || (raw.starts_with('\'') && raw.ends_with('\'')));
-        let value = if quoted {
-            raw[1..raw.len() - 1].to_string()
-        } else {
-            raw.to_string()
+        let key_line = i;
+        let (value, quoted, block) = match block_scalar(raw, 0, &lines[i..]) {
+            Some((value, used)) => {
+                // Its lines are the value, and none of them is a key.
+                i += used;
+                (value, false, true)
+            }
+            None => {
+                let raw = raw.trim();
+                let quoted = raw.len() >= 2
+                    && ((raw.starts_with('"') && raw.ends_with('"'))
+                        || (raw.starts_with('\'') && raw.ends_with('\'')));
+                let value = if quoted {
+                    raw[1..raw.len() - 1].to_string()
+                } else {
+                    raw.to_string()
+                };
+                (value, quoted, false)
+            }
         };
         fm.fields.entry(key.trim().to_string()).or_insert(Field {
-            line: i + 1,
+            line: key_line,
             value,
             quoted,
+            block,
         });
     }
     fm
@@ -540,7 +572,7 @@ fn frontmatter_findings(s: &SkillFile, out: &mut Vec<Finding>) {
                     ),
                 ));
             }
-            if !f.quoted && f.value.contains(": ") {
+            if !f.quoted && !f.block && f.value.contains(": ") {
                 out.push(advice(
                     s,
                     Some(f.line),
@@ -2039,5 +2071,53 @@ mod tests {
         assert!(!none.present);
         assert_eq!(none.stray_marker, Some(3));
         assert_eq!(none.body_start, 1);
+    }
+
+    /// #1419: a block-scalar description is the indented lines under
+    /// it, at the key's line, and the key after it is still a field.
+    #[test]
+    fn frontmatter_reads_a_block_scalar_in_full() {
+        let fm = parse_frontmatter(
+            "---\nname: a\ndescription: >-\n  Use when X:\n  any Y.\n\n  Then Z.\nmodel: b\n---\n",
+        );
+        let d = &fm.fields["description"];
+        assert_eq!(d.value, "Use when X: any Y.\nThen Z.");
+        assert_eq!(d.line, 3);
+        assert!(d.block && !d.quoted);
+        assert_eq!(fm.fields["model"].value, "b");
+        assert_eq!(fm.body_start, 10);
+    }
+
+    /// #1419 end to end: the cost Note and the scope total measure a
+    /// folded description's text, not its `>-` header, and `: ` inside a
+    /// block scalar is legal YAML, so it is not the plain-scalar warning.
+    #[test]
+    fn a_block_scalar_description_is_costed_in_full() {
+        let t = tempfile::tempdir().unwrap();
+        let text = "Use when the user asks for the octocat widget: any widget, any size, \
+                    in any of the hello-world repositories.";
+        skill(
+            t.path(),
+            "octocat-widget",
+            "---\nname: octocat-widget\ndescription: >-\n  Use when the user asks for the \
+             octocat widget: any widget,\n  any size, in any of the hello-world \
+             repositories.\n---\nbody\n",
+        );
+        let report = run_over(t.path());
+        let got = sentences(&report);
+        let est = tokens::estimate(text);
+        assert!(est > 20, "{est}");
+        assert!(
+            got.iter().any(|s| s.contains(&format!(
+                "its description is ~{est} est. tokens, paid by every session"
+            ))),
+            "{got:?}"
+        );
+        assert!(
+            got.iter()
+                .any(|s| s.contains(&format!("~{est} est. tokens of descriptions"))),
+            "{got:?}"
+        );
+        assert!(!got.iter().any(|s| s.contains("unquoted `: `")), "{got:?}");
     }
 }
