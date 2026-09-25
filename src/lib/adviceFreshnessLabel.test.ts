@@ -24,8 +24,24 @@ describe("freshnessLabel", () => {
     // And the DETAIL distinguishes them, because "we just ran" and "we
     // checked that nothing changed" are different evidence for the same
     // claim.
-    expect(label({ state: "fresh", recomputed: true }).detail).toContain("just now");
+    expect(label({ state: "fresh", recomputed: true }).detail).toContain("every check ran");
     expect(label({ state: "fresh", recomputed: false }).detail).toContain("nothing has changed");
+  });
+
+  /// #1424: "recomputed" is how the report became fresh, not a second
+  /// time stamp. It once appended ", just now" to `relativeTime`, which
+  /// read "Checked just now, just now" on a new report and "Checked 1
+  /// hour ago, just now" -- a contradiction -- on an older one.
+  it("states a recomputed report's time once, and never contradicts it", () => {
+    const hourOld = label({ state: "fresh", recomputed: true }).detail;
+    expect(hourOld).not.toContain("just now");
+    const brandNew = freshnessLabel(
+      { state: "fresh", recomputed: true },
+      NOW.toISOString(),
+      false,
+      NOW,
+    ).detail;
+    expect(brandNew.match(/just now/g)?.length ?? 0).toBeLessThanOrEqual(1);
   });
 
   /// An unchanged cached report is current in substance and says where
