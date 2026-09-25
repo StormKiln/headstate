@@ -70,6 +70,10 @@ const state = vi.hoisted(() => ({
   // page never read `isError`, so a rejection showed skeletons and then
   // silently became an em dash.
   sizingFailed: false,
+  // What the failed sizing pass rejected with (#1459), for the "not
+  // measured" hint: a desktop that did not answer is not "a very large
+  // tree".
+  sizingError: undefined as unknown,
   // The orphan confirmation's measured size (#845). An orphan's size
   // comes from nowhere else on this page -- `sizeWorktrees` opens with
   // `git worktree list` inside a repository that is gone -- so it is its
@@ -243,6 +247,7 @@ vi.mock("../api/hooks", () => ({
     // #769: the page must read this. A mock that omitted it would let
     // the "rejection shows skeletons forever" bug pass unnoticed.
     isError: state.sizingFailed,
+    error: state.sizingFailed ? state.sizingError : null,
   }),
 }));
 
@@ -389,6 +394,7 @@ describe("WorktreesPage on a phone", () => {
       sizesFailed: 0,
       sizing: false,
       sizingFailed: false,
+      sizingError: undefined,
       // #845. A leaked `orphanMeasuring` would put every orphan dialog
       // on "Measuring…" and hide the figure the dialog exists to state.
       orphanBytes: 2_684_354_560,
@@ -545,6 +551,7 @@ describe("WorktreesPage", () => {
       // #769. A leaked failure flag turns every later size assertion
       // into "not measured", which is a confusing way to fail.
       sizingFailed: false,
+      sizingError: undefined,
       sizesFailed: 0,
       assessed: [],
       prs: [],
@@ -918,6 +925,39 @@ describe("WorktreesPage", () => {
     render(<WorktreesPage />);
     expect(screen.getByText(/not measured/i)).not.toBeNull();
     expect(screen.getByText("2.0 KB")).not.toBeNull();
+  });
+
+  /// A pass that FAILED keeps the sizes it had already streamed (#1459).
+  ///
+  /// On the phone a sizing call can outlive the companion's deadline
+  /// after the stream has delivered most of its rows. Those rows were
+  /// measured; blanking them to "not measured" because the call as a
+  /// whole failed threw real numbers away -- partial is not nothing.
+  /// Only the row with no answer takes the failure, and its hint says
+  /// what failed rather than blaming the tree's size.
+  it("keeps streamed sizes when the sizing pass fails, and says why the rest are missing", () => {
+    Object.assign(state, {
+      repos: [
+        {
+          identity: null,
+          name: "proj",
+          path: "/code/proj",
+          worktrees: [
+            wt({ path: "/code/proj/ok", size_bytes: null, safety: { kind: "safe" } }),
+            wt({ path: "/code/proj/late", size_bytes: null, safety: { kind: "safe" } }),
+          ],
+        },
+      ],
+      partialSizes: new Map<string, number | null>([["/code/proj/ok", 2048]]),
+      sizing: false,
+      sizingFailed: true,
+      sizingError: "Desktop is unreachable: timed out",
+    });
+    render(<WorktreesPage />);
+    expect(screen.getByText("2.0 KB")).not.toBeNull();
+    const missing = screen.getAllByText(/not measured/i);
+    expect(missing).toHaveLength(1);
+    expect(missing[0].getAttribute("title")).toMatch(/Desktop is unreachable: timed out/);
   });
 
   /// The all-repositories rollup says it too, once the pass is done.

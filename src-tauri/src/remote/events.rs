@@ -171,7 +171,7 @@ pub const KEEP_ALIVE: Duration = Duration::from_secs(15);
 /// burstiest producer is `worktree-removal-progress`, one frame per
 /// worktree removed; a phone keeps up with that unless its socket has
 /// stopped draining, and then ending the stream is the right answer.
-const CAPACITY: usize = 256;
+pub(crate) const CAPACITY: usize = 256;
 
 /// One event as the webview received it.
 #[derive(Clone, Debug, PartialEq, Eq)]

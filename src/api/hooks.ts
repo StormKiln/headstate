@@ -59,6 +59,8 @@ import type {
   ScanKind,
 } from "./tauri";
 import { createCoalescer, type Scheduler } from "@/lib/coalesce";
+import { createLimiter, withDeadline } from "@/lib/limiter";
+import { IS_MOBILE_BUILD } from "@/lib/target";
 import { parsePrQuery, reposForNumber } from "@/lib/claudePrs";
 import {
   toolVersions,
@@ -2919,6 +2921,7 @@ export function useWorktreeSafety(repoPath: string | undefined, listed?: Worktre
 /// row promising a number for 15 minutes.
 function useStreamingSizes(): Map<string, number | null> {
   const [sizes, setSizes] = useState<Map<string, number | null>>(() => new Map());
+  useRefetchFailedSizesOnReconnect();
 
   useEffect(() => {
     // The same guarded teardown as every other listener here -- see
@@ -2963,6 +2966,108 @@ function useStreamingSizes(): Map<string, number | null> {
   return sizes;
 }
 
+/// How many `size_worktrees` calls the phone has in flight at once
+/// (#1459). See `src/lib/limiter.ts` for why the phone queues its own
+/// calls. Two, the floor of the desktop's own scan-permit pool
+/// (`scan_permits` in `commands.rs` clamps to 2..=8), so the phone never
+/// asks for more walks than the smallest desktop admits at once, and
+/// there is no idle permit while the phone has more waiting.
+///
+/// Unbounded on the desktop, which is exactly what it was: its invoke
+/// has no deadline, so a call waiting on a permit costs nothing but
+/// time, and the desktop's permits already bound the disk.
+const PHONE_SIZE_CALLS = 2;
+
+const sizeCalls = createLimiter(IS_MOBILE_BUILD ? PHONE_SIZE_CALLS : Number.POSITIVE_INFINITY);
+
+/// The phone's backstop for a size call that never settles (#1459).
+///
+/// The companion already bounds every call at `CALL_TIMEOUT` (120s,
+/// `src-mobile/src/client.rs`) and rejects when it passes, so this is
+/// NOT the deadline a user normally meets. It exists because a promise
+/// that never settles leaves the query fetching forever -- a skeleton
+/// nothing moves out of Pending, which is #1042's shape and #1459's
+/// symptom. Whatever the reason the companion's answer did not arrive
+/// (an older companion, a response lost in the webview bridge), the row
+/// must end up saying it could not be measured.
+///
+/// Longer than `CALL_TIMEOUT` so it can never pre-empt the companion's
+/// own, more specific, message; `hooks.worktreeSizes.test.tsx` reads the
+/// Rust constant to hold that. Started when the call is SENT, after any
+/// wait in `sizeCalls`, so queueing never counts against it.
+export const PHONE_SIZE_DEADLINE_MS = 135_000;
+
+/// One repository's sizes, through the phone's queue and deadline.
+function measureSizes(repoPath: string): Promise<Map<string, number | null>> {
+  return sizeCalls
+    .run(repoPath, () =>
+      IS_MOBILE_BUILD
+        ? withDeadline(
+            sizeWorktrees(repoPath),
+            PHONE_SIZE_DEADLINE_MS,
+            "the desktop did not answer in time",
+          )
+        : sizeWorktrees(repoPath),
+    )
+    .then((pairs) => new Map(pairs));
+}
+
+/// Retry the size queries that FAILED once the phone reconnects (#1459).
+///
+/// A size call fails on the phone when the desktop was unreachable or
+/// the call outlived `CALL_TIMEOUT`. Either way the query settles in
+/// error, the rows say "not measured", and -- with `retry: false` --
+/// nothing asks again until a focus change happens to. The companion
+/// emits `connection-state` each time it (re)opens the event stream, so
+/// a transition INTO `connected` is the moment a retry can succeed.
+///
+/// Only settled failures. A call still in flight keeps going: its
+/// settled answer carries every size the stream may have dropped across
+/// the reconnect, so re-issuing it would only start a second walk of the
+/// same tree on the desktop -- a JS-side refetch cannot cancel the first,
+/// which the companion is still waiting on. And never a success:
+/// `staleTime` governs those as it always has.
+///
+/// `cancelRefetch: false` because both size hooks mount this on the
+/// Worktrees page; the second call must join the first refetch, not
+/// cancel and restart it.
+///
+/// Phone only. The desktop has no connection to lose, and no one emits
+/// `connection-state` there.
+function useRefetchFailedSizesOnReconnect(): void {
+  const qc = useQueryClient();
+  useEffect(() => {
+    if (!IS_MOBILE_BUILD) return;
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    let previous: string | undefined;
+    listen<{ state?: string }>("connection-state", (e) => {
+      const state = e.payload?.state;
+      const reconnected = state === "connected" && previous !== "connected";
+      previous = state;
+      if (!reconnected) return;
+      void qc.refetchQueries(
+        {
+          queryKey: ["worktree-sizes"],
+          type: "active",
+          predicate: (q) => q.state.status === "error" && q.state.fetchStatus === "idle",
+        },
+        { cancelRefetch: false },
+      );
+    }).then(
+      (fn) => {
+        if (cancelled) safeUnlisten(fn);
+        else unlisten = fn;
+      },
+      () => {},
+    );
+    return () => {
+      cancelled = true;
+      safeUnlisten(unlisten);
+    };
+  }, [qc]);
+}
+
 /// Disk sizes for one repo's worktrees, keyed by path.
 ///
 /// The slowest of the three passes by far, so it is last: the list
@@ -2982,10 +3087,7 @@ export function useWorktreeSizes(repoPath: string | undefined) {
   const partial = useStreamingSizes();
   const query = useQuery({
     queryKey: ["worktree-sizes", repoPath],
-    queryFn: async () => {
-      const pairs = await sizeWorktrees(repoPath as string);
-      return new Map(pairs);
-    },
+    queryFn: () => measureSizes(repoPath as string),
     enabled: Boolean(repoPath),
     staleTime: 5 * 60 * 1000,
     // NOT the default `retry: 3`. This query is a full filesystem walk
@@ -2997,6 +3099,13 @@ export function useWorktreeSizes(repoPath: string | undefined) {
     // repeats a very expensive operation to get the same answer.
     retry: false,
   });
+  // The repository on screen goes first (#1459). When it was opened
+  // from All repositories, its call may still be waiting behind every
+  // other repository's on the phone; this is the one the user is
+  // looking at.
+  useEffect(() => {
+    if (repoPath) sizeCalls.promote(repoPath);
+  }, [repoPath]);
   return { ...query, partial };
 }
 
@@ -3029,7 +3138,7 @@ export function useAllWorktreeSizes(repoPaths: string[], enabled: boolean) {
   const results = useQueries({
     queries: repoPaths.map((path) => ({
       queryKey: ["worktree-sizes", path],
-      queryFn: async () => new Map(await sizeWorktrees(path)),
+      queryFn: () => measureSizes(path),
       enabled,
       staleTime: 5 * 60 * 1000,
       // Same reason as the single-repo hook: four sequential walks of a

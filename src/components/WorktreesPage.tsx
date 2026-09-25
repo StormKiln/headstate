@@ -132,6 +132,7 @@ function Row({
   onToggle,
   sizePending,
   sizeUnmeasurable = false,
+  sizeUnmeasuredWhy = UNMEASURED_HINT,
   removing = false,
   assessed = false,
   onForce,
@@ -203,6 +204,11 @@ function Row({
   /// measure" must never read as "this tree is empty", which is an
   /// invitation to delete a checkout nobody has measured.
   sizeUnmeasurable?: boolean;
+  /// Why no size is coming, for the "not measured" hint. Defaults to the
+  /// walk-budget reason (#769); a pass that failed outright carries its
+  /// own reason instead, because "a very large tree" is the wrong thing
+  /// to tell someone whose desktop did not answer (#1459).
+  sizeUnmeasuredWhy?: string;
   /// The repo this worktree belongs to. Needed to assess it: git has to
   /// be run from the repo, not the worktree.
   repoPath: string;
@@ -529,7 +535,7 @@ function Row({
             `sizePending` would leave the skeleton up for the rest of the
             pass. */}
         {sizeUnmeasurable ? (
-          <span className="cursor-help text-[#6e7681]" title={UNMEASURED_HINT}>
+          <span className="cursor-help text-[#6e7681]" title={sizeUnmeasuredWhy}>
             not measured
           </span>
         ) : sizePending && wt.size_bytes === null ? (
@@ -1187,6 +1193,19 @@ export function WorktreesPage() {
   // one reading the size cell's own comment says is wrong, because it
   // claims a measurement that never happened.
   const sizingFailed = sizesQuery.isError;
+  // Why the pass failed, in the reader's terms, for the rows it left
+  // without a number (#1459). On the phone that is most often the
+  // desktop not answering in time, which is nothing to do with the tree.
+  const sizingError = sizesQuery.error as unknown;
+  const sizingFailedWhy = sizingFailed
+    ? `Sizes for this repository could not be measured: ${
+        typeof sizingError === "string"
+          ? sizingError
+          : sizingError instanceof Error
+            ? sizingError.message
+            : "the request failed"
+      }`
+    : undefined;
   const remove = useRemoveWorktree();
 
   /// Copy rather than spawn. The command lands in the user's own shell,
@@ -1449,8 +1468,16 @@ export function WorktreesPage() {
     /// This row's own walk was abandoned, OR the whole repository's
     /// sizing pass failed. Either way no number is coming for it, and
     /// the row must say so instead of holding a skeleton.
-    sizeUnmeasurable: (sizes?.has(w.path) && sizes.get(w.path) === null) || sizingFailed,
-  })), [rows, verdicts, sizes, sizingFailed]);
+    //
+    // A size that DID arrive survives the pass failing (#1459). The
+    // stream delivers each worktree's size as it is walked, so a pass
+    // that timed out after measuring forty rows has forty real numbers;
+    // blanking them to "not measured" because the forty-first did not
+    // finish discards measured data -- partial is not nothing. Only a
+    // row with no answer at all takes the pass's failure.
+    sizeUnmeasurable: sizes?.has(w.path) ? sizes.get(w.path) === null : sizingFailed,
+    sizeUnmeasuredWhy: sizes?.has(w.path) ? UNMEASURED_HINT : sizingFailedWhy,
+  })), [rows, verdicts, sizes, sizingFailed, sizingFailedWhy]);
 
   // SORTING VS STREAMING (#771).
   //
@@ -3489,6 +3516,7 @@ export function WorktreesPage() {
               onForget={forget}
               sizePending={sizing}
               sizeUnmeasurable={wt.sizeUnmeasurable}
+              sizeUnmeasuredWhy={wt.sizeUnmeasuredWhy}
               removing={removing === wt.path}
             />
           ))
