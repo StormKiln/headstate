@@ -4,6 +4,9 @@ import { describe, expect, it } from "vitest";
 // deliberately carries no `@types/node` -- see `vite.config.ts`, which
 // resolves its own paths with `import.meta.url` for the same reason.
 import modelRs from "../../src-tauri/src/worktrees/model.rs?raw";
+// Every `Safety` variant as Rust serialises it, pinned by
+// `safety_serialises_as_the_frontend_fixture_says` in that file (#1437).
+import safetyFixture from "../../src-tauri/tests/fixtures/safety_variants.json?raw";
 import testSource from "./worktrees.test.ts?raw";
 import type {
   ClaudeSession, Lock, Safety, Worktree, WorktreeRepo } from "@/types/pr";
@@ -145,8 +148,11 @@ describe("isSafe", () => {
       modelRs.indexOf("\n}", modelRs.indexOf("pub enum Safety {")),
     );
     expect(block.length).toBeGreaterThan(0);
+    // A struct variant (`InProgress {`) counts too. The pattern once
+    // accepted only unit and tuple variants, so `InProgress` was never in
+    // this set and its misspelt TS kind went unnoticed (#1437).
     const rustVariants = new Set(
-      [...block.matchAll(/^\s{4}([A-Z][A-Za-z]*)(?:\(|,|\s*$)/gm)].map((m) => m[1]),
+      [...block.matchAll(/^\s{4}([A-Z][A-Za-z]*)(?:\(|,|\s*\{|\s*$)/gm)].map((m) => m[1]),
     );
     // A sanity floor: if the regex stops matching, an empty set would make
     // this test pass while checking nothing.
@@ -1217,7 +1223,7 @@ describe("an operation in progress", () => {
   const inProgress = (
     op: "rebase" | "merge" | "cherryPick" | "revert" | "bisect",
     conflicts: number | null,
-  ): Safety => ({ kind: "inProgress", op, conflicts });
+  ): Safety => ({ kind: "in_progress", detail: { op, conflicts } });
 
   it("names the operation and the conflict count", () => {
     expect(safetyReason(inProgress("rebase", 3))).toBe(
@@ -1251,5 +1257,60 @@ describe("an operation in progress", () => {
     const w = forceWarning(inProgress("rebase", 2));
     expect(w).toContain("rebase");
     expect(w).toMatch(/finish or abort/i);
+  });
+});
+
+/// #1437: the frontend against what Rust ACTUALLY sends.
+///
+/// Every test above builds its `Safety` by hand, in this file's own
+/// spelling, so the two sides were never compared: Rust sent
+/// `in_progress` with its fields under `detail`, this side matched
+/// `inProgress`, and every in-progress row read "could not determine:
+/// [object Object]". The fixture is Rust's serialisation, pinned by a
+/// Rust test, so a rename on either side fails one of the two.
+describe("the Safety wire contract", () => {
+  const variants = JSON.parse(safetyFixture) as Safety[];
+
+  it("reads a fixture that covers every kind", () => {
+    // A floor, so a fixture that stopped parsing into anything could not
+    // make the loops below pass vacuously.
+    expect(new Set(variants.map((v) => v.kind)).size).toBeGreaterThanOrEqual(15);
+  });
+
+  it("describes every variant by name, never as an unreadable payload", () => {
+    for (const s of variants) {
+      const label = JSON.stringify(s);
+      for (const text of [safetyReason(s), forceWarning(s)]) {
+        expect(text, label).not.toContain("[object Object]");
+        expect(text, label).not.toContain("undefined");
+        expect(text, label).not.toContain("unrecognised state");
+      }
+      // The fallback wording belongs to `unknown` alone: anything else
+      // reaching it means this side did not recognise the kind.
+      if (s.kind === "unknown") {
+        expect(safetyReason(s), label).toContain("could not determine");
+      } else {
+        expect(safetyReason(s), label).not.toContain("could not determine");
+      }
+    }
+  });
+
+  it("names the operation for every in-progress variant", () => {
+    const inProgress = variants.filter((v) => v.kind === "in_progress");
+    expect(inProgress.length).toBe(5);
+    for (const s of inProgress) {
+      expect(safetyReason(s), JSON.stringify(s)).toMatch(
+        /^(rebase|merge|cherry-pick|revert|bisect) in progress/,
+      );
+    }
+  });
+
+  /// The default branch, for a kind the backend might add before this
+  /// side learns it: say so by name, never stringify the payload.
+  it("names an unrecognised kind instead of printing its payload", () => {
+    const future = { kind: "some_future_state", detail: { a: 1 } } as unknown as Safety;
+    const text = safetyReason(future);
+    expect(text).toBe("unrecognised state: some_future_state");
+    expect(text).not.toContain("[object Object]");
   });
 });

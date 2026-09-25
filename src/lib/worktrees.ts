@@ -397,7 +397,7 @@ export function safetyReason(s: Safety): string {
       // is gone, so nothing about the contents can be established, and
       // the user needs that before deciding.
       return "its repository is gone — nothing here can be checked";
-    case "inProgress": {
+    case "in_progress": {
       // The row's own sentence (#1136). Names the operation, because
       // that is the fact that survives the remedy -- committing the
       // working tree does not end a rebase -- and it is what the user
@@ -405,14 +405,30 @@ export function safetyReason(s: Safety): string {
       //
       // A null count is omitted rather than rendered as 0: an
       // unreadable `git status` is not a conflict-free rebase.
-      const what = s.op === "cherryPick" ? "cherry-pick" : s.op;
-      return s.conflicts && s.conflicts > 0
-        ? `${what} in progress — ${s.conflicts} conflicted file${s.conflicts === 1 ? "" : "s"}`
+      const { op, conflicts } = s.detail;
+      const what = op === "cherryPick" ? "cherry-pick" : op;
+      return conflicts && conflicts > 0
+        ? `${what} in progress — ${conflicts} conflicted file${conflicts === 1 ? "" : "s"}`
         : `${what} in progress`;
     }
-    default:
+    case "unknown":
       return `could not determine: ${s.detail}`;
+    default:
+      // A kind this side does not know. Says so by NAME rather than
+      // interpolating a payload it cannot read: that is how an
+      // unmatched `in_progress` printed "[object Object]" (#1437).
+      return `unrecognised state: ${unrecognisedKind(s)}`;
   }
+}
+
+/// The `kind` of a `Safety` no case matched, as printable text.
+///
+/// Typed `never` because the union is exhaustive at compile time; this
+/// runs only when the backend sends a kind the frontend does not
+/// declare, which is exactly the drift #1437 was.
+function unrecognisedKind(s: never): string {
+  const kind = (s as { kind?: unknown } | null)?.kind;
+  return typeof kind === "string" ? kind : "unknown kind";
 }
 
 /// What the force-removal confirmation warns about, for one safety
@@ -449,7 +465,7 @@ export function forceWarning(s: Safety): string {
       // disk that no git object holds a copy of, so there is no reflog
       // and no stash to recover them from.
       return `${s.detail} uncommitted file${s.detail === 1 ? "" : "s"} will be deleted permanently. This cannot be undone.`;
-    case "inProgress": {
+    case "in_progress": {
       // NAMES the operation, because that is what the user has to
       // resolve and the remedy differs per operation (#1136). The stakes
       // are specific for the same reason `dirty` above names its count:
@@ -457,7 +473,7 @@ export function forceWarning(s: Safety): string {
       // ref, so there is no reflog entry to recover them from once the
       // directory is gone.
       const what =
-        s.op === "cherryPick" ? "cherry-pick" : s.op;
+        s.detail.op === "cherryPick" ? "cherry-pick" : s.detail.op;
       return `A ${what} is in progress here. Removing the worktree discards it, along with any commits it has replayed so far. This cannot be undone — finish or abort the ${what} first.`;
     }
     case "empty":
@@ -769,7 +785,7 @@ export function safetyTone(s: Safety): string {
     // half-replayed rebase holds commits no other ref points at, so
     // removing the worktree loses work with no reflog to recover it
     // from. Amber would read as "needs attention"; this is "stop".
-    case "inProgress":
+    case "in_progress":
       return "text-[#f85149]";
     case "empty":
       // Grey, and explicitly so rather than by falling through to the

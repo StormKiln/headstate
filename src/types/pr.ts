@@ -262,10 +262,21 @@ export type Safety =
   /// `conflicts` is `null` when `git status` could not be read: an
   /// unreadable status is not zero conflicts, and the operation is in
   /// progress either way.
+  ///
+  /// Spelled and shaped as serde writes it: `rename_all = "snake_case"`
+  /// with `content = "detail"`, so the kind is `in_progress` and the
+  /// struct payload sits under `detail`. This side once said
+  /// `inProgress` with the fields flattened, matched nothing, and every
+  /// such row read "could not determine: [object Object]" (#1437).
+  /// `src-tauri/tests/fixtures/safety_variants.json` is pinned to the
+  /// Rust enum's serialisation and read by `worktrees.test.ts`, which
+  /// holds the two together.
   | {
-      kind: "inProgress";
-      op: "rebase" | "merge" | "cherryPick" | "revert" | "bisect";
-      conflicts: number | null;
+      kind: "in_progress";
+      detail: {
+        op: "rebase" | "merge" | "cherryPick" | "revert" | "bisect";
+        conflicts: number | null;
+      };
     }
   | { kind: "unpushed"; detail: number }
   | { kind: "never_pushed" }
