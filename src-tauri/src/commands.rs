@@ -912,17 +912,15 @@ pub async fn classify_worktrees(
     app: AppHandle,
     repo_path: String,
 ) -> Result<Vec<crate::worktrees::Worktree>, String> {
-    // One budget across every filesystem scan (#1149). Held for
-    // the whole walk: releasing early would let the next caller
-    // start while this one still has eight threads on the disk.
-    let permit = scan_permit().await?;
+    // One budget across every filesystem scan (#1149), held by the
+    // walk itself rather than by this future -- see `scan_blocking`.
     // Two failure modes, both real: the join can fail if the blocking
     // task panicked, and classification itself can fail if git refuses.
     // Flattened rather than swallowed, so an unreadable repo surfaces as
     // an error instead of as zero worktrees.
     let emitter = app.clone();
     let path = repo_path.clone();
-    let rows = tauri::async_runtime::spawn_blocking(move || {
+    let rows = scan_blocking(move || {
         let mut out = Vec::new();
         crate::worktrees::classify_repo_streaming(&path, &mut |w| {
             // Emitted per worktree rather than batched, for the reason
@@ -933,11 +931,9 @@ pub async fn classify_worktrees(
         })?;
         Ok::<_, String>(out)
     })
-    .await
-    .map_err(|e| e.to_string())??;
-    // The disk walk is done; the lookup below is network, not disk, and
-    // must not hold the next scan out.
-    drop(permit);
+    .await??;
+    // The disk walk is done and its permit went with it; the lookup
+    // below is network, not disk, and must not hold the next scan out.
 
     // GitHub's record of a merge, AFTER the offline pass (#1440). Every
     // verdict above is already on screen; this can only turn some
@@ -1004,17 +1000,11 @@ pub async fn classify_worktrees(
 pub async fn classify_repo_upstream(
     repo_path: String,
 ) -> Result<crate::worktrees::Worktree, String> {
-    // One budget across every filesystem scan (#1149). Held for
-    // the whole walk: releasing early would let the next caller
-    // start while this one still has eight threads on the disk.
-    let _permit = scan_permit().await?;
+    // One budget across every filesystem scan (#1149), held by the
+    // walk itself rather than by this future -- see `scan_blocking`.
     // Blocking git work: off the async runtime's worker threads, the
     // same treatment `list_worktrees` above gives the walk.
-    tauri::async_runtime::spawn_blocking(move || {
-        crate::worktrees::classify_main_checkout(&repo_path)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    scan_blocking(move || crate::worktrees::classify_main_checkout(&repo_path)).await?
 }
 
 /// Disk sizes for one repo's worktrees, as `(path, bytes)` pairs.
@@ -1044,11 +1034,9 @@ pub async fn size_worktrees(
     app: AppHandle,
     repo_path: String,
 ) -> Result<Vec<(String, Option<u64>)>, String> {
-    // One budget across every filesystem scan (#1149). Held for
-    // the whole walk: releasing early would let the next caller
-    // start while this one still has eight threads on the disk.
-    let _permit = scan_permit().await?;
-    tauri::async_runtime::spawn_blocking(move || {
+    // One budget across every filesystem scan (#1149), held by the
+    // walk itself rather than by this future -- see `scan_blocking`.
+    scan_blocking(move || {
         let mut out = Vec::new();
         crate::worktrees::size_repo_streaming(&repo_path, &mut |path, bytes| {
             // Emitted per worktree rather than batched: batching would
@@ -1058,8 +1046,7 @@ pub async fn size_worktrees(
         })?;
         Ok(out)
     })
-    .await
-    .map_err(|e| e.to_string())?
+    .await?
 }
 
 /// Regenerable build output under the configured scan roots.
@@ -1072,10 +1059,8 @@ pub async fn size_worktrees(
 /// shaped the worktree view.
 #[tauri::command]
 pub async fn scan_artifacts(app: AppHandle) -> Result<Vec<crate::artifacts::Artifact>, String> {
-    // One budget across every filesystem scan (#1149). Held for
-    // the whole walk: releasing early would let the next caller
-    // start while this one still has eight threads on the disk.
-    let _permit = scan_permit().await?;
+    // One budget across every filesystem scan (#1149), held by the
+    // walk itself rather than by this future -- see `scan_blocking`.
     // The SAME roots the worktree view scans. A second directory setting
     // would be one more thing to keep in sync, and a user who has told
     // the app where their code lives has already answered this question.
@@ -1087,14 +1072,13 @@ pub async fn scan_artifacts(app: AppHandle) -> Result<Vec<crate::artifacts::Arti
     // how many roots are left.
     let emitter = app.clone();
     let scanned = dirs.clone();
-    let (out, failed) = tauri::async_runtime::spawn_blocking(move || {
+    let (out, failed) = scan_blocking(move || {
         crate::artifacts::scan::scan_streaming(&scanned, &mut |p| {
             use tauri::Emitter;
             let _ = emitter.emit("artifact-scan-progress", p);
         })
     })
-    .await
-    .map_err(|e| e.to_string())?;
+    .await?;
     // A root that could not be read is NAMED, never silently dropped:
     // an empty list for a configured directory reads as an answer about
     // it (#846).
@@ -1152,35 +1136,89 @@ pub async fn scan_artifacts(app: AppHandle) -> Result<Vec<crate::artifacts::Arti
 /// A `OnceLock` rather than `const_new` because the width is computed:
 /// `available_parallelism` can fail, and four is the figure the
 /// measurement above already justified.
-fn scan_permits() -> &'static tokio::sync::Semaphore {
-    static PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+///
+/// In an `Arc` so a permit can be OWNED, and so moved onto the blocking
+/// pool with the walk it pays for -- see `scan_blocking` (#1467).
+fn scan_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static PERMITS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
     PERMITS.get_or_init(|| {
         let n = std::thread::available_parallelism()
             .map(|n| n.get().clamp(2, 8))
             .unwrap_or(4);
-        tokio::sync::Semaphore::new(n)
+        std::sync::Arc::new(tokio::sync::Semaphore::new(n))
     })
 }
 
-/// Take a scan permit, held for the whole walk.
+/// Take a permit from `permits`. Owned, so it can outlive the future
+/// that took it -- which is the point (#1467).
 ///
 /// `acquire` only fails when the semaphore is closed, which never
 /// happens for a process-lifetime static -- but the error is reported
 /// rather than unwrapped, because a panic here would take down a scan
 /// for a condition that has a perfectly good message.
-async fn scan_permit() -> Result<tokio::sync::SemaphorePermit<'static>, String> {
-    scan_permits()
-        .acquire()
+async fn permit_from(
+    permits: std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
+    permits
+        .acquire_owned()
         .await
         .map_err(|e| format!("could not schedule the scan: {e}"))
 }
 
+/// Run a filesystem walk on the blocking pool under a scan permit that
+/// the WALK holds, for as long as the walk actually runs (#1467).
+///
+/// The permit used to be a local of the async command, with the walk in
+/// `spawn_blocking` below it. When the caller went away -- the phone's
+/// `CALL_TIMEOUT` closing the connection, which drops the dispatch
+/// future -- the permit was dropped with the future, but the blocking
+/// walk kept going, because `spawn_blocking` cannot be cancelled. The
+/// next call took the freed permit and started a second walk beside it,
+/// so the #1149 cap was exceeded exactly when the disk was already slow
+/// enough for a caller to give up.
+///
+/// Moving the permit into the closure ties it to the work rather than to
+/// whoever is waiting for the work. An abandoned walk still finishes --
+/// nothing can stop it -- but it now finishes holding its permit, and
+/// the next caller waits for it as it should.
+///
+/// The only way a command should reach the blocking pool for a scan;
+/// `every_filesystem_scan_takes_a_permit` holds the walks to it.
+async fn scan_blocking<T, F>(walk: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    blocking_under(scan_permits().clone(), walk).await
+}
+
+/// `scan_blocking` against a given semaphore, so a test can hold a
+/// budget of its own instead of the process-wide one every other test
+/// is also drawing on.
+pub(crate) async fn blocking_under<T, F>(
+    permits: std::sync::Arc<tokio::sync::Semaphore>,
+    walk: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let permit = permit_from(permits).await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        // Dropped when the walk returns, and not before -- whether or not
+        // anyone is still awaiting this.
+        let _permit = permit;
+        walk()
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn size_artifacts(paths: Vec<String>) -> Result<Vec<(String, u64, Option<u64>)>, String> {
-    // Held for the whole walk. `acquire` only fails if the semaphore is
-    // closed, which never happens for a static.
-    let _permit = scan_permit().await?;
-    tauri::async_runtime::spawn_blocking(move || {
+    // Held for the whole walk, by the walk -- see `scan_blocking`.
+    scan_blocking(move || {
         // DIAGNOSTIC LOGGING (Settings > diagnostic log). Per-directory,
         // for the same reason as `size_venvs`: the total says the batch
         // was slow, this says which entry made it slow.
@@ -1209,7 +1247,6 @@ pub async fn size_artifacts(paths: Vec<String>) -> Result<Vec<(String, u64, Opti
         out
     })
     .await
-    .map_err(|e| e.to_string())
 }
 
 /// Remove artifact directories, re-verifying each at delete time.
@@ -1258,14 +1295,12 @@ pub async fn remove_artifacts(
 /// paint before that finishes.
 #[tauri::command]
 pub async fn scan_venvs(app: AppHandle) -> Result<Vec<crate::caches::Venv>, String> {
-    // One budget across every filesystem scan (#1149). Held for
-    // the whole walk: releasing early would let the next caller
-    // start while this one still has eight threads on the disk.
-    let _permit = scan_permit().await?;
+    // One budget across every filesystem scan (#1149), held by the
+    // walk itself rather than by this future -- see `scan_blocking`.
     let roots = get_worktree_dirs(app.clone());
     let emitter = app.clone();
     let scanned = roots.clone();
-    let out = tauri::async_runtime::spawn_blocking(move || {
+    let out = scan_blocking(move || {
         let dirs = crate::caches::project_dirs_streaming(&scanned, &mut |p| {
             use tauri::Emitter;
             // Every 200 directories, not every one: the walk visits
@@ -1288,8 +1323,7 @@ pub async fn scan_venvs(app: AppHandle) -> Result<Vec<crate::caches::Venv>, Stri
         );
         crate::caches::scan_poetry(&dirs)
     })
-    .await
-    .map_err(|e| e.to_string())?;
+    .await?;
     // 9-40 s measured, every cold start, against a blank page (#1152).
     remember_scan(&app, crate::store::scans::ScanKind::Venvs, &roots, &out);
     Ok(out)
@@ -1305,8 +1339,7 @@ pub async fn scan_venvs(app: AppHandle) -> Result<Vec<crate::caches::Venv>, Stri
 pub async fn size_venvs(paths: Vec<String>) -> Result<Vec<(String, u64, Option<u64>)>, String> {
     // Shares the artifact cap: both walk the same disk, and a venv batch
     // competing with a 54-way artifact fan-out is the same contention.
-    let _permit = scan_permit().await?;
-    tauri::async_runtime::spawn_blocking(move || {
+    scan_blocking(move || {
         // DIAGNOSTIC LOGGING (Settings > diagnostic log).
         //
         // PER-VENV, not just a total: these are walked serially in one
@@ -1342,7 +1375,6 @@ pub async fn size_venvs(paths: Vec<String>) -> Result<Vec<(String, u64, Option<u
         out
     })
     .await
-    .map_err(|e| e.to_string())
 }
 
 /// Remove Poetry virtualenvs, re-verifying each at delete time.
@@ -6888,7 +6920,9 @@ mod tests {
     async fn a_permit_is_returned_when_the_scan_ends() {
         let before = super::scan_permits().available_permits();
         {
-            let _p = super::scan_permit().await.expect("a permit is available");
+            let _p = super::permit_from(super::scan_permits().clone())
+                .await
+                .expect("a permit is available");
             assert_eq!(
                 super::scan_permits().available_permits(),
                 before - 1,
@@ -6899,6 +6933,59 @@ mod tests {
             super::scan_permits().available_permits(),
             before,
             "and dropping it must return the permit"
+        );
+    }
+
+    /// #1467: a walk its caller abandoned keeps its permit until the walk
+    /// itself finishes, and the next caller waits for it.
+    ///
+    /// The phone's `CALL_TIMEOUT` drops the dispatch future, and
+    /// `spawn_blocking` cannot be cancelled, so the walk runs on. With the
+    /// permit held by the future it was released at once and a second
+    /// walk started beside the first -- exceeding the #1149 cap exactly
+    /// when the disk was slow. A budget of its own, so no other test's
+    /// scan can move the count.
+    #[tokio::test]
+    async fn an_abandoned_walk_keeps_its_permit_until_it_finishes() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        let first = tokio::spawn(super::blocking_under(permits.clone(), move || {
+            let _ = started_tx.send(());
+            // The walk: still on the disk until the test lets it go.
+            let _ = release_rx.recv();
+        }));
+        started_rx.await.expect("the walk started");
+        // The caller gives up, as the phone does at its deadline.
+        first.abort();
+        let _ = first.await;
+        assert_eq!(
+            permits.available_permits(),
+            0,
+            "an abandoned walk that is still running must still hold its permit"
+        );
+
+        let second = tokio::spawn(super::blocking_under(permits.clone(), || 7));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !second.is_finished(),
+            "the next walk must wait for the abandoned one, not start beside it"
+        );
+
+        release_tx.send(()).expect("the walk is waiting");
+        let got = tokio::time::timeout(Duration::from_secs(10), second)
+            .await
+            .expect("the next walk ran once the first finished")
+            .expect("joined")
+            .expect("ran");
+        assert_eq!(got, 7);
+        assert_eq!(
+            permits.available_permits(),
+            1,
+            "and every permit is back once both walks are done"
         );
     }
 

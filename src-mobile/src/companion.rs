@@ -395,6 +395,21 @@ impl Companion {
                 }
                 Err(format!("{desktop_name} is unreachable: {m}"))
             }
+            // ONE command was slow; the connection is fine (#1466). The
+            // state and the event stream are left exactly as they are:
+            // marking the desktop unreachable flashed the banner, and
+            // `events.resume()` dropped the stream -- and with it every
+            // other call's in-flight frames (`worktree-size`, ...) -- over
+            // evidence about this call alone. Other calls may be
+            // succeeding at this moment. The desktop may also still be
+            // working on it, which is worth saying: a retry is a second
+            // copy of the same work, not a reconnect.
+            Err(ClientError::TimedOut(m)) => {
+                log::info!("companion: {command} timed out: {m}");
+                Err(format!(
+                    "{desktop_name} took too long to answer {command}; it may still be working on it"
+                ))
+            }
             Err(e) => Err(e.to_string()),
         }
     }
@@ -978,6 +993,72 @@ mod tests {
             Some("octocat's laptop")
         );
         assert_eq!(pairing::load_desktops(store.as_ref()).unwrap().len(), 1);
+    }
+
+    /// One slow command is not an unreachable desktop (#1466).
+    ///
+    /// A call that runs out its timeout fails on its own, with a message
+    /// that says the desktop was slow -- and leaves the connection state
+    /// and the event stream exactly as they were. Before, it marked the
+    /// desktop unreachable and restarted the stream, dropping every other
+    /// call's in-flight frames.
+    #[tokio::test]
+    async fn a_slow_call_leaves_the_connection_and_the_stream_alone() {
+        let (server, _, _, c) = paired().await;
+        server.reply("/v1/call/size_worktrees", Reply::Stall);
+        // The same desktop, with a call timeout a test can wait out. Only
+        // `call` uses this client; the subscriber keeps its own.
+        {
+            let identity = c.keys.session_identity().unwrap();
+            let mut live = c.live.lock().unwrap();
+            let l = live.as_mut().unwrap();
+            l.client = Arc::new(
+                Client::with_call_timeout(
+                    &identity,
+                    &l.desktop.fp,
+                    l.desktop.addrs.clone(),
+                    l.desktop.port,
+                    Duration::from_millis(500),
+                )
+                .unwrap(),
+            );
+        }
+        // One call first, so the fresh client has its address and the
+        // slow call below sends no `hello` of its own to be miscounted.
+        server.reply("/v1/call/get_stats", Reply::json(200, json!({"ok": 1})));
+        c.call("get_stats", json!({})).await.unwrap();
+        let streams = |s: &TestServer| {
+            s.requests()
+                .iter()
+                .filter(|r| r.path == "/v1/events" || r.path == "/v1/hello")
+                .count()
+        };
+        let before = streams(&server);
+
+        let err = c
+            .call("size_worktrees", json!({"paths": ["/srv/r"]}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            "octocat's laptop took too long to answer size_worktrees; it may still be working on it"
+        );
+        assert_eq!(c.connection_state().state, State::Connected);
+
+        // A restarted stream shows up as a fresh hello and events request
+        // on the server. Give one time to arrive, then check none did.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(c.connection_state().state, State::Connected);
+        assert_eq!(
+            streams(&server),
+            before,
+            "the event stream must not be restarted over one slow call"
+        );
+        // And the connection still serves other calls.
+        assert_eq!(
+            c.call("get_stats", json!({})).await.unwrap(),
+            json!({"ok": 1})
+        );
     }
 
     #[tokio::test]

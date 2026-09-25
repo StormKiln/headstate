@@ -61,6 +61,9 @@ pub(crate) enum Reply {
         frames: Vec<(String, String)>,
         hold: bool,
     },
+    /// Read the request and never answer it: a desktop that is up, has
+    /// accepted the connection, and is still working (#1466).
+    Stall,
 }
 
 impl Reply {
@@ -367,6 +370,12 @@ async fn accept_loop(listener: TcpListener, acceptor: TlsAcceptor, shared: Arc<S
                     }
                     let _ = tls.write_all(b"0\r\n\r\n").await;
                     let _ = tls.shutdown().await;
+                }
+                Reply::Stall => {
+                    // Held until the client gives up and closes its end,
+                    // which is what a real slow desktop sees.
+                    let mut sink = [0u8; 64];
+                    while matches!(tls.read(&mut sink).await, Ok(n) if n > 0) {}
                 }
             }
         });

@@ -144,6 +144,10 @@ pub enum PairingError {
     Rejected { status: u16, message: String },
     #[error("could not reach the desktop: {0}")]
     Unreachable(String),
+    /// Reached, and did not answer in time -- not the same as the above,
+    /// and not reported as it (#1466).
+    #[error("the desktop took too long to answer: {0}")]
+    TimedOut(String),
     #[error("{0}")]
     Protocol(String),
     #[error(transparent)]
@@ -252,6 +256,7 @@ pub async fn pair(
             ClientError::FingerprintMismatch => PairingError::FingerprintMismatch,
             ClientError::Handshake(m) => PairingError::Handshake(m),
             ClientError::Unreachable(m) => PairingError::Unreachable(m),
+            ClientError::TimedOut(m) => PairingError::TimedOut(m),
             ClientError::Status {
                 status: 403,
                 message,
