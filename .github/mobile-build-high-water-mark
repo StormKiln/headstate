@@ -22,9 +22,12 @@
 # Raise it when a build reaches TestFlight or Play. Non-contiguous is
 # correct: a rejected upload still consumes its number.
 #
-# You no longer have to REMEMBER to raise it: scripts/check-mobile-build-mark.py
-# runs in CI's lint job and fails when this line is below the `build<N>`
-# of the newest published mobile asset, naming the value to write. It is
+# You no longer have to REMEMBER to raise it: the Mobile release run's
+# summary names the value as a required follow-up, and
+# scripts/check-mobile-build-mark.py compares this line with the `build<N>`
+# of the newest published mobile asset. Per commit (CI's lint job) a lag
+# is a warning naming the value to write; the next mobile release's
+# Preflight refuses to build until it is fixed (#1418). It is
 # a comparison against the assets, not a replacement for this file --
 # this file is written before the upload, so it still records a number
 # consumed by a run whose `publish` never finished, which no asset can.

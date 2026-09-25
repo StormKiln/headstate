@@ -62,9 +62,52 @@ This runs in `lint`, which IS one of those nine required contexts, so the
 check genuinely blocks rather than merely warning -- #787 proposed a
 warning, and six ignored chore PRs are what a warning is worth here.
 
+That last paragraph was right about warnings and wrong about WHERE to
+block (#1418). Failing `lint` on a stale mark failed every open PR, and
+the merge queue, from the moment a mobile release published until a
+one-line PR raised the mark -- a failure unrelated to any PR it landed
+on, which in one cycle cost four branches a rebase and meant nothing
+could merge until the mark PR did. Nor could the failure move to the
+`push` run on main or a scheduled job: the desktop release gate waits
+on EVERY check-run attempt on a commit (`wait-for-duplicates`), so one
+red attempt on a main commit burns it for releases, and a scheduled
+run's check-runs attach to main's head. The failure had to leave the
+per-commit checks altogether, not move between them.
+
+So the split is now: warn per commit, enforce at the next mobile
+release.
+
+  - Per commit (`lint`, locally and in CI): a mark that LAGS the newest
+    shipped build is a `::warning::` annotation naming the one-line fix,
+    and exits 0.
+  - At release (`--release`, run by mobile-release.yml before the
+    build): the same lag is an `::error::` and exits 1. That run
+    attaches to no main commit, so it burns nothing, and it is the one
+    place staleness guards something -- a release cannot go ahead with
+    a record that names the wrong number. The release workflow also
+    prints the mark change as a required follow-up in its summary, and
+    docs/mobile-release-process.md lists it as a numbered step, so the
+    warning is not the only thing asking. Six ignored PRs showed a
+    warning alone is not enough; a warning backed by a release that
+    will refuse to run is a different thing.
+  - Always a hard failure: a missing or unparseable mark file. That is
+    not a lag the next release corrects but a record nobody can read,
+    and Preflight's shell parser would refuse it too.
+  - A mark AHEAD of every asset still passes, per commit and at
+    release, for the reason given in `main()`: a consumed number with
+    no asset behind it is still consumed. (#1418 listed "ahead" as a
+    hard failure to keep; it never was one, and making it one would
+    reject the legitimate record of a run whose `publish` failed after
+    the store took the build. A mark absurdly far ahead is caught
+    anyway: Preflight refuses every `BUILD_NUMBER` at or below it.)
+
+`--require` is unchanged and independent of `--release`: it decides only
+what "could not look" means.
+
 Usage:
   check-mobile-build-mark.py            advisory; skips if it cannot look
   check-mobile-build-mark.py --require  a failure to look is a failure
+  check-mobile-build-mark.py --release  a lagging mark is a failure
 """
 
 import json
@@ -166,6 +209,7 @@ def shipped_builds() -> tuple[dict[str, int], str | None]:
 
 def main(argv: list[str]) -> int:
     require = "--require" in argv[1:]
+    release = "--release" in argv[1:]
     mark = read_mark()
     builds, why = shipped_builds()
 
@@ -183,19 +227,34 @@ def main(argv: list[str]) -> int:
     print(f"Committed mark: {mark}")
 
     if mark < highest:
+        fix = f"set the last line of {MARK_FILE} to {highest} (a one-line PR)."
         print()
         print(f"{MARK_FILE} says {mark}, but build {highest} already shipped")
         print(f"as an asset of {tag}. The mark is STALE.")
         print()
-        print("This does not block the next release -- BUILD_NUMBER is")
-        print("github.run_number and climbs every run, so it clears a stale")
-        print("mark as easily as a current one. That is why this drifts")
-        print("unnoticed (#787). What it costs is the record: Preflight")
-        print(f"names {mark} when an upload is refused as a duplicate, and")
-        print(f"the store has actually seen {highest}.")
+        print("BUILD_NUMBER is github.run_number and climbs every run, so")
+        print("it clears a stale mark as easily as a current one; the")
+        print("duplicate check alone would never notice (#787). What a stale")
+        print(f"mark costs is the record: Preflight names {mark} when an")
+        print(f"upload is refused as a duplicate, and the store has seen {highest}.")
         print()
-        print(f"Fix: set the last line of {MARK_FILE} to {highest}.")
-        return 1
+        if release:
+            # The one run where failing guards something and burns
+            # nothing: a mobile release attaches to no main commit.
+            print("A mobile release will not go ahead with a stale record.")
+            print("Raise the mark on main, then tag a commit that has it.")
+            print(f"::error file={MARK_FILE}::Mobile build mark {mark} lags "
+                  f"shipped build {highest} ({tag}). Fix: {fix}")
+            return 1
+        # Per commit it only warns (#1418): failing here reddened every
+        # open PR and the merge queue after each mobile release, and the
+        # next mobile release's Preflight enforces it instead.
+        print("Not failing this run: staleness is enforced by the next")
+        print("mobile release's Preflight (--release), not per commit.")
+        print(f"::warning file={MARK_FILE}::Mobile build mark {mark} lags "
+              f"shipped build {highest} ({tag}); the next mobile release "
+              f"will refuse to run until it is raised. Fix: {fix}")
+        return 0
 
     if mark > highest:
         # Correct and expected: the file is written BEFORE the upload, so

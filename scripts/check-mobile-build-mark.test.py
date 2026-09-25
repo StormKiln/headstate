@@ -38,27 +38,65 @@ def check(name: str, cond: bool, detail: str = "") -> None:
         FAILURES.append(name)
 
 
-def run(mark_text: str, builds, why, require: bool):
-    """Run main() with a temp mark file and a stubbed asset lookup."""
+def run(mark_text, builds, why, require: bool, release: bool = False):
+    """Run main() with a temp mark file and a stubbed asset lookup.
+
+    `mark_text` None means the mark file does not exist. A `sys.exit`
+    inside main() is caught and its status returned, so the missing and
+    unparseable paths are measured by exit code like every other case.
+    """
     with tempfile.TemporaryDirectory() as d:
         path = pathlib.Path(d) / "mark"
-        path.write_text(mark_text)
-        argv = ["prog"] + (["--require"] if require else [])
+        if mark_text is not None:
+            path.write_text(mark_text)
+        argv = ["prog"] + (["--require"] if require else []) \
+            + (["--release"] if release else [])
         out = io.StringIO()
         with unittest.mock.patch.object(guard, "MARK_FILE", path), \
              unittest.mock.patch.object(
                  guard, "shipped_builds", lambda: (builds, why)), \
              unittest.mock.patch.object(sys, "stdout", out):
-            code = guard.main(argv)
+            try:
+                code = guard.main(argv)
+            except SystemExit as e:
+                # sys.exit("message") exits 1 and carries the message.
+                code = e.code if isinstance(e.code, int) else 1
+                out.write(str(e.code))
         return code, out.getvalue()
 
 
 print("check-mobile-build-mark self-test")
 
 # --- The comparison ---------------------------------------------------
+# A lagging mark WARNS per commit; it does not fail (#1418). As a hard
+# failure it turned every open PR and the merge queue red after each
+# mobile release, until a one-line PR raised the mark -- for a reason
+# unrelated to any of them. Nor can the failure move to push or
+# scheduled runs: the release gate reads every check-run attempt on a
+# main commit, so one red attempt there burns it for desktop releases.
 code, out = run("# c\n28\n", {"mobile-v0.10.0": 29}, None, True)
-check("a mark below the newest asset fails", code == 1)
+check("a mark below the newest asset passes per commit", code == 0, out)
+check("...as a ::warning:: annotation", "::warning" in out, out)
+check("...that names the value to write", "to 29" in out, out)
+code, out = run("# c\n28\n", {"mobile-v0.10.0": 29}, None, False)
+check("...and without --require too", code == 0 and "::warning" in out, out)
+
+# At release time it is ENFORCED: the next mobile release cannot go
+# ahead with a stale record. That run attaches to no main commit, so it
+# burns nothing for the desktop release gate.
+code, out = run("# c\n28\n", {"mobile-v0.10.0": 29}, None, True, True)
+check("a lagging mark under --release fails", code == 1, out)
 check("...and names the value to write", "to 29" in out, out)
+check("...as an ::error::, not a warning",
+      "::error" in out and "::warning" not in out, out)
+code, out = run("# c\n29\n", {"mobile-v0.10.0": 29}, None, True, True)
+check("a current mark under --release passes", code == 0, out)
+code, out = run("# c\n30\n", {"mobile-v0.10.0": 29}, None, True, True)
+check("a mark ahead under --release passes", code == 0, out)
+# --release does not soften "could not look".
+code, out = run("# c\n29\n", {}, "the API is unreachable", True, True)
+check("--release --require with no evidence fails", code == 1, out)
+check("...and does NOT claim a highest of 0", "is 0" not in out, out)
 
 code, _ = run("# c\n29\n", {"mobile-v0.10.0": 29}, None, True)
 check("a mark equal to the newest asset passes", code == 0)
@@ -89,6 +127,20 @@ check("...and still refuses to invent a number", "Cannot determine" in out, out)
 # A low mark plus no evidence must not be blessed as a pass.
 code, _ = run("# c\n1\n", {}, "the API is unreachable", True)
 check("a badly stale mark is not blessed by a lookup failure", code == 1)
+
+# --- A broken mark file is corruption, not lag ------------------------
+# Hard failures with or without --require: not a lag the next release
+# corrects, but a record nobody can read -- and Preflight's shell
+# parser would refuse the same file.
+for req in (True, False):
+    code, out = run(None, {"mobile-v0.10.0": 29}, None, req)
+    check(f"a missing mark file fails (require={req})", code == 1, out)
+    check("...and says it does not exist", "does not exist" in out, out)
+    code, out = run("# c\nabc\n", {"mobile-v0.10.0": 29}, None, req)
+    check(f"an unparseable mark fails (require={req})", code == 1, out)
+    check("...and says why", "does not contain a build number" in out, out)
+    code, out = run("# only a comment\n", {"mobile-v0.10.0": 29}, None, req)
+    check(f"a mark with no number fails (require={req})", code == 1, out)
 
 # --- Parsing ----------------------------------------------------------
 check(
