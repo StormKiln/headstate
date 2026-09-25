@@ -192,25 +192,38 @@ fn frontmatter(text: &str) -> (Option<String>, Option<String>) {
     while i < lines.len() {
         let line = lines[i];
         i += 1;
-        let t = line.trim();
-        if t == "---" {
+        if line.trim() == "---" {
             break;
         }
-        let (slot, raw) = if let Some(v) = t.strip_prefix("name:") {
+        // Top-level keys only (#1434). An indented `name:` belongs to
+        // whatever key it is nested under -- `metadata:` and the like --
+        // and matching the trimmed line let it overwrite the real one.
+        // This is the rule `skills::parse_frontmatter` already follows, so
+        // the inventory and the skills check read the same fields.
+        if line.starts_with([' ', '\t']) {
+            continue;
+        }
+        let (slot, raw) = if let Some(v) = line.strip_prefix("name:") {
             (&mut name, v)
-        } else if let Some(v) = t.strip_prefix("description:") {
+        } else if let Some(v) = line.strip_prefix("description:") {
             (&mut description, v)
         } else {
             continue;
         };
-        let indent = line.len() - line.trim_start().len();
-        *slot = Some(match block_scalar(raw, indent, &lines[i..]) {
+        let value = match block_scalar(raw, 0, &lines[i..]) {
             Some((value, used)) => {
                 i += used;
                 value
             }
             None => raw.trim().trim_matches('"').trim_matches('\'').to_string(),
-        });
+        };
+        // The first occurrence wins, as in `parse_frontmatter`; a repeated
+        // top-level key is a YAML error, and "last wins" silently read the
+        // later one. The block scalar is consumed either way, so its lines
+        // are never read as keys.
+        if slot.is_none() {
+            *slot = Some(value);
+        }
     }
     (name, description)
 }
@@ -1153,5 +1166,28 @@ mod tests {
         let inv = scan_scopes(&roots(None, &[repo], &[]));
         assert_eq!(inv.definitions.len(), 1);
         assert_eq!(inv.definitions[0].name, "deploy");
+    }
+
+    /// #1434: only TOP-LEVEL keys, and the first wins. `frontmatter` once
+    /// matched against the trimmed line, so a `name:` nested under another
+    /// key overwrote the real one -- and disagreed with the skills check's
+    /// `parse_frontmatter`, which reads unindented keys only.
+    #[test]
+    fn a_nested_name_or_description_never_replaces_the_top_level_one() {
+        let text = "---\nname: real-skill\ndescription: the real one\nmetadata:\n  name: nested\n  description: nested too\n---\nbody\n";
+        assert_eq!(
+            frontmatter(text),
+            (
+                Some("real-skill".to_string()),
+                Some("the real one".to_string())
+            )
+        );
+        // A top-level key given twice keeps the first, as the skills
+        // check's reader does.
+        let twice = "---\nname: first\nname: second\n---\n";
+        assert_eq!(frontmatter(twice).0.as_deref(), Some("first"));
+        // A nested key alone is not the skill's name.
+        let only_nested = "---\nmetadata:\n  name: nested\n---\n";
+        assert_eq!(frontmatter(only_nested).0, None);
     }
 }
