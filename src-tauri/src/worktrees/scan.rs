@@ -2081,9 +2081,19 @@ const SIZE_WORKERS: usize = 8;
 /// Unreadable entries are skipped rather than failing the whole
 /// measurement -- a permission error on one file should not turn a real
 /// size into "unknown".
+///
+/// Test-only, and with nothing excluded: the "everything under the path"
+/// rule the tests below pin is the walk's own. What `size_paths` excludes
+/// on top of it -- the OTHER worktrees nested inside this one (#1441) --
+/// is a property of the set of rows, not of one directory.
 #[cfg(test)]
 fn dir_size(path: &Path) -> u64 {
-    dir_size_within(path, std::time::Duration::MAX).unwrap_or(0)
+    dir_size_within(
+        path,
+        std::time::Duration::MAX,
+        &std::collections::HashSet::new(),
+    )
+    .unwrap_or(0)
 }
 
 /// How long ONE worktree's walk may run before it is abandoned.
@@ -2097,13 +2107,18 @@ fn dir_size(path: &Path) -> u64 {
 ///
 /// MEASURED on this machine, and the reason a single tree can be
 /// unbounded at all: 26 of 42 worktrees in one checkout live UNDER the
-/// main checkout, in a `worktrees` directory beneath it. So the parent's
-/// walk subsumes all 26 -- 235.02 GB and 1,125,352 files -- and every
-/// one of those bytes is then walked a second time as a worktree in its
-/// own right. The parent measured 265.15 GB in 38.63s where a leaf
-/// worktree measured 0.30 GB in 0.16s: a 240x spread within one
-/// repository. Add nesting two levels deep, or a network mount that
-/// answers `read_dir` slowly, and the parent's walk has no finish.
+/// main checkout, in a `worktrees` directory beneath it. Before #1441 the
+/// parent's walk subsumed all 26 -- 235.02 GB and 1,125,352 files -- and
+/// every one of those bytes was then walked a second time as a worktree
+/// in its own right. The parent measured 265.15 GB in 38.63s where a
+/// leaf worktree measured 0.30 GB in 0.16s: a 240x spread within one
+/// repository. That was a double count as well as a slow walk (#1441:
+/// a 153 GB main row whose nested worktrees summed to ~44 GB), and the
+/// walk now stops at every directory that is another worktree's row --
+/// see `size_paths`. The bound still stands, because nesting was only
+/// ONE way to be unbounded: a single real tree with millions of files,
+/// or a network mount that answers `read_dir` slowly, has no finish
+/// either, and the exclusion does nothing for those.
 ///
 /// 60s, not `GIT_TIMEOUT`'s 30s: 38.63s for a real parent checkout is a
 /// legitimate answer and must not be thrown away. The bound exists to
@@ -2120,6 +2135,18 @@ const SIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// checkout is the worst possible wrong answer. Callers propagate the
 /// `Option` all the way to the cell so the UI can say so.
 ///
+/// A directory in `skip` is not entered. `size_paths` passes the other
+/// worktrees of the same repository, so a worktree nested inside this
+/// one -- `<repo>/.claude/worktrees/x`, or one linked worktree inside
+/// another -- is counted on its OWN row and not a second time here
+/// (#1441). Only directories strictly BELOW `path` are compared, so
+/// `path` being in `skip` itself (it is: `skip` is every row) does not
+/// empty the walk. The comparison is exact `Path` equality, which is
+/// why both sides must be canonicalised the same way first: every child
+/// is `root.join(name)`, so a canonical root yields canonical children
+/// (symlinks are never entered), and on Windows both carry the same
+/// verbatim `\\?\` prefix.
+///
 /// The deadline is checked once per DIRECTORY rather than once per
 /// entry. A directory is the unit that can be pathological -- a network
 /// mount whose `read_dir` blocks, a permission wall -- and checking
@@ -2133,7 +2160,11 @@ const SIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// number is an artifact of which directories happened to pop off the
 /// stack first, not a bound the user can act on, and it would render
 /// indistinguishably from a real measurement.
-fn dir_size_within(path: &Path, budget: std::time::Duration) -> Option<u64> {
+fn dir_size_within(
+    path: &Path,
+    budget: std::time::Duration,
+    skip: &std::collections::HashSet<std::path::PathBuf>,
+) -> Option<u64> {
     let started = std::time::Instant::now();
     let mut total = 0u64;
     let mut stack = vec![path.to_path_buf()];
@@ -2150,7 +2181,10 @@ fn dir_size_within(path: &Path, budget: std::time::Duration) -> Option<u64> {
                 continue;
             }
             if meta.is_dir() {
-                stack.push(e.path());
+                let child = e.path();
+                if !skip.contains(&child) {
+                    stack.push(child);
+                }
             } else {
                 total += meta.len();
             }
@@ -2180,12 +2214,35 @@ fn dir_size_within(path: &Path, budget: std::time::Duration) -> Option<u64> {
 /// column stalled at N-1 forever with no row able to say why. A worker
 /// that gives up and reports keeps the cursor moving, which is what
 /// stops one bad directory from stalling the other 110.
+///
+/// Each byte is counted on EXACTLY ONE row (#1441). The paths are the
+/// rows of one page, so a directory that is itself one of them is not
+/// entered by any other row's walk: the main checkout stops at
+/// `<repo>/.worktrees/x`, and a linked worktree stops at a worktree
+/// nested inside it, however deep. Before this the main checkout's row
+/// included every worktree under it -- 153 GB against a real 71 GB, with
+/// the nested rows (~44 GB) counted twice -- and the rows could not be
+/// summed. A directory that is NOT a row (a submodule, an unrelated
+/// clone) is still counted where it sits; it has no row of its own.
+///
+/// Canonicalised once, up front, so the comparison survives a path that
+/// reached git through a symlink (macOS `/var` vs `/private/var`) and
+/// Windows' verbatim `\\?\C:\` form. A path that cannot be
+/// canonicalised (already deleted, say) is kept as given: it can still
+/// match itself, and it no longer exists to be walked into anyway.
+/// Reports still carry the path AS GIVEN, since that is the row's key.
 fn size_paths(paths: &[String], report: &(dyn Fn(&str, Option<u64>) + Sync)) {
+    let roots: Vec<std::path::PathBuf> = paths
+        .iter()
+        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| Path::new(p).to_path_buf()))
+        .collect();
+    let rows: std::collections::HashSet<std::path::PathBuf> = roots.iter().cloned().collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let workers = SIZE_WORKERS.min(paths.len().max(1));
     std::thread::scope(|scope| {
         for _ in 0..workers {
             let next = &next;
+            let (roots, rows) = (&roots, &rows);
             scope.spawn(move || loop {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some(p) = paths.get(i) else { break };
@@ -2197,7 +2254,7 @@ fn size_paths(paths: &[String], report: &(dyn Fn(&str, Option<u64>) + Sync)) {
                 // reason `size_venvs` logs per venv: the total says
                 // "slow", this says WHICH.
                 let started = std::time::Instant::now();
-                let bytes = dir_size_within(Path::new(p), SIZE_TIMEOUT);
+                let bytes = dir_size_within(&roots[i], SIZE_TIMEOUT, rows);
                 crate::diag!(
                     "[diag] worktree-size {} {}ms {}",
                     p,
@@ -7537,7 +7594,10 @@ prunable gitdir file points to non-existent location
     /// (#754), and that a walk which will not finish becomes "could not
     /// measure" rather than nothing at all (#769).
     mod sizing {
-        use super::super::{dir_size, dir_size_within, size_paths, SIZE_TIMEOUT, SIZE_WORKERS};
+        use super::super::{
+            dir_size, dir_size_within, size_paths, size_repo, SIZE_TIMEOUT, SIZE_WORKERS,
+        };
+        use std::collections::HashSet;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Mutex;
 
@@ -7717,7 +7777,7 @@ prunable gitdir file points to non-existent location
             // Zero budget: the deadline is already spent when the first
             // directory pops, so this cannot depend on machine speed.
             assert_eq!(
-                dir_size_within(&root, std::time::Duration::ZERO),
+                dir_size_within(&root, std::time::Duration::ZERO, &HashSet::new()),
                 None,
                 "a walk that runs out of budget must say it could not \
                  measure; returning a number claims an answer it does \
@@ -7727,7 +7787,7 @@ prunable gitdir file points to non-existent location
             // The same tree measures fine with a real budget, so the
             // None above is the BOUND firing and not a broken walk.
             assert_eq!(
-                dir_size_within(&root, SIZE_TIMEOUT),
+                dir_size_within(&root, SIZE_TIMEOUT, &HashSet::new()),
                 Some(400),
                 "40 levels of one 10-byte file must still measure"
             );
@@ -7744,10 +7804,12 @@ prunable gitdir file points to non-existent location
         ///
         /// MEASURED on this machine, for why one tree can be unbounded
         /// at all: 26 of 42 worktrees in one checkout live UNDERNEATH
-        /// the main checkout, so the parent's walk subsumes all 26 --
-        /// 235.02 GB and 1,125,352 files, walked once as the parent and
-        /// again as 26 worktrees. The parent took 38.63s where a leaf
-        /// took 0.16s, a 240x spread inside one repository.
+        /// the main checkout, so before #1441 the parent's walk subsumed
+        /// all 26 -- 235.02 GB and 1,125,352 files, walked once as the
+        /// parent and again as 26 worktrees. The parent took 38.63s where
+        /// a leaf took 0.16s, a 240x spread inside one repository. The
+        /// walk now stops at nested worktrees, but one huge tree or a
+        /// slow mount is unbounded all the same, so this still holds.
         ///
         /// Asserts that EVERY path is reported, the slow one included.
         /// Reporting the other N-1 is not enough: the row for the bad
@@ -7772,6 +7834,7 @@ prunable gitdir file points to non-existent location
                     super::super::dir_size_within(
                         std::path::Path::new(p),
                         std::time::Duration::ZERO,
+                        &HashSet::new(),
                     )
                 } else {
                     b
@@ -7802,6 +7865,177 @@ prunable gitdir file points to non-existent location
                     assert_eq!(*b, Some(100), "a measurable tree keeps its real size");
                 }
             }
+        }
+
+        /// A worktree nested inside another row is counted on its own row
+        /// and NOT again inside the row that contains it (#1441).
+        ///
+        /// The main checkout's row read 153 GB where the whole checkout
+        /// was 71 GB, because nine worktrees lived under it and were
+        /// walked twice: once as themselves and once as part of the
+        /// parent. Covers both shapes -- a worktree under the main
+        /// checkout, and one under a LINKED worktree -- and that a plain
+        /// directory which is not a row is still counted where it sits.
+        #[test]
+        fn a_nested_worktree_is_counted_on_its_own_row_only() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let main = tmp.path().join("main");
+            tree(tmp.path(), "main", 1, 100);
+            // Not a row: a vendored directory belongs to the checkout.
+            tree(&main.join("vendor"), "lib", 1, 7);
+            let outer = tree(&main.join(".worktrees"), "outer", 1, 1_000);
+            let inner = tree(
+                &std::path::Path::new(&outer).join(".worktrees"),
+                "inner",
+                1,
+                10_000,
+            );
+            let main = main.to_string_lossy().to_string();
+            let paths = vec![main.clone(), outer.clone(), inner.clone()];
+
+            let seen = Mutex::new(std::collections::HashMap::new());
+            size_paths(&paths, &|p: &str, b: Option<u64>| {
+                seen.lock().unwrap().insert(p.to_string(), b);
+            });
+            let seen = seen.into_inner().unwrap();
+
+            assert_eq!(
+                seen[&main],
+                Some(107),
+                "the main checkout must not include the worktrees under it"
+            );
+            assert_eq!(
+                seen[&outer],
+                Some(1_000),
+                "a linked worktree must not include one nested inside it"
+            );
+            assert_eq!(seen[&inner], Some(10_000), "the nested row keeps its bytes");
+            // The rows now sum to what is actually on disk.
+            let sum: u64 = seen.values().map(|b| b.unwrap()).sum();
+            assert_eq!(sum, dir_size(std::path::Path::new(&main)));
+        }
+
+        /// Rows are compared after canonicalisation, not as spelled.
+        ///
+        /// The nested row arrives through a symlinked parent while the
+        /// main checkout arrives by its real path -- the macOS `/var`
+        /// versus `/private/var` shape, and on Windows the verbatim
+        /// `\\?\` prefix `canonicalize` adds. Compared as spelled, the
+        /// two never match and the double count of #1441 survives.
+        #[test]
+        #[cfg(unix)]
+        fn nested_rows_match_however_their_paths_are_spelled() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let real = tmp.path().join("real");
+            let main = tree(&real, "main", 1, 100);
+            tree(&real.join("main").join(".worktrees"), "x", 1, 1_000);
+            let link = tmp.path().join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            let nested = link
+                .join("main")
+                .join(".worktrees")
+                .join("x")
+                .to_string_lossy()
+                .to_string();
+
+            let seen = Mutex::new(std::collections::HashMap::new());
+            size_paths(&[main.clone(), nested.clone()], &|p: &str, b| {
+                seen.lock().unwrap().insert(p.to_string(), b);
+            });
+            let seen = seen.into_inner().unwrap();
+            assert_eq!(seen[&main], Some(100));
+            assert_eq!(seen[&nested], Some(1_000));
+        }
+
+        /// The same, end to end through `git worktree list`: a file
+        /// written into a nested worktree moves that row and no other.
+        ///
+        /// Measured as a DELTA so the fixture's own `.git` bytes do not
+        /// have to be predicted. Before #1441 the main checkout's row
+        /// grew by every byte written into either nested worktree.
+        #[test]
+        fn size_repo_counts_a_nested_worktree_once() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let ident = [
+                ("GIT_AUTHOR_NAME", "octocat"),
+                ("GIT_COMMITTER_NAME", "octocat"),
+                ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+                ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+            ];
+            let run = |dir: &std::path::Path, args: &[&str]| {
+                let out = std::process::Command::new(crate::auth::git_program())
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .envs(ident)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "git {args:?}");
+            };
+            let repo = tmp.path().join("proj");
+            std::fs::create_dir_all(&repo).unwrap();
+            run(&repo, &["init", "-q", "-b", "main"]);
+            std::fs::write(repo.join("f"), "base\n").unwrap();
+            run(&repo, &["add", "-A"]);
+            run(&repo, &["commit", "-q", "-m", "base"]);
+            // One under the main checkout, one under THAT linked worktree.
+            let inner = repo.join(".worktrees").join("inner");
+            run(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "inner",
+                    inner.to_str().unwrap(),
+                ],
+            );
+            let deeper = inner.join(".worktrees").join("deeper");
+            run(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "deeper",
+                    deeper.to_str().unwrap(),
+                ],
+            );
+
+            let measure = || {
+                let sizes = size_repo(repo.to_str().unwrap()).unwrap();
+                assert_eq!(sizes.len(), 3, "main plus two worktrees: {sizes:?}");
+                let find = |suffix: &std::path::Path| {
+                    sizes
+                        .iter()
+                        .find(|(p, _)| std::path::Path::new(p).ends_with(suffix))
+                        .and_then(|(_, b)| *b)
+                        .unwrap_or_else(|| panic!("no size for {suffix:?} in {sizes:?}"))
+                };
+                (
+                    find(std::path::Path::new("proj")),
+                    find(&std::path::Path::new(".worktrees").join("inner")),
+                    find(&std::path::Path::new(".worktrees").join("deeper")),
+                )
+            };
+
+            let before = measure();
+            std::fs::write(inner.join("blob"), vec![b'x'; 1_000]).unwrap();
+            std::fs::write(deeper.join("blob"), vec![b'x'; 30_000]).unwrap();
+            let after = measure();
+
+            assert_eq!(
+                after.0, before.0,
+                "the main checkout must not grow when a nested worktree does"
+            );
+            assert_eq!(
+                after.1,
+                before.1 + 1_000,
+                "a linked worktree grows by its own bytes, not its nested one's"
+            );
+            assert_eq!(after.2, before.2 + 30_000);
         }
 
         /// The bound is generous enough not to reject honest walks.
