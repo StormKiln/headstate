@@ -20,6 +20,16 @@
 //! | S5 repeated error | `is_error: true` text normalised by [`normalise_error`] | identical first [`ERROR_KEY_CHARS`] chars in ≥ [`MIN_SESSIONS_ERROR`] sessions |
 //! | S6 task census | sessions per attributed directory, from `claude_session` | always, as a count |
 //!
+//! A call's key is its command head, its path or its pattern. A call
+//! whose input could not be read -- no input object, or none of the
+//! fields its tool keys on -- has NO key, never its tool's name (#1420):
+//! a `Read` whose input did not parse is not a read of a file called
+//! `Read`. It is not an S4 read or search, its S5 finding names no call
+//! ("recurring error: `Read`: …", no "on …"), and S2 and S3 group it
+//! under its tool alone ("a `Read` call was denied"). A failed one is
+//! still looking: an early read after it says "after a failed `Read`
+//! (input could not be read)".
+//!
 //! S1, S2 and S3 are [`Severity::Advice`]: each carries a rule a session
 //! had to learn -- the command that worked after the one that failed,
 //! the user's stated fix, the call not to make. S4 and S5 are
@@ -95,7 +105,10 @@
 //!   held back, and one Note per file counts them ("N findings on
 //!   `CLAUDE.md` reach their thresholds only with sessions from before it
 //!   last changed on <date>"), each held finding's sentence as evidence.
-//!   Never dropped silently.
+//!   Never dropped silently. A held finding no current session shows
+//!   says so: "in none of 40 analysed sessions … (5 before it)", never
+//!   "at least 0" (#1425). "At least" qualifies a count that might be
+//!   higher; it is used only for one of 1 or more.
 //! - A CLAUDE.md git lists as modified, staged or untracked changed
 //!   "now": no session has run under it yet, so every session is older,
 //!   and the Note says so.
@@ -176,7 +189,10 @@
 //! under `<repo>`" when there are none -- never an empty list, because
 //! no sessions is not "nothing went wrong". While the pass is short,
 //! every count says "at least". These and the S6 census are Notes: they
-//! state what was measured and recommend nothing (#1339).
+//! state what was measured and recommend nothing (#1339). The census's
+//! evidence names only the exceptions -- a session with no opening
+//! prompt, one read only to the budget, one with no transcript on disk
+//! -- because an ordinary session is not evidence of anything (#1425).
 //!
 //! A session whose transcript is not on disk -- no path recorded, or a
 //! path that is `NotFound` because its worktree's project directory was
@@ -238,7 +254,13 @@ pub const SESSIONS_PER_PASS: usize = 200;
 ///
 /// 5: an S5 row carries the failing call's key (migration 29), so the
 /// finding can name the file a `Read` failed on (#1338).
-pub const RULE_VERSION: i64 = 5;
+///
+/// 6: a call whose input could not be read has no key, never its tool's
+/// name (#1420). Such a `Read` stores no S4 row, its S5 row carries no
+/// `call_key`, and a failed one reads "a failed `Read` (input could not
+/// be read)" as the search before an early read. A row stored before it
+/// would still say "`Read` on `Read`".
+pub const RULE_VERSION: i64 = 6;
 
 /// S1: sessions showing the same A-head → B-head correction.
 const MIN_SESSIONS_CORRECTED: usize = 2;
@@ -438,6 +460,7 @@ fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, 
     let mut missing: Vec<(String, String)> = Vec::new();
     let mut analysed: HashSet<String> = HashSet::new();
     let mut truncated = 0usize;
+    let mut cut_ids: Vec<String> = Vec::new();
     let mut todo: Vec<(&SessionRow, i64, i64)> = Vec::new();
     for s in &sessions {
         let Some(path) = &s.transcript_path else {
@@ -474,6 +497,7 @@ fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, 
                 analysed.insert(s.session_id.clone());
                 if *kt {
                     truncated += 1;
+                    cut_ids.push(s.session_id.clone());
                 }
             }
             _ => todo.push((s, size, mtime)),
@@ -513,6 +537,7 @@ fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, 
         analysed.insert(s.session_id.clone());
         if cut {
             truncated += 1;
+            cut_ids.push(s.session_id.clone());
         }
     }
 
@@ -526,8 +551,24 @@ fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, 
     // in one batched git call rather than one per file or per finding.
     let files: Vec<String> = cx.scan.repo.files.iter().map(|f| f.path.clone()).collect();
     let versions = versions_of(crate::auth::git_program(), repo, &files);
+    // The census's exceptions beside a missing opening prompt (#1425):
+    // a session read only in part, or with no transcript on disk.
+    let cut_at = format!("truncated at {} MB", BUDGET_BYTES / (1024 * 1024));
+    let mut exceptions: HashMap<String, String> =
+        cut_ids.into_iter().map(|id| (id, cut_at.clone())).collect();
+    for (id, _) in &missing {
+        exceptions.insert(id.clone(), "no transcript on disk".to_string());
+    }
     let mut out = emit(
-        &stored, &tasks, &denials, &sessions, &analysed, &versions, cx, short,
+        &stored,
+        &tasks,
+        &denials,
+        &sessions,
+        &analysed,
+        &exceptions,
+        &versions,
+        cx,
+        short,
     );
     out.extend(checkout_unknown);
 
@@ -1029,8 +1070,12 @@ struct Call {
     record: u64,
     name: String,
     id: Option<String>,
-    /// The dedup key: Bash head, file path, pattern, or the tool name.
-    key: String,
+    /// The dedup key: a Bash head, a file path, or a pattern. `None`
+    /// when the call's input could not be read -- no input object, or
+    /// none of the fields its tool keys on -- and for a tool keyed by
+    /// none of those (#1420). Never the tool's name: a `Read` whose
+    /// input did not parse is not a read of a file called `Read`.
+    key: Option<String>,
     dir: PathBuf,
     /// Bash: the command's non-flag tokens after the `cd`/`export`
     /// prefix, for S1's shared-token test.
@@ -1161,9 +1206,15 @@ fn extract(
         call_key: None,
     };
 
-    // S1 -- corrected command.
+    // S2 and S3 group by tool and key, and a call with no key groups
+    // under its tool alone: the key column then holds the tool's name,
+    // and `emit` reads `key == aux` as "no key" and names no call.
+    let key_or_tool = |c: &Call| c.key.clone().unwrap_or_else(|| c.name.clone());
+
+    // S1 -- corrected command. A Bash call whose command could not be
+    // read has no head to correct, or to correct with.
     let bash: Vec<usize> = (0..calls.len())
-        .filter(|&i| calls[i].name == "Bash")
+        .filter(|&i| calls[i].name == "Bash" && calls[i].key.is_some())
         .collect();
     for (bi, &ai) in bash.iter().enumerate() {
         let a = &calls[ai];
@@ -1195,8 +1246,8 @@ fn extract(
                 session_id: session_id.to_string(),
                 signal: SIG_CORRECTED,
                 dir: a.dir.clone(),
-                key: b.key.clone(),
-                aux: Some(a.key.clone()),
+                key: key_or_tool(b),
+                aux: Some(key_or_tool(a)),
                 record: Some(a.record),
                 record_2: Some(b.record),
                 detail: Some(clamp(&outcome.text)),
@@ -1219,7 +1270,7 @@ fn extract(
         else {
             continue;
         };
-        let mut r = row(SIG_USER_CORRECTION, c, c.key.clone());
+        let mut r = row(SIG_USER_CORRECTION, c, key_or_tool(c));
         r.record = Some(*record);
         r.record_2 = Some(c.record);
         r.detail = Some(clamp(text));
@@ -1236,7 +1287,7 @@ fn extract(
             continue;
         }
         if is_denial(&o.text) {
-            let mut r = row(SIG_DENIED, c, c.key.clone());
+            let mut r = row(SIG_DENIED, c, key_or_tool(c));
             r.detail = Some(clamp(&o.text));
             r.tool_use_id = c.id.clone();
             rows.push(r);
@@ -1244,7 +1295,7 @@ fn extract(
             let mut r = row(SIG_ERROR, c, error_key(&o.text));
             r.record = Some(o.record);
             r.detail = Some(clamp(&o.text));
-            r.call_key = Some(c.key.clone());
+            r.call_key = c.key.clone();
             rows.push(r);
         }
     }
@@ -1256,22 +1307,26 @@ fn extract(
     // had to LOOK first: a Grep, a Glob, or a failed Read before it
     // (#1336). Reading a CI workflow during a CI task is the work, not a
     // detour. The nearest such call rides on the row as its `detail`.
+    //
+    // A call with no key is neither: a search whose pattern could not be
+    // read ran no known search, and a Read whose path could not be read
+    // read no known file (#1420). A failed one is still looking.
     let changed: HashSet<&str> = calls
         .iter()
         .filter(|c| is_change(&c.name))
-        .map(|c| c.key.as_str())
+        .filter_map(|c| c.key.as_deref())
         .collect();
     let mut looked: Option<String> = None;
     for (i, c) in calls.iter().enumerate() {
-        match c.name.as_str() {
-            "Grep" | "Glob" => {
-                rows.push(row(SIG_SEARCH, c, c.key.clone()));
-                looked = Some(format!("`{}` `{}`", c.name, c.key));
+        match (c.name.as_str(), c.key.as_deref()) {
+            ("Grep" | "Glob", Some(key)) => {
+                rows.push(row(SIG_SEARCH, c, key.to_string()));
+                looked = Some(format!("`{}` `{key}`", c.name));
             }
-            "Read" => {
-                if i < EARLY_CALLS && !changed.contains(c.key.as_str()) {
-                    if let Some(after) = &looked {
-                        let mut r = row(SIG_SEARCH, c, c.key.clone());
+            ("Read", key) => {
+                if let (true, Some(key), Some(after)) = (i < EARLY_CALLS, key, &looked) {
+                    if !changed.contains(key) {
+                        let mut r = row(SIG_SEARCH, c, key.to_string());
                         r.detail = Some(after.clone());
                         rows.push(r);
                     }
@@ -1282,10 +1337,15 @@ fn extract(
                         .and_then(|id| outcomes.get(id))
                         .is_some_and(|o| o.is_error == Some(true));
                 if failed {
-                    looked = Some(format!("a failed `Read` of `{}`", c.key));
+                    looked = Some(match key {
+                        Some(key) => format!("a failed `Read` of `{key}`"),
+                        None => "a failed `Read` (input could not be read)".to_string(),
+                    });
                 }
             }
-            "Edit" | "Write" | "MultiEdit" => rows.push(row(SIG_EDIT, c, c.key.clone())),
+            // The edit census counts calls per directory, as before; a
+            // call with no path is counted under its record's cwd.
+            ("Edit" | "Write" | "MultiEdit", _) => rows.push(row(SIG_EDIT, c, key_or_tool(c))),
             _ => {}
         }
     }
@@ -1320,9 +1380,9 @@ fn call_of(
 ) -> Call {
     let repo = worktrees.repo;
     let (key, dir, tokens) = match &args {
-        ToolArgs::Bash { command, .. } => {
+        ToolArgs::Bash { command, .. } if !command.trim().is_empty() => {
             let (head, tokens) = command_head(command);
-            (head, cwd.to_path_buf(), tokens)
+            (Some(head), cwd.to_path_buf(), tokens)
         }
         ToolArgs::Edit { file_path, .. }
         | ToolArgs::MultiEdit { file_path, .. }
@@ -1342,17 +1402,21 @@ fn call_of(
             } else {
                 cwd.to_path_buf()
             };
-            (path_key(&p, repo), dir, Vec::new())
+            (Some(path_key(&p, repo)), dir, Vec::new())
         }
-        ToolArgs::Grep { pattern, path, .. } | ToolArgs::Glob { pattern, path } => {
+        ToolArgs::Grep { pattern, path, .. } | ToolArgs::Glob { pattern, path }
+            if !pattern.is_empty() =>
+        {
             let dir = path
                 .as_deref()
                 .map(|p| worktrees.reroot(Path::new(p)))
                 .filter(|p| p.starts_with(repo))
                 .unwrap_or_else(|| cwd.to_path_buf());
-            (pattern.clone(), dir, Vec::new())
+            (Some(pattern.clone()), dir, Vec::new())
         }
-        _ => (name.clone(), cwd.to_path_buf(), Vec::new()),
+        // No input, an input missing the field this tool keys on, or a
+        // tool keyed by nothing here: no key, never the tool's name.
+        _ => (None, cwd.to_path_buf(), Vec::new()),
     };
     Call {
         record,
@@ -2048,6 +2112,7 @@ fn emit(
     denials: &[(String, String, Option<String>)],
     sessions: &[SessionRow],
     analysed: &HashSet<String>,
+    exceptions: &HashMap<String, String>,
     versions: &HashMap<String, Version>,
     cx: &Context,
     short: bool,
@@ -2223,11 +2288,15 @@ fn emit(
                 .map(|sid| task_of(sid))
                 .collect::<HashSet<_>>()
                 .len();
-            let mut sessions_phrase = format!(
-                "{at_least}{n} of {denominator} analysed session{} under `{}`",
-                plural(denominator),
-                cx.repo.display()
-            );
+            // No session under this version: "none of", never "at least
+            // 0 of" (#1425). "At least" qualifies a count that could be
+            // higher; it is not a way to say zero.
+            let counted = match (n, denominator) {
+                (0, 0) => "no analysed session".to_string(),
+                (0, d) => format!("none of {d} analysed session{}", plural(d)),
+                (n, d) => format!("{at_least}{n} of {d} analysed session{}", plural(d)),
+            };
+            let mut sessions_phrase = format!("{counted} under `{}`", cx.repo.display());
             match version {
                 Some(Version::Since(at)) => sessions_phrase
                     .push_str(&format!(" since `{rel}` last changed on {}", day(*at))),
@@ -2237,7 +2306,8 @@ fn emit(
                 _ => {}
             }
             if b > 0 {
-                sessions_phrase.push_str(&format!(" ({b} more before it)"));
+                let more = if n == 0 { "" } else { "more " };
+                sessions_phrase.push_str(&format!(" ({b} {more}before it)"));
             }
             if total > n {
                 sessions_phrase.push_str(&format!(
@@ -2264,15 +2334,26 @@ fn emit(
                     format!("`{aux}` failed and `{key}` followed it in {sessions_phrase}"),
                     key.clone(),
                 ),
-                SIG_USER_CORRECTION => (
-                    format!("a `{aux}` call (`{key}`) was followed by a user correction in {sessions_phrase}"),
-                    key.clone(),
-                ),
+                // `key == aux`: the call had no key (#1420), so there is
+                // no call to name and nothing to look for as written.
+                SIG_USER_CORRECTION => {
+                    if key == aux {
+                        (format!("a `{aux}` call was followed by a user correction in {sessions_phrase}"), String::new())
+                    } else {
+                        (format!("a `{aux}` call (`{key}`) was followed by a user correction in {sessions_phrase}"), key.clone())
+                    }
+                }
                 SIG_DENIED => {
                     if key == aux {
-                        (format!("a `{aux}` call was denied in {sessions_phrase}"), String::new())
+                        (
+                            format!("a `{aux}` call was denied in {sessions_phrase}"),
+                            String::new(),
+                        )
                     } else {
-                        (format!("a `{aux}` call (`{key}`) was denied in {sessions_phrase}"), key.clone())
+                        (
+                            format!("a `{aux}` call (`{key}`) was denied in {sessions_phrase}"),
+                            key.clone(),
+                        )
                     }
                 }
                 SIG_SEARCH => {
@@ -2532,20 +2613,25 @@ fn emit(
             .filter(|s| analysed.contains(&s.session_id))
             .count();
         let subject = subject_for(&placement(&[dir.as_path()], &candidates, cx.repo), cx.scan);
+        // Only the exceptions (#1425). A session with an opening prompt,
+        // read whole, is the ordinary case and says nothing as evidence.
         let evidence = rows
             .iter()
-            .take(MAX_EVIDENCE)
-            .map(|s| Evidence {
-                at: Locator::Session {
-                    session_id: s.session_id.clone(),
-                    record: None,
-                },
-                measured: if s.has_prompt {
-                    "opening prompt recorded".to_string()
-                } else {
-                    "no opening prompt recorded".to_string()
-                },
+            .filter_map(|s| {
+                let mut why: Vec<&str> = Vec::new();
+                if !s.has_prompt {
+                    why.push("no opening prompt recorded");
+                }
+                why.extend(exceptions.get(&s.session_id).map(String::as_str));
+                (!why.is_empty()).then(|| Evidence {
+                    at: Locator::Session {
+                        session_id: s.session_id.clone(),
+                        record: None,
+                    },
+                    measured: why.join("; "),
+                })
             })
+            .take(MAX_EVIDENCE)
             .collect();
         out.push(Finding::new(
             Check::Transcripts,
@@ -3502,6 +3588,20 @@ mod tests {
         assert_eq!(
             cut, 1,
             "truncation is remembered so the next open says so too"
+        );
+        // #1425: the census names the truncated session as one.
+        let census = out
+            .iter()
+            .find(|f| f.finding.starts_with("2 sessions recorded under"))
+            .expect("the census");
+        assert!(
+            census.evidence.iter().any(|e| e.at
+                == Locator::Session {
+                    session_id: "s2".into(),
+                    record: None
+                }
+                && e.measured == "no opening prompt recorded; truncated at 8 MB"),
+            "{census:#?}"
         );
     }
 
@@ -4775,6 +4875,92 @@ mod tests {
         assert_eq!(s5[0].severity, Severity::Note, "{}", s5[0].finding);
     }
 
+    /// #1420: a call whose input could not be read has no key, and is
+    /// never keyed by its tool's name. Three sessions each make two Read
+    /// calls whose input did not parse, both refused with the same
+    /// validation error. The old rule keyed them `Read`, so the second
+    /// counted as an early read of a file called `Read` (after "a failed
+    /// `Read` of `Read`"), and the error cluster said "on `Read`". Now:
+    /// no S4 row, and an S5 finding that names no call.
+    #[test]
+    fn a_call_whose_input_could_not_be_read_has_no_key() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path();
+        let cwd = repo.to_string_lossy().into_owned();
+        let error = "InputValidationError: Read was called with input that could not be parsed";
+        let unread = |id: String, input: serde_json::Value| {
+            [
+                tool_use(&cwd, &id, "Read", input),
+                tool_result(&cwd, &id, Some(true), error),
+            ]
+            .join("\n")
+        };
+        let conn = db();
+        for n in [1, 2, 3] {
+            let body = [
+                user_text(&cwd, &format!("look around, take {n}")),
+                // No input object at all, then one with no `file_path`.
+                unread(format!("a{n}"), serde_json::json!("{not json")),
+                unread(format!("b{n}"), serde_json::json!({})),
+            ]
+            .join("\n");
+            let p = write(repo, &format!("s{n}.jsonl"), &body);
+            insert_session(&conn, &format!("s{n}"), &cwd, Some(&p), None);
+        }
+        let body = fs::read_to_string(repo.join("s1.jsonl")).unwrap();
+        let rows = rows_of(&body, &cwd, repo);
+        assert!(
+            rows.iter().all(|r| r.signal != SIG_SEARCH),
+            "an unread input is neither an early read nor a search: {rows:?}"
+        );
+        let errs: Vec<&Row> = rows.iter().filter(|r| r.signal == SIG_ERROR).collect();
+        assert_eq!(errs.len(), 2, "{rows:?}");
+        assert!(errs.iter().all(|r| r.call_key.is_none()), "{errs:?}");
+
+        let scan = scan_effective_opt(repo, None);
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        assert!(early_reads(&out).is_empty(), "{out:#?}");
+        let hits: Vec<&Finding> = out
+            .iter()
+            .filter(|f| f.finding.starts_with("recurring error: `Read`"))
+            .collect();
+        assert_eq!(hits.len(), 1, "{out:#?}");
+        assert_eq!(
+            hits[0].finding,
+            format!(
+                "recurring error: `Read`: `{error}`, in 3 of 3 analysed sessions under `{}`",
+                repo.display()
+            )
+        );
+        assert_eq!(hits[0].evidence[0].measured, format!("error text: {error}"));
+        for f in &out {
+            assert!(!f.finding.contains("`Read` was read"), "{}", f.finding);
+            assert!(!f.finding.contains("on `Read`"), "{}", f.finding);
+        }
+
+        // #1336's search-before evidence: a failed Read with no path is
+        // still looking, and says it could not tell where.
+        let ci = repo.join("ci.yml");
+        let body = [
+            unread("x".into(), serde_json::json!({})),
+            tool_use(
+                &cwd,
+                "r",
+                "Read",
+                serde_json::json!({"file_path":ci.to_string_lossy()}),
+            ),
+        ]
+        .join("\n");
+        let rows = rows_of(&body, &cwd, repo);
+        let early: Vec<&Row> = rows.iter().filter(|r| r.signal == SIG_SEARCH).collect();
+        assert_eq!(early.len(), 1, "{rows:?}");
+        assert_eq!(early[0].key, "ci.yml");
+        assert_eq!(
+            early[0].detail.as_deref(),
+            Some("a failed `Read` (input could not be read)")
+        );
+    }
+
     /// `git` in `dir` as octocat, with the commit dated `date`.
     fn git_at(dir: &Path, args: &[&str], date: &str) {
         let ok = std::process::Command::new("git")
@@ -4904,6 +5090,103 @@ mod tests {
             held[0].finding,
             "`CLAUDE.md` has uncommitted changes, so no session has run under this version \
              yet; 2 findings from sessions under an earlier version are not shown"
+        );
+    }
+
+    /// #1425: a finding held back because every session it counts ran
+    /// under an older CLAUDE.md is "in none of N", never "at least 0 of
+    /// N", even while the pass is short. The older sessions are "K before
+    /// it", not "K more": there is nothing for them to be more than.
+    #[test]
+    fn a_held_back_finding_with_no_current_session_says_none() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path();
+        git_init(repo);
+        write(repo, "CLAUDE.md", "# rules\n");
+        let changed = "2026-03-01T00:00:00Z";
+        git_at(repo, &["add", "CLAUDE.md"], changed);
+        git_at(repo, &["commit", "-q", "-m", "rules"], changed);
+        let cwd = repo.to_string_lossy().into_owned();
+        let conn = db();
+        for n in [1, 2, 3] {
+            let p = write(repo, &format!("s{n}.jsonl"), &corrected_pair(&cwd, n));
+            insert_session_at(
+                &conn,
+                &format!("s{n}"),
+                &cwd,
+                Some(&p),
+                None,
+                "2026-01-01T00:00:00Z",
+            );
+        }
+        // One session since, with nothing in it, and one with no
+        // transcript on disk, which makes the pass short.
+        let p = write(repo, "s4.jsonl", &user_text(&cwd, "hello"));
+        insert_session_at(&conn, "s4", &cwd, Some(&p), None, "2026-04-01T00:00:00Z");
+        insert_session_at(&conn, "s5", &cwd, None, None, "2026-04-01T00:00:00Z");
+        let scan = scan_effective_opt(repo, None);
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        let held = held_back(&out);
+        assert_eq!(held.len(), 1, "{out:#?}");
+        let first = &held[0].evidence[0].measured;
+        assert_eq!(
+            first,
+            &format!(
+                "`yarn lint` failed and `make lint` followed it in none of 1 analysed session \
+                 under `{}` since `CLAUDE.md` last changed on 2026-03-01 (3 before it)",
+                repo.display()
+            )
+        );
+        for e in &held[0].evidence {
+            assert!(!e.measured.contains("at least 0"), "{}", e.measured);
+            assert!(!e.measured.contains("more before it"), "{}", e.measured);
+        }
+    }
+
+    /// #1425: the census names only the sessions that are exceptions --
+    /// no opening prompt, truncated, no transcript on disk -- never an
+    /// ordinary one as "opening prompt recorded".
+    #[test]
+    fn the_census_evidence_lists_only_exceptions() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path();
+        let cwd = repo.to_string_lossy().into_owned();
+        let conn = db();
+        let p = write(repo, "s1.jsonl", &user_text(&cwd, "hello"));
+        insert_session(&conn, "s1", &cwd, Some(&p), Some("hello"));
+        let p = write(repo, "s2.jsonl", &user_text(&cwd, "hello"));
+        insert_session(&conn, "s2", &cwd, Some(&p), None);
+        insert_session(&conn, "s3", &cwd, None, Some("hello"));
+        let scan = scan_effective_opt(repo, None);
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        let census = out
+            .iter()
+            .find(|f| f.finding.starts_with("3 sessions recorded under"))
+            .unwrap_or_else(|| panic!("{out:#?}"));
+        let rows: Vec<(&Locator, &str)> = census
+            .evidence
+            .iter()
+            .map(|e| (&e.at, e.measured.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (
+                    &Locator::Session {
+                        session_id: "s2".into(),
+                        record: None
+                    },
+                    "no opening prompt recorded"
+                ),
+                (
+                    &Locator::Session {
+                        session_id: "s3".into(),
+                        record: None
+                    },
+                    "no transcript on disk"
+                ),
+            ],
+            "{census:#?}"
         );
     }
 
