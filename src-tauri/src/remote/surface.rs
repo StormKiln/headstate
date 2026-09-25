@@ -608,6 +608,18 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("rerun_checks", Class::Write),
     ("update_pr_branch", Class::Write),
     ("set_auto_merge", Class::Write),
+    // Merge or queue a native GitHub stack through the async merge API
+    // (#1468).
+    //
+    // WRITE, not Destructive. It lands several pull requests at once, which
+    // is why the UI confirms with every one listed -- but `Destructive` here
+    // means DELETING something (files, branches, images, volumes) and
+    // carries the step-up signature for that. A merge deletes nothing, and
+    // `act_on_pr`'s merge and enqueue, the single-PR form of this same act,
+    // are `Write` above. Classing the stack form higher would make the phone
+    // demand a signature for merging three PRs that it does not demand for
+    // merging one.
+    ("merge_stack", Class::Write),
     ("mark_assessed", Class::Write),
     ("clear_assessed", Class::Write),
     ("set_cleanup_prefs", Class::Write),
@@ -1296,6 +1308,15 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             a.get("id")?,
             a.get("repo")?,
             a.get("number")?,
+            a.get("expectedHead")?,
+        )
+        .await),
+        "merge_stack" => res(commands::merge_stack(
+            app.state(),
+            app.state(),
+            a.get("repo")?,
+            a.get("number")?,
+            a.get("action")?,
             a.get("expectedHead")?,
         )
         .await),

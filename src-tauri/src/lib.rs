@@ -304,6 +304,7 @@ pub fn run() {
             commands::get_pr_detail,
             commands::get_review_gates,
             commands::act_on_pr,
+            commands::merge_stack,
             commands::build_target,
             commands::get_viewer,
             commands::rerun_checks,

@@ -1,4 +1,4 @@
-import type { PrStack } from "../types/pr";
+import type { PrStack, StackMember } from "../types/pr";
 
 type Stacked = Extract<PrStack, { kind: "stacked" }>;
 
@@ -90,4 +90,36 @@ function nativeReason(facts: StackFacts): string {
   const which = facts.stack_number ? `GitHub stack #${facts.stack_number}` : "a GitHub stack";
   const where = facts.label ? ` (${facts.label})` : "";
   return `part of ${which}${where}, which GitHub merges only as a stack — merge it on GitHub or with "gh stack merge"`;
+}
+
+/// What merging this pull request as a stack would land (#1468), or null
+/// when the stack merge must not be offered.
+///
+/// GitHub's stack merge lands every OPEN pull request beneath this one,
+/// and this one, all or nothing. The confirmation lists them, so it is
+/// offered only when that list is certain: a native stack, GitHub's whole
+/// membership (`members_complete`), and this pull request found in it.
+/// Anything less falls back to the #1452 gate rather than to a
+/// confirmation that might understate what it lands.
+export function stackMergePlan(stack: PrStack | undefined, number: number): StackMember[] | null {
+  if (stack?.kind !== "stacked" || !stack.native || !stack.members_complete) return null;
+  const members = stack.members ?? [];
+  const self = members.find((m) => m.number === number);
+  if (self === undefined || self.state !== "open") return null;
+  return members
+    .filter((m) => m.position <= self.position && m.state === "open")
+    .sort((a, b) => a.position - b.position);
+}
+
+/// The facts the #1452 gate reads, or null when the stack merge is
+/// offered instead -- a stack GitHub can merge is not "blocked", it is
+/// merged a different way.
+export function stackGate(stack: PrStack | undefined, number: number): StackFacts | null {
+  return stackMergePlan(stack, number) === null ? stackFacts(stack) : null;
+}
+
+/// "#101, #102 and #103".
+export function numberList(members: StackMember[]): string {
+  const n = members.map((m) => `#${m.number}`);
+  return n.length <= 1 ? (n[0] ?? "") : `${n.slice(0, -1).join(", ")} and ${n[n.length - 1]}`;
 }

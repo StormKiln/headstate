@@ -2,7 +2,8 @@ import { useState } from "react";
 import { toast } from "sonner";
 import { useActOnPr } from "../api/hooks";
 import type { PrActionName } from "../api/tauri";
-import { stackBlocksMerge, stackBlocksQueue, stackFacts } from "../lib/stack";
+import { stackBlocksMerge, stackBlocksQueue, stackGate, stackMergePlan } from "../lib/stack";
+import { StackMerge } from "./StackMerge";
 import { inverseOf } from "../lib/undo";
 import type { PrDetail } from "../types/pr";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
@@ -32,7 +33,7 @@ function unavailable(
     case "merge": {
       // A native stack merges only through GitHub's stack merge (#1452).
       // First, because no other obstacle clearing would make this work.
-      const stacked = stackBlocksMerge(stackFacts(pr.stack));
+      const stacked = stackBlocksMerge(stackGate(pr.stack, pr.number));
       if (stacked) return stacked;
       if (pr.is_draft) return "drafts cannot be merged";
       if (pr.merge_status === "dirty") return "merge conflicts";
@@ -64,7 +65,7 @@ function unavailable(
     // that has to come first either way. Open conversations (#1454) are the
     // next blocker once the stack is out of the way.
     case "enqueue":
-      return stackBlocksQueue(stackFacts(pr.stack)) ?? byConversations;
+      return stackBlocksQueue(stackGate(pr.stack, pr.number)) ?? byConversations;
     case "ready":
       return pr.is_draft ? null : "already ready for review";
     case "draft":
@@ -211,6 +212,22 @@ export function PrActions({
         // here (`inverseOf` deliberately gives close no undo), so it is
         // the one action that must not look like its neutral neighbours.
         const destructive = action === "close";
+        // A native stack GitHub can merge is merged AS a stack (#1468): the
+        // primary action becomes the stack merge, which confirms with every
+        // pull request it lands. Same availability reason as the plain
+        // button would have had.
+        const lands = stackMergePlan(pr.stack, pr.number);
+        if (lands !== null && (action === "merge" || action === "enqueue")) {
+          return (
+            <StackMerge
+              key={action}
+              pr={pr}
+              lands={lands}
+              queue={action === "enqueue"}
+              why={why}
+            />
+          );
+        }
         return (
           <button
             key={action}

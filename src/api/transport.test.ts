@@ -220,6 +220,7 @@ const ROWS: Row[] = [
     { sessionId: "sess-1", cwd: "/tmp/x", model: null, permissionMode: "acceptEdits" },
   ),
   row(api.setAutoMerge, [id, repo, number, expectedHead, enable], "set_auto_merge", { id, repo, number, expectedHead, enable }),
+  row(api.mergeStack, [repo, number, "merge_queue", expectedHead], "merge_stack", { repo, number, action: "merge_queue", expectedHead }),
   row(api.deleteHeadBranch, [refId, repo, number, branch, merged], "delete_head_branch", { refId, repo, number, branch, merged }),
   row(api.updatePrBranch, [id, repo, number, expectedHead], "update_pr_branch", { id, repo, number, expectedHead }),
   row(api.actOnPrs, [prs, action], "act_on_prs", { prs, action }),

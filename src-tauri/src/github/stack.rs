@@ -18,7 +18,7 @@
 //! QUALIFIED ("at least"), never discarded and never printed as exact.
 
 use super::client::GitHubClient;
-use super::model::PrStack;
+use super::model::{PrStack, StackMember};
 use super::query::{PR_STACK_QUERY, PR_STACK_UP_QUERY};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -46,6 +46,10 @@ pub const STACK_BUDGET: Duration = Duration::from_secs(10);
 pub struct Down {
     /// `(position, size, stack number)` from `stackEntry`, when native.
     pub native: Option<(u64, u64, u64)>,
+    /// The native stack's entries, bottom first (#1468).
+    pub members: Vec<StackMember>,
+    /// Whether `members` is the whole list.
+    pub members_complete: bool,
     pub head: String,
     pub cross_repository: bool,
     /// The open pull requests beneath this one, nearest first.
@@ -77,8 +81,11 @@ pub fn parse_down(v: &Value) -> Option<Down> {
         _ => None,
     };
 
+    let (members, members_complete) = parse_members(&pr["stackEntry"]["stack"]["entries"]);
     let mut down = Down {
         native,
+        members,
+        members_complete,
         head: pr["headRefName"].as_str().unwrap_or_default().to_string(),
         cross_repository: pr["isCrossRepository"].as_bool().unwrap_or(false),
         ..Down::default()
@@ -129,6 +136,31 @@ pub fn parse_down(v: &Value) -> Option<Down> {
     Some(down)
 }
 
+/// A native stack's `entries`, bottom first, and whether that is all of
+/// them. An entry GitHub could not describe (a pull request the viewer
+/// cannot see) makes the list incomplete rather than silently shorter.
+fn parse_members(entries: &Value) -> (Vec<StackMember>, bool) {
+    let Some(nodes) = entries["nodes"].as_array() else {
+        return (Vec::new(), false);
+    };
+    let mut members: Vec<StackMember> = nodes
+        .iter()
+        .filter_map(|n| {
+            let pr = &n["pullRequest"];
+            Some(StackMember {
+                position: n["position"].as_u64()?,
+                number: pr["number"].as_u64()?,
+                title: pr["title"].as_str().unwrap_or_default().to_string(),
+                state: pr["state"].as_str()?.to_lowercase(),
+            })
+        })
+        .collect();
+    members.sort_by_key(|m| m.position);
+    let complete = members.len() == nodes.len()
+        && entries["totalCount"].as_u64() == Some(members.len() as u64);
+    (members, complete)
+}
+
 /// One step of the upward walk.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UpStep {
@@ -177,6 +209,8 @@ pub fn assemble(down: &Down, children: &[u64], up_complete: bool) -> PrStack {
             position_exact: true,
             size_exact: true,
             below: down.parents.first().copied(),
+            members: down.members.clone(),
+            members_complete: down.members_complete,
         };
     }
     // An ambiguous hop still proves there is SOMETHING beneath it, so the
@@ -199,6 +233,8 @@ pub fn assemble(down: &Down, children: &[u64], up_complete: bool) -> PrStack {
         position_exact: down.complete,
         size_exact: down.complete && up_complete,
         below: down.parents.first().copied(),
+        members: Vec::new(),
+        members_complete: false,
     }
 }
 
@@ -335,6 +371,8 @@ mod tests {
                 position_exact: true,
                 size_exact: true,
                 below: Some(20),
+                members: vec![],
+                members_complete: false,
             }
         );
     }
@@ -356,6 +394,8 @@ mod tests {
                 position_exact: true,
                 size_exact: true,
                 below: Some(10),
+                members: vec![],
+                members_complete: false,
             }
         );
     }
@@ -581,6 +621,8 @@ mod tests {
                     position_exact: true,
                     size_exact: true,
                     below: Some(20),
+                    members: vec![],
+                    members_complete: false,
                 }
             );
         }
@@ -644,6 +686,40 @@ mod tests {
                 .await;
             assert_eq!(got, PrStack::Unknown);
         }
+    }
+
+    /// A native stack's membership is read bottom first, and only a list
+    /// matching GitHub's `totalCount` is complete -- the stack-merge
+    /// confirmation (#1468) is built from it and must not understate.
+    #[test]
+    fn a_native_stacks_members_are_read_and_checked_for_completeness() {
+        let mut v = down_response("feat-b", one(20, "main", Some(none())));
+        v["repository"]["pullRequest"]["stackEntry"] = json!({
+            "position": 2,
+            "stack": { "number": 7, "size": 3, "entries": { "totalCount": 3, "nodes": [
+                { "position": 2, "pullRequest": { "number": 30, "title": "Second", "state": "OPEN" } },
+                { "position": 1, "pullRequest": { "number": 20, "title": "First", "state": "MERGED" } },
+                { "position": 3, "pullRequest": { "number": 40, "title": "Third", "state": "OPEN" } }
+            ] } }
+        });
+        let down = parse_down(&v).unwrap();
+        assert!(down.members_complete);
+        assert_eq!(
+            down.members
+                .iter()
+                .map(|m| (m.number, m.state.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(20, "merged"), (30, "open"), (40, "open")]
+        );
+
+        // One entry GitHub could not describe: not complete.
+        v["repository"]["pullRequest"]["stackEntry"]["stack"]["entries"]["nodes"][2]
+            ["pullRequest"] = Value::Null;
+        assert!(!parse_down(&v).unwrap().members_complete);
+        // A page shorter than the total: not complete.
+        v["repository"]["pullRequest"]["stackEntry"]["stack"]["entries"] =
+            json!({ "totalCount": 60, "nodes": [] });
+        assert!(!parse_down(&v).unwrap().members_complete);
     }
 
     /// A payload cached before #1452 carries no `stack`, and must read as

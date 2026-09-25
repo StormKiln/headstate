@@ -744,7 +744,20 @@ export type PrStack =
       size_exact: boolean;
       /// The open pull request directly beneath this one, when known.
       below: number | null;
+      /// A native stack's entries, bottom first (#1468); empty otherwise.
+      members?: StackMember[];
+      /// True when `members` is GitHub's whole list.
+      members_complete?: boolean;
     };
+
+/// One entry of a native stack (#1468).
+export interface StackMember {
+  position: number;
+  number: number;
+  title: string;
+  /// `open`, `merged` or `closed`.
+  state: string;
+}
 
 /// How an image's provenance was established. A recorded fact and a
 /// resolved guess should not look identical in the UI.

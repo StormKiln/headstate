@@ -4,6 +4,9 @@ import {
   stackBlocksMerge,
   stackBlocksQueue,
   stackFacts,
+  stackGate,
+  stackMergePlan,
+  numberList,
   stackFactsFromList,
   stackLabel,
   stackTitle,
@@ -93,5 +96,37 @@ describe("stackBlocksQueue", () => {
   it("gates a list row on the same predicate", () => {
     expect(stackBlocksQueue(stackFactsFromList(12))).toBe("stacked on #12 — merge #12 first");
     expect(stackBlocksQueue(stackFactsFromList(undefined))).toBeNull();
+  });
+});
+
+describe("stackMergePlan (#1468)", () => {
+  const native = stacked({
+    native: true,
+    stack_number: 7,
+    position: 3,
+    members: [
+      { position: 3, number: 30, title: "c", state: "open" },
+      { position: 1, number: 10, title: "a", state: "merged" },
+      { position: 2, number: 20, title: "b", state: "open" },
+      { position: 4, number: 40, title: "d", state: "open" },
+    ],
+    members_complete: true,
+  });
+
+  it("lands the open pull requests beneath and this one, bottom first", () => {
+    expect(stackMergePlan(native, 30)?.map((m) => m.number)).toEqual([20, 30]);
+    expect(numberList(stackMergePlan(native, 30) ?? [])).toBe("#20 and #30");
+  });
+
+  it("is not offered on a partial membership, a base-chain stack, or a PR not in it", () => {
+    expect(stackMergePlan({ ...native, members_complete: false }, 30)).toBeNull();
+    expect(stackMergePlan(stacked(), 30)).toBeNull();
+    expect(stackMergePlan(native, 99)).toBeNull();
+  });
+
+  /// A stack GitHub can merge is not "blocked" -- the #1452 gate steps aside.
+  it("lifts the #1452 gate only when the stack merge is offered", () => {
+    expect(stackGate(native, 30)).toBeNull();
+    expect(stackGate({ ...native, members_complete: false }, 30)?.native).toBe(true);
   });
 });
