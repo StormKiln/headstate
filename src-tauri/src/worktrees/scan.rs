@@ -2193,6 +2193,66 @@ fn dir_size_within(
     Some(total)
 }
 
+/// How long `size_paths` waits for ALL its rows' paths to canonicalise.
+///
+/// Canonicalising is a handful of `lstat`s per path and normally takes
+/// microseconds, so this bound exists only to convert "never" into
+/// "kept as given" -- the #769 rule applied to the step before the walk.
+/// Without it one dead mount among the rows would hold up every row's
+/// size, which is exactly the stall #769 removed from the walk itself.
+const CANONICAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Each of `paths` canonicalised by `canon`, or kept as given if that
+/// fails or has not answered within `budget` (shared by all paths, not
+/// per path).
+///
+/// One detached thread per path, NOT joined: a `canonicalize` blocked on
+/// a mount that never answers cannot be interrupted, and joining it would
+/// re-create the stall this function exists to bound. The abandoned
+/// thread's later answer goes to a dropped receiver and is discarded. A
+/// thread that cannot be spawned leaves its path as given, like a
+/// timeout.
+///
+/// `canon` is a parameter so the timeout can be tested with a stand-in
+/// that blocks, rather than needing a real mount that does.
+fn canonical_rows(
+    paths: &[String],
+    budget: std::time::Duration,
+    canon: fn(&Path) -> std::io::Result<std::path::PathBuf>,
+) -> Vec<std::path::PathBuf> {
+    let mut roots: Vec<std::path::PathBuf> = paths.iter().map(std::path::PathBuf::from).collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut pending = 0usize;
+    for (i, p) in roots.iter().enumerate() {
+        let (tx, p) = (tx.clone(), p.clone());
+        let spawned = std::thread::Builder::new()
+            .name("worktree-canonicalize".into())
+            .spawn(move || {
+                // The receiver is gone once the budget is spent; a late
+                // answer has nowhere to go and nothing waiting on it.
+                let _ = tx.send((i, canon(&p)));
+            });
+        if spawned.is_ok() {
+            pending += 1;
+        }
+    }
+    drop(tx);
+    let deadline = std::time::Instant::now() + budget;
+    while pending > 0 {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left) {
+            Ok((i, Ok(canonical))) => {
+                roots[i] = canonical;
+                pending -= 1;
+            }
+            Ok((_, Err(_))) => pending -= 1,
+            // Timed out: whatever is still pending keeps its given path.
+            Err(_) => break,
+        }
+    }
+    roots
+}
+
 /// Size every path in `paths`, `SIZE_WORKERS` at a time.
 ///
 /// A shared cursor rather than fixed chunks, because worktree sizes vary
@@ -2225,17 +2285,21 @@ fn dir_size_within(
 /// summed. A directory that is NOT a row (a submodule, an unrelated
 /// clone) is still counted where it sits; it has no row of its own.
 ///
-/// Canonicalised once, up front, so the comparison survives a path that
+/// Canonicalised up front, so the comparison survives a path that
 /// reached git through a symlink (macOS `/var` vs `/private/var`) and
-/// Windows' verbatim `\\?\C:\` form. A path that cannot be
-/// canonicalised (already deleted, say) is kept as given: it can still
-/// match itself, and it no longer exists to be walked into anyway.
-/// Reports still carry the path AS GIVEN, since that is the row's key.
+/// Windows' verbatim `\\?\C:\` form -- but under `CANONICAL_BUDGET`, see
+/// `canonical_rows`. Reports still carry the path AS GIVEN, since that
+/// is the row's key.
+///
+/// QUALIFICATION: a row whose path could not be canonicalised in time
+/// (or at all) is kept as given. It still matches a parent that spells
+/// it the same way, but one reached by a different spelling may then
+/// count it a second time. That is the only cost, and it is bounded to
+/// that row: such a path is most likely on a mount that is not
+/// answering, so its own walk will most likely report "could not
+/// measure" anyway.
 fn size_paths(paths: &[String], report: &(dyn Fn(&str, Option<u64>) + Sync)) {
-    let roots: Vec<std::path::PathBuf> = paths
-        .iter()
-        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| Path::new(p).to_path_buf()))
-        .collect();
+    let roots = canonical_rows(paths, CANONICAL_BUDGET, |p| std::fs::canonicalize(p));
     let rows: std::collections::HashSet<std::path::PathBuf> = roots.iter().cloned().collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let workers = SIZE_WORKERS.min(paths.len().max(1));
@@ -7595,7 +7659,8 @@ prunable gitdir file points to non-existent location
     /// measure" rather than nothing at all (#769).
     mod sizing {
         use super::super::{
-            dir_size, dir_size_within, size_paths, size_repo, SIZE_TIMEOUT, SIZE_WORKERS,
+            canonical_rows, dir_size, dir_size_within, size_paths, size_repo, SIZE_TIMEOUT,
+            SIZE_WORKERS,
         };
         use std::collections::HashSet;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -7945,6 +8010,48 @@ prunable gitdir file points to non-existent location
             let seen = seen.into_inner().unwrap();
             assert_eq!(seen[&main], Some(100));
             assert_eq!(seen[&nested], Some(1_000));
+        }
+
+        /// Canonicalising the rows is bounded: a path that never answers
+        /// is kept as given, and the rest are not held up by it.
+        ///
+        /// #769's shape, one step earlier. The walk was bounded so one
+        /// dead mount could not stall every row; an UNBOUNDED
+        /// canonicalise before the walk would put that stall straight
+        /// back. The stand-in blocks for an hour, standing in for a mount
+        /// that never answers -- a real hanging mount cannot be made in
+        /// a test.
+        #[test]
+        fn canonicalising_the_rows_cannot_stall_on_one_path() {
+            fn canon(p: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+                if p.ends_with("hangs") {
+                    std::thread::sleep(std::time::Duration::from_secs(3_600));
+                }
+                if p.ends_with("fails") {
+                    return Err(std::io::Error::other("no such path"));
+                }
+                Ok(std::path::Path::new("canonical").join(p))
+            }
+            let paths = vec!["a".to_string(), "hangs".into(), "fails".into()];
+
+            let started = std::time::Instant::now();
+            let roots = canonical_rows(&paths, std::time::Duration::from_millis(200), canon);
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(30),
+                "a path that never answers must not hold up the others: \
+                 took {:?}",
+                started.elapsed()
+            );
+            assert_eq!(
+                roots,
+                vec![
+                    std::path::Path::new("canonical").join("a"),
+                    std::path::PathBuf::from("hangs"),
+                    std::path::PathBuf::from("fails"),
+                ],
+                "answered paths are canonical; timed-out and failed ones \
+                 are kept as given"
+            );
         }
 
         /// The same, end to end through `git worktree list`: a file
