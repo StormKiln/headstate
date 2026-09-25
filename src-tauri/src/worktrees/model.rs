@@ -233,6 +233,41 @@ pub enum Safety {
     /// rows were `Unknown`, with no action at all: four on the reporting
     /// machine, every one provably an ancestor of the default branch.
     DetachedMerged(String),
+    /// GitHub records this branch's pull request as MERGED, and this
+    /// worktree holds nothing that pull request did not (#1440). Carries
+    /// the pull request's number. Removable.
+    ///
+    /// # Why a second route exists at all
+    ///
+    /// The offline checks (`merged_into`) look for the branch's CONTENT on
+    /// the default branch, and both of their squash signals decay: the
+    /// aggregate patch-id hashes context lines, and `content_landed` needs
+    /// every touched file unchanged since. Once the default branch edits
+    /// those files again, a squash-merged branch reads "not merged" -- 3
+    /// of 4 such rows on the reporting machine were PRs GitHub had
+    /// merged. The busier the repository, the sooner it happens.
+    ///
+    /// # The rule is strict, and only ever UPGRADES
+    ///
+    /// Reached only from `Unmerged` or `Unpushed`, and only when a merged
+    /// pull request's base is the default branch AND this worktree's HEAD
+    /// is exactly its `headRefOid` or an ancestor of it -- the PR carried
+    /// every commit the worktree has, never fewer. A local commit past the
+    /// PR's head is work GitHub never saw, and does not qualify. See
+    /// `worktrees::github::qualifying_pr`.
+    ///
+    /// A GitHub lookup that failed, was refused, or was never made leaves
+    /// the offline verdict exactly as it was. "We did not ask" is not
+    /// "GitHub said no", and nothing here ever moves a verdict DOWN.
+    ///
+    /// # Its own variant rather than `Safe`
+    ///
+    /// For the reason `MergedUpstreamDeleted` exists: the ROUTE differs
+    /// and the row must say which one it took. `Safe` means the content
+    /// was found on the default branch; this means GitHub vouched for the
+    /// merge and the content was NOT found locally, so the number is the
+    /// evidence the user can go and check.
+    MergedAsPr(u64),
     /// The branch was created and never committed to.
     ///
     /// Its own state rather than a flavour of `Safe` or `NeverPushed`,
@@ -506,12 +541,20 @@ impl Safety {
         // when there is no directory) and the note on `Empty` above (a
         // large previously-refused population must not be promoted as a
         // side effect of a wording fix).
+        //
+        // `MergedAsPr` joined in #1440, and it is a widening of the EVIDENCE
+        // rather than of the rows: GitHub's record of a merged pull request
+        // whose head contains this worktree's HEAD. It is only ever produced
+        // from a clean, unlocked, not-in-progress row (it upgrades `Unmerged`
+        // and `Unpushed`, which those states outrank), and the delete-time
+        // gate re-asks GitHub rather than trusting the scan.
         matches!(
             self,
             Safety::Safe
                 | Safety::MergedUpstreamDeleted
                 | Safety::MergedNoUpstream
                 | Safety::DetachedMerged(_)
+                | Safety::MergedAsPr(_)
         )
     }
 
@@ -573,6 +616,10 @@ impl Safety {
             Safety::DetachedMerged(at) => {
                 format!("merged — {at}, no branch to delete")
             }
+            // Names the ROUTE (#1440): the number is GitHub's evidence and
+            // the thing a user can go and check, where "merged" alone
+            // would read like the offline verdict it is not.
+            Safety::MergedAsPr(n) => format!("merged as #{n} on GitHub"),
             // Says what is TRUE of the branch, not what the app will
             // let you do about it. "Nothing to lose" is the fact the
             // user was trying to establish by hand; whether the Remove
@@ -820,6 +867,8 @@ mod tests {
             // Same `merged_into` evidence as the two above.
             Safety::MergedNoUpstream,
             Safety::DetachedMerged("detached at v1.13.0~30".into()),
+            // #1440: GitHub's record of the merge, under the strict rule.
+            Safety::MergedAsPr(7),
         ] {
             assert!(s.is_safe(), "{s:?} is one of the merged states");
         }
@@ -847,6 +896,18 @@ mod tests {
         ] {
             assert!(!s.is_safe(), "{s:?} must not be one-click removable");
         }
+    }
+
+    /// A GitHub-vouched merge says which route produced it (#1440).
+    ///
+    /// The number is the evidence: it is what separates this verdict from
+    /// the offline `Safe`, and what the user can open to check.
+    #[test]
+    fn a_github_merge_names_its_pull_request() {
+        let r = Safety::MergedAsPr(42).reason();
+        assert!(r.contains("#42"), "{r}");
+        assert!(r.contains("GitHub"), "{r}");
+        assert!(!r.contains("not merged"), "{r}");
     }
 
     /// The default must never be deletable. A partially-constructed
@@ -895,6 +956,7 @@ mod tests {
             Safety::MergedUpstreamDeleted,
             Safety::MergedNoUpstream,
             Safety::DetachedMerged("v1.0.0~3".into()),
+            Safety::MergedAsPr(7),
             Safety::Empty,
             Safety::Orphaned,
             Safety::Unmerged,
@@ -922,6 +984,7 @@ mod tests {
                 | Safety::MergedUpstreamDeleted
                 | Safety::MergedNoUpstream
                 | Safety::DetachedMerged(_)
+                | Safety::MergedAsPr(_)
                 | Safety::Empty
                 | Safety::Orphaned
                 | Safety::Unmerged

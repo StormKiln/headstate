@@ -67,6 +67,9 @@ describe("isSafe", () => {
     // branch, which is the thing removal would otherwise lose. Four such
     // rows on the reporting machine were `unknown` with no action at all.
     expect(isSafe({ kind: "detached_merged", detail: "detached at v1.13.0~30" })).toBe(true);
+    // #1440: GitHub's record of a merged pull request containing HEAD,
+    // under the strict rule. Mirrors `Safety::MergedAsPr` in model.rs.
+    expect(isSafe({ kind: "merged_as_pr", detail: 7 })).toBe(true);
     for (const s of [
       { kind: "main_checkout" },
       { kind: "dirty", detail: 3 },
@@ -211,6 +214,16 @@ describe("safetyReason", () => {
     expect(untracked).toContain("no upstream");
     expect(untracked).not.toContain("only here");
     expect(untracked).not.toContain("never pushed");
+  });
+
+  // #1440: the row names the route -- the pull request GitHub merged --
+  // so it cannot be mistaken for the offline verdict, and is green.
+  it("names the pull request when GitHub vouched for the merge", () => {
+    const reason = safetyReason({ kind: "merged_as_pr", detail: 42 });
+    expect(reason).toContain("merged as #42");
+    expect(reason).toContain("GitHub");
+    expect(reason).not.toContain("not merged");
+    expect(safetyTone({ kind: "merged_as_pr", detail: 42 })).toContain("3fb950");
   });
 
   // The bug in #701: a scratch branch was described as holding commits

@@ -2695,6 +2695,9 @@ fn safety_label(s: &Safety) -> &'static str {
         Safety::MergedUpstreamDeleted => "merged_upstream_deleted",
         Safety::MergedNoUpstream => "merged_no_upstream",
         Safety::DetachedMerged(_) => "detached_merged",
+        // The number is not carried, for the reason above: it names a
+        // pull request in what may be a private repository.
+        Safety::MergedAsPr(_) => "merged_as_pr",
         Safety::Empty => "empty",
         Safety::Unmerged => "unmerged",
         Safety::Locked(_) => "locked",
@@ -3395,7 +3398,7 @@ mod tests {
             .collect();
 
         let seen = std::cell::RefCell::new(Vec::new());
-        let outcomes = remove_worktrees_with_progress(&repo, &paths, |done, total| {
+        let outcomes = remove_worktrees_with_progress(&repo, &paths, None, |done, total| {
             seen.borrow_mut().push((done, total));
         });
 
@@ -3412,7 +3415,7 @@ mod tests {
     #[test]
     fn an_empty_batch_reports_no_progress() {
         let seen = std::cell::RefCell::new(Vec::new());
-        let outcomes = remove_worktrees_with_progress("/tmp", &[], |d, t| {
+        let outcomes = remove_worktrees_with_progress("/tmp", &[], None, |d, t| {
             seen.borrow_mut().push((d, t));
         });
         assert!(seen.into_inner().is_empty());
@@ -6374,8 +6377,12 @@ prunable gitdir file points to non-existent location
 
         // The fixture's branch is genuinely unmerged, so a bulk call
         // naming it must refuse rather than delete.
-        let outcomes =
-            remove_worktrees_with_progress(repo_s, &[wt.to_string_lossy().into_owned()], |_, _| {});
+        let outcomes = remove_worktrees_with_progress(
+            repo_s,
+            &[wt.to_string_lossy().into_owned()],
+            None,
+            |_, _| {},
+        );
         assert_eq!(outcomes.len(), 1);
         assert!(
             outcomes[0].error.is_some(),
@@ -6398,6 +6405,7 @@ prunable gitdir file points to non-existent location
                 "/nonexistent/path".to_string(),
                 wt.to_string_lossy().into_owned(),
             ],
+            None,
             |_, _| {},
         );
         assert_eq!(outcomes.len(), 2, "every input must get an outcome");
@@ -9349,6 +9357,9 @@ mod live {
                 // moving into `never_pushed`, and a merged total would
                 // hide both halves.
                 Safety::DetachedMerged(_) => "detached_merged",
+                // Never produced by this offline scan (#1440): only the
+                // GitHub enrichment in `worktrees::github` reaches it.
+                Safety::MergedAsPr(_) => "merged_as_pr",
                 Safety::Empty => "empty",
                 Safety::Unmerged => "unmerged",
                 Safety::Locked(_) => "locked",
@@ -10608,9 +10619,13 @@ pub fn fetch_refs(path: &str) -> Result<String, String> {
     git(dir, args)
 }
 
+/// `github` is the same delete-time GitHub check `remove_worktree_asking`
+/// takes (#1440), asked only for a row the offline gate would refuse as
+/// unmerged or unpushed. `None` is the offline gate alone.
 pub fn remove_worktrees_with_progress(
     repo_path: &str,
     worktree_paths: &[String],
+    github: Option<super::github::Ask<'_>>,
     mut on_progress: impl FnMut(usize, usize),
 ) -> Vec<RemovalOutcome> {
     let total = worktree_paths.len();
@@ -10620,7 +10635,7 @@ pub fn remove_worktrees_with_progress(
         .map(|(i, p)| {
             let outcome = RemovalOutcome {
                 path: p.clone(),
-                error: remove_worktree(repo_path, p).err(),
+                error: remove_inner(repo_path, p, false, github).err(),
             };
             // AFTER the removal, so the count means "done", not
             // "started" -- a progress bar that reaches 100% before the
@@ -10675,7 +10690,27 @@ fn canonical_key(p: &Path) -> String {
 /// administrative files, where a raw delete leaves a stale entry making
 /// the repo report a worktree that no longer exists.
 pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> Result<(), String> {
-    remove_inner(repo_path, worktree_path, false)
+    remove_inner(repo_path, worktree_path, false, None)
+}
+
+/// [`remove_worktree`], with GitHub's record of a merge as a second
+/// route through the gate (#1440).
+///
+/// The offline gate runs first and unchanged. Only when it refuses a row
+/// as `Unmerged` or `Unpushed` -- the two verdicts the scan's GitHub
+/// enrichment can upgrade -- is `github` asked, FRESH, about the branch,
+/// and the answer must pass `github::qualifying_pr` against the HEAD
+/// git reports right now. Anything else keeps the offline refusal.
+///
+/// Fresh rather than trusted from the scan for the reason the offline
+/// gate is: the scan is a snapshot. A commit made since would sit past
+/// the PR's head, and the strict rule refuses exactly that.
+pub fn remove_worktree_asking(
+    repo_path: &str,
+    worktree_path: &str,
+    github: super::github::Ask<'_>,
+) -> Result<(), String> {
+    remove_inner(repo_path, worktree_path, false, Some(github))
 }
 
 /// Remove a worktree the safety gate would refuse.
@@ -10709,10 +10744,15 @@ pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> Result<(), Strin
 /// worktree still fails here, loudly, rather than being torn out from
 /// under whatever holds it.
 pub fn remove_worktree_forced(repo_path: &str, worktree_path: &str) -> Result<(), String> {
-    remove_inner(repo_path, worktree_path, true)
+    remove_inner(repo_path, worktree_path, true, None)
 }
 
-fn remove_inner(repo_path: &str, worktree_path: &str, allow_unsafe: bool) -> Result<(), String> {
+fn remove_inner(
+    repo_path: &str,
+    worktree_path: &str,
+    allow_unsafe: bool,
+    github: Option<super::github::Ask<'_>>,
+) -> Result<(), String> {
     let repo = Path::new(repo_path);
     let target = Path::new(worktree_path);
 
@@ -10754,7 +10794,11 @@ fn remove_inner(repo_path: &str, worktree_path: &str, allow_unsafe: bool) -> Res
         };
         let safety = worktree_safety(wt, &branch, has_upstream, ahead);
         if !safety.is_safe() {
-            return Err(format!("not safe to remove: {}", safety.reason()));
+            // GitHub's record of a merge, as a second route (#1440). It can
+            // only let through what the offline gate refused as unmerged or
+            // unpushed; every other refusal -- dirty, in progress, locked --
+            // returns here exactly as before.
+            super::github::gate(wt, &safety, github)?;
         }
     } else {
         log::warn!("removing {worktree_path} past the safety gate, by explicit confirmation");

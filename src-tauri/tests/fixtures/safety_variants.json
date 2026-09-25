@@ -62,6 +62,10 @@
     "detail": "v1.0.0~3"
   },
   {
+    "kind": "merged_as_pr",
+    "detail": 7
+  },
+  {
     "kind": "empty"
   },
   {
