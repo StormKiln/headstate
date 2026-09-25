@@ -102,6 +102,9 @@ struct Shared {
     /// The scheme the last client CertificateVerify was checked with.
     last_sig: Mutex<Option<SignatureScheme>>,
     end_streams: Notify,
+    /// Set by [`TestServer::go_away`]: every new connection is closed
+    /// before the handshake, while the port stays bound.
+    gone: AtomicBool,
 }
 
 /// The desktop's client-cert rule: paired, or the pairing window is
@@ -293,6 +296,22 @@ impl TestServer {
     pub fn end_streams(&self) {
         self.shared.end_streams.notify_waiters();
     }
+    /// The desktop goes away, as far as the phone can tell: held streams
+    /// end and every new connection is closed before the TLS handshake,
+    /// so a connect fails the way it does against a dead desktop.
+    ///
+    /// Use this instead of `drop(server)` when a test needs the desktop
+    /// GONE. Dropping frees the port, and under a parallel test run
+    /// another test's server can bind it -- the phone then reaches a
+    /// stranger with a different certificate and reports a fingerprint
+    /// mismatch instead of "unreachable". That burned a release commit
+    /// (`a_window_while_the_desktop_is_away_touches_nothing`, CI, the
+    /// merge of #1470). Keeping the listener bound makes the port
+    /// impossible to reuse for as long as the server lives.
+    pub fn go_away(&self) {
+        self.shared.gone.store(true, Ordering::SeqCst);
+        self.shared.end_streams.notify_waiters();
+    }
     /// The QR a desktop would show for this server.
     pub fn qr(&self, token_b64url: &str, exp: i64) -> String {
         json!({
@@ -313,6 +332,10 @@ async fn accept_loop(listener: TcpListener, acceptor: TlsAcceptor, shared: Arc<S
         let Ok((tcp, _)) = listener.accept().await else {
             return;
         };
+        if shared.gone.load(Ordering::SeqCst) {
+            drop(tcp);
+            continue;
+        }
         let acceptor = acceptor.clone();
         let shared = shared.clone();
         tokio::spawn(async move {

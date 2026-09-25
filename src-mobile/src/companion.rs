@@ -937,7 +937,7 @@ mod tests {
     #[tokio::test]
     async fn while_unreachable_the_list_comes_from_the_cache_and_actions_are_refused() {
         let (server, _, _, c) = paired().await;
-        drop(server);
+        server.go_away();
         until(|| c.connection_state().state == State::Unreachable).await;
         assert_eq!(
             c.call("get_cached", json!({})).await.unwrap(),

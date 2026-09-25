@@ -1431,12 +1431,29 @@ mod tests {
         );
     }
 
+    /// A desktop that has gone away keeps its port: nothing else can bind
+    /// it while the test still needs it gone.
+    ///
+    /// `drop(server)` freed the port, and in a parallel run another
+    /// test's server took it -- the phone then met a stranger's
+    /// certificate and reported a fingerprint mismatch, not
+    /// "unreachable". That failed CI on a release candidate.
+    #[tokio::test]
+    async fn a_desktop_that_went_away_keeps_its_port() {
+        let server = TestServer::start().await;
+        server.go_away();
+        assert!(
+            std::net::TcpListener::bind(("127.0.0.1", server.port())).is_err(),
+            "the port must stay held so no other test's server can answer on it"
+        );
+    }
+
     #[tokio::test]
     async fn no_address_answering_is_unreachable() {
         let id = identity();
         let server = TestServer::start().await;
         let port = server.port();
-        drop(server);
+        server.go_away();
         let client = Client::new(&id, &"ab".repeat(32), vec!["127.0.0.1".into()], port).unwrap();
         assert!(matches!(
             client.hello().await,
@@ -1527,7 +1544,7 @@ mod tests {
         // Answered once, so the call goes straight to the known address
         // rather than through `hello`'s race.
         client.call("get_stats", &json!({}), None).await.unwrap();
-        drop(server);
+        server.go_away();
         let err = client
             .call("get_stats", &json!({}), None)
             .await
