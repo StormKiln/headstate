@@ -551,6 +551,55 @@ pub struct PrDetail {
     /// `poll::truncation_payload` takes with `issueCount`.
     #[serde(default)]
     pub checks_total: u64,
+    /// Where this pull request sits in a stack, asked of GitHub directly
+    /// rather than inferred from whatever the list happens to hold (#1452).
+    ///
+    /// Defaults to `Unknown`, never `None`: a payload cached before this
+    /// field existed, or a stack lookup that failed, has not established
+    /// that the pull request is standalone, and "not stacked" is the answer
+    /// that re-enables an "Add to merge queue" GitHub would refuse.
+    #[serde(default)]
+    pub stack: PrStack,
+}
+
+/// A pull request's place in a stack (#1452).
+///
+/// Two sources, in order of authority:
+///
+/// - **GitHub's native stack** (`PullRequest.stackEntry`, what `gh stack`
+///   creates). Position and size are GitHub's own numbers and are exact.
+/// - **The base chain**, for stacks made by any other tool or by hand: the
+///   base branch is another open pull request's head branch. Walked a
+///   bounded number of hops each way, so either end can be truncated; the
+///   `*_exact` flags say which, and the UI qualifies with "at least".
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PrStack {
+    /// Could not be determined: the lookup failed, timed out, was refused,
+    /// or the payload predates it. NOT the same as `None`.
+    #[default]
+    Unknown,
+    /// Checked, and not part of any stack.
+    None,
+    Stacked {
+        /// A GitHub-native stack, which GitHub merges only through its
+        /// stack merge -- `mergePullRequest` "does not support stacked pull
+        /// requests" (the schema's own words), and neither does the queue.
+        native: bool,
+        /// The native stack's number, as github.com shows it.
+        stack_number: Option<u64>,
+        /// 1 is the pull request closest to the trunk.
+        position: u64,
+        size: u64,
+        /// False when the downward walk stopped before the trunk, so
+        /// `position` (and therefore `size`) is a floor.
+        position_exact: bool,
+        /// False when either walk stopped early, so `size` is a floor.
+        size_exact: bool,
+        /// The open pull request directly beneath this one, when known --
+        /// the one that has to merge first.
+        below: Option<u64>,
+    },
 }
 
 #[cfg(test)]

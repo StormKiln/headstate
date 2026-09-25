@@ -2,7 +2,7 @@
 
 use super::model::{
     CheckRun, CiState, CycleTrend, HistoryPoint, Label, MergeState, MergeStateStatus, MergedDetail,
-    MergedPr, PrComment, PrDetail, PullRequest, RepoCount, ReviewState, ReviewThread,
+    MergedPr, PrComment, PrDetail, PrStack, PullRequest, RepoCount, ReviewState, ReviewThread,
     ReviewerVerdict,
 };
 use chrono::{DateTime, Duration, Utc};
@@ -210,6 +210,9 @@ pub fn map_detail(v: &Value, repo: &str) -> PrDetail {
             .as_u64()
             .unwrap_or(checks.len() as u64),
         checks,
+        // Not in this document: `fetch_pr_detail` fills it from its own
+        // lookup (#1452). Unknown until then, never "not stacked".
+        stack: PrStack::Unknown,
     }
 }
 

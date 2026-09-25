@@ -530,7 +530,7 @@ export function PrRow({
         )}
       </div>
       {isMobile ? null : <div className="shrink-0 text-xs text-[#8b949e]">{pr.repo}</div>}
-      <PrKebab pr={pr} canWrite={canWrite} />
+      <PrKebab pr={pr} canWrite={canWrite} stackedOn={stackedOn} />
     </div>
   );
 }

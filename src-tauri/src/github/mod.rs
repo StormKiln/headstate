@@ -7,4 +7,5 @@ pub mod map;
 pub mod model;
 pub mod mutate;
 pub mod query;
+pub mod stack;
 pub mod stats;
