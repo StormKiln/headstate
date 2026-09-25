@@ -14,11 +14,26 @@ const update = vi.fn<Upd>(() => Promise.resolve());
 const setAuto = vi.fn<
   (id: string, repo: string, n: number, head: string, enable: boolean) => Promise<void>
 >(() => Promise.resolve());
+/// The scan and the prefs Claudify reads (#1455). No checkout and no
+/// terminal by default, which is the "copy the prompt" fallback.
+const claudify = vi.hoisted(() => ({
+  repos: [] as { identity: string | null; name: string; path: string; worktrees: never[] }[],
+  terminal: "",
+}));
 vi.mock("@/api/hooks", () => ({
   useActOnPr: () => act,
   useSetAutoMerge: () => setAuto,
   useUpdatePrBranch: () => update,
+  useWorktrees: () => ({ data: claudify.repos, unreadable: [], isError: false, error: null }),
+  useUiPrefs: () => ({ prefs: { terminal_command: claudify.terminal } }),
 }));
+const tauri = vi.hoisted(() => ({
+  claudifyPrCommand: vi.fn(),
+  claudeLaunchPr: vi.fn(),
+  claudeLaunchPrPreview: vi.fn(),
+  claudeLaunchTerms: vi.fn(),
+}));
+vi.mock("@/api/tauri", async (orig) => ({ ...(await orig<object>()), ...tauri }));
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 
 const pr = (over: Partial<PullRequest> = {}): PullRequest => ({
@@ -119,17 +134,46 @@ describe("PrKebab", () => {
   });
 
   // Available on every PR regardless of state and without write access:
-  // it is a clipboard operation, not a mutation.
-  it("copies an agent prompt naming the PR and its branch pair", async () => {
+  // it is a clipboard operation, not a mutation. With no local checkout
+  // it copies the prompt alone, and says why it is not Claudify (#1455).
+  it("copies an agent prompt naming the PR and its branch pair when there is no checkout", async () => {
+    claudify.repos = [];
     const writeText = vi.fn<(text: string) => Promise<void>>(() => Promise.resolve());
     Object.assign(navigator, { clipboard: { writeText } });
     render(<PrKebab pr={pr({ head_ref: "ci_fix_2", base_ref: "main" })} canWrite={false} />);
     open();
-    fireEvent.click(screen.getByRole("menuitem", { name: /Copy for agent/ }));
+    const item = screen.getByRole("menuitem", { name: /Copy prompt/ });
+    expect(item.textContent).toContain("No local checkout");
+    expect(screen.queryByRole("menuitem", { name: /Claudify/ })).toBeNull();
+    fireEvent.click(item);
     await waitFor(() => expect(writeText).toHaveBeenCalled());
     const text = writeText.mock.calls[0][0];
     expect(text).toContain("(ci_fix_2 → main)");
     expect(text).toContain(`#${PR_FIXTURES[0].number}`);
+    expect(tauri.claudifyPrCommand).not.toHaveBeenCalled();
+  });
+
+  /// #1455: with a checkout and a terminal, the item is Claudify and
+  /// opens the terms dialog -- which outlives the menu that opened it.
+  it("offers Claudify with a checkout and opens the terms dialog after the menu closes", async () => {
+    const p = pr();
+    claudify.repos = [{ identity: p.repo, name: "r", path: "/code/r", worktrees: [] }];
+    claudify.terminal = "wezterm start -- bash -lc {command}";
+    tauri.claudeLaunchTerms.mockResolvedValue({ models: [], permissionModes: [], unattended: [] });
+    tauri.claudeLaunchPrPreview.mockResolvedValue({ program: "wezterm", args: ["x"] });
+    try {
+      render(<PrKebab pr={p} canWrite={false} />);
+      open();
+      fireEvent.click(screen.getByRole("menuitem", { name: /Claudify/ }));
+      // The menu is gone; the dialog is not.
+      expect(screen.queryByRole("menuitem", { name: /Copy branch name/ })).toBeNull();
+      expect(await screen.findByText(new RegExp(`Hand ${p.repo}#${p.number} to Claude Code`))).toBeTruthy();
+      await waitFor(() => expect(tauri.claudeLaunchPrPreview).toHaveBeenCalled());
+      expect(tauri.claudeLaunchPrPreview.mock.calls[0].slice(0, 2)).toEqual(["/code/r", p.repo]);
+    } finally {
+      claudify.repos = [];
+      claudify.terminal = "";
+    }
   });
 
   it("copies the head branch, not the base", async () => {

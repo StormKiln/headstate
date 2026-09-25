@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { PR_FIXTURES } from "@/fixtures/prs";
-import { type AgentContext, agentPrompt, toAgentContext } from "@/lib/agentPrompt";
+import {
+  type AgentContext,
+  agentPrompt,
+  shellWord,
+  toAgentContext,
+  worktreeName,
+} from "@/lib/agentPrompt";
 
 const ctx = (over: Partial<AgentContext> = {}): AgentContext => ({
   repo: "octocat/hello-world",
@@ -88,11 +94,76 @@ describe("agentPrompt", () => {
   });
 });
 
+/// #1455: "Review X" alone left the agent to invent a standard.
+describe("review criteria", () => {
+  const CRITERIA = [
+    /Correctness and edge cases/,
+    /Security/,
+    /Performance/,
+    /Tests: is the CHANGED behaviour covered/,
+    /Documentation and comments/,
+    /Backwards compatibility and migrations/,
+    /Error handling/,
+  ];
+
+  it("proposes every criterion when the task is a review", () => {
+    const out = agentPrompt(ctx());
+    expect(out.split("\n")[0]).toMatch(/^Review /);
+    for (const c of CRITERIA) expect(out).toMatch(c);
+    // Named against the actual base branch.
+    expect(out).toContain("relying on main's");
+    // Before the setup, which stays last.
+    expect(out.indexOf("Error handling")).toBeLessThan(out.indexOf("git worktree add"));
+  });
+
+  /// The lead lines keep their concrete job; a checklist would bury it.
+  it.each([
+    ["conflicts", { merge_status: "dirty" }],
+    ["failing CI", { checks: [{ name: "build", state: "failure", url: "u" }] }],
+    ["feedback", { unresolved_threads: 2 }],
+    ["behind", { merge_status: "behind" }],
+  ])("leaves the criteria out for %s", (_name, over) => {
+    const out = agentPrompt(ctx(over as Partial<AgentContext>));
+    expect(out).not.toMatch(/Review it against these criteria/);
+  });
+
+  /// Adapted where the data is real, and silent where it is absent: a
+  /// list row has no size, so none is stated (absent is not zero).
+  it("adapts to size, description and pending checks only when known", () => {
+    const rich = agentPrompt(
+      ctx({
+        size: { additions: 120, deletions: 4, changed_files: 1 },
+        has_description: false,
+        checks: [
+          { name: "build", state: "pending", url: "u" },
+          { name: "lint", state: "success", url: "u" },
+        ],
+      }),
+    );
+    expect(rich).toContain("The change is +120/-4 across 1 file.");
+    expect(rich).toContain("The PR has no description");
+    expect(rich).toContain("1 check is still running");
+
+    const bare = agentPrompt(ctx({ checks: undefined }));
+    expect(bare).not.toContain("The change is");
+    expect(bare).not.toContain("no description");
+    expect(bare).not.toContain("still running");
+  });
+});
+
 describe("toAgentContext", () => {
   // The absence of `checks` on a row is load-bearing -- it drives the
   // "not loaded" line -- so it must not be defaulted to [].
   it("preserves a list row's missing checks rather than defaulting them", () => {
     expect(toAgentContext(PR_FIXTURES[0]).checks).toBeUndefined();
+    // And its missing size and body, for the same reason.
+    expect(toAgentContext(PR_FIXTURES[0]).size).toBeUndefined();
+    expect(toAgentContext(PR_FIXTURES[0]).has_description).toBeUndefined();
+  });
+
+  it("carries the checkout the caller resolved", () => {
+    expect(toAgentContext(PR_FIXTURES[0], "/code/r").checkout).toBe("/code/r");
+    expect(toAgentContext(PR_FIXTURES[0]).checkout).toBeUndefined();
   });
 
   it("carries a detail's checks through", () => {
@@ -106,10 +177,46 @@ describe("toAgentContext", () => {
 
 /// #426: the prompt named what was wrong and never said where to work.
 describe("where the agent should work", () => {
-  it("tells the agent to use a worktree, not the current checkout", () => {
+  it("tells the agent to use a worktree, not the checkout itself", () => {
     const out = agentPrompt(ctx());
     expect(out).toContain("git worktree add");
-    expect(out).toMatch(/not the current checkout/i);
+    expect(out).toMatch(/not in the checkout itself/i);
+  });
+
+  /// #1455: `../pr-{n}` was relative to wherever the agent started, so
+  /// from inside another worktree it landed beside THAT one. The hint
+  /// now says to start from the main checkout, and names it when known.
+  it("anchors the worktree on the main checkout, by path when one is known", () => {
+    const known = agentPrompt(ctx({ checkout: "/code/hello-world" }));
+    expect(known).toContain("created from the main checkout at /code/hello-world");
+    const cdAt = known.indexOf("  cd /code/hello-world\n");
+    expect(cdAt).toBeGreaterThan(-1);
+    // The cd comes before the fetch, so the relative add is relative to it.
+    expect(cdAt).toBeLessThan(known.indexOf("git fetch origin"));
+    expect(known).toContain("git worktree add ../hello-world-pr-42 feature/retry-client");
+    expect(known.trimEnd().endsWith("cd ../hello-world-pr-42")).toBe(true);
+
+    const unknown = agentPrompt(ctx());
+    expect(unknown).toMatch(/from the repository's main checkout \(not from another worktree\)/);
+    expect(unknown).not.toMatch(/^ {2}cd \//m);
+  });
+
+  /// The setup lines are commands an agent runs, and a branch name is
+  /// chosen by whoever pushed it. Quoted the way `shell_quote` does.
+  it("shell-quotes a branch or checkout that needs it", () => {
+    const out = agentPrompt(ctx({ head_ref: "x';touch pwned;'", checkout: "/my code/repo" }));
+    expect(out).toContain(`git fetch origin 'x'\\'';touch pwned;'\\'''`);
+    expect(out).toContain("  cd '/my code/repo'");
+    expect(shellWord("feature/retry-client")).toBe("feature/retry-client");
+    expect(shellWord("$(whoami)")).toBe("'$(whoami)'");
+  });
+
+  /// Only the name after the slash, and only a plain one, may prefix the
+  /// directory: a repository name must not add a path segment.
+  it("falls back to pr-{n} when the repository name is not a plain name", () => {
+    expect(worktreeName({ repo: "octocat/hello-world", number: 7 })).toBe("hello-world-pr-7");
+    expect(worktreeName({ repo: "octocat/..", number: 7 })).toBe("pr-7");
+    expect(worktreeName({ repo: "", number: 7 })).toBe("pr-7");
   });
 
   it("fetches the PR's branch before adding the worktree", () => {
@@ -124,7 +231,7 @@ describe("where the agent should work", () => {
   /// somewhere the user did not expect. The PR number cannot.
   it("names the worktree from the number, so a slashed branch cannot nest it", () => {
     const out = agentPrompt(ctx({ number: 42, head_ref: "feature/deep/nested" }));
-    expect(out).toContain("../pr-42");
+    expect(out).toContain("../hello-world-pr-42");
     expect(out).not.toContain("../feature/deep/nested");
   });
 

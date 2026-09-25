@@ -1,14 +1,14 @@
 import { ExternalLink } from "./ExternalLink";
 import { useWritesPaused } from "@/lib/useWritesPaused";
 import { copyText } from "../lib/clipboard";
-import { Bot, Copy, ExternalLink as ExternalLinkIcon, MoreHorizontal } from "lucide-react";
+import { Copy, ExternalLink as ExternalLinkIcon, MoreHorizontal } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { useActOnPr, useSetAutoMerge, useUpdatePrBranch } from "../api/hooks";
 import type { PrActionName } from "../api/tauri";
 import { inverseOf } from "../lib/undo";
-import { agentPrompt, toAgentContext } from "../lib/agentPrompt";
 import type { PullRequest } from "../types/pr";
+import { PrClaudifyDialogs, PrClaudifyMenuItem, type PrClaudifyDialog } from "./PrClaudify";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 
 /// Why a row-level action is unavailable, or null when offered.
@@ -83,6 +83,9 @@ export function PrKebab({ pr, canWrite = true }: { pr: PullRequest; canWrite?: b
   const setAuto = useSetAutoMerge();
   const [open, setOpen] = useState(false);
   const [pending, setPending] = useState<PrActionName | null>(null);
+  // Held here rather than in the menu item: the menu closes on click,
+  // and the dialog must outlive it.
+  const [claudify, setClaudify] = useState<PrClaudifyDialog | null>(null);
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -237,22 +240,15 @@ export function PrKebab({ pr, canWrite = true }: { pr: PullRequest; canWrite?: b
 
           {canWrite ? <div className="my-1 border-t border-[#30363d]" /> : null}
 
-          <button
-            type="button"
-            role="menuitem"
-            onClick={() => {
+          {/* Claudify (#1455). Mounted only while the menu is open, so
+              rendering a list of rows does not start a worktree scan. */}
+          <PrClaudifyMenuItem
+            pr={pr}
+            onPick={(d) => {
               setOpen(false);
-              void copyText(agentPrompt(toAgentContext(pr))).then((failure) =>
-                failure === null
-                  ? toast.success("Prompt copied — paste it to an agent")
-                  : toast.error("Could not copy the prompt", { description: failure }),
-              );
+              if (d !== null) setClaudify(d);
             }}
-            className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm text-[#e6edf3] hover:bg-[#21262d]"
-          >
-            <Bot className="h-3.5 w-3.5" aria-hidden="true" />
-            Copy for agent
-          </button>
+          />
           <button
             type="button"
             role="menuitem"
@@ -316,6 +312,8 @@ export function PrKebab({ pr, canWrite = true }: { pr: PullRequest; canWrite?: b
           </DialogContent>
         </Dialog>
       ) : null}
+
+      <PrClaudifyDialogs dialog={claudify} onClose={() => setClaudify(null)} />
     </div>
   );
 }

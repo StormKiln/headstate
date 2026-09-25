@@ -297,6 +297,16 @@ pub const SURFACE: &[(&str, Class)] = &[
     // anything -- Local is about what a command DOES, not about which
     // screen its caller sits on.
     ("claude_launch_terms", Class::Read),
+    // A pull request's Claudify (#1455), the worktree trio's shape
+    // exactly: the copy command returns a STRING the phone can show, so
+    // Read, like `claudify_command`; the launch opens a terminal WINDOW
+    // on the desktop and the preview describes that window's argv, so
+    // both are Local, like `claude_launch_worktree` and its preview.
+    // All three re-derive the checkout against the live scan, so the
+    // phone cannot name a directory the desktop's scan does not hold.
+    ("claudify_pr_command", Class::Read),
+    ("claude_launch_pr", Class::Local),
+    ("claude_launch_pr_preview", Class::Local),
     ("check_packages", Class::Read),
     ("packages_markdown", Class::Read),
     // Read: the effective context a session loads, across scopes
@@ -1127,6 +1137,14 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         // `Class::Local` and `admit` rejects them before this match is
         // reached. `claude_launch_terms` is `Class::Read`, so it does.
         "claude_launch_terms" => ok(commands::claude_launch_terms()),
+        // Read; its two Local siblings have no arm, like the four above.
+        "claudify_pr_command" => res(commands::claudify_pr_command(
+            app.clone(),
+            a.get("repoPath")?,
+            a.get("prRepo")?,
+            a.get("prompt")?,
+        )
+        .await),
         "check_packages" => res(commands::check_packages(a.get("repoPath")?).await),
         "packages_markdown" => ok(commands::packages_markdown(
             a.get("repoPath")?,

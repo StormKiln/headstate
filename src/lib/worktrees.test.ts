@@ -22,6 +22,7 @@ import {
   lockHolderIsGone,
   lockHolderNote,
   lockReason,
+  mainCheckoutFor,
   pathBasename,
   prForWorktree,
   safetyReason,
@@ -684,6 +685,32 @@ describe("pathBasename", () => {
 
   it("returns the input when there is no separator at all", () => {
     expect(pathBasename("proj")).toBe("proj");
+  });
+});
+
+/// #1455: the reverse join, pull request to the checkout Claudify starts in.
+describe("mainCheckoutFor", () => {
+  const repo = (identity: string | null, path: string, bare = false) =>
+    ({ identity, name: path, path, worktrees: [], bare }) as WorktreeRepo;
+
+  it("matches on the remote identity, case-insensitively", () => {
+    const repos = [repo("octocat/other", "/code/a"), repo("OctoCat/API", "/code/b")];
+    expect(mainCheckoutFor(repos, "octocat/api")).toBe("/code/b");
+  });
+
+  /// None rather than a guess: no identity, a bare clone, or no scan yet.
+  it("returns null when nothing can host the session", () => {
+    expect(mainCheckoutFor([repo(null, "/code/api")], "octocat/api")).toBeNull();
+    expect(mainCheckoutFor([repo("octocat/api", "/code/api.git", true)], "octocat/api")).toBeNull();
+    expect(mainCheckoutFor(undefined, "octocat/api")).toBeNull();
+    expect(mainCheckoutFor([repo("octocat/api", "/code/api")], "")).toBeNull();
+  });
+
+  /// Several clones: the same one every time, not the walk's order.
+  it("picks the first clone by path when there are several", () => {
+    const repos = [repo("octocat/api", "/code/z-api"), repo("octocat/api", "/code/a-api")];
+    expect(mainCheckoutFor(repos, "octocat/api")).toBe("/code/a-api");
+    expect(mainCheckoutFor([...repos].reverse(), "octocat/api")).toBe("/code/a-api");
   });
 });
 

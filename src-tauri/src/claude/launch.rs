@@ -302,14 +302,36 @@ fn split_words(raw: &str) -> Result<Vec<String>, String> {
 /// which `Finding::new` renders at construction precisely so "a `Finding`
 /// built by hand could carry a `brief` that names a different subject
 /// than its `subject` field". Building the command line here keeps that
-/// guarantee end to end -- the frontend passes a repository path and an
-/// index, never a command and never a prompt, so there is no point at
-/// which TypeScript could compose a line the backend then runs.
+/// guarantee end to end -- for that path the frontend passes a repository
+/// path and an index, never a command and never a prompt, so there is no
+/// point at which TypeScript could compose a line the backend then runs.
 ///
 /// That is the same rule `claude_launch_worktree` states for itself:
 /// accepting a command string from the caller would make this "run
 /// whatever you are given in a terminal", which is a different and much
-/// larger capability.
+/// larger capability. **No caller ever supplies a command string.**
+///
+/// # The one path that accepts a PROMPT: a pull request's Claudify (#1455)
+///
+/// `commands::claudify_pr_command`, `claude_launch_pr` and
+/// `claude_launch_pr_preview` take the prompt as text, composed by
+/// `src/lib/agentPrompt.ts` from the pull request fetch -- which the
+/// backend does not hold, so it cannot rebuild the prompt itself the way
+/// it looks up a brief. That is a weaker guarantee than #1292's, and it
+/// is bounded by these limits, each enforced in Rust:
+///
+/// - The prompt occupies ONE single-quoted argv slot of `claude`, built
+///   here by `prompt_command`; it never becomes shell.
+/// - The directory is not trusted: `commands::pr_checkout` re-validates
+///   it against the LIVE worktree scan (scanned, `origin` identity equal
+///   to the pull request's repository, not bare).
+/// - The launch and its preview are `Class::Local`, so no remote caller
+///   -- a paired phone included -- can launch; only the desktop webview
+///   can. The phone-reachable `claudify_pr_command` returns a string and
+///   runs nothing.
+/// - An empty prompt, or one with a NUL byte, is refused.
+/// - The whole argv is previewed in the terms dialog before it runs
+///   (#1214).
 ///
 /// # How a multi-line Markdown prompt reaches `claude`, verified
 ///
