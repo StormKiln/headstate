@@ -25,6 +25,7 @@ import { ReviewThreads } from "./ReviewThreads";
 import { PrDates } from "./PrDates";
 import { Section } from "./Section";
 import { PrActions } from "./PrActions";
+import { StackBadge } from "./StackBadge";
 import { ReviewBox } from "./ReviewBox";
 import { QueryError, errorMessage } from "./QueryError";
 import { scopeEffect } from "../lib/branchDelete";
@@ -469,6 +470,7 @@ export function PrDetailView({
           {/* Opened, ready for review, last commit (#1457); each omitted
               when it cannot be read. */}
           <PrDates pr={pr} />
+          <StackBadge stack={pr.stack} />
           {/* The ONE metadata fact the list row does not carry: the list
               query does not select additions, deletions or changedFiles
               (see `PRS_QUERY`). So while this is the seeded placeholder

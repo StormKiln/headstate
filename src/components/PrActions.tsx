@@ -2,6 +2,7 @@ import { useState } from "react";
 import { toast } from "sonner";
 import { useActOnPr } from "../api/hooks";
 import type { PrActionName } from "../api/tauri";
+import { stackBlocksMerge, stackBlocksQueue, stackFacts } from "../lib/stack";
 import { inverseOf } from "../lib/undo";
 import type { PrDetail } from "../types/pr";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
@@ -28,10 +29,11 @@ function unavailable(
   const byConversations =
     conversations !== null && pr.merge_status !== "clean" ? conversations : null;
   switch (action) {
-    case "enqueue":
-      if (byConversations) return byConversations;
-      return null;
-    case "merge":
+    case "merge": {
+      // A native stack merges only through GitHub's stack merge (#1452).
+      // First, because no other obstacle clearing would make this work.
+      const stacked = stackBlocksMerge(stackFacts(pr.stack));
+      if (stacked) return stacked;
       if (pr.is_draft) return "drafts cannot be merged";
       if (pr.merge_status === "dirty") return "merge conflicts";
       if (byConversations) return byConversations;
@@ -55,6 +57,14 @@ function unavailable(
       // answer that costs something.
       if (pr.merge_status !== "clean") return "GitHub has not confirmed this can merge";
       return null;
+    }
+    // Two gates, the STACK first (#1452): resolving conversations would not
+    // make GitHub accept a stacked pull request into the queue, while
+    // merging the one beneath (or merging the stack as a stack) is the step
+    // that has to come first either way. Open conversations (#1454) are the
+    // next blocker once the stack is out of the way.
+    case "enqueue":
+      return stackBlocksQueue(stackFacts(pr.stack)) ?? byConversations;
     case "ready":
       return pr.is_draft ? null : "already ready for review";
     case "draft":
@@ -231,6 +241,16 @@ export function PrActions({
       {!compact && unavailable(pr, "merge", conversations) && !pr.is_draft ? (
         <span className="text-xs text-[#8b949e]">
           Cannot merge: {unavailable(pr, "merge", conversations)}
+        </span>
+      ) : null}
+      {/* The reason a disabled "Add to merge queue" is disabled (#1452),
+          unless the line above already said the same thing. */}
+      {!compact &&
+      primaryMerge === "enqueue" &&
+      unavailable(pr, "enqueue", conversations) &&
+      unavailable(pr, "enqueue", conversations) !== unavailable(pr, "merge", conversations) ? (
+        <span className="text-xs text-[#8b949e]">
+          Cannot queue: {unavailable(pr, "enqueue", conversations)}
         </span>
       ) : null}
 

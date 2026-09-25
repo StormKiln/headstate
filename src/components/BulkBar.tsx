@@ -2,6 +2,8 @@ import { useState } from "react";
 import { toast } from "sonner";
 import { useActOnPrs } from "../api/hooks";
 import type { PrActionName } from "../api/tauri";
+import { deriveStacked } from "../lib/derive";
+import { stackBlocksQueue, stackFactsFromList } from "../lib/stack";
 import { useFilters } from "../store/filters";
 import type { PullRequest } from "../types/pr";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
@@ -56,6 +58,23 @@ function noOp(pr: PullRequest, action: PrActionName): string | null {
   }
 }
 
+/// Why this action should not be SENT for this pull request, or null.
+///
+/// `noOp` (already in that state) plus the one refusal the list can
+/// predict: queueing a pull request stacked on another open one, which
+/// GitHub refuses (#1452). Stacking comes from `deriveStacked` over the
+/// whole list passed in, so a parent outside that list is not seen -- the
+/// detail view asks GitHub and gates on more; this gates on what it has.
+function skipReason(
+  pr: PullRequest,
+  action: PrActionName,
+  stacked: Map<string, number>,
+): string | null {
+  const same = noOp(pr, action);
+  if (same !== null) return same;
+  return action === "enqueue" ? stackBlocksQueue(stackFactsFromList(stacked.get(pr.id))) : null;
+}
+
 /// The bar shown while rows are selected.
 ///
 /// Every action confirms here, not just Close. A single merge applies
@@ -72,6 +91,8 @@ export function BulkBar({ prs }: { prs: PullRequest[] }) {
   // narrowed after selecting cannot silently shrink the batch.
   const selected = prs.filter((pr) => checked.includes(prKey(pr)));
   if (selected.length === 0) return null;
+  const stacked = deriveStacked(prs);
+  const skip = (pr: PullRequest, action: PrActionName) => skipReason(pr, action, stacked);
 
   // Split the SELECTION for the pending action, without changing it.
   //
@@ -88,15 +109,15 @@ export function BulkBar({ prs }: { prs: PullRequest[] }) {
   // true. Filtering the selection when rows are ticked would bake one
   // action's notion of redundancy into the selection itself, which is
   // the silent shrink under another name (#752).
-  const applicable = pending ? selected.filter((pr) => noOp(pr, pending) === null) : selected;
-  const skipped = pending ? selected.filter((pr) => noOp(pr, pending) !== null) : [];
+  const applicable = pending ? selected.filter((pr) => skip(pr, pending) === null) : selected;
+  const skipped = pending ? selected.filter((pr) => skip(pr, pending) !== null) : [];
 
   const run = (action: PrActionName) => {
     // Send only the rows the action can change. The user has just been
     // shown exactly which ones those are and confirmed against that
     // count, so this acts on what was agreed rather than on a batch
     // three of whose members were always going to be refused.
-    const targets = selected.filter((pr) => noOp(pr, action) === null);
+    const targets = selected.filter((pr) => skip(pr, action) === null);
     if (targets.length === 0) {
       // Nothing to do, and saying so beats a "0 updated" toast that
       // reads like the batch silently failed.
@@ -119,9 +140,12 @@ export function BulkBar({ prs }: { prs: PullRequest[] }) {
           // updated ones. The toast used to say "8 updated" when five
           // changed, which is the dishonesty #752 is about -- and a
           // count alone would leave the user wondering which three.
+          // "already in that state" only when it is true of every skipped
+          // row; a stacked one was skipped because GitHub would refuse it.
+          const allSame = selected.every((pr) => targets.includes(pr) || noOp(pr, action) !== null);
           const also =
             selected.length > targets.length
-              ? ` — ${selected.length - targets.length} skipped, already in that state`
+              ? ` — ${selected.length - targets.length} skipped${allSame ? ", already in that state" : ""}`
               : "";
           toast.success(`${ok} pull request${ok === 1 ? "" : "s"} updated${also}`);
           clearChecked();
@@ -192,7 +216,10 @@ export function BulkBar({ prs }: { prs: PullRequest[] }) {
               // rather than appearing to have lost rows (#752).
               <p className="mt-2 text-sm text-[#d29922]">
                 {selected.length} selected — {skipped.length}{" "}
-                {skipped[0] ? noOp(skipped[0], pending) : ""}, so {skipped.length === 1 ? "it" : "they"}{" "}
+                {new Set(skipped.map((pr) => skip(pr, pending))).size === 1
+                  ? skip(skipped[0], pending)
+                  : "cannot be changed (see below)"}
+                , so {skipped.length === 1 ? "it" : "they"}{" "}
                 will be skipped.
               </p>
             ) : null}
@@ -205,7 +232,7 @@ export function BulkBar({ prs }: { prs: PullRequest[] }) {
                 shrink the unfiltered-list rule exists to prevent. */}
             <ul className="mt-3 max-h-64 overflow-y-auto text-sm text-[#8b949e]">
               {selected.map((pr) => {
-                const why = pending ? noOp(pr, pending) : null;
+                const why = pending ? skip(pr, pending) : null;
                 return (
                   <li key={prKey(pr)} className={`py-0.5 ${why ? "opacity-60" : ""}`}>
                     {pr.repo}#{pr.number} — {pr.title}

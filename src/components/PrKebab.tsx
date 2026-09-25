@@ -6,6 +6,7 @@ import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { useActOnPr, useSetAutoMerge, useUpdatePrBranch } from "../api/hooks";
 import type { PrActionName } from "../api/tauri";
+import { stackBlocksQueue, stackFactsFromList } from "../lib/stack";
 import { inverseOf } from "../lib/undo";
 import type { PullRequest } from "../types/pr";
 import { PrClaudifyDialogs, PrClaudifyMenuItem, type PrClaudifyDialog } from "./PrClaudify";
@@ -22,7 +23,7 @@ import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 /// the actual obstacle ("merge conflicts") rather than the catch-all.
 /// Anything not listed here is left to GitHub, which refuses with a
 /// toast -- better than guessing wrongly in the client.
-function unavailable(pr: PullRequest, action: PrActionName): string | null {
+function unavailable(pr: PullRequest, action: PrActionName, stackedOn?: number): string | null {
   switch (action) {
     case "merge":
       if (pr.is_draft) return "drafts cannot be merged";
@@ -36,7 +37,9 @@ function unavailable(pr: PullRequest, action: PrActionName): string | null {
       // saying so up front beats a toast after the round trip.
       if (pr.is_draft) return "drafts cannot be queued";
       if (pr.merge === "conflicted") return "merge conflicts";
-      return null;
+      // The same gate as the detail view's, on the evidence a row has
+      // (#1452): `deriveStacked`'s parent, when the parent is in the list.
+      return stackBlocksQueue(stackFactsFromList(stackedOn));
     default:
       return null;
   }
@@ -74,7 +77,16 @@ const LABEL: Record<PrActionName, string> = {
 /// `canWrite` is false on the review view: merging or closing someone
 /// else's pull request is usually not yours to do, and offering an action
 /// that fails with a permissions error is worse than not offering it.
-export function PrKebab({ pr, canWrite = true }: { pr: PullRequest; canWrite?: boolean }) {
+export function PrKebab({
+  pr,
+  canWrite = true,
+  stackedOn,
+}: {
+  pr: PullRequest;
+  canWrite?: boolean;
+  /// The open PR this one is stacked on, from `deriveStacked` (#1452).
+  stackedOn?: number;
+}) {
   // Null on the desktop and whenever the paired desktop is reachable,
   // so this changes nothing there.
   const paused = useWritesPaused();
@@ -164,7 +176,7 @@ export function PrKebab({ pr, canWrite = true }: { pr: PullRequest; canWrite?: b
                 // Paused beats specific: naming "merge conflicts" for
                 // a desktop the phone cannot reach describes the wrong
                 // obstacle, and fixing it would not help.
-                const why = paused ?? unavailable(pr, action);
+                const why = paused ?? unavailable(pr, action, stackedOn);
                 return (
                   <button
                     key={action}

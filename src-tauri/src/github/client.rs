@@ -310,7 +310,7 @@ impl GitHubClient {
     /// list" rule one layer above where it was enforced.
     ///
     /// Errors are only fatal when NO data came back at all.
-    async fn graphql_partial_ok(
+    pub(super) async fn graphql_partial_ok(
         &self,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, ClientError> {
@@ -858,12 +858,20 @@ impl GitHubClient {
         let (owner, name) = repo
             .split_once('/')
             .ok_or_else(|| ClientError::Graphql(format!("malformed repository: {repo}")))?;
-        let mut v = self
-            .graphql_partial_ok(&json!({
-                "query": PR_DETAIL_QUERY,
-                "variables": { "owner": owner, "repo": name, "number": number }
-            }))
-            .await?;
+        // The stack lookup runs BESIDE the detail query rather than after
+        // it (#1452), so it costs a point and not a round trip. It never
+        // fails the view: its own failures are `PrStack::Unknown`, and it
+        // stops itself at `stack::STACK_BUDGET`, well inside the command's
+        // ceiling.
+        let body = json!({
+            "query": PR_DETAIL_QUERY,
+            "variables": { "owner": owner, "repo": name, "number": number }
+        });
+        let (first, stack) = tokio::join!(
+            self.graphql_partial_ok(&body),
+            self.fetch_pr_stack(owner, name, number),
+        );
+        let mut v = first?;
         // A refusal on THIS document is not survivable by defaulting, and
         // this is the one path where that is counter-intuitive enough to
         // spell out (#854).
@@ -892,7 +900,9 @@ impl GitHubClient {
         }
         self.append_remaining_checks(&mut v, owner, name, number)
             .await?;
-        Ok(map_detail(&v, repo))
+        let mut detail = map_detail(&v, repo);
+        detail.stack = stack;
+        Ok(detail)
     }
 
     /// Follow `statusCheckRollup.contexts` pagination into `v`.
@@ -3044,7 +3054,15 @@ mod tests {
             .await
             .unwrap();
 
-        let posts = server.received_requests().await.unwrap().len();
+        // The stack lookup (#1452) runs BESIDE this chain, not in it, so it
+        // is not part of the serial count this test guards.
+        let posts = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| !String::from_utf8_lossy(&r.body).contains("query PrStack"))
+            .count();
         assert_eq!(
             posts, 4,
             "one detail query plus at most three check pages; {posts} POSTs is the #790 chain"
@@ -3353,6 +3371,7 @@ mod tests {
             "\n    fn ",
             "\n    pub fn ",
             "\n    pub async fn ",
+            "\n    pub(super) async fn ",
             "\n    async fn ",
             "\nfn ",
             "\npub fn ",

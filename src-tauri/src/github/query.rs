@@ -718,6 +718,80 @@ query ChecksPage($owner: String!, $repo: String!, $number: Int!, $after: String!
   }
 }"#;
 
+/// Where one pull request sits in a stack, looking DOWN toward the trunk
+/// (#1452).
+///
+/// A separate document from `PR_DETAIL_QUERY`, deliberately. The detail
+/// query turns any refused field into an error for the whole view (#854),
+/// and `stackEntry` is new enough that a server without it is plausible;
+/// a stack lookup that fails must cost the badge, not the pull request.
+/// It also runs CONCURRENTLY with the detail query (`fetch_pr_detail`),
+/// so it adds a point, not a round trip.
+///
+/// - `stackEntry` is GitHub's native stack (`gh stack`), with position and
+///   size as GitHub counts them. VERIFIED live against the schema
+///   2026-09-25: `PullRequest.stackEntry: PullRequestStackEntry` with
+///   `position: Int!` ("1 is the closest to the base branch") and
+///   `stack { number size }`.
+/// - The nested `baseRef.associatedPullRequests` is the base CHAIN, for
+///   stacks made any other way. `Ref.associatedPullRequests` is "pull
+///   requests with this ref as the HEAD ref" -- VERIFIED live: on a PR
+///   based on `main` it returns nothing, where a head-or-base reading would
+///   have returned every PR into `main`. So a non-empty answer on the BASE
+///   ref is the open pull request this one is stacked on. Four hops; the
+///   deepest selects no `baseRef`, which is how the mapper tells "the walk
+///   ran out" from "the chain ended".
+/// - `first: 2`, not 1, so two open pull requests from one branch read as
+///   ambiguous rather than as whichever GitHub listed first.
+/// - `defaultBranchRef` ends the walk with certainty: a base that IS the
+///   trunk has nothing below it.
+///
+/// MEASURED live 2026-09-25 (`gh api graphql`, this document verbatim):
+/// **cost 1**.
+pub const PR_STACK_QUERY: &str = r#"
+query PrStack($owner: String!, $repo: String!, $number: Int!) {
+  rateLimit { cost remaining resetAt }
+  repository(owner: $owner, name: $repo) {
+    defaultBranchRef { name }
+    pullRequest(number: $number) {
+      number headRefName baseRefName isCrossRepository
+      stackEntry { position stack { number size } }
+      baseRef { associatedPullRequests(states: OPEN, first: 2) { nodes {
+        number baseRefName
+        baseRef { associatedPullRequests(states: OPEN, first: 2) { nodes {
+          number baseRefName
+          baseRef { associatedPullRequests(states: OPEN, first: 2) { nodes {
+            number baseRefName
+            baseRef { associatedPullRequests(states: OPEN, first: 2) { nodes {
+              number baseRefName
+            } } }
+          } } }
+        } } }
+      } } }
+    }
+  }
+}"#;
+
+/// One hop UP a stack: the open pull requests based on `$base` (#1452).
+///
+/// The upward direction cannot be nested the way `PR_STACK_QUERY` nests the
+/// downward one -- nothing on a `Ref` or a `PullRequest` lists the pull
+/// requests that TARGET it, so each hop needs the previous hop's head
+/// branch as a variable. The walk is therefore serial and bounded
+/// (`stack::UP_HOPS`), and a walk that stops early reports its total as a
+/// floor rather than a count.
+///
+/// MEASURED live 2026-09-25: **cost 1** per hop.
+pub const PR_STACK_UP_QUERY: &str = r#"
+query PrStackUp($owner: String!, $repo: String!, $base: String!) {
+  rateLimit { cost remaining resetAt }
+  repository(owner: $owner, name: $repo) {
+    pullRequests(baseRefName: $base, states: OPEN, first: 2) {
+      nodes { number headRefName isCrossRepository }
+    }
+  }
+}"#;
+
 /// The authenticated user's login, and what asking cost.
 ///
 /// # Why this is a named const and not an inline literal (#844)
@@ -1853,5 +1927,48 @@ mod tests {
                 .is_some(),
             "the aliases must sit inside the repository they are about"
         );
+    }
+
+    /// `PR_STACK_QUERY` asks for what `stack::parse_down` reads (#1452).
+    ///
+    /// The mapper tests feed `json!` literals, so a document that stopped
+    /// asking for `stackEntry` would leave every native stack reading as
+    /// "not stacked" with the suite green -- and "not stacked" is the
+    /// answer that re-offers the queue GitHub refuses.
+    #[test]
+    fn the_stack_query_asks_for_what_the_walk_reads() {
+        let q = PR_STACK_QUERY;
+        for f in [
+            "rateLimit { cost remaining resetAt }",
+            "defaultBranchRef { name }",
+            "number headRefName baseRefName isCrossRepository",
+            "stackEntry { position stack { number size } }",
+        ] {
+            assert!(q.contains(f), "PR_STACK_QUERY must select `{f}`");
+        }
+        // Four hops down, each asking for the parent's number and base, and
+        // the deepest selecting NO `baseRef` -- that absence is how the
+        // mapper tells "ran out of hops" from "the chain ended".
+        let hop = "baseRef { associatedPullRequests(states: OPEN, first: 2) { nodes {";
+        assert_eq!(q.matches(hop).count(), 4, "four nested hops");
+        let deepest = q.rsplit_once(hop).map(|(_, r)| r).unwrap();
+        assert!(deepest.contains("number baseRefName"));
+        assert!(
+            !deepest.contains("baseRef {"),
+            "the deepest hop selects no baseRef"
+        );
+    }
+
+    /// `PR_STACK_UP_QUERY` asks for what `stack::parse_up` reads.
+    #[test]
+    fn the_stack_up_query_asks_for_what_the_walk_reads() {
+        let q = PR_STACK_UP_QUERY;
+        for f in [
+            "rateLimit { cost remaining resetAt }",
+            "pullRequests(baseRefName: $base, states: OPEN, first: 2)",
+            "nodes { number headRefName isCrossRepository }",
+        ] {
+            assert!(q.contains(f), "PR_STACK_UP_QUERY must select `{f}`");
+        }
     }
 }

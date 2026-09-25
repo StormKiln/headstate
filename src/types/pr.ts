@@ -714,7 +714,37 @@ export interface PrDetail {
   /// mid-fetch, so a total BELOW the length is possible and is not a
   /// negative shortfall.
   checks_total: number;
+  /// Where this pull request sits in a stack, asked of GitHub directly
+  /// (#1452) rather than inferred from the rows on screen.
+  ///
+  /// OPTIONAL because the detail view is seeded from a list row before the
+  /// fetch lands, and the row cannot know: absent means NOT ASKED YET, which
+  /// is neither "unknown" (asked, could not tell) nor "none" (not stacked).
+  stack?: PrStack;
 }
+
+/// A pull request's place in a stack; see `PrStack` in `github/model.rs`.
+///
+/// `native` is GitHub's own stack (`gh stack`), whose numbers are exact and
+/// which GitHub merges only through its stack merge. Otherwise the stack is
+/// the base chain, walked a bounded distance each way: `position_exact` /
+/// `size_exact` false means the walk stopped early and the number is a
+/// FLOOR, to be rendered with "at least".
+export type PrStack =
+  | { kind: "unknown" }
+  | { kind: "none" }
+  | {
+      kind: "stacked";
+      native: boolean;
+      stack_number: number | null;
+      /// 1 is the pull request closest to the trunk.
+      position: number;
+      size: number;
+      position_exact: boolean;
+      size_exact: boolean;
+      /// The open pull request directly beneath this one, when known.
+      below: number | null;
+    };
 
 /// How an image's provenance was established. A recorded fact and a
 /// resolved guess should not look identical in the UI.
