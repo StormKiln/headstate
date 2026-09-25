@@ -755,7 +755,14 @@ query PrStack($owner: String!, $repo: String!, $number: Int!) {
     defaultBranchRef { name }
     pullRequest(number: $number) {
       number headRefName baseRefName isCrossRepository
-      stackEntry { position stack { number size } }
+      # `entries` is the native stack's whole membership, bottom first
+      # (#1468): the stack-merge confirmation names every open pull
+      # request a merge would land. 50 is past any stack `gh stack` makes;
+      # `totalCount` says when it is not, and the merge is then not
+      # offered. MEASURED live 2026-09-25 with this field: still cost 1.
+      stackEntry { position stack { number size
+        entries(first: 50) { totalCount nodes { position pullRequest { number title state } } }
+      } }
       baseRef { associatedPullRequests(states: OPEN, first: 2) { nodes {
         number baseRefName
         baseRef { associatedPullRequests(states: OPEN, first: 2) { nodes {
@@ -1942,7 +1949,8 @@ mod tests {
             "rateLimit { cost remaining resetAt }",
             "defaultBranchRef { name }",
             "number headRefName baseRefName isCrossRepository",
-            "stackEntry { position stack { number size } }",
+            "stackEntry { position stack { number size",
+            "entries(first: 50) { totalCount nodes { position pullRequest { number title state } } }",
         ] {
             assert!(q.contains(f), "PR_STACK_QUERY must select `{f}`");
         }

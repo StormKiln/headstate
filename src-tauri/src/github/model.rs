@@ -599,7 +599,30 @@ pub enum PrStack {
         /// The open pull request directly beneath this one, when known --
         /// the one that has to merge first.
         below: Option<u64>,
+        /// A native stack's entries, bottom first, as GitHub lists them
+        /// (#1468). Empty for a base-chain stack, which has no such list.
+        ///
+        /// This is what the stack-merge confirmation names: merging a
+        /// stacked pull request through GitHub lands every open one beneath
+        /// it too, and the user must see which before agreeing.
+        #[serde(default)]
+        members: Vec<StackMember>,
+        /// True when `members` is GitHub's WHOLE list. A confirmation built
+        /// from a partial list would understate what the merge lands, so the
+        /// stack merge is offered only when this holds.
+        #[serde(default)]
+        members_complete: bool,
     },
+}
+
+/// One entry of a native stack (#1468).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StackMember {
+    pub position: u64,
+    pub number: u64,
+    pub title: String,
+    /// GitHub's `PullRequestState`, lowercased: `open`, `merged`, `closed`.
+    pub state: String,
 }
 
 #[cfg(test)]

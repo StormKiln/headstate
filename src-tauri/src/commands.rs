@@ -287,6 +287,57 @@ pub async fn act_on_pr(
     }
 }
 
+/// Merge, or add to the merge queue, a native GitHub stack up to and
+/// including `number` (#1468).
+///
+/// GitHub merges a stacked pull request only through its asynchronous
+/// merge API, and that lands every open pull request beneath `number` as
+/// well. The frontend confirms with that list before calling this; this
+/// command carries out what was agreed and reports how it ended.
+///
+/// `action` is `merge_queue` or `direct_merge`. `expected_head` is the head
+/// the user was looking at, so GitHub refuses rather than landing commits
+/// they never saw.
+///
+/// The REST pool is checked BEFORE submitting: declining to ask is reported
+/// as that, not as GitHub refusing.
+#[tauri::command]
+pub async fn merge_stack(
+    client: State<'_, GhClient>,
+    waker: State<'_, crate::poll::Waker>,
+    repo: String,
+    number: u64,
+    action: String,
+    expected_head: String,
+) -> Result<crate::github::stack_merge::StackMergeOutcome, String> {
+    use crate::github::stack_merge::{StackMergeAction, StackMergeOutcome};
+    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+    let action = StackMergeAction::parse(&action)?;
+    let budget = crate::github::stats::Budget::new();
+    if !budget.permits_rest(1) {
+        return Err(
+            "Not submitted: GitHub's REST rate limit is nearly spent. Try again after it resets."
+                .into(),
+        );
+    }
+    let out = client
+        .merge_stack(&repo, number, action, &expected_head, &budget)
+        .await;
+    match &out {
+        Ok(StackMergeOutcome::Failed { message }) => {
+            log::warn!("{repo}#{number} stack merge failed: {message}")
+        }
+        Ok(outcome) => {
+            log::info!("{repo}#{number} stack merge: {outcome:?}");
+            // Merged, queued or still running: the list should catch up now
+            // rather than a poll interval later.
+            waker.0.notify_one();
+        }
+        Err(e) => log::warn!("{repo}#{number} stack merge could not run: {e}"),
+    }
+    out
+}
+
 /// Re-run the failed jobs of a pull request's CI.
 ///
 /// Takes the workflow RUN id, which the detail query now fetches per

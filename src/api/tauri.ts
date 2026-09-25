@@ -769,6 +769,26 @@ export const setAutoMerge = (
   enable: boolean,
 ) => call<void>("set_auto_merge", { id, repo, number, expectedHead, enable });
 
+/// How a stack merge ended (#1468); see `StackMergeOutcome` in
+/// `github/stack_merge.rs`. `in_progress` is NOT a failure: GitHub accepted
+/// it and was still working when Headstate stopped checking.
+export type StackMergeOutcome =
+  | { kind: "merged"; sha: string | null }
+  | { kind: "enqueued" }
+  | { kind: "failed"; message: string }
+  | { kind: "in_progress"; message: string };
+
+/// Merge, or queue, a native GitHub stack up to and including `number`
+/// (#1468). Lands every open pull request beneath it too -- callers confirm
+/// with that list first. `expectedHead` makes GitHub refuse rather than
+/// land a head the user never saw.
+export const mergeStack = (
+  repo: string,
+  number: number,
+  action: "merge_queue" | "direct_merge",
+  expectedHead: string,
+) => call<StackMergeOutcome>("merge_stack", { repo, number, action, expectedHead });
+
 /// Delete a merged pull request's head branch.
 ///
 /// `merged` is re-checked on the Rust side: deleting the head ref of an

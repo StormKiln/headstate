@@ -791,6 +791,40 @@ impl GitHubClient {
         serde_json::from_str(&text).map_err(|_| ClientError::NotJson("non-JSON body".into()))
     }
 
+    /// A REST PUT with a JSON body, metered into `budget`, returning the
+    /// HTTP status beside the parsed body (#1468).
+    ///
+    /// Unlike `rest_get`, a non-2xx status is NOT turned into an error
+    /// here: the stack merge API answers 400 and 409 with a body that IS the
+    /// answer (`status: failed` with GitHub's reason, or the `uuid` of a
+    /// merge already running), and mapping those to `ClientError::Api`
+    /// would throw away exactly what the caller must show. The caller
+    /// judges the status. Metered before anything else, for `rest_get`'s
+    /// reason: a refusal still spent a `core` request.
+    ///
+    /// A body that is not JSON comes back as `Null`, and the caller reads
+    /// the status alone.
+    pub(super) async fn rest_put(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+        budget: &crate::github::stats::Budget,
+    ) -> Result<(u16, serde_json::Value), ClientError> {
+        let response = self.octocrab._put(path, Some(body)).await?;
+        let remaining = response
+            .headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        budget.record_rest(remaining);
+        let status = response.status().as_u16();
+        let text = self.octocrab.body_to_string(response).await?;
+        Ok((
+            status,
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::Null),
+        ))
+    }
+
     /// Like `graphql_mutation`, but hands back the `data` object.
     ///
     /// Most mutations only need "did it fail", so `graphql_mutation`

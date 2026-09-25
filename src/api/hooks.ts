@@ -101,6 +101,7 @@ import {
   type PairingQrPayload,
   type PairingRequest,
   actOnPr,
+  mergeStack,
   getPrDetail,
   getReviewGates,
   getWorktreeDirs,
@@ -673,6 +674,29 @@ export function useActOnPr() {
       void qc.invalidateQueries({ queryKey: ["pr-detail", repo, number] });
       void qc.invalidateQueries({ queryKey: ["reviewing"] });
       await refreshPrs(qc);
+    });
+}
+
+/// Merge or queue a native GitHub stack (#1468), then bring the detail
+/// and the list up to date.
+///
+/// Refreshes on EVERY outcome, including `failed` and `in_progress`: an
+/// atomic failure changes nothing, but a stack still in progress may land
+/// at any moment, and a stale "Merge stack" button invites a second
+/// submission.
+export function useMergeStack() {
+  const qc = useQueryClient();
+  return (
+    repo: string,
+    number: number,
+    action: "merge_queue" | "direct_merge",
+    expectedHead: string,
+  ) =>
+    mergeStack(repo, number, action, expectedHead).then((outcome) => {
+      void qc.invalidateQueries({ queryKey: ["pr-detail", repo, number] });
+      void qc.invalidateQueries({ queryKey: ["reviewing"] });
+      void refreshPrs(qc);
+      return outcome;
     });
 }
 
