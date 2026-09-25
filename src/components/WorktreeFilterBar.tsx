@@ -20,6 +20,9 @@ const FACETS: { kind: string; label: string }[] = [
   // mistaken for the red "Never pushed" facet it used to be counted under.
   { kind: "merged_no_upstream", label: "No upstream" },
   { kind: "detached_merged", label: "Detached" },
+  // #1440. Not a second "Merged": two facets reading the same word would
+  // filter to different rows. The row reads "merged as #N on GitHub".
+  { kind: "merged_as_pr", label: "Merged on GitHub" },
   // "Uncommitted", not "Dirty": the ROW says "2 uncommitted files", and
   // a facet whose word appears nowhere in the rows it selects is how a
   // user concludes the filter is broken. `WorktreeFilterBar.test.tsx`

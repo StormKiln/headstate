@@ -1068,6 +1068,39 @@ impl GitHubClient {
         map_viewer(&v).ok_or_else(|| ClientError::Graphql("no viewer login in response".into()))
     }
 
+    /// One chunk of the worktree view's merged-PR lookup (#1440), raw.
+    ///
+    /// `branches` must hold at most [`super::query::MERGED_HEADS_CHUNK`]
+    /// names; the chunking, the deadline and the strict rule that decides
+    /// what the answer is allowed to mean all live in `worktrees::github`,
+    /// which is the only caller. Returned unmapped for the same reason the
+    /// stats layer's `stats_graphql` is: the reader is next to its rule.
+    ///
+    /// Metered into `budget`, before anything is read out of the answer,
+    /// so a response that carried nothing usable still counts its point.
+    pub async fn merged_heads(
+        &self,
+        owner: &str,
+        name: &str,
+        branches: &[String],
+        budget: &crate::github::stats::Budget,
+    ) -> Result<serde_json::Value, ClientError> {
+        let mut vars = serde_json::Map::new();
+        vars.insert("owner".into(), json!(owner));
+        vars.insert("name".into(), json!(name));
+        for (i, b) in branches.iter().enumerate() {
+            vars.insert(format!("h{i}"), json!(b));
+        }
+        let v = self
+            .graphql_partial_ok(&json!({
+                "query": super::query::merged_heads_query(branches.len()),
+                "variables": vars,
+            }))
+            .await?;
+        budget.record(&v);
+        Ok(v)
+    }
+
     pub async fn fetch_prs_with_total(&self) -> Result<(Vec<PullRequest>, u64), ClientError> {
         let started = std::time::Instant::now();
         let v = self.search_page_with_fallback(AUTHORED_OPEN).await?;
@@ -3251,6 +3284,15 @@ mod tests {
             (
                 "stats_graphql",
                 "the stats layer reads the count at each of its own readers",
+            ),
+            // #1440. A refusal can only SHRINK what this answers: its
+            // mapper treats a null alias as unanswered and skips a node
+            // missing a field, and the only thing an answer can do is
+            // upgrade a worktree to merged. Nothing is ever rendered as
+            // "GitHub found no merge", so there is no zero to lie with.
+            (
+                "merged_heads",
+                "`worktrees::github::map_merged_heads` reads a refused alias as unanswered",
             ),
             // The machinery itself, not a caller of it.
             ("graphql_partial_ok", "the helper itself"),

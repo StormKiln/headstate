@@ -117,7 +117,15 @@ ancestry check says no.
 This app compares the branch's whole diff against recent commits on the
 default branch instead, which finds the squashed equivalent. Without
 that, a measurement on a real machine found ancestry alone recognised
-10 of 157 merged worktrees.`,
+10 of 157 merged worktrees.
+
+That comparison fades once the default branch edits the same files
+again. So when you are signed in, a branch the local checks call
+unmerged is also looked up on GitHub, and reads **merged as #N** when a
+merged pull request into the default branch contains the worktree's
+exact commit. A commit made after that pull request's head does not
+count. If GitHub cannot be reached, the row keeps what the local checks
+found — that is not GitHub saying it is unmerged.`,
   },
 
   "auto-cleanup": {

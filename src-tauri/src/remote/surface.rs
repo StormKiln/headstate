@@ -1343,7 +1343,10 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             )
         }
         "remove_worktree" => {
-            res(commands::remove_worktree(a.get("repoPath")?, a.get("worktreePath")?).await)
+            res(
+                commands::remove_worktree(app.state(), a.get("repoPath")?, a.get("worktreePath")?)
+                    .await,
+            )
         }
         "remove_worktrees" => res(commands::remove_worktrees(
             app.clone(),

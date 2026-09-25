@@ -52,7 +52,12 @@ export function isSafe(s: Safety): boolean {
     // #1439: the same `merged_into` evidence, on a branch that simply
     // has no tracking config. An unmerged one is still `never_pushed`.
     s.kind === "merged_no_upstream" ||
-    s.kind === "detached_merged"
+    s.kind === "detached_merged" ||
+    // #1440: GitHub's record of a merged pull request that contains this
+    // worktree's HEAD. Only ever an upgrade of a clean `unmerged` or
+    // `unpushed` row, and the remove command re-asks GitHub rather than
+    // trusting the scan.
+    s.kind === "merged_as_pr"
   );
 }
 
@@ -355,6 +360,11 @@ export function safetyReason(s: Safety): string {
       // user came for: the usual worry about removing a worktree is
       // losing the branch, and here there is none.
       return `merged — ${s.detail}, no branch to delete`;
+    case "merged_as_pr":
+      // Names the ROUTE (#1440): the number is GitHub's evidence, and
+      // what the user can open to check. Plain "merged" would read like
+      // the offline verdict, which on this row found nothing.
+      return `merged as #${s.detail} on GitHub — safe to delete`;
     case "empty":
       // Says what is TRUE of the branch, not what the app will let you
       // do about it: the Remove button stays disabled, deliberately,
@@ -785,6 +795,7 @@ export function safetyTone(s: Safety): string {
     case "merged_upstream_deleted":
     case "merged_no_upstream":
     case "detached_merged":
+    case "merged_as_pr":
       return "text-[#3fb950]";
     case "main_checkout":
       return "text-[#8b949e]";

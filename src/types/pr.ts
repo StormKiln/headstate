@@ -309,6 +309,16 @@ export type Safety =
   /// `unknown` before #819, with no action at all: four on the reporting
   /// machine, every one provably an ancestor of the default branch.
   | { kind: "detached_merged"; detail: string }
+  /// GitHub records this branch's pull request -- number `detail` -- as
+  /// merged into the default branch, and the worktree's HEAD is that
+  /// PR's head commit or an ancestor of it (#1440). Removable.
+  ///
+  /// Only ever an UPGRADE of `unmerged` or `unpushed`, made after the
+  /// offline scan when GitHub could be asked. The offline squash checks
+  /// fade once the default branch edits the same files again; this is
+  /// the route that does not. Its own kind so the row can say which
+  /// evidence it used -- the number is the thing a user can check.
+  | { kind: "merged_as_pr"; detail: number }
   /// The branch was created and never committed to -- a scratch
   /// worktree. Distinct from `never_pushed`, which claims commits exist
   /// only here: for a branch with none, that claim is false, and the

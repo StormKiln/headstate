@@ -729,6 +729,52 @@ query($q: String!) {
 }
 "#;
 
+/// How many branch names one merged-PR lookup asks about (#1440).
+///
+/// 36, the ceiling this app already chunks aliased searches at: GitHub
+/// answers 502 above roughly 44 aliases in one document. MEASURED live
+/// 2026-09-25: 36 aliases at `first: 10` cost ONE rate-limit point.
+pub const MERGED_HEADS_CHUNK: usize = 36;
+
+/// Merged pull requests for up to [`MERGED_HEADS_CHUNK`] head branch
+/// names in one repository (#1440).
+///
+/// The worktree view's merge detection is offline and content-based, and
+/// it loses a squash-merged branch as soon as the default branch edits the
+/// same files again. GitHub's record of the merge does not decay that way,
+/// so this document asks for it -- as a POSITIVE signal only; see
+/// `worktrees::github` for the strict rule the answer has to pass.
+///
+/// Each alias `hN` is bound to the variable `$hN`, so a branch name is
+/// never spliced into the document text: branch names are arbitrary
+/// strings the user (or an agent) chose, and quoting them by hand is how a
+/// name containing `"` becomes a malformed or different query.
+///
+/// `defaultBranchRef` is asked for because the rule needs the base to be
+/// the default branch as GITHUB names it, not as a local ref happens to.
+/// `headRefOid` is the exact commit GitHub merged, which is what the rule
+/// compares the worktree's HEAD against. `first: 10` because branch names
+/// are reused; a name merged more than ten times is simply not upgraded,
+/// which is the safe direction.
+pub fn merged_heads_query(n: usize) -> String {
+    let mut vars = String::new();
+    let mut aliases = String::new();
+    for i in 0..n {
+        vars.push_str(&format!(", $h{i}: String!"));
+        aliases.push_str(&format!(
+            "    h{i}: pullRequests(headRefName: $h{i}, states: MERGED, first: 10, \
+             orderBy: {{field: UPDATED_AT, direction: DESC}}) \
+             {{ nodes {{ number headRefOid baseRefName }} }}\n"
+        ));
+    }
+    format!(
+        "query($owner: String!, $name: String!{vars}) {{\n  \
+         rateLimit {{ cost remaining resetAt }}\n  \
+         repository(owner: $owner, name: $name) {{\n    \
+         defaultBranchRef {{ name }}\n{aliases}  }}\n}}\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1628,6 +1674,45 @@ mod tests {
         assert!(
             nodes.contains("... on ReadyForReviewEvent { createdAt }"),
             "the event's own `createdAt` must be selected on the event fragment"
+        );
+    }
+
+    /// #1440: the merged-PR lookup asks for every field the strict rule
+    /// reads, and binds each branch name as a VARIABLE.
+    ///
+    /// `worktrees::github::map_merged_heads` reads `number`, `headRefOid`
+    /// and `baseRefName` per node and `defaultBranchRef { name }` once. A
+    /// mapper test feeds `json!` literals that supply those itself, so a
+    /// document that stopped asking for `headRefOid` would leave it green
+    /// while no row could ever qualify -- or, worse, one that stopped
+    /// filtering to `MERGED` would hand an open PR's head to a rule that
+    /// assumes it merged.
+    #[test]
+    fn the_merged_heads_query_asks_for_what_the_rule_reads() {
+        let q = merged_heads_query(3);
+        for f in [
+            "defaultBranchRef { name }",
+            "number",
+            "headRefOid",
+            "baseRefName",
+            "rateLimit { cost remaining resetAt }",
+        ] {
+            assert!(q.contains(f), "merged_heads_query must select `{f}`");
+        }
+        // One alias per name, each filtered to MERGED and bound to its
+        // own variable rather than to spliced text.
+        assert_eq!(q.matches("states: MERGED").count(), 3);
+        for i in 0..3 {
+            assert!(q.contains(&format!("$h{i}: String!")), "variable h{i}");
+            assert!(
+                q.contains(&format!("h{i}: pullRequests(headRefName: $h{i},")),
+                "alias h{i} must read its own variable"
+            );
+        }
+        assert!(
+            q.split_once("repository(owner: $owner, name: $name)")
+                .is_some(),
+            "the aliases must sit inside the repository they are about"
         );
     }
 }

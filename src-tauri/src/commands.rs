@@ -915,24 +915,41 @@ pub async fn classify_worktrees(
     // One budget across every filesystem scan (#1149). Held for
     // the whole walk: releasing early would let the next caller
     // start while this one still has eight threads on the disk.
-    let _permit = scan_permit().await?;
+    let permit = scan_permit().await?;
     // Two failure modes, both real: the join can fail if the blocking
     // task panicked, and classification itself can fail if git refuses.
     // Flattened rather than swallowed, so an unreadable repo surfaces as
     // an error instead of as zero worktrees.
-    tauri::async_runtime::spawn_blocking(move || {
+    let emitter = app.clone();
+    let path = repo_path.clone();
+    let rows = tauri::async_runtime::spawn_blocking(move || {
         let mut out = Vec::new();
-        crate::worktrees::classify_repo_streaming(&repo_path, &mut |w| {
+        crate::worktrees::classify_repo_streaming(&path, &mut |w| {
             // Emitted per worktree rather than batched, for the reason
             // `size_worktrees` gives: batching would reintroduce exactly
             // the wait this exists to remove.
-            let _ = app.emit("worktree-safety", w);
+            let _ = emitter.emit("worktree-safety", w);
             out.push(w.clone());
         })?;
-        Ok(out)
+        Ok::<_, String>(out)
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())??;
+    // The disk walk is done; the lookup below is network, not disk, and
+    // must not hold the next scan out.
+    drop(permit);
+
+    // GitHub's record of a merge, AFTER the offline pass (#1440). Every
+    // verdict above is already on screen; this can only turn some
+    // `unmerged`/`unpushed` rows into `merged_as_pr`, and every way it can
+    // fail leaves them exactly as they are. Upgraded rows are re-emitted
+    // so the streamed view agrees with the returned set.
+    let client = app.state::<GhClient>().0.clone();
+    let (rows, changed) = crate::worktrees::github::enrich(client, &repo_path, rows).await;
+    for i in changed {
+        let _ = app.emit("worktree-safety", &rows[i]);
+    }
+    Ok(rows)
 }
 
 /// One repository's main checkout, classified. See `classify_worktrees`.
@@ -1961,14 +1978,29 @@ pub async fn read_claude_md(path: String) -> Result<String, String> {
 /// user may have started editing since.
 ///
 /// Logged with path and branch, so "where did that go?" has an answer.
+///
+/// Signed in, the gate has a second route (#1440): a row the offline
+/// checks refuse as unmerged or unpushed is put to GitHub, fresh, and
+/// removed only if a merged pull request contains its HEAD. See
+/// `worktrees::github`.
 #[tauri::command]
-pub async fn remove_worktree(repo_path: String, worktree_path: String) -> Result<(), String> {
+pub async fn remove_worktree(
+    client: State<'_, GhClient>,
+    repo_path: String,
+    worktree_path: String,
+) -> Result<(), String> {
     let wt = worktree_path.clone();
     let repo = repo_path.clone();
-    let result =
-        tauri::async_runtime::spawn_blocking(move || crate::worktrees::remove_worktree(&repo, &wt))
-            .await
-            .map_err(|e| e.to_string())?;
+    let client = client.0.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || match client {
+        Some(c) => {
+            let ask = crate::worktrees::github::blocking_ask(c, repo.clone());
+            crate::worktrees::remove_worktree_asking(&repo, &wt, &ask)
+        }
+        None => crate::worktrees::remove_worktree(&repo, &wt),
+    })
+    .await
+    .map_err(|e| e.to_string())?;
 
     match &result {
         Ok(()) => log::info!("removed worktree {worktree_path}"),
@@ -2342,10 +2374,16 @@ pub async fn remove_worktrees(
     // which also stalled the poll loop and every other command. The
     // single-worktree command already did this; the bulk one, which
     // blocks far longer, did not.
+    // The same second route `remove_worktree` has (#1440), asked only for
+    // rows the offline gate refuses as unmerged or unpushed.
+    let client = app.state::<GhClient>().0.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let ask = client.map(|c| crate::worktrees::github::blocking_ask(c, repo_path.clone()));
+        let ask_ref = ask.as_ref().map(|a| a as crate::worktrees::github::Ask<'_>);
         let outcomes = crate::worktrees::remove_worktrees_with_progress(
             &repo_path,
             &worktree_paths,
+            ask_ref,
             |done, total| {
                 // Counts only -- never paths. A progress event is not a
                 // place to leak what the user is working on.
