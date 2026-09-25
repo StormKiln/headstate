@@ -13,6 +13,8 @@
 //!   the published linters is asserted, not measured, and is
 //!   [`Severity::Advice`]. The brief quotes the source; the finding
 //!   never predicts an effect.
+//! - **Statistics** with no threshold, such as the launch-set row, are
+//!   [`Severity::Note`]: they recommend nothing (#1422).
 //! - **Measurements.** ETH Zurich (arXiv:2602.11988): context files raise
 //!   inference cost by over 20% on average. McMillan (arXiv:2605.10039):
 //!   1,650 sessions, file size varied 25 to 500 lines, no detectable
@@ -28,11 +30,11 @@
 //! | rule | source | threshold | severity |
 //! |---|---|---|---|
 //! | [`Rule::LineTarget`] | memory docs "target under 200 lines per CLAUDE.md file"; features-overview "Keep CLAUDE.md under 200 lines"; UFMG's context-bloat threshold | 200 lines. The brief names the community range: 60 (HumanLayer's own root), 300 (HumanLayer's cap), 500 (Cursor rules) | Advice |
-//! | [`Rule::LaunchSet`] | memory docs: imported files "still load and enter the context window at launch"; subdirectory files load "when Claude reads files in those subdirectories" | none: one informational row per report, every file loaded before the first prompt with lines and est. tokens; "at least" when the scan is partial | Advice |
+//! | [`Rule::LaunchSet`] | memory docs: imported files "still load and enter the context window at launch"; subdirectory files load "when Claude reads files in those subdirectories" | none: one informational row per report, every file loaded before the first prompt with lines and est. tokens; "at least" when the scan is partial. A statistic that recommends nothing (#1422) | Note |
 //! | [`Rule::HardSkip`] | memory docs "loads a CLAUDE.md file of up to 4 MiB in full and skips a larger file" | 4 MiB, on-disk bytes | Problem |
 //! | [`Rule::Secret`] | cclint's secret rule; changelog: the feedback share uploads "the system prompt (which includes your CLAUDE.md instructions)" | `sk-ant-`, `ghp_`, `github_pat_`, a PEM private-key header, `AKIA` + 16; placeholders (`xxx`, `your`, `example`, one repeated character) skipped. The finding carries the line and a masked prefix, never the value | Problem |
 //! | [`Rule::Emphasis`] | best-practices "add emphasis such as 'IMPORTANT' to that line alone. If you emphasize many lines, none of them stands out." | 2 or more prose lines in one file carrying all-caps `IMPORTANT`, `YOU MUST`, `NEVER` or `ALWAYS`. Caps only: bold prose does not count, or this repository's own house style would trip it | Advice |
-//! | [`Rule::HookRule`] | memory docs: Claude treats CLAUDE.md as "context, not enforced configuration … use a PreToolUse hook instead"; features-overview "Put guardrails in hooks" | a tool verb (`edit`, `write`, `delete`, `rm`, `commit`, `push`, `force`), any case, in the clause a modal opens: after `never`, `always`, `must not` or `do not`, before the next `;` or sentence-ending `.`, `!`, `?` on the same line (#1374). A tool verb before the modal or in another sentence ("fails any loosening edit. Never loosen a baseline.") is not the rule's verb. Words are read outside inline code spans. A hyphenated compound counts only when every part is a tool verb (`force-push` fires; `slow-write`, `write-ahead` do not), a word directly after `@` is a tag, and a word directly after a determiner, quantifier or possessive (`a`, `an`, `any`, `the`, `each`, `every`, `this`, `that`, `no`, `some`, `my`, `your`, `his`, `her`, `its`, `our`, `their`, `'s`) is a noun. A code span in the clause counts only when it is itself a tool-action command, by its first words: `git <verb>` names the verb, `rm` names `rm`; any other span (`8 write`) names nothing (#1322). Still not parsed: a noun after an adjective ("never make any loosening edit" fires), a verb in a subordinate clause ("always run the gate before you commit" fires), a rule wrapped across lines, `don't`, and an abbreviation's `.` read as a sentence break | Advice |
+//! | [`Rule::HookRule`] | memory docs: Claude treats CLAUDE.md as "context, not enforced configuration … use a PreToolUse hook instead"; features-overview "Put guardrails in hooks" | a tool verb (`edit`, `write`, `delete`, `rm`, `commit`, `push`, `force`), any case, in the clause a modal opens: after `never`, `always`, `must not` or `do not`, before the next `;` or sentence-ending `.`, `!`, `?` on the same line (#1374). A sentence mark ends the clause when whitespace or the end of the line follows it, directly or after a run of closing `*`, `_`, `` ` ``, `)`, `]`, `"`, `'` or `~`, so `.**`, `._`, `.)` and `."` end a clause and ``**Never work on `main`.** Create a worktree → commit`` is silent (#1421). A tool verb before the modal or in another sentence ("fails any loosening edit. Never loosen a baseline.") is not the rule's verb. Words are read outside inline code spans. A hyphenated compound counts only when every part is a tool verb (`force-push` fires; `slow-write`, `write-ahead` do not), a word directly after `@` is a tag, and a word directly after a determiner, quantifier or possessive (`a`, `an`, `any`, `the`, `each`, `every`, `this`, `that`, `no`, `some`, `my`, `your`, `his`, `her`, `its`, `our`, `their`, `'s`) is a noun. A code span in the clause counts only when it is itself a tool-action command, by its first words: `git <verb>` names the verb, `rm` names `rm`; any other span (`8 write`) names nothing (#1322). Still not parsed: a noun after an adjective ("never make any loosening edit" fires), a verb in a subordinate clause ("always run the gate before you commit" fires), a rule wrapped across lines, `don't`, and an abbreviation's `.` read as a sentence break | Advice |
 //! | [`Rule::Conflict`] | memory docs "if two rules contradict each other, Claude may pick one arbitrarily"; UFMG: conflicting instructions in 28% | two files in one launch set whose named package managers (`npm`/`pnpm`/`yarn`/`bun`), lint entry points (`make lint` vs `yarn lint` …) or default branches are non-empty and disjoint | Advice |
 //! | [`Rule::TreeListing`] | `/doctor` "cuts content Claude can derive from the codebase, such as directory layouts"; best-practices' exclude table | a fenced block with 3 or more lines starting `├`, `└` or `│` | Advice |
 //! | [`Rule::InitSkeleton`] | UFMG: init fossilization in 24%; `/doctor` removes architecture overviews; best-practices "There's no required format" | the `/init` skeleton headings `Project Overview`, `Development Commands` and `Architecture` all present | Advice |
@@ -115,6 +117,10 @@ static EMPHASIS: LazyLock<Regex> =
 /// A hard rule's modal, any case.
 static MODAL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(never|must not|do not|always)\b").unwrap());
+/// Closing markdown or punctuation that may sit between a sentence mark
+/// and the whitespace that makes it a break (#1421): bold/italic, code,
+/// a closing bracket or quote, strikethrough.
+const CLOSERS: [char; 8] = ['*', '_', '`', ')', ']', '"', '\'', '~'];
 /// A tool action a `PreToolUse` hook can block.
 const TOOL_VERBS: [&str; 7] = ["edit", "write", "delete", "rm", "commit", "push", "force"];
 /// A word, or words joined by single hyphens (`slow-write`,
@@ -485,6 +491,8 @@ fn emit(
 }
 
 /// The informational row: every file loaded before the first prompt.
+/// A statistic with no threshold, so a [`Severity::Note`] (#1422); the
+/// size rules that recommend a cut ([`Rule::LineTarget`]) stay Advice.
 fn launch_set(cx: &Context, loaded: &[Loaded]) -> Result<Finding, String> {
     let mut files = 0u64;
     let mut lines = 0u64;
@@ -537,7 +545,7 @@ fn launch_set(cx: &Context, loaded: &[Loaded]) -> Result<Finding, String> {
     };
     Ok(emit(
         Rule::LaunchSet,
-        Severity::Advice,
+        Severity::Note,
         Subject::Directory {
             path: cx.repo.to_string_lossy().to_string(),
         },
@@ -760,7 +768,8 @@ fn is_tool_verb(word: &str) -> bool {
 /// Tied to the modal (#1374): for each `never`, `always`, `must not` or
 /// `do not` in the prose, only the clause it opens is read -- after the
 /// modal, up to the next sentence break (`;`, or `.`, `!`, `?` before
-/// whitespace or the end of the line). A tool verb before the modal, or
+/// whitespace or the end of the line, directly or after closing markdown
+/// such as `**` or `)`: [`clause_end`]). A tool verb before the modal, or
 /// in another sentence, is not the rule's verb.
 ///
 /// Inside the clause, inline code spans are blanked for the words: what
@@ -805,14 +814,18 @@ fn tool_action(line: &str) -> Option<String> {
 }
 
 /// The byte where the clause starting at `from` ends: the next `;`, or
-/// `.`, `!` or `?` followed by whitespace or the end of the line.
+/// `.`, `!` or `?` followed by whitespace or the end of the line --
+/// directly, or after a run of closing markdown or punctuation
+/// ([`CLOSERS`]), so `.**`, `._`, `.)` and `."` end a clause too (#1421).
 fn clause_end(prose: &str, from: usize) -> usize {
     let rest = &prose[from..];
-    let mut chars = rest.char_indices().peekable();
-    while let Some((i, c)) = chars.next() {
+    for (i, c) in rest.char_indices() {
         let at_break = match c {
             ';' => true,
-            '.' | '!' | '?' => chars.peek().is_none_or(|(_, n)| n.is_whitespace()),
+            '.' | '!' | '?' => {
+                let after = rest[i + c.len_utf8()..].trim_start_matches(CLOSERS);
+                after.chars().next().is_none_or(char::is_whitespace)
+            }
             _ => false,
         };
         if at_break {
@@ -1152,6 +1165,9 @@ mod tests {
         assert_eq!(hits.len(), 1, "{found:?}");
         let f = hits[0];
         assert_eq!(f.severity, Severity::Advice);
+        // #1422: the size rule that recommends a cut stays Advice while
+        // the launch-set row beside it, a statistic, is a Note.
+        assert_eq!(by_rule(&found, Rule::LaunchSet)[0].severity, Severity::Note);
         assert!(f.finding.contains("201 lines"), "{}", f.finding);
         assert!(f.finding.contains("target is under 200"), "{}", f.finding);
         assert!(f.finding.contains("est."), "{}", f.finding);
@@ -1190,7 +1206,8 @@ mod tests {
         let rows = by_rule(&found, Rule::LaunchSet);
         assert_eq!(rows.len(), 1, "one row per report: {found:?}");
         let row = rows[0];
-        assert_eq!(row.severity, Severity::Advice);
+        // #1422: a statistic with no threshold recommends nothing.
+        assert_eq!(row.severity, Severity::Note);
         let expected = crate::claudemd::tokens::estimate("global\nrules\n")
             + crate::claudemd::tokens::estimate("@./shared.md\nroot\n")
             + crate::claudemd::tokens::estimate("a\nb\nc\n");
@@ -1547,6 +1564,44 @@ ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
         {
             assert!(
                 sentences[i].contains(&format!("line {}", i + 1))
+                    && sentences[i].contains(&format!("(`{verb}`)")),
+                "{sentences:?}"
+            );
+        }
+    }
+
+    /// #1421: a sentence mark followed by closing markdown or punctuation
+    /// (`.**`, `._`, `.)`, `."`, `.~~` ...) and then whitespace or the end
+    /// of the line ends the modal's clause, so a tool verb in the next
+    /// sentence is not the rule's verb. A verb inside the closed clause
+    /// still fires.
+    #[test]
+    fn a_sentence_mark_before_closing_markdown_ends_the_modals_clause() {
+        let (_t, _home, repo) = fixture();
+        fs::write(
+            repo.join("CLAUDE.md"),
+            "* **Never work directly on `main`.** Create a worktree → commit → push.\n\
+             Never skip _the gate._ Then commit.\n\
+             (Never skip the gate.) Then push.\n\
+             \"Never skip the gate.\" Then edit.\n\
+             ~~Never skip the gate.~~ Then delete.\n\
+             **Always check `main`?** Then commit.\n\
+             *Never skip the gate!*) Then push.\n\
+             **Never force-push.**\n\
+             Never commit `.env`.\n\
+             **Never skip the gate.**Then commit.\n",
+        )
+        .unwrap();
+        let found = shape(&repo, None);
+        let hits = by_rule(&found, Rule::HookRule);
+        let sentences: Vec<&str> = hits.iter().map(|f| f.finding.as_str()).collect();
+        assert_eq!(hits.len(), 3, "{sentences:?}");
+        for (i, (line, verb)) in [(8, "force-push"), (9, "commit"), (10, "commit")]
+            .iter()
+            .enumerate()
+        {
+            assert!(
+                sentences[i].contains(&format!("line {line} "))
                     && sentences[i].contains(&format!("(`{verb}`)")),
                 "{sentences:?}"
             );
