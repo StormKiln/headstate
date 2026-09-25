@@ -7,9 +7,11 @@ import {
   useDeleteHeadBranch,
   usePrDetail,
   useRerunChecks,
+  useReviewGates,
   useReviewPr,
   useViewer,
 } from "../api/hooks";
+import { gateVerdict } from "../lib/reviewGates";
 import { useState } from "react";
 import type { ReviewVerdictName } from "../api/tauri";
 import type { ClaudePrLink } from "../types/pr";
@@ -185,6 +187,13 @@ export function PrDetailView({
   // ReviewBox reads that as "might not be mine" rather than "is mine",
   // so a failed viewer fetch never silently removes the approve button.
   const { data: viewer } = useViewer();
+  // The base branch's review rules (#1451, #1454). Undefined while pending
+  // and when unreadable alike -- both render nothing new -- so `gate` is
+  // all-null until a rule is actually READ.
+  const { data: gates } = useReviewGates(pr, isPlaceholderData);
+  const gate = pr
+    ? gateVerdict(gates, pr, viewer, isPlaceholderData)
+    : { approveWontCount: null, approveCaveat: null, mergeBlocked: null };
   const [reviewing, setReviewing] = useState<ReviewVerdictName | null>(null);
   const rerun = useRerunChecks();
   const [rerunning, setRerunning] = useState(false);
@@ -241,7 +250,13 @@ export function PrDetailView({
     submit.then(
       () => {
         done();
-        toast.success(`${label} ${pr.repo}#${pr.number}`);
+        // The after-approve state: an approval that will not count toward
+        // merging still reads "Approved", so the toast says what it means
+        // (#1451).
+        toast.success(`${label} ${pr.repo}#${pr.number}`, {
+          description:
+            verdict === "approve" && gate.approveWontCount ? gate.approveWontCount : undefined,
+        });
       },
       (e: unknown) => {
         done();
@@ -322,7 +337,7 @@ export function PrDetailView({
           title={
             approvedByViewer
               ? "You have already approved this pull request"
-              : "Approve without a comment"
+              : (gate.approveWontCount ?? "Approve without a comment")
           }
           className={`rounded px-2.5 py-1 text-sm font-medium ${
             approvedByViewer || reviewing !== null
@@ -337,7 +352,15 @@ export function PrDetailView({
               : "Approve"}
         </button>
       ) : null}
-      <PrActions pr={pr} compact />
+      {/* The header has no room for the sentence, so it carries the short
+          form beside the button, with the full one in its title and in
+          the body's review box (#1451). */}
+      {viewer !== undefined && viewer !== pr.author && gate.approveWontCount ? (
+        <span className="text-xs font-medium text-[#d29922]" title={gate.approveWontCount}>
+          Won't count toward merging
+        </span>
+      ) : null}
+      <PrActions pr={pr} compact conversations={gate.mergeBlocked} />
     </>
   );
 
@@ -477,7 +500,7 @@ export function PrDetailView({
         </p>
       </div>
 
-      <PrActions pr={pr} />
+      <PrActions pr={pr} conversations={gate.mergeBlocked} />
 
       {/* Available on EVERY pull request, not only the review queue.
           Gating this on which list you arrived from would mean the same
@@ -489,6 +512,8 @@ export function PrDetailView({
         viewer={viewer}
         author={pr.author}
         latestReviews={pr.latest_reviews}
+        approveWontCount={gate.approveWontCount}
+        approveCaveat={gate.approveCaveat}
         busy={reviewing}
         onSubmit={submitReview}
       />

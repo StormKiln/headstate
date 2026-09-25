@@ -302,6 +302,7 @@ pub fn run() {
             commands::get_reviewing,
             commands::count_reviewing,
             commands::get_pr_detail,
+            commands::get_review_gates,
             commands::act_on_pr,
             commands::build_target,
             commands::get_viewer,

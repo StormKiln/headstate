@@ -102,6 +102,7 @@ import {
   type PairingRequest,
   actOnPr,
   getPrDetail,
+  getReviewGates,
   getWorktreeDirs,
   classifyRepoUpstream,
   classifyWorktrees,
@@ -2695,6 +2696,40 @@ export function usePrDetail(repo: string | undefined, number: number | undefined
     // background cost.
     refetchInterval: (query) =>
       query.state.data?.merge_status === "unknown" ? 3_000 : false,
+  });
+}
+
+/// The base branch's review rules and the head's last pusher, for the
+/// detail view (#1451, #1454).
+///
+/// Waits for the REAL detail: the seeded placeholder has no `head_repo`
+/// (the list query does not select it), and asking without one would
+/// come back "pusher declined" and cache that under a key the real
+/// answer then has to displace. `head_repo` is `undefined` only on the
+/// placeholder -- the real detail carries a string or null.
+///
+/// Keyed on the head commit, so a push re-asks who pushed. The rules half
+/// is cached per (repo, base) on the Rust side, so re-asking is cheap.
+export function useReviewGates(pr: PrDetail | undefined, isPlaceholder: boolean) {
+  const ready = pr !== undefined && !isPlaceholder && pr.head_repo !== undefined;
+  return useQuery({
+    queryKey: [
+      "review-gates",
+      pr?.repo,
+      pr?.base_ref,
+      pr?.head_repo ?? null,
+      pr?.head_ref,
+      pr?.head_oid,
+    ],
+    queryFn: () => {
+      const p = pr as PrDetail;
+      return getReviewGates(p.repo, p.base_ref, p.head_repo ?? null, p.head_ref, p.head_oid);
+    },
+    enabled: ready,
+    staleTime: 60_000,
+    // The command folds every GitHub failure into a state; a rejection is
+    // only "no client", which a retry cannot fix.
+    retry: 0,
   });
 }
 

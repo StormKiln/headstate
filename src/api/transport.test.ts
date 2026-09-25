@@ -224,6 +224,12 @@ const ROWS: Row[] = [
   row(api.updatePrBranch, [id, repo, number, expectedHead], "update_pr_branch", { id, repo, number, expectedHead }),
   row(api.actOnPrs, [prs, action], "act_on_prs", { prs, action }),
   row(api.getPrDetail, [repo, number], "get_pr_detail", { repo, number }),
+  row(
+    api.getReviewGates,
+    [repo, "main", "fork/r", "feat/x", "abc123"],
+    "get_review_gates",
+    { repo, base: "main", headRepo: "fork/r", headRef: "feat/x", headOid: "abc123" },
+  ),
   row(api.sizeWorktrees, [repoPath], "size_worktrees", { repoPath }),
   row(api.pullCheckout, [path], "pull_checkout", { path }),
   row(api.fetchRefs, [path], "fetch_refs", { path }),

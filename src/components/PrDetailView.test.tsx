@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useFilters } from "../store/filters";
-import type { PrDetail } from "@/types/pr";
+import type { PrDetail, ReviewGates } from "@/types/pr";
 import { stubViewport } from "@/test-utils";
 import { scopeEffect } from "@/lib/branchDelete";
 
@@ -15,6 +15,10 @@ const state = vi.hoisted(() => ({
   // exercises the LOADED view exactly as before.
   isPlaceholderData: false,
   isError: false,
+  /// The review gates (#1451, #1454). Undefined by default -- pending and
+  /// unreadable both render nothing new -- so every existing test sees
+  /// the view exactly as before.
+  gates: undefined as ReviewGates | undefined,
 }));
 
 const deleteBranch = vi.hoisted(() =>
@@ -32,6 +36,12 @@ const rerunChecks = vi.fn(() => Promise.resolve());
 const commentOnPr = vi.fn(() => Promise.resolve());
 
 const viewer = vi.hoisted(() => ({ current: undefined as string | undefined }));
+
+// Spied, not replaced in behaviour: no test here renders a Toaster, so
+// the real `toast` draws nothing either way. The spy lets the review-gate
+// test assert what the after-approve toast SAYS (#1451).
+const toastSuccess = vi.hoisted(() => vi.fn());
+vi.mock("sonner", () => ({ toast: { success: toastSuccess, error: vi.fn() } }));
 
 vi.mock("../api/hooks", () => ({
   // No linked session by default: the panel renders nothing, which is
@@ -59,6 +69,7 @@ vi.mock("../api/hooks", () => ({
     error: claudifyState.scanError,
   }),
   useUiPrefs: () => ({ prefs: { terminal_command: claudifyState.terminal } }),
+  useReviewGates: () => ({ data: state.gates }),
 }));
 
 /// What Claudify sees (#1455). Defaults: scanned, no checkout of the
@@ -1003,6 +1014,106 @@ describe("PrDetailView", () => {
   /// could sit in the gap. `ReviewThreads.test.tsx` covers the notice
   /// itself; these two assert the WIRING, since a `review_threads_total`
   /// that never reaches the section is a field that changes nothing.
+  /// The base branch's review rules, wired into Approve and Merge
+  /// (#1451, #1454). The derivation is tested in `lib/reviewGates.test.ts`;
+  /// these assert that the view USES it, on both Approve buttons and on
+  /// the merge reason.
+  describe("review gates", () => {
+    const read = (lastPush: boolean, resolution: boolean): ReviewGates["rules"] => ({
+      state: "read",
+      require_last_push_approval: lastPush,
+      required_review_thread_resolution: resolution,
+    });
+    const thread = (id: string, outdated: boolean) => ({
+      id,
+      is_resolved: false,
+      is_outdated: outdated,
+      path: "src/a.ts",
+      line: outdated ? null : 1,
+      viewer_can_reply: false,
+      viewer_can_resolve: false,
+      viewer_can_unresolve: false,
+      comments: [],
+      comment_count: 0,
+    });
+    afterEach(() => {
+      state.gates = undefined;
+      viewer.current = undefined;
+    });
+
+    /// A warning, not a block: GitHub records the approval, it just does
+    /// not count toward merging, and the reviewer may still want it.
+    it("warns beside both Approve buttons, which stay enabled, when the viewer pushed last", () => {
+      viewer.current = "reviewer";
+      state.gates = { rules: read(true, false), last_pusher: { state: "known", login: "reviewer" } };
+      view({ author: "someone-else" });
+      expect(
+        screen.getByText(
+          "You pushed the latest commit, so your approval won't count toward merging here.",
+        ),
+      ).toBeTruthy();
+      const bar = document.querySelector(".sticky") as HTMLElement;
+      expect(within(bar).getByText("Won't count toward merging")).toBeTruthy();
+      const approves = screen.getAllByRole("button", { name: "Approve" });
+      expect(approves.length).toBe(2);
+      for (const b of approves) expect((b as HTMLButtonElement).disabled).toBe(false);
+    });
+
+    /// The after-approve state: the toast carries the warning too.
+    it("repeats the warning in the toast after approving", async () => {
+      viewer.current = "reviewer";
+      state.gates = { rules: read(true, false), last_pusher: { state: "known", login: "reviewer" } };
+      view({ author: "someone-else" });
+      const bar = document.querySelector(".sticky") as HTMLElement;
+      fireEvent.click(within(bar).getByRole("button", { name: "Approve" }));
+      await waitFor(() => expect(reviewPr).toHaveBeenCalled());
+      await waitFor(() =>
+        expect(toastSuccess).toHaveBeenCalledWith(expect.stringContaining("Approved"), {
+          description:
+            "You pushed the latest commit, so your approval won't count toward merging here.",
+        }),
+      );
+    });
+
+    it("leaves Approve alone when someone else pushed last", () => {
+      viewer.current = "reviewer";
+      state.gates = { rules: read(true, false), last_pusher: { state: "known", login: "other" } };
+      view({ author: "someone-else" });
+      expect(screen.queryByText(/won't count/)).toBeNull();
+      for (const b of screen.getAllByRole("button", { name: "Approve" }))
+        expect((b as HTMLButtonElement).disabled).toBe(false);
+    });
+
+    it("says nothing new when the rules could not be read", () => {
+      viewer.current = "reviewer";
+      state.gates = {
+        rules: { state: "unreadable", reason: "404" },
+        last_pusher: { state: "not_needed" },
+      };
+      view({
+        author: "someone-else",
+        merge_status: "blocked",
+        review_threads: [thread("RT_1", false)],
+        review_threads_total: 1,
+      });
+      expect(screen.queryByText(/won't count|could not be confirmed/)).toBeNull();
+      expect(screen.getByText(/a required review or check is missing/)).toBeTruthy();
+    });
+
+    it("names open conversations, outdated ones included, as the merge blocker", () => {
+      state.gates = { rules: read(false, true), last_pusher: { state: "not_needed" } };
+      view({
+        merge_status: "blocked",
+        unresolved_threads: 1,
+        review_threads: [thread("RT_1", false), thread("RT_2", true)],
+        review_threads_total: 2,
+      });
+      expect(
+        screen.getByText("Cannot merge: 2 conversations must be resolved first (1 outdated)"),
+      ).toBeTruthy();
+    });
+  });
+
   describe("truncated conversation list", () => {
     const t = (id: string) => ({
       id,

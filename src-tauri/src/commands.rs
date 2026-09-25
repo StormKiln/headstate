@@ -766,6 +766,57 @@ pub async fn get_pr_detail(
     out
 }
 
+/// Whether the viewer's approval can count, and whether conversations must
+/// be resolved before merge, for one pull request (#1451, #1454).
+///
+/// Separate from `get_pr_detail` rather than folded into it, for three
+/// reasons: it is REST, from a different rate-limit pool, and must not sit
+/// inside that command's 30-second chain; the rules half is cached per
+/// (repository, base) and most opens answer from memory; and every failure
+/// here is ADVISORY -- it renders nothing new -- where a detail failure is
+/// an error the view has to show.
+///
+/// Never an `Err` for a GitHub failure: those fold into
+/// `BaseRules::Unreadable` / `LastPusher::Unknown`, and a budget refusal
+/// into `Declined`, so the view can tell "we did not ask" from "GitHub did
+/// not answer" (#1050). `Err` is only "no client".
+///
+/// `head_repo` is `None` when the detail has not arrived or the fork is
+/// gone; the pusher is then declined rather than guessed from the base.
+#[tauri::command]
+pub async fn get_review_gates(
+    client: State<'_, GhClient>,
+    repo: String,
+    base: String,
+    head_repo: Option<String>,
+    head_ref: String,
+    head_oid: String,
+) -> Result<crate::github::gates::ReviewGates, String> {
+    // Repository and branch names are not logged, for the reason
+    // `get_pr_detail` gives.
+    crate::diag!("[diag] cmd get_review_gates start");
+    let started = std::time::Instant::now();
+    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+    let budget = crate::github::stats::Budget::new();
+    let out = crate::github::gates::review_gates(
+        &client,
+        &budget,
+        &repo,
+        &base,
+        head_repo.as_deref(),
+        &head_ref,
+        &head_oid,
+        crate::poll::FETCH_TIMEOUT,
+    )
+    .await;
+    crate::diag!(
+        "[diag] cmd get_review_gates end {}ms rest_requests={}",
+        started.elapsed().as_millis(),
+        budget.rest_requests()
+    );
+    Ok(out)
+}
+
 #[tauri::command]
 /// A previously stored scan, for the cold start (#1152).
 ///

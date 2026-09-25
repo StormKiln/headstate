@@ -161,6 +161,9 @@ pub fn map_detail(v: &Value, repo: &str) -> PrDetail {
         repo: repo.to_string(),
         head_ref: pr["headRefName"].as_str().unwrap_or_default().to_string(),
         head_oid: pr["headRefOid"].as_str().unwrap_or_default().to_string(),
+        head_repo: pr["headRepository"]["nameWithOwner"]
+            .as_str()
+            .map(str::to_string),
         head_ref_id: pr["headRef"]["id"].as_str().map(str::to_string),
         base_ref: pr["baseRefName"].as_str().unwrap_or_default().to_string(),
         merge_status: merge_status(pr),
@@ -1159,6 +1162,21 @@ mod tests {
             d.review_threads_total, 3,
             "no total must mean complete, never a zero the UI subtracts from"
         );
+    }
+
+    /// The head repository is carried, and its absence (a deleted fork) is
+    /// `None` rather than a guess at the base repository (#1451).
+    #[test]
+    fn carries_the_head_repository_or_none() {
+        let v = json!({"repository": {"pullRequest": {
+            "headRepository": {"nameWithOwner": "fork-owner/r"}
+        }}});
+        assert_eq!(
+            map_detail(&v, "o/r").head_repo.as_deref(),
+            Some("fork-owner/r")
+        );
+        let v = json!({"repository": {"pullRequest": {"headRepository": null}}});
+        assert_eq!(map_detail(&v, "o/r").head_repo, None);
     }
 
     /// The header count and the thread list are two renderings of one

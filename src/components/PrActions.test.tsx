@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { PrDetail } from "@/types/pr";
 
@@ -57,6 +57,33 @@ describe("PrActions", () => {
     render(<PrActions pr={pr({ merge_queue_enabled: false })} />);
     expect(screen.getByRole("button", { name: "Merge" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Add to merge queue" })).toBeNull();
+  });
+
+  /// #1454: when the base's rules require resolution and threads are open,
+  /// merge AND enqueue name the real blocker instead of the generic one.
+  it("names open conversations as the blocker for merge and enqueue", () => {
+    const reason = "2 conversations must be resolved first";
+    render(<PrActions pr={pr({ merge_status: "blocked" })} conversations={reason} />);
+    const merge = screen.getByRole("button", { name: "Merge" }) as HTMLButtonElement;
+    expect(merge.disabled).toBe(true);
+    expect(screen.getByText(`Cannot merge: ${reason}`)).toBeTruthy();
+    cleanup();
+    render(
+      <PrActions
+        pr={pr({ merge_status: "blocked", merge_queue_enabled: true })}
+        conversations={reason}
+      />,
+    );
+    const enqueue = screen.getByRole("button", { name: "Add to merge queue" }) as HTMLButtonElement;
+    expect(enqueue.disabled).toBe(true);
+    expect(enqueue.title).toBe(reason);
+  });
+
+  /// GitHub's own `clean` is its final word -- it knows about bypass
+  /// permissions this view cannot see.
+  it("does not override a clean merge state", () => {
+    render(<PrActions pr={pr({ merge_status: "clean" })} conversations="1 conversation must be resolved first" />);
+    expect((screen.getByRole("button", { name: "Merge" }) as HTMLButtonElement).disabled).toBe(false);
   });
 
   /// Once it is queued the only useful action is getting it back out.

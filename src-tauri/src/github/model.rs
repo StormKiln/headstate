@@ -149,6 +149,13 @@ pub struct PullRequest {
     /// is blocked: whether a repo REQUIRES resolution before merging lives
     /// in `requiresConversationResolution`, which needs admin access on
     /// that repository and is unreadable for most of them.
+    ///
+    /// CORRECTED for #1454: that holds for CLASSIC branch protection only.
+    /// A ruleset's `required_review_thread_resolution` is readable without
+    /// admin, and the detail view reads it (`github::gates`) -- counting
+    /// outdated threads too, which GitHub's requirement does. The list row
+    /// still cannot: the rules are a REST read per (repository, base), not
+    /// something `PRS_QUERY` can carry under its cost guard (#312).
     #[serde(default)]
     pub unresolved_threads: u64,
     /// Logins whose review is still outstanding.
@@ -445,6 +452,14 @@ pub struct PrDetail {
     /// tells "already cleaned up" from "still there".
     #[serde(default)]
     pub head_ref_id: Option<String>,
+    /// The repository the head branch lives in, `owner/name` (#1451).
+    ///
+    /// The base repository for a same-repository pull request, the fork
+    /// for one from a fork, and `None` once the fork is deleted. The review
+    /// gates ask this repository who pushed the head; asking the BASE
+    /// repository instead would read a different, same-named branch.
+    #[serde(default)]
+    pub head_repo: Option<String>,
     pub base_ref: String,
     // Defaults to Unknown, never Clean: a merge button enabled on data the
     // app never fetched is the one wrong answer that costs something.
