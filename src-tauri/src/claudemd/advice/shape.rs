@@ -34,7 +34,7 @@
 //! | [`Rule::HardSkip`] | memory docs "loads a CLAUDE.md file of up to 4 MiB in full and skips a larger file" | 4 MiB, on-disk bytes | Problem |
 //! | [`Rule::Secret`] | cclint's secret rule; changelog: the feedback share uploads "the system prompt (which includes your CLAUDE.md instructions)" | `sk-ant-`, `ghp_`, `github_pat_`, a PEM private-key header, `AKIA` + 16; placeholders (`xxx`, `your`, `example`, one repeated character) skipped. The finding carries the line and a masked prefix, never the value | Problem |
 //! | [`Rule::Emphasis`] | best-practices "add emphasis such as 'IMPORTANT' to that line alone. If you emphasize many lines, none of them stands out." | 2 or more prose lines in one file carrying all-caps `IMPORTANT`, `YOU MUST`, `NEVER` or `ALWAYS`. Caps only: bold prose does not count, or this repository's own house style would trip it | Advice |
-//! | [`Rule::HookRule`] | memory docs: Claude treats CLAUDE.md as "context, not enforced configuration … use a PreToolUse hook instead"; features-overview "Put guardrails in hooks" | a tool verb (`edit`, `write`, `delete`, `rm`, `commit`, `push`, `force`), any case, in the clause a modal opens: after `never`, `always`, `must not` or `do not`, before the next `;` or sentence-ending `.`, `!`, `?` on the same line (#1374). A sentence mark ends the clause when whitespace or the end of the line follows it, directly or after a run of closing `*`, `_`, `` ` ``, `)`, `]`, `"`, `'` or `~`, so `.**`, `._`, `.)` and `."` end a clause and ``**Never work on `main`.** Create a worktree → commit`` is silent (#1421). A tool verb before the modal or in another sentence ("fails any loosening edit. Never loosen a baseline.") is not the rule's verb. Words are read outside inline code spans. A hyphenated compound counts only when every part is a tool verb (`force-push` fires; `slow-write`, `write-ahead` do not), a word directly after `@` is a tag, and a word directly after a determiner, quantifier or possessive (`a`, `an`, `any`, `the`, `each`, `every`, `this`, `that`, `no`, `some`, `my`, `your`, `his`, `her`, `its`, `our`, `their`, `'s`) is a noun. A code span in the clause counts only when it is itself a tool-action command, by its first words: `git <verb>` names the verb, `rm` names `rm`; any other span (`8 write`) names nothing (#1322). Still not parsed: a noun after an adjective ("never make any loosening edit" fires), a verb in a subordinate clause ("always run the gate before you commit" fires), a rule wrapped across lines, `don't`, and an abbreviation's `.` read as a sentence break | Advice |
+//! | [`Rule::HookRule`] | memory docs: Claude treats CLAUDE.md as "context, not enforced configuration … use a PreToolUse hook instead"; features-overview "Put guardrails in hooks" | a tool verb (`edit`, `write`, `delete`, `rm`, `commit`, `push`, `force`), any case, in the clause a modal opens: after `never`, `always`, `must not` or `do not` (in any emphasis, `_Never …_` included, #1432), before the next `;` or sentence-ending `.`, `!`, `?` on the same line (#1374). A sentence mark ends the clause when whitespace or the end of the line follows it, directly or after a run of closing `*`, `_`, `` ` ``, `)`, `]`, `"`, `'` or `~`, so `.**`, `._`, `.)` and `."` end a clause and ``**Never work on `main`.** Create a worktree → commit`` is silent (#1421). A tool verb before the modal or in another sentence ("fails any loosening edit. Never loosen a baseline.") is not the rule's verb. Words are read outside inline code spans. A hyphenated compound counts only when every part is a tool verb (`force-push` fires; `slow-write`, `write-ahead` do not), a word directly after `@` is a tag, and a word directly after a determiner, quantifier or possessive (`a`, `an`, `any`, `the`, `each`, `every`, `this`, `that`, `no`, `some`, `my`, `your`, `his`, `her`, `its`, `our`, `their`, `'s`) is a noun. A code span in the clause counts only when it is itself a tool-action command, by its first words: `git <verb>` names the verb, `rm` names `rm`; any other span (`8 write`) names nothing (#1322). Still not parsed: a noun after an adjective ("never make any loosening edit" fires), a verb in a subordinate clause ("always run the gate before you commit" fires), a rule wrapped across lines, `don't`, and an abbreviation's `.` read as a sentence break | Advice |
 //! | [`Rule::Conflict`] | memory docs "if two rules contradict each other, Claude may pick one arbitrarily"; UFMG: conflicting instructions in 28% | two files in one launch set whose named package managers (`npm`/`pnpm`/`yarn`/`bun`), lint entry points (`make lint` vs `yarn lint` …) or default branches are non-empty and disjoint | Advice |
 //! | [`Rule::TreeListing`] | `/doctor` "cuts content Claude can derive from the codebase, such as directory layouts"; best-practices' exclude table | a fenced block with 3 or more lines starting `├`, `└` or `│` | Advice |
 //! | [`Rule::InitSkeleton`] | UFMG: init fossilization in 24%; `/doctor` removes architecture overviews; best-practices "There's no required format" | the `/init` skeleton headings `Project Overview`, `Development Commands` and `Architecture` all present | Advice |
@@ -115,8 +115,17 @@ const HARD_SKIP_BYTES: u64 = 4 * 1024 * 1024;
 static EMPHASIS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(IMPORTANT|YOU MUST|NEVER|ALWAYS)\b").unwrap());
 /// A hard rule's modal, any case.
+///
+/// Opened by the start of the line or any character that is not a letter
+/// or digit, rather than `\b` (#1432): `_` is a regex word character, so
+/// `\b` found no boundary in `_Never commit._` and an underscore-italic
+/// rule was missed outright. The match therefore may include that one
+/// opening character; callers read only `end()`, which is still the end
+/// of the modal word. The closing `\b` keeps `do_not_commit` and
+/// `nevermind` from counting. The `regex` crate has no lookbehind, which
+/// is why this consumes the character rather than asserting it.
 static MODAL: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\b(never|must not|do not|always)\b").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)(?:^|[^a-z0-9])(never|must not|do not|always)\b").unwrap());
 /// Closing markdown or punctuation that may sit between a sentence mark
 /// and the whitespace that makes it a break (#1421): bold/italic, code,
 /// a closing bracket or quote, strikethrough.
@@ -1463,6 +1472,32 @@ ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
         let found = shape(&repo, None);
         let hits = by_rule(&found, Rule::HookRule);
         assert!(hits.is_empty(), "{hits:?}");
+    }
+
+    /// #1432: a rule in UNDERSCORE italics is still a rule. `_` is a regex
+    /// word character, so `\b` found no boundary between `_` and `N` and
+    /// `_Never commit the key._` produced no finding at all -- the missed
+    /// half of #1421. Asterisk emphasis already worked and still does, and
+    /// an identifier that merely contains `do_not` is still not a modal.
+    #[test]
+    fn a_rule_in_underscore_italics_is_still_a_rule() {
+        let (_t, _home, repo) = fixture();
+        fs::write(
+            repo.join("CLAUDE.md"),
+            "_Never commit the key._\n\
+             *Never commit the key.*\n\
+             **Never commit.**\n\
+             Set the do_not_commit_flag before you commit.\n",
+        )
+        .unwrap();
+        let found = shape(&repo, None);
+        let hits = by_rule(&found, Rule::HookRule);
+        let sentences: Vec<&str> = hits.iter().map(|f| f.finding.as_str()).collect();
+        assert_eq!(hits.len(), 3, "{sentences:?}");
+        for (i, s) in sentences.iter().enumerate() {
+            assert!(s.contains(&format!("line {}", i + 1)), "{sentences:?}");
+            assert!(s.contains("(`commit`)"), "{sentences:?}");
+        }
     }
 
     /// The other direction of #1322: a verb in prose still fires beside
