@@ -340,13 +340,70 @@ describe("PrDetailView", () => {
     expect(visible).toHaveLength(1);
   });
 
-  // The query caps comments at 50; claiming to show all of them would
-  // be a quiet lie.
-  it("says when comments are truncated", () => {
+  /// #1453: the query fetches the NEWEST comments, so a truncated list is
+  /// missing the oldest -- and says so ABOVE the rows, before the reader
+  /// takes them for the whole discussion.
+  it("says which comments are missing, above the ones it shows", () => {
     view({ comment_count: 80, comments: [
       { author: "hubot", created_at: "2026-08-20T10:00:00Z", body: "one" },
+      { author: "hubot", created_at: "2026-08-21T10:00:00Z", body: "two" },
     ] });
-    expect(screen.getByText(/showing 1 of 80/i)).toBeTruthy();
+    const notice = screen.getByText(/Showing the newest 2 of 80 — older ones are on GitHub/);
+    const firstRow = screen.getAllByText("hubot")[0];
+    expect(
+      notice.compareDocumentPosition(firstRow) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("does not annotate a complete comment list", () => {
+    view({ comment_count: 1, comments: [
+      { author: "hubot", created_at: "2026-08-20T10:00:00Z", body: "one" },
+    ] });
+    expect(screen.queryByText(/Showing the newest/)).toBeNull();
+  });
+
+  /// #1457: the PR's age and last commit, in the header. Each date is
+  /// relative to the real clock, so the text is stable without fake
+  /// timers.
+  describe("header dates", () => {
+    const ago = (ms: number) => new Date(Date.now() - ms).toISOString();
+    const HOUR = 3_600_000;
+    const DAY = 24 * HOUR;
+
+    it("shows opened, ready for review and last commit", () => {
+      view({ created_at: ago(9 * DAY), ready_at: ago(3 * DAY), last_commit_at: ago(5 * HOUR) });
+      expect(screen.getByText("9 days ago").closest("[data-pr-date]")?.textContent).toBe(
+        "opened 9 days ago",
+      );
+      const ready = screen.getByText("3 days ago").closest("[data-pr-date]") as HTMLElement;
+      expect(ready.textContent).toBe("ready for review 3 days ago");
+      // The review queue's stale colour: past 48 hours.
+      expect(ready.className).toContain("text-[#f85149]");
+      expect(screen.getByText("5 hours ago").closest("[data-pr-date]")?.textContent).toBe(
+        "last commit 5 hours ago",
+      );
+    });
+
+    it("colours a fresh ready time as the review queue does", () => {
+      view({ created_at: ago(9 * DAY), ready_at: ago(2 * HOUR) });
+      const ready = screen.getByText(/ready for review/) as HTMLElement;
+      expect(ready.className).toContain("text-[#3fb950]");
+    });
+
+    /// Absent is not zero: a date that did not arrive, did not parse, or
+    /// sits in the future beyond clock skew is left out -- never "just now".
+    it("omits every date it cannot read", () => {
+      view({ created_at: null, ready_at: "not a date", last_commit_at: ago(-2 * HOUR) });
+      expect(screen.queryByText(/opened/)).toBeNull();
+      expect(screen.queryByText(/ready for review/)).toBeNull();
+      expect(screen.queryByText(/last commit/)).toBeNull();
+      expect(screen.queryByText(/just now/)).toBeNull();
+    });
+
+    it("omits the dates entirely on a payload without them", () => {
+      view();
+      expect(document.querySelector("[data-pr-date]")).toBeNull();
+    });
   });
 
   it("surfaces unresolved conversations", () => {

@@ -494,8 +494,24 @@ query($owner: String!, $repo: String!, $number: Int!) {
       headRefName headRefOid baseRefName
         headRef { id }
       createdAt updatedAt
+      # When it became ready for review (#1457): the list query's own
+      # selection, read by the same `map.rs` `ready_at`, so the header
+      # and the row it was opened from date the pull request alike.
+      timelineItems(itemTypes: [READY_FOR_REVIEW_EVENT], last: 1) {
+        nodes { ... on ReadyForReviewEvent { createdAt } }
+      }
       author { login }
-      comments(first: 50) {
+      # The NEWEST 50, not the oldest (#1453). `first:` pages from the
+      # start of a connection, so a pull request with 80 comments showed
+      # its 50 oldest and dropped every newer one -- and the view renders
+      # oldest to newest, so the last row read as the latest while the
+      # latest was the one missing. `last:` still returns its page in
+      # chronological order, so the rendering is unchanged; only WHICH
+      # 50 arrive is. MEASURED 2026-09-25 on a pull request with 2,500
+      # comments: `last: 50` returned the newest 50 oldest-first, at cost
+      # 1; and this whole document, before and after this change, cost 1
+      # in three runs each.
+      comments(last: 50) {
         totalCount
         nodes { author { login } createdAt body }
       }
@@ -531,6 +547,15 @@ query($owner: String!, $repo: String!, $number: Int!) {
       # actual defect -- a reviewer deciding from a complete-looking view
       # of 20 of 25 threads decides on partial information without being
       # told it is partial.
+      #
+      # `first:` rather than the `last:` the comments above moved to
+      # (#1453), deliberately. The list query counts its badge from the
+      # FIRST 100 threads, and the header's unresolved count
+      # comes from the threads that arrived here: paging from opposite
+      # ends would let a row and the view it opens disagree about the
+      # same pull request above 100 threads. The view does not read the
+      # threads as a timeline either -- `ReviewThreads.tsx` sorts open
+      # ones first -- so "the last row is not the latest" does not arise.
       reviewThreads(first: 100) {
         totalCount
         nodes {
@@ -555,6 +580,14 @@ query($owner: String!, $repo: String!, $number: Int!) {
           # twenty-first THREAD could be an unanswered blocking question
           # the view never admitted existed. Different severity, and only
           # the second one was silent.
+          #
+          # And `first:`, not the `last:` the conversation comments above
+          # moved to (#1453). A thread's FIRST comment is its subject --
+          # the review remark the replies answer -- so `last: 10` would
+          # show a long thread as replies to a question it no longer
+          # carries. The cost of keeping the opener is that the newest
+          # replies are the ones cut, and `ReviewThreads.tsx` says exactly
+          # that rather than the bare "see the rest".
           comments(first: 10) {
             totalCount
             nodes { author { login } createdAt body }
@@ -590,8 +623,12 @@ query($owner: String!, $repo: String!, $number: Int!) {
       # covers any realistic pull request and the viewer's entry is
       # found by matching login.
       latestReviews(first: 20) { nodes { state author { login } } }
+      # `committedDate` is the head commit's own date for the header's
+      # "last commit" (#1457). The COMMITTER's clock, not the push: a
+      # rebase or a late push leaves it earlier than the push, which is
+      # why the view never calls it one.
       commits(last: 1) {
-        nodes { commit { statusCheckRollup {
+        nodes { commit { committedDate statusCheckRollup {
           state
           # 100 is the connection maximum. The page is NOT the cost --
           # measured on the list query, `first: 1` and `first: 20` cost
@@ -973,6 +1010,103 @@ mod tests {
         assert!(
             before_nodes.contains("totalCount"),
             "the thread connection must select totalCount, or truncation is silent again"
+        );
+    }
+
+    /// #1453: the conversation comments are the NEWEST page, and each
+    /// review thread's comments are its FIRST page.
+    ///
+    /// Opposite directions on purpose. `first: 50` on the conversation
+    /// kept the 50 oldest of a long discussion, so the last row the view
+    /// rendered read as the latest while every newer comment was missing.
+    /// A thread is the other way round: its first comment is the remark
+    /// the replies answer, and `last:` would cut exactly that. No mapper
+    /// test can see either -- they feed `json!` literals in whatever order
+    /// they like -- so only the document can pin it.
+    ///
+    /// Comment lines are stripped first: the query documents both choices
+    /// in prose right above the fields, and a guard matching its own
+    /// pattern inside a comment is #874's mistake.
+    #[test]
+    fn the_detail_query_asks_for_the_newest_comments_and_each_threads_opener() {
+        let code: String = PR_DETAIL_QUERY
+            .replace("\r\n", "\n")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (before_threads, threads) = code
+            .split_once("reviewThreads(")
+            .expect("the detail query asks for review threads");
+
+        let conversation = before_threads
+            .split_once("comments(")
+            .expect("the conversation comments sit before the threads")
+            .1
+            .split_once(')')
+            .expect("the connection closes")
+            .0;
+        assert_eq!(
+            conversation.trim(),
+            "last: 50",
+            "the conversation must fetch its NEWEST comments; `comments({conversation})` \
+             drops the latest ones on a long pull request while the view reads as current"
+        );
+
+        let per_thread = threads
+            .split_once("comments(")
+            .expect("each thread asks for its comments")
+            .1
+            .split_once(')')
+            .expect("the connection closes")
+            .0;
+        assert!(
+            per_thread.contains("first:"),
+            "a thread's page must start at its opener; `comments({per_thread})` would \
+             show replies to a remark it no longer carries"
+        );
+    }
+
+    /// #1457: the detail query asks for everything the header's dates are
+    /// read from -- `ready_at`'s fields, the same filtered `last: 1`
+    /// timeline page the list query pins, and the head commit's
+    /// `committedDate`.
+    ///
+    /// The mapper tests supply these themselves, so a document that stopped
+    /// asking would leave them green while the header silently lost its
+    /// dates (the #847 hole).
+    #[test]
+    fn the_detail_query_asks_for_the_dates_its_header_shows() {
+        let code: String = PR_DETAIL_QUERY
+            .replace("\r\n", "\n")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for f in fields_read_by(&["ready_at"]) {
+            assert!(
+                code.contains(&f),
+                "`ready_at` reads `{f}` and PR_DETAIL_QUERY does not select it"
+            );
+        }
+        assert!(
+            code.contains("timelineItems(itemTypes: [READY_FOR_REVIEW_EVENT], last: 1)"),
+            "the ready time is the LAST ready-for-review event, and only that event type"
+        );
+        assert!(
+            code.contains("... on ReadyForReviewEvent { createdAt }"),
+            "the event's own `createdAt` must be selected on the event fragment"
+        );
+        let head = code
+            .split_once("commits(last: 1)")
+            .expect("the head commit")
+            .1;
+        assert!(
+            head.split_once("statusCheckRollup")
+                .expect("the rollup")
+                .0
+                .contains("committedDate"),
+            "the head commit must select its own `committedDate` for \"last commit\""
         );
     }
 

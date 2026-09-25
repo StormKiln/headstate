@@ -21,6 +21,7 @@ import { Markdown } from "./Markdown";
 import { copyText } from "../lib/clipboard";
 import { CommentRow } from "./CommentRow";
 import { ReviewThreads } from "./ReviewThreads";
+import { PrDates } from "./PrDates";
 import { Section } from "./Section";
 import { PrActions } from "./PrActions";
 import { ReviewBox } from "./ReviewBox";
@@ -443,6 +444,9 @@ export function PrDetailView({
               <span>draft</span>
             </>
           ) : null}
+          {/* Opened, ready for review, last commit (#1457); each omitted
+              when it cannot be read. */}
+          <PrDates pr={pr} />
           {/* The ONE metadata fact the list row does not carry: the list
               query does not select additions, deletions or changedFiles
               (see `PRS_QUERY`). So while this is the seeded placeholder
@@ -619,6 +623,16 @@ export function PrDetailView({
         // hides nothing worth a click.
         <Section title="Comments" count={pr.comment_count}>
           <div className="flex flex-col gap-2">
+          {/* At the TOP, and naming which ones are missing (#1453). The
+              query fetches the newest comments, so what is cut is the
+              oldest, and the reader should know that before scrolling
+              rather than after. */}
+          {pr.comment_count > pr.comments.length ? (
+            <p className="text-xs text-[#8b949e]">
+              Showing the newest {pr.comments.length} of {pr.comment_count} — older ones are on
+              GitHub.
+            </p>
+          ) : null}
           {/* Each comment collapses on its OWN, rather than the whole
               block collapsing together. One section for fifty comments
               meant finding a particular one required expanding all of
@@ -636,12 +650,6 @@ export function PrDetailView({
               defaultOpen={pr.comments.length === 1}
             />
           ))}
-          {/* GitHub is where you reply; this view is for deciding. */}
-          {pr.comment_count > pr.comments.length ? (
-            <p className="text-xs text-[#8b949e]">
-              Showing {pr.comments.length} of {pr.comment_count}. See the rest on GitHub.
-            </p>
-          ) : null}
           </div>
         </Section>
       ) : null}

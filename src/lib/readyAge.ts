@@ -13,6 +13,19 @@ const SKEW = 5 * MINUTE;
 /// no time to measure from (#1407).
 export type ReadyTone = "fresh" | "aging" | "stale" | "unknown";
 
+/// The palette the app already uses for success, warning and failure,
+/// plus its muted grey for "we do not know". Literal class strings so
+/// Tailwind's scanner sees every one.
+///
+/// Shared by the review queue's chip and the detail header (#1457), so a
+/// pull request cannot read green in one and amber in the other.
+export const READY_TONE_CLASS: Record<ReadyTone, string> = {
+  fresh: "border-[#3fb950]/40 text-[#3fb950]",
+  aging: "border-[#d29922]/40 text-[#d29922]",
+  stale: "border-[#f85149]/40 text-[#f85149]",
+  unknown: "border-[#8b949e]/40 text-[#8b949e]",
+};
+
 export interface ReadyAge {
   /// Compact age for the row: "45m", "5h", "1d 4h", "3d", or "age unknown".
   text: string;

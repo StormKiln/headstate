@@ -414,6 +414,23 @@ pub struct PrDetail {
     pub url: String,
     pub state: String,
     pub is_draft: bool,
+    /// When the pull request was opened (#1457). `None` when GitHub's
+    /// value is missing or does not parse -- the header then omits the
+    /// age rather than printing one measured from nothing.
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
+    /// When it became ready for review (#1457): the same derivation, from
+    /// the same selection, as `PullRequest::ready_at` -- see that field for
+    /// what `None` means. `None` also when `created_at` is, since a pull
+    /// request never drafted became ready when it was opened.
+    #[serde(default)]
+    pub ready_at: Option<DateTime<Utc>>,
+    /// The head commit's `committedDate` (#1457). The committer's clock,
+    /// NOT the push time: a rebase or a late push leaves it earlier than
+    /// the push, which is why the view says "last commit". `None` when
+    /// there is no head commit or its date is missing.
+    #[serde(default)]
+    pub last_commit_at: Option<DateTime<Utc>>,
     pub body: String,
     pub author: String,
     pub repo: String,

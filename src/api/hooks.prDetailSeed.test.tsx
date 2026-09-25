@@ -130,6 +130,29 @@ describe("usePrDetail seeding", () => {
     // unknown. The view suppresses the line at zero rather than printing
     // "+0 −0 across 0 files".
     expect(result.current.data?.changed_files).toBe(0);
+    // Nor a commit time (#1457): absent, which the header omits.
+    expect(result.current.data?.last_commit_at).toBeNull();
+  });
+
+  /// #1457: the row's own dates reach the header from the first frame.
+  /// Ready is the row's value as-is -- including UNKNOWN, which must stay
+  /// unknown rather than fall back to the opening time.
+  it("carries the row's opening and ready times", async () => {
+    invoke.mockImplementation(() => hanging());
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    qc.setQueryData<PullRequest[]>(["prs"], [
+      ROW,
+      { ...ROW, number: 8, ready_at: "2026-09-03T00:00:00Z" },
+    ]);
+
+    const seven = renderHook(() => usePrDetail("o/r", 7), { wrapper: wrap(qc) });
+    await waitFor(() => expect(seven.result.current.data).toBeDefined());
+    expect(seven.result.current.data?.created_at).toBe("2026-09-01T00:00:00Z");
+    expect(seven.result.current.data?.ready_at).toBeNull();
+
+    const eight = renderHook(() => usePrDetail("o/r", 8), { wrapper: wrap(qc) });
+    await waitFor(() => expect(eight.result.current.data).toBeDefined());
+    expect(eight.result.current.data?.ready_at).toBe("2026-09-03T00:00:00Z");
   });
 
   /// To review is the other way into this view, and it is a different
