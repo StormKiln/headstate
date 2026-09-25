@@ -193,7 +193,7 @@ export function PrDetailView({
   const { data: gates } = useReviewGates(pr, isPlaceholderData);
   const gate = pr
     ? gateVerdict(gates, pr, viewer, isPlaceholderData)
-    : { approveBlocked: null, approveCaveat: null, mergeBlocked: null };
+    : { approveWontCount: null, approveCaveat: null, mergeBlocked: null };
   const [reviewing, setReviewing] = useState<ReviewVerdictName | null>(null);
   const rerun = useRerunChecks();
   const [rerunning, setRerunning] = useState(false);
@@ -250,7 +250,13 @@ export function PrDetailView({
     submit.then(
       () => {
         done();
-        toast.success(`${label} ${pr.repo}#${pr.number}`);
+        // The after-approve state: an approval that will not count toward
+        // merging still reads "Approved", so the toast says what it means
+        // (#1451).
+        toast.success(`${label} ${pr.repo}#${pr.number}`, {
+          description:
+            verdict === "approve" && gate.approveWontCount ? gate.approveWontCount : undefined,
+        });
       },
       (e: unknown) => {
         done();
@@ -326,15 +332,15 @@ export function PrDetailView({
       {viewer !== undefined && viewer !== pr.author ? (
         <button
           type="button"
-          disabled={approvedByViewer || reviewing !== null || gate.approveBlocked !== null}
+          disabled={approvedByViewer || reviewing !== null}
           onClick={() => submitReview("approve", "")}
           title={
             approvedByViewer
               ? "You have already approved this pull request"
-              : (gate.approveBlocked ?? "Approve without a comment")
+              : (gate.approveWontCount ?? "Approve without a comment")
           }
           className={`rounded px-2.5 py-1 text-sm font-medium ${
-            approvedByViewer || reviewing !== null || gate.approveBlocked !== null
+            approvedByViewer || reviewing !== null
               ? "border border-[#30363d] text-[#8b949e] opacity-50"
               : "bg-[#238636] text-white hover:bg-[#1a7f37]"
           }`}
@@ -345,6 +351,14 @@ export function PrDetailView({
               ? "Approved"
               : "Approve"}
         </button>
+      ) : null}
+      {/* The header has no room for the sentence, so it carries the short
+          form beside the button, with the full one in its title and in
+          the body's review box (#1451). */}
+      {viewer !== undefined && viewer !== pr.author && gate.approveWontCount ? (
+        <span className="text-xs font-medium text-[#d29922]" title={gate.approveWontCount}>
+          Won't count toward merging
+        </span>
       ) : null}
       <PrActions pr={pr} compact conversations={gate.mergeBlocked} />
     </>
@@ -498,7 +512,7 @@ export function PrDetailView({
         viewer={viewer}
         author={pr.author}
         latestReviews={pr.latest_reviews}
-        approveBlocked={gate.approveBlocked}
+        approveWontCount={gate.approveWontCount}
         approveCaveat={gate.approveCaveat}
         busy={reviewing}
         onSubmit={submitReview}

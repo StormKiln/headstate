@@ -6,8 +6,11 @@ import type { PrDetail, ReviewGates } from "../types/pr";
 /// "we could not ask" is not "no rule", so an unreadable lookup changes
 /// nothing on screen.
 export interface GateVerdict {
-  /// The viewer's approval cannot count. Disables Approve with this reason.
-  approveBlocked: string | null;
+  /// The viewer's approval will not count toward merging. A WARNING, not a
+  /// block: GitHub accepts the approval and records it, it just does not
+  /// satisfy the rule -- and a reviewer may still want it on record. So
+  /// Approve stays enabled and this is shown beside it and after it.
+  approveWontCount: string | null;
   /// The rule is on but who pushed last is unknown: qualify, do not assert.
   approveCaveat: string | null;
   /// Merge or enqueue is waiting on conversations. Replaces the generic
@@ -15,10 +18,10 @@ export interface GateVerdict {
   mergeBlocked: string | null;
 }
 
-const NOTHING: GateVerdict = { approveBlocked: null, approveCaveat: null, mergeBlocked: null };
+const NOTHING: GateVerdict = { approveWontCount: null, approveCaveat: null, mergeBlocked: null };
 
-export const LAST_PUSH_BLOCKED =
-  "You pushed the latest commit, so your approval won't count here.";
+export const LAST_PUSH_WONT_COUNT =
+  "You pushed the latest commit, so your approval won't count toward merging here.";
 
 export const LAST_PUSH_UNKNOWN =
   "This branch needs the latest push approved by someone other than its pusher, and who pushed it could not be confirmed — your approval may not count.";
@@ -57,7 +60,7 @@ export function gateVerdict(
   if (rules.require_last_push_approval && !own) {
     const p = gates.last_pusher;
     if (p.state === "known") {
-      if (viewer !== undefined && p.login === viewer) out.approveBlocked = LAST_PUSH_BLOCKED;
+      if (viewer !== undefined && p.login === viewer) out.approveWontCount = LAST_PUSH_WONT_COUNT;
     } else if (p.state === "unknown" || p.state === "declined") {
       out.approveCaveat = LAST_PUSH_UNKNOWN;
     }

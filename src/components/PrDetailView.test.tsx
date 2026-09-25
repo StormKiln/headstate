@@ -37,6 +37,12 @@ const commentOnPr = vi.fn(() => Promise.resolve());
 
 const viewer = vi.hoisted(() => ({ current: undefined as string | undefined }));
 
+// Spied, not replaced in behaviour: no test here renders a Toaster, so
+// the real `toast` draws nothing either way. The spy lets the review-gate
+// test assert what the after-approve toast SAYS (#1451).
+const toastSuccess = vi.hoisted(() => vi.fn());
+vi.mock("sonner", () => ({ toast: { success: toastSuccess, error: vi.fn() } }));
+
 vi.mock("../api/hooks", () => ({
   // No linked session by default: the panel renders nothing, which is
   // what every other assertion in this file assumes (#1211).
@@ -1035,16 +1041,38 @@ describe("PrDetailView", () => {
       viewer.current = undefined;
     });
 
-    it("disables both Approve buttons when the viewer pushed last", () => {
+    /// A warning, not a block: GitHub records the approval, it just does
+    /// not count toward merging, and the reviewer may still want it.
+    it("warns beside both Approve buttons, which stay enabled, when the viewer pushed last", () => {
       viewer.current = "reviewer";
       state.gates = { rules: read(true, false), last_pusher: { state: "known", login: "reviewer" } };
       view({ author: "someone-else" });
       expect(
-        screen.getByText("You pushed the latest commit, so your approval won't count here."),
+        screen.getByText(
+          "You pushed the latest commit, so your approval won't count toward merging here.",
+        ),
       ).toBeTruthy();
+      const bar = document.querySelector(".sticky") as HTMLElement;
+      expect(within(bar).getByText("Won't count toward merging")).toBeTruthy();
       const approves = screen.getAllByRole("button", { name: "Approve" });
       expect(approves.length).toBe(2);
-      for (const b of approves) expect((b as HTMLButtonElement).disabled).toBe(true);
+      for (const b of approves) expect((b as HTMLButtonElement).disabled).toBe(false);
+    });
+
+    /// The after-approve state: the toast carries the warning too.
+    it("repeats the warning in the toast after approving", async () => {
+      viewer.current = "reviewer";
+      state.gates = { rules: read(true, false), last_pusher: { state: "known", login: "reviewer" } };
+      view({ author: "someone-else" });
+      const bar = document.querySelector(".sticky") as HTMLElement;
+      fireEvent.click(within(bar).getByRole("button", { name: "Approve" }));
+      await waitFor(() => expect(reviewPr).toHaveBeenCalled());
+      await waitFor(() =>
+        expect(toastSuccess).toHaveBeenCalledWith(expect.stringContaining("Approved"), {
+          description:
+            "You pushed the latest commit, so your approval won't count toward merging here.",
+        }),
+      );
     });
 
     it("leaves Approve alone when someone else pushed last", () => {

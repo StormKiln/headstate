@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { PrDetail, ReviewGates, ReviewThread } from "../types/pr";
-import { LAST_PUSH_BLOCKED, LAST_PUSH_UNKNOWN, gateVerdict } from "./reviewGates";
+import { LAST_PUSH_WONT_COUNT, LAST_PUSH_UNKNOWN, gateVerdict } from "./reviewGates";
 
 const pr = (over: Partial<PrDetail> = {}): PrDetail =>
   ({
@@ -31,50 +31,50 @@ const read = (lastPush: boolean, resolution: boolean): ReviewGates["rules"] => (
 });
 
 describe("gateVerdict: last-push approval (#1451)", () => {
-  it("blocks the viewer's approval when the viewer pushed last", () => {
+  it("warns that the viewer's approval won't count when the viewer pushed last", () => {
     const g: ReviewGates = { rules: read(true, false), last_pusher: { state: "known", login: "me" } };
-    expect(gateVerdict(g, pr(), "me", false).approveBlocked).toBe(LAST_PUSH_BLOCKED);
+    expect(gateVerdict(g, pr(), "me", false).approveWontCount).toBe(LAST_PUSH_WONT_COUNT);
   });
 
   it("says nothing when someone else pushed last", () => {
     const g: ReviewGates = { rules: read(true, false), last_pusher: { state: "known", login: "them" } };
     const v = gateVerdict(g, pr(), "me", false);
-    expect(v.approveBlocked).toBeNull();
+    expect(v.approveWontCount).toBeNull();
     expect(v.approveCaveat).toBeNull();
   });
 
   it("says nothing when no readable rule requires it", () => {
     const g: ReviewGates = { rules: read(false, false), last_pusher: { state: "not_needed" } };
     expect(gateVerdict(g, pr(), "me", false)).toEqual({
-      approveBlocked: null,
+      approveWontCount: null,
       approveCaveat: null,
       mergeBlocked: null,
     });
   });
 
   /// Qualify, do not assert: the pusher could not be confirmed.
-  it("qualifies rather than blocks when the pusher is unknown or was not asked", () => {
+  it("qualifies rather than warns when the pusher is unknown or was not asked", () => {
     for (const last_pusher of [
       { state: "unknown", reason: "x" },
       { state: "declined", reason: "x" },
     ] as const) {
       const v = gateVerdict({ rules: read(true, false), last_pusher }, pr(), "me", false);
-      expect(v.approveBlocked).toBeNull();
+      expect(v.approveWontCount).toBeNull();
       expect(v.approveCaveat).toBe(LAST_PUSH_UNKNOWN);
     }
   });
 
   /// An unknown viewer is "we could not ask", never "it is you".
-  it("never blocks on an unknown viewer", () => {
+  it("never warns on an unknown viewer", () => {
     const g: ReviewGates = { rules: read(true, false), last_pusher: { state: "known", login: "me" } };
-    expect(gateVerdict(g, pr(), undefined, false).approveBlocked).toBeNull();
+    expect(gateVerdict(g, pr(), undefined, false).approveWontCount).toBeNull();
   });
 
   /// GitHub refuses self-approval anyway, and ReviewBox already says so.
   it("adds nothing on the viewer's own pull request", () => {
     const g: ReviewGates = { rules: read(true, false), last_pusher: { state: "known", login: "me" } };
     const v = gateVerdict(g, pr({ author: "me" }), "me", false);
-    expect(v.approveBlocked).toBeNull();
+    expect(v.approveWontCount).toBeNull();
     expect(v.approveCaveat).toBeNull();
   });
 });
@@ -88,7 +88,7 @@ describe("gateVerdict: rules not read render nothing new", () => {
     const g: ReviewGates = { rules, last_pusher: { state: "not_needed" } };
     const busy = pr({ review_threads: [thread(false, false)], review_threads_total: 1 });
     expect(gateVerdict(g, busy, "me", false)).toEqual({
-      approveBlocked: null,
+      approveWontCount: null,
       approveCaveat: null,
       mergeBlocked: null,
     });
