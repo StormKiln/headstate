@@ -3279,6 +3279,15 @@ mod tests {
     /// Derived from the walk functions the command layer calls, not from
     /// a list of command names, per #844's lesson that a hand-written
     /// list cannot cover the item nobody remembered to add.
+    ///
+    /// And the permit must be held BY THE WALK, not by the command's
+    /// future (#1467). A permit taken in the async fn above a
+    /// `spawn_blocking` is released when the caller gives up, while the
+    /// walk -- which nothing can cancel -- runs on, and the next caller
+    /// starts a second one beside it. So the walk must sit inside
+    /// `scan_blocking`'s closure, which moves an owned permit onto the
+    /// blocking pool with it: the nearest of `scan_blocking(` and
+    /// `spawn_blocking(` above the walk has to be the former.
     #[test]
     fn every_filesystem_scan_takes_a_permit() {
         let src = std::fs::read_to_string(
@@ -3326,20 +3335,31 @@ mod tests {
                     continue;
                 };
                 checked += 1;
-                let region = &prod[cmd..hit];
+                // Code only: the rule's own prose, in comments above the
+                // call, names both functions.
+                let region = prod[cmd..hit]
+                    .replace("\r\n", "\n")
+                    .lines()
+                    .filter(|l| !is_comment(l))
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 let name = region
                     .split("pub async fn ")
                     .nth(1)
                     .or_else(|| region.split("pub fn ").nth(1))
                     .and_then(|r| r.split('(').next())
                     .unwrap_or("<unnamed>");
+                let gated = region.rfind("scan_blocking(");
+                let bare = region.rfind("spawn_blocking(");
                 assert!(
-                    region.contains("scan_permit().await?"),
-                    "commands.rs: `{name}` starts a filesystem walk ({walk}) without \
-                     taking a scan permit. The frontend fires one of these per \
-                     repository and each spawns up to eight OS threads, so an ungated \
-                     one puts ~300 walkers on one disk -- measured at 17.6 seconds for \
-                     groups of two (#1149). Add `let _permit = scan_permit().await?;`."
+                    gated.is_some_and(|g| bare.is_none_or(|b| g > b)),
+                    "commands.rs: `{name}` starts a filesystem walk ({walk}) outside \
+                     `scan_blocking`. The frontend fires one of these per repository and \
+                     each spawns up to eight OS threads, so an ungated one puts ~300 \
+                     walkers on one disk -- measured at 17.6 seconds for groups of two \
+                     (#1149). And a permit held by the command rather than the walk is \
+                     released when the caller gives up while the walk runs on (#1467). \
+                     Run the walk as `scan_blocking(move || ...).await`."
                 );
             }
         }

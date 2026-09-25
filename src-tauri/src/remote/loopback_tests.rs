@@ -525,22 +525,33 @@ async fn pair_refuses_a_bad_body_and_a_denied_request() {
     desktop.handle.stop().await;
 }
 
-/// A stand-in for `size_worktrees` (#1459): takes a permit from its own
-/// pool, as `commands::size_worktrees` takes `scan_permit()`, publishes
-/// one `worktree-size` frame per worktree on the hub, holds the permit
-/// for `hold`, and replies with every pair -- the command's two outputs,
-/// the stream and the settled result.
+/// A stand-in for `size_worktrees` (#1459): runs its "walk" through the
+/// REAL `commands::blocking_under` -- the helper `scan_blocking` wraps --
+/// against a pool of its own, so the permit is held by the walk on the
+/// blocking pool exactly as production holds it (#1467). It then
+/// publishes one `worktree-size` frame per worktree on the hub and
+/// replies with every pair -- the command's two outputs, the stream and
+/// the settled result.
+///
+/// The walk blocks until `release` is called or `hold` passes, standing
+/// in for a disk walk nothing can cancel.
 ///
 /// The frames go out in one synchronous burst, with no `.await` between
 /// them. On the single-threaded test runtime that means no subscriber
 /// can drain between two sends, which is what makes "more frames than
-/// the hub buffers" a deterministic condition rather than a race.
+/// the hub buffers" a deterministic condition rather than a race. That
+/// is why they are published after the walk rather than from inside it:
+/// on the blocking pool a subscriber could drain between two sends.
 struct SlowSizer {
     hub: Arc<Hub>,
     permits: Arc<tokio::sync::Semaphore>,
     worktrees: usize,
     hold: Duration,
-    started: AtomicUsize,
+    gate: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    /// Walks that have started, i.e. taken a permit.
+    started: Arc<AtomicUsize>,
+    /// Walks that have ended, whether or not anyone still awaited them.
+    walked: Arc<AtomicUsize>,
     finished: AtomicUsize,
     abandoned: AtomicUsize,
 }
@@ -552,10 +563,19 @@ impl SlowSizer {
             permits: Arc::new(tokio::sync::Semaphore::new(1)),
             worktrees,
             hold,
-            started: AtomicUsize::new(0),
+            gate: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
+            started: Arc::new(AtomicUsize::new(0)),
+            walked: Arc::new(AtomicUsize::new(0)),
             finished: AtomicUsize::new(0),
             abandoned: AtomicUsize::new(0),
         }
+    }
+
+    /// Let every walk, running or yet to start, finish at once.
+    fn release(&self) {
+        let (lock, cv) = &*self.gate;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
     }
 }
 
@@ -587,15 +607,23 @@ impl CommandHost for SlowSizer {
                 count: &self.abandoned,
                 done: false,
             };
-            let _permit = self.permits.acquire().await.expect("the pool is open");
-            self.started.fetch_add(1, Ordering::SeqCst);
+            let (gate, hold) = (self.gate.clone(), self.hold);
+            let (started, walked) = (self.started.clone(), self.walked.clone());
+            crate::commands::blocking_under(self.permits.clone(), move || {
+                started.fetch_add(1, Ordering::SeqCst);
+                let (lock, cv) = &*gate;
+                let released = lock.lock().unwrap();
+                let _ = cv.wait_timeout_while(released, hold, |r| !*r).unwrap();
+                walked.fetch_add(1, Ordering::SeqCst);
+            })
+            .await
+            .expect("the walk ran");
             let mut pairs = Vec::new();
             for i in 0..self.worktrees {
                 let pair = json!([format!("/src/repo/.worktrees/wt-{i}"), 1000 + i]);
                 self.hub.publish("worktree-size", pair.to_string());
                 pairs.push(pair);
             }
-            tokio::time::sleep(self.hold).await;
             self.finished.fetch_add(1, Ordering::SeqCst);
             guard.done = true;
             Ok(Value::Array(pairs))
@@ -664,22 +692,23 @@ async fn a_size_burst_the_stream_drops_still_arrives_in_the_reply() {
     desktop.handle.stop().await;
 }
 
-/// #1459, candidate 1: a call the phone gives up on releases its permit
-/// on the desktop, so the next call is not queued behind a walk no one
-/// is waiting for.
+/// #1467: a call the phone gives up on keeps its permit on the desktop
+/// until its walk actually ends, and the next call waits for it.
 ///
-/// The phone's `CALL_TIMEOUT` closes the connection. The listener drops
-/// the dispatch future with it, and the permit the future holds goes
-/// with it -- which rules out the amplifier where every timed-out phone
-/// call kept a scan permit and pushed the NEXT call past its own
-/// deadline too.
+/// The phone's `CALL_TIMEOUT` closes the connection, and the listener
+/// drops the dispatch future with it. The walk runs on `spawn_blocking`,
+/// which a dropped future cannot stop -- so a permit held by the FUTURE
+/// was released at once while the walk carried on, and the next call
+/// started a second walk beside it. That is what this test asserted
+/// when #1464 wrote it: the permit released, the next call started at
+/// once. It exceeded the #1149 cap exactly when the disk was slow enough
+/// for the phone to give up.
 ///
-/// QUALIFICATION, for whoever reads this next: in production the walk
-/// itself runs on `spawn_blocking`, which a dropped future cannot stop.
-/// The permit is released; the disk work is not, and finishes on its
-/// own. That is a cost in contention, not a queue that never drains.
+/// Now the permit rides with the walk (`commands::scan_blocking`). The
+/// queue still drains -- the walk finishes on its own and hands the
+/// permit on -- it just no longer pretends the disk is free before then.
 #[tokio::test]
-async fn a_call_the_phone_abandons_releases_its_permit() {
+async fn a_call_the_phone_abandons_keeps_its_permit_until_the_walk_ends() {
     let (desktop, phone) = sizing_desktop(1, Duration::from_secs(30)).await;
 
     let mut tls = connect(desktop.addr, Some(&phone.cert), &desktop.fp)
@@ -704,16 +733,21 @@ async fn a_call_the_phone_abandons_releases_its_permit() {
     drop(tls);
 
     tokio::time::timeout(Duration::from_secs(5), async {
-        while desktop.host.permits.available_permits() == 0 {
+        while desktop.host.abandoned.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("the abandoned call's permit was never released");
-    assert_eq!(desktop.host.abandoned.load(Ordering::SeqCst), 1);
-    assert_eq!(desktop.host.finished.load(Ordering::SeqCst), 0);
+    .expect("the listener dropped the abandoned call");
+    // The caller is gone; the walk is not, and neither is its permit.
+    assert_eq!(desktop.host.walked.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        desktop.host.permits.available_permits(),
+        0,
+        "an abandoned walk that is still running must still hold its permit"
+    );
 
-    // And the next call starts at once rather than after the 30s hold.
+    // The next call waits rather than starting a second walk beside it.
     let mut next = connect(desktop.addr, Some(&phone.cert), &desktop.fp)
         .await
         .unwrap();
@@ -722,13 +756,34 @@ async fn a_call_the_phone_abandons_releases_its_permit() {
     )
     .await
     .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        desktop.host.started.load(Ordering::SeqCst),
+        1,
+        "the next call started a walk while the abandoned one still ran"
+    );
+
+    // The abandoned walk ends; its permit passes to the waiting call.
+    desktop.host.release();
     tokio::time::timeout(Duration::from_secs(5), async {
         while desktop.host.started.load(Ordering::SeqCst) < 2 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("the next call waited on a permit no one was using");
+    .expect("the next call never got the permit the finished walk released");
+    // Both walks end; only the second call finishes, because the first
+    // has no one left to finish for.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while desktop.host.finished.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the waiting call finished");
+    assert_eq!(desktop.host.walked.load(Ordering::SeqCst), 2);
+    assert_eq!(desktop.host.finished.load(Ordering::SeqCst), 1);
+    assert_eq!(desktop.host.permits.available_permits(), 1);
     drop(next);
 
     desktop.handle.stop().await;
