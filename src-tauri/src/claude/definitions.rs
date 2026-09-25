@@ -173,26 +173,153 @@ pub struct Definitions {
 /// definition with an exotic frontmatter key is still a definition, and
 /// refusing to list it would hide something that exists.
 ///
+/// A value is read one of three ways, and [`block_scalar`] says what
+/// YAML it still does not read:
+/// - a block scalar (`>` or `|`, with chomping or indentation
+///   indicators) is the more-indented lines under the key (#1419);
+/// - a value in one pair of quotes has them stripped;
+/// - anything else is the rest of the line as written.
+///
 /// Returns `(name, description)`, either of which may be absent.
 fn frontmatter(text: &str) -> (Option<String>, Option<String>) {
-    let mut lines = text.lines();
+    let lines: Vec<&str> = text.lines().map(|l| l.trim_end_matches('\r')).collect();
     // Frontmatter opens with `---` on the first line, or there is none.
-    if lines.next().map(str::trim) != Some("---") {
+    if lines.first().map(|l| l.trim()) != Some("---") {
         return (None, None);
     }
     let (mut name, mut description) = (None, None);
-    for line in lines {
+    let mut i = 1;
+    while i < lines.len() {
+        let line = lines[i];
+        i += 1;
         let t = line.trim();
         if t == "---" {
             break;
         }
-        if let Some(v) = t.strip_prefix("name:") {
-            name = Some(v.trim().trim_matches('"').trim_matches('\'').to_string());
+        let (slot, raw) = if let Some(v) = t.strip_prefix("name:") {
+            (&mut name, v)
         } else if let Some(v) = t.strip_prefix("description:") {
-            description = Some(v.trim().trim_matches('"').trim_matches('\'').to_string());
-        }
+            (&mut description, v)
+        } else {
+            continue;
+        };
+        let indent = line.len() - line.trim_start().len();
+        *slot = Some(match block_scalar(raw, indent, &lines[i..]) {
+            Some((value, used)) => {
+                i += used;
+                value
+            }
+            None => raw.trim().trim_matches('"').trim_matches('\'').to_string(),
+        });
     }
     (name, description)
+}
+
+/// Read a YAML block scalar, when `raw` -- the text after `key:` -- is a
+/// block-scalar header (#1419). The one reader for this: `frontmatter`
+/// above and `claudemd::advice::skills` both call it.
+///
+/// The header is `>` (folded) or `|` (literal), optionally followed by a
+/// chomping indicator (`-` strip, `+` keep, none clip) and an
+/// indentation digit in either order, then an optional `# comment`. The
+/// value is the lines of `following` up to the first non-blank line
+/// indented no more than the key (`key_indent`), blank lines included.
+/// Their indentation is the first non-blank line's, or `key_indent`
+/// plus the digit. Literal keeps the line breaks; folded joins adjacent
+/// lines with a space and reads a blank line as a line break.
+///
+/// Returns the value and how many lines of `following` it used, or
+/// `None` when `raw` is not a block-scalar header, in which case the
+/// caller reads `raw` as it always has.
+///
+/// Still a small reader, not a YAML parser. NOT read:
+/// - a plain scalar continued on more-indented lines (`description: a`
+///   then `  b`): only its first line is the value;
+/// - a quoted scalar that spans lines: only its first line;
+/// - folded "more-indented" lines, which YAML leaves unfolded: they are
+///   folded like the rest, their extra indentation kept;
+/// - tabs as indentation, escapes inside double quotes, anchors, tags
+///   and flow collections, which stay as written.
+pub(crate) fn block_scalar(
+    raw: &str,
+    key_indent: usize,
+    following: &[&str],
+) -> Option<(String, usize)> {
+    let header = raw.trim();
+    let header = header
+        .split_once(" #")
+        .map_or(header, |(h, _)| h)
+        .trim_end();
+    let mut chars = header.chars();
+    let folded = match chars.next()? {
+        '>' => true,
+        '|' => false,
+        _ => return None,
+    };
+    let (mut chomp, mut digit) = (None, None);
+    for c in chars {
+        match c {
+            '-' | '+' if chomp.is_none() => chomp = Some(c),
+            '1'..='9' if digit.is_none() => digit = c.to_digit(10),
+            _ => return None,
+        }
+    }
+
+    let indent_of = |l: &str| l.len() - l.trim_start_matches(' ').len();
+    let blank = |l: &str| l.trim().is_empty();
+    let used = following
+        .iter()
+        .position(|l| !blank(l) && indent_of(l) <= key_indent)
+        .unwrap_or(following.len());
+    let block = &following[..used];
+    let content_indent = match digit {
+        Some(d) => key_indent + d as usize,
+        None => block
+            .iter()
+            .find(|l| !blank(l))
+            .map_or(key_indent + 1, |l| indent_of(l)),
+    };
+    let body: Vec<&str> = block
+        .iter()
+        .map(|l| {
+            if blank(l) {
+                ""
+            } else {
+                l.get(content_indent..).unwrap_or_else(|| l.trim_start())
+            }
+        })
+        .collect();
+    let Some(last) = body.iter().rposition(|l| !l.is_empty()) else {
+        // No content: empty, except that `+` keeps the blank lines.
+        let kept = if chomp == Some('+') {
+            "\n".repeat(body.len())
+        } else {
+            String::new()
+        };
+        return Some((kept, used));
+    };
+    let mut value = String::new();
+    for (n, l) in body[..=last].iter().enumerate() {
+        if !folded {
+            if n > 0 {
+                value.push('\n');
+            }
+            value.push_str(l);
+        } else if l.is_empty() {
+            value.push('\n');
+        } else if n == 0 || body[n - 1].is_empty() {
+            value.push_str(l);
+        } else {
+            value.push(' ');
+            value.push_str(l);
+        }
+    }
+    match chomp {
+        Some('-') => {}
+        Some('+') => value.push_str(&"\n".repeat(body.len() - last)),
+        _ => value.push('\n'),
+    }
+    Some((value, used))
 }
 
 /// Read one definition file.
@@ -656,6 +783,68 @@ mod tests {
         let found = scan_in(root, &Source::User);
         assert_eq!(found.definitions.len(), 1);
         assert_eq!(found.definitions[0].name, "x");
+    }
+
+    /// #1419: a block-scalar description (`description: >-`) is the
+    /// indented lines that follow it, not the two characters `>-`. A
+    /// nine-line description read as `>-` was reported as ~1 est. token.
+    #[test]
+    fn a_folded_block_scalar_description_reads_in_full() {
+        let text = "---\nname: octocat-best\ndescription: >-\n  Use when the user asks\n  about \
+                    the best thing: any of them.\n\n  Second paragraph.\nmodel: opus\n---\nbody\n";
+        let (name, description) = frontmatter(text);
+        let want = "Use when the user asks about the best thing: any of them.\nSecond paragraph.";
+        assert_eq!(name.as_deref(), Some("octocat-best"));
+        assert_eq!(description.as_deref(), Some(want));
+        assert_eq!(
+            crate::claudemd::tokens::estimate(description.as_deref().unwrap()),
+            crate::claudemd::tokens::estimate(want)
+        );
+    }
+
+    /// Literal keeps its newlines; each chomping indicator trims as YAML
+    /// says: `-` strips every trailing newline, none clips to one, `+`
+    /// keeps them all.
+    #[test]
+    fn literal_block_scalars_keep_newlines_and_honour_chomping() {
+        let read = |header: &str| {
+            let text = format!("---\ndescription: {header}\n  one\n  two\n\n\nname: x\n---\n");
+            frontmatter(&text).1.unwrap()
+        };
+        assert_eq!(read("|"), "one\ntwo\n");
+        assert_eq!(read("|-"), "one\ntwo");
+        assert_eq!(read("|+"), "one\ntwo\n\n\n");
+        assert_eq!(read(">"), "one two\n");
+        assert_eq!(read(">+"), "one two\n\n\n");
+        // An indentation digit and a trailing comment are part of the
+        // header, not the value.
+        assert_eq!(read("|2- # a comment"), "one\ntwo");
+        // A header with nothing indented under it is empty, not `|`.
+        let (_, empty) = frontmatter("---\ndescription: |\nname: x\n---\n");
+        assert_eq!(empty.as_deref(), Some(""));
+    }
+
+    /// `name:` gets the same reading, CRLF files included, and the key
+    /// after a block is still read.
+    #[test]
+    fn a_block_scalar_name_reads_and_the_next_key_survives() {
+        let (name, description) =
+            frontmatter("---\r\nname: >-\r\n  octocat\r\ndescription: after it\r\n---\r\n");
+        assert_eq!(name.as_deref(), Some("octocat"));
+        assert_eq!(description.as_deref(), Some("after it"));
+    }
+
+    /// What was already read is unchanged: a plain value, and a quoted
+    /// one whose quotes are stripped. A quoted `">"` is a string, not a
+    /// block header.
+    #[test]
+    fn plain_and_quoted_values_are_unchanged() {
+        let (_, plain) = frontmatter("---\ndescription: x\n---\n");
+        assert_eq!(plain.as_deref(), Some("x"));
+        let (_, quoted) = frontmatter("---\ndescription: \"Use when X: Y\"\n  z\n---\n");
+        assert_eq!(quoted.as_deref(), Some("Use when X: Y"));
+        let (_, arrow) = frontmatter("---\ndescription: '>'\n  z\n---\n");
+        assert_eq!(arrow.as_deref(), Some(">"));
     }
 
     /// An ABSENT directory is not a problem. A machine with no agents

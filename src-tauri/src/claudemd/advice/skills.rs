@@ -36,7 +36,19 @@
 //! both behind the egress proxy), and `definitions::frontmatter` accepts
 //! the line, so the inventory is no evidence either way. The finding
 //! names the line and the YAML rule, and never says "Claude Code will
-//! reject this".
+//! reject this". A block scalar (`description: >-` and the indented
+//! lines under it) is not a plain scalar, so a `: ` in one is legal and
+//! not this warning.
+//!
+//! # A block scalar is its indented lines (#1419)
+//!
+//! `description: >-` is a header, not a value: the value is the
+//! more-indented lines under it. Both readers -- `parse_frontmatter`
+//! here and `definitions::frontmatter`, whose description the cost Notes
+//! and plugin totals measure -- read it through the one
+//! `definitions::block_scalar`, which documents what YAML it still does
+//! not read. Read as the header, a nine-line description was ~1 est.
+//! token "paid by every session".
 //!
 //! # Rules taken from the skills authoring page
 //!
@@ -73,6 +85,27 @@
 //! and still counts when a CLAUDE.md section repeats its commands: both
 //! of those findings are about the CLAUDE.md, which is this
 //! repository's.
+//!
+//! # What counts as a procedure (#1423)
+//!
+//! Any single signal used to be enough, and four of five findings on
+//! Headstate's own CLAUDE.md files were not procedures. The signals
+//! now, a shell fence that a skill also holds being two of them:
+//!
+//! - a shell fence of two or more command lines (a one-line fence is an
+//!   example);
+//! - a fence at least two of whose lines, and at least half, appear in
+//!   one skill (one shared line is coincidence, not a duplicate);
+//! - a heading starting `Before`, `Gates` or `Releasing`, which only
+//!   strengthens: it counts beside overlap, or beside a fence LONGER
+//!   than a pair -- two gate commands under `## Gates` are a checklist,
+//!   three commands under `## Releasing` a process;
+//! - an ordered list of two or more commands, which is enough alone.
+//!
+//! A finding needs the ordered list, or two signals. A section whose
+//! prose already points to a document or skill for the process ("follow
+//! it", "see the `x` skill") is delegating, and gives none whatever else
+//! it holds: that is what the finding would have recommended.
 //!
 //! # An absent `name` is not a finding
 //!
@@ -113,7 +146,7 @@
 //! ones; `definitions.rs` says why the second is not this module's call.
 
 use super::{Check, Context, Evidence, Finding, Locator, Producer, Severity, Subject};
-use crate::claude::definitions::{Definition, Inventory, Kind, ScopeRefusal, Source};
+use crate::claude::definitions::{block_scalar, Definition, Inventory, Kind, ScopeRefusal, Source};
 use crate::claudemd::{refs, text, tokens, Scope};
 use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet};
@@ -202,9 +235,13 @@ struct Field {
     /// The value with one pair of surrounding quotes stripped, as
     /// `definitions::frontmatter` strips them.
     value: String,
-    /// Whether the value was written in quotes. An unquoted value is the
-    /// one YAML reads as a plain scalar.
+    /// Whether the value was written in quotes. An unquoted value that
+    /// is not `block` is the one YAML reads as a plain scalar.
     quoted: bool,
+    /// Whether the value is a block scalar (`>-`, `|`, ...): the
+    /// indented lines under the key, read by [`block_scalar`] (#1419).
+    /// `line` is still the key's line.
+    block: bool,
 }
 
 /// What the top of a SKILL.md holds, parsed no further than the checks
@@ -234,9 +271,13 @@ fn parse_frontmatter(text: &str) -> Frontmatter {
     // An unclosed frontmatter runs to the end of the file, and the body
     // is then empty.
     fm.body_start = lines.len() + 1;
-    for (i, line) in lines.iter().enumerate().skip(1) {
+    let mut i = 1;
+    while i < lines.len() {
+        let line = lines[i];
+        // `i` is now the 1-based number of `line`.
+        i += 1;
         if line.trim() == "---" {
-            fm.body_start = i + 2;
+            fm.body_start = i + 1;
             break;
         }
         if line.starts_with([' ', '\t']) {
@@ -247,19 +288,31 @@ fn parse_frontmatter(text: &str) -> Frontmatter {
         let Some((key, raw)) = line.split_once(':') else {
             continue;
         };
-        let raw = raw.trim();
-        let quoted = raw.len() >= 2
-            && ((raw.starts_with('"') && raw.ends_with('"'))
-                || (raw.starts_with('\'') && raw.ends_with('\'')));
-        let value = if quoted {
-            raw[1..raw.len() - 1].to_string()
-        } else {
-            raw.to_string()
+        let key_line = i;
+        let (value, quoted, block) = match block_scalar(raw, 0, &lines[i..]) {
+            Some((value, used)) => {
+                // Its lines are the value, and none of them is a key.
+                i += used;
+                (value, false, true)
+            }
+            None => {
+                let raw = raw.trim();
+                let quoted = raw.len() >= 2
+                    && ((raw.starts_with('"') && raw.ends_with('"'))
+                        || (raw.starts_with('\'') && raw.ends_with('\'')));
+                let value = if quoted {
+                    raw[1..raw.len() - 1].to_string()
+                } else {
+                    raw.to_string()
+                };
+                (value, quoted, false)
+            }
         };
         fm.fields.entry(key.trim().to_string()).or_insert(Field {
-            line: i + 1,
+            line: key_line,
             value,
             quoted,
+            block,
         });
     }
     fm
@@ -547,7 +600,7 @@ fn frontmatter_findings(s: &SkillFile, out: &mut Vec<Finding>) {
                     ),
                 ));
             }
-            if !f.quoted && f.value.contains(": ") {
+            if !f.quoted && !f.block && f.value.contains(": ") {
                 out.push(advice(
                     s,
                     Some(f.line),
@@ -1016,6 +1069,20 @@ fn cross_references(
 }
 
 // ---- (c) procedures -----------------------------------------------------
+//
+// What counts as one: the module docs, "What counts as a procedure".
+
+/// A prose line that hands the process to a document or a skill: `see`
+/// or `follow`, and a code span naming a `.md` file or followed by
+/// `skill`.
+static POINTER_VERB: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b(?:see|follow)\b").unwrap());
+static POINTER_TARGET: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)`[^`]+\.md(?:#[^`]*)?`|`[^`]+`\s+skill\b").unwrap());
+
+/// The heading words that strengthen other evidence and are never
+/// enough alone.
+const PROCEDURE_HEADINGS: &[&str] = &["Before", "Gates", "Releasing"];
 
 /// The lines of a fence body that are long enough to be evidence.
 fn fence_lines(body: &str) -> Vec<&str> {
@@ -1025,7 +1092,18 @@ fn fence_lines(body: &str) -> Vec<&str> {
         .collect()
 }
 
-/// The skill holding the most of a fence's lines, when it holds any.
+/// The lines of a fence that run something: not blank, not a comment.
+/// Counted as lines, so a command continued with `\` is two, and the
+/// finding says "command lines" rather than claim a number of commands.
+fn command_lines(body: &str) -> usize {
+    body.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .count()
+}
+
+/// The skill holding the most of a fence's lines, when it holds at
+/// least two of them and at least half.
 fn skill_holding<'a>(
     lines: &[&str],
     skills: &'a [SkillFile],
@@ -1037,89 +1115,95 @@ fn skill_holding<'a>(
             best = Some((s, k));
         }
     }
-    best
+    best.filter(|&(_, k)| k >= 2 && 2 * k >= lines.len())
 }
 
 fn procedures(claude_mds: &[ClaudeMdFile], skills: &[SkillFile], out: &mut Vec<Finding>) {
     for f in claude_mds {
         for sec in text::sections(&f.text) {
+            let delegates = text::prose_lines(&sec.text)
+                .into_iter()
+                .any(|(_, l)| POINTER_VERB.is_match(l) && POINTER_TARGET.is_match(l));
+            if delegates {
+                continue;
+            }
             // Text under a heading starts one line below it; the preamble
             // starts at line 1.
             let offset = if sec.heading.is_some() { sec.line } else { 0 };
-            let mut signals: Vec<String> = Vec::new();
-            let mut evidence: Vec<Evidence> = Vec::new();
             let at = |line: usize| Locator::File {
                 path: f.path.clone(),
                 line: Some(line as u32),
             };
-
-            if let Some(h) = &sec.heading {
-                for word in ["Before", "Gates", "Releasing"] {
-                    if h.starts_with(word) {
-                        signals.push(format!("a heading starting `{word}`"));
-                        evidence.push(Evidence {
-                            at: at(sec.line),
-                            measured: format!("heading `{h}`"),
-                        });
-                    }
-                }
-            }
+            // One phrase per fence, list or heading, heading first; and
+            // how many signals they carry between them.
+            let mut found: Vec<(String, Evidence)> = Vec::new();
+            let mut count = 0;
+            // Whether the section holds something a heading word may
+            // strengthen: overlap, or a fence longer than a pair.
+            let mut strengthenable = false;
 
             for fence in text::fences(&sec.text) {
                 let line = offset + fence.line;
                 let lang = fence.info.split_whitespace().next().unwrap_or("");
                 let is_shell = matches!(lang, "bash" | "sh" | "shell" | "zsh" | "console");
+                let commands = command_lines(&fence.body);
                 let lines = fence_lines(&fence.body);
                 let held = skill_holding(&lines, skills);
-                match (is_shell, held) {
-                    (true, Some((s, k))) => {
-                        signals.push(format!(
+                let procedure = is_shell && commands >= 2;
+                strengthenable |= held.is_some() || (procedure && commands > 2);
+                // A fence and its overlap are two signals, stated as one
+                // phrase.
+                let (n, signal, measured) = match (procedure, held) {
+                    (true, Some((s, k))) => (
+                        2,
+                        format!(
                             "a `{lang}` fence at line {line}, {k} of {} lines of which also \
                              appear in skill `{}` (`{}`)",
                             lines.len(),
                             s.def.name,
                             s.def.path
-                        ));
-                        evidence.push(Evidence {
-                            at: at(line),
-                            measured: format!(
-                                "`{lang}` fence; {k} of {} lines found in `{}`",
-                                lines.len(),
-                                s.def.path
-                            ),
-                        });
-                    }
-                    (true, None) => {
-                        signals.push(format!("a `{lang}` fence at line {line}"));
-                        evidence.push(Evidence {
-                            at: at(line),
-                            measured: format!(
-                                "`{lang}` fence; none of its {} lines found in {} skill{}",
-                                lines.len(),
-                                skills.len(),
-                                if skills.len() == 1 { "" } else { "s" }
-                            ),
-                        });
-                    }
-                    (false, Some((s, k))) => {
-                        signals.push(format!(
+                        ),
+                        format!(
+                            "`{lang}` fence of {commands} command lines; {k} of {} lines found \
+                             in `{}`",
+                            lines.len(),
+                            s.def.path
+                        ),
+                    ),
+                    (true, None) => (
+                        1,
+                        format!("a `{lang}` fence of {commands} command lines at line {line}"),
+                        format!(
+                            "`{lang}` fence of {commands} command lines; no skill of {} holds \
+                             two lines and half of it",
+                            skills.len()
+                        ),
+                    ),
+                    (false, Some((s, k))) => (
+                        1,
+                        format!(
                             "a fence at line {line}, {k} of {} lines of which also appear in \
                              skill `{}` (`{}`)",
                             lines.len(),
                             s.def.name,
                             s.def.path
-                        ));
-                        evidence.push(Evidence {
-                            at: at(line),
-                            measured: format!(
-                                "fence; {k} of {} lines found in `{}`",
-                                lines.len(),
-                                s.def.path
-                            ),
-                        });
-                    }
-                    (false, None) => {}
-                }
+                        ),
+                        format!(
+                            "fence; {k} of {} lines found in `{}`",
+                            lines.len(),
+                            s.def.path
+                        ),
+                    ),
+                    (false, None) => continue,
+                };
+                count += n;
+                found.push((
+                    signal,
+                    Evidence {
+                        at: at(line),
+                        measured,
+                    },
+                ));
             }
 
             let ordered: Vec<usize> = text::prose_lines(&sec.text)
@@ -1127,24 +1211,47 @@ fn procedures(claude_mds: &[ClaudeMdFile], skills: &[SkillFile], out: &mut Vec<F
                 .filter(|(_, l)| ORDERED_COMMAND.is_match(l))
                 .map(|(n, _)| offset + n)
                 .collect();
-            if ordered.len() >= 2 {
-                signals.push(format!(
-                    "an ordered list of {} commands at line {}",
-                    ordered.len(),
-                    ordered[0]
-                ));
-                evidence.push(Evidence {
-                    at: at(ordered[0]),
-                    measured: format!(
-                        "{} numbered items beginning with a code span",
-                        ordered.len()
+            let listed = ordered.len() >= 2;
+            if listed {
+                count += 1;
+                found.push((
+                    format!(
+                        "an ordered list of {} commands at line {}",
+                        ordered.len(),
+                        ordered[0]
                     ),
-                });
+                    Evidence {
+                        at: at(ordered[0]),
+                        measured: format!(
+                            "{} numbered items beginning with a code span",
+                            ordered.len()
+                        ),
+                    },
+                ));
             }
 
-            if signals.is_empty() {
+            if let Some(h) = &sec.heading {
+                if strengthenable || listed {
+                    for word in PROCEDURE_HEADINGS.iter().filter(|w| h.starts_with(*w)) {
+                        count += 1;
+                        found.insert(
+                            0,
+                            (
+                                format!("a heading starting `{word}`"),
+                                Evidence {
+                                    at: at(sec.line),
+                                    measured: format!("heading `{h}`"),
+                                },
+                            ),
+                        );
+                    }
+                }
+            }
+
+            if !listed && count < 2 {
                 continue;
             }
+            let (signals, evidence): (Vec<String>, Vec<Evidence>) = found.into_iter().unzip();
             let section = sec
                 .heading
                 .as_ref()
@@ -1653,10 +1760,10 @@ mod tests {
         );
     }
 
-    /// (c) An ordered list of commands is a signal; a fence no skill
-    /// holds is reported without naming one.
+    /// (c) An ordered list of commands is enough on its own; a one-line
+    /// fence is an example, not a procedure (#1423).
     #[test]
-    fn an_ordered_list_of_commands_and_an_unheld_fence_are_signals() {
+    fn an_ordered_list_of_commands_is_enough_and_a_one_line_fence_is_not() {
         let t = tempfile::tempdir().unwrap();
         skill(t.path(), "octocat-verify", GOOD);
         write(
@@ -1674,14 +1781,139 @@ mod tests {
                 )),
             "{got:?}"
         );
-        let dbg = got
-            .iter()
-            .find(|s| s.contains("`## Debugging`"))
-            .unwrap_or_else(|| panic!("{got:?}"));
-        assert!(dbg.ends_with("holds a `sh` fence at line 8"), "{dbg}");
+        assert!(
+            !got.iter().any(|s| s.contains("`## Debugging`")),
+            "a one-line fence is an example: {got:?}"
+        );
         assert!(
             !got.iter().any(|s| s.contains("`## Notes`")),
             "a numbered list of prose is not a list of commands: {got:?}"
+        );
+    }
+
+    /// The procedure findings of a fixture: the sections named.
+    fn procedure_sections(report: &Report) -> Vec<String> {
+        skills_findings(report)
+            .into_iter()
+            .filter_map(|f| match &f.subject {
+                Subject::ClaudeMd {
+                    section: Some(s), ..
+                } if f.severity == Severity::Advice => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// #1423, the four shapes Headstate's own CLAUDE.md files hold that
+    /// are not procedures: a section pointing to the document that IS
+    /// the process, a heading word over two commands in prose, a
+    /// two-command gate fence one line of which a skill also holds, and
+    /// a one-line command a skill also holds.
+    #[test]
+    fn a_heading_word_a_pointer_a_gate_pair_and_a_one_line_example_are_not_procedures() {
+        let t = tempfile::tempdir().unwrap();
+        skill(
+            t.path(),
+            "octocat-verify",
+            "---\nname: octocat-verify\ndescription: Use before pushing\n---\n\n\
+             ```bash\nmake lint-widget\ncargo test --lib\n\
+             grep -rn 'Widget' src --include='*.tsx'\n```\n",
+        );
+        write(
+            &t.path().join("CLAUDE.md"),
+            "# hello-world\n\n\
+             ## Releasing\n\n`docs/widget-release.md` is the process — follow it rather than \
+             improvising.\n\n\
+             ## Before pushing\n\n`cargo fmt` first. Then `cargo test --lib`.\n\n\
+             ## Gates\n\n```bash\nmake lint-widget\nmake test-widget\n```\n\n\
+             ## A widget and its host\n\nBefore calling it done:\n\n\
+             ```bash\ngrep -rn 'Widget' src --include='*.tsx'\n```\n",
+        );
+        let report = run_over(t.path());
+        assert_eq!(
+            procedure_sections(&report),
+            Vec::<String>::new(),
+            "{:?}",
+            sentences(&report)
+        );
+    }
+
+    /// #1423: what still fires. Three commands under `## Releasing` (a
+    /// heading word strengthening a fence longer than a pair), and a
+    /// fence two of whose two lines a skill holds, under no heading word.
+    #[test]
+    fn a_release_fence_and_a_duplicate_of_a_skill_still_fire() {
+        let t = tempfile::tempdir().unwrap();
+        let sk = skill(
+            t.path(),
+            "octocat-release",
+            "---\nname: octocat-release\ndescription: Use when releasing\n---\n\n\
+             ```bash\ngh api \"repos/octocat/hello-world/commits/SHA/check-runs\" \\\n  \
+             -q '[.check_runs[]|.conclusion]'\n```\n",
+        );
+        let md = t.path().join("CLAUDE.md");
+        write(
+            &md,
+            "## Releasing\n\n```sh\ngit tag v1.2.3\ngit push origin v1.2.3\n\
+             gh release view v1.2.3\n```\n\n\
+             ## The gate sees every attempt\n\n```bash\n\
+             gh api \"repos/octocat/hello-world/commits/SHA/check-runs\" \\\n  \
+             -q '[.check_runs[]|.conclusion]'\n```\n",
+        );
+        let report = run_over(t.path());
+        let got = sentences(&report);
+        assert_eq!(
+            procedure_sections(&report),
+            vec![
+                "## Releasing".to_string(),
+                "## The gate sees every attempt".to_string()
+            ],
+            "{got:?}"
+        );
+        let md = md.to_string_lossy();
+        assert!(
+            got.contains(&format!(
+                "section `## Releasing` of `{md}` holds a heading starting `Releasing` and a \
+                 `sh` fence of 3 command lines at line 3"
+            )),
+            "{got:?}"
+        );
+        assert!(
+            got.contains(&format!(
+                "section `## The gate sees every attempt` of `{md}` holds a `bash` fence at \
+                 line 11, 2 of 2 lines of which also appear in skill \
+                 `octocat-release` (`{}`)",
+                sk.to_string_lossy()
+            )),
+            "{got:?}"
+        );
+    }
+
+    /// #1423: overlap counts only when at least two lines, and at least
+    /// half the fence, are in one skill; and a section that points to a
+    /// skill for the process is delegating, whatever else it holds.
+    #[test]
+    fn thin_overlap_and_a_delegating_section_give_no_finding() {
+        let t = tempfile::tempdir().unwrap();
+        skill(
+            t.path(),
+            "octocat-release",
+            "---\nname: octocat-release\ndescription: Use when releasing\n---\n\n\
+             ```bash\ngit tag v1.2.3 -m release\ngit push origin v1.2.3\n```\n",
+        );
+        write(
+            &t.path().join("CLAUDE.md"),
+            "## Tagging\n\n```text\ngit tag v1.2.3 -m release\ngit push origin v1.2.3\n\
+             gh release view v1.2.3\ngh run list --limit 5\ngh run watch --exit-status\n```\n\n\
+             ## Shipping\n\nSee the `octocat-release` skill.\n\n```bash\n\
+             git tag v1.2.3 -m release\ngit push origin v1.2.3\ngh release view v1.2.3\n```\n",
+        );
+        let report = run_over(t.path());
+        assert_eq!(
+            procedure_sections(&report),
+            Vec::<String>::new(),
+            "{:?}",
+            sentences(&report)
         );
     }
 
@@ -2161,5 +2393,53 @@ mod tests {
         assert!(!none.present);
         assert_eq!(none.stray_marker, Some(3));
         assert_eq!(none.body_start, 1);
+    }
+
+    /// #1419: a block-scalar description is the indented lines under
+    /// it, at the key's line, and the key after it is still a field.
+    #[test]
+    fn frontmatter_reads_a_block_scalar_in_full() {
+        let fm = parse_frontmatter(
+            "---\nname: a\ndescription: >-\n  Use when X:\n  any Y.\n\n  Then Z.\nmodel: b\n---\n",
+        );
+        let d = &fm.fields["description"];
+        assert_eq!(d.value, "Use when X: any Y.\nThen Z.");
+        assert_eq!(d.line, 3);
+        assert!(d.block && !d.quoted);
+        assert_eq!(fm.fields["model"].value, "b");
+        assert_eq!(fm.body_start, 10);
+    }
+
+    /// #1419 end to end: the cost Note and the scope total measure a
+    /// folded description's text, not its `>-` header, and `: ` inside a
+    /// block scalar is legal YAML, so it is not the plain-scalar warning.
+    #[test]
+    fn a_block_scalar_description_is_costed_in_full() {
+        let t = tempfile::tempdir().unwrap();
+        let text = "Use when the user asks for the octocat widget: any widget, any size, \
+                    in any of the hello-world repositories.";
+        skill(
+            t.path(),
+            "octocat-widget",
+            "---\nname: octocat-widget\ndescription: >-\n  Use when the user asks for the \
+             octocat widget: any widget,\n  any size, in any of the hello-world \
+             repositories.\n---\nbody\n",
+        );
+        let report = run_over(t.path());
+        let got = sentences(&report);
+        let est = tokens::estimate(text);
+        assert!(est > 20, "{est}");
+        assert!(
+            got.iter().any(|s| s.contains(&format!(
+                "its description is ~{est} est. tokens, paid by every session"
+            ))),
+            "{got:?}"
+        );
+        assert!(
+            got.iter()
+                .any(|s| s.contains(&format!("~{est} est. tokens of descriptions"))),
+            "{got:?}"
+        );
+        assert!(!got.iter().any(|s| s.contains("unquoted `: `")), "{got:?}");
     }
 }
