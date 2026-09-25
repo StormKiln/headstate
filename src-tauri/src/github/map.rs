@@ -135,13 +135,24 @@ pub fn map_detail(v: &Value, repo: &str) -> PrDetail {
         })
         .collect();
 
+    // #1457. `ready_at` is the list row's own function, so the header and
+    // the row it was opened from cannot date the pull request differently.
+    // An unreadable `createdAt` leaves both absent rather than failing the
+    // whole view the way `map_node` drops a row: a detail payload is one
+    // pull request the user asked for, and the rest of it is still true.
+    let is_draft = pr["isDraft"].as_bool().unwrap_or(false);
+    let created_at = ts(pr, "createdAt");
+
     PrDetail {
         id: pr["id"].as_str().unwrap_or_default().to_string(),
         number: pr["number"].as_u64().unwrap_or(0),
         title: pr["title"].as_str().unwrap_or_default().to_string(),
         url: pr["url"].as_str().unwrap_or_default().to_string(),
         state: pr["state"].as_str().unwrap_or("OPEN").to_lowercase(),
-        is_draft: pr["isDraft"].as_bool().unwrap_or(false),
+        is_draft,
+        ready_at: created_at.and_then(|c| ready_at(pr, c, is_draft)),
+        created_at,
+        last_commit_at: ts(&pr["commits"]["nodes"][0]["commit"], "committedDate"),
         body: pr["body"].as_str().unwrap_or_default().to_string(),
         author: pr["author"]["login"]
             .as_str()
@@ -1516,6 +1527,80 @@ mod tests {
         assert_eq!(d.latest_reviews[0].author, "octocat");
         assert_eq!(d.latest_reviews[0].state, "APPROVED");
         assert_eq!(d.latest_reviews[1].state, "CHANGES_REQUESTED");
+    }
+
+    /// #1457: the header's three dates, read from the detail payload.
+    ///
+    /// Ready is the list row's derivation: the latest ready-for-review
+    /// event when there is one, `createdAt` when the timeline arrived
+    /// empty (never drafted), and absent while it is a draft.
+    #[test]
+    fn a_detail_payload_carries_its_age_and_last_commit() {
+        let at = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        let payload = |draft: bool, events: serde_json::Value| {
+            json!({"repository": {"pullRequest": {
+                "number": 7, "isDraft": draft,
+                "createdAt": "2026-08-01T09:00:00Z",
+                "timelineItems": {"nodes": events},
+                "commits": {"nodes": [{"commit": {"committedDate": "2026-08-09T17:30:00Z"}}]}
+            }}})
+        };
+
+        let d = map_detail(
+            &payload(false, json!([{"createdAt": "2026-08-05T12:00:00Z"}])),
+            "acme/widgets",
+        );
+        assert_eq!(d.created_at, Some(at("2026-08-01T09:00:00Z")));
+        assert_eq!(d.ready_at, Some(at("2026-08-05T12:00:00Z")));
+        assert_eq!(d.last_commit_at, Some(at("2026-08-09T17:30:00Z")));
+
+        let never_drafted = map_detail(&payload(false, json!([])), "acme/widgets");
+        assert_eq!(
+            never_drafted.ready_at,
+            Some(at("2026-08-01T09:00:00Z")),
+            "no ready event means it was ready when opened"
+        );
+
+        let draft = map_detail(
+            &payload(true, json!([{"createdAt": "2026-08-05T12:00:00Z"}])),
+            "acme/widgets",
+        );
+        assert_eq!(
+            draft.ready_at, None,
+            "a draft is not ready, however old its event"
+        );
+    }
+
+    /// Absent dates stay absent, never the epoch or "now": the header
+    /// omits what it could not read rather than printing "0s ago".
+    #[test]
+    fn absent_detail_dates_are_absent_not_zero() {
+        let d = map_detail(
+            &json!({"repository": {"pullRequest": {
+                "number": 7, "isDraft": false,
+                "createdAt": "not a date",
+                "timelineItems": {"nodes": []},
+                "commits": {"nodes": []}
+            }}}),
+            "acme/widgets",
+        );
+        assert_eq!(d.created_at, None);
+        assert_eq!(
+            d.ready_at, None,
+            "with no opening time, never-drafted cannot date readiness"
+        );
+        assert_eq!(d.last_commit_at, None, "no head commit, no commit time");
+
+        // The connection MISSING is unknown, not empty -- the same rule
+        // `ready_at` applies to the list row.
+        let no_timeline = map_detail(
+            &json!({"repository": {"pullRequest": {
+                "number": 7, "createdAt": "2026-08-01T09:00:00Z"
+            }}}),
+            "acme/widgets",
+        );
+        assert!(no_timeline.created_at.is_some());
+        assert_eq!(no_timeline.ready_at, None);
     }
 
     /// A PR with no checks, no comments and a null author must not panic:

@@ -2568,6 +2568,12 @@ function seedFromRow(row: PullRequest): PrDetail {
     // lowercases GitHub's `state`.
     state: "open",
     is_draft: row.is_draft,
+    // The row's own dates (#1457), so the header's age is there from the
+    // first frame. The row has no commit time: absent until the detail
+    // lands, and the header omits it rather than guessing.
+    created_at: row.created_at,
+    ready_at: row.ready_at ?? null,
+    last_commit_at: null,
     body: "",
     author: row.author,
     repo: row.repo,

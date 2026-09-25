@@ -617,6 +617,16 @@ export interface PrDetail {
   url: string;
   state: string;
   is_draft: boolean;
+  /// When it was opened, when it became ready for review, and the head
+  /// commit's `committedDate` (#1457). `ready_at` is `PullRequest.ready_at`'s
+  /// derivation; `last_commit_at` is the committer's clock, not the push.
+  ///
+  /// `null` is UNKNOWN and the header omits it -- never "0s ago". OPTIONAL
+  /// because a payload from an older desktop to the companion has no such
+  /// keys, and the list-row placeholder has no commit time to offer.
+  created_at?: string | null;
+  ready_at?: string | null;
+  last_commit_at?: string | null;
   body: string;
   author: string;
   repo: string;

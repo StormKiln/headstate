@@ -11,7 +11,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { ExternalLink } from "./ExternalLink";
-import { type ReadyTone, readyAge, useNow } from "@/lib/readyAge";
+import { READY_TONE_CLASS, readyAge, useNow } from "@/lib/readyAge";
 
 /// Both labels name the FIELD, not just the direction (#1277).
 ///
@@ -30,16 +30,6 @@ const READY_SORT_OPTIONS: {
   { value: "newest-opened", label: "Newest ready first" },
 ];
 
-/// The palette the app already uses for success, warning and failure,
-/// plus its muted grey for "we do not know". Literal class strings so
-/// Tailwind's scanner sees every one.
-const TONE_CLASS: Record<ReadyTone, string> = {
-  fresh: "border-[#3fb950]/40 text-[#3fb950]",
-  aging: "border-[#d29922]/40 text-[#d29922]",
-  stale: "border-[#f85149]/40 text-[#f85149]",
-  unknown: "border-[#8b949e]/40 text-[#8b949e]",
-};
-
 /// Re-read the clock once a minute. The coarsest unit shown is minutes,
 /// and a threshold crossing is at most this late.
 const AGE_TICK_MS = 60_000;
@@ -54,7 +44,7 @@ const AGE_TICK_MS = 60_000;
 /// number. Absent is not zero.
 function ReadyAgeChip({ readyAt, now }: { readyAt: PullRequest["ready_at"]; now: Date }) {
   const age = readyAge(readyAt, now);
-  const chip = `shrink-0 whitespace-nowrap rounded-full border px-1.5 py-0.5 text-xs tabular-nums ${TONE_CLASS[age.tone]}`;
+  const chip = `shrink-0 whitespace-nowrap rounded-full border px-1.5 py-0.5 text-xs tabular-nums ${READY_TONE_CLASS[age.tone]}`;
   if (age.since === null) {
     return (
       <>
