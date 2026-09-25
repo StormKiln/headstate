@@ -353,6 +353,13 @@ lint-deps:
 	# "cannot look" path exits 0 on purpose, so a bug that always took it
 	# would leave the mark unguarded while printing something reassuring.
 	#
+	# A mark that LAGS a shipped build is a warning here and in CI, not a
+	# failure (#1418): failing turned every branch cut before the mark PR
+	# red for a reason unrelated to it. Warn per commit, enforce at the
+	# next mobile release -- mobile-release.yml's Preflight runs this with
+	# --release and refuses to build. A missing or unparseable mark file
+	# still fails here.
+	#
 	# NOT passed --require here. Unlike everything above it, this one
 	# needs the network and a `gh` token, and `lint-deps` is the target
 	# whose comment promises answers in a second. Locally it reports what
