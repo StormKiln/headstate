@@ -61,11 +61,15 @@
 //! runs on a skill whose `Source` is `Plugin`, and nothing here emits
 //! Advice or Problem about one.
 //!
-//! What a plugin skill still gets is its cost, as the Note every skill
-//! gets, and its plugin's description total ("plugin `x`: N skills; ~M
-//! est. tokens ... paid by every session"). That is worth showing
-//! whatever its size, because disabling the plugin IS the reader's
-//! choice. A plugin skill still counts as held when a CLAUDE.md names it,
+//! What a plugin skill still gets is its cost, in its plugin's
+//! description total ("plugin `x`: N skills; ~M est. tokens ... paid by
+//! every session"), whose evidence names the plugin's three skills with
+//! the most expensive descriptions. That is worth showing whatever its
+//! size, because disabling the plugin IS the reader's choice. A plugin
+//! skill gets no cost Note of its own (#1425): 95 of them, one per
+//! `SKILL.md` across 11 plugins on this repository's own report, buried
+//! the few rows worth reading, and none was a choice the reader could
+//! make one skill at a time. A plugin skill still counts as held when a CLAUDE.md names it,
 //! and still counts when a CLAUDE.md section repeats its commands: both
 //! of those findings are about the CLAUDE.md, which is this
 //! repository's.
@@ -88,8 +92,9 @@
 //!
 //! # A cost figure is a Note
 //!
-//! Each skill's cost (body lines and est. tokens, description est.
-//! tokens) and each scope's description total are [`Severity::Note`]:
+//! Each repository or user skill's cost (body lines and est. tokens,
+//! description est. tokens) and each scope's description total are
+//! [`Severity::Note`]:
 //! they state what was measured and recommend nothing, so their brief
 //! asks for no edit (#1354). No cost threshold turns one into Advice.
 //! The only measured limit on size is the authoring page's 500 body
@@ -167,14 +172,16 @@ impl Producer for Skills {
 
         let skills = read_skills(inv, &mut out);
         for s in &skills {
-            // A plugin's skill is observed, never advised on (#1365).
+            // A plugin's skill is observed, never advised on (#1365), and
+            // its cost is its plugin's total Note, not one of its own
+            // (#1425).
             if !matches!(s.def.source, Source::Plugin { .. }) {
                 frontmatter_findings(s, &mut out);
                 body_findings(s, &mut out);
                 reference_chain(s, &mut out);
                 dated_facts(s, &mut out);
+                cost(s, &mut out);
             }
-            cost(s, &mut out);
         }
         scope_totals(&skills, inv, &mut out);
 
@@ -791,8 +798,13 @@ fn refused(source: &Source, inv: &Inventory) -> bool {
     })
 }
 
+/// A plugin's total names this many of its skills, most expensive first.
+const PLUGIN_TOP: usize = 3;
+
 /// (d) One informational finding per scope that holds a skill: how many,
-/// and what every session pays for their descriptions.
+/// and what every session pays for their descriptions. A plugin's also
+/// names its [`PLUGIN_TOP`] skills whose descriptions cost the most, as
+/// its skills get no cost Note of their own (#1425).
 fn scope_totals(skills: &[SkillFile], inv: &Inventory, out: &mut Vec<Finding>) {
     let mut by_scope: BTreeMap<String, (&Source, Vec<&SkillFile>)> = BTreeMap::new();
     for s in skills {
@@ -826,22 +838,50 @@ fn scope_totals(skills: &[SkillFile], inv: &Inventory, out: &mut Vec<Finding>) {
         };
         let root = members[0].scope_root();
         let skills_dir = root.join("skills");
+        let mut evidence = vec![Evidence {
+            at: Locator::File {
+                path: skills_dir.to_string_lossy().to_string(),
+                line: None,
+            },
+            measured: format!(
+                "{n} SKILL.md files read, {described} with a description, {chars} \
+                 description characters ÷ 4"
+            ),
+        }];
+        if matches!(source, Source::Plugin { .. }) {
+            // Ranked by what every session pays. A skill with no
+            // `description:` has no measured listing cost, so it is not
+            // ranked: absent is not zero.
+            let mut ranked: Vec<(u64, &SkillFile)> = members
+                .iter()
+                .filter_map(|s| {
+                    s.def
+                        .description
+                        .as_deref()
+                        .map(|d| (tokens::estimate(d), *s))
+                })
+                .collect();
+            ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.def.name.cmp(&b.1.def.name)));
+            for (est, s) in ranked.into_iter().take(PLUGIN_TOP) {
+                evidence.push(Evidence {
+                    at: s.at(None),
+                    measured: format!(
+                        "skill `{}`: its description is ~{est} est. tokens, paid by every \
+                         session; its body is {} lines (~{} est. tokens), paid when invoked",
+                        s.def.name,
+                        s.body_lines(),
+                        tokens::estimate(&s.body)
+                    ),
+                });
+            }
+        }
         out.push(Finding::new(
             Check::Skills,
             Severity::Note,
             Subject::Directory {
                 path: root.to_string_lossy().to_string(),
             },
-            vec![Evidence {
-                at: Locator::File {
-                    path: skills_dir.to_string_lossy().to_string(),
-                    line: None,
-                },
-                measured: format!(
-                    "{n} SKILL.md files read, {described} with a description, {chars} \
-                     description characters ÷ 4"
-                ),
-            }],
+            evidence,
             format!(
                 "{}: {floor}{n} skill{}; {floor}~{est} est. tokens of descriptions paid by \
                  every session",
@@ -1892,8 +1932,8 @@ mod tests {
 
     /// #1365: a plugin skill is the plugin author's, rewritten on every
     /// update, so advice on its content is not actionable. However many
-    /// rules it breaks, it gets its cost Note and its plugin's total
-    /// Note and nothing else. The same file in this repository's
+    /// rules it breaks, it gets its plugin's total Note, which names it
+    /// (#1425), and nothing else. The same file in this repository's
     /// `.claude/skills/` still gets the advice.
     #[test]
     fn a_plugin_skill_gets_only_its_cost() {
@@ -1919,21 +1959,21 @@ mod tests {
                 |f| matches!(&f.subject, Subject::Skill { path, .. } if Path::new(path) == file),
             )
             .collect();
-        assert_eq!(about_it.len(), 1, "{about_it:#?}");
-        assert!(
-            about_it[0]
-                .finding
-                .contains("), paid when the skill is invoked"),
-            "{}",
-            about_it[0].finding
-        );
+        assert!(about_it.is_empty(), "{about_it:#?}");
         for f in &got {
             assert_eq!(f.severity, Severity::Note, "{}", f.finding);
         }
+        let total = got
+            .iter()
+            .find(|f| f.finding.starts_with("plugin `octo-plugin`: 1 skill;"))
+            .unwrap_or_else(|| panic!("{got:#?}"));
         assert!(
-            got.iter()
-                .any(|f| f.finding.starts_with("plugin `octo-plugin`: 1 skill;")),
-            "{got:#?}"
+            total.evidence.iter().any(|e| e.at
+                == Locator::File {
+                    path: file.to_string_lossy().to_string(),
+                    line: None
+                }),
+            "{total:#?}"
         );
 
         // The control: the same file as this repository's own skill.
@@ -1947,6 +1987,88 @@ mod tests {
             })
             .count();
         assert!(advice >= 6, "{:#?}", sentences(&report));
+    }
+
+    /// #1425: a plugin's skills are one Note, not one each. What the
+    /// reader can act on is disabling the plugin, so its total carries
+    /// the figure, and its evidence names the three skills whose
+    /// descriptions cost every session the most, most expensive first.
+    /// A skill in this repository, which the reader can edit, keeps its
+    /// own cost Note.
+    #[test]
+    fn a_plugins_skills_are_one_note_naming_the_three_most_expensive() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path().join("repo");
+        skill(&repo, "octocat-verify", GOOD);
+        let plugin = t.path().join("cache").join("acme").join("octo-plugin");
+        // Descriptions of 1..=5 times one sentence: `octo-5` costs most.
+        for n in 1..=5 {
+            let desc = "Use when deploying the hello-world service. ".repeat(n);
+            write(
+                &plugin
+                    .join("skills")
+                    .join(format!("octo-{n}"))
+                    .join("SKILL.md"),
+                &format!(
+                    "---\nname: octo-{n}\ndescription: {}\n---\n\nBody.\n",
+                    desc.trim()
+                ),
+            );
+        }
+        let inv = scan_scopes(&roots(
+            None,
+            std::slice::from_ref(&repo),
+            &[(
+                "octo-plugin".to_string(),
+                plugin.to_string_lossy().to_string(),
+            )],
+        ));
+        let report = run_with_inventory(&repo, &inv);
+        let got = skills_findings(&report);
+
+        let per_skill: Vec<&str> = got
+            .iter()
+            .filter(|f| f.finding.contains("paid when the skill is invoked"))
+            .filter_map(|f| match &f.subject {
+                Subject::Skill { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(per_skill, ["octocat-verify"], "{got:#?}");
+        assert!(
+            got.iter().all(|f| !matches!(
+                &f.subject,
+                Subject::Skill { name, .. } if name.starts_with("octo-")
+            )),
+            "{got:#?}"
+        );
+
+        let totals: Vec<&&Finding> = got
+            .iter()
+            .filter(|f| f.finding.starts_with("plugin `octo-plugin`:"))
+            .collect();
+        assert_eq!(totals.len(), 1, "{got:#?}");
+        assert!(
+            totals[0]
+                .finding
+                .starts_with("plugin `octo-plugin`: 5 skills;"),
+            "{}",
+            totals[0].finding
+        );
+        let named: Vec<&str> = totals[0]
+            .evidence
+            .iter()
+            .filter_map(|e| e.measured.strip_prefix("skill `"))
+            .filter_map(|m| m.split('`').next())
+            .collect();
+        assert_eq!(named, ["octo-5", "octo-4", "octo-3"], "{totals:#?}");
+        assert!(
+            totals[0].evidence[1]
+                .measured
+                .contains("est. tokens, paid by every session"),
+            "{}",
+            totals[0].evidence[1].measured
+        );
     }
 
     /// (b) A project skill nothing names is advice, and says why it is

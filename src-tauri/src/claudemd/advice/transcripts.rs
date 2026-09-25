@@ -105,7 +105,10 @@
 //!   held back, and one Note per file counts them ("N findings on
 //!   `CLAUDE.md` reach their thresholds only with sessions from before it
 //!   last changed on <date>"), each held finding's sentence as evidence.
-//!   Never dropped silently.
+//!   Never dropped silently. A held finding no current session shows
+//!   says so: "in none of 40 analysed sessions … (5 before it)", never
+//!   "at least 0" (#1425). "At least" qualifies a count that might be
+//!   higher; it is used only for one of 1 or more.
 //! - A CLAUDE.md git lists as modified, staged or untracked changed
 //!   "now": no session has run under it yet, so every session is older,
 //!   and the Note says so.
@@ -186,7 +189,10 @@
 //! under `<repo>`" when there are none -- never an empty list, because
 //! no sessions is not "nothing went wrong". While the pass is short,
 //! every count says "at least". These and the S6 census are Notes: they
-//! state what was measured and recommend nothing (#1339).
+//! state what was measured and recommend nothing (#1339). The census's
+//! evidence names only the exceptions -- a session with no opening
+//! prompt, one read only to the budget, one with no transcript on disk
+//! -- because an ordinary session is not evidence of anything (#1425).
 //!
 //! A session whose transcript is not on disk -- no path recorded, or a
 //! path that is `NotFound` because its worktree's project directory was
@@ -454,6 +460,7 @@ fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, 
     let mut missing: Vec<(String, String)> = Vec::new();
     let mut analysed: HashSet<String> = HashSet::new();
     let mut truncated = 0usize;
+    let mut cut_ids: Vec<String> = Vec::new();
     let mut todo: Vec<(&SessionRow, i64, i64)> = Vec::new();
     for s in &sessions {
         let Some(path) = &s.transcript_path else {
@@ -490,6 +497,7 @@ fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, 
                 analysed.insert(s.session_id.clone());
                 if *kt {
                     truncated += 1;
+                    cut_ids.push(s.session_id.clone());
                 }
             }
             _ => todo.push((s, size, mtime)),
@@ -529,6 +537,7 @@ fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, 
         analysed.insert(s.session_id.clone());
         if cut {
             truncated += 1;
+            cut_ids.push(s.session_id.clone());
         }
     }
 
@@ -542,8 +551,24 @@ fn analyse(conn: &Connection, cx: &Context, cap: usize) -> Result<Vec<Finding>, 
     // in one batched git call rather than one per file or per finding.
     let files: Vec<String> = cx.scan.repo.files.iter().map(|f| f.path.clone()).collect();
     let versions = versions_of(crate::auth::git_program(), repo, &files);
+    // The census's exceptions beside a missing opening prompt (#1425):
+    // a session read only in part, or with no transcript on disk.
+    let cut_at = format!("truncated at {} MB", BUDGET_BYTES / (1024 * 1024));
+    let mut exceptions: HashMap<String, String> =
+        cut_ids.into_iter().map(|id| (id, cut_at.clone())).collect();
+    for (id, _) in &missing {
+        exceptions.insert(id.clone(), "no transcript on disk".to_string());
+    }
     let mut out = emit(
-        &stored, &tasks, &denials, &sessions, &analysed, &versions, cx, short,
+        &stored,
+        &tasks,
+        &denials,
+        &sessions,
+        &analysed,
+        &exceptions,
+        &versions,
+        cx,
+        short,
     );
     out.extend(checkout_unknown);
 
@@ -2087,6 +2112,7 @@ fn emit(
     denials: &[(String, String, Option<String>)],
     sessions: &[SessionRow],
     analysed: &HashSet<String>,
+    exceptions: &HashMap<String, String>,
     versions: &HashMap<String, Version>,
     cx: &Context,
     short: bool,
@@ -2262,11 +2288,15 @@ fn emit(
                 .map(|sid| task_of(sid))
                 .collect::<HashSet<_>>()
                 .len();
-            let mut sessions_phrase = format!(
-                "{at_least}{n} of {denominator} analysed session{} under `{}`",
-                plural(denominator),
-                cx.repo.display()
-            );
+            // No session under this version: "none of", never "at least
+            // 0 of" (#1425). "At least" qualifies a count that could be
+            // higher; it is not a way to say zero.
+            let counted = match (n, denominator) {
+                (0, 0) => "no analysed session".to_string(),
+                (0, d) => format!("none of {d} analysed session{}", plural(d)),
+                (n, d) => format!("{at_least}{n} of {d} analysed session{}", plural(d)),
+            };
+            let mut sessions_phrase = format!("{counted} under `{}`", cx.repo.display());
             match version {
                 Some(Version::Since(at)) => sessions_phrase
                     .push_str(&format!(" since `{rel}` last changed on {}", day(*at))),
@@ -2276,7 +2306,8 @@ fn emit(
                 _ => {}
             }
             if b > 0 {
-                sessions_phrase.push_str(&format!(" ({b} more before it)"));
+                let more = if n == 0 { "" } else { "more " };
+                sessions_phrase.push_str(&format!(" ({b} {more}before it)"));
             }
             if total > n {
                 sessions_phrase.push_str(&format!(
@@ -2582,20 +2613,25 @@ fn emit(
             .filter(|s| analysed.contains(&s.session_id))
             .count();
         let subject = subject_for(&placement(&[dir.as_path()], &candidates, cx.repo), cx.scan);
+        // Only the exceptions (#1425). A session with an opening prompt,
+        // read whole, is the ordinary case and says nothing as evidence.
         let evidence = rows
             .iter()
-            .take(MAX_EVIDENCE)
-            .map(|s| Evidence {
-                at: Locator::Session {
-                    session_id: s.session_id.clone(),
-                    record: None,
-                },
-                measured: if s.has_prompt {
-                    "opening prompt recorded".to_string()
-                } else {
-                    "no opening prompt recorded".to_string()
-                },
+            .filter_map(|s| {
+                let mut why: Vec<&str> = Vec::new();
+                if !s.has_prompt {
+                    why.push("no opening prompt recorded");
+                }
+                why.extend(exceptions.get(&s.session_id).map(String::as_str));
+                (!why.is_empty()).then(|| Evidence {
+                    at: Locator::Session {
+                        session_id: s.session_id.clone(),
+                        record: None,
+                    },
+                    measured: why.join("; "),
+                })
             })
+            .take(MAX_EVIDENCE)
             .collect();
         out.push(Finding::new(
             Check::Transcripts,
@@ -3552,6 +3588,20 @@ mod tests {
         assert_eq!(
             cut, 1,
             "truncation is remembered so the next open says so too"
+        );
+        // #1425: the census names the truncated session as one.
+        let census = out
+            .iter()
+            .find(|f| f.finding.starts_with("2 sessions recorded under"))
+            .expect("the census");
+        assert!(
+            census.evidence.iter().any(|e| e.at
+                == Locator::Session {
+                    session_id: "s2".into(),
+                    record: None
+                }
+                && e.measured == "no opening prompt recorded; truncated at 8 MB"),
+            "{census:#?}"
         );
     }
 
@@ -5040,6 +5090,103 @@ mod tests {
             held[0].finding,
             "`CLAUDE.md` has uncommitted changes, so no session has run under this version \
              yet; 2 findings from sessions under an earlier version are not shown"
+        );
+    }
+
+    /// #1425: a finding held back because every session it counts ran
+    /// under an older CLAUDE.md is "in none of N", never "at least 0 of
+    /// N", even while the pass is short. The older sessions are "K before
+    /// it", not "K more": there is nothing for them to be more than.
+    #[test]
+    fn a_held_back_finding_with_no_current_session_says_none() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path();
+        git_init(repo);
+        write(repo, "CLAUDE.md", "# rules\n");
+        let changed = "2026-03-01T00:00:00Z";
+        git_at(repo, &["add", "CLAUDE.md"], changed);
+        git_at(repo, &["commit", "-q", "-m", "rules"], changed);
+        let cwd = repo.to_string_lossy().into_owned();
+        let conn = db();
+        for n in [1, 2, 3] {
+            let p = write(repo, &format!("s{n}.jsonl"), &corrected_pair(&cwd, n));
+            insert_session_at(
+                &conn,
+                &format!("s{n}"),
+                &cwd,
+                Some(&p),
+                None,
+                "2026-01-01T00:00:00Z",
+            );
+        }
+        // One session since, with nothing in it, and one with no
+        // transcript on disk, which makes the pass short.
+        let p = write(repo, "s4.jsonl", &user_text(&cwd, "hello"));
+        insert_session_at(&conn, "s4", &cwd, Some(&p), None, "2026-04-01T00:00:00Z");
+        insert_session_at(&conn, "s5", &cwd, None, None, "2026-04-01T00:00:00Z");
+        let scan = scan_effective_opt(repo, None);
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        let held = held_back(&out);
+        assert_eq!(held.len(), 1, "{out:#?}");
+        let first = &held[0].evidence[0].measured;
+        assert_eq!(
+            first,
+            &format!(
+                "`yarn lint` failed and `make lint` followed it in none of 1 analysed session \
+                 under `{}` since `CLAUDE.md` last changed on 2026-03-01 (3 before it)",
+                repo.display()
+            )
+        );
+        for e in &held[0].evidence {
+            assert!(!e.measured.contains("at least 0"), "{}", e.measured);
+            assert!(!e.measured.contains("more before it"), "{}", e.measured);
+        }
+    }
+
+    /// #1425: the census names only the sessions that are exceptions --
+    /// no opening prompt, truncated, no transcript on disk -- never an
+    /// ordinary one as "opening prompt recorded".
+    #[test]
+    fn the_census_evidence_lists_only_exceptions() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path();
+        let cwd = repo.to_string_lossy().into_owned();
+        let conn = db();
+        let p = write(repo, "s1.jsonl", &user_text(&cwd, "hello"));
+        insert_session(&conn, "s1", &cwd, Some(&p), Some("hello"));
+        let p = write(repo, "s2.jsonl", &user_text(&cwd, "hello"));
+        insert_session(&conn, "s2", &cwd, Some(&p), None);
+        insert_session(&conn, "s3", &cwd, None, Some("hello"));
+        let scan = scan_effective_opt(repo, None);
+        let out = analyse(&conn, &context(repo, &scan, &conn), SESSIONS_PER_PASS).unwrap();
+        let census = out
+            .iter()
+            .find(|f| f.finding.starts_with("3 sessions recorded under"))
+            .unwrap_or_else(|| panic!("{out:#?}"));
+        let rows: Vec<(&Locator, &str)> = census
+            .evidence
+            .iter()
+            .map(|e| (&e.at, e.measured.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (
+                    &Locator::Session {
+                        session_id: "s2".into(),
+                        record: None
+                    },
+                    "no opening prompt recorded"
+                ),
+                (
+                    &Locator::Session {
+                        session_id: "s3".into(),
+                        record: None
+                    },
+                    "no transcript on disk"
+                ),
+            ],
+            "{census:#?}"
         );
     }
 
