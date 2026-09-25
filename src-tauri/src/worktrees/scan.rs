@@ -2479,6 +2479,15 @@ const CLASSIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45)
 /// through a conflict as mid-rebase -- and so unremovable -- for the
 /// rest of its life.
 ///
+/// A multi-commit cherry-pick or revert is also detected by its
+/// `sequencer/` directory (#1446). Stopped on a conflict it has both the
+/// `*_HEAD` ref and `sequencer/`; once the conflict is resolved and
+/// COMMITTED, the ref goes and `sequencer/` is the only marker left,
+/// while `git status` still says "Cherry-pick currently in progress" and
+/// the rest of the plan waits in `sequencer/todo`. Measured on git
+/// 2.50.1: `--continue`, `--abort` and `--quit` each remove it, so unlike
+/// `REBASE_HEAD` it does not outlive its operation.
+///
 /// Paths are built with `PathBuf::join`, never `format!`: Windows
 /// `canonicalize` returns verbatim `\\?\C:\` paths and this has cost
 /// six Windows-only failures.
@@ -2506,6 +2515,20 @@ fn operation_in_progress(dir: &Path) -> Option<GitOperation> {
         if git_dir.join(marker).exists() {
             return Some(op);
         }
+    }
+    // Last, because between commits it is the ONLY marker (#1446). The
+    // todo's first instruction names the operation. An unreadable or
+    // unrecognised todo still means a sequence is in flight -- absent is
+    // not zero -- so it falls back to cherry-pick, the command that
+    // writes a sequencer far more often than revert.
+    let sequencer = git_dir.join("sequencer");
+    if sequencer.is_dir() {
+        let todo = std::fs::read_to_string(sequencer.join("todo")).unwrap_or_default();
+        let first = todo.split_whitespace().next();
+        return Some(match first {
+            Some("revert") => GitOperation::Revert,
+            _ => GitOperation::CherryPick,
+        });
     }
     None
 }
@@ -11111,6 +11134,104 @@ mod in_progress_tests {
         assert_eq!(operation_in_progress(dir), Some(GitOperation::Bisect));
         assert!(run(dir, &["bisect", "reset"]));
         assert_eq!(operation_in_progress(dir), None, "bisect reset");
+    }
+
+    /// Two commits on `feat` after its base: the first conflicts with
+    /// `main`, the second (a new file) does not. Picking or reverting
+    /// both stops on the first with the second still queued.
+    fn two_step_sequence(dir: &Path) {
+        conflicting(dir);
+        assert!(run(dir, &["checkout", "-q", "feat"]));
+        std::fs::write(dir.join("g.txt"), "second\n").unwrap();
+        assert!(run(dir, &["add", "g.txt"]));
+        assert!(run(dir, &["commit", "-q", "-m", "second"]));
+        assert!(run(dir, &["checkout", "-q", "main"]));
+    }
+
+    /// #1446: a multi-commit cherry-pick paused BETWEEN commits.
+    ///
+    /// Once the conflict is resolved and committed, `CHERRY_PICK_HEAD` is
+    /// gone and `sequencer/` is all that is left -- the worktree is clean,
+    /// so without this it read as removable while the rest of the pick
+    /// plan waited in `sequencer/todo`.
+    #[test]
+    fn a_cherry_pick_paused_between_commits_is_in_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        two_step_sequence(dir);
+        let _ = run(dir, &["cherry-pick", "feat~1", "feat"]);
+        assert_eq!(operation_in_progress(dir), Some(GitOperation::CherryPick));
+
+        std::fs::write(dir.join("f.txt"), "resolved\n").unwrap();
+        assert!(run(dir, &["add", "f.txt"]));
+        assert!(run(dir, &["commit", "-q", "--no-edit"]));
+        assert!(
+            !dir.join(".git").join("CHERRY_PICK_HEAD").exists(),
+            "precondition: only the sequencer is left"
+        );
+        assert!(dir.join(".git").join("sequencer").is_dir(), "precondition");
+        assert_eq!(operation_in_progress(dir), Some(GitOperation::CherryPick));
+
+        let continued = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["cherry-pick", "--continue"])
+            .envs(IDENT)
+            .env("GIT_EDITOR", "true")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(continued, "cherry-pick --continue must succeed");
+        assert_eq!(operation_in_progress(dir), None, "the sequence finished");
+    }
+
+    /// The same state for `revert`, named as a revert rather than
+    /// defaulting to cherry-pick: the todo's first word says which.
+    #[test]
+    fn a_revert_paused_between_commits_is_in_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        conflicting(dir);
+        assert!(run(dir, &["checkout", "-q", "feat"]));
+        std::fs::write(dir.join("f.txt"), "later\n").unwrap();
+        assert!(run(dir, &["commit", "-q", "-am", "later"]));
+        std::fs::write(dir.join("g.txt"), "extra\n").unwrap();
+        assert!(run(dir, &["add", "g.txt"]));
+        assert!(run(dir, &["commit", "-q", "-m", "extra"]));
+        // Reverting "theirs" (HEAD~2) conflicts with "later", and "extra"
+        // (HEAD) is queued after it, so the sequence stops on the first
+        // with work left.
+        let _ = run(dir, &["revert", "--no-edit", "HEAD~2", "HEAD"]);
+        assert_eq!(operation_in_progress(dir), Some(GitOperation::Revert));
+
+        std::fs::write(dir.join("f.txt"), "resolved\n").unwrap();
+        assert!(run(dir, &["add", "f.txt"]));
+        assert!(run(dir, &["commit", "-q", "--no-edit"]));
+        assert!(
+            !dir.join(".git").join("REVERT_HEAD").exists(),
+            "precondition: only the sequencer is left"
+        );
+        assert!(dir.join(".git").join("sequencer").is_dir(), "precondition");
+        assert_eq!(operation_in_progress(dir), Some(GitOperation::Revert));
+    }
+
+    /// And the sequencer does not outlive an abandoned sequence: `--abort`
+    /// and `--quit` both clear it, so this cannot become #1438 again.
+    #[test]
+    fn abandoning_a_paused_sequence_clears_the_state() {
+        for end in ["--abort", "--quit"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path();
+            two_step_sequence(dir);
+            let _ = run(dir, &["cherry-pick", "feat~1", "feat"]);
+            std::fs::write(dir.join("f.txt"), "resolved\n").unwrap();
+            assert!(run(dir, &["add", "f.txt"]));
+            assert!(run(dir, &["commit", "-q", "--no-edit"]));
+            assert!(operation_in_progress(dir).is_some(), "precondition");
+
+            assert!(run(dir, &["cherry-pick", end]), "cherry-pick {end}");
+            assert_eq!(operation_in_progress(dir), None, "after {end}");
+        }
     }
 
     /// An ABORTED rebase leaves no markers, so the row goes back to
