@@ -13,6 +13,8 @@
 //!   the published linters is asserted, not measured, and is
 //!   [`Severity::Advice`]. The brief quotes the source; the finding
 //!   never predicts an effect.
+//! - **Statistics** with no threshold, such as the launch-set row, are
+//!   [`Severity::Note`]: they recommend nothing (#1422).
 //! - **Measurements.** ETH Zurich (arXiv:2602.11988): context files raise
 //!   inference cost by over 20% on average. McMillan (arXiv:2605.10039):
 //!   1,650 sessions, file size varied 25 to 500 lines, no detectable
@@ -28,7 +30,7 @@
 //! | rule | source | threshold | severity |
 //! |---|---|---|---|
 //! | [`Rule::LineTarget`] | memory docs "target under 200 lines per CLAUDE.md file"; features-overview "Keep CLAUDE.md under 200 lines"; UFMG's context-bloat threshold | 200 lines. The brief names the community range: 60 (HumanLayer's own root), 300 (HumanLayer's cap), 500 (Cursor rules) | Advice |
-//! | [`Rule::LaunchSet`] | memory docs: imported files "still load and enter the context window at launch"; subdirectory files load "when Claude reads files in those subdirectories" | none: one informational row per report, every file loaded before the first prompt with lines and est. tokens; "at least" when the scan is partial | Advice |
+//! | [`Rule::LaunchSet`] | memory docs: imported files "still load and enter the context window at launch"; subdirectory files load "when Claude reads files in those subdirectories" | none: one informational row per report, every file loaded before the first prompt with lines and est. tokens; "at least" when the scan is partial. A statistic that recommends nothing (#1422) | Note |
 //! | [`Rule::HardSkip`] | memory docs "loads a CLAUDE.md file of up to 4 MiB in full and skips a larger file" | 4 MiB, on-disk bytes | Problem |
 //! | [`Rule::Secret`] | cclint's secret rule; changelog: the feedback share uploads "the system prompt (which includes your CLAUDE.md instructions)" | `sk-ant-`, `ghp_`, `github_pat_`, a PEM private-key header, `AKIA` + 16; placeholders (`xxx`, `your`, `example`, one repeated character) skipped. The finding carries the line and a masked prefix, never the value | Problem |
 //! | [`Rule::Emphasis`] | best-practices "add emphasis such as 'IMPORTANT' to that line alone. If you emphasize many lines, none of them stands out." | 2 or more prose lines in one file carrying all-caps `IMPORTANT`, `YOU MUST`, `NEVER` or `ALWAYS`. Caps only: bold prose does not count, or this repository's own house style would trip it | Advice |
@@ -489,6 +491,8 @@ fn emit(
 }
 
 /// The informational row: every file loaded before the first prompt.
+/// A statistic with no threshold, so a [`Severity::Note`] (#1422); the
+/// size rules that recommend a cut ([`Rule::LineTarget`]) stay Advice.
 fn launch_set(cx: &Context, loaded: &[Loaded]) -> Result<Finding, String> {
     let mut files = 0u64;
     let mut lines = 0u64;
@@ -541,7 +545,7 @@ fn launch_set(cx: &Context, loaded: &[Loaded]) -> Result<Finding, String> {
     };
     Ok(emit(
         Rule::LaunchSet,
-        Severity::Advice,
+        Severity::Note,
         Subject::Directory {
             path: cx.repo.to_string_lossy().to_string(),
         },
@@ -1161,6 +1165,9 @@ mod tests {
         assert_eq!(hits.len(), 1, "{found:?}");
         let f = hits[0];
         assert_eq!(f.severity, Severity::Advice);
+        // #1422: the size rule that recommends a cut stays Advice while
+        // the launch-set row beside it, a statistic, is a Note.
+        assert_eq!(by_rule(&found, Rule::LaunchSet)[0].severity, Severity::Note);
         assert!(f.finding.contains("201 lines"), "{}", f.finding);
         assert!(f.finding.contains("target is under 200"), "{}", f.finding);
         assert!(f.finding.contains("est."), "{}", f.finding);
@@ -1199,7 +1206,8 @@ mod tests {
         let rows = by_rule(&found, Rule::LaunchSet);
         assert_eq!(rows.len(), 1, "one row per report: {found:?}");
         let row = rows[0];
-        assert_eq!(row.severity, Severity::Advice);
+        // #1422: a statistic with no threshold recommends nothing.
+        assert_eq!(row.severity, Severity::Note);
         let expected = crate::claudemd::tokens::estimate("global\nrules\n")
             + crate::claudemd::tokens::estimate("@./shared.md\nroot\n")
             + crate::claudemd::tokens::estimate("a\nb\nc\n");
