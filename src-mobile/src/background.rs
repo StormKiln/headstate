@@ -1021,7 +1021,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .received_at;
-        drop(server);
+        server.go_away();
         // The subscriber notices the dead stream on its own; the window
         // must not be what tells it.
         until(|| c.connection_state().state == State::Unreachable).await;
