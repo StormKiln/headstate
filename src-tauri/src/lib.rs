@@ -455,6 +455,7 @@ pub fn run() {
             remote::pairing::respond_to_pairing,
             remote::pairing::list_paired_devices,
             remote::pairing::revoke_paired_device,
+            remote::pairing::set_paired_device_access,
             remote::gate::get_remote_enabled,
             remote::gate::set_remote_enabled,
         ])

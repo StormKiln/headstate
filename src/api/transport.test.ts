@@ -375,6 +375,11 @@ const ROWS: Row[] = [
   row(api.respondToPairing, [requestId, approve, replaceExisting], "respond_to_pairing", { requestId, approve, replaceExisting }),
   row(api.listPairedDevices, [], "list_paired_devices"),
   row(api.revokePairedDevice, [deviceId], "revoke_paired_device", { id: deviceId }),
+  row(api.setPairedDeviceAccess, [deviceId, true, false], "set_paired_device_access", {
+    id: deviceId,
+    transcriptsAllowed: true,
+    revealAllowed: false,
+  }),
   // Both take no arguments: the health sample is of THIS machine and
   // the history is bounded on the Rust side, so there is nothing for a
   // caller to scope or to ask for more of.

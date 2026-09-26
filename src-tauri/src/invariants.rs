@@ -3635,6 +3635,147 @@ fn suggestion(f: &Finding) -> String {
         assert!(offenders[0].starts_with("5: "), "{offenders:?}");
     }
 
+    /// Every remote command that returns transcript text is masked at the
+    /// remote boundary (#1488).
+    ///
+    /// # The defect this prevents
+    ///
+    /// `remote/privacy.rs` masks secrets in transcript text before it
+    /// leaves for a phone, and it does so for exactly the commands in its
+    /// `TRANSCRIPT_TEXT` table. The 7.9 read model and paged reads (#1475,
+    /// #1220) add transcript commands after that table was written. A new
+    /// one registered on the surface and not listed there would send a
+    /// phone every token in the transcript -- green in every behavioural
+    /// test, because the command itself works.
+    ///
+    /// # What is asserted
+    ///
+    /// A non-`Local` row of `surface::SURFACE` is transcript-bearing when
+    /// its NAME says "transcript", or its function's RETURN TYPE names
+    /// `transcript`, `preview::` or `search::` (the modules transcript
+    /// text is read in). Each must have a `TRANSCRIPT_TEXT` row or a named
+    /// exemption below saying why its answer holds no text. And every
+    /// `TRANSCRIPT_TEXT` row must be a live remote command, so a renamed
+    /// command cannot leave a stale row that masks nothing.
+    ///
+    /// # What this cannot see
+    ///
+    /// A command named and typed with no hint of transcripts that
+    /// nonetheless returns transcript text. The name and module
+    /// conventions are what it leans on; `claude_sessions`' opening prompt
+    /// is such a case, found by reading, and listed by hand.
+    #[test]
+    fn every_transcript_command_is_masked_at_the_remote_boundary() {
+        use crate::remote::privacy;
+        use crate::remote::surface::{Class, SURFACE};
+
+        /// Transcript-sounding commands whose answers carry no transcript
+        /// TEXT, with why.
+        const NO_TEXT: &[(&str, &str)] = &[
+            (
+                "claude_import_transcripts",
+                "returns counts of files scanned and indexed",
+            ),
+            (
+                "claude_index_coverage",
+                "returns counts of indexed transcripts, no snippets",
+            ),
+        ];
+
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let files: Vec<(PathBuf, String)> = rust_files(&manifest.join("src"))
+            .into_iter()
+            .filter(|f| !f.ends_with("invariants.rs"))
+            .filter_map(|f| {
+                let src = std::fs::read_to_string(&f).ok()?.replace("\r\n", "\n");
+                let prod = production(&f, &src);
+                Some((f, prod))
+            })
+            .collect();
+
+        // The signature of a `pub fn` / `pub async fn` named `name`, and
+        // where it is, from production code only.
+        let signature = |name: &str| -> Option<(String, String)> {
+            for (file, src) in &files {
+                for needle in [format!("pub async fn {name}("), format!("pub fn {name}(")] {
+                    if let Some(at) = src.find(&needle) {
+                        let rest = &src[at..];
+                        let end = rest.find("{\n").unwrap_or(rest.len());
+                        let line = src[..at].lines().count() + 1;
+                        let rel = file.strip_prefix(manifest).unwrap_or(file);
+                        return Some((
+                            rest[..end].to_string(),
+                            format!("{}", rel.display())
+                                + &format!(" (near line {line} of its production text)"),
+                        ));
+                    }
+                }
+            }
+            None
+        };
+
+        let mut found = 0usize;
+        let mut bearing = 0usize;
+        let mut offenders = Vec::new();
+        for (name, class) in SURFACE {
+            if *class == Class::Local {
+                continue;
+            }
+            let sig = signature(name);
+            if sig.is_some() {
+                found += 1;
+            }
+            let returns = sig
+                .as_ref()
+                .and_then(|(s, _)| s.split_once("->").map(|(_, r)| r.to_ascii_lowercase()))
+                .unwrap_or_default();
+            let by_name = name.contains("transcript");
+            let by_type = ["transcript", "preview::", "search::"]
+                .iter()
+                .any(|m| returns.contains(m));
+            if !(by_name || by_type) {
+                continue;
+            }
+            bearing += 1;
+            if privacy::carries(name).is_some() || NO_TEXT.iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            let at = sig.map(|(_, at)| at).unwrap_or_else(|| "?".into());
+            offenders.push(format!(
+                "{name} ({at}) returns transcript text by its name or type but has no row in \
+                 remote/privacy.rs TRANSCRIPT_TEXT -- add one (Whole or Fields), or add it to \
+                 NO_TEXT here with why its answer holds no text"
+            ));
+        }
+        for (name, _) in privacy::TRANSCRIPT_TEXT {
+            if !SURFACE.iter().any(|(n, c)| n == name && *c != Class::Local) {
+                offenders.push(format!(
+                    "remote/privacy.rs TRANSCRIPT_TEXT lists `{name}`, which is not a remote \
+                     command in remote/surface.rs SURFACE -- a stale row masks nothing"
+                ));
+            }
+        }
+        for (name, _) in NO_TEXT {
+            if !SURFACE.iter().any(|(n, _)| n == name) {
+                offenders.push(format!(
+                    "NO_TEXT exempts `{name}`, which is no longer a command"
+                ));
+            }
+        }
+
+        // Self-guards: the scan found the commands' functions at all, and
+        // saw the three transcript commands known today.
+        assert!(
+            found > 80,
+            "found the signatures of only {found} remote commands; the `pub fn` scan is broken"
+        );
+        assert!(
+            bearing >= 3,
+            "saw only {bearing} transcript-bearing command(s); the markers are broken"
+        );
+        assert!(offenders.is_empty(), "{}", offenders.join("\n"));
+    }
+
     /// A `Mirrors `rust::path::Type`` doc comment is a claim about the
     /// WIRE, and this holds it to one (#1288).
     ///

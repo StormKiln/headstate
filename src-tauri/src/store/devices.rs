@@ -31,6 +31,13 @@ pub struct PairedDevice {
     pub paired_at: String,
     /// RFC 3339; `None` until the device's first connection after pairing.
     pub last_seen: Option<String>,
+    /// "Allow this phone to read session transcripts" (#1488). On by
+    /// default, including for pairings made before the switch existed.
+    pub transcripts_allowed: bool,
+    /// "Allow this phone to reveal hidden text" (#1488). Off by default:
+    /// transcript text reaches this device with likely secrets masked
+    /// unless the owner turned this on at the desktop.
+    pub reveal_allowed: bool,
 }
 
 /// What pairing knows about a device before it has a row.
@@ -43,8 +50,13 @@ pub struct NewDevice {
     pub mldsa_pubkey: Option<Vec<u8>>,
 }
 
-const COLUMNS: &str =
-    "id, name, cert_fp, cert_der, ecdsa_pubkey, mldsa_pubkey, paired_at, last_seen";
+/// Every column of a [`PairedDevice`], over [`FROM`]. A device with no
+/// `paired_device_access` row has the defaults migration 30 documents:
+/// transcripts on, reveal off.
+const COLUMNS: &str = "d.id, d.name, d.cert_fp, d.cert_der, d.ecdsa_pubkey, d.mldsa_pubkey, \
+     d.paired_at, d.last_seen, COALESCE(a.transcripts_allowed, 1), COALESCE(a.reveal_allowed, 0)";
+
+const FROM: &str = "paired_devices d LEFT JOIN paired_device_access a ON a.device_id = d.id";
 
 fn from_row(r: &Row<'_>) -> rusqlite::Result<PairedDevice> {
     Ok(PairedDevice {
@@ -56,6 +68,8 @@ fn from_row(r: &Row<'_>) -> rusqlite::Result<PairedDevice> {
         mldsa_pubkey: r.get(5)?,
         paired_at: r.get(6)?,
         last_seen: r.get(7)?,
+        transcripts_allowed: r.get(8)?,
+        reveal_allowed: r.get(9)?,
     })
 }
 
@@ -80,13 +94,21 @@ pub fn insert(conn: &Connection, device: &NewDevice) -> Result<i64, StoreError> 
             Utc::now().to_rfc3339(),
         ],
     )?;
-    Ok(conn.last_insert_rowid())
+    let id = conn.last_insert_rowid();
+    // SQLite reuses the highest id once its row is deleted, so a setting
+    // left behind by a device removed some other way must not become
+    // this new device's. A new pairing starts at the defaults.
+    conn.execute(
+        "DELETE FROM paired_device_access WHERE device_id = ?1",
+        [id],
+    )?;
+    Ok(id)
 }
 
 /// Every paired device, oldest pairing first.
 pub fn list(conn: &Connection) -> Result<Vec<PairedDevice>, StoreError> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT {COLUMNS} FROM paired_devices ORDER BY paired_at, id"
+        "SELECT {COLUMNS} FROM {FROM} ORDER BY d.paired_at, d.id"
     ))?;
     let rows = stmt.query_map([], from_row)?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -100,7 +122,7 @@ pub fn find_by_fingerprint(
 ) -> Result<Option<PairedDevice>, StoreError> {
     Ok(conn
         .query_row(
-            &format!("SELECT {COLUMNS} FROM paired_devices WHERE cert_fp = ?1"),
+            &format!("SELECT {COLUMNS} FROM {FROM} WHERE d.cert_fp = ?1"),
             [cert_fp],
             from_row,
         )
@@ -112,7 +134,7 @@ pub fn find_by_fingerprint(
 /// coexist.
 pub fn find_by_name(conn: &Connection, name: &str) -> Result<Vec<PairedDevice>, StoreError> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT {COLUMNS} FROM paired_devices WHERE name = ?1 ORDER BY paired_at, id"
+        "SELECT {COLUMNS} FROM {FROM} WHERE d.name = ?1 ORDER BY d.paired_at, d.id"
     ))?;
     let rows = stmt.query_map([name], from_row)?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -125,15 +147,43 @@ pub fn find_by_name(conn: &Connection, name: &str) -> Result<Vec<PairedDevice>, 
 pub fn revoke(conn: &Connection, id: i64) -> Result<Option<PairedDevice>, StoreError> {
     let existing = conn
         .query_row(
-            &format!("SELECT {COLUMNS} FROM paired_devices WHERE id = ?1"),
+            &format!("SELECT {COLUMNS} FROM {FROM} WHERE d.id = ?1"),
             [id],
             from_row,
         )
         .optional()?;
     if existing.is_some() {
         conn.execute("DELETE FROM paired_devices WHERE id = ?1", [id])?;
+        conn.execute(
+            "DELETE FROM paired_device_access WHERE device_id = ?1",
+            [id],
+        )?;
     }
     Ok(existing)
+}
+
+/// Set what one device may read of the session transcripts (#1488).
+///
+/// Returns whether a row was changed; `false` when the device was revoked
+/// in the meantime, which is not an error for the same reason a second
+/// Revoke is not one.
+pub fn set_transcript_access(
+    conn: &Connection,
+    id: i64,
+    transcripts_allowed: bool,
+    reveal_allowed: bool,
+) -> Result<bool, StoreError> {
+    // Only for a device that exists: a setting stored for a revoked id
+    // would wait for the next device to reuse it.
+    let changed = conn.execute(
+        "INSERT INTO paired_device_access (device_id, transcripts_allowed, reveal_allowed)
+         SELECT id, ?2, ?3 FROM paired_devices WHERE id = ?1
+         ON CONFLICT(device_id) DO UPDATE SET
+            transcripts_allowed = excluded.transcripts_allowed,
+            reveal_allowed = excluded.reveal_allowed",
+        params![id, transcripts_allowed, reveal_allowed],
+    )?;
+    Ok(changed > 0)
 }
 
 /// Record that a paired device connected. Called by the listener after
@@ -224,6 +274,58 @@ mod tests {
 
         // A second click on Revoke is a no-op, not a failure.
         assert_eq!(revoke(&conn, id).unwrap(), None);
+    }
+
+    /// Transcripts on, reveal off: the defaults #1488's owner decision
+    /// set, for a device paired from now on.
+    #[test]
+    fn a_new_pairing_reads_transcripts_masked() {
+        let conn = db();
+        insert(&conn, &phone("a", "fresh")).unwrap();
+        let row = find_by_fingerprint(&conn, "fresh").unwrap().unwrap();
+        assert!(row.transcripts_allowed);
+        assert!(!row.reveal_allowed);
+    }
+
+    #[test]
+    fn transcript_access_round_trips_and_touches_one_row() {
+        let conn = db();
+        let id = insert(&conn, &phone("a", "one")).unwrap();
+        insert(&conn, &phone("b", "two")).unwrap();
+
+        assert!(set_transcript_access(&conn, id, false, true).unwrap());
+        let one = find_by_fingerprint(&conn, "one").unwrap().unwrap();
+        assert!(!one.transcripts_allowed);
+        assert!(one.reveal_allowed);
+        let two = find_by_fingerprint(&conn, "two").unwrap().unwrap();
+        assert!(two.transcripts_allowed && !two.reveal_allowed);
+
+        // A revoked device is not an error.
+        assert!(!set_transcript_access(&conn, 999, true, true).unwrap());
+    }
+
+    /// SQLite reuses the highest id after a delete. A revoked phone's
+    /// reveal allowance must not pass to the next phone paired.
+    #[test]
+    fn a_reused_id_starts_at_the_defaults() {
+        let conn = db();
+        let id = insert(&conn, &phone("old", "old")).unwrap();
+        set_transcript_access(&conn, id, false, true).unwrap();
+        revoke(&conn, id).unwrap();
+
+        let again = insert(&conn, &phone("new", "new")).unwrap();
+        assert_eq!(again, id, "the premise: SQLite reused the id");
+        let row = find_by_fingerprint(&conn, "new").unwrap().unwrap();
+        assert!(row.transcripts_allowed && !row.reveal_allowed);
+
+        // And a row left behind by a path other than `revoke` is cleared
+        // at insert.
+        set_transcript_access(&conn, again, false, true).unwrap();
+        conn.execute("DELETE FROM paired_devices WHERE id = ?1", [again])
+            .unwrap();
+        insert(&conn, &phone("newer", "newer")).unwrap();
+        let row = find_by_fingerprint(&conn, "newer").unwrap().unwrap();
+        assert!(row.transcripts_allowed && !row.reveal_allowed);
     }
 
     #[test]

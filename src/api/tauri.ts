@@ -1974,6 +1974,12 @@ export interface PairedDevice {
   paired_at: string;
   /// RFC 3339, or null until the device's first connection after pairing.
   last_seen: string | null;
+  /// "Allow this phone to read session transcripts" (#1488). On by
+  /// default.
+  transcripts_allowed: boolean;
+  /// "Allow this phone to reveal hidden text" (#1488). Off by default:
+  /// the phone gets transcript text with likely secrets masked.
+  reveal_allowed: boolean;
 }
 
 export const listPairedDevices = () =>
@@ -1983,6 +1989,15 @@ export const listPairedDevices = () =>
 /// click on an already-revoked device resolves rather than rejects.
 export const revokePairedDevice = (id: number) =>
   call<void>("revoke_paired_device", { id });
+
+/// What one phone may read of the session transcripts (#1488). Both
+/// switches in one call; the phone's very next request is judged by
+/// them. Rejects when the phone was revoked in the meantime.
+export const setPairedDeviceAccess = (
+  id: number,
+  transcriptsAllowed: boolean,
+  revealAllowed: boolean,
+) => call<void>("set_paired_device_access", { id, transcriptsAllowed, revealAllowed });
 
 /// The machine's health right now, sampled on demand.
 ///

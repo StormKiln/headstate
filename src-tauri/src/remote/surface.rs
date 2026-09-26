@@ -536,6 +536,11 @@ pub const SURFACE: &[(&str, Class)] = &[
     // unlike `claude_reveal_path` a `Read` command's argument arrives
     // from a paired device rather than from this machine's own frontend;
     // `claude_transcript_path` in `commands.rs` argues it.
+    //
+    // What crosses is not what the webview sees (#1488): every command
+    // returning transcript text is listed in `remote/privacy.rs`'s
+    // `TRANSCRIPT_TEXT`, and the listener masks likely secrets in it and
+    // honours the per-device switches before it leaves this machine.
     ("claude_transcript_tail", Class::Read),
     // One incremental step of following a live transcript (#1208).
     //
@@ -832,6 +837,11 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("respond_to_pairing", Class::Local),
     ("list_paired_devices", Class::Local),
     ("revoke_paired_device", Class::Local),
+    // What a phone may read of the session transcripts, and whether it
+    // may unmask them (#1488). `Local` for the reason the rows above
+    // are: a phone that could widen its own access would make the switch
+    // meaningless -- the owner decides at the desktop, per device.
+    ("set_paired_device_access", Class::Local),
     ("get_remote_enabled", Class::Local),
     ("set_remote_enabled", Class::Local),
     // The Claude Code hook installer (#915). All three, deliberately.
@@ -1543,6 +1553,7 @@ mod tests {
             "respond_to_pairing",
             "list_paired_devices",
             "revoke_paired_device",
+            "set_paired_device_access",
             "get_remote_enabled",
             "set_remote_enabled",
         ] {
