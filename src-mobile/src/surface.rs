@@ -520,6 +520,9 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("respond_to_pairing", Class::Local),
     ("list_paired_devices", Class::Local),
     ("revoke_paired_device", Class::Local),
+    // #1488: a phone must not widen its own transcript access. See the
+    // desktop table.
+    ("set_paired_device_access", Class::Local),
     ("get_remote_enabled", Class::Local),
     ("set_remote_enabled", Class::Local),
     // The Claude Code hook installer (#915). All three `Local`: they edit

@@ -44,8 +44,10 @@
 //! - `POST /v1/pair`: `remote/pairing.rs`. 200 with a `PairOutcome`;
 //!   400 for a body that does not decode; otherwise `PairError::http_status`.
 //! - `POST /v1/call/{command}`: `remote/surface.rs` and `remote/stepup.rs`.
-//!   200 with the command's JSON result; 404 unknown command, 403
-//!   desktop-only command or not paired, 400 for a body that is not JSON
+//!   200 with the command's JSON result (transcript text masked per
+//!   `remote/privacy.rs`); 404 unknown command, 403 desktop-only command,
+//!   not paired, or a transcript read or reveal this device is not
+//!   allowed; 400 for a body that is not JSON
 //!   or does not decode as the command's arguments, 500 when the command
 //!   itself failed (the body is its message); a destructive command's
 //!   signature is checked first and refused with `StepUpError::http_status`.
@@ -56,6 +58,7 @@
 use crate::remote::events::{self, Hub};
 use crate::remote::identity::{fingerprint_of, Identity};
 use crate::remote::pairing::{self, PairRequest, PairingState, PeerCert};
+use crate::remote::privacy;
 use crate::remote::stepup::{self, NonceWindow};
 use crate::remote::surface::{self, Class, RemoteError};
 use crate::store::devices::PairedDevice;
@@ -546,13 +549,22 @@ async fn call(
             return refusal(e.http_status(), e.to_string());
         }
     }
+    // Transcript text leaves the desktop only through here, and only as
+    // `remote/privacy.rs` allows this device: refused when its switch is
+    // off, masked unless it may reveal and asked to (#1488). After the
+    // step-up check, so a destructive command's signature covers the
+    // arguments the phone actually sent.
+    let (args, plan) = match privacy::admit(&command, args, privacy::Access::from(&device)) {
+        Ok(admitted) => admitted,
+        Err(e) => return refusal(403, e.to_string()),
+    };
     let result = st.host.dispatch(&command, args, &device.name).await;
     if class == Class::Destructive {
         // The attempt is the news, whether or not it succeeded.
         st.host.notify_destructive(&device.name, &command);
     }
     match result {
-        Ok(value) => Json(value).into_response(),
+        Ok(value) => Json(plan.finish(&command, value)).into_response(),
         Err(e) => refusal_for(e),
     }
 }
@@ -857,6 +869,8 @@ pub(crate) mod tests {
             mldsa_pubkey: None,
             paired_at: "2026-09-05T00:00:00Z".into(),
             last_seen: None,
+            transcripts_allowed: true,
+            reveal_allowed: false,
         }
     }
 
@@ -892,12 +906,15 @@ pub(crate) mod tests {
 
     /// A `CommandHost` that runs nothing and remembers everything: what
     /// it was asked to dispatch, and which destructive calls it was told
-    /// to announce. Answers `{"ran": <command>}` unless told to fail.
+    /// to announce. Answers `{"ran": <command>}` unless told to fail, or
+    /// `reply_with` when a test needs a particular answer to come back
+    /// through the listener (a transcript, to see it masked).
     #[derive(Default)]
     pub(crate) struct RecordingHost {
         pub(crate) calls: Mutex<Vec<(String, Value, String)>>,
         pub(crate) notices: Mutex<Vec<(String, String)>>,
         pub(crate) fail_with: Mutex<Option<RemoteError>>,
+        pub(crate) reply_with: Mutex<Option<Value>>,
     }
 
     impl CommandHost for RecordingHost {
@@ -915,7 +932,12 @@ pub(crate) mod tests {
                 ));
                 match self.fail_with.lock().unwrap().clone() {
                     Some(e) => Err(e),
-                    None => Ok(serde_json::json!({ "ran": command })),
+                    None => Ok(self
+                        .reply_with
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or_else(|| serde_json::json!({ "ran": command }))),
                 }
             })
         }

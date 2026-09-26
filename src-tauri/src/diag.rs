@@ -52,13 +52,23 @@ macro_rules! diag {
     };
 }
 
+/// The test logger and the switch lock, shared with every test that
+/// needs to see what a diag line SAID (#1488), not only that one was
+/// written.
+///
+/// Lifted out of `tests` rather than copied: `log::set_boxed_logger` is
+/// process-global and one-shot, so a second module installing its own
+/// capturing logger would lose the race to this one (or win it and break
+/// the counting test below). One logger, installed once, serves both.
 #[cfg(test)]
-mod tests {
+pub(crate) mod capture {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     /// Serialises the tests that drive the global diagnostics switch.
     ///
-    /// `set_enabled` is process-global and BOTH tests here toggle it, so
-    /// under `--test-threads=8` one flips the switch while the other is
+    /// `set_enabled` is process-global and several tests toggle it, so
+    /// under `--test-threads=8` one flips the switch while another is
     /// asserting on it. The counter noise was already handled with
     /// deltas; the SWITCH itself was not.
     ///
@@ -66,28 +76,35 @@ mod tests {
     /// synchronous tests with no await in the guarded window. Recovers
     /// from poisoning so a panic in one test fails that test rather than
     /// cascading.
-    fn switch_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) fn switch_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    use super::*;
-
-    /// Defaults OFF, so a user who never opens Settings never pays for
-    /// a diagnosis they did not ask for.
-    ///
-    /// Asserted on `UiPrefs::default()` rather than on the static: the
-    /// static is process-global and other tests in this binary flip it,
-    /// so reading it here would be a race, not a guarantee. The
-    /// preference is what actually decides the startup value, so it is
-    /// the honest thing to pin.
-    #[test]
-    fn diagnostics_default_to_off() {
-        assert!(!crate::poll::UiPrefs::default().diagnostic_logging);
+    /// What the installed logger has seen: a count, and every formatted
+    /// line, in arrival order.
+    pub(crate) struct Captured {
+        pub(crate) records: AtomicUsize,
+        pub(crate) lines: Mutex<Vec<String>>,
     }
 
-    /// The counting logger, installed at most once for this whole test
-    /// binary.
+    impl Captured {
+        /// Lines logged since `mark` (a previous `lines.len()`).
+        ///
+        /// Other tests log concurrently into the same logger, so a caller
+        /// reads a window and asserts on what it must NOT contain -- which
+        /// holds however much foreign noise the window also carries.
+        pub(crate) fn since(&self, mark: usize) -> Vec<String> {
+            let lines = self.lines.lock().unwrap_or_else(|e| e.into_inner());
+            lines.get(mark..).unwrap_or(&[]).to_vec()
+        }
+
+        pub(crate) fn mark(&self) -> usize {
+            self.lines.lock().unwrap_or_else(|e| e.into_inner()).len()
+        }
+    }
+
+    /// The logger, installed at most once for this whole test binary.
     ///
     /// # Why a shared static rather than a per-test install (#853)
     ///
@@ -103,26 +120,30 @@ mod tests {
     /// The race is avoidable rather than merely detectable, which is why
     /// this is a fix and not a loud skip. There is only ever ONE logger
     /// per process, so the test does not need to own the installation --
-    /// it needs the installed logger to be a counting one. Installing it
+    /// it needs the installed logger to be a capturing one. Installing it
     /// from a `OnceLock` does that: whichever test arrives first installs
-    /// it, every later caller gets the same counter back, and no call
+    /// it, every later caller gets the same capture back, and no call
     /// ever fails. `set_max_level` is set here too, since a logger that
-    /// is installed but filtered out counts nothing.
-    ///
-    /// Returns the counter so the caller reads deltas off the same
-    /// instance it installed.
-    fn counting_logger() -> &'static std::sync::atomic::AtomicUsize {
-        use std::sync::atomic::AtomicUsize;
-        static RECORDS: AtomicUsize = AtomicUsize::new(0);
+    /// is installed but filtered out captures nothing.
+    pub(crate) fn logger() -> &'static Captured {
+        static CAPTURED: Captured = Captured {
+            records: AtomicUsize::new(0),
+            lines: Mutex::new(Vec::new()),
+        };
         static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
-        struct Counting;
-        impl log::Log for Counting {
+        struct Capturing;
+        impl log::Log for Capturing {
             fn enabled(&self, _: &log::Metadata) -> bool {
                 true
             }
-            fn log(&self, _: &log::Record) {
-                RECORDS.fetch_add(1, Ordering::Relaxed);
+            fn log(&self, record: &log::Record) {
+                CAPTURED.records.fetch_add(1, Ordering::Relaxed);
+                CAPTURED
+                    .lines
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(record.args().to_string());
             }
             fn flush(&self) {}
         }
@@ -131,13 +152,32 @@ mod tests {
             // An Err here means something OUTSIDE these tests installed a
             // logger first (a harness, a dependency). That cannot be
             // counted against, and silently passing is the bug being
-            // fixed -- so it fails loudly instead of returning a counter
+            // fixed -- so it fails loudly instead of returning a capture
             // that will never move.
-            log::set_boxed_logger(Box::new(Counting))
+            log::set_boxed_logger(Box::new(Capturing))
                 .expect("a foreign logger is already installed; this test cannot count records");
             log::set_max_level(log::LevelFilter::Info);
         });
-        &RECORDS
+        &CAPTURED
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::capture::switch_lock;
+    use super::*;
+
+    /// Defaults OFF, so a user who never opens Settings never pays for
+    /// a diagnosis they did not ask for.
+    ///
+    /// Asserted on `UiPrefs::default()` rather than on the static: the
+    /// static is process-global and other tests in this binary flip it,
+    /// so reading it here would be a race, not a guarantee. The
+    /// preference is what actually decides the startup value, so it is
+    /// the honest thing to pin.
+    #[test]
+    fn diagnostics_default_to_off() {
+        assert!(!crate::poll::UiPrefs::default().diagnostic_logging);
     }
 
     /// The macro must actually consult the switch.
@@ -150,10 +190,10 @@ mod tests {
     /// counted arguments passed even with the gate deleted.
     ///
     /// No longer returns early when it loses the logger race: see
-    /// `counting_logger`, which removes the race instead (#853).
+    /// `capture::logger`, which removes the race instead (#853).
     #[test]
     fn the_macro_writes_nothing_while_off() {
-        let records = counting_logger();
+        let records = &super::capture::logger().records;
 
         // DELTAS, not absolutes. The logger is process-global and this
         // whole binary shares it, so other tests logging concurrently

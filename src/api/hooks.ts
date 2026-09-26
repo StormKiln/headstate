@@ -98,6 +98,7 @@ import {
   listPairedDevices,
   respondToPairing,
   revokePairedDevice,
+  setPairedDeviceAccess,
   type PairingQrPayload,
   type PairingRequest,
   actOnPr,
@@ -4874,6 +4875,20 @@ export function useRevokePairedDevice() {
   return async (id: number) => {
     try {
       await revokePairedDevice(id);
+    } finally {
+      await qc.invalidateQueries({ queryKey: ["paired-devices"] });
+    }
+  };
+}
+
+/// Set what one phone may read of the session transcripts (#1488). The
+/// list is refreshed whichever way the call ends, so the checkboxes show
+/// what is stored rather than what was clicked.
+export function useSetPairedDeviceAccess() {
+  const qc = useQueryClient();
+  return async (id: number, transcriptsAllowed: boolean, revealAllowed: boolean) => {
+    try {
+      await setPairedDeviceAccess(id, transcriptsAllowed, revealAllowed);
     } finally {
       await qc.invalidateQueries({ queryKey: ["paired-devices"] });
     }
