@@ -6546,6 +6546,63 @@ pub async fn claude_transcript_follow(
     .map_err(|e| e.to_string())?
 }
 
+/// The tail of one transcript as stable, render-ready messages (#1475).
+///
+/// The read model the transcript viewer is built on: every message keyed
+/// by its record's uuid, grouped into turns, with the full record
+/// allowlist and per-block clip metadata. `claude_transcript_tail` keeps
+/// serving the current pane; this is additive until the viewer replaces
+/// it. Paging (#1220) and live follow (#1476) build on the same parser.
+///
+/// `Class::Read`, on `claude_transcript_tail`'s grounds: one `.jsonl`
+/// under `~/.claude/projects`, resolved through the same
+/// `claude_transcript_path` guard -- which is also what makes a subagent
+/// link (`TranscriptSubagent::transcript_path`) safe to hand back here,
+/// since it lies under the same root. Bounded inside the command: the
+/// same 256 KB window, at most `transcript_model::MAX_MESSAGES` messages,
+/// each block clipped with its clip stated.
+///
+/// # Absent is not zero
+///
+/// An `Err` means the transcript could not be READ. A page with no
+/// messages was read, and its `machinery_records`, `unparseable_records`
+/// and `duplicate_records` say what the window held instead.
+#[tauri::command]
+pub async fn claude_transcript_messages(
+    path: String,
+) -> Result<crate::claude::transcript_model::TranscriptPage, String> {
+    let p = claude_transcript_path(&path)?;
+    tauri::async_runtime::spawn_blocking(move || crate::claude::transcript_model::tail(&p))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// One clipped block's full text, by the record's uuid and the block's
+/// index (#1475).
+///
+/// The "show all 38,210 characters" behind a per-block clip. Full text
+/// comes through this bounded fetch rather than by lifting the per-block
+/// cap on the page: see `transcript_model::block_text` for the design.
+///
+/// `Class::Read`: reads one `.jsonl` through the `claude_transcript_path`
+/// guard and writes nothing. Bounded server-side at
+/// `transcript_model::FULL_TEXT_CHARS`, and the response says when that
+/// bound bit, so the phone cannot be handed a 38 MB tool result by
+/// asking for one.
+#[tauri::command]
+pub async fn claude_transcript_block_text(
+    path: String,
+    message_id: String,
+    index: usize,
+) -> Result<crate::claude::transcript_model::TranscriptBlockText, String> {
+    let p = claude_transcript_path(&path)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::claude::transcript_model::block_text(&p, &message_id, index)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 // ---------------------------------------------------------------------
 // The repository browser (#1030-#1036, epic #1011). Rust side:
 // `repos/mod.rs`, where the git-index listing, the 256 KB bound and the

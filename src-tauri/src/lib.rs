@@ -364,6 +364,8 @@ pub fn run() {
             commands::claude_session_usage,
             commands::claude_transcript_tail,
             commands::claude_transcript_follow,
+            commands::claude_transcript_messages,
+            commands::claude_transcript_block_text,
             commands::claude_poll_live,
             commands::claude_overview,
             commands::claude_coverage,

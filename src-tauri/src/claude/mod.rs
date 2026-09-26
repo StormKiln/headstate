@@ -131,6 +131,9 @@ pub mod subagent;
 /// command string from the caller.
 pub mod terms;
 pub mod transcript;
+/// A transcript as stable, render-ready messages: ids, turns and the
+/// full record allowlist (#1475).
+pub mod transcript_model;
 /// Per-message token usage, summed per session (#959).
 pub mod usage;
 

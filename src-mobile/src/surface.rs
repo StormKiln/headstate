@@ -327,6 +327,12 @@ pub const SURFACE: &[(&str, Class)] = &[
     // Bounded by the same constants, and cheaper per poll than the row
     // above: it reads from a cursor rather than a fixed 256 KB window.
     ("claude_transcript_follow", Class::Read),
+    // The same transcript as stable, render-ready messages, and one
+    // clipped block's full text by record id (#1475). Read on the rows'
+    // grounds above, and bounded inside the command the same way; see the
+    // desktop copy.
+    ("claude_transcript_messages", Class::Read),
+    ("claude_transcript_block_text", Class::Read),
     // Whether the DESKTOP's hooks are installed (#915). Read: one file
     // read, no side effects, and "is that desktop recording?" is a real
     // away-from-desk question.
