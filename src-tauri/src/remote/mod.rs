@@ -14,6 +14,7 @@ pub mod gate;
 pub mod identity;
 pub mod listener;
 pub mod pairing;
+pub mod privacy;
 pub mod stepup;
 pub mod surface;
 

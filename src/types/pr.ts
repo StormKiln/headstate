@@ -1503,6 +1503,26 @@ type ClaudeSearchVerdict =
   | { kind: "none_yet"; indexed: number; total: number }
   | { kind: "not_asked" };
 
+/// What the desktop did to the transcript text in one answer before it
+/// crossed to a phone (#1488). Mirrors `remote::privacy::Masking`.
+///
+/// Present only on answers to a paired phone. The desktop's own window
+/// is never masked, so its answers carry none -- absence means "not
+/// masked by construction", not "nothing matched". Masked spans are
+/// `⟦hidden:<kind>⟧` markers in the text; `src/lib/masked.ts` splits them.
+export interface TranscriptMasking {
+  /// Spans replaced by a marker in this answer.
+  hidden: number;
+  /// Unmasked because the phone asked and this device may reveal.
+  revealed: boolean;
+  /// Whether asking to reveal would be honoured, so the button is only
+  /// offered when it can work.
+  reveal_allowed: boolean;
+  /// Transcript fields were set to `null` because this device may not
+  /// read transcripts: the text exists and was not sent.
+  withheld: boolean;
+}
+
 /// A search result and the coverage that qualifies it, together.
 ///
 /// One object, deliberately: handing a caller the hits and making the
@@ -1511,6 +1531,8 @@ type ClaudeSearchVerdict =
 export interface ClaudeSearchAnswer {
   verdict: ClaudeSearchVerdict;
   coverage: ClaudeIndexCoverage;
+  /// On a phone's answer only. See `TranscriptMasking`.
+  masking?: TranscriptMasking;
 }
 
 /// A liveness exactly as it arrives on the wire, with its reason
@@ -2592,6 +2614,9 @@ export interface ClaudePreview {
   /// Results whose call is older than the window. Non-zero is the normal
   /// consequence of a tail read, not a defect.
   results_above_window: number;
+  /// On a phone's `claude_transcript_tail` answer only. See
+  /// `TranscriptMasking`.
+  masking?: TranscriptMasking;
 }
 
 /// Where a follow left off, and what the file looked like there (#1208).
@@ -2631,6 +2656,8 @@ export interface ClaudeFollow {
   bytes_read: number;
   fingerprint_bytes_read: number;
   file_bytes: number;
+  /// On a phone's answer only. See `TranscriptMasking`.
+  masking?: TranscriptMasking;
 }
 
 /// The session list, INCLUDING what could not be read (#917).

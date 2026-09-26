@@ -148,6 +148,7 @@ describe("the remote surface's frontend half", () => {
       "revealLog",
       "revokePairedDevice",
       "setAutostart",
+      "setPairedDeviceAccess",
       "setNotifyPrefs",
       "setRemoteEnabled",
       "setWorktreeDirs",
