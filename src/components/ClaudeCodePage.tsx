@@ -3478,6 +3478,7 @@ function TranscriptPreview({ detail: d }: { detail: ClaudeSessionDetail }) {
     reread,
     window,
     pairings,
+    capped,
     isError,
     error,
     isLoading,
@@ -3572,10 +3573,16 @@ function TranscriptPreview({ detail: d }: { detail: ClaudeSessionDetail }) {
                   been told something false by omission. #910's own words asked
                   for "a 'showing the last N lines of a large file' label", and
                   the 39 real files over 1 MB are where it binds. */}
-              <p className="mt-2 text-xs text-[#8b949e]">
-                {window?.truncated
-                  ? `The last ${messages.length.toLocaleString()} message${messages.length === 1 ? "" : "s"} of a ${formatKb(window.file_bytes)} transcript. Earlier exchanges are not shown.`
-                  : `All ${messages.length.toLocaleString()} message${messages.length === 1 ? "" : "s"} in this transcript.`}
+              {/* #1474: CAPPED is its own sentence, checked first. The
+                  follow lets its oldest messages go once it holds too many,
+                  and a transcript read whole must not then be labelled
+                  "All N messages" over a conversation missing its start. */}
+              <p className="mt-2 text-xs text-[#8b949e]" data-testid="follow-window">
+                {capped > 0
+                  ? `Capped at the newest ${messages.length.toLocaleString()} message${messages.length === 1 ? "" : "s"}${window !== null ? ` of a ${formatKb(window.file_bytes)} transcript` : ""}. Earlier exchanges are not shown.`
+                  : window?.truncated
+                    ? `The last ${messages.length.toLocaleString()} message${messages.length === 1 ? "" : "s"} of a ${formatKb(window.file_bytes)} transcript. Earlier exchanges are not shown.`
+                    : `All ${messages.length.toLocaleString()} message${messages.length === 1 ? "" : "s"} in this transcript.`}
                 {window !== null && window.non_conversation_records > 0
                   ? ` ${window.non_conversation_records.toLocaleString()} bookkeeping record${window.non_conversation_records === 1 ? "" : "s"} in the last window are not conversation and are not shown.`
                   : ""}
@@ -3583,12 +3590,14 @@ function TranscriptPreview({ detail: d }: { detail: ClaudeSessionDetail }) {
               <ol className="mt-3 space-y-2">
                 {messages.map((m, i) => (
                   <li
-                    // The index is the key on purpose: transcript records
-                    // carry no stable id this reads, and two identical
-                    // messages in a row are a real thing a session does. The
-                    // list is only ever appended to or replaced whole, never
-                    // reordered or filtered, so the index IS the identity.
-                    key={i}
+                    // The position in the FOLLOW is the key: transcript
+                    // records carry no stable id this reads, and two
+                    // identical messages in a row are a real thing a session
+                    // does. The list is appended to, replaced whole, or has
+                    // its oldest let go by the cap (#1474) -- never
+                    // reordered -- so `capped + i` IS the identity, and a
+                    // message keeps its key when the cap shifts the window.
+                    key={capped + i}
                     className="rounded border border-[#30363d] bg-[#0d1117] p-2"
                   >
                     <div className="flex flex-wrap items-center gap-x-2 text-[11px] text-[#8b949e]">

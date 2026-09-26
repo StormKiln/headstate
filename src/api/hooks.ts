@@ -2148,6 +2148,104 @@ export function useClaudePlugins(enabled = true) {
 /// instead of.
 const FOLLOW_POLL_MS = 3_000;
 
+/// The most messages a follow holds at once (#1474).
+///
+/// The Rust side caps each READ at 200 messages (`preview.rs`
+/// `MAX_MESSAGES`), but a follow is the SUM of its reads, so without a
+/// bound of its own a session followed for an afternoon grows without
+/// limit in memory. When an append pushes past this, the oldest messages
+/// are let go and the hook reports how many (`capped`), so the pane says
+/// it is capped rather than claiming to show everything.
+///
+/// Five times one read: room for a busy stretch of a live session
+/// without the pane re-rendering thousands of rows. The windowed read
+/// model (#1475, #1220) replaces this bound with paging.
+export const FOLLOW_MAX_MESSAGES = 1_000;
+
+/// What two reads said about one `tool_use_id`, combined (#1474).
+///
+/// Each read pairs only the messages IN IT, so a call answered on a later
+/// poll is `unanswered` in the read that carried the call and
+/// `call_above_window` in the read that carried the result. Together
+/// the accumulation holds both halves, which is `paired` -- and letting
+/// either read win alone would render a finished call as unanswered, or
+/// crashed. So:
+///
+/// - `paired` from either read wins;
+/// - a call seen in one read and its result in the other is `paired`;
+/// - otherwise the later read wins.
+function mergePairing(earlier: ClaudePairing, later: ClaudePairing): ClaudePairing {
+  if (earlier === "paired" || later === "paired") return "paired";
+  if (
+    (earlier === "unanswered" && later === "call_above_window") ||
+    (earlier === "call_above_window" && later === "unanswered")
+  ) {
+    return "paired";
+  }
+  return later;
+}
+
+/// Merge a read's pairings into what the follow already holds, by key.
+///
+/// Never replaces the map: an idle poll returns `{}`, and replacing with
+/// it turned every earlier call in the pane into "unanswered" (#1474).
+function mergePairings(
+  held: Record<string, ClaudePairing>,
+  read: Record<string, ClaudePairing>,
+): Record<string, ClaudePairing> {
+  const ids = Object.keys(read);
+  if (ids.length === 0) return held;
+  const out = { ...held };
+  for (const id of ids) {
+    const prev = out[id];
+    out[id] = prev === undefined ? read[id] : mergePairing(prev, read[id]);
+  }
+  return out;
+}
+
+/// Apply `FOLLOW_MAX_MESSAGES`, stating it when it binds.
+///
+/// Returns the kept messages, how many were let go, and the pairings
+/// re-stated for what is kept: an id only the evicted messages named is
+/// dropped with them (that is the memory the cap exists to bound), and a
+/// result whose CALL was evicted is now `call_above_window` -- its call is
+/// above what the pane shows, and a `paired` left behind would claim a
+/// call the reader cannot find.
+function capFollow(
+  messages: ClaudePreviewMessage[],
+  pairings: Record<string, ClaudePairing>,
+): {
+  messages: ClaudePreviewMessage[];
+  evicted: number;
+  pairings: Record<string, ClaudePairing>;
+} {
+  const evicted = messages.length - FOLLOW_MAX_MESSAGES;
+  if (evicted <= 0) return { messages, evicted: 0, pairings };
+  const kept = messages.slice(evicted);
+  const calls = new Set<string>();
+  const results = new Set<string>();
+  for (const m of kept) {
+    for (const b of m.blocks) {
+      if (b.kind === "tool_use" && b.id !== null) calls.add(b.id);
+      if (b.kind === "tool_result" && b.tool_use_id !== null) results.add(b.tool_use_id);
+    }
+  }
+  const gone = new Set<string>();
+  for (const m of messages.slice(0, evicted)) {
+    for (const b of m.blocks) {
+      if (b.kind === "tool_use" && b.id !== null) gone.add(b.id);
+      if (b.kind === "tool_result" && b.tool_use_id !== null) gone.add(b.tool_use_id);
+    }
+  }
+  const out = { ...pairings };
+  for (const id of gone) {
+    if (calls.has(id)) continue;
+    if (results.has(id)) out[id] = "call_above_window";
+    else delete out[id];
+  }
+  return { messages: kept, evicted, pairings: out };
+}
+
 /// Following one session's transcript as it is written (#1208).
 ///
 /// # Why polling, and not a filesystem watcher
@@ -2218,11 +2316,15 @@ export function useClaudeTranscriptFollow(
       unparseable_records: number;
     } | null;
     pairings: Record<string, ClaudePairing>;
-  }>(() => ({ path, messages: [], reread: null, window: null, pairings: {} }));
+    /// Messages let go by `FOLLOW_MAX_MESSAGES` since the last full read.
+    /// Zero until the cap binds; reset only by a re-read, which replaces
+    /// the whole conversation.
+    capped: number;
+  }>(() => ({ path, messages: [], reread: null, window: null, pairings: {}, capped: 0 }));
 
   // Computed DURING RENDER, never set from an effect: React's own
   // "adjusting state when a prop changes" rule, and this file's.
-  const fresh = { path, messages: [], reread: null, window: null, pairings: {} };
+  const fresh = { path, messages: [], reread: null, window: null, pairings: {}, capped: 0 };
   const state = acc.path === path ? acc : fresh;
 
   /// Where the last read left off.
@@ -2258,7 +2360,14 @@ export function useClaudeTranscriptFollow(
       setAcc((prev) => {
         const mine = batch.filter((b) => b.path === prev.path).map((b) => b.message);
         if (mine.length === 0) return prev;
-        return { ...prev, messages: [...prev.messages, ...mine] };
+        // Bounded here, where the conversation grows (#1474).
+        const kept = capFollow([...prev.messages, ...mine], prev.pairings);
+        return {
+          ...prev,
+          messages: kept.messages,
+          pairings: kept.pairings,
+          capped: prev.capped + kept.evicted,
+        };
       });
     }, schedule),
   );
@@ -2306,18 +2415,41 @@ export function useClaudeTranscriptFollow(
         // Re-based onto a fresh accumulation when the path moved under
         // the request: the answer is still for `path`, so it is kept --
         // but it must not be merged into the PREVIOUS file's messages.
+        //
+        // The one place pairings and truncation are REPLACED rather than
+        // merged: a full re-read is the only answer that can say "not
+        // truncated" about the whole window.
+        const kept = capFollow(got.preview.messages, got.preview.pairings);
         setAcc({
           path,
-          messages: got.preview.messages,
+          messages: kept.messages,
           reread: { why: got.reread as ClaudeReread, at },
           window: win,
-          pairings: got.preview.pairings,
+          pairings: kept.pairings,
+          capped: kept.evicted,
         });
       } else {
+        // An append MERGES (#1474). Its `pairings` cover only the new
+        // messages -- `{}` on an idle poll -- and its `truncated` is
+        // `false` because an append reads to the end from the cursor.
+        // Replacing with either rewrote what the earlier reads had
+        // established: every earlier call turned "unanswered", and a
+        // tail of a 76 MB file was labelled as the whole of it.
         setAcc((prev) =>
           prev.path === path
-            ? { ...prev, window: win, pairings: got.preview.pairings }
-            : { path, messages: [], reread: null, window: win, pairings: got.preview.pairings },
+            ? {
+                ...prev,
+                window: { ...win, truncated: (prev.window?.truncated ?? false) || win.truncated },
+                pairings: mergePairings(prev.pairings, got.preview.pairings),
+              }
+            : {
+                path,
+                messages: [],
+                reread: null,
+                window: win,
+                pairings: got.preview.pairings,
+                capped: 0,
+              },
         );
         for (const message of got.preview.messages) coalescer.push({ path, message });
       }
@@ -2362,6 +2494,7 @@ export function useClaudeTranscriptFollow(
     reread: state.reread,
     window: state.window,
     pairings: state.pairings,
+    capped: state.capped,
     isError: query.isError,
     error: query.error,
     isLoading: query.isLoading,
