@@ -486,6 +486,26 @@ interface FilterStore {
   /// which is the reason `selectedPr` gives for the same choice.
   claudeSelected: string | undefined;
   selectClaudeSession: (id: string | undefined) => void;
+  /// The session whose transcript fills the main panel, or undefined for
+  /// none (#1479).
+  ///
+  /// The transcript viewer's full-window route. This app routes through
+  /// the store rather than a URL, so "deep-linkable" means ONE action
+  /// that any caller -- a session row, the overview, the phone's list --
+  /// can fire to land on it: `openClaudeTranscript` sets the page, the
+  /// selected session and this in one `set` (after `setView` when coming
+  /// from another view), for the reason `showClaudeSessions` gives about
+  /// pairings a caller could order wrongly.
+  ///
+  /// An id, not a flag, and matched against `claudeSelected` by
+  /// `ClaudeCodePage`: picking another session in the sidebar shows THAT
+  /// session's detail rather than carrying the full-window transcript
+  /// over to a session nobody opened it for.
+  ///
+  /// Not persisted, for `claudeSelected`'s reason.
+  claudeTranscript: string | undefined;
+  openClaudeTranscript: (id: string) => void;
+  closeClaudeTranscript: () => void;
   /// Where inside the selected repository the browser is (#1034).
   ///
   /// Repository-relative, `""` for the root, and it names a DIRECTORY --
@@ -642,7 +662,7 @@ export const PERSIST_KEY = "headstate-filters";
 
 export const useFilters = create<FilterStore>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       filtersByView: { ...EMPTY_FILTERS },
       view: "my-prs",
       density: "comfortable",
@@ -761,6 +781,7 @@ export const useFilters = create<FilterStore>()(
           // stale-control failure in the other direction.
           claudeShowSubagents: false,
           claudeSelected: undefined,
+          claudeTranscript: undefined,
           // And the browser's position (#1034), for the reason this
           // block gives throughout: a position inside one view means
           // nothing on another, and coming back to a file panel opened
@@ -799,9 +820,19 @@ export const useFilters = create<FilterStore>()(
           // number is a promise about what the next screen shows.
           claudeShowSubagents: false,
           claudeSelected: undefined,
+          claudeTranscript: undefined,
         }),
       claudeSelected: undefined,
       selectClaudeSession: (claudeSelected) => set({ claudeSelected }),
+      claudeTranscript: undefined,
+      openClaudeTranscript: (id) => {
+        // Arriving from another view takes `setView`'s resets first --
+        // the selection, the bulk checks, the cursor -- rather than a
+        // second copy of that list here that could drift from it.
+        if (get().view !== "claude-code") get().setView("claude-code");
+        set({ claudePage: "sessions", claudeSelected: id, claudeTranscript: id });
+      },
+      closeClaudeTranscript: () => set({ claudeTranscript: undefined }),
       repoPath: "",
       // Descending or going up CLEARS the file being read, in one `set`
       // rather than two calls a caller has to order (#1034). The pairing

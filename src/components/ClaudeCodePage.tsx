@@ -30,6 +30,7 @@ import {
   useClaudeSessionsForPrQuery,
   type PrQueryState,
   useClaudeTranscriptFollow,
+  useClaudeTranscriptMessages,
   useWorktrees,
   useUiPrefs,
 } from "@/api/hooks";
@@ -59,6 +60,9 @@ import { type ClaudeSessionFilter, useFilters } from "@/store/filters";
 import { QueryError, errorMessage } from "./QueryError";
 import { ExternalLink } from "./ExternalLink";
 import { MaskedText } from "./MaskedText";
+import { TranscriptViewer } from "./transcript/TranscriptViewer";
+import { renderPlaceholderMessage } from "./transcript/PlaceholderMessage";
+import { transcriptStreaming } from "./transcript/streaming";
 
 /// The sessions list is virtualized, and this is the note that used to
 /// be `RENDER_CAP = 200` (#1200).
@@ -254,6 +258,7 @@ export function ClaudeCodePage() {
   // matches that search" and "nothing has been read yet" are different
   // emptinesses, and the pane must not offer "choose one" for either.
   const query = useFilters((f) => f.claudeQuery);
+  const transcriptFor = useFilters((f) => f.claudeTranscript);
   const isMobile = useIsMobile();
 
   // By LOOKUP against the current list, never a remembered session. The
@@ -272,6 +277,9 @@ export function ClaudeCodePage() {
   // has gone must send the phone BACK to the list, because the alternative
   // is a detail screen with nothing on it but a back link.
   const showingList = !isMobile || active === undefined;
+  // The full-window transcript route (#1479): only for the session it was
+  // opened for, so selecting another row shows that row's detail.
+  const fullTranscript = active !== undefined && transcriptFor === active.session_id;
 
   if (list.isLoading) {
     return <p className="p-4 text-sm text-[#8b949e]">Reading Claude Code sessions…</p>;
@@ -326,14 +334,19 @@ export function ClaudeCodePage() {
 
         <div
           className={
-            isMobile
-              ? showingList
-                ? "hidden"
-                : "flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto p-4"
-              : "min-w-0 flex-1 overflow-y-auto p-4"
+            isMobile && showingList
+              ? "hidden"
+              : fullTranscript
+                ? // No scroll here: the viewer is the scroll container.
+                  "flex min-h-0 min-w-0 flex-1 flex-col p-4"
+                : isMobile
+                  ? "flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto p-4"
+                  : "min-w-0 flex-1 overflow-y-auto p-4"
           }
         >
-          {isMobile && !showingList ? (
+          {fullTranscript && active ? (
+            <TranscriptWindow session={active} />
+          ) : isMobile && !showingList ? (
             <button
               type="button"
               onClick={() => selectSession(undefined)}
@@ -342,7 +355,7 @@ export function ClaudeCodePage() {
               ← All sessions
             </button>
           ) : null}
-          {active ? (
+          {fullTranscript ? null : active ? (
             <SessionDetail session={active} now={now} />
           ) : matched.ordered.length === 0 ? (
             // NOT "choose a session" (#978). There is nothing to choose,
@@ -1872,6 +1885,11 @@ function SessionDetail({
               evidence for it, which is the arrangement #1219 exists to
               avoid (#1219). */}
           <StopSession session={s} detail={detail.data} />
+          {/* The viewer shell (#1479), beside the preview it will replace
+              once the renderers (#1480, #1481) and the follow (#1476)
+              land. Both stay until then: the preview is the one that
+              shows tool calls today. */}
+          <TranscriptPane session={s} detail={detail.data} />
           <TranscriptPreview detail={detail.data} />
         </>
       )}
@@ -3665,6 +3683,160 @@ function TranscriptPreview({ detail: d }: { detail: ClaudeSessionDetail }) {
         </>
       )}
     </section>
+  );
+}
+
+/// The transcript viewer's pane in the session detail (#1479).
+///
+/// Opened by a click, as the preview beside it is: it costs a read, and
+/// the detail pane is visited far more often than it is read. "Open in
+/// full window" is the viewer's full-window route
+/// (`openClaudeTranscript`), which on the phone is a screen of its own.
+///
+/// Absent when there is no transcript to read. `TranscriptPreview`
+/// directly below states that refusal, and a second copy of the same
+/// sentence beside it would read as a second failure (the rule
+/// `TranscriptPreview`'s own refusal comment follows). When the
+/// renderers retire the preview, this pane inherits the sentence.
+function TranscriptPane({
+  session: s,
+  detail: d,
+}: {
+  session: ClaudeSession;
+  detail: ClaudeSessionDetail;
+}) {
+  const [open, setOpen] = useState(false);
+  const openFull = useFilters((f) => f.openClaudeTranscript);
+  if (revealRefusal(d.transcript_path, d.transcript_state) !== null) return null;
+  return (
+    <section
+      className="rounded-md border border-[#30363d] bg-[#161b22] p-3"
+      data-testid="transcript-pane"
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h3 className="text-xs font-semibold text-[#e6edf3]">Transcript</h3>
+        <button
+          type="button"
+          onClick={() => openFull(s.session_id)}
+          className="tap-target rounded-md border border-[#30363d] bg-[#21262d] px-2 py-1 text-xs text-[#e6edf3] hover:bg-[#30363d]"
+        >
+          Open in full window
+        </button>
+      </div>
+      {!open ? (
+        <button
+          type="button"
+          onClick={() => setOpen(true)}
+          className="tap-target mt-3 flex items-center gap-1.5 rounded-md border border-[#30363d] bg-[#21262d] px-2 py-1 text-xs text-[#e6edf3] hover:bg-[#30363d]"
+        >
+          <Terminal className="h-3 w-3" aria-hidden="true" />
+          Show the transcript
+        </button>
+      ) : (
+        <div className="mt-2 flex h-[28rem] flex-col">
+          <SessionTranscript detail={d} />
+        </div>
+      )}
+    </section>
+  );
+}
+
+/// The transcript viewer filling the main panel: the full-window route
+/// (#1479), reached through `openClaudeTranscript`.
+function TranscriptWindow({ session: s }: { session: ClaudeSession }) {
+  const detail = useClaudeSessionDetail(s.session_id, true);
+  const close = useFilters((f) => f.closeClaudeTranscript);
+  return (
+    <div className="flex min-h-0 flex-1 flex-col gap-2" data-testid="transcript-window">
+      <div className="flex items-center gap-3">
+        <button
+          type="button"
+          onClick={close}
+          className="tap-target -ml-1 flex items-center rounded px-2 text-sm text-[#58a6ff] hover:bg-[#161b22]"
+        >
+          ← Session detail
+        </button>
+        <h2 className="min-w-0 truncate text-sm font-semibold text-[#e6edf3]">
+          {s.name ?? s.session_id}
+        </h2>
+      </div>
+      {detail.isError ? (
+        <QueryError
+          title="No transcript for this session"
+          message="This session's detail could not be read, so where its transcript is is not known."
+          onRetry={() => void detail.refetch()}
+        />
+      ) : detail.data === null ? (
+        <p className="text-xs text-[#8b949e]">
+          This session is no longer in the store, so there is nothing more to show about it.
+        </p>
+      ) : detail.data === undefined ? (
+        <p className="text-xs text-[#8b949e]">Reading the rest of this session…</p>
+      ) : revealRefusal(detail.data.transcript_path, detail.data.transcript_state) !== null ? (
+        <p className="text-xs text-[#8b949e]">
+          There is nothing to read here:{" "}
+          {revealRefusal(detail.data.transcript_path, detail.data.transcript_state)}.
+        </p>
+      ) : (
+        <SessionTranscript detail={detail.data} />
+      )}
+    </div>
+  );
+}
+
+/// One session's transcript in the viewer shell (#1479).
+///
+/// TEMPORARY wiring, marked as such where it is replaced:
+/// `useClaudeTranscriptMessages` gives way to #1476's follow over the
+/// paging reads, and `renderPlaceholderMessage` to the renderers (#1480
+/// desktop, #1481 phone).
+function SessionTranscript({ detail: d }: { detail: ClaudeSessionDetail }) {
+  const page = useClaudeTranscriptMessages(
+    d.transcript_path,
+    true,
+    d.liveness.state === "running",
+  );
+  if (page.isError) {
+    // BEFORE the empty arm (#846): no messages on a rejection is not a
+    // transcript with nothing in it.
+    return (
+      <p className="text-xs text-[#8b949e]">
+        Could not read its transcript
+        {errorMessage(page.error) ? ` (${errorMessage(page.error)})` : ""}. This is not the same
+        as the session having said nothing.
+      </p>
+    );
+  }
+  if (page.data === undefined) {
+    return <p className="text-xs text-[#8b949e]">Reading its transcript…</p>;
+  }
+  const p = page.data;
+  if (p.messages.length === 0) {
+    return (
+      <p className="text-xs text-[#8b949e]">
+        {p.truncated
+          ? `No conversation in the last ${formatKb(p.bytes_read)} of a ${formatKb(p.file_bytes)} transcript.`
+          : "Its transcript holds no conversation to show."}
+      </p>
+    );
+  }
+  return (
+    <>
+      {p.truncated ? (
+        <p className="mb-2 text-xs text-[#8b949e]" data-testid="transcript-truncated">
+          The last {p.messages.length.toLocaleString()} message
+          {p.messages.length === 1 ? "" : "s"} of a {formatKb(p.file_bytes)} transcript. Earlier
+          exchanges are not shown.
+        </p>
+      ) : null}
+      <div className="min-h-0 flex-1 rounded border border-[#30363d] bg-[#0d1117]">
+        <TranscriptViewer
+          messages={p.messages}
+          renderMessage={renderPlaceholderMessage}
+          streaming={transcriptStreaming(d.liveness)}
+        />
+      </div>
+    </>
   );
 }
 

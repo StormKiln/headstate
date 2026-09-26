@@ -58,6 +58,7 @@ import type {
   LogTail,
   ScanKind,
 } from "./tauri";
+import type { TranscriptPage } from "../types/transcript";
 import { createCoalescer, type Scheduler } from "@/lib/coalesce";
 import { createLimiter, withDeadline } from "@/lib/limiter";
 import { IS_MOBILE_BUILD } from "@/lib/target";
@@ -156,6 +157,7 @@ import {
   claudeSessionDetail,
   claudeSessionsForPr,
   claudeTranscriptFollow,
+  claudeTranscriptMessages,
   claudeHooksStatus,
   claudeInstallHooks,
   claudeReinstallHooks,
@@ -1708,6 +1710,33 @@ export function useClaudeSessionDetail(sessionId: string | null, enabled: boolea
     queryFn: () => claudeSessionDetail(sessionId as string),
     enabled: enabled && sessionId !== null && sessionId !== "",
     refetchInterval: enabled && sessionId ? CLAUDE_POLL_MS : false,
+    staleTime: CLAUDE_POLL_MS - 1_000,
+    retry: false,
+  });
+}
+
+/// The tail of one transcript as render-ready messages, for the viewer
+/// shell's first host (#1479).
+///
+/// TEMPORARY, and deliberately the simplest thing that feeds the shell:
+/// #1476 (live follow over the paging reads) replaces it, and with it
+/// the viewer's `onReachStart`/`onReachEnd` get something to call. Until
+/// then this is one bounded tail read (`claude_transcript_messages`,
+/// the same 256 KB window as the old preview) re-read on
+/// `CLAUDE_POLL_MS` while the session is running, so the shell's follow
+/// and "↓ N new" have arrivals to act on. A re-read returns the whole
+/// window again; the viewer keys rows by the read model's stable ids, so
+/// an unchanged message keeps its row. react-query's structural sharing
+/// keeps `data` the same object when nothing changed.
+///
+/// `retry: false`, this feature's rule (see `useClaudeTranscriptFollow`).
+export function useClaudeTranscriptMessages(path: string | null, enabled: boolean, live: boolean) {
+  const on = enabled && path !== null && path !== "";
+  return useQuery<TranscriptPage>({
+    queryKey: ["claude-transcript-messages", path],
+    queryFn: () => claudeTranscriptMessages(path as string),
+    enabled: on,
+    refetchInterval: on && live ? CLAUDE_POLL_MS : false,
     staleTime: CLAUDE_POLL_MS - 1_000,
     retry: false,
   });

@@ -17,6 +17,7 @@ import type {
 } from "@/types/pr";
 import { useFilters } from "@/store/filters";
 import type { PrQueryState } from "@/api/hooks";
+import type { TranscriptMessage, TranscriptPage } from "@/types/transcript";
 
 const copyFn = vi.hoisted(() => vi.fn(() => Promise.resolve(null as string | null)));
 const revealFn = vi.hoisted(() => vi.fn(() => Promise.resolve("/code/app")));
@@ -128,6 +129,13 @@ const state = vi.hoisted(() => ({
   /// Every query string the lookup hook was handed, so a test can assert
   /// that ordinary prose never reaches it.
   prQueriesSeen: [] as string[],
+  /// What `useClaudeTranscriptMessages` returns (#1479): `undefined` is
+  /// still reading, `transcriptFailed` the rejection.
+  transcript: undefined as TranscriptPage | undefined,
+  transcriptFailed: false,
+  /// Every path the viewer's read was ENABLED for, so a test can assert
+  /// it is not paid for on selection.
+  transcriptAskedFor: [] as (string | null)[],
 }));
 
 vi.mock("../api/hooks", () => ({
@@ -221,6 +229,15 @@ vi.mock("../api/hooks", () => ({
   // follow's flattened return from it, so the pre-existing content tests
   // still pin what they always pinned. `following`, `lastReadAt` and
   // `reread` are the new surface and have their own fixtures.
+  // #1479's temporary feed for the viewer shell.
+  useClaudeTranscriptMessages: (path: string | null, enabled: boolean) => {
+    if (enabled) state.transcriptAskedFor.push(path);
+    return {
+      data: state.transcriptFailed ? undefined : state.transcript,
+      isError: state.transcriptFailed,
+      error: state.transcriptFailed ? "Permission denied" : undefined,
+    };
+  },
   useClaudeTranscriptFollow: (path: string | null, enabled: boolean) => {
     if (enabled) state.previewEnabledFor.push(path);
     const pv = state.preview;
@@ -593,6 +610,9 @@ beforeEach(() => {
   // test that does not set it.
   state.prQuery = { state: "off" };
   state.prQueriesSeen = [];
+  state.transcript = undefined;
+  state.transcriptFailed = false;
+  state.transcriptAskedFor = [];
   // #1208. A FOLLOWING follow that has read once, by default: the state
   // the pane is in for the overwhelming majority of the tests below, and
   // an explicit default so a test that cares about "idle" or "stopped"
@@ -628,6 +648,7 @@ beforeEach(() => {
     claudeSelected: undefined,
     claudeFilter: "all",
     claudeShowSubagents: false,
+    claudeTranscript: undefined,
   });
   copyFn.mockClear();
   revealFn.mockClear();
@@ -4838,5 +4859,135 @@ describe("searching for a pull request finds the session that produced it", () =
     expect(row.textContent).toMatch(/Kestrel/);
     expect(within(row).queryAllByRole("mark")).toHaveLength(0);
     expect(container.querySelectorAll("mark")).toHaveLength(0);
+  });
+});
+
+/// The transcript viewer shell's first host (#1479).
+///
+/// A pane in the session detail and a full-window route, both fed by the
+/// temporary tail read with the text-only renderer. What the shell does
+/// with scrolling is `transcript/TranscriptViewer.test.tsx`'s subject;
+/// these pin that the host renders it, only when asked, for the right
+/// session, and that each empty state says which kind of empty it is.
+describe("the transcript viewer", () => {
+  const message = (id: string, text: string, prompt: boolean): TranscriptMessage => ({
+    id,
+    id_source: "uuid",
+    turn_id: prompt ? id : "u1",
+    kind: prompt ? { kind: "user_prompt", origin: null } : { kind: "assistant" },
+    timestamp: null,
+    model: null,
+    api_message_id: null,
+    usage: null,
+    duration_ms: null,
+    is_meta: false,
+    is_sidechain: false,
+    blocks: [{ kind: "text", index: 0, text, clip: null }],
+  });
+  const page = (over: Partial<TranscriptPage> = {}): TranscriptPage => ({
+    messages: [message("u1", "run the tests", true), message("a1", "Running them now.", false)],
+    truncated: false,
+    bytes_read: 183_237,
+    file_bytes: 183_237,
+    machinery_records: [],
+    unparseable_records: 0,
+    duplicate_records: 0,
+    ...over,
+  });
+
+  it("is behind a click, and then shows the conversation as a log", () => {
+    state.transcript = page();
+    renderView();
+    open("HeadState GitHub issues filing");
+    const pane = screen.getByTestId("transcript-pane");
+    expect(state.transcriptAskedFor).toEqual([]);
+    expect(within(pane).queryByRole("log")).toBeNull();
+
+    fireEvent.click(within(pane).getByRole("button", { name: /show the transcript/i }));
+    expect(state.transcriptAskedFor).toContain("/Users/acme/.claude/projects/slug/e5dff3bd.jsonl");
+    const log = within(pane).getByRole("log");
+    expect(within(log).getByText("run the tests")).toBeTruthy();
+    expect(within(log).getByText("Running them now.")).toBeTruthy();
+    // The old preview stays until the renderers replace it.
+    expect(screen.getByRole("button", { name: /follow the transcript/i })).toBeTruthy();
+  });
+
+  it("says when the transcript was only read from its end", () => {
+    state.transcript = page({ truncated: true, file_bytes: 5 * 1024 * 1024 });
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /show the transcript/i }));
+    expect(screen.getByTestId("transcript-truncated").textContent).toMatch(
+      /The last 2 messages of a 5\.0 MB transcript\. Earlier exchanges are not shown\./,
+    );
+  });
+
+  it("does not render a failed read as an empty transcript", () => {
+    state.transcriptFailed = true;
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /show the transcript/i }));
+    expect(screen.getByText(/could not read its transcript \(Permission denied\)/i)).toBeTruthy();
+    expect(screen.queryByText(/holds no conversation/i)).toBeNull();
+  });
+
+  it("tells a still-reading transcript from an empty one", () => {
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /show the transcript/i }));
+    expect(screen.getByText(/reading its transcript…/i)).toBeTruthy();
+  });
+
+  it("offers no pane for a transcript that is gone, leaving the refusal to one sentence", () => {
+    state.list = listOf([session({ transcript_state: { state: "gone" } })]);
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.queryByTestId("transcript-pane")).toBeNull();
+    expect(screen.getAllByText(/there is nothing to read here/i)).toHaveLength(1);
+  });
+
+  it("opens in the full window for that session, and goes back to its detail", () => {
+    state.transcript = page();
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /open in full window/i }));
+
+    const full = screen.getByTestId("transcript-window");
+    expect(within(full).getByRole("log")).toBeTruthy();
+    // The full window replaces the detail rather than stacking on it.
+    expect(screen.queryByTestId("transcript-pane")).toBeNull();
+    expect(useFilters.getState().claudeTranscript).toBe("e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2");
+
+    fireEvent.click(within(full).getByRole("button", { name: /session detail/i }));
+    expect(screen.queryByTestId("transcript-window")).toBeNull();
+    expect(screen.getByTestId("transcript-pane")).toBeTruthy();
+  });
+
+  it("shows another session's detail, not the transcript, when another row is picked", () => {
+    state.transcript = page();
+    state.list = listOf([
+      session(),
+      session({ session_id: "0b5c9d1e-2f3a-4b5c-8d7e-9f0a1b2c3d4e", name: "Second session" }),
+    ]);
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /open in full window/i }));
+    expect(screen.getByTestId("transcript-window")).toBeTruthy();
+
+    open("Second session");
+    expect(screen.queryByTestId("transcript-window")).toBeNull();
+    expect(screen.getByTestId("transcript-pane")).toBeTruthy();
+  });
+
+  it("is reachable from another view in one action", () => {
+    state.transcript = page();
+    useFilters.setState({ view: "my-prs" });
+    useFilters.getState().openClaudeTranscript("e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2");
+    const f = useFilters.getState();
+    expect(f.view).toBe("claude-code");
+    expect(f.claudePage).toBe("sessions");
+    expect(f.claudeSelected).toBe("e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2");
+    renderView();
+    expect(within(screen.getByTestId("transcript-window")).getByRole("log")).toBeTruthy();
   });
 });

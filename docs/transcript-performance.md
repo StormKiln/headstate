@@ -7,10 +7,10 @@ in the live-follow issue (#1476). Neither choice should be made without these
 numbers.
 
 **Status.** The foundation is in place: the fixtures, the Rust read bench, and
-the receive-side parse bench. The browser-level and phone measurements need
-the viewer (#1479), which does not exist yet. Their harness is designed below
-and lands with it. Until then, the viewer rows of the budget table read
-**not measured**, not "passing".
+the receive-side parse bench. The viewer shell (#1479) now exists, with a
+text-only stand-in renderer; the browser harness designed below lands with
+the first real renderer (#1480), for the reason given there. Until then, the
+viewer rows of the budget table read **not measured**, not "passing".
 
 ## Budgets
 
@@ -157,27 +157,31 @@ ratio real text would not reach. Recorded here, it would read as a pass on B5.
    224 KiB of JSON before compression. B5 depends on the codec and on how many
    messages a page holds, and #1478 and #1220 decide those.
 
-## Browser harness (design: lands with #1479)
+## Browser harness (design: lands with the first real renderer)
 
 Not implemented yet. There are two reasons, and both are facts about the repo:
 
-- **There is nothing to open.** The viewer is #1479. The current pane
-  (`TranscriptPreview` in `ClaudeCodePage.tsx`) renders a capped 200-message tail.
-  Measuring it would set budgets against the component the viewer replaces.
+- **What would be measured is a stand-in.** The viewer shell landed in #1479
+  (`src/components/transcript/TranscriptViewer.tsx`), but it renders every
+  message through a text-only placeholder that #1480 and #1481 replace. B1-B3
+  are dominated by what a row renders, so a budget set against the placeholder
+  would be set against a component that is about to go. The shell already
+  carries the B1 probe: the newest mounted message has `elementtiming="newest"`.
 - **The repo has no Playwright.** It is not in `package.json`, and CI
   installs no browser. Adding it means a dev dependency and a browser download
   in CI. That decision belongs with the PR that has something to measure.
 
-The design, so #1479 can land it with the viewer:
+The design, for the renderer PR to land:
 
 - **Target.** `vite build` with `VITE_TARGET=desktop`, served by `vite preview`,
   driven by Playwright's Chromium.
 - **Backend.** No Tauri process. `@tauri-apps/api/mocks`' `mockIPC`, installed
   from `page.addInitScript`, answers the viewer's read commands (today
-  `claude_transcript_tail`, later the paged reads) from the page payloads
+  `claude_transcript_messages`, later the paged reads) from the page payloads
   `make bench-transcript BENCH_TRANSCRIPT_OUT=…` writes. The fixtures are
   generated, so the harness needs no committed data.
-- **B1, first paint.** The newest message carries `elementtiming="newest"`.
+- **B1, first paint.** The newest message carries `elementtiming="newest"`
+  (set by the shell).
   A `PerformanceObserver({ type: "element" })` reports its `renderTime`,
   measured from the selection that opened the fixture (`performance.mark`
   at the click).
