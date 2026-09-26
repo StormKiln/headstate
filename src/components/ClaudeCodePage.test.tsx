@@ -449,6 +449,7 @@ const listOf = (
   sessions,
   registry_failure: null,
   registry_unreadable: [],
+  registry_unnamed: [],
   ...over,
 });
 
@@ -1232,6 +1233,30 @@ describe("absent is not zero", () => {
     });
     renderView();
     expect(screen.getByText(/1 live-session record could not be read/i)).toBeTruthy();
+  });
+
+  /// A session running with no record naming it is stated, with its
+  /// pid and folder, above rows that still render (#1315). Without this
+  /// the list reads as complete while a session runs on no row.
+  it("names a running session that no row can show", () => {
+    state.list = listOf([session()], {
+      registry_unnamed: ["pid 4242, running in /Users/acme/code/widget"],
+    });
+    renderView();
+    expect(
+      screen.getByText(/a claude code session is running that is not matched to any row below/i),
+    ).toBeTruthy();
+    expect(screen.getByText(/same folder read as .could not tell./i)).toBeTruthy();
+    expect(screen.getByText("pid 4242, running in /Users/acme/code/widget")).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: /HeadState GitHub/i }).length).toBeGreaterThan(0);
+  });
+
+  /// And says nothing when there is none: a banner that always showed
+  /// would teach the reader to ignore it.
+  it("says nothing about unmatched sessions when there are none", () => {
+    state.list = listOf([session()]);
+    renderView();
+    expect(screen.queryByText(/not matched to any row below/i)).toBeNull();
   });
 
   /// A partial rescan says how much is missing, above a list that still

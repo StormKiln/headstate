@@ -2651,6 +2651,10 @@ export interface ClaudeSessionList {
   /// Registry files that could not be parsed. Each one hides a session
   /// whose liveness cannot be stated.
   registry_unreadable: string[];
+  /// Claude Code processes running with no session record (#1315), one
+  /// line each ("pid N, running in <folder>"). No row can show them as
+  /// running, so the list is not complete while this is non-empty.
+  registry_unnamed: string[];
 }
 
 /// The session list exactly as it arrives, before the reasons are
@@ -2665,6 +2669,7 @@ export interface WireClaudeSessionList {
   reasons: string[];
   registry_failure: string | null;
   registry_unreadable: string[];
+  registry_unnamed: string[];
 }
 
 /// The headline figures on the Claude Code overview (#921).
@@ -2803,6 +2808,10 @@ export interface ClaudeRestartList {
   /// Records present but unusable. Each hides a session that may be
   /// running, so the list is a floor.
   registry_unreadable: string[];
+  /// Sessions running with no session record (#1315). They cannot be
+  /// listed -- nothing names the session to resume -- so the list is a
+  /// floor while any exist.
+  registry_unnamed: string[];
 }
 
 /// Everything the Claude Code overview draws, plus what it could not

@@ -50,6 +50,7 @@ const wire = (over: Partial<WireClaudeSessionList> = {}): WireClaudeSessionList 
   reasons: [DEAD],
   registry_failure: null,
   registry_unreadable: [],
+  registry_unnamed: [],
   ...over,
 });
 
@@ -243,10 +244,16 @@ describe("hydrateClaudeSessions", () => {
   /// must not have quietly dropped either.
   it("carries the registry failure and the unreadable list through", () => {
     const got = hydrateClaudeSessions(
-      wire({ registry_failure: "Permission denied", registry_unreadable: ["4242.json"] }),
+      wire({
+        registry_failure: "Permission denied",
+        registry_unreadable: ["4242.json"],
+        registry_unnamed: ["pid 4243, running in /Users/acme/code/widget"],
+      }),
     );
     expect(got.registry_failure).toBe("Permission denied");
     expect(got.registry_unreadable).toEqual(["4242.json"]);
+    // #1315: a field-by-field copy is where a new list field vanishes.
+    expect(got.registry_unnamed).toEqual(["pid 4243, running in /Users/acme/code/widget"]);
   });
 
   /// The honest total, which is #985's stated trap.
