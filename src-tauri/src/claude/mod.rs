@@ -77,6 +77,10 @@ pub mod events;
 /// The restart list: every running session's resume command, as text to
 /// save before a reboot (#1071).
 pub mod export;
+/// Generated transcripts shaped like real ones, for measuring (#1487).
+/// Test-only: written at test or bench time, never committed.
+#[cfg(test)]
+pub(crate) mod fixtures;
 pub mod handoff;
 pub mod hook;
 pub mod install;
@@ -102,6 +106,9 @@ pub mod permissions;
 pub mod plugins;
 /// The tail of one transcript, as conversation rather than JSONL (#982).
 pub mod preview;
+/// What the transcript reads cost against those fixtures (#1487).
+#[cfg(test)]
+mod read_bench;
 pub mod registry;
 pub mod search;
 pub mod sessions;
