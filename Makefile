@@ -1,7 +1,7 @@
 .PHONY: dev build test test-rust test-ui lint lint-rust lint-ui lint-deps fmt icons \
 	mobile-frontend lint-mobile test-mobile check-mobile-ios check-mobile-android \
 	deny-mobile deny-stepup ios-init android-init icons-mobile ios-device android-device \
-	deny test-race check-intel doctor
+	deny test-race check-intel doctor bench-transcript
 
 # ---- Mobile companion (src-mobile) ---------------------------------------
 #
@@ -132,6 +132,25 @@ test-rust:
 
 test-ui:
 	yarn vitest run
+
+# ---- Transcript performance (#1487) --------------------------------------
+#
+# The measured half of docs/transcript-performance.md: generates the four
+# fixtures (1k and 10k messages, a 70 MB tool-heavy file, one 5 MB tool
+# result), times the transcript reads against them in a RELEASE build, and
+# parses each page payload the way the webview receives it. Not in `test`:
+# it writes ~110 MB to a temporary directory and its durations describe
+# the machine, so it is run on purpose and its tables go in the PR.
+#
+# Pass BENCH_TRANSCRIPT_OUT=<dir> to keep the fixtures and payloads there;
+# otherwise they go to a fresh temporary directory that is removed after.
+# One shell for the whole recipe, so both halves see the SAME directory.
+bench-transcript:
+	@out="$(BENCH_TRANSCRIPT_OUT)"; [ -n "$$out" ] || out="$$(mktemp -d)"; \
+	( cd src-tauri && HEADSTATE_TRANSCRIPT_BENCH=1 HEADSTATE_TRANSCRIPT_BENCH_OUT="$$out" \
+		cargo test --release --lib read_bench -- --ignored --nocapture --test-threads=1 ) \
+	&& node --expose-gc scripts/transcript-receive-bench.mjs "$$out"; status=$$?; \
+	[ -n "$(BENCH_TRANSCRIPT_OUT)" ] || rm -rf "$$out"; exit $$status
 
 # ---- Parity with CI (#853) -----------------------------------------------
 #
