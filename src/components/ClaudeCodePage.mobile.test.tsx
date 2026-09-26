@@ -141,6 +141,7 @@ vi.mock("../api/hooks", () => ({
             non_conversation_records: state.preview.non_conversation_records,
             unparseable_records: state.preview.unparseable_records,
           },
+    capped: 0,
     isError: false,
     error: undefined,
     isLoading: enabled && path !== null && state.preview === undefined,

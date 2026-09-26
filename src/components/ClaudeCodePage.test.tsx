@@ -94,6 +94,9 @@ const state = vi.hoisted(() => ({
   /// The last read that REPLACED history rather than extending it.
   /// `null` is the ordinary append.
   reread: null as { why: ClaudeReread; at: number } | null,
+  /// #1474: messages the follow let go to its cap. Zero unless a test
+  /// says otherwise.
+  capped: 0,
   /// What `useClaudeSessionDetail` returns (#985), keyed by session id.
   ///
   /// A MAP rather than one value, because the split made "the detail for
@@ -237,6 +240,7 @@ vi.mock("../api/hooks", () => ({
               unparseable_records: pv.unparseable_records,
             },
       pairings: pv?.pairings ?? {},
+      capped: state.capped,
       isError: state.previewFailed,
       error: state.previewFailed ? "Permission denied" : undefined,
       isLoading: enabled && !state.previewFailed && pv === undefined,
@@ -595,6 +599,7 @@ beforeEach(() => {
   state.following = "following";
   state.lastReadAt = Date.UTC(2026, 0, 1, 12, 4, 31);
   state.reread = null;
+  state.capped = 0;
   // A LOADED, empty listing by default -- not `undefined`. `undefined`
   // means "still loading or unreadable", and leaving it there would make
   // every unrelated test render the wrong one of the #920 section's three
@@ -3380,6 +3385,23 @@ describe("reading a transcript rather than revealing it", () => {
     expect(screen.getByText(/the last 2 messages/i)).toBeTruthy();
     expect(screen.getByText(/of a 73\.2 MB transcript/i)).toBeTruthy();
     expect(screen.getByText(/earlier exchanges are not shown/i)).toBeTruthy();
+  });
+
+  /// #1474: a follow that let its oldest messages go to its cap says it
+  /// is CAPPED -- even over a transcript that was read whole, where the
+  /// label would otherwise claim "All N messages".
+  ///
+  /// **Sabotage:** drop the `capped > 0` arm and the whole-file wording
+  /// renders instead, and this fails.
+  it("says the conversation is capped once the follow let messages go", () => {
+    state.capped = 37;
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
+    const label = screen.getByTestId("follow-window").textContent ?? "";
+    expect(label).toMatch(/capped at the newest 2 messages/i);
+    expect(label).toMatch(/earlier exchanges are not shown/i);
+    expect(label).not.toMatch(/all 2 messages in this transcript/i);
   });
 
   /// The happy-path pair: a transcript read whole says so, rather than

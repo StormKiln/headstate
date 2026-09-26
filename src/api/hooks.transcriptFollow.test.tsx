@@ -11,7 +11,7 @@ const invoke = vi.hoisted(() =>
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(() => Promise.resolve(() => {})) }));
 
-import { useClaudeTranscriptFollow } from "./hooks";
+import { FOLLOW_MAX_MESSAGES, useClaudeTranscriptFollow } from "./hooks";
 
 const PATH = "/Users/acme/.claude/projects/slug/e5dff3bd.jsonl";
 
@@ -56,7 +56,32 @@ const msg = (text: string): ClaudePreviewMessage => ({
   blocks: [{ kind: "text", text, truncated: false }],
 });
 
-const cursorAt = (offset: number, digest: string): ClaudeFollowCursor => ({
+/// An assistant message that CALLS a tool, keyed `id`.
+const call = (id: string): ClaudePreviewMessage => ({
+  role: "assistant",
+  timestamp: "2026-01-01T12:00:00Z",
+  model: "claude-opus-5",
+  blocks: [{ kind: "tool_use", name: "Bash", id, args: { tool: "other", keys: [] } }],
+});
+
+/// A user message carrying the RESULT of the call keyed `id`.
+const answer = (id: string): ClaudePreviewMessage => ({
+  role: "user",
+  timestamp: "2026-01-01T12:00:01Z",
+  model: null,
+  blocks: [
+    {
+      kind: "tool_result",
+      text: "ok",
+      truncated: false,
+      tool_use_id: id,
+      is_error: false,
+      change: null,
+    },
+  ],
+});
+
+const cursorAt =(offset: number, digest: string): ClaudeFollowCursor => ({
   offset,
   behind_digest: digest,
   behind_bytes: Math.min(offset, 65_536),
@@ -386,5 +411,238 @@ describe("useClaudeTranscriptFollow", () => {
 
     rerender({ on: true });
     await waitFor(() => expect(invoke).toHaveBeenCalledTimes(1));
+  });
+
+  /// #1474. **An idle poll must not un-pair anything.** Each read pairs
+  /// only the messages in it, so an idle poll's `pairings` is `{}` -- and
+  /// the hook used to REPLACE its map with that, turning every earlier
+  /// call in the pane into "unanswered" (or crashed, on a dead session).
+  ///
+  /// **Sabotage:** put back `pairings: got.preview.pairings` on the append
+  /// arm and this fails.
+  it("keeps every pairing across an idle poll", async () => {
+    invoke
+      .mockImplementationOnce(() =>
+        Promise.resolve(
+          follow({
+            reread: "first",
+            preview: {
+              messages: [call("t1"), answer("t1"), call("t2")],
+              pairings: { t1: "paired", t2: "unanswered" },
+            },
+          }),
+        ),
+      )
+      .mockImplementation(() =>
+        Promise.resolve(follow({ bytes_read: 0, preview: { messages: [], pairings: {} } })),
+      );
+    const qc = client();
+    const { result } = renderHook(() => useClaudeTranscriptFollow(PATH, true), {
+      wrapper: wrapper(qc),
+    });
+    await waitFor(() => expect(result.current.messages).toHaveLength(3));
+
+    await act(async () => {
+      await qc.refetchQueries({ queryKey: ["claude-transcript-follow", PATH] });
+    });
+    await waitFor(() => expect(result.current.following).toBe("idle"));
+    expect(result.current.pairings).toEqual({ t1: "paired", t2: "unanswered" });
+  });
+
+  /// #1474. A call carried by one poll and ANSWERED on the next is
+  /// `unanswered` in the first read and `call_above_window` in the second
+  /// -- each read sees half. The follow holds both halves, so it is
+  /// `paired`; letting the later read win alone would say the result
+  /// answers a call above the window when the call is right there.
+  ///
+  /// **Sabotage:** make `mergePairing` return `later` and this fails.
+  it("pairs a call with the result that arrived on a later poll", async () => {
+    const m = manualScheduler();
+    invoke
+      .mockImplementationOnce(() =>
+        Promise.resolve(
+          follow({
+            reread: "first",
+            preview: { messages: [call("t9")], pairings: { t9: "unanswered" } },
+          }),
+        ),
+      )
+      .mockImplementationOnce(() =>
+        Promise.resolve(
+          follow({
+            bytes_read: 90,
+            preview: { messages: [answer("t9")], pairings: { t9: "call_above_window" } },
+          }),
+        ),
+      );
+    const qc = client();
+    const { result } = renderHook(() => useClaudeTranscriptFollow(PATH, true, m.schedule), {
+      wrapper: wrapper(qc),
+    });
+    await waitFor(() => expect(result.current.messages).toHaveLength(1));
+    expect(result.current.pairings).toEqual({ t9: "unanswered" });
+
+    await act(async () => {
+      await qc.refetchQueries({ queryKey: ["claude-transcript-follow", PATH] });
+    });
+    act(() => m.flush());
+    expect(result.current.messages).toHaveLength(2);
+    expect(result.current.pairings).toEqual({ t9: "paired" });
+  });
+
+  /// #1474. **Truncation is sticky.** An append reads from the cursor to
+  /// the end, so it reports `truncated: false` -- and the hook used to
+  /// take that as the whole window's answer, labelling the tail of a
+  /// 76 MB transcript "All N messages". Only a full re-read may clear it.
+  ///
+  /// **Sabotage:** set `window: win` on the append arm and the
+  /// after-append assertion fails.
+  it("stays truncated across appends until a full re-read says otherwise", async () => {
+    const m = manualScheduler();
+    invoke
+      .mockImplementationOnce(() =>
+        Promise.resolve(
+          follow({
+            reread: "first",
+            file_bytes: 76_000_000,
+            preview: { messages: [msg("tail")], truncated: true },
+          }),
+        ),
+      )
+      .mockImplementationOnce(() =>
+        Promise.resolve(
+          follow({ bytes_read: 80, preview: { messages: [msg("more")], truncated: false } }),
+        ),
+      )
+      .mockImplementationOnce(() =>
+        Promise.resolve(
+          follow({
+            reread: "shrank",
+            file_bytes: 400,
+            bytes_read: 400,
+            preview: { messages: [msg("whole")], truncated: false },
+          }),
+        ),
+      );
+    const qc = client();
+    const { result } = renderHook(() => useClaudeTranscriptFollow(PATH, true, m.schedule), {
+      wrapper: wrapper(qc),
+    });
+    await waitFor(() => expect(result.current.window?.truncated).toBe(true));
+
+    await act(async () => {
+      await qc.refetchQueries({ queryKey: ["claude-transcript-follow", PATH] });
+    });
+    act(() => m.flush());
+    expect(result.current.messages).toHaveLength(2);
+    expect(result.current.window?.truncated).toBe(true);
+
+    // A full re-read of a file that now fits is the one answer that can
+    // say the window is whole.
+    await act(async () => {
+      await qc.refetchQueries({ queryKey: ["claude-transcript-follow", PATH] });
+    });
+    await waitFor(() => expect(result.current.reread?.why).toBe("shrank"));
+    expect(result.current.window?.truncated).toBe(false);
+  });
+
+  /// #1474. **The cap holds, and says so.** Each read is bounded, but a
+  /// follow is the sum of its reads; without a bound of its own a session
+  /// followed for an afternoon grows without limit. Past the cap the
+  /// oldest messages go, the newest stay, and `capped` counts what went
+  /// -- so the pane can say it is capped rather than "All N messages".
+  ///
+  /// **Sabotage:** skip `capFollow` in the coalescer's commit and every
+  /// assertion after the append fails.
+  it("holds at most the cap, drops the oldest, and counts what it let go", async () => {
+    const m = manualScheduler();
+    const first = [call("old"), answer("old"), call("edge"), answer("edge")];
+    const over = 7;
+    const burst = Array.from({ length: FOLLOW_MAX_MESSAGES - first.length + over }, (_, i) =>
+      msg(`n${i}`),
+    );
+    invoke
+      .mockImplementationOnce(() =>
+        Promise.resolve(
+          follow({
+            reread: "first",
+            preview: { messages: first, pairings: { old: "paired", edge: "paired" } },
+          }),
+        ),
+      )
+      .mockImplementationOnce(() =>
+        Promise.resolve(follow({ bytes_read: 90_000, preview: { messages: burst } })),
+      );
+    const qc = client();
+    const { result } = renderHook(() => useClaudeTranscriptFollow(PATH, true, m.schedule), {
+      wrapper: wrapper(qc),
+    });
+    await waitFor(() => expect(result.current.messages).toHaveLength(4));
+    expect(result.current.capped).toBe(0);
+
+    await act(async () => {
+      await qc.refetchQueries({ queryKey: ["claude-transcript-follow", PATH] });
+    });
+    act(() => m.flush());
+
+    expect(result.current.messages).toHaveLength(FOLLOW_MAX_MESSAGES);
+    expect(result.current.capped).toBe(over);
+    // The NEWEST are kept...
+    expect(result.current.messages[FOLLOW_MAX_MESSAGES - 1].blocks[0]).toEqual({
+      kind: "text",
+      text: `n${burst.length - 1}`,
+      truncated: false,
+    });
+    // ...and the oldest went: 7 over took the first four and three of the
+    // burst, so both tool pairs are gone -- and their pairings with them,
+    // or the map would still grow without bound.
+    expect(result.current.messages[0].blocks[0]).toEqual({
+      kind: "text",
+      text: "n3",
+      truncated: false,
+    });
+    expect(result.current.pairings).toEqual({});
+  });
+
+  /// #1474. When the cap splits a call from its result, the result is now
+  /// answering a call above what the pane shows. `paired` left behind
+  /// would claim a call the reader cannot find.
+  it("re-states a kept result whose call the cap let go", async () => {
+    const m = manualScheduler();
+    const burst = Array.from({ length: FOLLOW_MAX_MESSAGES - 1 }, (_, i) => msg(`n${i}`));
+    invoke
+      .mockImplementationOnce(() =>
+        Promise.resolve(
+          follow({
+            reread: "first",
+            preview: { messages: [call("split")], pairings: { split: "unanswered" } },
+          }),
+        ),
+      )
+      .mockImplementationOnce(() =>
+        Promise.resolve(
+          follow({
+            bytes_read: 90_000,
+            preview: {
+              messages: [answer("split"), ...burst],
+              pairings: { split: "call_above_window" },
+            },
+          }),
+        ),
+      );
+    const qc = client();
+    const { result } = renderHook(() => useClaudeTranscriptFollow(PATH, true, m.schedule), {
+      wrapper: wrapper(qc),
+    });
+    await waitFor(() => expect(result.current.messages).toHaveLength(1));
+
+    await act(async () => {
+      await qc.refetchQueries({ queryKey: ["claude-transcript-follow", PATH] });
+    });
+    act(() => m.flush());
+
+    expect(result.current.capped).toBe(1);
+    expect(result.current.messages[0].blocks[0].kind).toBe("tool_result");
+    expect(result.current.pairings).toEqual({ split: "call_above_window" });
   });
 });
