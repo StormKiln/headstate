@@ -788,3 +788,374 @@ async fn a_call_the_phone_abandons_keeps_its_permit_until_the_walk_ends() {
 
     desktop.handle.stop().await;
 }
+
+// ---------------------------------------------------------------------
+// Compression on `/v1/call/*` (#1478). The scope and the CRIME/BREACH
+// review are in `listener.rs`'s module docs.
+// ---------------------------------------------------------------------
+
+/// A generated, tool-heavy Claude Code transcript: each round is an
+/// assistant turn with a line of prose and one tool call, then the
+/// tool's result, cycling through a test run, a file read and a search.
+///
+/// The output text is varied with a fixed-seed xorshift, so it is not
+/// one line repeated. A repeated line would compress absurdly well and
+/// would make the ratio this fixture measures meaningless. The names and
+/// paths are generic on purpose.
+fn tool_heavy_transcript(rounds: usize) -> String {
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = move |m: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % m
+    };
+    let mut out = String::new();
+    for i in 0..rounds {
+        let ts = format!("2026-09-13T10:{:02}:{:02}Z", (i / 60) % 60, i % 60);
+        let (name, input, result) = match i % 3 {
+            0 => {
+                let mut lines = Vec::new();
+                for _ in 0..40 {
+                    lines.push(format!(
+                        "test module_{}::case_{}_{} ... ok",
+                        next(30),
+                        next(500),
+                        next(9)
+                    ));
+                }
+                lines.push(format!(
+                    "test result: ok. {} passed; 0 failed; finished in {}.{:02}s",
+                    40 + next(900),
+                    next(9),
+                    next(100)
+                ));
+                (
+                    "Bash",
+                    json!({"command": "cargo test --lib", "description": "Run the tests"}),
+                    lines.join("\n"),
+                )
+            }
+            1 => {
+                let mut lines = Vec::new();
+                for n in 1..=45 {
+                    lines.push(format!(
+                        "{n:>6}\tfn item_{}(x: u32) -> u32 {{ x.wrapping_mul({}) + {} }}",
+                        next(10_000),
+                        next(97),
+                        next(1_000)
+                    ));
+                }
+                (
+                    "Read",
+                    json!({"file_path": format!("/src/app/mod_{}/file_{}.rs", next(20), next(50))}),
+                    lines.join("\n"),
+                )
+            }
+            _ => {
+                let mut lines = Vec::new();
+                for _ in 0..35 {
+                    lines.push(format!(
+                        "/src/app/mod_{}/file_{}.rs:{}:    let value_{} = compute_{}(&input, {});",
+                        next(20),
+                        next(50),
+                        next(800),
+                        next(300),
+                        next(40),
+                        next(64)
+                    ));
+                }
+                (
+                    "Grep",
+                    json!({"pattern": format!("compute_{}", next(40)), "path": "/src/app"}),
+                    lines.join("\n"),
+                )
+            }
+        };
+        let id = format!("toolu_{i:05}");
+        let assistant = json!({
+            "type": "assistant",
+            "timestamp": ts,
+            "message": {"role": "assistant", "model": "claude-opus-5", "content": [
+                {"type": "text", "text": format!("Step {i}: checking the next part of the change.")},
+                {"type": "tool_use", "id": id, "name": name, "input": input},
+            ]},
+        });
+        let user = json!({
+            "type": "user",
+            "timestamp": ts,
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": id, "is_error": false, "content": result},
+            ]},
+        });
+        out.push_str(&assistant.to_string());
+        out.push('\n');
+        out.push_str(&user.to_string());
+        out.push('\n');
+    }
+    out
+}
+
+/// A host that answers `claude_transcript_tail` the way
+/// `commands::claude_transcript_tail` does, by running the real
+/// `preview::tail`. It reads a fixture rather than a path under
+/// `~/.claude/projects`, which is where the command resolves its path.
+struct TranscriptHost {
+    path: std::path::PathBuf,
+}
+
+impl CommandHost for TranscriptHost {
+    fn dispatch<'a>(
+        &'a self,
+        command: &'a str,
+        _args: Value,
+        _device_name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, RemoteError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            assert_eq!(command, "claude_transcript_tail");
+            let page = crate::claude::preview::tail(&self.path).expect("the fixture reads");
+            Ok(serde_json::to_value(page).unwrap())
+        })
+    }
+    fn notify_destructive(&self, _: &str, _: &str) {}
+}
+
+/// One response as the bytes that crossed the wire: the status, the
+/// headers (names lowercased), and the body with any chunked framing
+/// removed but NOT decoded. `listener::tests::request` reads the body as
+/// text, which a gzip body is not.
+struct WireReply {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl WireReply {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The body as JSON, gunzipped first if the response says gzip.
+    fn json(&self) -> Value {
+        let plain = match self.header("content-encoding") {
+            Some("gzip") => {
+                let mut out = Vec::new();
+                std::io::Read::read_to_end(
+                    &mut flate2::read::GzDecoder::new(self.body.as_slice()),
+                    &mut out,
+                )
+                .expect("a gzip body decodes");
+                out
+            }
+            None => self.body.clone(),
+            Some(other) => panic!("unexpected content-encoding {other}"),
+        };
+        serde_json::from_slice(&plain).expect("the body is JSON")
+    }
+}
+
+/// One request over a fresh mTLS connection, answered as a [`WireReply`].
+async fn wire_request(
+    desktop: &Desktop<impl CommandHost>,
+    phone: &Phone,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> WireReply {
+    let mut tls = connect(desktop.addr, Some(&phone.cert), &desktop.fp)
+        .await
+        .unwrap();
+    let mut head = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
+    tls.write_all(head.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    let _ = tls.read_to_end(&mut raw).await;
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("a response head");
+    let head = String::from_utf8_lossy(&raw[..split]).to_string();
+    let mut lines = head.lines();
+    let status = lines
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .expect("a status line");
+    let headers: Vec<(String, String)> = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    let mut rest = &raw[split + 4..];
+    let chunked = headers
+        .iter()
+        .any(|(k, v)| k == "transfer-encoding" && v.eq_ignore_ascii_case("chunked"));
+    let body = if chunked {
+        let mut body = Vec::new();
+        loop {
+            let eol = rest
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .expect("a chunk size line");
+            let size = usize::from_str_radix(std::str::from_utf8(&rest[..eol]).unwrap().trim(), 16)
+                .expect("a hex chunk size");
+            rest = &rest[eol + 2..];
+            if size == 0 {
+                break;
+            }
+            body.extend_from_slice(&rest[..size]);
+            rest = &rest[size + 2..];
+        }
+        body
+    } else {
+        rest.to_vec()
+    };
+    WireReply {
+        status,
+        headers,
+        body,
+    }
+}
+
+/// A paired phone against a desktop serving a generated tool-heavy
+/// transcript page. The tempdir lives as long as the desktop.
+async fn transcript_desktop() -> (Desktop<TranscriptHost>, Phone, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    std::fs::write(&path, tool_heavy_transcript(150)).unwrap();
+    let hub = Arc::new(Hub::new(Arc::new(|| {
+        Box::pin(async { Some("[]".to_string()) })
+    })));
+    let mut desktop = desktop_on(Arc::new(TranscriptHost { path }), hub).await;
+    let phone = Phone::new();
+    desktop.pair(&phone, "Test phone").await;
+    (desktop, phone, dir)
+}
+
+const TAIL_ARGS: &str = r#"{"path":"session.jsonl"}"#;
+
+/// The least this fixture's page must shrink by. It is a regression
+/// guard, not a forecast. The fixture measured 7.2x when #1478 landed,
+/// but real transcript pages measured 2.1x to 4.4x. They are prose-heavy
+/// and less repetitive, and each page is small because the 256 KB tail
+/// window holds few large records. The PR records both sets of figures.
+/// The floor sits well under the fixture's figure, so a change to the
+/// fixture or to the gzip level does not flake the test, while a layer
+/// that is off still fails.
+const MIN_TRANSCRIPT_RATIO: usize = 4;
+
+/// #1478: a transcript page asked for with `Accept-Encoding: gzip`
+/// arrives gzipped, decodes to exactly the page the command produced,
+/// and is at least [`MIN_TRANSCRIPT_RATIO`] times smaller on the wire
+/// than the same page sent plain.
+#[tokio::test]
+async fn a_transcript_page_crosses_gzipped_and_decodes_to_the_same_page() {
+    let (desktop, phone, _dir) = transcript_desktop().await;
+
+    let gz = wire_request(
+        &desktop,
+        &phone,
+        "POST",
+        "/v1/call/claude_transcript_tail",
+        &[("Accept-Encoding", "gzip")],
+        TAIL_ARGS,
+    )
+    .await;
+    assert_eq!(gz.status, 200);
+    assert_eq!(gz.header("content-encoding"), Some("gzip"));
+
+    let plain = wire_request(
+        &desktop,
+        &phone,
+        "POST",
+        "/v1/call/claude_transcript_tail",
+        &[],
+        TAIL_ARGS,
+    )
+    .await;
+    assert_eq!(plain.status, 200);
+
+    // The same page both ways, and the page the command produced.
+    let expected = serde_json::to_value(
+        crate::claude::preview::tail(&desktop.host.path).expect("the fixture reads"),
+    )
+    .unwrap();
+    assert_eq!(gz.json(), expected);
+    assert_eq!(plain.json(), expected);
+    let messages = expected["messages"].as_array().map_or(0, Vec::len);
+    assert!(
+        messages >= 100,
+        "the fixture should fill a real page; it produced {messages} messages"
+    );
+
+    let (wire, full) = (gz.body.len(), plain.body.len());
+    eprintln!(
+        "transcript page: {full} bytes plain, {wire} bytes gzip, ratio {:.2}",
+        full as f64 / wire as f64
+    );
+    assert!(
+        wire * MIN_TRANSCRIPT_RATIO <= full,
+        "a {full}-byte page crossed as {wire} bytes, less than {MIN_TRANSCRIPT_RATIO}x smaller"
+    );
+
+    desktop.handle.stop().await;
+}
+
+/// #1478: a client that does not ask for gzip, which is every companion
+/// built before this change, gets the plain JSON it always did, with no
+/// `Content-Encoding`.
+#[tokio::test]
+async fn a_client_that_does_not_ask_for_gzip_gets_plain_json() {
+    let (desktop, phone, _dir) = transcript_desktop().await;
+
+    let reply = wire_request(
+        &desktop,
+        &phone,
+        "POST",
+        "/v1/call/claude_transcript_tail",
+        &[],
+        TAIL_ARGS,
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.header("content-encoding"), None);
+    let page: Value = serde_json::from_slice(&reply.body).expect("plain JSON on the wire");
+    assert!(page["messages"].as_array().is_some_and(|m| !m.is_empty()));
+
+    desktop.handle.stop().await;
+}
+
+/// #1478: compression is scoped to `/v1/call/*`. `/v1/hello`, asked
+/// with the same header, answers plain. That proves the layer is on the
+/// call route and not on the whole router, where it would also reach
+/// `/v1/pair`.
+#[tokio::test]
+async fn only_the_call_route_is_compressed() {
+    let (desktop, phone, _dir) = transcript_desktop().await;
+
+    let hello = wire_request(
+        &desktop,
+        &phone,
+        "GET",
+        "/v1/hello",
+        &[("Accept-Encoding", "gzip")],
+        "",
+    )
+    .await;
+    assert_eq!(hello.status, 200);
+    assert!(
+        hello.body.len() > 32,
+        "hello must be over tower-http's 32-byte floor, or this proves nothing"
+    );
+    assert_eq!(hello.header("content-encoding"), None);
+    assert_eq!(hello.json()["protocol_version"], 2);
+
+    desktop.handle.stop().await;
+}

@@ -17,6 +17,10 @@
 //! - The desktop may be reachable at several addresses (LAN, overlay);
 //!   [`Client`] tries them in order with a short connect timeout each
 //!   and remembers the one that answered.
+//! - Every request says `Accept-Encoding: gzip`, and reqwest decodes a
+//!   gzipped reply before `json_body` sees it (#1478). The desktop gzips
+//!   `/v1/call/*` responses only. `src-tauri/src/remote/listener.rs`
+//!   argues why that is safe from CRIME/BREACH.
 //!
 //! # Errors the caller acts on
 //!
@@ -1680,6 +1684,43 @@ mod tests {
                 status: 500,
                 message: "gh auth status failed".into()
             }
+        );
+    }
+
+    /// #1478: a call asks for gzip, and a gzipped reply decodes to the
+    /// JSON the desktop sent. The page is transcript-shaped and large
+    /// enough that the stand-in desktop's gzip is doing real work.
+    #[tokio::test]
+    async fn a_call_asks_for_gzip_and_decodes_a_gzipped_reply() {
+        let id = identity();
+        let server = TestServer::start().await;
+        server.pair(&id.fingerprint());
+        let lines: Vec<String> = (0..400)
+            .map(|i| format!("test module_{}::case_{i} ... ok", i % 17))
+            .collect();
+        let page = json!({"messages": [{"text": lines.join("\n")}], "truncated": false});
+        server.reply(
+            "/v1/call/claude_transcript_tail",
+            Reply::GzipJson {
+                status: 200,
+                body: page.to_string(),
+            },
+        );
+        let client = Client::new(&id, &server.fp, vec![server.addr()], server.port()).unwrap();
+        let out = client
+            .call("claude_transcript_tail", &json!({"path": "p.jsonl"}), None)
+            .await
+            .unwrap();
+        assert_eq!(out, page);
+        let req = server
+            .requests()
+            .into_iter()
+            .find(|r| r.path == "/v1/call/claude_transcript_tail")
+            .unwrap();
+        let accept = req.header("accept-encoding").unwrap_or("");
+        assert!(
+            accept.split(',').any(|c| c.trim() == "gzip"),
+            "the call must ask for gzip; it sent Accept-Encoding {accept:?}"
         );
     }
 }
