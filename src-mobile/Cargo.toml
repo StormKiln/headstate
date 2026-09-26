@@ -62,7 +62,12 @@ tauri-plugin-log = "2.9.1"
 # chose it. `json` for the command bodies. No native-tls: the platform
 # TLS stack cannot present a client identity we control, and iOS has no
 # OpenSSL to vendor.
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+#
+# `gzip` (#1478): sends `Accept-Encoding: gzip` and decodes a gzip body
+# transparently, so transcript pages cross the LAN at a fraction of their
+# size. It is reqwest's own feature over tower-http, already in this
+# graph; see src-tauri/Cargo.toml for the crates it adds and why gzip.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "gzip"] }
 # Named directly so the provider choice is explicit and so #514 can set
 # `CryptoProvider::install_default` without adding a dependency. Feature
 # names match what reqwest enables, so nothing is compiled twice.
@@ -182,3 +187,6 @@ thiserror = "2"
 # reqwest's hyper-rustls; default features off so TLS 1.2 stays out.
 tokio-rustls = { version = "0.26", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util"] }
+# The stand-in desktop gzips a reply the way the real listener does
+# (#1478). Already in this graph via png and zip.
+flate2 = "1"
