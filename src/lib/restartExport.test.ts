@@ -42,6 +42,7 @@ function list(over: Partial<ClaudeRestartList> = {}): ClaudeRestartList {
     uncertain: [],
     registry_failure: null,
     registry_unreadable: [],
+    registry_unnamed: [],
     ...over,
   };
 }
@@ -153,6 +154,23 @@ describe("restartExportText", () => {
     expect(text).toContain("at least 1 session");
     expect(text).toContain("floor, not a count");
     expect(text).toContain("4821.json: invalid JSON at line 1");
+  });
+
+  /// A running session with no record naming it qualifies the list and
+  /// is named, but gets no resume line -- there is no id to resume
+  /// (#1315).
+  it("says the list is a floor when a session runs that no entry names", () => {
+    const text = restartExportText(
+      list({
+        running: [anchored("s1", "/tmp/x")],
+        registry_unnamed: ["pid 4242, running in /Users/acme/code/widget"],
+      }),
+    );
+
+    expect(text).toContain("at least 1 session");
+    expect(text).toContain("floor, not a count");
+    expect(text).toContain("# pid 4242, running in /Users/acme/code/widget");
+    expect(commandLines(text)).toHaveLength(1);
   });
 
   /// An `Unknown`-liveness session is INCLUDED, under its own heading.

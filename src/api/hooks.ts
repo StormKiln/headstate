@@ -1678,6 +1678,7 @@ export function hydrateClaudeSessions(wire: WireClaudeSessionList): ClaudeSessio
     }),
     registry_failure: wire.registry_failure,
     registry_unreadable: wire.registry_unreadable,
+    registry_unnamed: wire.registry_unnamed,
   };
 }
 

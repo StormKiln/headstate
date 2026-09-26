@@ -36,6 +36,7 @@ const restartFn = vi.hoisted(() =>
       uncertain: [],
       registry_failure: null,
       registry_unreadable: [],
+      registry_unnamed: [],
     } as unknown),
   ),
 );
@@ -859,6 +860,7 @@ describe("the restart export card", () => {
     uncertain: [],
     registry_failure: null,
     registry_unreadable: [],
+    registry_unnamed: [],
     ...over,
   });
 

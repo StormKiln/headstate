@@ -219,6 +219,7 @@ const listOf = (sessions: ClaudeSession[]): ClaudeSessionList => ({
   sessions,
   registry_failure: null,
   registry_unreadable: [],
+  registry_unnamed: [],
 });
 
 beforeEach(() => {
