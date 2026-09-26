@@ -71,7 +71,7 @@
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use super::liveness::{derive, Liveness, ProcessProbe, Registry, Run, SysinfoProbe};
+use super::liveness::{derive_at, Liveness, ProcessProbe, Registry, Run, SysinfoProbe};
 
 /// Whether the directory a session ran in is still there.
 ///
@@ -532,6 +532,12 @@ pub struct SessionList {
     /// Registry files that could not be parsed, with why. Each one hides
     /// a session whose liveness cannot be stated.
     pub registry_unreadable: Vec<String>,
+    /// Claude Code processes that are (or may be) running and published
+    /// no session record, one line each (#1315). No row below can show
+    /// them as running, because nothing says which session they are --
+    /// so the list is NOT complete while this is non-empty, and rows
+    /// they could be read as `Unknown` rather than `Dead`.
+    pub registry_unnamed: Vec<String>,
 }
 
 /// What one selected session knows that the list does not carry.
@@ -651,7 +657,7 @@ pub fn list(conn: &Connection) -> Result<SessionList, rusqlite::Error> {
     // Only the pids that could be alive. A refresh of the whole process
     // table would cost the same whatever the answer; this asks about the
     // handful that any row's liveness could turn on.
-    let mut pids: Vec<u32> = registry.entries.values().map(|e| e.pid).collect();
+    let mut pids: Vec<u32> = registry.probe_pids();
     for rs in runs.values() {
         for r in rs.iter().filter(|r| r.ended_at.is_none()) {
             pids.push(r.pid);
@@ -962,19 +968,33 @@ pub fn detail(
     conn: &Connection,
     session_id: &str,
 ) -> Result<Option<SessionDetail>, rusqlite::Error> {
-    let Some(stored) = stored_row(conn, session_id)? else {
-        return Ok(None);
-    };
-
     let registry = super::liveness::registry_dir()
         .map(|d| super::liveness::read_registry(&d))
         .unwrap_or_else(|| Registry {
             failure: Some("no home directory, so the live session registry is unreachable".into()),
             ..Default::default()
         });
+    detail_with(conn, session_id, registry)
+}
+
+/// [`detail`] against a given registry read.
+///
+/// Split so a test asserting a `Dead` verdict is not at the mercy of
+/// whatever the developer's machine is running: a terminal-launched
+/// `claude` leaves a live `.key`-only record, which rightly hedges a row
+/// with no recorded folder (#1315).
+fn detail_with(
+    conn: &Connection,
+    session_id: &str,
+    registry: Registry,
+) -> Result<Option<SessionDetail>, rusqlite::Error> {
+    let Some(stored) = stored_row(conn, session_id)? else {
+        return Ok(None);
+    };
+
     let runs = runs_for_session(conn, session_id)?;
 
-    let mut pids: Vec<u32> = registry.entries.values().map(|e| e.pid).collect();
+    let mut pids: Vec<u32> = registry.probe_pids();
     for r in runs.iter().filter(|r| r.ended_at.is_none()) {
         pids.push(r.pid);
     }
@@ -982,7 +1002,6 @@ pub fn detail(
     pids.dedup();
     let probe = SysinfoProbe::for_pids(&pids);
 
-    let liveness = derive(&probe, &registry, session_id, &runs);
     // The same cwd precedence the list uses: a live session republishes
     // its own, and the stored one is all a dead session has. Stated in
     // both places rather than shared, because the two reads happen at
@@ -992,6 +1011,9 @@ pub fn detail(
         .get(session_id)
         .and_then(|e| e.cwd.clone())
         .or_else(|| stored.cwd.clone());
+    // With the cwd, so a `.key`-only session elsewhere on the machine
+    // does not hedge this one (#1315).
+    let liveness = derive_at(&probe, &registry, session_id, cwd.as_deref(), &runs);
     let cwd_state = check_cwd(cwd.as_deref());
 
     let kind = super::subagent::Kind::classify(cwd.as_deref());
@@ -1207,7 +1229,6 @@ fn assemble<P: ProcessProbe>(
             // the rows outside its window claiming "running" until they
             // happened to be rewritten, and this poll is the only thing
             // that ever corrects that.
-            let liveness = derive(probe, registry, &s.session_id, session_runs);
             // The registry's cwd wins when the session is running: the
             // transcript's cwd is where the session STARTED, and a live
             // session republishes its own. Falls back to the stored one,
@@ -1217,6 +1238,10 @@ fn assemble<P: ProcessProbe>(
                 .get(&s.session_id)
                 .and_then(|e| e.cwd.clone())
                 .or_else(|| s.cwd.clone());
+            // The cwd narrows which rows a `.key`-only session could be
+            // (#1315): without it, one terminal launch would hedge every
+            // historical row.
+            let liveness = derive_at(probe, registry, &s.session_id, cwd.as_deref(), session_runs);
             // Stays on the list row: the Resumable and Directory-gone
             // chips switch on it, and those counts are over the whole
             // corpus.
@@ -1262,6 +1287,13 @@ fn assemble<P: ProcessProbe>(
         reasons: reasons.list,
         registry_failure: registry.failure.clone(),
         registry_unreadable: registry.unreadable.clone(),
+        // Stated once for the list, beside the rows it hedged: a session
+        // that is running and on no row is exactly what "the list is
+        // complete" would hide (#1315).
+        registry_unnamed: super::liveness::unnamed_sessions(probe, registry)
+            .into_iter()
+            .map(|u| u.line)
+            .collect(),
     }
 }
 
@@ -1976,7 +2008,11 @@ mod tests {
         // "crashed" from `runs.first()`, so a detail query that ordered
         // its runs differently would report a crash as a clean exit on
         // the one screen that shows the words.
-        match detail(&conn, "s1").unwrap().expect("stored").liveness {
+        match detail_with(&conn, "s1", Registry::default())
+            .unwrap()
+            .expect("stored")
+            .liveness
+        {
             Liveness::Dead { why } => assert!(
                 why.contains("without shutting down"),
                 "the detail must agree with the list about the crash: {why}"
@@ -2018,7 +2054,11 @@ mod tests {
             ),
             other => panic!("expected Dead, got {other:?}"),
         }
-        match detail(&conn, "s1").unwrap().expect("stored").liveness {
+        match detail_with(&conn, "s1", Registry::default())
+            .unwrap()
+            .expect("stored")
+            .liveness
+        {
             Liveness::Dead { why } => assert!(
                 !why.contains("without shutting down"),
                 "the detail must not turn a clean exit into a crash: {why}"
@@ -2199,7 +2239,8 @@ mod tests {
             "two identical verdicts must be carried once: {:?}",
             got.reasons
         );
-        let direct = derive(&Fake(Ok(None)), &Registry::default(), "s1", &[]);
+        let direct =
+            crate::claude::liveness::derive(&Fake(Ok(None)), &Registry::default(), "s1", &[]);
         let Liveness::Dead { why: expected } = direct else {
             panic!("expected Dead");
         };
@@ -2652,6 +2693,68 @@ mod tests {
         );
     }
 
+    /// A terminal-launched session reaches the list (#1315): it is
+    /// stated once at list level, and the row in its folder -- and only
+    /// that row -- stops reading as stopped.
+    ///
+    /// Through `assemble`, the function the list actually runs, because
+    /// `derive_at` being right is worth nothing if the list passes it no
+    /// cwd (every row would hedge) or the wrong one. Sabotage: passing
+    /// `None` for the cwd in `assemble` makes the unrelated row hedge and
+    /// fails this; dropping `registry_unnamed` fails the list assertion.
+    #[test]
+    fn a_key_only_session_reaches_the_list_and_hedges_only_its_folder() {
+        struct Live;
+        impl ProcessProbe for Live {
+            fn start_time(&self, pid: u32) -> Result<Option<i64>, String> {
+                Ok((pid == 4242).then_some(PROC_START_EPOCH))
+            }
+            fn cwd(&self, pid: u32) -> Result<Option<std::path::PathBuf>, String> {
+                Ok((pid == 4242).then(|| "/Users/acme/code/widget".into()))
+            }
+        }
+        let conn = db();
+        insert(&conn, "here", Some("/Users/acme/code/widget"), None);
+        insert(&conn, "elsewhere", Some("/Users/acme/code/gadget"), None);
+        let registry = Registry {
+            unnamed: vec![crate::claude::liveness::UnnamedRecord {
+                pid: 4242,
+                proc_start: Some(PROC_START.into()),
+                path: "/Users/acme/.claude/sessions/4242.deadbeef.key".into(),
+            }],
+            ..Default::default()
+        };
+
+        let got = assemble(
+            &Live,
+            &registry,
+            &Default::default(),
+            stored_rows(&conn).unwrap(),
+            &Default::default(),
+            &Default::default(),
+        );
+
+        assert_eq!(
+            got.registry_unnamed,
+            ["pid 4242, running in /Users/acme/code/widget"],
+            "the list must not read as complete while a session runs on no row"
+        );
+        match resolved(&got, "here") {
+            Liveness::Unknown { why } => assert!(why.contains("pid 4242"), "{why}"),
+            other => panic!("the row in the live session's folder read as {other:?}"),
+        }
+        assert!(
+            matches!(resolved(&got, "elsewhere"), Liveness::Dead { .. }),
+            "a row in another folder keeps its settled answer"
+        );
+        assert!(
+            got.sessions
+                .iter()
+                .all(|r| !matches!(resolved(&got, &r.session_id), Liveness::Running { .. })),
+            "nothing names the unnamed session, so no row may claim it"
+        );
+    }
+
     /// The row and the detail pane never disagree about waiting.
     ///
     /// They derive it separately -- the list from its batch liveness
@@ -2683,7 +2786,12 @@ mod tests {
             &Default::default(),
             &hook_events(&conn).unwrap(),
         );
-        let d = detail(&conn, "s1").unwrap().expect("the session is stored");
+        // The SAME registry as the row: the real one on a developer's
+        // machine may carry a live `.key`-only session, which would hedge
+        // the pane and not the row (#1315).
+        let d = detail_with(&conn, "s1", Registry::default())
+            .unwrap()
+            .expect("the session is stored");
 
         assert_eq!(
             got.sessions[0].waiting, d.waiting,

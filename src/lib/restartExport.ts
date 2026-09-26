@@ -70,7 +70,10 @@ function renderEntry(entry: ClaudeRestartEntry): string[] {
 /// is short is worth far more before a reboot than no list at all.
 function summary(list: ClaudeRestartList): string[] {
   const total = list.running.length + list.uncertain.length;
-  const short = list.registry_failure !== null || list.registry_unreadable.length > 0;
+  const short = 
+    list.registry_failure !== null ||
+    list.registry_unreadable.length > 0 ||
+    list.registry_unnamed.length > 0;
   const noun = total === 1 ? "session" : "sessions";
   const count = short ? `at least ${total} ${noun}` : `${total} ${noun}`;
   const split =
@@ -98,6 +101,17 @@ function summary(list: ClaudeRestartList): string[] {
       `# INCOMPLETE: ${n} live session ${n === 1 ? "record" : "records"} could not be read, and each`,
       "# hides a session that may be running. This list is a floor, not a count.",
       `# ${list.registry_unreadable[0]}`,
+    );
+  }
+  if (list.registry_unnamed.length > 0) {
+    // #1315. Running, and not in this file: nothing names the session, so
+    // there is no resume line to write. Each process is named so the
+    // user can find its terminal before the reboot.
+    const n = list.registry_unnamed.length;
+    lines.push(
+      `# INCOMPLETE: ${n} running Claude Code ${n === 1 ? "session is" : "sessions are"} not matched to a saved`,
+      "# session, so no resume line is written for them. This list is a floor, not a count.",
+      ...list.registry_unnamed.map((line) => `# ${line}`),
     );
   }
   return lines;
@@ -138,7 +152,10 @@ export function restartExportText(list: ClaudeRestartList): string {
   }
 
   if (list.running.length === 0 && list.uncertain.length === 0) {
-    const short = list.registry_failure !== null || list.registry_unreadable.length > 0;
+    const short = 
+    list.registry_failure !== null ||
+    list.registry_unreadable.length > 0 ||
+    list.registry_unnamed.length > 0;
     lines.push(
       "",
       ...(short

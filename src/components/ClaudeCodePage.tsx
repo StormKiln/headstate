@@ -306,6 +306,7 @@ export function ClaudeCodePage() {
       <Banners
         registryFailure={list.data?.registry_failure ?? null}
         registryUnreadable={list.data?.registry_unreadable ?? []}
+        registryUnnamed={list.data?.registry_unnamed ?? []}
         imported={imported}
         onRescan={rescan}
       />
@@ -1146,11 +1147,13 @@ function NoSessions({
 function Banners({
   registryFailure,
   registryUnreadable,
+  registryUnnamed,
   imported,
   onRescan,
 }: {
   registryFailure: string | null;
   registryUnreadable: string[];
+  registryUnnamed: string[];
   imported: ReturnType<typeof useClaudeSessions>["imported"];
   onRescan: () => Promise<void>;
 }) {
@@ -1196,6 +1199,29 @@ function Banners({
           {registryUnreadable.length} live-session record
           {registryUnreadable.length === 1 ? "" : "s"} could not be read, so any session they
           describe reads as “could not tell”.
+        </div>
+      ) : null}
+      {/* #1315: a session launched from a terminal runs with no record
+          naming it, so no row can show it as running. Grey like the two
+          above -- it is a gap in what could be established, not a fault
+          to act on -- and it names each process, because "some session is
+          running somewhere" is not something a reader can check. */}
+      {registryUnnamed.length > 0 ? (
+        <div
+          role="status"
+          className="rounded-md border border-[#30363d] bg-[#161b22] px-3 py-2 text-xs text-[#8b949e]"
+        >
+          {registryUnnamed.length === 1
+            ? "A Claude Code session is running that is not matched to any row below"
+            : `${registryUnnamed.length} Claude Code sessions are running that are not matched to any row below`}
+          . Sessions in the same folder read as “could not tell”.
+          <ul className="mt-1 list-disc pl-4">
+            {registryUnnamed.map((line) => (
+              <li key={line} className="break-all">
+                {line}
+              </li>
+            ))}
+          </ul>
         </div>
       ) : null}
       {/* The rescan's own failure, separately from the list's. They are

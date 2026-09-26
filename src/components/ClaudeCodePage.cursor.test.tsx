@@ -100,6 +100,7 @@ const listOf = (n: number): ClaudeSessionList => ({
   sessions: Array.from({ length: n }, (_, i) => session(i)),
   registry_failure: null,
   registry_unreadable: [],
+  registry_unnamed: [],
 });
 
 beforeEach(() => {
