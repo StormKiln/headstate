@@ -371,6 +371,17 @@ pub enum MessageKind {
         task_id: Option<String>,
         status: Option<String>,
     },
+    /// A background task's state as the harness recorded it (a
+    /// `task_status` attachment, #1483). Its own kind rather than a
+    /// [`MessageKind::Notice`], because the renderer shows the STATUS --
+    /// `running`, `completed`, ... verbatim -- beside the task, and a
+    /// notice carried only the description. The description is the first
+    /// text block. Every field is as recorded; `None` is "not recorded".
+    TaskStatus {
+        task_id: Option<String>,
+        task_type: Option<String>,
+        status: Option<String>,
+    },
     /// Text the harness inserted on the user's behalf (`isMeta`): skill
     /// bodies, caveats, auto-continuations. NOT the user speaking.
     Injected { origin: Option<String> },
@@ -1046,8 +1057,16 @@ fn attachment_message(
             },
             text_blocks([str_of(att, "prompt")], ctx),
         ),
-        // Two attachments a reader wants and nothing else renders.
-        "max_turns_reached" | "task_status" => base(
+        "task_status" => base(
+            MessageKind::TaskStatus {
+                task_id: str_of(att, "taskId"),
+                task_type: str_of(att, "taskType"),
+                status: str_of(att, "status"),
+            },
+            text_blocks([str_of(att, "description")], ctx),
+        ),
+        // An attachment a reader wants and nothing else renders.
+        "max_turns_reached" => base(
             MessageKind::Notice {
                 subtype: t.clone(),
                 level: None,
@@ -1994,6 +2013,44 @@ mod tests {
                 message_count: Some(4)
             }
         );
+    }
+
+    /// A background task's status is its own kind, carrying the status
+    /// a notice dropped (#1483). The `model` attachment stays
+    /// bookkeeping: it is the identity line the harness gives the model,
+    /// and a change of model is already derived from the assistant
+    /// records themselves.
+    #[test]
+    fn task_status_carries_its_status_and_model_stays_bookkeeping() {
+        let t = one(serde_json::json!({
+            "type": "attachment", "uuid": "ts1",
+            "attachment": {"type": "task_status", "taskId": "b1", "taskType": "local_bash",
+                "description": "Wait for the build", "status": "running"}
+        }));
+        assert_eq!(
+            t.kind,
+            MessageKind::TaskStatus {
+                task_id: Some("b1".into()),
+                task_type: Some("local_bash".into()),
+                status: Some("running".into()),
+            }
+        );
+        assert!(
+            matches!(&t.blocks[0], TranscriptBlock::Text { text, .. } if text == "Wait for the build")
+        );
+        let bare = one(serde_json::json!({
+            "type": "attachment", "uuid": "ts2",
+            "attachment": {"type": "task_status", "description": "x"}
+        }));
+        assert_eq!(
+            bare.kind,
+            MessageKind::TaskStatus {
+                task_id: None,
+                task_type: None,
+                status: None,
+            }
+        );
+        assert!(MACHINERY_ATTACHMENTS.contains(&"model"));
     }
 
     /// A queued prompt, and a legacy summary record.

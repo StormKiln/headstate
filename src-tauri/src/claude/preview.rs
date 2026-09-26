@@ -521,6 +521,27 @@ pub enum ToolArgs {
         prompt: String,
         truncated: bool,
     },
+    /// `TodoWrite`: the whole checklist, as the call set it (#1483).
+    ///
+    /// The best "what is it doing" signal while the reader was away, so
+    /// it is parsed rather than left to [`ToolArgs::Other`]. Absent from
+    /// this machine's corpus (newer Claude Code builds track tasks with
+    /// other tools), so the shape is Claude Code's documented input --
+    /// `todos: [{content, status, activeForm}]` -- and every field a
+    /// record omits stays `None` rather than being guessed. Bounded by
+    /// [`MAX_TODOS`], and `todos_omitted` says when the bound bit.
+    TodoWrite {
+        todos: Vec<Todo>,
+        todos_omitted: usize,
+    },
+    /// `WebFetch`: the URL and what the caller asked of the page.
+    WebFetch {
+        url: String,
+        prompt: String,
+        truncated: bool,
+    },
+    /// `WebSearch`: the query.
+    WebSearch { query: String, truncated: bool },
     /// A tool whose argument shape this build does not know.
     ///
     /// The KEYS, not the values: the keys are what tell a reader whether
@@ -545,6 +566,23 @@ pub struct Replacement {
     pub replace_all: bool,
     pub truncated: bool,
 }
+
+/// One item of a [`ToolArgs::TodoWrite`] checklist.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Todo {
+    pub content: String,
+    /// `pending`, `in_progress`, `completed`, verbatim. `None` when the
+    /// item carried none, which is not "pending".
+    pub status: Option<String>,
+    /// The present-tense line Claude Code shows while the item runs.
+    pub active_form: Option<String>,
+    pub truncated: bool,
+}
+
+/// The most items listed from one `TodoWrite`, for [`MAX_EDITS`]'s
+/// reason: the render must stay finite. Stated, never silent --
+/// `todos_omitted` carries the remainder.
+const MAX_TODOS: usize = 50;
 
 /// The most edits listed from one `MultiEdit`.
 ///
@@ -1526,6 +1564,48 @@ pub(crate) fn tool_args(name: &str, input: Option<&serde_json::Value>) -> ToolAr
                 truncated,
             }
         }
+        "TodoWrite" => {
+            let all = map
+                .get("todos")
+                .and_then(|e| e.as_array())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let todos = all
+                .iter()
+                .take(MAX_TODOS)
+                .map(|t| {
+                    let f = |k: &str| {
+                        t.get(k)
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned)
+                    };
+                    let (content, truncated) = clamp(f("content").as_deref().unwrap_or(""));
+                    Todo {
+                        content,
+                        status: f("status"),
+                        active_form: f("activeForm"),
+                        truncated,
+                    }
+                })
+                .collect();
+            ToolArgs::TodoWrite {
+                todos,
+                todos_omitted: all.len().saturating_sub(MAX_TODOS),
+            }
+        }
+        "WebFetch" => {
+            let (prompt, truncated) = clamp(text("prompt"));
+            ToolArgs::WebFetch {
+                url: text("url").to_owned(),
+                prompt,
+                truncated,
+            }
+        }
+        "WebSearch" => {
+            let (query, truncated) = clamp(text("query"));
+            ToolArgs::WebSearch { query, truncated }
+        }
         // Everything else -- 18 distinct tool names appear in the sample,
         // most of them MCP tools. The KEYS, so a reader can see that
         // Headstate is behind rather than that the call was empty; not
@@ -2413,6 +2493,93 @@ mod tests {
                 assert_eq!(*edits_omitted, 5);
             }
             other => panic!("expected a MultiEdit call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn todo_write_and_web_tools_are_parsed_rather_than_left_as_keys() {
+        // #1483: the checklist is the "what is it doing" signal, and a
+        // web call is read as its URL or query. A missing status stays
+        // `None` -- absent is not "pending".
+        let tmp = Tmp::new("todoweb");
+        let p = write(
+            tmp.path(),
+            "s.jsonl",
+            &[
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"TodoWrite","input":{"todos":[{"content":"Write the parser","status":"completed","activeForm":"Writing the parser"},{"content":"Test it"}]}},{"type":"tool_use","id":"t2","name":"WebFetch","input":{"url":"https://example.com/a","prompt":"summarise"}},{"type":"tool_use","id":"t3","name":"WebSearch","input":{"query":"unified diff format"}}]}}"#,
+            ],
+        );
+        let v = tail(&p).unwrap();
+        let args: Vec<&ToolArgs> = v.messages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::ToolUse { args, .. } => Some(args),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            *args[0],
+            ToolArgs::TodoWrite {
+                todos: vec![
+                    Todo {
+                        content: "Write the parser".into(),
+                        status: Some("completed".into()),
+                        active_form: Some("Writing the parser".into()),
+                        truncated: false,
+                    },
+                    Todo {
+                        content: "Test it".into(),
+                        status: None,
+                        active_form: None,
+                        truncated: false,
+                    },
+                ],
+                todos_omitted: 0,
+            }
+        );
+        assert_eq!(
+            *args[1],
+            ToolArgs::WebFetch {
+                url: "https://example.com/a".into(),
+                prompt: "summarise".into(),
+                truncated: false,
+            }
+        );
+        assert_eq!(
+            *args[2],
+            ToolArgs::WebSearch {
+                query: "unified diff format".into(),
+                truncated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_long_checklist_counts_the_items_it_drops() {
+        let tmp = Tmp::new("todomany");
+        let todos: Vec<String> = (0..MAX_TODOS + 3)
+            .map(|i| format!(r#"{{"content":"item {i}","status":"pending"}}"#))
+            .collect();
+        let line = format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"tt","name":"TodoWrite","input":{{"todos":[{}]}}}}]}}}}"#,
+            todos.join(",")
+        );
+        let p = write(tmp.path(), "s.jsonl", &[&line]);
+        let v = tail(&p).unwrap();
+        match &v.messages[0].blocks[0] {
+            Block::ToolUse {
+                args:
+                    ToolArgs::TodoWrite {
+                        todos,
+                        todos_omitted,
+                    },
+                ..
+            } => {
+                assert_eq!(todos.len(), MAX_TODOS);
+                assert_eq!(*todos_omitted, 3);
+            }
+            other => panic!("expected a TodoWrite call, got {other:?}"),
         }
     }
 

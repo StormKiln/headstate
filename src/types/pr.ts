@@ -2388,6 +2388,10 @@ export type ClaudeToolArgs =
       prompt: string;
       truncated: boolean;
     }
+  /// The whole checklist, as the call set it (#1483).
+  | { tool: "todo_write"; todos: ClaudeTodo[]; todos_omitted: number }
+  | { tool: "web_fetch"; url: string; prompt: string; truncated: boolean }
+  | { tool: "web_search"; query: string; truncated: boolean }
   /// A tool whose shape this build does not know: its argument keys, so
   /// the reader can see Headstate is behind rather than that the call
   /// was empty.
@@ -2395,6 +2399,19 @@ export type ClaudeToolArgs =
   /// No `input` was recorded at all. DISTINCT from `other` with no keys
   /// -- absent is not zero.
   | { tool: "none" };
+
+/** @public */
+/// One item of a `TodoWrite` checklist. Mirrors
+/// `claude::preview::Todo`.
+///
+/// `status` is verbatim (`pending`, `in_progress`, `completed`) and
+/// `null` when the item carried none, which is not "pending".
+export interface ClaudeTodo {
+  content: string;
+  status: string | null;
+  active_form: string | null;
+  truncated: boolean;
+}
 
 interface ClaudeReplacement {
   old_string: string;

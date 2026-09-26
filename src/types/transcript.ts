@@ -109,7 +109,7 @@ export interface TranscriptToolOutput {
 
 /// One content block. `index` is the block's position in the record it
 /// came from -- with the message id, the full-text fetch address.
-type TranscriptBlock =
+export type TranscriptBlock =
   | { kind: "text"; index: number; text: string; clip: TranscriptClip | null }
   /// `recorded: false` when only the signature was kept: render
   /// "thinking (not recorded)", never empty thought.
@@ -147,6 +147,14 @@ type TranscriptMessageKind =
   | { kind: "assistant" }
   | { kind: "tool_results" }
   | { kind: "agent_notification"; task_id: string | null; status: string | null }
+  /// A background task's recorded state (#1483); the description is the
+  /// first text block.
+  | {
+      kind: "task_status";
+      task_id: string | null;
+      task_type: string | null;
+      status: string | null;
+    }
   | { kind: "injected"; origin: string | null }
   | { kind: "queued_prompt"; mode: string | null }
   | { kind: "interruption"; during_tool_use: boolean }

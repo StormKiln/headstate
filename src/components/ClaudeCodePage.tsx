@@ -3826,6 +3826,26 @@ function ToolArguments({ args }: { args: ClaudeToolArgs }) {
           </p>
         </div>
       );
+    case "todo_write":
+      return (
+        <p className="mt-0.5 text-[11px] text-[#8b949e]">
+          {(args.todos.length + args.todos_omitted).toLocaleString()} item
+          {args.todos.length + args.todos_omitted === 1 ? "" : "s"}
+        </p>
+      );
+    case "web_fetch":
+      return (
+        <p className="mt-0.5 text-[11px] text-[#8b949e]">
+          <span className={mono}>{args.url}</span>
+        </p>
+      );
+    case "web_search":
+      return (
+        <p className="mt-0.5 text-[11px] text-[#8b949e]">
+          <span className={mono}>{args.query}</span>
+          {clipped(args.truncated)}
+        </p>
+      );
     case "other":
       // NAMED, never dropped and never dumped. The keys say whether
       // Headstate simply does not know this tool yet; the values are the
