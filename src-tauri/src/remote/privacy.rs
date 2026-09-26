@@ -120,6 +120,10 @@ pub const TRANSCRIPT_TEXT: &[(&str, Carries)] = &[
     // what flagged them.
     ("claude_transcript_messages", Carries::Whole),
     ("claude_transcript_block_text", Carries::Whole),
+    // One bounded page of the same model, before or after a cursor
+    // (#1220). Whole: every message string is transcript text. Its
+    // `start`/`end` cursors round-trip through `behind_digest` below.
+    ("claude_transcript_page", Carries::Whole),
     // The first thing the user typed (#1133), clamped to 300 characters
     // -- still a place a pasted token lands.
     ("claude_sessions", Carries::Fields(&["opening_prompt"])),
@@ -130,8 +134,15 @@ pub const TRANSCRIPT_TEXT: &[(&str, Carries)] = &[
 /// ids a phone sends back to `claude_transcript_block_text`, and the
 /// subagent transcript path it opens next. None is anything a person
 /// typed, and a false match inside one would break the call it feeds.
+///
+/// `behind_digest` is a paged read's cursor digest (#1220): a page's
+/// `start` and `end` are handed back unread as the next page's anchor,
+/// and a masked digest would read as a rewritten file. No pattern
+/// matches a SHA256 hex digest today, so this is defensive: it keeps a
+/// future hex-shaped pattern from breaking paging.
 pub const OPAQUE_KEYS: &[&str] = &[
     "cursor",
+    "behind_digest",
     "id",
     "message_id",
     "turn_id",
@@ -750,6 +761,46 @@ mod tests {
             "cursor": { "offset": 10, "behind_digest": "API_KEY=abcd1234efgh", "behind_bytes": 10 },
             "bytes_read": 10
         })
+    }
+
+    /// A transcript page (#1220) crossing to the phone: its text is
+    /// masked, and its cursors survive intact -- handed back, they still
+    /// anchor the next page rather than reading as a rewritten file.
+    #[test]
+    fn a_transcript_page_is_masked_and_its_cursors_still_work() {
+        use crate::claude::transcript_page::{self, PageAnchor, PageDirection};
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        for i in 0..40 {
+            writeln!(
+                f,
+                r#"{{"type":"user","uuid":"u{i}","message":{{"role":"user","content":"token ghp_abcdefABCDEF0123456789abcdefABCDEF01 turn {i}"}}}}"#
+            )
+            .unwrap();
+        }
+        drop(f);
+        let page =
+            transcript_page::page(&path, &PageAnchor::End, PageDirection::Before, Some(5)).unwrap();
+        let (_, plan) = admit("claude_transcript_page", json!({"path": "p"}), ON).unwrap();
+        let out = plan.finish(
+            "claude_transcript_page",
+            serde_json::to_value(&page).unwrap(),
+        );
+        let text = out["page"].to_string();
+        assert!(text.contains("turn 39"), "{text}");
+        assert!(!text.contains("ghp_abcdef"), "{text}");
+        assert_eq!(out["start"], serde_json::to_value(&page.start).unwrap());
+        let anchor: PageAnchor = serde_json::from_value(json!({
+            "kind": "cursor",
+            "offset": out["start"]["offset"],
+            "behind_digest": out["start"]["behind_digest"],
+        }))
+        .unwrap();
+        let older = transcript_page::page(&path, &anchor, PageDirection::Before, Some(5)).unwrap();
+        assert!(!older.rewritten);
+        assert_eq!(older.end.offset, page.start.offset);
     }
 
     #[test]

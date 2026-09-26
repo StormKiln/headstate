@@ -333,6 +333,10 @@ pub const SURFACE: &[(&str, Class)] = &[
     // desktop copy.
     ("claude_transcript_messages", Class::Read),
     ("claude_transcript_block_text", Class::Read),
+    // One bounded page of that transcript before or after a cursor
+    // (#1220). Read on the same grounds, and bounded inside the command
+    // per call whatever the phone asks; see the desktop copy.
+    ("claude_transcript_page", Class::Read),
     // Whether the DESKTOP's hooks are installed (#915). Read: one file
     // read, no side effects, and "is that desktop recording?" is a real
     // away-from-desk question.

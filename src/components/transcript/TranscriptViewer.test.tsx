@@ -20,6 +20,8 @@ function msg(id: string, turn: string | null, opener = false): TranscriptMessage
     duration_ms: null,
     is_meta: false,
     is_sidechain: false,
+    offset: null,
+    oversized_bytes: null,
     blocks: [{ kind: "text", index: 0, text: id, clip: null }],
   };
 }

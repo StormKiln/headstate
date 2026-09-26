@@ -33,6 +33,8 @@ function message(blocks: ToolCallBlock[], over: Partial<TranscriptMessage> = {})
     duration_ms: null,
     is_meta: false,
     is_sidechain: false,
+    offset: null,
+    oversized_bytes: null,
     blocks,
     ...over,
   };

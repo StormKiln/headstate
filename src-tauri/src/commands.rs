@@ -6584,6 +6584,11 @@ pub async fn claude_transcript_messages(
 /// comes through this bounded fetch rather than by lifting the per-block
 /// cap on the page: see `transcript_model::block_text` for the design.
 ///
+/// `offset` is the record's `offset` from the page that showed the block
+/// (#1220): with it the fetch reads that one record, streamed, instead of
+/// scanning the file. `null`, or an offset that no longer names the
+/// record, falls back to the scan.
+///
 /// `Class::Read`: reads one `.jsonl` through the `claude_transcript_path`
 /// guard and writes nothing. Bounded server-side at
 /// `transcript_model::FULL_TEXT_CHARS`, and the response says when that
@@ -6594,10 +6599,51 @@ pub async fn claude_transcript_block_text(
     path: String,
     message_id: String,
     index: usize,
+    offset: Option<u64>,
 ) -> Result<crate::claude::transcript_model::TranscriptBlockText, String> {
     let p = claude_transcript_path(&path)?;
     tauri::async_runtime::spawn_blocking(move || {
-        crate::claude::transcript_model::block_text(&p, &message_id, index)
+        crate::claude::transcript_model::block_text(&p, &message_id, index, offset)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// One bounded page of a transcript, before or after a cursor (#1220).
+///
+/// The viewer's way to "what happened earlier" in a transcript of any
+/// size: pages of `transcript_model::TranscriptMessage`, read backwards
+/// from the end or from any cursor a previous page returned, each one
+/// O(page) wherever it lands. See `claude::transcript_page` for the
+/// bounds, the oversized-record rule, the position estimate and where
+/// pages are merged (the client, by id, with the seam info each page
+/// carries).
+///
+/// `limit` is the most messages wanted, clamped to
+/// `transcript_page::PAGE_MESSAGES`; `null` means that maximum.
+///
+/// `Class::Read`, on `claude_transcript_messages`' grounds: one `.jsonl`
+/// under `~/.claude/projects` through the `claude_transcript_path`
+/// guard, nothing written. Bounded INSIDE the command whatever the
+/// caller asks: at most `PAGE_MESSAGES` messages and
+/// `transcript_page::PAGE_READ_BOUND` bytes read into memory, and a
+/// record over `RECORD_HOLD_BYTES` streamed and clipped rather than
+/// held -- so a paired phone paging through a 70 MB transcript is handed
+/// one bounded page per call, never the file.
+///
+/// The position index it consults is built on a worker thread the first
+/// time a transcript is paged; the call never waits for it, and says
+/// which basis its position figures rest on.
+#[tauri::command]
+pub async fn claude_transcript_page(
+    path: String,
+    anchor: crate::claude::transcript_page::PageAnchor,
+    direction: crate::claude::transcript_page::PageDirection,
+    limit: Option<usize>,
+) -> Result<crate::claude::transcript_page::TranscriptWindow, String> {
+    let p = claude_transcript_path(&path)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::claude::transcript_page::page(&p, &anchor, direction, limit)
     })
     .await
     .map_err(|e| e.to_string())?

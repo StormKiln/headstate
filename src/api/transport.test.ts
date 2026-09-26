@@ -353,11 +353,26 @@ const ROWS: Row[] = [
   // record's id and its index, camelCased on the wire as every
   // multi-word argument is.
   row(api.claudeTranscriptMessages, [path], "claude_transcript_messages", { path }),
-  row(api.claudeTranscriptBlockText, [path, "u1", 2], "claude_transcript_block_text", {
+  // #1220 adds the record's offset as a hint (`null` to scan).
+  row(api.claudeTranscriptBlockText, [path, "u1", 2, false, 4096], "claude_transcript_block_text", {
     path,
     messageId: "u1",
     index: 2,
+    offset: 4096,
   }),
+  // #1220. The anchor is a tagged object, snake_case inside as every
+  // transcript wire type is; the argument NAMES are the command's own.
+  row(
+    api.claudeTranscriptPage,
+    [path, { kind: "cursor", offset: 8192, behind_digest: "ab12" }, "after", 50],
+    "claude_transcript_page",
+    {
+      path,
+      anchor: { kind: "cursor", offset: 8192, behind_digest: "ab12" },
+      direction: "after",
+      limit: 50,
+    },
+  ),
   row(api.claudeRevealPath, [path], "claude_reveal_path", { path }),
   row(api.readClaudeMd, [path], "read_claude_md", { path }),
   // The Claude Code hook installer (#915). All four take no arguments: the

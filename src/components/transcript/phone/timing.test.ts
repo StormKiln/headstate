@@ -16,6 +16,8 @@ function msg(id: string, timestamp: string | null, blocks: TranscriptBlock[]): T
     duration_ms: null,
     is_meta: false,
     is_sidechain: false,
+    offset: null,
+    oversized_bytes: null,
     blocks,
   };
 }

@@ -14,6 +14,7 @@ export function output(over: Partial<TranscriptToolOutput> = {}): TranscriptTool
     message_id: "m-result",
     index: 0,
     timestamp: null,
+    offset: null,
     tool_use_id: "toolu_1",
     text: "",
     clip: null,

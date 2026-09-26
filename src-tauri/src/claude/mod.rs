@@ -134,6 +134,11 @@ pub mod transcript;
 /// A transcript as stable, render-ready messages: ids, turns and the
 /// full record allowlist (#1475).
 pub mod transcript_model;
+/// Paged reads of a transcript: bounded pages before or after a cursor,
+/// at any position in any size of file (#1220).
+pub mod transcript_page;
+/// Streaming a record too large to hold, without holding it (#1220).
+pub mod transcript_skim;
 /// Per-message token usage, summed per session (#959).
 pub mod usage;
 

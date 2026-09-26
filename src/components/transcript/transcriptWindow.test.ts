@@ -26,6 +26,8 @@ const m = (id: string, opener = false): TranscriptMessage => ({
   duration_ms: null,
   is_meta: false,
   is_sidechain: false,
+  offset: null,
+  oversized_bytes: null,
   blocks: [],
 });
 const many = (n: number, prefix = "m") => Array.from({ length: n }, (_, i) => m(`${prefix}${i}`));

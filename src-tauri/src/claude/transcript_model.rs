@@ -291,6 +291,10 @@ pub struct TranscriptToolOutput {
     /// call took (call to result) could not be measured once the two are
     /// paired. `None` when the record carried none -- never substituted.
     pub timestamp: Option<String>,
+    /// Where that record starts in the file: the hint that lets the
+    /// full-text fetch read one record instead of scanning (#1220). `None`
+    /// when the text was parsed without a file position.
+    pub offset: Option<u64>,
     pub tool_use_id: Option<String>,
     pub text: String,
     pub clip: Option<TranscriptClip>,
@@ -498,6 +502,17 @@ pub struct TranscriptMessage {
     pub is_meta: bool,
     pub is_sidechain: bool,
     pub blocks: Vec<TranscriptBlock>,
+    /// Where this message's record starts in the file (#1220): the hint
+    /// for `claude_transcript_block_text`, and the boundary a page is cut
+    /// at. `None` for a derived message, and for text parsed without a
+    /// file position.
+    pub offset: Option<u64>,
+    /// Set when the record was larger than a page may hold
+    /// (`transcript_page::RECORD_HOLD_BYTES`): its size in bytes. The
+    /// record was streamed rather than held, so its blocks are clipped --
+    /// each clip still states the record's true length -- but it is
+    /// never dropped (#1220).
+    pub oversized_bytes: Option<u64>,
 }
 
 /// A window of a transcript as messages.
@@ -559,6 +574,153 @@ struct Ctx<'a> {
     /// both, so the full text of block `n` is by construction the text
     /// block `n` was clipped from.
     limit: usize,
+    /// Where the record starts in the file, when known.
+    offset: Option<u64>,
+    /// Strings a skim cut before they reached the parser, with their true
+    /// lengths (`transcript_skim`). Empty for a record read whole.
+    cut: &'a [(String, usize)],
+}
+
+/// One record of a window, parsed and positioned.
+///
+/// The unit both a whole-window [`parse`] and a page
+/// (`transcript_page`) build from: a page gathers these a record at a
+/// time, backwards or forwards, and holds only what it gathered.
+#[derive(Debug, Clone)]
+pub(crate) struct Line {
+    /// Where the record starts in the file, when known.
+    pub(crate) offset: Option<u64>,
+    /// `None`: the record would not parse as JSON.
+    pub(crate) value: Option<serde_json::Value>,
+    /// The line's hash, taken only for a record with no uuid -- the one
+    /// case an id is made from it ([`IdSource::Unanchored`]).
+    hash: Option<String>,
+    /// Strings a skim cut, with their true lengths. Empty when whole.
+    cut: Vec<(String, usize)>,
+    /// The record's size, when it was too large to hold and was skimmed.
+    pub(crate) oversized: Option<u64>,
+}
+
+impl Line {
+    /// A record read whole. `None` for a blank line, which is no record.
+    pub(crate) fn whole(text: &str, offset: Option<u64>) -> Option<Line> {
+        // `trim` strips a trailing `\r`, so a CRLF file parses the same
+        // as an LF one.
+        let line = text.trim();
+        if line.is_empty() {
+            return None;
+        }
+        let value = serde_json::from_str::<serde_json::Value>(line).ok();
+        let hash = match &value {
+            Some(v) if str_of(v, "uuid").is_none() => Some(short_hash(line)),
+            _ => None,
+        };
+        Some(Line {
+            offset,
+            value,
+            hash,
+            cut: Vec::new(),
+            oversized: None,
+        })
+    }
+
+    /// A record streamed through `transcript_skim` rather than held.
+    ///
+    /// `head` is the first bytes of the record, hashed in place of the
+    /// whole line should the record carry no uuid: stable for the same
+    /// bytes, which is all [`IdSource::Unanchored`] promises.
+    pub(crate) fn skimmed(
+        skim: Result<super::transcript_skim::Skimmed, String>,
+        offset: u64,
+        bytes: u64,
+        head: &str,
+    ) -> Line {
+        let (value, cut) = match skim {
+            Ok(s) => (Some(s.value), s.cut),
+            Err(_) => (None, Vec::new()),
+        };
+        let hash = match &value {
+            Some(v) if str_of(v, "uuid").is_none() => {
+                Some(short_hash(&format!("{bytes}:{}", head.trim())))
+            }
+            _ => None,
+        };
+        Line {
+            offset: Some(offset),
+            value,
+            hash,
+            cut,
+            oversized: Some(bytes),
+        }
+    }
+
+    pub(crate) fn uuid(&self) -> Option<String> {
+        self.value.as_ref().and_then(|v| str_of(v, "uuid"))
+    }
+
+    /// Whether this record can become a message. Bookkeeping cannot;
+    /// everything else -- unparseable lines excepted -- can, which is
+    /// what a page counts against its message bound before it parses.
+    pub(crate) fn may_render(&self) -> bool {
+        let Some(v) = &self.value else {
+            return false;
+        };
+        let t = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if MACHINERY_TYPES.contains(&t) {
+            return false;
+        }
+        if t == "attachment" {
+            let sub = v
+                .get("attachment")
+                .and_then(|a| a.get("type"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            return sub.starts_with("hook_") || !MACHINERY_ATTACHMENTS.contains(&sub);
+        }
+        true
+    }
+}
+
+/// Every line of `bytes`, which start at file offset `base`.
+///
+/// Split on the raw bytes BEFORE decoding, so an offset is a file offset
+/// even where a record holds invalid UTF-8 (decoded lossily, record by
+/// record).
+pub(crate) fn lines_of(bytes: &[u8], base: u64) -> Vec<Line> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    for piece in bytes.split(|b| *b == b'\n') {
+        let text = String::from_utf8_lossy(piece);
+        if let Some(line) = Line::whole(&text, Some(base + at as u64)) {
+            out.push(line);
+        }
+        at += piece.len() + 1;
+    }
+    out
+}
+
+/// The id state a window starts from: the nearest preceding uuid and how
+/// many uuid-less records followed it. See [`IdSource`].
+///
+/// A page that starts mid-file is seeded from the records behind it
+/// (`transcript_page`), so its first uuid-less record gets the same
+/// anchored id a read of the whole file gives it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct Seed {
+    pub(crate) anchor: Option<String>,
+    pub(crate) since: usize,
+}
+
+impl Seed {
+    pub(crate) fn at(start: WindowStart) -> Seed {
+        match start {
+            WindowStart::FileStart => Seed {
+                anchor: Some("^".to_owned()),
+                since: 0,
+            },
+            WindowStart::MidFile => Seed::default(),
+        }
+    }
 }
 
 /// Parse a window of JSONL into messages, then [`settle`] them.
@@ -566,32 +728,38 @@ struct Ctx<'a> {
 /// `transcript` is the file the body came from, used only to resolve
 /// subagent links; `None` leaves them unresolved and says so.
 pub fn parse(body: &str, start: WindowStart, transcript: Option<&Path>) -> TranscriptPage {
-    let ctx = Ctx {
-        transcript,
-        limit: preview::MAX_TEXT_CHARS,
-    };
+    let lines: Vec<Line> = body.lines().filter_map(|l| Line::whole(l, None)).collect();
+    capped(build(&lines, Seed::at(start), transcript))
+}
+
+/// Apply [`MAX_MESSAGES`] to a whole-window read.
+fn capped(mut page: TranscriptPage) -> TranscriptPage {
+    if page.messages.len() > MAX_MESSAGES {
+        page.messages.drain(..page.messages.len() - MAX_MESSAGES);
+        page.truncated = true;
+        // The drain can cut a turn's opener off; re-derive so no message
+        // points at a turn id that is no longer in the page.
+        settle(&mut page.messages);
+    }
+    page
+}
+
+/// Messages from parsed lines, settled. No message cap: the caller
+/// bounds what it passes (`transcript_page`) or caps after ([`parse`]).
+pub(crate) fn build(lines: &[Line], seed: Seed, transcript: Option<&Path>) -> TranscriptPage {
     let mut page = TranscriptPage::default();
     let mut machinery: HashMap<String, usize> = HashMap::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let mut anchor: Option<String> = match start {
-        WindowStart::FileStart => Some("^".to_owned()),
-        WindowStart::MidFile => None,
-    };
-    let mut since_anchor = 0usize;
+    let mut anchor = seed.anchor;
+    let mut since_anchor = seed.since;
     let mut unanchored: HashMap<String, usize> = HashMap::new();
 
-    for raw in body.lines() {
-        // `lines()` already strips a trailing `\r`, so a CRLF file parses
-        // the same as an LF one.
-        let line = raw.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(rec) = serde_json::from_str::<serde_json::Value>(line) else {
+    for line in lines {
+        let Some(rec) = &line.value else {
             page.unparseable_records += 1;
             continue;
         };
-        let uuid = str_of(&rec, "uuid");
+        let uuid = str_of(rec, "uuid");
         if let Some(u) = &uuid {
             if !seen.insert(u.clone()) {
                 page.duplicate_records += 1;
@@ -607,7 +775,7 @@ pub fn parse(body: &str, start: WindowStart, transcript: Option<&Path>) -> Trans
                 (format!("{a}+{since_anchor}"), IdSource::Anchored)
             }
             (None, None) => {
-                let h = short_hash(line);
+                let h = line.hash.clone().unwrap_or_default();
                 let n = unanchored.entry(h.clone()).or_default();
                 *n += 1;
                 let id = if *n == 1 {
@@ -618,10 +786,17 @@ pub fn parse(body: &str, start: WindowStart, transcript: Option<&Path>) -> Trans
                 (id, IdSource::Unanchored)
             }
         };
-        match record(&rec, id, id_source, &ctx) {
+        let ctx = Ctx {
+            transcript,
+            limit: preview::MAX_TEXT_CHARS,
+            offset: line.offset,
+            cut: &line.cut,
+        };
+        match record(rec, id, id_source, &ctx) {
             Parsed::Message(mut m) => {
                 stamp_results(&mut m);
-                page.messages.push(*m)
+                m.oversized_bytes = line.oversized;
+                page.messages.push(*m);
             }
             Parsed::Machinery(t) => *machinery.entry(t).or_default() += 1,
         }
@@ -630,15 +805,7 @@ pub fn parse(body: &str, start: WindowStart, transcript: Option<&Path>) -> Trans
     let mut counts: Vec<(String, usize)> = machinery.into_iter().collect();
     counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     page.machinery_records = counts;
-
     settle(&mut page.messages);
-    if page.messages.len() > MAX_MESSAGES {
-        page.messages.drain(..page.messages.len() - MAX_MESSAGES);
-        page.truncated = true;
-        // The drain can cut a turn's opener off; re-derive so no message
-        // points at a turn id that is no longer in the page.
-        settle(&mut page.messages);
-    }
     page
 }
 
@@ -752,6 +919,8 @@ fn model_changes(messages: &mut Vec<TranscriptMessage>) {
                         is_meta: false,
                         is_sidechain: false,
                         blocks: Vec::new(),
+                        offset: None,
+                        oversized_bytes: None,
                     });
                 }
             }
@@ -796,6 +965,8 @@ fn record(rec: &serde_json::Value, id: String, id_source: IdSource, ctx: &Ctx) -
             is_meta: rec.get("isMeta").and_then(|v| v.as_bool()) == Some(true),
             is_sidechain: rec.get("isSidechain").and_then(|v| v.as_bool()) == Some(true),
             blocks,
+            offset: ctx.offset,
+            oversized_bytes: None,
         }))
     };
     match kind {
@@ -1147,11 +1318,11 @@ fn block(index: usize, v: &serde_json::Value, ctx: &Ctx, message_id: &str) -> Tr
     let field = |k: &str| v.get(k).and_then(|s| s.as_str()).unwrap_or("");
     match kind {
         "text" => {
-            let (text, clip) = clip(field("text"), ctx.limit);
+            let (text, clip) = clip(field("text"), ctx);
             TranscriptBlock::Text { index, text, clip }
         }
         "thinking" => {
-            let (text, clip) = clip(field("thinking"), ctx.limit);
+            let (text, clip) = clip(field("thinking"), ctx);
             TranscriptBlock::Thinking {
                 index,
                 recorded: !text.is_empty(),
@@ -1198,13 +1369,14 @@ fn block(index: usize, v: &serde_json::Value, ctx: &Ctx, message_id: &str) -> Tr
                 }
                 _ => {}
             }
-            let (text, clip) = clip(&texts.join("\n"), ctx.limit);
+            let (text, clip) = clip(&texts.join("\n"), ctx);
             TranscriptBlock::ToolResult(TranscriptToolOutput {
                 message_id: message_id.to_owned(),
                 index,
                 // Stamped from the record by `stamp_results` once the
                 // message is built; a block does not see its record.
                 timestamp: None,
+                offset: ctx.offset,
                 tool_use_id: str_of(v, "tool_use_id"),
                 text,
                 clip,
@@ -1355,7 +1527,7 @@ fn text_blocks_from(
         .enumerate()
         .filter_map(|(i, t)| {
             let t = t.filter(|t| !t.is_empty())?;
-            let (text, clip) = clip(&t, ctx.limit);
+            let (text, clip) = clip(&t, ctx);
             Some(TranscriptBlock::Text {
                 index: first + i,
                 text,
@@ -1367,7 +1539,50 @@ fn text_blocks_from(
 
 /// Bound one block's text by characters, on a char boundary, reporting
 /// how much was kept against how much there was.
-fn clip(s: &str, limit: usize) -> (String, Option<TranscriptClip>) {
+///
+/// A skimmed record's long strings were cut BEFORE they got here, so the
+/// text alone would understate them. Each cut string's kept prefix is
+/// looked for in the text and its missing characters are added back, so
+/// the clip states the record's true length, as a whole read would. Only
+/// strings longer than the per-block cap are ever cut, so a prefix is
+/// thousands of characters long and cannot match by accident.
+///
+/// Each cut string accounts for ONE occurrence of its prefix. A record
+/// carries a tool result twice -- `message.content` and `toolUseResult`
+/// -- so two cuts share a prefix while the block holds it once; counting
+/// both would double the stated length.
+fn clip(s: &str, ctx: &Ctx) -> (String, Option<TranscriptClip>) {
+    let (text, clipped) = clip_chars(s, ctx.limit);
+    let mut claimed: Vec<usize> = Vec::new();
+    let mut missing = 0usize;
+    for (kept, total) in ctx.cut {
+        if kept.is_empty() {
+            continue;
+        }
+        let unclaimed = s
+            .match_indices(kept.as_str())
+            .map(|(at, _)| at)
+            .find(|at| !claimed.contains(at));
+        if let Some(at) = unclaimed {
+            claimed.push(at);
+            missing += total.saturating_sub(kept.chars().count());
+        }
+    }
+    if missing == 0 {
+        return (text, clipped);
+    }
+    let shown_chars = text.chars().count();
+    let total_chars = s.chars().count() + missing;
+    (
+        text,
+        Some(TranscriptClip {
+            shown_chars,
+            total_chars,
+        }),
+    )
+}
+
+fn clip_chars(s: &str, limit: usize) -> (String, Option<TranscriptClip>) {
     match s.char_indices().nth(limit) {
         None => (s.to_owned(), None),
         Some((byte, _)) => (
@@ -1442,20 +1657,19 @@ pub fn tail(path: &Path) -> Result<TranscriptPage, String> {
         .map_err(|e| format!("{}: could not read it: {e}", path.display()))?;
     let bytes_read = limit - bounded.limit();
 
-    let text = String::from_utf8_lossy(&buf);
-    let mut body: &str = &text;
-    let window = if start > 0 {
+    let (skip, window) = if start > 0 {
         // Landed mid-record: drop to the first newline, `preview::tail`'s
         // rule and for its reason.
-        body = match body.find('\n') {
-            Some(nl) => &body[nl + 1..],
-            None => "",
-        };
-        WindowStart::MidFile
+        let skip = buf
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(buf.len(), |nl| nl + 1);
+        (skip, WindowStart::MidFile)
     } else {
-        WindowStart::FileStart
+        (0, WindowStart::FileStart)
     };
-    let mut page = parse(body, window, Some(path));
+    let lines = lines_of(&buf[skip..], start + skip as u64);
+    let mut page = capped(build(&lines, Seed::at(window), Some(path)));
     page.bytes_read = bytes_read;
     page.file_bytes = file_bytes;
     page.truncated |= start > 0;
@@ -1476,9 +1690,20 @@ pub fn tail(path: &Path) -> Result<TranscriptPage, String> {
 ///   place of the per-block cap, so block `index` of the fetch is by
 ///   construction the block that was clipped.
 /// - **Bounded server-side**: the response is at most [`FULL_TEXT_CHARS`]
-///   characters and says when that bound bit. The scan reads the file
-///   line by line, parsing only lines that contain the id; the FIRST
-///   record with that uuid wins, matching [`parse`]'s duplicate rule.
+///   characters and says when that bound bit.
+/// - **Found by offset when the caller knows it** (#1220). Every message
+///   and tool output carries its record's `offset`; handed back as
+///   `hint`, the fetch reads that ONE record -- streamed through
+///   `transcript_skim`, so even a 10 MB record costs one read buffer
+///   plus the characters returned -- and checks its uuid. #1475 measured
+///   the scan below as a full read per fetch on a large file.
+/// - **Otherwise, or when the hint misses, a scan.** A hint misses when
+///   the file was rewritten under it; the scan is the answer that still
+///   works. It reads line by line, parsing only lines that contain the
+///   id; the FIRST record with that uuid wins, matching [`parse`]'s
+///   duplicate rule. (A hint names one record, which may be a later
+///   duplicate; duplicates differ only in `cwd`, `gitBranch`, `slug` and
+///   `promptId`, never in text -- see the module docs.)
 ///
 /// # Errors
 ///
@@ -1489,7 +1714,25 @@ pub fn block_text(
     path: &Path,
     message_id: &str,
     index: usize,
+    hint: Option<u64>,
 ) -> Result<TranscriptBlockText, String> {
+    block_text_located(path, message_id, index, hint).map(|(t, _)| t)
+}
+
+/// How [`block_text`] found its record: what a test asserts to show the
+/// hint was used rather than merely harmless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Located {
+    Hint,
+    Scan,
+}
+
+pub(crate) fn block_text_located(
+    path: &Path,
+    message_id: &str,
+    index: usize,
+    hint: Option<u64>,
+) -> Result<(TranscriptBlockText, Located), String> {
     if message_id.is_empty()
         || message_id.len() > 64
         || !message_id
@@ -1500,14 +1743,31 @@ pub fn block_text(
             "{message_id:?} is not a record id; only messages keyed by their record's uuid have fetchable text"
         ));
     }
+    let answer = |m: &TranscriptMessage| {
+        text_at(&m.blocks, index)
+            .map(|(text, clip)| TranscriptBlockText {
+                message_id: message_id.to_owned(),
+                index,
+                text,
+                clip,
+            })
+            .ok_or_else(|| format!("record {message_id} has no text at block {index}"))
+    };
+    if let Some(offset) = hint {
+        match record_at(path, offset, message_id)? {
+            Some(Parsed::Message(m)) => return answer(&m).map(|t| (t, Located::Hint)),
+            Some(Parsed::Machinery(_)) => {
+                return Err(format!("record {message_id} carries no text"))
+            }
+            // Not the record the hint named: fall through to the scan.
+            None => {}
+        }
+    }
     let file = std::fs::File::open(path)
         .map_err(|e| format!("{}: could not open it: {e}", path.display()))?;
     let mut reader = std::io::BufReader::new(file);
     let mut line = String::new();
-    let ctx = Ctx {
-        transcript: Some(path),
-        limit: FULL_TEXT_CHARS,
-    };
+    let mut at = 0u64;
     loop {
         line.clear();
         let n = reader
@@ -1516,6 +1776,8 @@ pub fn block_text(
         if n == 0 {
             return Err(format!("no record in this transcript has id {message_id}"));
         }
+        let offset = at;
+        at += n as u64;
         if !line.contains(message_id) {
             continue;
         }
@@ -1525,18 +1787,69 @@ pub fn block_text(
         if str_of(&rec, "uuid").as_deref() != Some(message_id) {
             continue;
         }
+        let ctx = Ctx {
+            transcript: Some(path),
+            limit: FULL_TEXT_CHARS,
+            offset: Some(offset),
+            cut: &[],
+        };
         let Parsed::Message(m) = record(&rec, message_id.to_owned(), IdSource::Uuid, &ctx) else {
             return Err(format!("record {message_id} carries no text"));
         };
-        return text_at(&m.blocks, index)
-            .map(|(text, clip)| TranscriptBlockText {
-                message_id: message_id.to_owned(),
-                index,
-                text,
-                clip,
-            })
-            .ok_or_else(|| format!("record {message_id} has no text at block {index}"));
+        return answer(&m).map(|t| (t, Located::Scan));
     }
+}
+
+/// The record at `offset`, parsed for a full-text fetch -- or `None` when
+/// `offset` is not a record boundary or the record there is not
+/// `message_id`, which is a stale hint rather than a failure.
+///
+/// Streamed, never held whole: at most [`FULL_TEXT_CHARS`] characters of
+/// each string are kept, and every cut string's true length is carried
+/// into the clip.
+fn record_at(path: &Path, offset: u64, message_id: &str) -> Result<Option<Parsed>, String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("{}: could not open it: {e}", path.display()))?;
+    let size = file
+        .metadata()
+        .map_err(|e| format!("{}: could not read its size: {e}", path.display()))?
+        .len();
+    if offset >= size {
+        return Ok(None);
+    }
+    if offset > 0 {
+        let mut before = [0u8; 1];
+        file.seek(SeekFrom::Start(offset - 1))
+            .and_then(|_| file.read_exact(&mut before))
+            .map_err(|e| format!("{}: could not read it: {e}", path.display()))?;
+        if before[0] != b'\n' {
+            return Ok(None);
+        }
+    }
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| format!("{}: could not seek in it: {e}", path.display()))?;
+    // Up to four bytes a character, and a record can carry the same text
+    // twice (`message.content` and `toolUseResult`): room for that, and
+    // no more, whatever the record's size.
+    let Ok(skim) = super::transcript_skim::skim_value(file, FULL_TEXT_CHARS, 8 * FULL_TEXT_CHARS)
+    else {
+        return Ok(None);
+    };
+    if str_of(&skim.value, "uuid").as_deref() != Some(message_id) {
+        return Ok(None);
+    }
+    let ctx = Ctx {
+        transcript: Some(path),
+        limit: FULL_TEXT_CHARS,
+        offset: Some(offset),
+        cut: &skim.cut,
+    };
+    Ok(Some(record(
+        &skim.value,
+        message_id.to_owned(),
+        IdSource::Uuid,
+        &ctx,
+    )))
 }
 
 fn text_at(blocks: &[TranscriptBlock], index: usize) -> Option<(String, Option<TranscriptClip>)> {
@@ -2521,14 +2834,14 @@ mod tests {
             panic!()
         };
         assert!(out.clip.is_some());
-        let full = block_text(&p, &out.message_id, out.index).unwrap();
+        let full = block_text(&p, &out.message_id, out.index, None).unwrap();
         assert_eq!(full.text, long);
         assert_eq!(full.clip, None);
 
-        assert!(block_text(&p, "r1", 5).is_err());
-        assert!(block_text(&p, "missing", 0).is_err());
-        assert!(block_text(&p, "^+1", 0).is_err());
-        assert!(block_text(&p, "a1/model", 0).is_err());
+        assert!(block_text(&p, "r1", 5, None).is_err());
+        assert!(block_text(&p, "missing", 0, None).is_err());
+        assert!(block_text(&p, "^+1", 0, None).is_err());
+        assert!(block_text(&p, "a1/model", 0, None).is_err());
         let _ = std::fs::remove_file(&p);
     }
 
@@ -2543,7 +2856,7 @@ mod tests {
                 serde_json::json!([{"type": "text", "text": huge}]),
             )]),
         );
-        let full = block_text(&p, "u1", 0).unwrap();
+        let full = block_text(&p, "u1", 0, None).unwrap();
         assert_eq!(full.text.len(), FULL_TEXT_CHARS);
         assert_eq!(
             full.clip,
@@ -2575,6 +2888,113 @@ mod tests {
         assert_eq!(page.messages.len(), 2, "{:#?}", page.messages);
         assert_eq!(page.messages[0].id_source, IdSource::Unanchored);
         assert_eq!(page.messages[1].id, "u1");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Every message and tool output carries its record's file offset,
+    /// and the offset is where that record's bytes really start -- in a
+    /// file with a multi-byte character and a CRLF ending before it.
+    #[test]
+    fn offsets_are_where_the_records_start() {
+        let text = format!(
+            "{}\r\n{}\n{}\n",
+            user("u1", serde_json::json!("caf\u{e9} \u{1f600}")),
+            call("a1", "t1"),
+            result("r1", "t1")
+        );
+        let p = tmp_file("offsets", &text);
+        let page = tail(&p).unwrap();
+        let bytes = std::fs::read(&p).unwrap();
+        let starts =
+            |at: u64| bytes[at as usize] == b'{' && (at == 0 || bytes[at as usize - 1] == b'\n');
+        let mut seen = 0;
+        for m in &page.messages {
+            let at = m.offset.expect("a record from a file has an offset");
+            assert!(starts(at), "{} at {at}", m.id);
+            seen += 1;
+            for b in &m.blocks {
+                if let TranscriptBlock::ToolCall {
+                    result: Some(o), ..
+                } = b
+                {
+                    let at = o.offset.expect("its output too");
+                    assert!(starts(at));
+                    assert!(std::str::from_utf8(&bytes[at as usize..])
+                        .unwrap()
+                        .contains("\"r1\""));
+                    seen += 1;
+                }
+            }
+        }
+        assert_eq!(seen, 3);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// With the record's offset as a hint, the full-text fetch reads that
+    /// one record; a stale hint falls back to the scan and still answers.
+    ///
+    /// Sabotaged by ignoring `hint` in `block_text_located`: the first
+    /// assertion sees `Located::Scan` and fails.
+    #[test]
+    fn a_hinted_fetch_reads_one_record_and_a_stale_hint_still_answers() {
+        let long = "q".repeat(preview::MAX_TEXT_CHARS * 3);
+        let recs = [
+            user("u0", serde_json::json!("before")),
+            call("a1", "t1"),
+            user(
+                "r1",
+                serde_json::json!([{"type": "tool_result", "tool_use_id": "t1", "content": long}]),
+            ),
+        ];
+        let p = tmp_file("hint", &body(&recs));
+        let page = tail(&p).unwrap();
+        let TranscriptBlock::ToolCall {
+            result: Some(out), ..
+        } = &page.messages[1].blocks[0]
+        else {
+            panic!("{:#?}", page.messages)
+        };
+        let (full, how) = block_text_located(&p, &out.message_id, out.index, out.offset).unwrap();
+        assert_eq!(how, Located::Hint);
+        assert_eq!(full.text, long);
+        assert_eq!(full.clip, None);
+        // A hint that names another record, or no boundary at all.
+        for stale in [Some(0), Some(3), Some(u64::MAX)] {
+            let (again, how) = block_text_located(&p, &out.message_id, out.index, stale).unwrap();
+            assert_eq!(how, Located::Scan, "{stale:?}");
+            assert_eq!(again, full);
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A hinted fetch of a record far larger than the fetch returns
+    /// streams it: the text is bounded and the clip states the record's
+    /// true length, counted once though the record carries it twice.
+    #[test]
+    fn a_hinted_fetch_of_a_huge_record_is_bounded_and_honest() {
+        let huge = "w".repeat(FULL_TEXT_CHARS * 2 + 7);
+        let mut rec = user(
+            "r1",
+            serde_json::json!([{"type": "tool_result", "tool_use_id": "t1", "content": huge}]),
+        );
+        rec["toolUseResult"] = serde_json::json!({"stdout": huge});
+        let recs = [user("u0", serde_json::json!("go")), call("a1", "t1"), rec];
+        let p = tmp_file("hint-huge", &body(&recs));
+        let at = std::fs::read_to_string(&p).unwrap().find("\"r1\"").unwrap();
+        let start = std::fs::read(&p).unwrap()[..at]
+            .iter()
+            .rposition(|b| *b == b'\n')
+            .map_or(0, |i| i + 1) as u64;
+        let (full, how) = block_text_located(&p, "r1", 0, Some(start)).unwrap();
+        assert_eq!(how, Located::Hint);
+        assert_eq!(full.text.chars().count(), FULL_TEXT_CHARS);
+        assert_eq!(
+            full.clip,
+            Some(TranscriptClip {
+                shown_chars: FULL_TEXT_CHARS,
+                total_chars: huge.len()
+            })
+        );
         let _ = std::fs::remove_file(&p);
     }
 }

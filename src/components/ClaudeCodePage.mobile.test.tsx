@@ -581,6 +581,8 @@ describe("the transcript viewer on the phone", () => {
         duration_ms: null,
         is_meta: false,
         is_sidechain: false,
+        offset: null,
+        oversized_bytes: null,
         blocks: [{ kind: "text", index: 0, text: "run the tests", clip: null }],
       },
     ],
