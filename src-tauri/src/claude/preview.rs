@@ -116,7 +116,7 @@ pub const MAX_MESSAGES: usize = 200;
 /// rather than per response keeps the SHAPE of the exchange -- the reader
 /// still sees that four tools ran -- where a whole-message cap would drop
 /// the last three entirely.
-const MAX_TEXT_CHARS: usize = 4_000;
+pub(crate) const MAX_TEXT_CHARS: usize = 4_000;
 
 /// The record types that are conversation. See the module docs on why
 /// this is an allowlist.
@@ -1426,7 +1426,7 @@ fn block_of(v: &serde_json::Value) -> Block {
 ///
 /// Dispatches on the NAME, because the input object carries no type tag
 /// of its own. `Task`/`Agent` share a variant: see [`ToolArgs::Task`].
-fn tool_args(name: &str, input: Option<&serde_json::Value>) -> ToolArgs {
+pub(crate) fn tool_args(name: &str, input: Option<&serde_json::Value>) -> ToolArgs {
     let Some(serde_json::Value::Object(map)) = input else {
         // No `input` object at all. Distinct from an input whose keys we
         // did not recognise -- absent is not zero.
@@ -1555,7 +1555,7 @@ fn tool_args(name: &str, input: Option<&serde_json::Value>) -> ToolArgs {
 /// `oldString`/`newString`. It never reads the file from disk; see
 /// [`DiffSource`] for why that option is fabrication rather than a
 /// trade-off.
-fn file_change(record: &serde_json::Value) -> Option<FileChange> {
+pub(crate) fn file_change(record: &serde_json::Value) -> Option<FileChange> {
     let tur = record.get("toolUseResult")?.as_object()?;
     let file_path = tur
         .get("filePath")

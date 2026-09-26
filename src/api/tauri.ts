@@ -77,6 +77,7 @@ import type {
   RepoTree,
   RepoFile,
 } from "../types/pr";
+import type { TranscriptBlockText, TranscriptPage } from "../types/transcript";
 
 export interface AuthState {
   ok: boolean;
@@ -1452,6 +1453,22 @@ export const claudeTranscriptTail = (path: string) =>
 /// snapshot fails.
 export const claudeTranscriptFollow = (path: string, cursor: ClaudeFollowCursor | null) =>
   call<ClaudeFollow>("claude_transcript_follow", { path, cursor });
+
+/// The tail of one transcript as stable, render-ready messages (#1475).
+///
+/// Every message keyed by its record's uuid and grouped into turns, with
+/// the full record allowlist and per-block clip metadata. Additive:
+/// `claudeTranscriptTail` keeps serving the current pane.
+///
+/// `Class::Read`, bounded inside the command by the same 256 KB window.
+export const claudeTranscriptMessages = (path: string) =>
+  call<TranscriptPage>("claude_transcript_messages", { path });
+
+/// One clipped block's full text, by the record's id and the block's
+/// index (#1475). Bounded server-side too; the response's `clip` says
+/// when that bound bit.
+export const claudeTranscriptBlockText = (path: string, messageId: string, index: number) =>
+  call<TranscriptBlockText>("claude_transcript_block_text", { path, messageId, index });
 
 // ---------------------------------------------------------------------
 // The Claude Code hook installer (#915). Rust side:

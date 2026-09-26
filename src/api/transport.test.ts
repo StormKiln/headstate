@@ -348,6 +348,16 @@ const ROWS: Row[] = [
     path,
     cursor: null,
   }),
+  // #1475. Both resolve `path` through `claude_transcript_path` like the
+  // two rows above. The block-text fetch addresses a block by its
+  // record's id and its index, camelCased on the wire as every
+  // multi-word argument is.
+  row(api.claudeTranscriptMessages, [path], "claude_transcript_messages", { path }),
+  row(api.claudeTranscriptBlockText, [path, "u1", 2], "claude_transcript_block_text", {
+    path,
+    messageId: "u1",
+    index: 2,
+  }),
   row(api.claudeRevealPath, [path], "claude_reveal_path", { path }),
   row(api.readClaudeMd, [path], "read_claude_md", { path }),
   // The Claude Code hook installer (#915). All four take no arguments: the

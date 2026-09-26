@@ -550,6 +550,17 @@ pub const SURFACE: &[(&str, Class)] = &[
     // bytes at all -- only the bounded 64 KB fingerprint that detects a
     // compaction having rewritten history behind the cursor.
     ("claude_transcript_follow", Class::Read),
+    // The same transcript as stable, render-ready messages (#1475), and
+    // one clipped block's full text by record id.
+    //
+    // `Read` on the two rows' grounds above: one `.jsonl` under
+    // `~/.claude/projects`, resolved through `claude_transcript_path`,
+    // nothing written. Both are bounded inside the command -- the page by
+    // the same 256 KB window and a message cap, the full-text fetch at
+    // `transcript_model::FULL_TEXT_CHARS` with the clip stated -- so the
+    // phone is never handed more than the desktop would render.
+    ("claude_transcript_messages", Class::Read),
+    ("claude_transcript_block_text", Class::Read),
     // Whether the Claude Code hooks are in `~/.claude/settings.json`
     // (#915).
     //
@@ -1222,6 +1233,15 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "claude_transcript_follow" => {
             res(commands::claude_transcript_follow(a.get("path")?, a.get("cursor")?).await)
         }
+        "claude_transcript_messages" => {
+            res(commands::claude_transcript_messages(a.get("path")?).await)
+        }
+        "claude_transcript_block_text" => res(commands::claude_transcript_block_text(
+            a.get("path")?,
+            a.get("messageId")?,
+            a.get("index")?,
+        )
+        .await),
         "claude_hooks_inventory" => res(commands::claude_hooks_inventory()),
         "claude_effective_settings" => {
             res(commands::claude_effective_settings(a.get("repoPath")?).await)
