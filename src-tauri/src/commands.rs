@@ -5719,6 +5719,27 @@ pub async fn claude_sessions_for_pr(
     .map_err(|e| e.to_string())?
 }
 
+/// The sessions that produced a pull request with this number, in every
+/// repository the link table holds (#1545).
+///
+/// The search box's lookup. A bare `#1234` names no repository, and the
+/// tracked open pull requests it used to be resolved against do not hold
+/// the merged ones -- so the PR a session made was usually not searched
+/// for at all. `store::sessions_for_pr_number` carries the measurement.
+#[tauri::command]
+pub async fn claude_sessions_for_pr_number(
+    app: AppHandle,
+    number: u64,
+) -> Result<Vec<crate::claude::subagent::PrLink>, String> {
+    let db = db_path(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&db).map_err(|e| e.to_string())?;
+        crate::claude::store::sessions_for_pr_number(&conn, number).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 pub async fn claude_session_detail(
     app: tauri::AppHandle,

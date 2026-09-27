@@ -234,6 +234,8 @@ pub const SURFACE: &[(&str, Class)] = &[
     // for the rest only when the user opens a session.
     // Read: one indexed query (#1132).
     ("claude_sessions_for_pr", Class::Read),
+    // #1545: the search box's lookup by number alone; no transcript text.
+    ("claude_sessions_for_pr_number", Class::Read),
     ("claude_session_detail", Class::Read),
     // #1486: what the background window reads to notify about sessions.
     // No transcript text; see the desktop's surface.rs.

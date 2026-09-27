@@ -1263,6 +1263,13 @@ export const claudeSessions = () => call<WireClaudeSessionList>("claude_sessions
 export const claudeSessionsForPr = (repo: string, number: number) =>
   call<ClaudePrLink[]>("claude_sessions_for_pr", { repo, number });
 
+/// The sessions that produced a pull request with this number, in every
+/// repository the link table holds (#1545). The search box's lookup: a
+/// bare `#1234` names no repository, and a qualified one is matched
+/// case-insensitively by the caller.
+export const claudeSessionsForPrNumber = (number: number) =>
+  call<ClaudePrLink[]>("claude_sessions_for_pr_number", { number });
+
 export const claudeSessionDetail = (sessionId: string) =>
   call<ClaudeSessionDetail | null>("claude_session_detail", { sessionId });
 

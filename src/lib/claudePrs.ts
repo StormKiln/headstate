@@ -81,10 +81,10 @@ export function groupPrsByRepo(prs: readonly ClaudePrLink[]): PrGroup[] {
 /// A search query that names a pull request (#1280).
 ///
 /// `repo` is null when the query gave a number but no repository --
-/// `#1234` or `1234`. The lookup is keyed on `(repo, number)`, so the
-/// repository has to be resolved before it can run; `reposForNumber`
-/// below is what does that, and it returns a LIST because two
-/// repositories can both hold a `#1234`.
+/// `#1234` or `1234`. The lookup is by number alone (#1545), so no
+/// repository has to be resolved first; `matchPrLinks` below picks the
+/// answer out of it, and returns a LIST because two repositories can
+/// both hold a `#1234`.
 export interface PrQuery {
   repo: string | null;
   number: number;
@@ -176,32 +176,46 @@ function withNumber(repo: string | null, digits: string): PrQuery | null {
   return number > 0 ? { repo, number } : null;
 }
 
-/// Which repository a bare `#1234` means (#1280).
+/// Which of a number's links answer the query, and which only nearly do
+/// (#1545).
 ///
-/// `claude_sessions_for_pr` is keyed on `(repo, number)` -- the index
-/// `schema.rs` builds -- so a number alone cannot be looked up. Rather
-/// than add a scanning command, the repository is resolved from the
-/// pull request list this app already holds in cache: `usePullRequests`
-/// fetches it once with `staleTime: Infinity`, so this costs nothing on
-/// the wire and no extra round trip per keystroke.
+/// The lookup is by NUMBER alone -- `claude_sessions_for_pr_number` --
+/// and this picks the answer out of it. A bare `#1234` takes every
+/// repository's `#1234`: the link table is itself the list of
+/// repositories that can answer, which is what #1280's resolution
+/// against the tracked OPEN pull requests got wrong. Those hold no
+/// merged PR, and "the PR that session made" is usually merged by the
+/// time anyone searches for it -- 8 of 1,034 linked PRs on the owner's
+/// machine were open.
 ///
-/// # What this deliberately cannot do
+/// A qualified query takes the links for exactly that repository,
+/// compared CASE-INSENSITIVELY, because GitHub compares slugs that way
+/// and a pasted `Acme/API` names the same repository as `acme/api`.
 ///
-/// The cached list holds the pull requests Headstate TRACKS. A number
-/// belonging to a repository outside it -- or to a PR closed long enough
-/// ago to have left the list -- resolves to nothing here, and the caller
-/// must then say it could not tell which repository was meant rather
-/// than reporting an empty lookup. Those are different facts: "we asked
-/// and no session produced it" against "we never got to ask".
+/// # `elsewhere`: the same repository under another owner, maybe
 ///
-/// Returns every repository carrying that number, because two repos can
-/// both have a `#1234` and picking one would be a guess.
-export function reposForNumber(
-  prs: readonly { repo: string; number: number }[] | undefined,
-  number: number,
-): string[] {
-  if (!prs) return [];
-  const out = new Set<string>();
-  for (const pr of prs) if (pr.number === number) out.add(pr.repo);
-  return [...out].sort();
+/// A link records the repository as it was named when the PR was
+/// opened, and a transferred repository keeps its old owner in every
+/// link written before the transfer. GitHub redirects the old URL; this
+/// table cannot know about the move. So a qualified query that matched
+/// nothing also returns the links for the same repository NAME under a
+/// different owner -- NOT as matches, which would be a guess, but for
+/// the caller to state as a fact the reader can act on. Empty whenever
+/// the query matched, or named no repository.
+export function matchPrLinks(
+  links: readonly ClaudePrLink[],
+  query: PrQuery,
+): { links: ClaudePrLink[]; elsewhere: ClaudePrLink[] } {
+  const own = links.filter((l) => l.number === query.number);
+  if (query.repo === null) return { links: own, elsewhere: [] };
+  const want = query.repo.toLowerCase();
+  const exact = own.filter((l) => l.repo.toLowerCase() === want);
+  if (exact.length > 0) return { links: exact, elsewhere: [] };
+  const name = repoName(want);
+  return { links: [], elsewhere: own.filter((l) => repoName(l.repo.toLowerCase()) === name) };
+}
+
+/// The part of `owner/repo` after the owner.
+function repoName(slug: string): string {
+  return slug.slice(slug.indexOf("/") + 1);
 }
