@@ -1,6 +1,8 @@
 import { useId, useState } from "react";
 import { ClippedText } from "./ClippedText";
+import { linesOf } from "./diff";
 import { palette } from "./palette";
+import { countLabel } from "./summary";
 import type { LoadFullText, ThinkingBlock as Block, ToolVariant } from "./types";
 
 /// A thinking block (#1483). Shown, dimmed, per the epic's default.
@@ -47,6 +49,8 @@ export function ThinkingBlock({
           type="button"
           aria-expanded={open}
           aria-controls={regionId}
+          // How much it hides, as `Fold` says it (#1489).
+          aria-label={`Thinking, ${countLabel(linesOf(block.text).length, "line", block.clip !== null)}`}
           onClick={() => setOpen((o) => !o)}
           className="italic hover:underline focus-visible:outline focus-visible:outline-2"
           style={{ color: palette.muted }}
@@ -58,7 +62,15 @@ export function ThinkingBlock({
           ✻ Thinking
         </p>
       )}
-      <div id={regionId} hidden={!open}>
+      {/* A rule down its side, as the phone draws it: thinking reads as
+          apart from the reply in greyscale, not only by its dimmer colour
+          (#1489). */}
+      <div
+        id={regionId}
+        hidden={!open}
+        className="border-l-2 border-dotted pl-2"
+        style={{ borderColor: palette.border }}
+      >
         {open ? (
           <ClippedText
             text={block.text}

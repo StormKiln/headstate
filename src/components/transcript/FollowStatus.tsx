@@ -28,6 +28,33 @@ function reason(e: unknown): string {
   return commandError(e).message;
 }
 
+/// What a screen reader is told when the follow's state CHANGES
+/// (#1489): the state sentence without its clock time. The visible line
+/// carries the time and is not a live region -- it changes on every
+/// read, and announcing each one would talk over the transcript.
+function followAnnouncement(
+  live: Pick<TranscriptLive, "status" | "atLiveEdge" | "lastReadAt" | "error">,
+): string {
+  switch (live.status) {
+    case "loading":
+      return "";
+    case "following":
+      return "Following.";
+    case "idle":
+      return "Following; nothing new for a minute.";
+    case "paused":
+      return live.atLiveEdge
+        ? "Paused while this is not on screen."
+        : "Not following while earlier messages are shown.";
+    case "stopped":
+      return "Not following: the session is not running.";
+    case "could-not-read":
+      return live.lastReadAt === null
+        ? `Could not read this transcript: ${reason(live.error)}.`
+        : `Could not read new output: ${reason(live.error)}.`;
+  }
+}
+
 export function FollowStatus({ live }: { live: TranscriptLive }) {
   const at = live.lastReadAt === null ? null : clock(live.lastReadAt);
   let line: string | null;
@@ -59,6 +86,9 @@ export function FollowStatus({ live }: { live: TranscriptLive }) {
   const older = live.older;
   return (
     <>
+      <span role="status" className="sr-only" data-testid="transcript-follow-announce">
+        {followAnnouncement(live)}
+      </span>
       {line !== null ? (
         <p data-testid="transcript-read-status" data-state={live.status}>
           {line}

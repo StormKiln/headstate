@@ -44,6 +44,7 @@ import { TranscriptMarkdown } from "../TranscriptMarkdown";
 import { ClippedText } from "./ClippedText";
 import { linesOf } from "./diff";
 import { Fold } from "./Fold";
+import { messageName, PENDING_NAME } from "./messageName";
 import { MonoOutput } from "./output";
 import { palette } from "./palette";
 import { type PendingMessage, pendingStatus } from "./pending";
@@ -104,6 +105,8 @@ const MemoTerminalMessage = memo(
     const compact = env.density === "compact";
     return (
       <Message
+        role="article"
+        aria-label={messageName(m)}
         data-kind={m.kind.kind}
         data-density={env.density}
         className={cn("flex-col", compact ? "gap-0.5 text-[13px]" : "gap-1.5 text-sm")}
@@ -138,6 +141,8 @@ export function TerminalPendingMessage({
   const status = pendingStatus(p);
   return (
     <Message
+      role="article"
+      aria-label={PENDING_NAME}
       data-kind="pending"
       data-pending-state={p.state}
       data-density={density}
@@ -255,8 +260,13 @@ function UserBand({
   const texts = m.blocks.filter((b) => b.kind === "text");
   const rest = m.blocks.filter((b) => b.kind !== "text");
   return (
+    // Space above, as well as the band, bar and glyph: a new turn reads
+    // as one in greyscale too (#1489).
     <MessageContent
-      className={cn("gap-1 rounded-sm border-l-2", compact ? "px-2 py-1" : "px-3 py-2")}
+      className={cn(
+        "gap-1 rounded-sm border-l-2",
+        compact ? "mt-1 px-2 py-1" : "mt-3 px-3 py-2",
+      )}
       style={{ background: palette.userBand, borderColor: palette.accent }}
     >
       <MessageHeader className="gap-2 px-0 text-[11px]" style={{ color: palette.muted }}>
@@ -560,8 +570,9 @@ function CopyMarkdown({ what, markdown }: { what: "message" | "turn"; markdown: 
           toast.success(`Copied the ${what} as markdown`);
         });
       }}
-      className="text-[11px] opacity-60 hover:underline hover:opacity-100 focus-visible:opacity-100 focus-visible:outline focus-visible:outline-2"
-      style={{ color: palette.link }}
+      // Muted until pointed at or focused, never faded: link blue at 60%
+      // opacity measured 3.2:1 on the user band (#1489).
+      className="text-[11px] text-[#8b949e] hover:text-[#58a6ff] hover:underline focus-visible:text-[#58a6ff] focus-visible:outline focus-visible:outline-2"
     >
       {what === "turn" ? "Copy turn" : "Copy"}
     </button>

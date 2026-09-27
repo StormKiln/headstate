@@ -105,6 +105,9 @@ export interface TranscriptViewerHandle {
   scrollTo(id: string): boolean;
   /// The first row inside the viewport, or `null` when none is laid out.
   firstVisible(): string | null;
+  /// Go to the live edge and follow it, as the jump button does: the
+  /// desktop's `End` key (#1489).
+  scrollToLatest(): void;
 }
 
 export interface TranscriptViewerProps {
@@ -266,6 +269,30 @@ function ViewerBody({
     setPins(next);
   };
 
+  // The live edge from a window that does not reach it: re-window, and
+  // scroll once the rows are mounted. `false` when the window already
+  // reaches it and a plain scroll to the end is the whole job.
+  // `moveWindow` written out with the (stable) setters, so this is stable
+  // for the handle below.
+  const winTo = win.to;
+  const rewindToLatest = useCallback((): boolean => {
+    const toTail = () => {
+      jumpRef.current = true;
+      setSeen((s) => ({ ...s, arrivals: withoutAnchors(s.arrivals) }));
+      setPins(tailPins(messages));
+    };
+    if (!atLiveEdge && onJumpToLatest) {
+      // The newest messages are not held: the hook opens on them, and
+      // the window lands on the tail of what it brings.
+      onJumpToLatest();
+      toTail();
+      return true;
+    }
+    if (winTo >= messages.length) return false;
+    toTail();
+    return true;
+  }, [atLiveEdge, onJumpToLatest, messages, winTo]);
+
   // A jump to a message (#1484): re-window around it when it is outside
   // the window, then scroll once its row is mounted.
   // A ref, not state: the scroll is the effect's whole job, and a request
@@ -294,9 +321,12 @@ function ViewerBody({
         const row = viewport ? firstVisibleRow(viewport) : null;
         return row?.element.dataset.messageId ?? null;
       },
+      scrollToLatest() {
+        if (!rewindToLatest()) scrollToEnd({ behavior: reducedMotion ? "auto" : "smooth" });
+      },
     }),
     // `moveWindow` is recreated each render and closes over setters only.
-    [messages, win.from, win.to],
+    [messages, win.from, win.to, rewindToLatest, reducedMotion, scrollToEnd],
   );
 
   // Following the live edge, the newest message is on screen.
@@ -337,20 +367,9 @@ function ViewerBody({
     }
   };
 
+  // Otherwise the scroller's own scrollToEnd does it.
   const onJump = (e: MouseEvent<HTMLButtonElement>) => {
-    if (!atLiveEdge && onJumpToLatest) {
-      // The newest messages are not held: the hook opens on them, and
-      // the window lands on the tail of what it brings.
-      e.preventDefault();
-      onJumpToLatest();
-      jumpRef.current = true;
-      moveWindow(tailPins(messages));
-      return;
-    }
-    if (win.to >= messages.length) return; // the scroller's own scrollToEnd does it
-    e.preventDefault();
-    jumpRef.current = true;
-    moveWindow(tailPins(messages));
+    if (rewindToLatest()) e.preventDefault();
   };
 
   const count = arrivals.newCount;

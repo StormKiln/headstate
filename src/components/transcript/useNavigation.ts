@@ -262,7 +262,11 @@ export function useJumps({
 
 /// `j`/`k` on the desktop: the next and previous prompt, from anywhere
 /// in the transcript but a text field.
-export function turnKeys(step: (dir: -1 | 1) => void) {
+///
+/// `End` goes to the live edge and follows it (#1489) -- more than the
+/// engine's own `End`, which stops at the last message MOUNTED and does
+/// not bring back newer pages the follow let go.
+export function turnKeys(step: (dir: -1 | 1) => void, toLatest?: () => void) {
   return (e: KeyboardEvent) => {
     if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
     const t = e.target as HTMLElement;
@@ -273,6 +277,9 @@ export function turnKeys(step: (dir: -1 | 1) => void) {
     } else if (e.key === "k") {
       e.preventDefault();
       step(-1);
+    } else if (e.key === "End" && toLatest) {
+      e.preventDefault();
+      toLatest();
     }
   };
 }

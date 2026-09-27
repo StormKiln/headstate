@@ -5,10 +5,12 @@ import type { TranscriptImage, TranscriptMessage } from "../../../types/transcri
 import { MaskedText } from "../../MaskedText";
 import { TranscriptMarkdown } from "../../TranscriptMarkdown";
 import { ClippedText } from "../ClippedText";
+import { messageName, PENDING_NAME } from "../messageName";
 import { MonoOutput } from "../output";
 import { palette } from "../palette";
 import { type PendingMessage, pendingStatus } from "../pending";
-import { durationBetween, formatDuration } from "../summary";
+import { linesOf } from "../diff";
+import { countLabel, durationBetween, formatDuration } from "../summary";
 import { TaskStatusRow } from "../TaskStatusRow";
 import { ToolResultOrphan } from "../ToolResultOrphan";
 import type { ThinkingBlock } from "../types";
@@ -37,7 +39,13 @@ export function PhoneMessage({ message: m }: { message: TranscriptMessage }) {
   const phone = usePhone();
   return (
     // Dynamic Type, applied to this row's content (see `textScale.ts`).
-    <div data-slot="phone-message" data-kind={m.kind.kind} style={scaleStyle(phone.scale)}>
+    <div
+      role="article"
+      aria-label={messageName(m)}
+      data-slot="phone-message"
+      data-kind={m.kind.kind}
+      style={scaleStyle(phone.scale)}
+    >
       <Body m={m} />
     </div>
   );
@@ -63,7 +71,7 @@ function Body({ m }: { m: TranscriptMessage }) {
   if (m.is_meta && (k.kind === "user_prompt" || k.kind === "assistant")) {
     // Harness-written context in a user or assistant record: not the
     // user speaking, and not Claude's reply.
-    return <SystemRow label="Added context" body={plainBody(m)} collapsed />;
+    return <SystemRow label="Added context" body={plainBody(m)} collapsed={linesIn(m)} />;
   }
   switch (k.kind) {
     case "user_prompt":
@@ -119,7 +127,7 @@ function Body({ m }: { m: TranscriptMessage }) {
         <SystemRow
           label={`Background agent${k.status ? ` ${k.status.replace(/_/g, " ")}` : ""}`}
           body={plainBody(m)}
-          collapsed
+          collapsed={linesIn(m)}
         />
       );
     case "task_status":
@@ -129,7 +137,7 @@ function Body({ m }: { m: TranscriptMessage }) {
         </div>
       );
     case "injected":
-      return <SystemRow label="Added context" body={plainBody(m)} collapsed />;
+      return <SystemRow label="Added context" body={plainBody(m)} collapsed={linesIn(m)} />;
     case "interruption":
       return (
         <SystemRow
@@ -144,7 +152,7 @@ function Body({ m }: { m: TranscriptMessage }) {
         <SystemRow
           label="Summary of the earlier conversation"
           body={textsOf(m).length > 0 ? <MarkdownTexts m={m} /> : undefined}
-          collapsed
+          collapsed={linesIn(m)}
         />
       );
     case "summary":
@@ -156,7 +164,7 @@ function Body({ m }: { m: TranscriptMessage }) {
           detail={apiErrorDetail(k)}
           tone="error"
           body={plainBody(m)}
-          collapsed
+          collapsed={linesIn(m)}
         />
       );
     case "hook_output":
@@ -166,7 +174,7 @@ function Body({ m }: { m: TranscriptMessage }) {
           detail={hookDetail(k)}
           tone={k.outcome === "success" ? "muted" : "warn"}
           body={plainBody(m)}
-          collapsed
+          collapsed={linesIn(m)}
         />
       );
     case "turn_duration":
@@ -240,11 +248,7 @@ function UserBubble({ label, children }: { label?: string; children: ReactNode }
   return (
     <Message align="end">
       <MessageContent>
-        <Bubble
-          variant="muted"
-          align="end"
-          aria-label={label ? `You, ${label.toLowerCase()}` : "You"}
-        >
+        <Bubble variant="muted" align="end">
           {label ? (
             <span className="px-1 text-[0.75em]" style={{ color: palette.muted }}>
               {label}
@@ -268,6 +272,8 @@ export function PhonePendingMessage({ pending: p }: { pending: PendingMessage })
   const status = pendingStatus(p);
   return (
     <div
+      role="article"
+      aria-label={PENDING_NAME}
       data-slot="phone-message"
       data-kind="pending"
       data-pending-state={p.state}
@@ -275,13 +281,13 @@ export function PhonePendingMessage({ pending: p }: { pending: PendingMessage })
     >
       <Message align="end">
         <MessageContent className="gap-1">
-          <Bubble
-            variant="muted"
-            align="end"
-            aria-label="You, not in the transcript yet"
-            className="opacity-70"
-          >
-            <BubbleContent className="rounded-2xl border border-dashed text-[1em] leading-relaxed">
+          {/* Dimmed with a muted colour, not opacity: a faded row's
+              contrast is whatever the blend happens to give (#1489). */}
+          <Bubble variant="muted" align="end">
+            <BubbleContent
+              className="rounded-2xl border border-dashed text-[1em] leading-relaxed"
+              style={{ color: palette.muted, borderColor: palette.muted }}
+            >
               <p className="whitespace-pre-wrap break-words">{p.text}</p>
             </BubbleContent>
           </Bubble>
@@ -480,6 +486,8 @@ function Thought({ m, block }: { m: TranscriptMessage; block: ThinkingBlock }) {
         type="button"
         aria-expanded={open}
         aria-controls={regionId}
+        // How much it hides, as the desktop's fold says it (#1489).
+        aria-label={`${label}, ${countLabel(linesOf(block.text).length, "line", block.clip !== null)}`}
         onClick={() => setOpen((o) => !o)}
         className="flex min-h-8 items-center gap-1.5 text-left text-[0.8125em] focus-visible:outline focus-visible:outline-2"
         style={{ color: palette.muted }}
@@ -525,23 +533,32 @@ const TONE_COLOUR = {
   error: palette.error,
 } as const;
 
+/// How much a collapsed row hides, for its toggle's name: "3 lines",
+/// "at least 40 lines" when a block was clipped.
+function linesIn(m: TranscriptMessage): string {
+  const texts = textsOf(m);
+  const n = texts.reduce((sum, t) => sum + linesOf(t.text).length, 0);
+  return countLabel(n, "line", texts.some((t) => t.clip !== null));
+}
+
 /// A centred small-caps divider for a system, hook or meta record, with
 /// its detail beneath -- behind "Show" when `collapsed`, because hook
-/// output and injected context can run to pages.
+/// output and injected context can run to pages. `collapsed` is how much
+/// is behind it ("12 lines"), which the toggle's name says (#1489).
 function SystemRow({
   label,
   detail = null,
   body,
   tone = "muted",
-  collapsed = false,
+  collapsed,
 }: {
   label: string;
   detail?: string | null;
   body?: ReactNode;
   tone?: keyof typeof TONE_COLOUR;
-  collapsed?: boolean;
+  collapsed?: string;
 }) {
-  const [open, setOpen] = useState(!collapsed);
+  const [open, setOpen] = useState(collapsed === undefined);
   const regionId = useId();
   return (
     <div className="flex min-w-0 flex-col items-center gap-0.5 text-center">
@@ -558,12 +575,13 @@ function SystemRow({
         </p>
       ) : null}
       {body ? (
-        collapsed ? (
+        collapsed !== undefined ? (
           <>
             <button
               type="button"
               aria-expanded={open}
               aria-controls={regionId}
+              aria-label={`${open ? "Hide" : "Show"} ${label}, ${collapsed}`}
               onClick={() => setOpen((o) => !o)}
               className="min-h-8 text-[0.75em] underline-offset-2 hover:underline focus-visible:outline focus-visible:outline-2"
               style={{ color: palette.link }}

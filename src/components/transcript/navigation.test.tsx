@@ -179,7 +179,9 @@ describe("jumping to a turn (#1484)", () => {
     await shim.flush();
     const results = screen.getByRole("list", { name: "Matches" });
     expect(findRead).toHaveBeenLastCalledWith(PATH, "needle", null, false);
-    expect(screen.getByText("1 match")).toBeTruthy();
+    expect(screen.getByTestId("find-count").textContent).toBe("1 match");
+    // And said, from the region mounted with the box (#1489).
+    expect(within(screen.getByTestId("find-in-session")).getByRole("status").textContent).toBe("1 match");
     fireEvent.click(within(results).getByRole("button"));
     await shim.flush();
     await shim.flush();
@@ -265,5 +267,78 @@ describe("what is shown (#1484)", () => {
     fireEvent.click(screen.getByText("Show", { selector: "summary" }));
     fireEvent.click(screen.getByRole("checkbox", { name: "System and meta records" }));
     expect(useFilters.getState().transcriptShow).toMatchObject({ system: false, thinking: true });
+  });
+});
+
+/// #1489: the desktop's keyboard. `j`/`k` are above; these are the live
+/// edge, and `Escape` closing what it is in without stranding the focus.
+describe("the keyboard (#1489)", () => {
+  it("End goes back to the live edge from far back, and follows it", async () => {
+    await open();
+    await shim.userScrollTo(0);
+    // Older pages came in above, and the view held still over them.
+    expect(shim.viewport().scrollTop).toBeLessThan(shim.maxScrollTop());
+    fireEvent.keyDown(shim.viewport(), { key: "End" });
+    await shim.flush();
+    await shim.flush();
+    expect(mounted("p59")).toBe(true);
+    expect(shim.viewport().scrollTop).toBe(shim.maxScrollTop());
+  });
+
+  it("End jumps instantly under reduced motion", async () => {
+    const saved = window.matchMedia;
+    window.matchMedia = ((q: string) => ({ matches: q.includes("reduce") })) as never;
+    try {
+      await open();
+      await shim.userScrollTo(0);
+      fireEvent.keyDown(shim.viewport(), { key: "End" });
+      await shim.flush();
+      expect(shim.lastBehavior()).toBe("auto");
+    } finally {
+      window.matchMedia = saved;
+    }
+  });
+
+  it("End in the find box is typing, not a jump", async () => {
+    await open();
+    await shim.userScrollTo(0);
+    fireEvent.click(screen.getByRole("button", { name: "Find" }));
+    const box = screen.getByRole("searchbox", { name: "Find in this session" });
+    // Not prevented: the caret goes to the end of what was typed.
+    expect(fireEvent.keyDown(box, { key: "End" })).toBe(true);
+    await shim.flush();
+    expect(shim.viewport().scrollTop).toBeLessThan(shim.maxScrollTop());
+  });
+
+  it.each(["Turns", "Find"])(
+    "Escape closes the %s panel and gives the focus back to its button",
+    async (name) => {
+      await open();
+      const button = screen.getByRole("button", { name });
+      fireEvent.click(button);
+      await shim.flush();
+      const panel = screen.getByRole("complementary");
+      const inside = panel.querySelector<HTMLElement>("input, button") ?? panel;
+      inside.focus();
+      fireEvent.keyDown(inside, { key: "Escape" });
+      expect(screen.queryByRole("complementary")).toBeNull();
+      expect(document.activeElement).toBe(button);
+      expect(button.getAttribute("aria-pressed")).toBe("false");
+    },
+  );
+
+  it("Escape closes an open Show menu before the panel, focus on its summary", async () => {
+    await open();
+    fireEvent.click(screen.getByRole("button", { name: "Turns" }));
+    const summary = screen.getByText("Show", { selector: "summary" });
+    const menu = summary.closest("details")!;
+    menu.open = true;
+    const box = screen.getByRole("checkbox", { name: "System and meta records" });
+    box.focus();
+    fireEvent.keyDown(box, { key: "Escape" });
+    expect(menu.open).toBe(false);
+    expect(document.activeElement).toBe(summary);
+    // The panel is still open: one Escape closes one thing.
+    expect(screen.getByRole("complementary")).toBeTruthy();
   });
 });

@@ -14,7 +14,15 @@
 /// (`src/lib/transcriptFollow.ts`). Everything below the read takes a
 /// message list and does not care where it came from.
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  type KeyboardEvent,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useClaudeTranscriptLive } from "../../api/hooks";
 import { claudeTranscriptBlockText } from "../../api/tauri";
 import { useFilters } from "../../store/filters";
@@ -219,6 +227,15 @@ function Loaded({
   const handle = useRef<TranscriptViewerHandle>(null);
   const jumps = useJumps({ live, messages: all, shown, handle });
   const [panel, setPanel] = useState<Panel>(null);
+  // Where `Escape` hands the focus back when it closes a panel.
+  const panelButtons = useRef<Record<"turns" | "find", HTMLButtonElement | null>>({
+    turns: null,
+    find: null,
+  });
+  const onPanelButton = useCallback((k: "turns" | "find", el: HTMLButtonElement | null) => {
+    panelButtons.current[k] = el;
+  }, []);
+  const toLatest = useCallback(() => handle.current?.scrollToLatest(), []);
 
   // Opened from a notification: land on the first unread message once.
   const landed = useRef(openAt !== "marker");
@@ -292,15 +309,43 @@ function Loaded({
         : dividerAt !== null
           ? () => void handle.current?.scrollTo(dividerAt)
           : undefined;
+  // `Escape` closes what it is inside (#1489): an open Show or Export
+  // menu, else the side panel -- and hands the focus back to what
+  // opened it, so the keyboard is never left on a control that went away.
+  const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === "Escape") {
+      const menu = (e.target as HTMLElement).closest<HTMLDetailsElement>("details[open]");
+      if (menu) {
+        e.preventDefault();
+        menu.open = false;
+        menu.querySelector("summary")?.focus();
+        return;
+      }
+      if (panel !== null) {
+        e.preventDefault();
+        const opener = panel;
+        setPanel(null);
+        panelButtons.current[opener]?.focus();
+        return;
+      }
+    }
+    turnKeys(jumps.step, toLatest)(e);
+  };
   return (
     <div
       className="@container flex min-h-0 flex-1 flex-col gap-2"
-      onKeyDown={turnKeys(jumps.step)}
+      onKeyDown={onKeyDown}
       data-testid="desktop-transcript"
     >
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs" style={{ color: palette.muted }}>
         <FollowStatus live={live} />
-        <NavButtons panel={panel} setPanel={setPanel} step={jumps.step} />
+        {/* A jump's note, said from a region mounted with the host: one
+            that arrives with its text already in it -- or is hidden until
+            it has some -- is often not read (#1489). */}
+        <span role="status" className="sr-only" data-testid="jump-note-announce">
+          {jumps.note}
+        </span>
+        <NavButtons panel={panel} setPanel={setPanel} step={jumps.step} onButton={onPanelButton} />
         <details className="relative">
           <summary className="cursor-pointer" style={{ color: palette.link }}>
             Show{hidden > 0 ? ` (${hidden.toLocaleString()} hidden)` : ""}
@@ -329,7 +374,7 @@ function Loaded({
         <AwayCard since={since} onGo={goToMarker} onDismiss={() => setCardDismissed(true)} />
       ) : null}
       {jumps.note !== null ? (
-        <p role="status" className="text-xs" style={{ color: palette.warn }}>
+        <p className="text-xs" style={{ color: palette.warn }}>
           {jumps.note}
         </p>
       ) : null}
@@ -437,10 +482,13 @@ function NavButtons({
   panel,
   setPanel,
   step,
+  onButton,
 }: {
   panel: Panel;
   setPanel: (p: Panel) => void;
   step: (dir: -1 | 1) => void;
+  /// Each panel's button, for `Escape` to return the focus to.
+  onButton: (k: "turns" | "find", el: HTMLButtonElement | null) => void;
 }) {
   const btn = "rounded border px-2 py-0.5 focus-visible:outline focus-visible:outline-2";
   const style = (on: boolean) => ({
@@ -450,13 +498,30 @@ function NavButtons({
   });
   return (
     <div role="group" aria-label="Navigate the transcript" className="flex gap-1">
-      <button type="button" className={btn} style={style(false)} onClick={() => step(-1)} title="Previous prompt (k)">
-        ↑ Prompt
-      </button>
-      <button type="button" className={btn} style={style(false)} onClick={() => step(1)} title="Next prompt (j)">
-        ↓ Prompt
+      <button
+        type="button"
+        className={btn}
+        style={style(false)}
+        onClick={() => step(-1)}
+        title="Previous prompt (k)"
+        aria-label="Previous prompt"
+        aria-keyshortcuts="k"
+      >
+        <span aria-hidden>↑</span> Prompt
       </button>
       <button
+        type="button"
+        className={btn}
+        style={style(false)}
+        onClick={() => step(1)}
+        title="Next prompt (j)"
+        aria-label="Next prompt"
+        aria-keyshortcuts="j"
+      >
+        <span aria-hidden>↓</span> Prompt
+      </button>
+      <button
+        ref={(el) => onButton("turns", el)}
         type="button"
         className={btn}
         style={style(panel === "turns")}
@@ -466,6 +531,7 @@ function NavButtons({
         Turns
       </button>
       <button
+        ref={(el) => onButton("find", el)}
         type="button"
         className={btn}
         style={style(panel === "find")}

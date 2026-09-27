@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { claudeTranscriptBlockText } from "@/api/tauri";
 import { useClaudeTranscriptLive } from "@/api/hooks";
 import { PullIndicator } from "@/components/PullIndicator";
@@ -307,7 +307,13 @@ export function PhoneTranscript({
     );
   } else {
     body = (
-      <div ref={wrapRef} className="relative flex min-h-0 flex-1 flex-col">
+      // `--text-scale` reaches the jump button, which the viewer draws:
+      // Dynamic Type sizes it like the rows (#1489).
+      <div
+        ref={wrapRef}
+        className="relative flex min-h-0 flex-1 flex-col"
+        style={{ "--text-scale": scale } as CSSProperties}
+      >
         <PullIndicator state={pull} />
         {/* Beside the viewer, never instead of it: the viewer keeps the
             composer slot, pending rows and the live edge (#1490
@@ -336,7 +342,7 @@ export function PhoneTranscript({
             // Within thumb reach: the jump button sits bottom-right, off
             // the centre line where the home indicator's swipe lives,
             // and a 44 pt target.
-            className="[&_[data-slot=message-scroller-button]]:inset-s-auto [&_[data-slot=message-scroller-button]]:right-4 [&_[data-slot=message-scroller-button]]:min-h-11 [&_[data-slot=message-scroller-button]]:translate-x-0 [&_[data-slot=message-scroller-viewport]]:[-webkit-overflow-scrolling:touch]"
+            className="[&_[data-slot=message-scroller-button]]:inset-s-auto [&_[data-slot=message-scroller-button]]:right-4 [&_[data-slot=message-scroller-button]]:min-h-11 [&_[data-slot=message-scroller-button]]:translate-x-0 [&_[data-slot=message-scroller-button]]:[zoom:var(--text-scale)] [&_[data-slot=message-scroller-viewport]]:[-webkit-overflow-scrolling:touch]"
           />
         </PhoneContext.Provider>
       </div>
@@ -348,7 +354,7 @@ export function PhoneTranscript({
       {held !== undefined ? (
         <div
           className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs"
-          style={{ color: palette.muted }}
+          style={{ color: palette.muted, ...scaleStyle(scale) }}
         >
           <FollowStatus live={active} />
           {note ? <span>{note}</span> : null}
@@ -402,6 +408,7 @@ export function PhoneTranscript({
           role="group"
           aria-label="Navigate the transcript"
           className="flex flex-wrap items-center gap-2 text-xs"
+          style={scaleStyle(scale)}
         >
           <button
             type="button"
@@ -409,7 +416,7 @@ export function PhoneTranscript({
             className="tap-target rounded-md border px-2"
             style={{ borderColor: palette.border, color: palette.text }}
           >
-            ↑ Previous prompt
+            <span aria-hidden>↑</span> Previous prompt
           </button>
           <button
             type="button"
@@ -417,7 +424,7 @@ export function PhoneTranscript({
             className="tap-target rounded-md border px-2"
             style={{ borderColor: palette.border, color: palette.text }}
           >
-            ↓ Next prompt
+            <span aria-hidden>↓</span> Next prompt
           </button>
           {(["turns", "find", "options"] as const).map((k) => (
             <button
@@ -439,10 +446,17 @@ export function PhoneTranscript({
         </div>
       ) : null}
       {held !== undefined && !cardDismissed ? (
-        <AwayCard since={since} onGo={goToMarker} onDismiss={() => setCardDismissed(true)} />
+        <div style={scaleStyle(scale)}>
+          <AwayCard since={since} onGo={goToMarker} onDismiss={() => setCardDismissed(true)} />
+        </div>
       ) : null}
+      {/* Said from a region mounted with the host (#1489), as the
+          desktop does. */}
+      <span role="status" className="sr-only" data-testid="jump-note-announce">
+        {jumps.note}
+      </span>
       {jumps.note !== null ? (
-        <p role="status" className="text-xs" style={{ color: palette.warn }}>
+        <p className="text-xs" style={{ color: palette.warn, ...scaleStyle(scale) }}>
           {jumps.note}
         </p>
       ) : null}

@@ -115,12 +115,12 @@ function usage(over: Partial<ClaudeUsage> = {}): ClaudeUsage {
 
 const NOW = Date.parse("2026-09-26T10:05:00Z");
 
-function renderHeader(
+function headerElement(
   d: Partial<ClaudeSessionDetail> = {},
   s: Partial<ClaudeSession> = {},
   props: { variant?: "desktop" | "phone"; withheld?: boolean; rollup?: boolean } = {},
 ) {
-  return render(
+  return (
     <TranscriptHeader
       session={session(s)}
       detail={detail(d)}
@@ -128,8 +128,12 @@ function renderHeader(
       variant={props.variant ?? "desktop"}
       withheld={props.withheld}
       subagentRollup={props.rollup ? <p>the rollup</p> : undefined}
-    />,
+    />
   );
+}
+
+function renderHeader(...args: Parameters<typeof headerElement>) {
+  return render(headerElement(...args));
 }
 
 beforeEach(() => {
@@ -204,10 +208,27 @@ describe("TranscriptHeader waiting", () => {
   it("'not recorded' and 'not waiting' are different sentences, and neither is announced", () => {
     renderHeader({ waiting: { state: "no", reason: "never-observed" } });
     expect(screen.getByText("Whether it is waiting is not recorded")).toBeTruthy();
-    expect(screen.queryByRole("status")).toBeNull();
+    // The region is there, so starting to wait WILL be read, and empty.
+    expect(screen.getByRole("status").textContent).toBe("");
     cleanup();
     renderHeader({ waiting: { state: "no", reason: "superseded" } });
     expect(screen.getByText("Not waiting for you")).toBeTruthy();
+    expect(screen.getByRole("status").textContent).toBe("");
+  });
+
+  /// #1489: a live region that arrives already holding its text is often
+  /// not read, so the one that says "waiting" is there before it waits.
+  it("announces the session starting to wait from a region already mounted", () => {
+    const { rerender } = renderHeader({ waiting: { state: "no", reason: "superseded" } });
+    const region = screen.getByRole("status");
+    rerender(
+      headerElement({
+        liveness: RUNNING,
+        waiting: { state: "now", kind: "idle_prompt", at: "2026-09-26T10:00:00Z" },
+      }),
+    );
+    expect(screen.getByRole("status")).toBe(region);
+    expect(region.textContent).toContain("Waiting for your input");
   });
 });
 

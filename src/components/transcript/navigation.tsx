@@ -34,6 +34,10 @@ import { findShortfall, type SinceYouLeft } from "./useNavigation";
 
 export function ShowControls({ show, hidden }: { show: TranscriptShow; hidden: number }) {
   const set = useFilters((f) => f.setTranscriptShow);
+  const hiddenText =
+    hidden > 0
+      ? `${hidden.toLocaleString()} ${hidden === 1 ? "item is" : "items are"} hidden in the loaded part of this transcript.`
+      : "";
   return (
     <fieldset className="text-xs" style={{ color: palette.text }}>
       <legend className="mb-1" style={{ color: palette.muted }}>
@@ -51,10 +55,15 @@ export function ShowControls({ show, hidden }: { show: TranscriptShow; hidden: n
       ))}
       {hidden > 0 ? (
         <p className="mt-1" style={{ color: palette.muted }} data-testid="filter-hidden">
-          {hidden.toLocaleString()} {hidden === 1 ? "item is" : "items are"} hidden in the loaded
-          part of this transcript.
+          {hiddenText}
         </p>
       ) : null}
+      {/* Mounted with the controls, so ticking a box announces what it
+          hid (#1489): a region that arrives with its text is often not
+          read. */}
+      <span role="status" className="sr-only">
+        {hiddenText}
+      </span>
     </fieldset>
   );
 }
@@ -236,9 +245,14 @@ export function FindInSession({
   const asked = query.length >= 2;
   const q = useClaudeTranscriptFind(path, asked ? query : null, { enabled: asked, reveal });
   let body = null;
+  // What a screen reader hears as the search moves on (#1489), from a
+  // region mounted with the box -- one that appeared already holding
+  // its text would often not be read.
+  let said = "";
   if (!asked) {
     // Nothing typed: nothing was asked, which is not "no matches".
   } else if (q.isError) {
+    said = "Could not search this session.";
     body = (
       <p className="text-xs" style={{ color: palette.muted }}>
         Could not search this session{errorMessage(q.error) ? ` (${errorMessage(q.error)})` : ""}.{" "}
@@ -248,6 +262,7 @@ export function FindInSession({
       </p>
     );
   } else if (q.data === undefined) {
+    said = "Searching the session…";
     body = (
       <p className="text-xs" style={{ color: palette.muted }}>
         Searching the session…
@@ -258,14 +273,17 @@ export function FindInSession({
     const short = findShortfall(f, "matches");
     const unsearched = unsearchedNote(f.masking);
     const bounded = f.more || !f.complete;
+    const count =
+      f.hits.length === 0
+        ? f.complete
+          ? "No matches in this session."
+          : "No matches in the part that was read."
+        : `${bounded ? "At least " : ""}${f.hits.length.toLocaleString()} ${f.hits.length === 1 ? "match" : "matches"}`;
+    said = count;
     body = (
       <>
-        <p className="mb-1 text-[11px]" style={{ color: palette.muted }} role="status">
-          {f.hits.length === 0
-            ? f.complete
-              ? "No matches in this session."
-              : "No matches in the part that was read."
-            : `${bounded ? "At least " : ""}${f.hits.length.toLocaleString()} ${f.hits.length === 1 ? "match" : "matches"}`}
+        <p className="mb-1 text-[11px]" style={{ color: palette.muted }} data-testid="find-count">
+          {count}
         </p>
         {short ? (
           <p className="mb-1 text-[11px]" style={{ color: palette.warn }}>
@@ -294,6 +312,9 @@ export function FindInSession({
         className="mb-2 w-full rounded border px-2 py-1 text-xs"
         style={{ background: palette.ground, borderColor: palette.border, color: palette.text }}
       />
+      <span role="status" className="sr-only">
+        {said}
+      </span>
       {body}
     </div>
   );

@@ -19,7 +19,8 @@
         "minHeight": 640,
         "label": "main",
         "theme": "Dark",
-        "backgroundColor": "#0d1117"
+        "backgroundColor": "#0d1117",
+        "zoomHotkeysEnabled": true
       }
     ],
     "security": {
