@@ -11,6 +11,7 @@ import type {
 } from "@/types/pr";
 import { useFilters } from "@/store/filters";
 import { stubViewport } from "@/test-utils";
+import type { TranscriptPage } from "@/types/transcript";
 
 /// The companion OFFERS this view and hides only what cannot work (#922).
 ///
@@ -69,6 +70,9 @@ const state = vi.hoisted(() => ({
   /// Every id the detail hook was asked for while enabled, so the tests
   /// below can assert the phone fetches ONE.
   detailAskedFor: [] as string[],
+  /// #1479's viewer feed. The phone reads it through the remote surface
+  /// exactly as the desktop reads it locally (`Class::Read`).
+  transcript: undefined as TranscriptPage | undefined,
 }));
 
 vi.mock("../api/hooks", () => ({
@@ -123,6 +127,11 @@ vi.mock("../api/hooks", () => ({
       refetch: refetchFn,
     };
   },
+  useClaudeTranscriptMessages: () => ({
+    data: state.transcript,
+    isError: false,
+    error: undefined,
+  }),
   // #1208: a FOLLOW. The phone's case for it is the stronger one -- the
   // companion user cannot reach the machine, so a frozen snapshot of a
   // RUNNING agent is the worst view in the app.
@@ -274,7 +283,8 @@ beforeEach(() => {
   // is a module singleton -- so a selection made by one test would open a
   // detail screen in the next one before it clicked anything, which on the
   // phone means the LIST is the thing that is hidden.
-  useFilters.setState({ claudeQuery: "", claudeSelected: undefined });
+  useFilters.setState({ claudeQuery: "", claudeSelected: undefined, claudeTranscript: undefined });
+  state.transcript = undefined;
   copyFn.mockClear();
   revealFn.mockClear();
 });
@@ -544,6 +554,49 @@ describe("the companion offers the view and hides only the Local actions", () =>
     render(<ClaudeCodePage />);
     expect(screen.getByRole("button", { name: /HeadState GitHub issues filing/i })).toBeTruthy();
     open("HeadState GitHub issues filing");
+    expect(screen.getByRole("button", { name: /all sessions/i })).toBeTruthy();
+  });
+});
+
+/// #1479: on the phone the full-window transcript is a screen of its own,
+/// reached from the session list through the session's detail.
+describe("the transcript viewer on the phone", () => {
+  it("opens as its own screen in place of the list and the detail", () => {
+    state.transcript = {
+      messages: [
+        {
+          id: "u1",
+          id_source: "uuid",
+          turn_id: "u1",
+          kind: { kind: "user_prompt", origin: null },
+          timestamp: null,
+          model: null,
+          api_message_id: null,
+          usage: null,
+          duration_ms: null,
+          is_meta: false,
+          is_sidechain: false,
+          blocks: [{ kind: "text", index: 0, text: "run the tests", clip: null }],
+        },
+      ],
+      truncated: false,
+      bytes_read: 1_000,
+      file_bytes: 1_000,
+      machinery_records: [],
+      unparseable_records: 0,
+      duplicate_records: 0,
+    };
+    render(<ClaudeCodePage />);
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("button", { name: /open in full window/i }));
+
+    const full = screen.getByTestId("transcript-window");
+    expect(full.textContent).toContain("run the tests");
+    // The detail screen's own controls are gone: this is the screen now.
+    expect(screen.queryByRole("button", { name: /all sessions/i })).toBeNull();
+    expect(screen.queryByTestId("transcript-pane")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /session detail/i }));
     expect(screen.getByRole("button", { name: /all sessions/i })).toBeTruthy();
   });
 });
