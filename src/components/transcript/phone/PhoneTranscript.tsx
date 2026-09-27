@@ -10,6 +10,7 @@ import { isRevealOff, isTranscriptsOff } from "@/lib/transcriptAccess";
 import { usePullToRefresh } from "@/lib/usePullToRefresh";
 import type { Liveness } from "../../../types/pr";
 import type { TranscriptMessage, TranscriptSubagent } from "../../../types/transcript";
+import { subagentLiveness } from "../header";
 import { palette } from "../palette";
 import { transcriptStreaming } from "../streaming";
 import { FollowStatus } from "../FollowStatus";
@@ -293,7 +294,7 @@ export function PhoneTranscript({
             {subagent?.transcript_path ? (
               <PhoneTranscript
                 path={subagent.transcript_path}
-                liveness={subagentLiveness(liveness)}
+                liveness={subagentLiveness(liveness, subagent)}
                 label="Subagent transcript"
               />
             ) : null}
@@ -302,15 +303,6 @@ export function PhoneTranscript({
       </Sheet>
     </div>
   );
-}
-
-/// A subagent's own liveness is not tracked. Its session being over
-/// settles it; otherwise whether it is still running is not known, and
-/// its unanswered calls say that rather than "running".
-function subagentLiveness(parent: Liveness): Liveness {
-  return parent.state === "dead"
-    ? parent
-    : { state: "unknown", why: "a subagent's own process is not tracked" };
 }
 
 /// The desktop's owner turned this phone's transcripts off (#1488).

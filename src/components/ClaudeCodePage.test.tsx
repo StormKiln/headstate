@@ -4297,6 +4297,27 @@ describe("the opening prompt", () => {
     expect(screen.getByText("One")).toBeTruthy();
     expect(screen.queryByText("Two")).toBeNull();
   });
+
+  /// #1485, from #1481: a phone that may not read transcripts gets every
+  /// prompt as `null`, and the list says so rather than showing rows that
+  /// look like sessions with no prompt.
+  it("says when a phone's prompts were withheld", () => {
+    state.list = listOf([session({ name: "Fix the retry", opening_prompt: null })], {
+      masking: { hidden: 0, revealed: false, reveal_allowed: false, withheld: true },
+    });
+    renderView();
+    expect(screen.getByTestId("sessions-prompts-withheld").textContent).toContain(
+      "Transcripts are turned off for this phone on the desktop",
+    );
+  });
+
+  it("says nothing about withholding when nothing was withheld", () => {
+    state.list = listOf([session({ name: "Fix the retry", opening_prompt: null })], {
+      masking: { hidden: 0, revealed: false, reveal_allowed: true, withheld: false },
+    });
+    renderView();
+    expect(screen.queryByTestId("sessions-prompts-withheld")).toBeNull();
+  });
 });
 
 /// #1135: what the transcript corpus costs on disk.
@@ -5035,5 +5056,24 @@ describe("the transcript viewer", () => {
     expect(f.claudeSelected).toBe("e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2");
     renderView();
     expect(within(screen.getByTestId("transcript-window")).getByRole("log")).toBeTruthy();
+  });
+
+  /// #1485: the session header is hosted by the full window, above the
+  /// transcript -- and above the refusal too, where a running session
+  /// with no transcript yet must still read as running.
+  it("hosts the session header, even when there is no transcript yet", () => {
+    state.list = listOf([
+      session({
+        liveness: { state: "running", pid: 4242, status: null },
+        transcript_path: null,
+        transcript_state: { state: "not-recorded" },
+      }),
+    ]);
+    useFilters.getState().openClaudeTranscript("e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2");
+    renderView();
+    const header = within(screen.getByTestId("transcript-window")).getByTestId(
+      "transcript-header",
+    );
+    expect(within(header).getByText("Running, no transcript yet")).toBeTruthy();
   });
 });
