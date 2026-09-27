@@ -33,10 +33,15 @@ export function DesktopTranscript({
   path,
   liveness,
   label = "Transcript",
+  sessionId = null,
 }: {
   path: string;
   liveness: Liveness;
   label?: string;
+  /// The session `path` is the main transcript of, so the desktop's
+  /// activity nudge for it reads at once (#1477). A subagent's
+  /// transcript below is not nudged and follows on its cadence.
+  sessionId?: string | null;
 }) {
   // A subagent opened from a call replaces the main transcript here, with
   // a way back. A stack, because a subagent can open its own.
@@ -74,7 +79,13 @@ export function DesktopTranscript({
     );
   }
   return (
-    <Loaded path={path} liveness={liveness} label={label} onOpenSubagent={onOpenSubagent} />
+    <Loaded
+      path={path}
+      liveness={liveness}
+      label={label}
+      onOpenSubagent={onOpenSubagent}
+      sessionId={sessionId}
+    />
   );
 }
 
@@ -83,13 +94,15 @@ function Loaded({
   liveness,
   label,
   onOpenSubagent,
+  sessionId = null,
 }: {
   path: string;
   liveness: Liveness;
   label: string;
   onOpenSubagent: OpenSubagent;
+  sessionId?: string | null;
 }) {
-  const live = useClaudeTranscriptLive(path, { liveness });
+  const live = useClaudeTranscriptLive(path, { liveness, sessionId });
   const density = useFilters((f) => f.transcriptDensity);
   const setDensity = useFilters((f) => f.setTranscriptDensity);
 

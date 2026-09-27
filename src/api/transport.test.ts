@@ -600,6 +600,20 @@ const POLL_EVENTS: [string, () => unknown][] = [
   // work on the desktop and silently never fire on the phone, which is
   // the client with no window to leave open and wait in.
   ["stats-backfill-progress", () => hooks.useStatsBackfill("board|merged|*|org:X")],
+  // The fifteenth (#1477). A content-free nudge that a running session's
+  // transcript changed: the list's "active now" set hears every one, and
+  // the open transcript's follow hears its own session's. Through the seam
+  // for the reason every row here is: the phone is the client that most
+  // needs it, and a direct Tauri `listen` would never fire there.
+  ["claude-session-activity", hooks.useSessionActivity],
+  [
+    "claude-session-activity",
+    () =>
+      hooks.useClaudeTranscriptLive("/tmp/x.jsonl", {
+        liveness: { state: "dead", why: "fixture" },
+        sessionId: "s-1",
+      }),
+  ],
 ];
 
 function wrapper({ children }: { children: ReactNode }) {

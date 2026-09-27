@@ -62,6 +62,9 @@
 //! particular are read-only by design -- they are Claude Code's data and the
 //! files `claude --resume` depends on.
 
+/// A content-free nudge when a running session's transcript changes
+/// (#1477): session id, byte size, sequence number -- no path, no text.
+pub mod activity;
 pub mod cli;
 /// Silently-broken agent configuration, swept across repositories (#1217).
 pub mod confighealth;

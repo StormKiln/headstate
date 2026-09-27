@@ -34,9 +34,25 @@
 /// | otherwise | `IDLE_MIN_MS`, doubling to `IDLE_MAX_MS` |
 /// | the last read failed | the idle backoff, and the state says so |
 /// | a catch-up has more pages to read | at once |
+/// | the desktop nudged: this transcript changed (#1477) | at once, if any row above but the first two would read |
 ///
 /// Liveness `unknown` follows at the idle cadence only: nothing says the
 /// session is writing, and nothing says it is not.
+///
+/// # Nudges (#1477)
+///
+/// The desktop stats running sessions' transcripts about once a second
+/// and emits a content-free `claude-session-activity` when one changed.
+/// `nudge` is how that reaches here: when the follow would read anyway
+/// (running, visible, attached, not stopped), it reads NOW instead of
+/// waiting out the rest of its delay. A nudge whose size is the size
+/// already read changes nothing, and one arriving during a read makes
+/// the next read immediate rather than starting a second one beside it.
+///
+/// A nudge is only ever a shortcut. The cadence above is unchanged, so a
+/// nudge that never arrives -- lost to a lagging event stream, a
+/// reconnect, a backgrounded phone -- costs the wait it would have cut,
+/// and nothing else.
 ///
 /// # Replacement, and re-anchoring on ids
 ///
@@ -204,6 +220,10 @@ export class TranscriptFollower {
   private visible = true;
   private running = false;
   private lastMasking: TranscriptMasking | undefined = undefined;
+  /// Reads queued or in flight.
+  private busy = 0;
+  /// A nudge arrived while a read was queued or in flight.
+  private nudged = false;
   private snap: FollowSnapshot = {
     messages: undefined,
     status: "loading",
@@ -281,6 +301,21 @@ export class TranscriptFollower {
     this.viewport = { first, last };
   }
 
+  /// The desktop saw this transcript change (#1477): read now rather
+  /// than at the end of the current delay, if the follow would read at
+  /// all. `size` is the file's size when it was seen; a nudge for a size
+  /// already read is ignored.
+  nudge(size: number | null = null): void {
+    if (!this.running || !this.visible || this.pages.length === 0 || !this.follows()) return;
+    if (size !== null && size === this.snap.fileBytes) return;
+    if (this.busy > 0) {
+      this.nudged = true;
+      return;
+    }
+    this.clearTimer();
+    void this.enqueue(() => this.tick());
+  }
+
   // ---- the reader's actions ----
 
   /// The viewer reached the oldest message held.
@@ -329,7 +364,11 @@ export class TranscriptFollower {
   // ---- internals ----
 
   private enqueue(op: () => Promise<void>): Promise<void> {
-    const next = this.queue.then(op).finally(() => this.schedule());
+    this.busy++;
+    const next = this.queue.then(op).finally(() => {
+      this.busy--;
+      this.schedule();
+    });
     // The queue itself never rejects: each op records its own failure.
     this.queue = next.catch(() => undefined);
     return next;
@@ -360,6 +399,9 @@ export class TranscriptFollower {
     if (!this.running || !this.visible) return null;
     if (this.pages.length === 0) return this.idleDelay; // retrying the first read
     if (!this.follows()) return null;
+    // Before the failure backoff: the file changed, which is worth a
+    // read even after one failed -- and nudges come at most once a second.
+    if (this.nudged) return 0;
     if (this.snap.error !== null) return this.idleDelay;
     if (this.catchingUp) return 0;
     if (this.live === "running" && this.recentlyGrew()) return FAST_MS;
@@ -410,6 +452,9 @@ export class TranscriptFollower {
       return;
     }
     if (!this.attached) return;
+    // This read covers every nudge before it; one arriving during it
+    // sets the flag again.
+    this.nudged = false;
     let grew = false;
     this.catchingUp = false;
     for (let i = 0; i < CATCH_UP_PAGES; i++) {
