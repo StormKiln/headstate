@@ -219,3 +219,18 @@ export function turnMarkdown(messages: readonly TranscriptMessage[], turnId: str
   if (turnId === null) out.unshift("_This turn began before the part of the transcript that was read._");
   return `${out.join("\n\n")}\n`;
 }
+
+/// Several messages as one markdown document (#1484): the session as
+/// loaded, or a range of turns. Says so when it is not the whole
+/// session, at the end where the gap is.
+export function messagesMarkdown(
+  messages: readonly TranscriptMessage[],
+  { earlierUnloaded, laterUnloaded }: { earlierUnloaded: boolean; laterUnloaded: boolean },
+): string {
+  const out = messages.map(messageMarkdown);
+  if (earlierUnloaded) {
+    out.unshift("_Earlier messages in this session were not loaded, so this starts partway through._");
+  }
+  if (laterUnloaded) out.push("_Later messages in this session were not loaded._");
+  return `${out.join("\n\n")}\n`;
+}

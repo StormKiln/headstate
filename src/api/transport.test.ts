@@ -367,6 +367,12 @@ const ROWS: Row[] = [
       limit: 50,
     },
   ),
+  // #1484. `query: null` is the outline, and is sent as null.
+  row(api.claudeTranscriptFind, [path, "needle", 20], "claude_transcript_find", {
+    path,
+    query: "needle",
+    limit: 20,
+  }),
   row(api.claudeRevealPath, [path], "claude_reveal_path", { path }),
   row(api.readClaudeMd, [path], "read_claude_md", { path }),
   // The Claude Code hook installer (#915). All four take no arguments: the

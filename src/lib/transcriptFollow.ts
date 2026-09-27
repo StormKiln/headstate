@@ -126,6 +126,13 @@ const MAX_RESIDENT = 2_000;
 const PRESSURE_RESIDENT = 600;
 /// Pages one tick reads before yielding to the next.
 export const CATCH_UP_PAGES = 5;
+/// How far before what is held a `seek` target may be and still be
+/// reached by prepending pages rather than by replacing them: three
+/// pages' worth of bytes (`transcript_page::PAGE_BYTES` is 256 KB).
+const SEEK_NEAR_BYTES = 3 * 256 * 1024;
+/// Pages one `loadOlderUntil` reads before it stops and lets the reader
+/// ask again.
+export const SEEK_PAGES = 10;
 
 export type FollowStatus =
   | "loading"
@@ -344,6 +351,78 @@ export class TranscriptFollower {
       this.bump();
       this.publish();
     });
+  }
+
+  /// Hold the message `id` (#1484): a turn chosen from the outline, a
+  /// find's hit, the "since you left" marker. Resolves to whether it is
+  /// held once the read settles, so the caller scrolls only to a row
+  /// that exists.
+  ///
+  /// Already held: nothing is read. Within `SEEK_NEAR_BYTES` before
+  /// what is held: older pages are prepended until it is, so the run the
+  /// reader was in stays whole. Otherwise, with `at` (the hit's cursor):
+  /// the held pages are REPLACED by the page starting at it, detached
+  /// from the live edge -- the reader pages on from there in either
+  /// direction, and "jump to latest" re-attaches. A cursor the file no
+  /// longer matches comes back `rewritten`, which is a replacement from
+  /// the end as any other.
+  seek(id: string, at: PageCursor | null): Promise<boolean> {
+    return this.enqueue(async () => {
+      if (this.pages.length === 0) return;
+      if (pageOf(this.pages, id) >= 0) return;
+      const first = this.pages[0];
+      const near =
+        at === null || (at.offset < first.start.offset && first.start.offset - at.offset <= SEEK_NEAR_BYTES);
+      if (near) await this.reachBack(id);
+      if (pageOf(this.pages, id) < 0 && at !== null) {
+        const w = await this.read(cursor(at), "after");
+        if (w === null) return;
+        if (w.rewritten) {
+          await this.replace(w);
+          await this.reachBack(id);
+        } else {
+          this.pages = [w];
+          this.attached = w.at_end;
+          this.viewport = null;
+          this.bump();
+        }
+      }
+      this.publish();
+    }).then(() => this.pages.length > 0 && pageOf(this.pages, id) >= 0);
+  }
+
+  /// Read older pages until one holds a message `wanted` accepts, the
+  /// start of the file is reached, or `SEEK_PAGES` pages were read --
+  /// "Load earlier" for a result whose call is not held, and the
+  /// previous turn when none is (#1484). Resolves to whether one is
+  /// held. Stopping at `SEEK_PAGES` is not the end: the next call goes
+  /// on from there, so the button that asked still works.
+  loadOlderUntil(wanted: (m: TranscriptMessage) => boolean): Promise<boolean> {
+    const held = () => this.pages.some((p) => p.page.messages.some(wanted));
+    return this.enqueue(async () => {
+      if (this.pages.length === 0 || held()) return;
+      this.snap = { ...this.snap, older: { state: "loading" } };
+      this.publish();
+      for (let i = 0; i < SEEK_PAGES && !held() && !this.pages[0].at_start; i++) {
+        const first = this.pages[0];
+        try {
+          const w = await this.fetchPage(cursor(first.start), "before");
+          if (w.masking !== undefined) this.lastMasking = w.masking;
+          this.snap = { ...this.snap, older: IDLE_OLDER, lastReadAt: this.now() };
+          if (w.rewritten || w.end.offset !== first.start.offset) {
+            await this.replace(w);
+            break;
+          }
+          this.pages = [w, ...this.pages];
+          this.evict(this.max, "head");
+        } catch (e) {
+          this.snap = { ...this.snap, older: { state: "failed", error: e } };
+          break;
+        }
+      }
+      if (this.snap.older.state === "loading") this.snap = { ...this.snap, older: IDLE_OLDER };
+      this.publish();
+    }).then(held);
   }
 
   /// Read now, whatever the cadence says: pull to refresh, "Try again".

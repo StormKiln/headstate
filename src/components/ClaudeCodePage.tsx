@@ -3613,6 +3613,8 @@ function TranscriptWindow({
   const detail = useClaudeSessionDetail(s.session_id, true);
   const close = useFilters((f) => f.closeClaudeTranscript);
   const selectSession = useFilters((f) => f.selectClaudeSession);
+  // A notification's tap opens at the "since you left" marker (#1484).
+  const openAt = useFilters((f) => f.claudeTranscriptAt);
   const phone = useTranscriptRenderer() === "phone";
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-2" data-testid="transcript-window">
@@ -3678,7 +3680,7 @@ function TranscriptWindow({
           {revealRefusal(detail.data.transcript_path, detail.data.transcript_state)}.
         </p>
       ) : (
-        <TranscriptFor detail={detail.data} />
+        <TranscriptFor detail={detail.data} openAt={openAt} />
       )}
     </div>
   );
@@ -3689,28 +3691,52 @@ function TranscriptWindow({
 ///
 /// By layout (`useTranscriptRenderer`, which is `useIsMobile()`), not by
 /// build -- see `transcript/phone/renderer.ts`.
-function TranscriptFor({ detail: d }: { detail: ClaudeSessionDetail }) {
+function TranscriptFor({
+  detail: d,
+  openAt = "latest",
+}: {
+  detail: ClaudeSessionDetail;
+  openAt?: "latest" | "marker";
+}) {
   const renderer = useTranscriptRenderer();
   if (renderer === "phone" && d.transcript_path) {
     return (
-      <PhoneTranscript path={d.transcript_path} liveness={d.liveness} sessionId={d.session_id} />
+      <PhoneTranscript
+        path={d.transcript_path}
+        liveness={d.liveness}
+        sessionId={d.session_id}
+        waiting={d.waiting}
+        openAt={openAt}
+      />
     );
   }
-  return <SessionTranscript detail={d} />;
+  return <SessionTranscript detail={d} openAt={openAt} />;
 }
 
 /// One session's transcript on the desktop layout: the terminal
 /// renderer (#1480, `DesktopTranscript`), over #1476's live, paged
 /// follow. `TranscriptFor` sends the phone layout to #1481's bubbles
 /// instead.
-function SessionTranscript({ detail: d }: { detail: ClaudeSessionDetail }) {
+function SessionTranscript({
+  detail: d,
+  openAt,
+}: {
+  detail: ClaudeSessionDetail;
+  openAt: "latest" | "marker";
+}) {
   // Reached only past `revealRefusal`, which refuses a missing path; said
   // rather than rendered as an empty transcript if that ever changes.
   if (!d.transcript_path) {
     return <p className="text-xs text-[#8b949e]">This session recorded no transcript path.</p>;
   }
   return (
-    <DesktopTranscript path={d.transcript_path} liveness={d.liveness} sessionId={d.session_id} />
+    <DesktopTranscript
+      path={d.transcript_path}
+      liveness={d.liveness}
+      sessionId={d.session_id}
+      waiting={d.waiting}
+      openAt={openAt}
+    />
   );
 }
 

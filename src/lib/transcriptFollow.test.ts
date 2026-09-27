@@ -16,6 +16,7 @@ import {
   IDLE_MAX_MS,
   IDLE_MIN_MS,
   RECENT_GROWTH_MS,
+  SEEK_PAGES,
   TranscriptFollower,
   type FollowSnapshot,
 } from "./transcriptFollow";
@@ -670,6 +671,96 @@ describe("TranscriptFollower: bounded memory", () => {
     await f.loadOlder();
     expect(f.getSnapshot().older.state).toBe("idle");
     expect(ids(f.getSnapshot())[0]).toBe("r4");
+  });
+});
+
+describe("TranscriptFollower: seeking by id (#1484)", () => {
+  const at = (i: number) => ({ offset: i * REC, behind_digest: `g0@${i * REC}` });
+
+  it("a message already held is not read again", async () => {
+    const file = new FakeFile(10);
+    const f = follower(file);
+    f.setLive("not-running");
+    f.start();
+    await settle();
+    const reads = file.calls.length;
+    await expect(f.seek("r8", at(8))).resolves.toBe(true);
+    expect(file.calls.length).toBe(reads);
+  });
+
+  it("a target a few pages back is prepended, keeping the run to the live edge", async () => {
+    const file = new FakeFile(20);
+    const f = follower(file);
+    f.setLive("not-running");
+    f.start();
+    await settle();
+    await expect(f.seek("r9", at(9))).resolves.toBe(true);
+    const s = f.getSnapshot();
+    expect(ids(s)).toContain("r9");
+    expect(ids(s).at(-1)).toBe("r19");
+    expect(s.atLiveEdge).toBe(true);
+  });
+
+  it("a far target loads its own page, detached from the live edge, and jump to latest re-attaches", async () => {
+    const file = new FakeFile(10_000);
+    const f = follower(file, { maxResident: 12 });
+    f.setLive("not-running");
+    f.start();
+    await settle();
+    await expect(f.seek("r10", at(10))).resolves.toBe(true);
+    let s = f.getSnapshot();
+    expect(ids(s)).toEqual(["r10", "r11", "r12"]);
+    expect(s.atLiveEdge).toBe(false);
+    expect(s.hasOlder).toBe(true);
+    expect(file.calls.at(-1)).toEqual({ anchor: { kind: "cursor", ...at(10) }, direction: "after" });
+    await f.jumpToLatest();
+    s = f.getSnapshot();
+    expect(ids(s).at(-1)).toBe("r9999");
+    expect(s.atLiveEdge).toBe(true);
+  });
+
+  it("a cursor into a rewritten file is answered from the end, and says the id was not reached", async () => {
+    const file = new FakeFile(10_000);
+    const f = follower(file, { maxResident: 12 });
+    f.setLive("not-running");
+    f.start();
+    await settle();
+    file.rewrite();
+    await expect(f.seek("r10", at(10))).resolves.toBe(false);
+    expect(ids(f.getSnapshot()).at(-1)).toBe("r9999");
+  });
+});
+
+describe("TranscriptFollower: loading older until found (#1484)", () => {
+  it("pages back until the call a result answers is held, not one page per ask", async () => {
+    const file = new FakeFile(30);
+    file.recs[4] = { id: "r4", call: "toolu_x" };
+    file.recs[28] = { id: "r28", result: "toolu_x" };
+    const f = follower(file);
+    f.setLive("not-running");
+    f.start();
+    await settle();
+    const found = await f.loadOlderUntil((m) =>
+      m.blocks.some((b) => b.kind === "tool_call" && b.id === "toolu_x"),
+    );
+    expect(found).toBe(true);
+    expect(ids(f.getSnapshot())).toContain("r4");
+    expect(f.getSnapshot().older.state).toBe("idle");
+  });
+
+  it("stops after a bounded number of pages, and the next ask goes on from there", async () => {
+    const file = new FakeFile(200, 3);
+    const f = follower(file);
+    f.setLive("not-running");
+    f.start();
+    await settle();
+    const before = file.calls.length;
+    await expect(f.loadOlderUntil((m) => m.id === "r0")).resolves.toBe(false);
+    expect(file.calls.length - before).toBe(SEEK_PAGES);
+    const oldest = () => Number(ids(f.getSnapshot())[0].slice(1));
+    const first = oldest();
+    await f.loadOlderUntil((m) => m.id === "r0");
+    expect(oldest()).toBeLessThan(first);
   });
 });
 

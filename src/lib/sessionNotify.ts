@@ -13,10 +13,10 @@ export const TOAST_MS = 8_000;
 
 /// Open the transcript of the session a notification was about (#1486).
 ///
-/// The phone's transcript screen (#1481) opens at the NEWEST message.
-/// Opening at the "since you left" marker needs the follow model's
-/// message-id anchor (#1476), which has not landed; when it does, this
-/// is the one place that should pass it.
+/// It opens AT this device's "since you left" marker (#1484): the
+/// notification is about what happened while the reader was away, so
+/// the screen starts where they left off. With no marker stored -- never
+/// read here -- the transcript opens at the newest message as any other.
 export function openFromNotification(sessionId: string): void {
-  useFilters.getState().openClaudeTranscript(sessionId);
+  useFilters.getState().openClaudeTranscript(sessionId, "marker");
 }

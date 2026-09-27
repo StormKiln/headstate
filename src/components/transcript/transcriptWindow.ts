@@ -198,6 +198,14 @@ export function tailPins(messages: readonly TranscriptMessage[]): WindowPins {
   return pinsFor(messages, Math.max(0, n - WINDOW_SIZE), n);
 }
 
+/// A window of `WINDOW_SIZE` centred on the message at `index`: where a
+/// jump to a message out of the window lands (#1484).
+export function aroundPins(messages: readonly TranscriptMessage[], index: number): WindowPins {
+  const n = messages.length;
+  const to = Math.min(n, Math.max(0, index - WINDOW_SIZE / 2) + WINDOW_SIZE);
+  return pinsFor(messages, Math.max(0, to - WINDOW_SIZE), to);
+}
+
 /// Whether a message opens a turn: a prompt, slash command or shell
 /// input. The read model says so by giving it its own id as `turn_id`.
 function opensTurn(m: TranscriptMessage): boolean {

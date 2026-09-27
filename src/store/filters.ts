@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import type { Filters } from "../lib/derive";
+import type { TranscriptShow } from "../components/transcript/filters";
 
 /// zustand holds UI state only. Server data lives in TanStack Query and is
 /// never duplicated here.
@@ -504,7 +505,11 @@ interface FilterStore {
   ///
   /// Not persisted, for `claudeSelected`'s reason.
   claudeTranscript: string | undefined;
-  openClaudeTranscript: (id: string) => void;
+  /// Where the transcript opens (#1484): `"marker"` at this device's
+  /// "since you left" marker -- a notification's tap -- or `"latest"`,
+  /// the newest turn. Set with `claudeTranscript` by the one action.
+  claudeTranscriptAt: "latest" | "marker";
+  openClaudeTranscript: (id: string, at?: "latest" | "marker") => void;
   closeClaudeTranscript: () => void;
   /// Where inside the selected repository the browser is (#1034).
   ///
@@ -578,6 +583,11 @@ interface FilterStore {
   /// persisted with it.
   transcriptDensity: "comfortable" | "compact";
   setTranscriptDensity: (density: "comfortable" | "compact") => void;
+  /// What the transcript shows (#1484): thinking, tool calls, system
+  /// records, sidechains. Per device, persisted with the density; read
+  /// through `showFrom`, which treats a missing key as shown.
+  transcriptShow: Partial<TranscriptShow>;
+  setTranscriptShow: (show: TranscriptShow) => void;
   /// The PR the detail view is showing, or null for the list.
   ///
   /// Deliberately NOT persisted: reopening the app on a detail page for a
@@ -677,6 +687,8 @@ export const useFilters = create<FilterStore>()(
       setDensity: (density) => set({ density }),
       transcriptDensity: "comfortable",
       setTranscriptDensity: (transcriptDensity) => set({ transcriptDensity }),
+      transcriptShow: {},
+      setTranscriptShow: (transcriptShow) => set({ transcriptShow }),
       setFilter: (key, value) =>
         set((s) => ({
           filtersByView: {
@@ -835,12 +847,18 @@ export const useFilters = create<FilterStore>()(
       claudeSelected: undefined,
       selectClaudeSession: (claudeSelected) => set({ claudeSelected }),
       claudeTranscript: undefined,
-      openClaudeTranscript: (id) => {
+      claudeTranscriptAt: "latest",
+      openClaudeTranscript: (id, at = "latest") => {
         // Arriving from another view takes `setView`'s resets first --
         // the selection, the bulk checks, the cursor -- rather than a
         // second copy of that list here that could drift from it.
         if (get().view !== "claude-code") get().setView("claude-code");
-        set({ claudePage: "sessions", claudeSelected: id, claudeTranscript: id });
+        set({
+          claudePage: "sessions",
+          claudeSelected: id,
+          claudeTranscript: id,
+          claudeTranscriptAt: at,
+        });
       },
       closeClaudeTranscript: () => set({ claudeTranscript: undefined }),
       repoPath: "",
@@ -1035,6 +1053,7 @@ export const useFilters = create<FilterStore>()(
         // and the axis would survive its own removal.
         density: s.density,
         transcriptDensity: s.transcriptDensity,
+        transcriptShow: s.transcriptShow,
       }),
     },
   ),

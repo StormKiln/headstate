@@ -46,6 +46,11 @@ describe("session notifications in the app", () => {
     expect(s.view).toBe("claude-code");
     expect(s.claudeSelected).toBe("s-1");
     expect(s.claudeTranscript).toBe("s-1");
+    // At the "since you left" marker, not the newest message (#1484).
+    expect(s.claudeTranscriptAt).toBe("marker");
+    // Opening it any other way is at the newest.
+    useFilters.getState().openClaudeTranscript("s-1");
+    expect(useFilters.getState().claudeTranscriptAt).toBe("latest");
   });
 
   it("opens nothing when no notification was tapped", async () => {

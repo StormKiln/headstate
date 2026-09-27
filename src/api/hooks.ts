@@ -54,7 +54,7 @@ import type {
   ScanKind,
 } from "./tauri";
 import { type FollowLive, TranscriptFollower } from "@/lib/transcriptFollow";
-import type { SessionActivity } from "@/types/transcript";
+import type { PageCursor, SessionActivity, TranscriptMessage } from "@/types/transcript";
 import { createCoalescer } from "@/lib/coalesce";
 import { createLimiter, withDeadline } from "@/lib/limiter";
 import { IS_MOBILE_BUILD } from "@/lib/target";
@@ -153,6 +153,7 @@ import {
   claudeSessionDetail,
   claudeSessionsForPr,
   claudeTranscriptPage,
+  claudeTranscriptFind,
   claudeHooksStatus,
   claudeInstallHooks,
   claudeReinstallHooks,
@@ -1836,10 +1837,37 @@ export function useClaudeTranscriptLive(
       jumpToLatest: () => void follower.jumpToLatest(),
       refresh: () => follower.refresh(),
       setViewport: (first: string, last: string) => follower.setViewport(first, last),
+      seek: (id: string, at: PageCursor | null) => follower.seek(id, at),
+      loadOlderUntil: (wanted: (m: TranscriptMessage) => boolean) =>
+        follower.loadOlderUntil(wanted),
     }),
     [follower],
   );
   return { ...snapshot, ...actions };
+}
+
+/// Find messages anywhere in one transcript (#1484): the turn outline
+/// when `query` is `null`, otherwise the messages holding it.
+///
+/// Asked only while `enabled` -- the outline panel or the find box is
+/// open -- because it streams the whole file. `retry: false`: a find
+/// that failed is said, not silently re-run. Not polled: the outline of
+/// a growing session is re-asked when the panel is reopened, and the
+/// newest turns are in the follow's own pages meanwhile.
+export function useClaudeTranscriptFind(
+  path: string | null,
+  query: string | null,
+  options: { enabled: boolean; reveal?: boolean },
+) {
+  const { enabled, reveal = false } = options;
+  return useQuery({
+    queryKey: ["claude-transcript-find", path, query, reveal],
+    queryFn: () => claudeTranscriptFind(path as string, query, null, reveal),
+    enabled: enabled && path !== null && path !== "" && (query === null || query.trim() !== ""),
+    staleTime: 0,
+    gcTime: 60_000,
+    retry: false,
+  });
 }
 
 /// What `useClaudeTranscriptLive` returns: what a host passes down.

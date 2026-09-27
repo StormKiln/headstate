@@ -21,6 +21,8 @@
 /// | the button returns to the live edge and re-engages follow | `scrollToEnd`, after re-windowing to the tail if needed |
 /// | older rows loaded above keep the visible row still | `preserveScrollOnPrepend` (the default) |
 /// | at most ~`WINDOW_SIZE` messages mounted | `transcriptWindow.ts` |
+/// | a jump to a held message: re-window around it, then scroll it to the top | `handle.scrollTo` + `aroundPins` (#1484) |
+/// | the newest message read, for the "since you left" marker | `onRead` (#1484) |
 ///
 /// # Accessibility
 ///
@@ -55,8 +57,11 @@
 import {
   type MouseEvent,
   type ReactNode,
+  type Ref,
   type UIEvent,
   useCallback,
+  useEffect,
+  useImperativeHandle,
   useLayoutEffect,
   useRef,
   useState,
@@ -79,6 +84,7 @@ import { type PendingMessage, pendingItemId } from "./pending";
 import { sendScroll, TranscriptSendContext } from "./sendScroll";
 import {
   type Arrivals,
+  aroundPins,
   caughtUp,
   extendEnd,
   extendStart,
@@ -90,6 +96,16 @@ import {
   type WindowPins,
   withoutAnchors,
 } from "./transcriptWindow";
+
+/// What a host can ask of the viewer directly (#1484): turn navigation,
+/// a find's hit, the "since you left" marker.
+export interface TranscriptViewerHandle {
+  /// Bring `id` into the window and scroll it to the top. `false` when
+  /// the viewer does not hold it: the host loads its page first.
+  scrollTo(id: string): boolean;
+  /// The first row inside the viewport, or `null` when none is laid out.
+  firstVisible(): string | null;
+}
 
 export interface TranscriptViewerProps {
   /// Oldest first, as the read model returns them. May hold more than
@@ -119,6 +135,11 @@ export interface TranscriptViewerProps {
   onJumpToLatest?: () => void;
   /// The viewport's accessible name.
   label?: string;
+  handle?: Ref<TranscriptViewerHandle>;
+  /// The newest message the reader has had on screen: the last row in
+  /// the viewport after a scroll, and the newest message while following
+  /// the live edge. Feeds the "since you left" marker (#1484).
+  onRead?: (id: string) => void;
   /// Reserved for 7.10's composer (#1491); ignored while
   /// `COMPOSER_ENABLED` is off.
   composer?: ReactNode;
@@ -167,9 +188,11 @@ function ViewerBody({
   renderPending,
   className,
   onWindowAtTail,
+  handle,
+  onRead,
 }: TranscriptViewerProps & { onWindowAtTail: (atTail: boolean) => void }) {
   const scrollable = useMessageScrollerScrollable();
-  const { scrollToEnd } = useMessageScroller();
+  const { scrollToEnd, scrollToMessage } = useMessageScroller();
   const viewportRef = useRef<HTMLDivElement | null>(null);
 
   const [pins, setPins] = useState<WindowPins>(OPEN_PINS);
@@ -243,8 +266,52 @@ function ViewerBody({
     setPins(next);
   };
 
+  // A jump to a message (#1484): re-window around it when it is outside
+  // the window, then scroll once its row is mounted.
+  // A ref, not state: the scroll is the effect's whole job, and a request
+  // bumps `jumps` so the effect runs even when the window did not move.
+  const targetRef = useRef<string | null>(null);
+  const [jumps, setJumps] = useState(0);
+  useLayoutEffect(() => {
+    const id = targetRef.current;
+    if (id !== null && scrollToMessage(id, { align: "start", behavior: "auto" })) {
+      targetRef.current = null;
+    }
+  }, [jumps, win.from, win.to, scrollToMessage]);
+  useImperativeHandle(
+    handle,
+    () => ({
+      scrollTo(id: string) {
+        const i = messages.findIndex((m) => m.id === id);
+        if (i < 0) return false;
+        if (i < win.from || i >= win.to) moveWindow(aroundPins(messages, i));
+        targetRef.current = id;
+        setJumps((n) => n + 1);
+        return true;
+      },
+      firstVisible() {
+        const viewport = viewportRef.current;
+        const row = viewport ? firstVisibleRow(viewport) : null;
+        return row?.element.dataset.messageId ?? null;
+      },
+    }),
+    // `moveWindow` is recreated each render and closes over setters only.
+    [messages, win.from, win.to],
+  );
+
+  // Following the live edge, the newest message is on screen.
+  const newestId = messages[messages.length - 1]?.id;
+  const followingLive = following && atLiveEdge;
+  useEffect(() => {
+    if (followingLive && newestId !== undefined) onRead?.(newestId);
+  }, [followingLive, newestId, onRead]);
+
   const onScroll = (e: UIEvent<HTMLDivElement>) => {
     const el = e.currentTarget;
+    if (onRead) {
+      const last = lastVisibleRow(el);
+      if (last !== null) onRead(last);
+    }
     const margin = el.clientHeight;
     if (messages.length === 0 || margin <= 0) return;
 
@@ -366,6 +433,19 @@ function ViewerBody({
       </div>
     </TranscriptSendContext.Provider>
   );
+}
+
+/// The id of the last mounted row whose box is inside the viewport.
+function lastVisibleRow(viewport: HTMLElement): string | null {
+  const top = viewport.getBoundingClientRect().top;
+  const bottom = viewport.getBoundingClientRect().bottom;
+  let last: string | null = null;
+  for (const el of viewport.querySelectorAll<HTMLElement>("[data-message-id]")) {
+    const r = el.getBoundingClientRect();
+    if (r.bottom > top && r.top < bottom) last = el.dataset.messageId ?? last;
+    else if (last !== null) break;
+  }
+  return last;
 }
 
 /// The first mounted row whose box is inside the viewport, and where.

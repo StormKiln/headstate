@@ -30,6 +30,18 @@ const blockText = vi.hoisted(() =>
   ),
 );
 vi.mock("../../api/tauri", () => ({ claudeTranscriptBlockText: blockText }));
+/// What the host hands pending reconciliation (#1491), per render.
+const reconciled = vi.hoisted(() => ({ lists: [] as (readonly { id: string }[])[] }));
+vi.mock("./usePendingMessages", async (importOriginal) => {
+  const real = await importOriginal<typeof import("./usePendingMessages")>();
+  return {
+    ...real,
+    usePendingMessages: (messages: readonly TranscriptMessage[]) => {
+      reconciled.lists.push(messages);
+      return real.usePendingMessages(messages);
+    },
+  };
+});
 
 const MAIN = "/tmp/projects/p/main.jsonl";
 const SUB = "/tmp/projects/p/subagents/agent-1.jsonl";
@@ -77,12 +89,40 @@ beforeEach(() => {
   shim = installScrollShim();
   state.pages = {};
   state.asked = [];
-  useFilters.setState({ transcriptDensity: "comfortable" });
+  useFilters.setState({ transcriptDensity: "comfortable", transcriptShow: {} });
 });
 afterEach(() => {
   cleanup();
   shim.restore();
   blockText.mockClear();
+});
+
+describe("Show filters and 7.10's send path (#1484, #1490)", () => {
+  const hideable = () =>
+    page([
+      msg("m1", "m1", { kind: "user_prompt", origin: null }, [text("added by the harness")]),
+      msg("a1", "m1", { kind: "assistant" }, [{ kind: "thinking", index: 0, text: "hmm", clip: null, recorded: true }]),
+    ]).messages.map((m, i) => (i === 0 ? { ...m, is_meta: true } : m));
+
+  it("reconciles pending messages against every held message, not the filtered ones", () => {
+    state.pages[MAIN] = { ...page([]), messages: hideable() };
+    useFilters.setState({ transcriptShow: { system: false, thinking: false } });
+    reconciled.lists = [];
+    render(<DesktopTranscript path={MAIN} liveness={DEAD} />);
+    expect(reconciled.lists.at(-1)?.map((m) => m.id)).toEqual(["m1", "a1"]);
+  });
+
+  it("keeps the viewer, its composer slot and pending rows mounted when filters hide every row", () => {
+    state.pages[MAIN] = { ...page([]), messages: hideable() };
+    useFilters.setState({ transcriptShow: { system: false, thinking: false } });
+    const { container } = render(<DesktopTranscript path={MAIN} liveness={DEAD} />);
+    expect(screen.getByTestId("all-hidden").textContent).toBe(
+      "Everything loaded is hidden by the Show settings.",
+    );
+    expect(container.querySelector('[data-slot="transcript-viewer"]')).toBeTruthy();
+    expect(container.querySelector('[data-slot="transcript-composer"]')).toBeTruthy();
+    expect(container.querySelector('[data-message-id="m1"]')).toBeNull();
+  });
 });
 
 describe("the desktop transcript", () => {
