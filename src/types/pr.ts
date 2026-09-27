@@ -1521,6 +1521,10 @@ export interface TranscriptMasking {
   /// Transcript fields were set to `null` because this device may not
   /// read transcripts: the text exists and was not sent.
   withheld: boolean;
+  /// This answer's query was matched against the masked text (#1519):
+  /// text hidden as a likely secret was not searched. Optional because a
+  /// desktop from before #1519 does not send it.
+  matched_masked?: boolean;
 }
 
 /// A search result and the coverage that qualifies it, together.

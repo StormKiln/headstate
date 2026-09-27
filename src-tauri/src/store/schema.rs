@@ -1219,6 +1219,26 @@ const MIGRATIONS: &[&str] = &[
         transcripts_allowed INTEGER NOT NULL DEFAULT 1,
         reveal_allowed      INTEGER NOT NULL DEFAULT 0
      );",
+    // 31: a MASKED copy of each session's text in the content index
+    // (#1519).
+    //
+    // A phone's search must match only what it could be shown, or
+    // hit-or-no-hit tells it whether a secret is in the corpus while
+    // every snippet it gets is masked. FTS5 cannot mask at query time --
+    // it matches tokens it stored -- so the masked text is stored beside
+    // the real text, and `claude/search.rs` confines a phone's query to
+    // `body_masked` and the desktop's to `body`.
+    //
+    // FTS5 has no `ALTER TABLE ... ADD COLUMN`, so the table is rebuilt,
+    // and the ledger is emptied with it: a ledger row claims its session
+    // is indexed, and after the drop none is. The live pass re-indexes
+    // at its usual rate, and until it has, every search says how much of
+    // the corpus it covered -- the index is derived data, recovered by a
+    // re-read, and the coverage sentence is what keeps the gap honest.
+    "DROP TABLE IF EXISTS claude_transcript_fts;
+     CREATE VIRTUAL TABLE claude_transcript_fts
+        USING fts5(session_id UNINDEXED, body, body_masked);
+     DELETE FROM claude_index_ledger;",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
@@ -1512,6 +1532,50 @@ mod tests {
         assert_eq!(version, MIGRATIONS.len() as i64);
     }
 
+    /// Migration 31 rebuilds the content index with a masked column
+    /// (#1519) and empties the ledger with it, so no session reads as
+    /// indexed without its masked text -- and costs no stored session.
+    #[test]
+    fn migration_31_rebuilds_the_content_index_with_a_masked_copy() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in MIGRATIONS.iter().take(30) {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 30i64).unwrap();
+        conn.execute_batch(
+            "INSERT INTO claude_session (session_id, first_seen_at) VALUES ('s1', '2026-01-01T00:00:00Z');
+             INSERT INTO claude_transcript_fts (session_id, body) VALUES ('s1', 'fsevents stream');
+             INSERT INTO claude_index_ledger (session_id, size_bytes, mtime_ms, truncated, indexed_at)
+                VALUES ('s1', 1, 1, 0, '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(count("SELECT COUNT(*) FROM claude_transcript_fts"), 0);
+        assert_eq!(
+            count("SELECT COUNT(*) FROM claude_index_ledger"),
+            0,
+            "a ledger row would claim a session is indexed that is not"
+        );
+        assert_eq!(count("SELECT COUNT(*) FROM claude_session"), 1);
+        conn.execute(
+            "INSERT INTO claude_transcript_fts (session_id, body, body_masked)
+             VALUES ('s1', 'key sk-real', 'key hidden')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            count("SELECT COUNT(*) FROM claude_transcript_fts WHERE claude_transcript_fts MATCH '{body_masked} : hidden'"),
+            1
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM claude_transcript_fts WHERE claude_transcript_fts MATCH '{body} : hidden'"),
+            0
+        );
+    }
+
     /// Migration 24 adds the advice ledger and signal tables without
     /// costing anything a v23 database held (7.1).
     ///
@@ -1537,6 +1601,19 @@ mod tests {
             [],
         )
         .unwrap();
+
+        // Migration 24 alone keeps the search index's ledger. Checked
+        // before the rest run, because migration 31 (#1519) empties it
+        // on purpose when it rebuilds the index.
+        conn.execute_batch(MIGRATIONS[23]).unwrap();
+        conn.pragma_update(None, "user_version", 24i64).unwrap();
+        let kept_index: i64 = conn
+            .query_row("SELECT COUNT(*) FROM claude_index_ledger", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            kept_index, 1,
+            "migration 24 must not cost the search index's ledger"
+        );
 
         migrate(&conn).unwrap();
 
@@ -1568,13 +1645,6 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM claude_session", [], |r| r.get(0))
             .unwrap();
         assert_eq!(kept, 1, "an upgrade must not cost a stored session");
-        let kept_index: i64 = conn
-            .query_row("SELECT COUNT(*) FROM claude_index_ledger", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(
-            kept_index, 1,
-            "an upgrade must not cost the search index's ledger"
-        );
 
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))

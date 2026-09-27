@@ -19,6 +19,7 @@ import { useClaudeTranscriptFind } from "../../api/hooks";
 import { copyText } from "../../lib/clipboard";
 import { useFilters } from "../../store/filters";
 import type { FindHit, TranscriptMessage } from "../../types/transcript";
+import { unsearchedNote } from "../../lib/masked";
 import { MaskedText } from "../MaskedText";
 import { errorMessage } from "../QueryError";
 import { SHOW_LABELS, type TranscriptShow } from "./filters";
@@ -255,6 +256,7 @@ export function FindInSession({
   } else {
     const f = q.data;
     const short = findShortfall(f, "matches");
+    const unsearched = unsearchedNote(f.masking);
     const bounded = f.more || !f.complete;
     body = (
       <>
@@ -268,6 +270,11 @@ export function FindInSession({
         {short ? (
           <p className="mb-1 text-[11px]" style={{ color: palette.warn }}>
             {short}
+          </p>
+        ) : null}
+        {unsearched ? (
+          <p className="mb-1 text-[11px]" style={{ color: palette.muted }}>
+            {unsearched}
           </p>
         ) : null}
         <HitList hits={f.hits} onJump={onJump} label="Matches" />

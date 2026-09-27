@@ -82,6 +82,7 @@ use super::transcript_model::{
     build, IdSource, Line, MessageKind, Seed, TranscriptMessage, TranscriptPage, WindowStart,
 };
 use super::transcript_skim;
+use crate::remote::privacy::{self, Matching};
 
 /// The most bytes of records a page holds.
 ///
@@ -1235,6 +1236,13 @@ pub struct TranscriptFind {
 /// holding it with an ordinary [`PageAnchor::Cursor`] -- the cursor's
 /// digest guards it against a rewrite exactly as a page's own does.
 ///
+/// `matching` says which text `query` is matched against (#1519): the
+/// real text for the desktop's window, the masked text for a phone --
+/// so a phone's query can only hit what it could see, and a hit or a
+/// miss says nothing about a secret. Masked, each string is masked
+/// WHOLE before it is matched and clipped to a snippet, so a snippet's
+/// clip can never cut a secret short of its recognisable shape.
+///
 /// # Errors
 ///
 /// Only when the file cannot be opened, sized, sought or read.
@@ -1242,20 +1250,23 @@ pub fn find(
     path: &Path,
     query: Option<&str>,
     limit: Option<usize>,
+    matching: Matching,
 ) -> Result<TranscriptFind, String> {
-    find_until(path, query, limit, Instant::now() + FIND_DEADLINE)
+    find_until(path, query, limit, matching, Instant::now() + FIND_DEADLINE)
 }
 
 pub(crate) fn find_until(
     path: &Path,
     query: Option<&str>,
     limit: Option<usize>,
+    matching: Matching,
     deadline: Instant,
 ) -> Result<TranscriptFind, String> {
     let limit = limit.unwrap_or(FIND_HITS).clamp(1, FIND_HITS);
     let needle = query
         .map(|q| q.replace("\r\n", "\n").trim().to_lowercase())
-        .filter(|q| !q.is_empty());
+        .filter(|q| !q.is_empty())
+        .map(|q| Needle::new(&q, matching));
     let mut r = Reader::open(path)?;
     let boundary = r.boundary_end()?;
     let mut fwd = Forward {
@@ -1397,38 +1408,101 @@ fn strings_in<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) {
     }
 }
 
+/// A find's query, prepared once per find rather than once per record.
+struct Needle {
+    /// The query, lowercased, as chars.
+    want: Vec<char>,
+    matching: Matching,
+    /// Masked, and the query could match inside a marker: every string
+    /// must be masked to be matched, not only those it occurs in.
+    marker_reach: bool,
+}
+
+impl Needle {
+    fn new(lower: &str, matching: Matching) -> Needle {
+        Needle {
+            want: lower.chars().collect(),
+            matching,
+            marker_reach: matching == Matching::Masked
+                && privacy::needle_could_touch_a_marker(lower),
+        }
+    }
+}
+
 /// The first match of `needle` (already lowercase) in the record's
 /// text, with [`FIND_CONTEXT_CHARS`] either side; `None` when it has none.
-fn snippet_in(v: &serde_json::Value, needle: &str) -> Option<String> {
-    let want: Vec<char> = needle.chars().collect();
+///
+/// [`Matching::Masked`] matches each string as `privacy::mask_text`
+/// leaves it, and the snippet is cut from that masked string. Only the
+/// strings the needle occurs in are masked, unless the needle could
+/// match inside a marker itself: masking elsewhere in a string cannot
+/// create an occurrence that was not there
+/// ([`privacy::needle_could_touch_a_marker`] argues it), so the cost of
+/// masking follows the matches rather than the file.
+fn snippet_in(v: &serde_json::Value, needle: &Needle) -> Option<String> {
+    let Needle {
+        want,
+        matching,
+        marker_reach,
+    } = needle;
     let mut texts = Vec::new();
     texts_of(v, &mut texts);
     for t in texts {
         let normal = t.replace("\r\n", "\n");
-        // Char by char, lowercased one to one, so an index into `lower`
-        // is an index into `chars` whatever the script.
-        let chars: Vec<char> = normal.chars().collect();
-        if want.len() > chars.len() {
-            continue;
-        }
-        let lower: Vec<char> = chars
-            .iter()
-            .map(|c| c.to_lowercase().next().unwrap_or(*c))
-            .collect();
-        if let Some(i) = lower.windows(want.len()).position(|w| w == want.as_slice()) {
-            let from = i.saturating_sub(FIND_CONTEXT_CHARS);
-            let to = (i + want.len() + FIND_CONTEXT_CHARS).min(chars.len());
-            let mut s = one_line(&chars[from..to].iter().collect::<String>());
-            if from > 0 {
-                s.insert(0, '…');
+        let found = snippet_of(&normal, want);
+        match matching {
+            Matching::Unmasked => {
+                if found.is_some() {
+                    return found;
+                }
             }
-            if to < chars.len() {
-                s.push('…');
+            Matching::Masked => {
+                if found.is_none() && !marker_reach {
+                    continue;
+                }
+                match privacy::mask_text(&normal) {
+                    // Nothing hidden: the real text is the masked text.
+                    (_, 0) => {
+                        if found.is_some() {
+                            return found;
+                        }
+                    }
+                    (masked, _) => {
+                        if let Some(s) = snippet_of(&masked, want) {
+                            return Some(s);
+                        }
+                    }
+                }
             }
-            return Some(s);
         }
     }
     None
+}
+
+/// The first match of `want` (lowercase) in `text`, with
+/// [`FIND_CONTEXT_CHARS`] either side.
+fn snippet_of(text: &str, want: &[char]) -> Option<String> {
+    // Char by char, lowercased one to one, so an index into `lower`
+    // is an index into `chars` whatever the script.
+    let chars: Vec<char> = text.chars().collect();
+    if want.len() > chars.len() {
+        return None;
+    }
+    let lower: Vec<char> = chars
+        .iter()
+        .map(|c| c.to_lowercase().next().unwrap_or(*c))
+        .collect();
+    let i = lower.windows(want.len()).position(|w| w == want)?;
+    let from = i.saturating_sub(FIND_CONTEXT_CHARS);
+    let to = (i + want.len() + FIND_CONTEXT_CHARS).min(chars.len());
+    let mut s = one_line(&chars[from..to].iter().collect::<String>());
+    if from > 0 {
+        s.insert(0, '…');
+    }
+    if to < chars.len() {
+        s.push('…');
+    }
+    Some(s)
 }
 
 fn one_line(s: &str) -> String {
@@ -2058,7 +2132,7 @@ mod tests {
     fn a_find_without_a_query_lists_every_turn_opener() {
         let dir = tempfile::tempdir().unwrap();
         let p = write(dir.path(), "t.jsonl", &conversation(30));
-        let found = find(&p, None, None).unwrap();
+        let found = find(&p, None, None, Matching::Unmasked).unwrap();
         assert!(found.complete);
         assert!(!found.more);
         let ids: Vec<&str> = found.hits.iter().map(|h| h.message_id.as_str()).collect();
@@ -2093,13 +2167,13 @@ mod tests {
         let mut recs = conversation(3);
         recs.push(result("rx", "t2", "a line with Needle in it"));
         let p = write(dir.path(), "t.jsonl", &recs);
-        let found = find(&p, Some("needle"), None).unwrap();
+        let found = find(&p, Some("needle"), None, Matching::Unmasked).unwrap();
         assert_eq!(found.hits.len(), 1);
         assert_eq!(found.hits[0].message_id, "rx");
         assert!(!found.hits[0].opener);
         assert_eq!(found.hits[0].snippet, "a line with Needle in it");
 
-        let prompts = find(&p, Some("PROMPT 1"), None).unwrap();
+        let prompts = find(&p, Some("PROMPT 1"), None, Matching::Unmasked).unwrap();
         assert_eq!(
             prompts
                 .hits
@@ -2108,7 +2182,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["u1"]
         );
-        assert!(find(&p, Some("absent words"), None)
+        assert!(find(&p, Some("absent words"), None, Matching::Unmasked)
             .unwrap()
             .hits
             .is_empty());
@@ -2121,13 +2195,45 @@ mod tests {
     fn a_find_says_when_it_stopped_short() {
         let dir = tempfile::tempdir().unwrap();
         let p = write(dir.path(), "t.jsonl", &conversation(10));
-        let limited = find(&p, None, Some(4)).unwrap();
+        let limited = find(&p, None, Some(4), Matching::Unmasked).unwrap();
         assert_eq!(limited.hits.len(), 4);
         assert!(limited.more);
 
-        let stopped = find_until(&p, None, None, Instant::now()).unwrap();
+        let stopped = find_until(&p, None, None, Matching::Unmasked, Instant::now()).unwrap();
         assert!(!stopped.complete);
         assert!(stopped.hits.is_empty());
         assert!(stopped.scanned_to < stopped.file_bytes);
+    }
+
+    /// Masked matching (#1519) is held to the same two bounds: the hit
+    /// limit sets `more`, and a passed deadline keeps what was found --
+    /// including for a needle that reaches into a marker, the one case
+    /// that masks every string rather than only those it occurs in.
+    #[test]
+    fn a_masked_find_keeps_the_same_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recs = conversation(10);
+        recs.push(user("sx", "token sk-ant-api03-AAAAbbbbCCCCddddEEEE0000"));
+        let p = write(dir.path(), "t.jsonl", &recs);
+        let limited = find(&p, Some("prompt"), Some(4), Matching::Masked).unwrap();
+        assert_eq!(limited.hits.len(), 4);
+        assert!(limited.more);
+
+        for needle in ["prompt", "hidden"] {
+            let stopped =
+                find_until(&p, Some(needle), None, Matching::Masked, Instant::now()).unwrap();
+            assert!(!stopped.complete, "{needle}");
+            assert!(stopped.hits.is_empty(), "{needle}");
+        }
+        let whole = find(&p, Some("hidden"), None, Matching::Masked).unwrap();
+        assert!(whole.complete);
+        assert_eq!(
+            whole
+                .hits
+                .iter()
+                .map(|h| h.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sx"]
+        );
     }
 }

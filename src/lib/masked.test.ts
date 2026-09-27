@@ -9,6 +9,7 @@ import {
   MASK_LABELS,
   maskingNote,
   splitMasked,
+  unsearchedNote,
 } from "./masked";
 
 describe("splitMasked", () => {
@@ -40,6 +41,17 @@ describe("splitMasked", () => {
     expect(maskingNote({ ...m, hidden: 0 })).toBeNull();
     expect(maskingNote({ ...m, revealed: true })).toBeNull();
     expect(maskingNote(undefined)).toBeNull();
+  });
+
+  it("says hidden text was not searched only when the query was matched masked", () => {
+    const m = { hidden: 0, revealed: false, reveal_allowed: false, withheld: false };
+    expect(unsearchedNote({ ...m, matched_masked: true })).toBe(
+      "Text hidden as a likely secret was not searched.",
+    );
+    expect(unsearchedNote({ ...m, matched_masked: false })).toBeNull();
+    // A desktop from before #1519 sends no flag: nothing is claimed.
+    expect(unsearchedNote(m)).toBeNull();
+    expect(unsearchedNote(undefined)).toBeNull();
   });
 
   it("labels every kind", () => {
