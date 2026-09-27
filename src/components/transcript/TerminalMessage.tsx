@@ -68,9 +68,10 @@ export interface TerminalEnv {
   density: TranscriptDensity;
   onLoadFullText?: LoadFullText;
   onOpenSubagent?: OpenSubagent;
-  /// Read the page before the oldest held (#1476), for a result whose
-  /// call is earlier. Absent when nothing earlier exists.
-  onLoadEarlier?: () => void;
+  /// Page back until the call a result answers is held (#1476, #1484):
+  /// `toolUseId` names it, `null` when the result did not record one.
+  /// Absent when nothing earlier exists.
+  onLoadEarlier?: (toolUseId: string | null) => void;
   /// Every message the viewer holds, read when a turn is copied -- on
   /// click, never on render.
   messages: () => readonly TranscriptMessage[];

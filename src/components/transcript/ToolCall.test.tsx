@@ -183,6 +183,8 @@ describe("result states", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: "Load earlier messages" }));
     expect(onLoadEarlier).toHaveBeenCalledOnce();
+    // With the call it answers named, so the host pages back until it is held (#1484).
+    expect(onLoadEarlier).toHaveBeenCalledWith("toolu_1");
   });
 
   it("says an unkeyed call cannot be matched", () => {

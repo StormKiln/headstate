@@ -26,9 +26,10 @@ export function ToolResultOrphan({
   variant: ToolVariant;
   onLoadFullText?: LoadFullText;
   onOpenSubagent?: OpenSubagent;
-  /// Page back to the call. Omitted when there is nothing earlier to
-  /// load, so no button is offered that cannot work.
-  onLoadEarlier?: () => void;
+  /// Page back until the call is held, not one page per click (#1484).
+  /// Omitted when there is nothing earlier to load, so no button is
+  /// offered that cannot work.
+  onLoadEarlier?: (toolUseId: string | null) => void;
 }) {
   const error = block.is_error === true;
   const clipped = isClipped(block.clip);
@@ -49,7 +50,7 @@ export function ToolResultOrphan({
               type="button"
               className="underline focus-visible:outline focus-visible:outline-2"
               style={{ color: palette.link }}
-              onClick={onLoadEarlier}
+              onClick={() => onLoadEarlier(block.tool_use_id)}
             >
               Load earlier messages
             </button>

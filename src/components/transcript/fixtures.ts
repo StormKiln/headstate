@@ -116,6 +116,8 @@ export function liveOf(
     jumpToLatest: () => undefined,
     refresh: () => Promise.resolve(),
     setViewport: () => undefined,
+    seek: () => Promise.resolve(true),
+    loadOlderUntil: () => Promise.resolve(false),
     ...over,
   };
 }

@@ -384,3 +384,42 @@ export interface SessionActivity {
   size: number;
   seq: number;
 }
+
+/** @public */
+/// One message a find located (#1484). Mirrors
+/// `claude::transcript_page::FindHit`.
+///
+/// `cursor` reads the page starting at the message:
+/// `{ kind: "cursor", ...hit.cursor }`, `"after"`. A result record's id
+/// is its own, although the merge absorbs it into its call.
+export interface FindHit {
+  message_id: string;
+  cursor: PageCursor;
+  timestamp: string | null;
+  /// The text around the match, or an opener's first text.
+  snippet: string;
+  /// A prompt, slash command or shell input: a turn opener.
+  opener: boolean;
+}
+
+/** @public */
+/// What a find over one whole transcript located (#1484). Mirrors
+/// `claude::transcript_page::TranscriptFind`.
+///
+/// Both bounds say so: `more` when the hit limit was reached, and
+/// `complete: false` when the scan's deadline stopped it at
+/// `scanned_to`. Hits already found are kept either way.
+export interface TranscriptFind {
+  /// Oldest first.
+  hits: FindHit[];
+  more: boolean;
+  complete: boolean;
+  scanned_to: number;
+  file_bytes: number;
+  /// Records too large to hold, searched only in part.
+  skimmed_records: number;
+}
+
+/// A find as it reaches the webview: on a paired phone, with the masking
+/// summary the remote boundary attaches (#1488).
+export type RemoteTranscriptFind = TranscriptFind & { masking?: TranscriptMasking };

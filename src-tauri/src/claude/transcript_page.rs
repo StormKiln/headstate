@@ -79,7 +79,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::{Deserialize, Serialize};
 
 use super::transcript_model::{
-    build, Line, MessageKind, Seed, TranscriptMessage, TranscriptPage, WindowStart,
+    build, IdSource, Line, MessageKind, Seed, TranscriptMessage, TranscriptPage, WindowStart,
 };
 use super::transcript_skim;
 
@@ -1176,6 +1176,274 @@ fn counts_as_message(line: &Line, calls: &mut std::collections::HashSet<String>)
     !absorbed
 }
 
+// ---------------------------------------------------------------------
+// Finding messages in the whole file (#1484)
+// ---------------------------------------------------------------------
+
+/// The most hits one find returns, and the default `limit`.
+pub const FIND_HITS: usize = 500;
+
+/// The most one find may take before it keeps what it found.
+///
+/// A find streams the whole file, as the position index does, and is
+/// bounded the same way: past the deadline it answers with what it
+/// found (partial is not nothing) and says how far it got.
+pub const FIND_DEADLINE: Duration = Duration::from_secs(8);
+
+/// How much text either side of a match a snippet keeps.
+const FIND_CONTEXT_CHARS: usize = 60;
+
+/// One message a find located: where it is, and enough to name it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindHit {
+    /// The message's id, as a page read gives it. A result record's id
+    /// is its own even though a merge absorbs it into its call.
+    pub message_id: String,
+    /// The record's start, handed back as a page anchor to read from it.
+    pub cursor: PageCursor,
+    pub timestamp: Option<String>,
+    /// The text around the match, or an opener's first text.
+    pub snippet: String,
+    /// The message opens a turn: a prompt, slash command or shell input.
+    pub opener: bool,
+}
+
+/// What a find over the whole file located.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptFind {
+    /// Oldest first.
+    pub hits: Vec<FindHit>,
+    /// The hit limit was reached: more matches may exist after the last.
+    pub more: bool,
+    /// The scan reached the end of the file. `false` when the deadline
+    /// stopped it: nothing after `scanned_to` was looked at.
+    pub complete: bool,
+    /// Where the scan stopped, a record boundary.
+    pub scanned_to: u64,
+    pub file_bytes: u64,
+    /// Records too large to hold, searched only in the part a skim kept.
+    pub skimmed_records: usize,
+}
+
+/// Find messages in `path`: every turn opener when `query` is `None`
+/// (the outline), otherwise every message whose text contains `query`,
+/// ignoring case.
+///
+/// Streams the file record by record, holding one at a time, bounded by
+/// `limit` hits (clamped to [`FIND_HITS`]) and [`FIND_DEADLINE`]. Each
+/// hit carries a cursor at its record, so the caller reads the page
+/// holding it with an ordinary [`PageAnchor::Cursor`] -- the cursor's
+/// digest guards it against a rewrite exactly as a page's own does.
+///
+/// # Errors
+///
+/// Only when the file cannot be opened, sized, sought or read.
+pub fn find(
+    path: &Path,
+    query: Option<&str>,
+    limit: Option<usize>,
+) -> Result<TranscriptFind, String> {
+    find_until(path, query, limit, Instant::now() + FIND_DEADLINE)
+}
+
+pub(crate) fn find_until(
+    path: &Path,
+    query: Option<&str>,
+    limit: Option<usize>,
+    deadline: Instant,
+) -> Result<TranscriptFind, String> {
+    let limit = limit.unwrap_or(FIND_HITS).clamp(1, FIND_HITS);
+    let needle = query
+        .map(|q| q.replace("\r\n", "\n").trim().to_lowercase())
+        .filter(|q| !q.is_empty());
+    let mut r = Reader::open(path)?;
+    let boundary = r.boundary_end()?;
+    let mut fwd = Forward {
+        start: 0,
+        buf: Vec::new(),
+    };
+    let mut out = TranscriptFind {
+        hits: Vec::new(),
+        more: false,
+        complete: false,
+        scanned_to: 0,
+        file_bytes: r.size,
+        skimmed_records: 0,
+    };
+    loop {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let Some(line) = fwd.next_line(&mut r, boundary)? else {
+            out.complete = true;
+            break;
+        };
+        // One record held at a time; the bound is per record.
+        r.held = 0;
+        out.scanned_to = fwd.start;
+        if !line.may_render() {
+            continue;
+        }
+        if line.oversized.is_some() {
+            out.skimmed_records += 1;
+        }
+        let Some(v) = &line.value else { continue };
+        let found = match &needle {
+            Some(n) => match snippet_in(v, n) {
+                Some(s) => Some(s),
+                None => continue,
+            },
+            // Only a user record can open a turn.
+            None if v.get("type").and_then(|t| t.as_str()) == Some("user") => None,
+            None => continue,
+        };
+        let Some(at) = line.offset else { continue };
+        let page = build(std::slice::from_ref(&line), Seed::default(), Some(path));
+        let Some(m) = page
+            .messages
+            .into_iter()
+            .find(|m| m.id_source != IdSource::Derived)
+        else {
+            continue;
+        };
+        let opener = m.turn_id.as_deref() == Some(m.id.as_str()) && !m.is_meta && !m.is_sidechain;
+        if needle.is_none() && !opener {
+            continue;
+        }
+        if out.hits.len() == limit {
+            out.more = true;
+            break;
+        }
+        let snippet = found.unwrap_or_else(|| opener_text(&m));
+        out.hits.push(FindHit {
+            message_id: m.id,
+            cursor: PageCursor {
+                offset: at,
+                behind_digest: r.digest_behind(at)?,
+            },
+            timestamp: m.timestamp,
+            snippet,
+            opener,
+        });
+    }
+    if out.complete {
+        out.scanned_to = boundary;
+    }
+    Ok(out)
+}
+
+/// What an opener says, in one line: its first text, or the command.
+fn opener_text(m: &TranscriptMessage) -> String {
+    use super::transcript_model::TranscriptBlock;
+    let text = m.blocks.iter().find_map(|b| match b {
+        TranscriptBlock::Text { text, .. } => Some(text.as_str()),
+        _ => None,
+    });
+    let s = match (&m.kind, text) {
+        (MessageKind::SlashCommand { name }, Some(t)) => format!("{name} {t}"),
+        (MessageKind::SlashCommand { name }, None) => name.clone(),
+        (MessageKind::ShellInput { command }, _) => format!("! {command}"),
+        (_, Some(t)) => t.to_owned(),
+        (_, None) => String::new(),
+    };
+    clip_chars(&one_line(&s), 2 * FIND_CONTEXT_CHARS)
+}
+
+/// The text of a record a person could read: prompt and reply text,
+/// thinking, tool arguments and tool output -- each string separately,
+/// so a match never spans two of them.
+fn texts_of<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+    match v.get("message").and_then(|m| m.get("content")) {
+        Some(serde_json::Value::String(s)) => out.push(s),
+        Some(serde_json::Value::Array(items)) => {
+            for b in items {
+                for key in ["text", "thinking"] {
+                    if let Some(s) = b.get(key).and_then(|s| s.as_str()) {
+                        out.push(s);
+                    }
+                }
+                if let Some(input) = b.get("input") {
+                    strings_in(input, out);
+                }
+                match b.get("content") {
+                    Some(serde_json::Value::String(s)) => out.push(s),
+                    Some(serde_json::Value::Array(parts)) => {
+                        for p in parts {
+                            if let Some(s) = p.get("text").and_then(|s| s.as_str()) {
+                                out.push(s);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    // System records and summaries carry their text at the top level.
+    for key in ["content", "summary"] {
+        if let Some(s) = v.get(key).and_then(|s| s.as_str()) {
+            out.push(s);
+        }
+    }
+}
+
+fn strings_in<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+    match v {
+        serde_json::Value::String(s) => out.push(s),
+        serde_json::Value::Array(a) => a.iter().for_each(|x| strings_in(x, out)),
+        serde_json::Value::Object(o) => o.values().for_each(|x| strings_in(x, out)),
+        _ => {}
+    }
+}
+
+/// The first match of `needle` (already lowercase) in the record's
+/// text, with [`FIND_CONTEXT_CHARS`] either side; `None` when it has none.
+fn snippet_in(v: &serde_json::Value, needle: &str) -> Option<String> {
+    let want: Vec<char> = needle.chars().collect();
+    let mut texts = Vec::new();
+    texts_of(v, &mut texts);
+    for t in texts {
+        let normal = t.replace("\r\n", "\n");
+        // Char by char, lowercased one to one, so an index into `lower`
+        // is an index into `chars` whatever the script.
+        let chars: Vec<char> = normal.chars().collect();
+        if want.len() > chars.len() {
+            continue;
+        }
+        let lower: Vec<char> = chars
+            .iter()
+            .map(|c| c.to_lowercase().next().unwrap_or(*c))
+            .collect();
+        if let Some(i) = lower.windows(want.len()).position(|w| w == want.as_slice()) {
+            let from = i.saturating_sub(FIND_CONTEXT_CHARS);
+            let to = (i + want.len() + FIND_CONTEXT_CHARS).min(chars.len());
+            let mut s = one_line(&chars[from..to].iter().collect::<String>());
+            if from > 0 {
+                s.insert(0, '…');
+            }
+            if to < chars.len() {
+                s.push('…');
+            }
+            return Some(s);
+        }
+    }
+    None
+}
+
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn clip_chars(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        return s.to_owned();
+    }
+    let mut out: String = s.chars().take(n).collect();
+    out.push('…');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1781,5 +2049,85 @@ mod tests {
             "{} is stale: regenerate it with HEADSTATE_WRITE_GOLDEN=1",
             at.display()
         );
+    }
+
+    /// #1484: with no query, a find is the outline -- every turn opener
+    /// in the file, oldest first, each with a cursor that reads the page
+    /// starting at it.
+    #[test]
+    fn a_find_without_a_query_lists_every_turn_opener() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), "t.jsonl", &conversation(30));
+        let found = find(&p, None, None).unwrap();
+        assert!(found.complete);
+        assert!(!found.more);
+        let ids: Vec<&str> = found.hits.iter().map(|h| h.message_id.as_str()).collect();
+        let want: Vec<String> = (0..30).map(|t| format!("u{t}")).collect();
+        assert_eq!(ids, want.iter().map(String::as_str).collect::<Vec<_>>());
+        assert!(found.hits.iter().all(|h| h.opener));
+        assert_eq!(found.hits[7].snippet, "prompt 7");
+
+        // The cursor is an ordinary page anchor: the page after it
+        // starts with the hit.
+        let h = &found.hits[7];
+        let w = read_page(
+            &p,
+            &PageAnchor::Cursor {
+                offset: h.cursor.offset,
+                behind_digest: h.cursor.behind_digest.clone(),
+            },
+            PageDirection::After,
+            None,
+            IndexUse::None,
+        )
+        .unwrap();
+        assert!(!w.rewritten);
+        assert_eq!(w.page.messages[0].id, "u7");
+    }
+
+    /// A query matches any readable text -- here a tool result -- case
+    /// insensitively, and the snippet shows the match in context.
+    #[test]
+    fn a_find_with_a_query_matches_text_anywhere_ignoring_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recs = conversation(3);
+        recs.push(result("rx", "t2", "a line with Needle in it"));
+        let p = write(dir.path(), "t.jsonl", &recs);
+        let found = find(&p, Some("needle"), None).unwrap();
+        assert_eq!(found.hits.len(), 1);
+        assert_eq!(found.hits[0].message_id, "rx");
+        assert!(!found.hits[0].opener);
+        assert_eq!(found.hits[0].snippet, "a line with Needle in it");
+
+        let prompts = find(&p, Some("PROMPT 1"), None).unwrap();
+        assert_eq!(
+            prompts
+                .hits
+                .iter()
+                .map(|h| h.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["u1"]
+        );
+        assert!(find(&p, Some("absent words"), None)
+            .unwrap()
+            .hits
+            .is_empty());
+    }
+
+    /// Bounded both ways, and each bound says so: the hit limit sets
+    /// `more`, and a deadline that has passed keeps what was found and
+    /// reports the scan incomplete rather than failing.
+    #[test]
+    fn a_find_says_when_it_stopped_short() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), "t.jsonl", &conversation(10));
+        let limited = find(&p, None, Some(4)).unwrap();
+        assert_eq!(limited.hits.len(), 4);
+        assert!(limited.more);
+
+        let stopped = find_until(&p, None, None, Instant::now()).unwrap();
+        assert!(!stopped.complete);
+        assert!(stopped.hits.is_empty());
+        assert!(stopped.scanned_to < stopped.file_bytes);
     }
 }

@@ -62,6 +62,20 @@ vi.mock("@/api/tauri", async (importOriginal) => ({
   claudeTranscriptPage: pageRead,
 }));
 
+/// What the host hands pending reconciliation (#1491), per render.
+const reconciled = vi.hoisted(() => ({ lists: [] as (readonly { id: string }[])[] }));
+vi.mock("../usePendingMessages", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../usePendingMessages")>();
+  return {
+    ...real,
+    usePendingMessages: (messages: readonly TranscriptMessage[]) => {
+      reconciled.lists.push(messages);
+      return real.usePendingMessages(messages);
+    },
+  };
+});
+const { useFilters } = await import("@/store/filters");
+
 /// A whole transcript as one page, the masking where the remote boundary
 /// puts it: on the answer, not the page.
 function windowOf(p: RemoteTranscriptPage): RemoteTranscriptWindow {
@@ -271,6 +285,45 @@ describe("paging on the phone (#1476)", () => {
     });
     expect(screen.queryByText(/Result of a call in an earlier part/)).toBeNull();
     expect(screen.queryByRole("button", { name: "Load earlier messages" })).toBeNull();
+  });
+});
+
+describe("navigation on the phone (#1484)", () => {
+  it("filters change what is drawn, not what pending reconciles against, and never unmount the viewer (#1490)", async () => {
+    useFilters.setState({ transcriptShow: { system: false } });
+    try {
+      reconciled.lists = [];
+      const { container } = await show({
+        data: page([msg("m1", { is_meta: true }), msg("m2", { is_meta: true })]),
+      });
+      expect(reconciled.lists.at(-1)?.map((m) => m.id)).toEqual(["m1", "m2"]);
+      expect(screen.getByTestId("all-hidden")).toBeTruthy();
+      expect(container.querySelector('[data-slot="transcript-viewer"]')).toBeTruthy();
+      expect(container.querySelector('[data-slot="transcript-composer"]')).toBeTruthy();
+    } finally {
+      useFilters.setState({ transcriptShow: {} });
+    }
+  });
+
+  it("moves between prompts with buttons, and offers turns, find and options in sheets", async () => {
+    const messages = Array.from({ length: 12 }, (_, i) => msg(`u${i}`));
+    await show({ data: page(messages) });
+    const firstShown = () =>
+      shim.rows().find((r) => shim.rowTop(r.dataset.messageId!) >= -1)!.dataset.messageId!;
+    const before = Number(firstShown().slice(1));
+    fireEvent.click(screen.getByRole("button", { name: "↑ Previous prompt" }));
+    await shim.flush();
+    expect(Number(firstShown().slice(1))).toBe(before - 1);
+    fireEvent.click(screen.getByRole("button", { name: "↓ Next prompt" }));
+    await shim.flush();
+    expect(Number(firstShown().slice(1))).toBe(before);
+    for (const name of ["Turns", "Find", "Options"]) {
+      expect(screen.getByRole("button", { name }).getAttribute("aria-haspopup")).toBe("dialog");
+    }
+    fireEvent.click(screen.getByRole("button", { name: "Options" }));
+    await shim.flush();
+    expect(screen.getByRole("checkbox", { name: "Thinking" })).toBeTruthy();
+    expect(screen.getByTestId("export-controls")).toBeTruthy();
   });
 });
 

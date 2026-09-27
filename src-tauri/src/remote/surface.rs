@@ -567,6 +567,13 @@ pub const SURFACE: &[(&str, Class)] = &[
     // last consumer, and the paged viewer reads only these two.
     ("claude_transcript_block_text", Class::Read),
     ("claude_transcript_page", Class::Read),
+    // Find messages anywhere in that transcript: the turn outline, or
+    // the messages whose text holds a query (#1484). `Read` on the same
+    // grounds, and bounded inside the command however large the file:
+    // one record held at a time, at most `FIND_HITS` hits, and a
+    // deadline past which it answers with what it found. Its snippets
+    // are masked at the boundary like any page (`privacy.rs`).
+    ("claude_transcript_find", Class::Read),
     // Whether the Claude Code hooks are in `~/.claude/settings.json`
     // (#915).
     //
@@ -1258,6 +1265,12 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             a.get("limit")?,
         )
         .await),
+        "claude_transcript_find" => {
+            res(
+                commands::claude_transcript_find(a.get("path")?, a.get("query")?, a.get("limit")?)
+                    .await,
+            )
+        }
         "claude_hooks_inventory" => res(commands::claude_hooks_inventory()),
         "claude_effective_settings" => {
             res(commands::claude_effective_settings(a.get("repoPath")?).await)

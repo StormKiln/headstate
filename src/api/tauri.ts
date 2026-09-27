@@ -75,6 +75,7 @@ import type {
   RepoFile,
 } from "../types/pr";
 import type {
+  RemoteTranscriptFind,
   RemoteTranscriptWindow,
   TranscriptBlockText,
   TranscriptPageAnchor,
@@ -1495,6 +1496,29 @@ export const claudeTranscriptPage = (
     reveal
       ? { path, anchor, direction, limit, reveal: true }
       : { path, anchor, direction, limit },
+  );
+
+/// Find messages anywhere in one transcript (#1484): the turn outline
+/// when `query` is `null`, otherwise every message whose text holds it,
+/// ignoring case. Each hit's `cursor` reads the page starting at it
+/// through `claudeTranscriptPage` (`{ kind: "cursor", ...hit.cursor }`,
+/// `"after"`).
+///
+/// Not `claudeSearchTranscripts`: that searches the corpus index, one
+/// row per session from each file's first 8 MB, and names sessions, not
+/// messages. Bounded inside the command -- `more` and `complete` say
+/// when a bound stopped it -- and masked for a phone like a page.
+///
+/// `reveal` as `claudeTranscriptPage`: sent only when true.
+export const claudeTranscriptFind = (
+  path: string,
+  query: string | null,
+  limit: number | null,
+  reveal = false,
+) =>
+  call<RemoteTranscriptFind>(
+    "claude_transcript_find",
+    reveal ? { path, query, limit, reveal: true } : { path, query, limit },
   );
 
 // ---------------------------------------------------------------------

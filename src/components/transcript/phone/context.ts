@@ -21,10 +21,11 @@ export interface PhoneTranscriptContext {
   thinkingStarts: ReadonlyMap<string, string>;
   onLoadFullText?: LoadFullText;
   onOpenSubagent?: OpenSubagent;
-  /// Read the page before the oldest held (#1476): offered on a result
-  /// whose call is earlier than what is held. Absent when nothing earlier
-  /// exists, so no button is offered that cannot work.
-  onLoadEarlier?: () => void;
+  /// Page back until the call a result answers is held (#1476, #1484):
+  /// offered on a result whose call is earlier than what is held. Absent
+  /// when nothing earlier exists, so no button is offered that cannot
+  /// work.
+  onLoadEarlier?: (toolUseId: string | null) => void;
 }
 
 export const PhoneContext = createContext<PhoneTranscriptContext | null>(null);

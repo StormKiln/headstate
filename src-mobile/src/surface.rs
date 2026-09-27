@@ -327,6 +327,9 @@ pub const SURFACE: &[(&str, Class)] = &[
     // and for the three transcript commands #1514 retired.
     ("claude_transcript_block_text", Class::Read),
     ("claude_transcript_page", Class::Read),
+    // Find messages anywhere in that transcript (#1484). Read on the
+    // same grounds, bounded inside the command; see the desktop copy.
+    ("claude_transcript_find", Class::Read),
     // Whether the DESKTOP's hooks are installed (#915). Read: one file
     // read, no side effects, and "is that desktop recording?" is a real
     // away-from-desk question.

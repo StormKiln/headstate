@@ -6577,6 +6577,37 @@ pub async fn claude_transcript_page(
     .map_err(|e| e.to_string())?
 }
 
+/// Find messages anywhere in ONE transcript (#1484): the turn outline
+/// when `query` is null, otherwise every message whose text contains it.
+///
+/// Not `claude_search_transcripts`, which answers a different question:
+/// it searches the corpus index, one row per SESSION built from the
+/// first 8 MB of each file, and returns sessions and snippets -- no
+/// message ids, and nothing past the 8 MB bound. The viewer needs the
+/// message, anywhere in a file of any size, so this streams the one
+/// file. Each hit carries a page cursor at its record, so the viewer
+/// reads the page holding it with `claude_transcript_page`.
+///
+/// `Class::Read` on `claude_transcript_page`'s grounds: one `.jsonl`
+/// through the `claude_transcript_path` guard, nothing written. Bounded
+/// inside the command whatever the caller asks: one record held at a
+/// time, at most `transcript_page::FIND_HITS` hits, and
+/// `transcript_page::FIND_DEADLINE` of scanning, past which it answers
+/// with what it found and says where it stopped.
+#[tauri::command]
+pub async fn claude_transcript_find(
+    path: String,
+    query: Option<String>,
+    limit: Option<usize>,
+) -> Result<crate::claude::transcript_page::TranscriptFind, String> {
+    let p = claude_transcript_path(&path)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::claude::transcript_page::find(&p, query.as_deref(), limit)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 // ---------------------------------------------------------------------
 // The repository browser (#1030-#1036, epic #1011). Rust side:
 // `repos/mod.rs`, where the git-index listing, the 256 KB bound and the

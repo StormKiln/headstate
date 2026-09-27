@@ -121,6 +121,10 @@ pub const TRANSCRIPT_TEXT: &[(&str, Carries)] = &[
     // (#1220). Whole: every message string is transcript text. Its
     // `start`/`end` cursors round-trip through `behind_digest` below.
     ("claude_transcript_page", Carries::Whole),
+    // A find in one transcript (#1484): its snippets are transcript
+    // text. Each hit's `cursor` round-trips unread (`OPAQUE_KEYS`) as a
+    // page anchor, and its `message_id` is an id.
+    ("claude_transcript_find", Carries::Whole),
     // The first thing the user typed (#1133), clamped to 300 characters
     // -- still a place a pasted token lands.
     ("claude_sessions", Carries::Fields(&["opening_prompt"])),

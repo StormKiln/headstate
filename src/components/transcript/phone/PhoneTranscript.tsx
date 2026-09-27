@@ -8,7 +8,7 @@ import { maskingNote } from "@/lib/masked";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { isRevealOff, isTranscriptsOff } from "@/lib/transcriptAccess";
 import { usePullToRefresh } from "@/lib/usePullToRefresh";
-import type { Liveness } from "../../../types/pr";
+import type { ClaudeWaiting, Liveness } from "../../../types/pr";
 import type { TranscriptMessage, TranscriptSubagent } from "../../../types/transcript";
 import { Composer } from "../Composer";
 import { subagentLiveness } from "../header";
@@ -18,7 +18,21 @@ import { transcriptStreaming } from "../streaming";
 import { FollowStatus } from "../FollowStatus";
 import { deriveTaskChecklist, taskSummary } from "../tasks";
 import { TaskChecklist } from "../TaskChecklist";
-import { TranscriptViewer } from "../TranscriptViewer";
+import {
+  AwayCard,
+  ExportControls,
+  FindInSession,
+  ShowControls,
+  TurnOutline,
+  UnreadDivider,
+} from "../navigation";
+import {
+  useJumps,
+  useOpenedMarker,
+  useShown,
+  useSinceYouLeft,
+} from "../useNavigation";
+import { TranscriptViewer, type TranscriptViewerHandle } from "../TranscriptViewer";
 import type { LoadFullText } from "../types";
 import { usePendingMessages } from "../usePendingMessages";
 import { PhoneContext, type PhoneTranscriptContext } from "./context";
@@ -45,6 +59,7 @@ const renderPhonePending = (p: PendingMessage) => <PhonePendingMessage pending={
 /// | the task list, in a sheet (#1504) | here |
 /// | pull to refresh | here |
 /// | Dynamic Type | `textScale.ts`, applied per row |
+/// | since you left, prompts, turns, find, show, export (#1484) | `../navigation.tsx`, in sheets |
 ///
 /// # The data (#1476)
 ///
@@ -81,6 +96,8 @@ export function PhoneTranscript({
   liveness,
   label = "Transcript",
   sessionId = null,
+  waiting,
+  openAt = "latest",
 }: {
   path: string;
   liveness: Liveness;
@@ -89,13 +106,21 @@ export function PhoneTranscript({
   /// activity nudge for it reads at once (#1477). Omitted for a
   /// subagent's transcript, which is not nudged.
   sessionId?: string | null;
+  /// For the "while you were away" card (#1484). Absent: not said.
+  waiting?: ClaudeWaiting;
+  /// Open at the newest turn, or at this device's "since you left"
+  /// marker -- a notification's tap (#1486, #1484).
+  openAt?: "latest" | "marker";
 }) {
+  const marker = useOpenedMarker(path);
+  const openAtId = openAt === "marker" ? (marker?.id ?? null) : null;
   const [reveal, setReveal] = useState(false);
   const revealed = useClaudeTranscriptLive(path, {
     liveness,
     reveal: true,
     enabled: reveal,
     sessionId,
+    openAt: openAtId,
   });
   // Refused or failed before it read anything: the masked text stays.
   const revealFailed =
@@ -106,6 +131,7 @@ export function PhoneTranscript({
     liveness,
     enabled: !reveal || revealFailed,
     sessionId,
+    openAt: openAtId,
   });
   const showingRevealed = reveal && revealed.messages !== undefined;
   const active = showingRevealed ? revealed : masked;
@@ -130,7 +156,20 @@ export function PhoneTranscript({
     (a) => claudeTranscriptBlockText(path, a.messageId, a.index, showingRevealed, a.offset),
     [path, showingRevealed],
   );
-  const onLoadEarlier = active.hasOlder ? active.loadOlder : undefined;
+  const loadOlderUntil = active.loadOlderUntil;
+  // Pages back until the call is held, not one page per tap (#1484).
+  const onLoadEarlier = useMemo(
+    () =>
+      active.hasOlder
+        ? (toolUseId: string | null) =>
+            void loadOlderUntil((m) =>
+              toolUseId === null
+                ? true
+                : m.blocks.some((b) => b.kind === "tool_call" && b.id === toolUseId),
+            )
+        : undefined,
+    [active.hasOlder, loadOlderUntil],
+  );
   const ctx = useMemo<PhoneTranscriptContext>(
     () => ({
       liveness,
@@ -169,6 +208,57 @@ export function PhoneTranscript({
     // Keyed like the viewport lookup: the wrapper mounts with the first
     // messages, not with this component.
   }, [hasMessages]);
+
+  const { show, messages: shown, hidden } = useShown(messages);
+  const since = useSinceYouLeft({
+    path,
+    marker,
+    messages,
+    shown,
+    hasOlder: active.hasOlder,
+    tasks: checklist,
+    waiting,
+  });
+  const [cardDismissed, setCardDismissed] = useState(false);
+  const handle = useRef<TranscriptViewerHandle>(null);
+  const jumps = useJumps({ live: active, messages, shown, handle });
+  const [sheet, setSheet] = useState<"turns" | "find" | "options" | null>(null);
+  const jumpTo = jumps.jumpTo;
+  const onHit = useCallback(
+    (h: { message_id: string; cursor: { offset: number; behind_digest: string } }) => {
+      setSheet(null);
+      jumpTo(h.message_id, h.cursor);
+    },
+    [jumpTo],
+  );
+  const dividerAt = since.dividerAt;
+  const renderMessage = useCallback(
+    (m: TranscriptMessage) =>
+      m.id === dividerAt ? (
+        <>
+          <UnreadDivider />
+          {renderPhoneMessage(m)}
+        </>
+      ) : (
+        renderPhoneMessage(m)
+      ),
+    [dividerAt],
+  );
+  // Opened from a notification: land on the first unread message once.
+  const landed = useRef(openAt !== "marker");
+  useEffect(() => {
+    if (landed.current || held === undefined) return;
+    landed.current = true;
+    if (dividerAt !== null) handle.current?.scrollTo(dividerAt);
+  }, [held, dividerAt]);
+  const goToMarker =
+    marker === null
+      ? undefined
+      : since.beforeHeld
+        ? () => jumps.jumpTo(marker.id, null)
+        : dividerAt !== null
+          ? () => void handle.current?.scrollTo(dividerAt)
+          : undefined;
 
   const summary = taskSummary(checklist);
   const note = maskingNote(masking);
@@ -219,10 +309,20 @@ export function PhoneTranscript({
     body = (
       <div ref={wrapRef} className="relative flex min-h-0 flex-1 flex-col">
         <PullIndicator state={pull} />
+        {/* Beside the viewer, never instead of it: the viewer keeps the
+            composer slot, pending rows and the live edge (#1490
+            constraint 3), whatever the Show settings hide. */}
+        {shown.length === 0 ? (
+          <p className="text-xs" style={{ color: palette.muted }} data-testid="all-hidden">
+            Everything loaded is hidden by the Show settings.
+          </p>
+        ) : null}
         <PhoneContext.Provider value={ctx}>
           <TranscriptViewer
-            messages={held}
-            renderMessage={renderPhoneMessage}
+            messages={shown}
+            renderMessage={renderMessage}
+            handle={handle}
+            onRead={since.onRead}
             streaming={transcriptStreaming(liveness)}
             label={label}
             onReachStart={active.loadOlder}
@@ -297,7 +397,81 @@ export function PhoneTranscript({
           ) : null}
         </div>
       ) : null}
+      {held !== undefined && held.length > 0 ? (
+        <div
+          role="group"
+          aria-label="Navigate the transcript"
+          className="flex flex-wrap items-center gap-2 text-xs"
+        >
+          <button
+            type="button"
+            onClick={() => jumps.step(-1)}
+            className="tap-target rounded-md border px-2"
+            style={{ borderColor: palette.border, color: palette.text }}
+          >
+            ↑ Previous prompt
+          </button>
+          <button
+            type="button"
+            onClick={() => jumps.step(1)}
+            className="tap-target rounded-md border px-2"
+            style={{ borderColor: palette.border, color: palette.text }}
+          >
+            ↓ Next prompt
+          </button>
+          {(["turns", "find", "options"] as const).map((k) => (
+            <button
+              key={k}
+              type="button"
+              aria-haspopup="dialog"
+              aria-expanded={sheet === k}
+              onClick={() => setSheet(k)}
+              className="tap-target rounded-md border px-2"
+              style={{ borderColor: palette.border, color: palette.text }}
+            >
+              {k === "turns"
+                ? "Turns"
+                : k === "find"
+                  ? "Find"
+                  : `Options${hidden > 0 ? ` · ${hidden.toLocaleString()} hidden` : ""}`}
+            </button>
+          ))}
+        </div>
+      ) : null}
+      {held !== undefined && !cardDismissed ? (
+        <AwayCard since={since} onGo={goToMarker} onDismiss={() => setCardDismissed(true)} />
+      ) : null}
+      {jumps.note !== null ? (
+        <p role="status" className="text-xs" style={{ color: palette.warn }}>
+          {jumps.note}
+        </p>
+      ) : null}
       {body}
+      <Sheet open={sheet !== null} onOpenChange={(o) => (o ? null : setSheet(null))}>
+        <SheetContent side="bottom" className="max-h-[85dvh] overflow-y-auto">
+          <SheetHeader>
+            <SheetTitle>
+              {sheet === "turns" ? "Turns" : sheet === "find" ? "Find in this session" : "Options"}
+            </SheetTitle>
+          </SheetHeader>
+          <div className="px-4 pb-4" style={scaleStyle(scale)}>
+            {sheet === "turns" ? (
+              <TurnOutline path={path} reveal={showingRevealed} onJump={onHit} />
+            ) : sheet === "find" ? (
+              <FindInSession path={path} reveal={showingRevealed} onJump={onHit} />
+            ) : sheet === "options" ? (
+              <div className="flex flex-col gap-4">
+                <ShowControls show={show} hidden={hidden} />
+                <ExportControls
+                  messages={messages}
+                  hasOlder={active.hasOlder}
+                  atLiveEdge={active.atLiveEdge}
+                />
+              </div>
+            ) : null}
+          </div>
+        </SheetContent>
+      </Sheet>
       <Sheet open={tasksOpen} onOpenChange={setTasksOpen}>
         <SheetContent side="bottom" className="max-h-[85dvh] overflow-y-auto">
           <SheetHeader>
