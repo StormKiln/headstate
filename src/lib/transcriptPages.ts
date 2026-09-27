@@ -155,7 +155,8 @@ function standing(o: TranscriptToolOutput, turn: string | null): TranscriptMessa
     is_sidechain: false,
     blocks: [{ kind: "tool_result", ...o }],
     offset: o.offset,
-    oversized_bytes: null,
+    // The record's own, which the output carries (#1476).
+    oversized_bytes: o.oversized_bytes,
   };
 }
 

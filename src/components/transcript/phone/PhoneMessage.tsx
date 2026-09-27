@@ -276,7 +276,7 @@ function ClippedTextFor({
     <ClippedText
       text={text}
       clip={clip}
-      address={{ messageId: m.id, index }}
+      address={{ messageId: m.id, index, offset: m.offset }}
       onLoadFullText={phone.onLoadFullText}
     >
       {children}
@@ -396,6 +396,7 @@ function ToolResultOrphanFor({
       variant="compact"
       onLoadFullText={phone.onLoadFullText}
       onOpenSubagent={phone.onOpenSubagent}
+      onLoadEarlier={phone.onLoadEarlier}
     />
   );
 }

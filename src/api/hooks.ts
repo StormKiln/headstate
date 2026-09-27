@@ -58,7 +58,7 @@ import type {
   LogTail,
   ScanKind,
 } from "./tauri";
-import type { RemoteTranscriptPage } from "../types/transcript";
+import { type FollowLive, TranscriptFollower } from "@/lib/transcriptFollow";
 import { createCoalescer, type Scheduler } from "@/lib/coalesce";
 import { createLimiter, withDeadline } from "@/lib/limiter";
 import { IS_MOBILE_BUILD } from "@/lib/target";
@@ -157,7 +157,7 @@ import {
   claudeSessionDetail,
   claudeSessionsForPr,
   claudeTranscriptFollow,
-  claudeTranscriptMessages,
+  claudeTranscriptPage,
   claudeHooksStatus,
   claudeInstallHooks,
   claudeReinstallHooks,
@@ -1715,43 +1715,105 @@ export function useClaudeSessionDetail(sessionId: string | null, enabled: boolea
   });
 }
 
-/// The tail of one transcript as render-ready messages, for the viewer
-/// shell's first host (#1479).
-///
-/// TEMPORARY, and deliberately the simplest thing that feeds the shell:
-/// #1476 (live follow over the paging reads) replaces it, and with it
-/// the viewer's `onReachStart`/`onReachEnd` get something to call. Until
-/// then this is one bounded tail read (`claude_transcript_messages`,
-/// the same 256 KB window as the old preview) re-read on
-/// `CLAUDE_POLL_MS` while the session is running, so the shell's follow
-/// and "↓ N new" have arrivals to act on. A re-read returns the whole
-/// window again; the viewer keys rows by the read model's stable ids, so
-/// an unchanged message keeps its row. react-query's structural sharing
-/// keeps `data` the same object when nothing changed.
-///
-/// `retry: false`, this feature's rule (see `useClaudeTranscriptFollow`).
-///
-/// `reveal` is the phone's Reveal (#1481): a separate query, keyed apart,
-/// so the masked read stays cached underneath it and a refused reveal
-/// leaves the masked text on screen rather than nothing.
-export function useClaudeTranscriptMessages(
-  path: string | null,
-  enabled: boolean,
-  live: boolean,
-  reveal = false,
-) {
-  const on = enabled && path !== null && path !== "";
-  return useQuery<RemoteTranscriptPage>({
-    queryKey: reveal
-      ? ["claude-transcript-messages", path, "reveal"]
-      : ["claude-transcript-messages", path],
-    queryFn: () => claudeTranscriptMessages(path as string, reveal),
-    enabled: on,
-    refetchInterval: on && live ? CLAUDE_POLL_MS : false,
-    staleTime: CLAUDE_POLL_MS - 1_000,
-    retry: false,
-  });
+/// Whether the document is visible, for the transcript follow (#1476):
+/// hidden -- the window minimised, or the phone's app backgrounded --
+/// stops the reads entirely. Absent `document` reads as visible.
+function subscribeVisibility(onChange: () => void): () => void {
+  document.addEventListener("visibilitychange", onChange);
+  return () => document.removeEventListener("visibilitychange", onChange);
 }
+function documentVisible(): boolean {
+  return typeof document === "undefined" || document.visibilityState !== "hidden";
+}
+
+/// What liveness says about whether a session is writing, as the follow
+/// reads it (`transcriptFollow.ts`).
+function followLive(liveness: Liveness): FollowLive {
+  switch (liveness.state) {
+    case "running":
+      return "running";
+    case "unknown":
+      return "unknown";
+    case "dead":
+      return "not-running";
+  }
+}
+
+/// One transcript, live, paged and bounded (#1476): the viewer's data.
+///
+/// Everything is argued in `src/lib/transcriptFollow.ts`: the newest
+/// page first, older pages on `loadOlder`, live growth on an adaptive
+/// cadence that stops while hidden, at most `MAX_RESIDENT` messages held,
+/// and a rewrite answered by re-anchoring on the reader's message id.
+/// This hook binds it to a path and to React.
+///
+/// Not react-query, deliberately: the transcript is the SUM of many
+/// reads, joined by id, and the cursor each read continues from is an
+/// input the next one needs -- the shape `useClaudeTranscriptFollow`
+/// had to bend a query into. Nothing else shares this cache.
+///
+/// `reveal` is the phone's Reveal (#1481, #1488): a separate follower,
+/// so the masked one stays underneath and a refused reveal leaves the
+/// masked text on screen. `enabled: false` pauses a follower and keeps
+/// what it holds.
+export function useClaudeTranscriptLive(
+  path: string | null,
+  options: {
+    liveness: Liveness;
+    enabled?: boolean;
+    reveal?: boolean;
+    /// Open at this message id when it is within reach (#1486).
+    openAt?: string | null;
+  },
+) {
+  const { liveness, enabled = true, reveal = false, openAt = null } = options;
+  const on = enabled && path !== null && path !== "";
+  const key = `${reveal ? "reveal" : "masked"}:${path ?? ""}`;
+  const make = () =>
+    new TranscriptFollower(
+      (anchor, direction) => claudeTranscriptPage(path as string, anchor, direction, null, reveal),
+      { openAt },
+    );
+  // A follower belongs to ONE file: a cursor is an offset into it. A new
+  // path is a new follower, swapped during render so the pane never
+  // shows one transcript's messages under another's header.
+  const [held, setHeld] = useState(() => ({ key, follower: make() }));
+  let follower = held.follower;
+  if (held.key !== key) {
+    follower = make();
+    setHeld({ key, follower });
+  }
+
+  const visible = useSyncExternalStore(subscribeVisibility, documentVisible, () => true);
+  const live = followLive(liveness);
+  useEffect(() => follower.setLive(live), [follower, live]);
+  useEffect(() => {
+    follower.setVisible(visible);
+    // A backgrounded phone is where iOS reclaims memory first.
+    if (!visible && IS_MOBILE_BUILD) follower.relievePressure();
+  }, [follower, visible]);
+  useEffect(() => {
+    if (!on) return;
+    follower.start();
+    return () => follower.stop();
+  }, [follower, on]);
+
+  const snapshot = useSyncExternalStore(follower.subscribe, follower.getSnapshot);
+  const actions = useMemo(
+    () => ({
+      loadOlder: () => void follower.loadOlder(),
+      loadNewer: () => void follower.loadNewer(),
+      jumpToLatest: () => void follower.jumpToLatest(),
+      refresh: () => follower.refresh(),
+      setViewport: (first: string, last: string) => follower.setViewport(first, last),
+    }),
+    [follower],
+  );
+  return { ...snapshot, ...actions };
+}
+
+/// What `useClaudeTranscriptLive` returns: what a host passes down.
+export type TranscriptLive = ReturnType<typeof useClaudeTranscriptLive>;
 
 /// The Claude sessions that produced this pull request (#1211).
 ///
@@ -2200,8 +2262,10 @@ const FOLLOW_POLL_MS = 3_000;
 /// it is capped rather than claiming to show everything.
 ///
 /// Five times one read: room for a busy stretch of a live session
-/// without the pane re-rendering thousands of rows. The windowed read
-/// model (#1475, #1220) replaces this bound with paging.
+/// without the pane re-rendering thousands of rows. The transcript
+/// VIEWER no longer uses this follow: its data is the paged, evicting
+/// `useClaudeTranscriptLive` (#1476, `MAX_RESIDENT`). This cap bounds
+/// only the older preview pane, for as long as it remains.
 export const FOLLOW_MAX_MESSAGES = 1_000;
 
 /// What two reads said about one `tool_use_id`, combined (#1474).

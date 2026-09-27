@@ -807,8 +807,13 @@ pub enum Pairing {
 /// identical while changing what precedes them.
 ///
 /// It is also the cost ceiling of the whole scheme: a poll over an
-/// unchanged file reads 64 KB and one `stat`, not the 76.7 MB the
-/// largest real transcript holds.
+/// unchanged file reads ONE fingerprint (64 KB) and one `stat`, not the
+/// 76.7 MB the largest real transcript holds -- the probe's digest is
+/// reused as the new cursor's when the offset did not move (#1476; it
+/// used to be read twice, 128 KB per idle poll, as #1487's harness
+/// measured). A poll that DID read something costs the new bytes plus
+/// two fingerprints: the probe behind the old offset, and the new
+/// cursor's behind the new one.
 pub const FINGERPRINT_BYTES: u64 = 64 * 1024;
 
 /// Where a follow left off, and what the file looked like there.
@@ -989,6 +994,10 @@ pub fn follow(path: &Path, cursor: Option<&Cursor>) -> Result<Follow, String> {
     // anything, because a rewrite that also grew the file passes every
     // length test there is.
     let mut fingerprint_bytes_read = 0u64;
+    // The probe's digest, kept: when nothing moved, the new cursor's
+    // digest is over the SAME region, and reading it twice is what made
+    // an idle poll cost two fingerprints (#1476).
+    let mut probed: Option<(u64, String, u64)> = None;
     let reread = match cursor {
         None => Some(Reread::First),
         Some(c) if c.offset > file_bytes => Some(Reread::Shrank),
@@ -996,6 +1005,7 @@ pub fn follow(path: &Path, cursor: Option<&Cursor>) -> Result<Follow, String> {
             let (digest, covered) = fingerprint(&mut file, c.offset, path)?;
             fingerprint_bytes_read = covered;
             if digest == c.behind_digest && covered == c.behind_bytes {
+                probed = Some((c.offset, digest, covered));
                 None
             } else {
                 Some(Reread::RewrittenBehind)
@@ -1082,8 +1092,17 @@ pub fn follow(path: &Path, cursor: Option<&Cursor>) -> Result<Follow, String> {
     cap_messages(&mut preview);
 
     let offset = start + consumed;
-    let (behind_digest, behind_bytes) = fingerprint(&mut file, offset, path)?;
-    fingerprint_bytes_read += behind_bytes;
+    // Unchanged since the probe -- the cursor did not move, and the
+    // probe just verified those bytes -- so its digest IS the new
+    // cursor's. Only a read that moved the offset fingerprints again.
+    let (behind_digest, behind_bytes) = match probed {
+        Some((at, digest, covered)) if at == offset => (digest, covered),
+        _ => {
+            let (digest, covered) = fingerprint(&mut file, offset, path)?;
+            fingerprint_bytes_read += covered;
+            (digest, covered)
+        }
+    };
 
     Ok(Follow {
         preview,
@@ -3618,6 +3637,13 @@ mod tests {
         assert_eq!(next.bytes_read, 0);
         assert!(next.preview.messages.is_empty());
         assert_eq!(next.cursor, first.cursor, "the cursor did not move");
+        // ONE fingerprint: the probe's digest is the new cursor's, so the
+        // same region is not read twice (#1476, measured at 2x by #1487).
+        assert!(first.cursor.behind_bytes > 0);
+        assert_eq!(
+            next.fingerprint_bytes_read, first.cursor.behind_bytes,
+            "an idle poll reads the region behind the cursor once"
+        );
     }
 
     /// A transcript shorter than the fingerprint window still follows.

@@ -15,6 +15,7 @@ import type { LoadFullText, ThinkingBlock as Block, ToolVariant } from "./types"
 export function ThinkingBlock({
   block,
   messageId,
+  offset,
   variant,
   onLoadFullText,
   collapsible = false,
@@ -23,6 +24,8 @@ export function ThinkingBlock({
   /// The message the block is in: with `block.index`, the full-text
   /// address.
   messageId: string;
+  /// That message's `offset`, the fetch's hint (#1476).
+  offset: number | null;
   variant: ToolVariant;
   onLoadFullText?: LoadFullText;
   collapsible?: boolean;
@@ -60,7 +63,7 @@ export function ThinkingBlock({
           <ClippedText
             text={block.text}
             clip={block.clip}
-            address={{ messageId, index: block.index }}
+            address={{ messageId, index: block.index, offset }}
             onLoadFullText={onLoadFullText}
           >
             {(t) => (

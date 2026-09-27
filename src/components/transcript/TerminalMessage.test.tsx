@@ -180,9 +180,15 @@ describe("Claude's reply", () => {
     const load = vi.fn(() =>
       Promise.resolve({ message_id: "m1", index: 3, text: "the whole thing", clip: null }),
     );
-    show(msg({ kind: "assistant" }, [text("the wh", 3, { shown_chars: 6, total_chars: 15 })]), env({ onLoadFullText: load }));
+    show(
+      msg({ kind: "assistant" }, [text("the wh", 3, { shown_chars: 6, total_chars: 15 })], {
+        offset: 2048,
+      }),
+      env({ onLoadFullText: load }),
+    );
     fireEvent.click(screen.getByRole("button", { name: "Show all 15 characters" }));
-    expect(load).toHaveBeenCalledWith({ messageId: "m1", index: 3 });
+    // With the record's offset, so the fetch reads one record (#1476).
+    expect(load).toHaveBeenCalledWith({ messageId: "m1", index: 3, offset: 2048 });
     await waitFor(() => expect(screen.getByText("the whole thing")).toBeTruthy());
   });
 });

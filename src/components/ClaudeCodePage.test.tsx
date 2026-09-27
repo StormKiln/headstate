@@ -18,6 +18,7 @@ import type {
 import { useFilters } from "@/store/filters";
 import type { PrQueryState } from "@/api/hooks";
 import type { TranscriptMessage, TranscriptPage } from "@/types/transcript";
+import { liveOf } from "./transcript/fixtures";
 
 const copyFn = vi.hoisted(() => vi.fn(() => Promise.resolve(null as string | null)));
 const revealFn = vi.hoisted(() => vi.fn(() => Promise.resolve("/code/app")));
@@ -129,7 +130,7 @@ const state = vi.hoisted(() => ({
   /// Every query string the lookup hook was handed, so a test can assert
   /// that ordinary prose never reaches it.
   prQueriesSeen: [] as string[],
-  /// What `useClaudeTranscriptMessages` returns (#1479): `undefined` is
+  /// What `useClaudeTranscriptLive` has read (#1476): `undefined` is
   /// still reading, `transcriptFailed` the rejection.
   transcript: undefined as TranscriptPage | undefined,
   transcriptFailed: false,
@@ -229,14 +230,10 @@ vi.mock("../api/hooks", () => ({
   // follow's flattened return from it, so the pre-existing content tests
   // still pin what they always pinned. `following`, `lastReadAt` and
   // `reread` are the new surface and have their own fixtures.
-  // #1479's temporary feed for the viewer shell.
-  useClaudeTranscriptMessages: (path: string | null, enabled: boolean) => {
-    if (enabled) state.transcriptAskedFor.push(path);
-    return {
-      data: state.transcriptFailed ? undefined : state.transcript,
-      isError: state.transcriptFailed,
-      error: state.transcriptFailed ? "Permission denied" : undefined,
-    };
+  // The viewer's live, paged data (#1476).
+  useClaudeTranscriptLive: (path: string | null, options: { enabled?: boolean }) => {
+    if (options.enabled ?? true) state.transcriptAskedFor.push(path);
+    return liveOf(state.transcript, state.transcriptFailed ? "Permission denied" : undefined);
   },
   useClaudeTranscriptFollow: (path: string | null, enabled: boolean) => {
     if (enabled) state.previewEnabledFor.push(path);
@@ -4956,8 +4953,10 @@ describe("the transcript viewer", () => {
     renderView();
     open("HeadState GitHub issues filing");
     fireEvent.click(screen.getByRole("button", { name: /show the transcript/i }));
-    expect(screen.getByTestId("transcript-truncated").textContent).toMatch(
-      /The last 2 messages of a 5\.0 MB transcript\. Earlier exchanges are not shown\./,
+    // Said as a position, an estimate when it is one, with where the rest
+    // is: earlier messages page in as the reader scrolls up (#1476).
+    expect(screen.getByTestId("transcript-truncated").textContent).toBe(
+      "Showing messages ~1–2 (estimate). Earlier messages load as you scroll up.",
     );
   });
 

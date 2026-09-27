@@ -104,6 +104,33 @@ describe("trackArrivals", () => {
     expect(away.newCount).toBe(2);
   });
 
+  /// #1476: when the hook REPLACES the list (a compaction rewrote the
+  /// file) and the last message seen is gone, what arrived is placed by
+  /// time: a floor, said as "at least N" -- or suppressed when the last
+  /// message seen recorded no time.
+  it("counts a replacement as at least the messages recorded after the last one seen", () => {
+    const at = (id: string, ts: string | null) => ({ ...m(id), timestamp: ts });
+    const first = [at("a", "2026-01-01T10:00:00Z"), at("b", "2026-01-01T10:01:00Z")];
+    const a = trackArrivals(NO_ARRIVALS, first, false);
+    const replaced = [
+      at("summary", "2026-01-01T10:00:30Z"),
+      at("c", "2026-01-01T10:02:00Z"),
+      at("d", null), // may be new too: not counted, which is why it is a floor
+      at("e", "2026-01-01T10:03:00Z"),
+    ];
+    const r = trackArrivals(a, replaced, false);
+    expect(r.newCount).toBe(2);
+    expect(r.atLeast).toBe(true);
+    // Appends after it stay a floor.
+    const more = trackArrivals(r, [...replaced, at("f", "2026-01-01T10:04:00Z")], false);
+    expect([more.newCount, more.atLeast]).toEqual([3, true]);
+
+    // The last message seen recorded no time: nothing to count against.
+    const untimed = trackArrivals(trackArrivals(NO_ARRIVALS, [at("x", null)], false), replaced, false);
+    expect(untimed.newCount).toBeNull();
+    expect(untimed.atLeast).toBe(false);
+  });
+
   it("does not count prepended history as new", () => {
     const first = [m("p1", true), m("r1")];
     const a = trackArrivals(NO_ARRIVALS, first, false);

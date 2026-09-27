@@ -70,7 +70,7 @@ describe("Bash", () => {
         call={call(
           "Bash",
           BASH,
-          output({ text: "a\nb", clip: { shown_chars: 3, total_chars: 7 } }),
+          output({ text: "a\nb", clip: { shown_chars: 3, total_chars: 7 }, offset: 4096 }),
         )}
         variant="terminal"
         liveness={DEAD}
@@ -80,7 +80,8 @@ describe("Bash", () => {
     fireEvent.click(screen.getByRole("button", { name: "Output, at least 2 lines" }));
     expect(screen.getByText(/Showing the first 3 of 7 characters/)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Show all 7 characters" }));
-    expect(load).toHaveBeenCalledWith({ messageId: "m-result", index: 0 });
+    // With the record's offset, so the fetch reads one record (#1476).
+    expect(load).toHaveBeenCalledWith({ messageId: "m-result", index: 0, offset: 4096 });
     await waitFor(() => expect(pre("a\nb\nc\nd")).toBeTruthy());
     expect(screen.queryByText(/Showing the first/)).toBeNull();
   });
@@ -543,6 +544,7 @@ describe("ThinkingBlock", () => {
       <ThinkingBlock
         block={{ kind: "thinking", index: 0, text: "", clip: null, recorded: false }}
         messageId="m1"
+        offset={null}
         variant="terminal"
       />,
     );
@@ -560,6 +562,7 @@ describe("ThinkingBlock", () => {
           recorded: true,
         }}
         messageId="m1"
+        offset={null}
         variant="compact"
         onLoadFullText={vi.fn()}
       />,

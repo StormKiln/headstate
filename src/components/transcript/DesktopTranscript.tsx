@@ -5,18 +5,20 @@
 /// Both desktop hosts -- the session detail's pane and the full-window
 /// route -- render this. The phone keeps its own path until #1481.
 ///
-/// The data is `useClaudeTranscriptMessages`: the transcript's newest
-/// window, re-read on the poll while the session runs. #1476's follow
-/// replaces it; everything below the read takes a message list and does
-/// not care which.
+/// The data is `useClaudeTranscriptLive` (#1476): the newest page first,
+/// older pages as the reader scrolls up, live growth on an adaptive
+/// cadence, and a bounded number of messages held
+/// (`src/lib/transcriptFollow.ts`). Everything below the read takes a
+/// message list and does not care where it came from.
 
 import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { useClaudeTranscriptMessages } from "../../api/hooks";
+import { useClaudeTranscriptLive } from "../../api/hooks";
 import { claudeTranscriptBlockText } from "../../api/tauri";
 import { useFilters } from "../../store/filters";
 import type { Liveness } from "../../types/pr";
 import type { TranscriptMessage, TranscriptSubagent } from "../../types/transcript";
 import { errorMessage } from "../QueryError";
+import { FollowStatus } from "./FollowStatus";
 import { palette } from "./palette";
 import { transcriptStreaming } from "./streaming";
 import { TaskChecklist } from "./TaskChecklist";
@@ -89,13 +91,12 @@ function Loaded({
   label: string;
   onOpenSubagent: OpenSubagent;
 }) {
-  const live = liveness.state === "running";
-  const page = useClaudeTranscriptMessages(path, true, live);
+  const live = useClaudeTranscriptLive(path, { liveness });
   const density = useFilters((f) => f.transcriptDensity);
   const setDensity = useFilters((f) => f.setTranscriptDensity);
 
-  const messages = page.data?.messages;
-  const truncated = page.data?.truncated ?? false;
+  const messages = live.messages;
+  const truncated = live.hasOlder;
   // Read by "Copy turn" on click. Updated after commit, never in render.
   const holder = useRef<readonly TranscriptMessage[]>([]);
   useLayoutEffect(() => {
@@ -103,9 +104,10 @@ function Loaded({
   }, [messages]);
 
   const onLoadFullText = useCallback<LoadFullText>(
-    (a) => claudeTranscriptBlockText(path, a.messageId, a.index),
+    (a) => claudeTranscriptBlockText(path, a.messageId, a.index, false, a.offset),
     [path],
   );
+  const onLoadEarlier = live.hasOlder ? live.loadOlder : undefined;
   const streaming = transcriptStreaming(liveness);
   const env = useMemo<TerminalEnv>(
     () => ({
@@ -113,9 +115,10 @@ function Loaded({
       density: density === "compact" ? "compact" : "comfortable",
       onLoadFullText,
       onOpenSubagent,
+      onLoadEarlier,
       messages: () => holder.current,
     }),
-    [liveness, density, onLoadFullText, onOpenSubagent],
+    [liveness, density, onLoadFullText, onOpenSubagent, onLoadEarlier],
   );
   const footers = useMemo(
     () => turnFooters(messages ?? [], streaming === true),
@@ -137,30 +140,35 @@ function Loaded({
     [footers, env, tasks],
   );
 
-  if (page.isError) {
-    // BEFORE the empty arm (#846): no messages on a rejection is not a
-    // transcript with nothing in it.
-    return (
+  if (messages === undefined) {
+    // BEFORE any empty arm (#846): no messages on a rejection is not a
+    // transcript with nothing in it -- and a read not answered yet is
+    // not one either.
+    return live.status === "could-not-read" ? (
       <p className="text-xs" style={{ color: palette.muted }}>
         Could not read its transcript
-        {errorMessage(page.error) ? ` (${errorMessage(page.error)})` : ""}. This is not the same
-        as the session having said nothing.
+        {errorMessage(live.error) ? ` (${errorMessage(live.error)})` : ""}. This is not the same
+        as the session having said nothing.{" "}
+        <button
+          type="button"
+          className="underline"
+          style={{ color: palette.link }}
+          onClick={() => void live.refresh()}
+        >
+          Try again
+        </button>
       </p>
-    );
-  }
-  if (page.data === undefined) {
-    return (
+    ) : (
       <p className="text-xs" style={{ color: palette.muted }}>
         Reading its transcript…
       </p>
     );
   }
-  const p = page.data;
-  if (p.messages.length === 0) {
+  if (messages.length === 0) {
     return (
       <p className="text-xs" style={{ color: palette.muted }}>
-        {p.truncated
-          ? `No conversation in the last ${formatBytes(p.bytes_read)} of a ${formatBytes(p.file_bytes)} transcript.`
+        {live.hasOlder
+          ? "No conversation in the part of this transcript that was read."
           : "Its transcript holds no conversation to show."}
       </p>
     );
@@ -168,18 +176,7 @@ function Loaded({
   return (
     <div className="@container flex min-h-0 flex-1 flex-col gap-2">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs" style={{ color: palette.muted }}>
-        <p data-testid="transcript-read-status">
-          {live
-            ? `Following. Last read at ${clockTime(page.dataUpdatedAt)}.`
-            : `Read at ${clockTime(page.dataUpdatedAt)}.`}
-        </p>
-        {p.truncated ? (
-          <p data-testid="transcript-truncated">
-            The last {p.messages.length.toLocaleString()} message
-            {p.messages.length === 1 ? "" : "s"} of a {formatBytes(p.file_bytes)} transcript.
-            Earlier exchanges are not shown.
-          </p>
-        ) : null}
+        <FollowStatus live={live} />
         <DensityToggle value={env.density} onChange={setDensity} />
       </div>
       {tasks.tasks.length > 0 ? (
@@ -203,10 +200,15 @@ function Loaded({
           style={{ background: palette.ground, borderColor: palette.border }}
         >
           <TranscriptViewer
-            messages={p.messages}
+            messages={messages}
             renderMessage={renderMessage}
             streaming={streaming}
             label={label}
+            onReachStart={live.loadOlder}
+            onReachEnd={live.loadNewer}
+            onWindowChange={live.setViewport}
+            atLiveEdge={live.atLiveEdge}
+            onJumpToLatest={live.jumpToLatest}
           />
         </div>
         {tasks.tasks.length > 0 ? (
@@ -260,19 +262,4 @@ function DensityToggle({
       ))}
     </div>
   );
-}
-
-function clockTime(ms: number): string {
-  const at = new Date(ms);
-  if (ms === 0 || Number.isNaN(at.getTime())) return "an unknown time";
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${p(at.getHours())}:${p(at.getMinutes())}:${p(at.getSeconds())}`;
-}
-
-/// Bytes as KB or MB, whichever reads better. The same rule as the
-/// session detail's `formatKb`.
-function formatBytes(bytes: number): string {
-  return bytes >= 1024 * 1024
-    ? `${(bytes / (1024 * 1024)).toFixed(1)} MB`
-    : `${Math.round(bytes / 1024).toLocaleString()} KB`;
 }

@@ -3850,9 +3850,9 @@ function TranscriptFor({ detail: d }: { detail: ClaudeSessionDetail }) {
 }
 
 /// One session's transcript on the desktop layout: the terminal
-/// renderer (#1480, `DesktopTranscript`). `TranscriptFor` sends the
-/// phone layout to #1481's bubbles instead. `useClaudeTranscriptMessages`
-/// under it gives way to #1476's follow over the paging reads.
+/// renderer (#1480, `DesktopTranscript`), over #1476's live, paged
+/// follow. `TranscriptFor` sends the phone layout to #1481's bubbles
+/// instead.
 function SessionTranscript({ detail: d }: { detail: ClaudeSessionDetail }) {
   // Reached only past `revealRefusal`, which refuses a missing path; said
   // rather than rendered as an empty transcript if that ever changes.

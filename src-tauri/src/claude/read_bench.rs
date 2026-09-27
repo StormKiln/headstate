@@ -225,14 +225,11 @@ fn byte_bound(read: Read) -> Option<u64> {
         Read::TailAtEnd => Some(TAIL_BYTES),
         // The window, plus the fingerprint of what is behind its end.
         Read::FollowFirst => Some(TAIL_BYTES + FINGERPRINT_BYTES),
-        // Nothing new, and yet TWO fingerprints: the probe behind the
-        // stored offset, then the new cursor's digest over the same
-        // region. Measured at 131,072 bytes per idle tick, where
-        // `FINGERPRINT_BYTES`' own doc says an unchanged file costs
-        // "64 KB and one `stat`". Bounded either way; the second read is
-        // redundant when nothing moved, and is left to the live-follow
-        // work (#1476) rather than changed by a measuring PR.
-        Read::FollowIdleAtEnd => Some(2 * FINGERPRINT_BYTES),
+        // Nothing new: ONE fingerprint, the probe behind the stored
+        // offset, whose digest is reused as the new cursor's (#1476).
+        // It was two -- 131,072 bytes per idle tick -- until the
+        // redundant second read of the same region was dropped.
+        Read::FollowIdleAtEnd => Some(FINGERPRINT_BYTES),
         Read::FollowFromStart => None,
         // The same bound wherever the page lands: the point of #1220.
         Read::PageFromStart | Read::PageBackToStart | Read::PageAtMiddle | Read::PageAtEnd => {

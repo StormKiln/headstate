@@ -1481,10 +1481,17 @@ mod tests {
                 .unwrap();
             // Oversized is carried by the record's own message when it
             // stands; when it merged into its call the call's message is
-            // a different record, so check the standing case only.
+            // a different record.
             if msg.id == "big-result" {
                 assert!(msg.oversized_bytes.unwrap() > 3 * PAGE_BYTES);
             }
+            // And by the OUTPUT either way (#1476): merged into its call,
+            // the record's message is gone, and this is what still says
+            // the output was streamed and clipped.
+            assert!(
+                found[0].oversized_bytes.expect("carried onto the output") > 3 * PAGE_BYTES,
+                "{dir:?}"
+            );
             let scanned: u64 = all.iter().map(|w| w.bytes_scanned).sum();
             assert!(scanned >= 3 * PAGE_BYTES, "the big record was streamed");
         }
