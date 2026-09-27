@@ -2,7 +2,10 @@
   "$schema": "https://unpkg.com/knip@6/schema.json",
   "entry": [
     "src/main.tsx",
-    "vite.config.ts"
+    "vite.config.ts",
+    "vite.harness.config.ts",
+    "src/harness/transcriptBench.tsx",
+    "scripts/transcript-browser-bench.mjs"
   ],
   "project": [
     "src/**/*.{ts,tsx}"

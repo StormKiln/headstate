@@ -1,7 +1,7 @@
 .PHONY: dev build test test-rust test-ui lint lint-rust lint-ui lint-deps fmt icons \
 	mobile-frontend lint-mobile test-mobile check-mobile-ios check-mobile-android \
 	deny-mobile deny-stepup ios-init android-init icons-mobile ios-device android-device \
-	deny test-race check-intel doctor bench-transcript
+	deny test-race check-intel doctor bench-transcript bench-transcript-browser
 
 # ---- Mobile companion (src-mobile) ---------------------------------------
 #
@@ -150,6 +150,22 @@ bench-transcript:
 	( cd src-tauri && HEADSTATE_TRANSCRIPT_BENCH=1 HEADSTATE_TRANSCRIPT_BENCH_OUT="$$out" \
 		cargo test --release --lib read_bench -- --ignored --nocapture --test-threads=1 ) \
 	&& node --expose-gc scripts/transcript-receive-bench.mjs "$$out"; status=$$?; \
+	[ -n "$(BENCH_TRANSCRIPT_OUT)" ] || rm -rf "$$out"; exit $$status
+
+# The viewer in a browser (#1480, the harness #1487 designed): writes each
+# fixture's message page, builds the harness page (vite.harness.config.ts,
+# into dist-harness), and opens every page in Playwright's Chromium to
+# take B1 (open to first paint), B2 (long tasks while scrolling) and B3
+# (heap). Not in `test` or CI, for bench-transcript's reason: its figures
+# describe the machine. Needs the browser once:
+# `yarn playwright install chromium` (or HARNESS_CHANNEL=chrome to use an
+# installed Chrome).
+bench-transcript-browser:
+	@out="$(BENCH_TRANSCRIPT_OUT)"; [ -n "$$out" ] || out="$$(mktemp -d)"; \
+	( cd src-tauri && HEADSTATE_TRANSCRIPT_PAYLOADS_OUT="$$out" \
+		cargo test --release --lib read_bench::transcript_message_payloads -- --ignored --nocapture ) \
+	&& yarn vite build -c vite.harness.config.ts \
+	&& node scripts/transcript-browser-bench.mjs "$$out"; status=$$?; \
 	[ -n "$(BENCH_TRANSCRIPT_OUT)" ] || rm -rf "$$out"; exit $$status
 
 # ---- Parity with CI (#853) -----------------------------------------------
