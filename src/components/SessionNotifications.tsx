@@ -13,7 +13,7 @@ import { useFilters } from "@/store/filters";
 function viewedSession(): string | undefined {
   const s = useFilters.getState();
   if (s.view !== "claude-code") return undefined;
-  return s.claudeTranscript ?? s.claudeSelected;
+  return s.claudeSelected;
 }
 
 /// One in-app toast, through the app's own toaster. Keyed by session, so

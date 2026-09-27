@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   ClaudeImported,
@@ -576,7 +576,8 @@ beforeEach(() => {
     claudeSelected: undefined,
     claudeFilter: "all",
     claudeShowSubagents: false,
-    claudeTranscript: undefined,
+    claudeSessionTab: "details",
+    claudeTranscriptAt: "latest",
   });
   copyFn.mockClear();
   revealFn.mockClear();
@@ -4113,13 +4114,14 @@ describe("searching for a pull request finds the session that produced it", () =
   });
 });
 
-/// The transcript viewer shell's first host (#1479).
+/// The transcript viewer's host (#1479): since #1546 the Transcript tab
+/// on a selected session's pane.
 ///
-/// A pane in the session detail and a full-window route, both fed by the
-/// temporary tail read with the text-only renderer. What the shell does
-/// with scrolling is `transcript/TranscriptViewer.test.tsx`'s subject;
-/// these pin that the host renders it, only when asked, for the right
-/// session, and that each empty state says which kind of empty it is.
+/// What the viewer does with scrolling is
+/// `transcript/TranscriptViewer.test.tsx`'s subject; these pin that the
+/// host renders it, only when asked, for the right session, that the tab
+/// is the one way in, and that each empty state says which kind of empty
+/// it is.
 describe("the transcript viewer", () => {
   const message = (id: string, text: string, prompt: boolean): TranscriptMessage => ({
     id,
@@ -4148,32 +4150,57 @@ describe("the transcript viewer", () => {
     ...over,
   });
 
-  it("is behind a click, and then shows the conversation as a log", () => {
+  /// The pane's two tabs (#1546), by role, as a screen reader reaches them.
+  const tab = (name: "Details" | "Transcript") => screen.getByRole("tab", { name });
+  const selected = (name: "Details" | "Transcript") => tab(name).getAttribute("aria-selected");
+  /// The open tab's panel.
+  const panel = () => screen.getByRole("tabpanel");
+  const second = "0b5c9d1e-2f3a-4b5c-8d7e-9f0a1b2c3d4e";
+
+  it("is behind the Transcript tab, and then shows the conversation as a log", () => {
     state.transcript = page();
     renderView();
     open("HeadState GitHub issues filing");
-    const pane = screen.getByTestId("transcript-pane");
+    // A selection lands on Details, and costs no transcript read.
+    expect(selected("Details")).toBe("true");
+    expect(selected("Transcript")).toBe("false");
     expect(state.transcriptAskedFor).toEqual([]);
-    expect(within(pane).queryByRole("log")).toBeNull();
+    expect(screen.queryByRole("log")).toBeNull();
 
-    fireEvent.click(within(pane).getByRole("button", { name: /show the transcript/i }));
+    fireEvent.click(tab("Transcript"));
+    expect(selected("Transcript")).toBe("true");
     expect(state.transcriptAskedFor).toContain("/Users/acme/.claude/projects/slug/e5dff3bd.jsonl");
     // The follow is told whose transcript it is, so that session's
     // activity nudges read at once (#1477).
     expect(state.transcriptSessionIds).toContain("e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2");
-    const log = within(pane).getByRole("log");
+    const log = within(panel()).getByRole("log");
     expect(within(log).getByText("run the tests")).toBeTruthy();
     expect(within(log).getByText("Running them now.")).toBeTruthy();
     // The desktop renderer replaced the old preview on the desktop (#1480).
     expect(screen.queryByRole("button", { name: /follow the transcript/i })).toBeNull();
     expect(screen.queryByText(/what it was doing/i)).toBeNull();
+    // Only one panel is mounted: the detail is not under the transcript.
+    expect(screen.getAllByRole("tabpanel")).toHaveLength(1);
+  });
+
+  /// #1546: the tab is the ONE way in. The old pane in the detail
+  /// ("Show the transcript", "Open in full window") and the full window's
+  /// "← Session detail" are gone, so there is nothing else to press.
+  it("leaves no second way in", () => {
+    state.transcript = page();
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.queryByRole("button", { name: /show the transcript/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /open in full window/i })).toBeNull();
+    fireEvent.click(tab("Transcript"));
+    expect(screen.queryByRole("button", { name: /session detail/i })).toBeNull();
   });
 
   it("says when the transcript was only read from its end", () => {
     state.transcript = page({ truncated: true, file_bytes: 5 * 1024 * 1024 });
     renderView();
     open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /show the transcript/i }));
+    fireEvent.click(tab("Transcript"));
     // Said as a position, an estimate when it is one, with where the rest
     // is: earlier messages page in as the reader scrolls up (#1476).
     expect(screen.getByTestId("transcript-truncated").textContent).toBe(
@@ -4185,7 +4212,7 @@ describe("the transcript viewer", () => {
     state.transcriptFailed = true;
     renderView();
     open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /show the transcript/i }));
+    fireEvent.click(tab("Transcript"));
     expect(screen.getByText(/could not read its transcript \(Permission denied\)/i)).toBeTruthy();
     expect(screen.queryByText(/holds no conversation/i)).toBeNull();
   });
@@ -4193,44 +4220,44 @@ describe("the transcript viewer", () => {
   it("tells a still-reading transcript from an empty one", () => {
     renderView();
     open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /show the transcript/i }));
+    fireEvent.click(tab("Transcript"));
     expect(screen.getByText(/reading its transcript…/i)).toBeTruthy();
   });
 
-  /// #1479's follow-up: with the preview retired from the desktop
-  /// (#1480), the pane states the refusal itself -- once, in the
-  /// preview's words, and with nothing offered that cannot work.
+  /// With the preview retired from the desktop (#1480), the tab states
+  /// the refusal itself -- once, in the preview's words, and with nothing
+  /// offered that cannot work.
   ///
-  /// **Sabotage:** return `null` for a refusal on the desktop too, and
-  /// the sentence is gone.
-  it("says why there is nothing to read, once, in place of the pane", () => {
+  /// **Sabotage:** drop the `revealRefusal` arm in `SessionTranscriptTab`,
+  /// and the sentence is gone.
+  it("says why there is nothing to read, once, in the Transcript tab", () => {
     state.list = listOf([session({ transcript_state: { state: "gone" } })]);
     renderView();
     open("HeadState GitHub issues filing");
-    const pane = screen.getByTestId("transcript-pane");
-    expect(within(pane).getByText(/there is nothing to read here: the path no longer exists/i)).toBeTruthy();
-    expect(within(pane).queryByRole("button", { name: /show the transcript/i })).toBeNull();
+    fireEvent.click(tab("Transcript"));
+    expect(
+      within(panel()).getByText(/there is nothing to read here: the path no longer exists/i),
+    ).toBeTruthy();
     expect(screen.getAllByText(/there is nothing to read here/i)).toHaveLength(1);
+    expect(screen.queryByRole("log")).toBeNull();
+    expect(state.transcriptAskedFor).toEqual([]);
   });
 
-  /// #1514: the phone build shows the same viewer pane, and the old
-  /// preview pane ("What it was doing", "Follow the transcript") is gone
-  /// from it. The refusal it used to state is stated by the viewer.
+  /// #1514: the phone build shows the same viewer, and the old preview
+  /// pane ("What it was doing", "Follow the transcript") is gone from it.
+  /// The refusal it used to state is stated by the viewer's tab.
   describe("on the phone build", () => {
     asThePhoneBuild();
 
-    /// **Sabotage:** put back `if (IS_MOBILE_BUILD) return null;` for a
-    /// refusal in `TranscriptPane`, and the sentence is gone.
-    it("says why there is nothing to read, once, in the viewer's pane", () => {
+    it("says why there is nothing to read, once, in the Transcript tab", () => {
       state.list = listOf([session({ transcript_state: { state: "gone" } })]);
       renderView();
       open("HeadState GitHub issues filing");
-      const pane = screen.getByTestId("transcript-pane");
+      fireEvent.click(tab("Transcript"));
       expect(
-        within(pane).getByText(/there is nothing to read here: the path no longer exists/i),
+        within(panel()).getByText(/there is nothing to read here: the path no longer exists/i),
       ).toBeTruthy();
       expect(screen.getAllByText(/there is nothing to read here/i)).toHaveLength(1);
-      expect(within(pane).queryByRole("button", { name: /show the transcript/i })).toBeNull();
     });
 
     /// `unknown` is worded differently from `gone`: the path may well be
@@ -4241,68 +4268,108 @@ describe("the transcript viewer", () => {
       ]);
       renderView();
       open("HeadState GitHub issues filing");
-      const pane = screen.getByTestId("transcript-pane");
+      fireEvent.click(tab("Transcript"));
       expect(
-        within(pane).getByText(
+        within(panel()).getByText(
           /there is nothing to read here: could not check whether it exists \(Permission denied\)/i,
         ),
       ).toBeTruthy();
       expect(screen.queryByText(/no longer exists/i)).toBeNull();
     });
 
-    /// Behind a click, as the preview was: a read over the pairing
-    /// transport must not happen on selection.
+    /// Behind the tab, as the preview was behind a click: a read over the
+    /// pairing transport must not happen on selection.
     it("renders the viewer rather than the old preview, and reads only when asked", () => {
       state.transcript = page();
       renderView();
       open("HeadState GitHub issues filing");
-      const pane = screen.getByTestId("transcript-pane");
       expect(screen.queryByText(/what it was doing/i)).toBeNull();
       expect(screen.queryByRole("button", { name: /follow the transcript/i })).toBeNull();
       expect(state.transcriptAskedFor).toEqual([]);
 
-      fireEvent.click(within(pane).getByRole("button", { name: /show the transcript/i }));
+      fireEvent.click(tab("Transcript"));
       expect(state.transcriptAskedFor).toContain(
         "/Users/acme/.claude/projects/slug/e5dff3bd.jsonl",
       );
-      expect(within(pane).getByText("run the tests")).toBeTruthy();
+      expect(within(panel()).getByText("run the tests")).toBeTruthy();
     });
   });
 
-  it("opens in the full window for that session, and goes back to its detail", () => {
+  /// #1546: the tab choice is ONE value for the pane, kept while the
+  /// reader moves between sessions -- in both directions.
+  ///
+  /// **Sabotage:** reset `claudeSessionTab` to `"details"` in
+  /// `selectClaudeSession`, and the second session opens on Details.
+  it("keeps the tab while moving between sessions, showing the new session's transcript", () => {
     state.transcript = page();
+    state.list = listOf([session(), session({ session_id: second, name: "Second session" })]);
     renderView();
     open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /open in full window/i }));
-
-    const full = screen.getByTestId("transcript-window");
-    expect(within(full).getByRole("log")).toBeTruthy();
-    // The full window replaces the detail rather than stacking on it.
-    expect(screen.queryByTestId("transcript-pane")).toBeNull();
-    expect(useFilters.getState().claudeTranscript).toBe("e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2");
-
-    fireEvent.click(within(full).getByRole("button", { name: /session detail/i }));
-    expect(screen.queryByTestId("transcript-window")).toBeNull();
-    expect(screen.getByTestId("transcript-pane")).toBeTruthy();
-  });
-
-  it("shows another session's detail, not the transcript, when another row is picked", () => {
-    state.transcript = page();
-    state.list = listOf([
-      session(),
-      session({ session_id: "0b5c9d1e-2f3a-4b5c-8d7e-9f0a1b2c3d4e", name: "Second session" }),
-    ]);
-    renderView();
-    open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /open in full window/i }));
-    expect(screen.getByTestId("transcript-window")).toBeTruthy();
+    fireEvent.click(tab("Transcript"));
+    state.transcriptSessionIds = [];
 
     open("Second session");
-    expect(screen.queryByTestId("transcript-window")).toBeNull();
-    expect(screen.getByTestId("transcript-pane")).toBeTruthy();
+    expect(selected("Transcript")).toBe("true");
+    expect(within(panel()).getByRole("heading", { name: "Second session" })).toBeTruthy();
+    // The follow now belongs to the session on screen, not the one left.
+    expect(new Set(state.transcriptSessionIds)).toEqual(new Set([second]));
+
+    // And Details sticks the same way, reading nothing.
+    fireEvent.click(tab("Details"));
+    state.transcriptAskedFor = [];
+    open("HeadState GitHub issues filing");
+    expect(selected("Details")).toBe("true");
+    expect(state.transcriptAskedFor).toEqual([]);
   });
 
-  it("is reachable from another view in one action", () => {
+  /// #1546 and #1489: `tablist` semantics, and the arrow keys move
+  /// between the tabs and activate the one they land on.
+  it("is a labelled tablist the arrow keys move through", async () => {
+    state.transcript = page();
+    renderView();
+    open("HeadState GitHub issues filing");
+    const list = screen.getByRole("tablist", { name: "Session" });
+    expect(within(list).getAllByRole("tab").map((t) => t.textContent)).toEqual([
+      "Details",
+      "Transcript",
+    ]);
+    // Each panel is labelled by its tab.
+    expect(panel().getAttribute("aria-labelledby")).toBe(tab("Details").id);
+
+    act(() => tab("Details").focus());
+    fireEvent.keyDown(tab("Details"), { key: "ArrowRight" });
+    // Base UI moves focus in a microtask.
+    await act(async () => {});
+    expect(document.activeElement).toBe(tab("Transcript"));
+    expect(selected("Transcript")).toBe("true");
+    expect(within(panel()).getByRole("log")).toBeTruthy();
+
+    fireEvent.keyDown(tab("Transcript"), { key: "ArrowLeft" });
+    await act(async () => {});
+    expect(document.activeElement).toBe(tab("Details"));
+    expect(selected("Details")).toBe("true");
+  });
+
+  /// The viewer is the ONE scroll container on the Transcript tab: the
+  /// panel and the pane around it add none, and fill the height instead.
+  it("adds no second scroller around the viewer", () => {
+    state.transcript = page();
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(tab("Transcript"));
+    const log = within(panel()).getByRole("log");
+    const scrollers: string[] = [];
+    for (let el = log.parentElement; el && el !== document.body; el = el.parentElement) {
+      if (/overflow-(y-)?(auto|scroll)/.test(el.className)) {
+        scrollers.push(el.getAttribute("data-slot") ?? el.outerHTML.slice(0, 80));
+      }
+    }
+    expect(scrollers).toEqual(["message-scroller-viewport"]);
+    expect(panel().className).toMatch(/\bflex-1\b/);
+    expect(panel().className).toMatch(/\bmin-h-0\b/);
+  });
+
+  it("is reachable from another view in one action, on the Transcript tab", () => {
     state.transcript = page();
     useFilters.setState({ view: "my-prs" });
     useFilters.getState().openClaudeTranscript("e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2");
@@ -4310,11 +4377,26 @@ describe("the transcript viewer", () => {
     expect(f.view).toBe("claude-code");
     expect(f.claudePage).toBe("sessions");
     expect(f.claudeSelected).toBe("e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2");
+    expect(f.claudeSessionTab).toBe("transcript");
     renderView();
-    expect(within(screen.getByTestId("transcript-window")).getByRole("log")).toBeTruthy();
+    expect(selected("Transcript")).toBe("true");
+    expect(within(panel()).getByRole("log")).toBeTruthy();
   });
 
-  /// #1485: the session header is hosted by the full window, above the
+  /// A deep link from the Details tab of ANOTHER session still lands on
+  /// the linked session's transcript.
+  it("opens the linked session's Transcript tab over another session's Details", () => {
+    state.transcript = page();
+    state.list = listOf([session(), session({ session_id: second, name: "Second session" })]);
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(selected("Details")).toBe("true");
+    act(() => useFilters.getState().openClaudeTranscript(second));
+    expect(selected("Transcript")).toBe("true");
+    expect(within(panel()).getByRole("heading", { name: "Second session" })).toBeTruthy();
+  });
+
+  /// #1485: the session header is hosted by the Transcript tab, above the
   /// transcript -- and above the refusal too, where a running session
   /// with no transcript yet must still read as running.
   it("hosts the session header, even when there is no transcript yet", () => {
@@ -4327,9 +4409,7 @@ describe("the transcript viewer", () => {
     ]);
     useFilters.getState().openClaudeTranscript("e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2");
     renderView();
-    const header = within(screen.getByTestId("transcript-window")).getByTestId(
-      "transcript-header",
-    );
+    const header = within(screen.getByTestId("transcript-tab")).getByTestId("transcript-header");
     expect(within(header).getByText("Running, no transcript yet")).toBeTruthy();
   });
 });

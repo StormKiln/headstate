@@ -5,8 +5,8 @@
 /// the turn outline and find in a side panel, Show and Export
 /// (`navigation.tsx`, `useNavigation.ts`).
 ///
-/// Both desktop hosts -- the session detail's pane and the full-window
-/// route -- render this. The phone keeps its own path until #1481.
+/// Its one desktop host is a session's Transcript tab (#1546); the phone
+/// layout renders `PhoneTranscript` there instead (#1481).
 ///
 /// The data is `useClaudeTranscriptLive` (#1476): the newest page first,
 /// older pages as the reader scrolls up, live growth on an adaptive

@@ -26,7 +26,7 @@ beforeEach(() => {
   useFilters.setState({
     view: "my-prs",
     claudeSelected: undefined,
-    claudeTranscript: undefined,
+    claudeSessionTab: "details",
   });
 });
 afterEach(() => {
@@ -45,7 +45,8 @@ describe("session notifications in the app", () => {
     const s = useFilters.getState();
     expect(s.view).toBe("claude-code");
     expect(s.claudeSelected).toBe("s-1");
-    expect(s.claudeTranscript).toBe("s-1");
+    // On its Transcript tab (#1546).
+    expect(s.claudeSessionTab).toBe("transcript");
     // At the "since you left" marker, not the newest message (#1484).
     expect(s.claudeTranscriptAt).toBe("marker");
     // Opening it any other way is at the newest.
@@ -66,7 +67,8 @@ describe("session notifications in the app", () => {
     api.takeNotificationSession.mockResolvedValueOnce("s-2");
     document.dispatchEvent(new Event("visibilitychange"));
     await settle();
-    expect(useFilters.getState().claudeTranscript).toBe("s-2");
+    expect(useFilters.getState().claudeSelected).toBe("s-2");
+    expect(useFilters.getState().claudeSessionTab).toBe("transcript");
   });
 
   /// Toasts are for OTHER sessions: the one on screen is passed as
@@ -100,7 +102,8 @@ describe("session notifications in the app", () => {
     expect(opts.id).toBe("session-s-4");
     expect(opts.duration).toBe(TOAST_MS);
     opts.action.onClick();
-    expect(useFilters.getState().claudeTranscript).toBe("s-4");
+    expect(useFilters.getState().claudeSelected).toBe("s-4");
+    expect(useFilters.getState().claudeSessionTab).toBe("transcript");
   });
 
   /// A desktop that is away costs the toasts, not the app.

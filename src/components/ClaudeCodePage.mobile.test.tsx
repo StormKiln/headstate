@@ -243,7 +243,12 @@ beforeEach(() => {
   // is a module singleton -- so a selection made by one test would open a
   // detail screen in the next one before it clicked anything, which on the
   // phone means the LIST is the thing that is hidden.
-  useFilters.setState({ claudeQuery: "", claudeSelected: undefined, claudeTranscript: undefined });
+  useFilters.setState({
+    claudeQuery: "",
+    claudeSelected: undefined,
+    claudeSessionTab: "details",
+    claudeTranscriptAt: "latest",
+  });
   state.transcript = undefined;
   state.transcriptSessionIds = [];
   copyFn.mockClear();
@@ -255,11 +260,11 @@ afterEach(() => {
 });
 
 /// Open a session's DETAIL screen. Since #1481 a row opens the session
-/// at its transcript, as the Claude app opens a conversation; the detail
-/// is the "Details" button in that screen's header.
+/// at its transcript, as the Claude app opens a conversation; since
+/// #1546 the detail is the pane's "Details" tab.
 function open(name: string) {
   fireEvent.click(screen.getByRole("button", { name: new RegExp(name, "i") }));
-  fireEvent.click(screen.getByRole("button", { name: /^details$/i }));
+  fireEvent.click(screen.getByRole("tab", { name: "Details" }));
 }
 
 describe("the companion offers the view and hides only the Local actions", () => {
@@ -495,12 +500,10 @@ describe("the companion offers the view and hides only the Local actions", () =>
   /// session died and not one word of what it was doing. The desktop user
   /// can `cat` the file; the phone cannot reach the machine at all.
   ///
-  /// Since #1514 the detail's transcript is the viewer's pane, in the
-  /// phone renderer, over `claude_transcript_page` (`Class::Read`); the
-  /// old preview pane is gone from this build.
-  ///
-  /// **Sabotage:** return `null` from `TranscriptPane` when
-  /// `IS_MOBILE_BUILD` and this fails while every other test stays green.
+  /// Since #1514 the session's transcript is the viewer, in the phone
+  /// renderer, over `claude_transcript_page` (`Class::Read`); the old
+  /// preview pane is gone from this build. Since #1546 it is the pane's
+  /// Transcript tab.
   it("lets the phone read a transcript in the viewer, because claude_transcript_page is Class::Read", () => {
     state.transcript = {
       messages: [
@@ -531,14 +534,13 @@ describe("the companion offers the view and hides only the Local actions", () =>
     render(<ClaudeCodePage />);
     open("HeadState GitHub issues filing");
 
-    const pane = screen.getByTestId("transcript-pane");
     // The old preview pane is not rendered beside it (#1514).
     expect(screen.queryByText(/what it was doing/i)).toBeNull();
     expect(screen.queryByRole("button", { name: /follow the transcript/i })).toBeNull();
-    // Behind the disclosure on the phone as on the desktop: a read over
-    // the pairing transport is exactly what must not happen on every
-    // selection.
-    fireEvent.click(within(pane).getByRole("button", { name: /show the transcript/i }));
+    // On Details, no transcript is mounted and none is followed.
+    expect(screen.queryByTestId("phone-transcript")).toBeNull();
+    fireEvent.click(screen.getByRole("tab", { name: "Transcript" }));
+    const pane = screen.getByRole("tabpanel");
     expect(within(pane).getByText("Running the tests now.")).toBeTruthy();
     expect(within(pane).getByTestId("phone-transcript")).toBeTruthy();
   });
@@ -566,8 +568,8 @@ describe("the companion offers the view and hides only the Local actions", () =>
   });
 });
 
-/// #1479, #1481: on the phone the full-window transcript is a screen of
-/// its own, and it is where a session row opens.
+/// #1481, #1546: on the phone a session row opens the session's screen
+/// at its Transcript tab, beside the "← All sessions" back link.
 describe("the transcript viewer on the phone", () => {
   const prompt = (): TranscriptPage => ({
     messages: [
@@ -596,20 +598,21 @@ describe("the transcript viewer on the phone", () => {
     duplicate_records: 0,
   });
 
-  /// The entry point (#1481): the list opens the transcript screen, in
-  /// the phone renderer -- the prompt is a bubble, not the placeholder's
-  /// "You" header.
-  it("opens from the session list, in the phone renderer", () => {
+  /// The entry point (#1481): the list opens the session on its
+  /// Transcript tab, in the phone renderer -- the prompt is a bubble, not
+  /// the placeholder's "You" header.
+  it("opens from the session list on the Transcript tab, in the phone renderer", () => {
     state.transcript = prompt();
     render(<ClaudeCodePage />);
     fireEvent.click(screen.getByRole("button", { name: /HeadState GitHub issues filing/i }));
 
-    const full = screen.getByTestId("transcript-window");
-    expect(full.textContent).toContain("run the tests");
-    expect(full.querySelector('[data-slot="bubble"]')).not.toBeNull();
+    expect(screen.getByRole("tab", { name: "Transcript" }).getAttribute("aria-selected")).toBe(
+      "true",
+    );
+    const tab = screen.getByTestId("transcript-tab");
+    expect(tab.textContent).toContain("run the tests");
+    expect(tab.querySelector('[data-slot="bubble"]')).not.toBeNull();
     expect(screen.getByTestId("phone-transcript")).toBeTruthy();
-    // The detail screen is not showing: this is the screen now.
-    expect(screen.queryByTestId("transcript-pane")).toBeNull();
     // Told whose transcript it is, so this session's nudges read at once
     // on the phone and nobody else's do (#1477).
     expect(state.transcriptSessionIds.length).toBeGreaterThan(0);
@@ -618,21 +621,33 @@ describe("the transcript viewer on the phone", () => {
     );
   });
 
-  it("reaches the detail from its header, and the list from its back link", () => {
+  /// The tabs and the back link share the phone screen: Details and back
+  /// again by tab, and the list by the back link.
+  ///
+  /// The memory bound (#1476) holds across the switch: on Details the
+  /// phone transcript is UNMOUNTED, so no pages are held for it.
+  ///
+  /// **Sabotage:** pass `keepMounted` to the Transcript panel and the
+  /// phone transcript is still in the tree on Details.
+  it("reaches Details by tab, keeps no transcript mounted there, and the list by its back link", () => {
     state.transcript = prompt();
     render(<ClaudeCodePage />);
     fireEvent.click(screen.getByRole("button", { name: /HeadState GitHub issues filing/i }));
-    fireEvent.click(screen.getByRole("button", { name: /^details$/i }));
-    expect(screen.queryByTestId("transcript-window")).toBeNull();
+    expect(screen.getByRole("button", { name: /all sessions/i })).toBeTruthy();
+    expect(screen.getByRole("tablist", { name: "Session" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("tab", { name: "Details" }));
+    expect(screen.queryByTestId("transcript-tab")).toBeNull();
+    expect(screen.queryByTestId("phone-transcript")).toBeNull();
     expect(screen.getByText(/pid 14779 is no longer running/i)).toBeTruthy();
 
-    // And from the detail, back into the transcript screen.
-    fireEvent.click(screen.getByRole("button", { name: /open in full window/i }));
-    expect(screen.getByTestId("transcript-window")).toBeTruthy();
+    // And from the detail, back into the transcript.
+    fireEvent.click(screen.getByRole("tab", { name: "Transcript" }));
+    expect(screen.getByTestId("phone-transcript")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: /all sessions/i }));
-    expect(screen.queryByTestId("transcript-window")).toBeNull();
+    expect(screen.queryByTestId("transcript-tab")).toBeNull();
+    expect(screen.queryByRole("tablist")).toBeNull();
     expect(useFilters.getState().claudeSelected).toBeUndefined();
-    expect(useFilters.getState().claudeTranscript).toBeUndefined();
   });
 });
