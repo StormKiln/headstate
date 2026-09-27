@@ -325,6 +325,131 @@ describe("TranscriptFollower: cadence (mocked clock)", () => {
   });
 });
 
+/// #1477: the desktop's activity nudge cuts the current wait short, and
+/// is never needed -- the cadence above is the backstop.
+describe("TranscriptFollower: nudges (#1477)", () => {
+  /// Opened, quiet past the growth window, so the next read is a whole
+  /// idle backoff step away.
+  async function quiet(file: FakeFile) {
+    const f = follower(file);
+    f.setLive("running");
+    f.start();
+    await settle();
+    await vi.advanceTimersByTimeAsync(RECENT_GROWTH_MS + FAST_MS);
+    expect(f.getSnapshot().status).toBe("idle");
+    return f;
+  }
+
+  it("reads at once, instead of at the end of the backoff", async () => {
+    const file = new FakeFile(3);
+    const f = await quiet(file);
+    const n = file.calls.length;
+    file.add(1);
+    f.nudge(file.recs.length * REC);
+    await settle();
+    expect(file.calls.length).toBe(n + 1);
+    expect(ids(f.getSnapshot()).at(-1)).toBe("r3");
+    // Growth found: back to the fast cadence.
+    expect(f.getSnapshot().status).toBe("following");
+  });
+
+  it("ignores a nudge for the size it has already read to", async () => {
+    const file = new FakeFile(3);
+    const f = await quiet(file);
+    const n = file.calls.length;
+    f.nudge(file.recs.length * REC);
+    await settle();
+    expect(file.calls.length).toBe(n);
+  });
+
+  /// Nudges queued before a read starts are covered by it. One arriving
+  /// DURING a read is not a second read beside it: the next read is
+  /// simply immediate.
+  it("coalesces nudges: one read per burst, and one more for a nudge mid-read", async () => {
+    const file = new FakeFile(3);
+    let gate: (() => void) | null = null;
+    const held = { on: false };
+    const f = new TranscriptFollower(async (anchor, direction) => {
+      if (held.on) await new Promise<void>((r) => (gate = r));
+      return file.page(anchor, direction);
+    });
+    f.setLive("running");
+    f.start();
+    await settle();
+    await vi.advanceTimersByTimeAsync(RECENT_GROWTH_MS + FAST_MS);
+    const n = file.calls.length;
+
+    // A burst before the read starts: one read.
+    file.add(1);
+    f.nudge();
+    f.nudge();
+    f.nudge();
+    await settle();
+    expect(file.calls.length).toBe(n + 1);
+
+    // A nudge while a read is in flight: exactly one more, at once.
+    held.on = true;
+    f.nudge();
+    await settle();
+    expect(gate).not.toBeNull();
+    f.nudge();
+    f.nudge();
+    held.on = false;
+    (gate as unknown as () => void)();
+    await settle();
+    await settle();
+    expect(file.calls.length).toBe(n + 3);
+    await vi.advanceTimersByTimeAsync(FAST_MS - 10);
+    expect(file.calls.length).toBe(n + 3);
+  });
+
+  it("changes nothing when the follow would not read: hidden, stopped, or not running", async () => {
+    const file = new FakeFile(3);
+    const f = await quiet(file);
+    const n = file.calls.length;
+
+    f.setVisible(false);
+    f.nudge(9_999);
+    await settle();
+    f.setVisible(true);
+    await settle(); // returning reads once, on its own account
+    const back = file.calls.length;
+    expect(back).toBe(n + 1);
+
+    f.setLive("not-running");
+    await settle();
+    f.nudge(9_999);
+    await settle();
+    expect(file.calls.length).toBe(back);
+
+    f.stop();
+    f.nudge(9_999);
+    await settle();
+    expect(file.calls.length).toBe(back);
+  });
+
+  it("before the first page, a nudge does not race the open", async () => {
+    const file = new FakeFile(3);
+    const f = follower(file);
+    f.setLive("running");
+    f.nudge(9_999);
+    await settle();
+    expect(file.calls.length).toBe(0);
+  });
+
+  /// The nudge that never came -- lost to a lagging event stream, a
+  /// reconnect, a phone that was backgrounded -- costs the wait it would
+  /// have cut and nothing else: the growth is read on the cadence.
+  it("a dropped nudge is recovered by the poll", async () => {
+    const file = new FakeFile(3);
+    const f = await quiet(file);
+    file.add(2);
+    // No nudge. Within one full backoff step the growth is on screen.
+    await vi.advanceTimersByTimeAsync(IDLE_MAX_MS);
+    expect(ids(f.getSnapshot()).at(-1)).toBe("r4");
+  });
+});
+
 describe("TranscriptFollower: growth", () => {
   it("pages a large catch-up, a bounded number of pages per tick, never from byte 0", async () => {
     const file = new FakeFile(3, 3);

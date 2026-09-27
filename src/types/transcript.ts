@@ -369,3 +369,18 @@ export interface TranscriptWindow {
   /// Bytes streamed past without being held (oversized records).
   bytes_scanned: number;
 }
+
+/// A nudge that a RUNNING session's transcript changed (#1477): the
+/// payload of the `claude-session-activity` event. Mirrors
+/// `claude::activity::SessionActivity`.
+///
+/// Content-free by design: an id the session list already carries, the
+/// file's byte size (the same measure as a page's `file_bytes`), and a
+/// sequence number that resets when the desktop restarts. Never order on
+/// `seq`, and never treat a nudge as data: a lost one costs latency only,
+/// because the follow keeps its own poll.
+export interface SessionActivity {
+  session_id: string;
+  size: number;
+  seq: number;
+}

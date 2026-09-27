@@ -1033,6 +1033,12 @@ pub fn run() {
             // binds a port when the setting says so.
             remote::gate::setup(&app.handle().clone());
 
+            // The session activity nudge (#1477): a one-second stat of
+            // RUNNING sessions' transcripts, emitting a content-free
+            // `claude-session-activity` on change. Its own thread, not
+            // the 60-second health loop's: its whole point is latency.
+            claude::activity::spawn(app.handle().clone());
+
             Ok(())
         })
         .on_window_event(|window, event| match event {

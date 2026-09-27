@@ -74,19 +74,33 @@ export function PhoneTranscript({
   path,
   liveness,
   label = "Transcript",
+  sessionId = null,
 }: {
   path: string;
   liveness: Liveness;
   label?: string;
+  /// The session `path` is the main transcript of, so the desktop's
+  /// activity nudge for it reads at once (#1477). Omitted for a
+  /// subagent's transcript, which is not nudged.
+  sessionId?: string | null;
 }) {
   const [reveal, setReveal] = useState(false);
-  const revealed = useClaudeTranscriptLive(path, { liveness, reveal: true, enabled: reveal });
+  const revealed = useClaudeTranscriptLive(path, {
+    liveness,
+    reveal: true,
+    enabled: reveal,
+    sessionId,
+  });
   // Refused or failed before it read anything: the masked text stays.
   const revealFailed =
     reveal && revealed.messages === undefined && revealed.status === "could-not-read";
   // The masked follower keeps running unless the revealed one is standing
   // in for it: a refused or failed reveal falls back to it at once.
-  const masked = useClaudeTranscriptLive(path, { liveness, enabled: !reveal || revealFailed });
+  const masked = useClaudeTranscriptLive(path, {
+    liveness,
+    enabled: !reveal || revealFailed,
+    sessionId,
+  });
   const showingRevealed = reveal && revealed.messages !== undefined;
   const active = showingRevealed ? revealed : masked;
   const held = active.messages;

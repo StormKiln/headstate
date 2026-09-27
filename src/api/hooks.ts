@@ -59,6 +59,7 @@ import type {
   ScanKind,
 } from "./tauri";
 import { type FollowLive, TranscriptFollower } from "@/lib/transcriptFollow";
+import type { SessionActivity } from "@/types/transcript";
 import { createCoalescer, type Scheduler } from "@/lib/coalesce";
 import { createLimiter, withDeadline } from "@/lib/limiter";
 import { IS_MOBILE_BUILD } from "@/lib/target";
@@ -1756,6 +1757,12 @@ function followLive(liveness: Liveness): FollowLive {
 /// so the masked one stays underneath and a refused reveal leaves the
 /// masked text on screen. `enabled: false` pauses a follower and keeps
 /// what it holds.
+///
+/// `sessionId` is the session whose MAIN transcript `path` is: a
+/// `claude-session-activity` nudge for it reads at once (#1477), and a
+/// nudge for any other session is ignored here. Omitted for a subagent's
+/// transcript, which the desktop does not stat -- that one follows on
+/// its cadence alone, as every transcript does when a nudge is lost.
 export function useClaudeTranscriptLive(
   path: string | null,
   options: {
@@ -1764,9 +1771,11 @@ export function useClaudeTranscriptLive(
     reveal?: boolean;
     /// Open at this message id when it is within reach (#1486).
     openAt?: string | null;
+    /// The session `path` belongs to, for its activity nudges (#1477).
+    sessionId?: string | null;
   },
 ) {
-  const { liveness, enabled = true, reveal = false, openAt = null } = options;
+  const { liveness, enabled = true, reveal = false, openAt = null, sessionId = null } = options;
   const on = enabled && path !== null && path !== "";
   const key = `${reveal ? "reveal" : "masked"}:${path ?? ""}`;
   const make = () =>
@@ -1797,6 +1806,27 @@ export function useClaudeTranscriptLive(
     follower.start();
     return () => follower.stop();
   }, [follower, on]);
+  // Through the transport seam, so the phone hears it too.
+  useEffect(() => {
+    if (!on || sessionId === null || sessionId === "") return;
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    listen<SessionActivity>(SESSION_ACTIVITY_EVENT, (e) => {
+      // Another session's nudge is the list's news, not this pane's.
+      if (e.payload.session_id !== sessionId) return;
+      follower.nudge(e.payload.size);
+    }).then(
+      (fn) => {
+        if (cancelled) safeUnlisten(fn);
+        else unlisten = fn;
+      },
+      () => {},
+    );
+    return () => {
+      cancelled = true;
+      safeUnlisten(unlisten);
+    };
+  }, [follower, on, sessionId]);
 
   const snapshot = useSyncExternalStore(follower.subscribe, follower.getSnapshot);
   const actions = useMemo(
@@ -1814,6 +1844,66 @@ export function useClaudeTranscriptLive(
 
 /// What `useClaudeTranscriptLive` returns: what a host passes down.
 export type TranscriptLive = ReturnType<typeof useClaudeTranscriptLive>;
+
+/// The desktop's content-free nudge that a running session's transcript
+/// changed (#1477). `claude::activity` on the desktop; on the phone's
+/// allowlist as well, so the phone hears it through the transport.
+export const SESSION_ACTIVITY_EVENT = "claude-session-activity";
+
+/// How long a nudge keeps a session "active now" in the list. Nudges come
+/// about once a second while a session writes, so a few missed ones do
+/// not flicker the badge, and a session that went quiet loses it soon.
+export const ACTIVE_NOW_MS = 10_000;
+
+/// The sessions the desktop saw writing in the last `ACTIVE_NOW_MS`
+/// (#1477), for the list's "active now" badge.
+///
+/// Every nudge, for every session: the list is where other sessions'
+/// nudges go -- they never read a transcript. Empty until a nudge
+/// arrives, which is what a session that has not written looks like
+/// too; the badge is only ever an addition to a row, never a claim that
+/// an unbadged session is quiet, since a nudge can be lost.
+///
+/// Expiry is a timer per session, not a clock read at render, so a
+/// repaint for any other reason cannot move a badge.
+export function useSessionActivity(): ReadonlySet<string> {
+  const [active, setActive] = useState<ReadonlySet<string>>(() => new Set());
+  useEffect(() => {
+    const timers = new Map<string, ReturnType<typeof setTimeout>>();
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    listen<SessionActivity>(SESSION_ACTIVITY_EVENT, (e) => {
+      const id = e.payload.session_id;
+      const held = timers.get(id);
+      if (held !== undefined) clearTimeout(held);
+      timers.set(
+        id,
+        setTimeout(() => {
+          timers.delete(id);
+          setActive((prev) => {
+            if (!prev.has(id)) return prev;
+            const next = new Set(prev);
+            next.delete(id);
+            return next;
+          });
+        }, ACTIVE_NOW_MS),
+      );
+      setActive((prev) => (prev.has(id) ? prev : new Set(prev).add(id)));
+    }).then(
+      (fn) => {
+        if (cancelled) safeUnlisten(fn);
+        else unlisten = fn;
+      },
+      () => {},
+    );
+    return () => {
+      cancelled = true;
+      safeUnlisten(unlisten);
+      for (const t of timers.values()) clearTimeout(t);
+    };
+  }, []);
+  return active;
+}
 
 /// The Claude sessions that produced this pull request (#1211).
 ///

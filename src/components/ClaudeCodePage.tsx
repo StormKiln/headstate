@@ -30,6 +30,7 @@ import {
   useClaudeSessionsForPrQuery,
   type PrQueryState,
   useClaudeTranscriptFollow,
+  useSessionActivity,
   useWorktrees,
   useUiPrefs,
 } from "@/api/hooks";
@@ -739,6 +740,10 @@ export function ClaudeSessionColumn() {
   // WHY it is empty, and only the scan knows whether `~/.claude/projects`
   // is there. Same query as the page's, so this costs a cache hit.
   const { now, imported } = useClaudeSessions(true);
+  // Which sessions the desktop saw writing just now (#1477), for the
+  // rows' "active now" badge. Every session's nudges land here; only the
+  // open transcript's make a read.
+  const activeNow = useSessionActivity();
   const query = useFilters((f) => f.claudeQuery);
   const setQuery = useFilters((f) => f.setClaudeQuery);
   const filter = useFilters((f) => f.claudeFilter);
@@ -1032,6 +1037,7 @@ export function ClaudeSessionColumn() {
                   session={s}
                   now={now}
                   active={s.session_id === selected}
+                  activeNow={activeNow.has(s.session_id)}
                   // The keyboard cursor, drawn as a ring (#953). `PrList`
                   // passes it the same way and for the same reason: only
                   // the list knows a row's index, and the cursor is an
@@ -1419,6 +1425,29 @@ function LivenessBadge({ liveness }: { liveness: Liveness }) {
   );
 }
 
+/// "active now" (#1477): the desktop saw this session's transcript change
+/// within the last few seconds. Subtle on purpose -- a word and a small
+/// pulsing dot beside "Running", not a colour change of the row -- and
+/// only ever an addition: a row without it is not claimed to be quiet,
+/// because a nudge can be lost.
+///
+/// `motion-safe` so the pulse stops for a reader who asked for less
+/// motion; the word carries the meaning either way.
+function ActiveNow({ muted }: { muted: boolean }) {
+  return (
+    <span
+      className={`flex shrink-0 items-center gap-1 ${muted ? "text-white" : "text-[#3fb950]"}`}
+      data-testid="active-now"
+    >
+      <span
+        className="h-1.5 w-1.5 rounded-full bg-current motion-safe:animate-pulse"
+        aria-hidden="true"
+      />
+      active now
+    </span>
+  );
+}
+
 /// The wall-clock time a notification was recorded, as `HH:MM`.
 ///
 /// #1067 asks for "last seen waiting at HH:MM" in so many words, and a
@@ -1612,10 +1641,16 @@ function SessionEntry({
   session: s,
   now,
   active,
+  activeNow = false,
   cursored = false,
   onSelect,
 }: {
   session: ClaudeSession;
+  /// The desktop saw this session's transcript change in the last few
+  /// seconds (#1477). Drawn only beside a Running verdict: a nudge next
+  /// to "Not running" would contradict the row, and the verdict is the
+  /// fresher claim until the next poll says otherwise.
+  activeNow?: boolean;
   /// The poll's timestamp. See the page's doc comment: never
   /// `Date.now()`.
   now: number;
@@ -1684,6 +1719,7 @@ function SessionEntry({
         }`}
       >
         <LivenessBadge liveness={s.liveness} />
+        {activeNow && s.liveness.state === "running" ? <ActiveNow muted={active} /> : null}
         {/* A DATE on every row, not only in the detail. 147 sessions in
             the largest directory share a title with a sibling (mostly
             repeated `/security-review` runs), so the title alone cannot
@@ -3844,7 +3880,9 @@ function TranscriptWindow({ session: s }: { session: ClaudeSession }) {
 function TranscriptFor({ detail: d }: { detail: ClaudeSessionDetail }) {
   const renderer = useTranscriptRenderer();
   if (renderer === "phone" && d.transcript_path) {
-    return <PhoneTranscript path={d.transcript_path} liveness={d.liveness} />;
+    return (
+      <PhoneTranscript path={d.transcript_path} liveness={d.liveness} sessionId={d.session_id} />
+    );
   }
   return <SessionTranscript detail={d} />;
 }
@@ -3859,7 +3897,9 @@ function SessionTranscript({ detail: d }: { detail: ClaudeSessionDetail }) {
   if (!d.transcript_path) {
     return <p className="text-xs text-[#8b949e]">This session recorded no transcript path.</p>;
   }
-  return <DesktopTranscript path={d.transcript_path} liveness={d.liveness} />;
+  return (
+    <DesktopTranscript path={d.transcript_path} liveness={d.liveness} sessionId={d.session_id} />
+  );
 }
 
 /// Bytes as KB or MB, whichever reads better.

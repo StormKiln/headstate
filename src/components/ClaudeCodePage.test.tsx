@@ -137,9 +137,16 @@ const state = vi.hoisted(() => ({
   /// Every path the viewer's read was ENABLED for, so a test can assert
   /// it is not paid for on selection.
   transcriptAskedFor: [] as (string | null)[],
+  /// The sessions `useSessionActivity` says the desktop saw writing just
+  /// now (#1477), for the rows' "active now" badge.
+  activeNow: new Set<string>(),
+  /// The `sessionId` each transcript follow was given, so a test can
+  /// assert the open session's nudges reach its follow.
+  transcriptSessionIds: [] as (string | null | undefined)[],
 }));
 
 vi.mock("../api/hooks", () => ({
+  useSessionActivity: () => state.activeNow,
   // Empty by default, which is what every assertion in this file about
   // "Copy resume command" assumes (#1126). Set per-test to reach the
   // launch path.
@@ -231,8 +238,12 @@ vi.mock("../api/hooks", () => ({
   // still pin what they always pinned. `following`, `lastReadAt` and
   // `reread` are the new surface and have their own fixtures.
   // The viewer's live, paged data (#1476).
-  useClaudeTranscriptLive: (path: string | null, options: { enabled?: boolean }) => {
+  useClaudeTranscriptLive: (
+    path: string | null,
+    options: { enabled?: boolean; sessionId?: string | null },
+  ) => {
     if (options.enabled ?? true) state.transcriptAskedFor.push(path);
+    state.transcriptSessionIds.push(options.sessionId);
     return liveOf(state.transcript, state.transcriptFailed ? "Permission denied" : undefined);
   },
   useClaudeTranscriptFollow: (path: string | null, enabled: boolean) => {
@@ -639,6 +650,8 @@ beforeEach(() => {
   state.transcript = undefined;
   state.transcriptFailed = false;
   state.transcriptAskedFor = [];
+  state.activeNow = new Set();
+  state.transcriptSessionIds = [];
   // #1208. A FOLLOWING follow that has read once, by default: the state
   // the pane is in for the overwhelming majority of the tests below, and
   // an explicit default so a test that cares about "idle" or "stopped"
@@ -1000,6 +1013,45 @@ describe("liveness renders as three states, not two", () => {
     const dead = titles.findIndex((t) => t.includes("Touched ten minutes ago"));
     expect(live).toBeGreaterThanOrEqual(0);
     expect(live).toBeLessThan(dead);
+  });
+});
+
+/// #1477: other sessions' nudges only mark their rows; they never read.
+describe("the list's active-now badge (#1477)", () => {
+  it("marks a running session the desktop saw writing, and no other row", () => {
+    state.list = listOf([
+      session({
+        session_id: "writing",
+        name: "Writing now",
+        liveness: { state: "running", pid: 7, status: "busy" },
+      }),
+      session({
+        session_id: "quiet",
+        name: "Running and quiet",
+        liveness: { state: "running", pid: 8, status: "idle" },
+      }),
+    ]);
+    state.activeNow = new Set(["writing"]);
+    renderView();
+    const badges = screen.getAllByTestId("active-now");
+    expect(badges).toHaveLength(1);
+    expect(badges[0].closest("button")?.getAttribute("aria-label")).toBe("Writing now");
+  });
+
+  /// A nudge beside "Not running" would contradict the row: the verdict
+  /// wins until the next poll.
+  it("is not drawn beside a verdict that is not Running", () => {
+    state.list = listOf([
+      session({ session_id: "stale", name: "Stale verdict" }),
+      session({
+        session_id: "unknown",
+        name: "Could not tell",
+        liveness: { state: "unknown", why: "registry unreadable" },
+      }),
+    ]);
+    state.activeNow = new Set(["stale", "unknown"]);
+    renderView();
+    expect(screen.queryByTestId("active-now")).toBeNull();
   });
 });
 
@@ -4940,6 +4992,9 @@ describe("the transcript viewer", () => {
 
     fireEvent.click(within(pane).getByRole("button", { name: /show the transcript/i }));
     expect(state.transcriptAskedFor).toContain("/Users/acme/.claude/projects/slug/e5dff3bd.jsonl");
+    // The follow is told whose transcript it is, so that session's
+    // activity nudges read at once (#1477).
+    expect(state.transcriptSessionIds).toContain("e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2");
     const log = within(pane).getByRole("log");
     expect(within(log).getByText("run the tests")).toBeTruthy();
     expect(within(log).getByText("Running them now.")).toBeTruthy();

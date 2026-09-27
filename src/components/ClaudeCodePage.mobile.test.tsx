@@ -74,9 +74,13 @@ const state = vi.hoisted(() => ({
   /// #1479's viewer feed. The phone reads it through the remote surface
   /// exactly as the desktop reads it locally (`Class::Read`).
   transcript: undefined as TranscriptPage | undefined,
+  /// The `sessionId` each transcript follow was given (#1477).
+  transcriptSessionIds: [] as (string | null | undefined)[],
 }));
 
 vi.mock("../api/hooks", () => ({
+  // #1477's "active now" set: no session nudged in this file.
+  useSessionActivity: () => new Set<string>(),
   // #1280's reverse lookup. `off` -- nothing typed here is a pull
   // request reference -- which is what every assertion in this file
   // assumes; `ClaudeCodePage.test.tsx` is where the other states are
@@ -128,7 +132,10 @@ vi.mock("../api/hooks", () => ({
       refetch: refetchFn,
     };
   },
-  useClaudeTranscriptLive: () => liveOf(state.transcript),
+  useClaudeTranscriptLive: (_path: string | null, options?: { sessionId?: string | null }) => {
+    state.transcriptSessionIds.push(options?.sessionId);
+    return liveOf(state.transcript);
+  },
   // #1208: a FOLLOW. The phone's case for it is the stronger one -- the
   // companion user cannot reach the machine, so a frozen snapshot of a
   // RUNNING agent is the worst view in the app.
@@ -287,6 +294,7 @@ beforeEach(() => {
   // phone means the LIST is the thing that is hidden.
   useFilters.setState({ claudeQuery: "", claudeSelected: undefined, claudeTranscript: undefined });
   state.transcript = undefined;
+  state.transcriptSessionIds = [];
   copyFn.mockClear();
   revealFn.mockClear();
 });
@@ -617,6 +625,12 @@ describe("the transcript viewer on the phone", () => {
     expect(screen.getByTestId("phone-transcript")).toBeTruthy();
     // The detail screen is not showing: this is the screen now.
     expect(screen.queryByTestId("transcript-pane")).toBeNull();
+    // Told whose transcript it is, so this session's nudges read at once
+    // on the phone and nobody else's do (#1477).
+    expect(state.transcriptSessionIds.length).toBeGreaterThan(0);
+    expect(new Set(state.transcriptSessionIds)).toEqual(
+      new Set(["e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2"]),
+    );
   });
 
   it("reaches the detail from its header, and the list from its back link", () => {
