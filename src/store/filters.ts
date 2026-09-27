@@ -291,6 +291,9 @@ export type ClaudePage = "sessions" | "overview" | "plugins";
 /// body, which proposes one rather than smuggling it in here.
 export type ClaudeSessionFilter = "all" | "resumable" | "gone" | "running" | "ended";
 
+/// The two tabs on a selected session's pane (#1546).
+export type ClaudeSessionTab = "details" | "transcript";
+
 interface FilterStore {
   /// Filters are PER VIEW: a repo selected in My PRs must not leak into
   /// Worktrees, which has an entirely different repo list.
@@ -487,30 +490,35 @@ interface FilterStore {
   /// which is the reason `selectedPr` gives for the same choice.
   claudeSelected: string | undefined;
   selectClaudeSession: (id: string | undefined) => void;
-  /// The session whose transcript fills the main panel, or undefined for
-  /// none (#1479).
+  /// Which tab the selected session's pane shows (#1546): its Details or
+  /// its Transcript.
   ///
-  /// The transcript viewer's full-window route. This app routes through
-  /// the store rather than a URL, so "deep-linkable" means ONE action
-  /// that any caller -- a session row, the overview, the phone's list --
-  /// can fire to land on it: `openClaudeTranscript` sets the page, the
-  /// selected session and this in one `set` (after `setView` when coming
-  /// from another view), for the reason `showClaudeSessions` gives about
-  /// pairings a caller could order wrongly.
+  /// ONE choice for the pane, not one per session: it stays put while
+  /// the reader moves between sessions, so reading down the list with
+  /// the Transcript tab open shows each session's transcript in turn,
+  /// and a reader on Details is never dropped into a read they did not
+  /// ask for. A per-session map would also have to decide what an entry
+  /// means for a session that has since gone; one value cannot go stale.
   ///
-  /// An id, not a flag, and matched against `claudeSelected` by
-  /// `ClaudeCodePage`: picking another session in the sidebar shows THAT
-  /// session's detail rather than carrying the full-window transcript
-  /// over to a session nobody opened it for.
+  /// The transcript's one way in. This app routes through the store
+  /// rather than a URL, so "deep-linkable" means ONE action that any
+  /// caller -- a notification, the phone's list -- can fire to land on
+  /// it: `openClaudeTranscript` sets the page, the selected session and
+  /// this tab in one `set` (after `setView` when coming from another
+  /// view), for the reason `showClaudeSessions` gives about pairings a
+  /// caller could order wrongly.
   ///
-  /// Not persisted, for `claudeSelected`'s reason.
-  claudeTranscript: string | undefined;
+  /// Not persisted, for `claudeSelected`'s reason, and reset to Details
+  /// when the view is left.
+  claudeSessionTab: ClaudeSessionTab;
+  setClaudeSessionTab: (tab: ClaudeSessionTab) => void;
   /// Where the transcript opens (#1484): `"marker"` at this device's
   /// "since you left" marker -- a notification's tap -- or `"latest"`,
-  /// the newest turn. Set with `claudeTranscript` by the one action.
+  /// the newest turn. Set by `openClaudeTranscript`; picking another
+  /// session or tab puts it back to `"latest"`, so the marker applies to
+  /// the one session and the one opening it was asked for.
   claudeTranscriptAt: "latest" | "marker";
   openClaudeTranscript: (id: string, at?: "latest" | "marker") => void;
-  closeClaudeTranscript: () => void;
   /// Where inside the selected repository the browser is (#1034).
   ///
   /// Repository-relative, `""` for the root, and it names a DIRECTORY --
@@ -803,7 +811,8 @@ export const useFilters = create<FilterStore>()(
           // stale-control failure in the other direction.
           claudeShowSubagents: false,
           claudeSelected: undefined,
-          claudeTranscript: undefined,
+          claudeSessionTab: "details",
+          claudeTranscriptAt: "latest",
           // And the browser's position (#1034), for the reason this
           // block gives throughout: a position inside one view means
           // nothing on another, and coming back to a file panel opened
@@ -842,11 +851,15 @@ export const useFilters = create<FilterStore>()(
           // number is a promise about what the next screen shows.
           claudeShowSubagents: false,
           claudeSelected: undefined,
-          claudeTranscript: undefined,
+          claudeSessionTab: "details",
+          claudeTranscriptAt: "latest",
         }),
       claudeSelected: undefined,
-      selectClaudeSession: (claudeSelected) => set({ claudeSelected }),
-      claudeTranscript: undefined,
+      selectClaudeSession: (claudeSelected) =>
+        set({ claudeSelected, claudeTranscriptAt: "latest" }),
+      claudeSessionTab: "details",
+      setClaudeSessionTab: (claudeSessionTab) =>
+        set({ claudeSessionTab, claudeTranscriptAt: "latest" }),
       claudeTranscriptAt: "latest",
       openClaudeTranscript: (id, at = "latest") => {
         // Arriving from another view takes `setView`'s resets first --
@@ -856,11 +869,10 @@ export const useFilters = create<FilterStore>()(
         set({
           claudePage: "sessions",
           claudeSelected: id,
-          claudeTranscript: id,
+          claudeSessionTab: "transcript",
           claudeTranscriptAt: at,
         });
       },
-      closeClaudeTranscript: () => set({ claudeTranscript: undefined }),
       repoPath: "",
       // Descending or going up CLEARS the file being read, in one `set`
       // rather than two calls a caller has to order (#1034). The pairing

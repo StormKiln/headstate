@@ -59,6 +59,7 @@ import { SessionMuteToggle } from "./SessionMuteToggle";
 import { useTranscriptRenderer } from "./transcript/phone/renderer";
 import { DesktopTranscript } from "./transcript/DesktopTranscript";
 import { TranscriptHeader } from "./transcript/TranscriptHeader";
+import { SessionTabs } from "./transcript/SessionTabs";
 
 /// The sessions list is virtualized, and this is the note that used to
 /// be `RENDER_CAP = 200` (#1200).
@@ -254,7 +255,6 @@ export function ClaudeCodePage() {
   // matches that search" and "nothing has been read yet" are different
   // emptinesses, and the pane must not offer "choose one" for either.
   const query = useFilters((f) => f.claudeQuery);
-  const transcriptFor = useFilters((f) => f.claudeTranscript);
   const isMobile = useIsMobile();
 
   // By LOOKUP against the current list, never a remembered session. The
@@ -273,9 +273,6 @@ export function ClaudeCodePage() {
   // has gone must send the phone BACK to the list, because the alternative
   // is a detail screen with nothing on it but a back link.
   const showingList = !isMobile || active === undefined;
-  // The full-window transcript route (#1479): only for the session it was
-  // opened for, so selecting another row shows that row's detail.
-  const fullTranscript = active !== undefined && transcriptFor === active.session_id;
 
   if (list.isLoading) {
     return <p className="p-4 text-sm text-[#8b949e]">Reading Claude Code sessions…</p>;
@@ -328,35 +325,29 @@ export function ClaudeCodePage() {
           </div>
         ) : null}
 
+        {/* No scroll here: a session's tabs own it (#1546). Details
+            scrolls inside its panel, and on the Transcript tab the
+            viewer is the one scroll container. */}
         <div
           className={
-            isMobile && showingList
-              ? "hidden"
-              : fullTranscript
-                ? // No scroll here: the viewer is the scroll container.
-                  "flex min-h-0 min-w-0 flex-1 flex-col p-4"
-                : isMobile
-                  ? "flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto p-4"
-                  : "min-w-0 flex-1 overflow-y-auto p-4"
+            isMobile && showingList ? "hidden" : "flex min-h-0 min-w-0 flex-1 flex-col p-4"
           }
         >
-          {fullTranscript && active ? (
-            <TranscriptWindow
-              session={active}
-              now={now}
-              withheld={list.data?.masking?.withheld === true}
-            />
-          ) : isMobile && !showingList ? (
+          {isMobile && !showingList ? (
             <button
               type="button"
               onClick={() => selectSession(undefined)}
-              className="tap-target -ml-1 mb-2 flex items-center self-start rounded px-2 text-sm text-[#58a6ff] hover:bg-[#161b22]"
+              className="tap-target -ml-1 mb-2 flex shrink-0 items-center self-start rounded px-2 text-sm text-[#58a6ff] hover:bg-[#161b22]"
             >
               ← All sessions
             </button>
           ) : null}
-          {fullTranscript ? null : active ? (
-            <SessionDetail session={active} now={now} />
+          {active ? (
+            <SessionPane
+              session={active}
+              now={now}
+              withheld={list.data?.masking?.withheld === true}
+            />
           ) : matched.ordered.length === 0 ? (
             // NOT "choose a session" (#978). There is nothing to choose,
             // and an instruction a reader cannot follow makes them
@@ -1059,10 +1050,10 @@ export function ClaudeSessionColumn() {
                   // the ring is drawn over the blue rather than instead
                   // of it.
                   cursored={cursor === i}
-                  // On the phone a session opens at its transcript, as a
-                  // conversation does in the Claude app (#1481); its
-                  // detail is one tap away in that screen's header. The
-                  // desktop keeps the detail beside the list.
+                  // On the phone a session opens at its Transcript tab, as
+                  // a conversation does in the Claude app (#1481, #1546);
+                  // its Details tab is one tap away. The desktop keeps
+                  // whichever tab the pane was already on.
                   onSelect={() =>
                     isMobile ? openTranscript(s.session_id) : selectSession(s.session_id)
                   }
@@ -1941,11 +1932,8 @@ function SessionDetail({
           {/* #1486: this phone's per-session mute. The companion's own
               setting, so the phone build only. */}
           {IS_MOBILE_BUILD && <SessionMuteToggle sessionId={s.session_id} />}
-          {/* The transcript viewer (#1479), on every host: the terminal
-              renderer on a desktop layout (#1480), the phone's bubbles on
-              a phone layout (#1481). The old preview pane it replaced is
-              gone from both (#1514). */}
-          <TranscriptPane session={s} detail={detail.data} />
+          {/* The transcript is the pane's other tab (#1546), not a
+              section here: one way in. */}
         </>
       )}
       {/* OUTSIDE the detail gate: the jump is derived from `cwd` and
@@ -3525,82 +3513,17 @@ function StopSession({
   );
 }
 
-/// The transcript viewer's pane in the session detail (#1479).
+/// A selected session's pane (#1546): its Details and its Transcript, as
+/// two tabs.
 ///
-/// Opened by a click, as the preview it replaced was: it costs a read, and
-/// the detail pane is visited far more often than it is read. "Open in
-/// full window" is the viewer's full-window route
-/// (`openClaudeTranscript`), which on the phone is a screen of its own.
-///
-/// When there is no transcript to read, the pane states WHY ("There is
-/// nothing to read here: …"), on the desktop and the phone alike: the
-/// preview it replaced (#1480, #1514) used to, and the refusal must not
-/// vanish with it.
-function TranscriptPane({
-  session: s,
-  detail: d,
-}: {
-  session: ClaudeSession;
-  detail: ClaudeSessionDetail;
-}) {
-  const [open, setOpen] = useState(false);
-  const openFull = useFilters((f) => f.openClaudeTranscript);
-  const refusal = revealRefusal(d.transcript_path, d.transcript_state);
-  if (refusal !== null) {
-    return (
-      <section
-        className="rounded-md border border-[#30363d] bg-[#161b22] p-3"
-        data-testid="transcript-pane"
-      >
-        <h3 className="text-xs font-semibold text-[#e6edf3]">Transcript</h3>
-        <p className="mt-2 text-xs text-[#8b949e]">There is nothing to read here: {refusal}.</p>
-      </section>
-    );
-  }
-  return (
-    <section
-      className="rounded-md border border-[#30363d] bg-[#161b22] p-3"
-      data-testid="transcript-pane"
-    >
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h3 className="text-xs font-semibold text-[#e6edf3]">Transcript</h3>
-        <button
-          type="button"
-          onClick={() => openFull(s.session_id)}
-          className="tap-target rounded-md border border-[#30363d] bg-[#21262d] px-2 py-1 text-xs text-[#e6edf3] hover:bg-[#30363d]"
-        >
-          Open in full window
-        </button>
-      </div>
-      {!open ? (
-        <button
-          type="button"
-          onClick={() => setOpen(true)}
-          className="tap-target mt-3 flex items-center gap-1.5 rounded-md border border-[#30363d] bg-[#21262d] px-2 py-1 text-xs text-[#e6edf3] hover:bg-[#30363d]"
-        >
-          <Terminal className="h-3 w-3" aria-hidden="true" />
-          Show the transcript
-        </button>
-      ) : (
-        <div className="mt-2 flex h-[28rem] flex-col">
-          <TranscriptFor detail={d} />
-        </div>
-      )}
-    </section>
-  );
-}
-
-/// The transcript viewer filling the main panel: the full-window route
-/// (#1479), reached through `openClaudeTranscript`.
-///
-/// On the phone this is the screen a session row opens (#1481), so its
-/// back link returns to the list and the detail is a button beside the
-/// title; on the desktop it returns to the detail it was opened from.
-///
-/// The session header (#1485) sits above the transcript once the detail
-/// is read -- including when there is no transcript to show, since a
-/// running session with none yet is exactly when "running" matters.
-function TranscriptWindow({
+/// The transcript was a full-window route that replaced the detail
+/// (#1479), reached from a "show the transcript" pane inside it. It is a
+/// tab now and the route is gone, so there is one way in. Which tab shows
+/// is `claudeSessionTab`, one choice for the pane that stays put while
+/// the reader moves between sessions (the store says why);
+/// `openClaudeTranscript` selects the session AND this tab, which is how
+/// a notification and the phone's list land on it.
+function SessionPane({
   session: s,
   now,
   withheld,
@@ -3610,48 +3533,44 @@ function TranscriptWindow({
   /// This phone may not read transcripts (the list's `masking`).
   withheld: boolean;
 }) {
+  const tab = useFilters((f) => f.claudeSessionTab);
+  const setTab = useFilters((f) => f.setClaudeSessionTab);
+  return (
+    <SessionTabs
+      value={tab}
+      onValueChange={setTab}
+      details={<SessionDetail session={s} now={now} />}
+      transcript={<SessionTranscriptTab session={s} now={now} withheld={withheld} />}
+    />
+  );
+}
+
+/// The Transcript tab (#1546): the session header (#1485) over the
+/// viewer, which is the tab's one scroll container.
+///
+/// The header sits above the transcript once the detail is read --
+/// including when there is no transcript to show, since a running
+/// session with none yet is exactly when "running" matters. When there
+/// is none, the tab states WHY ("There is nothing to read here: …"), on
+/// the desktop and the phone alike (#1480, #1514).
+function SessionTranscriptTab({
+  session: s,
+  now,
+  withheld,
+}: {
+  session: ClaudeSession;
+  now: number;
+  withheld: boolean;
+}) {
   const detail = useClaudeSessionDetail(s.session_id, true);
-  const close = useFilters((f) => f.closeClaudeTranscript);
-  const selectSession = useFilters((f) => f.selectClaudeSession);
   // A notification's tap opens at the "since you left" marker (#1484).
   const openAt = useFilters((f) => f.claudeTranscriptAt);
   const phone = useTranscriptRenderer() === "phone";
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-2" data-testid="transcript-window">
-      <div className="flex items-center gap-3">
-        {phone ? (
-          <button
-            type="button"
-            onClick={() => {
-              close();
-              selectSession(undefined);
-            }}
-            className="tap-target -ml-1 flex shrink-0 items-center rounded px-2 text-sm text-[#58a6ff] hover:bg-[#161b22]"
-          >
-            ← All sessions
-          </button>
-        ) : (
-          <button
-            type="button"
-            onClick={close}
-            className="tap-target -ml-1 flex items-center rounded px-2 text-sm text-[#58a6ff] hover:bg-[#161b22]"
-          >
-            ← Session detail
-          </button>
-        )}
-        <h2 className="min-w-0 flex-1 truncate text-sm font-semibold text-[#e6edf3]">
-          {s.name ?? s.session_id}
-        </h2>
-        {phone ? (
-          <button
-            type="button"
-            onClick={close}
-            className="tap-target flex shrink-0 items-center rounded px-2 text-sm text-[#58a6ff] hover:bg-[#161b22]"
-          >
-            Details
-          </button>
-        ) : null}
-      </div>
+    <div className="flex min-h-0 flex-1 flex-col gap-2" data-testid="transcript-tab">
+      <h2 className="min-w-0 shrink-0 truncate text-sm font-semibold text-[#e6edf3]">
+        {s.name ?? s.session_id}
+      </h2>
       {detail.data ? (
         <TranscriptHeader
           session={s}
