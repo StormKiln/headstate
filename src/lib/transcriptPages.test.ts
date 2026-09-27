@@ -72,7 +72,7 @@ describe("mergeWindows", () => {
       ...call,
       blocks: call.blocks.map((b) =>
         b.kind === "tool_call" && b.result !== null
-          ? { ...b, result: { ...b.result, message_id: "late-result" } }
+          ? { ...b, result: { ...b.result, message_id: "late-result", oversized_bytes: 900_000 } }
           : b,
       ),
     };
@@ -87,6 +87,38 @@ describe("mergeWindows", () => {
     expect(merged.filter((m) => m.id === call.id)).toHaveLength(1);
     const late = merged.find((m) => m.id === "late-result");
     expect(late?.kind.kind).toBe("tool_results");
+    // Standing again, it is still the oversized record it was (#1476).
+    expect(late?.oversized_bytes).toBe(900_000);
+  });
+
+  /// #1476: a result too large for its page, paired into its call across
+  /// pages, keeps saying so -- its own message is folded away.
+  it("carries an oversized result's size onto the call it merges into", () => {
+    const c = G.cases.find((x) => x.limit === 1)!;
+    const at = c.windows.findIndex((w) =>
+      w.page.messages.some((m) => m.blocks.some((b) => b.kind === "tool_result")),
+    );
+    expect(at).toBeGreaterThan(0);
+    const windows = c.windows.map((w, i) =>
+      i !== at
+        ? w
+        : {
+            ...w,
+            page: {
+              ...w.page,
+              messages: w.page.messages.map((m) => ({
+                ...m,
+                blocks: m.blocks.map((b) =>
+                  b.kind === "tool_result" ? { ...b, oversized_bytes: 700_000 } : b,
+                ),
+              })),
+            },
+          },
+    );
+    const results = mergeWindows(windows).flatMap((m) =>
+      m.blocks.flatMap((b) => (b.kind === "tool_call" && b.result ? [b.result] : [])),
+    );
+    expect(results.some((r) => r.oversized_bytes === 700_000)).toBe(true);
   });
 });
 

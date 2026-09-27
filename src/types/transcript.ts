@@ -115,6 +115,10 @@ export interface TranscriptToolOutput {
   subagent: TranscriptSubagent | null;
   /// Set when this is a `TaskCreate`'s or `TaskUpdate`'s output (#1504).
   task: TranscriptTaskResult | null;
+  /// The record's `oversized_bytes`, carried with the output so it
+  /// survives being merged into its call (#1476). `null` when the record
+  /// was held whole.
+  oversized_bytes: number | null;
 }
 
 /** @public */

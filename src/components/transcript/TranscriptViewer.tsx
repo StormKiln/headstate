@@ -96,6 +96,15 @@ export interface TranscriptViewerProps {
   /// The reader reached the newest message the viewer holds. The data
   /// hook pages newer messages in by APPENDING to `messages`.
   onReachEnd?: () => void;
+  /// Which messages are mounted, by id, whenever that changes: the data
+  /// hook keeps the pages holding them and lets far ones go (#1476).
+  onWindowChange?: (firstId: string, lastId: string) => void;
+  /// Whether `messages` reaches the newest message the hook knows of.
+  /// `false` once it let the newest pages go while the reader was far
+  /// back; "jump to latest" then asks `onJumpToLatest` for them rather
+  /// than scrolling to the end of what is held. Default `true`.
+  atLiveEdge?: boolean;
+  onJumpToLatest?: () => void;
   /// The viewport's accessible name.
   label?: string;
   /// Reserved for 7.10's composer (#1491); ignored while
@@ -132,6 +141,9 @@ function ViewerBody({
   streaming,
   onReachStart,
   onReachEnd,
+  onWindowChange,
+  atLiveEdge = true,
+  onJumpToLatest,
   label = "Transcript",
   composer,
   className,
@@ -166,8 +178,16 @@ function ViewerBody({
     setSeen({ messages, arrivals });
   }
 
-  const windowAtTail = win.pins.end.at === "tail";
+  // Following only where the held messages reach the live edge: at the
+  // end of a run the hook detached from it, new output is not arriving.
+  const windowAtTail = win.pins.end.at === "tail" && atLiveEdge;
   useLayoutEffect(() => onWindowAtTail(windowAtTail), [windowAtTail, onWindowAtTail]);
+
+  const firstShown = messages[win.from]?.id;
+  const lastShown = messages[win.to - 1]?.id;
+  useLayoutEffect(() => {
+    if (firstShown !== undefined && lastShown !== undefined) onWindowChange?.(firstShown, lastShown);
+  }, [firstShown, lastShown, onWindowChange]);
 
   // Rows dropped from the top by a reach toward the end: hold the row the
   // reader was looking at in place. Compared relative to the viewport, so
@@ -232,6 +252,15 @@ function ViewerBody({
   };
 
   const onJump = (e: MouseEvent<HTMLButtonElement>) => {
+    if (!atLiveEdge && onJumpToLatest) {
+      // The newest messages are not held: the hook opens on them, and
+      // the window lands on the tail of what it brings.
+      e.preventDefault();
+      onJumpToLatest();
+      jumpRef.current = true;
+      moveWindow(tailPins(messages));
+      return;
+    }
     if (win.to >= messages.length) return; // the scroller's own scrollToEnd does it
     e.preventDefault();
     jumpRef.current = true;
@@ -239,6 +268,10 @@ function ViewerBody({
   };
 
   const count = arrivals.newCount;
+  const counted =
+    count !== null && count > 0
+      ? `${arrivals.atLeast ? "at least " : ""}${count.toLocaleString()} new`
+      : null;
   const shown = messages.slice(win.from, win.to);
   const atTail = win.to >= messages.length;
 
@@ -268,13 +301,11 @@ function ViewerBody({
           onClick={onJump}
           className="h-auto gap-1 rounded-full px-3 py-1 motion-reduce:transition-none"
           aria-label={
-            count !== null && count > 0
-              ? `Jump to the latest message, ${count.toLocaleString()} new`
-              : "Jump to the latest message"
+            counted !== null ? `Jump to the latest message, ${counted}` : "Jump to the latest message"
           }
         >
           <span aria-hidden="true">↓</span>
-          {count !== null && count > 0 ? `${count.toLocaleString()} new` : "Latest"}
+          {counted ?? "Latest"}
         </MessageScrollerButton>
       </MessageScroller>
       <div data-slot="transcript-composer" className="shrink-0" hidden={!COMPOSER_ENABLED}>

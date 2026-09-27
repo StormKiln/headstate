@@ -309,6 +309,11 @@ pub struct TranscriptToolOutput {
     pub subagent: Option<TranscriptSubagent>,
     /// Set when this output is a `TaskCreate`'s or `TaskUpdate`'s (#1504).
     pub task: Option<TranscriptTaskResult>,
+    /// The record's `oversized_bytes`, carried with the output (#1476):
+    /// merging absorbs the record, and without this a call answered by a
+    /// record too large for a page would lose the fact that its output
+    /// was streamed and clipped. `None` when the record was held whole.
+    pub oversized_bytes: Option<u64>,
 }
 
 /// What a task tool's result recorded (#1504).
@@ -794,8 +799,9 @@ pub(crate) fn build(lines: &[Line], seed: Seed, transcript: Option<&Path>) -> Tr
         };
         match record(rec, id, id_source, &ctx) {
             Parsed::Message(mut m) => {
-                stamp_results(&mut m);
+                // Before the stamp, which copies it onto the outputs.
                 m.oversized_bytes = line.oversized;
+                stamp_results(&mut m);
                 page.messages.push(*m);
             }
             Parsed::Machinery(t) => *machinery.entry(t).or_default() += 1,
@@ -809,12 +815,14 @@ pub(crate) fn build(lines: &[Line], seed: Seed, transcript: Option<&Path>) -> Tr
     page
 }
 
-/// Give every standing tool output its record's timestamp, before
-/// [`settle`] can move it into a call and the record is dropped.
+/// Give every standing tool output its record's timestamp and
+/// `oversized_bytes`, before [`settle`] can move it into a call and the
+/// record is dropped.
 fn stamp_results(m: &mut TranscriptMessage) {
     for b in &mut m.blocks {
         if let TranscriptBlock::ToolResult(out) = b {
             out.timestamp.clone_from(&m.timestamp);
+            out.oversized_bytes = m.oversized_bytes;
         }
     }
 }
@@ -1385,6 +1393,8 @@ fn block(index: usize, v: &serde_json::Value, ctx: &Ctx, message_id: &str) -> Tr
                 images,
                 subagent: None,
                 task: None,
+                // Stamped with `timestamp`, for the same reason.
+                oversized_bytes: None,
             })
         }
         "image" => TranscriptBlock::Image {

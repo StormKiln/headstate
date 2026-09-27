@@ -6,7 +6,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useFilters } from "../../store/filters";
 import type { TranscriptMessage, TranscriptPage } from "../../types/transcript";
 import { DesktopTranscript } from "./DesktopTranscript";
-import { call, DEAD, LIVE, output } from "./fixtures";
+import type { Liveness } from "../../types/pr";
+import { call, DEAD, LIVE, liveOf, output } from "./fixtures";
 import { installScrollShim, type ScrollShim } from "./scrollShim";
 
 const state = vi.hoisted(() => ({
@@ -14,14 +15,13 @@ const state = vi.hoisted(() => ({
   asked: [] as { path: string | null; live: boolean }[],
 }));
 vi.mock("../../api/hooks", () => ({
-  useClaudeTranscriptMessages: (path: string | null, enabled: boolean, live: boolean) => {
-    if (enabled) state.asked.push({ path, live });
-    return {
-      data: path ? state.pages[path] : undefined,
-      isError: false,
-      error: undefined,
-      dataUpdatedAt: Date.parse("2026-01-01T10:11:12"),
-    };
+  useClaudeTranscriptLive: (path: string | null, options: { liveness: Liveness }) => {
+    const live = options.liveness.state === "running";
+    state.asked.push({ path, live });
+    return liveOf(path ? (state.pages[path] as TranscriptPage | undefined) : undefined, undefined, {
+      status: live ? "following" : "stopped",
+      lastReadAt: Date.parse("2026-01-01T10:11:12"),
+    });
   },
 }));
 const blockText = vi.hoisted(() =>
@@ -107,17 +107,23 @@ describe("the desktop transcript", () => {
     expect(state.asked.at(-1)).toEqual({ path: MAIN, live: true });
     cleanup();
     render(<DesktopTranscript path={MAIN} liveness={DEAD} />);
-    expect(screen.getByTestId("transcript-read-status").textContent).toBe("Read at 10:11:12.");
+    expect(screen.getByTestId("transcript-read-status").textContent).toBe(
+      "Read at 10:11:12. Not following: the session is not running.",
+    );
     expect(state.asked.at(-1)).toEqual({ path: MAIN, live: false });
   });
 
   it("fetches a clipped block's full text from this transcript", async () => {
     state.pages[MAIN] = page([
-      msg("a1", "a1", { kind: "assistant" }, [text("all", { shown_chars: 3, total_chars: 9 })]),
+      {
+        ...msg("a1", "a1", { kind: "assistant" }, [text("all", { shown_chars: 3, total_chars: 9 })]),
+        offset: 512,
+      },
     ]);
     render(<DesktopTranscript path={MAIN} liveness={DEAD} />);
     fireEvent.click(screen.getByRole("button", { name: "Show all 9 characters" }));
-    expect(blockText).toHaveBeenCalledWith(MAIN, "a1", 0);
+    // With the record's offset hint, so the fetch reads one record (#1476).
+    expect(blockText).toHaveBeenCalledWith(MAIN, "a1", 0, false, 512);
     await act(() => shim.flush());
     expect(screen.getByText("all of it")).toBeTruthy();
   });

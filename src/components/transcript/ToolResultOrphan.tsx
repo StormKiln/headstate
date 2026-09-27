@@ -73,7 +73,7 @@ export function ToolResultOrphan({
           <ClippedText
             text={block.text}
             clip={block.clip}
-            address={{ messageId: block.message_id, index: block.index }}
+            address={{ messageId: block.message_id, index: block.index, offset: block.offset }}
             onLoadFullText={onLoadFullText}
           >
             {(t) => <MonoOutput text={t} error={error} />}

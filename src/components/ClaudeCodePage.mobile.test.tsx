@@ -12,6 +12,7 @@ import type {
 import { useFilters } from "@/store/filters";
 import { stubViewport } from "@/test-utils";
 import type { TranscriptPage } from "@/types/transcript";
+import { liveOf } from "./transcript/fixtures";
 
 /// The companion OFFERS this view and hides only what cannot work (#922).
 ///
@@ -127,13 +128,7 @@ vi.mock("../api/hooks", () => ({
       refetch: refetchFn,
     };
   },
-  useClaudeTranscriptMessages: () => ({
-    data: state.transcript,
-    isError: false,
-    error: undefined,
-    isFetching: false,
-    refetch: refetchFn,
-  }),
+  useClaudeTranscriptLive: () => liveOf(state.transcript),
   // #1208: a FOLLOW. The phone's case for it is the stronger one -- the
   // companion user cannot reach the machine, so a frozen snapshot of a
   // RUNNING agent is the worst view in the app.

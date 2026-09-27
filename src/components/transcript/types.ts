@@ -21,6 +21,9 @@ export type ToolVariant = "terminal" | "compact";
 export interface BlockAddress {
   messageId: string;
   index: number;
+  /// Where that record starts in the file (#1220): with it the fetch
+  /// reads one record instead of scanning (#1476). `null` when unknown.
+  offset: number | null;
 }
 
 /// Fetch one block's full text. Injected by the renderer, which knows

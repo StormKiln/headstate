@@ -207,13 +207,21 @@ function opensTurn(m: TranscriptMessage): boolean {
 export interface Arrivals {
   /// The newest message id seen, or `null` before any.
   tailId: string | null;
+  /// That message's recorded timestamp: what a replacement is counted
+  /// against (#1476). `null` when it recorded none.
+  tailAt: string | null;
   /// Messages that arrived below the reader while they were scrolled up.
   ///
   /// `null` when it cannot be counted: the hook replaced the list (a
-  /// re-read after compaction) and the last message seen is no longer
-  /// in it. "Qualify, or suppress": the button then says "Latest" with
-  /// no figure rather than a count that might be wrong.
+  /// re-read after compaction) and neither the last message seen nor its
+  /// timestamp can place what is new. "Qualify, or suppress": the button
+  /// then says "Latest" with no figure rather than a count that might be
+  /// wrong.
   newCount: number | null;
+  /// `newCount` is a floor, not a count: the list was replaced, and only
+  /// messages recorded after the last one seen are counted -- one with
+  /// no timestamp may be new too. Said as "at least N".
+  atLeast: boolean;
   /// Turn openers to mark `scrollAnchor` in the CURRENT batch.
   ///
   /// Only the current batch, deliberately. The scroller scrolls to any
@@ -233,7 +241,28 @@ export interface Arrivals {
 
 const NO_ANCHORS: ReadonlySet<string> = new Set();
 
-export const NO_ARRIVALS: Arrivals = { tailId: null, newCount: 0, anchors: NO_ANCHORS };
+export const NO_ARRIVALS: Arrivals = {
+  tailId: null,
+  tailAt: null,
+  newCount: 0,
+  atLeast: false,
+  anchors: NO_ANCHORS,
+};
+
+/// How many of `messages` were recorded after `after`: a floor on what
+/// a replaced list brought in, or `null` when there is nothing to count
+/// against. Claude Code stamps records as it writes them, so a message
+/// recorded later than the last one seen was not seen; one with no
+/// timestamp is not counted, which is why this is a floor.
+function recordedAfter(messages: readonly TranscriptMessage[], after: string | null): number | null {
+  const t = after === null ? Number.NaN : Date.parse(after);
+  if (Number.isNaN(t)) return null;
+  let n = 0;
+  for (const m of messages) {
+    if (m.timestamp !== null && Date.parse(m.timestamp) > t) n++;
+  }
+  return n;
+}
 
 /// Fold one new list from the hook into the arrival bookkeeping.
 export function trackArrivals(
@@ -244,6 +273,7 @@ export function trackArrivals(
   const n = messages.length;
   if (n === 0) return { ...prev, anchors: NO_ANCHORS };
   const tailId = messages[n - 1].id;
+  const tailAt = messages[n - 1].timestamp;
 
   if (prev.tailId === null) {
     let last: string | null = null;
@@ -253,21 +283,45 @@ export function trackArrivals(
         break;
       }
     }
-    return { tailId, newCount: 0, anchors: last === null ? NO_ANCHORS : new Set([last]) };
+    return {
+      tailId,
+      tailAt,
+      newCount: 0,
+      atLeast: false,
+      anchors: last === null ? NO_ANCHORS : new Set([last]),
+    };
   }
 
   const k = indexOfId(messages, prev.tailId);
   if (k < 0) {
-    return { tailId, newCount: following ? 0 : null, anchors: NO_ANCHORS };
+    if (following) return { tailId, tailAt, newCount: 0, atLeast: false, anchors: NO_ANCHORS };
+    // Replaced (#1476): the last message seen is gone, so what arrived is
+    // placed by time instead -- a floor, said as one -- or not at all.
+    const floor = recordedAfter(messages, prev.tailAt);
+    return {
+      tailId,
+      tailAt,
+      newCount: floor === null ? null : (prev.newCount ?? 0) + floor,
+      atLeast: floor !== null,
+      anchors: NO_ANCHORS,
+    };
   }
   const appended = messages.slice(k + 1);
   if (following) {
     const openers = appended.filter(opensTurn).map((m) => m.id);
-    return { tailId, newCount: 0, anchors: openers.length ? new Set(openers) : NO_ANCHORS };
+    return {
+      tailId,
+      tailAt,
+      newCount: 0,
+      atLeast: false,
+      anchors: openers.length ? new Set(openers) : NO_ANCHORS,
+    };
   }
   return {
     tailId,
+    tailAt,
     newCount: prev.newCount === null ? null : prev.newCount + appended.length,
+    atLeast: prev.atLeast,
     anchors: NO_ANCHORS,
   };
 }
@@ -275,7 +329,7 @@ export function trackArrivals(
 /// The same bookkeeping once the reader is back at the live edge: nothing
 /// is new any more.
 export function caughtUp(prev: Arrivals): Arrivals {
-  return prev.newCount === 0 ? prev : { ...prev, newCount: 0 };
+  return prev.newCount === 0 && !prev.atLeast ? prev : { ...prev, newCount: 0, atLeast: false };
 }
 
 /// Drop the batch's anchors, for a window move the READER made (a reach

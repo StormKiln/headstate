@@ -191,7 +191,7 @@ function ResultFold({
       <ClippedText
         text={r.text}
         clip={r.clip}
-        address={{ messageId: r.message_id, index: r.index }}
+        address={{ messageId: r.message_id, index: r.index, offset: r.offset }}
         onLoadFullText={ctx.onLoadFullText}
       >
         {(t) => (prose && !error ? <ProseOutput text={t} /> : <MonoOutput text={t} error={error} />)}
@@ -208,7 +208,7 @@ function ErrorText({ ctx }: { ctx: Ctx }) {
     <ClippedText
       text={r.text}
       clip={r.clip}
-      address={{ messageId: r.message_id, index: r.index }}
+      address={{ messageId: r.message_id, index: r.index, offset: r.offset }}
       onLoadFullText={ctx.onLoadFullText}
     >
       {(t) => <MonoOutput text={t} error />}

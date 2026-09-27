@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { claudeTranscriptBlockText } from "@/api/tauri";
-import { useClaudeTranscriptMessages } from "@/api/hooks";
+import { useClaudeTranscriptLive } from "@/api/hooks";
 import { PullIndicator } from "@/components/PullIndicator";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { commandError } from "@/lib/errorKind";
@@ -12,6 +12,7 @@ import type { Liveness } from "../../../types/pr";
 import type { TranscriptMessage, TranscriptSubagent } from "../../../types/transcript";
 import { palette } from "../palette";
 import { transcriptStreaming } from "../streaming";
+import { FollowStatus } from "../FollowStatus";
 import { deriveTaskChecklist, taskSummary } from "../tasks";
 import { TaskChecklist } from "../TaskChecklist";
 import { TranscriptViewer } from "../TranscriptViewer";
@@ -39,14 +40,21 @@ const renderPhoneMessage = (m: TranscriptMessage) => <PhoneMessage message={m} /
 /// | pull to refresh | here |
 /// | Dynamic Type | `textScale.ts`, applied per row |
 ///
+/// # The data (#1476)
+///
+/// `useClaudeTranscriptLive`: the newest page, older pages as the reader
+/// scrolls up, live growth while the session writes, at most a bounded
+/// number of messages held -- and, backgrounded, only the reader's own
+/// pages. `src/lib/transcriptFollow.ts` argues all of it.
+///
 /// # Reveal (#1488)
 ///
 /// The desktop masks likely secrets before transcript text leaves it,
 /// and says so in the answer's `masking`. When it also says
-/// `reveal_allowed`, a Reveal button re-reads the page with
-/// `reveal: true` -- a fresh read, from nothing, not an update of the
-/// masked one. The masked read stays cached underneath, so a refused
-/// reveal leaves the masked text on screen with the refusal beside it.
+/// `reveal_allowed`, a Reveal button re-reads with `reveal: true` -- a
+/// fresh follower, from nothing, not an update of the masked one. The
+/// masked follower stays underneath, paused, so a refused reveal leaves
+/// the masked text on screen with the refusal beside it.
 ///
 /// # Transcripts turned off (#1488)
 ///
@@ -71,31 +79,35 @@ export function PhoneTranscript({
   liveness: Liveness;
   label?: string;
 }) {
-  const live = liveness.state === "running";
   const [reveal, setReveal] = useState(false);
-  const revealed = useClaudeTranscriptMessages(path, reveal, live, true);
-  // The masked read keeps running unless the revealed one is standing in
-  // for it: a refused or failed reveal falls back to it at once.
-  const masked = useClaudeTranscriptMessages(path, !reveal || revealed.isError, live);
-  const showingRevealed = reveal && revealed.data !== undefined;
-  const page = showingRevealed ? revealed.data : masked.data;
+  const revealed = useClaudeTranscriptLive(path, { liveness, reveal: true, enabled: reveal });
+  // Refused or failed before it read anything: the masked text stays.
+  const revealFailed =
+    reveal && revealed.messages === undefined && revealed.status === "could-not-read";
+  // The masked follower keeps running unless the revealed one is standing
+  // in for it: a refused or failed reveal falls back to it at once.
+  const masked = useClaudeTranscriptLive(path, { liveness, enabled: !reveal || revealFailed });
+  const showingRevealed = reveal && revealed.messages !== undefined;
   const active = showingRevealed ? revealed : masked;
+  const held = active.messages;
+  const masking = active.masking;
 
   const scale = useTextScale();
   const [tasksOpen, setTasksOpen] = useState(false);
   const [subagent, setSubagent] = useState<TranscriptSubagent | null>(null);
 
-  const messages = useMemo(() => page?.messages ?? [], [page]);
-  const truncated = page?.truncated ?? false;
+  const messages = useMemo(() => held ?? [], [held]);
+  const truncated = active.hasOlder;
   const checklist = useMemo(
     () => deriveTaskChecklist(messages, { truncated }),
     [messages, truncated],
   );
   const starts = useMemo(() => thinkingStarts(messages), [messages]);
   const onLoadFullText = useCallback<LoadFullText>(
-    (a) => claudeTranscriptBlockText(path, a.messageId, a.index, showingRevealed),
+    (a) => claudeTranscriptBlockText(path, a.messageId, a.index, showingRevealed, a.offset),
     [path, showingRevealed],
   );
+  const onLoadEarlier = active.hasOlder ? active.loadOlder : undefined;
   const ctx = useMemo<PhoneTranscriptContext>(
     () => ({
       liveness,
@@ -104,8 +116,9 @@ export function PhoneTranscript({
       thinkingStarts: starts,
       onLoadFullText,
       onOpenSubagent: setSubagent,
+      onLoadEarlier,
     }),
-    [liveness, checklist, scale, starts, onLoadFullText],
+    [liveness, checklist, scale, starts, onLoadFullText, onLoadEarlier],
   );
 
   // Pull to refresh on the viewer's own scroller, and the shield (see
@@ -118,10 +131,10 @@ export function PhoneTranscript({
       wrapRef.current?.querySelector<HTMLElement>('[data-slot="message-scroller-viewport"]') ??
       null;
   }, [hasMessages]);
-  // The query's own `refetch`, which is stable per query: a callback that
-  // changed on every render would re-attach the gesture's listeners
-  // mid-pull and lose the pull.
-  const refetch = active.refetch;
+  // The follower's own `refresh`, which is stable per follower: a
+  // callback that changed on every render would re-attach the gesture's
+  // listeners mid-pull and lose the pull.
+  const refetch = active.refresh;
   const refresh = useCallback(() => refetch(), [refetch]);
   const pull = usePullToRefresh(viewportRef, refresh, IS_MOBILE_BUILD && hasMessages);
   useEffect(() => {
@@ -135,15 +148,16 @@ export function PhoneTranscript({
   }, [hasMessages]);
 
   const summary = taskSummary(checklist);
-  const note = maskingNote(page?.masking);
+  const note = maskingNote(masking);
   const canReveal =
-    page?.masking?.reveal_allowed === true && !page.masking.revealed && page.masking.hidden > 0;
+    masking?.reveal_allowed === true && !masking.revealed && masking.hidden > 0;
+  const revealing = reveal && revealed.status === "loading";
 
   let body;
-  if (page === undefined) {
-    if (masked.isError) {
+  if (held === undefined) {
+    if (masked.status === "could-not-read") {
       body = isTranscriptsOff(masked.error) ? (
-        <TranscriptsOff onCheck={() => void masked.refetch()} />
+        <TranscriptsOff onCheck={() => void masked.refresh()} />
       ) : (
         // BEFORE the empty arm (#846): a rejection is not a transcript
         // with nothing in it.
@@ -155,7 +169,7 @@ export function PhoneTranscript({
             type="button"
             className="underline"
             style={{ color: palette.link }}
-            onClick={() => void masked.refetch()}
+            onClick={() => void masked.refresh()}
           >
             Try again
           </button>
@@ -168,12 +182,12 @@ export function PhoneTranscript({
         </p>
       );
     }
-  } else if (page.masking?.withheld) {
-    body = <TranscriptsOff onCheck={() => void active.refetch()} />;
-  } else if (page.messages.length === 0) {
+  } else if (masking?.withheld) {
+    body = <TranscriptsOff onCheck={() => void active.refresh()} />;
+  } else if (held.length === 0) {
     body = (
       <p className="text-xs" style={{ color: palette.muted }}>
-        {page.truncated
+        {active.hasOlder
           ? "No conversation in the part of this transcript that was read."
           : "Its transcript holds no conversation to show."}
       </p>
@@ -184,10 +198,15 @@ export function PhoneTranscript({
         <PullIndicator state={pull} />
         <PhoneContext.Provider value={ctx}>
           <TranscriptViewer
-            messages={page.messages}
+            messages={held}
             renderMessage={renderPhoneMessage}
             streaming={transcriptStreaming(liveness)}
             label={label}
+            onReachStart={active.loadOlder}
+            onReachEnd={active.loadNewer}
+            onWindowChange={active.setViewport}
+            atLiveEdge={active.atLiveEdge}
+            onJumpToLatest={active.jumpToLatest}
             // Within thumb reach: the jump button sits bottom-right, off
             // the centre line where the home indicator's swipe lives,
             // and a 44 pt target.
@@ -200,30 +219,25 @@ export function PhoneTranscript({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-2" data-testid="phone-transcript">
-      {page !== undefined ? (
+      {held !== undefined ? (
         <div
           className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs"
           style={{ color: palette.muted }}
         >
-          {page.truncated && page.messages.length > 0 ? (
-            <span data-testid="transcript-truncated">
-              The last {page.messages.length.toLocaleString()} message
-              {page.messages.length === 1 ? "" : "s"}. Earlier ones are not shown.
-            </span>
-          ) : null}
+          <FollowStatus live={active} />
           {note ? <span>{note}</span> : null}
           {canReveal ? (
             <button
               type="button"
               onClick={() => setReveal(true)}
-              disabled={reveal && revealed.isFetching}
+              disabled={revealing}
               className="tap-target rounded-md border px-2"
               style={{ borderColor: palette.border, color: palette.text }}
             >
-              {reveal && revealed.isFetching ? "Revealing…" : "Reveal"}
+              {revealing ? "Revealing…" : "Reveal"}
             </button>
           ) : null}
-          {showingRevealed && page.masking?.revealed ? (
+          {showingRevealed && masking?.revealed ? (
             <>
               <span>Hidden text is shown.</span>
               <button
@@ -236,7 +250,7 @@ export function PhoneTranscript({
               </button>
             </>
           ) : null}
-          {reveal && revealed.isError ? (
+          {revealFailed ? (
             <span role="alert" style={{ color: palette.warn }}>
               {isRevealOff(revealed.error)
                 ? "This computer does not allow this phone to reveal hidden text."

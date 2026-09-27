@@ -157,8 +157,8 @@ describe("TranscriptViewer: following", () => {
     const messages = conversation(10);
     const { update } = await mount(messages);
     await shim.userScrollTo(100);
-    // A re-read that no longer holds the last message seen: how many are
-    // new cannot be known, so no figure is shown.
+    // A re-read that no longer holds the last message seen, which recorded
+    // no time: how many are new cannot be known, so no figure is shown.
     const replaced = conversation(12, 2, 20);
     await update(replaced);
     expect(jump().textContent).toContain("Latest");
@@ -167,6 +167,41 @@ describe("TranscriptViewer: following", () => {
     // missing everything the replacement brought in.
     await update([...replaced, msg("z0", "t31"), msg("z1", "t31")]);
     expect(jump().textContent).not.toMatch(/\d+ new/);
+  });
+
+  it("says at least N new when a replacement brought messages recorded after the last one seen", async () => {
+    const stamp = (list: TranscriptMessage[], minute0: number) =>
+      list.map((m, i) => ({
+        ...m,
+        timestamp: `2026-01-01T10:${String(minute0 + i).padStart(2, "0")}:00Z`,
+      }));
+    const messages = stamp(conversation(10), 0);
+    const { update } = await mount(messages);
+    await shim.userScrollTo(100);
+    // The last one seen was recorded at 10:29. The replacement no longer
+    // holds it; three of its messages were recorded later (#1476).
+    await update(stamp(conversation(10, 2, 20), 3));
+    expect(jump().textContent).toContain("at least 3 new");
+    expect(jump().getAttribute("aria-label")).toBe("Jump to the latest message, at least 3 new");
+  });
+
+  it("reports the mounted window by id, for the hook's eviction (#1476)", async () => {
+    const onWindowChange = vi.fn();
+    const messages = conversation(200); // 600: more than a window
+    await mount(messages, { onWindowChange });
+    const [first, last] = onWindowChange.mock.calls.at(-1)!;
+    expect(last).toBe(messages.at(-1)!.id);
+    expect(messages.findIndex((m) => m.id === first)).toBe(messages.length - WINDOW_SIZE);
+  });
+
+  it("asks the hook for the latest when it no longer holds them", async () => {
+    const onJumpToLatest = vi.fn();
+    await mount(conversation(10), { atLiveEdge: false, onJumpToLatest });
+    await shim.userScrollTo(0);
+    await act(async () => {
+      fireEvent.click(jump());
+    });
+    expect(onJumpToLatest).toHaveBeenCalledTimes(1);
   });
 
   it("returns to the live edge from the button and follows again", async () => {

@@ -1,7 +1,11 @@
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TranscriptMasking } from "../../../types/pr";
-import type { RemoteTranscriptPage, TranscriptMessage } from "../../../types/transcript";
+import type {
+  RemoteTranscriptPage,
+  RemoteTranscriptWindow,
+  TranscriptMessage,
+} from "../../../types/transcript";
 import { DEAD, output } from "../fixtures";
 import { installScrollShim, type ScrollShim } from "../scrollShim";
 
@@ -16,33 +20,66 @@ type Answer = {
 };
 
 const state = vi.hoisted(() => ({
-  masked: {} as { data?: unknown; isError?: boolean; error?: unknown },
-  revealed: {} as { data?: unknown; isError?: boolean; error?: unknown },
-  /// Every `(enabled, reveal)` the hook was called with.
-  calls: [] as [boolean, boolean][],
+  masked: {} as Answer,
+  revealed: {} as Answer,
+  /// Reads not answered yet: an `Answer` with neither data nor an error.
+  waiting: [] as (() => void)[],
+  /// A transcript in several pages, oldest first, served by cursor
+  /// instead of `masked` when set.
+  book: null as unknown[] | null,
 }));
-const refetchMasked = vi.hoisted(() => vi.fn(() => Promise.resolve()));
-const refetchRevealed = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 
-vi.mock("@/api/hooks", () => ({
-  useClaudeTranscriptMessages: (
-    _path: string | null,
-    enabled: boolean,
-    _live: boolean,
-    reveal = false,
-  ) => {
-    state.calls.push([enabled, reveal]);
-    const a = reveal ? state.revealed : state.masked;
-    return {
-      data: enabled || !reveal ? a.data : undefined,
-      isError: enabled ? (a.isError ?? false) : false,
-      error: a.error,
-      isFetching: false,
-      refetch: reveal ? refetchRevealed : refetchMasked,
-    };
-  },
+/// The real data layer (#1476) over a mocked paged read: every page the
+/// phone asks for, and whether it asked to reveal.
+const pageRead = vi.hoisted(() =>
+  vi.fn(
+    (
+      _path: string,
+      anchor: { kind: string; offset?: number },
+      _direction: string,
+      _limit: number | null,
+      reveal = false,
+    ): Promise<unknown> => {
+      if (state.book !== null) {
+        const book = state.book as { end: { offset: number } }[];
+        const at = anchor.kind === "cursor" ? anchor.offset : book.at(-1)!.end.offset;
+        return Promise.resolve(book.find((w) => w.end.offset === at));
+      }
+      const answer = () => (reveal ? state.revealed : state.masked);
+      const a = answer();
+      if (a.isError) return Promise.reject(a.error);
+      if (a.data) return Promise.resolve(windowOf(a.data));
+      return new Promise((resolve) => state.waiting.push(() => resolve(windowOf(answer().data!))));
+    },
+  ),
+);
+const maskedReads = () => pageRead.mock.calls.filter((c) => c[4] !== true).length;
+const revealReads = () => pageRead.mock.calls.filter((c) => c[4] === true).length;
+
+vi.mock("@/api/tauri", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  claudeTranscriptBlockText: vi.fn(),
+  claudeTranscriptPage: pageRead,
 }));
-vi.mock("@/api/tauri", () => ({ claudeTranscriptBlockText: vi.fn() }));
+
+/// A whole transcript as one page, the masking where the remote boundary
+/// puts it: on the answer, not the page.
+function windowOf(p: RemoteTranscriptPage): RemoteTranscriptWindow {
+  const { masking, ...page } = p;
+  const end = { offset: page.file_bytes, behind_digest: "d" };
+  return {
+    page,
+    start: { offset: 0, behind_digest: "" },
+    end,
+    at_start: true,
+    at_end: true,
+    rewritten: false,
+    position: { first: 1, last: page.messages.length, total: page.messages.length, exact: true, basis: "whole_file" },
+    seam: { first_model: null, last_model: null },
+    bytes_scanned: 0,
+    ...(masking ? { masking } : {}),
+  };
+}
 
 const { PhoneTranscript } = await import("./PhoneTranscript");
 
@@ -86,9 +123,9 @@ beforeEach(() => {
   shim = installScrollShim({ viewportHeight: 400, rowHeight: 40 });
   state.masked = {};
   state.revealed = {};
-  state.calls = [];
-  refetchMasked.mockClear();
-  refetchRevealed.mockClear();
+  state.waiting = [];
+  state.book = null;
+  pageRead.mockClear();
 });
 afterEach(() => {
   cleanup();
@@ -120,7 +157,7 @@ describe("masked secrets and Reveal (#1488)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Reveal" }));
     await shim.flush();
     // A fresh read that asks to reveal, not a tweak of the masked one.
-    expect(state.calls).toContainEqual([true, true]);
+    expect(revealReads()).toBe(1);
     expect(screen.getByText("key plain-value")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Reveal" })).toBeNull();
 
@@ -171,8 +208,10 @@ describe("transcripts turned off for this phone (#1488)", () => {
       "Transcripts are turned off for this phone on the desktop.",
     );
     expect(screen.queryByText(/Could not read/)).toBeNull();
+    const before = maskedReads();
     fireEvent.click(screen.getByRole("button", { name: "Check again" }));
-    expect(refetchMasked).toHaveBeenCalled();
+    await shim.flush();
+    expect(maskedReads()).toBe(before + 1);
   });
 
   it("says so for an answer whose text was withheld", async () => {
@@ -185,6 +224,53 @@ describe("transcripts turned off for this phone (#1488)", () => {
     await show({ isError: true, error: "the desktop did not answer" });
     expect(screen.getByText(/Could not read its transcript \(the desktop did not answer\)/)).toBeTruthy();
     expect(screen.queryByTestId("transcripts-off")).toBeNull();
+  });
+});
+
+describe("paging on the phone (#1476)", () => {
+  it("offers Load earlier on a result whose call is in an earlier page, and pairs them once read", async () => {
+    const call = msg("c1", {
+      kind: { kind: "assistant" },
+      blocks: [
+        {
+          kind: "tool_call",
+          index: 0,
+          name: "Bash",
+          id: "toolu_1",
+          args: { tool: "bash", command: "yarn test", description: null, truncated: false },
+          result: null,
+        },
+      ],
+    });
+    const result = msg("r1", {
+      kind: { kind: "tool_results" },
+      turn_id: null,
+      blocks: [{ kind: "tool_result", ...output({ message_id: "r1", text: "all passed" }) }],
+    });
+    const older = windowOf(page([msg("p1"), call]));
+    const newer = windowOf(page([result, msg("p2")]));
+    state.book = [
+      { ...older, end: { offset: 100, behind_digest: "a" }, at_end: false },
+      {
+        ...newer,
+        start: { offset: 100, behind_digest: "a" },
+        end: { offset: 200, behind_digest: "b" },
+        at_start: false,
+      },
+    ];
+    await show({});
+    expect(screen.getByText(/Result of a call in an earlier part of the transcript/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Load earlier messages" }));
+    await shim.flush();
+    // The page before was read by its cursor, and the result is inside its
+    // call now rather than standing on its own.
+    expect(pageRead.mock.calls.at(-1)?.[1]).toEqual({
+      kind: "cursor",
+      offset: 100,
+      behind_digest: "a",
+    });
+    expect(screen.queryByText(/Result of a call in an earlier part/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Load earlier messages" })).toBeNull();
   });
 });
 
@@ -232,10 +318,12 @@ describe("touch (#1481)", () => {
     await show({ data: page([msg("a")]) });
     const vp = viewport();
     vp.scrollTop = 0;
+    const before = maskedReads();
     touch(vp, "touchstart", 100);
     touch(vp, "touchmove", 300);
     touch(vp, "touchend", 300);
-    expect(refetchMasked).toHaveBeenCalledTimes(1);
+    await shim.flush();
+    expect(maskedReads()).toBe(before + 1);
   });
 
   it("keeps a touch in the transcript from reaching the app's own pull to refresh", async () => {
@@ -259,14 +347,17 @@ describe("touch (#1481)", () => {
       const view = await show({});
       expect(screen.getByText("Reading its transcript…")).toBeTruthy();
       state.masked = { data: page([msg("a")]) };
+      for (const answer of state.waiting.splice(0)) answer();
       view.rerender(<PhoneTranscript path="/p.jsonl" liveness={DEAD} />);
       await shim.flush();
       const vp = viewport();
       touch(vp, "touchstart", 100);
       expect(outer).not.toHaveBeenCalled();
+      const before = maskedReads();
       touch(vp, "touchmove", 300);
       touch(vp, "touchend", 300);
-      expect(refetchMasked).toHaveBeenCalledTimes(1);
+      await shim.flush();
+      expect(maskedReads()).toBe(before + 1);
     } finally {
       document.removeEventListener("touchstart", outer);
     }

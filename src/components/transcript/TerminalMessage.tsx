@@ -66,6 +66,9 @@ export interface TerminalEnv {
   density: TranscriptDensity;
   onLoadFullText?: LoadFullText;
   onOpenSubagent?: OpenSubagent;
+  /// Read the page before the oldest held (#1476), for a result whose
+  /// call is earlier. Absent when nothing earlier exists.
+  onLoadEarlier?: () => void;
   /// Every message the viewer holds, read when a turn is copied -- on
   /// click, never on render.
   messages: () => readonly TranscriptMessage[];
@@ -238,7 +241,7 @@ function UserBand({
                 key={b.index}
                 text={b.text}
                 clip={b.clip}
-                address={{ messageId: m.id, index: b.index }}
+                address={{ messageId: m.id, index: b.index, offset: m.offset }}
                 onLoadFullText={env.onLoadFullText}
               >
                 {(t) => (
@@ -300,7 +303,7 @@ function BlockView({ m, b, env, tasks }: RowProps & { b: TranscriptBlock }) {
             <ClippedText
               text={b.text}
               clip={b.clip}
-              address={{ messageId: m.id, index: b.index }}
+              address={{ messageId: m.id, index: b.index, offset: m.offset }}
               onLoadFullText={env.onLoadFullText}
             >
               {(t) => <Prose text={t} />}
@@ -313,6 +316,7 @@ function BlockView({ m, b, env, tasks }: RowProps & { b: TranscriptBlock }) {
         <ThinkingBlock
           block={b}
           messageId={m.id}
+          offset={m.offset}
           variant="terminal"
           onLoadFullText={env.onLoadFullText}
           collapsible
@@ -338,6 +342,7 @@ function BlockView({ m, b, env, tasks }: RowProps & { b: TranscriptBlock }) {
           variant="terminal"
           onLoadFullText={env.onLoadFullText}
           onOpenSubagent={env.onOpenSubagent}
+          onLoadEarlier={env.onLoadEarlier}
         />
       );
     case "image":
@@ -424,7 +429,7 @@ function Divider({ m, env }: { m: TranscriptMessage; env: TerminalEnv }) {
                 <ClippedText
                   text={b.text}
                   clip={b.clip}
-                  address={{ messageId: m.id, index: b.index }}
+                  address={{ messageId: m.id, index: b.index, offset: m.offset }}
                   onLoadFullText={env.onLoadFullText}
                 >
                   {(t) => (mono ? <MonoOutput text={t} error={error} /> : <Prose text={t} />)}
