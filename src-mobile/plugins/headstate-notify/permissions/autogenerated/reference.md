@@ -84,4 +84,30 @@ Denies the request_permission command without any pre-configured scope.
 
 </td>
 </tr>
+
+<tr>
+<td>
+
+`headstate-notify:allow-take-tapped`
+
+</td>
+<td>
+
+Enables the take_tapped command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`headstate-notify:deny-take-tapped`
+
+</td>
+<td>
+
+Denies the take_tapped command without any pre-configured scope.
+
+</td>
+</tr>
 </table>

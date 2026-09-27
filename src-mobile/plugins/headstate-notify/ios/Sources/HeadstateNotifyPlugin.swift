@@ -49,16 +49,27 @@
 // is backgrounded. In the FOREGROUND nothing is shown, because no
 // `UNUserNotificationCenterDelegate` is installed -- see below.
 //
-// # No delegate, so no foreground banners and no tap routing
+// # The delegate: no foreground banners, and a tap is PARKED (#1486)
 //
-// Without a `UNUserNotificationCenterDelegate`, iOS suppresses banners
-// while the app is in the foreground and a tap simply opens the app.
-// Both are correct for what this feature is: a notification exists to
-// tell someone something while they are NOT looking at the app, and a
-// user who is looking at it can see the pull request in the list. Tap
-// routing would need a payload convention and a frontend route, which is
-// a navigation feature; it is deliberately out of scope so the first
-// release of this is small enough to be obviously correct.
+// #789 installed no `UNUserNotificationCenterDelegate`, so iOS
+// suppressed banners in the foreground and a tap simply opened the app.
+// A session notification needs the tap to land on that session, so the
+// plugin is now the delegate, installed in `initPlugin` -- which Rust
+// calls while the app is being set up, before launch finishes, which is
+// when iOS requires a delegate for a tap that launched the app to be
+// delivered.
+//
+// - `willPresent` answers NO options: the foreground behaviour is what
+//   it was. The app shows its own in-app toasts while it is open.
+// - `didReceive` stores the notification's `session` (from `userInfo`)
+//   in `tappedSession` and calls nothing. Rust's `takeTapped` reads and
+//   clears it when the webview asks, which it does whenever it becomes
+//   visible. On a cold launch the webview does not exist yet when the
+//   response arrives; a parked value waits for it, and an event pushed
+//   at nobody would be lost.
+//
+// A pull-request notification carries no `session`, so tapping one
+// parks nothing and just opens the app, as before.
 
 import Foundation
 import Tauri
@@ -67,6 +78,14 @@ import UserNotifications
 struct PostArgs: Decodable {
   let title: String
   let body: String
+  /// The Claude Code session a tap should open (#1486). An id, never
+  /// text; absent for a notification a tap should just open the app for.
+  let session: String?
+}
+
+/// `{"session": "<id>" | null}`: what `takeTapped` answers.
+struct TappedResponse: Encodable {
+  let session: String?
 }
 
 /// `{"permission": "granted" | "prompt" | "denied"}`, the three states
@@ -76,7 +95,43 @@ struct PermissionResponse: Encodable {
   let permission: String
 }
 
-class HeadstateNotifyPlugin: Plugin {
+class HeadstateNotifyPlugin: Plugin, UNUserNotificationCenterDelegate {
+  /// The session of the notification last tapped, until Rust takes it.
+  /// Guarded by `lock`: the delegate runs on the main queue and
+  /// `takeTapped` on Tauri's plugin queue.
+  private var tappedSession: String? = nil
+  private let lock = NSLock()
+
+  // MARK: UNUserNotificationCenterDelegate
+
+  /// No banner, sound or list entry while the app is in the foreground --
+  /// what iOS did before this delegate existed. The app shows in-app
+  /// toasts instead.
+  func userNotificationCenter(
+    _ center: UNUserNotificationCenter,
+    willPresent notification: UNNotification,
+    withCompletionHandler completionHandler:
+      @escaping (UNNotificationPresentationOptions) -> Void
+  ) {
+    completionHandler([])
+  }
+
+  /// Park the tapped notification's session for `takeTapped`.
+  func userNotificationCenter(
+    _ center: UNUserNotificationCenter,
+    didReceive response: UNNotificationResponse,
+    withCompletionHandler completionHandler: @escaping () -> Void
+  ) {
+    if response.actionIdentifier == UNNotificationDefaultActionIdentifier,
+      let session = response.notification.request.content.userInfo["session"] as? String
+    {
+      lock.lock()
+      tappedSession = session
+      lock.unlock()
+    }
+    completionHandler()
+  }
+
   /// `UNAuthorizationStatus` collapsed to the three states Rust acts on.
   ///
   /// `.provisional` counts as GRANTED: it is what a quiet-delivery
@@ -165,6 +220,9 @@ class HeadstateNotifyPlugin: Plugin {
     content.title = args.title
     content.body = args.body
     content.sound = .default
+    if let session = args.session {
+      content.userInfo = ["session": session]
+    }
     let request = UNNotificationRequest(
       identifier: UUID().uuidString, content: content, trigger: nil)
 
@@ -181,9 +239,24 @@ class HeadstateNotifyPlugin: Plugin {
     }
     invoke.resolve()
   }
+
+  /// Read and clear the session of the notification last tapped.
+  @objc public func takeTapped(_ invoke: Invoke) throws {
+    lock.lock()
+    let session = tappedSession
+    tappedSession = nil
+    lock.unlock()
+    invoke.resolve(TappedResponse(session: session))
+  }
 }
 
 @_cdecl("init_plugin_headstate_notify")
 func initPlugin() -> Plugin {
-  return HeadstateNotifyPlugin()
+  let plugin = HeadstateNotifyPlugin()
+  // Here rather than in `load(webview:)`: this runs while the app is
+  // being set up, and iOS delivers the tap that LAUNCHED the app only to
+  // a delegate installed before launch finishes. `delegate` is weak;
+  // Tauri holds the plugin for the life of the app.
+  UNUserNotificationCenter.current().delegate = plugin
+  return plugin
 }

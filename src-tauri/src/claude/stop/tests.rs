@@ -44,6 +44,7 @@ fn registry() -> Registry {
             name: Some("widget-c3".into()),
             status: Some("busy".into()),
             version: Some("2.0.1".into()),
+            status_updated_at: None,
         },
     );
     r

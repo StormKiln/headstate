@@ -54,15 +54,28 @@
 //! A user who sees "Allow notifications?" immediately after a pull
 //! request appeared has the context to answer it.
 //!
-//! # Notification TAPS are deliberately not handled
+//! # A tap on a SESSION notification is remembered, not pushed (#1486)
 //!
-//! Tapping a notification opens the app, which is the whole of what a
-//! user expects. Routing a tap to a specific pull request needs a
-//! `UNUserNotificationCenterDelegate` set before the app finishes
-//! launching, a payload convention, and a frontend route to navigate
-//! to -- and it is a navigation feature, not a notification one. Left
-//! out so the first release of this is small enough to be obviously
-//! correct.
+//! #789 left taps unhandled: tapping opened the app, and that was the
+//! whole of what a pull-request notification needed. A session
+//! notification is different -- "waiting for your input" is only useful
+//! if the tap lands on THAT session's transcript -- so the Swift side now
+//! installs a `UNUserNotificationCenterDelegate` when the plugin is
+//! registered, during app setup.
+//!
+//! The delegate does not call into Rust or the webview. It stores the
+//! tapped notification's `session` in one slot, and
+//! [`HeadstateNotify::take_tapped`] reads and clears it. The webview asks
+//! whenever it becomes visible. That shape is deliberate: a cold launch
+//! from a tap delivers the response before the webview exists, and a
+//! pushed event with no listener yet would be lost. A slot that waits to
+//! be asked cannot be.
+//!
+//! The same delegate answers `willPresent` with NO presentation options,
+//! which is what iOS did before it existed: while the app is in the
+//! foreground the app shows its own in-app toasts instead of a banner.
+//! Pull-request notifications carry no `session` and a tap on one still
+//! just opens the app.
 
 use std::sync::Mutex;
 
@@ -94,6 +107,8 @@ pub mod cmd {
     pub const REQUEST_PERMISSION: &str = "requestPermission";
     /// Post one notification now.
     pub const POST: &str = "post";
+    /// Read and clear the session of the notification last tapped.
+    pub const TAKE_TAPPED: &str = "takeTapped";
 }
 
 /// What iOS says about notification authorization.
@@ -122,16 +137,26 @@ struct PermissionReply {
 
 /// One notification to post.
 ///
-/// No category, no thread identifier and no badge. A category is only
-/// useful with action buttons, which need the delegate this plugin
-/// deliberately does not install; a badge count is state the app would
-/// have to maintain correctly across a suspension to avoid showing a
-/// stale number, which is a worse failure than showing none.
+/// No category and no badge. A category is only useful with action
+/// buttons; a badge count is state the app would have to maintain
+/// correctly across a suspension to avoid showing a stale number, which
+/// is a worse failure than showing none.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Notification {
     pub title: String,
     pub body: String,
+    /// The Claude Code session a tap should open (#1486), carried in the
+    /// notification's `userInfo`. An id, never text. `None` for a
+    /// notification a tap should simply open the app for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+}
+
+/// What `takeTapped` answers.
+#[derive(Debug, Deserialize)]
+struct TappedReply {
+    session: Option<String>,
 }
 
 /// Why a notification was not posted.
@@ -268,6 +293,16 @@ impl HeadstateNotify {
         let _: serde_json::Value = self.bridge.call(cmd::POST, args)?;
         Ok(())
     }
+
+    /// The session of the notification the user last tapped, cleared as
+    /// it is read, so one tap opens the session once (#1486).
+    ///
+    /// No permission gate: reading what was tapped posts nothing, and a
+    /// notification that was tapped was by definition allowed.
+    pub fn take_tapped(&self) -> Result<Option<String>, Error> {
+        let reply: TappedReply = self.bridge.call(cmd::TAKE_TAPPED, serde_json::json!({}))?;
+        Ok(reply.session)
+    }
 }
 
 /// Reach the plugin from an app handle.
@@ -320,6 +355,8 @@ mod tests {
         states: StdMutex<Vec<Permission>>,
         calls: StdMutex<Vec<String>>,
         posts: StdMutex<Vec<Notification>>,
+        /// What the Swift delegate's slot holds.
+        tapped: StdMutex<Option<String>>,
     }
 
     impl Fake {
@@ -344,8 +381,13 @@ mod tests {
                 self.posts.lock().unwrap().push(Notification {
                     title: args["title"].as_str().unwrap_or_default().to_string(),
                     body: args["body"].as_str().unwrap_or_default().to_string(),
+                    session: args["session"].as_str().map(str::to_string),
                 });
                 return Ok("{}".into());
+            }
+            if command == cmd::TAKE_TAPPED {
+                let tapped = self.tapped.lock().unwrap().take();
+                return Ok(serde_json::json!({ "session": tapped }).to_string());
             }
             let mut states = self.states.lock().unwrap();
             let state = if states.len() > 1 {
@@ -436,7 +478,8 @@ mod tests {
         assert_eq!(
             n.post(&Notification {
                 title: "x".into(),
-                body: "y".into()
+                body: "y".into(),
+                session: None,
             }),
             Err(Error::Denied),
             "the gate refuses before the bridge is reached"
@@ -453,6 +496,7 @@ mod tests {
             n.post(&Notification {
                 title: "A pull request appeared".into(),
                 body: "octocat/hello-world#7".into(),
+                session: None,
             }),
             Ok(())
         );
@@ -471,7 +515,8 @@ mod tests {
         assert_eq!(
             n.post(&Notification {
                 title: "x".into(),
-                body: "y".into()
+                body: "y".into(),
+                session: None,
             }),
             Err(Error::Denied)
         );
@@ -488,6 +533,7 @@ mod tests {
         assert_eq!(cmd::PERMISSION, "permission");
         assert_eq!(cmd::REQUEST_PERMISSION, "requestPermission");
         assert_eq!(cmd::POST, "post");
+        assert_eq!(cmd::TAKE_TAPPED, "takeTapped");
     }
 
     /// The Swift side implements every command Rust invokes.
@@ -499,7 +545,12 @@ mod tests {
     #[test]
     fn the_swift_side_implements_every_command() {
         let swift = include_str!("../ios/Sources/HeadstateNotifyPlugin.swift");
-        for name in [cmd::PERMISSION, cmd::REQUEST_PERMISSION, cmd::POST] {
+        for name in [
+            cmd::PERMISSION,
+            cmd::REQUEST_PERMISSION,
+            cmd::POST,
+            cmd::TAKE_TAPPED,
+        ] {
             assert!(
                 swift.contains(&format!("func {name}(")),
                 "Swift has no `func {name}(`"
@@ -514,8 +565,57 @@ mod tests {
     #[test]
     fn the_acl_list_names_every_command() {
         let build = include_str!("../build.rs");
-        for name in ["\"permission\"", "\"request_permission\"", "\"post\""] {
+        for name in [
+            "\"permission\"",
+            "\"request_permission\"",
+            "\"post\"",
+            "\"take_tapped\"",
+        ] {
             assert!(build.contains(name), "build.rs COMMANDS is missing {name}");
         }
+    }
+
+    /// A session notification carries the session id to the Swift side
+    /// for its `userInfo`, and a pull-request one carries no key at all
+    /// -- so a tap on it still just opens the app (#1486).
+    #[test]
+    fn a_session_notification_carries_its_session_and_others_carry_none() {
+        let fake = Fake::new(&[Permission::Granted]);
+        let n = plugin(&fake);
+        n.post(&Notification {
+            title: "hello-world".into(),
+            body: "Waiting for your input".into(),
+            session: Some("s-1".into()),
+        })
+        .unwrap();
+        n.post(&Notification {
+            title: "Add a spoon".into(),
+            body: "octocat/hello-world#7 just appeared".into(),
+            session: None,
+        })
+        .unwrap();
+        let posts = fake.posts();
+        assert_eq!(posts[0].session.as_deref(), Some("s-1"));
+        assert_eq!(posts[1].session, None);
+        let wire = serde_json::to_value(&posts[1]).unwrap();
+        assert!(wire.get("session").is_none(), "{wire}");
+    }
+
+    /// A tap is read ONCE: the slot clears, so returning to the app a
+    /// second time does not re-open the same session over whatever the
+    /// user moved on to.
+    #[test]
+    fn a_tapped_session_is_taken_once() {
+        let fake = Fake::new(&[Permission::Granted]);
+        *fake.tapped.lock().unwrap() = Some("s-1".into());
+        let n = plugin(&fake);
+        assert_eq!(n.take_tapped(), Ok(Some("s-1".into())));
+        assert_eq!(n.take_tapped(), Ok(None));
+    }
+
+    #[test]
+    fn no_native_side_has_no_tap_to_take() {
+        let n = HeadstateNotify::new(Box::new(bridge::Unavailable));
+        assert_eq!(n.take_tapped(), Err(Error::Unavailable));
     }
 }

@@ -241,6 +241,10 @@ pub fn run() {
             // correctly so -- see `notify::PhoneNotifyPrefs`.
             notify::get_phone_notify_prefs,
             notify::set_phone_notify_prefs,
+            notify::get_session_mutes,
+            notify::set_session_muted,
+            notify::poll_session_toasts,
+            notify::take_notification_session,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Headstate Companion");

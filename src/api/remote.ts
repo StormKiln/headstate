@@ -48,6 +48,14 @@ const CLIENT_COMMANDS = new Set([
   "subscribe_events",
   "get_phone_notify_prefs",
   "set_phone_notify_prefs",
+  // Session notifications (#1486): per-session mutes, the in-app toast
+  // poll, and the session of the notification last tapped. All the
+  // phone's own; `poll_session_toasts` reaches the desktop itself, from
+  // Rust, so its transitions share the background window's state.
+  "get_session_mutes",
+  "set_session_muted",
+  "poll_session_toasts",
+  "take_notification_session",
 ]);
 
 let installed = false;

@@ -127,6 +127,12 @@ pub const TRANSCRIPT_TEXT: &[(&str, Carries)] = &[
     // The first thing the user typed (#1133), clamped to 300 characters
     // -- still a place a pasted token lands.
     ("claude_sessions", Carries::Fields(&["opening_prompt"])),
+    // The same opening prompt for ONE session, as the phone's opt-in
+    // lock-screen snippet (#1486). Whole: `prompt` is its only string.
+    // Its sibling `claude_session_digest` has NO row because it carries
+    // no text at all -- a notification payload is not covered by this
+    // table (#1488), so the digest is content-free by construction.
+    ("claude_transcript_opening_prompt", Carries::Whole),
 ];
 
 /// Keys whose values round-trip to the desktop unread, or are machine

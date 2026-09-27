@@ -645,13 +645,31 @@ pub struct SessionDetail {
 /// pids against 1,438 sessions, so the probe cost is proportional to
 /// what is live rather than to the history.
 pub fn list(conn: &Connection) -> Result<SessionList, rusqlite::Error> {
-    let registry = super::liveness::registry_dir()
+    list_with(conn, &live_registry())
+}
+
+/// One read of the live session registry, or a [`Registry`] whose
+/// `failure` says why there could not be one.
+///
+/// Its own function so a caller that needs the registry's OTHER fields
+/// -- [`super::digest`] reads each entry's `statusUpdatedAt` -- reads it
+/// once and derives the list's liveness from the SAME read. Two reads
+/// could disagree about which sessions are running, and the digest would
+/// then state a turn end for a session its own row calls dead.
+pub(crate) fn live_registry() -> Registry {
+    super::liveness::registry_dir()
         .map(|d| super::liveness::read_registry(&d))
         .unwrap_or_else(|| Registry {
             failure: Some("no home directory, so the live session registry is unreachable".into()),
             ..Default::default()
-        });
+        })
+}
 
+/// [`list`], against a registry the caller already read.
+pub(crate) fn list_with(
+    conn: &Connection,
+    registry: &Registry,
+) -> Result<SessionList, rusqlite::Error> {
     let runs = runs_by_session(conn)?;
 
     // Only the pids that could be alive. A refresh of the whole process
@@ -671,7 +689,7 @@ pub fn list(conn: &Connection) -> Result<SessionList, rusqlite::Error> {
     let children = children_by_parent(conn)?;
     Ok(assemble(
         &probe,
-        &registry,
+        registry,
         &runs,
         rows,
         &children,
@@ -1141,6 +1159,30 @@ fn stored_row(conn: &Connection, session_id: &str) -> Result<Option<Stored>, rus
         })
     })?;
     rows.next().transpose()
+}
+
+/// One session's opening prompt, as the phone's lock-screen snippet
+/// reads it (#1486).
+///
+/// An object rather than a bare string so the remote boundary can attach
+/// its masking summary beside it (`remote/privacy.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpeningPrompt {
+    /// `None` when the store has no such session or recorded no prompt
+    /// for it. The phone shows no snippet either way, so the two are not
+    /// told apart here -- an error reading the DATABASE is still an
+    /// error, not a `None`.
+    pub prompt: Option<String>,
+}
+
+/// [`OpeningPrompt`] for one session.
+pub fn opening_prompt(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<OpeningPrompt, rusqlite::Error> {
+    Ok(OpeningPrompt {
+        prompt: stored_row(conn, session_id)?.and_then(|s| s.opening_prompt),
+    })
 }
 
 /// One session's recorded runs, newest first.

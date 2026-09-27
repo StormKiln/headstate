@@ -84,6 +84,7 @@ import type {
   TranscriptPageAnchor,
   TranscriptPageDirection,
 } from "../types/transcript";
+import type { OpeningPrompt, SessionDigest } from "../types/sessionDigest";
 
 export interface AuthState {
   ok: boolean;
@@ -1267,6 +1268,18 @@ export const claudeSessionsForPr = (repo: string, number: number) =>
 
 export const claudeSessionDetail = (sessionId: string) =>
   call<ClaudeSessionDetail | null>("claude_session_detail", { sessionId });
+
+/// A compact, content-free status per session (#1486): liveness, waiting
+/// kind, and the last turn's end and outcome. What the phone's
+/// notifications are computed from; `Class::Read`, and carries no
+/// transcript text.
+export const claudeSessionDigest = () => call<SessionDigest>("claude_session_digest");
+
+/// One session's opening prompt (#1486), for the phone's opt-in
+/// lock-screen snippet. Transcript text, so masked before it reaches a
+/// phone and refused to one that may not read transcripts.
+export const claudeTranscriptOpeningPrompt = (sessionId: string) =>
+  call<OpeningPrompt>("claude_transcript_opening_prompt", { sessionId });
 
 /// Reveal a session's directory or transcript in the file manager.
 /// Returns the path on success.
