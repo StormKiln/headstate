@@ -60,7 +60,7 @@ import type { PageCursor, SessionActivity, TranscriptMessage } from "@/types/tra
 import { createCoalescer } from "@/lib/coalesce";
 import { createLimiter, withDeadline } from "@/lib/limiter";
 import { IS_MOBILE_BUILD } from "@/lib/target";
-import { parsePrQuery, reposForNumber } from "@/lib/claudePrs";
+import { matchPrLinks, parsePrQuery } from "@/lib/claudePrs";
 import {
   toolVersions,
   readLogTail,
@@ -154,6 +154,7 @@ import {
   claudeSessions,
   claudeSessionDetail,
   claudeSessionsForPr,
+  claudeSessionsForPrNumber,
   claudeTranscriptPage,
   claudeTranscriptFind,
   claudeHooksStatus,
@@ -1964,30 +1965,35 @@ export function useClaudeSessionsForPr(repo: string, number: number, enabled: bo
   });
 }
 
-/// What a PR-shaped search query resolved to (#1280).
+/// What a PR-shaped search query resolved to (#1280, #1545).
 ///
-/// FOUR states, and the reason they are four rather than three is the
-/// rule this codebase keeps re-applying (#846, #1044): an absence has to
-/// say which absence it is.
+/// An absence has to say which absence it is (#846, #1044):
 ///
 /// | state | what happened |
 /// |---|---|
 /// | `"off"` | the query is not a pull request reference -- nothing was asked |
-/// | `"unresolved"` | a bare number whose repository we could not name, so no lookup ran |
-/// | `"loading"` | a lookup is in flight |
-/// | `"done"` | every lookup answered; `links` may be empty, which is a real answer |
-/// | `"failed"` | at least one lookup rejected; `links` holds what did answer |
+/// | `"loading"` | the lookup is in flight |
+/// | `"done"` | the lookup answered; `links` may be empty, which is a real answer |
+/// | `"failed"` | the lookup rejected -- nothing is known about who wrote the PR |
 ///
 /// `"done"` with an empty `links` is the finding "no session recorded
 /// for this PR". `"failed"` is NOT that, and the caller must never word
 /// them alike -- a database that could not be read has said nothing
 /// about who wrote the PR.
+///
+/// There was an `"unresolved"` state until #1545: a bare `#1234` whose
+/// repository the tracked OPEN pull requests could not name, for which
+/// no lookup ran. The lookup is now by number alone, so every reference
+/// is asked about and the "we never asked" case no longer exists.
+///
+/// `elsewhere` is `matchPrLinks`'s: links for the same repository name
+/// under another owner, when a qualified query matched nothing. They are
+/// NOT in `links` and the list does not show them.
 export type PrQueryState =
   | { state: "off" }
-  | { state: "unresolved"; number: number }
   | { state: "loading"; ref: string }
-  | { state: "done"; ref: string; links: ClaudePrLink[] }
-  | { state: "failed"; ref: string; links: ClaudePrLink[]; error: string };
+  | { state: "done"; ref: string; links: ClaudePrLink[]; elsewhere: ClaudePrLink[] }
+  | { state: "failed"; ref: string; error: string };
 
 /// How long the search box rests before a PR reference reaches the
 /// backend (#1280).
@@ -2057,48 +2063,31 @@ export function useClaudeSessionsForPrQuery(query: string, enabled: boolean): Pr
   const ref = settled === key ? key : "";
   const live = ref === "" ? null : parsed;
 
-  // The tracked pull requests, read from cache (#1280). `staleTime:
-  // Infinity` on that query means this is a cache read and not a fetch,
-  // so a bare `#1234` costs no extra round trip to learn its repository.
-  const prs = useQuery({ queryKey: ["prs"], queryFn: PRS_FN, staleTime: Infinity, enabled });
-  const repos = useMemo(() => {
-    if (live === null) return [];
-    if (live.repo !== null) return [live.repo];
-    return reposForNumber(prs.data, live.number);
-  }, [live, prs.data]);
-
-  const results = useQueries({
-    queries: repos.map((repo) => ({
-      // The SAME key `useClaudeSessionsForPr` uses, so a PR detail view
-      // already opened for this pull request has warmed this and the
-      // search answers from cache.
-      queryKey: ["claude-sessions-for-pr", repo, live?.number ?? 0],
-      queryFn: () => claudeSessionsForPr(repo, live?.number ?? 0),
-      enabled: enabled && live !== null,
-      staleTime: Infinity,
-      retry: false,
-    })),
+  // By NUMBER alone (#1545), for every form of reference. The link table
+  // is itself the list of repositories that can answer, so a bare
+  // `#1234` needs no repository resolved first -- and a qualified one is
+  // matched case-insensitively in `matchPrLinks` rather than by an exact
+  // `repo = ?` that missed `Acme/API` against `acme/api`.
+  const number = live?.number ?? 0;
+  const lookup = useQuery<ClaudePrLink[]>({
+    queryKey: ["claude-sessions-for-pr-number", number],
+    queryFn: () => claudeSessionsForPrNumber(number),
+    enabled: enabled && live !== null,
+    // Infinity, and refreshed by the page's Rescan: the link table only
+    // changes when the transcripts are imported, so re-asking between
+    // imports would re-read an answer that cannot have moved.
+    staleTime: Infinity,
+    retry: false,
   });
 
   // Derived during render rather than stored, so there is no effect
   // writing state and no frame where the two disagree.
-  if (live === null) return { state: "off" };
-  if (repos.length === 0) {
-    // A bare number we could not attach to a repository. NOT an empty
-    // lookup: nothing was asked, and saying "no session recorded" here
-    // would claim a finding we never went looking for.
-    return { state: "unresolved", number: live.number };
-  }
-  if (results.some((r) => r.isLoading)) return { state: "loading", ref };
-  const links = results.flatMap((r) => r.data ?? []);
-  const failed = results.find((r) => r.isError);
-  if (failed) {
-    // PARTIAL is not nothing (#1044): whichever repos answered keep
-    // their links, and the caller renders them alongside the failure
-    // rather than instead of it.
-    return { state: "failed", ref, links, error: prLookupError(failed.error) };
-  }
-  return { state: "done", ref, links };
+  // Disabled is "off", not "loading": nothing was asked, and a lookup
+  // that will never run must not render as one in flight (#1042).
+  if (live === null || !enabled) return { state: "off" };
+  if (lookup.isError) return { state: "failed", ref, error: prLookupError(lookup.error) };
+  if (lookup.data === undefined) return { state: "loading", ref };
+  return { state: "done", ref, ...matchPrLinks(lookup.data, live) };
 }
 
 export function useClaudeSessions(enabled: boolean) {
@@ -2138,6 +2127,11 @@ export function useClaudeSessions(enabled: boolean) {
     rescan: async () => {
       await qc.invalidateQueries({ queryKey: ["claude-import"] });
       await qc.invalidateQueries({ queryKey: ["claude-sessions"] });
+      // The pull request links are written by the same import (#1545),
+      // and their lookups are cached forever between imports -- so a PR
+      // opened since the last one stays unfound until these go too.
+      await qc.invalidateQueries({ queryKey: ["claude-sessions-for-pr-number"] });
+      await qc.invalidateQueries({ queryKey: ["claude-sessions-for-pr"] });
     },
   };
 }

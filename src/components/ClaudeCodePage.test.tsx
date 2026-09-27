@@ -95,12 +95,11 @@ const state = vi.hoisted(() => ({
   /// real hook returns.
   ///
   /// The state is set whole rather than derived from a flag, because the
-  /// whole feature is that these five do not collapse into one another:
-  /// `done` with no links ("we asked, nothing is recorded"), `failed`
-  /// ("the database did not answer") and `unresolved` ("we could not
-  /// tell which repository, so we never asked") are three different
-  /// sentences, and a fixture with one boolean could not express the
-  /// difference well enough to test it.
+  /// whole feature is that these do not collapse into one another:
+  /// `done` with no links ("we asked, nothing is recorded") and `failed`
+  /// ("the database did not answer") are different sentences, and a
+  /// fixture with one boolean could not express the difference well
+  /// enough to test it.
   prQuery: { state: "off" } as PrQueryState,
   /// Every query string the lookup hook was handed, so a test can assert
   /// that ordinary prose never reaches it.
@@ -3928,7 +3927,7 @@ describe("searching for a pull request finds the session that produced it", () =
   /// because neither title contains `1234`.
   it("shows the session the link table attributes the pull request to", () => {
     two();
-    state.prQuery = { state: "done", ref: "acme/api#1234", links: [link("owner-1")] };
+    state.prQuery = { state: "done", ref: "acme/api#1234", links: [link("owner-1")], elsewhere: [] };
     renderView();
     type("acme/api#1234");
 
@@ -3940,8 +3939,8 @@ describe("searching for a pull request finds the session that produced it", () =
   });
 
   /// The found sentence names the REPOSITORY, and reads it off the
-  /// links rather than off the query. A bare `#1234` was resolved
-  /// against the tracked pull requests, so the query itself never said
+  /// links rather than off the query. A bare `#1234` is looked up in
+  /// every repository (#1545), so the query itself never said
   /// which repository answered -- and with two of them carrying that
   /// number, "2 sessions produced #1234" would leave the reader unable
   /// to tell which is which.
@@ -3960,6 +3959,7 @@ describe("searching for a pull request finds the session that produced it", () =
         { ...link("owner-1"), repo: "acme/api" },
         { ...link("owner-2"), repo: "acme/ui" },
       ],
+      elsewhere: [],
     };
     renderView();
     type("1234");
@@ -3982,7 +3982,7 @@ describe("searching for a pull request finds the session that produced it", () =
       session({ session_id: "owner-1", name: "Kestrel" }),
       session({ session_id: "other-1", name: "Merlin" }),
     ]);
-    state.prQuery = { state: "done", ref: "#1234", links: [link("owner-1")] };
+    state.prQuery = { state: "done", ref: "#1234", links: [link("owner-1")], elsewhere: [] };
     renderView();
     type("1234");
 
@@ -4005,7 +4005,7 @@ describe("searching for a pull request finds the session that produced it", () =
     two();
 
     // 1. The lookup RAN and the link table holds nothing. A finding.
-    state.prQuery = { state: "done", ref: "acme/api#1234", links: [] };
+    state.prQuery = { state: "done", ref: "acme/api#1234", links: [], elsewhere: [] };
     renderView();
     type("acme/api#1234");
     const recorded = screen.getByTestId("pr-query-note").textContent ?? "";
@@ -4018,7 +4018,6 @@ describe("searching for a pull request finds the session that produced it", () =
     state.prQuery = {
       state: "failed",
       ref: "acme/api#1234",
-      links: [],
       error: "database is locked",
     };
     renderView();
@@ -4049,20 +4048,49 @@ describe("searching for a pull request finds the session that produced it", () =
     expect(searchEmpty).toBe(noMatch);
   });
 
-  /// A fourth state, and also not any of the three: a bare number whose
-  /// repository could not be named. The lookup is keyed on
-  /// `(repo, number)`, so nothing was asked -- and "we did not ask" must
-  /// not be reported as "they did not answer" (#1050).
-  it("says it could not tell which repository a bare number is in", () => {
-    two();
-    state.prQuery = { state: "unresolved", number: 1234 };
+  /// #1545: "shown below" is counted. A session the lookup found can be
+  /// hidden by the chip or the subagent toggle, and the note must not
+  /// promise a row the reader then cannot find.
+  ///
+  /// SABOTAGE: always render ", shown below." and this fails.
+  it("says when the filter hides the session the lookup found", () => {
+    state.list = listOf([
+      session({ session_id: "other-1", name: "Merlin" }),
+      session({
+        session_id: "owner-1",
+        name: "Kestrel",
+        kind: { kind: "subagent", agent_id: "a1" },
+      }),
+    ]);
+    state.prQuery = { state: "done", ref: "acme/api#1234", links: [link("owner-1")], elsewhere: [] };
     renderView();
-    type("1234");
+    type("acme/api#1234");
+
+    expect(screen.queryByRole("button", { name: /Kestrel/i })).toBeNull();
+    const note = screen.getByTestId("pr-query-note").textContent ?? "";
+    expect(note).toMatch(/1 session produced acme\/api#1234/i);
+    expect(note).toMatch(/none is shown/i);
+    expect(note).not.toMatch(/shown below/i);
+  });
+
+  /// #1545: a transferred repository's older links carry the old owner.
+  /// A qualified miss names where the number WAS recorded, without
+  /// adding those rows to the list on a guess.
+  it("names the same repository under another owner when a qualified search misses", () => {
+    two();
+    state.prQuery = {
+      state: "done",
+      ref: "acme/api#1234",
+      links: [],
+      elsewhere: [{ ...link("owner-1"), repo: "old-owner/api" }],
+    };
+    renderView();
+    type("acme/api#1234");
 
     const note = screen.getByTestId("pr-query-note").textContent ?? "";
-    expect(note).toMatch(/could not tell which repository/i);
-    expect(note).not.toMatch(/no session recorded/i);
-    expect(note).not.toMatch(/could not look up/i);
+    expect(note).toMatch(/no session recorded for acme\/api#1234/i);
+    expect(note).toMatch(/old-owner\/api#1234/);
+    expect(screen.queryByRole("button", { name: /Kestrel/i })).toBeNull();
   });
 
   /// Nothing is denied while the answer is still coming. "No session
@@ -4076,24 +4104,6 @@ describe("searching for a pull request finds the session that produced it", () =
     expect(screen.queryByTestId("pr-query-note")).toBeNull();
   });
 
-  /// PARTIAL is not nothing (#1044). One repository answered and another
-  /// rejected: the rows that were found still show, above a line saying
-  /// the lookup did not fully succeed.
-  it("keeps the links that did answer when another lookup failed", () => {
-    two();
-    state.prQuery = {
-      state: "failed",
-      ref: "#1234",
-      links: [link("owner-1")],
-      error: "database is locked",
-    };
-    renderView();
-    type("1234");
-
-    expect(screen.getByRole("button", { name: /Kestrel/i })).toBeTruthy();
-    expect(screen.getByTestId("pr-query-note").textContent).toMatch(/could not look up/i);
-  });
-
   /// The #1200 highlighting keeps working: a session matched by pull
   /// request has no matching text in the five searched fields, so its
   /// row draws with nothing marked and still reads as a row.
@@ -4103,7 +4113,7 @@ describe("searching for a pull request finds the session that produced it", () =
   /// above it too, which is why both are here.
   it("renders a row matched only by pull request with nothing highlighted", () => {
     two();
-    state.prQuery = { state: "done", ref: "acme/api#1234", links: [link("owner-1")] };
+    state.prQuery = { state: "done", ref: "acme/api#1234", links: [link("owner-1")], elsewhere: [] };
     const { container } = renderView();
     type("acme/api#1234");
 

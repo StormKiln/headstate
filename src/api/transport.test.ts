@@ -328,6 +328,7 @@ const ROWS: Row[] = [
   // Headstate's OWN table, so an id the store does not have returns
   // `null` rather than reaching the filesystem.
   row(api.claudeSessionsForPr, ["acme/api", 7], "claude_sessions_for_pr", { repo: "acme/api", number: 7 }),
+  row(api.claudeSessionsForPrNumber, [7], "claude_sessions_for_pr_number", { number: 7 }),
   row(api.claudeSessionDetail, ["s1"], "claude_session_detail", { sessionId: "s1" }),
   row(api.claudeSessionDigest, [], "claude_session_digest"),
   row(api.claudeTranscriptOpeningPrompt, ["s1"], "claude_transcript_opening_prompt", {

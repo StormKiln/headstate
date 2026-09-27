@@ -252,6 +252,50 @@ pub fn sessions_for_pr(
     rows.collect()
 }
 
+/// The sessions that produced a pull request with this NUMBER, in any
+/// repository (#1545).
+///
+/// What the search box asks when the query is a bare `#1234` or `1234`.
+/// It used to resolve the repository from the tracked OPEN pull requests
+/// first, so a merged one -- the usual state of "the PR that session
+/// made" by the time anyone searches for it -- named no repository, and
+/// nothing was looked up. Measured on the owner's link table: 8 of 1,034
+/// linked pull requests were in that open list.
+///
+/// The link table itself is the list of repositories that can answer, so
+/// the number is looked up there directly. Every repository carrying it
+/// comes back -- two repos can both hold a `#1234`, and choosing one
+/// would be a guess -- and the caller names each.
+///
+/// Also what a QUALIFIED query uses, filtered in the caller, because
+/// `owner/repo` is case-insensitive on GitHub and a transferred
+/// repository keeps its old owner in the links written before the
+/// transfer. An exact `repo = ?` match missed both.
+///
+/// No index on `number` alone: the table holds one row per (session,
+/// PR) -- 1,034 on the owner's machine -- so the scan is sub-millisecond
+/// and an index would be a migration for nothing measurable.
+pub fn sessions_for_pr_number(
+    conn: &Connection,
+    number: u64,
+) -> Result<Vec<super::subagent::PrLink>, rusqlite::Error> {
+    let mut q = conn.prepare(
+        "SELECT session_id, repo, number, url, first_seen_at
+           FROM claude_session_pr WHERE number = ?1
+          ORDER BY repo, first_seen_at, session_id",
+    )?;
+    let rows = q.query_map([number as i64], |r| {
+        Ok(super::subagent::PrLink {
+            session_id: r.get(0)?,
+            repo: r.get(1)?,
+            number: r.get::<_, i64>(2)? as u64,
+            url: r.get(3)?,
+            first_seen_at: r.get(4)?,
+        })
+    })?;
+    rows.collect()
+}
+
 /// Record one session's token usage (#1134).
 ///
 /// Called from the import pass, which is the only place that can afford
@@ -1353,6 +1397,42 @@ mod tests {
         assert_eq!(reverse.len(), 2);
         assert!(reverse.iter().any(|l| l.session_id == "s1"));
         assert!(reverse.iter().any(|l| l.session_id == "s2"));
+    }
+
+    /// #1545: a bare number is looked up in the link table itself, across
+    /// every repository that carries it -- merged or not, tracked or not.
+    #[test]
+    fn a_number_alone_finds_its_sessions_in_every_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::store::open_db(&dir.path().join("t.db")).unwrap();
+        for (session, repo, n) in [
+            ("s1", "acme/api", 7),
+            ("s2", "acme/ui", 7),
+            ("s3", "acme/api", 8),
+        ] {
+            conn.execute(
+                "INSERT OR REPLACE INTO claude_session_pr
+                     (session_id, repo, number, url, first_seen_at)
+                 VALUES (?1, ?2, ?3, 'u', '2026-09-11T12:00:00Z')",
+                rusqlite::params![session, repo, n],
+            )
+            .unwrap();
+        }
+
+        let got = sessions_for_pr_number(&conn, 7).unwrap();
+        let pairs: Vec<(&str, &str)> = got
+            .iter()
+            .map(|l| (l.session_id.as_str(), l.repo.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [("s1", "acme/api"), ("s2", "acme/ui")],
+            "both repositories' #7, ordered by repository, and not #8"
+        );
+        assert!(
+            sessions_for_pr_number(&conn, 9).unwrap().is_empty(),
+            "a number no session linked is an empty answer, not an error"
+        );
     }
 
     /// The primary key is the dedup rule made structural: a session

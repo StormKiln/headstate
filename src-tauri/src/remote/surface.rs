@@ -404,6 +404,10 @@ pub const SURFACE: &[(&str, Class)] = &[
     // one.
     // Read: one indexed query (#1132).
     ("claude_sessions_for_pr", Class::Read),
+    // #1545: the search box's lookup by number alone. Read for the same
+    // reason: one query of the same link table, returning the same
+    // `PrLink` rows, which carry no transcript text.
+    ("claude_sessions_for_pr_number", Class::Read),
     ("claude_session_detail", Class::Read),
     // #1486. A compact per-session status -- liveness, waiting kind, the
     // last turn's end and outcome -- for the phone's best-effort
@@ -1232,6 +1236,9 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
                 commands::claude_sessions_for_pr(app.clone(), a.get("repo")?, a.get("number")?)
                     .await,
             )
+        }
+        "claude_sessions_for_pr_number" => {
+            res(commands::claude_sessions_for_pr_number(app.clone(), a.get("number")?).await)
         }
         "claude_session_detail" => {
             res(commands::claude_session_detail(app.clone(), a.get("sessionId")?).await)

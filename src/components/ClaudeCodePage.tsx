@@ -199,7 +199,10 @@ import { SessionTabs } from "./transcript/SessionTabs";
 /// every title and prompt containing those digits. `parsePrQuery`
 /// carries the full argument for which shapes trigger it.
 ///
-/// # Absent is not zero: ten conditions, ten renderings
+/// # Absent is not zero: nine conditions, nine renderings
+///
+/// Ten until #1545, which removed "a bare `#1234` whose repository we
+/// cannot name": the lookup is by number alone now, so it is always made.
 ///
 /// | condition | rendering |
 /// |---|---|
@@ -212,9 +215,8 @@ import { SessionTabs } from "./transcript/SessionTabs";
 /// | genuinely nothing | `NoSessions` -- only when the read SUCCEEDED and nothing was narrowed |
 /// | the PR lookup ran and found nothing | "No session recorded for `owner/repo#1234`" (#1280) -- a finding about the link table |
 /// | the PR lookup FAILED | "Could not look up ..." -- not a finding at all, and never worded as the row above |
-/// | a bare `#1234` whose repo we cannot name | "Could not tell which repository ..." -- we never asked (#1050) |
 ///
-/// The last three are `PrQueryNote`'s, which argues each wording where
+/// The last two are `PrQueryNote`'s, which argues each wording where
 /// it is rendered. They are stated beside the COUNTS rather than in the
 /// empty list, because they are true whether or not the text filter also
 /// matched something -- a pull request with no recorded session and a
@@ -470,9 +472,7 @@ function useMatchedSessions() {
   const prOwners = useMemo(
     () =>
       new Set(
-        prQuery.state === "done" || prQuery.state === "failed"
-          ? prQuery.links.map((l) => l.session_id)
-          : [],
+        prQuery.state === "done" ? prQuery.links.map((l) => l.session_id) : [],
       ),
     [prQuery],
   );
@@ -649,17 +649,33 @@ const CLAUDE_CHIPS: ReadonlyArray<{
 /// Collapsing any two of these is the defect #846 and #1044 are both
 /// about. "No session recorded for #1234" is a finding: we asked the
 /// link table and it holds nothing, which is the ordinary answer for a
-/// pull request opened by hand, by CI, or before this machine imported
-/// its transcripts. "Could not look up #1234" is not a finding at all --
+/// pull request opened by hand, by CI, or since the transcripts were
+/// last read -- the link table is written by the import, not live
+/// (#1545). "Could not look up #1234" is not a finding at all --
 /// the database did not answer, and the pull request may well have a
 /// session we simply could not see. Rendering the second as the first
 /// would tell a user their session is gone on the strength of a failed
 /// read.
 ///
-/// A fourth state exists and is also not any of the three: a bare
-/// `#1234` whose repository could not be named. The lookup is keyed on
-/// `(repo, number)`, so no query was issued -- and "we never asked" must
-/// not be reported as "they did not answer" (#1050).
+/// A bare `#1234` used to have a fourth wording, "Could not tell which
+/// repository", for a number the tracked open pull requests could not
+/// place -- which was every merged one. #1545 looks the number up in
+/// the link table directly, so it is always asked and that state is gone.
+///
+/// # "shown below" is counted, not assumed (#1545)
+///
+/// The list is also narrowed by the chip and the subagent toggle, and a
+/// session the lookup found can be outside both. The note says how many
+/// of them the list actually shows, rather than promising rows the
+/// reader then cannot find.
+///
+/// # A qualified miss says where the number WAS found
+///
+/// A link keeps the repository's name from when the PR was opened, so a
+/// transferred repository's older links carry the old owner. When
+/// `owner/repo#1234` matched nothing but the same repository name under
+/// another owner did, the note names it -- as a fact the reader can
+/// search for, not as rows added to the list on a guess.
 ///
 /// Nothing is rendered while the lookup is in flight. A row that is
 /// about to appear must not first be denied: "No session recorded"
@@ -668,8 +684,8 @@ const CLAUDE_CHIPS: ReadonlyArray<{
 /// The pull requests a set of links names, as prose.
 ///
 /// Read off the LINKS rather than off the query, because a bare
-/// `#1234` was resolved through the tracked pull request list and the
-/// query never said which repository answered. Almost always one; two
+/// `#1234` is looked up in every repository and the query never said
+/// which repository answered. Almost always one; two
 /// only when two repositories both carry that number, and then naming
 /// both is the point.
 function prRefsOf(links: readonly ClaudePrLink[]): string {
@@ -677,16 +693,8 @@ function prRefsOf(links: readonly ClaudePrLink[]): string {
   return refs.length <= 2 ? refs.join(" and ") : `${refs.slice(0, -1).join(", ")} and ${refs.at(-1)}`;
 }
 
-function PrQueryNote({ q }: { q: PrQueryState }) {
+function PrQueryNote({ q, shown }: { q: PrQueryState; shown: ReadonlySet<string> }) {
   if (q.state === "off" || q.state === "loading") return null;
-  if (q.state === "unresolved") {
-    return (
-      <p className="mt-1 text-[11px] text-[#8b949e]" data-testid="pr-query-note">
-        Could not tell which repository #{q.number} is in, so no session was looked up. Search{" "}
-        <code className="text-[#e6edf3]">owner/repo#{q.number}</code> to ask directly.
-      </p>
-    );
-  }
   if (q.state === "failed") {
     return (
       <p className="mt-1 text-[11px] text-[#d29922]" data-testid="pr-query-note">
@@ -698,11 +706,20 @@ function PrQueryNote({ q }: { q: PrQueryState }) {
   if (q.links.length === 0) {
     return (
       <p className="mt-1 text-[11px] text-[#8b949e]" data-testid="pr-query-note">
-        No session recorded for {q.ref}. It may have been opened by hand, by CI, or before this
-        machine imported its transcripts.
+        No session recorded for {q.ref}. It may have been opened by hand, by CI, or since the
+        transcripts were last read — Rescan transcripts reads them again.
+        {q.elsewhere.length > 0 ? (
+          <>
+            {" "}
+            Sessions did record {prRefsOf(q.elsewhere)}; search{" "}
+            <code className="text-[#e6edf3]">#{q.elsewhere[0].number}</code> to see them.
+          </>
+        ) : null}
       </p>
     );
   }
+  const sessions = new Set(q.links.map((l) => l.session_id));
+  const visible = [...sessions].filter((id) => shown.has(id)).length;
   return (
     <p className="mt-1 text-[11px] text-[#8b949e]" data-testid="pr-query-note">
       {/* The rows are in the list below and carry NO highlight: a
@@ -710,13 +727,18 @@ function PrQueryNote({ q }: { q: PrQueryState }) {
           five searched fields, which #1200's find-over-data highlighting
           correctly renders as nothing marked. This line is what tells
           the reader why those rows are there. */}
-      {q.links.length === 1 ? "1 session" : `${q.links.length} sessions`} produced{" "}
+      {sessions.size === 1 ? "1 session" : `${sessions.size} sessions`} produced{" "}
       {/* The REPOSITORY, from the links rather than from the query. A
-          bare `#1234` was resolved against the tracked pull requests, so
-          `q.ref` is `#1234` and does not say which repository answered
-          -- and "1 session produced #1234" leaves the reader unable to
-          tell which of two repositories' `#1234` they are looking at. */}
-      {prRefsOf(q.links)}, shown below.
+          bare `#1234` is looked up in every repository, so `q.ref` is
+          `#1234` and does not say which repository answered -- and
+          "1 session produced #1234" leaves the reader unable to tell
+          which of two repositories' `#1234` they are looking at. */}
+      {prRefsOf(q.links)}
+      {visible === sessions.size
+        ? ", shown below."
+        : visible === 0
+          ? ". None is shown: the current filter hides them."
+          : `. ${visible} of them shown below; the current filter hides the rest.`}
     </p>
   );
 }
@@ -981,7 +1003,10 @@ export function ClaudeSessionColumn() {
             shown or searched.
           </p>
         ) : null}
-        <PrQueryNote q={prQuery} />
+        <PrQueryNote
+          q={prQuery}
+          shown={new Set((matched?.ordered ?? []).map((s) => s.session_id))}
+        />
       </div>
       <div
         ref={scrollRef}
