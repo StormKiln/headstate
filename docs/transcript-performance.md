@@ -7,10 +7,34 @@ in the live-follow issue (#1476). Neither choice should be made without these
 numbers.
 
 **Status.** The fixtures, the Rust read bench, the receive-side parse bench
-and the browser harness are in place. The harness landed with the first real
-renderer, the desktop terminal renderer (#1480), and measures B1 to B3 in
-Chromium; B4 in the browser and every phone figure are still **not
-measured**, not "passing".
+and the browser harness are in place. The harness measures B1 to B4 in
+Chromium and estimates B5 from real-text compression ratios. Nothing is
+yet confirmed in WKWebView, and every phone figure is still **not
+measured**, not "passing". Two desktop defects are open: the residency
+bound does not bind while the reader's window holds the oldest page, and an
+idle read is never shown ("Findings, 2026-09-27").
+
+## Where each budget stands (2026-09-27)
+
+Every figure below was taken on an Apple M2 Max, macOS 26.6, with
+Playwright 1.63.0 Chromium (headless shell 153) at 1280×800 for the browser
+figures, and a release build for the Rust ones. "Chromium" is not the
+desktop app: the app renders in WKWebView, and a budget is **met** only once
+it is confirmed there (the engine caveat below).
+
+| # | Budget | Measured | Where | Verdict |
+|---|---|---|---|---|
+| B1 | open → newest painted: desktop < 300 ms | 20 to 122 ms on every fixture page | Chromium, `make bench-transcript-browser` | **within in Chromium**; NOT MEASURED in WKWebView (device) |
+| B1 | phone < 800 ms on the LAN | -- | -- | **NOT MEASURED (device)** |
+| B2 | no long task > 50 ms while scrolling; 60 fps | 0 long tasks while scrolling on every page; frame p95 16.7 ms. Opening a 400-message page is one 93 to 99 ms task (not a scroll) | Chromium | **within in Chromium**; NOT MEASURED in WKWebView or on the phone (device) |
+| B3 | desktop < 50 MB whatever the size | 3.9 to 10.6 MB after a full scroll; 14.9 MB with the reader following 3,240 appended messages | Chromium | **within in Chromium, with one defect**: while the reader's window holds the oldest page, nothing is evicted (30 of 30 appended pages held, heap +0.8 MB per 610 messages, without bound). NOT MEASURED in WKWebView |
+| B3 | phone < 25 MB | -- | -- | **NOT MEASURED (device)** |
+| B4 | idle follow: nothing on the main thread beyond the read | Rust: 12.0 KiB and 0.02 to 0.03 ms per idle tick (two runs), on every fixture. Browser: 564 to 571 B answered per tick, 0.34 to 1.40 ms main thread per tick, **0 React commits, 0 DOM mutations, 0 long tasks**; 0 reads while hidden; a nudge for new bytes read in 5.8 to 12.4 ms, a nudge for the same size read nothing | Rust release bench + Chromium | **within in Chromium, with one defect**: the zero commits are because an idle tick's `lastReadAt` is never published, so "Last read at …" stops advancing while the follow keeps reading (Finding 2, 2026-09-27). NOT MEASURED in WKWebView or on the phone (device) |
+| B4 | growth O(new bytes); eviction at 2,000 | following at the live edge: 19 of 30 appended pages held (the bound allows 20); parked on a new turn: 30 of 30 held | Chromium | **NOT MET** in the parked case (Finding 1, 2026-09-27) |
+| B4 | backgrounded phone trims to ~600 | -- | unit test only (`relieves memory pressure down to the reader's own pages`) | **NOT MEASURED (device)**: the trim runs only in the iOS build |
+| B5 | phone page < 150 KB compressed | **estimate**: 2.7 to 57.2 KB at the worst real-page ratio (2.11×), 2.0 to 43.1 KB at the median (2.8×), for every real page payload (5.7 to 120.7 KB of JSON) | page payloads from `transcript_message_payloads` ÷ #1478's real-page ratios | **within, as an estimate**; NOT MEASURED on the wire (device) |
+| -- | gzip decode CPU on the phone | -- | -- | **NOT MEASURED (device)**; ~50 µs median on the M2 Max (#1478) |
+| -- | highlighting worker time on the phone (#1482's 1 s deadline, 1,000-line and 60,000-character caps) | -- | -- | **NOT MEASURED (device)** |
 
 ## Budgets
 
@@ -20,11 +44,11 @@ the LAN.
 
 | # | Budget | Target | How it is measured | Measured today |
 |---|---|---|---|---|
-| B1 | Open to first paint at the newest message | desktop < 300 ms, phone < 800 ms on the LAN | Browser harness: from the selection that opens a fixture until the newest message has painted (Element Timing `renderTime` on the newest message, else the second frame after it is in the DOM). Phone: Instruments, from the tap to the first frame showing the newest message. | **Desktop, Chromium: 43 to 105 ms** across every fixture page (see "Browser harness, measured"). Not yet confirmed in WKWebView. Phone: not measured. |
-| B2 | Scrolling | no long task > 50 ms while scrolling; 60 fps on desktop and phone | Browser harness: a `longtask` PerformanceObserver during a scripted scroll from the newest message to the oldest and back, plus frame intervals counted with `requestAnimationFrame`. Phone: Instruments Time Profiler and the Animation Hitches instrument during a manual scroll. | **Desktop, Chromium: no long task while scrolling** on any page; frame p95 16.7 to 16.8 ms. The OPEN of a 400-message page is one 85 to 88 ms task (see "Browser harness, measured"). Phone: not measured. |
-| B3 | Resident transcript memory | desktop < 50 MB, phone < 25 MB, **whatever the transcript's size** | Browser harness: JS heap after a forced GC (CDP `HeapProfiler.collectGarbage`, then `Runtime.getHeapUsage`), taken after opening and after the full scroll, on every fixture page. Rust: bytes each read holds (`bytes_read`), asserted in every `cargo test`. Phone: Instruments Allocations. | **Desktop, Chromium: at most 9.6 MB** after a full scroll, the 70 MB fixture's page included. Rust side: **bounded at any position** by the paged read (#1220): 260 to 268 KiB per page at the start, middle and end of every fixture. `follow`'s unbounded catch-up is gone (#1514): the viewer pages instead. Phone: not measured. |
-| B4 | Live follow | idle follow costs no main-thread work beyond one stat per tick; growth costs O(new bytes) | Rust: bytes and time of `follow` on an idle tick and on an append. Browser harness: zero long tasks and no React commit during 30 s of idle follow on an open fixture (React Profiler `onRender` count). | **Idle tick: 128 KiB and ~0.09 ms**, off the main thread. It is O(1), but twice what `preview.rs` documents (see Findings). Viewer side: not measured. |
-| B5 | Phone bandwidth | a page < 150 KB compressed | Size of the page payload as sent over the remote surface, compressed with the codec the compression issue (#1478) picks. | **Uncompressed: 99 to 224 KiB.** Compressed: not yet measurable, because the generated text compresses far better than real text (see Fixtures). The bench prints gzip sizes, but only as a floor, never as a pass. |
+| B1 | Open to first paint at the newest message | desktop < 300 ms, phone < 800 ms on the LAN | Browser harness: from the selection that opens a fixture until the newest message has painted (Element Timing `renderTime` on the newest message, else the second frame after it is in the DOM). Phone: Instruments, from the tap to the first frame showing the newest message. | **Desktop, Chromium: 20 to 122 ms** across every fixture page (2026-09-27; 43 to 105 ms on 2026-09-26). Not yet confirmed in WKWebView. Phone: not measured. |
+| B2 | Scrolling | no long task > 50 ms while scrolling; 60 fps on desktop and phone | Browser harness: a `longtask` PerformanceObserver during a scripted scroll from the newest message to the oldest and back, plus frame intervals counted with `requestAnimationFrame`. Phone: Instruments Time Profiler and the Animation Hitches instrument during a manual scroll. | **Desktop, Chromium: no long task while scrolling** on any page; frame p95 16.7 to 16.8 ms. The OPEN of a 400-message page is one 93 to 99 ms task (85 to 88 ms on 2026-09-26). Phone: not measured. |
+| B3 | Resident transcript memory | desktop < 50 MB, phone < 25 MB, **whatever the transcript's size** | Browser harness: JS heap after a forced GC (CDP `HeapProfiler.collectGarbage`, then `Runtime.getHeapUsage`), taken after opening and after the full scroll, on every fixture page. Rust: bytes each read holds (`bytes_read`), asserted in every `cargo test`. Phone: Instruments Allocations. | **Desktop, Chromium: at most 10.6 MB** after a full scroll, the 70 MB fixture's page included; 14.9 MB following 3,240 appended messages, but unbounded while the reader's window holds the oldest page (Finding 1, 2026-09-27). Rust side: **bounded at any position** by the paged read (#1220): 260 to 268 KiB per page at the start, middle and end of every fixture. `follow`'s unbounded catch-up is gone (#1514): the viewer pages instead. Phone: not measured. |
+| B4 | Live follow | idle follow costs no main-thread work beyond one stat per tick; growth costs O(new bytes) | Rust: bytes and time of the page after the newest cursor with nothing appended (`page after (end, nothing new)`), the read an idle tick makes. Browser harness: reads, answer bytes, main-thread time, React commits, DOM mutations and long tasks at the active cadence, in the idle backoff, while hidden, and on nudges; then growth past the 2,000-message bound (see "Browser harness"). | **Idle tick: 12.0 KiB and 0.02 ms** in Rust, bounded by `IDLE_TICK_BOUND` in every `cargo test`. In Chromium: 0.34 to 1.40 ms main thread and no commit per tick. Eviction does not bind while the reader's window holds the oldest page (Finding 1, 2026-09-27). Phone: not measured. |
+| B5 | Phone bandwidth | a page < 150 KB compressed | Size of the page payload as sent over the remote surface, compressed with the codec the compression issue (#1478) picks. | **Estimate: at most 57.2 KB** at the worst real-page ratio #1478 measured (2.11×), from 5.7 to 120.7 KB of JSON per real page. Generated text compresses ~7×, which real text does not, so the fixtures' own compressed sizes are never used. On the wire: not measured. |
 
 B1 to B4 are what the viewer is held to. The Rust read budgets below are
 **derived** from them, not given by #1487. The read gets a sixth of B1's
@@ -34,6 +58,7 @@ B1 to B4 are what the viewer is held to. The Rust read budgets below are
 |---|---|---|
 | `tail` at the end | ≤ `TAIL_BYTES` (256 KiB) | < 50 ms |
 | paged read (#1220), at the start, middle or end | ≤ `PAGE_READ_BOUND` (716 KiB); measured 260 to 268 KiB | < 50 ms |
+| idle follow tick (B4): the page after the newest cursor, nothing appended | ≤ `IDLE_TICK_BOUND` (three cursor digests, 12 KiB); measured 12.0 KiB | < 5 ms |
 | position index build (#1220), worker thread | per record, not per file | reported only: no request waits on it |
 
 `preview::follow` (first read, idle tick, catch-up from offset 0) was in
@@ -133,6 +158,24 @@ same machine.
 | huge-result-5mb | 10.3 MiB | page before (middle) | 22.51 ms | 268.0 KiB | 1 (tail) | 5.5 KiB | < 50 ms: ok |
 | huge-result-5mb | 10.3 MiB | page before (end) | 22.38 ms | 264.0 KiB | 2 (tail) | 6.3 KiB | < 50 ms: ok |
 
+**The idle follow tick (B4)**, added 2026-09-27 (same machine, release): the
+page after the newest cursor when nothing was appended, which the live viewer
+(#1476) asks on every tick of an idle session. Every other row was re-taken in
+the same run and came in 13 to 19% faster than the table above.
+
+| fixture | file | read | median | bytes read | messages | payload (JSON) | budget |
+|---|---:|---|---:|---:|---:|---:|---|
+| messages-1k | 2.1 MiB | page after (end, nothing new) | 0.02 ms | 12.0 KiB | 0 | 0.6 KiB | < 5 ms: ok |
+| messages-10k | 20.8 MiB | page after (end, nothing new) | 0.02 ms | 12.0 KiB | 0 | 0.6 KiB | < 5 ms: ok |
+| tool-heavy-70mb | 70.0 MiB | page after (end, nothing new) | 0.02 ms | 12.0 KiB | 0 | 0.6 KiB | < 5 ms: ok |
+| huge-result-5mb | 10.3 MiB | page after (end, nothing new) | 0.03 ms | 12.0 KiB | 0 | 0.6 KiB | < 5 ms: ok |
+
+12.0 KiB is the three cursor digests a page call reads (the one it checks and
+the two it returns), whatever the file's size; `an_idle_tick_reads_digests_not_the_file`
+holds it to `IDLE_TICK_BOUND` in every `cargo test`. It replaces the old
+preview follow's 128 KiB idle tick (Finding 2), and is three times the "4 KB
+digest" `transcriptFollow.ts` documented, which now says 12 KB.
+
 A page's `bytes read` includes the two cursor digests it returns and any
 anchor lookback. The `huge-result-5mb` pages take ~22 ms because they stream
 the 10.3 MiB record through the skim to present it as one message; that time
@@ -227,7 +270,13 @@ How it is built:
   (`<fixture>.messages-tail.json`) and the whole file parsed as one page
   (`<fixture>.messages-whole.json`). The read model caps a page at its newest
   400 messages (`MAX_MESSAGES`), so "whole" is the fullest page a read can hand
-  the viewer today.
+  the viewer today. It also writes the pages the viewer actually reads
+  (`<fixture>.window-{end,middle,start}.json`): the `TranscriptWindow` of
+  `claude_transcript_page` backwards from the end, backwards from the middle
+  and forwards from byte 0, as JSON exactly as it crosses to the webview and
+  the phone. B5 is estimated from these. The fixtures themselves are
+  generated into the test's own temporary directory, which is dropped; only
+  the payloads are written to the output directory.
 - **Target.** `vite.harness.config.ts` builds the app's own Vite config
   against `harness/transcript.html` into `dist-harness/`; the app bundle never
   includes it. The page (`src/harness/transcriptBench.tsx`) mounts
@@ -238,6 +287,12 @@ How it is built:
   with the fixture page as one window, which the page fetched BEFORE "Open" and parses
   inside the answer, so B1 covers receive, render and paint but not the
   harness's own network. Any other command is refused, not answered falsely.
+  With `?mode=follow` the session reads as running, a forward read answers
+  "nothing new" unless growth was queued, events are mocked so the desktop's
+  activity nudge (#1477) can be emitted, and `window.__harness` exposes every
+  read and the bytes of its answer. Growth is the fixture page's own messages
+  under fresh ids (`<id>-g<n>`), either continuing the turn in progress (its
+  prompts left out) or opening new turns.
 - **Driver.** `scripts/transcript-browser-bench.mjs` serves `dist-harness` and
   the payloads, opens each page in a 1280×800 Chromium context, and prints the
   table below. It fails (exit 1) on any figure over budget, on a page error,
@@ -263,12 +318,37 @@ The design it implements:
   either is over 50 MB, or if the 70 MB fixture's heap exceeds the 1k fixture's
   by more than the budget allows. That second test is the "whatever the size"
   half of B3.
-- **B4, idle follow.** Leave a fixture open with follow on for 30 s, with the
-  mock answering "nothing new". Count React commits with the Profiler
-  `onRender` callback, and long tasks. Expect zero of each. **Not implemented
-  yet**: the viewer's data is still the tail re-read
-  (`useClaudeTranscriptMessages`), and B4 is about #1476's follow, which
-  replaces it. It lands with #1476.
+- **B4, live follow** (#1476, #1477; `B4_FIXTURES`, by default
+  `messages-1k` tail and `tool-heavy-70mb` whole). Open a fixture on a running
+  session with the mock answering "nothing new", and measure five phases in
+  real time -- the cadence is real time, so this takes about three minutes a
+  page: 20 s at the active cadence (750 ms, for 60 s after the open), 45 s of
+  the idle backoff (5, 10, 15 s), 20 s hidden, 2 s after becoming visible,
+  and 2 s after a nudge for the size already read. Each phase reports reads,
+  their intervals and answer bytes; main-thread time (`TaskDuration`) and
+  script time from CDP `Performance.getMetrics`; React commits; DOM mutations
+  inside and outside the message rows; layouts; long tasks. Then one nudge for
+  new bytes, timed to the read and to the new row's paint. Fail on a long task,
+  a mutated row, a read while hidden, no read on becoming visible, a read on a
+  same-size nudge, or a new-bytes nudge not read within 1 s.
+
+  React commits are counted by a `__REACT_DEVTOOLS_GLOBAL_HOOK__` installed
+  before React loads (`onCommitFiberRoot`), not the Profiler `onRender` this
+  design first named: a production build does not call `onRender`, and a
+  profiling build would change the B1 figures the same harness takes.
+- **B4, growth and eviction.** On `messages-1k` tail, append 30 pages, one
+  per nudge, past the follower's 2,000-message bound, and take the heap after
+  a GC every five. At the end, a heap snapshot says which appended pages'
+  message ids are still in memory: that is what the follow holds, whatever
+  holds it. Two readers: **at the live edge** (they pressed "jump to latest";
+  each page continues the turn in progress) and **parked on a new turn**
+  (each page opens turns, which the viewer places at the top of the view, so
+  the reader stays at the first new prompt). Fail if more pages are held than
+  the bound allows, or on a heap over B3.
+- **B5, estimated.** Each `*.window-*.json` payload divided by the
+  compression ratios #1478 measured on 20 real local transcript pages: 2.8×
+  (median) and 2.11× (worst). An estimate of what the phone receives, labelled
+  so, never a device figure: the wire size is on the phone checklist.
 - **Engine caveat.** Chromium is not WKWebView. The harness catches
   regressions; it does not certify the desktop app. Before a budget is marked
   **met**, confirm it once in Safari Web Inspector's Timelines on the real app
@@ -307,6 +387,150 @@ Two findings:
   That is B3's "whatever the size" for what a read hands the viewer today;
   what the client HOLDS as it pages is #1476's to bound.
 
+### Browser harness, measured: 2026-09-27, same machine and browser
+
+Re-run on `main` after the viewer gained navigation (#1484), accessibility
+(#1489) and the header, with B4 and the B5 estimate added.
+
+**B1 to B3**
+
+| page | messages | rows mounted | B1 open → newest painted | long tasks, open | long tasks, scroll | frame intervals, scroll | heap: ready → open → scrolled | sideways overflow |
+|---|---:|---:|---:|---:|---:|---|---|---|
+| huge-result-5mb tail | 1 | 1 | 19.6 ms (2nd frame) | 0 | 0 | 16.7 ms p95 | 2.0 → 3.3 → 3.9 MB | none |
+| huge-result-5mb whole | 68 | 68 | 55.5 ms (2nd frame) | 0 | 0 | 16.8 ms p95 | 2.1 → 4.8 → 5.7 MB | none |
+| messages-1k tail | 122 | 122 | 73.2 ms (2nd frame) | 1 (51 ms) | 0 | 16.7 ms p95 | 2.1 → 5.5 → 6.5 MB | none |
+| messages-1k whole | 400 | 400 | 105.4 ms (2nd frame) | 1 (93 ms) | 0 | 16.7 ms p95 | 2.4 → 8.6 → 9.9 MB | none |
+| messages-10k tail | 131 | 131 | 72.8 ms (2nd frame) | 1 (55 ms) | 0 | 16.7 ms p95 | 2.2 → 5.6 → 6.7 MB | none |
+| messages-10k whole | 400 | 400 | 121.5 ms (2nd frame) | 1 (97 ms) | 0 | 16.7 ms p95 | 2.4 → 8.6 → 10.0 MB | none |
+| tool-heavy-70mb tail | 78 | 78 | 73.6 ms (2nd frame) | 0 | 0 | 16.7 ms p95 | 2.1 → 5.1 → 6.0 MB | none |
+| tool-heavy-70mb whole | 400 | 400 | 120.7 ms (2nd frame) | 1 (99 ms) | 0 | 16.7 ms p95 | 2.6 → 9.4 → 10.6 MB | none |
+
+A second run the same day, before the harness changes, gave B1 of 68 to
+136 ms and open tasks of 56 to 106 ms: run-to-run spread is about ±15 ms.
+Against 2026-09-26, opening a 400-message page costs ~10 ms more (93 to 99 ms
+against 85 to 88 ms) and ~0.6 to 1.0 MB more heap. Every figure is still
+within B1, B2 and B3 in Chromium.
+
+**B4, live follow.** Every read finds nothing new.
+
+| page | phase | time | reads | read intervals | answer bytes / read | main thread / read | script / read | React commits | DOM mutations: rows / other | long tasks |
+|---|---|---:|---:|---|---:|---:|---:|---:|---|---:|
+| messages-1k tail | active cadence | 20.0 s | 27 | 0.75 s | 571 B | 0.36 ms | 0.04 ms | 0 | 0 / 0 | 0 |
+| messages-1k tail | idle backoff | 45.0 s | 4 | 10.00 to 15.00 s | 571 B | 0.69 ms | 0.03 ms | 0 | 0 / 0 | 0 |
+| messages-1k tail | hidden | 20.0 s | 0 | none | no reads | 7.1 ms in all | 4.6 ms in all | 2 | 0 / 28 | 0 |
+| messages-1k tail | visible again | 2.0 s | 1 | -- | 571 B | 5.42 ms | 3.43 ms | 2 | 0 / 27 | 0 |
+| messages-1k tail | nudge, same size | 2.0 s | 0 | none | no reads | 0.7 ms in all | 0.0 ms | 0 | 0 / 0 | 0 |
+| tool-heavy-70mb whole | active cadence | 20.0 s | 27 | 0.75 s | 564 B | 0.34 ms | 0.03 ms | 0 | 0 / 0 | 0 |
+| tool-heavy-70mb whole | idle backoff | 45.0 s | 4 | 10.00 to 15.00 s | 564 B | 1.40 ms | 0.03 ms | 0 | 0 / 0 | 0 |
+| tool-heavy-70mb whole | hidden | 20.0 s | 0 | none | no reads | 11.4 ms in all | 7.8 ms in all | 2 | 0 / 28 | 0 |
+| tool-heavy-70mb whole | visible again | 2.0 s | 1 | -- | 564 B | 9.04 ms | 6.16 ms | 2 | 0 / 27 | 0 |
+| tool-heavy-70mb whole | nudge, same size | 2.0 s | 0 | none | no reads | 1.0 ms in all | 0.0 ms | 0 | 0 / 0 | 0 |
+
+"Main thread / read" is CDP's `TaskDuration` over the phase divided by its
+reads, so it includes whatever else the page did in that time: an upper
+bound, not the read alone. The hidden phase has no reads and costs 7 to 11 ms
+in 20 s; its commits and mutations are the status line changing to "Paused".
+
+| page | nudge for new bytes → read answered | → new message painted |
+|---|---:|---:|
+| messages-1k tail | 5.8 ms | 62.1 ms |
+| tool-heavy-70mb whole | 12.4 ms | not mounted: the reader is not at the live edge (a 400-message page opens on its newest turn's prompt) |
+
+**B4, growth past the 2,000-message bound** (`messages-1k` tail, 30 pages
+appended one per nudge).
+
+| messages appended | reader at the live edge: heap | rows mounted | reader parked on a new turn: heap | rows mounted |
+|---:|---:|---:|---:|---:|
+| 540 / 610 | 9.9 MB | 400 | 9.9 MB | 400 |
+| 1,080 / 1,220 | 10.8 MB | 400 | 10.9 MB | 400 |
+| 1,620 / 1,830 | 11.4 MB | 400 | 11.7 MB | 400 |
+| 2,160 / 2,440 | 14.0 MB | 400 | 12.5 MB | 400 |
+| 2,700 / 3,050 | 14.5 MB | 400 | 13.2 MB | 400 |
+| 3,240 / 3,660 | 14.9 MB | 400 | 13.9 MB | 400 |
+| **appended pages still held at the end** | **19 of 30** (pages 12 to 30; the bound allows 20) | | **30 of 30** (the bound allows 18) | |
+
+The live-edge reader's pages are 108 messages (the turn continues, so its
+prompts are left out); the parked reader's are 122. Appending a 108-message
+page at the live edge was a long task 8 times out of 30 (at most 54 ms).
+
+**B5, estimated** (not a device measurement).
+
+| page | messages | payload (JSON) | at 2.8× (median) | at 2.11× (worst) |
+|---|---:|---:|---:|---:|
+| huge-result-5mb end / middle / start | 2 / 1 / 67 | 6.6 / 5.7 / 76.5 KB | 2.3 / 2.0 / 27.3 KB | 3.1 / 2.7 / 36.2 KB |
+| messages-1k end / middle / start | 91 / 88 / 101 | 114.6 / 118.8 / 118.4 KB | 40.9 / 42.4 / 42.3 KB | 54.3 / 56.3 / 56.1 KB |
+| messages-10k end / middle / start | 100 / 91 / 101 | 117.4 / 120.7 / 118.4 KB | 41.9 / 43.1 / 42.3 KB | 55.6 / 57.2 / 56.1 KB |
+| tool-heavy-70mb end / middle / start | 64 / 20 / 55 | 114.9 / 38.1 / 90.5 KB | 41.0 / 13.6 / 32.3 KB | 54.5 / 18.1 / 42.9 KB |
+
+Every page is under 150 KB at the worst ratio, with about 2.6× headroom. A
+phone's page also carries masking, which changes the text's length; the
+estimate does not include that.
+
+### Findings, 2026-09-27
+
+1. **The residency bound does not bind while the reader's window holds the
+   oldest page (B3, B4: NOT MET).** `TranscriptFollower.tick` appends a
+   followed page with `evict(max, "tail")`, which protects the page just
+   loaded -- "the reader asked for it". The follow asked, not the reader.
+   With the head shown as well, neither end may go, so every page the session
+   writes is kept: 30 of 30 in the harness, heap +0.7 to 1.0 MB per 610
+   messages, without bound, for as long as the reader stays. A reader lands
+   there without scrolling: the viewer places a new turn's prompt at the top
+   of the view, so a session that starts a turn and then writes a long reply
+   parks its reader above everything it writes next. **Proposed fix:** evict
+   with `null` from `tick` (`this.evict(this.max, null)`), keeping `"tail"`
+   for `newer()`, where the reader did ask. With the head shown, the far end
+   is then the newest page; it goes and the follow detaches
+   ("Not following while earlier messages are shown", with "↓ Latest" to
+   return), which is what the module docs already say should happen. The
+   unit test "live growth never lets go of the page the reader is reading"
+   asserts the opposite for the page just appended and would change with it.
+2. **An idle tick is never shown: "Last read at" stops advancing while the
+   follow reads.** `read()` writes `lastReadAt` into the snapshot object
+   before `publish()` compares against that same object, so a read that finds
+   nothing changes nothing and notifies no one -- hence B4's zero commits.
+   The status line then shows the time of the last read that found
+   something, and a follow that is polling looks the same as one that has
+   stopped, which is what #1201's "a poll that stops is visible" rules out.
+   **Proposed fix:** compare against the last snapshot delivered, not the
+   one `read()` mutated. Measured with that change (not landed): one commit
+   per idle tick, 2.6 to 5.2 ms script and 4.6 to 11 ms main thread per
+   tick, 0 row mutations and 0 long tasks. B4's "no React commit" would then
+   read "one commit per read, touching only the status line".
+3. **In the harness, a reader who wheels to the bottom is not followed; a
+   reader who presses "jump to latest" is.** After wheeling to the bottom
+   (0 px to go), the next appended page left the reader 18,579 px above the
+   newest message; after "jump to latest" every appended page kept them at
+   0 px. This may be the headless engine, not the viewer. Check it in the
+   app: open a running session, wheel to the bottom, and watch whether new
+   output scrolls in.
+4. **Appending a whole page at the live edge can be a 50 to 54 ms task.**
+   Live growth arrives a few messages a read, and a catch-up is at most five
+   pages a tick, so this is the harness's page-at-a-time growth; worth
+   watching if a catch-up after a sleep lands many pages at once.
+
+## Desktop app checklist (WKWebView, Safari Web Inspector)
+
+Chromium is not the app's engine. To mark B1 to B4 **met** on the desktop:
+
+1. Build and run the app (`make dev` or a release build), enable Develop →
+   the Headstate window in Safari, and open Web Inspector → Timelines with
+   JavaScript & Events, Layout & Rendering and Memory recording.
+2. **B1.** Open a long session's transcript from the session list. Record the
+   time from the click to the paint that shows the newest turn. < 300 ms.
+3. **B2.** Scroll from the newest message to the oldest and back at a steady
+   pace. Record any script or layout event over 50 ms and the frame rate
+   lane. No event over 50 ms.
+4. **B3.** Record the JavaScript heap after the open and after the scroll
+   (Memory timeline), on a short and on a very long session. < 50 MB each,
+   and no growth with the session's size beyond it.
+5. **B4.** Leave a running but quiet session open for 60 s. Record the
+   events per tick (JavaScript & Events) and whether "Last read at" advances
+   (it does not today: Finding 2). Then let a session write a long reply
+   with the view parked on its prompt, and watch the Memory timeline
+   (Finding 1).
+6. Record the macOS version, the app build and every figure in the PR.
+
 ## Phone checklist (Instruments, until the phone can be automated)
 
 Device: an iPhone 12-class phone, release build from TestFlight or
@@ -328,9 +552,22 @@ installed as sessions. Copy them into a scratch project directory under
    no growth between the two fixtures beyond it.
 4. **B4, idle follow.** Leave a followed session open for 60 s with nothing
    appended. Time Profiler should show no main-thread work beyond the poll's
-   timer.
-5. **B5, bandwidth.** Use the Network instrument, or the desktop's remote
+   timer and one small read per tick (Chromium: 0.3 to 1.4 ms).
+5. **B4, backgrounded trim.** With a session scrolled so that more than 600
+   messages are held, background the app for 10 s, then return. Allocations
+   on the WebContent process should drop at backgrounding (the follow keeps
+   ~600 messages, `PRESSURE_RESIDENT`), and scrolling back should read the
+   let-go pages again. Record persistent bytes before, during and after.
+6. **B5, bandwidth.** Use the Network instrument, or the desktop's remote
    surface log, to record the compressed bytes of each page request. Budget:
-   < 150 KB.
-6. Record the device, iOS version, build number and every figure in the PR.
+   < 150 KB. The estimate is at most 57.2 KB.
+7. **Decode CPU (#1478).** Time Profiler over 20 page loads of a long
+   session: the time in the gzip decode per page. ~50 µs median on an M2 Max;
+   record the phone's median and maximum.
+8. **Highlighting worker (#1482).** Open a transcript with large code
+   results (a 1,000-line file read, and a single line of 60,000 characters).
+   Record the highlighting worker's time per block from the os_signpost lane
+   or Time Profiler, and whether any block hit the 1 s deadline. Tune the
+   deadline, the 1,000-line cap and the 60,000-character cap from these.
+9. Record the device, iOS version, build number and every figure in the PR.
    Mark a figure you could not take as not measured, never as zero.

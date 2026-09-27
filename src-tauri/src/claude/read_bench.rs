@@ -23,6 +23,11 @@
 //!   asked for), backwards from the middle, and backwards from the end.
 //!   Its byte bound is the same at all four -- that is the point of it
 //!   -- and is asserted on every fixture.
+//! - **an idle follow tick** (budget B4): the page after the newest
+//!   cursor when nothing was appended, which is what the live viewer
+//!   (#1476) asks on every tick of an idle session. Its bound,
+//!   [`IDLE_TICK_BOUND`], is a few cursor digests, whatever the file's
+//!   size, and is asserted in every `cargo test`.
 //!
 //! `preview::follow` was measured here too -- first read, idle tick and
 //! an unbounded catch-up from offset 0 -- until #1514 retired it with the
@@ -51,6 +56,9 @@ enum Read {
     PageAtMiddle,
     /// A page backwards from the end: what the viewer opens on.
     PageAtEnd,
+    /// A page forward from the newest cursor with nothing appended: one
+    /// idle tick of the live follow (#1476, budget B4).
+    IdleTickAtEnd,
 }
 
 impl Read {
@@ -61,6 +69,7 @@ impl Read {
             Read::PageBackToStart => "page before (start)",
             Read::PageAtMiddle => "page before (middle)",
             Read::PageAtEnd => "page before (end)",
+            Read::IdleTickAtEnd => "page after (end, nothing new)",
         }
     }
 }
@@ -108,12 +117,15 @@ fn page_cursor_near(path: &Path, offset: u64) -> PageCursor {
 struct Marks {
     near_start: PageCursor,
     middle: PageCursor,
+    /// The end of the file: the cursor a follow at the live edge holds.
+    end: PageCursor,
 }
 
 fn marks(path: &Path, bytes: u64) -> Marks {
     Marks {
         near_start: page_cursor_near(path, PAGE_BYTES.min(bytes / 4)),
         middle: page_cursor_near(path, bytes / 2),
+        end: page_cursor_near(path, bytes),
     }
 }
 
@@ -139,6 +151,7 @@ fn take(read: Read, path: &Path, marks: &Marks) -> Taken {
         Read::PageBackToStart => page(at(&marks.near_start), PageDirection::Before),
         Read::PageAtMiddle => page(at(&marks.middle), PageDirection::Before),
         Read::PageAtEnd => page(PageAnchor::End, PageDirection::Before),
+        Read::IdleTickAtEnd => page(at(&marks.end), PageDirection::After),
         Read::TailAtEnd => {
             let p = preview::tail(path).expect("tail");
             Taken {
@@ -152,22 +165,30 @@ fn take(read: Read, path: &Path, marks: &Marks) -> Taken {
 }
 
 /// The reads measured for every fixture.
-fn cases() -> [Read; 5] {
+fn cases() -> [Read; 6] {
     [
         Read::TailAtEnd,
         Read::PageFromStart,
         Read::PageBackToStart,
         Read::PageAtMiddle,
         Read::PageAtEnd,
+        Read::IdleTickAtEnd,
     ]
 }
 
+/// A read that returns a page of messages. The idle tick is a page
+/// read too, but an empty one by design.
 fn is_page(read: Read) -> bool {
     matches!(
         read,
         Read::PageFromStart | Read::PageBackToStart | Read::PageAtMiddle | Read::PageAtEnd
     )
 }
+
+/// The most an idle follow tick may read (B4): the digest the cursor is
+/// checked against and the two it returns, each with its boundary byte.
+/// Nothing else -- no record, no lookback -- because nothing was appended.
+const IDLE_TICK_BOUND: u64 = 3 * (transcript_page::CURSOR_FINGERPRINT_BYTES + 1);
 
 /// The most bytes a read may hold, whatever the file's size -- `None`
 /// for a read unbounded by design, which the bench only reports. Every
@@ -180,6 +201,7 @@ fn byte_bound(read: Read) -> Option<u64> {
         Read::PageFromStart | Read::PageBackToStart | Read::PageAtMiddle | Read::PageAtEnd => {
             Some(PAGE_READ_BOUND)
         }
+        Read::IdleTickAtEnd => Some(IDLE_TICK_BOUND),
     }
 }
 
@@ -198,6 +220,9 @@ fn time_budget(read: Read) -> Option<Duration> {
         | Read::PageBackToStart
         | Read::PageAtMiddle
         | Read::PageAtEnd => Some(Duration::from_millis(50)),
+        // B4: an idle tick runs up to every 750 ms for every open
+        // transcript, so it gets a tenth of a page's budget.
+        Read::IdleTickAtEnd => Some(Duration::from_millis(5)),
     }
 }
 
@@ -234,6 +259,32 @@ fn reads_at_the_end_are_bounded_whatever_the_file_size() {
                 t.bytes_read
             );
         }
+    }
+}
+
+/// An idle follow tick (B4) reads the cursor's digests and nothing else,
+/// and returns no messages, whatever the file's size.
+///
+/// Sabotaged by anchoring the idle tick's page one page back
+/// (`page_cursor_near(path, bytes - PAGE_BYTES)`): it then reads a page of
+/// records and fails both assertions.
+#[test]
+fn an_idle_tick_reads_digests_not_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    for fixture in [fixtures::MESSAGES_1K, fixtures::HUGE_RESULT_5MB] {
+        let w = fixtures::write(fixture, dir.path()).unwrap();
+        let t = take(Read::IdleTickAtEnd, &w.path, &marks(&w.path, w.bytes));
+        assert!(
+            t.bytes_read <= IDLE_TICK_BOUND,
+            "{}: an idle tick read {} bytes, bound {IDLE_TICK_BOUND}",
+            fixture.name,
+            t.bytes_read
+        );
+        assert_eq!(
+            t.messages, 0,
+            "{}: an idle tick found messages",
+            fixture.name
+        );
     }
 }
 
@@ -276,6 +327,9 @@ fn transcript_read_timings() {
         "\n| fixture | file | read | median | bytes read | messages | payload (JSON) | budget |"
     );
     println!("|---|---:|---|---:|---:|---:|---:|---|");
+    // Each fixture is written ONCE and reused for the index builds below:
+    // `fixtures::write` refuses a path that exists (#1522).
+    let mut written: Vec<(&str, Written)> = Vec::new();
     for fixture in fixtures::ALL {
         let gen_started = std::time::Instant::now();
         let w: Written = fixtures::write(fixture, &dir).unwrap();
@@ -337,13 +391,13 @@ fn transcript_read_timings() {
                 );
             }
         }
+        written.push((fixture.name, w));
     }
     // The position index a paged viewer builds once per file, off the
     // request path: reported, not budgeted -- no request waits on it.
     println!("\n| fixture | position index build (worker thread) | records |");
     println!("|---|---:|---:|");
-    for fixture in fixtures::ALL {
-        let w: Written = fixtures::write(fixture, &dir).unwrap();
+    for (name, w) in &written {
         let started = std::time::Instant::now();
         let ix = transcript_page::build_index(
             &w.path,
@@ -353,7 +407,7 @@ fn transcript_read_timings() {
         .unwrap();
         println!(
             "| {} | {:.1} ms | {} |",
-            fixture.name,
+            name,
             started.elapsed().as_secs_f64() * 1000.0,
             ix.record_count()
         );
@@ -526,9 +580,20 @@ fn transcript_find_timings() {
 /// at its newest [`super::transcript_model::MAX_MESSAGES`] -- the fullest
 /// page a read can hand the viewer today.
 ///
+/// It also writes the pages the live viewer actually reads
+/// (`<name>.window-{end,middle,start}.json`): the `TranscriptWindow` of
+/// `claude_transcript_page` backwards from the end (what the viewer
+/// opens on), backwards from the middle, and forwards from byte 0, as
+/// JSON exactly as it crosses to the webview and the phone. The harness
+/// sizes budget B5 from them.
+///
 /// Writes, measures nothing, so it is not in the timings above. Run by
 /// `make bench-transcript-browser` with
 /// `HEADSTATE_TRANSCRIPT_PAYLOADS_OUT=<dir>`; a no-op without it.
+///
+/// The fixtures themselves are generated into a temporary directory of
+/// this test's own and cleaned up by dropping it: only the payloads go to
+/// `<dir>`, and nothing here deletes a file by path.
 #[test]
 #[ignore]
 fn transcript_message_payloads() {
@@ -539,8 +604,9 @@ fn transcript_message_payloads() {
         return;
     };
     std::fs::create_dir_all(&dir).unwrap();
+    let temp = tempfile::tempdir().unwrap();
     for fixture in fixtures::ALL {
-        let w: Written = fixtures::write(fixture, &dir).unwrap();
+        let w: Written = fixtures::write(fixture, temp.path()).unwrap();
         let tail = super::transcript_model::tail(&w.path).unwrap();
         let body = std::fs::read_to_string(&w.path).unwrap();
         let whole = super::transcript_model::parse(
@@ -562,7 +628,25 @@ fn transcript_message_payloads() {
             )
             .unwrap();
         }
-        std::fs::remove_file(&w.path).unwrap();
+        let m = marks(&w.path, w.bytes);
+        for (slug, read) in [
+            ("end", Read::PageAtEnd),
+            ("middle", Read::PageAtMiddle),
+            ("start", Read::PageFromStart),
+        ] {
+            let t = take(read, &w.path, &m);
+            println!(
+                "{} window-{slug}: {} messages, {}",
+                fixture.name,
+                t.messages,
+                human(t.payload.len() as u64)
+            );
+            std::fs::write(
+                dir.join(format!("{}.window-{slug}.json", fixture.name)),
+                t.payload,
+            )
+            .unwrap();
+        }
     }
 }
 

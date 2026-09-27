@@ -156,7 +156,10 @@ bench-transcript:
 # fixture's message page, builds the harness page (vite.harness.config.ts,
 # into dist-harness), and opens every page in Playwright's Chromium to
 # take B1 (open to first paint), B2 (long tasks while scrolling) and B3
-# (heap). Not in `test` or CI, for bench-transcript's reason: its figures
+# (heap); then B4 (idle live-follow cost, nudges, eviction; about three
+# minutes a page in real time) and a B5 estimate (page bytes over the
+# real-text compression ratio). HARNESS_PHASES=open|follow|b5 picks parts.
+# Not in `test` or CI, for bench-transcript's reason: its figures
 # describe the machine. Needs the browser once:
 # `yarn playwright install chromium` (or HARNESS_CHANNEL=chrome to use an
 # installed Chrome).
