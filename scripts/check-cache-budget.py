@@ -27,9 +27,10 @@ it, rather than discovering the ceiling through a 3x-slower run".
 
 ---- What FAILS a run, and what only gets printed (#1107) ----
 
-Two findings follow from a diff and block it: a Rust job class with no
-declared budget, and a class that has outgrown its ceiling. Both are
-fixed by editing this file or the job.
+Two findings block: a Rust job class with no declared budget, and a
+class that has outgrown its ceiling. Both are fixed by editing this file
+or the job. WHERE they block changed in #1505 -- see the last section:
+a local `make lint` only warns, and the scheduled job enforces.
 
 Two are the repository's state at that moment and are printed WITHOUT
 failing: a base-ref total over budget, and duplicate live generations
@@ -111,6 +112,30 @@ draining resource is not a property of the branch under test.
 It earns a place in `lint` once steady state is measured under budget on
 `main` with the `save-if` fix in place. Until then it is the thing you run
 when CI timings look unreproducible, and it answers in one API call.
+
+---- WHERE IT IS ENFORCED, and why a local run only warns (#1505) ----
+
+"Blocking" findings were said to "follow from a diff". From a LOCAL run
+they cannot: what this measures is `main`'s cache, and since `save-if`
+only `main` and the merge queue write it -- never the branch being
+linted. A class over its ceiling reflects a diff that ALREADY MERGED.
+So `make lint` failed on every branch for a state none of them caused:
+on 2026-09-26 build-Darwin sat at 0.94GB against 0.9, and every local
+gate went red until the ceiling moved -- which trains people to read a
+red `make lint` as noise.
+
+So the split is now by WHERE, not only by what:
+
+  - `make lint` passes `--advisory`: every finding is printed, over-
+    ceiling ones under a WARNING heading, and the exit is 0. The floor
+    still fails -- a measurement that returned nothing is a broken guard
+    on any machine, not a state of the cache.
+  - `.github/workflows/cache-budget.yml` runs it daily with `--require`,
+    judging `main` where a ceiling is actually crossed, and fails there.
+    That run's check attaches to `main`'s head commit, and the desktop
+    release gate reads EVERY check run on a tagged commit -- so its job
+    name is in release.yml's `ignore-checks`. Cache size says nothing
+    about whether a build is releasable, and must not burn a tag.
 """
 
 import argparse
@@ -134,8 +159,41 @@ QUOTA_GIB = 10.0
 TOTAL_BUDGET_GIB = 8.5
 
 # Per job class, keyed by the rust-cache key with its trailing lockfile
-# hash stripped. Measured on 2026-09-12 and rounded UP to the next 0.1GB,
-# so these are ceilings rather than observations.
+# hash stripped. First measured on 2026-09-12 and rounded UP to the next
+# 0.1GB, so these are ceilings rather than observations.
+#
+# RE-MEASURED 2026-09-27 (#1505), when two classes had crossed theirs:
+# build-Darwin 0.94GB against 0.9, platform-Windows 1.64 against 1.6, and
+# platform-Linux 1.69 was 11MB under 1.7. Every class held ONE generation
+# on `main`, so this was growth, not a leaked copy. The lockfile since
+# 2026-09-12 added four crates (async-compression, compression-codecs,
+# compression-core, zlib-rs: #1497's gzip), moved 57 to new versions, and
+# the toolchain was pinned to 1.98.1 (#1153). Not tower-http, which was
+# already locked, nor refractor, which is an npm package and never enters
+# a Rust cache. The whole steady state went 7.37 -> 7.73GB (+4.9%) in 15
+# days; the fastest classes (Windows, build, test-rust) ~+10%.
+#
+# The rule now: the 2026-09-27 figure plus 20%, rounded UP to 0.1GB. At
+# the fastest measured rate that is about a month of ordinary dependency
+# churn before a ceiling asks to be re-decided, while the step these
+# ceilings exist to catch -- a second cache root or uncleaned targets
+# (#889), which roughly doubles an entry -- still fails at once. A tighter
+# margin re-fires on routine bumps and trains people to wave it through.
+#
+# The ceilings deliberately sum past TOTAL_BUDGET_GIB: classes do not all
+# peak together, and the total is its own check. These catch ONE class
+# jumping; the total bounds the repository.
+#
+#   class                 2026-09-12  2026-09-27  ceiling
+#   platform-Linux          1.65        1.69        2.1
+#   mobile-android          1.52        1.53        1.9
+#   platform-Windows        1.48        1.64        2.0
+#   build-Darwin            0.86        0.94        1.2
+#   test-rust-Darwin        0.61        0.67        0.9
+#   mobile-ios-Darwin       0.54        0.54        0.7
+#   lint-Darwin             0.40        0.42        0.5
+#   supply-chain-Darwin     0.16        0.16        0.2
+#   test-frontend-Darwin    0.15        0.16        0.2
 #
 # The per-class ceilings exist because the TOTAL is not enough on its own:
 # #901's incident was one job class (`platform-Windows`) with two live
@@ -146,12 +204,12 @@ TOTAL_BUDGET_GIB = 8.5
 # even when the total is fine: it means two generations are live, which is
 # the state that evicts.
 CLASS_BUDGET_GIB = {
-    "v0-rust-platform-Linux-x64": 1.7,
-    "v0-rust-mobile-android-Linux-x64": 1.6,
-    "v0-rust-platform-Windows_NT-x64": 1.6,
-    "v0-rust-build-Darwin-arm64": 0.9,
-    "v0-rust-test-rust-Darwin-arm64": 0.7,
-    "v0-rust-mobile-ios-Darwin-arm64": 0.6,
+    "v0-rust-platform-Linux-x64": 2.1,
+    "v0-rust-mobile-android-Linux-x64": 1.9,
+    "v0-rust-platform-Windows_NT-x64": 2.0,
+    "v0-rust-build-Darwin-arm64": 1.2,
+    "v0-rust-test-rust-Darwin-arm64": 0.9,
+    "v0-rust-mobile-ios-Darwin-arm64": 0.7,
     "v0-rust-lint-Darwin-arm64": 0.5,
     "v0-rust-supply-chain-Darwin-arm64": 0.2,
     "v0-rust-test-frontend-Darwin-arm64": 0.2,
@@ -447,6 +505,15 @@ def main() -> int:
         action="store_true",
         help="treat an unreachable API as a failure (CI, where a token exists)",
     )
+    ap.add_argument(
+        "--advisory",
+        action="store_true",
+        help=(
+            "report over-budget findings as a warning and exit 0 (make lint: "
+            "a local run measures main's cache, which no branch writes). The "
+            "floor -- nothing measured -- still fails."
+        ),
+    )
     args = ap.parse_args()
 
     measured = measure()
@@ -463,6 +530,17 @@ def main() -> int:
         print("CI asks with --require, where a token exists.")
         return 0
 
+    return report(measured, args.advisory)
+
+
+def report(measured: list[dict], advisory: bool) -> int:
+    """Print what `measured` shows and return the exit code.
+
+    Split from `main` so the self-test can drive the exit code in both
+    modes without a network: `--advisory` changing what FAILS is the
+    whole of #1505, and a mode that silently always returned 0 would pass
+    every run while guarding nothing.
+    """
     blocking, ambient = verdict(measured)
     total = sum(e["size_in_bytes"] for e in measured) / GIB
     base_total = sum(e["size_in_bytes"] for e in measured if _is_base(e)) / GIB
@@ -504,13 +582,27 @@ def main() -> int:
         print()
 
     if blocking:
-        print("This branch is over the cache budget:")
+        # `measured` non-empty: the floor is not a state of the cache but a
+        # measurement that did not happen, so it fails in every mode.
+        if advisory and measured:
+            print("WARNING -- `main`'s cache is over its budget:")
+            for p in blocking:
+                print(f"  {p}")
+            print()
+            print("Not failing this local run (#1505): it measured `main`'s cache,")
+            print("which no branch writes, so nothing here follows from this")
+            print("branch. The scheduled `cache-budget` workflow enforces it on")
+            print("`main`. The fix -- a new ceiling or a trimmed job -- is still")
+            print("decided in this file, by whoever takes it on.")
+            return 0
+        print("The cache is over its budget:")
         for p in blocking:
             print(f"  {p}")
         print()
-        print("Failing on this: unlike the notice above, these follow from a")
-        print("diff -- a job class with no declared budget, or one that has")
-        print("outgrown its ceiling -- and both are decided in this file.")
+        print("Failing on this: unlike the notice above, these are decided in")
+        print("this file -- a job class with no declared budget, or one that")
+        print("has outgrown its ceiling. Either what it caches grew, or the")
+        print("ceiling is wrong; move the number on purpose.")
         return 1
 
     # Only claim "within budget" when it IS. Before #1107 this line

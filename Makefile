@@ -416,8 +416,15 @@ lint-deps:
 	# shared, draining resource rather than a property of the branch under
 	# test, so a gate would fail pull requests for a state their authors
 	# cannot fix. See the script's docstring.
+	#
+	# --advisory (#1505): an over-ceiling class is printed as a WARNING and
+	# does not fail this target. What it measures is `main`'s cache, which
+	# no branch writes, so it went red on every branch for a state none of
+	# them caused. The scheduled .github/workflows/cache-budget.yml enforces
+	# the ceilings on `main`. A measurement that returns nothing still
+	# fails here: that is a broken guard, not a cache state.
 	python3 scripts/check-cache-budget.test.py
-	python3 scripts/check-cache-budget.py
+	python3 scripts/check-cache-budget.py --advisory
 	python3 scripts/check-supply-chain-pins.test.py
 	python3 scripts/check-supply-chain-pins.py
 	# The leak guard, LAST in this target: it is the only check here that

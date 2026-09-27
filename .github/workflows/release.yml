@@ -60,6 +60,12 @@ jobs:
   # that survived name deduplication. A gate cannot wait on a job that
   # waits on the gate.
   #
+  # `cache-budget` is cache-budget.yml's scheduled job (#1505). Its check
+  # attaches to `main`'s head commit, the commit a release tags, and it
+  # fails when `main`'s Actions cache outgrows a ceiling -- a statement
+  # about CI's cache, not about this build. Waiting on it would let a
+  # cache size burn a tag.
+  #
   # Everything not listed here must still conclude `success`, so this
   # stays as strict as it was for everything CI actually runs.
   #
@@ -131,7 +137,7 @@ jobs:
           running-workflow-name: gate
           wait-interval: 15
           allowed-conclusions: success
-          ignore-checks: ios-release,android-release,publish
+          ignore-checks: ios-release,android-release,publish,cache-budget
           # See the long note above: without this the gate can be answered
           # by the `main`-push suite and never wait for the tag's own CI.
           wait-for-duplicates: true

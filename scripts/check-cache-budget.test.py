@@ -303,6 +303,77 @@ checks(
 checks("an empty measurement BLOCKS rather than passing trivially", [], False)
 
 
+# ---- 2026-09-27's re-measurement (#1505) ----
+#
+# The figures the ceilings were re-decided on, one generation per class on
+# `main`, as the API returned them. The new ceilings must call this
+# healthy; the old ones did not (build-Darwin and platform-Windows were
+# over), which is the state that turned every local `make lint` red.
+MEASURED_0927 = [
+    entry("v0-rust-platform-Linux-x64-6ff13d87-84ed4606", 1.689),
+    entry("v0-rust-mobile-android-Linux-x64-6ff13d87-15890f27", 1.531),
+    entry("v0-rust-platform-Windows_NT-x64-2113753f-704831f1", 1.635),
+    entry("v0-rust-build-Darwin-arm64-2eab217e-84ed4606", 0.941),
+    entry("v0-rust-test-rust-Darwin-arm64-2eab217e-84ed4606", 0.670),
+    entry("v0-rust-mobile-ios-Darwin-arm64-2eab217e-15890f27", 0.537),
+    entry("v0-rust-lint-Darwin-arm64-2eab217e-84ed4606", 0.416),
+    entry("v0-rust-supply-chain-Darwin-arm64-2eab217e-84ed4606", 0.159),
+    entry("v0-rust-test-frontend-Darwin-arm64-2eab217e-84ed4606", 0.155),
+]
+checks("the 2026-09-27 steady state passes the re-decided ceilings", MEASURED_0927, True)
+
+# The rule the ceilings were set by: measured + 20%, rounded UP to 0.1GB.
+# Pinned so a later edit that moves one number without re-measuring shows
+# up here as a disagreement with its own comment.
+for e in MEASURED_0927:
+    cls = guard.job_class(e["key"])
+    gb = e["size_in_bytes"] / GB
+    want = -(-round(gb * 1.2 * 10, 6) // 1) / 10
+    if abs(guard.CLASS_BUDGET_GIB[cls] - want) > 1e-9:
+        failures.append(
+            f"`{cls}`'s ceiling is {guard.CLASS_BUDGET_GIB[cls]}GB, but its 2026-09-27 "
+            f"figure {gb:.3f}GB + 20% rounds up to {want}GB"
+        )
+
+
+# ---- WHERE it fails: `--advisory` (#1505) ----
+#
+# `report()` is `main()` after the measurement, so the exit code can be
+# pinned in both modes without a network. Output is swallowed; the codes
+# are what the Makefile and the scheduled workflow act on.
+import contextlib
+import io
+
+
+def exit_code(entries: list[dict], advisory: bool) -> int:
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        code = guard.report(entries, advisory)
+    exit_code.last = out.getvalue()
+    return code
+
+
+OVER = [e for e in MEASURED_0927 if "build-Darwin" not in e["key"]] + [
+    entry("v0-rust-build-Darwin-arm64-2eab217e-84ed4606", 5.0)
+]
+if exit_code(OVER, advisory=False) != 1:
+    failures.append("a class over its ceiling must FAIL the enforcing run (scheduled job)")
+if exit_code(OVER, advisory=True) != 0:
+    failures.append("a class over its ceiling must only WARN under --advisory (make lint)")
+elif "WARNING" not in exit_code.last or "build-Darwin" not in exit_code.last:
+    failures.append(
+        "--advisory must still PRINT the over-ceiling finding, naming the class; "
+        f"got {exit_code.last!r}"
+    )
+# The floor is a broken measurement, not a cache state: it fails in BOTH
+# modes, or `--advisory` would be a way to pass a guard that cannot see.
+if exit_code([], advisory=True) != 1:
+    failures.append("an empty measurement must fail even under --advisory")
+if exit_code([], advisory=False) != 1:
+    failures.append("an empty measurement must fail the enforcing run")
+if exit_code(MEASURED_0927, advisory=False) != 0:
+    failures.append("the healthy 2026-09-27 state must pass the enforcing run")
+
+
 if failures:
     print("check-cache-budget.py self-test FAILED:")
     for f in failures:
