@@ -4,9 +4,30 @@
 import type { ClaudeFileChange, ClaudeToolArgs, Liveness } from "../../types/pr";
 import type { TranscriptLive } from "../../api/hooks";
 import type { TranscriptPage, TranscriptToolOutput } from "../../types/transcript";
+import type { PendingMessage } from "./pending";
 import type { ToolCallBlock } from "./types";
 
 export const LIVE: Liveness = { state: "running", pid: 42, status: "busy" };
+
+/// A message being sent (#1491), in any state the renderers draw.
+export function pendingMessage(over: Partial<PendingMessage> = {}): PendingMessage {
+  return {
+    clientId: "c1",
+    text: "please run the tests",
+    createdAt: Date.parse("2026-01-01T00:00:00Z"),
+    state: "pending",
+    after: null,
+    reason: null,
+    ...over,
+  };
+}
+
+export const PENDING_STATES: PendingMessage["state"][] = [
+  "pending",
+  "delivered",
+  "unconfirmed",
+  "failed",
+];
 export const DEAD: Liveness = { state: "dead", why: "exited" };
 export const UNKNOWN: Liveness = { state: "unknown", why: "unreadable" };
 

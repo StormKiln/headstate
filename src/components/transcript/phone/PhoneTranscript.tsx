@@ -10,22 +10,27 @@ import { isRevealOff, isTranscriptsOff } from "@/lib/transcriptAccess";
 import { usePullToRefresh } from "@/lib/usePullToRefresh";
 import type { Liveness } from "../../../types/pr";
 import type { TranscriptMessage, TranscriptSubagent } from "../../../types/transcript";
+import { Composer } from "../Composer";
 import { subagentLiveness } from "../header";
 import { palette } from "../palette";
+import type { PendingMessage } from "../pending";
 import { transcriptStreaming } from "../streaming";
 import { FollowStatus } from "../FollowStatus";
 import { deriveTaskChecklist, taskSummary } from "../tasks";
 import { TaskChecklist } from "../TaskChecklist";
 import { TranscriptViewer } from "../TranscriptViewer";
 import type { LoadFullText } from "../types";
+import { usePendingMessages } from "../usePendingMessages";
 import { PhoneContext, type PhoneTranscriptContext } from "./context";
-import { PhoneMessage } from "./PhoneMessage";
+import { PhoneMessage, PhonePendingMessage } from "./PhoneMessage";
 import { scaleStyle, useTextScale } from "./textScale";
 import { thinkingStarts } from "./timing";
 
 /// The shell's `renderMessage` for the phone. Module-level, so the shell
 /// sees one function for the life of the app.
 const renderPhoneMessage = (m: TranscriptMessage) => <PhoneMessage message={m} />;
+/// Its `renderPending` (#1491), for the same reason.
+const renderPhonePending = (p: PendingMessage) => <PhonePendingMessage pending={p} />;
 
 /// One transcript on the phone (#1481): the viewer shell (#1479) with
 /// the phone's renderer, and everything around it the phone needs.
@@ -118,6 +123,9 @@ export function PhoneTranscript({
     [messages, truncated],
   );
   const starts = useMemo(() => thinkingStarts(messages), [messages]);
+  // 7.10's sends (#1491). Nothing adds one in 7.9: the composer has no
+  // `onSend` and is hidden behind `COMPOSER_ENABLED`.
+  const pending = usePendingMessages(messages);
   const onLoadFullText = useCallback<LoadFullText>(
     (a) => claudeTranscriptBlockText(path, a.messageId, a.index, showingRevealed, a.offset),
     [path, showingRevealed],
@@ -222,6 +230,9 @@ export function PhoneTranscript({
             onWindowChange={active.setViewport}
             atLiveEdge={active.atLiveEdge}
             onJumpToLatest={active.jumpToLatest}
+            pending={pending.visible}
+            renderPending={renderPhonePending}
+            composer={<Composer variant="phone" />}
             // Within thumb reach: the jump button sits bottom-right, off
             // the centre line where the home indicator's swipe lives,
             // and a 44 pt target.

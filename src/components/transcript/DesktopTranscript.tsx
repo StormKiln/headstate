@@ -18,16 +18,26 @@ import { useFilters } from "../../store/filters";
 import type { Liveness } from "../../types/pr";
 import type { TranscriptMessage, TranscriptSubagent } from "../../types/transcript";
 import { errorMessage } from "../QueryError";
+import { Composer } from "./Composer";
 import { FollowStatus } from "./FollowStatus";
 import { subagentLiveness } from "./header";
 import { palette } from "./palette";
+import type { PendingMessage } from "./pending";
 import { transcriptStreaming } from "./streaming";
 import { TaskChecklist } from "./TaskChecklist";
 import { deriveTaskChecklist } from "./tasks";
-import { TerminalMessage, type TerminalEnv, type TranscriptDensity } from "./TerminalMessage";
+import {
+  TerminalMessage,
+  TerminalPendingMessage,
+  type TerminalEnv,
+  type TranscriptDensity,
+} from "./TerminalMessage";
 import { TranscriptViewer } from "./TranscriptViewer";
 import { turnFooters } from "./turnFooter";
 import type { LoadFullText, OpenSubagent } from "./types";
+import { usePendingMessages } from "./usePendingMessages";
+
+const NO_MESSAGES: readonly TranscriptMessage[] = [];
 
 export function DesktopTranscript({
   path,
@@ -150,6 +160,13 @@ function Loaded({
     ),
     [footers, env, tasks],
   );
+  // 7.10's sends (#1491). Nothing adds one in 7.9: the composer below
+  // has no `onSend` and is hidden behind `COMPOSER_ENABLED`.
+  const pending = usePendingMessages(messages ?? NO_MESSAGES);
+  const renderPending = useCallback(
+    (p: PendingMessage) => <TerminalPendingMessage pending={p} density={env.density} />,
+    [env.density],
+  );
 
   if (messages === undefined) {
     // BEFORE any empty arm (#846): no messages on a rejection is not a
@@ -220,6 +237,9 @@ function Loaded({
             onWindowChange={live.setViewport}
             atLiveEdge={live.atLiveEdge}
             onJumpToLatest={live.jumpToLatest}
+            pending={pending.visible}
+            renderPending={renderPending}
+            composer={<Composer variant="desktop" />}
           />
         </div>
         {tasks.tasks.length > 0 ? (

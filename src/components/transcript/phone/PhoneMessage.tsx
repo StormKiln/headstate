@@ -7,6 +7,7 @@ import { TranscriptMarkdown } from "../../TranscriptMarkdown";
 import { ClippedText } from "../ClippedText";
 import { MonoOutput } from "../output";
 import { palette } from "../palette";
+import { type PendingMessage, pendingStatus } from "../pending";
 import { durationBetween, formatDuration } from "../summary";
 import { TaskStatusRow } from "../TaskStatusRow";
 import { ToolResultOrphan } from "../ToolResultOrphan";
@@ -26,6 +27,7 @@ import { ToolChip } from "./ToolChip";
 /// | a tool call | a chip; tapping it opens the whole call in a sheet (`ToolChip`) |
 /// | thinking | "Thought for about 14 s", collapsible, open by default |
 /// | system, hook and meta records | a centred small-caps divider, its detail beneath |
+/// | a message being sent, not in the transcript yet (#1491) | the right-aligned bubble dimmed and dashed, its delivery state beneath (`PhonePendingMessage`) |
 ///
 /// Every text is drawn through `MaskedText` or `TranscriptMarkdown`,
 /// both of which turn the desktop's masking markers into "hidden" pills.
@@ -254,6 +256,45 @@ function UserBubble({ label, children }: { label?: string; children: ReactNode }
         </Bubble>
       </MessageContent>
     </Message>
+  );
+}
+
+/// A message being sent that the transcript does not hold yet (#1491):
+/// the user's bubble, drawn provisionally -- dimmed -- with what is
+/// known about its delivery beneath it, right-aligned under the bubble
+/// as the iOS apps do. `pending.ts` has the states.
+export function PhonePendingMessage({ pending: p }: { pending: PendingMessage }) {
+  const phone = usePhone();
+  const status = pendingStatus(p);
+  return (
+    <div
+      data-slot="phone-message"
+      data-kind="pending"
+      data-pending-state={p.state}
+      style={scaleStyle(phone.scale)}
+    >
+      <Message align="end">
+        <MessageContent className="gap-1">
+          <Bubble
+            variant="muted"
+            align="end"
+            aria-label="You, not in the transcript yet"
+            className="opacity-70"
+          >
+            <BubbleContent className="rounded-2xl border border-dashed text-[1em] leading-relaxed">
+              <p className="whitespace-pre-wrap break-words">{p.text}</p>
+            </BubbleContent>
+          </Bubble>
+          <p
+            role="status"
+            className="max-w-[85%] self-end px-1 text-right text-[0.75em]"
+            style={{ color: TONE_COLOUR[status.tone] }}
+          >
+            {status.text}
+          </p>
+        </MessageContent>
+      </Message>
+    </div>
   );
 }
 

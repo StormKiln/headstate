@@ -17,7 +17,10 @@
 /// # The model
 ///
 /// - The viewport (`data-slot="message-scroller-viewport"`) is
-///   `viewportHeight` tall and sits at `top: 0`.
+///   `viewportHeight` tall and sits at `top: 0`. `setViewportHeight`
+///   stands in for something below it taking height (the composer, the
+///   on-screen keyboard); it keeps `scrollTop` unless the new maximum is
+///   lower, as a browser does, and fires nothing until `resize()`.
 /// - Rows (`[data-message-id]` children of the content) stack top to
 ///   bottom with no gap or padding, each `rowHeight` tall unless
 ///   `setRowHeight` says otherwise.
@@ -59,6 +62,7 @@ export interface ScrollShim {
   /// Rows currently mounted, in order.
   rows(): HTMLElement[];
   setRowHeight(id: string, height: number): void;
+  setViewportHeight(height: number): void;
   /// Fire every `ResizeObserver`, then let frames run.
   resize(): Promise<void>;
   /// Let pending frames and timers run.
@@ -109,12 +113,16 @@ export function installScrollShim({
   // Row offsets, cached per content element. The scroller reads every
   // row's rect in a loop, so recomputing offsets per rect is quadratic
   // and a 500-row window takes seconds. Invalidated by any change to the
-  // declared heights or to which rows are mounted.
+  // declared heights or to which rows are mounted. The last child is the
+  // scroller's spacer, so the row before it is compared too: a row
+  // swapped for another at the tail (a pending message replaced by its
+  // record, #1491) keeps the count and both ends.
   let heightsVersion = 0;
   interface Layout {
     version: number;
     first: Element | null;
     last: Element | null;
+    beforeLast: Element | null;
     count: number;
     offsets: Map<Element, number>;
     total: number;
@@ -127,7 +135,8 @@ export function installScrollShim({
       cached.version === heightsVersion &&
       cached.count === content.childElementCount &&
       cached.first === content.firstElementChild &&
-      cached.last === content.lastElementChild
+      cached.last === content.lastElementChild &&
+      cached.beforeLast === (content.lastElementChild?.previousElementSibling ?? null)
     )
       return cached;
     const offsets = new Map<Element, number>();
@@ -140,6 +149,7 @@ export function installScrollShim({
       version: heightsVersion,
       first: content.firstElementChild,
       last: content.lastElementChild,
+      beforeLast: content.lastElementChild?.previousElementSibling ?? null,
       count: content.childElementCount,
       offsets,
       total,
@@ -271,6 +281,11 @@ export function installScrollShim({
     setRowHeight: (id, height) => {
       heights.set(id, height);
       heightsVersion++;
+    },
+    setViewportHeight: (height) => {
+      viewportHeight = height;
+      const el = document.querySelector(`[data-slot="${VIEWPORT}"]`);
+      if (el) setTop(el, scrollTops.get(el) ?? 0);
     },
     resize: async () => {
       await act(async () => {

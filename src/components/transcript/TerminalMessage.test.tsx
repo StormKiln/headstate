@@ -6,9 +6,9 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Liveness } from "../../types/pr";
 import type { TranscriptMessage } from "../../types/transcript";
-import { call, DEAD, LIVE, output } from "./fixtures";
+import { call, DEAD, LIVE, output, PENDING_STATES, pendingMessage } from "./fixtures";
 import { deriveTaskChecklist } from "./tasks";
-import { TerminalMessage, type TerminalEnv } from "./TerminalMessage";
+import { TerminalMessage, TerminalPendingMessage, type TerminalEnv } from "./TerminalMessage";
 import type { TurnFooter } from "./turnFooter";
 
 const copyFn = vi.hoisted(() => vi.fn(() => Promise.resolve(null as string | null)));
@@ -390,5 +390,52 @@ describe("density", () => {
     rerender(<TerminalMessage message={msg({ kind: "assistant" }, [text("a")])} footer={undefined} env={env({ density: "compact" })} />);
     expect(row().getAttribute("data-density")).toBe("compact");
     expect(row().className).toContain("gap-0.5");
+  });
+});
+
+describe("a message being sent (#1491)", () => {
+  const showPending = (over: Parameters<typeof pendingMessage>[0] = {}) =>
+    render(<TerminalPendingMessage pending={pendingMessage(over)} density="comfortable" />);
+
+  it("is the user's band, drawn provisionally: dashed, no time, nothing to copy", () => {
+    const { container } = showPending();
+    const row = container.querySelector('[data-slot="message"]')!;
+    expect(row.getAttribute("data-kind")).toBe("pending");
+    expect(row.getAttribute("data-pending-state")).toBe("pending");
+    const band = container.querySelector('[data-slot="message-content"]') as HTMLElement;
+    expect(band.className).toContain("border-l-2");
+    expect(band.className).toContain("border-dashed");
+    expect(screen.getByText("please run the tests")).toBeTruthy();
+    expect(container.querySelector("time")).toBeNull();
+    expect(screen.queryByRole("button")).toBeNull();
+  });
+
+  it("differs from a recorded prompt with the same text", () => {
+    const recorded = show(
+      msg({ kind: "user_prompt", origin: null }, [text("please run the tests")], { id: "u1" }),
+    );
+    const bandClass = (
+      recorded.container.querySelector('[data-slot="message-content"]') as HTMLElement
+    ).className;
+    cleanup();
+    const { container } = showPending();
+    const band = container.querySelector('[data-slot="message-content"]') as HTMLElement;
+    expect(band.className).not.toBe(bandClass);
+  });
+
+  it.each(PENDING_STATES)("says what is known in state %s", (state) => {
+    showPending({ state, reason: state === "failed" || state === "unconfirmed" ? "no answer" : null });
+    const expected = {
+      pending: /^Sending…$/,
+      delivered: /^Sent\. Not in the transcript yet\.$/,
+      unconfirmed: /^Not confirmed: .*\(no answer\).*before sending it again\.$/,
+      failed: /^Not sent: no answer\.$/,
+    }[state];
+    expect(screen.getByRole("status").textContent).toMatch(expected);
+  });
+
+  it("shows the text as typed, never as markdown", () => {
+    showPending({ text: "**not bold**" });
+    expect(screen.getByText("**not bold**")).toBeTruthy();
   });
 });
