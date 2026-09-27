@@ -12,7 +12,7 @@
 //! masked on the DESKTOP, before it leaves, and unmasked text never
 //! crosses unless the owner allowed that phone to ask for it.
 //!
-//! The commands themselves (`claude_transcript_tail` and friends) are
+//! The commands themselves (`claude_transcript_page` and friends) are
 //! untouched: they serve both callers, and the webview must keep getting
 //! the real text. The difference lives at the remote boundary, which is
 //! `listener::call` -- the one path every remote command takes. So:
@@ -58,10 +58,11 @@
 //!   the user sends to strangers. Here the reader is the owner's own
 //!   paired phone; every file read in a transcript names a path, so
 //!   masking them would bury the real secrets' pills in noise. And the
-//!   `path` argument the phone sends back to `claude_transcript_follow`
+//!   `path` argument the phone sends back to `claude_transcript_page`
 //!   must round-trip.
-//! - **Opaque round-trip values** in [`OPAQUE_KEYS`] (the follow cursor):
-//!   the phone hands them back unread, so they must arrive intact.
+//! - **Opaque round-trip values** in [`OPAQUE_KEYS`] (a page's cursor
+//!   digest): the phone hands them back unread, so they must arrive
+//!   intact.
 //! - **Anything the patterns do not recognise.** This is best-effort
 //!   pattern masking. A secret with no recognisable shape, or one clamped
 //!   mid-way by the command's own size bound so that too little of it is
@@ -110,15 +111,11 @@ pub enum Carries {
 /// module docs. The invariant named there catches a missing row for any
 /// remote command whose name or return type says "transcript".
 pub const TRANSCRIPT_TEXT: &[(&str, Carries)] = &[
-    ("claude_transcript_tail", Carries::Whole),
-    ("claude_transcript_follow", Carries::Whole),
     // The snippets are transcript text; the coverage beside them is
     // counts, which no pattern matches.
     ("claude_search_transcripts", Carries::Whole),
-    // The read model's page and one block's full text (#1475, #1220).
-    // Both landed while this table was being written; the invariant is
-    // what flagged them.
-    ("claude_transcript_messages", Carries::Whole),
+    // One block's full text (#1475). It landed while this table was
+    // being written; the invariant is what flagged it.
     ("claude_transcript_block_text", Carries::Whole),
     // One bounded page of the same model, before or after a cursor
     // (#1220). Whole: every message string is transcript text. Its
@@ -136,7 +133,7 @@ pub const TRANSCRIPT_TEXT: &[(&str, Carries)] = &[
 ];
 
 /// Keys whose values round-trip to the desktop unread, or are machine
-/// identifiers rather than text: the follow cursor, the record and call
+/// identifiers rather than text: a page's cursor digest, the record and call
 /// ids a phone sends back to `claude_transcript_block_text`, and the
 /// subagent transcript path it opens next. None is anything a person
 /// typed, and a false match inside one would break the call it feeds.
@@ -147,7 +144,6 @@ pub const TRANSCRIPT_TEXT: &[(&str, Carries)] = &[
 /// matches a SHA256 hex digest today, so this is defensive: it keeps a
 /// future hex-shaped pattern from breaking paging.
 pub const OPAQUE_KEYS: &[&str] = &[
-    "cursor",
     "behind_digest",
     "id",
     "message_id",
@@ -748,24 +744,23 @@ mod tests {
         }
     }
 
-    fn follow_answer() -> Value {
+    /// A page-shaped answer (#1220): transcript text in `page`, and
+    /// cursors whose digest looks like a secret here on purpose.
+    fn page_answer() -> Value {
         json!({
-            "preview": {
+            "page": {
                 "messages": [{
-                    "role": "user",
-                    "timestamp": null,
-                    "model": null,
+                    "id": "u1",
                     "blocks": [
-                        { "kind": "text", "text": "here: API_KEY=abcd1234efgh", "truncated": false },
-                        { "kind": "tool_result", "text": "ghp_abcdefABCDEF0123456789abcdefABCDEF01",
-                          "truncated": false, "tool_use_id": "toolu_1", "is_error": null, "change": null }
+                        { "kind": "text", "index": 0, "text": "here: API_KEY=abcd1234efgh", "clip": null },
+                        { "kind": "tool_result", "index": 1, "text": "ghp_abcdefABCDEF0123456789abcdefABCDEF01",
+                          "tool_use_id": "toolu_1", "clip": null }
                     ]
                 }],
                 "truncated": false
             },
-            "reread": null,
-            "cursor": { "offset": 10, "behind_digest": "API_KEY=abcd1234efgh", "behind_bytes": 10 },
-            "bytes_read": 10
+            "start": { "offset": 10, "behind_digest": "API_KEY=abcd1234efgh" },
+            "end": { "offset": 20, "behind_digest": "API_KEY=abcd1234efgh" }
         })
     }
 
@@ -811,15 +806,16 @@ mod tests {
 
     #[test]
     fn a_whole_answer_is_masked_everywhere_but_its_opaque_keys() {
-        let (args, plan) = admit("claude_transcript_follow", json!({"path": "p"}), ON).unwrap();
+        let (args, plan) = admit("claude_transcript_page", json!({"path": "p"}), ON).unwrap();
         assert_eq!(args, json!({"path": "p"}));
-        let out = plan.finish("claude_transcript_follow", follow_answer());
-        let text = out["preview"].to_string();
+        let out = plan.finish("claude_transcript_page", page_answer());
+        let text = out["page"].to_string();
         assert!(!text.contains("abcd1234efgh"), "{text}");
         assert!(!text.contains("ghp_abcdef"), "{text}");
-        // The cursor round-trips byte for byte, even though its content
+        // The cursors round-trip byte for byte, even though their digest
         // looks like a secret here on purpose.
-        assert_eq!(out["cursor"], follow_answer()["cursor"]);
+        assert_eq!(out["start"], page_answer()["start"]);
+        assert_eq!(out["end"], page_answer()["end"]);
         assert_eq!(
             out[MASKING_KEY],
             json!({"hidden": 2, "revealed": false, "reveal_allowed": false, "withheld": false})
@@ -834,8 +830,8 @@ mod tests {
             reveal: true,
         };
         for command in [
-            "claude_transcript_tail",
-            "claude_transcript_follow",
+            "claude_transcript_page",
+            "claude_transcript_block_text",
             "claude_search_transcripts",
         ] {
             assert_eq!(
@@ -890,7 +886,7 @@ mod tests {
     fn the_reveal_gate_is_honoured() {
         let ask = json!({"path": "p", "reveal": true});
         assert_eq!(
-            admit("claude_transcript_follow", ask.clone(), ON).unwrap_err(),
+            admit("claude_transcript_page", ask.clone(), ON).unwrap_err(),
             Refusal::RevealOff
         );
 
@@ -898,21 +894,21 @@ mod tests {
             transcripts: true,
             reveal: true,
         };
-        let (args, plan) = admit("claude_transcript_follow", ask, allowed).unwrap();
+        let (args, plan) = admit("claude_transcript_page", ask, allowed).unwrap();
         assert_eq!(
             args,
             json!({"path": "p"}),
             "the command never sees `reveal`"
         );
-        let out = plan.finish("claude_transcript_follow", follow_answer());
+        let out = plan.finish("claude_transcript_page", page_answer());
         assert!(out.to_string().contains("ghp_abcdef"));
         assert_eq!(out[MASKING_KEY]["revealed"], true);
         assert_eq!(out[MASKING_KEY]["hidden"], 0);
 
         // Allowed but not asked for: still masked, and the phone is told
         // the button would work.
-        let (_, plan) = admit("claude_transcript_follow", json!({"path": "p"}), allowed).unwrap();
-        let out = plan.finish("claude_transcript_follow", follow_answer());
+        let (_, plan) = admit("claude_transcript_page", json!({"path": "p"}), allowed).unwrap();
+        let out = plan.finish("claude_transcript_page", page_answer());
         assert!(!out.to_string().contains("ghp_abcdef"));
         assert_eq!(out[MASKING_KEY]["reveal_allowed"], true);
     }
@@ -921,7 +917,7 @@ mod tests {
     #[test]
     fn reveal_false_is_not_a_reveal() {
         let (args, _) = admit(
-            "claude_transcript_tail",
+            "claude_transcript_page",
             json!({"path": "p", "reveal": false}),
             ON,
         )
@@ -941,7 +937,8 @@ mod tests {
     /// the text (#1488).
     ///
     /// Drives the whole desktop-side path a phone's transcript call takes
-    /// -- the real `preview::tail` and `preview::follow` over a transcript
+    /// -- the real `transcript_page::page` and `transcript_model::block_text`
+    /// over a transcript
     /// on disk, then this module's gate and masking -- with diagnostics
     /// ON, and asserts no line logged in that window contains a word of
     /// the transcript. Other tests log concurrently into the same logger,
@@ -958,12 +955,12 @@ mod tests {
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(
             f,
-            r#"{{"type":"user","timestamp":"2026-09-13T10:00:00Z","message":{{"role":"user","content":"the {CANARY} said {SECRET}"}}}}"#
+            r#"{{"type":"user","uuid":"u1","timestamp":"2026-09-13T10:00:00Z","message":{{"role":"user","content":"the {CANARY} said {SECRET}"}}}}"#
         )
         .unwrap();
         writeln!(
             f,
-            r#"{{"type":"assistant","timestamp":"2026-09-13T10:00:01Z","message":{{"role":"assistant","content":[{{"type":"text","text":"{CANARY} reply"}}]}}}}"#
+            r#"{{"type":"assistant","uuid":"a1","timestamp":"2026-09-13T10:00:01Z","message":{{"role":"assistant","content":[{{"type":"text","text":"{CANARY} reply"}}]}}}}"#
         )
         .unwrap();
         drop(f);
@@ -973,17 +970,19 @@ mod tests {
         crate::diag::set_enabled(true);
         let mark = log.mark();
 
-        let tail = crate::claude::preview::tail(&path).unwrap();
-        let follow = crate::claude::preview::follow(&path, None).unwrap();
+        use crate::claude::transcript_page::{self, PageAnchor, PageDirection};
+        let page =
+            transcript_page::page(&path, &PageAnchor::End, PageDirection::Before, None).unwrap();
+        let block = crate::claude::transcript_model::block_text(&path, "u1", 0, None).unwrap();
         let mut finished = Vec::new();
         for (command, value) in [
             (
-                "claude_transcript_tail",
-                serde_json::to_value(&tail).unwrap(),
+                "claude_transcript_page",
+                serde_json::to_value(&page).unwrap(),
             ),
             (
-                "claude_transcript_follow",
-                serde_json::to_value(&follow).unwrap(),
+                "claude_transcript_block_text",
+                serde_json::to_value(&block).unwrap(),
             ),
         ] {
             let (_, plan) = admit(command, json!({"path": "p"}), ON).unwrap();

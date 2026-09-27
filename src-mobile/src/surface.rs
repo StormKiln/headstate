@@ -80,7 +80,7 @@ pub const SURFACE: &[(&str, Class)] = &[
     // most 256 KB of one of its files, and neither writes anything.
     //
     // The sharpest case of the companion's purpose yet, and the same
-    // argument `claude_transcript_tail` below makes about itself: the
+    // argument `claude_transcript_page` below makes about itself: the
     // desktop user can `cat` the file and the phone cannot reach the
     // machine at all.
     //
@@ -311,36 +311,21 @@ pub const SURFACE: &[(&str, Class)] = &[
     // Read: one aggregate query over stored rows (#1134).
     ("claude_usage_profile", Class::Read),
     ("claude_session_usage", Class::Read),
-    // The tail of one of the DESKTOP's transcripts, as conversation
-    // (#982). Read: one bounded tail read, writing nothing.
+    // One of the DESKTOP's transcripts (#982, #1475, #1220): one clipped
+    // block's full text by record id, and one bounded page before or
+    // after a cursor. Read: bounded reads, writing nothing.
     //
-    // The one Claude action where the phone's case is STRONGER than the
+    // The one Claude read where the phone's case is STRONGER than the
     // desktop's. `claude_reveal_path` is `Local` and absent from this
-    // table, so until now a companion user could see that a session died
-    // and could not see a word of what it was doing -- the desktop user
-    // can `cat` the file, and the phone cannot reach the machine.
+    // table, so without these a companion user could see that a session
+    // died and could not see a word of what it was doing -- the desktop
+    // user can `cat` the file, and the phone cannot reach the machine.
     //
-    // Bounded inside the command (256 KB, 200 messages, clamped blocks)
-    // so asking for the desktop's 76 MB transcript cannot hand the phone
-    // 76 MB. See the desktop copy for the path guard both commands share.
-    ("claude_transcript_tail", Class::Read),
-    // Following that transcript as it is written (#1208). Same `Read`
-    // grounds as the row above, and the phone's case is the stronger one
-    // again: the companion user cannot reach the machine, so a frozen
-    // snapshot of a RUNNING agent is the worst view in the app.
-    //
-    // Bounded by the same constants, and cheaper per poll than the row
-    // above: it reads from a cursor rather than a fixed 256 KB window.
-    ("claude_transcript_follow", Class::Read),
-    // The same transcript as stable, render-ready messages, and one
-    // clipped block's full text by record id (#1475). Read on the rows'
-    // grounds above, and bounded inside the command the same way; see the
-    // desktop copy.
-    ("claude_transcript_messages", Class::Read),
+    // Bounded inside the command per call whatever the phone asks, so
+    // asking for the desktop's 76 MB transcript cannot hand the phone
+    // 76 MB. See the desktop copy for the path guard both commands share,
+    // and for the three transcript commands #1514 retired.
     ("claude_transcript_block_text", Class::Read),
-    // One bounded page of that transcript before or after a cursor
-    // (#1220). Read on the same grounds, and bounded inside the command
-    // per call whatever the phone asks; see the desktop copy.
     ("claude_transcript_page", Class::Read),
     // Whether the DESKTOP's hooks are installed (#915). Read: one file
     // read, no side effects, and "is that desktop recording?" is a real

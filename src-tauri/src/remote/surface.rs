@@ -154,7 +154,7 @@ pub const SURFACE: &[(&str, Class)] = &[
     // companion's whole purpose yet. Apply `Class::Local`'s stated test --
     // could the phone act on the answer? -- and it is plainly yes; a
     // listing and a file are exactly what a person away from their desk
-    // wants. `claude_transcript_tail` makes the stronger form of the
+    // wants. `claude_transcript_page` makes the stronger form of the
     // argument and it transfers verbatim: "the desktop user can `cat` the
     // file and the companion user cannot reach the machine." A repository
     // browser is that argument repeated for every file in 38
@@ -530,65 +530,42 @@ pub const SURFACE: &[(&str, Class)] = &[
     // Read: one aggregate query over stored rows (#1134).
     ("claude_usage_profile", Class::Read),
     ("claude_session_usage", Class::Read),
-    // The tail of one session's transcript, as conversation (#982).
+    // One session's transcript (#982, #1475, #1220): one clipped
+    // block's full text by record id, and one bounded page before or
+    // after a cursor -- how the viewer reaches "what happened earlier" in
+    // a 70 MB file.
     //
     // `Read`, and the phone's case here is STRONGER than the desktop's.
-    // `claude_reveal_path` is `Class::Local`, so until now a companion
-    // user who could see that a session died could not see one word of
-    // what it was doing -- the desktop user can `cat` the file and the
-    // companion user cannot reach the machine at all.
+    // `claude_reveal_path` is `Class::Local`, so without these a
+    // companion user who could see that a session died could not see one
+    // word of what it was doing -- the desktop user can `cat` the file
+    // and the companion user cannot reach the machine at all.
     //
-    // It reads one `.jsonl` under `~/.claude/projects` and writes
+    // Each reads one `.jsonl` under `~/.claude/projects` and writes
     // nothing; `~/.claude` stays read-only, per `claude/mod.rs`'s two
-    // stated exceptions, neither of which this is.
-    //
-    // The response is bounded inside the command -- a 256 KB window, at
-    // most 200 messages, each block clamped -- so the phone cannot be
-    // handed a 76 MB file by asking for one. Both commands resolve their
+    // stated exceptions, neither of which this is. Both resolve their
     // path argument against `~/.claude/projects` before reading, because
     // unlike `claude_reveal_path` a `Read` command's argument arrives
     // from a paired device rather than from this machine's own frontend;
     // `claude_transcript_path` in `commands.rs` argues it.
     //
-    // What crosses is not what the webview sees (#1488): every command
-    // returning transcript text is listed in `remote/privacy.rs`'s
-    // `TRANSCRIPT_TEXT`, and the listener masks likely secrets in it and
-    // honours the per-device switches before it leaves this machine.
-    ("claude_transcript_tail", Class::Read),
-    // One incremental step of following a live transcript (#1208).
-    //
-    // `Read` on exactly the grounds the row above carries, and the phone
-    // benefits more than the desktop again: a companion user watching a
-    // running agent gets the transcript as it is written rather than a
-    // snapshot frozen at the moment they tapped.
-    //
-    // It reads LESS than the row above, not more. `tail` pulls a 256 KB
-    // window per call; this reads from the cursor the caller returns, so
-    // a poll over a transcript that did not change moves no transcript
-    // bytes at all -- only the bounded 64 KB fingerprint that detects a
-    // compaction having rewritten history behind the cursor.
-    ("claude_transcript_follow", Class::Read),
-    // The same transcript as stable, render-ready messages (#1475), and
-    // one clipped block's full text by record id.
-    //
-    // `Read` on the two rows' grounds above: one `.jsonl` under
-    // `~/.claude/projects`, resolved through `claude_transcript_path`,
-    // nothing written. Both are bounded inside the command -- the page by
-    // the same 256 KB window and a message cap, the full-text fetch at
-    // `transcript_model::FULL_TEXT_CHARS` with the clip stated -- so the
-    // phone is never handed more than the desktop would render.
-    ("claude_transcript_messages", Class::Read),
-    ("claude_transcript_block_text", Class::Read),
-    // One bounded page of that transcript, before or after a cursor
-    // (#1220): how the viewer reaches "what happened earlier" in a 70 MB
-    // file.
-    //
-    // `Read` on the rows' grounds above, and bounded INSIDE the command
-    // whatever the phone asks for: at most `PAGE_MESSAGES` messages and
+    // Both are bounded INSIDE the command whatever the phone asks for:
+    // the full-text fetch at `transcript_model::FULL_TEXT_CHARS` with the
+    // clip stated, and a page at `PAGE_MESSAGES` messages and
     // `transcript_page::PAGE_READ_BOUND` bytes read into memory per call,
     // with a record larger than a page streamed and clipped rather than
     // held. The phone can page through the whole file, one bounded page
     // per round trip, and is never handed the file.
+    //
+    // What crosses is not what the webview sees (#1488): every command
+    // returning transcript text is listed in `remote/privacy.rs`'s
+    // `TRANSCRIPT_TEXT`, and the listener masks likely secrets in it and
+    // honours the per-device switches before it leaves this machine.
+    //
+    // #1514 retired `claude_transcript_tail`, `claude_transcript_follow`
+    // and `claude_transcript_messages`: the old preview pane was their
+    // last consumer, and the paged viewer reads only these two.
+    ("claude_transcript_block_text", Class::Read),
     ("claude_transcript_page", Class::Read),
     // Whether the Claude Code hooks are in `~/.claude/settings.json`
     // (#915).
@@ -1267,13 +1244,6 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "claude_restart_list" => res(commands::claude_restart_list(app.clone()).await),
         "claude_usage_profile" => res(commands::claude_usage_profile(app.clone()).await),
         "claude_session_usage" => res(commands::claude_session_usage(a.get("path")?).await),
-        "claude_transcript_tail" => res(commands::claude_transcript_tail(a.get("path")?).await),
-        "claude_transcript_follow" => {
-            res(commands::claude_transcript_follow(a.get("path")?, a.get("cursor")?).await)
-        }
-        "claude_transcript_messages" => {
-            res(commands::claude_transcript_messages(a.get("path")?).await)
-        }
         "claude_transcript_block_text" => res(commands::claude_transcript_block_text(
             a.get("path")?,
             a.get("messageId")?,

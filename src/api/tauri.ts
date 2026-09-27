@@ -30,9 +30,6 @@ import type {
   ClaudeCoverage,
   PluginsReport,
   ClaudeRestartList,
-  ClaudePreview,
-  ClaudeFollow,
-  ClaudeFollowCursor,
   ClaudeSessionDetail,
   ClaudeStopProposal,
   ClaudeStopOutcome,
@@ -78,7 +75,6 @@ import type {
   RepoFile,
 } from "../types/pr";
 import type {
-  RemoteTranscriptPage,
   RemoteTranscriptWindow,
   TranscriptBlockText,
   TranscriptPageAnchor,
@@ -1443,60 +1439,16 @@ export const claudeSessionEvents = (sessionId: string) =>
 /// denominators, without which the profile reads as covering everything.
 export const claudeEventProfile = () => call<ClaudeCorpus>("claude_event_profile");
 
-/// The tail of one session's transcript, as conversation (#982).
-///
-/// `Class::Read`, and the one Claude action whose phone case is stronger
-/// than the desktop's: `claudeRevealPath` is `Class::Local`, so without
-/// this a companion user can see that a session died and not one word of
-/// what it was doing.
-///
-/// Bounded inside the command -- a 256 KB window, at most 200 messages,
-/// each block clamped -- so the 76 MB transcript on the development
-/// machine cannot be pulled over the pairing transport.
-export const claudeTranscriptTail = (path: string) =>
-  call<ClaudePreview>("claude_transcript_tail", { path });
-
-/// One incremental step of following a live transcript (#1208).
-///
-/// The companion to `claudeTranscriptTail` and deliberately a separate
-/// command: `tail` answers "show me this session" and reads a 256 KB
-/// window every call, which is the wrong shape for a poll. This answers
-/// "what changed since byte N" and reads nothing when nothing did.
-///
-/// `cursor` is opaque -- whatever the last call returned, handed back
-/// unread. `null` on the first poll.
-///
-/// `Class::Read`, bounded by the same constants as `tail` plus a 64 KB
-/// fingerprint probe; the phone's case is the stronger one, because a
-/// companion user watching a RUNNING agent is exactly who a frozen
-/// snapshot fails.
-export const claudeTranscriptFollow = (path: string, cursor: ClaudeFollowCursor | null) =>
-  call<ClaudeFollow>("claude_transcript_follow", { path, cursor });
-
-/// The tail of one transcript as stable, render-ready messages (#1475).
-///
-/// Every message keyed by its record's uuid and grouped into turns, with
-/// the full record allowlist and per-block clip metadata. Additive:
-/// `claudeTranscriptTail` keeps serving the current pane.
-///
-/// `Class::Read`, bounded inside the command by the same 256 KB window.
-///
-/// `reveal` is the phone's Reveal button (#1481, #1488): the desktop
-/// sends the text unmasked when this device may reveal, and refuses
-/// otherwise. Sent only when true, so the desktop's own calls -- which
-/// are never masked -- carry exactly the arguments they always did.
-export const claudeTranscriptMessages = (path: string, reveal = false) =>
-  call<RemoteTranscriptPage>(
-    "claude_transcript_messages",
-    reveal ? { path, reveal: true } : { path },
-  );
-
 /// One clipped block's full text, by the record's id and the block's
 /// index (#1475). Bounded server-side too; the response's `clip` says
 /// when that bound bit.
 ///
-/// `reveal` as `claudeTranscriptMessages`: a block fetched while the
-/// phone shows revealed text must arrive revealed too.
+/// `reveal` is the phone's Reveal button (#1481, #1488): the desktop
+/// sends the text unmasked when this device may reveal, and refuses
+/// otherwise. A block fetched while the phone shows revealed text must
+/// arrive revealed too. Sent only when true, so the desktop's own calls
+/// -- which are never masked -- carry exactly the arguments they always
+/// did.
 ///
 /// `offset` is the record's `offset` from the message or tool output that
 /// showed the block (#1220): with it the fetch reads that one record
@@ -1530,7 +1482,7 @@ export const claudeTranscriptBlockText = (
 /// and a larger ask is clamped to it. `Class::Read`, bounded per call
 /// inside the command however large the file.
 ///
-/// `reveal` as `claudeTranscriptMessages`: sent only when true.
+/// `reveal` as `claudeTranscriptBlockText`: sent only when true.
 export const claudeTranscriptPage = (
   path: string,
   anchor: TranscriptPageAnchor,

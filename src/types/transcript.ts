@@ -6,7 +6,7 @@
 /// phone bubbles), live follow, paging and 7.10's sent-message echo
 /// consume this one model.
 ///
-/// Wire keys are snake_case, matching `ClaudePreview` beside it.
+/// Wire keys are snake_case, as every Rust wire type is.
 ///
 /// The nested interfaces are EXPORTED and tagged `@public` for `yarn
 /// knip`, where `pr.ts` would keep them private until a consumer
@@ -79,7 +79,7 @@ export interface TranscriptSubagent {
   /// `async_launched`, `completed`, ... verbatim.
   status: string | null;
   agent_type: string | null;
-  /// Openable with `claudeTranscriptMessages`, which applies the same
+  /// Openable with `claudeTranscriptPage`, which applies the same
   /// path guard as the parent's.
   transcript_path: string | null;
   /// `null` when it was not checked, which is not "missing".

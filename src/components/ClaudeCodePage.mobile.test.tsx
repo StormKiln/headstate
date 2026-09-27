@@ -1,7 +1,6 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
-  ClaudePreview,
   ClaudeSession,
   ClaudeSessionDetail,
   ClaudeSessionList,
@@ -54,15 +53,14 @@ const state = vi.hoisted(() => ({
   list: undefined as ClaudeSessionList | undefined,
   now: Date.parse("2026-09-13T12:00:00Z"),
   /// #959 and #982. Both commands are `Class::Read`, so unlike the two
-  /// reveal buttons the phone DOES get them -- and the preview is the one
-  /// Claude action whose phone case is stronger than the desktop's, since
+  /// reveal buttons the phone DOES get them -- and the transcript is the
+  /// one Claude read whose phone case is stronger than the desktop's, since
   /// `claude_reveal_path` is `Local` and there is otherwise no path to a
   /// transcript's content at all. Filled here so the tests below can
   /// assert that, rather than only that the Local controls are gone.
   usage: undefined as ClaudeUsage | undefined,
   rollup: undefined as ClaudeSubagentRollup | undefined,
   events: undefined as ClaudeObservation | undefined,
-  preview: undefined as ClaudePreview | undefined,
   /// One session's detail, keyed by id (#985). `Class::Read`, so the
   /// phone gets this too -- and the phone is who the split is for: the
   /// list crosses the pairing transport every ten seconds and was
@@ -136,30 +134,6 @@ vi.mock("../api/hooks", () => ({
     state.transcriptSessionIds.push(options?.sessionId);
     return liveOf(state.transcript);
   },
-  // #1208: a FOLLOW. The phone's case for it is the stronger one -- the
-  // companion user cannot reach the machine, so a frozen snapshot of a
-  // RUNNING agent is the worst view in the app.
-  useClaudeTranscriptFollow: (path: string | null, enabled: boolean) => ({
-    messages: state.preview?.messages ?? [],
-    following: "following" as const,
-    lastReadAt: Date.UTC(2026, 0, 1, 12, 4, 31),
-    reread: null,
-    window:
-      state.preview === undefined
-        ? null
-        : {
-            truncated: state.preview.truncated,
-            file_bytes: state.preview.file_bytes,
-            bytes_read: state.preview.bytes_read,
-            non_conversation_records: state.preview.non_conversation_records,
-            unparseable_records: state.preview.unparseable_records,
-          },
-    capped: 0,
-    isError: false,
-    error: undefined,
-    isLoading: enabled && path !== null && state.preview === undefined,
-    pollMs: 3_000,
-  }),
 }));
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 vi.mock("../lib/clipboard", () => ({ copyText: copyFn }));
@@ -262,29 +236,6 @@ beforeEach(() => {
     // that wants one sets it, so the absent arm is what every other test
     // here renders.
     recorded_cost: null,
-  };
-  state.preview = {
-    messages: [
-      {
-        role: "assistant",
-        timestamp: "2026-09-13T11:00:05Z",
-        model: "claude-opus-5",
-        blocks: [{ kind: "text", text: "Running the tests now.", truncated: false }],
-      },
-    ],
-    truncated: false,
-    bytes_read: 183_237,
-    file_bytes: 183_237,
-    non_conversation_records: 0,
-    unparseable_records: 0,
-    lifecycle: {
-      queue: null,
-      permission_mode: null,
-      worktree: { state: "unknown" },
-    },
-    pairings: {},
-    unanswered_calls: 0,
-    results_above_window: 0,
   };
   // 390px: an iPhone 15's CSS width, comfortably under `MOBILE_BREAKPOINT`.
   stubViewport(390);
@@ -544,18 +495,52 @@ describe("the companion offers the view and hides only the Local actions", () =>
   /// session died and not one word of what it was doing. The desktop user
   /// can `cat` the file; the phone cannot reach the machine at all.
   ///
-  /// **Sabotage:** wrap `<TranscriptPreview>` in `!IS_MOBILE_BUILD` in
-  /// `ClaudeCodePage` and this fails while every other test stays green.
-  it("lets the phone read a transcript, because claude_transcript_tail is Class::Read", () => {
+  /// Since #1514 the detail's transcript is the viewer's pane, in the
+  /// phone renderer, over `claude_transcript_page` (`Class::Read`); the
+  /// old preview pane is gone from this build.
+  ///
+  /// **Sabotage:** return `null` from `TranscriptPane` when
+  /// `IS_MOBILE_BUILD` and this fails while every other test stays green.
+  it("lets the phone read a transcript in the viewer, because claude_transcript_page is Class::Read", () => {
+    state.transcript = {
+      messages: [
+        {
+          id: "a1",
+          id_source: "uuid",
+          turn_id: "a1",
+          kind: { kind: "assistant" },
+          timestamp: null,
+          model: null,
+          api_message_id: null,
+          usage: null,
+          duration_ms: null,
+          is_meta: false,
+          is_sidechain: false,
+          offset: null,
+          oversized_bytes: null,
+          blocks: [{ kind: "text", index: 0, text: "Running the tests now.", clip: null }],
+        },
+      ],
+      truncated: false,
+      bytes_read: 1_000,
+      file_bytes: 1_000,
+      machinery_records: [],
+      unparseable_records: 0,
+      duplicate_records: 0,
+    };
     render(<ClaudeCodePage />);
     open("HeadState GitHub issues filing");
 
-    // Behind the disclosure on the phone as on the desktop: a 256 KB read
-    // over the pairing transport is exactly what must not happen on every
+    const pane = screen.getByTestId("transcript-pane");
+    // The old preview pane is not rendered beside it (#1514).
+    expect(screen.queryByText(/what it was doing/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: /follow the transcript/i })).toBeNull();
+    // Behind the disclosure on the phone as on the desktop: a read over
+    // the pairing transport is exactly what must not happen on every
     // selection.
-    expect(screen.getByRole("button", { name: /follow the transcript/i })).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
-    expect(screen.getByText("Running the tests now.")).toBeTruthy();
+    fireEvent.click(within(pane).getByRole("button", { name: /show the transcript/i }));
+    expect(within(pane).getByText("Running the tests now.")).toBeTruthy();
+    expect(within(pane).getByTestId("phone-transcript")).toBeTruthy();
   });
 
   /// The viewport stub is load-bearing and is asserted rather than

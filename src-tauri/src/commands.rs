@@ -3401,7 +3401,7 @@ pub async fn claude_propose_stop(
                         .map(|c| c.auto as u32),
                     // The LAST TURN, which the issue requires be shown
                     // before acting. Read through the same bounded
-                    // `preview::tail` the transcript pane uses; `None`
+                    // `preview::tail` the old preview pane used; `None`
                     // when it could not be read, which the UI states
                     // rather than rendering a blank as "it said nothing".
                     last_turn: detail
@@ -6466,8 +6466,8 @@ fn transcript_path_in(root: &std::path::Path, path: &str) -> Result<std::path::P
 ///
 /// `Class::Read`. It reads one file under `~/.claude/projects` and writes
 /// nothing, and the phone wants this answer for the same reason the
-/// desktop does -- see `claude_transcript_tail` below, which argues the
-/// path guard both commands share.
+/// desktop does -- see `claude_transcript_page` below, which shares
+/// the same path guard.
 ///
 /// # Absent is not zero
 ///
@@ -6500,122 +6500,6 @@ pub async fn claude_session_usage(path: String) -> Result<crate::claude::usage::
     // wraps its query. Removing the byte cap (#1086) makes this MORE
     // load-bearing, not less.
     tauri::async_runtime::spawn_blocking(move || crate::claude::usage::summarise_whole(&p))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-/// The tail of one session's transcript, as conversation (#982).
-///
-/// The only way to read a transcript's CONTENT. Until now the one action
-/// that touched a transcript was Reveal in Finder, which is `Class::Local`
-/// and hands the user a JSONL file -- so a companion user who could see
-/// that a session died could not see one word of what it was doing.
-///
-/// `Class::Read`, and this is the one Claude action where the phone's
-/// case is stronger than the desktop's: the desktop user can `cat` the
-/// file and the companion user cannot reach the machine. The response is
-/// bounded inside the command -- a 256 KB window, at most 200 messages,
-/// each block clamped -- which is the property that makes exposing it
-/// over the transport safe rather than a second set of limits to keep in
-/// sync, the same rule `stats_board` is classed by.
-///
-/// # Absent is not zero
-///
-/// An `Err` means the transcript could not be READ. A `Preview` with no
-/// messages means the window held no conversation, and its
-/// `non_conversation_records` and `unparseable_records` say which.
-#[tauri::command]
-pub async fn claude_transcript_tail(
-    path: String,
-) -> Result<crate::claude::preview::Preview, String> {
-    let p = claude_transcript_path(&path)?;
-    tauri::async_runtime::spawn_blocking(move || crate::claude::preview::tail(&p))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-/// One incremental step of following a live transcript (#1208).
-///
-/// The companion to `claude_transcript_tail`, and the reason it is a
-/// separate command rather than a parameter: `tail` answers "show me this
-/// session" and reads a 256 KB window every time. This answers "what has
-/// changed since byte N", and on an unchanged file reads no transcript
-/// bytes at all.
-///
-/// # Why polling, and not a watcher
-///
-/// `claude/handoff.rs:9-19` argues it for its own file and the argument
-/// is the same here: `notify` is not a dependency, and a dead FSEvents
-/// stream on macOS reports "no new records" indistinguishably from "the
-/// watch died". Silence is the one failure a pane that claims to be
-/// following must never produce. A poll that stops is visible, because
-/// the pane states when it last read. #1201 is open on the same question
-/// for the filesystem scans.
-///
-/// # `Class::Read`
-///
-/// Same grounds as `claude_transcript_tail`: one `.jsonl` under
-/// `~/.claude/projects`, read-only, resolved through the same
-/// `claude_transcript_path` guard. Its response is bounded by the same
-/// constants -- a 256 KB window on any re-read, at most 200 messages,
-/// each block clamped -- plus a 64 KB fingerprint probe, so a phone
-/// following a 76 MB transcript is handed the same bounded answer the
-/// desktop is.
-///
-/// `cursor` is opaque to the caller: it is handed back exactly as it was
-/// received. `None` means "I have nothing, read me a window", which is
-/// the first poll after the pane opens.
-///
-/// # Absent is not zero
-///
-/// An `Err` means the transcript could not be READ -- including that it
-/// is GONE, which differs from `handoff.rs`'s case 4 on purpose: a
-/// missing handoff file is a machine without the hook installed, while a
-/// transcript that vanished mid-follow is a real failure the pane must
-/// state. A `Follow` with no messages and `bytes_read: 0` means we read
-/// it and the session wrote nothing, which is the session being idle --
-/// a different fact from the follow having stopped, and the UI must not
-/// render them the same way (#846, #1042).
-#[tauri::command]
-pub async fn claude_transcript_follow(
-    path: String,
-    cursor: Option<crate::claude::preview::Cursor>,
-) -> Result<crate::claude::preview::Follow, String> {
-    let p = claude_transcript_path(&path)?;
-    tauri::async_runtime::spawn_blocking(move || {
-        crate::claude::preview::follow(&p, cursor.as_ref())
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-/// The tail of one transcript as stable, render-ready messages (#1475).
-///
-/// The read model the transcript viewer is built on: every message keyed
-/// by its record's uuid, grouped into turns, with the full record
-/// allowlist and per-block clip metadata. `claude_transcript_tail` keeps
-/// serving the current pane; this is additive until the viewer replaces
-/// it. Paging (#1220) and live follow (#1476) build on the same parser.
-///
-/// `Class::Read`, on `claude_transcript_tail`'s grounds: one `.jsonl`
-/// under `~/.claude/projects`, resolved through the same
-/// `claude_transcript_path` guard -- which is also what makes a subagent
-/// link (`TranscriptSubagent::transcript_path`) safe to hand back here,
-/// since it lies under the same root. Bounded inside the command: the
-/// same 256 KB window, at most `transcript_model::MAX_MESSAGES` messages,
-/// each block clipped with its clip stated.
-///
-/// # Absent is not zero
-///
-/// An `Err` means the transcript could not be READ. A page with no
-/// messages was read, and its `machinery_records`, `unparseable_records`
-/// and `duplicate_records` say what the window held instead.
-#[tauri::command]
-pub async fn claude_transcript_messages(
-    path: String,
-) -> Result<crate::claude::transcript_model::TranscriptPage, String> {
-    let p = claude_transcript_path(&path)?;
-    tauri::async_runtime::spawn_blocking(move || crate::claude::transcript_model::tail(&p))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -6665,9 +6549,10 @@ pub async fn claude_transcript_block_text(
 /// `limit` is the most messages wanted, clamped to
 /// `transcript_page::PAGE_MESSAGES`; `null` means that maximum.
 ///
-/// `Class::Read`, on `claude_transcript_messages`' grounds: one `.jsonl`
-/// under `~/.claude/projects` through the `claude_transcript_path`
-/// guard, nothing written. Bounded INSIDE the command whatever the
+/// `Class::Read`, and the phone's case is STRONGER than the desktop's:
+/// the desktop user can `cat` the file and the companion user cannot
+/// reach the machine. One `.jsonl` under `~/.claude/projects` through
+/// the `claude_transcript_path` guard, nothing written. Bounded INSIDE the command whatever the
 /// caller asks: at most `PAGE_MESSAGES` messages and
 /// `transcript_page::PAGE_READ_BOUND` bytes read into memory, and a
 /// record over `RECORD_HOLD_BYTES` streamed and clipped rather than
@@ -6796,7 +6681,7 @@ pub async fn repo_tree(
 /// 256 KB window, the binary refusal and the containment guard -- which
 /// is the property that makes the `Read` row safe rather than a second
 /// set of limits to keep in sync, the rule `stats_board` is classed by
-/// and `claude_transcript_tail` restates. A phone that asks for the
+/// and `claude_transcript_page` restates. A phone that asks for the
 /// 275 MB tracked zip is handed 256 KB with the truncation stated,
 /// because this command never reads more.
 ///

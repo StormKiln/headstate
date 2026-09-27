@@ -4,9 +4,8 @@ import { type View, useFilters } from "../store/filters";
 import { listen, type UnlistenFn } from "./transport";
 import { safeUnlisten } from "./unlisten";
 import { timeCall, timed } from "./diag";
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import type {
-  ClaudePairing,
   AlertReport,
   ClaudeMdAdviceMode,
   Artifact,
@@ -18,10 +17,6 @@ import type {
   ClaudeOverview,
   ClaudeCoverage,
   PluginsReport,
-  ClaudePreviewMessage,
-  ClaudeFollow,
-  ClaudeFollowCursor,
-  ClaudeReread,
   ClaudeUsage,
   ClaudeSubagentRollup,
   ClaudeObservation,
@@ -60,7 +55,7 @@ import type {
 } from "./tauri";
 import { type FollowLive, TranscriptFollower } from "@/lib/transcriptFollow";
 import type { SessionActivity } from "@/types/transcript";
-import { createCoalescer, type Scheduler } from "@/lib/coalesce";
+import { createCoalescer } from "@/lib/coalesce";
 import { createLimiter, withDeadline } from "@/lib/limiter";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { parsePrQuery, reposForNumber } from "@/lib/claudePrs";
@@ -157,7 +152,6 @@ import {
   claudeSessions,
   claudeSessionDetail,
   claudeSessionsForPr,
-  claudeTranscriptFollow,
   claudeTranscriptPage,
   claudeHooksStatus,
   claudeInstallHooks,
@@ -1756,8 +1750,8 @@ function followLive(liveness: Liveness): FollowLive {
 ///
 /// Not react-query, deliberately: the transcript is the SUM of many
 /// reads, joined by id, and the cursor each read continues from is an
-/// input the next one needs -- the shape `useClaudeTranscriptFollow`
-/// had to bend a query into. Nothing else shares this cache.
+/// input the next one needs, which a single react-query entry
+/// cannot hold. Nothing else shares this cache.
 ///
 /// `reveal` is the phone's Reveal (#1481, #1488): a separate follower,
 /// so the masked one stays underneath and a refused reveal leaves the
@@ -2331,386 +2325,6 @@ export function useClaudePlugins(enabled = true) {
     staleTime: Infinity,
     retry: false,
   });
-}
-
-// `useClaudeTranscriptTail` (#982) was here. #1208 replaced it: it was
-// `staleTime: Infinity` with no `refetchInterval`, so the pane opened
-// onto a snapshot frozen at the moment of the click, and the app spends
-// its ten-second poll drawing attention to RUNNING sessions. The read it
-// wrapped -- `claude_transcript_tail` -- is still a registered
-// `Class::Read` command, so a paired device that wants one bounded
-// window rather than a follow can still ask for one.
-
-/// How often an open follow re-reads the transcript.
-///
-/// 3 seconds, deliberately FASTER than `CLAUDE_POLL_MS`'s 10, and the
-/// asymmetry is the point of #1208. The list polls at 10 s because it
-/// answers "which of 1,474 sessions is alive"; a follow answers "what is
-/// this one agent doing right now", which is a question the user is
-/// actively watching, and 10 s of lag there is what made the most
-/// valuable view in the app its most stale one.
-///
-/// It is affordable only because the read is incremental: a poll over a
-/// transcript that did not change moves zero transcript bytes and reads
-/// one bounded 64 KB fingerprint, against the 256 KB `tail` would pull
-/// every tick. A `tail` on a 3-second timer is the thing this exists
-/// instead of.
-const FOLLOW_POLL_MS = 3_000;
-
-/// The most messages a follow holds at once (#1474).
-///
-/// The Rust side caps each READ at 200 messages (`preview.rs`
-/// `MAX_MESSAGES`), but a follow is the SUM of its reads, so without a
-/// bound of its own a session followed for an afternoon grows without
-/// limit in memory. When an append pushes past this, the oldest messages
-/// are let go and the hook reports how many (`capped`), so the pane says
-/// it is capped rather than claiming to show everything.
-///
-/// Five times one read: room for a busy stretch of a live session
-/// without the pane re-rendering thousands of rows. The transcript
-/// VIEWER no longer uses this follow: its data is the paged, evicting
-/// `useClaudeTranscriptLive` (#1476, `MAX_RESIDENT`). This cap bounds
-/// only the older preview pane, for as long as it remains.
-export const FOLLOW_MAX_MESSAGES = 1_000;
-
-/// What two reads said about one `tool_use_id`, combined (#1474).
-///
-/// Each read pairs only the messages IN IT, so a call answered on a later
-/// poll is `unanswered` in the read that carried the call and
-/// `call_above_window` in the read that carried the result. Together
-/// the accumulation holds both halves, which is `paired` -- and letting
-/// either read win alone would render a finished call as unanswered, or
-/// crashed. So:
-///
-/// - `paired` from either read wins;
-/// - a call seen in one read and its result in the other is `paired`;
-/// - otherwise the later read wins.
-function mergePairing(earlier: ClaudePairing, later: ClaudePairing): ClaudePairing {
-  if (earlier === "paired" || later === "paired") return "paired";
-  if (
-    (earlier === "unanswered" && later === "call_above_window") ||
-    (earlier === "call_above_window" && later === "unanswered")
-  ) {
-    return "paired";
-  }
-  return later;
-}
-
-/// Merge a read's pairings into what the follow already holds, by key.
-///
-/// Never replaces the map: an idle poll returns `{}`, and replacing with
-/// it turned every earlier call in the pane into "unanswered" (#1474).
-function mergePairings(
-  held: Record<string, ClaudePairing>,
-  read: Record<string, ClaudePairing>,
-): Record<string, ClaudePairing> {
-  const ids = Object.keys(read);
-  if (ids.length === 0) return held;
-  const out = { ...held };
-  for (const id of ids) {
-    const prev = out[id];
-    out[id] = prev === undefined ? read[id] : mergePairing(prev, read[id]);
-  }
-  return out;
-}
-
-/// Apply `FOLLOW_MAX_MESSAGES`, stating it when it binds.
-///
-/// Returns the kept messages, how many were let go, and the pairings
-/// re-stated for what is kept: an id only the evicted messages named is
-/// dropped with them (that is the memory the cap exists to bound), and a
-/// result whose CALL was evicted is now `call_above_window` -- its call is
-/// above what the pane shows, and a `paired` left behind would claim a
-/// call the reader cannot find.
-function capFollow(
-  messages: ClaudePreviewMessage[],
-  pairings: Record<string, ClaudePairing>,
-): {
-  messages: ClaudePreviewMessage[];
-  evicted: number;
-  pairings: Record<string, ClaudePairing>;
-} {
-  const evicted = messages.length - FOLLOW_MAX_MESSAGES;
-  if (evicted <= 0) return { messages, evicted: 0, pairings };
-  const kept = messages.slice(evicted);
-  const calls = new Set<string>();
-  const results = new Set<string>();
-  for (const m of kept) {
-    for (const b of m.blocks) {
-      if (b.kind === "tool_use" && b.id !== null) calls.add(b.id);
-      if (b.kind === "tool_result" && b.tool_use_id !== null) results.add(b.tool_use_id);
-    }
-  }
-  const gone = new Set<string>();
-  for (const m of messages.slice(0, evicted)) {
-    for (const b of m.blocks) {
-      if (b.kind === "tool_use" && b.id !== null) gone.add(b.id);
-      if (b.kind === "tool_result" && b.tool_use_id !== null) gone.add(b.tool_use_id);
-    }
-  }
-  const out = { ...pairings };
-  for (const id of gone) {
-    if (calls.has(id)) continue;
-    if (results.has(id)) out[id] = "call_above_window";
-    else delete out[id];
-  }
-  return { messages: kept, evicted, pairings: out };
-}
-
-/// Following one session's transcript as it is written (#1208).
-///
-/// # Why polling, and not a filesystem watcher
-///
-/// `src-tauri/src/claude/handoff.rs:9-19` argues it for its own file:
-/// `notify` is not a dependency, and on macOS a dead FSEvents stream
-/// reports "no new content" indistinguishably from "the watch died".
-/// Silence is the one failure a pane claiming to follow must never
-/// produce. A poll that stops is legible -- `lastReadAt` below stops
-/// advancing and the pane says so in words. #1201 is open on the same
-/// question for the filesystem scans.
-///
-/// # Why the messages are accumulated here and not re-fetched
-///
-/// The command returns only what is NEW since the cursor. That is what
-/// makes a 3-second poll affordable, and it means the rendered
-/// conversation lives in this hook rather than in the query cache: the
-/// query's `data` is one increment, and the conversation is the sum of
-/// them.
-///
-/// Appends are coalesced through `createCoalescer` (#1150) for the
-/// reason that module exists: a burst of records during a busy tool loop
-/// would otherwise be one full re-render of up to 200 messages each. The
-/// scheduler is injected so a test can flush deterministically, exactly
-/// as `coalesce.ts` intends.
-///
-/// # Three states, three renderings
-///
-/// `following` is what the caller switches on, and the three values must
-/// not be collapsed (#846, #1042):
-///
-/// - `"following"` -- the poll is running.
-/// - `"idle"` -- the poll is running and the transcript is not changing.
-///   We read, and the session wrote nothing.
-/// - `"stopped"` -- we are NOT reading any more, because the pane was
-///   closed, the path went away, or the read failed.
-///
-/// "This session is idle" and "we stopped following" are different
-/// facts with different remedies, and a pane that rendered them the same
-/// way would be telling the reader a running agent is quiet when in
-/// truth nobody is looking.
-export function useClaudeTranscriptFollow(
-  path: string | null,
-  enabled: boolean,
-  schedule?: Scheduler,
-) {
-  const on = enabled && path !== null && path !== "";
-
-  /// Everything the follow has accumulated, TAGGED with the file it came
-  /// from.
-  ///
-  /// One state object rather than four, and the tag is what makes the
-  /// path change safe without an effect: a cursor is an offset into ONE
-  /// file, and carrying one across a selection would read one
-  /// transcript's history at another's offset. Comparing the tag during
-  /// render discards it in the same pass the new path arrives in, so the
-  /// pane never renders one session's messages under another's header --
-  /// which a reset in an effect would allow for exactly one frame.
-  const [acc, setAcc] = useState<{
-    path: string | null;
-    messages: ClaudePreviewMessage[];
-    reread: { why: ClaudeReread; at: number } | null;
-    window: {
-      truncated: boolean;
-      file_bytes: number;
-      bytes_read: number;
-      non_conversation_records: number;
-      unparseable_records: number;
-    } | null;
-    pairings: Record<string, ClaudePairing>;
-    /// Messages let go by `FOLLOW_MAX_MESSAGES` since the last full read.
-    /// Zero until the cap binds; reset only by a re-read, which replaces
-    /// the whole conversation.
-    capped: number;
-  }>(() => ({ path, messages: [], reread: null, window: null, pairings: {}, capped: 0 }));
-
-  // Computed DURING RENDER, never set from an effect: React's own
-  // "adjusting state when a prop changes" rule, and this file's.
-  const fresh = { path, messages: [], reread: null, window: null, pairings: {}, capped: 0 };
-  const state = acc.path === path ? acc : fresh;
-
-  /// Where the last read left off.
-  ///
-  /// A REF, not state, and this is the one thing here that must be:
-  /// the cursor is an INPUT to the next fetch, read inside `queryFn`
-  /// rather than rendered. Held in state it would be captured by the
-  /// closure at render time, so a poll that fired before React committed
-  /// the previous result would re-send a spent cursor -- and the case-5
-  /// fingerprint would then report a rewrite on a file nobody rewrote.
-  ///
-  /// Written only from inside `queryFn`, never during render. It is
-  /// discarded alongside the messages it indexes, in the same callback,
-  /// because a cursor is an offset into ONE file and carrying one across
-  /// a selection would read one transcript's history at another's offset.
-  const cursor = useRef<ClaudeFollowCursor | null>(null);
-  const cursorFor = useRef<string | null>(path);
-
-  /// Batched appends (#1150).
-  ///
-  /// Built once, in a lazy `useState` initialiser rather than assigned to
-  /// a ref during render: a burst of records during a busy tool loop
-  /// would otherwise be one full re-render of up to 200 messages each,
-  /// and the scheduler is injected so a test can flush deterministically
-  /// -- exactly what `coalesce.ts` exists for.
-  ///
-  /// It appends onto whatever the CURRENT accumulation is, and only when
-  /// the batch still belongs to the file it was read from: a batch in
-  /// flight when the selection changed belongs to the previous
-  /// transcript.
-  const [coalescer] = useState(() =>
-    createCoalescer<{ path: string | null; message: ClaudePreviewMessage }>((batch) => {
-      setAcc((prev) => {
-        const mine = batch.filter((b) => b.path === prev.path).map((b) => b.message);
-        if (mine.length === 0) return prev;
-        // Bounded here, where the conversation grows (#1474).
-        const kept = capFollow([...prev.messages, ...mine], prev.pairings);
-        return {
-          ...prev,
-          messages: kept.messages,
-          pairings: kept.pairings,
-          capped: prev.capped + kept.evicted,
-        };
-      });
-    }, schedule),
-  );
-  useEffect(
-    () =>
-      // Stopped rather than left dangling on unmount, so a batch in
-      // flight does not try to set state on a closed pane --
-      // `createCoalescer.stop`'s own contract.
-      () =>
-        coalescer.stop(),
-    [coalescer],
-  );
-
-  const query = useQuery<ClaudeFollow>({
-    // The cursor is deliberately NOT in the key. It changes on every
-    // poll, and a key that changed every poll would make each read a
-    // fresh cache entry -- unbounded growth, and `refetchInterval` would
-    // have nothing stable to tick against.
-    queryKey: ["claude-transcript-follow", path],
-    queryFn: async () => {
-      // A cursor belongs to ONE file. If the selection moved since it
-      // was stored, it is discarded here rather than sent -- reading a
-      // new transcript at the old one's offset would splice two
-      // conversations together and the fingerprint would report it as a
-      // rewrite, which it is not.
-      const sending = cursorFor.current === path ? cursor.current : null;
-      const got = await claudeTranscriptFollow(path as string, sending);
-      cursor.current = got.cursor;
-      cursorFor.current = path;
-      const win = {
-        truncated: got.preview.truncated,
-        file_bytes: got.file_bytes,
-        bytes_read: got.bytes_read,
-        non_conversation_records: got.preview.non_conversation_records,
-        unparseable_records: got.preview.unparseable_records,
-      };
-      if (got.reread !== null) {
-        // A re-read REPLACES. Anything the coalescer is still holding
-        // belongs to the history that no longer exists, so it is dropped
-        // rather than appended after the replacement -- which is the
-        // whole point of the fifth case: appending here would splice new
-        // content onto a history that is gone.
-        coalescer.stop();
-        const at = Date.now();
-        // Re-based onto a fresh accumulation when the path moved under
-        // the request: the answer is still for `path`, so it is kept --
-        // but it must not be merged into the PREVIOUS file's messages.
-        //
-        // The one place pairings and truncation are REPLACED rather than
-        // merged: a full re-read is the only answer that can say "not
-        // truncated" about the whole window.
-        const kept = capFollow(got.preview.messages, got.preview.pairings);
-        setAcc({
-          path,
-          messages: kept.messages,
-          reread: { why: got.reread as ClaudeReread, at },
-          window: win,
-          pairings: kept.pairings,
-          capped: kept.evicted,
-        });
-      } else {
-        // An append MERGES (#1474). Its `pairings` cover only the new
-        // messages -- `{}` on an idle poll -- and its `truncated` is
-        // `false` because an append reads to the end from the cursor.
-        // Replacing with either rewrote what the earlier reads had
-        // established: every earlier call turned "unanswered", and a
-        // tail of a 76 MB file was labelled as the whole of it.
-        setAcc((prev) =>
-          prev.path === path
-            ? {
-                ...prev,
-                window: { ...win, truncated: (prev.window?.truncated ?? false) || win.truncated },
-                pairings: mergePairings(prev.pairings, got.preview.pairings),
-              }
-            : {
-                path,
-                messages: [],
-                reread: null,
-                window: win,
-                pairings: got.preview.pairings,
-                capped: 0,
-              },
-        );
-        for (const message of got.preview.messages) coalescer.push({ path, message });
-      }
-      return got;
-    },
-    enabled: on,
-    refetchInterval: on ? FOLLOW_POLL_MS : false,
-    // Shorter than the interval so each tick is a real read rather than
-    // a cache hit, the same relationship `useClaudeSessions` sets.
-    staleTime: FOLLOW_POLL_MS - 500,
-    // `retry: false`, this feature's rule: the failures a transcript read
-    // has -- gone, unreadable, refused path -- are settled refusals, and
-    // three silent re-reads only delay the pane saying the follow
-    // stopped.
-    retry: false,
-  });
-
-  /// When we last actually heard from disk.
-  ///
-  /// `dataUpdatedAt`, not `Date.now()`: it advances once per successful
-  /// read and stops dead when the follow does, which is exactly the edge
-  /// the honesty requirement asks for. A clock read during render would
-  /// tick on forever and make a stopped follow look live.
-  const lastReadAt = query.dataUpdatedAt;
-
-  /// Three states, never two. See the hook's docs.
-  const following: "following" | "idle" | "stopped" = !on
-    ? "stopped"
-    : query.isError
-      ? "stopped"
-      : // Read, and the file had not changed: the session is idle. Only
-        // once a read has actually succeeded -- before that we are
-        // starting, not idle.
-        query.data !== undefined && query.data.bytes_read === 0 && query.data.reread === null
-        ? "idle"
-        : "following";
-
-  return {
-    messages: state.messages,
-    following,
-    lastReadAt,
-    reread: state.reread,
-    window: state.window,
-    pairings: state.pairings,
-    capped: state.capped,
-    isError: query.isError,
-    error: query.error,
-    isLoading: query.isLoading,
-    pollMs: FOLLOW_POLL_MS,
-  };
 }
 
 /// How often the Claude Code overview re-reads.

@@ -343,20 +343,10 @@ const ROWS: Row[] = [
   row(api.claudeSubagentRollup, ["s1"], "claude_subagent_rollup", { sessionId: "s1" }),
   row(api.claudeSessionEvents, ["s1"], "claude_session_events", { sessionId: "s1" }),
   row(api.claudeEventProfile, [], "claude_event_profile"),
-  row(api.claudeTranscriptTail, [path], "claude_transcript_tail", { path }),
-  // #1208. `cursor` rides as an explicit `null` on the first poll rather
-  // than being omitted: the Rust argument is an `Option`, and a key that
-  // is present-and-null and a key that is absent must not become two
-  // different wire shapes for one call.
-  row(api.claudeTranscriptFollow, [path, null], "claude_transcript_follow", {
-    path,
-    cursor: null,
-  }),
-  // #1475. Both resolve `path` through `claude_transcript_path` like the
-  // two rows above. The block-text fetch addresses a block by its
+  // #1475. Resolves `path` through `claude_transcript_path` like every
+  // transcript read. The block-text fetch addresses a block by its
   // record's id and its index, camelCased on the wire as every
   // multi-word argument is.
-  row(api.claudeTranscriptMessages, [path], "claude_transcript_messages", { path }),
   // #1220 adds the record's offset as a hint (`null` to scan).
   row(api.claudeTranscriptBlockText, [path, "u1", 2, false, 4096], "claude_transcript_block_text", {
     path,
@@ -509,9 +499,12 @@ describe("tauri.ts wrappers through the transport", () => {
   /// the default shape is the rows above, byte for byte, and the key
   /// appears only on the call that means it.
   it("asks the desktop to reveal only when the caller says so", async () => {
-    await api.claudeTranscriptMessages("/p.jsonl", true);
-    expect(local.call).toHaveBeenLastCalledWith("claude_transcript_messages", {
+    await api.claudeTranscriptPage("/p.jsonl", { kind: "end" }, "before", null, true);
+    expect(local.call).toHaveBeenLastCalledWith("claude_transcript_page", {
       path: "/p.jsonl",
+      anchor: { kind: "end" },
+      direction: "before",
+      limit: null,
       reveal: true,
     });
     await api.claudeTranscriptBlockText("/p.jsonl", "u1", 2, true);

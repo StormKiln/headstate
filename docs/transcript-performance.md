@@ -22,7 +22,7 @@ the LAN.
 |---|---|---|---|---|
 | B1 | Open to first paint at the newest message | desktop < 300 ms, phone < 800 ms on the LAN | Browser harness: from the selection that opens a fixture until the newest message has painted (Element Timing `renderTime` on the newest message, else the second frame after it is in the DOM). Phone: Instruments, from the tap to the first frame showing the newest message. | **Desktop, Chromium: 43 to 105 ms** across every fixture page (see "Browser harness, measured"). Not yet confirmed in WKWebView. Phone: not measured. |
 | B2 | Scrolling | no long task > 50 ms while scrolling; 60 fps on desktop and phone | Browser harness: a `longtask` PerformanceObserver during a scripted scroll from the newest message to the oldest and back, plus frame intervals counted with `requestAnimationFrame`. Phone: Instruments Time Profiler and the Animation Hitches instrument during a manual scroll. | **Desktop, Chromium: no long task while scrolling** on any page; frame p95 16.7 to 16.8 ms. The OPEN of a 400-message page is one 85 to 88 ms task (see "Browser harness, measured"). Phone: not measured. |
-| B3 | Resident transcript memory | desktop < 50 MB, phone < 25 MB, **whatever the transcript's size** | Browser harness: JS heap after a forced GC (CDP `HeapProfiler.collectGarbage`, then `Runtime.getHeapUsage`), taken after opening and after the full scroll, on every fixture page. Rust: bytes each read holds (`bytes_read`), asserted in every `cargo test`. Phone: Instruments Allocations. | **Desktop, Chromium: at most 9.6 MB** after a full scroll, the 70 MB fixture's page included. Rust side: **bounded at any position** by the paged read (#1220): 260 to 268 KiB per page at the start, middle and end of every fixture. `follow`'s catch-up is still unbounded, and the viewer should page instead of using it (see Findings). Phone: not measured. |
+| B3 | Resident transcript memory | desktop < 50 MB, phone < 25 MB, **whatever the transcript's size** | Browser harness: JS heap after a forced GC (CDP `HeapProfiler.collectGarbage`, then `Runtime.getHeapUsage`), taken after opening and after the full scroll, on every fixture page. Rust: bytes each read holds (`bytes_read`), asserted in every `cargo test`. Phone: Instruments Allocations. | **Desktop, Chromium: at most 9.6 MB** after a full scroll, the 70 MB fixture's page included. Rust side: **bounded at any position** by the paged read (#1220): 260 to 268 KiB per page at the start, middle and end of every fixture. `follow`'s unbounded catch-up is gone (#1514): the viewer pages instead. Phone: not measured. |
 | B4 | Live follow | idle follow costs no main-thread work beyond one stat per tick; growth costs O(new bytes) | Rust: bytes and time of `follow` on an idle tick and on an append. Browser harness: zero long tasks and no React commit during 30 s of idle follow on an open fixture (React Profiler `onRender` count). | **Idle tick: 128 KiB and ~0.09 ms**, off the main thread. It is O(1), but twice what `preview.rs` documents (see Findings). Viewer side: not measured. |
 | B5 | Phone bandwidth | a page < 150 KB compressed | Size of the page payload as sent over the remote surface, compressed with the codec the compression issue (#1478) picks. | **Uncompressed: 99 to 224 KiB.** Compressed: not yet measurable, because the generated text compresses far better than real text (see Fixtures). The bench prints gzip sizes, but only as a floor, never as a pass. |
 
@@ -33,11 +33,13 @@ B1 to B4 are what the viewer is held to. The Rust read budgets below are
 | Read | Byte bound (every `cargo test`) | Time budget (release, `make bench-transcript`) |
 |---|---|---|
 | `tail` at the end | ≤ `TAIL_BYTES` (256 KiB) | < 50 ms |
-| `follow`, first read | ≤ 256 KiB + `FINGERPRINT_BYTES` (64 KiB) | < 50 ms |
-| `follow`, idle tick | ≤ 2 × 64 KiB | < 5 ms |
-| `follow`, catch-up from offset 0 | none: reported only | none: reported only |
 | paged read (#1220), at the start, middle or end | ≤ `PAGE_READ_BOUND` (716 KiB); measured 260 to 268 KiB | < 50 ms |
 | position index build (#1220), worker thread | per record, not per file | reported only: no request waits on it |
+
+`preview::follow` (first read, idle tick, catch-up from offset 0) was in
+this table until #1514 retired it with the old preview pane. The viewer
+follows through the paged read; the `follow` figures below are the record
+of what it cost when they were taken.
 
 ## Fixtures
 
@@ -221,7 +223,7 @@ How it is built:
 
 - **Payloads.** `read_bench::transcript_message_payloads` (ignored; a no-op
   without `HEADSTATE_TRANSCRIPT_PAYLOADS_OUT`) writes, per fixture, the
-  `TranscriptPage` exactly as `claude_transcript_messages` returns it
+  `TranscriptPage` exactly as `transcript_model::tail` reads it
   (`<fixture>.messages-tail.json`) and the whole file parsed as one page
   (`<fixture>.messages-whole.json`). The read model caps a page at its newest
   400 messages (`MAX_MESSAGES`), so "whole" is the fullest page a read can hand
@@ -230,10 +232,10 @@ How it is built:
   against `harness/transcript.html` into `dist-harness/`; the app bundle never
   includes it. The page (`src/harness/transcriptBench.tsx`) mounts
   `DesktopTranscript` -- the component both desktop hosts render -- behind an
-  "Open" button, through the real read path (`useClaudeTranscriptMessages`
-  calling `claude_transcript_messages`).
-- **Backend.** No Tauri process. `mockIPC` answers `claude_transcript_messages`
-  with the fixture page, which the page fetched BEFORE "Open" and parses
+  "Open" button, through the real read path (`useClaudeTranscriptLive`
+  calling `claude_transcript_page`).
+- **Backend.** No Tauri process. `mockIPC` answers `claude_transcript_page`
+  with the fixture page as one window, which the page fetched BEFORE "Open" and parses
   inside the answer, so B1 covers receive, render and paint but not the
   harness's own network. Any other command is refused, not answered falsely.
 - **Driver.** `scripts/transcript-browser-bench.mjs` serves `dist-harness` and

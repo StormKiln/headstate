@@ -499,7 +499,7 @@ async fn transcript_text_reaches_a_phone_masked_and_only_as_allowed() {
 
     // Default: masked, and the phone is told reveal would not work.
     let masked = desktop
-        .call(&phone, "claude_transcript_tail", &[], Some(body))
+        .call(&phone, "claude_transcript_page", &[], Some(body))
         .await;
     assert_eq!(masked.status, 200, "{}", masked.body);
     assert!(!masked.body.contains(SECRET), "{}", masked.body);
@@ -510,7 +510,7 @@ async fn transcript_text_reaches_a_phone_masked_and_only_as_allowed() {
     // Reveal without the desktop's allowance: refused, nothing run.
     let before = desktop.host.calls.lock().unwrap().len();
     let refused = desktop
-        .call(&phone, "claude_transcript_tail", &[], Some(reveal))
+        .call(&phone, "claude_transcript_page", &[], Some(reveal))
         .await;
     assert_eq!(refused.status, 403);
     assert!(
@@ -527,7 +527,7 @@ async fn transcript_text_reaches_a_phone_masked_and_only_as_allowed() {
         .set_transcript_access(&desktop.conn, id, true, true)
         .unwrap();
     let revealed = desktop
-        .call(&phone, "claude_transcript_tail", &[], Some(reveal))
+        .call(&phone, "claude_transcript_page", &[], Some(reveal))
         .await;
     assert_eq!(revealed.status, 200, "{}", revealed.body);
     assert!(revealed.body.contains(SECRET));
@@ -541,7 +541,7 @@ async fn transcript_text_reaches_a_phone_masked_and_only_as_allowed() {
         .unwrap();
     let before = desktop.host.calls.lock().unwrap().len();
     let off = desktop
-        .call(&phone, "claude_transcript_follow", &[], Some(body))
+        .call(&phone, "claude_transcript_block_text", &[], Some(body))
         .await;
     assert_eq!(off.status, 403);
     assert!(
@@ -979,10 +979,12 @@ fn tool_heavy_transcript(rounds: usize) -> String {
     out
 }
 
-/// A host that answers `claude_transcript_tail` the way
-/// `commands::claude_transcript_tail` does, by running the real
-/// `preview::tail`. It reads a fixture rather than a path under
-/// `~/.claude/projects`, which is where the command resolves its path.
+/// A host that answers `claude_transcript_page` the way
+/// `commands::claude_transcript_page` does for the viewer's first page
+/// (the end, backwards), by running the real paged read. It reads a
+/// fixture rather than a path under `~/.claude/projects`, which is where
+/// the command resolves its path, and it skips the position index so two
+/// calls in one test are answered from the same basis.
 struct TranscriptHost {
     path: std::path::PathBuf,
 }
@@ -996,12 +998,25 @@ impl CommandHost for TranscriptHost {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, RemoteError>> + Send + 'a>>
     {
         Box::pin(async move {
-            assert_eq!(command, "claude_transcript_tail");
-            let page = crate::claude::preview::tail(&self.path).expect("the fixture reads");
-            Ok(serde_json::to_value(page).unwrap())
+            assert_eq!(command, "claude_transcript_page");
+            Ok(serde_json::to_value(end_page(&self.path)).unwrap())
         })
     }
     fn notify_destructive(&self, _: &str, _: &str) {}
+}
+
+/// The viewer's opening page of `path`: the end, backwards, with no
+/// position index.
+fn end_page(path: &std::path::Path) -> crate::claude::transcript_page::TranscriptWindow {
+    use crate::claude::transcript_page::{read_page, IndexUse, PageAnchor, PageDirection};
+    read_page(
+        path,
+        &PageAnchor::End,
+        PageDirection::Before,
+        None,
+        IndexUse::None,
+    )
+    .expect("the fixture reads")
 }
 
 /// One response as the bytes that crossed the wire: the status, the
@@ -1122,7 +1137,8 @@ async fn transcript_desktop() -> (Desktop<TranscriptHost>, Phone, tempfile::Temp
     (desktop, phone, dir)
 }
 
-const TAIL_ARGS: &str = r#"{"path":"session.jsonl"}"#;
+const PAGE_ARGS: &str =
+    r#"{"path":"session.jsonl","anchor":{"kind":"end"},"direction":"before","limit":null}"#;
 
 /// The least this fixture's page must shrink by. It is a regression
 /// guard, not a forecast. The fixture measured 7.2x when #1478 landed,
@@ -1146,9 +1162,9 @@ async fn a_transcript_page_crosses_gzipped_and_decodes_to_the_same_page() {
         &desktop,
         &phone,
         "POST",
-        "/v1/call/claude_transcript_tail",
+        "/v1/call/claude_transcript_page",
         &[("Accept-Encoding", "gzip")],
-        TAIL_ARGS,
+        PAGE_ARGS,
     )
     .await;
     assert_eq!(gz.status, 200);
@@ -1158,21 +1174,18 @@ async fn a_transcript_page_crosses_gzipped_and_decodes_to_the_same_page() {
         &desktop,
         &phone,
         "POST",
-        "/v1/call/claude_transcript_tail",
+        "/v1/call/claude_transcript_page",
         &[],
-        TAIL_ARGS,
+        PAGE_ARGS,
     )
     .await;
     assert_eq!(plain.status, 200);
 
     // The same page both ways, and the page the command produced -- as a
     // phone receives it, through #1488's masking at the remote boundary.
-    let produced = serde_json::to_value(
-        crate::claude::preview::tail(&desktop.host.path).expect("the fixture reads"),
-    )
-    .unwrap();
+    let produced = serde_json::to_value(end_page(&desktop.host.path)).unwrap();
     let (_, plan) = crate::remote::privacy::admit(
-        "claude_transcript_tail",
+        "claude_transcript_page",
         json!({}),
         crate::remote::privacy::Access {
             transcripts: true,
@@ -1180,12 +1193,16 @@ async fn a_transcript_page_crosses_gzipped_and_decodes_to_the_same_page() {
         },
     )
     .unwrap();
-    let expected = plan.finish("claude_transcript_tail", produced);
+    let expected = plan.finish("claude_transcript_page", produced);
     assert_eq!(gz.json(), expected);
     assert_eq!(plain.json(), expected);
-    let messages = expected["messages"].as_array().map_or(0, Vec::len);
+    // A FULL page: its byte window bound before the file's start did, so
+    // there is more above it. The model groups a call with its result, so
+    // the count is lower than the records read; 71 when this was written.
+    let messages = expected["page"]["messages"].as_array().map_or(0, Vec::len);
+    assert_eq!(expected["page"]["truncated"], true, "the page is not full");
     assert!(
-        messages >= 100,
+        messages >= 50,
         "the fixture should fill a real page; it produced {messages} messages"
     );
 
@@ -1230,7 +1247,7 @@ async fn a_reveal_answer_is_never_compressed() {
         &desktop,
         &phone,
         "POST",
-        "/v1/call/claude_transcript_tail",
+        "/v1/call/claude_transcript_page",
         &gzip,
         r#"{"path":"p"}"#,
     )
@@ -1242,7 +1259,7 @@ async fn a_reveal_answer_is_never_compressed() {
         &desktop,
         &phone,
         "POST",
-        "/v1/call/claude_transcript_tail",
+        "/v1/call/claude_transcript_page",
         &gzip,
         r#"{"path":"p","reveal":true}"#,
     )
@@ -1266,15 +1283,17 @@ async fn a_client_that_does_not_ask_for_gzip_gets_plain_json() {
         &desktop,
         &phone,
         "POST",
-        "/v1/call/claude_transcript_tail",
+        "/v1/call/claude_transcript_page",
         &[],
-        TAIL_ARGS,
+        PAGE_ARGS,
     )
     .await;
     assert_eq!(reply.status, 200);
     assert_eq!(reply.header("content-encoding"), None);
     let page: Value = serde_json::from_slice(&reply.body).expect("plain JSON on the wire");
-    assert!(page["messages"].as_array().is_some_and(|m| !m.is_empty()));
+    assert!(page["page"]["messages"]
+        .as_array()
+        .is_some_and(|m| !m.is_empty()));
 
     desktop.handle.stop().await;
 }
