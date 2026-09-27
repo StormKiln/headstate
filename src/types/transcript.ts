@@ -105,6 +105,23 @@ export interface TranscriptToolOutput {
   change: ClaudeFileChange | null;
   images: TranscriptImage[];
   subagent: TranscriptSubagent | null;
+  /// Set when this is a `TaskCreate`'s or `TaskUpdate`'s output (#1504).
+  task: TranscriptTaskResult | null;
+}
+
+/** @public */
+/// What a task tool's result recorded (#1504). Mirrors
+/// `claude::transcript_model::TranscriptTaskResult`.
+///
+/// The only place a created task's id is written. `success: false` can
+/// arrive with `is_error: null`, so a refused update is read from
+/// `success`, not only from `is_error`. `null` everywhere is "the record
+/// did not say".
+export interface TranscriptTaskResult {
+  task_id: string | null;
+  success: boolean | null;
+  status_from: string | null;
+  status_to: string | null;
 }
 
 /// One content block. `index` is the block's position in the record it

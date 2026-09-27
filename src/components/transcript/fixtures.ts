@@ -20,6 +20,7 @@ export function output(over: Partial<TranscriptToolOutput> = {}): TranscriptTool
     change: null,
     images: [],
     subagent: null,
+    task: null,
     ...over,
   };
 }

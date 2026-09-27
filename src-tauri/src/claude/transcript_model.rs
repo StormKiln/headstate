@@ -298,6 +298,30 @@ pub struct TranscriptToolOutput {
     pub images: Vec<TranscriptImage>,
     /// Set when this output is a subagent's.
     pub subagent: Option<TranscriptSubagent>,
+    /// Set when this output is a `TaskCreate`'s or `TaskUpdate`'s (#1504).
+    pub task: Option<TranscriptTaskResult>,
+}
+
+/// What a task tool's result recorded (#1504).
+///
+/// Read from the record's `toolUseResult`, because that is the only place
+/// a created task's id is written: the `TaskCreate` input carries none.
+/// Measured on this machine's corpus: 52 of 52 create results carry
+/// `task: {id, subject}`; 105 of 107 update results carry `taskId`,
+/// `success`, `updatedFields` and `statusChange: {from, to}`.
+///
+/// `success` matters on its own: a "Task not found" update was recorded
+/// with `success: false` and NO `is_error`, so `is_error` alone would
+/// read a refused update as applied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptTaskResult {
+    /// `task.id` on a create, `taskId` on an update. Verbatim.
+    pub task_id: Option<String>,
+    /// `None` when the record did not say, which is not `true`.
+    pub success: Option<bool>,
+    /// `statusChange.from` / `.to`, when the update changed the status.
+    pub status_from: Option<String>,
+    pub status_to: Option<String>,
 }
 
 /// One content block.
@@ -1167,6 +1191,7 @@ fn block(index: usize, v: &serde_json::Value, ctx: &Ctx, message_id: &str) -> Tr
                 change: None,
                 images,
                 subagent: None,
+                task: None,
             })
         }
         "image" => TranscriptBlock::Image {
@@ -1213,12 +1238,35 @@ fn attach_record_result(rec: &serde_json::Value, blocks: &mut [TranscriptBlock],
             agent_type: str_of(tur, "agentType"),
         });
     }
+    out.task = task_result(tur);
     if let Some(dims) = tur.get("file").and_then(|f| f.get("dimensions")) {
         if let Some(img) = out.images.first_mut() {
             img.width = u64_of(dims, "originalWidth");
             img.height = u64_of(dims, "originalHeight");
         }
     }
+}
+
+/// A task tool's recorded result, when `toolUseResult` has either
+/// measured shape: a create's `task` object, or an update's `taskId`
+/// beside `updatedFields`. Both keys are required for an update so that
+/// another tool's result carrying a `taskId` is not read as a task
+/// change.
+fn task_result(tur: &serde_json::Value) -> Option<TranscriptTaskResult> {
+    let change = tur.get("statusChange");
+    let (task_id, is_task) = if let Some(task) = tur.get("task").filter(|t| t.is_object()) {
+        (preview::task_id(task.get("id")), true)
+    } else if tur.get("updatedFields").is_some() && tur.get("taskId").is_some() {
+        (preview::task_id(tur.get("taskId")), true)
+    } else {
+        (None, false)
+    };
+    is_task.then(|| TranscriptTaskResult {
+        task_id,
+        success: tur.get("success").and_then(serde_json::Value::as_bool),
+        status_from: change.and_then(|c| str_of(c, "from")),
+        status_to: change.and_then(|c| str_of(c, "to")),
+    })
 }
 
 /// Where a subagent's transcript lives, relative to its parent's.
@@ -1959,6 +2007,74 @@ mod tests {
             matches!(&page.messages[0].blocks[0], TranscriptBlock::ToolResult(o) if o.subagent.is_none())
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1504: a task tool's result carries the id a create was given --
+    /// its input has none -- and an update's recorded success and
+    /// status change. `success: false` with no `is_error` is kept as
+    /// said: it is the only sign a refused update was refused.
+    #[test]
+    fn task_results_carry_the_id_and_the_recorded_outcome() {
+        let c = assistant(
+            "a1",
+            "model-a",
+            serde_json::json!([
+                {"type": "tool_use", "id": "t1", "name": "TaskCreate",
+                    "input": {"subject": "Write it", "description": "d"}},
+                {"type": "tool_use", "id": "t2", "name": "TaskUpdate",
+                    "input": {"taskId": "1", "status": "in_progress"}},
+                {"type": "tool_use", "id": "t3", "name": "TaskUpdate",
+                    "input": {"taskId": "9", "status": "completed"}}
+            ]),
+        );
+        let mut r1 = result("r1", "t1");
+        r1["toolUseResult"] = serde_json::json!({"task": {"id": "1", "subject": "Write it"}});
+        let mut r2 = result("r2", "t2");
+        r2["toolUseResult"] = serde_json::json!({"success": true, "taskId": "1",
+            "updatedFields": ["status"], "statusChange": {"from": "pending", "to": "in_progress"},
+            "extra": {"unknown": 1}});
+        let mut r3 = result("r3", "t3");
+        r3["toolUseResult"] = serde_json::json!({"success": false, "taskId": "9",
+            "updatedFields": [], "error": "Task not found"});
+        // Another tool's result naming a task id is not a task change.
+        let mut r4 = result("r4", "t4");
+        r4["toolUseResult"] = serde_json::json!({"taskId": "b1", "status": "running"});
+        let page = parse(&body(&[c, r1, r2, r3, r4]), WindowStart::FileStart, None);
+        let outs: Vec<&TranscriptToolOutput> = page.messages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                TranscriptBlock::ToolCall {
+                    result: Some(o), ..
+                } => Some(o),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outs.len(), 3, "{:#?}", page.messages);
+        assert_eq!(
+            outs[0].task,
+            Some(TranscriptTaskResult {
+                task_id: Some("1".into()),
+                success: None,
+                status_from: None,
+                status_to: None,
+            })
+        );
+        assert_eq!(
+            outs[1].task,
+            Some(TranscriptTaskResult {
+                task_id: Some("1".into()),
+                success: Some(true),
+                status_from: Some("pending".into()),
+                status_to: Some("in_progress".into()),
+            })
+        );
+        assert_eq!(outs[2].task.as_ref().unwrap().success, Some(false));
+        assert_eq!(outs[2].is_error, None);
+        let TranscriptBlock::ToolResult(o4) = &page.messages.last().unwrap().blocks[0] else {
+            panic!("{:#?}", page.messages)
+        };
+        assert!(o4.task.is_none());
     }
 
     /// An agent id that could walk out of the directory is refused.

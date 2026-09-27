@@ -18,6 +18,7 @@ import {
   searchSummary,
   type CallState,
 } from "./summary";
+import { taskCallRefused, taskIdOfCall, taskStatusWords, type TaskListState } from "./tasks";
 import type { LoadFullText, OpenSubagent, ToolCallBlock, ToolVariant } from "./types";
 
 /// One tool call, rendered the way Claude Code shows it (#1483).
@@ -39,6 +40,7 @@ export function ToolCall({
   durationMs = null,
   onLoadFullText,
   onOpenSubagent,
+  tasks,
 }: {
   call: ToolCallBlock;
   variant: ToolVariant;
@@ -47,10 +49,13 @@ export function ToolCall({
   durationMs?: number | null;
   onLoadFullText?: LoadFullText;
   onOpenSubagent?: OpenSubagent;
+  /// The session's task list (`deriveTaskChecklist`), so a `TaskUpdate`
+  /// row -- which names its task only by id -- can say which task.
+  tasks?: TaskListState;
 }) {
   const state = callState(call, liveness);
   const result = state.state === "paired" ? state.result : null;
-  const ctx: Ctx = { call, result, variant, onLoadFullText, onOpenSubagent };
+  const ctx: Ctx = { call, result, variant, onLoadFullText, onOpenSubagent, tasks };
   const view = render(call.args, ctx);
   const failed = result?.is_error === true;
 
@@ -100,6 +105,7 @@ interface Ctx {
   variant: ToolVariant;
   onLoadFullText?: LoadFullText;
   onOpenSubagent?: OpenSubagent;
+  tasks?: TaskListState;
 }
 
 interface View {
@@ -131,6 +137,11 @@ function render(args: ClaudeToolArgs, ctx: Ctx): View {
     case "web_fetch":
     case "web_search":
       return web(args, ctx);
+    case "task_create":
+    case "task_update":
+    case "task_get":
+    case "task_list":
+      return taskCall(args, ctx);
     case "other":
     case "none":
       return other(args, ctx);
@@ -515,6 +526,96 @@ function todos(args: Extract<ClaudeToolArgs, { tool: "todo_write" }>, ctx: Ctx):
       </>
     ),
   };
+}
+
+/// A task-list call as one compact row (#1504): "#3 → in progress ·
+/// Write the parser". An update names its task only by id, so the name
+/// comes from the session's task list when the host passed one.
+function taskCall(
+  args: Extract<ClaudeToolArgs, { tool: "task_create" | "task_update" | "task_get" | "task_list" }>,
+  ctx: Ctx,
+): View {
+  const r = ctx.result;
+  const id = taskIdOfCall(ctx.call);
+  const refused = taskCallRefused(ctx.call);
+  const known = id !== null ? ctx.tasks?.tasks.find((t) => t.id === id) : undefined;
+  const ref = id !== null ? `#${id}` : "task";
+  // A refusal recorded only as `success: false` says so in words: it
+  // carried no error flag, so "error" would overstate what was recorded.
+  const status: ReactNode = refused ? (
+    <Chip tone="error">{r?.is_error === true ? "error" : "not applied"}</Chip>
+  ) : null;
+  const errorBody = refused ? <ErrorText ctx={ctx} /> : null;
+
+  switch (args.tool) {
+    case "task_create":
+      return {
+        title: "TaskCreate",
+        summary: `${id !== null ? `#${id} ` : ""}${args.subject}${args.truncated ? " …" : ""}`,
+        status,
+        body: (
+          <>
+            {args.description ? (
+              <Fold
+                label="Description"
+                count={countLabel(linesOf(args.description).length, "line", args.truncated)}
+                variant={ctx.variant}
+                title={args.subject}
+              >
+                <ProseOutput text={args.description} />
+              </Fold>
+            ) : null}
+            {errorBody}
+          </>
+        ),
+      };
+    case "task_update": {
+      const name = args.subject ?? known?.subject ?? null;
+      const extra = args.fields.filter(
+        (f) => f !== "status" && f !== "subject" && f !== "activeForm",
+      );
+      const change =
+        args.status !== null
+          ? `→ ${taskStatusWords(args.status)}`
+          : args.subject !== null
+            ? "renamed"
+            : "updated";
+      return {
+        title: "TaskUpdate",
+        summary: `${ref} ${change}${name !== null ? ` · ${name}` : ""}`,
+        status,
+        body: (
+          <>
+            {args.task_id === null ? (
+              <p className="text-[11px]" style={{ color: palette.muted }}>
+                No task was named.
+              </p>
+            ) : null}
+            {extra.length > 0 ? (
+              <p className="text-[11px]" style={{ color: palette.muted }}>
+                Also set: {extra.join(", ")}
+              </p>
+            ) : null}
+            {errorBody}
+          </>
+        ),
+      };
+    }
+    case "task_get":
+      return {
+        title: "TaskGet",
+        summary: `${ref}${known?.subject ? ` · ${known.subject}` : ""}`,
+        status,
+        body: refused ? errorBody : <ResultFold ctx={ctx} label="Task" title={ref} />,
+      };
+    case "task_list":
+      return {
+        title: "TaskList",
+        summary: null,
+        status,
+        body: refused ? errorBody : <ResultFold ctx={ctx} label="Tasks" title="Tasks" />,
+      };
+  }
 }
 
 function web(args: Extract<ClaudeToolArgs, { tool: "web_fetch" | "web_search" }>, ctx: Ctx): View {

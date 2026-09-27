@@ -4024,6 +4024,31 @@ function ToolArguments({ args }: { args: ClaudeToolArgs }) {
           {clipped(args.truncated)}
         </p>
       );
+    // #1504: the task-list tools. The created id is in the result, not
+    // the call, so a create is named by its subject.
+    case "task_create":
+      return (
+        <p className="mt-0.5 text-[11px] text-[#8b949e]">
+          {args.subject}
+          {clipped(args.truncated)}
+        </p>
+      );
+    case "task_update":
+      return (
+        <p className="mt-0.5 text-[11px] text-[#8b949e]">
+          {args.task_id !== null ? `#${args.task_id}` : "No task named"}
+          {args.status !== null ? ` → ${args.status.replace(/_/g, " ")}` : ""}
+          {args.subject !== null ? ` · ${args.subject}` : ""}
+        </p>
+      );
+    case "task_get":
+      return (
+        <p className="mt-0.5 text-[11px] text-[#8b949e]">
+          {args.task_id !== null ? `#${args.task_id}` : "No task named"}
+        </p>
+      );
+    case "task_list":
+      return null;
     case "other":
       // NAMED, never dropped and never dumped. The keys say whether
       // Headstate simply does not know this tool yet; the values are the
