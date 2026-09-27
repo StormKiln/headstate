@@ -125,9 +125,20 @@ pub(crate) struct Written {
 }
 
 /// Write `fixture` into `dir` as `<name>.jsonl`.
+///
+/// **Refuses to overwrite an existing file** (`create_new`). The benches
+/// accept an output directory from the environment and delete what this
+/// wrote when they finish, so a writer that truncated an existing file
+/// would let a mistyped directory destroy real data -- and a real
+/// transcript was deleted by a bench's cleanup on 2026-09-27. With
+/// `create_new`, every file a caller later removes is one this function
+/// created.
 pub(crate) fn write(fixture: Fixture, dir: &Path) -> std::io::Result<Written> {
     let path = dir.join(format!("{}.jsonl", fixture.name));
-    let file = std::fs::File::create(&path)?;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
     let mut g = Gen::new(BufWriter::with_capacity(1 << 20, file));
     match fixture.shape {
         Shape::Messages(n) => {
@@ -535,6 +546,23 @@ mod tests {
         let wb = write(MESSAGES_1K, b.path()).unwrap();
         assert_eq!(wa.bytes, wb.bytes);
         assert_eq!(digest(&wa.path), digest(&wb.path));
+    }
+
+    /// The writer never touches a file it did not create: a file already
+    /// at the fixture's path is refused and left byte-for-byte intact.
+    ///
+    /// This is what keeps a bench's cleanup (`remove_file` on what was
+    /// written) from ever reaching real data through a mistyped output
+    /// directory. Sabotaged by going back to `File::create`: this fails.
+    #[test]
+    fn the_writer_refuses_to_overwrite_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join(format!("{}.jsonl", MESSAGES_1K.name));
+        std::fs::write(&existing, b"precious\n").unwrap();
+
+        let err = write(MESSAGES_1K, dir.path()).expect_err("must refuse");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&existing).unwrap(), b"precious\n");
     }
 
     /// The counts the generator reports are the file's, and every line is
