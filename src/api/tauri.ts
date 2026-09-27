@@ -494,8 +494,11 @@ export interface RemovalOutcome {
 /// Remove several worktrees, each safety-checked independently at delete
 /// time. Resolves with an outcome per worktree rather than throwing on
 /// the first refusal: partial failure is the normal case.
-export const removeWorktrees = (repoPath: string, worktreePaths: string[]) =>
-  call<RemovalOutcome[]>("remove_worktrees", { repoPath, worktreePaths });
+///
+/// `runId` is echoed on every `worktree-removal-progress` frame, so the
+/// caller can tell its own frames from an overlapping run's (#1544).
+export const removeWorktrees = (repoPath: string, worktreePaths: string[], runId: number | null) =>
+  call<RemovalOutcome[]>("remove_worktrees", { repoPath, worktreePaths, runId });
 
 /// The newest published release, or null when this build is current.
 ///

@@ -2490,6 +2490,61 @@ pub fn docker_start() -> Result<(), String> {
     crate::docker::start_engine()
 }
 
+/// One `worktree-removal-progress` frame: the `done`th of `total`
+/// removals has finished, and whether it removed the worktree.
+///
+/// # Which row, without a path (#1544)
+///
+/// The list used to change only when the whole batch returned, so a
+/// hundred-row removal showed an unchanged list for 30 seconds. Saying
+/// which row went needs a join key, and the obvious one -- the path --
+/// is exactly what this event must not carry: it is on the remote
+/// allowlist and forwarded to the phone, and a progress event is not a
+/// place to leak what the user is working on.
+///
+/// So the key is the INDEX. `remove_worktrees_with_progress` reports in
+/// the order of the paths it was given, so frame `done` is
+/// `worktree_paths[done - 1]` -- a list the calling webview already
+/// holds, because it sent it. A local-only Tauri `Channel` was the other
+/// option and was rejected: removal is offered on the phone
+/// (`remove_worktrees` is dispatched remotely), and a `Channel` cannot
+/// cross the remote transport, so the phone would have kept the bug.
+///
+/// `run` is the caller's own token, echoed back unchanged. The event is
+/// app-global and two removals can overlap -- one from the desktop, one
+/// from the phone -- and an index is meaningless against the other
+/// run's list: mapped there, it would drop a row that is still on disk.
+/// A number, never a string, so it cannot carry anything but a number.
+/// `None` for a caller that sent none; such a frame names no run, and a
+/// listener must not map it onto its own.
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeRemovalFrame {
+    pub run: Option<u64>,
+    pub done: usize,
+    pub total: usize,
+    pub removed: bool,
+}
+
+impl WorktreeRemovalFrame {
+    /// The frame for one finished removal. The ONLY place a frame is
+    /// built, and it takes the outcome whole so that what reaches the
+    /// wire is decided here: a boolean, never the path or the reason.
+    pub fn of(
+        run: Option<u64>,
+        done: usize,
+        total: usize,
+        outcome: &crate::worktrees::RemovalOutcome,
+    ) -> Self {
+        Self {
+            run,
+            done,
+            total,
+            removed: outcome.error.is_none(),
+        }
+    }
+}
+
 #[tauri::command]
 /// Remove several worktrees, reporting each one's outcome.
 ///
@@ -2497,10 +2552,14 @@ pub fn docker_start() -> Result<(), String> {
 /// not one bulk deletion. Each is re-checked at delete time, so a
 /// worktree that went dirty since the scan is refused while the rest
 /// proceed.
+///
+/// `run_id` is echoed on every [`WorktreeRemovalFrame`] so the caller
+/// can tell its own frames from another run's.
 pub async fn remove_worktrees(
     app: AppHandle,
     repo_path: String,
     worktree_paths: Vec<String>,
+    run_id: Option<u64>,
 ) -> Result<Vec<crate::worktrees::RemovalOutcome>, String> {
     // `spawn_blocking`, unlike the previous version. Removal is
     // sequential git plumbing at a few hundred milliseconds each, so
@@ -2518,10 +2577,11 @@ pub async fn remove_worktrees(
             &repo_path,
             &worktree_paths,
             ask_ref,
-            |done, total| {
-                // Counts only -- never paths. A progress event is not a
-                // place to leak what the user is working on.
-                let _ = app.emit("worktree-removal-progress", (done, total));
+            |done, total, outcome| {
+                // Counts and a flag -- never paths. A progress event is
+                // not a place to leak what the user is working on.
+                let frame = WorktreeRemovalFrame::of(run_id, done, total, outcome);
+                let _ = app.emit("worktree-removal-progress", frame);
             },
         );
         let failed = outcomes.iter().filter(|o| o.error.is_some()).count();
@@ -7334,6 +7394,75 @@ mod claudify_tests {
 
 #[cfg(test)]
 mod tests {
+    /// `worktree-removal-progress` is forwarded to the phone, so its
+    /// frame must never carry a path (#1544). Built from REAL outcomes
+    /// of a real batch -- each carrying a path and a refusal that names
+    /// it -- through the one constructor the command uses, and the
+    /// serialised frame is checked for the paths, their basenames, and
+    /// for any key beyond the four it is allowed.
+    #[test]
+    fn a_removal_frame_carries_no_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = dir.path().to_string_lossy().to_string();
+        let paths: Vec<String> = (0..3)
+            .map(|i| {
+                dir.path()
+                    .join(format!("private-wt-{i}"))
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+
+        let mut frames = Vec::new();
+        let outcomes =
+            crate::worktrees::remove_worktrees_with_progress(&repo, &paths, None, |d, t, o| {
+                frames.push(super::WorktreeRemovalFrame::of(Some(7), d, t, o));
+            });
+        assert_eq!(frames.len(), 3);
+        assert!(
+            outcomes.iter().all(|o| o.error.is_some()),
+            "every path is missing, so every outcome is a refusal carrying text"
+        );
+
+        for f in &frames {
+            let json = serde_json::to_value(f).unwrap();
+            let mut keys: Vec<&str> = json
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(keys, vec!["done", "removed", "run", "total"], "{json}");
+            let text = json.to_string();
+            for p in &paths {
+                let base = std::path::Path::new(p)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                assert!(!text.contains(&base), "frame leaks {base}: {text}");
+            }
+            assert!(!text.contains(&repo), "frame leaks the repo path: {text}");
+        }
+        assert!(frames.iter().all(|f| !f.removed && f.run == Some(7)));
+    }
+
+    /// `removed` is the outcome's success, and nothing else.
+    #[test]
+    fn a_removal_frame_says_removed_only_for_a_success() {
+        let ok = crate::worktrees::RemovalOutcome {
+            path: "/x/a".into(),
+            error: None,
+        };
+        let refused = crate::worktrees::RemovalOutcome {
+            path: "/x/b".into(),
+            error: Some("dirty".into()),
+        };
+        assert!(super::WorktreeRemovalFrame::of(None, 1, 2, &ok).removed);
+        assert!(!super::WorktreeRemovalFrame::of(None, 2, 2, &refused).removed);
+    }
+
     /// #1149: one budget across every filesystem scan.
     ///
     /// `SIZE_LIMIT` bounded two commands and nothing else, while

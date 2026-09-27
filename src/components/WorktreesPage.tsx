@@ -1112,6 +1112,14 @@ export function WorktreesPage() {
   const toggleChecked = useFilters((st) => st.toggleChecked);
   const setChecked = useFilters((st) => st.setChecked);
   const clearChecked = useFilters((st) => st.clearChecked);
+  /// Untick one removed path. Reads the store NOW rather than the
+  /// render's `checked`: a bulk removal calls this row by row over tens
+  /// of seconds, and a closure over the click-time list would re-tick
+  /// every row an earlier call had cleared.
+  const untick = (path: string) => {
+    const now = useFilters.getState().checked;
+    if (now.includes(path)) setChecked(now.filter((k) => k !== path));
+  };
   const anchor = useFilters((st) => st.anchor);
   const setAnchor = useFilters((st) => st.setAnchor);
 
@@ -3281,7 +3289,14 @@ export function WorktreesPage() {
                   const targets = selectedVisible.map((w) => w.path);
                   setBulkBusy(true);
                   setSelectionOpen(false);
-                  removeMany(selected?.path ?? "", targets).then(
+                  // Unticked as EACH one goes (#1544), and only the
+                  // paths actually removed, so a refused row stays
+                  // ticked and the user can see what did not go. As it
+                  // goes rather than at the end, because a run that
+                  // fails midway would otherwise leave removed paths
+                  // ticked -- counted as "hidden by the current
+                  // filters" in the next confirmation.
+                  removeMany(selected?.path ?? "", targets, untick).then(
                     (outcomes) => {
                       setBulkBusy(false);
                       const failed = outcomes.filter((o) => o.error !== null);
@@ -3297,12 +3312,6 @@ export function WorktreesPage() {
                           { description: failed.map((f) => `${f.path}: ${f.error}`).join("\n") },
                         );
                       }
-                      // Cleared only on the paths actually acted on, so
-                      // a refused row stays ticked and the user can see
-                      // what did not go.
-                      setChecked(checked.filter((k) => !outcomes.some(
-                        (o) => o.path === k && o.error === null,
-                      )));
                     },
                     (e: unknown) => {
                       setBulkBusy(false);
@@ -3387,7 +3396,7 @@ export function WorktreesPage() {
                   // their app back.
                   setBulkBusy(true);
                   setBulkOpen(false);
-                  removeMany(selected?.path ?? "", targets).then(
+                  removeMany(selected?.path ?? "", targets, untick).then(
                     (outcomes) => {
                       setBulkBusy(false);
                       const failed = outcomes.filter((o) => o.error !== null);

@@ -39,6 +39,7 @@ import type {
   Upstream,
   Venv,
   Worktree,
+  WorktreeRemovalFrame,
   WorktreeScan,
 } from "../types/pr";
 import type {
@@ -51,6 +52,7 @@ import type {
   ToolReport,
   TaskHealth,
   LogTail,
+  RemovalOutcome,
   ScanKind,
 } from "./tauri";
 import { type FollowLive, TranscriptFollower } from "@/lib/transcriptFollow";
@@ -3585,62 +3587,126 @@ export function useRemoveWorktree() {
     });
 }
 
-/// Remove every safe worktree in a repo.
+/// Drop removed worktrees from every cached list that could show them.
 ///
-/// Drops the successful paths from the cache rather than invalidating,
-/// for the same reason a single removal does: re-classifying 146
-/// worktrees takes ~51s, and removing worktrees cannot change any other
-/// worktree's safety.
+/// EVERY cached classification, not just the selected repository's.
+/// The bulk button's targets come from what is DISPLAYED, which on the
+/// all-repositories view spans many repos -- while this used to update
+/// only the selected one, so rows in other repositories came straight
+/// back from their stale cache. Filtering every cached list by path is
+/// safe regardless of which repository a path belongs to: a path not in
+/// a list leaves it unchanged.
+///
+/// The base listing too, and by EDITING it rather than only
+/// invalidating. The page renders `classified ?? selected?.worktrees`,
+/// so when the classification has not arrived it falls back to this
+/// list, and invalidation alone leaves the removed rows on screen until
+/// the refetch lands.
+///
+/// `unreadable` is carried through UNCHANGED (#951). Removing a worktree
+/// says nothing about a path the scan could not read, so dropping the
+/// report here would clear the partial-scan banner on an unrelated
+/// action -- and the next refetch would bring it back.
+function dropRemovedWorktrees(qc: QueryClient, removed: ReadonlySet<string>) {
+  qc.setQueriesData<Worktree[]>({ queryKey: ["worktree-safety"] }, (old) =>
+    old?.filter((w) => !removed.has(w.path)),
+  );
+  qc.setQueryData<WorktreeScan>(["worktrees"], (old) =>
+    old && {
+      ...old,
+      repos: old.repos.map((r) => ({
+        ...r,
+        worktrees: r.worktrees.filter((w) => !removed.has(w.path)),
+      })),
+    },
+  );
+}
+
+/// A token for one bulk removal, echoed on its progress frames.
+///
+/// A number, because the Rust side accepts nothing else and the event
+/// it rides on is forwarded to the phone. Random rather than a counter:
+/// the desktop and the phone each run their own copy of this module, so
+/// two counters would both start at 1 and collide on the first overlap.
+function newRemovalRun(): number {
+  return Math.floor(Math.random() * Number.MAX_SAFE_INTEGER);
+}
+
+/// Remove several worktrees, dropping each row as ITS removal succeeds.
+///
+/// Drops paths from the cache rather than invalidating, for the same
+/// reason a single removal does: re-classifying 146 worktrees takes
+/// ~51s, and removing worktrees cannot change any other worktree's
+/// safety.
+///
+/// # One row at a time (#1544)
+///
+/// The cache used to change only when the whole batch returned, so a
+/// hundred-row removal -- sequential at a few hundred ms each -- left
+/// the list unchanged for 30 seconds. Each `worktree-removal-progress`
+/// frame now says whether ITS removal succeeded, and frame `done` is the
+/// outcome of `worktreePaths[done - 1]`: the frame carries no path,
+/// because the event is forwarded to the phone, and this list is the
+/// one this call sent, so the index is enough. Only frames bearing this
+/// call's `run` are mapped; another run's index names a row in a list
+/// this call never saw.
+///
+/// A refused row is never dropped: `removed: false` does nothing here,
+/// and the final outcomes -- which the caller's toast reads -- are the
+/// record of why.
+///
+/// # Partial is not nothing
+///
+/// If the call rejects midway, the rows already dropped STAY dropped:
+/// they are gone from disk, and restoring them would show deleted work
+/// as present. The repository listing is invalidated either way so the
+/// next read is the truth.
+///
+/// `onRemoved` is called once per removed path, as it goes.
 export function useRemoveWorktrees() {
   const qc = useQueryClient();
-  return (repoPath: string, worktreePaths: string[]) =>
-    removeWorktrees(repoPath, worktreePaths).then((outcomes) => {
-      const removed = new Set(
-        outcomes.filter((o) => o.error === null).map((o) => o.path),
-      );
-      // EVERY cached classification, not just `repoPath`'s.
-      //
-      // The bulk button's targets come from what is DISPLAYED, which on
-      // the all-repositories view spans many repos -- while this only
-      // ever updated the selected one. So worktrees in other
-      // repositories were really removed, the toast correctly said so,
-      // and their rows came straight back because their cache still
-      // held them. `repoPath` is also "" when nothing is selected, and
-      // then this updated a key that does not exist at all.
-      //
-      // Filtering every cached list by path is safe regardless of which
-      // repository a path belongs to: a path that is not in a list
-      // leaves it unchanged.
-      qc.setQueriesData<Worktree[]>({ queryKey: ["worktree-safety"] }, (old) =>
-        old?.filter((w) => !removed.has(w.path)),
-      );
-      // The base listing too, and by EDITING it rather than only
-      // invalidating.
-      //
-      // The page renders `classified ?? selected?.worktrees` -- so when
-      // the classification has not arrived (or was cleared), it falls
-      // back to this list. Invalidation alone leaves the stale rows on
-      // screen until the refetch lands, which is what "the same 3
-      // worktrees are still listed" was: they really were removed, and
-      // the fallback was still serving them.
-      //
-      // `unreadable` is carried through UNCHANGED (#951). Removing a
-      // worktree says nothing about a path the scan could not read, so
-      // dropping the report here would clear the partial-scan banner on
-      // an unrelated action -- and the next refetch would bring it back,
-      // which is how a warning becomes noise nobody trusts.
-      qc.setQueryData<WorktreeScan>(["worktrees"], (old) =>
-        old && {
-          ...old,
-          repos: old.repos.map((r) => ({
-            ...r,
-            worktrees: r.worktrees.filter((w) => !removed.has(w.path)),
-          })),
-        },
-      );
-      void qc.invalidateQueries({ queryKey: ["worktrees"] });
+  return async (
+    repoPath: string,
+    worktreePaths: string[],
+    onRemoved?: (path: string) => void,
+  ): Promise<RemovalOutcome[]> => {
+    const run = newRemovalRun();
+    const dropped = new Set<string>();
+    const drop = (paths: string[]) => {
+      const fresh = paths.filter((p) => !dropped.has(p));
+      if (fresh.length === 0) return;
+      for (const p of fresh) dropped.add(p);
+      dropRemovedWorktrees(qc, new Set(fresh));
+      for (const p of fresh) onRemoved?.(p);
+    };
+
+    // Subscribed BEFORE the call, or the first frames could land before
+    // anything listens. A listener that cannot be installed costs only
+    // the live updates: the outcomes below still drop every removed row.
+    let unlisten: UnlistenFn | undefined;
+    try {
+      unlisten = await listen<WorktreeRemovalFrame>("worktree-removal-progress", (e) => {
+        const f = e.payload;
+        if (f.run !== run || !f.removed) return;
+        const path = worktreePaths[f.done - 1];
+        if (path !== undefined) drop([path]);
+      });
+    } catch {
+      unlisten = undefined;
+    }
+
+    try {
+      const outcomes = await removeWorktrees(repoPath, worktreePaths, run);
+      // The outcomes are the record: anything a frame did not deliver
+      // (a frame lost in transit, or arriving after this) is dropped
+      // here, and a refusal is not.
+      drop(outcomes.filter((o) => o.error === null).map((o) => o.path));
       return outcomes;
-    });
+    } finally {
+      safeUnlisten(unlisten);
+      void qc.invalidateQueries({ queryKey: ["worktrees"] });
+    }
+  };
 }
 
 /// Which worktrees have been assessed, so the row can say so.
@@ -4790,17 +4856,18 @@ export function usePairingRequest(): { request: PairingRequest | null; dismiss: 
 ///
 /// The button previously showed a single boolean for what can be ~30
 /// seconds of sequential deletion, so a long batch was
-/// indistinguishable from a hang. The Rust side emits (done, total)
-/// after EACH removal -- including failures, or a batch where several
-/// fail appears to stall.
+/// indistinguishable from a hang. The Rust side emits a frame after
+/// EACH removal -- including failures, or a batch where several fail
+/// appears to stall. Only the counts are read here; which rows went is
+/// `useRemoveWorktrees`' business.
 export function useRemovalProgress(): { done: number; total: number } | null {
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
 
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;
     let cancelled = false;
-    listen<[number, number]>("worktree-removal-progress", (e) => {
-      const [done, total] = e.payload;
+    listen<WorktreeRemovalFrame>("worktree-removal-progress", (e) => {
+      const { done, total } = e.payload;
       // Clears on the last one rather than leaving "106 of 106" on
       // screen after the work is over.
       setProgress(done >= total ? null : { done, total });

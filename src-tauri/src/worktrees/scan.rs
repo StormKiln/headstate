@@ -3398,7 +3398,7 @@ mod tests {
             .collect();
 
         let seen = std::cell::RefCell::new(Vec::new());
-        let outcomes = remove_worktrees_with_progress(&repo, &paths, None, |done, total| {
+        let outcomes = remove_worktrees_with_progress(&repo, &paths, None, |done, total, _| {
             seen.borrow_mut().push((done, total));
         });
 
@@ -3410,12 +3410,43 @@ mod tests {
         );
     }
 
+    /// Call `done` carries the outcome of `worktree_paths[done - 1]`
+    /// (#1544). The webview maps each progress frame onto its own
+    /// ordered target list by that index alone -- the frame has no path
+    /// -- so a callback out of order would drop the WRONG row from the
+    /// list while the right one stayed on disk.
+    #[test]
+    fn each_progress_call_carries_the_outcome_at_that_index() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = dir.path().to_string_lossy().to_string();
+        let paths: Vec<String> = (0..3)
+            .map(|i| {
+                dir.path()
+                    .join(format!("nope-{i}"))
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+
+        let seen = std::cell::RefCell::new(Vec::new());
+        remove_worktrees_with_progress(&repo, &paths, None, |done, _, o| {
+            seen.borrow_mut().push((done, o.path.clone()));
+        });
+
+        let want: Vec<(usize, String)> = paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i + 1, p.clone()))
+            .collect();
+        assert_eq!(seen.into_inner(), want);
+    }
+
     /// An empty batch must report nothing rather than a bare (0, 0),
     /// which a UI would render as a stuck progress line.
     #[test]
     fn an_empty_batch_reports_no_progress() {
         let seen = std::cell::RefCell::new(Vec::new());
-        let outcomes = remove_worktrees_with_progress("/tmp", &[], None, |d, t| {
+        let outcomes = remove_worktrees_with_progress("/tmp", &[], None, |d, t, _| {
             seen.borrow_mut().push((d, t));
         });
         assert!(seen.into_inner().is_empty());
@@ -6381,7 +6412,7 @@ prunable gitdir file points to non-existent location
             repo_s,
             &[wt.to_string_lossy().into_owned()],
             None,
-            |_, _| {},
+            |_, _, _| {},
         );
         assert_eq!(outcomes.len(), 1);
         assert!(
@@ -6406,7 +6437,7 @@ prunable gitdir file points to non-existent location
                 wt.to_string_lossy().into_owned(),
             ],
             None,
-            |_, _| {},
+            |_, _, _| {},
         );
         assert_eq!(outcomes.len(), 2, "every input must get an outcome");
         assert!(outcomes.iter().all(|o| o.error.is_some()));
@@ -10622,11 +10653,20 @@ pub fn fetch_refs(path: &str) -> Result<String, String> {
 /// `github` is the same delete-time GitHub check `remove_worktree_asking`
 /// takes (#1440), asked only for a row the offline gate would refuse as
 /// unmerged or unpushed. `None` is the offline gate alone.
+///
+/// `on_progress` gets `(done, total, outcome)` after each removal, in
+/// the ORDER of `worktree_paths`: call `done` is always the outcome of
+/// `worktree_paths[done - 1]`. That ordering is a contract, not an
+/// accident of the loop (#1544): the webview holds the same ordered
+/// list, so a caller can report WHICH row went by index alone and keep
+/// the path out of anything it emits. The outcome is handed over whole
+/// so the CALLER decides what leaves the process; this module emits
+/// nothing.
 pub fn remove_worktrees_with_progress(
     repo_path: &str,
     worktree_paths: &[String],
     github: Option<super::github::Ask<'_>>,
-    mut on_progress: impl FnMut(usize, usize),
+    mut on_progress: impl FnMut(usize, usize, &RemovalOutcome),
 ) -> Vec<RemovalOutcome> {
     let total = worktree_paths.len();
     worktree_paths
@@ -10640,7 +10680,7 @@ pub fn remove_worktrees_with_progress(
             // AFTER the removal, so the count means "done", not
             // "started" -- a progress bar that reaches 100% before the
             // work finishes is worse than none.
-            on_progress(i + 1, total);
+            on_progress(i + 1, total, &outcome);
             outcome
         })
         .collect()
