@@ -1741,6 +1741,8 @@ export interface ClaudeAgentTypes {
 interface WireClaudeSession {
   session_id: string;
   name: string | null;
+  /// #1133. Optional for the reason `ClaudeSession.opening_prompt` is.
+  opening_prompt?: string | null;
   cwd: string | null;
   git_branch: string | null;
   last_activity_at: string | null;
@@ -2722,6 +2724,11 @@ export interface ClaudeSessionList {
   /// line each ("pid N, running in <folder>"). No row can show them as
   /// running, so the list is not complete while this is non-empty.
   registry_unnamed: string[];
+  /// On a phone's answer only (#1488, #1485). `withheld` means every
+  /// `opening_prompt` was set to `null` because this phone may not read
+  /// transcripts: a null prompt then says nothing about the session.
+  /// Carried through `hydrateClaudeSessions` so the list can say so.
+  masking?: TranscriptMasking;
 }
 
 /// The session list exactly as it arrives, before the reasons are
@@ -2737,6 +2744,8 @@ export interface WireClaudeSessionList {
   registry_failure: string | null;
   registry_unreadable: string[];
   registry_unnamed: string[];
+  /// On a phone's answer only. See `TranscriptMasking`.
+  masking?: TranscriptMasking;
 }
 
 /// The headline figures on the Claude Code overview (#921).

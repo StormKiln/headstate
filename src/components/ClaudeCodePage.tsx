@@ -63,6 +63,7 @@ import { PhoneTranscript } from "./transcript/phone/PhoneTranscript";
 import { SessionMuteToggle } from "./SessionMuteToggle";
 import { useTranscriptRenderer } from "./transcript/phone/renderer";
 import { DesktopTranscript } from "./transcript/DesktopTranscript";
+import { TranscriptHeader } from "./transcript/TranscriptHeader";
 
 /// The sessions list is virtualized, and this is the note that used to
 /// be `RENDER_CAP = 200` (#1200).
@@ -345,7 +346,11 @@ export function ClaudeCodePage() {
           }
         >
           {fullTranscript && active ? (
-            <TranscriptWindow session={active} />
+            <TranscriptWindow
+              session={active}
+              now={now}
+              withheld={list.data?.masking?.withheld === true}
+            />
           ) : isMobile && !showingList ? (
             <button
               type="button"
@@ -976,6 +981,16 @@ export function ClaudeSessionColumn() {
               : `${matched.ordered.length.toLocaleString()} of ${all.length.toLocaleString()} sessions`}
           {matched.live.length > 0 ? ` · ${matched.live.length} running now` : ""}
         </p>
+        {/* On a phone that may not read transcripts, every opening
+            prompt arrives as `null` (#1488). Without this the rows show
+            nothing where the prompt was, which reads as sessions that
+            had none, and a search over prompts finds nothing (#1485). */}
+        {list.data?.masking?.withheld ? (
+          <p className="mt-1 text-[11px] text-[#8b949e]" data-testid="sessions-prompts-withheld">
+            Transcripts are turned off for this phone on the desktop, so opening prompts are not
+            shown or searched.
+          </p>
+        ) : null}
         <PrQueryNote q={prQuery} />
       </div>
       <div
@@ -3771,7 +3786,20 @@ function TranscriptPane({
 /// On the phone this is the screen a session row opens (#1481), so its
 /// back link returns to the list and the detail is a button beside the
 /// title; on the desktop it returns to the detail it was opened from.
-function TranscriptWindow({ session: s }: { session: ClaudeSession }) {
+///
+/// The session header (#1485) sits above the transcript once the detail
+/// is read -- including when there is no transcript to show, since a
+/// running session with none yet is exactly when "running" matters.
+function TranscriptWindow({
+  session: s,
+  now,
+  withheld,
+}: {
+  session: ClaudeSession;
+  now: number;
+  /// This phone may not read transcripts (the list's `masking`).
+  withheld: boolean;
+}) {
   const detail = useClaudeSessionDetail(s.session_id, true);
   const close = useFilters((f) => f.closeClaudeTranscript);
   const selectSession = useFilters((f) => f.selectClaudeSession);
@@ -3812,6 +3840,16 @@ function TranscriptWindow({ session: s }: { session: ClaudeSession }) {
           </button>
         ) : null}
       </div>
+      {detail.data ? (
+        <TranscriptHeader
+          session={s}
+          detail={detail.data}
+          now={now}
+          variant={phone ? "phone" : "desktop"}
+          withheld={withheld}
+          subagentRollup={<SessionSubagents detail={detail.data} />}
+        />
+      ) : null}
       {detail.isError ? (
         <QueryError
           title="No transcript for this session"

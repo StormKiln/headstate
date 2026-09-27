@@ -1661,6 +1661,9 @@ export function hydrateClaudeSessions(wire: WireClaudeSessionList): ClaudeSessio
       return {
         session_id: s.session_id,
         name: s.name,
+        // #1133. Was missing from this copy, so the opening prompt never
+        // reached the row; `?? null` because a cached list may predate it.
+        opening_prompt: s.opening_prompt ?? null,
         cwd: s.cwd,
         git_branch: s.git_branch,
         last_activity_at: s.last_activity_at,
@@ -1682,6 +1685,9 @@ export function hydrateClaudeSessions(wire: WireClaudeSessionList): ClaudeSessio
     registry_failure: wire.registry_failure,
     registry_unreadable: wire.registry_unreadable,
     registry_unnamed: wire.registry_unnamed,
+    // Carried, not dropped (#1485): a withheld opening prompt must read as
+    // "turned off for this phone", not as a session that had none.
+    ...(wire.masking ? { masking: wire.masking } : {}),
   };
 }
 
@@ -2061,7 +2067,11 @@ export function useClaudeUsageProfile(enabled = true) {
   });
 }
 
-export function useClaudeSessionUsage(path: string | null) {
+///
+/// `live` re-reads on `USAGE_LIVE_MS` while the session runs (#1485): the
+/// transcript header shows "so far" figures, and a running session's
+/// grow. Off by default, so every other caller keeps its one read.
+export function useClaudeSessionUsage(path: string | null, live = false) {
   return useQuery<ClaudeUsage>({
     queryKey: ["claude-usage", path],
     queryFn: () => claudeSessionUsage(path as string),
@@ -2070,9 +2080,14 @@ export function useClaudeSessionUsage(path: string | null) {
     // a rejected query that reads as a failure.
     enabled: path !== null && path !== "",
     staleTime: Infinity,
+    refetchInterval: live && path ? USAGE_LIVE_MS : false,
     retry: false,
   });
 }
+
+/// How often a running session's usage is re-read for the header. A
+/// whole-transcript read, so slower than the list's poll.
+const USAGE_LIVE_MS = 60_000;
 
 /// What one session's subagents cost, as a figure of its own (#1002).
 ///

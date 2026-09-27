@@ -19,6 +19,7 @@ import type { Liveness } from "../../types/pr";
 import type { TranscriptMessage, TranscriptSubagent } from "../../types/transcript";
 import { errorMessage } from "../QueryError";
 import { FollowStatus } from "./FollowStatus";
+import { subagentLiveness } from "./header";
 import { palette } from "./palette";
 import { transcriptStreaming } from "./streaming";
 import { TaskChecklist } from "./TaskChecklist";
@@ -64,11 +65,8 @@ export function DesktopTranscript({
           // one's messages under a new name.
           key={open.transcript_path}
           path={open.transcript_path}
-          // A subagent that finished cannot still be running a call; one
-          // that has not is as live as its session.
-          liveness={
-            open.status === "completed" ? { state: "dead", why: "subagent completed" } : liveness
-          }
+          // From its session's: see `subagentLiveness`.
+          liveness={subagentLiveness(liveness, open)}
           label={`Subagent transcript${open.agent_type ? `: ${open.agent_type}` : ""}`}
           onOpenSubagent={onOpenSubagent}
         />
