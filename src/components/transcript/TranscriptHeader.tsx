@@ -96,6 +96,13 @@ export function TranscriptHeader({
         <LivenessLine tone={live.tone} label={live.label} />
         <WaitingLine tone={waiting.tone} label={waiting.label} title={waiting.title} />
       </div>
+      {/* Mounted with the header, so the session STARTING to wait is
+          announced (#1489): a region that arrives with its text is often
+          not read. Polite, and only the present tense -- "waited earlier"
+          is history, not news. */}
+      <span role="status" className="sr-only">
+        {waiting.tone === "now" ? waiting.label : ""}
+      </span>
       {live.detail ? (
         <p className="text-[11px] text-[#8b949e]" data-testid="transcript-header-liveness-why">
           {live.detail}
@@ -113,7 +120,7 @@ export function TranscriptHeader({
         <span className="flex min-w-0 items-center gap-1">
           <GitBranch className="h-3 w-3 shrink-0" aria-hidden="true" />
           {s.git_branch ? (
-            <span className="truncate font-mono">{s.git_branch}</span>
+            <span className="min-w-0 font-mono [overflow-wrap:anywhere]">{s.git_branch}</span>
           ) : (
             <span>no branch recorded</span>
           )}
@@ -121,7 +128,7 @@ export function TranscriptHeader({
         <span className="flex min-w-0 items-center gap-1" title={s.cwd ?? undefined}>
           <Folder className="h-3 w-3 shrink-0" aria-hidden="true" />
           {s.cwd ? (
-            <span className="truncate font-mono" data-testid="transcript-header-cwd">
+            <span className="min-w-0 font-mono [overflow-wrap:anywhere]" data-testid="transcript-header-cwd">
               {variant === "phone" ? abbreviatePath(s.cwd) : s.cwd}
             </span>
           ) : (
@@ -194,7 +201,7 @@ function LivenessLine({ tone, label }: { tone: LivenessTone; label: string }) {
   );
 }
 
-/// Present tense in amber, and announced; past tense muted; "not
+/// Present tense in amber (and announced, by the header), past tense muted; "not
 /// recorded" and "not waiting" in words of their own.
 function WaitingLine({
   tone,
@@ -208,8 +215,7 @@ function WaitingLine({
   if (tone === "now") {
     return (
       <span
-        role="status"
-        className="flex items-center gap-1 rounded bg-[#d29922]/15 px-1.5 py-0.5 font-semibold text-[#d29922]"
+        className="flex items-center gap-1 rounded bg-[#322e22] px-1.5 py-0.5 font-semibold text-[#d29922]"
         title={title ?? undefined}
         data-tone={tone}
       >
@@ -327,7 +333,7 @@ function DesktopActions({
             type="button"
             aria-expanded={open === "resume"}
             onClick={() => toggle("resume")}
-            className="tap-target rounded-md bg-[#1f6feb] px-2 py-1 text-white hover:bg-[#388bfd]"
+            className="tap-target rounded-md bg-[#1f6feb] px-2 py-1 text-[#ffffff] hover:bg-[#316dca]"
           >
             Resume in terminal
           </button>
@@ -452,7 +458,7 @@ function LaunchPanel({
       <button
         type="button"
         onClick={onStart}
-        className="tap-target mt-2 rounded-md bg-[#1f6feb] px-2 py-1 text-white hover:bg-[#388bfd]"
+        className="tap-target mt-2 rounded-md bg-[#1f6feb] px-2 py-1 text-[#ffffff] hover:bg-[#316dca]"
       >
         {start}
       </button>

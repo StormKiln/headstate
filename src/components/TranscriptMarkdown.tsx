@@ -131,10 +131,18 @@ function maskedPills() {
                   tagName: "span",
                   properties: {
                     title: `Hidden on this phone: ${MASK_LABELS[part.hidden]}`,
-                    ariaLabel: `hidden ${MASK_LABELS[part.hidden]}`,
                     className: [...PILL_CLASSES],
                   },
-                  children: [{ type: "text", value: "hidden" }],
+                  // Spoken as text, as `MaskedText` does it (#1489).
+                  children: [
+                    { type: "text", value: "hidden" },
+                    {
+                      type: "element",
+                      tagName: "span",
+                      properties: { className: ["sr-only"] },
+                      children: [{ type: "text", value: ` ${MASK_LABELS[part.hidden]}` }],
+                    },
+                  ],
                 },
           );
         }
@@ -153,11 +161,13 @@ const PILL_CLASSES = [
   "mx-0.5",
   "inline-block",
   "rounded",
-  "bg-[#30363d]",
+  "border",
+  "border-[#30363d]",
+  "bg-[#21262d]",
   "px-1.5",
   "align-baseline",
   "font-sans",
-  "text-[10px]",
+  "text-[11px]",
   "not-italic",
   "text-[#8b949e]",
 ];

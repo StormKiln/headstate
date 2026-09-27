@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Minimal grants for the main window: subscribe to the Rust poll loop's events, and let the tray show, hide, and focus the window. External links open in the user's browser through the opener plugin. It needs BOTH entries below: `allow-open-url` grants the command, and `allow-default-urls` grants the http/https URL SCOPE. Without the scope the command is permitted and then every call is refused, which is silent -- the link simply does nothing. App-defined commands registered via generate_handler! are not ACL-gated and need no entry here.",
+  "description": "Minimal grants for the main window: subscribe to the Rust poll loop's events, and let the tray show, hide, and focus the window. External links open in the user's browser through the opener plugin. It needs BOTH entries below: `allow-open-url` grants the command, and `allow-default-urls` grants the http/https URL SCOPE. Without the scope the command is permitted and then every call is refused, which is silent -- the link simply does nothing. App-defined commands registered via generate_handler! are not ACL-gated and need no entry here. `allow-set-webview-zoom` is what the window's `zoomHotkeysEnabled` needs on macOS and Linux: Tauri zooms there through a script calling that command, and without the grant Cmd+plus and Cmd+minus do nothing (#1489, so the text can be read larger).",
   "windows": [
     "main"
   ],
@@ -11,6 +11,7 @@
     "core:window:allow-show",
     "core:window:allow-hide",
     "core:window:allow-set-focus",
+    "core:webview:allow-set-webview-zoom",
     "core:app:default",
     "opener:allow-open-url",
     "opener:allow-default-urls",

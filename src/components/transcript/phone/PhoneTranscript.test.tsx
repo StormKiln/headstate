@@ -166,7 +166,7 @@ describe("masked secrets and Reveal (#1488)", () => {
       },
     );
     expect(screen.getByText(/2 likely secrets were hidden/)).toBeTruthy();
-    expect(screen.getByLabelText("hidden an access token")).toBeTruthy();
+    expect(screen.getByTitle("Hidden on this phone: an access token")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Reveal" }));
     await shim.flush();
@@ -177,7 +177,7 @@ describe("masked secrets and Reveal (#1488)", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Hide it again" }));
     await shim.flush();
-    expect(screen.getByLabelText("hidden an access token")).toBeTruthy();
+    expect(screen.getByTitle("Hidden on this phone: an access token")).toBeTruthy();
   });
 
   it("offers no Reveal the desktop would refuse", async () => {
@@ -311,10 +311,10 @@ describe("navigation on the phone (#1484)", () => {
     const firstShown = () =>
       shim.rows().find((r) => shim.rowTop(r.dataset.messageId!) >= -1)!.dataset.messageId!;
     const before = Number(firstShown().slice(1));
-    fireEvent.click(screen.getByRole("button", { name: "↑ Previous prompt" }));
+    fireEvent.click(screen.getByRole("button", { name: "Previous prompt" }));
     await shim.flush();
     expect(Number(firstShown().slice(1))).toBe(before - 1);
-    fireEvent.click(screen.getByRole("button", { name: "↓ Next prompt" }));
+    fireEvent.click(screen.getByRole("button", { name: "Next prompt" }));
     await shim.flush();
     expect(Number(firstShown().slice(1))).toBe(before);
     for (const name of ["Turns", "Find", "Options"]) {

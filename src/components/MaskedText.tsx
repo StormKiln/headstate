@@ -19,13 +19,15 @@ export function MaskedText({ text }: { text: string }) {
         "text" in part ? (
           <Fragment key={i}>{part.text}</Fragment>
         ) : (
+          // The kind is spoken as text, not as an `aria-label`: a label
+          // on a plain span is prohibited by ARIA, and screen readers may
+          // ignore it (#1489).
           <span
             key={i}
             title={`Hidden on this phone: ${MASK_LABELS[part.hidden]}`}
-            aria-label={`hidden ${MASK_LABELS[part.hidden]}`}
-            className="mx-0.5 inline-block rounded bg-[#30363d] px-1.5 align-baseline font-sans text-[10px] not-italic text-[#8b949e]"
+            className="mx-0.5 inline-block rounded border border-[#30363d] bg-[#21262d] px-1.5 align-baseline font-sans text-[11px] not-italic text-[#8b949e]"
           >
-            hidden
+            hidden<span className="sr-only"> {MASK_LABELS[part.hidden]}</span>
           </span>
         ),
       )}

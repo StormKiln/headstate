@@ -121,7 +121,7 @@ describe("the user's turn", () => {
 
   it("draws text the desktop masked as a pill, never as the marker", () => {
     show(msg({ kind: "user_prompt", origin: null }, [text("key is ⟦hidden:api-key⟧ ok")], { id: "u1" }));
-    expect(screen.getByLabelText("hidden an API key")).toBeTruthy();
+    expect(screen.getByTitle("Hidden on this phone: an API key")).toBeTruthy();
     expect(document.body.textContent).not.toContain("⟦hidden");
   });
 

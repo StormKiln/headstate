@@ -288,7 +288,7 @@ describe("thinking", () => {
 
   it("gives no duration when the start was not recorded", () => {
     show(msg({ kind: "assistant" }, [thinking]));
-    expect(screen.getByRole("button", { name: /^✻?\s*Thought\s*▾?$/ })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^Thought, 1 line$/ })).toBeTruthy();
   });
 
   it("says unrecorded thinking was not recorded, never shows it empty", () => {
@@ -302,23 +302,23 @@ describe("masked secrets (#1488)", () => {
 
   it("draws a pill in a prompt, in prose and in tool output", async () => {
     show(msg({ kind: "user_prompt", origin: null }, [text(`key is ${MARK} ok`)]));
-    expect(screen.getByLabelText("hidden an API key")).toBeTruthy();
+    expect(screen.getByTitle("Hidden on this phone: an API key")).toBeTruthy();
     cleanup();
 
     show(msg({ kind: "assistant" }, [text(`The **key** is ${MARK}.`)]));
-    expect(screen.getByLabelText("hidden an API key")).toBeTruthy();
+    expect(screen.getByTitle("Hidden on this phone: an API key")).toBeTruthy();
     expect(document.body.textContent).not.toContain("⟦");
     cleanup();
 
     show(msg({ kind: "assistant" }, [call("Bash", BASH, output({ text: `TOKEN=${MARK}` }))]));
     fireEvent.click(screen.getByRole("button", { name: "Run the tests" }));
     const sheet = await screen.findByRole("dialog");
-    expect(within(sheet).getByLabelText("hidden an API key")).toBeTruthy();
+    expect(within(sheet).getByTitle("Hidden on this phone: an API key")).toBeTruthy();
   });
 
   it("draws a pill in a fenced code block, which is then not highlighted", () => {
     show(msg({ kind: "assistant" }, [text("```ts\nconst k = \"" + MARK + "\";\n```")]));
-    expect(screen.getByLabelText("hidden an API key")).toBeTruthy();
+    expect(screen.getByTitle("Hidden on this phone: an API key")).toBeTruthy();
     expect(document.body.textContent).not.toContain("⟦");
   });
 });
@@ -370,21 +370,23 @@ describe("a message being sent (#1491)", () => {
     expect(container.querySelector('[data-slot="message"]')?.getAttribute("data-align")).toBe("end");
     const bubble = container.querySelector<HTMLElement>('[data-slot="bubble"]')!;
     expect(bubble.getAttribute("data-align")).toBe("end");
-    expect(bubble.className).toContain("opacity-70");
-    expect(bubble.getAttribute("aria-label")).toBe("You, not in the transcript yet");
+    // Dimmed by colour, with a dashed edge -- not faded (#1489).
+    const content = bubble.querySelector<HTMLElement>('[data-slot="bubble-content"]')!;
+    expect(content.className).toContain("border-dashed");
+    expect(content.style.color).not.toBe("");
+    expect(screen.getByRole("article", { name: "You, not in the transcript yet" })).toBe(row);
     expect(screen.getByText("please run the tests")).toBeTruthy();
   });
 
   it("differs from a recorded prompt with the same text", () => {
     const recorded = show(msg({ kind: "user_prompt", origin: null }, [text("please run the tests")]));
-    const before = recorded.container.querySelector('[data-slot="bubble"]')!;
-    const label = before.getAttribute("aria-label");
+    const label = screen.getByRole("article").getAttribute("aria-label");
+    const before = recorded.container.querySelector('[data-slot="bubble-content"]')!;
     const cls = before.className;
     cleanup();
     const { container } = showPending();
-    const bubble = container.querySelector('[data-slot="bubble"]')!;
-    expect(bubble.getAttribute("aria-label")).not.toBe(label);
-    expect(bubble.className).not.toBe(cls);
+    expect(screen.getByRole("article").getAttribute("aria-label")).not.toBe(label);
+    expect(container.querySelector('[data-slot="bubble-content"]')!.className).not.toBe(cls);
   });
 
   it.each(PENDING_STATES)("says what is known in state %s, beneath the bubble", (state) => {
