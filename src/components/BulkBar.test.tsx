@@ -282,3 +282,30 @@ describe("BulkBar", () => {
     expect(useFilters.getState().checked).toEqual([]);
   });
 });
+
+/// #1286, the same defect #1278 fixed for the PR detail bar.
+///
+/// The bar always stuck. The app header in `App` is `sticky top-0 z-20`
+/// inside the same `<main>` scroll container, opaque, one z-layer up, so
+/// at `top-0` this bar pinned to exactly the header's band and was
+/// painted over -- pinned and invisible, which looks like not sticking.
+///
+/// This asserts the STRUCTURE, not the rendered result: jsdom performs no
+/// layout, so `position: sticky` cannot be observed here. What it can
+/// prove is the condition the fix depends on -- the bar is sticky and its
+/// `top` defers to the app header's published height instead of zero.
+/// The browser measurement is recorded on the PR.
+describe("BulkBar pins below the app header (#1286)", () => {
+  it("offsets its sticky top by the app header's height", () => {
+    select(PR_FIXTURES[0]);
+    const { container } = render(<BulkBar prs={PR_FIXTURES} />);
+    const bar = container.firstElementChild as HTMLElement;
+    const cls = bar.className.split(/\s+/);
+    expect(cls).toContain("sticky");
+    expect(cls).toContain("z-10");
+    // The regression in one assertion: any `top-*` class puts the bar
+    // at a fixed offset the app header may already occupy.
+    expect(cls.filter((c) => /^top-/.test(c))).toEqual([]);
+    expect(bar.style.top).toContain("--app-header-h");
+  });
+});

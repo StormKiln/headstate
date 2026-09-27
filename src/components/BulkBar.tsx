@@ -175,7 +175,20 @@ export function BulkBar({ prs }: { prs: PullRequest[] }) {
     // page already hit this and fixed it for its own confirm dialog.
     // `z-10` clears the rows; the opaque background stops text showing
     // through as they scroll under it.
-    <div className="sticky top-0 z-10 mb-3 flex flex-wrap items-center gap-2 rounded-md border border-[#1f6feb] bg-[#0d1a2f] px-3 py-2 text-sm">
+    //
+    // NOT `top-0` (#1286, the same cause as #1278). The app header is
+    // itself `sticky top-0 z-20` in this same `<main>`, opaque, one
+    // z-layer up -- so at `top-0` this bar pinned exactly where the
+    // header already sits and was painted over: pinned and invisible,
+    // which looks identical to not sticking. `--app-header-h` is the
+    // header's measured height, published onto `<main>` by
+    // `useStickyHeaderOffset`; measured because the phone header (69px,
+    // a 44px tap-target hamburger) is taller than the desktop's (45px).
+    // The fallback applies only where nothing publishes it (jsdom).
+    <div
+      className="sticky z-10 mb-3 flex flex-wrap items-center gap-2 rounded-md border border-[#1f6feb] bg-[#0d1a2f] px-3 py-2 text-sm"
+      style={{ top: "var(--app-header-h, 0px)" }}
+    >
       <span className="font-medium">
         {selected.length} selected
       </span>
