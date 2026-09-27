@@ -50,6 +50,25 @@ export interface PhoneNotifyPrefs {
   health_battery: boolean;
   /// The DESKTOP's CPU being busy with nothing in particular.
   health_cpu: boolean;
+  /// Claude Code sessions on the desktop: a turn finished, a session is
+  /// waiting for input or permission, or a turn errored (#1486). The
+  /// global switch; each session can be muted on its own too.
+  sessions: boolean;
+  /// Whether a session notification shows the session's opening prompt
+  /// under its state. Off by default: the lock screen names the project
+  /// and the state only.
+  session_snippet: boolean;
+}
+
+/// One in-app toast for a session transition (#1486). Mirrors the Rust
+/// `notify::SessionToast`, which the companion's `poll_session_toasts`
+/// returns: the same transitions a background window would notify about,
+/// computed in Rust against the same stored marks so one transition is
+/// never both toasted and notified.
+export interface SessionToast {
+  session_id: string;
+  title: string;
+  body: string;
 }
 
 /// Module-private rather than exported alongside the hook, unlike
@@ -89,3 +108,41 @@ export function usePhoneNotifyPrefs(enabled = true) {
     });
   return { prefs: query.data, set };
 }
+
+const getSessionMutes = () => call<string[]>("get_session_mutes");
+
+const setSessionMuted = (sessionId: string, muted: boolean) =>
+  call<void>("set_session_muted", { sessionId, muted });
+
+/// Whether one session's notifications are muted on this phone (#1486),
+/// with an optimistic local write for `usePhoneNotifyPrefs`'s reason.
+///
+/// `enabled` as there: these are the companion's own commands and do not
+/// exist on the desktop build.
+export function useSessionMute(sessionId: string, enabled = true) {
+  const qc = useQueryClient();
+  const query = useQuery({
+    queryKey: ["session-mutes"],
+    queryFn: getSessionMutes,
+    staleTime: Infinity,
+    enabled,
+  });
+  const muted = query.data?.includes(sessionId);
+  const set = (next: boolean) =>
+    setSessionMuted(sessionId, next).then(() => {
+      qc.setQueryData<string[]>(["session-mutes"], (prev) => {
+        const rest = (prev ?? []).filter((id) => id !== sessionId);
+        return next ? [...rest, sessionId] : rest;
+      });
+    });
+  return { muted, set, loaded: query.data !== undefined };
+}
+
+/// The in-app toasts since the last poll. `viewing` is the session on
+/// screen, which gets none.
+export const pollSessionToasts = (viewing: string | undefined) =>
+  call<SessionToast[]>("poll_session_toasts", { viewing: viewing ?? null });
+
+/// The session of the notification the owner last tapped, or null.
+/// Cleared as it is read, so one tap opens its session once.
+export const takeNotificationSession = () => call<string | null>("take_notification_session");

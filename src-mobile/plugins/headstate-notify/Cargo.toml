@@ -23,8 +23,9 @@ tauri-plugin = { version = "2.6", features = ["build"] }
 # No `Channel` here, unlike that plugin. Every call runs Rust -> native
 # and returns; nothing in iOS's notification API calls back into the app
 # for what this does (posting and asking permission), so there is no
-# reverse direction to plumb. Notification TAPS would be such a
-# callback, and they are deliberately not handled -- see the module docs.
+# reverse direction to plumb. Notification TAPS are the one callback,
+# and the Swift delegate parks them in a slot Rust reads on request
+# (`takeTapped`, #1486) rather than calling back -- see the module docs.
 tauri = { version = "2.11", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

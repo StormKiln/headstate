@@ -325,6 +325,10 @@ const ROWS: Row[] = [
   // `null` rather than reaching the filesystem.
   row(api.claudeSessionsForPr, ["acme/api", 7], "claude_sessions_for_pr", { repo: "acme/api", number: 7 }),
   row(api.claudeSessionDetail, ["s1"], "claude_session_detail", { sessionId: "s1" }),
+  row(api.claudeSessionDigest, [], "claude_session_digest"),
+  row(api.claudeTranscriptOpeningPrompt, ["s1"], "claude_transcript_opening_prompt", {
+    sessionId: "s1",
+  }),
   row(api.claudeOverview, [], "claude_overview"),
   // #1212. No arguments: the report is over Headstate's own cache in
   // full, so there is nothing for a remote caller to steer.

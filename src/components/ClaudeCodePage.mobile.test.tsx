@@ -162,6 +162,11 @@ vi.mock("../api/hooks", () => ({
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 vi.mock("../lib/clipboard", () => ({ copyText: copyFn }));
 vi.mock("../api/tauri", () => ({ claudeRevealPath: revealFn }));
+/// #1486: the per-session mute is the companion's own setting.
+const mute = vi.hoisted(() => ({ set: vi.fn(() => Promise.resolve()) }));
+vi.mock("@/api/phoneNotify", () => ({
+  useSessionMute: () => ({ muted: false, set: mute.set, loaded: true }),
+}));
 
 const { ClaudeCodePage } = await import("./ClaudeCodePage");
 
@@ -335,6 +340,15 @@ describe("the companion offers the view and hides only the Local actions", () =>
     expect(screen.getAllByText(/not running/i).length).toBeGreaterThan(0);
     open("HeadState GitHub issues filing");
     expect(screen.getByText(/pid 14779 is no longer running/i)).toBeTruthy();
+  });
+
+  /// #1486: the phone can mute ONE session's notifications from its
+  /// detail, without switching session notifications off.
+  it("offers a per-session mute on the phone", () => {
+    render(<ClaudeCodePage />);
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("checkbox", { name: /mute this session/i }));
+    expect(mute.set).toHaveBeenCalledWith(true);
   });
 
   /// The view says WHOSE sessions these are. A phone showing a session

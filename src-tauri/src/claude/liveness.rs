@@ -320,6 +320,29 @@ pub struct RegistryEntry {
     pub name: Option<String>,
     pub status: Option<String>,
     pub version: Option<String>,
+    /// When `status` last changed, as Claude Code wrote it: epoch
+    /// MILLISECONDS on every record measured (#1486).
+    ///
+    /// A `Value` rather than an `i64`, deliberately. This is another
+    /// program's private file, and a release that wrote it as a string
+    /// would otherwise fail the WHOLE entry -- turning a running session
+    /// `Unknown` over a field nothing deciding liveness reads. Read it
+    /// through [`RegistryEntry::status_since_ms`], which answers `None`
+    /// for any shape but a number.
+    ///
+    /// The same trust as `status` itself: a stored value a killed
+    /// session never corrects, so it refines a `Running` verdict and
+    /// is never consulted to reach one.
+    #[serde(rename = "statusUpdatedAt", default)]
+    pub status_updated_at: Option<serde_json::Value>,
+}
+
+impl RegistryEntry {
+    /// [`RegistryEntry::status_updated_at`] as epoch milliseconds, or
+    /// `None` when it is absent or not a whole number.
+    pub fn status_since_ms(&self) -> Option<i64> {
+        self.status_updated_at.as_ref().and_then(|v| v.as_i64())
+    }
 }
 
 /// What a read of the registry directory found, INCLUDING what it could
@@ -1052,6 +1075,7 @@ mod tests {
                 name: Some("widget-c3".into()),
                 status: status.map(str::to_string),
                 version: Some("2.1.268".into()),
+                status_updated_at: None,
             },
         );
         r

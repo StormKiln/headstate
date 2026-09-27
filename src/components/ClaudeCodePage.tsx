@@ -60,6 +60,7 @@ import { QueryError, errorMessage } from "./QueryError";
 import { ExternalLink } from "./ExternalLink";
 import { MaskedText } from "./MaskedText";
 import { PhoneTranscript } from "./transcript/phone/PhoneTranscript";
+import { SessionMuteToggle } from "./SessionMuteToggle";
 import { useTranscriptRenderer } from "./transcript/phone/renderer";
 import { DesktopTranscript } from "./transcript/DesktopTranscript";
 
@@ -1892,6 +1893,9 @@ function SessionDetail({
               evidence for it, which is the arrangement #1219 exists to
               avoid (#1219). */}
           <StopSession session={s} detail={detail.data} />
+          {/* #1486: this phone's per-session mute. The companion's own
+              setting, so the phone build only. */}
+          {IS_MOBILE_BUILD && <SessionMuteToggle sessionId={s.session_id} />}
           {/* The transcript viewer (#1479). On the desktop it renders
               through the terminal renderer (#1480), which replaced the
               preview there. The phone keeps the preview beside the

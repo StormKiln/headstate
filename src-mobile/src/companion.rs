@@ -521,6 +521,67 @@ impl Companion {
         .map_err(|e| e.to_string())
     }
 
+    /// What the last session pass saw (#1486). Unreadable is
+    /// [`notify::SessionsPrevious::First`] -- announce nothing -- for
+    /// [`Companion::notify_seen`]'s reason.
+    pub(crate) fn sessions_seen(&self) -> notify::SessionsPrevious {
+        match crate::store::get_json::<notify::SessionsSeen>(
+            self.store.as_ref(),
+            notify::SESSIONS_SEEN_KEY,
+        ) {
+            Ok(Some(seen)) => notify::SessionsPrevious::Known(seen),
+            Ok(None) => notify::SessionsPrevious::First,
+            Err(e) => {
+                log::warn!("notify: the session marks are unreadable; suppressing this pass: {e}");
+                notify::SessionsPrevious::First
+            }
+        }
+    }
+
+    pub(crate) fn record_sessions_seen(&self, seen: &notify::SessionsSeen) -> Result<(), String> {
+        crate::store::put_json(self.store.as_ref(), notify::SESSIONS_SEEN_KEY, seen)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Drop the session marks, so the next pass is a first sync. What
+    /// switching session notifications off does: switching them back on
+    /// must announce what happens next, not everything since.
+    pub(crate) fn forget_sessions_seen(&self) -> Result<(), String> {
+        // Only when there is something to forget: a removal saves the
+        // vault, and a window with sessions off should not write at all.
+        match self.store.get(notify::SESSIONS_SEEN_KEY) {
+            Ok(None) => Ok(()),
+            _ => self
+                .store
+                .remove(notify::SESSIONS_SEEN_KEY)
+                .map_err(|e| e.to_string()),
+        }
+    }
+
+    /// The sessions muted on this phone. Unreadable is NONE muted: a
+    /// store problem must cost a mute, not silence every session.
+    pub(crate) fn session_mutes(&self) -> notify::SessionMutes {
+        match crate::store::get_json(self.store.as_ref(), notify::SESSION_MUTES_KEY) {
+            Ok(Some(m)) => m,
+            Ok(None) => notify::SessionMutes::default(),
+            Err(e) => {
+                log::warn!("notify: session mutes unreadable, muting none: {e}");
+                notify::SessionMutes::default()
+            }
+        }
+    }
+
+    pub(crate) fn set_session_muted(&self, session_id: &str, muted: bool) -> Result<(), String> {
+        let mut m = self.session_mutes();
+        if muted {
+            m.sessions.insert(session_id.to_string());
+        } else {
+            m.sessions.remove(session_id);
+        }
+        crate::store::put_json(self.store.as_ref(), notify::SESSION_MUTES_KEY, &m)
+            .map_err(|e| e.to_string())
+    }
+
     /// The paired desktop's name, for the copy that must say whose
     /// machine a health alert is about.
     pub(crate) fn desktop_name(&self) -> Option<String> {

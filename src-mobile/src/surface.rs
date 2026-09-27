@@ -235,6 +235,11 @@ pub const SURFACE: &[(&str, Class)] = &[
     // Read: one indexed query (#1132).
     ("claude_sessions_for_pr", Class::Read),
     ("claude_session_detail", Class::Read),
+    // #1486: what the background window reads to notify about sessions.
+    // No transcript text; see the desktop's surface.rs.
+    ("claude_session_digest", Class::Read),
+    // #1486: the opt-in lock-screen snippet. Masked on the desktop.
+    ("claude_transcript_opening_prompt", Class::Read),
     ("claude_subagent_rollup", Class::Read),
     // The hook's failure and denial profile for one session, and
     // across all of them (#1062, #1063, #1064). Reads only.

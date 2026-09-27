@@ -12,7 +12,7 @@ import { PhoneNotifyPanel } from "./PhoneNotifyPanel";
 
 beforeEach(() => {
   set.mockClear();
-  state.prefs = { enabled: true, new_pr: true, health_battery: true, health_cpu: true };
+  state.prefs = { enabled: true, new_pr: true, health_battery: true, health_cpu: true, sessions: true, session_snippet: false };
 });
 afterEach(cleanup);
 
@@ -41,13 +41,15 @@ describe("the phone's notification settings", () => {
       new_pr: true,
       health_battery: false,
       health_cpu: true,
+      sessions: true,
+      session_snippet: false,
     });
   });
 
   /// The master switch keeps the choices underneath it, so turning
   /// notifications back on restores what was picked rather than a reset.
   it("keeps the per-category choices when the master switch goes off", () => {
-    state.prefs = { enabled: true, new_pr: false, health_battery: true, health_cpu: true };
+    state.prefs = { enabled: true, new_pr: false, health_battery: true, health_cpu: true, sessions: true, session_snippet: false };
     render(<PhoneNotifyPanel />);
     fireEvent.click(screen.getByRole("checkbox", { name: /phone notifications/i }));
     expect(set).toHaveBeenCalledWith({
@@ -55,11 +57,13 @@ describe("the phone's notification settings", () => {
       new_pr: false,
       health_battery: true,
       health_cpu: true,
+      sessions: true,
+      session_snippet: false,
     });
   });
 
   it("disables the categories when the master switch is off", () => {
-    state.prefs = { enabled: false, new_pr: true, health_battery: true, health_cpu: true };
+    state.prefs = { enabled: false, new_pr: true, health_battery: true, health_cpu: true, sessions: true, session_snippet: false };
     render(<PhoneNotifyPanel />);
     for (const name of [/a pull request appears/i, /battery problems/i, /cpu is busy/i]) {
       expect(screen.getByRole("checkbox", { name })).toHaveProperty("disabled", true);
@@ -98,6 +102,41 @@ describe("the phone's notification settings", () => {
   it("says the first notification is what asks permission", () => {
     render(<PhoneNotifyPanel />);
     expect(screen.getByText(/first one asks permission/i)).toBeTruthy();
+  });
+
+  /// #1486: the global Sessions switch, and the snippet setting that is
+  /// OFF by default -- the lock screen names the project and the state
+  /// only unless the owner asks for more.
+  it("offers a Sessions switch and an opening-prompt setting that defaults off", () => {
+    state.prefs = undefined;
+    render(<PhoneNotifyPanel />);
+    expect(screen.getByRole("checkbox", { name: /^sessions:/i })).toHaveProperty("checked", true);
+    expect(screen.getByRole("checkbox", { name: /opening prompt/i })).toHaveProperty(
+      "checked",
+      false,
+    );
+  });
+
+  it("switches sessions off without touching the other categories", () => {
+    render(<PhoneNotifyPanel />);
+    fireEvent.click(screen.getByRole("checkbox", { name: /^sessions:/i }));
+    expect(set).toHaveBeenCalledWith(expect.objectContaining({ sessions: false, new_pr: true }));
+  });
+
+  it("disables the snippet setting while sessions are off", () => {
+    state.prefs = { ...(state.prefs as object), sessions: false };
+    render(<PhoneNotifyPanel />);
+    expect(screen.getByRole("checkbox", { name: /opening prompt/i })).toHaveProperty(
+      "disabled",
+      true,
+    );
+  });
+
+  /// **The owner's decision on #1486**: instant delivery is #1492, and
+  /// this ships best-effort -- which the setting that enables it says.
+  it("says session notifications are best-effort where they are enabled", () => {
+    render(<PhoneNotifyPanel />);
+    expect(screen.getByText(/best-effort, delivery can be delayed by ios/i)).toBeTruthy();
   });
 
   /// One render passes before the query resolves. The Rust default is

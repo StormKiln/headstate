@@ -267,6 +267,12 @@ vi.mock("../api/hooks", () => ({
 }));
 vi.mock("sonner", () => ({ toast: { success: toastSuccess, error: toastError } }));
 vi.mock("../lib/clipboard", () => ({ copyText: copyFn }));
+/// The phone's per-session mute (#1486), which the phone-build describes
+/// below render. The companion's own command, so stubbed rather than
+/// reached through a transport.
+vi.mock("@/api/phoneNotify", () => ({
+  useSessionMute: () => ({ muted: false, set: () => Promise.resolve(), loaded: true }),
+}));
 /// Which build the page thinks it is, switchable per describe (#1480).
 /// The old transcript preview now renders ONLY in the phone build, so
 /// its tests below run as the phone: a getter, read on every access,

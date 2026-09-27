@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-take-tapped"
+description = "Enables the take_tapped command without any pre-configured scope."
+commands.allow = ["take_tapped"]
+
+[[permission]]
+identifier = "deny-take-tapped"
+description = "Denies the take_tapped command without any pre-configured scope."
+commands.deny = ["take_tapped"]

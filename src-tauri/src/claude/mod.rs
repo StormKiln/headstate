@@ -73,6 +73,9 @@ pub mod confighealth;
 pub mod coverage;
 pub mod crash;
 pub mod definitions;
+/// A compact, content-free status per session, for the phone's
+/// best-effort notifications (#1486). Carries no transcript text.
+pub mod digest;
 pub mod events;
 /// The restart list: every running session's resume command, as text to
 /// save before a reboot (#1071).

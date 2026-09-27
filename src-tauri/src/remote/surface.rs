@@ -404,6 +404,19 @@ pub const SURFACE: &[(&str, Class)] = &[
     // Read: one indexed query (#1132).
     ("claude_sessions_for_pr", Class::Read),
     ("claude_session_detail", Class::Read),
+    // #1486. A compact per-session status -- liveness, waiting kind, the
+    // last turn's end and outcome -- for the phone's best-effort
+    // notifications. Read: the same list derivation as `claude_sessions`
+    // plus one query of the hook table, bounded to 50 rows. Carries NO
+    // transcript text, so it has no `TRANSCRIPT_TEXT` row in
+    // `remote/privacy.rs`; `claude::digest` pins its field set.
+    ("claude_session_digest", Class::Read),
+    // #1486. One session's opening prompt, for the lock-screen snippet
+    // the phone shows only when its owner opts in. Read, and transcript
+    // text: listed in `remote/privacy.rs` as `Whole`, so it is masked
+    // before it crosses and refused for a phone whose "read session
+    // transcripts" switch is off.
+    ("claude_transcript_opening_prompt", Class::Read),
     // #1002. Reads each attributed child transcript with #959's bounded
     // summariser and the app's own database; writes nothing. The phone
     // wants the rollup for the same reason the desktop does.
@@ -1234,6 +1247,10 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         }
         "claude_session_detail" => {
             res(commands::claude_session_detail(app.clone(), a.get("sessionId")?).await)
+        }
+        "claude_session_digest" => res(commands::claude_session_digest(app.clone()).await),
+        "claude_transcript_opening_prompt" => {
+            res(commands::claude_transcript_opening_prompt(app.clone(), a.get("sessionId")?).await)
         }
         "claude_subagent_rollup" => {
             res(commands::claude_subagent_rollup(app.clone(), a.get("sessionId")?).await)

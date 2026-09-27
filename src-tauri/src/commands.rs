@@ -5629,6 +5629,49 @@ pub async fn claude_sessions(
     .map_err(|e| e.to_string())?
 }
 
+/// A compact status per session, for the phone's notifications (#1486).
+///
+/// `Class::Read` on the remote surface: it is what the phone's background
+/// refresh window reads to decide "finished", "waiting" and "errored".
+/// It carries NO transcript text -- identifiers, a closed vocabulary and
+/// timestamps only (`claude::digest`'s module docs, and its
+/// `digest_carries_no_transcript_text` test) -- which is why it has no
+/// row in `remote/privacy.rs`'s `TRANSCRIPT_TEXT`: there is nothing in it
+/// to mask.
+#[tauri::command]
+pub async fn claude_session_digest(
+    app: tauri::AppHandle,
+) -> Result<crate::claude::digest::SessionDigest, String> {
+    let db = db_path(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&db).map_err(|e| e.to_string())?;
+        crate::claude::digest::read(&conn, chrono::Utc::now()).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The first thing the user typed in ONE session (#1486), for the phone's
+/// opt-in lock-screen snippet.
+///
+/// Transcript text, so it is listed in `remote/privacy.rs`'s
+/// `TRANSCRIPT_TEXT` and masked before it crosses -- and refused outright
+/// for a phone whose "read session transcripts" switch is off. Named
+/// `transcript` so the masking invariant would catch a missing row.
+#[tauri::command]
+pub async fn claude_transcript_opening_prompt(
+    app: tauri::AppHandle,
+    session_id: String,
+) -> Result<crate::claude::sessions::OpeningPrompt, String> {
+    let db = db_path(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&db).map_err(|e| e.to_string())?;
+        crate::claude::sessions::opening_prompt(&conn, &session_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// What ONE Claude Code session knows that the list does not carry (#985).
 ///
 /// The other half of the split above: the resume command, the transcript
