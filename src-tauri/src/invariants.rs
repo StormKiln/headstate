@@ -4210,4 +4210,393 @@ fn suggestion(f: &Finding) -> String {
         }
         None
     }
+
+    // ---- Invariant: no test reaches the real home directory (#1535) ------
+
+    /// The functions allowed to read the home directory from the process
+    /// environment, as `(file, fn, why)`. Everything else goes through
+    /// `auth::home_dir`, which a test build answers from a fixture.
+    ///
+    /// Each entry must still match something, so one cannot outlive the
+    /// code it excuses.
+    const HOME_READERS: &[(&str, &str, &str)] = &[
+        (
+            "src-tauri/auth.rs",
+            "env_home",
+            "THE resolver. `home_dir` calls it only outside a test build.",
+        ),
+        (
+            "src-tauri/auth.rs",
+            "user_fallback_dirs",
+            "Windows `USERPROFILE` for where winget and Scoop put `gh`: \
+             read-only PATH candidates, never under `.claude`.",
+        ),
+        (
+            "src-tauri/packages/tools.rs",
+            "fallback_dirs",
+            "`$HOME` for package managers' bin directories: read-only PATH \
+             candidates, never under `.claude`. Routing it through \
+             `home_dir` would change tool lookup on Windows, which #1535 \
+             did not set out to do.",
+        ),
+    ];
+
+    /// Spellings that resolve the home directory around `auth::home_dir`:
+    /// the environment variables themselves, and the crates and the `std`
+    /// function that read them.
+    const HOME_TOKENS: &[&str] = &[
+        "\"HOME\"",
+        "\"USERPROFILE\"",
+        "env::home_dir",
+        "dirs::",
+        "dirs_next::",
+        "home::home_dir",
+        "directories::",
+    ];
+
+    /// Whether `line` contains `token` as a whole path segment: `dirs::`
+    /// must not match `scan_dirs::`, which is a module in this tree.
+    fn has_token(line: &str, token: &str) -> bool {
+        line.match_indices(token).any(|(at, _)| {
+            !token.starts_with(|c: char| c.is_alphanumeric())
+                || !line[..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        })
+    }
+
+    /// The line spans `[fn line, end)` of every `#[ignore]` test in
+    /// `lines`, whichever side of `#[test]` the `#[ignore]` is on.
+    fn ignored_test_spans(lines: &[&str]) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim_start();
+            if t != "#[test]" && !t.starts_with("#[tokio::test") {
+                continue;
+            }
+            let Some(fn_at) = (i + 1..lines.len().min(i + 6)).find(|j| {
+                let l = lines[*j].trim_start();
+                l.starts_with("fn ") || l.starts_with("async fn ")
+            }) else {
+                continue;
+            };
+            let above = (0..i)
+                .rev()
+                .take_while(|j| lines[*j].trim_start().starts_with("#["));
+            let ignored = (i + 1..fn_at)
+                .chain(above)
+                .any(|j| lines[j].trim_start().starts_with("#[ignore"));
+            if ignored {
+                let indent = lines[fn_at].len() - lines[fn_at].trim_start().len();
+                out.push((fn_at, item_end(lines, fn_at, indent)));
+            }
+        }
+        out
+    }
+
+    /// The name of the function line `n` is in: the nearest `fn` above it
+    /// that is indented less, with any visibility, `const`, `async` or
+    /// `unsafe` in front.
+    ///
+    /// Its own lookup rather than [`enclosing_fn`], whose patterns do not
+    /// include `pub(crate) fn`: sabotaging `claudemd::home` -- a
+    /// `pub(crate) fn` -- was reported as `read_file_reporting`, the
+    /// function above it. A line in no function at all (a `static`, say)
+    /// is named after the function before it, which can only fail to match
+    /// an allowlist entry: a false positive, never a silent pass.
+    fn fn_enclosing_line(lines: &[&str], n: usize) -> String {
+        let indent = |l: &str| l.len() - l.trim_start().len();
+        let depth = indent(lines[n]);
+        for l in lines[..n].iter().rev() {
+            if indent(l) >= depth {
+                continue;
+            }
+            let mut t = l.trim_start();
+            if let Some(r) = t.strip_prefix("pub") {
+                t = match r.strip_prefix('(') {
+                    Some(r) => r.split_once(')').map_or(r, |(_, r)| r),
+                    None => r,
+                }
+                .trim_start();
+            }
+            for q in ["const ", "async ", "unsafe "] {
+                t = t.strip_prefix(q).unwrap_or(t);
+            }
+            if let Some(r) = t.strip_prefix("fn ") {
+                return r.split(['(', '<']).next().unwrap_or("").to_string();
+            }
+        }
+        "<none>".to_string()
+    }
+
+    /// Every line of `src` (the file at `rel`) that breaks the rule, and
+    /// the [`HOME_READERS`] entries it used. See
+    /// [`no_test_resolves_the_real_home_directory`].
+    fn home_offenders(
+        rel: &str,
+        src: &str,
+        used: &mut std::collections::BTreeSet<(&'static str, &'static str)>,
+    ) -> (Vec<String>, usize) {
+        // `\r\n` first: the spans are found line by line.
+        let src = src.replace("\r\n", "\n");
+        let lines: Vec<&str> = src.lines().collect();
+        let ignored = ignored_test_spans(&lines);
+        let in_ignored = |n: usize| ignored.iter().any(|(a, b)| (*a..*b).contains(&n));
+        let mut out = Vec::new();
+        for (n, line) in lines.iter().enumerate() {
+            if is_comment(line) || in_ignored(n) {
+                continue;
+            }
+            if line.contains("real_for_a_live_probe") && !line.contains("fn real_for_a_live_probe")
+            {
+                out.push(format!(
+                    "{rel}:{}: the real home, outside an #[ignore] test: {}",
+                    n + 1,
+                    line.trim()
+                ));
+                continue;
+            }
+            if !HOME_TOKENS.iter().any(|t| has_token(line, t)) {
+                continue;
+            }
+            let name = fn_enclosing_line(&lines, n);
+            if let Some(&(f, g, _)) = HOME_READERS
+                .iter()
+                .find(|(f, g, _)| *f == rel && *g == name)
+            {
+                used.insert((f, g));
+                continue;
+            }
+            out.push(format!("{rel}:{}: in `{name}`: {}", n + 1, line.trim()));
+        }
+        (out, ignored.len())
+    }
+
+    /// No test resolves the developer's real home directory, so none can
+    /// reach the real `~/.claude` (#1535).
+    ///
+    /// # The defect
+    ///
+    /// `sessions::detail()` tests read the REAL `~/.claude/sessions`, so
+    /// they passed or failed on whatever was running (#1315 hit it), and a
+    /// machine-dependent test in the merge queue can burn a release commit
+    /// (#1048). Looking for the rest found 51 tests reaching the real home
+    /// through `auth::home_dir` -- the registry, the transcript corpus
+    /// through the handoff consumer -- and 203 more through
+    /// `claudemd::home`'s own `$HOME` read. Two wrote there: a tilde test
+    /// made and removed a directory in the real home, and the Poetry
+    /// removal tests made venvs and symlinks in the real cache and removed
+    /// them by computed path, the shape of the 2026-09-27 incident.
+    ///
+    /// # Why the rule is at the resolver and not at each test
+    ///
+    /// A source scan cannot follow a call, and every one of those tests
+    /// reached the home indirectly -- `consume` walks the corpus, `detail`
+    /// reads the registry. So `auth::home_dir` answers a per-thread
+    /// FIXTURE home in a test build, `None` unless the test set one. That
+    /// holds whatever the call chain. Two tests then check the two things
+    /// that would defeat it, the first in `a_test_build_has_no_real_home`:
+    ///
+    /// 1. **Runtime**: the resolver and the paths derived from it -- the
+    ///    registry, the corpus, the global `CLAUDE.md`'s home, the Poetry
+    ///    cache -- are absent here, and follow a fixture home when one is
+    ///    set. Asserting the derived paths is what shows they go THROUGH
+    ///    the resolver rather than around it.
+    /// 2. **Source**: nothing reads the home directory around the
+    ///    resolver -- the `HOME` or `USERPROFILE` variables, `dirs::`,
+    ///    `home::home_dir`, `std::env::home_dir` -- except the functions
+    ///    in [`HOME_READERS`], each with its reason. An `#[ignore]` test
+    ///    is exempt: a person runs it on purpose to measure this machine,
+    ///    never CI or the merge queue. The opt-in that gives such a probe
+    ///    the real home, `test_home::real_for_a_live_probe`, may appear
+    ///    ONLY in an `#[ignore]` test.
+    ///
+    /// # What it cannot see
+    ///
+    /// - **A read spelled some other way**: the variable name built at
+    ///   runtime or held in a `const`, `std::env::vars()` iterated, or a
+    ///   hard-coded absolute path. Only the spellings above are matched.
+    /// - **A home on another thread.** A thread the code under test spawns
+    ///   sees no home rather than the fixture. That fails safe -- nothing
+    ///   real is reached -- but such a test sees "no home", not its
+    ///   fixture.
+    /// - **What an `#[ignore]` probe does with the real home.** The opt-in
+    ///   says it must only read; nothing here checks that.
+    /// - **The allowlisted readers' callers.** A test reaching
+    ///   `tools::fallback_dirs` still reads real PATH candidate
+    ///   directories. Read-only, and nothing under `.claude`.
+    /// - **Other crates' tests at runtime.** The source half reads
+    ///   `src-mobile` and the step-up crate as text; neither resolves a
+    ///   home today.
+    ///
+    /// PROVEN BY SABOTAGE, both directions: see
+    /// `the_home_scan_flags_each_bypass_and_nothing_safe`, and the PR for
+    /// #1535 for the sabotage of the live tree.
+    #[test]
+    fn no_test_resolves_the_real_home_directory() {
+        // 2. Source. The runtime half is
+        // `a_test_build_has_no_real_home`, a separate test so that each
+        // half can be seen failing on its own: on a machine with a real
+        // Poetry cache, a bypass in `cache_dir` trips the runtime check
+        // first and would otherwise hide whether this one sees it.
+        let mut used = std::collections::BTreeSet::new();
+        let mut offenders = Vec::new();
+        let (mut files, mut ignored) = (0usize, 0usize);
+        for (crate_name, root) in crate_roots() {
+            for file in rust_files(&root) {
+                let rel = file
+                    .strip_prefix(&root)
+                    .unwrap_or(&file)
+                    .display()
+                    .to_string();
+                // Skipped by PATH: this file names every token in prose
+                // and in its fixtures.
+                if rel.contains("invariants.rs") {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&file) else {
+                    continue;
+                };
+                // `/` whatever the platform, so the allowlist matches on
+                // Windows too.
+                let rel = format!("{crate_name}/{}", rel.replace('\\', "/"));
+                let (found, n) = home_offenders(&rel, &src, &mut used);
+                offenders.extend(found);
+                ignored += n;
+                files += 1;
+            }
+        }
+        // Self-guards: a walk that read nothing, or an `#[ignore]` matcher
+        // that found none, would pass while exempting or checking nothing
+        // -- 51 ignored tests and 181 files existed when this was written.
+        assert!(files > 150, "read only {files} files");
+        assert!(ignored >= 40, "found only {ignored} #[ignore] tests");
+        let stale: Vec<_> = HOME_READERS
+            .iter()
+            .filter(|(f, g, _)| !used.contains(&(*f, *g)))
+            .map(|(f, g, _)| format!("{f}::{g}"))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "these HOME_READERS entries no longer match any home read; \
+             delete them: {stale:?}"
+        );
+        assert!(
+            offenders.is_empty(),
+            "the home directory is resolved around `auth::home_dir`, which a \
+             test build answers from a fixture (#1535). Call \
+             `crate::auth::home_dir()` instead -- in a test, set a fixture \
+             home with `crate::auth::test_home::set(tempdir)`. A probe that \
+             must measure this machine belongs in an `#[ignore]` test, with \
+             `test_home::real_for_a_live_probe()`. Offending lines:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// The runtime half of [`no_test_resolves_the_real_home_directory`]:
+    /// in a test build the resolver answers no home, the paths derived
+    /// from it are absent too, and they follow a fixture home when one is
+    /// set -- which is what shows they go THROUGH the resolver.
+    #[test]
+    fn a_test_build_has_no_real_home() {
+        use crate::claude::{liveness, transcript};
+
+        // The runtime half; see the doc.
+        assert_eq!(
+            crate::auth::home_dir(),
+            None,
+            "a test build must have no home unless the test sets one"
+        );
+        assert_eq!(crate::claudemd::home(), None);
+        assert_eq!(liveness::registry_dir(), None);
+        assert_eq!(transcript::projects_dir(), None);
+        assert_eq!(crate::caches::poetry::cache_dir(), None);
+        let fixture = tempfile::TempDir::new().unwrap();
+        {
+            let _home = crate::auth::test_home::set(fixture.path());
+            let claude = fixture.path().join(".claude");
+            assert_eq!(liveness::registry_dir(), Some(claude.join("sessions")));
+            assert_eq!(transcript::projects_dir(), Some(claude.join("projects")));
+            assert_eq!(crate::claudemd::home(), Some(fixture.path().to_path_buf()));
+        }
+        assert_eq!(
+            crate::auth::home_dir(),
+            None,
+            "the fixture home is dropped with its guard"
+        );
+    }
+
+    /// The scan behind [`no_test_resolves_the_real_home_directory`],
+    /// against fixtures: it flags each bypass, and stays silent on each
+    /// safe shape -- including under CRLF.
+    #[test]
+    fn the_home_scan_flags_each_bypass_and_nothing_safe() {
+        let fixture = "\
+fn production_reader() -> Option<String> {
+    std::env::var(\"HOME\").ok()
+}
+
+fn via_a_crate() {
+    let _ = dirs::home_dir();
+}
+
+pub(crate) fn env_home() -> Option<String> {
+    std::env::var(\"USERPROFILE\").ok()
+}
+
+fn safe() {
+    // std::env::var(\"HOME\") in a comment is a mention
+    let _ = crate::auth::home_dir();
+    let _ = crate::worktrees::scan_dirs::x();
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_plain_test() {
+        let _ = std::env::var_os(\"HOME\");
+    }
+
+    #[test]
+    fn a_plain_test_opting_in() {
+        let _home = crate::auth::test_home::real_for_a_live_probe();
+    }
+
+    #[test]
+    #[ignore = \"a live probe\"]
+    fn a_probe() {
+        let _home = crate::auth::test_home::real_for_a_live_probe();
+        let _ = std::env::var(\"HOME\");
+    }
+
+    #[ignore]
+    #[test]
+    fn a_probe_ignored_above() {
+        let _ = std::env::var(\"HOME\");
+    }
+}
+";
+        for src in [fixture.to_string(), fixture.replace('\n', "\r\n")] {
+            let mut used = std::collections::BTreeSet::new();
+            let (found, ignored) = home_offenders("src-tauri/auth.rs", &src, &mut used);
+            assert_eq!(ignored, 2, "both #[ignore] placements are found");
+            let lines: Vec<&str> = found.iter().map(|f| f.split(':').nth(1).unwrap()).collect();
+            // Flagged: the production read (2), the crate (6), the plain
+            // test (23) and its opt-in (28). Silent: the allowlisted
+            // `env_home` (10), the comment and the safe calls (14-16), and
+            // both probes.
+            assert_eq!(lines, ["2", "6", "23", "28"], "{found:#?}");
+            assert!(used.contains(&("src-tauri/auth.rs", "env_home")));
+        }
+        // The allowlist is by file AND function: the same `env_home`
+        // elsewhere is flagged.
+        let mut used = std::collections::BTreeSet::new();
+        let (found, _) = home_offenders("src-tauri/other.rs", fixture, &mut used);
+        assert!(
+            found.iter().any(|f| f.contains("in `env_home`")),
+            "{found:#?}"
+        );
+        assert!(used.is_empty());
+    }
 }

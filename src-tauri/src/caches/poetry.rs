@@ -112,9 +112,12 @@ pub fn parse_venv_name(name: &str) -> Option<(String, String)> {
 }
 
 /// Where Poetry keeps its virtualenvs on this platform.
+///
+/// The home comes from [`crate::auth::home_dir`], the one resolver, so a
+/// test build sees a fixture cache or none -- never the real one, which
+/// `remove_venv` deletes inside (#1535).
 pub fn cache_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let base = PathBuf::from(home);
+    let base = crate::auth::home_dir()?;
     // macOS uses Library/Caches; Linux respects XDG. Both are checked
     // rather than assuming the platform, because a user with
     // POETRY_CACHE_DIR set is not covered by either and should get an

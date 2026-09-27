@@ -729,6 +729,7 @@ mod tests {
     #[test]
     #[ignore = "needs live claude sessions; run with --ignored"]
     fn real_registry() {
+        let _home = crate::auth::test_home::real_for_a_live_probe();
         let dir = registry_dir().expect("a home directory");
         let live = running_ids(&dir, |pids| {
             println!("registry pids        {pids:?}");
