@@ -77,6 +77,13 @@
 /// longer reaches it would leave a hole. Scrolling back down pages
 /// forward again; reaching the end re-attaches.
 ///
+/// Live growth is no exception. The page a tick appends is not one the
+/// reader asked for, so it is not protected: a reader whose window holds
+/// the oldest page -- parked on a new turn's prompt while output arrives
+/// below it -- detaches the follow once the bound binds, exactly as
+/// reading far back does (#1524). Protecting it left neither end
+/// droppable, and memory grew with the session.
+///
 /// # States
 ///
 /// Six, and none may render as another (#846, #1042, #1050):
@@ -244,6 +251,11 @@ export class TranscriptFollower {
     replacements: 0,
     position: null,
   };
+  /// The snapshot subscribers were last given. `snap` is the working
+  /// copy: `read` writes `lastReadAt` into it before `publish` runs, so
+  /// comparing against `snap` would miss an idle read, and "Last read
+  /// at" would stop advancing while the poll kept going (#1525).
+  private delivered: FollowSnapshot = this.snap;
   private readonly listeners = new Set<() => void>();
   private readonly max: number;
   private readonly pressure: number;
@@ -267,7 +279,7 @@ export class TranscriptFollower {
     return () => this.listeners.delete(listener);
   };
 
-  readonly getSnapshot = (): FollowSnapshot => this.snap;
+  readonly getSnapshot = (): FollowSnapshot => this.delivered;
 
   // ---- conditions ----
 
@@ -548,7 +560,11 @@ export class TranscriptFollower {
       if (w.end.offset === w.start.offset) break; // nothing new
       grew = true;
       this.append(w);
-      this.evict(this.max, "tail");
+      // Nothing protects the page just appended: the reader did not ask
+      // for it. Where their window holds the oldest page, the newest is
+      // the one that goes, and the follow detaches (#1524) -- protecting
+      // it too left neither end droppable, and growth held without bound.
+      this.evict(this.max, null);
       if (!this.attached) break;
       if (w.at_end) break;
       if (i === CATCH_UP_PAGES - 1) this.catchingUp = true;
@@ -759,8 +775,12 @@ export class TranscriptFollower {
       masking: this.masking(),
       position: this.position(),
     };
-    if (shallowEqual(next, this.snap)) return;
     this.snap = next;
+    // Against what was delivered, not the working copy (#1525). An idle
+    // read changes only `lastReadAt`; `messages` keeps its identity, so
+    // no row re-renders.
+    if (shallowEqual(next, this.delivered)) return;
+    this.delivered = next;
     for (const l of this.listeners) l();
   }
 }

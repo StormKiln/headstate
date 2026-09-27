@@ -499,7 +499,7 @@ describe("TranscriptFollower: growth", () => {
     expect(call.kind === "tool_call" && call.result?.message_id).toBe("res1");
   });
 
-  it("an idle tick publishes nothing new", async () => {
+  it("an idle tick keeps the messages' identity", async () => {
     const file = new FakeFile(3);
     const f = follower(file);
     f.setLive("running");
@@ -508,6 +508,32 @@ describe("TranscriptFollower: growth", () => {
     const s = f.getSnapshot().messages;
     await vi.advanceTimersByTimeAsync(FAST_MS * 3);
     expect(f.getSnapshot().messages).toBe(s);
+  });
+
+  it("an idle read advances lastReadAt for subscribers, and nothing else (#1525)", async () => {
+    const file = new FakeFile(3);
+    const f = follower(file);
+    f.setLive("running");
+    f.start();
+    await settle();
+    const before = f.getSnapshot();
+    const seen: FollowSnapshot[] = [];
+    f.subscribe(() => seen.push(f.getSnapshot()));
+    const reads = file.calls.length;
+    await vi.advanceTimersByTimeAsync(FAST_MS);
+    expect(file.calls.length).toBe(reads + 1);
+    // Told once, with the new time: a poll that keeps going is seen to.
+    expect(seen).toHaveLength(1);
+    const after = f.getSnapshot();
+    expect(after.lastReadAt).toBe(before.lastReadAt! + FAST_MS);
+    // The same messages, the same objects: no row has anything to redo.
+    expect(after.messages).toBe(before.messages);
+    expect(after.position).toBe(before.position);
+    expect(after.status).toBe(before.status);
+    // Every idle read, not only the first.
+    await vi.advanceTimersByTimeAsync(FAST_MS * 2);
+    expect(seen).toHaveLength(3);
+    expect(f.getSnapshot().lastReadAt).toBe(before.lastReadAt! + FAST_MS * 3);
   });
 });
 
@@ -606,7 +632,49 @@ describe("TranscriptFollower: bounded memory", () => {
     expect(s.hasOlder).toBe(true);
   });
 
-  it("live growth never lets go of the page the reader is reading", async () => {
+  it("live growth past the bound, the reader on the oldest page: the newest goes and the follow detaches (#1524)", async () => {
+    const file = new FakeFile(12, 3);
+    const f = follower(file, { maxResident: 9 });
+    let most = 0;
+    f.subscribe(() => (most = Math.max(most, f.getSnapshot().messages?.length ?? 0)));
+    f.setLive("running");
+    f.start();
+    await settle();
+    await f.loadOlder();
+    await f.loadOlder();
+    // Reading the oldest held page -- parked on a turn's prompt -- while
+    // output arrives below.
+    f.setViewport("r3", "r5");
+    file.add(3);
+    await vi.advanceTimersByTimeAsync(FAST_MS);
+    let s = f.getSnapshot();
+    // The reader's page stays; the bound holds; the page read past it
+    // is let go, and the follow says it is not following.
+    expect(ids(s)).toEqual(["r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11"]);
+    expect(most).toBeLessThanOrEqual(9);
+    expect(s.atLiveEdge).toBe(false);
+    expect(s.status).toBe("paused");
+
+    // Detached, it reads nothing more, however long the session writes.
+    const n = file.calls.length;
+    file.add(30);
+    f.nudge();
+    await vi.advanceTimersByTimeAsync(IDLE_MAX_MS * 2);
+    expect(file.calls.length).toBe(n);
+    expect(f.getSnapshot().messages!.length).toBeLessThanOrEqual(9);
+
+    // "Jump to the latest" re-engages: the newest page, following again.
+    await f.jumpToLatest();
+    s = f.getSnapshot();
+    expect(s.atLiveEdge).toBe(true);
+    expect(ids(s).at(-1)).toBe("r44");
+    expect(s.status).toBe("following");
+    file.add(1);
+    await vi.advanceTimersByTimeAsync(FAST_MS);
+    expect(ids(f.getSnapshot()).at(-1)).toBe("r45");
+  });
+
+  it("a detached follow re-engages by paging forward to the end (#1524)", async () => {
     const file = new FakeFile(12, 3);
     const f = follower(file, { maxResident: 9 });
     f.setLive("running");
@@ -614,13 +682,26 @@ describe("TranscriptFollower: bounded memory", () => {
     await settle();
     await f.loadOlder();
     await f.loadOlder();
-    // Reading the oldest held page while output arrives below.
     f.setViewport("r3", "r5");
     file.add(3);
     await vi.advanceTimersByTimeAsync(FAST_MS);
-    const s = ids(f.getSnapshot());
-    expect(s).toContain("r3");
-    expect(s.at(-1)).toBe("r14");
+    expect(f.getSnapshot().atLiveEdge).toBe(false);
+    // The reader scrolls down: each reach of the end reads a page forward.
+    for (let i = 0; i < 5 && !f.getSnapshot().atLiveEdge; i++) {
+      const cur = ids(f.getSnapshot());
+      f.setViewport(cur.at(-3)!, cur.at(-1)!);
+      await f.loadNewer();
+    }
+    const s = f.getSnapshot();
+    expect(s.atLiveEdge).toBe(true);
+    expect(ids(s).at(-1)).toBe("r14");
+    expect(s.messages!.length).toBeLessThanOrEqual(9);
+    // At the bottom now, the window on the newest page: following again.
+    f.setViewport("r12", "r14");
+    file.add(1);
+    await vi.advanceTimersByTimeAsync(FAST_MS);
+    expect(ids(f.getSnapshot()).at(-1)).toBe("r15");
+    expect(f.getSnapshot().atLiveEdge).toBe(true);
   });
 
   it("jump to latest from far back opens on the newest page again", async () => {
