@@ -14,30 +14,25 @@
 //!   the code, so it is taken on purpose, on known hardware, in a release
 //!   build -- `make bench-transcript` -- and recorded in the PR.
 //!
-//! # What "the start" and "the end" of a 70 MB file mean today
+//! # What is measured
 //!
-//! #1487 asks for a reverse page at the START of a 70 MB file. There is
-//! no paged read yet -- that is #1220 -- so the reads measured are the
-//! two that exist:
+//! - **the end**: `preview::tail`, the bounded read the stop proposal's
+//!   "last turn" still uses;
+//! - #1220's paged read, at four places in each fixture: forward from
+//!   byte 0, backwards to byte 0 (the reverse page at the start #1487
+//!   asked for), backwards from the middle, and backwards from the end.
+//!   Its byte bound is the same at all four -- that is the point of it
+//!   -- and is asserted on every fixture.
 //!
-//! - **the end**: `preview::tail`, and `preview::follow` both on a first
-//!   open and idle at the end of the file;
-//! - **the start**: `preview::follow` from a cursor at offset 0, which is
-//!   what a follow does when it must catch up across the whole file. It
-//!   is measured precisely because it is UNBOUNDED: it reads everything
-//!   from the cursor to the end, so its cost is the file's size.
-//!
-//! #1220's paged read is measured beside them, at four places in each
-//! fixture: forward from byte 0, backwards to byte 0 (the reverse page
-//! at the start #1487 asked for), backwards from the middle, and
-//! backwards from the end. Its byte bound is the same at all four --
-//! that is the point of it -- and is asserted on every fixture.
+//! `preview::follow` was measured here too -- first read, idle tick and
+//! an unbounded catch-up from offset 0 -- until #1514 retired it with the
+//! old preview pane; the live viewer follows through paged reads.
 
 use std::path::Path;
 use std::time::Duration;
 
 use super::fixtures::{self, Written};
-use super::preview::{self, Cursor, FINGERPRINT_BYTES, TAIL_BYTES};
+use super::preview::{self, TAIL_BYTES};
 use super::transcript_page::{
     self, IndexUse, PageAnchor, PageCursor, PageDirection, PAGE_BYTES, PAGE_READ_BOUND,
 };
@@ -45,16 +40,8 @@ use super::transcript_page::{
 /// One read, as the bench names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Read {
-    /// `tail`: the last 256 KB, as the pane opens today.
+    /// `tail`: the last 256 KB, as the stop proposal reads it.
     TailAtEnd,
-    /// `follow` with no cursor: the first read of a followed pane.
-    FollowFirst,
-    /// `follow` with a cursor at the end and nothing new: one poll tick
-    /// of an idle session.
-    FollowIdleAtEnd,
-    /// `follow` from a cursor at offset 0: catching up across the whole
-    /// file.
-    FollowFromStart,
     /// A page forward from byte 0: the first page of a read from the top.
     PageFromStart,
     /// A page backwards from about [`PAGE_BYTES`] in, reaching byte 0:
@@ -70,9 +57,6 @@ impl Read {
     fn label(self) -> &'static str {
         match self {
             Read::TailAtEnd => "tail (end)",
-            Read::FollowFirst => "follow, first read (end)",
-            Read::FollowIdleAtEnd => "follow, idle tick (end)",
-            Read::FollowFromStart => "follow, catch-up (start)",
             Read::PageFromStart => "page after (start)",
             Read::PageBackToStart => "page before (start)",
             Read::PageAtMiddle => "page before (middle)",
@@ -84,24 +68,12 @@ impl Read {
 /// What one read cost, and what it produced.
 #[derive(Debug, Clone)]
 struct Taken {
-    /// Bytes of the transcript read into memory, fingerprint probe
-    /// included.
+    /// Bytes of the transcript read into memory.
     bytes_read: u64,
     messages: usize,
     truncated: bool,
-    /// The `Preview` as JSON: what crosses to the webview and the phone.
+    /// The answer as JSON: what crosses to the webview and the phone.
     payload: String,
-}
-
-fn cursor_at(offset: u64) -> Cursor {
-    // A cursor at 0 has nothing behind it to fingerprint, so its digest
-    // is empty and `follow` treats it as a genuine append from the start.
-    // A cursor anywhere else is taken from a real read.
-    Cursor {
-        offset,
-        behind_digest: String::new(),
-        behind_bytes: 0,
-    }
 }
 
 /// The record boundary at or after `offset`, as a cursor a page accepts.
@@ -134,14 +106,12 @@ fn page_cursor_near(path: &Path, offset: u64) -> PageCursor {
 /// timed region.
 #[derive(Debug, Clone)]
 struct Marks {
-    end: Cursor,
     near_start: PageCursor,
     middle: PageCursor,
 }
 
 fn marks(path: &Path, bytes: u64) -> Marks {
     Marks {
-        end: end_cursor(path),
         near_start: page_cursor_near(path, PAGE_BYTES.min(bytes / 4)),
         middle: page_cursor_near(path, bytes / 2),
     }
@@ -149,7 +119,6 @@ fn marks(path: &Path, bytes: u64) -> Marks {
 
 fn take(read: Read, path: &Path, marks: &Marks) -> Taken {
     let json = |p: &preview::Preview| serde_json::to_string(p).expect("a preview serialises");
-    let end = &marks.end;
     let page = |anchor: PageAnchor, dir: PageDirection| {
         // No position index: it is built off the request path, and the
         // read measured here is the page alone.
@@ -179,31 +148,13 @@ fn take(read: Read, path: &Path, marks: &Marks) -> Taken {
                 payload: json(&p),
             }
         }
-        Read::FollowFirst | Read::FollowIdleAtEnd | Read::FollowFromStart => {
-            let cursor = match read {
-                Read::FollowFirst => None,
-                Read::FollowIdleAtEnd => Some(end.clone()),
-                Read::FollowFromStart => Some(cursor_at(0)),
-                _ => unreachable!("only follow reads reach here"),
-            };
-            let f = preview::follow(path, cursor.as_ref()).expect("follow");
-            Taken {
-                bytes_read: f.bytes_read + f.fingerprint_bytes_read,
-                messages: f.preview.messages.len(),
-                truncated: f.preview.truncated,
-                payload: json(&f.preview),
-            }
-        }
     }
 }
 
 /// The reads measured for every fixture.
-fn cases() -> [Read; 8] {
+fn cases() -> [Read; 5] {
     [
         Read::TailAtEnd,
-        Read::FollowFirst,
-        Read::FollowIdleAtEnd,
-        Read::FollowFromStart,
         Read::PageFromStart,
         Read::PageBackToStart,
         Read::PageAtMiddle,
@@ -219,18 +170,12 @@ fn is_page(read: Read) -> bool {
 }
 
 /// The most bytes a read may hold, whatever the file's size -- `None`
-/// where the read is unbounded by design and the bench only reports it.
+/// for a read unbounded by design, which the bench only reports. Every
+/// read measured today is bounded; #1514 retired the one that was not
+/// (`follow`'s catch-up from offset 0).
 fn byte_bound(read: Read) -> Option<u64> {
     match read {
         Read::TailAtEnd => Some(TAIL_BYTES),
-        // The window, plus the fingerprint of what is behind its end.
-        Read::FollowFirst => Some(TAIL_BYTES + FINGERPRINT_BYTES),
-        // Nothing new: ONE fingerprint, the probe behind the stored
-        // offset, whose digest is reused as the new cursor's (#1476).
-        // It was two -- 131,072 bytes per idle tick -- until the
-        // redundant second read of the same region was dropped.
-        Read::FollowIdleAtEnd => Some(FINGERPRINT_BYTES),
-        Read::FollowFromStart => None,
         // The same bound wherever the page lands: the point of #1220.
         Read::PageFromStart | Read::PageBackToStart | Read::PageAtMiddle | Read::PageAtEnd => {
             Some(PAGE_READ_BOUND)
@@ -242,27 +187,18 @@ fn byte_bound(read: Read) -> Option<u64> {
 ///
 /// Derived, not given: #1487 sets 300 ms to first paint on the desktop
 /// and says nothing about the read alone. The read gets a sixth of it,
-/// leaving the rest for the transport, parse and render. An idle tick
-/// gets 5 ms because #1487's follow budget is "no main-thread work
-/// beyond one stat per tick" and the read runs off the main thread, so
-/// the bound is on the poller's cost, not on paint.
+/// leaving the rest for the transport, parse and render. `None` is a
+/// read only reported; none is, today.
 fn time_budget(read: Read) -> Option<Duration> {
     match read {
         // A page gets the tail's budget: it is the same size of read,
-        // and the viewer opens on one exactly as the pane opens on a tail.
+        // and the viewer opens on one exactly as the pane opened on a tail.
         Read::TailAtEnd
-        | Read::FollowFirst
         | Read::PageFromStart
         | Read::PageBackToStart
         | Read::PageAtMiddle
         | Read::PageAtEnd => Some(Duration::from_millis(50)),
-        Read::FollowIdleAtEnd => Some(Duration::from_millis(5)),
-        Read::FollowFromStart => None,
     }
-}
-
-fn end_cursor(path: &Path) -> Cursor {
-    preview::follow(path, None).expect("follow").cursor
 }
 
 /// The byte bounds hold on files far larger than the window.
@@ -280,7 +216,7 @@ fn reads_at_the_end_are_bounded_whatever_the_file_size() {
     for fixture in [fixtures::MESSAGES_1K, fixtures::HUGE_RESULT_5MB] {
         let w = fixtures::write(fixture, dir.path()).unwrap();
         assert!(
-            w.bytes > TAIL_BYTES + FINGERPRINT_BYTES,
+            w.bytes > TAIL_BYTES.max(PAGE_READ_BOUND),
             "{} is too small to test a bound",
             fixture.name
         );
@@ -299,26 +235,6 @@ fn reads_at_the_end_are_bounded_whatever_the_file_size() {
             );
         }
     }
-}
-
-/// Catching up from the start reads the whole file -- measured, so that
-/// the day a paged or bounded catch-up lands, this changes and the budget
-/// table in `docs/transcript-performance.md` changes with it.
-///
-/// This asserts what IS, not what should be: #1487's memory budget
-/// ("regardless of transcript size") is not met by this read today.
-#[test]
-fn a_catch_up_from_the_start_reads_the_whole_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let w = fixtures::write(fixtures::MESSAGES_1K, dir.path()).unwrap();
-    let m = marks(&w.path, w.bytes);
-    let t = take(Read::FollowFromStart, &w.path, &m);
-    assert!(
-        t.bytes_read >= w.bytes,
-        "{} of {} bytes",
-        t.bytes_read,
-        w.bytes
-    );
 }
 
 /// The timings, reported and checked against [`time_budget`].
@@ -404,16 +320,10 @@ fn transcript_read_timings() {
                 human(first.payload.len() as u64),
                 verdict
             );
-            if kept.is_some()
-                && matches!(
-                    read,
-                    Read::TailAtEnd | Read::FollowFromStart | Read::PageAtMiddle
-                )
-            {
+            if kept.is_some() && matches!(read, Read::TailAtEnd | Read::PageAtMiddle) {
                 let slug = match read {
                     Read::TailAtEnd => "tail",
-                    Read::PageAtMiddle => "page-middle",
-                    _ => "catch-up",
+                    _ => "page-middle",
                 };
                 let out = dir.join(format!("{}.{slug}.page.json", fixture.name));
                 std::fs::write(out, &first.payload).unwrap();
@@ -536,8 +446,8 @@ fn the_huge_result_is_one_message_on_a_page_not_a_hole() {
 }
 
 /// The message pages the browser harness renders (#1480, #1487): each
-/// fixture's `TranscriptPage` exactly as `claude_transcript_messages`
-/// returns it (`<name>.messages-tail.json`), and the whole file parsed
+/// fixture's `TranscriptPage` exactly as `transcript_model::tail` reads it
+/// (`<name>.messages-tail.json`), and the whole file parsed
 /// as one page (`<name>.messages-whole.json`), which the read model caps
 /// at its newest [`super::transcript_model::MAX_MESSAGES`] -- the fullest
 /// page a read can hand the viewer today.

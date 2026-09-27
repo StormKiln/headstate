@@ -1700,7 +1700,7 @@ mod tests {
             .collect();
         let page = json!({"messages": [{"text": lines.join("\n")}], "truncated": false});
         server.reply(
-            "/v1/call/claude_transcript_tail",
+            "/v1/call/claude_transcript_page",
             Reply::GzipJson {
                 status: 200,
                 body: page.to_string(),
@@ -1708,14 +1708,18 @@ mod tests {
         );
         let client = Client::new(&id, &server.fp, vec![server.addr()], server.port()).unwrap();
         let out = client
-            .call("claude_transcript_tail", &json!({"path": "p.jsonl"}), None)
+            .call(
+                "claude_transcript_page",
+                &json!({"path": "p.jsonl", "anchor": {"kind": "end"}, "direction": "before", "limit": null}),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(out, page);
         let req = server
             .requests()
             .into_iter()
-            .find(|r| r.path == "/v1/call/claude_transcript_tail")
+            .find(|r| r.path == "/v1/call/claude_transcript_page")
             .unwrap();
         let accept = req.header("accept-encoding").unwrap_or("");
         assert!(

@@ -115,8 +115,8 @@
 //!   desktop to fetch a page they control. Each guess then costs one
 //!   round of "make the agent ingest new text, wait for the phone to
 //!   poll". That new text then has to land in the same response as an
-//!   unchanged secret. A follow poll (`claude_transcript_follow`)
-//!   returns only the records appended since its cursor, so the secret
+//!   unchanged secret. A live-follow page (`claude_transcript_page`
+//!   after a cursor) returns only the records after that cursor, so the secret
 //!   would have to be re-written next to every guess.
 //!
 //! So the attack needs a LAN observer who also controls content that a

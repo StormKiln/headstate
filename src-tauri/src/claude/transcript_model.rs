@@ -264,7 +264,7 @@ pub struct TranscriptSubagent {
     pub status: Option<String>,
     pub agent_type: Option<String>,
     /// The subagent transcript's path. Suitable for
-    /// `claude_transcript_messages`, which applies the same path guard.
+    /// `claude_transcript_page`, which applies the same path guard.
     pub transcript_path: Option<String>,
     /// Whether that file exists. `None` when it was not checked -- the
     /// parse had no transcript path to resolve against -- which is not
