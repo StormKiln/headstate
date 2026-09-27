@@ -27,14 +27,20 @@
 //!   is measured precisely because it is UNBOUNDED: it reads everything
 //!   from the cursor to the end, so its cost is the file's size.
 //!
-//! When #1220 lands, its reverse page at the start goes in [`cases`]
-//! beside these, against the same fixture.
+//! #1220's paged read is measured beside them, at four places in each
+//! fixture: forward from byte 0, backwards to byte 0 (the reverse page
+//! at the start #1487 asked for), backwards from the middle, and
+//! backwards from the end. Its byte bound is the same at all four --
+//! that is the point of it -- and is asserted on every fixture.
 
 use std::path::Path;
 use std::time::Duration;
 
 use super::fixtures::{self, Written};
 use super::preview::{self, Cursor, FINGERPRINT_BYTES, TAIL_BYTES};
+use super::transcript_page::{
+    self, IndexUse, PageAnchor, PageCursor, PageDirection, PAGE_BYTES, PAGE_READ_BOUND,
+};
 
 /// One read, as the bench names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +55,15 @@ enum Read {
     /// `follow` from a cursor at offset 0: catching up across the whole
     /// file.
     FollowFromStart,
+    /// A page forward from byte 0: the first page of a read from the top.
+    PageFromStart,
+    /// A page backwards from about [`PAGE_BYTES`] in, reaching byte 0:
+    /// the reverse page at the start.
+    PageBackToStart,
+    /// A page backwards from the middle of the file.
+    PageAtMiddle,
+    /// A page backwards from the end: what the viewer opens on.
+    PageAtEnd,
 }
 
 impl Read {
@@ -58,6 +73,10 @@ impl Read {
             Read::FollowFirst => "follow, first read (end)",
             Read::FollowIdleAtEnd => "follow, idle tick (end)",
             Read::FollowFromStart => "follow, catch-up (start)",
+            Read::PageFromStart => "page after (start)",
+            Read::PageBackToStart => "page before (start)",
+            Read::PageAtMiddle => "page before (middle)",
+            Read::PageAtEnd => "page before (end)",
         }
     }
 }
@@ -85,9 +104,72 @@ fn cursor_at(offset: u64) -> Cursor {
     }
 }
 
-fn take(read: Read, path: &Path, end: &Cursor) -> Taken {
+/// The record boundary at or after `offset`, as a cursor a page accepts.
+fn page_cursor_near(path: &Path, offset: u64) -> PageCursor {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).expect("read the fixture");
+    let at = bytes[offset as usize..]
+        .iter()
+        .position(|b| *b == b'\n')
+        .map_or(bytes.len(), |i| offset as usize + i + 1);
+    let from = at.saturating_sub(transcript_page::CURSOR_FINGERPRINT_BYTES as usize);
+    let behind_digest = if at == 0 {
+        String::new()
+    } else {
+        Sha256::digest(&bytes[from..at])
+            .iter()
+            .fold(String::new(), |mut acc, b| {
+                use std::fmt::Write;
+                let _ = write!(acc, "{b:02x}");
+                acc
+            })
+    };
+    PageCursor {
+        offset: at as u64,
+        behind_digest,
+    }
+}
+
+/// Where the page reads start, per fixture: computed once, outside the
+/// timed region.
+#[derive(Debug, Clone)]
+struct Marks {
+    end: Cursor,
+    near_start: PageCursor,
+    middle: PageCursor,
+}
+
+fn marks(path: &Path, bytes: u64) -> Marks {
+    Marks {
+        end: end_cursor(path),
+        near_start: page_cursor_near(path, PAGE_BYTES.min(bytes / 4)),
+        middle: page_cursor_near(path, bytes / 2),
+    }
+}
+
+fn take(read: Read, path: &Path, marks: &Marks) -> Taken {
     let json = |p: &preview::Preview| serde_json::to_string(p).expect("a preview serialises");
+    let end = &marks.end;
+    let page = |anchor: PageAnchor, dir: PageDirection| {
+        // No position index: it is built off the request path, and the
+        // read measured here is the page alone.
+        let w = transcript_page::read_page(path, &anchor, dir, None, IndexUse::None).expect("page");
+        Taken {
+            bytes_read: w.page.bytes_read,
+            messages: w.page.messages.len(),
+            truncated: w.page.truncated,
+            payload: serde_json::to_string(&w).expect("a page serialises"),
+        }
+    };
+    let at = |c: &PageCursor| PageAnchor::Cursor {
+        offset: c.offset,
+        behind_digest: c.behind_digest.clone(),
+    };
     match read {
+        Read::PageFromStart => page(PageAnchor::Start, PageDirection::After),
+        Read::PageBackToStart => page(at(&marks.near_start), PageDirection::Before),
+        Read::PageAtMiddle => page(at(&marks.middle), PageDirection::Before),
+        Read::PageAtEnd => page(PageAnchor::End, PageDirection::Before),
         Read::TailAtEnd => {
             let p = preview::tail(path).expect("tail");
             Taken {
@@ -101,7 +183,8 @@ fn take(read: Read, path: &Path, end: &Cursor) -> Taken {
             let cursor = match read {
                 Read::FollowFirst => None,
                 Read::FollowIdleAtEnd => Some(end.clone()),
-                _ => Some(cursor_at(0)),
+                Read::FollowFromStart => Some(cursor_at(0)),
+                _ => unreachable!("only follow reads reach here"),
             };
             let f = preview::follow(path, cursor.as_ref()).expect("follow");
             Taken {
@@ -115,13 +198,24 @@ fn take(read: Read, path: &Path, end: &Cursor) -> Taken {
 }
 
 /// The reads measured for every fixture.
-fn cases() -> [Read; 4] {
+fn cases() -> [Read; 8] {
     [
         Read::TailAtEnd,
         Read::FollowFirst,
         Read::FollowIdleAtEnd,
         Read::FollowFromStart,
+        Read::PageFromStart,
+        Read::PageBackToStart,
+        Read::PageAtMiddle,
+        Read::PageAtEnd,
     ]
+}
+
+fn is_page(read: Read) -> bool {
+    matches!(
+        read,
+        Read::PageFromStart | Read::PageBackToStart | Read::PageAtMiddle | Read::PageAtEnd
+    )
 }
 
 /// The most bytes a read may hold, whatever the file's size -- `None`
@@ -140,6 +234,10 @@ fn byte_bound(read: Read) -> Option<u64> {
         // work (#1476) rather than changed by a measuring PR.
         Read::FollowIdleAtEnd => Some(2 * FINGERPRINT_BYTES),
         Read::FollowFromStart => None,
+        // The same bound wherever the page lands: the point of #1220.
+        Read::PageFromStart | Read::PageBackToStart | Read::PageAtMiddle | Read::PageAtEnd => {
+            Some(PAGE_READ_BOUND)
+        }
     }
 }
 
@@ -153,7 +251,14 @@ fn byte_bound(read: Read) -> Option<u64> {
 /// the bound is on the poller's cost, not on paint.
 fn time_budget(read: Read) -> Option<Duration> {
     match read {
-        Read::TailAtEnd | Read::FollowFirst => Some(Duration::from_millis(50)),
+        // A page gets the tail's budget: it is the same size of read,
+        // and the viewer opens on one exactly as the pane opens on a tail.
+        Read::TailAtEnd
+        | Read::FollowFirst
+        | Read::PageFromStart
+        | Read::PageBackToStart
+        | Read::PageAtMiddle
+        | Read::PageAtEnd => Some(Duration::from_millis(50)),
         Read::FollowIdleAtEnd => Some(Duration::from_millis(5)),
         Read::FollowFromStart => None,
     }
@@ -182,12 +287,12 @@ fn reads_at_the_end_are_bounded_whatever_the_file_size() {
             "{} is too small to test a bound",
             fixture.name
         );
-        let end = end_cursor(&w.path);
+        let m = marks(&w.path, w.bytes);
         for read in cases() {
             let Some(bound) = byte_bound(read) else {
                 continue;
             };
-            let t = take(read, &w.path, &end);
+            let t = take(read, &w.path, &m);
             assert!(
                 t.bytes_read <= bound,
                 "{} / {}: read {} bytes, bound {bound}",
@@ -209,8 +314,8 @@ fn reads_at_the_end_are_bounded_whatever_the_file_size() {
 fn a_catch_up_from_the_start_reads_the_whole_file() {
     let dir = tempfile::tempdir().unwrap();
     let w = fixtures::write(fixtures::MESSAGES_1K, dir.path()).unwrap();
-    let end = end_cursor(&w.path);
-    let t = take(Read::FollowFromStart, &w.path, &end);
+    let m = marks(&w.path, w.bytes);
+    let t = take(Read::FollowFromStart, &w.path, &m);
     assert!(
         t.bytes_read >= w.bytes,
         "{} of {} bytes",
@@ -266,13 +371,13 @@ fn transcript_read_timings() {
             "generated {} in {generated:?}: {} bytes, {} records, {} messages",
             fixture.name, w.bytes, w.records, w.messages
         );
-        let end = end_cursor(&w.path);
+        let m = marks(&w.path, w.bytes);
         for read in cases() {
-            let first = take(read, &w.path, &end);
+            let first = take(read, &w.path, &m);
             let mut times: Vec<Duration> = (0..RUNS)
                 .map(|_| {
                     let started = std::time::Instant::now();
-                    let _ = take(read, &w.path, &end);
+                    let _ = take(read, &w.path, &m);
                     started.elapsed()
                 })
                 .collect();
@@ -302,9 +407,15 @@ fn transcript_read_timings() {
                 human(first.payload.len() as u64),
                 verdict
             );
-            if kept.is_some() && matches!(read, Read::TailAtEnd | Read::FollowFromStart) {
+            if kept.is_some()
+                && matches!(
+                    read,
+                    Read::TailAtEnd | Read::FollowFromStart | Read::PageAtMiddle
+                )
+            {
                 let slug = match read {
                     Read::TailAtEnd => "tail",
+                    Read::PageAtMiddle => "page-middle",
                     _ => "catch-up",
                 };
                 let out = dir.join(format!("{}.{slug}.page.json", fixture.name));
@@ -320,7 +431,111 @@ fn transcript_read_timings() {
             }
         }
     }
+    // The position index a paged viewer builds once per file, off the
+    // request path: reported, not budgeted -- no request waits on it.
+    println!("\n| fixture | position index build (worker thread) | records |");
+    println!("|---|---:|---:|");
+    for fixture in fixtures::ALL {
+        let w: Written = fixtures::write(fixture, &dir).unwrap();
+        let started = std::time::Instant::now();
+        let ix = transcript_page::build_index(
+            &w.path,
+            None,
+            std::time::Instant::now() + transcript_page::INDEX_DEADLINE,
+        )
+        .unwrap();
+        println!(
+            "| {} | {:.1} ms | {} |",
+            fixture.name,
+            started.elapsed().as_secs_f64() * 1000.0,
+            ix.record_count()
+        );
+    }
     assert!(over.is_empty(), "over budget:\n  {}", over.join("\n  "));
+}
+
+/// A page is bounded the same at the start, the middle and the end, and
+/// a page at the start does not cost the file: the bound holds on a file
+/// many times its size, in both directions, and on a file whose middle is
+/// one 10 MiB record.
+///
+/// Sabotaged by holding every record whole (`RECORD_HOLD_BYTES` checks
+/// disabled): this fails on `huge-result-5mb`, the page holding the
+/// 10.3 MiB record. The byte BUDGET is proven by
+/// `transcript_page::a_page_of_large_records_stops_at_its_byte_budget`,
+/// on records large enough that it binds before the message limit.
+#[test]
+fn a_page_is_bounded_wherever_it_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    for fixture in [fixtures::MESSAGES_1K, fixtures::HUGE_RESULT_5MB] {
+        let w = fixtures::write(fixture, dir.path()).unwrap();
+        assert!(
+            w.bytes > 2 * PAGE_READ_BOUND,
+            "{} is too small",
+            fixture.name
+        );
+        let m = marks(&w.path, w.bytes);
+        for read in cases().into_iter().filter(|r| is_page(*r)) {
+            let t = take(read, &w.path, &m);
+            assert!(
+                t.bytes_read <= PAGE_READ_BOUND,
+                "{} / {}: read {} bytes, bound {PAGE_READ_BOUND}",
+                fixture.name,
+                read.label(),
+                t.bytes_read
+            );
+            assert!(
+                t.messages > 0,
+                "{} / {}: an empty page",
+                fixture.name,
+                read.label()
+            );
+        }
+    }
+}
+
+/// #1487's finding 3: a tail over the 5 MiB result showed only the reply
+/// after it. A page shows the record itself -- one message, its true size
+/// stated -- and still reads within its bound.
+///
+/// Sabotaged by dropping `Raw::Big` records in `Reader::line`: the
+/// result vanishes and this fails.
+#[test]
+fn the_huge_result_is_one_message_on_a_page_not_a_hole() {
+    use super::transcript_model::TranscriptBlock;
+    let dir = tempfile::tempdir().unwrap();
+    let w = fixtures::write(fixtures::HUGE_RESULT_5MB, dir.path()).unwrap();
+    let page = transcript_page::read_page(
+        &w.path,
+        &PageAnchor::End,
+        PageDirection::Before,
+        None,
+        IndexUse::None,
+    )
+    .unwrap();
+    assert!(page.page.bytes_read <= PAGE_READ_BOUND);
+    let huge = 5 * 1024 * 1024;
+    let clips: Vec<usize> = page
+        .page
+        .messages
+        .iter()
+        .flat_map(|m| &m.blocks)
+        .filter_map(|b| match b {
+            TranscriptBlock::ToolCall {
+                result: Some(o), ..
+            } => o.clip.map(|c| c.total_chars),
+            TranscriptBlock::ToolResult(o) => o.clip.map(|c| c.total_chars),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        clips.contains(&huge),
+        "no 5 MiB result on the page: {clips:?}"
+    );
+    assert!(
+        page.bytes_scanned >= 2 * huge as u64,
+        "the record was streamed"
+    );
 }
 
 fn human(bytes: u64) -> String {

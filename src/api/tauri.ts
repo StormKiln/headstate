@@ -77,7 +77,13 @@ import type {
   RepoTree,
   RepoFile,
 } from "../types/pr";
-import type { RemoteTranscriptPage, TranscriptBlockText } from "../types/transcript";
+import type {
+  RemoteTranscriptPage,
+  RemoteTranscriptWindow,
+  TranscriptBlockText,
+  TranscriptPageAnchor,
+  TranscriptPageDirection,
+} from "../types/transcript";
 
 export interface AuthState {
   ok: boolean;
@@ -1478,15 +1484,52 @@ export const claudeTranscriptMessages = (path: string, reveal = false) =>
 ///
 /// `reveal` as `claudeTranscriptMessages`: a block fetched while the
 /// phone shows revealed text must arrive revealed too.
+///
+/// `offset` is the record's `offset` from the message or tool output that
+/// showed the block (#1220): with it the fetch reads that one record
+/// instead of scanning the file. `null` scans, as does a stale offset.
 export const claudeTranscriptBlockText = (
   path: string,
   messageId: string,
   index: number,
   reveal = false,
+  offset: number | null = null,
 ) =>
-  call<TranscriptBlockText>(
-    "claude_transcript_block_text",
-    reveal ? { path, messageId, index, reveal: true } : { path, messageId, index },
+  call<TranscriptBlockText>("claude_transcript_block_text", {
+    path,
+    messageId,
+    index,
+    // Each rides only when set, so a call without them carries exactly
+    // the arguments it always did.
+    ...(offset !== null ? { offset } : {}),
+    ...(reveal ? { reveal: true } : {}),
+  });
+
+/// One bounded page of a transcript, before or after an anchor (#1220).
+///
+/// Open at `{ kind: "end" }` / `"before"`; page back with
+/// `{ kind: "cursor", ...window.start }` / `"before"`, forward with
+/// `{ kind: "cursor", ...window.end }` / `"after"`. Join pages with
+/// `mergeWindows` (`src/lib/transcriptPages.ts`), and label the position
+/// with `positionLabel` -- it says "estimate" when the figures are one.
+///
+/// `limit` is the most messages wanted; `null` is the server's maximum,
+/// and a larger ask is clamped to it. `Class::Read`, bounded per call
+/// inside the command however large the file.
+///
+/// `reveal` as `claudeTranscriptMessages`: sent only when true.
+export const claudeTranscriptPage = (
+  path: string,
+  anchor: TranscriptPageAnchor,
+  direction: TranscriptPageDirection,
+  limit: number | null,
+  reveal = false,
+) =>
+  call<RemoteTranscriptWindow>(
+    "claude_transcript_page",
+    reveal
+      ? { path, anchor, direction, limit, reveal: true }
+      : { path, anchor, direction, limit },
   );
 
 // ---------------------------------------------------------------------

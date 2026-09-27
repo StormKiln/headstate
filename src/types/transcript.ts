@@ -101,6 +101,10 @@ export interface TranscriptToolOutput {
   /// the record, and without it a paired call's duration could not be
   /// measured. `null` when the record carried none.
   timestamp: string | null;
+  /// Where that record starts in the file: pass it to
+  /// `claudeTranscriptBlockText` so the fetch reads one record instead of
+  /// scanning (#1220). `null` when parsed without a file position.
+  offset: number | null;
   tool_use_id: string | null;
   text: string;
   clip: TranscriptClip | null;
@@ -230,6 +234,13 @@ export interface TranscriptMessage {
   is_meta: boolean;
   is_sidechain: boolean;
   blocks: TranscriptBlock[];
+  /// Where the record starts in the file (#1220): the full-text fetch's
+  /// hint. `null` for a derived message.
+  offset: number | null;
+  /// Set when the record was too large for a page to hold: its size in
+  /// bytes. Its blocks are clipped, each clip stating the true length,
+  /// and the message is still here -- never dropped (#1220).
+  oversized_bytes: number | null;
 }
 
 /// A window of a transcript as messages. Mirrors
@@ -259,6 +270,11 @@ export interface TranscriptPage {
 /// Absent on the desktop's own answers, which are never masked.
 export type RemoteTranscriptPage = TranscriptPage & { masking?: TranscriptMasking };
 
+/// A paged read (#1220) as it reaches the webview: the same masking
+/// summary, attached at the top level by the remote boundary, for the
+/// same reason `RemoteTranscriptPage` is an alias.
+export type RemoteTranscriptWindow = TranscriptWindow & { masking?: TranscriptMasking };
+
 /// One block's full text, fetched by address. Mirrors
 /// `claude::transcript_model::TranscriptBlockText`.
 export interface TranscriptBlockText {
@@ -267,4 +283,85 @@ export interface TranscriptBlockText {
   text: string;
   /// Set when even the fetch's own bound bit.
   clip: TranscriptClip | null;
+}
+
+/// Where a page is read from (#1220). Mirrors the Rust `PageAnchor`.
+///
+/// `cursor` is a `PageCursor` a previous page returned, handed back
+/// unread: `{ kind: "cursor", ...window.start }`.
+export type TranscriptPageAnchor =
+  | { kind: "start" }
+  | { kind: "end" }
+  | { kind: "cursor"; offset: number; behind_digest: string };
+
+/// Which way from the anchor: `before` is older messages.
+export type TranscriptPageDirection = "before" | "after";
+
+/** @public */
+/// A record boundary and a digest of the bytes behind it. Mirrors
+/// `claude::transcript_page::PageCursor`. Opaque except for `offset`,
+/// which orders pages: they never overlap.
+export interface PageCursor {
+  offset: number;
+  behind_digest: string;
+}
+
+/// What a position figure rests on. Only `whole_file` is a count.
+type TranscriptPositionBasis = "whole_file" | "index" | "partial_index" | "bytes";
+
+/** @public */
+/// Where a page sits in the whole transcript. Mirrors
+/// `claude::transcript_page::TranscriptPosition`.
+///
+/// Render with `positionLabel` (`src/lib/transcriptPages.ts`), which says
+/// "estimate" whenever `exact` is false. `null` is "nothing to place" or
+/// "nothing to estimate from", never 0.
+export interface TranscriptPosition {
+  first: number | null;
+  last: number | null;
+  total: number | null;
+  exact: boolean;
+  basis: TranscriptPositionBasis;
+}
+
+/** @public */
+/// A page's first real assistant message. Mirrors
+/// `claude::transcript_page::SeamModel`.
+export interface SeamModel {
+  message_id: string;
+  model: string;
+  timestamp: string | null;
+}
+
+/** @public */
+/// What joins a page to the one before it. Mirrors
+/// `claude::transcript_page::PageSeam`. The server decides which
+/// assistant messages count; the merge only compares strings.
+export interface PageSeam {
+  first_model: SeamModel | null;
+  last_model: string | null;
+}
+
+/** @public */
+/// One bounded page of a transcript (#1220). Mirrors
+/// `claude::transcript_page::TranscriptWindow`.
+///
+/// Messages are settled WITHIN the page. Join pages with `mergeWindows`
+/// (`src/lib/transcriptPages.ts`), which pairs results into calls across
+/// pages by id and fills the seams -- never by concatenating.
+export interface TranscriptWindow {
+  page: TranscriptPage;
+  /// The page is exactly the records in `[start.offset, end.offset)`.
+  start: PageCursor;
+  end: PageCursor;
+  at_start: boolean;
+  at_end: boolean;
+  /// The anchor no longer described the file, so this page came from the
+  /// end instead: every page held before it is stale. Replace, do not
+  /// merge.
+  rewritten: boolean;
+  position: TranscriptPosition;
+  seam: PageSeam;
+  /// Bytes streamed past without being held (oversized records).
+  bytes_scanned: number;
 }

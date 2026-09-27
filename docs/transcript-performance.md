@@ -22,7 +22,7 @@ the LAN.
 |---|---|---|---|---|
 | B1 | Open to first paint at the newest message | desktop < 300 ms, phone < 800 ms on the LAN | Browser harness: from the navigation or selection that opens a fixture until the newest message has painted (Element Timing `renderTime` on the newest message). Phone: Instruments, from the tap to the first frame showing the newest message. | **Not measured.** The viewer does not exist yet. The read that feeds it is in the Rust table below. |
 | B2 | Scrolling | no long task > 50 ms while scrolling; 60 fps on desktop and phone | Browser harness: a `longtask` PerformanceObserver during a scripted scroll from the newest message to the oldest and back, plus frame intervals counted with `requestAnimationFrame`. Phone: Instruments Time Profiler and the Animation Hitches instrument during a manual scroll. | **Not measured** for the viewer. The receive step (parsing one page) is measured below: every page parses in under 1 ms (median). |
-| B3 | Resident transcript memory | desktop < 50 MB, phone < 25 MB, **whatever the transcript's size** | Browser harness: JS heap after a forced GC (CDP `HeapProfiler.collectGarbage`, then `Runtime.getHeapUsage`), taken after opening and after the full scroll, on the 1k fixture and on the 70 MB fixture. The two must not differ by more than the budget allows. Rust: bytes each read holds (`bytes_read`), asserted in every `cargo test`. Phone: Instruments Allocations. | **Rust side: bounded for the end-of-file reads, unbounded for catch-up** (see Findings). Viewer: not measured. |
+| B3 | Resident transcript memory | desktop < 50 MB, phone < 25 MB, **whatever the transcript's size** | Browser harness: JS heap after a forced GC (CDP `HeapProfiler.collectGarbage`, then `Runtime.getHeapUsage`), taken after opening and after the full scroll, on the 1k fixture and on the 70 MB fixture. The two must not differ by more than the budget allows. Rust: bytes each read holds (`bytes_read`), asserted in every `cargo test`. Phone: Instruments Allocations. | **Rust side: bounded at any position** by the paged read (#1220): 260 to 268 KiB per page at the start, middle and end of every fixture. `follow`'s catch-up is still unbounded, and the viewer should page instead of using it (see Findings). Viewer: not measured. |
 | B4 | Live follow | idle follow costs no main-thread work beyond one stat per tick; growth costs O(new bytes) | Rust: bytes and time of `follow` on an idle tick and on an append. Browser harness: zero long tasks and no React commit during 30 s of idle follow on an open fixture (React Profiler `onRender` count). | **Idle tick: 128 KiB and ~0.09 ms**, off the main thread. It is O(1), but twice what `preview.rs` documents (see Findings). Viewer side: not measured. |
 | B5 | Phone bandwidth | a page < 150 KB compressed | Size of the page payload as sent over the remote surface, compressed with the codec the compression issue (#1478) picks. | **Uncompressed: 99 to 224 KiB.** Compressed: not yet measurable, because the generated text compresses far better than real text (see Fixtures). The bench prints gzip sizes, but only as a floor, never as a pass. |
 
@@ -36,7 +36,8 @@ B1 to B4 are what the viewer is held to. The Rust read budgets below are
 | `follow`, first read | ≤ 256 KiB + `FINGERPRINT_BYTES` (64 KiB) | < 50 ms |
 | `follow`, idle tick | ≤ 2 × 64 KiB | < 5 ms |
 | `follow`, catch-up from offset 0 | none: reported only | none: reported only |
-| paged read, reverse page at the start (#1220) | to be set when it lands | to be set when it lands |
+| paged read (#1220), at the start, middle or end | ≤ `PAGE_READ_BOUND` (716 KiB); measured 260 to 268 KiB | < 50 ms |
+| position index build (#1220), worker thread | per record, not per file | reported only: no request waits on it |
 
 ## Fixtures
 
@@ -82,7 +83,8 @@ This runs, in order:
 
 In ordinary `cargo test`, the **byte** bounds run on every build
 (`reads_at_the_end_are_bounded_whatever_the_file_size`,
-`a_catch_up_from_the_start_reads_the_whole_file`). Byte counts are a property
+`a_catch_up_from_the_start_reads_the_whole_file`,
+`a_page_is_bounded_wherever_it_lands`). Byte counts are a property
 of the code, so they can gate CI. Durations are not, so they stay behind
 `#[ignore]`, as #853 requires. Record the tables in the PR that changes a
 read or the viewer.
@@ -91,24 +93,59 @@ read or the viewer.
 
 ### Rust reads (`make bench-transcript`, step 1)
 
+Re-measured with #1220's paged reads beside the existing ones, 2026-09-26,
+same machine.
+
 | fixture | file | read | median | bytes read | messages | payload (JSON) | budget |
 |---|---:|---|---:|---:|---:|---:|---|
-| messages-1k | 2.1 MiB | tail (end) | 1.17 ms | 256.0 KiB | 127 (tail) | 99.0 KiB | < 50 ms: ok |
-| messages-1k | 2.1 MiB | follow, first read (end) | 1.29 ms | 320.0 KiB | 127 (tail) | 99.0 KiB | < 50 ms: ok |
-| messages-1k | 2.1 MiB | follow, idle tick (end) | 0.09 ms | 128.0 KiB | 0 | 0.3 KiB | < 5 ms: ok |
-| messages-1k | 2.1 MiB | follow, catch-up (start) | 8.24 ms | 2.1 MiB | 200 (tail) | 161.8 KiB | reported only |
-| messages-10k | 20.8 MiB | tail (end) | 1.30 ms | 256.0 KiB | 125 (tail) | 103.2 KiB | < 50 ms: ok |
-| messages-10k | 20.8 MiB | follow, first read (end) | 2.62 ms | 320.0 KiB | 125 (tail) | 103.2 KiB | < 50 ms: ok |
-| messages-10k | 20.8 MiB | follow, idle tick (end) | 0.09 ms | 128.0 KiB | 0 | 0.3 KiB | < 5 ms: ok |
-| messages-10k | 20.8 MiB | follow, catch-up (start) | 402.62 ms | 20.9 MiB | 200 (tail) | 171.6 KiB | reported only |
-| tool-heavy-70mb | 70.0 MiB | tail (end) | 1.37 ms | 256.0 KiB | 96 (tail) | 107.1 KiB | < 50 ms: ok |
-| tool-heavy-70mb | 70.0 MiB | follow, first read (end) | 1.86 ms | 320.0 KiB | 96 (tail) | 107.1 KiB | < 50 ms: ok |
-| tool-heavy-70mb | 70.0 MiB | follow, idle tick (end) | 0.08 ms | 128.0 KiB | 0 | 0.3 KiB | < 5 ms: ok |
-| tool-heavy-70mb | 70.0 MiB | follow, catch-up (start) | 252.64 ms | 70.1 MiB | 200 (tail) | 223.9 KiB | reported only |
+| messages-1k | 2.1 MiB | tail (end) | 1.11 ms | 256.0 KiB | 127 (tail) | 99.0 KiB | < 50 ms: ok |
+| messages-1k | 2.1 MiB | follow, first read (end) | 1.16 ms | 320.0 KiB | 127 (tail) | 99.0 KiB | < 50 ms: ok |
+| messages-1k | 2.1 MiB | follow, idle tick (end) | 0.08 ms | 128.0 KiB | 0 | 0.3 KiB | < 5 ms: ok |
+| messages-1k | 2.1 MiB | follow, catch-up (start) | 8.12 ms | 2.1 MiB | 200 (tail) | 161.8 KiB | reported only |
+| messages-1k | 2.1 MiB | page after (start) | 1.68 ms | 260.0 KiB | 101 | 114.4 KiB | < 50 ms: ok |
+| messages-1k | 2.1 MiB | page before (start) | 1.08 ms | 268.0 KiB | 95 (tail) | 115.7 KiB | < 50 ms: ok |
+| messages-1k | 2.1 MiB | page before (middle) | 1.03 ms | 268.0 KiB | 88 (tail) | 114.5 KiB | < 50 ms: ok |
+| messages-1k | 2.1 MiB | page before (end) | 1.12 ms | 264.0 KiB | 91 (tail) | 110.1 KiB | < 50 ms: ok |
+| messages-10k | 20.8 MiB | tail (end) | 1.05 ms | 256.0 KiB | 125 (tail) | 103.2 KiB | < 50 ms: ok |
+| messages-10k | 20.8 MiB | follow, first read (end) | 1.08 ms | 320.0 KiB | 125 (tail) | 103.2 KiB | < 50 ms: ok |
+| messages-10k | 20.8 MiB | follow, idle tick (end) | 0.08 ms | 128.0 KiB | 0 | 0.3 KiB | < 5 ms: ok |
+| messages-10k | 20.8 MiB | follow, catch-up (start) | 80.32 ms | 20.9 MiB | 200 (tail) | 171.6 KiB | reported only |
+| messages-10k | 20.8 MiB | page after (start) | 1.73 ms | 260.0 KiB | 101 | 114.4 KiB | < 50 ms: ok |
+| messages-10k | 20.8 MiB | page before (start) | 1.06 ms | 268.0 KiB | 95 (tail) | 115.7 KiB | < 50 ms: ok |
+| messages-10k | 20.8 MiB | page before (middle) | 1.05 ms | 268.0 KiB | 91 (tail) | 116.5 KiB | < 50 ms: ok |
+| messages-10k | 20.8 MiB | page before (end) | 1.10 ms | 264.0 KiB | 100 (tail) | 113.0 KiB | < 50 ms: ok |
+| tool-heavy-70mb | 70.0 MiB | tail (end) | 0.90 ms | 256.0 KiB | 96 (tail) | 107.1 KiB | < 50 ms: ok |
+| tool-heavy-70mb | 70.0 MiB | follow, first read (end) | 0.91 ms | 320.0 KiB | 96 (tail) | 107.1 KiB | < 50 ms: ok |
+| tool-heavy-70mb | 70.0 MiB | follow, idle tick (end) | 0.09 ms | 128.0 KiB | 0 | 0.3 KiB | < 5 ms: ok |
+| tool-heavy-70mb | 70.0 MiB | follow, catch-up (start) | 181.26 ms | 70.1 MiB | 200 (tail) | 223.9 KiB | reported only |
+| tool-heavy-70mb | 70.0 MiB | page after (start) | 1.35 ms | 260.0 KiB | 55 | 86.9 KiB | < 50 ms: ok |
+| tool-heavy-70mb | 70.0 MiB | page before (start) | 0.76 ms | 268.0 KiB | 44 (tail) | 75.3 KiB | < 50 ms: ok |
+| tool-heavy-70mb | 70.0 MiB | page before (middle) | 1.99 ms | 268.0 KiB | 20 (tail) | 36.5 KiB | < 50 ms: ok |
+| tool-heavy-70mb | 70.0 MiB | page before (end) | 0.97 ms | 264.0 KiB | 64 (tail) | 110.3 KiB | < 50 ms: ok |
 | huge-result-5mb | 10.3 MiB | tail (end) | 0.13 ms | 256.0 KiB | 1 (tail) | 0.8 KiB | < 50 ms: ok |
-| huge-result-5mb | 10.3 MiB | follow, first read (end) | 0.16 ms | 320.0 KiB | 1 (tail) | 0.8 KiB | < 50 ms: ok |
+| huge-result-5mb | 10.3 MiB | follow, first read (end) | 0.17 ms | 320.0 KiB | 1 (tail) | 0.8 KiB | < 50 ms: ok |
 | huge-result-5mb | 10.3 MiB | follow, idle tick (end) | 0.09 ms | 128.0 KiB | 0 | 0.3 KiB | < 5 ms: ok |
-| huge-result-5mb | 10.3 MiB | follow, catch-up (start) | 14.98 ms | 10.3 MiB | 56 | 50.2 KiB | reported only |
+| huge-result-5mb | 10.3 MiB | follow, catch-up (start) | 11.29 ms | 10.3 MiB | 56 | 50.2 KiB | reported only |
+| huge-result-5mb | 10.3 MiB | page after (start) | 23.53 ms | 260.0 KiB | 67 | 74.0 KiB | < 50 ms: ok |
+| huge-result-5mb | 10.3 MiB | page before (start) | 21.97 ms | 268.0 KiB | 1 (tail) | 5.5 KiB | < 50 ms: ok |
+| huge-result-5mb | 10.3 MiB | page before (middle) | 22.51 ms | 268.0 KiB | 1 (tail) | 5.5 KiB | < 50 ms: ok |
+| huge-result-5mb | 10.3 MiB | page before (end) | 22.38 ms | 264.0 KiB | 2 (tail) | 6.3 KiB | < 50 ms: ok |
+
+A page's `bytes read` includes the two cursor digests it returns and any
+anchor lookback. The `huge-result-5mb` pages take ~22 ms because they stream
+the 10.3 MiB record through the skim to present it as one message; that time
+is O(record), is reported in each page's `bytes_scanned`, and holds no more
+than one 64 KiB buffer plus what is kept.
+
+The position index each paged transcript builds once, on a worker thread
+(`transcript_page::build_index`), off the request path:
+
+| fixture | position index build (worker thread) | records |
+|---|---:|---:|
+| messages-1k | 12.3 ms | 2255 |
+| messages-10k | 121.1 ms | 22522 |
+| tool-heavy-70mb | 252.9 ms | 32741 |
+| huge-result-5mb | 21.7 ms | 140 |
 
 "(tail)" means the read reported `truncated`: it saw a window, not the whole
 conversation.
@@ -118,16 +155,20 @@ conversation.
 Node 24 (V8). The webview is JavaScriptCore on macOS and iOS, so this is a
 floor on the receive cost, not the webview's figure.
 
-| page | payload | median parse | max parse | retained heap | budget |
-|---|---:|---:|---:|---:|---|
-| messages-1k tail | 99.0 KiB | 0.27 ms | 0.58 ms | 117.5 KiB | < 50 ms: ok |
-| messages-1k catch-up | 161.8 KiB | 0.24 ms | 1.19 ms | 191.8 KiB | < 50 ms: ok |
-| messages-10k tail | 103.2 KiB | 0.14 ms | 0.74 ms | 119.5 KiB | < 50 ms: ok |
-| messages-10k catch-up | 171.6 KiB | 0.38 ms | 1.28 ms | 200.5 KiB | < 50 ms: ok |
-| tool-heavy-70mb tail | 107.1 KiB | 0.28 ms | 0.60 ms | 120.3 KiB | < 50 ms: ok |
-| tool-heavy-70mb catch-up | 223.9 KiB | 0.28 ms | 0.54 ms | 256.0 KiB | < 50 ms: ok |
-| huge-result-5mb tail | 0.8 KiB | 0.00 ms | 0.01 ms | 0.9 KiB | < 50 ms: ok |
-| huge-result-5mb catch-up | 50.2 KiB | 0.07 ms | 1.82 ms | 60.8 KiB | < 50 ms: ok |
+| page | payload | gzip (generated text: a floor) | median parse | max parse | retained heap | budget |
+|---|---:|---:|---:|---:|---:|---|
+| huge-result-5mb.catch-up.page.json | 50.2 KiB | 9.1 KiB | 0.06 ms | 0.36 ms | 60.9 KiB | < 50 ms: ok |
+| huge-result-5mb.page-middle.page.json | 5.5 KiB | 2.0 KiB | 0.01 ms | 0.01 ms | 13.0 KiB | < 50 ms: ok |
+| huge-result-5mb.tail.page.json | 0.8 KiB | 0.4 KiB | 0.00 ms | 0.01 ms | 0.9 KiB | < 50 ms: ok |
+| messages-10k.catch-up.page.json | 171.6 KiB | 25.7 KiB | 0.22 ms | 0.36 ms | 200.6 KiB | < 50 ms: ok |
+| messages-10k.page-middle.page.json | 116.5 KiB | 20.1 KiB | 0.16 ms | 0.27 ms | 125.4 KiB | < 50 ms: ok |
+| messages-10k.tail.page.json | 103.2 KiB | 15.5 KiB | 0.13 ms | 0.24 ms | 121.1 KiB | < 50 ms: ok |
+| messages-1k.catch-up.page.json | 161.8 KiB | 25.5 KiB | 0.21 ms | 0.31 ms | 191.4 KiB | < 50 ms: ok |
+| messages-1k.page-middle.page.json | 114.5 KiB | 20.6 KiB | 0.15 ms | 0.27 ms | 120.7 KiB | < 50 ms: ok |
+| messages-1k.tail.page.json | 99.0 KiB | 16.2 KiB | 0.14 ms | 0.16 ms | 117.1 KiB | < 50 ms: ok |
+| tool-heavy-70mb.catch-up.page.json | 223.9 KiB | 33.9 KiB | 0.28 ms | 0.38 ms | 255.0 KiB | < 50 ms: ok |
+| tool-heavy-70mb.page-middle.page.json | 36.5 KiB | 8.4 KiB | 0.05 ms | 0.05 ms | 39.7 KiB | < 50 ms: ok |
+| tool-heavy-70mb.tail.page.json | 107.1 KiB | 18.2 KiB | 0.13 ms | 0.15 ms | 120.3 KiB | < 50 ms: ok |
 
 The script also prints a gzip column. It is left out of this table on
 purpose: on generated text, gzip makes the payload 5 to 7 times smaller, a
@@ -135,24 +176,27 @@ ratio real text would not reach. Recorded here, it would read as a pass on B5.
 
 ### Findings
 
-1. **A catch-up from the start is unbounded.** On the 70 MiB fixture,
-   `follow` from a cursor at offset 0 reads all 70.1 MiB into one buffer and
-   takes 253 ms. On the 10k-message fixture it takes 403 ms, because parse
-   cost follows record count rather than bytes. Today's reads meet B3 only at
-   the end of the file. This is what #1220's paged reads and #1476's memory
-   window exist to fix. When they land, their reverse page at the start goes in
-   `read_bench.rs`'s `cases` beside these rows.
+1. **A catch-up from the start is unbounded; a page is not.** On the 70 MiB
+   fixture, `follow` from a cursor at offset 0 reads all 70.1 MiB into one
+   buffer. #1220's paged read reaches the same place -- a page forward from
+   byte 0, or backwards to it -- in under 2 ms and 268 KiB, and the same at
+   the middle and the end: every page read in the table above is within
+   `PAGE_READ_BOUND`, asserted in every `cargo test`
+   (`a_page_is_bounded_wherever_it_lands`). `follow`'s catch-up itself is
+   unchanged here; #1476 decides whether live follow pages its catch-up.
 2. **An idle follow tick reads 128 KiB, not 64 KiB.** `follow` fingerprints
    the region behind the stored offset, then fingerprints the **same** region
    again for the new cursor. The doc on `FINGERPRINT_BYTES` says an unchanged
    file costs "64 KB and one `stat`". It is bounded and costs 0.09 ms, so B4
    holds, but the second read is redundant when nothing moved. Left for #1476.
-3. **A tail over a single huge result shows one message.** In
-   `huge-result-5mb`, the 256 KiB window lands inside the 10 MiB record, which
-   is dropped as a partial line. The pane shows only the reply that follows it
-   and says it is truncated. That is honest, but the result itself is
-   invisible from the tail. A paged viewer has to decide how a record larger
-   than its page is presented.
+3. **A tail over a single huge result shows one message; a page shows the
+   result.** In `huge-result-5mb`, the 256 KiB tail window lands inside the
+   10 MiB record, which is dropped as a partial line. A page streams a record
+   over `RECORD_HOLD_BYTES` (128 KiB) through `transcript_skim` instead of
+   holding it: it becomes one message, clipped, whose clip states the
+   record's true length (5,242,880 characters), and whose own message carries
+   `oversized_bytes`. `the_huge_result_is_one_message_on_a_page_not_a_hole`
+   holds this.
 4. **Uncompressed pages already sit near B5.** A 200-message page is up to
    224 KiB of JSON before compression. B5 depends on the codec and on how many
    messages a page holds, and #1478 and #1220 decide those.

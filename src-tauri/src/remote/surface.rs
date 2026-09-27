@@ -566,6 +566,17 @@ pub const SURFACE: &[(&str, Class)] = &[
     // phone is never handed more than the desktop would render.
     ("claude_transcript_messages", Class::Read),
     ("claude_transcript_block_text", Class::Read),
+    // One bounded page of that transcript, before or after a cursor
+    // (#1220): how the viewer reaches "what happened earlier" in a 70 MB
+    // file.
+    //
+    // `Read` on the rows' grounds above, and bounded INSIDE the command
+    // whatever the phone asks for: at most `PAGE_MESSAGES` messages and
+    // `transcript_page::PAGE_READ_BOUND` bytes read into memory per call,
+    // with a record larger than a page streamed and clipped rather than
+    // held. The phone can page through the whole file, one bounded page
+    // per round trip, and is never handed the file.
+    ("claude_transcript_page", Class::Read),
     // Whether the Claude Code hooks are in `~/.claude/settings.json`
     // (#915).
     //
@@ -1250,6 +1261,14 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             a.get("path")?,
             a.get("messageId")?,
             a.get("index")?,
+            a.get("offset")?,
+        )
+        .await),
+        "claude_transcript_page" => res(commands::claude_transcript_page(
+            a.get("path")?,
+            a.get("anchor")?,
+            a.get("direction")?,
+            a.get("limit")?,
         )
         .await),
         "claude_hooks_inventory" => res(commands::claude_hooks_inventory()),

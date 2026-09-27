@@ -4882,6 +4882,8 @@ describe("the transcript viewer", () => {
     duration_ms: null,
     is_meta: false,
     is_sidechain: false,
+    offset: null,
+    oversized_bytes: null,
     blocks: [{ kind: "text", index: 0, text, clip: null }],
   });
   const page = (over: Partial<TranscriptPage> = {}): TranscriptPage => ({

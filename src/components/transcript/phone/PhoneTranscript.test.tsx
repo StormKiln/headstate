@@ -59,6 +59,8 @@ function msg(id: string, over: Partial<TranscriptMessage> = {}): TranscriptMessa
     duration_ms: null,
     is_meta: false,
     is_sidechain: false,
+    offset: null,
+    oversized_bytes: null,
     blocks: [{ kind: "text", index: 0, text: `prompt ${id}`, clip: null }],
     ...over,
   };
