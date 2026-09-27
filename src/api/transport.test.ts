@@ -137,7 +137,11 @@ const ROWS: Row[] = [
   // the MAIN CHECKOUT only, where that one classifies every worktree.
   row(api.classifyRepoUpstream, [repoPath], "classify_repo_upstream", { repoPath }),
   row(api.actOnPr, [id, repo, number, action], "act_on_pr", { id, repo, number, action }),
-  row(api.removeWorktrees, [repoPath, worktreePaths], "remove_worktrees", { repoPath, worktreePaths }),
+  row(api.removeWorktrees, [repoPath, worktreePaths, 7], "remove_worktrees", {
+    repoPath,
+    worktreePaths,
+    runId: 7,
+  }),
   row(api.latestRelease, [], "latest_release"),
   row(api.dockerState, [], "docker_state"),
   row(api.dockerBuilds, [], "docker_builds"),

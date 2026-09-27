@@ -2884,6 +2884,21 @@ export type BranchDeleteFrame =
   | { kind: "checking"; repo: string; done: number; total: number }
   | { kind: "deleting"; repo: string; done: number; total: number; failed: number };
 
+/// One `worktree-removal-progress` frame (#1544). Mirrors
+/// `commands::WorktreeRemovalFrame`.
+///
+/// No path: the event is forwarded to the phone. Frame `done` is the
+/// outcome of the `done - 1`th path the caller sent, so the caller
+/// that holds that ordered list can drop the row by index. `run` is the
+/// caller's own token echoed back; a frame whose `run` is not yours is
+/// another run's, and its index means nothing against your list.
+export interface WorktreeRemovalFrame {
+  run: number | null;
+  done: number;
+  total: number;
+  removed: boolean;
+}
+
 /// One moment of the machine's health, mirroring the Rust
 /// `health::Sample` in `src-tauri/src/health/mod.rs`.
 ///

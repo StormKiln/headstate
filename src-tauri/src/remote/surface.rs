@@ -1459,6 +1459,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             app.clone(),
             a.get("repoPath")?,
             a.get("worktreePaths")?,
+            a.get("runId")?,
         )
         .await),
         "remove_worktree_forced" => res(commands::remove_worktree_forced(

@@ -256,7 +256,9 @@ const forceFn = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 const unlockFn = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 type Outcome = { path: string; error: string | null };
 const removeManyFn = vi.hoisted(() =>
-  vi.fn<(repo: string, paths: string[]) => Promise<Outcome[]>>((_r, paths) =>
+  vi.fn<
+    (repo: string, paths: string[], onRemoved?: (path: string) => void) => Promise<Outcome[]>
+  >((_r, paths) =>
     Promise.resolve(paths.map((p) => ({ path: p, error: null }))),
   ),
 );
@@ -4160,5 +4162,47 @@ describe("WorktreesPage selection", () => {
     fireEvent.click(screen.getByRole("checkbox", { name: /Select a/ }));
     fireEvent.click(screen.getByRole("button", { name: /Remove 1 selected/ }));
     expect(screen.queryByText(/will NOT be removed/)).toBeNull();
+  });
+
+  const removeAllThree = () => {
+    render(<WorktreesPage />);
+    fireEvent.click(screen.getByRole("checkbox", { name: /Select a/ }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /Select c/ }), { shiftKey: true });
+    fireEvent.click(screen.getByRole("button", { name: /Remove 3 selected/ }));
+    fireEvent.click(
+      within(screen.getByRole("dialog")).getByRole("button", { name: /Remove 3 worktrees/ }),
+    );
+  };
+
+  /// #1544: each removed row is unticked as it goes, and a refused one
+  /// stays ticked so the user can see what did not go.
+  it("unticks each removed row as it goes and keeps a refused one ticked", async () => {
+    removeManyFn.mockImplementationOnce((_r, _paths, onRemoved) => {
+      onRemoved?.("/code/a");
+      onRemoved?.("/code/c");
+      return Promise.resolve([
+        { path: "/code/a", error: null },
+        { path: "/code/b", error: "not safe to remove: 2 uncommitted files" },
+        { path: "/code/c", error: null },
+      ]);
+    });
+    removeAllThree();
+
+    await waitFor(() => expect(toastError).toHaveBeenCalled());
+    expect(useFilters.getState().checked).toEqual(["/code/b"]);
+  });
+
+  /// Partial is not nothing: a run that fails after removing one row
+  /// leaves that row unticked, so the next confirmation does not count
+  /// it as "hidden by the current filters".
+  it("unticks what was removed before a run failed midway", async () => {
+    removeManyFn.mockImplementationOnce((_r, _paths, onRemoved) => {
+      onRemoved?.("/code/a");
+      return Promise.reject("the connection dropped");
+    });
+    removeAllThree();
+
+    await waitFor(() => expect(toastError).toHaveBeenCalled());
+    expect([...useFilters.getState().checked].sort()).toEqual(["/code/b", "/code/c"]);
   });
 });
