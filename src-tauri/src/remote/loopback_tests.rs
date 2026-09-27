@@ -1165,11 +1165,22 @@ async fn a_transcript_page_crosses_gzipped_and_decodes_to_the_same_page() {
     .await;
     assert_eq!(plain.status, 200);
 
-    // The same page both ways, and the page the command produced.
-    let expected = serde_json::to_value(
+    // The same page both ways, and the page the command produced -- as a
+    // phone receives it, through #1488's masking at the remote boundary.
+    let produced = serde_json::to_value(
         crate::claude::preview::tail(&desktop.host.path).expect("the fixture reads"),
     )
     .unwrap();
+    let (_, plan) = crate::remote::privacy::admit(
+        "claude_transcript_tail",
+        json!({}),
+        crate::remote::privacy::Access {
+            transcripts: true,
+            reveal: false,
+        },
+    )
+    .unwrap();
+    let expected = plan.finish("claude_transcript_tail", produced);
     assert_eq!(gz.json(), expected);
     assert_eq!(plain.json(), expected);
     let messages = expected["messages"].as_array().map_or(0, Vec::len);
@@ -1187,6 +1198,59 @@ async fn a_transcript_page_crosses_gzipped_and_decodes_to_the_same_page() {
         wire * MIN_TRANSCRIPT_RATIO <= full,
         "a {full}-byte page crossed as {wire} bytes, less than {MIN_TRANSCRIPT_RATIO}x smaller"
     );
+
+    desktop.handle.stop().await;
+}
+
+/// #1488 with #1478: a reveal answer carries an unmasked secret, so it is
+/// never compressed, even when the phone asks for gzip -- masking is what
+/// defeats BREACH, and a reveal is the one answer masking does not cover.
+/// The masked answer to the same call, asked the same way, IS gzipped,
+/// which proves the header asked for compression and the reveal alone
+/// declined it.
+#[tokio::test]
+async fn a_reveal_answer_is_never_compressed() {
+    let mut desktop = desktop().await;
+    let phone = Phone::new();
+    desktop.pair(&phone, "Octocat's phone").await;
+    let id = devices::list(&desktop.conn).unwrap()[0].id;
+    desktop
+        .pairing
+        .set_transcript_access(&desktop.conn, id, true, true)
+        .unwrap();
+    const SECRET: &str = "ghp_wireWIRE0123456789wireWIRE0123456789";
+    *desktop.host.reply_with.lock().unwrap() = Some(json!({
+        "messages": [{ "role": "user", "timestamp": null, "model": null,
+            "blocks": [{ "kind": "text", "text": format!("token {SECRET} {}", "padding ".repeat(20)), "truncated": false }] }],
+        "truncated": false
+    }));
+    let gzip = [("Accept-Encoding", "gzip")];
+
+    let masked = wire_request(
+        &desktop,
+        &phone,
+        "POST",
+        "/v1/call/claude_transcript_tail",
+        &gzip,
+        r#"{"path":"p"}"#,
+    )
+    .await;
+    assert_eq!(masked.status, 200);
+    assert_eq!(masked.header("content-encoding"), Some("gzip"));
+
+    let revealed = wire_request(
+        &desktop,
+        &phone,
+        "POST",
+        "/v1/call/claude_transcript_tail",
+        &gzip,
+        r#"{"path":"p","reveal":true}"#,
+    )
+    .await;
+    assert_eq!(revealed.status, 200);
+    assert_eq!(revealed.header("content-encoding"), Some("identity"));
+    let body = String::from_utf8(revealed.body.clone()).expect("plain JSON on the wire");
+    assert!(body.contains(SECRET), "the reveal carries the text: {body}");
 
     desktop.handle.stop().await;
 }

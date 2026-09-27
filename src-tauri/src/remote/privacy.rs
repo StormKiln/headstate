@@ -115,13 +115,31 @@ pub const TRANSCRIPT_TEXT: &[(&str, Carries)] = &[
     // The snippets are transcript text; the coverage beside them is
     // counts, which no pattern matches.
     ("claude_search_transcripts", Carries::Whole),
+    // The read model's page and one block's full text (#1475, #1220).
+    // Both landed while this table was being written; the invariant is
+    // what flagged them.
+    ("claude_transcript_messages", Carries::Whole),
+    ("claude_transcript_block_text", Carries::Whole),
     // The first thing the user typed (#1133), clamped to 300 characters
     // -- still a place a pasted token lands.
     ("claude_sessions", Carries::Fields(&["opening_prompt"])),
 ];
 
-/// Keys whose values round-trip to the desktop unread.
-pub const OPAQUE_KEYS: &[&str] = &["cursor"];
+/// Keys whose values round-trip to the desktop unread, or are machine
+/// identifiers rather than text: the follow cursor, the record and call
+/// ids a phone sends back to `claude_transcript_block_text`, and the
+/// subagent transcript path it opens next. None is anything a person
+/// typed, and a false match inside one would break the call it feeds.
+pub const OPAQUE_KEYS: &[&str] = &[
+    "cursor",
+    "id",
+    "message_id",
+    "turn_id",
+    "tool_use_id",
+    "api_message_id",
+    "agent_id",
+    "transcript_path",
+];
 
 /// How [`TRANSCRIPT_TEXT`] classes `command`, or `None` when the command
 /// returns no transcript text.
@@ -229,6 +247,13 @@ pub fn admit(command: &str, args: Value, access: Access) -> Result<(Value, Plan)
 }
 
 impl Plan {
+    /// Whether this answer will carry transcript text UNMASKED because
+    /// the phone asked to reveal and the device may. The listener serves
+    /// such an answer uncompressed (#1478's BREACH review).
+    pub fn reveals(&self) -> bool {
+        self.carries.is_some() && self.reveal
+    }
+
     /// Mask (or withhold) the transcript text in `value` and attach the
     /// [`Masking`] summary.
     ///

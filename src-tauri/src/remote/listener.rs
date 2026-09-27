@@ -649,7 +649,21 @@ async fn call(
         st.host.notify_destructive(&device.name, &command);
     }
     match result {
-        Ok(value) => Json(plan.finish(&command, value)).into_response(),
+        Ok(value) => {
+            let revealed = plan.reveals();
+            let mut response = Json(plan.finish(&command, value)).into_response();
+            if revealed {
+                // An unmasked secret is never compressed: masking is what
+                // defeats BREACH here (see the module docs), and a reveal
+                // is the one answer masking does not cover. tower-http
+                // leaves a response that already names an encoding alone.
+                response.headers_mut().insert(
+                    axum::http::header::CONTENT_ENCODING,
+                    axum::http::HeaderValue::from_static("identity"),
+                );
+            }
+            response
+        }
         Err(e) => refusal_for(e),
     }
 }
