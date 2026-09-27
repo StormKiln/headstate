@@ -17,6 +17,10 @@ It measures the Actions cache against its budget, and that figure **changes
 between runs without anyone touching the repo**. Consequences:
 
 - A failure is not a permanent property of a branch. Re-read before concluding.
+- `make lint` runs it with `--advisory`: an over-ceiling class is a WARNING
+  there, because no branch writes the cache it measures (#1505). The scheduled
+  `.github/workflows/cache-budget.yml` enforces it; its job name is in
+  `release.yml`'s `ignore-checks` so a red run cannot burn a release tag.
 - Never tell someone "that one always fails" — that instruction was given twice
   in one cycle and was wrong both times; the check was passing.
 
