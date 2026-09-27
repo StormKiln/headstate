@@ -1408,7 +1408,11 @@ describe("WorktreesPage", () => {
         render(<WorktreesPage />);
         fireEvent.click(screen.getByRole("button", { name: /claudify/i }));
 
-        const model = await screen.findByLabelText(/model/i);
+        // Wait for the served vocabulary, not just the select: before it
+        // arrives the select holds only its empty option, and a change to
+        // "opus" there is a no-op (the race that ejected #1559).
+        await screen.findByRole("option", { name: "opus" });
+        const model = screen.getByLabelText(/model/i);
         fireEvent.change(model, { target: { value: "opus" } });
         const perms = screen.getByLabelText(/permissions/i);
         fireEvent.change(perms, { target: { value: "bypassPermissions" } });
