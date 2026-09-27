@@ -38,12 +38,25 @@
 /// showing it shrinks the scroller rather than pushing the conversation
 /// -- and the scroller's follow re-pins the live edge when its viewport
 /// shrinks. In 7.9 the slot is empty and `hidden`, behind
-/// `COMPOSER_ENABLED`.
+/// `COMPOSER_ENABLED` (`composerFlag.ts`).
+///
+/// # Pending messages and sends (#1491, #1490 constraints 2 and 4)
+///
+/// `pending` are messages this app is sending that the transcript does
+/// not hold yet (`pending.ts`). They are drawn by `renderPending` after
+/// the newest message, and only while the window reaches it AND the held
+/// messages reach the live edge (`atLiveEdge`): a pending message goes
+/// after the newest turn, not after whatever the reader scrolled back
+/// to. A send away from the live edge asks `onJumpToLatest` first, as
+/// the jump button does. A composer inside the viewer calls
+/// `useSendScroll()` once a send starts; that re-engages follow and
+/// anchors the pending row (`sendScroll.ts`).
 
 import {
   type MouseEvent,
   type ReactNode,
   type UIEvent,
+  useCallback,
   useLayoutEffect,
   useRef,
   useState,
@@ -61,6 +74,9 @@ import {
 } from "@/components/ui/message-scroller";
 import { cn } from "@/lib/utils";
 import type { TranscriptMessage } from "../../types/transcript";
+import { COMPOSER_ENABLED } from "./composerFlag";
+import { type PendingMessage, pendingItemId } from "./pending";
+import { sendScroll, TranscriptSendContext } from "./sendScroll";
 import {
   type Arrivals,
   caughtUp,
@@ -74,10 +90,6 @@ import {
   type WindowPins,
   withoutAnchors,
 } from "./transcriptWindow";
-
-/// 7.10 flips this (#1491). Off, the slot is laid out but hidden and
-/// holds nothing, and no send path exists anywhere.
-const COMPOSER_ENABLED = false;
 
 export interface TranscriptViewerProps {
   /// Oldest first, as the read model returns them. May hold more than
@@ -110,6 +122,11 @@ export interface TranscriptViewerProps {
   /// Reserved for 7.10's composer (#1491); ignored while
   /// `COMPOSER_ENABLED` is off.
   composer?: ReactNode;
+  /// Messages being sent that the transcript does not hold yet, oldest
+  /// first, already reconciled (`usePendingMessages`).
+  pending?: readonly PendingMessage[];
+  /// One pending message's content, like `renderMessage`.
+  renderPending?: (pending: PendingMessage) => ReactNode;
   className?: string;
 }
 
@@ -146,6 +163,8 @@ function ViewerBody({
   onJumpToLatest,
   label = "Transcript",
   composer,
+  pending,
+  renderPending,
   className,
   onWindowAtTail,
 }: TranscriptViewerProps & { onWindowAtTail: (atTail: boolean) => void }) {
@@ -274,44 +293,78 @@ function ViewerBody({
       : null;
   const shown = messages.slice(win.from, win.to);
   const atTail = win.to >= messages.length;
+  const shownPending = atTail && atLiveEdge && renderPending ? (pending ?? []) : [];
+
+  // The pending row a send anchored (`sendScroll.ts`). One at a time:
+  // the newest send is the turn the reader is waiting on.
+  const [sendAnchor, setSendAnchor] = useState<string | null>(null);
+  const onSent = useCallback(
+    (clientId: string) =>
+      sendScroll(clientId, {
+        atTail: atTail && atLiveEdge,
+        reducedMotion,
+        scrollToEnd,
+        rewindToTail: () => {
+          // As "jump to latest": the newest messages may not be held.
+          if (!atLiveEdge) onJumpToLatest?.();
+          jumpRef.current = true;
+          setSeen((s) => ({ ...s, arrivals: withoutAnchors(s.arrivals) }));
+          setPins(tailPins(messages));
+        },
+        anchor: setSendAnchor,
+      }),
+    [atTail, atLiveEdge, onJumpToLatest, reducedMotion, scrollToEnd, messages],
+  );
 
   return (
-    <div data-slot="transcript-viewer" className={cn("flex h-full min-h-0 flex-col", className)}>
-      <MessageScroller className="min-h-0 flex-1">
-        <MessageScrollerViewport ref={viewportRef} aria-label={label} onScroll={onScroll}>
-          <MessageScrollerContent aria-busy={streaming === true} className="gap-3 p-3">
-            {shown.map((m, i) => (
-              <MessageScrollerItem
-                key={m.id}
-                messageId={m.id}
-                scrollAnchor={arrivals.anchors.has(m.id)}
-                // Budget B1's probe (docs/transcript-performance.md): the
-                // browser harness times first paint of the newest message
-                // through Element Timing, which reads this attribute.
-                {...(atTail && i === shown.length - 1 ? { elementtiming: "newest" } : {})}
-              >
-                {renderMessage(m)}
-              </MessageScrollerItem>
-            ))}
-          </MessageScrollerContent>
-        </MessageScrollerViewport>
-        <MessageScrollerButton
-          size="sm"
-          behavior={reducedMotion ? "auto" : "smooth"}
-          onClick={onJump}
-          className="h-auto gap-1 rounded-full px-3 py-1 motion-reduce:transition-none"
-          aria-label={
-            counted !== null ? `Jump to the latest message, ${counted}` : "Jump to the latest message"
-          }
-        >
-          <span aria-hidden="true">↓</span>
-          {counted ?? "Latest"}
-        </MessageScrollerButton>
-      </MessageScroller>
-      <div data-slot="transcript-composer" className="shrink-0" hidden={!COMPOSER_ENABLED}>
-        {COMPOSER_ENABLED ? composer : null}
+    <TranscriptSendContext.Provider value={onSent}>
+      <div data-slot="transcript-viewer" className={cn("flex h-full min-h-0 flex-col", className)}>
+        <MessageScroller className="min-h-0 flex-1">
+          <MessageScrollerViewport ref={viewportRef} aria-label={label} onScroll={onScroll}>
+            <MessageScrollerContent aria-busy={streaming === true} className="gap-3 p-3">
+              {shown.map((m, i) => (
+                <MessageScrollerItem
+                  key={m.id}
+                  messageId={m.id}
+                  scrollAnchor={arrivals.anchors.has(m.id)}
+                  // Budget B1's probe (docs/transcript-performance.md): the
+                  // browser harness times first paint of the newest message
+                  // through Element Timing, which reads this attribute.
+                  {...(atTail && i === shown.length - 1 ? { elementtiming: "newest" } : {})}
+                >
+                  {renderMessage(m)}
+                </MessageScrollerItem>
+              ))}
+              {shownPending.map((p) => (
+                <MessageScrollerItem
+                  key={pendingItemId(p.clientId)}
+                  messageId={pendingItemId(p.clientId)}
+                  scrollAnchor={sendAnchor === p.clientId}
+                  data-pending-state={p.state}
+                >
+                  {renderPending?.(p)}
+                </MessageScrollerItem>
+              ))}
+            </MessageScrollerContent>
+          </MessageScrollerViewport>
+          <MessageScrollerButton
+            size="sm"
+            behavior={reducedMotion ? "auto" : "smooth"}
+            onClick={onJump}
+            className="h-auto gap-1 rounded-full px-3 py-1 motion-reduce:transition-none"
+            aria-label={
+              counted !== null ? `Jump to the latest message, ${counted}` : "Jump to the latest message"
+            }
+          >
+            <span aria-hidden="true">↓</span>
+            {counted ?? "Latest"}
+          </MessageScrollerButton>
+        </MessageScroller>
+        <div data-slot="transcript-composer" className="shrink-0" hidden={!COMPOSER_ENABLED}>
+          {COMPOSER_ENABLED ? composer : null}
+        </div>
       </div>
-    </div>
+    </TranscriptSendContext.Provider>
   );
 }
 

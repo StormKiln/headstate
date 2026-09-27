@@ -55,6 +55,8 @@ export const PAIRS: [fg: keyof typeof palette, bg: keyof typeof palette][] = [
   ["accent", "userBand"],
   ["accent", "ground"],
   ["error", "userBand"],
+  // A pending message's "not confirmed" (#1491).
+  ["warn", "userBand"],
   ["warn", "surface"],
   ["ok", "surface"],
   ["link", "userBand"],

@@ -12,6 +12,7 @@
 /// | tool call | `ToolCall`, variant `terminal` (#1483): `⏺ Bash(…)` then `⎿` and a one-line result, folded |
 /// | thinking | `ThinkingBlock`, shown dimmed, its label a toggle |
 /// | everything else | a thin labelled divider, its text under it (folded when long) |
+/// | a message being sent, not in the transcript yet (#1491) | the user band dashed and dimmed, its delivery state beneath (`TerminalPendingMessage`) |
 ///
 /// Under each assistant turn a muted footer gives its tokens, duration
 /// and model (`turnFooter.ts`). Messages and whole turns copy as markdown
@@ -45,6 +46,7 @@ import { linesOf } from "./diff";
 import { Fold } from "./Fold";
 import { MonoOutput } from "./output";
 import { palette } from "./palette";
+import { type PendingMessage, pendingStatus } from "./pending";
 import { countLabel, durationBetween, formatDuration } from "./summary";
 import { TaskStatusRow } from "./TaskStatusRow";
 import { ThinkingBlock } from "./ThinkingBlock";
@@ -118,6 +120,54 @@ const MemoTerminalMessage = memo(
     a.tasks === b.tasks &&
     footerEqual(a.footer, b.footer),
 );
+
+/// A message being sent that the transcript does not hold yet (#1491):
+/// the user band, drawn provisionally -- a dashed bar, dimmed text, no
+/// time (it has no record, so there is no recorded time to show) and
+/// no copy buttons -- with what is known about its delivery beneath.
+/// `pending.ts` has the states.
+export function TerminalPendingMessage({
+  pending: p,
+  density,
+}: {
+  pending: PendingMessage;
+  density: TranscriptDensity;
+}) {
+  const compact = density === "compact";
+  const status = pendingStatus(p);
+  return (
+    <Message
+      data-kind="pending"
+      data-pending-state={p.state}
+      data-density={density}
+      className={cn("flex-col", compact ? "gap-0.5 text-[13px]" : "gap-1.5 text-sm")}
+    >
+      <MessageContent
+        className={cn("gap-1 rounded-sm border-l-2 border-dashed", compact ? "px-2 py-1" : "px-3 py-2")}
+        style={{ background: palette.userBand, borderColor: palette.accent }}
+      >
+        <MessageHeader className="gap-2 px-0 text-[11px]" style={{ color: palette.muted }}>
+          <span>You</span>
+        </MessageHeader>
+        <div className="flex gap-2">
+          <span aria-hidden className="shrink-0 font-mono font-bold" style={{ color: palette.accent }}>
+            &gt;
+          </span>
+          <p className={cn("min-w-0 flex-1", WRAP)} style={{ color: palette.muted }}>
+            {p.text}
+          </p>
+        </div>
+        <p
+          role="status"
+          className="text-[11px]"
+          style={{ color: status.tone === "muted" ? palette.muted : palette[status.tone] }}
+        >
+          {status.text}
+        </p>
+      </MessageContent>
+    </Message>
+  );
+}
 
 function footerEqual(a: TurnFooter | undefined, b: TurnFooter | undefined): boolean {
   if (a === b) return true;

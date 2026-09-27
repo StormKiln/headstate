@@ -2,10 +2,18 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import { afterEach, describe, expect, it } from "vitest";
 import type { Liveness } from "../../../types/pr";
 import type { TranscriptBlock, TranscriptMessage } from "../../../types/transcript";
-import { call, DEAD, LIVE, output, RECORDED_CHANGE } from "../fixtures";
+import {
+  call,
+  DEAD,
+  LIVE,
+  output,
+  PENDING_STATES,
+  pendingMessage,
+  RECORDED_CHANGE,
+} from "../fixtures";
 import { deriveTaskChecklist } from "../tasks";
 import { PhoneContext, type PhoneTranscriptContext } from "./context";
-import { PhoneMessage } from "./PhoneMessage";
+import { PhoneMessage, PhonePendingMessage } from "./PhoneMessage";
 import { INLINE_DIFF_LINES } from "./ToolChip";
 import transcriptTypes from "../../../types/transcript.ts?raw";
 
@@ -343,5 +351,56 @@ describe("Dynamic Type (#1481)", () => {
   it("adds no zoom at the default size", () => {
     const { container } = show(msg({ kind: "assistant" }, [text("hi")]));
     expect(container.querySelector<HTMLElement>('[data-slot="phone-message"]')?.style.zoom).toBe("");
+  });
+});
+
+describe("a message being sent (#1491)", () => {
+  const showPending = (over: Parameters<typeof pendingMessage>[0] = {}) =>
+    render(
+      <PhoneContext.Provider value={ctx()}>
+        <PhonePendingMessage pending={pendingMessage(over)} />
+      </PhoneContext.Provider>,
+    );
+
+  it("is the user's right-aligned bubble, drawn provisionally", () => {
+    const { container } = showPending();
+    const row = container.querySelector('[data-slot="phone-message"]')!;
+    expect(row.getAttribute("data-kind")).toBe("pending");
+    expect(row.getAttribute("data-pending-state")).toBe("pending");
+    expect(container.querySelector('[data-slot="message"]')?.getAttribute("data-align")).toBe("end");
+    const bubble = container.querySelector<HTMLElement>('[data-slot="bubble"]')!;
+    expect(bubble.getAttribute("data-align")).toBe("end");
+    expect(bubble.className).toContain("opacity-70");
+    expect(bubble.getAttribute("aria-label")).toBe("You, not in the transcript yet");
+    expect(screen.getByText("please run the tests")).toBeTruthy();
+  });
+
+  it("differs from a recorded prompt with the same text", () => {
+    const recorded = show(msg({ kind: "user_prompt", origin: null }, [text("please run the tests")]));
+    const before = recorded.container.querySelector('[data-slot="bubble"]')!;
+    const label = before.getAttribute("aria-label");
+    const cls = before.className;
+    cleanup();
+    const { container } = showPending();
+    const bubble = container.querySelector('[data-slot="bubble"]')!;
+    expect(bubble.getAttribute("aria-label")).not.toBe(label);
+    expect(bubble.className).not.toBe(cls);
+  });
+
+  it.each(PENDING_STATES)("says what is known in state %s, beneath the bubble", (state) => {
+    const { container } = showPending({
+      state,
+      reason: state === "failed" ? "the session has ended" : null,
+    });
+    const status = screen.getByRole("status");
+    // Beneath the bubble, not inside its dimmed part.
+    expect(container.querySelector('[data-slot="bubble"]')!.contains(status)).toBe(false);
+    const expected = {
+      pending: /^Sending…$/,
+      delivered: /^Sent\. Not in the transcript yet\.$/,
+      unconfirmed: /^Not confirmed: .*before sending it again\.$/,
+      failed: /^Not sent: the session has ended\.$/,
+    }[state];
+    expect(status.textContent).toMatch(expected);
   });
 });
