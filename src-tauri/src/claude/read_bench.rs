@@ -445,6 +445,80 @@ fn the_huge_result_is_one_message_on_a_page_not_a_hole() {
     );
 }
 
+/// `claude_transcript_find` over the whole of each fixture (#1484), with
+/// the query matched against the real text (the desktop's window) and
+/// against the masked text (a phone's, #1519), so the cost of masking in
+/// the loop is measured rather than assumed.
+///
+/// Three needles, chosen for the three costs masked matching can have:
+///
+/// - `widget`, a word of the fixture's prose: the find fills its
+///   [`transcript_page::FIND_HITS`] limit early, masking each text it
+///   hits;
+/// - an absent word: the whole file is scanned and, masked, NOTHING is
+///   masked -- a string the needle does not occur in cannot match once
+///   masked;
+/// - `hidden`, which could match inside a marker: the worst case, every
+///   string of the file masked.
+///
+/// Every find is held to [`transcript_page::FIND_DEADLINE`] by the code
+/// itself; this checks the median stays inside it and reports whether
+/// the scan completed. Gated like `transcript_read_timings`, and run by
+/// `make bench-transcript`.
+#[test]
+#[ignore]
+fn transcript_find_timings() {
+    use crate::remote::privacy::Matching;
+    if std::env::var("HEADSTATE_TRANSCRIPT_BENCH").is_err() {
+        println!("set HEADSTATE_TRANSCRIPT_BENCH=1 to run the transcript find timings");
+        return;
+    }
+    const RUNS: usize = 5;
+    let temp = tempfile::tempdir().unwrap();
+    println!("\n| fixture | file | needle | matching | median | hits | more | complete |");
+    println!("|---|---:|---|---|---:|---:|---|---|");
+    let mut over = Vec::new();
+    // Generated fixtures only, in `temp`, cleaned up by dropping it.
+    // Nothing here deletes a file by path.
+    for fixture in [fixtures::MESSAGES_10K, fixtures::TOOL_HEAVY_70MB] {
+        let w: Written = fixtures::write(fixture, temp.path()).unwrap();
+        let (name, path, bytes) = (fixture.name, w.path, w.bytes);
+        for needle in ["widget", "zzzabsentzzz", "hidden"] {
+            for matching in [Matching::Unmasked, Matching::Masked] {
+                let run = || transcript_page::find(&path, Some(needle), None, matching).unwrap();
+                let found = run();
+                let mut times: Vec<Duration> = (0..RUNS)
+                    .map(|_| {
+                        let started = std::time::Instant::now();
+                        let _ = run();
+                        started.elapsed()
+                    })
+                    .collect();
+                times.sort();
+                let median = times[RUNS / 2];
+                // The deadline, plus the one record in hand when it
+                // passed and the answer's own assembly.
+                if median > transcript_page::FIND_DEADLINE + Duration::from_millis(500) {
+                    over.push(format!("{name} / {needle} / {matching:?}: {median:?}"));
+                }
+                println!(
+                    "| {name} | {} | `{needle}` | {matching:?} | {:.1} ms | {} | {} | {} |",
+                    human(bytes),
+                    median.as_secs_f64() * 1000.0,
+                    found.hits.len(),
+                    found.more,
+                    found.complete
+                );
+            }
+        }
+    }
+    assert!(
+        over.is_empty(),
+        "over the find deadline:\n  {}",
+        over.join("\n  ")
+    );
+}
+
 /// The message pages the browser harness renders (#1480, #1487): each
 /// fixture's `TranscriptPage` exactly as `transcript_model::tail` reads it
 /// (`<name>.messages-tail.json`), and the whole file parsed

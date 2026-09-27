@@ -39,7 +39,7 @@ import { useState } from "react";
 import { useClaudeIndexCoverage, useClaudeTranscriptSearch } from "../api/hooks";
 import { errorMessage } from "./QueryError";
 import { MaskedText } from "./MaskedText";
-import { maskingNote } from "@/lib/masked";
+import { maskingNote, unsearchedNote } from "@/lib/masked";
 
 /// How much of the corpus is searchable, in words.
 ///
@@ -174,7 +174,12 @@ export function ClaudeTranscriptSearch({ enabled = true }: { enabled?: boolean }
       ) : null}
 
       {search.data !== undefined ? (
-        <SearchResult answer={search.data} />
+        <>
+          {unsearchedNote(search.data.masking) !== null ? (
+            <p className="text-[11px] text-[#8b949e]">{unsearchedNote(search.data.masking)}</p>
+          ) : null}
+          <SearchResult answer={search.data} />
+        </>
       ) : null}
     </section>
   );

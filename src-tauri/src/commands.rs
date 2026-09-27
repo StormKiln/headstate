@@ -5497,13 +5497,19 @@ pub async fn claude_import_transcripts(
 /// [`SearchAnswer`]: crate::claude::search::SearchAnswer
 /// [`Verdict`]: crate::claude::search::Verdict
 /// [`Coverage`]: crate::claude::search::Coverage
+///
+/// `matching` is which text `query` is matched against (#1519), as
+/// `claude_transcript_find` states: absent from the webview, written by
+/// `remote::privacy::admit` for a phone.
 #[tauri::command]
 pub async fn claude_search_transcripts(
     app: tauri::AppHandle,
     query: String,
     limit: Option<usize>,
+    matching: Option<crate::remote::privacy::Matching>,
 ) -> Result<crate::claude::search::SearchAnswer, String> {
     let db = db_path(&app);
+    let matching = matching.unwrap_or(crate::remote::privacy::Matching::Unmasked);
     tauri::async_runtime::spawn_blocking(move || {
         let conn = open_db(&db).map_err(|e| e.to_string())?;
         // A fresh scan for the denominator and the unreadable set, so
@@ -5542,7 +5548,7 @@ pub async fn claude_search_transcripts(
                 Vec::new()
             }
         };
-        crate::claude::search::search(&conn, &query, limit.unwrap_or(50), unreadable)
+        crate::claude::search::search(&conn, &query, limit.unwrap_or(50), unreadable, matching)
             .map_err(|e| e.to_string())
     })
     .await
@@ -6594,15 +6600,22 @@ pub async fn claude_transcript_page(
 /// time, at most `transcript_page::FIND_HITS` hits, and
 /// `transcript_page::FIND_DEADLINE` of scanning, past which it answers
 /// with what it found and says where it stopped.
+///
+/// `matching` is which text `query` is matched against (#1519). The
+/// webview never sends it and matches the real text. A phone's call has
+/// it written by `remote::privacy::admit` -- masked unless the call
+/// reveals -- so a phone cannot use hit-or-miss to test for a secret.
 #[tauri::command]
 pub async fn claude_transcript_find(
     path: String,
     query: Option<String>,
     limit: Option<usize>,
+    matching: Option<crate::remote::privacy::Matching>,
 ) -> Result<crate::claude::transcript_page::TranscriptFind, String> {
     let p = claude_transcript_path(&path)?;
+    let matching = matching.unwrap_or(crate::remote::privacy::Matching::Unmasked);
     tauri::async_runtime::spawn_blocking(move || {
-        crate::claude::transcript_page::find(&p, query.as_deref(), limit)
+        crate::claude::transcript_page::find(&p, query.as_deref(), limit, matching)
     })
     .await
     .map_err(|e| e.to_string())?

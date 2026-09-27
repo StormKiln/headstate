@@ -1272,6 +1272,103 @@ async fn a_reveal_answer_is_never_compressed() {
     desktop.handle.stop().await;
 }
 
+/// A host that answers `claude_transcript_find` the way its dispatch arm
+/// does: the real find over a fixture, matching the text
+/// `privacy::admit` wrote into the arguments (#1519).
+struct FindHost {
+    path: std::path::PathBuf,
+}
+
+impl CommandHost for FindHost {
+    fn dispatch<'a>(
+        &'a self,
+        command: &'a str,
+        args: Value,
+        _device_name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, RemoteError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            use crate::remote::privacy::{Matching, MATCH_ARG};
+            assert_eq!(command, "claude_transcript_find");
+            let query = args["query"].as_str().map(str::to_string);
+            let written: Option<Matching> = args
+                .get(MATCH_ARG)
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
+            let found = crate::claude::transcript_page::find(
+                &self.path,
+                query.as_deref(),
+                None,
+                Matching::for_remote(written),
+            )
+            .expect("the fixture reads");
+            Ok(serde_json::to_value(found).unwrap())
+        })
+    }
+    fn notify_destructive(&self, _: &str, _: &str) {}
+}
+
+/// #1519 over the wire: a phone's find cannot test for a secret. A
+/// piece of it finds nothing -- even when the phone asks, by name, to be
+/// matched against the real text -- the whole of it is refused with the
+/// reason, and an ordinary word is found with the secret masked.
+#[tokio::test]
+async fn a_phone_cannot_use_find_to_test_for_a_secret() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    std::fs::write(
+        &path,
+        concat!(
+            r#"{"type":"user","uuid":"u1","message":{"role":"user","content":"deploy the widget with sk-ant-api03-SECRETsecret0123456789 today"}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let hub = Arc::new(Hub::new(Arc::new(|| {
+        Box::pin(async { Some("[]".to_string()) })
+    })));
+    let mut desktop = desktop_on(Arc::new(FindHost { path }), hub).await;
+    let phone = Phone::new();
+    desktop.pair(&phone, "Test phone").await;
+    let find = |body: &'static str| {
+        let (desktop, phone) = (&desktop, &phone);
+        async move {
+            wire_request(
+                desktop,
+                phone,
+                "POST",
+                "/v1/call/claude_transcript_find",
+                &[],
+                body,
+            )
+            .await
+        }
+    };
+
+    let piece = find(r#"{"path":"p","query":"SECRETsecret0123","matching":"unmasked"}"#).await;
+    assert_eq!(piece.status, 200);
+    assert_eq!(piece.json()["hits"], json!([]), "{:?}", piece.json());
+
+    let whole = find(r#"{"path":"p","query":"sk-ant-api03-SECRETsecret0123456789"}"#).await;
+    assert_eq!(whole.status, 403);
+    let reason = String::from_utf8(whole.body.clone()).unwrap();
+    assert!(
+        reason.contains("looks like a password, key or token"),
+        "{reason}"
+    );
+
+    let word = find(r#"{"path":"p","query":"widget"}"#).await;
+    assert_eq!(word.status, 200);
+    let answer = word.json();
+    assert_eq!(answer["hits"].as_array().map(Vec::len), Some(1));
+    let snippet = answer["hits"][0]["snippet"].as_str().unwrap();
+    assert!(
+        snippet.contains("widget") && !snippet.contains("SECRET"),
+        "{snippet}"
+    );
+
+    desktop.handle.stop().await;
+}
+
 /// #1478: a client that does not ask for gzip, which is every companion
 /// built before this change, gets the plain JSON it always did, with no
 /// `Content-Encoding`.

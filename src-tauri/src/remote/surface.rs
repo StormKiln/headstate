@@ -36,6 +36,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::commands;
 use crate::remote::error_kind::CommandError;
+use crate::remote::privacy::{self, Matching};
 
 /// What a command does, which decides what a phone must present to run it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1215,12 +1216,15 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         // inline held this listener for the length of the file.
         "read_claude_md" => res(commands::read_claude_md(a.get("path")?).await),
         "claude_import_transcripts" => res(commands::claude_import_transcripts(app.clone()).await),
-        "claude_search_transcripts" => {
-            res(
-                commands::claude_search_transcripts(app.clone(), a.get("query")?, a.get("limit")?)
-                    .await,
-            )
-        }
+        // Both query matchers read the `Matching` `privacy::admit` wrote
+        // (#1519), failing closed to masked when it is absent.
+        "claude_search_transcripts" => res(commands::claude_search_transcripts(
+            app.clone(),
+            a.get("query")?,
+            a.get("limit")?,
+            Some(Matching::for_remote(a.get(privacy::MATCH_ARG)?)),
+        )
+        .await),
         "claude_index_coverage" => res(commands::claude_index_coverage(app.clone()).await),
         "claude_sessions" => res(commands::claude_sessions(app.clone()).await),
         "claude_sessions_for_pr" => {
@@ -1265,12 +1269,13 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             a.get("limit")?,
         )
         .await),
-        "claude_transcript_find" => {
-            res(
-                commands::claude_transcript_find(a.get("path")?, a.get("query")?, a.get("limit")?)
-                    .await,
-            )
-        }
+        "claude_transcript_find" => res(commands::claude_transcript_find(
+            a.get("path")?,
+            a.get("query")?,
+            a.get("limit")?,
+            Some(Matching::for_remote(a.get(privacy::MATCH_ARG)?)),
+        )
+        .await),
         "claude_hooks_inventory" => res(commands::claude_hooks_inventory()),
         "claude_effective_settings" => {
             res(commands::claude_effective_settings(a.get("repoPath")?).await)

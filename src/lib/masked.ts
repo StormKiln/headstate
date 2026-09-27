@@ -62,6 +62,14 @@ export function maskingNote(masking: TranscriptMasking | undefined): string | nu
   return `${n} likely secret${n === 1 ? " was" : "s were"} hidden before this text left the computer.`;
 }
 
+/// The line a phone's search or find shows when its query was matched
+/// against the masked text (#1519), or `null`. Without it, "no matches"
+/// would read as a claim about the whole transcript, hidden text
+/// included.
+export function unsearchedNote(masking: TranscriptMasking | undefined): string | null {
+  return masking?.matched_masked === true ? "Text hidden as a likely secret was not searched." : null;
+}
+
 /// Split `text` into printable runs and hidden spans, in order.
 ///
 /// A marker naming a kind this build does not know is left as text: a

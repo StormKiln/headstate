@@ -20,7 +20,9 @@
 //! - [`admit`] runs before dispatch: refuses a transcript command for a
 //!   device whose "read session transcripts" switch is off, refuses a
 //!   `reveal` the desktop has not allowed, and strips the `reveal`
-//!   argument so the command never sees it.
+//!   argument so the command never sees it. For a command that matches
+//!   a query ([`QUERY_MATCHED`]) it also writes which text the query is
+//!   matched against -- see below.
 //! - [`Plan::finish`] runs on the command's answer: masks every string
 //!   the command's [`Carries`] says is transcript text and attaches a
 //!   [`Masking`] summary under the [`MASKING_KEY`] key.
@@ -34,6 +36,43 @@
 //! fails for a remote command whose name or return type says
 //! "transcript" and that has no row here, so forgetting is a red build
 //! rather than a leak.
+//!
+//! # A query is matched against the text the phone could see (#1519)
+//!
+//! Masking answers is not enough for a command that matches a query:
+//! `claude_transcript_find` and `claude_search_transcripts` answered
+//! hit-or-no-hit from the REAL text, then masked the snippets. A phone
+//! could search for a guessed token -- or a prefix, a character at a
+//! time -- and read the secret off the result's shape, every snippet it
+//! received still masked. "Masked before it leaves the desktop" has to
+//! cover the bits in the answer's shape as well as the text in it.
+//!
+//! So [`admit`] writes a [`Matching`] into a [`QUERY_MATCHED`] command's
+//! arguments under [`MATCH_ARG`] -- over anything the phone sent there --
+//! and the command matches that text:
+//!
+//! - **a phone, not revealing**: [`Matching::Masked`]. The query can hit
+//!   only what [`mask_text`] leaves, which is what the answer shows. A
+//!   query that is itself secret-shaped is REFUSED ([`Refusal::SecretQuery`])
+//!   rather than answered "no matches": matched against masked text it
+//!   can never hit, and "no matches" would be a claim about text that
+//!   was never searched.
+//! - **a phone revealing** (asked, and allowed by its per-device switch):
+//!   [`Matching::Unmasked`], consistent with the unmasked answer it gets.
+//! - **the desktop's own window**: never passes through here, and the
+//!   commands default to [`Matching::Unmasked`] -- the owner searching
+//!   their own disk.
+//!
+//! The dispatch arm reads the argument through [`Matching::for_remote`],
+//! which fails CLOSED: an arm reached without `admit` matches masked.
+//!
+//! Each command masks in the way its data allows. The find streams one
+//! file and masks each string it would match before matching it (only
+//! the strings the query occurs in -- see [`needle_could_touch_a_marker`]
+//! -- so the cost follows the hits, not the file). The corpus search
+//! queries an FTS5 index, which cannot mask at query time, so the index
+//! holds a masked copy of every session's text beside the real one and a
+//! remote query is confined to that column (`claude/search.rs`).
 //!
 //! # The marker a masked span becomes
 //!
@@ -136,6 +175,75 @@ pub const TRANSCRIPT_TEXT: &[(&str, Carries)] = &[
     ("claude_transcript_opening_prompt", Carries::Whole),
 ];
 
+/// The remote commands that MATCH a caller's query against transcript
+/// text, and the argument each carries the query in (#1519).
+///
+/// Masking the answer is not enough for these. A find that matches the
+/// real text and masks only the snippet still answers "is this string in
+/// the transcript?" -- hit or no hit -- so a phone could test a guessed
+/// token, or refine a prefix one character at a time, and learn the
+/// secret from the result's shape while every snippet it received was
+/// masked. So [`admit`] also decides WHAT TEXT the command matches
+/// against, and writes that decision into the arguments under
+/// [`MATCH_ARG`]: [`Matching::Masked`] unless this call reveals.
+///
+/// **A new command that matches a query against transcript text goes
+/// here**, and its dispatch arm reads [`MATCH_ARG`] through
+/// [`Matching::for_remote`].
+pub const QUERY_MATCHED: &[(&str, &str)] = &[
+    ("claude_search_transcripts", "query"),
+    ("claude_transcript_find", "query"),
+];
+
+/// The argument [`admit`] writes a [`QUERY_MATCHED`] command's
+/// [`Matching`] into. Always written, over anything the phone sent under
+/// the same name, so a phone cannot choose its own matching.
+pub const MATCH_ARG: &str = "matching";
+
+/// Which text a query is matched against (#1519).
+///
+/// The desktop's own window matches the real text: that is the owner
+/// searching their own disk. A remote caller matches the text it would
+/// be shown -- masked, unless the call reveals -- so a query can only
+/// hit what the phone could see anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Matching {
+    /// The real text. The desktop's window, or a revealing phone.
+    Unmasked,
+    /// The text as [`mask_text`] leaves it.
+    Masked,
+}
+
+impl Matching {
+    /// The matching a remote dispatch arm uses, from the [`MATCH_ARG`]
+    /// [`admit`] wrote. Absent means masked: an arm reached without
+    /// `admit` fails closed rather than matching secrets.
+    pub fn for_remote(written: Option<Matching>) -> Matching {
+        written.unwrap_or(Matching::Masked)
+    }
+}
+
+/// Whether a match of `needle` (lowercase) in masked text could overlap
+/// a marker, and so be found in masked text without being in the real
+/// text at all.
+///
+/// Masking replaces spans with markers and leaves everything else as it
+/// was, so an occurrence of `needle` in the masked text either lies
+/// wholly outside every marker -- and is then in the real text too -- or
+/// touches one. Touching one means containing a bracket, or lying wholly
+/// inside one of the finitely many markers. When this is false, a text
+/// the needle does not occur in cannot match once masked, so a find need
+/// mask only the texts the needle occurs in: the cost of masked matching
+/// is then proportional to the hits, not to the file.
+pub fn needle_could_touch_a_marker(needle: &str) -> bool {
+    needle.contains('\u{27e6}')
+        || needle.contains('\u{27e7}')
+        || KINDS
+            .iter()
+            .any(|k| format!("{MARKER_OPEN}{k}{MARKER_CLOSE}").contains(needle))
+}
+
 /// Keys whose values round-trip to the desktop unread, or are machine
 /// identifiers rather than text: a page's cursor digest, the record and call
 /// ids a phone sends back to `claude_transcript_block_text`, and the
@@ -204,6 +312,11 @@ pub struct Masking {
     /// may not read transcripts. A withheld field is NOT an absent one:
     /// the desktop has the text and declined to send it.
     pub withheld: bool,
+    /// Whether this answer's query was matched against the MASKED text
+    /// (#1519): text hidden as a likely secret was not searched, so a
+    /// miss says nothing about it. False for an answer that matched no
+    /// query, and for a revealing call, which matched the real text.
+    pub matched_masked: bool,
 }
 
 /// Why [`admit`] refused a call. Both are 403: the device is paired and
@@ -214,6 +327,14 @@ pub enum Refusal {
     TranscriptsOff,
     #[error("This computer does not allow this phone to reveal hidden text. It can be turned on under Settings > Paired devices on that computer.")]
     RevealOff,
+    /// A [`QUERY_MATCHED`] query that is itself secret-shaped, from a
+    /// call that does not reveal (#1519). Matched against masked text it
+    /// could never hit -- the secret it names is a marker there -- so
+    /// answering it would say "no matches" about text that may well be
+    /// present. Refused with the reason instead: never "we did not look"
+    /// as "it is not there".
+    #[error("This search looks like a password, key or token. Hidden text is not searched from this phone.")]
+    SecretQuery,
 }
 
 /// How one admitted call's answer is to be finished.
@@ -222,6 +343,8 @@ pub struct Plan {
     carries: Option<Carries>,
     access: Access,
     reveal: bool,
+    /// A query was matched against masked text (#1519).
+    matched_masked: bool,
 }
 
 /// The gate before dispatch. Returns the arguments to dispatch with and
@@ -237,6 +360,7 @@ pub fn admit(command: &str, args: Value, access: Access) -> Result<(Value, Plan)
                 carries: None,
                 access,
                 reveal: false,
+                matched_masked: false,
             },
         ));
     };
@@ -253,12 +377,43 @@ pub fn admit(command: &str, args: Value, access: Access) -> Result<(Value, Plan)
     if reveal && !access.reveal {
         return Err(Refusal::RevealOff);
     }
+    let mut matched_masked = false;
+    if let Some((_, query_key)) = QUERY_MATCHED.iter().find(|(name, _)| *name == command) {
+        if let Value::Object(map) = &mut args {
+            matched_masked = !reveal
+                && map
+                    .get(*query_key)
+                    .and_then(Value::as_str)
+                    .is_some_and(|q| !q.trim().is_empty());
+            if !reveal {
+                let secret_shaped = map
+                    .get(*query_key)
+                    .and_then(Value::as_str)
+                    .is_some_and(|q| mask_text(q).1 > 0);
+                if secret_shaped {
+                    return Err(Refusal::SecretQuery);
+                }
+            }
+            let matching = if reveal {
+                Matching::Unmasked
+            } else {
+                Matching::Masked
+            };
+            // Over whatever the phone sent under this name: the phone
+            // does not choose what its query is matched against.
+            map.insert(
+                MATCH_ARG.to_string(),
+                serde_json::to_value(matching).unwrap_or(Value::Null),
+            );
+        }
+    }
     Ok((
         args,
         Plan {
             carries: Some(carries),
             access,
             reveal,
+            matched_masked,
         },
     ))
 }
@@ -297,6 +452,7 @@ impl Plan {
                 revealed: self.reveal && !withhold,
                 reveal_allowed: self.access.reveal && self.access.transcripts,
                 withheld: withhold,
+                matched_masked: self.matched_masked && !withhold,
             };
             if let Ok(v) = serde_json::to_value(summary) {
                 map.insert(MASKING_KEY.to_string(), v);
@@ -822,7 +978,7 @@ mod tests {
         assert_eq!(out["end"], page_answer()["end"]);
         assert_eq!(
             out[MASKING_KEY],
-            json!({"hidden": 2, "revealed": false, "reveal_allowed": false, "withheld": false})
+            json!({"hidden": 2, "revealed": false, "reveal_allowed": false, "withheld": false, "matched_masked": false})
         );
     }
 
@@ -935,6 +1091,233 @@ mod tests {
         let (args, plan) = admit("get_cached", body.clone(), ON).unwrap();
         assert_eq!(args, body);
         assert_eq!(plan.finish("get_cached", body.clone()), body);
+    }
+
+    /// Every query matcher is also a transcript-text command: `admit`
+    /// returns before it writes a matching for a command with no
+    /// [`TRANSCRIPT_TEXT`] row, so a matcher missing one would match
+    /// the real text (#1519).
+    #[test]
+    fn every_query_matcher_is_a_transcript_command() {
+        for (name, _) in QUERY_MATCHED {
+            assert!(carries(name).is_some(), "{name} has no TRANSCRIPT_TEXT row");
+        }
+    }
+
+    fn matching_written(args: &Value) -> Option<Matching> {
+        serde_json::from_value(args.get(MATCH_ARG)?.clone()).ok()
+    }
+
+    /// `admit` writes the matching into a query matcher's arguments:
+    /// masked unless the call reveals, over anything the phone sent
+    /// (#1519). The desktop's window never passes through here, and the
+    /// dispatch arm fails closed without it.
+    #[test]
+    fn a_query_matcher_is_told_which_text_to_match() {
+        let allowed = Access {
+            transcripts: true,
+            reveal: true,
+        };
+        for (command, _) in QUERY_MATCHED {
+            // Not revealing: masked, whatever the phone claimed.
+            let (args, _) = admit(
+                command,
+                json!({"query": "deploy", "matching": "unmasked"}),
+                allowed,
+            )
+            .unwrap();
+            assert_eq!(matching_written(&args), Some(Matching::Masked), "{command}");
+            assert_eq!(args["query"], "deploy");
+
+            // Revealing, and allowed: the real text, like the answer.
+            let (args, plan) =
+                admit(command, json!({"query": "deploy", "reveal": true}), allowed).unwrap();
+            assert_eq!(
+                matching_written(&args),
+                Some(Matching::Unmasked),
+                "{command}"
+            );
+            assert!(plan.reveals());
+            // The answer says which text the query was matched against.
+            let said =
+                |plan: Plan| plan.finish(command, json!({}))[MASKING_KEY]["matched_masked"].clone();
+            assert_eq!(said(plan), json!(false), "{command}: revealed");
+            let (_, plan) = admit(command, json!({"query": "deploy"}), allowed).unwrap();
+            assert_eq!(said(plan), json!(true), "{command}: masked");
+            let (_, plan) = admit(command, json!({"query": null}), allowed).unwrap();
+            assert_eq!(said(plan), json!(false), "{command}: no query was matched");
+        }
+        // A command that matches nothing is not given a matching.
+        let (args, _) = admit("claude_transcript_page", json!({"path": "p"}), ON).unwrap();
+        assert!(args.get(MATCH_ARG).is_none());
+        // Absent is masked: an arm reached without `admit` fails closed.
+        assert_eq!(Matching::for_remote(None), Matching::Masked);
+    }
+
+    /// A secret-shaped query is refused with a reason rather than
+    /// answered "no matches" over text it could never hit -- unless the
+    /// call reveals, when it is matched against the real text (#1519).
+    #[test]
+    fn a_secret_shaped_query_is_refused_unless_revealing() {
+        let allowed = Access {
+            transcripts: true,
+            reveal: true,
+        };
+        for (command, _) in QUERY_MATCHED {
+            for query in [
+                "ghp_abcdefABCDEF0123456789abcdefABCDEF01",
+                // A prefix of the same family is still that shape.
+                "ghp_ab",
+                "API_KEY=abcd1234efgh",
+            ] {
+                assert_eq!(
+                    admit(command, json!({ "query": query }), allowed).unwrap_err(),
+                    Refusal::SecretQuery,
+                    "{command}: {query}"
+                );
+                assert!(admit(command, json!({ "query": query, "reveal": true }), allowed).is_ok());
+            }
+            // An ordinary query, and the outline's null one, pass.
+            assert!(admit(command, json!({"query": "deploy the widget"}), ON).is_ok());
+            assert!(admit(command, json!({"query": null}), ON).is_ok());
+        }
+        assert!(Refusal::SecretQuery.to_string().contains("not searched"));
+    }
+
+    /// Exactly the needles that can match inside a marker are flagged,
+    /// so masked find masks everything only for them.
+    #[test]
+    fn a_needle_touches_a_marker_only_by_its_text_or_its_brackets() {
+        for needle in [
+            "hidden",
+            "den:api",
+            "\u{27e6}",
+            "x\u{27e7}y",
+            "github-token",
+        ] {
+            assert!(needle_could_touch_a_marker(needle), "{needle}");
+        }
+        for needle in ["deploy", "hidden secret", "widget"] {
+            assert!(!needle_could_touch_a_marker(needle), "{needle}");
+        }
+    }
+
+    /// A transcript holding a secret, for the find tests below.
+    fn secret_transcript(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::io::Write;
+        let path = dir.join("t.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","uuid":"u1","message":{{"role":"user","content":"deploy the widget with sk-ant-api03-SECRETsecret0123456789 today"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","uuid":"u2","message":{{"role":"user","content":"then check the gadget"}}}}"#
+        )
+        .unwrap();
+        path
+    }
+
+    /// A find the way a phone's call runs it: through `admit`, with the
+    /// matching it wrote, then `Plan::finish`. Returns the finished
+    /// answer.
+    fn phone_find(path: &std::path::Path, query: &str, access: Access, reveal: bool) -> Value {
+        let (args, plan) = admit(
+            "claude_transcript_find",
+            json!({"path": "p", "query": query, "reveal": reveal}),
+            access,
+        )
+        .unwrap();
+        let matching = Matching::for_remote(matching_written(&args));
+        let found =
+            crate::claude::transcript_page::find(path, Some(query), None, matching).unwrap();
+        plan.finish(
+            "claude_transcript_find",
+            serde_json::to_value(found).unwrap(),
+        )
+    }
+
+    fn hit_ids(answer: &Value) -> Vec<String> {
+        answer["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["message_id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// #1519's tests, on the find: a secret is not findable by its
+    /// value from a phone that does not reveal -- not whole, where the
+    /// query is refused, and not by a piece too short to be refused;
+    /// findable with reveal allowed and asked for; findable from the
+    /// desktop's window; and ordinary words are still found, with the
+    /// secret masked in the snippet around them.
+    #[test]
+    fn a_secret_in_a_transcript_is_findable_only_where_it_could_be_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = secret_transcript(dir.path());
+        const PIECE: &str = "SECRETsecret0123";
+        const WHOLE: &str = "sk-ant-api03-SECRETsecret0123456789";
+
+        // A phone that does not reveal: the piece finds nothing, and the
+        // whole secret is refused rather than answered.
+        assert!(hit_ids(&phone_find(&path, PIECE, ON, false)).is_empty());
+        assert!(hit_ids(&phone_find(&path, "api03", ON, false)).is_empty());
+        assert_eq!(
+            admit(
+                "claude_transcript_find",
+                json!({"path": "p", "query": WHOLE}),
+                ON
+            )
+            .unwrap_err(),
+            Refusal::SecretQuery
+        );
+
+        // Allowed to reveal, and asking: found, and shown.
+        let allowed = Access {
+            transcripts: true,
+            reveal: true,
+        };
+        let revealed = phone_find(&path, PIECE, allowed, true);
+        assert_eq!(hit_ids(&revealed), vec!["u1"]);
+        assert!(revealed.to_string().contains(WHOLE));
+        // Allowed but not asking: matched like any phone.
+        assert!(hit_ids(&phone_find(&path, PIECE, allowed, false)).is_empty());
+
+        // The desktop's window: the command's own default, unmasked.
+        let desktop =
+            crate::claude::transcript_page::find(&path, Some(PIECE), None, Matching::Unmasked)
+                .unwrap();
+        assert_eq!(desktop.hits.len(), 1);
+        assert!(desktop.hits[0].snippet.contains(WHOLE));
+
+        // Ordinary words are still found from the phone, with the secret
+        // beside them masked.
+        let widget = phone_find(&path, "widget", ON, false);
+        assert_eq!(hit_ids(&widget), vec!["u1"]);
+        let snippet = widget["hits"][0]["snippet"].as_str().unwrap();
+        assert!(snippet.contains("deploy the widget"), "{snippet}");
+        assert!(snippet.contains(&marker("api-key")), "{snippet}");
+        assert!(!snippet.contains("SECRET"), "{snippet}");
+        assert_eq!(hit_ids(&phone_find(&path, "gadget", ON, false)), vec!["u2"]);
+
+        // Text the phone CAN see includes the marker: a query inside one
+        // finds it, though the real text never said "hidden".
+        assert_eq!(
+            hit_ids(&phone_find(&path, "hidden:api", ON, false)),
+            vec!["u1"]
+        );
+        assert!(crate::claude::transcript_page::find(
+            &path,
+            Some("hidden:api"),
+            None,
+            Matching::Unmasked
+        )
+        .unwrap()
+        .hits
+        .is_empty());
     }
 
     /// The diag lines on a transcript command's path carry counts, never
