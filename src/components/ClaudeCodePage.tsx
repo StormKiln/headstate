@@ -58,6 +58,7 @@ import {
 import { type ClaudeSessionFilter, useFilters } from "@/store/filters";
 import { QueryError, errorMessage } from "./QueryError";
 import { ExternalLink } from "./ExternalLink";
+import { MaskedText } from "./MaskedText";
 
 /// The sessions list is virtualized, and this is the note that used to
 /// be `RENDER_CAP = 200` (#1200).
@@ -1562,7 +1563,10 @@ function Highlight({ value }: { value: string }) {
   const parts = useMemo(() => segments(value, query), [value, query]);
   // No search: render the string itself rather than a single-element
   // span, so the common case adds no DOM.
-  if (parts.length === 1 && !parts[0].hit) return <>{value}</>;
+  // `MaskedText` because the opening prompt renders through here, and on
+  // a phone it may carry a span the desktop masked (#1488). Identity on
+  // every other field.
+  if (parts.length === 1 && !parts[0].hit) return <MaskedText text={value} />;
   return (
     <>
       {parts.map((part, i) =>
@@ -1574,7 +1578,9 @@ function Highlight({ value }: { value: string }) {
             {part.text}
           </mark>
         ) : (
-          <span key={i}>{part.text}</span>
+          <span key={i}>
+            <MaskedText text={part.text} />
+          </span>
         ),
       )}
     </>
@@ -3954,7 +3960,7 @@ function PreviewBlock({
     case "text":
       return (
         <p className="whitespace-pre-wrap break-words text-xs text-[#e6edf3]">
-          {b.text}
+          <MaskedText text={b.text} />
           {b.truncated ? <span className="text-[#8b949e]"> … (clipped)</span> : null}
         </p>
       );
@@ -3964,7 +3970,7 @@ function PreviewBlock({
       // out of the way but not gone.
       return (
         <p className="whitespace-pre-wrap break-words text-xs italic text-[#6e7681]">
-          {b.text}
+          <MaskedText text={b.text} />
           {b.truncated ? " … (clipped)" : ""}
         </p>
       );
@@ -4006,7 +4012,7 @@ function PreviewBlock({
             <p className="text-[11px] text-[#f85149]">The tool reported an error.</p>
           ) : null}
           <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-[#161b22] p-1.5 text-[11px] text-[#8b949e]">
-            {b.text || "(no output)"}
+            {b.text ? <MaskedText text={b.text} /> : "(no output)"}
             {b.truncated ? "\n… (clipped)" : ""}
           </pre>
           {b.change !== null ? <FileChangeView change={b.change} /> : null}

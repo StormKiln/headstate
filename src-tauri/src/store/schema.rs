@@ -1196,6 +1196,29 @@ const MIGRATIONS: &[&str] = &[
     // from before this migration; those sessions are at an older
     // `rule_version` (migration 26) and are re-read before use.
     "ALTER TABLE claude_advice_signal ADD COLUMN call_key TEXT;",
+    // 30: what each paired phone may read of the session transcripts
+    // (#1488).
+    //
+    // `transcripts_allowed` is "Allow this phone to read session
+    // transcripts", ON for every existing pairing: transcripts already
+    // crossed to these phones before this switch existed, and turning it
+    // off by migration would break a working companion with no word to
+    // its owner. `reveal_allowed` is "Allow this phone to reveal hidden
+    // text", OFF for every existing and new pairing: masking secrets is on
+    // by default, and only the owner, at the desktop, lifts it for a
+    // phone. Both are enforced in `remote/privacy.rs`.
+    //
+    // A side table keyed by the device's id rather than two columns on
+    // `paired_devices`, and a device with NO row here has the defaults.
+    // So every existing pairing is on-and-masked without a backfill, and
+    // the migration never has to alter a table a partial database may not
+    // hold. `store/devices.rs` removes a device's row with the device,
+    // and clears any stale one when an id is reused.
+    "CREATE TABLE IF NOT EXISTS paired_device_access (
+        device_id           INTEGER PRIMARY KEY,
+        transcripts_allowed INTEGER NOT NULL DEFAULT 1,
+        reveal_allowed      INTEGER NOT NULL DEFAULT 0
+     );",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
@@ -1792,6 +1815,37 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(schema, MIGRATIONS.len() as i64);
+    }
+
+    /// Migration 30 keeps every paired phone reading transcripts, and
+    /// masked (#1488). An existing pairing must not lose the companion's
+    /// transcript view to an upgrade, and must not gain unmasked text.
+    #[test]
+    fn migration_30_keeps_existing_pairings_reading_masked_transcripts() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in MIGRATIONS.iter().take(29) {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 29i64).unwrap();
+        conn.execute(
+            "INSERT INTO paired_devices (name, cert_fp, cert_der, ecdsa_pubkey, paired_at)
+             VALUES ('phone', 'ab', x'30', x'04', '2026-09-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let rows = crate::store::devices::list(&conn).unwrap();
+        assert_eq!(rows.len(), 1, "an upgrade must not cost a pairing");
+        assert!(
+            rows[0].transcripts_allowed,
+            "an existing pairing keeps reading transcripts"
+        );
+        assert!(
+            !rows[0].reveal_allowed,
+            "an existing pairing does not gain reveal"
+        );
     }
 
     /// Migration 16 adds the plugin scan cache without costing history.

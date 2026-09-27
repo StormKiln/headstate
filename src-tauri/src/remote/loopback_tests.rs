@@ -478,6 +478,89 @@ async fn call_refuses_what_the_allowlist_and_the_body_rule_out() {
     desktop.handle.stop().await;
 }
 
+/// Transcript text over the wire (#1488), end to end through the real
+/// pairing state and the real listener: masked by default, refused when
+/// the device's switch is off, and unmasked only on a reveal the desktop
+/// allowed -- with the switch taking effect on the very next call.
+#[tokio::test]
+async fn transcript_text_reaches_a_phone_masked_and_only_as_allowed() {
+    let mut desktop = desktop().await;
+    let phone = Phone::new();
+    desktop.pair(&phone, "Octocat's phone").await;
+    let id = devices::list(&desktop.conn).unwrap()[0].id;
+    const SECRET: &str = "ghp_wireWIRE0123456789wireWIRE0123456789";
+    *desktop.host.reply_with.lock().unwrap() = Some(json!({
+        "messages": [{ "role": "user", "timestamp": null, "model": null,
+            "blocks": [{ "kind": "text", "text": format!("token {SECRET} here"), "truncated": false }] }],
+        "truncated": false
+    }));
+    let body = r#"{"path":"p"}"#;
+    let reveal = r#"{"path":"p","reveal":true}"#;
+
+    // Default: masked, and the phone is told reveal would not work.
+    let masked = desktop
+        .call(&phone, "claude_transcript_tail", &[], Some(body))
+        .await;
+    assert_eq!(masked.status, 200, "{}", masked.body);
+    assert!(!masked.body.contains(SECRET), "{}", masked.body);
+    let v: Value = serde_json::from_str(&masked.body).unwrap();
+    assert_eq!(v["masking"]["hidden"], 1);
+    assert_eq!(v["masking"]["reveal_allowed"], false);
+
+    // Reveal without the desktop's allowance: refused, nothing run.
+    let before = desktop.host.calls.lock().unwrap().len();
+    let refused = desktop
+        .call(&phone, "claude_transcript_tail", &[], Some(reveal))
+        .await;
+    assert_eq!(refused.status, 403);
+    assert!(
+        refused.body.contains("reveal hidden text"),
+        "{}",
+        refused.body
+    );
+    assert_eq!(desktop.host.calls.lock().unwrap().len(), before);
+
+    // Allowed at the desktop: the reveal is honoured, and the command
+    // never saw the `reveal` argument.
+    desktop
+        .pairing
+        .set_transcript_access(&desktop.conn, id, true, true)
+        .unwrap();
+    let revealed = desktop
+        .call(&phone, "claude_transcript_tail", &[], Some(reveal))
+        .await;
+    assert_eq!(revealed.status, 200, "{}", revealed.body);
+    assert!(revealed.body.contains(SECRET));
+    let (_, sent, _) = desktop.host.calls.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(sent, json!({"path": "p"}));
+
+    // Switch off: refused before the command runs.
+    desktop
+        .pairing
+        .set_transcript_access(&desktop.conn, id, false, true)
+        .unwrap();
+    let before = desktop.host.calls.lock().unwrap().len();
+    let off = desktop
+        .call(&phone, "claude_transcript_follow", &[], Some(body))
+        .await;
+    assert_eq!(off.status, 403);
+    assert!(
+        off.body.contains("read session transcripts"),
+        "{}",
+        off.body
+    );
+    assert_eq!(desktop.host.calls.lock().unwrap().len(), before);
+
+    // A command carrying no transcript text is not this switch's.
+    *desktop.host.reply_with.lock().unwrap() = None;
+    assert_eq!(
+        desktop.call(&phone, "get_cached", &[], None).await.status,
+        200
+    );
+
+    desktop.handle.stop().await;
+}
+
 /// Pairing's refusals over the wire: a body that does not decode is
 /// 400 and keeps the token; a denied request is 403 and pairs nothing.
 #[tokio::test]
@@ -1082,11 +1165,22 @@ async fn a_transcript_page_crosses_gzipped_and_decodes_to_the_same_page() {
     .await;
     assert_eq!(plain.status, 200);
 
-    // The same page both ways, and the page the command produced.
-    let expected = serde_json::to_value(
+    // The same page both ways, and the page the command produced -- as a
+    // phone receives it, through #1488's masking at the remote boundary.
+    let produced = serde_json::to_value(
         crate::claude::preview::tail(&desktop.host.path).expect("the fixture reads"),
     )
     .unwrap();
+    let (_, plan) = crate::remote::privacy::admit(
+        "claude_transcript_tail",
+        json!({}),
+        crate::remote::privacy::Access {
+            transcripts: true,
+            reveal: false,
+        },
+    )
+    .unwrap();
+    let expected = plan.finish("claude_transcript_tail", produced);
     assert_eq!(gz.json(), expected);
     assert_eq!(plain.json(), expected);
     let messages = expected["messages"].as_array().map_or(0, Vec::len);
@@ -1104,6 +1198,59 @@ async fn a_transcript_page_crosses_gzipped_and_decodes_to_the_same_page() {
         wire * MIN_TRANSCRIPT_RATIO <= full,
         "a {full}-byte page crossed as {wire} bytes, less than {MIN_TRANSCRIPT_RATIO}x smaller"
     );
+
+    desktop.handle.stop().await;
+}
+
+/// #1488 with #1478: a reveal answer carries an unmasked secret, so it is
+/// never compressed, even when the phone asks for gzip -- masking is what
+/// defeats BREACH, and a reveal is the one answer masking does not cover.
+/// The masked answer to the same call, asked the same way, IS gzipped,
+/// which proves the header asked for compression and the reveal alone
+/// declined it.
+#[tokio::test]
+async fn a_reveal_answer_is_never_compressed() {
+    let mut desktop = desktop().await;
+    let phone = Phone::new();
+    desktop.pair(&phone, "Octocat's phone").await;
+    let id = devices::list(&desktop.conn).unwrap()[0].id;
+    desktop
+        .pairing
+        .set_transcript_access(&desktop.conn, id, true, true)
+        .unwrap();
+    const SECRET: &str = "ghp_wireWIRE0123456789wireWIRE0123456789";
+    *desktop.host.reply_with.lock().unwrap() = Some(json!({
+        "messages": [{ "role": "user", "timestamp": null, "model": null,
+            "blocks": [{ "kind": "text", "text": format!("token {SECRET} {}", "padding ".repeat(20)), "truncated": false }] }],
+        "truncated": false
+    }));
+    let gzip = [("Accept-Encoding", "gzip")];
+
+    let masked = wire_request(
+        &desktop,
+        &phone,
+        "POST",
+        "/v1/call/claude_transcript_tail",
+        &gzip,
+        r#"{"path":"p"}"#,
+    )
+    .await;
+    assert_eq!(masked.status, 200);
+    assert_eq!(masked.header("content-encoding"), Some("gzip"));
+
+    let revealed = wire_request(
+        &desktop,
+        &phone,
+        "POST",
+        "/v1/call/claude_transcript_tail",
+        &gzip,
+        r#"{"path":"p","reveal":true}"#,
+    )
+    .await;
+    assert_eq!(revealed.status, 200);
+    assert_eq!(revealed.header("content-encoding"), Some("identity"));
+    let body = String::from_utf8(revealed.body.clone()).expect("plain JSON on the wire");
+    assert!(body.contains(SECRET), "the reveal carries the text: {body}");
 
     desktop.handle.stop().await;
 }

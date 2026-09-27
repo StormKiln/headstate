@@ -8,9 +8,13 @@ const list = vi.hoisted(() => ({
   isLoading: false,
   error: null as unknown,
 }));
+const setAccess = vi.hoisted(() =>
+  vi.fn<(id: number, transcripts: boolean, reveal: boolean) => Promise<void>>(),
+);
 vi.mock("../api/hooks", () => ({
   usePairedDevices: () => list,
   useRevokePairedDevice: () => revoke,
+  useSetPairedDeviceAccess: () => setAccess,
 }));
 
 import { PairedDevicesList } from "./PairedDevicesList";
@@ -24,6 +28,8 @@ const PHONE: PairedDevice = {
   has_mldsa: true,
   paired_at: "2026-09-01T10:00:00Z",
   last_seen: "2026-09-05T07:00:00Z",
+  transcripts_allowed: true,
+  reveal_allowed: false,
 };
 
 const TABLET: PairedDevice = {
@@ -33,6 +39,8 @@ const TABLET: PairedDevice = {
   has_mldsa: false,
   paired_at: "2026-08-20T10:00:00Z",
   last_seen: null,
+  transcripts_allowed: true,
+  reveal_allowed: false,
 };
 
 beforeEach(() => {
@@ -40,6 +48,8 @@ beforeEach(() => {
   vi.setSystemTime(NOW);
   revoke.mockReset();
   revoke.mockImplementation(() => Promise.resolve());
+  setAccess.mockReset();
+  setAccess.mockImplementation(() => Promise.resolve());
   list.data = [PHONE, TABLET];
   list.isLoading = false;
   list.error = null;
@@ -118,6 +128,49 @@ describe("PairedDevicesList", () => {
       });
       expect(screen.getByRole("dialog")).toBeTruthy();
       expect(screen.getByRole("alert").textContent).toBe("database is locked");
+    });
+  });
+
+  describe("transcript access (#1488)", () => {
+    const readBox = () =>
+      screen.getAllByRole("checkbox", { name: /read session transcripts/i })[0] as HTMLInputElement;
+    const revealBox = () =>
+      screen.getAllByRole("checkbox", { name: /reveal hidden text/i })[0] as HTMLInputElement;
+
+    it("shows each phone's stored switches: reading on, reveal off by default", () => {
+      render(<PairedDevicesList />);
+      expect(readBox().checked).toBe(true);
+      expect(revealBox().checked).toBe(false);
+      expect(revealBox().disabled).toBe(false);
+    });
+
+    it("saves both switches for that phone only", async () => {
+      render(<PairedDevicesList />);
+      await act(async () => {
+        fireEvent.click(revealBox());
+      });
+      expect(setAccess).toHaveBeenCalledWith(1, true, true);
+      await act(async () => {
+        fireEvent.click(readBox());
+      });
+      expect(setAccess).toHaveBeenLastCalledWith(1, false, false);
+    });
+
+    it("disables reveal, keeping its stored value, while reading is off", () => {
+      list.data = [{ ...PHONE, transcripts_allowed: false, reveal_allowed: true }];
+      render(<PairedDevicesList />);
+      expect(readBox().checked).toBe(false);
+      expect(revealBox().disabled).toBe(true);
+      expect(revealBox().checked).toBe(true);
+    });
+
+    it("says why a change could not be saved", async () => {
+      setAccess.mockImplementation(() => Promise.reject("this phone is no longer paired"));
+      render(<PairedDevicesList />);
+      await act(async () => {
+        fireEvent.click(readBox());
+      });
+      expect(screen.getByRole("alert").textContent).toBe("this phone is no longer paired");
     });
   });
 });
