@@ -1,3 +1,4 @@
+import { useId, useState } from "react";
 import { ClippedText } from "./ClippedText";
 import { palette } from "./palette";
 import type { LoadFullText, ThinkingBlock as Block, ToolVariant } from "./types";
@@ -7,11 +8,16 @@ import type { LoadFullText, ThinkingBlock as Block, ToolVariant } from "./types"
 /// `recorded: false` is a block whose text Claude Code did not keep --
 /// only its signature. It renders as "not recorded", never as an empty
 /// thought: the model did think; the transcript did not write it down.
+///
+/// `collapsible` (the desktop, #1480) makes the "Thinking" label a
+/// toggle that hides the text. Open by default either way: the default
+/// is to show thinking.
 export function ThinkingBlock({
   block,
   messageId,
   variant,
   onLoadFullText,
+  collapsible = false,
 }: {
   block: Block;
   /// The message the block is in: with `block.index`, the full-text
@@ -19,7 +25,10 @@ export function ThinkingBlock({
   messageId: string;
   variant: ToolVariant;
   onLoadFullText?: LoadFullText;
+  collapsible?: boolean;
 }) {
+  const [open, setOpen] = useState(true);
+  const regionId = useId();
   const size = variant === "terminal" ? "font-mono text-[12px]" : "text-[13px]";
   if (!block.recorded) {
     return (
@@ -30,21 +39,38 @@ export function ThinkingBlock({
   }
   return (
     <div className={size} role="group" aria-label="Thinking">
-      <p className="italic" style={{ color: palette.muted }}>
-        ✻ Thinking
-      </p>
-      <ClippedText
-        text={block.text}
-        clip={block.clip}
-        address={{ messageId, index: block.index }}
-        onLoadFullText={onLoadFullText}
-      >
-        {(t) => (
-          <p className="whitespace-pre-wrap break-words italic" style={{ color: palette.muted }}>
-            {t}
-          </p>
-        )}
-      </ClippedText>
+      {collapsible ? (
+        <button
+          type="button"
+          aria-expanded={open}
+          aria-controls={regionId}
+          onClick={() => setOpen((o) => !o)}
+          className="italic hover:underline focus-visible:outline focus-visible:outline-2"
+          style={{ color: palette.muted }}
+        >
+          ✻ Thinking {open ? "▾" : "▸"}
+        </button>
+      ) : (
+        <p className="italic" style={{ color: palette.muted }}>
+          ✻ Thinking
+        </p>
+      )}
+      <div id={regionId} hidden={!open}>
+        {open ? (
+          <ClippedText
+            text={block.text}
+            clip={block.clip}
+            address={{ messageId, index: block.index }}
+            onLoadFullText={onLoadFullText}
+          >
+            {(t) => (
+              <p className="whitespace-pre-wrap break-words italic" style={{ color: palette.muted }}>
+                {t}
+              </p>
+            )}
+          </ClippedText>
+        ) : null}
+      </div>
     </div>
   );
 }

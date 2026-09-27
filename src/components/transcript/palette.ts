@@ -22,6 +22,12 @@ export const palette = {
   removedText: "#ff7b72",
   removedWordBg: "#6e1f24",
   removedWordText: "#ffdcd7",
+  /// The desktop renderer's (#1480). Claude Code's own accent, the
+  /// orange its `>` prompt and bullets wear in a terminal, and the
+  /// user turn's band: one step lighter than the ground, so the turn
+  /// reads as a separator even before its bar is seen.
+  accent: "#d97757",
+  userBand: "#1c2128",
 } as const;
 
 /// Every foreground/background pair the renderers draw, by name.
@@ -42,4 +48,14 @@ export const PAIRS: [fg: keyof typeof palette, bg: keyof typeof palette][] = [
   ["removedWordText", "removedWordBg"],
   ["muted", "addedBg"],
   ["muted", "removedBg"],
+  // The desktop renderer (#1480): the user band, its accent bar and
+  // `>` glyph, and the status colours on the surfaces it draws them on.
+  ["text", "userBand"],
+  ["muted", "userBand"],
+  ["accent", "userBand"],
+  ["accent", "ground"],
+  ["error", "userBand"],
+  ["warn", "surface"],
+  ["ok", "surface"],
+  ["link", "userBand"],
 ];

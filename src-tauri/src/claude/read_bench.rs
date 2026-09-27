@@ -538,6 +538,53 @@ fn the_huge_result_is_one_message_on_a_page_not_a_hole() {
     );
 }
 
+/// The message pages the browser harness renders (#1480, #1487): each
+/// fixture's `TranscriptPage` exactly as `claude_transcript_messages`
+/// returns it (`<name>.messages-tail.json`), and the whole file parsed
+/// as one page (`<name>.messages-whole.json`), which the read model caps
+/// at its newest [`super::transcript_model::MAX_MESSAGES`] -- the fullest
+/// page a read can hand the viewer today.
+///
+/// Writes, measures nothing, so it is not in the timings above. Run by
+/// `make bench-transcript-browser` with
+/// `HEADSTATE_TRANSCRIPT_PAYLOADS_OUT=<dir>`; a no-op without it.
+#[test]
+#[ignore]
+fn transcript_message_payloads() {
+    let Some(dir) =
+        std::env::var_os("HEADSTATE_TRANSCRIPT_PAYLOADS_OUT").map(std::path::PathBuf::from)
+    else {
+        println!("set HEADSTATE_TRANSCRIPT_PAYLOADS_OUT=<dir> to write the harness payloads");
+        return;
+    };
+    std::fs::create_dir_all(&dir).unwrap();
+    for fixture in fixtures::ALL {
+        let w: Written = fixtures::write(fixture, &dir).unwrap();
+        let tail = super::transcript_model::tail(&w.path).unwrap();
+        let body = std::fs::read_to_string(&w.path).unwrap();
+        let whole = super::transcript_model::parse(
+            &body,
+            super::transcript_model::WindowStart::FileStart,
+            Some(&w.path),
+        );
+        for (slug, page) in [("tail", &tail), ("whole", &whole)] {
+            let json = serde_json::to_vec(page).unwrap();
+            println!(
+                "{} {slug}: {} messages, {}",
+                fixture.name,
+                page.messages.len(),
+                human(json.len() as u64)
+            );
+            std::fs::write(
+                dir.join(format!("{}.messages-{slug}.json", fixture.name)),
+                json,
+            )
+            .unwrap();
+        }
+        std::fs::remove_file(&w.path).unwrap();
+    }
+}
+
 fn human(bytes: u64) -> String {
     if bytes >= 1024 * 1024 {
         format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))

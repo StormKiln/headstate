@@ -25,6 +25,7 @@ export default tseslint.config(
   {
     ignores: [
       "dist",
+      "dist-harness",
       "src-tauri/target",
       "src-mobile/target",
       "src-mobile/gen/apple/build",

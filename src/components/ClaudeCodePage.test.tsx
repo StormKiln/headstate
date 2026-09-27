@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   ClaudeImported,
   ClaudePreview,
@@ -267,6 +267,29 @@ vi.mock("../api/hooks", () => ({
 }));
 vi.mock("sonner", () => ({ toast: { success: toastSuccess, error: toastError } }));
 vi.mock("../lib/clipboard", () => ({ copyText: copyFn }));
+/// Which build the page thinks it is, switchable per describe (#1480).
+/// The old transcript preview now renders ONLY in the phone build, so
+/// its tests below run as the phone: a getter, read on every access,
+/// rather than the constant the real module folds to. Everything else in
+/// this file stays the desktop.
+const target = vi.hoisted(() => ({ mobile: false }));
+vi.mock("@/lib/target", () => ({
+  get IS_MOBILE_BUILD() {
+    return target.mobile;
+  },
+  get IS_DESKTOP_BUILD() {
+    return !target.mobile;
+  },
+}));
+/// Run a describe's tests as the phone build.
+function asThePhoneBuild() {
+  beforeEach(() => {
+    target.mobile = true;
+  });
+  afterEach(() => {
+    target.mobile = false;
+  });
+}
 /// The #1214 additions: the vocabulary Rust admits and the argv it
 /// would spawn, both served rather than listed in TypeScript.
 const launchTerms = vi.hoisted(() =>
@@ -2961,7 +2984,12 @@ describe("what Claude Code recorded a session cost", () => {
 });
 
 /// #982. Reading a transcript in the app.
+///
+/// The preview these pin is the PHONE's since #1480 retired it from the
+/// desktop, whose terminal renderer is `transcript/TerminalMessage`'s
+/// subject. So they run as the phone build (`asThePhoneBuild`).
 describe("reading a transcript rather than revealing it", () => {
+  asThePhoneBuild();
   /// Behind a disclosure, and the read does NOT start on selection: a
   /// 256 KB read per row, over the pairing transport on the phone, for a
   /// pane the user may not want.
@@ -3570,6 +3598,8 @@ describe("reading a transcript rather than revealing it", () => {
 /// These tests are about the HONESTY of the follow rather than about its
 /// content, which the section above already pins.
 describe("following a transcript as it is written", () => {
+  // The phone's preview since #1480; see the describe above.
+  asThePhoneBuild();
   /// Requirement 2, and the one this codebase keeps having to re-apply
   /// (#846, #1042): "this session is idle" and "we stopped following" are
   /// different facts with different remedies.
@@ -4910,8 +4940,9 @@ describe("the transcript viewer", () => {
     const log = within(pane).getByRole("log");
     expect(within(log).getByText("run the tests")).toBeTruthy();
     expect(within(log).getByText("Running them now.")).toBeTruthy();
-    // The old preview stays until the renderers replace it.
-    expect(screen.getByRole("button", { name: /follow the transcript/i })).toBeTruthy();
+    // The desktop renderer replaced the old preview on the desktop (#1480).
+    expect(screen.queryByRole("button", { name: /follow the transcript/i })).toBeNull();
+    expect(screen.queryByText(/what it was doing/i)).toBeNull();
   });
 
   it("says when the transcript was only read from its end", () => {
@@ -4940,11 +4971,19 @@ describe("the transcript viewer", () => {
     expect(screen.getByText(/reading its transcript…/i)).toBeTruthy();
   });
 
-  it("offers no pane for a transcript that is gone, leaving the refusal to one sentence", () => {
+  /// #1479's follow-up: with the preview retired from the desktop
+  /// (#1480), the pane states the refusal itself -- once, in the
+  /// preview's words, and with nothing offered that cannot work.
+  ///
+  /// **Sabotage:** return `null` for a refusal on the desktop too, and
+  /// the sentence is gone.
+  it("says why there is nothing to read, once, in place of the pane", () => {
     state.list = listOf([session({ transcript_state: { state: "gone" } })]);
     renderView();
     open("HeadState GitHub issues filing");
-    expect(screen.queryByTestId("transcript-pane")).toBeNull();
+    const pane = screen.getByTestId("transcript-pane");
+    expect(within(pane).getByText(/there is nothing to read here: the path no longer exists/i)).toBeTruthy();
+    expect(within(pane).queryByRole("button", { name: /show the transcript/i })).toBeNull();
     expect(screen.getAllByText(/there is nothing to read here/i)).toHaveLength(1);
   });
 

@@ -1,0 +1,15 @@
+<!doctype html>
+<!-- The transcript viewer's browser harness (#1487, #1480). NOT part of
+     the app: built only by `vite.harness.config.ts`, for
+     `make bench-transcript-browser`. See docs/transcript-performance.md. -->
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Transcript harness</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/harness/transcriptBench.tsx"></script>
+  </body>
+</html>

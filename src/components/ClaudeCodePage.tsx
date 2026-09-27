@@ -30,7 +30,6 @@ import {
   useClaudeSessionsForPrQuery,
   type PrQueryState,
   useClaudeTranscriptFollow,
-  useClaudeTranscriptMessages,
   useWorktrees,
   useUiPrefs,
 } from "@/api/hooks";
@@ -60,11 +59,9 @@ import { type ClaudeSessionFilter, useFilters } from "@/store/filters";
 import { QueryError, errorMessage } from "./QueryError";
 import { ExternalLink } from "./ExternalLink";
 import { MaskedText } from "./MaskedText";
-import { TranscriptViewer } from "./transcript/TranscriptViewer";
-import { renderPlaceholderMessage } from "./transcript/PlaceholderMessage";
 import { PhoneTranscript } from "./transcript/phone/PhoneTranscript";
 import { useTranscriptRenderer } from "./transcript/phone/renderer";
-import { transcriptStreaming } from "./transcript/streaming";
+import { DesktopTranscript } from "./transcript/DesktopTranscript";
 
 /// The sessions list is virtualized, and this is the note that used to
 /// be `RENDER_CAP = 200` (#1200).
@@ -1895,12 +1892,12 @@ function SessionDetail({
               evidence for it, which is the arrangement #1219 exists to
               avoid (#1219). */}
           <StopSession session={s} detail={detail.data} />
-          {/* The viewer shell (#1479), beside the preview it will replace
-              once the renderers (#1480, #1481) and the follow (#1476)
-              land. Both stay until then: the preview is the one that
-              shows tool calls today. */}
+          {/* The transcript viewer (#1479). On the desktop it renders
+              through the terminal renderer (#1480), which replaced the
+              preview there. The phone keeps the preview beside the
+              viewer's stand-in until its own renderer lands (#1481). */}
           <TranscriptPane session={s} detail={detail.data} />
-          <TranscriptPreview detail={detail.data} />
+          {IS_MOBILE_BUILD ? <TranscriptPreview detail={detail.data} /> : null}
         </>
       )}
       {/* OUTSIDE the detail gate: the jump is derived from `cwd` and
@@ -3703,11 +3700,12 @@ function TranscriptPreview({ detail: d }: { detail: ClaudeSessionDetail }) {
 /// full window" is the viewer's full-window route
 /// (`openClaudeTranscript`), which on the phone is a screen of its own.
 ///
-/// Absent when there is no transcript to read. `TranscriptPreview`
-/// directly below states that refusal, and a second copy of the same
-/// sentence beside it would read as a second failure (the rule
-/// `TranscriptPreview`'s own refusal comment follows). When the
-/// renderers retire the preview, this pane inherits the sentence.
+/// When there is no transcript to read, the desktop pane states WHY in
+/// the preview's words ("There is nothing to read here: …"): the
+/// preview it replaced there (#1480) used to, and the refusal must not
+/// vanish with it. On the phone the preview is still below and states
+/// it, so the pane is absent there -- a second copy of the sentence
+/// would read as a second failure.
 function TranscriptPane({
   session: s,
   detail: d,
@@ -3717,7 +3715,19 @@ function TranscriptPane({
 }) {
   const [open, setOpen] = useState(false);
   const openFull = useFilters((f) => f.openClaudeTranscript);
-  if (revealRefusal(d.transcript_path, d.transcript_state) !== null) return null;
+  const refusal = revealRefusal(d.transcript_path, d.transcript_state);
+  if (refusal !== null) {
+    if (IS_MOBILE_BUILD) return null;
+    return (
+      <section
+        className="rounded-md border border-[#30363d] bg-[#161b22] p-3"
+        data-testid="transcript-pane"
+      >
+        <h3 className="text-xs font-semibold text-[#e6edf3]">Transcript</h3>
+        <p className="mt-2 text-xs text-[#8b949e]">There is nothing to read here: {refusal}.</p>
+      </section>
+    );
+  }
   return (
     <section
       className="rounded-md border border-[#30363d] bg-[#161b22] p-3"
@@ -3835,60 +3845,17 @@ function TranscriptFor({ detail: d }: { detail: ClaudeSessionDetail }) {
   return <SessionTranscript detail={d} />;
 }
 
-/// One session's transcript in the viewer shell (#1479).
-///
-/// TEMPORARY wiring, marked as such where it is replaced:
-/// `useClaudeTranscriptMessages` gives way to #1476's follow over the
-/// paging reads, and `renderPlaceholderMessage` to the renderers (#1480
-/// desktop, #1481 phone).
+/// One session's transcript on the desktop layout: the terminal
+/// renderer (#1480, `DesktopTranscript`). `TranscriptFor` sends the
+/// phone layout to #1481's bubbles instead. `useClaudeTranscriptMessages`
+/// under it gives way to #1476's follow over the paging reads.
 function SessionTranscript({ detail: d }: { detail: ClaudeSessionDetail }) {
-  const page = useClaudeTranscriptMessages(
-    d.transcript_path,
-    true,
-    d.liveness.state === "running",
-  );
-  if (page.isError) {
-    // BEFORE the empty arm (#846): no messages on a rejection is not a
-    // transcript with nothing in it.
-    return (
-      <p className="text-xs text-[#8b949e]">
-        Could not read its transcript
-        {errorMessage(page.error) ? ` (${errorMessage(page.error)})` : ""}. This is not the same
-        as the session having said nothing.
-      </p>
-    );
+  // Reached only past `revealRefusal`, which refuses a missing path; said
+  // rather than rendered as an empty transcript if that ever changes.
+  if (!d.transcript_path) {
+    return <p className="text-xs text-[#8b949e]">This session recorded no transcript path.</p>;
   }
-  if (page.data === undefined) {
-    return <p className="text-xs text-[#8b949e]">Reading its transcript…</p>;
-  }
-  const p = page.data;
-  if (p.messages.length === 0) {
-    return (
-      <p className="text-xs text-[#8b949e]">
-        {p.truncated
-          ? `No conversation in the last ${formatKb(p.bytes_read)} of a ${formatKb(p.file_bytes)} transcript.`
-          : "Its transcript holds no conversation to show."}
-      </p>
-    );
-  }
-  return (
-    <>
-      {p.truncated ? (
-        <p className="mb-2 text-xs text-[#8b949e]" data-testid="transcript-truncated">
-          The last {p.messages.length.toLocaleString()} message
-          {p.messages.length === 1 ? "" : "s"} of a {formatKb(p.file_bytes)} transcript. Earlier
-          exchanges are not shown.
-        </p>
-      ) : null}
-      <div className="min-h-0 flex-1 rounded border border-[#30363d] bg-[#0d1117]">
-        <TranscriptViewer
-          messages={p.messages}
-          renderMessage={renderPlaceholderMessage}
-          streaming={transcriptStreaming(d.liveness)}
-        />
-      </div>
-    </>
-  );
+  return <DesktopTranscript path={d.transcript_path} liveness={d.liveness} />;
 }
 
 /// Bytes as KB or MB, whichever reads better.

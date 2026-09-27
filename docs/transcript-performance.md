@@ -6,11 +6,11 @@ virtualization choice in the viewer-shell issue (#1479) and the memory window
 in the live-follow issue (#1476). Neither choice should be made without these
 numbers.
 
-**Status.** The foundation is in place: the fixtures, the Rust read bench, and
-the receive-side parse bench. The viewer shell (#1479) now exists, with a
-text-only stand-in renderer; the browser harness designed below lands with
-the first real renderer (#1480), for the reason given there. Until then, the
-viewer rows of the budget table read **not measured**, not "passing".
+**Status.** The fixtures, the Rust read bench, the receive-side parse bench
+and the browser harness are in place. The harness landed with the first real
+renderer, the desktop terminal renderer (#1480), and measures B1 to B3 in
+Chromium; B4 in the browser and every phone figure are still **not
+measured**, not "passing".
 
 ## Budgets
 
@@ -20,9 +20,9 @@ the LAN.
 
 | # | Budget | Target | How it is measured | Measured today |
 |---|---|---|---|---|
-| B1 | Open to first paint at the newest message | desktop < 300 ms, phone < 800 ms on the LAN | Browser harness: from the navigation or selection that opens a fixture until the newest message has painted (Element Timing `renderTime` on the newest message). Phone: Instruments, from the tap to the first frame showing the newest message. | **Not measured.** The viewer does not exist yet. The read that feeds it is in the Rust table below. |
-| B2 | Scrolling | no long task > 50 ms while scrolling; 60 fps on desktop and phone | Browser harness: a `longtask` PerformanceObserver during a scripted scroll from the newest message to the oldest and back, plus frame intervals counted with `requestAnimationFrame`. Phone: Instruments Time Profiler and the Animation Hitches instrument during a manual scroll. | **Not measured** for the viewer. The receive step (parsing one page) is measured below: every page parses in under 1 ms (median). |
-| B3 | Resident transcript memory | desktop < 50 MB, phone < 25 MB, **whatever the transcript's size** | Browser harness: JS heap after a forced GC (CDP `HeapProfiler.collectGarbage`, then `Runtime.getHeapUsage`), taken after opening and after the full scroll, on the 1k fixture and on the 70 MB fixture. The two must not differ by more than the budget allows. Rust: bytes each read holds (`bytes_read`), asserted in every `cargo test`. Phone: Instruments Allocations. | **Rust side: bounded at any position** by the paged read (#1220): 260 to 268 KiB per page at the start, middle and end of every fixture. `follow`'s catch-up is still unbounded, and the viewer should page instead of using it (see Findings). Viewer: not measured. |
+| B1 | Open to first paint at the newest message | desktop < 300 ms, phone < 800 ms on the LAN | Browser harness: from the selection that opens a fixture until the newest message has painted (Element Timing `renderTime` on the newest message, else the second frame after it is in the DOM). Phone: Instruments, from the tap to the first frame showing the newest message. | **Desktop, Chromium: 43 to 105 ms** across every fixture page (see "Browser harness, measured"). Not yet confirmed in WKWebView. Phone: not measured. |
+| B2 | Scrolling | no long task > 50 ms while scrolling; 60 fps on desktop and phone | Browser harness: a `longtask` PerformanceObserver during a scripted scroll from the newest message to the oldest and back, plus frame intervals counted with `requestAnimationFrame`. Phone: Instruments Time Profiler and the Animation Hitches instrument during a manual scroll. | **Desktop, Chromium: no long task while scrolling** on any page; frame p95 16.7 to 16.8 ms. The OPEN of a 400-message page is one 85 to 88 ms task (see "Browser harness, measured"). Phone: not measured. |
+| B3 | Resident transcript memory | desktop < 50 MB, phone < 25 MB, **whatever the transcript's size** | Browser harness: JS heap after a forced GC (CDP `HeapProfiler.collectGarbage`, then `Runtime.getHeapUsage`), taken after opening and after the full scroll, on every fixture page. Rust: bytes each read holds (`bytes_read`), asserted in every `cargo test`. Phone: Instruments Allocations. | **Desktop, Chromium: at most 9.6 MB** after a full scroll, the 70 MB fixture's page included. Rust side: **bounded at any position** by the paged read (#1220): 260 to 268 KiB per page at the start, middle and end of every fixture. `follow`'s catch-up is still unbounded, and the viewer should page instead of using it (see Findings). Phone: not measured. |
 | B4 | Live follow | idle follow costs no main-thread work beyond one stat per tick; growth costs O(new bytes) | Rust: bytes and time of `follow` on an idle tick and on an append. Browser harness: zero long tasks and no React commit during 30 s of idle follow on an open fixture (React Profiler `onRender` count). | **Idle tick: 128 KiB and ~0.09 ms**, off the main thread. It is O(1), but twice what `preview.rs` documents (see Findings). Viewer side: not measured. |
 | B5 | Phone bandwidth | a page < 150 KB compressed | Size of the page payload as sent over the remote surface, compressed with the codec the compression issue (#1478) picks. | **Uncompressed: 99 to 224 KiB.** Compressed: not yet measurable, because the generated text compresses far better than real text (see Fixtures). The bench prints gzip sizes, but only as a floor, never as a pass. |
 
@@ -201,34 +201,55 @@ ratio real text would not reach. Recorded here, it would read as a pass on B5.
    224 KiB of JSON before compression. B5 depends on the codec and on how many
    messages a page holds, and #1478 and #1220 decide those.
 
-## Browser harness (design: lands with the first real renderer)
+## Browser harness
 
-Not implemented yet. There are two reasons, and both are facts about the repo:
+Landed with the desktop renderer (#1480). Run it with:
 
-- **What would be measured is a stand-in.** The viewer shell landed in #1479
-  (`src/components/transcript/TranscriptViewer.tsx`), but it renders every
-  message through a text-only placeholder that #1480 and #1481 replace. B1-B3
-  are dominated by what a row renders, so a budget set against the placeholder
-  would be set against a component that is about to go. The shell already
-  carries the B1 probe: the newest mounted message has `elementtiming="newest"`.
-- **The repo has no Playwright.** It is not in `package.json`, and CI
-  installs no browser. Adding it means a dev dependency and a browser download
-  in CI. That decision belongs with the PR that has something to measure.
+```
+yarn playwright install chromium                       # once
+make bench-transcript-browser                          # temp dir, removed after
+make bench-transcript-browser BENCH_TRANSCRIPT_OUT=/tmp/x
+HARNESS_CHANNEL=chrome make bench-transcript-browser   # an installed Chrome instead
+```
 
-The design, for the renderer PR to land:
+It is **not in CI**, for the reason the Rust timings are not: its figures
+describe the machine. `playwright` is a pinned dev dependency (resolved under
+the `.yarnrc.yml` age gate like every other); CI installs it but downloads no
+browser.
 
-- **Target.** `vite build` with `VITE_TARGET=desktop`, served by `vite preview`,
-  driven by Playwright's Chromium.
-- **Backend.** No Tauri process. `@tauri-apps/api/mocks`' `mockIPC`, installed
-  from `page.addInitScript`, answers the viewer's read commands (today
-  `claude_transcript_messages`, later the paged reads) from the page payloads
-  `make bench-transcript BENCH_TRANSCRIPT_OUT=…` writes. The fixtures are
-  generated, so the harness needs no committed data.
+How it is built:
+
+- **Payloads.** `read_bench::transcript_message_payloads` (ignored; a no-op
+  without `HEADSTATE_TRANSCRIPT_PAYLOADS_OUT`) writes, per fixture, the
+  `TranscriptPage` exactly as `claude_transcript_messages` returns it
+  (`<fixture>.messages-tail.json`) and the whole file parsed as one page
+  (`<fixture>.messages-whole.json`). The read model caps a page at its newest
+  400 messages (`MAX_MESSAGES`), so "whole" is the fullest page a read can hand
+  the viewer today.
+- **Target.** `vite.harness.config.ts` builds the app's own Vite config
+  against `harness/transcript.html` into `dist-harness/`; the app bundle never
+  includes it. The page (`src/harness/transcriptBench.tsx`) mounts
+  `DesktopTranscript` -- the component both desktop hosts render -- behind an
+  "Open" button, through the real read path (`useClaudeTranscriptMessages`
+  calling `claude_transcript_messages`).
+- **Backend.** No Tauri process. `mockIPC` answers `claude_transcript_messages`
+  with the fixture page, which the page fetched BEFORE "Open" and parses
+  inside the answer, so B1 covers receive, render and paint but not the
+  harness's own network. Any other command is refused, not answered falsely.
+- **Driver.** `scripts/transcript-browser-bench.mjs` serves `dist-harness` and
+  the payloads, opens each page in a 1280×800 Chromium context, and prints the
+  table below. It fails (exit 1) on any figure over budget, on a page error,
+  on a row that widens the page, or on a scroll that did not reach both ends.
+
+The design it implements:
 - **B1, first paint.** The newest message carries `elementtiming="newest"`
   (set by the shell).
   A `PerformanceObserver({ type: "element" })` reports its `renderTime`,
   measured from the selection that opened the fixture (`performance.mark`
-  at the click).
+  in the same task as the click). **Chromium reports no element entry for
+  that row** -- its text is in descendants, not in the row itself -- so every
+  figure below is the fallback: the second animation frame after the row is
+  in the DOM. The table says which was used.
 - **B2, scrolling.** A `PerformanceObserver({ type: "longtask" })` is installed
   before a scripted scroll: `page.mouse.wheel` in fixed steps from newest to
   oldest and back, awaiting a frame between steps. Frame intervals are
@@ -242,7 +263,10 @@ The design, for the renderer PR to land:
   half of B3.
 - **B4, idle follow.** Leave a fixture open with follow on for 30 s, with the
   mock answering "nothing new". Count React commits with the Profiler
-  `onRender` callback, and long tasks. Expect zero of each.
+  `onRender` callback, and long tasks. Expect zero of each. **Not implemented
+  yet**: the viewer's data is still the tail re-read
+  (`useClaudeTranscriptMessages`), and B4 is about #1476's follow, which
+  replaces it. It lands with #1476.
 - **Engine caveat.** Chromium is not WKWebView. The harness catches
   regressions; it does not certify the desktop app. Before a budget is marked
   **met**, confirm it once in Safari Web Inspector's Timelines on the real app
@@ -250,6 +274,36 @@ The design, for the renderer PR to land:
 
 Results go in the PR as the same markdown table shape as above. A run over
 budget fails the harness, as #1487 requires.
+
+### Browser harness, measured: 2026-09-26, Apple M2 Max, macOS 26.6, Playwright 1.63.0 Chromium (headless shell 153)
+
+| page | messages | rows mounted | B1 open → newest painted | long tasks, open | long tasks, scroll | frame intervals, scroll | heap: ready → open → scrolled | sideways overflow |
+|---|---:|---:|---:|---:|---:|---|---|---|
+| huge-result-5mb tail | 1 | 1 | 42.6 ms (2nd frame) | 0 | 0 | 16.7 ms p95 | 2.0 → 3.1 → 3.8 MB | none |
+| huge-result-5mb whole | 68 | 68 | 69.4 ms (2nd frame) | 0 | 0 | 16.8 ms p95 | 2.0 → 4.5 → 5.4 MB | none |
+| messages-1k tail | 122 | 122 | 71.8 ms (2nd frame) | 0 | 0 | 16.8 ms p95 | 2.0 → 5.2 → 6.1 MB | none |
+| messages-1k whole | 400 | 400 | 104.6 ms (2nd frame) | 1 (85 ms) | 0 | 16.7 ms p95 | 2.0 → 7.8 → 9.0 MB | none |
+| messages-10k tail | 131 | 131 | 69.9 ms (2nd frame) | 1 (54 ms) | 0 | 16.7 ms p95 | 2.0 → 5.2 → 6.3 MB | none |
+| messages-10k whole | 400 | 400 | 104.7 ms (2nd frame) | 1 (88 ms) | 0 | 16.8 ms p95 | 2.0 → 7.8 → 9.2 MB | none |
+| tool-heavy-70mb tail | 78 | 78 | 71.9 ms (2nd frame) | 0 | 0 | 16.7 ms p95 | 2.0 → 4.8 → 5.6 MB | none |
+| tool-heavy-70mb whole | 400 | 400 | 104.4 ms (2nd frame) | 1 (87 ms) | 0 | 16.8 ms p95 | 2.0 → 8.4 → 9.6 MB | none |
+
+Every page is within B1, B2 and B3 in Chromium. Before any of them is marked
+**met** for the desktop app, confirm it once in WKWebView (the engine caveat
+above).
+
+Two findings:
+
+- **Opening a 400-message page is one 85 to 88 ms task.** It is the first
+  render of 400 terminal rows in one commit. B2 is about scrolling, and no
+  scroll produced a long task, so no budget is exceeded -- but it is the cost
+  the page size sets. #1476's memory window and #1220's page size should keep
+  the first commit near today's tail (78 to 131 messages, at most one 54 ms
+  task).
+- **The heap follows what is mounted, not the file.** The 70 MB fixture's
+  page ends at 9.6 MB against the 1k fixture's 9.0 MB: both mount 400 rows.
+  That is B3's "whatever the size" for what a read hands the viewer today;
+  what the client HOLDS as it pages is #1476's to bound.
 
 ## Phone checklist (Instruments, until the phone can be automated)
 

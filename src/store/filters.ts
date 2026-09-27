@@ -570,6 +570,14 @@ interface FilterStore {
   /// eyes and screen, not about which list they happen to be reading.
   density: "comfortable" | "dense";
   setDensity: (density: "comfortable" | "dense") => void;
+  /// How tightly the desktop transcript renderer packs its rows (#1480).
+  ///
+  /// Its own setting rather than `density`: a transcript is read, not
+  /// scanned, and a reader who packs PR rows tight may still want
+  /// comfortable prose. Global for the reason `density` is, and
+  /// persisted with it.
+  transcriptDensity: "comfortable" | "compact";
+  setTranscriptDensity: (density: "comfortable" | "compact") => void;
   /// The PR the detail view is showing, or null for the list.
   ///
   /// Deliberately NOT persisted: reopening the app on a detail page for a
@@ -667,6 +675,8 @@ export const useFilters = create<FilterStore>()(
       view: "my-prs",
       density: "comfortable",
       setDensity: (density) => set({ density }),
+      transcriptDensity: "comfortable",
+      setTranscriptDensity: (transcriptDensity) => set({ transcriptDensity }),
       setFilter: (key, value) =>
         set((s) => ({
           filtersByView: {
@@ -1024,6 +1034,7 @@ export const useFilters = create<FilterStore>()(
         // the v4 migration drops, so the next launch would read it back
         // and the axis would survive its own removal.
         density: s.density,
+        transcriptDensity: s.transcriptDensity,
       }),
     },
   ),
