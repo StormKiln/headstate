@@ -19,10 +19,10 @@
 /// #1201 rejected a filesystem watcher: on macOS a dead FSEvents stream
 /// says nothing, indistinguishably from "no new content". A poll that
 /// stops is visible -- `lastReadAt` stops advancing -- and the follow
-/// after a cursor costs one `stat` and a 4 KB digest when nothing
-/// changed (`CURSOR_FINGERPRINT_BYTES`), so a sub-second cadence is
-/// affordable (#1487 measured the preview follow's idle tick at
-/// 0.08 ms on a 70 MB file).
+/// after a cursor costs one `stat` and three 4 KB digests when nothing
+/// changed (`CURSOR_FINGERPRINT_BYTES`: the one checked, the two
+/// returned), so a sub-second cadence is affordable (#1487 measured this
+/// idle tick at 12 KiB and 0.02 ms, on a 70 MB file as on a 2 MB one).
 ///
 /// # The cadence
 ///

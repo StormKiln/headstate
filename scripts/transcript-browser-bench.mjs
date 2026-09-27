@@ -19,6 +19,19 @@
 //   (`HeapProfiler.collectGarbage`), after the open and after the scroll.
 // - That no row widens the page: the document and the viewer's viewport
 //   must not scroll sideways (#1480's long-line test, in a real layout).
+// - B4, live follow (#1476, #1477), on `B4_FIXTURES`: the session reads
+//   as running and the mock answers "nothing new", so every read is an
+//   idle tick. Per phase -- the active cadence, the idle backoff, hidden,
+//   and the activity nudge -- it counts the reads and the bytes of their
+//   answers, main-thread time (CDP `Performance.getMetrics`), React
+//   commits (a counting `__REACT_DEVTOOLS_GLOBAL_HOOK__`), DOM mutations
+//   inside and outside the message rows, and long tasks. Then it grows
+//   the transcript page by page past the 2,000-message residency bound
+//   and takes the heap every few pages: eviction, in a browser.
+// - B5, phone page bytes, as an ESTIMATE: each real page payload
+//   (`<fixture>.window-*.json`, what `claude_transcript_page` returns)
+//   divided by the compression ratios #1478 measured on REAL transcript
+//   pages. Not a device measurement, and labelled so.
 //
 // Chromium is not WKWebView. This catches regressions; it does not
 // certify the desktop app (see the doc's engine caveat).
@@ -28,6 +41,10 @@
 // Usage: node scripts/transcript-browser-bench.mjs <payload dir>
 //   HARNESS_CHANNEL=chrome  use the installed Google Chrome instead of
 //                           Playwright's Chromium
+//   HARNESS_PHASES=open,follow,growth,b5  which parts to run (default: all)
+//   B4_FIXTURES=a,b         the pages B4 opens (default below). B4 takes
+//                           about three minutes a page, in real time: the
+//                           cadence it measures is real time.
 
 import { createServer } from "node:http";
 import { readdirSync, readFileSync, statSync } from "node:fs";
@@ -40,6 +57,33 @@ const FRAME_MS = 1000 / 60;
 const HEAP_MB = 50;
 const WHEEL_PX = 400;
 const MAX_STEPS = 4000;
+
+// B4. The cadence is the follower's own (src/lib/transcriptFollow.ts):
+// 750 ms while the session grew in the last 60 s, then 5, 10, 15 s.
+const FAST_WINDOW_MS = 60_000;
+const ACTIVE_MS = 20_000;
+const IDLE_MS = 45_000;
+const HIDDEN_MS = 20_000;
+/// A nudge for new bytes must be read faster than any idle delay.
+const NUDGE_MS = 1_000;
+/// Growth pages for the eviction runs, one fixture page's messages each:
+/// enough to pass the follower's `MAX_RESIDENT` (2,000) about 1.6 times.
+const GROW_CHUNKS = 30;
+const MAX_RESIDENT = 2_000;
+const B4_DEFAULT = ["messages-1k.messages-tail", "tool-heavy-70mb.messages-whole"];
+/// Only this page is grown past the bound: it is page-sized (122
+/// messages, as a real page is). A 400-message chunk would measure a
+/// page the paged read never returns.
+const GROW_FIXTURE = "messages-1k.messages-tail";
+
+// B5. #1478 (PR #1497): 20 real local transcript pages compressed 2.11x
+// to 4.43x, median ~2.8x. The generated fixtures compress ~7x, which
+// real text does not, so their own compressed size is never used.
+const REAL_RATIO_MEDIAN = 2.8;
+const REAL_RATIO_WORST = 2.11;
+const B5_BYTES = 150 * 1000;
+
+const PHASES = new Set((process.env.HARNESS_PHASES || "open,follow,growth,b5").split(","));
 
 const dir = process.argv[2];
 if (!dir) {
@@ -57,6 +101,9 @@ const fixtures = readdirSync(dir)
   .filter((f) => /\.messages-(tail|whole)\.json$/.test(f))
   .sort()
   .map((f) => f.replace(/\.json$/, ""));
+const b4Fixtures = (process.env.B4_FIXTURES ? process.env.B4_FIXTURES.split(",") : B4_DEFAULT).filter((f) =>
+  fixtures.includes(f),
+);
 if (fixtures.length === 0) {
   // Not a pass: nothing was measured.
   console.error(`no *.messages-*.json pages in ${dir}: nothing was measured`);
@@ -86,9 +133,19 @@ const port = server.address().port;
 
 const browser = await chromium.launch({ channel: process.env.HARNESS_CHANNEL || undefined });
 const rows = [];
+const followRows = [];
+const growthRows = [];
 const over = [];
 try {
-  for (const name of fixtures) rows.push(await measure(name));
+  if (PHASES.has("open")) for (const name of fixtures) rows.push(await measure(name));
+  if (PHASES.has("follow")) {
+    if (b4Fixtures.length === 0) over.push("B4: none of B4_FIXTURES was written, so nothing was measured");
+    for (const name of b4Fixtures) followRows.push(await follow(name));
+  }
+  if (PHASES.has("growth")) {
+    if (!fixtures.includes(GROW_FIXTURE)) over.push(`B4 growth: ${GROW_FIXTURE} was not written, so nothing was measured`);
+    else for (const scenario of ["live edge", "parked on a new turn"]) growthRows.push(await growth(GROW_FIXTURE, scenario));
+  }
 } finally {
   await browser.close();
   server.close();
@@ -229,10 +286,364 @@ async function measure(name) {
   };
 }
 
-console.log(
-  `\n| page | messages | rows mounted | B1 open → newest painted | long tasks, open | long tasks, scroll | frame intervals, scroll | heap: ready → open → scrolled | sideways overflow |`,
-);
-console.log("|---|---:|---:|---:|---:|---:|---|---|---|");
+// ---- B4: live follow ----------------------------------------------------
+
+// Counts React commits in a production build: React reports each commit
+// to the DevTools hook when one is installed before it loads.
+function commitHook() {
+  window.__commits = 0;
+  window.__REACT_DEVTOOLS_GLOBAL_HOOK__ = {
+    renderers: new Map(),
+    supportsFiber: true,
+    isDisabled: false,
+    inject(renderer) {
+      this.renderers.set(1, renderer);
+      return 1;
+    },
+    onCommitFiberRoot() {
+      window.__commits += 1;
+    },
+    onCommitFiberUnmount() {},
+    onPostCommitFiberRoot() {},
+    onScheduleFiberRoot() {},
+    checkDCE() {},
+  };
+}
+
+// A declaration, not a `const`: `follow` runs from the top-level await
+// above, before a `const` down here would be initialised.
+function twoFrames() {
+  return new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())));
+}
+
+async function follow(name) {
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  await context.addInitScript(commitHook);
+  const page = await context.newPage();
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  await page.goto(`http://127.0.0.1:${port}/harness/transcript.html?fixture=${name}&mode=follow`);
+  await page.waitForFunction(() => document.body.dataset.harness === "ready", null, { timeout: 30_000 });
+  const cdp = await context.newCDPSession(page);
+  await cdp.send("Performance.enable");
+  await page.evaluate(() => {
+    const w = window;
+    w.__longTasks = [];
+    w.__rowMutations = 0;
+    w.__otherMutations = 0;
+    w.__otherWhere = {};
+    new PerformanceObserver((l) => {
+      for (const e of l.getEntries()) w.__longTasks.push(e.duration);
+    }).observe({ type: "longtask" });
+    new MutationObserver((records) => {
+      for (const r of records) {
+        const el = r.target.nodeType === 1 ? r.target : r.target.parentElement;
+        if (el?.closest("[data-message-id]")) {
+          w.__rowMutations += 1;
+        } else {
+          w.__otherMutations += 1;
+          const where = el?.closest("[data-testid]")?.getAttribute("data-testid") ?? el?.tagName ?? "?";
+          w.__otherWhere[where] = (w.__otherWhere[where] ?? 0) + 1;
+        }
+      }
+    }).observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true });
+    [...document.querySelectorAll("button")].find((b) => b.textContent === "Open").click();
+  });
+  const openedAt = Date.now();
+  await page.waitForSelector("[data-message-id]", { timeout: 30_000 });
+
+  const metrics = async () => {
+    const m = Object.fromEntries((await cdp.send("Performance.getMetrics")).metrics.map((x) => [x.name, x.value]));
+    const p = await page.evaluate(() => ({
+      reads: window.__harness.reads.length,
+      bytes: window.__harness.reads.reduce((a, r) => a + r.bytes, 0),
+      commits: window.__commits,
+      rowMutations: window.__rowMutations,
+      otherMutations: window.__otherMutations,
+      longTasks: window.__longTasks.length,
+      now: performance.now(),
+    }));
+    return { ...p, task: m.TaskDuration * 1000, script: m.ScriptDuration * 1000, layouts: m.LayoutCount };
+  };
+  const phase = async (label, waitMs, during) => {
+    const before = await metrics();
+    if (during) await during();
+    await page.waitForTimeout(waitMs);
+    const after = await metrics();
+    const longTasks = await page.evaluate((from) => window.__longTasks.slice(from), before.longTasks);
+    const intervals = await page.evaluate(
+      ([a, b]) => {
+        const at = window.__harness.reads.filter((r) => r.at >= a && r.at <= b).map((r) => r.at);
+        return at.slice(1).map((t, i) => t - at[i]);
+      },
+      [before.now, after.now],
+    );
+    const d = (k) => after[k] - before[k];
+    return {
+      label,
+      seconds: (after.now - before.now) / 1000,
+      reads: d("reads"),
+      bytes: d("bytes"),
+      commits: d("commits"),
+      rowMutations: d("rowMutations"),
+      otherMutations: d("otherMutations"),
+      layouts: d("layouts"),
+      task: d("task"),
+      script: d("script"),
+      longTasks,
+      intervals,
+    };
+  };
+  // The hook reads `document.visibilityState` on `visibilitychange`; a
+  // headless page is never hidden, so the harness says it is.
+  const setVisible = (visible) =>
+    page.evaluate((v) => {
+      const state = v ? "visible" : "hidden";
+      Object.defineProperty(document, "visibilityState", { configurable: true, get: () => state });
+      Object.defineProperty(document, "hidden", { configurable: true, get: () => !v });
+      document.dispatchEvent(new Event("visibilitychange"));
+    }, visible);
+
+  const phases = [];
+  await page.waitForTimeout(2_000);
+  // For 60 s after opening on a running session the follow reads every
+  // 750 ms: the active cadence, finding nothing new each time.
+  phases.push(await phase("active cadence", ACTIVE_MS));
+  // Past that window it backs off: 5, 10, 15, 15 s.
+  const wait = openedAt + FAST_WINDOW_MS + 1_000 - Date.now();
+  if (wait > 0) await page.waitForTimeout(wait);
+  phases.push(await phase("idle backoff", IDLE_MS));
+  phases.push(await phase("hidden", HIDDEN_MS, () => setVisible(false)));
+  phases.push(await phase("visible again (2 s)", 2_000, () => setVisible(true)));
+  // A nudge for the size already read changes nothing (#1477).
+  const size = await page.evaluate(() => window.__harness.size);
+  phases.push(
+    await phase("nudge, same size (2 s)", 2_000, () => page.evaluate((s) => window.__harness.nudge(s), size)),
+  );
+
+  // A nudge for new bytes reads at once, and the new message paints.
+  await page.evaluate(() => window.__harness.grow(1));
+  const nudgeAt = await page.evaluate(() => performance.now());
+  await page.evaluate((s) => window.__harness.nudge(s + 1), size);
+  // The read is timed on its own: the new rows mount only where the
+  // viewer's window reaches the newest message, which a reader parked on
+  // the newest turn's prompt (where a 400-message page opens) is not.
+  let nudge = { read: null, painted: null };
+  try {
+    await page.waitForFunction(() => window.__harness.queued === 0, null, { timeout: 20_000 });
+    nudge.read = await page.evaluate(
+      (t0) => window.__harness.reads.find((x) => x.at >= t0 && x.messages > 0).at - t0,
+      nudgeAt,
+    );
+  } catch {
+    // Not read within 20 s: reported as not measured, never as fast.
+  }
+  try {
+    await page.waitForFunction(() => document.querySelector('[data-message-id*="-g1"]') !== null, null, {
+      timeout: 3_000,
+    });
+    nudge.painted = await page.evaluate(
+      (t0) => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame((t) => r(t - t0)))),
+      nudgeAt,
+    );
+  } catch {
+    // Not mounted: the reader is not at the live edge. Not measured.
+  }
+
+  const refused = await page.evaluate(() => [...new Set(window.__harness.refused)]);
+  const otherWhere = await page.evaluate(() => window.__otherWhere);
+  await context.close();
+
+  const at = Object.fromEntries(phases.map((p) => [p.label, p]));
+  const check = (bad, what) => bad && over.push(`${name}: ${what}`);
+  check(errors.length > 0, `page errors: ${errors.join("; ")}`);
+  for (const p of phases) {
+    const worst = p.longTasks.length === 0 ? 0 : Math.max(...p.longTasks);
+    check(worst > LONG_TASK_MS, `B4 ${p.label}: a ${worst.toFixed(0)} ms long task with nothing new`);
+    check(p.rowMutations > 0, `B4 ${p.label}: ${p.rowMutations} DOM mutations inside message rows with nothing new`);
+  }
+  check(at["active cadence"].reads === 0, "B4: no reads at the active cadence: nothing was measured");
+  check(at["idle backoff"].reads === 0, "B4: no reads in the idle backoff: nothing was measured");
+  check(at.hidden.reads > 0, `B4: ${at.hidden.reads} reads while hidden`);
+  check(at["visible again (2 s)"].reads < 1, "B4: no read on becoming visible again");
+  check(at["nudge, same size (2 s)"].reads > 0, `B4: a nudge for the size already read caused ${at["nudge, same size (2 s)"].reads} reads`);
+  check(nudge.read === null || nudge.read > NUDGE_MS, `B4: a nudge for new bytes was not read within ${NUDGE_MS} ms`);
+  return { name, phases, nudge, refused, otherWhere };
+}
+
+// ---- B4: growth past the residency bound (eviction) ---------------------
+
+/// Which growth pages' messages are still in the heap: every message id
+/// a chunk carries ends `-g<chunk>`, so a heap snapshot's strings say
+/// which chunks the page still holds, whatever holds them.
+async function heldChunks(cdp) {
+  await cdp.send("HeapProfiler.collectGarbage");
+  const parts = [];
+  const onChunk = (e) => parts.push(e.chunk);
+  cdp.on("HeapProfiler.addHeapSnapshotChunk", onChunk);
+  await cdp.send("HeapProfiler.takeHeapSnapshot", { reportProgress: false });
+  cdp.off("HeapProfiler.addHeapSnapshotChunk", onChunk);
+  const held = new Set();
+  for (const s of JSON.parse(parts.join("")).strings) {
+    const m = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-g(\d+)$/.exec(s);
+    if (m) held.add(Number(m[1]));
+  }
+  return held;
+}
+
+/// Grow the transcript `GROW_CHUNKS` pages past the first, one page per
+/// nudge, and see what the follow lets go. Two readers:
+///
+/// - `live edge`: the reader pressed "jump to latest" and is following;
+///   each page continues the turn in progress. The window moves with the
+///   newest message, so the oldest pages are the far end and go.
+/// - `parked on a new turn`: each page opens new turns, which the viewer
+///   places at the top of the view, so the reader stops at the first new
+///   prompt and the newest pages arrive below them.
+async function growth(name, scenario) {
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const page = await context.newPage();
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  await page.goto(`http://127.0.0.1:${port}/harness/transcript.html?fixture=${name}&mode=follow`);
+  await page.waitForFunction(() => document.body.dataset.harness === "ready", null, { timeout: 30_000 });
+  const cdp = await context.newCDPSession(page);
+  await page.evaluate(() => {
+    window.__longTasks = [];
+    new PerformanceObserver((l) => {
+      for (const e of l.getEntries()) window.__longTasks.push(e.duration);
+    }).observe({ type: "longtask" });
+  });
+  await page.click("text=Open");
+  await page.waitForSelector("[data-message-id]", { timeout: 30_000 });
+  await page.waitForTimeout(1_000);
+  const newTurns = scenario !== "live edge";
+  if (!newTurns) {
+    await page.click('button[aria-label^="Jump to the latest message"]');
+    await page.waitForTimeout(1_000);
+  }
+  const perChunk = [];
+  const heaps = [];
+  let rowsMax = 0;
+  for (let i = 1; i <= GROW_CHUNKS; i++) {
+    const s = await page.evaluate((t) => {
+      window.__harness.grow(1, t);
+      return window.__harness.size;
+    }, newTurns);
+    await page.evaluate((x) => window.__harness.nudge(x + 1), s);
+    await page.waitForFunction(() => window.__harness.queued === 0, null, { timeout: 20_000 });
+    await page.evaluate(twoFrames);
+    const state = await page.evaluate(() => {
+      const vp = document.querySelector('[data-slot="message-scroller-viewport"]');
+      return {
+        mounted: document.querySelectorAll("[data-message-id]").length,
+        bottomGap: vp.scrollHeight - vp.scrollTop - vp.clientHeight,
+        appended: window.__harness.appended,
+      };
+    });
+    rowsMax = Math.max(rowsMax, state.mounted);
+    perChunk.push(state.appended);
+    if (i % 5 === 0) heaps.push({ ...state, heap: await heap(cdp) });
+  }
+  const held = await heldChunks(cdp);
+  const longTasks = await page.evaluate(() => window.__longTasks);
+  await context.close();
+
+  const chunkSize = perChunk[0];
+  const bound = Math.ceil(MAX_RESIDENT / chunkSize) + 1;
+  const check = (bad, what) => bad && over.push(`${name}, ${scenario}: ${what}`);
+  check(errors.length > 0, `page errors: ${errors.join("; ")}`);
+  const top = Math.max(...heaps.map((h) => h.heap));
+  check(top > HEAP_MB * 1024 * 1024, `B3 while growing: heap ${mb(top)} > ${HEAP_MB} MB`);
+  check(
+    held.size > bound,
+    `eviction: ${held.size} of ${GROW_CHUNKS} appended pages (${chunkSize} messages each) are still held; the ${MAX_RESIDENT}-message bound allows ${bound}`,
+  );
+  return { name, scenario, chunkSize, heaps, held, bound, rowsMax, longTasks };
+}
+
+function growthTables() {
+  for (const g of growthRows) {
+    const lt = g.longTasks;
+    console.log(
+      `\n#### Growth past the ${MAX_RESIDENT}-message bound: ${g.name}, reader ${g.scenario} (${GROW_CHUNKS} pages of ${g.chunkSize} messages, one per nudge)\n`,
+    );
+    console.log("| messages appended after the first page | heap after GC | rows mounted | reader's distance from the bottom |");
+    console.log("|---:|---:|---:|---:|");
+    for (const h of g.heaps) console.log(`| ${h.appended} | ${mb(h.heap)} | ${h.mounted} | ${Math.round(h.bottomGap)} px |`);
+    const ids = [...g.held].sort((a, b) => a - b);
+    console.log(
+      `\nappended pages whose messages are still in the heap: ${g.held.size} of ${GROW_CHUNKS}${ids.length ? ` (pages ${ids[0]} to ${ids[ids.length - 1]})` : ""}; the bound allows ${g.bound}. Long tasks while growing: ${lt.length}${lt.length ? ` (max ${Math.max(...lt).toFixed(0)} ms)` : ""}; most rows mounted: ${g.rowsMax}.`,
+    );
+  }
+}
+
+function followTables() {
+  console.log("\n### B4, live follow: every read finds nothing new, except the nudge and the growth\n");
+  console.log(
+    "| page | phase | time | reads | read intervals | answer bytes / read | main thread / read (TaskDuration) | script / read | React commits | DOM mutations: rows / other | layouts | long tasks |",
+  );
+  console.log("|---|---|---:|---:|---|---:|---:|---:|---:|---|---:|---:|");
+  for (const f of followRows) {
+    for (const p of f.phases) {
+      const per = (x, unit) => (p.reads === 0 ? `${x.toFixed(1)} ${unit} total, no reads` : `${(x / p.reads).toFixed(2)} ${unit}`);
+      const iv =
+        p.intervals.length === 0
+          ? "none"
+          : `${(Math.min(...p.intervals) / 1000).toFixed(2)} to ${(Math.max(...p.intervals) / 1000).toFixed(2)} s`;
+      const bytes = p.reads === 0 ? "no reads" : `${Math.round(p.bytes / p.reads)} B`;
+      console.log(
+        `| ${f.name} | ${p.label} | ${p.seconds.toFixed(1)} s | ${p.reads} | ${iv} | ${bytes} | ${per(p.task, "ms")} | ${per(p.script, "ms")} | ${p.commits} | ${p.rowMutations} / ${p.otherMutations} | ${p.layouts} | ${p.longTasks.length} |`,
+      );
+    }
+  }
+  console.log("\n| page | nudge for new bytes → read answered | → new message painted | commands the harness refused |");
+  console.log("|---|---:|---:|---|");
+  for (const f of followRows) {
+    console.log(
+      `| ${f.name} | ${ms(f.nudge.read)} | ${f.nudge.painted === null ? "not mounted: the reader is not at the live edge" : ms(f.nudge.painted)} | ${f.refused.length === 0 ? "none" : f.refused.join(", ")} |`,
+    );
+  }
+  for (const f of followRows) {
+    console.log(`\nDOM mutations outside the rows, by nearest data-testid (${f.name}): ${JSON.stringify(f.otherWhere)}`);
+  }
+}
+
+// ---- B5: phone page bytes, estimated ------------------------------------
+
+function kb(x) {
+  return `${(x / 1000).toFixed(1)} KB`;
+}
+
+function b5Table() {
+  const pages = readdirSync(dir)
+    .filter((f) => /\.window-(end|middle|start)\.json$/.test(f))
+    .sort();
+  if (pages.length === 0) {
+    console.log("\nB5: no *.window-*.json pages were written, so B5 was not estimated");
+    return;
+  }
+  console.log(
+    `\n### B5, phone page bytes: an ESTIMATE from real-page ratios (${REAL_RATIO_MEDIAN}x median, ${REAL_RATIO_WORST}x worst; #1478), not a device measurement\n`,
+  );
+  console.log("| page | messages | payload (JSON) | est. compressed at the median ratio | est. compressed at the worst ratio | vs 150 KB |");
+  console.log("|---|---:|---:|---:|---:|---|");
+  for (const f of pages) {
+    const raw = readFileSync(join(dir, f));
+    const n = JSON.parse(raw).page.messages.length;
+    const worst = raw.length / REAL_RATIO_WORST;
+    console.log(
+      `| ${f.replace(/\.json$/, "")} | ${n} | ${kb(raw.length)} | ${kb(raw.length / REAL_RATIO_MEDIAN)} | ${kb(worst)} | ${worst <= B5_BYTES ? "within (estimate)" : "OVER (estimate)"} |`,
+    );
+  }
+}
+
+if (rows.length > 0) {
+  console.log(
+    `\n| page | messages | rows mounted | B1 open → newest painted | long tasks, open | long tasks, scroll | frame intervals, scroll | heap: ready → open → scrolled | sideways overflow |`,
+  );
+  console.log("|---|---:|---:|---:|---:|---:|---|---|---|");
+}
 for (const r of rows) {
   console.log(
     `| ${r.name} | ${r.messages} | ${r.rows} | ${r.b1} | ${r.openLong} | ${r.scrollLong} | ${r.frames} | ${r.heap} | ${r.overflow} |`,
@@ -244,8 +655,21 @@ if (slowFrames.length > 0) {
   // display's, so a p95 here is a regression signal, not a verdict.
   console.log(`\nframe p95 over ${FRAME_MS.toFixed(1)} ms (reported, not gated): ${slowFrames.map((r) => r.name).join(", ")}`);
 }
+if (followRows.length > 0) followTables();
+if (growthRows.length > 0) growthTables();
+if (PHASES.has("b5")) b5Table();
 if (over.length > 0) {
   console.error(`\nover budget:\n  ${over.join("\n  ")}`);
   process.exit(1);
 }
-console.log(`\nall ${rows.length} pages within B1 (< ${B1_MS} ms), B2 (no long task > ${LONG_TASK_MS} ms) and B3 (< ${HEAP_MB} MB).`);
+if (rows.length > 0) {
+  console.log(`\nall ${rows.length} pages within B1 (< ${B1_MS} ms), B2 (no long task > ${LONG_TASK_MS} ms) and B3 (< ${HEAP_MB} MB).`);
+}
+if (followRows.length > 0) {
+  console.log(
+    `all ${followRows.length} B4 pages: no read while hidden, none on a same-size nudge, a new-bytes nudge read within ${NUDGE_MS} ms, and no long task and no row touched while nothing was new.`,
+  );
+}
+if (growthRows.length > 0) {
+  console.log(`eviction held the ${MAX_RESIDENT}-message bound for every reader: ${growthRows.map((g) => g.scenario).join(", ")}.`);
+}
