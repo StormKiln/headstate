@@ -1045,7 +1045,11 @@ describe("the resume command carries the cwd that makes it work", () => {
       state.terminal = "open -a Terminal {command}";
       renderView();
       open("HeadState GitHub issues filing");
-      fireEvent.change(await screen.findByLabelText(/model/i), {
+      // The select renders before the served vocabulary arrives, with
+      // only its empty option; a change to "sonnet" in that window is a
+      // no-op and the launch carries no model. Wait for the option.
+      await screen.findByRole("option", { name: "sonnet" });
+      fireEvent.change(screen.getByLabelText(/model/i), {
         target: { value: "sonnet" },
       });
       fireEvent.click(screen.getByRole("button", { name: /resume in terminal/i }));
