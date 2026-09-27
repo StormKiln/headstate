@@ -16,7 +16,7 @@
 /// unchecked one. Until the renderers (#1479-#1481) import them, `@public`
 /// is what lets the guard see them.
 
-import type { ClaudeFileChange, ClaudeToolArgs } from "./pr";
+import type { ClaudeFileChange, ClaudeToolArgs, TranscriptMasking } from "./pr";
 
 /// Where a message's id came from. The variant says which promise the id
 /// makes:
@@ -97,6 +97,10 @@ export interface TranscriptToolOutput {
   /// `claudeTranscriptBlockText`.
   message_id: string;
   index: number;
+  /// That record's timestamp, as recorded. Kept because merging absorbs
+  /// the record, and without it a paired call's duration could not be
+  /// measured. `null` when the record carried none.
+  timestamp: string | null;
   tool_use_id: string | null;
   text: string;
   clip: TranscriptClip | null;
@@ -244,6 +248,16 @@ export interface TranscriptPage {
   /// Repeated uuids; the first occurrence was kept.
   duplicate_records: number;
 }
+
+/// A page as it reaches the webview: on a paired phone, with the masking
+/// summary the desktop's remote boundary attaches (#1488).
+///
+/// An alias, not a field on `TranscriptPage`: the read model does not
+/// emit `masking` -- `remote::privacy::Plan::finish` adds the key to
+/// whatever a transcript command returned -- so declaring it on the
+/// mirror would be a key the mirrored Rust type never serialises.
+/// Absent on the desktop's own answers, which are never masked.
+export type RemoteTranscriptPage = TranscriptPage & { masking?: TranscriptMasking };
 
 /// One block's full text, fetched by address. Mirrors
 /// `claude::transcript_model::TranscriptBlockText`.

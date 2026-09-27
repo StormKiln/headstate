@@ -131,6 +131,8 @@ vi.mock("../api/hooks", () => ({
     data: state.transcript,
     isError: false,
     error: undefined,
+    isFetching: false,
+    refetch: refetchFn,
   }),
   // #1208: a FOLLOW. The phone's case for it is the stronger one -- the
   // companion user cannot reach the machine, so a frozen snapshot of a
@@ -293,8 +295,12 @@ afterEach(() => {
   stubViewport(null);
 });
 
+/// Open a session's DETAIL screen. Since #1481 a row opens the session
+/// at its transcript, as the Claude app opens a conversation; the detail
+/// is the "Details" button in that screen's header.
 function open(name: string) {
   fireEvent.click(screen.getByRole("button", { name: new RegExp(name, "i") }));
+  fireEvent.click(screen.getByRole("button", { name: /^details$/i }));
 }
 
 describe("the companion offers the view and hides only the Local actions", () => {
@@ -558,45 +564,65 @@ describe("the companion offers the view and hides only the Local actions", () =>
   });
 });
 
-/// #1479: on the phone the full-window transcript is a screen of its own,
-/// reached from the session list through the session's detail.
+/// #1479, #1481: on the phone the full-window transcript is a screen of
+/// its own, and it is where a session row opens.
 describe("the transcript viewer on the phone", () => {
-  it("opens as its own screen in place of the list and the detail", () => {
-    state.transcript = {
-      messages: [
-        {
-          id: "u1",
-          id_source: "uuid",
-          turn_id: "u1",
-          kind: { kind: "user_prompt", origin: null },
-          timestamp: null,
-          model: null,
-          api_message_id: null,
-          usage: null,
-          duration_ms: null,
-          is_meta: false,
-          is_sidechain: false,
-          blocks: [{ kind: "text", index: 0, text: "run the tests", clip: null }],
-        },
-      ],
-      truncated: false,
-      bytes_read: 1_000,
-      file_bytes: 1_000,
-      machinery_records: [],
-      unparseable_records: 0,
-      duplicate_records: 0,
-    };
+  const prompt = (): TranscriptPage => ({
+    messages: [
+      {
+        id: "u1",
+        id_source: "uuid",
+        turn_id: "u1",
+        kind: { kind: "user_prompt", origin: null },
+        timestamp: null,
+        model: null,
+        api_message_id: null,
+        usage: null,
+        duration_ms: null,
+        is_meta: false,
+        is_sidechain: false,
+        blocks: [{ kind: "text", index: 0, text: "run the tests", clip: null }],
+      },
+    ],
+    truncated: false,
+    bytes_read: 1_000,
+    file_bytes: 1_000,
+    machinery_records: [],
+    unparseable_records: 0,
+    duplicate_records: 0,
+  });
+
+  /// The entry point (#1481): the list opens the transcript screen, in
+  /// the phone renderer -- the prompt is a bubble, not the placeholder's
+  /// "You" header.
+  it("opens from the session list, in the phone renderer", () => {
+    state.transcript = prompt();
     render(<ClaudeCodePage />);
-    open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /open in full window/i }));
+    fireEvent.click(screen.getByRole("button", { name: /HeadState GitHub issues filing/i }));
 
     const full = screen.getByTestId("transcript-window");
     expect(full.textContent).toContain("run the tests");
-    // The detail screen's own controls are gone: this is the screen now.
-    expect(screen.queryByRole("button", { name: /all sessions/i })).toBeNull();
+    expect(full.querySelector('[data-slot="bubble"]')).not.toBeNull();
+    expect(screen.getByTestId("phone-transcript")).toBeTruthy();
+    // The detail screen is not showing: this is the screen now.
     expect(screen.queryByTestId("transcript-pane")).toBeNull();
+  });
 
-    fireEvent.click(screen.getByRole("button", { name: /session detail/i }));
-    expect(screen.getByRole("button", { name: /all sessions/i })).toBeTruthy();
+  it("reaches the detail from its header, and the list from its back link", () => {
+    state.transcript = prompt();
+    render(<ClaudeCodePage />);
+    fireEvent.click(screen.getByRole("button", { name: /HeadState GitHub issues filing/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^details$/i }));
+    expect(screen.queryByTestId("transcript-window")).toBeNull();
+    expect(screen.getByText(/pid 14779 is no longer running/i)).toBeTruthy();
+
+    // And from the detail, back into the transcript screen.
+    fireEvent.click(screen.getByRole("button", { name: /open in full window/i }));
+    expect(screen.getByTestId("transcript-window")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /all sessions/i }));
+    expect(screen.queryByTestId("transcript-window")).toBeNull();
+    expect(useFilters.getState().claudeSelected).toBeUndefined();
+    expect(useFilters.getState().claudeTranscript).toBeUndefined();
   });
 });

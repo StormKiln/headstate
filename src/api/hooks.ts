@@ -58,7 +58,7 @@ import type {
   LogTail,
   ScanKind,
 } from "./tauri";
-import type { TranscriptPage } from "../types/transcript";
+import type { RemoteTranscriptPage } from "../types/transcript";
 import { createCoalescer, type Scheduler } from "@/lib/coalesce";
 import { createLimiter, withDeadline } from "@/lib/limiter";
 import { IS_MOBILE_BUILD } from "@/lib/target";
@@ -1730,11 +1730,22 @@ export function useClaudeSessionDetail(sessionId: string | null, enabled: boolea
 /// keeps `data` the same object when nothing changed.
 ///
 /// `retry: false`, this feature's rule (see `useClaudeTranscriptFollow`).
-export function useClaudeTranscriptMessages(path: string | null, enabled: boolean, live: boolean) {
+///
+/// `reveal` is the phone's Reveal (#1481): a separate query, keyed apart,
+/// so the masked read stays cached underneath it and a refused reveal
+/// leaves the masked text on screen rather than nothing.
+export function useClaudeTranscriptMessages(
+  path: string | null,
+  enabled: boolean,
+  live: boolean,
+  reveal = false,
+) {
   const on = enabled && path !== null && path !== "";
-  return useQuery<TranscriptPage>({
-    queryKey: ["claude-transcript-messages", path],
-    queryFn: () => claudeTranscriptMessages(path as string),
+  return useQuery<RemoteTranscriptPage>({
+    queryKey: reveal
+      ? ["claude-transcript-messages", path, "reveal"]
+      : ["claude-transcript-messages", path],
+    queryFn: () => claudeTranscriptMessages(path as string, reveal),
     enabled: on,
     refetchInterval: on && live ? CLAUDE_POLL_MS : false,
     staleTime: CLAUDE_POLL_MS - 1_000,

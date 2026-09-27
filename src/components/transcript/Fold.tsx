@@ -1,5 +1,6 @@
-import { useId, useState, type ReactNode } from "react";
+import { useContext, useId, useState, type ReactNode } from "react";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "../ui/sheet";
+import { InSheet } from "./inSheet";
 import { palette } from "./palette";
 import type { ToolVariant } from "./types";
 
@@ -27,11 +28,12 @@ export function Fold({
   defaultOpen?: boolean;
   children: ReactNode;
 }) {
-  const [open, setOpen] = useState(defaultOpen);
+  const inSheet = useContext(InSheet);
+  const [open, setOpen] = useState(defaultOpen || inSheet);
   const regionId = useId();
   const name = `${label}, ${count}`;
 
-  if (variant === "compact") {
+  if (variant === "compact" && !inSheet) {
     return (
       <Sheet open={open} onOpenChange={setOpen}>
         <button
@@ -63,7 +65,10 @@ export function Fold({
         aria-controls={regionId}
         aria-label={name}
         onClick={() => setOpen((o) => !o)}
-        className="mt-0.5 text-[11px] hover:underline focus-visible:outline focus-visible:outline-2"
+        className={`mt-0.5 hover:underline focus-visible:outline focus-visible:outline-2 ${
+          // In a phone sheet: a finger's target, not a pointer's.
+          variant === "compact" ? "min-h-8 text-[12px]" : "text-[11px]"
+        }`}
         style={{ color: palette.muted }}
       >
         {count} {open ? "▾" : "▸"}
