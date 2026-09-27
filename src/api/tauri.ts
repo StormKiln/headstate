@@ -77,7 +77,7 @@ import type {
   RepoTree,
   RepoFile,
 } from "../types/pr";
-import type { TranscriptBlockText, TranscriptPage } from "../types/transcript";
+import type { RemoteTranscriptPage, TranscriptBlockText } from "../types/transcript";
 
 export interface AuthState {
   ok: boolean;
@@ -1461,14 +1461,33 @@ export const claudeTranscriptFollow = (path: string, cursor: ClaudeFollowCursor 
 /// `claudeTranscriptTail` keeps serving the current pane.
 ///
 /// `Class::Read`, bounded inside the command by the same 256 KB window.
-export const claudeTranscriptMessages = (path: string) =>
-  call<TranscriptPage>("claude_transcript_messages", { path });
+///
+/// `reveal` is the phone's Reveal button (#1481, #1488): the desktop
+/// sends the text unmasked when this device may reveal, and refuses
+/// otherwise. Sent only when true, so the desktop's own calls -- which
+/// are never masked -- carry exactly the arguments they always did.
+export const claudeTranscriptMessages = (path: string, reveal = false) =>
+  call<RemoteTranscriptPage>(
+    "claude_transcript_messages",
+    reveal ? { path, reveal: true } : { path },
+  );
 
 /// One clipped block's full text, by the record's id and the block's
 /// index (#1475). Bounded server-side too; the response's `clip` says
 /// when that bound bit.
-export const claudeTranscriptBlockText = (path: string, messageId: string, index: number) =>
-  call<TranscriptBlockText>("claude_transcript_block_text", { path, messageId, index });
+///
+/// `reveal` as `claudeTranscriptMessages`: a block fetched while the
+/// phone shows revealed text must arrive revealed too.
+export const claudeTranscriptBlockText = (
+  path: string,
+  messageId: string,
+  index: number,
+  reveal = false,
+) =>
+  call<TranscriptBlockText>(
+    "claude_transcript_block_text",
+    reveal ? { path, messageId, index, reveal: true } : { path, messageId, index },
+  );
 
 // ---------------------------------------------------------------------
 // The Claude Code hook installer (#915). Rust side:

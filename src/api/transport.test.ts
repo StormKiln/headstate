@@ -483,6 +483,27 @@ describe("tauri.ts wrappers through the transport", () => {
     });
   });
 
+  /// The phone's Reveal (#1481, #1488) asks with `reveal: true`, and
+  /// ONLY then carries the key. Unlike `terms` above, `reveal` is not an
+  /// argument of either command: it is a directive to the remote
+  /// boundary, which strips it before dispatch (`privacy::admit`). So
+  /// the default shape is the rows above, byte for byte, and the key
+  /// appears only on the call that means it.
+  it("asks the desktop to reveal only when the caller says so", async () => {
+    await api.claudeTranscriptMessages("/p.jsonl", true);
+    expect(local.call).toHaveBeenLastCalledWith("claude_transcript_messages", {
+      path: "/p.jsonl",
+      reveal: true,
+    });
+    await api.claudeTranscriptBlockText("/p.jsonl", "u1", 2, true);
+    expect(local.call).toHaveBeenLastCalledWith("claude_transcript_block_text", {
+      path: "/p.jsonl",
+      messageId: "u1",
+      index: 2,
+      reveal: true,
+    });
+  });
+
   /// The pre-#1214 call shape still works and still says "no terms".
   ///
   /// A separate assertion rather than a second ROWS entry, because

@@ -13,6 +13,9 @@ import { countLines, grammarFor, oversize } from "../lib/highlightLangs";
 import type { Tree } from "../lib/highlightCore";
 import { useIsMobile } from "../lib/useIsMobile";
 import { useSeen } from "../lib/useSeen";
+import { MARKER_OPEN, MASK_LABELS, splitMasked } from "../lib/masked";
+import { IS_MOBILE_BUILD } from "../lib/target";
+import { MaskedText } from "./MaskedText";
 import { ExternalLink } from "./ExternalLink";
 import { PROSE, clean } from "./markdownProse";
 
@@ -60,7 +63,7 @@ export function TranscriptMarkdown({ children }: { children: string }) {
 /// redone, its copy state lost. Hoisted, a block keeps its identity for
 /// as long as its position in the text does.
 const REMARK = [remarkGfm];
-const REHYPE = [rawAsText, rehypeSanitize];
+const REHYPE = [rawAsText, rehypeSanitize, maskedPills];
 const COMPONENTS: Components = {
   ...PROSE,
   a: ({ href, children }) => <TranscriptLink href={href}>{children}</TranscriptLink>,
@@ -81,7 +84,7 @@ type HNode = {
   type: string;
   value?: string;
   tagName?: string;
-  properties?: { className?: unknown };
+  properties?: { className?: unknown; [key: string]: unknown };
   children?: HNode[];
 };
 
@@ -100,6 +103,64 @@ function rawAsText() {
   };
   return walk;
 }
+
+/// Draws each span the desktop masked as a "hidden" pill (#1481, #1488).
+///
+/// A phone's copy of transcript text carries `⟦hidden:<kind>⟧` markers
+/// (`lib/masked.ts`); prose would otherwise print them literally. Runs
+/// AFTER the sanitiser, on text nodes only, and builds the pill from
+/// constants -- the kind is one of `MASK_KINDS` or the marker stays
+/// text, so nothing from the transcript reaches an attribute. Fenced
+/// blocks are skipped here and handled by `CodeBlock`, which renders
+/// the source string rather than this tree. The desktop's text carries
+/// no markers, so there this changes nothing.
+function maskedPills() {
+  const walk = (node: HNode) => {
+    if (node.type === "element" && node.tagName === "pre") return;
+    const children = node.children;
+    if (!children) return;
+    const out: HNode[] = [];
+    for (const child of children) {
+      if (child.type === "text" && (child.value ?? "").includes(MARKER_OPEN)) {
+        for (const part of splitMasked(child.value ?? "")) {
+          out.push(
+            "text" in part
+              ? { type: "text", value: part.text }
+              : {
+                  type: "element",
+                  tagName: "span",
+                  properties: {
+                    title: `Hidden on this phone: ${MASK_LABELS[part.hidden]}`,
+                    ariaLabel: `hidden ${MASK_LABELS[part.hidden]}`,
+                    className: [...PILL_CLASSES],
+                  },
+                  children: [{ type: "text", value: "hidden" }],
+                },
+          );
+        }
+      } else {
+        walk(child);
+        out.push(child);
+      }
+    }
+    node.children = out;
+  };
+  return walk;
+}
+
+/// `MaskedText`'s pill, as classes a hast element can carry.
+const PILL_CLASSES = [
+  "mx-0.5",
+  "inline-block",
+  "rounded",
+  "bg-[#30363d]",
+  "px-1.5",
+  "align-baseline",
+  "font-sans",
+  "text-[10px]",
+  "not-italic",
+  "text-[#8b949e]",
+];
 
 /// The text and language of a fenced block, from its `<pre>` node.
 ///
@@ -170,7 +231,11 @@ function CodeBlock({ code, lang }: { code: string; lang: string | undefined }) {
   const ref = useRef<HTMLDivElement>(null);
   const seen = useSeen(ref);
   const mobile = useIsMobile();
-  const grammar = grammarFor(lang);
+  // Masked code (a phone's copy, #1488) is drawn with its pills and not
+  // highlighted: a grammar would tokenise the marker, and a pill split
+  // across tokens would print as the raw marker.
+  const masked = code.includes(MARKER_OPEN);
+  const grammar = masked ? null : grammarFor(lang);
   const tooBig = oversize(code);
   // Kept WITH the code it was computed for. A live transcript grows its
   // last block while the reader watches; a tree from the previous text
@@ -205,12 +270,20 @@ function CodeBlock({ code, lang }: { code: string; lang: string | undefined }) {
   // of them, has no colour. A grammar that failed to load is not said:
   // nothing about the block explains it and nothing the reader does
   // changes it, and the code itself is all there.
+  //
+  // Except on the phone build (#1481). Highlighting there runs in a
+  // module worker loaded from the app's custom scheme, which is not yet
+  // verified on a device; if it fails, EVERY block is plain, and without
+  // a word nobody would notice. So the phone says it, and the report of
+  // it is how the device check gets done.
   const plainNote =
     tooBig === "lines"
       ? `${countLines(code).toLocaleString()} lines, shown without highlighting`
       : tooBig === "chars" || outcome?.kind === "too-slow"
         ? "shown without highlighting"
-        : null;
+        : IS_MOBILE_BUILD && outcome?.kind === "failed"
+          ? "highlighting did not load on this device"
+          : null;
 
   return (
     <div
@@ -239,7 +312,7 @@ function CodeBlock({ code, lang }: { code: string; lang: string | undefined }) {
           mobile ? "whitespace-pre-wrap break-words" : "overflow-x-auto"
         }`}
       >
-        <code>{tree ? renderTree(tree) : code}</code>
+        <code>{tree ? renderTree(tree) : masked ? <MaskedText text={code} /> : code}</code>
       </pre>
     </div>
   );

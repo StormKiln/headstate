@@ -62,6 +62,8 @@ import { ExternalLink } from "./ExternalLink";
 import { MaskedText } from "./MaskedText";
 import { TranscriptViewer } from "./transcript/TranscriptViewer";
 import { renderPlaceholderMessage } from "./transcript/PlaceholderMessage";
+import { PhoneTranscript } from "./transcript/phone/PhoneTranscript";
+import { useTranscriptRenderer } from "./transcript/phone/renderer";
 import { transcriptStreaming } from "./transcript/streaming";
 
 /// The sessions list is virtualized, and this is the note that used to
@@ -747,6 +749,8 @@ export function ClaudeSessionColumn() {
   const setShowSubagents = useFilters((f) => f.setClaudeShowSubagents);
   const selected = useFilters((f) => f.claudeSelected);
   const selectSession = useFilters((f) => f.selectClaudeSession);
+  const openTranscript = useFilters((f) => f.openClaudeTranscript);
+  const isMobile = useIsMobile();
   // The single app-wide keyboard cursor (#953). One cursor, owned by
   // whichever view has claimed it -- `filters.ts` holds one value and
   // #953 forbids a second, because two lists owning two cursors is the
@@ -1042,7 +1046,13 @@ export function ClaudeSessionColumn() {
                   // the ring is drawn over the blue rather than instead
                   // of it.
                   cursored={cursor === i}
-                  onSelect={() => selectSession(s.session_id)}
+                  // On the phone a session opens at its transcript, as a
+                  // conversation does in the Claude app (#1481); its
+                  // detail is one tap away in that screen's header. The
+                  // desktop keeps the detail beside the list.
+                  onSelect={() =>
+                    isMobile ? openTranscript(s.session_id) : selectSession(s.session_id)
+                  }
                 />
               );
             })}
@@ -3734,7 +3744,7 @@ function TranscriptPane({
         </button>
       ) : (
         <div className="mt-2 flex h-[28rem] flex-col">
-          <SessionTranscript detail={d} />
+          <TranscriptFor detail={d} />
         </div>
       )}
     </section>
@@ -3743,22 +3753,50 @@ function TranscriptPane({
 
 /// The transcript viewer filling the main panel: the full-window route
 /// (#1479), reached through `openClaudeTranscript`.
+///
+/// On the phone this is the screen a session row opens (#1481), so its
+/// back link returns to the list and the detail is a button beside the
+/// title; on the desktop it returns to the detail it was opened from.
 function TranscriptWindow({ session: s }: { session: ClaudeSession }) {
   const detail = useClaudeSessionDetail(s.session_id, true);
   const close = useFilters((f) => f.closeClaudeTranscript);
+  const selectSession = useFilters((f) => f.selectClaudeSession);
+  const phone = useTranscriptRenderer() === "phone";
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-2" data-testid="transcript-window">
       <div className="flex items-center gap-3">
-        <button
-          type="button"
-          onClick={close}
-          className="tap-target -ml-1 flex items-center rounded px-2 text-sm text-[#58a6ff] hover:bg-[#161b22]"
-        >
-          ← Session detail
-        </button>
-        <h2 className="min-w-0 truncate text-sm font-semibold text-[#e6edf3]">
+        {phone ? (
+          <button
+            type="button"
+            onClick={() => {
+              close();
+              selectSession(undefined);
+            }}
+            className="tap-target -ml-1 flex shrink-0 items-center rounded px-2 text-sm text-[#58a6ff] hover:bg-[#161b22]"
+          >
+            ← All sessions
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={close}
+            className="tap-target -ml-1 flex items-center rounded px-2 text-sm text-[#58a6ff] hover:bg-[#161b22]"
+          >
+            ← Session detail
+          </button>
+        )}
+        <h2 className="min-w-0 flex-1 truncate text-sm font-semibold text-[#e6edf3]">
           {s.name ?? s.session_id}
         </h2>
+        {phone ? (
+          <button
+            type="button"
+            onClick={close}
+            className="tap-target flex shrink-0 items-center rounded px-2 text-sm text-[#58a6ff] hover:bg-[#161b22]"
+          >
+            Details
+          </button>
+        ) : null}
       </div>
       {detail.isError ? (
         <QueryError
@@ -3778,10 +3816,23 @@ function TranscriptWindow({ session: s }: { session: ClaudeSession }) {
           {revealRefusal(detail.data.transcript_path, detail.data.transcript_state)}.
         </p>
       ) : (
-        <SessionTranscript detail={detail.data} />
+        <TranscriptFor detail={detail.data} />
       )}
     </div>
   );
+}
+
+/// One session's transcript, in the renderer its layout calls for
+/// (#1481): the phone's bubbles, or the desktop's.
+///
+/// By layout (`useTranscriptRenderer`, which is `useIsMobile()`), not by
+/// build -- see `transcript/phone/renderer.ts`.
+function TranscriptFor({ detail: d }: { detail: ClaudeSessionDetail }) {
+  const renderer = useTranscriptRenderer();
+  if (renderer === "phone" && d.transcript_path) {
+    return <PhoneTranscript path={d.transcript_path} liveness={d.liveness} />;
+  }
+  return <SessionTranscript detail={d} />;
 }
 
 /// One session's transcript in the viewer shell (#1479).

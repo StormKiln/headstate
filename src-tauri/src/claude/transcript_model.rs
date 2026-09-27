@@ -286,6 +286,11 @@ pub struct TranscriptToolOutput {
     pub message_id: String,
     /// This block's position in that record, for the same fetch.
     pub index: usize,
+    /// That record's timestamp, as recorded (RFC 3339). Kept on the
+    /// output because merging absorbs the record: without it, how long a
+    /// call took (call to result) could not be measured once the two are
+    /// paired. `None` when the record carried none -- never substituted.
+    pub timestamp: Option<String>,
     pub tool_use_id: Option<String>,
     pub text: String,
     pub clip: Option<TranscriptClip>,
@@ -614,7 +619,10 @@ pub fn parse(body: &str, start: WindowStart, transcript: Option<&Path>) -> Trans
             }
         };
         match record(&rec, id, id_source, &ctx) {
-            Parsed::Message(m) => page.messages.push(*m),
+            Parsed::Message(mut m) => {
+                stamp_results(&mut m);
+                page.messages.push(*m)
+            }
             Parsed::Machinery(t) => *machinery.entry(t).or_default() += 1,
         }
     }
@@ -632,6 +640,16 @@ pub fn parse(body: &str, start: WindowStart, transcript: Option<&Path>) -> Trans
         settle(&mut page.messages);
     }
     page
+}
+
+/// Give every standing tool output its record's timestamp, before
+/// [`settle`] can move it into a call and the record is dropped.
+fn stamp_results(m: &mut TranscriptMessage) {
+    for b in &mut m.blocks {
+        if let TranscriptBlock::ToolResult(out) = b {
+            out.timestamp.clone_from(&m.timestamp);
+        }
+    }
 }
 
 /// Pair tool results into their calls, derive model changes and assign
@@ -1184,6 +1202,9 @@ fn block(index: usize, v: &serde_json::Value, ctx: &Ctx, message_id: &str) -> Tr
             TranscriptBlock::ToolResult(TranscriptToolOutput {
                 message_id: message_id.to_owned(),
                 index,
+                // Stamped from the record by `stamp_results` once the
+                // message is built; a block does not see its record.
+                timestamp: None,
                 tool_use_id: str_of(v, "tool_use_id"),
                 text,
                 clip,
@@ -1670,6 +1691,38 @@ mod tests {
         assert_eq!(out.text, "out");
         assert_eq!(out.message_id, "r1");
         assert!(matches!(args, ToolArgs::Bash { .. }));
+    }
+
+    /// The absorbed result record's timestamp survives the merge, so the
+    /// renderers can say how long the call took (#1481).
+    #[test]
+    fn a_merged_result_keeps_its_records_timestamp() {
+        let mut r = result("r1", "t1");
+        r["timestamp"] = serde_json::json!("2026-01-01T00:00:07Z");
+        let page = parse(&body(&[call("a1", "t1"), r]), WindowStart::FileStart, None);
+        let TranscriptBlock::ToolCall {
+            result: Some(out), ..
+        } = &page.messages[0].blocks[0]
+        else {
+            panic!("{:#?}", page.messages[0].blocks)
+        };
+        assert_eq!(out.timestamp.as_deref(), Some("2026-01-01T00:00:07Z"));
+    }
+
+    /// A result record with no timestamp says so: `None`, not a borrowed
+    /// time from its call.
+    #[test]
+    fn a_result_without_a_timestamp_has_none() {
+        let mut r = result("r1", "t1");
+        r.as_object_mut().unwrap().remove("timestamp");
+        let page = parse(&body(&[call("a1", "t1"), r]), WindowStart::FileStart, None);
+        let TranscriptBlock::ToolCall {
+            result: Some(out), ..
+        } = &page.messages[0].blocks[0]
+        else {
+            panic!("{:#?}", page.messages[0].blocks)
+        };
+        assert_eq!(out.timestamp, None);
     }
 
     /// A result whose call is not loaded stands on its own.

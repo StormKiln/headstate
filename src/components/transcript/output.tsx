@@ -1,3 +1,4 @@
+import { MaskedText } from "../MaskedText";
 import { TranscriptMarkdown } from "../TranscriptMarkdown";
 import { palette } from "./palette";
 
@@ -9,7 +10,12 @@ export function MonoOutput({ text, error = false }: { text: string; error?: bool
       className="mt-0.5 max-h-[60vh] overflow-auto whitespace-pre-wrap break-words rounded p-1.5 font-mono text-[11px]"
       style={{ background: palette.surface, color: error ? palette.error : palette.text }}
     >
-      {text === "" ? <span style={{ color: palette.muted }}>(no output)</span> : text}
+      {text === "" ? (
+        <span style={{ color: palette.muted }}>(no output)</span>
+      ) : (
+        // A phone's copy may carry the desktop's masking markers (#1488).
+        <MaskedText text={text} />
+      )}
     </pre>
   );
 }

@@ -1,5 +1,6 @@
 import { useId, useState } from "react";
 import type { ClaudeFileChange } from "../../types/pr";
+import { MaskedText } from "../MaskedText";
 import { diffStat, numberHunk, type NumberedLine } from "./diff";
 import { palette } from "./palette";
 import type { ToolVariant } from "./types";
@@ -158,13 +159,16 @@ function DiffRow({ line, variant }: { line: NumberedLine; variant: ToolVariant }
                     color: line.op === "added" ? palette.addedWordText : palette.removedWordText,
                   }}
                 >
-                  {s.text}
+                  <MaskedText text={s.text} />
                 </mark>
               ) : (
-                <span key={k}>{s.text}</span>
+                <span key={k}>
+                  <MaskedText text={s.text} />
+                </span>
               ),
             )
-          : line.text}
+          : // A phone's copy may carry masking markers (#1488).
+            <MaskedText text={line.text} />}
       </span>
     </div>
   );
