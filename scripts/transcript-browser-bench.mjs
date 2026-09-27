@@ -499,7 +499,11 @@ async function heldChunks(cdp) {
 ///   newest message, so the oldest pages are the far end and go.
 /// - `parked on a new turn`: each page opens new turns, which the viewer
 ///   places at the top of the view, so the reader stops at the first new
-///   prompt and the newest pages arrive below them.
+///   prompt and the newest pages arrive below them. Once the bound binds
+///   with the reader's window on the oldest page held, the newest page
+///   goes and the follow detaches (#1524): it says so, stops reading,
+///   and "Jump to the latest" follows again. Growth stops there -- a
+///   detached follow reads nothing, so more would only queue.
 async function growth(name, scenario) {
   const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
   const page = await context.newPage();
@@ -525,13 +529,31 @@ async function growth(name, scenario) {
   const perChunk = [];
   const heaps = [];
   let rowsMax = 0;
+  // The chunk after which the follow detached from the live edge, or
+  // `null` while it followed.
+  let detachedAfter = null;
+  const detached = () =>
+    page.evaluate(() => {
+      const s = document.querySelector('[data-testid="transcript-read-status"]');
+      return s?.dataset.state === "paused" && s.textContent.includes("Jump to the latest");
+    });
   for (let i = 1; i <= GROW_CHUNKS; i++) {
     const s = await page.evaluate((t) => {
       window.__harness.grow(1, t);
       return window.__harness.size;
     }, newTurns);
     await page.evaluate((x) => window.__harness.nudge(x + 1), s);
-    await page.waitForFunction(() => window.__harness.queued === 0, null, { timeout: 20_000 });
+    // Read, or detached: the page read past the bound was let go, and
+    // nothing reads the next chunk.
+    await page.waitForFunction(
+      () => {
+        if (window.__harness.queued === 0) return true;
+        const st = document.querySelector('[data-testid="transcript-read-status"]');
+        return st?.dataset.state === "paused" && st.textContent.includes("Jump to the latest");
+      },
+      null,
+      { timeout: 20_000 },
+    );
     await page.evaluate(twoFrames);
     const state = await page.evaluate(() => {
       const vp = document.querySelector('[data-slot="message-scroller-viewport"]');
@@ -543,9 +565,29 @@ async function growth(name, scenario) {
     });
     rowsMax = Math.max(rowsMax, state.mounted);
     perChunk.push(state.appended);
-    if (i % 5 === 0) heaps.push({ ...state, heap: await heap(cdp) });
+    const off = await detached();
+    if (i % 5 === 0 || off) heaps.push({ ...state, heap: await heap(cdp) });
+    if (off) {
+      detachedAfter = i;
+      break;
+    }
   }
   const held = await heldChunks(cdp);
+  // Detached: the status line offers the way back, and it works.
+  let rejoined = null;
+  if (detachedAfter !== null) {
+    await page.click('[data-testid="transcript-read-status"] button:has-text("Jump to the latest")');
+    try {
+      await page.waitForFunction(
+        () => document.querySelector('[data-testid="transcript-read-status"]')?.dataset.state === "following",
+        null,
+        { timeout: 5_000 },
+      );
+      rejoined = true;
+    } catch {
+      rejoined = false;
+    }
+  }
   const longTasks = await page.evaluate(() => window.__longTasks);
   await context.close();
 
@@ -559,7 +601,14 @@ async function growth(name, scenario) {
     held.size > bound,
     `eviction: ${held.size} of ${GROW_CHUNKS} appended pages (${chunkSize} messages each) are still held; the ${MAX_RESIDENT}-message bound allows ${bound}`,
   );
-  return { name, scenario, chunkSize, heaps, held, bound, rowsMax, longTasks };
+  // A reader following at the bottom keeps following: the far end is
+  // the oldest page, never the newest.
+  check(
+    !newTurns && detachedAfter !== null,
+    `the follow detached after page ${detachedAfter} while the reader followed the live edge`,
+  );
+  check(rejoined === false, `"Jump to the latest" did not follow again after the follow detached`);
+  return { name, scenario, chunkSize, heaps, held, bound, rowsMax, longTasks, detachedAfter, rejoined };
 }
 
 function growthTables() {
@@ -574,6 +623,11 @@ function growthTables() {
     const ids = [...g.held].sort((a, b) => a - b);
     console.log(
       `\nappended pages whose messages are still in the heap: ${g.held.size} of ${GROW_CHUNKS}${ids.length ? ` (pages ${ids[0]} to ${ids[ids.length - 1]})` : ""}; the bound allows ${g.bound}. Long tasks while growing: ${lt.length}${lt.length ? ` (max ${Math.max(...lt).toFixed(0)} ms)` : ""}; most rows mounted: ${g.rowsMax}.`,
+    );
+    console.log(
+      g.detachedAfter === null
+        ? `The follow stayed at the live edge for all ${GROW_CHUNKS} pages.`
+        : `The follow detached after page ${g.detachedAfter} of ${GROW_CHUNKS} (growth stopped there); "Jump to the latest" ${g.rejoined ? "followed again" : "did NOT follow again"}.`,
     );
   }
 }

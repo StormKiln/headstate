@@ -1,7 +1,9 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { TranscriptMessage } from "../../types/transcript";
+import { useSyncExternalStore } from "react";
+import { TranscriptFollower } from "../../lib/transcriptFollow";
+import type { RemoteTranscriptWindow, TranscriptMessage } from "../../types/transcript";
 import { installScrollShim, type ScrollShim } from "./scrollShim";
 import { TranscriptViewer } from "./TranscriptViewer";
 import { WINDOW_SIZE, WINDOW_SLACK, WINDOW_STEP } from "./transcriptWindow";
@@ -365,5 +367,74 @@ describe("TranscriptViewer: history", () => {
     }
     expect(dropped).toBe(true);
     expect(shim.rows().at(-1)!.dataset.messageId).toBe(messages.at(-1)!.id);
+  });
+});
+
+describe("TranscriptViewer: an idle read (#1525)", () => {
+  /// One page that never grows: every read after the first finds nothing.
+  function still(messages: TranscriptMessage[]) {
+    const end = { offset: messages.length * 100, behind_digest: "d" };
+    const whole: RemoteTranscriptWindow = {
+      page: {
+        messages,
+        truncated: false,
+        bytes_read: end.offset,
+        file_bytes: end.offset,
+        machinery_records: [],
+        unparseable_records: 0,
+        duplicate_records: 0,
+      },
+      start: { offset: 0, behind_digest: "" },
+      end,
+      at_start: true,
+      at_end: true,
+      rewritten: false,
+      position: { first: null, last: null, total: null, exact: false, basis: "bytes" },
+      seam: { first_model: null, last_model: null },
+      bytes_scanned: 0,
+    };
+    const nothing: RemoteTranscriptWindow = {
+      ...whole,
+      page: { ...whole.page, messages: [], bytes_read: 0 },
+      start: end,
+    };
+    return async (anchor: { kind: string }) => (anchor.kind === "end" ? whole : nothing);
+  }
+
+  function Followed({ follower }: { follower: TranscriptFollower }) {
+    const s = useSyncExternalStore(follower.subscribe, follower.getSnapshot);
+    return (
+      <>
+        <p data-testid="read-at">{s.lastReadAt}</p>
+        <TranscriptViewer messages={s.messages ?? []} renderMessage={renderOne} />
+      </>
+    );
+  }
+
+  it("advances the read time and mutates no row", async () => {
+    let clock = 1_000;
+    const follower = new TranscriptFollower(still(conversation(4)), { now: () => clock });
+    follower.setLive("unknown");
+    render(<Followed follower={follower} />);
+    await act(() => follower.refresh());
+    await shim.flush();
+    expect(shim.rows().length).toBe(12);
+    expect(screen.getByTestId("read-at").textContent).toBe("1000");
+
+    const content = document.querySelector('[data-slot="message-scroller-content"]')!;
+    const mutations: MutationRecord[] = [];
+    const observer = new MutationObserver((m) => mutations.push(...m));
+    observer.observe(content, { subtree: true, childList: true, attributes: true, characterData: true });
+
+    clock = 6_000;
+    await act(() => follower.refresh());
+    await shim.flush();
+    // The reader sees the poll go on...
+    expect(screen.getByTestId("read-at").textContent).toBe("6000");
+    // ...and no row was touched to show it.
+    mutations.push(...observer.takeRecords());
+    observer.disconnect();
+    expect(mutations).toEqual([]);
+    follower.stop();
   });
 });
