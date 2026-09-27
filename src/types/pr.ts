@@ -2414,6 +2414,29 @@ export type ClaudeToolArgs =
   | { tool: "todo_write"; todos: ClaudeTodo[]; todos_omitted: number }
   | { tool: "web_fetch"; url: string; prompt: string; truncated: boolean }
   | { tool: "web_search"; query: string; truncated: boolean }
+  /// One item added to the session's task list (#1504). The input has
+  /// no id: the id it was given is in the result's `task`.
+  | {
+      tool: "task_create";
+      subject: string;
+      description: string | null;
+      active_form: string | null;
+      truncated: boolean;
+    }
+  /// A change to one task (#1504). `status: null` is "not changed",
+  /// never "pending". `fields` names every key the call set, known or
+  /// not.
+  | {
+      tool: "task_update";
+      task_id: string | null;
+      status: string | null;
+      subject: string | null;
+      active_form: string | null;
+      fields: string[];
+      truncated: boolean;
+    }
+  | { tool: "task_get"; task_id: string | null }
+  | { tool: "task_list" }
   /// A tool whose shape this build does not know: its argument keys, so
   /// the reader can see Headstate is behind rather than that the call
   /// was empty.

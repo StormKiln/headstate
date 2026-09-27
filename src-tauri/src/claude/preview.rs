@@ -542,6 +542,48 @@ pub enum ToolArgs {
     },
     /// `WebSearch`: the query.
     WebSearch { query: String, truncated: bool },
+    /// `TaskCreate`: one item added to the session's task list (#1504).
+    ///
+    /// What current Claude Code tracks work with, where [`ToolArgs::TodoWrite`]
+    /// is what older builds did. Measured on this machine's corpus: 51
+    /// calls, every one with `subject` and `description`, 39 with
+    /// `activeForm`. The input carries NO id: the id the task gets is in
+    /// the result's `toolUseResult.task.id` (see
+    /// `transcript_model::TranscriptTaskResult`), so a create is only
+    /// linkable to later updates once its result is loaded.
+    TaskCreate {
+        subject: String,
+        description: Option<String>,
+        active_form: Option<String>,
+        /// Whether any of the three was clipped by [`MAX_TEXT_CHARS`].
+        truncated: bool,
+    },
+    /// `TaskUpdate`: a change to one task, by id (#1504).
+    ///
+    /// Measured: 95 calls, 94 with `taskId` (a numeric STRING) and
+    /// `status` (`in_progress` or `completed`). A call can also change
+    /// `subject`, `activeForm`, `description` or fields this build does
+    /// not know, so `fields` names every key the call set -- the known
+    /// ones are also parsed out below; the rest are named, never dropped.
+    TaskUpdate {
+        /// `None` when the call named no task, which then cannot be
+        /// matched to one.
+        task_id: Option<String>,
+        /// Verbatim. `None` when the call did not change the status --
+        /// NOT "pending".
+        status: Option<String>,
+        subject: Option<String>,
+        active_form: Option<String>,
+        /// Every key the call carried other than `taskId`, sorted.
+        fields: Vec<String>,
+        truncated: bool,
+    },
+    /// `TaskGet`: one task read back, by id. Absent from this machine's
+    /// corpus; parsed to Claude Code's documented `taskId` input.
+    TaskGet { task_id: Option<String> },
+    /// `TaskList`: the task list read back. Absent from this machine's
+    /// corpus; takes no arguments.
+    TaskList,
     /// A tool whose argument shape this build does not know.
     ///
     /// The KEYS, not the values: the keys are what tell a reader whether
@@ -1606,6 +1648,35 @@ pub(crate) fn tool_args(name: &str, input: Option<&serde_json::Value>) -> ToolAr
             let (query, truncated) = clamp(text("query"));
             ToolArgs::WebSearch { query, truncated }
         }
+        "TaskCreate" => {
+            let (subject, a) = clamp(text("subject"));
+            let (description, b) = clamp_opt(opt("description"));
+            let (active_form, c) = clamp_opt(opt("activeForm"));
+            ToolArgs::TaskCreate {
+                subject,
+                description,
+                active_form,
+                truncated: a || b || c,
+            }
+        }
+        "TaskUpdate" => {
+            let (subject, a) = clamp_opt(opt("subject"));
+            let (active_form, b) = clamp_opt(opt("activeForm"));
+            let mut fields: Vec<String> = map.keys().filter(|k| *k != "taskId").cloned().collect();
+            fields.sort();
+            ToolArgs::TaskUpdate {
+                task_id: task_id(map.get("taskId")),
+                status: opt("status"),
+                subject,
+                active_form,
+                fields,
+                truncated: a || b,
+            }
+        }
+        "TaskGet" => ToolArgs::TaskGet {
+            task_id: task_id(map.get("taskId")),
+        },
+        "TaskList" => ToolArgs::TaskList,
         // Everything else -- 18 distinct tool names appear in the sample,
         // most of them MCP tools. The KEYS, so a reader can see that
         // Headstate is behind rather than that the call was empty; not
@@ -1789,6 +1860,31 @@ fn clamp(s: &str) -> (String, bool) {
         out.push(c);
     }
     (out, false)
+}
+
+/// [`clamp`] for a field that may be absent: absent stays `None`.
+fn clamp_opt(s: Option<String>) -> (Option<String>, bool) {
+    match s {
+        Some(s) => {
+            let (s, t) = clamp(&s);
+            (Some(s), t)
+        }
+        None => (None, false),
+    }
+}
+
+/// A task id as the record spelled it.
+///
+/// Every measured `taskId` is a numeric STRING. A bare number is taken
+/// too, as its digits: the same id written another way, not a guess.
+/// Anything else -- absent, empty, an object -- is `None`: the call named
+/// no task this build can match.
+pub(crate) fn task_id(v: Option<&serde_json::Value>) -> Option<String> {
+    match v? {
+        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -2550,6 +2646,84 @@ mod tests {
             *args[2],
             ToolArgs::WebSearch {
                 query: "unified diff format".into(),
+                truncated: false,
+            }
+        );
+    }
+
+    /// #1504: the task tools current Claude Code tracks work with are
+    /// parsed, not left as keys. Generic fixtures cut to the measured
+    /// shape: `taskId` a numeric string, `status` verbatim, an unknown
+    /// field NAMED in `fields` rather than refused or dropped.
+    #[test]
+    fn task_tools_are_parsed_and_unknown_task_fields_are_named() {
+        let tmp = Tmp::new("tasktools");
+        let p = write(
+            tmp.path(),
+            "s.jsonl",
+            &[
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"TaskCreate","input":{"subject":"Write the parser","description":"Parse the input.","activeForm":"Writing the parser"}},{"type":"tool_use","id":"t2","name":"TaskUpdate","input":{"taskId":"3","status":"in_progress","owner":"someone","addBlockedBy":["1"]}},{"type":"tool_use","id":"t3","name":"TaskUpdate","input":{"taskId":7,"subject":"Renamed"}},{"type":"tool_use","id":"t4","name":"TaskUpdate","input":{"status":"completed"}},{"type":"tool_use","id":"t5","name":"TaskGet","input":{"taskId":"3"}},{"type":"tool_use","id":"t6","name":"TaskList","input":{}},{"type":"tool_use","id":"t7","name":"TaskCreate","input":{"subject":"No form"}}]}}"#,
+            ],
+        );
+        let v = tail(&p).unwrap();
+        let args: Vec<&ToolArgs> = v.messages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::ToolUse { args, .. } => Some(args),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            *args[0],
+            ToolArgs::TaskCreate {
+                subject: "Write the parser".into(),
+                description: Some("Parse the input.".into()),
+                active_form: Some("Writing the parser".into()),
+                truncated: false,
+            }
+        );
+        assert_eq!(
+            *args[1],
+            ToolArgs::TaskUpdate {
+                task_id: Some("3".into()),
+                status: Some("in_progress".into()),
+                subject: None,
+                active_form: None,
+                fields: vec!["addBlockedBy".into(), "owner".into(), "status".into()],
+                truncated: false,
+            }
+        );
+        // A number is the same id written another way; no status is
+        // "not changed", never "pending".
+        assert_eq!(
+            *args[2],
+            ToolArgs::TaskUpdate {
+                task_id: Some("7".into()),
+                status: None,
+                subject: Some("Renamed".into()),
+                active_form: None,
+                fields: vec!["subject".into()],
+                truncated: false,
+            }
+        );
+        assert!(matches!(
+            args[3],
+            ToolArgs::TaskUpdate { task_id: None, .. }
+        ));
+        assert_eq!(
+            *args[4],
+            ToolArgs::TaskGet {
+                task_id: Some("3".into())
+            }
+        );
+        assert_eq!(*args[5], ToolArgs::TaskList);
+        assert_eq!(
+            *args[6],
+            ToolArgs::TaskCreate {
+                subject: "No form".into(),
+                description: None,
+                active_form: None,
                 truncated: false,
             }
         );
