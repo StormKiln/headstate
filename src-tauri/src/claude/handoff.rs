@@ -1194,6 +1194,42 @@ mod tests {
         );
     }
 
+    // ---- transcript validation, against a fixture home (#1535) ----
+
+    /// A session id with no transcript anywhere under the home's
+    /// `projects` is counted as unvalidated; one with a transcript is not;
+    /// and with no home at all nothing is claimed either way.
+    ///
+    /// Against a FIXTURE home. Until #1535 every consume test walked the
+    /// developer's real `~/.claude/projects`, so this count depended on
+    /// the machine, and nothing asserted it.
+    #[test]
+    fn the_transcript_check_counts_only_what_it_could_look_for() {
+        let t = tempfile::TempDir::new().unwrap();
+        let p = path_in(t.path());
+        let lines = vec![
+            start("found", 100, "2026-09-13T10:00:00Z"),
+            start("missing", 101, "2026-09-13T10:00:00Z"),
+        ];
+
+        // No home: `transcript_exists` cannot look, so no miss is claimed.
+        write_file(&p, &lines);
+        let got = consume(&mut db(), &p, Offset(0), &no_registry()).unwrap();
+        assert_eq!(got.runs, 2);
+        assert_eq!(got.unvalidated, 0, "an unasked question is not a miss");
+
+        let home = tempfile::TempDir::new().unwrap();
+        let project = home.path().join(".claude").join("projects").join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("found.jsonl"), "").unwrap();
+        let _home = crate::auth::test_home::set(home.path());
+
+        write_file(&p, &lines);
+        let got = consume(&mut db(), &p, Offset(0), &no_registry()).unwrap();
+        assert_eq!(got.runs, 2);
+        assert_eq!(got.unvalidated, 1, "only `missing` has no transcript");
+    }
+
     // ---- pid_start_time ----
 
     /// `pid_start_time` comes from the registry, resolved HERE.

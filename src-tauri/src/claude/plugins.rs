@@ -2591,6 +2591,7 @@ mod tests {
     #[test]
     #[ignore]
     fn corpus_probe() {
+        let _home = crate::auth::test_home::real_for_a_live_probe();
         let root = crate::claude::transcript::projects_dir().unwrap();
         let mut totals: BTreeMap<String, PluginUsage> = BTreeMap::new();
         let t0 = std::time::Instant::now();

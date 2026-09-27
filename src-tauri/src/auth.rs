@@ -96,11 +96,6 @@ fn searched_locations() -> String {
     dirs.join(", ")
 }
 
-/// Per-user install locations that cannot be written as constants.
-///
-/// winget and Scoop install under the user's profile, so the path depends
-/// on who is logged in. Empty on non-Windows, where the constants above
-/// already cover the realistic locations.
 /// The user's home directory.
 ///
 /// Windows sets `USERPROFILE`, not `HOME` -- only Git-Bash and MSYS
@@ -109,12 +104,92 @@ fn searched_locations() -> String {
 /// read `HOME` unconditionally, which left a first-run Windows user with
 /// an empty worktrees view AND cost the Docker page its provenance,
 /// since image origins resolve against those same directories.
+///
+/// # A test build has no real home (#1535)
+///
+/// Under `cfg(test)` this answers [`test_home::current`] -- `None`
+/// unless the test set a fixture home -- and never reads the process
+/// environment. Every path this app derives under `~/.claude` (the
+/// session registry, the transcript corpus, the handoff file, the global
+/// `CLAUDE.md`) starts here, so no test can reach the developer's real
+/// `~/.claude` by any call chain, however indirect. Tests that read the
+/// real registry passed or failed on whatever happened to be running
+/// (#1315): a merge-queue flake waiting to burn a release commit
+/// (#1048). `invariants.rs` checks that nothing resolves the home
+/// directory around this function.
 pub fn home_dir() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    return test_home::current();
+    #[cfg(not(test))]
+    env_home()
+}
+
+/// The home directory the environment names. The one place it is read.
+fn env_home() -> Option<std::path::PathBuf> {
     std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
         .ok()
         .map(std::path::PathBuf::from)
 }
 
+/// What [`home_dir`] answers inside a test build.
+///
+/// Per THREAD, so one test's fixture home cannot leak into a test running
+/// beside it, and restored on drop, so it cannot leak into the next test
+/// the same thread runs. A thread the code under test spawns does not
+/// inherit it and sees no home at all -- the safe direction.
+#[cfg(test)]
+pub mod test_home {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static HOME: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// The home this thread's test set, or `None`.
+    pub fn current() -> Option<PathBuf> {
+        HOME.with(|h| h.borrow().clone())
+    }
+
+    /// Restores the previous home when dropped.
+    #[must_use = "the home is restored when this is dropped"]
+    pub struct Scoped(Option<PathBuf>);
+
+    impl Drop for Scoped {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            HOME.with(|h| *h.borrow_mut() = prev);
+        }
+    }
+
+    fn replace(with: Option<PathBuf>) -> Scoped {
+        Scoped(HOME.with(|h| std::mem::replace(&mut *h.borrow_mut(), with)))
+    }
+
+    /// Make `home` this thread's home directory until the guard drops.
+    ///
+    /// A temp directory: this is how a test exercises code that derives
+    /// paths from the home directory.
+    pub fn set(home: &Path) -> Scoped {
+        replace(Some(home.to_path_buf()))
+    }
+
+    /// The REAL home, for a live probe that measures this machine.
+    ///
+    /// Allowed only inside an `#[ignore]` test -- one a person runs on
+    /// purpose, never CI or the merge queue -- and `invariants.rs`
+    /// enforces that. Such a probe may READ real data. It must never
+    /// write, move or delete anything under the home it gets here.
+    pub fn real_for_a_live_probe() -> Scoped {
+        replace(super::env_home())
+    }
+}
+
+/// Per-user install locations that cannot be written as constants.
+///
+/// winget and Scoop install under the user's profile, so the path depends
+/// on who is logged in. Empty on non-Windows, where the constants above
+/// already cover the realistic locations.
 fn user_fallback_dirs() -> Vec<String> {
     if !cfg!(windows) {
         return Vec::new();

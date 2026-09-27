@@ -1409,6 +1409,7 @@ mod tests {
     #[test]
     #[ignore]
     fn selected_session_reads_the_largest_real_transcript_whole() {
+        let _home = crate::auth::test_home::real_for_a_live_probe();
         let Some(root) = crate::claude::transcript::projects_dir() else {
             return;
         };
@@ -1451,6 +1452,7 @@ mod tests {
     #[test]
     #[ignore]
     fn real_corpus_usage() {
+        let _home = crate::auth::test_home::real_for_a_live_probe();
         let Some(root) = crate::claude::transcript::projects_dir() else {
             return;
         };

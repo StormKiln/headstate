@@ -885,6 +885,7 @@ mod tests {
     #[test]
     #[ignore]
     fn measured_sweep_cost_over_this_machines_repositories() {
+        let _home = crate::auth::test_home::real_for_a_live_probe();
         let Some(home) = crate::auth::home_dir() else {
             return;
         };

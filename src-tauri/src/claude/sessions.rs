@@ -1797,7 +1797,9 @@ mod tests {
         );
         assert_eq!(got.sessions[0].cwd_state, CwdState::Gone);
 
-        let d = detail(&conn, "s1").unwrap().expect("the session is stored");
+        let d = detail_with(&conn, "s1", Registry::default())
+            .unwrap()
+            .expect("the session is stored");
         assert_eq!(
             d.transcript_state,
             CwdState::Exists,
@@ -1880,9 +1882,13 @@ mod tests {
         // command is now built -- the real registry is readable here, so
         // this proves the FALLBACK to the stored cwd rather than the
         // registry's own, which is what the original test was about.
-        let d2 = detail(&conn, "s2").unwrap().expect("s2 is stored");
+        let d2 = detail_with(&conn, "s2", Registry::default())
+            .unwrap()
+            .expect("s2 is stored");
         assert!(!d2.resume.anchored, "s2 has no cwd at all");
-        let d1 = detail(&conn, "s1").unwrap().expect("s1 is stored");
+        let d1 = detail_with(&conn, "s1", Registry::default())
+            .unwrap()
+            .expect("s1 is stored");
         assert!(
             d1.resume.anchored,
             "the stored cwd must still carry the `cd`: {}",
@@ -1991,7 +1997,13 @@ mod tests {
         // `runs` is the detail's since #985 -- the list neither renders
         // nor counts it -- so the two facts are asserted from the two
         // tiers that now carry them.
-        assert_eq!(detail(&conn, "s1").unwrap().expect("stored").runs, 0);
+        assert_eq!(
+            detail_with(&conn, "s1", Registry::default())
+                .unwrap()
+                .expect("stored")
+                .runs,
+            0
+        );
         match resolved(&got, "s1") {
             Liveness::Dead { why } => assert!(
                 why.contains("live session registry"),
@@ -2138,19 +2150,43 @@ mod tests {
         assert!(got.registry_unreadable.is_empty());
     }
 
-    /// End to end against the real machine's registry and a real row.
+    /// End to end through `list` and `detail` themselves, against a
+    /// FIXTURE home's registry and a real row.
     ///
-    /// Proves the pieces compose -- the registry read, the pid probe, the
-    /// cwd check and the command -- rather than asserting a count that
-    /// depends on what the developer is running. Both tiers, since #985:
-    /// the command moved to `detail` and the same composition has to
-    /// hold there.
+    /// Proves the pieces compose -- the registry path, its read, the pid
+    /// probe, the cwd check and the command. Both tiers, since #985: the
+    /// command moved to `detail` and the same composition has to hold
+    /// there. The home is a temp directory (#1535): this test read the
+    /// developer's real `~/.claude/sessions` until then, so what it saw
+    /// depended on what was running.
+    ///
+    /// The fixture registry holds one unparseable record, and the list
+    /// reporting it is what shows the read went through the fixture. An
+    /// empty directory would not: a registry path derived wrongly is ABSENT,
+    /// and an absent registry is "nothing is running" with no failure --
+    /// exactly what an empty one reads as. Sabotage-checked by deriving
+    /// `sessionz` instead of `sessions`.
     #[test]
-    fn list_composes_against_the_real_registry() {
+    fn list_and_detail_compose_against_a_fixture_home_registry() {
+        let home = tempfile::TempDir::new().unwrap();
+        let registry = home.path().join(".claude").join("sessions");
+        std::fs::create_dir_all(&registry).unwrap();
+        std::fs::write(registry.join("1.json"), "{ not json").unwrap();
+        let _home = crate::auth::test_home::set(home.path());
+
         let conn = db();
         insert(&conn, "s1", Some(&real_dir()), Some("2026-09-01T00:00:00Z"));
         let got = list(&conn).unwrap();
         assert_eq!(got.sessions.len(), 1);
+        assert_eq!(
+            got.registry_failure, None,
+            "the fixture registry was listed"
+        );
+        assert_eq!(
+            got.registry_unreadable.len(),
+            1,
+            "and its one bad record was read and reported"
+        );
         assert_eq!(
             got.sessions[0].cwd_state,
             CwdState::Exists,
@@ -2160,9 +2196,26 @@ mod tests {
         let d = detail(&conn, "s1").unwrap().expect("the session is stored");
         assert!(d.resume.anchored);
         assert!(d.resume.command.contains("claude --resume 's1'"));
-        eprintln!(
-            "liveness for an unobserved session: {:?}",
-            resolved(&got, "s1")
+    }
+
+    /// With no home, `list` says the registry is unreachable rather than
+    /// "nothing is running" (#1535).
+    ///
+    /// The other half of the test above: a test build has no home unless
+    /// it sets one, and the answer must then be a stated failure. An empty
+    /// registry with no failure would be the claim "no session is live",
+    /// which nobody checked.
+    #[test]
+    fn with_no_home_the_registry_is_a_stated_failure() {
+        let conn = db();
+        insert(&conn, "s1", None, Some("2026-09-01T00:00:00Z"));
+        let got = list(&conn).unwrap();
+        assert!(
+            got.registry_failure
+                .as_deref()
+                .is_some_and(|f| f.contains("no home directory")),
+            "{:?}",
+            got.registry_failure
         );
     }
 
@@ -2195,13 +2248,15 @@ mod tests {
                     Some(&format!("2026-09-01T00:00:{:02}Z", i % 60)),
                 );
             }
-            // Through `list`, NOT `assemble`: the truncation this test
-            // exists to forbid would live in `list`, between the query
+            // Through `list_with`, NOT `assemble`: the truncation this
+            // test exists to forbid would live there, between the query
             // and the assembly, and a test that called `assemble` with
             // its own rows would step right over it. Proven by sabotage
             // -- a `rows.truncate(200)` in `list` passed the
-            // `assemble` version of this test.
-            let got = list(&conn).unwrap();
+            // `assemble` version of this test. `list_with` rather than
+            // `list` so the registry is a fixture, not the machine's
+            // (#1535); `list` itself only adds the registry read.
+            let got = list_with(&conn, &Registry::default()).unwrap();
             assert_eq!(
                 got.sessions.len(),
                 n,
@@ -2354,10 +2409,14 @@ mod tests {
         let conn = db();
         insert(&conn, "s1", None, Some("2026-09-01T00:00:00Z"));
         assert!(
-            detail(&conn, "never-stored").unwrap().is_none(),
+            detail_with(&conn, "never-stored", Registry::default())
+                .unwrap()
+                .is_none(),
             "an absent id is an answer, not a failure"
         );
-        assert!(detail(&conn, "s1").unwrap().is_some());
+        assert!(detail_with(&conn, "s1", Registry::default())
+            .unwrap()
+            .is_some());
     }
 
     /// The detail carries the fields the list gave up, for the row the
@@ -2384,7 +2443,9 @@ mod tests {
         )
         .unwrap();
 
-        let d = detail(&conn, "s1").unwrap().expect("stored");
+        let d = detail_with(&conn, "s1", Registry::default())
+            .unwrap()
+            .expect("stored");
         assert_eq!(d.session_id, "s1");
         assert_eq!(d.claude_version.as_deref(), Some("2.0.1"));
         assert_eq!(d.first_seen_at, "2026-09-01T00:00:00Z");
@@ -2474,6 +2535,7 @@ mod tests {
     #[test]
     #[ignore = "needs the developer's own ~/.claude/projects"]
     fn real_session_list() {
+        let _home = crate::auth::test_home::real_for_a_live_probe();
         let mut conn = db();
         let scan = match crate::claude::scan_default() {
             Ok(s) => s,
@@ -2936,7 +2998,9 @@ mod tests {
             &[("trigger_kind", "manual")],
         );
 
-        let d = detail(&conn, "s1").unwrap().expect("the session is stored");
+        let d = detail_with(&conn, "s1", Registry::default())
+            .unwrap()
+            .expect("the session is stored");
         let c = d.compactions.expect("compactions were recorded");
         assert_eq!((c.auto, c.manual), (1, 1));
         assert_eq!(c.total(), 2);
@@ -2971,7 +3035,7 @@ mod tests {
         )
         .unwrap();
 
-        let d = detail(&conn, "parent")
+        let d = detail_with(&conn, "parent", Registry::default())
             .unwrap()
             .expect("the session is stored");
         let a = d

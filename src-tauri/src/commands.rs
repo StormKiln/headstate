@@ -8201,27 +8201,20 @@ mod tests {
     /// #945: the field's own placeholder is `~/code`, and typing it used to
     /// be rejected with `not a directory: ~/code`.
     ///
-    /// Asserted against the REAL home directory rather than a temporary
-    /// one. Setting `HOME` would be a process-wide mutation in a test
-    /// binary that runs in parallel, which is the shape that makes other
-    /// tests fail for reasons they cannot see -- and there is no env lock
-    /// in this crate to serialise against. `expand_tilde` reads
-    /// `auth::home_dir`, so the real value is the honest input anyway.
-    ///
-    /// Uses a directory that must exist inside any home on any platform:
-    /// the home itself, via bare `~`.
+    /// Against a FIXTURE home (#1535). `expand_tilde` reads
+    /// `auth::home_dir`, which in a test build answers the thread's
+    /// `test_home` -- so no process-wide `HOME` mutation, and nothing the
+    /// test does can touch the developer's real home. Until #1535 these
+    /// two tests used the real one, and the second created and removed a
+    /// directory in it.
     #[test]
     fn validate_dirs_expands_a_bare_tilde_to_the_home_directory() {
-        let Some(home) = crate::auth::home_dir() else {
-            // No HOME in this environment, so there is nothing `~` could
-            // mean. Skipped rather than asserted, and said out loud.
-            eprintln!("skipped: no home directory in this environment");
-            return;
-        };
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::auth::test_home::set(home.path());
         let out = validate_dirs(vec!["~".into()]).expect("a bare ~ is the home directory");
         assert_eq!(
             out,
-            vec![home.to_string_lossy().into_owned()],
+            vec![home.path().to_string_lossy().into_owned()],
             "the stored value must be the EXPANDED path, not `~`: one consumer \
              reads it and re-expanding at every read is the same rule in two places"
         );
@@ -8230,25 +8223,30 @@ mod tests {
     /// `~/<subdir>` is the placeholder's actual shape.
     #[test]
     fn validate_dirs_expands_a_tilde_prefixed_subdirectory() {
-        let Some(home) = crate::auth::home_dir() else {
-            eprintln!("skipped: no home directory in this environment");
-            return;
-        };
-        // Created inside the real home so the `is_dir()` check passes on a
-        // path we control, then removed. A name unlikely to collide.
-        let name = ".headstate-tilde-test";
-        let dir = home.join(name);
-        std::fs::create_dir_all(&dir).expect("create a scratch dir in home");
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::auth::test_home::set(home.path());
+        let dir = home.path().join("code");
+        std::fs::create_dir_all(&dir).unwrap();
 
-        let out = validate_dirs(vec![format!("~/{name}")]);
-
-        // Removed BEFORE asserting, so a failure cannot leave it behind.
-        let _ = std::fs::remove_dir(&dir);
+        let out = validate_dirs(vec!["~/code".into()]);
 
         assert_eq!(
             out.expect("~/<subdir> must expand"),
             vec![dir.to_string_lossy().into_owned()]
         );
+    }
+
+    /// With no home, `~` is refused rather than expanded against nothing.
+    ///
+    /// A test build has no home unless it sets one (#1535), so this is
+    /// also the shape every other test in the binary sees.
+    #[test]
+    fn validate_dirs_refuses_a_tilde_when_there_is_no_home() {
+        assert!(
+            crate::auth::home_dir().is_none(),
+            "a test build has no home"
+        );
+        assert!(validate_dirs(vec!["~/code".into()]).is_err());
     }
 
     /// `~otheruser/...` is NOT expanded, and the refusal is the point.

@@ -992,6 +992,7 @@ mod tests {
     #[test]
     #[ignore]
     fn real_corpus_parent_map() {
+        let _home = crate::auth::test_home::real_for_a_live_probe();
         let Some(root) = crate::claude::transcript::projects_dir() else {
             return;
         };

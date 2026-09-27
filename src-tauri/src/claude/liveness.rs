@@ -2017,8 +2017,15 @@ mod tests {
     /// `sysinfo`'s reading, which is the measurement
     /// [`START_TOLERANCE_SECS`] is justified by -- 0s on all three live
     /// sessions when that constant's comment was written.
+    ///
+    /// `#[ignore]` since #1535: it ran in every `cargo test` and read the
+    /// developer's real registry, so its outcome depended on what was
+    /// running. The parse-or-report invariant is a property of the code,
+    /// which the fixture tests above hold; this is the measurement.
     #[test]
+    #[ignore = "reads the developer's real ~/.claude/sessions"]
     fn real_registry() {
+        let _home = crate::auth::test_home::real_for_a_live_probe();
         let Some(dir) = registry_dir() else {
             eprintln!("no home directory; skipping");
             return;

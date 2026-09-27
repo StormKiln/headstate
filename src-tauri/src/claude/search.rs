@@ -1632,6 +1632,7 @@ mod tests {
     #[test]
     #[ignore = "needs the developer's own ~/.claude/projects"]
     fn real_corpus() {
+        let _home = crate::auth::test_home::real_for_a_live_probe();
         let Some(root) = crate::claude::transcript::projects_dir() else {
             eprintln!("no home directory");
             return;

@@ -888,6 +888,7 @@ mod tests {
     #[test]
     #[ignore = "needs the real ~/.claude corpus; run with --ignored"]
     fn real_corpus_overview() {
+        let _home = crate::auth::test_home::real_for_a_live_probe();
         let scan = crate::claude::scan_default().expect("a real ~/.claude/projects");
         let mut conn = db();
         crate::claude::store::import(&mut conn, scan).unwrap();
