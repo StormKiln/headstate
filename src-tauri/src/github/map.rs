@@ -354,6 +354,27 @@ fn unresolved_threads(node: &Value) -> u64 {
         .unwrap_or(0)
 }
 
+/// The list query's review-thread page: `reviewThreads(first: 100)` in
+/// `PRS_QUERY`. `the_list_thread_page_matches_the_query` pins the two.
+pub(crate) const LIST_THREAD_PAGE: usize = 100;
+
+/// Whether `unresolved_threads` may be a floor (#1577).
+///
+/// A page that came back FULL may have had more behind it, so the count
+/// over it is only "at least". A short page is the whole connection.
+/// No `totalCount` is needed to know that, and none is asked for: a
+/// total of exactly one page reads as "may be short", which is the
+/// qualified answer, never the wrong one.
+///
+/// A node with no thread connection at all counts zero threads and says
+/// nothing about more; a zero is never shown as a tag, so that case
+/// cannot print.
+fn unresolved_threads_floor(node: &Value) -> bool {
+    node["reviewThreads"]["nodes"]
+        .as_array()
+        .is_some_and(|threads| threads.len() >= LIST_THREAD_PAGE)
+}
+
 /// The review conversations in full, for the detail view.
 ///
 /// `unresolved_threads` above counts the same node and stays the source of
@@ -561,6 +582,7 @@ fn map_node(node: &Value) -> Option<PullRequest> {
         labels,
         comment_count: node["totalCommentsCount"].as_u64().unwrap_or(0),
         unresolved_threads: unresolved_threads(node),
+        unresolved_threads_floor: unresolved_threads_floor(node),
     })
 }
 
@@ -1029,6 +1051,52 @@ mod tests {
             "labels": {"nodes": []}, "commits": {"nodes": []}
         }]}});
         assert_eq!(map_search(&v)[0].unresolved_threads, 0);
+    }
+
+    /// #1577: a FULL thread page may have more behind it, so its count is
+    /// a floor; a short page is the whole connection, so its count is
+    /// exact. The strip prints the first as "3+", the second as "3".
+    #[test]
+    fn a_full_thread_page_marks_the_count_as_a_floor() {
+        let mut threads: Vec<serde_json::Value> = Vec::new();
+        for _ in 0..3 {
+            threads.push(json!({"isResolved": false, "isOutdated": false}));
+        }
+        for _ in 3..LIST_THREAD_PAGE {
+            threads.push(json!({"isResolved": true, "isOutdated": false}));
+        }
+        let full = &map_search(&node_with_threads(json!(threads)))[0];
+        assert_eq!(full.unresolved_threads, 3);
+        assert!(full.unresolved_threads_floor, "a full page may be short");
+
+        threads.pop();
+        let short = &map_search(&node_with_threads(json!(threads)))[0];
+        assert_eq!(short.unresolved_threads, 3);
+        assert!(!short.unresolved_threads_floor, "a short page is complete");
+    }
+
+    /// The constant the floor test leans on must be the query's real page,
+    /// or a narrowed window would print floors as totals again (#802).
+    #[test]
+    fn the_list_thread_page_matches_the_query() {
+        let page = format!("reviewThreads(first: {LIST_THREAD_PAGE})");
+        assert!(
+            crate::github::query::PRS_QUERY.contains(&page),
+            "PRS_QUERY must ask for `{page}`"
+        );
+    }
+
+    /// A snapshot cached before #1577 has no `unresolved_threads_floor`.
+    /// It reads as "may be short", never as an exact total.
+    #[test]
+    fn a_cached_row_without_the_floor_flag_reads_as_a_floor() {
+        let mut v = serde_json::to_value(&map_search(&node_with_threads(json!([])))[0]).unwrap();
+        v.as_object_mut()
+            .unwrap()
+            .remove("unresolved_threads_floor")
+            .expect("the field is on the wire");
+        let pr: PullRequest = serde_json::from_value(v).unwrap();
+        assert!(pr.unresolved_threads_floor);
     }
 
     #[test]

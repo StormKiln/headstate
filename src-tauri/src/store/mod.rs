@@ -86,6 +86,7 @@ mod tests {
             }],
             comment_count: 2,
             unresolved_threads: 0,
+            unresolved_threads_floor: false,
             requested_reviewers: Vec::new(),
             assignees: Vec::new(),
             latest_reviews: Vec::new(),

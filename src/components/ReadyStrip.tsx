@@ -1,5 +1,5 @@
 import { prKey } from "@/lib/prIdentity";
-import { CircleCheck } from "lucide-react";
+import { CircleCheck, MessageCircleWarning } from "lucide-react";
 import type { PullRequest } from "@/types/pr";
 import { type Filters, readyForReview, sortReadyForReview } from "@/lib/derive";
 import { useActiveFilters, useFilters } from "@/store/filters";
@@ -68,6 +68,46 @@ function ReadyAgeChip({ readyAt, now }: { readyAt: PullRequest["ready_at"]; now:
         {age.text}
       </time>
       <span className="sr-only">, ready for review since {since}</span>
+    </>
+  );
+}
+
+/// Open review conversations on a row the strip calls ready (#1577).
+///
+/// `readyForReview` does not consider conversations, so without this a
+/// pull request with open questions reads as clean. Amber, as on the main
+/// list's row: unanswered questions are not a failure.
+///
+/// The count is a FLOOR when the list query's thread page came back full
+/// (#802), and then prints as "N+" and reads as "at least N". Absent
+/// (a payload from an older desktop) is treated the same: qualified,
+/// never an exact-looking total that might be low.
+///
+/// Nothing renders for zero. The text carries the count, the icon and
+/// colour only repeat it, and the accessible name spells it out.
+function UnresolvedChip({
+  count,
+  floor,
+}: {
+  count: number;
+  floor: PullRequest["unresolved_threads_floor"];
+}) {
+  if (!(count > 0)) return null;
+  const mayBeShort = floor !== false;
+  const noun = `unresolved conversation${count === 1 ? "" : "s"}`;
+  const label = mayBeShort ? `at least ${count} ${noun}` : `${count} ${noun}`;
+  return (
+    <>
+      <span
+        data-unresolved={mayBeShort ? "floor" : "exact"}
+        title={label.charAt(0).toUpperCase() + label.slice(1)}
+        aria-hidden="true"
+        className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border border-[#d29922]/40 px-1.5 py-0.5 text-xs tabular-nums text-[#d29922]"
+      >
+        <MessageCircleWarning className="h-3 w-3" aria-hidden="true" />
+        {mayBeShort ? `${count}+` : count}
+      </span>
+      <span className="sr-only">, {label}</span>
     </>
   );
 }
@@ -183,6 +223,7 @@ export function ReadyStrip({
                     {pr.repo}#{pr.number} · {pr.author}
                   </span>
                 </span>
+                <UnresolvedChip count={pr.unresolved_threads} floor={pr.unresolved_threads_floor} />
                 <ReadyAgeChip readyAt={pr.ready_at} now={now} />
               </div>
             ) : (
@@ -195,6 +236,7 @@ export function ReadyStrip({
                     {pr.repo}#{pr.number} · {pr.author}
                   </span>
                 </span>
+                <UnresolvedChip count={pr.unresolved_threads} floor={pr.unresolved_threads_floor} />
                 <ReadyAgeChip readyAt={pr.ready_at} now={now} />
               </div>
             )}

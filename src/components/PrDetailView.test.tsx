@@ -166,6 +166,42 @@ describe("PrDetailView layout", () => {
     // link so four controls are not squeezed into 390 pixels.
     const merge = within(bar).getByRole("button", { name: /^merge$/i });
     expect(merge.closest(".basis-full")).toBeTruthy();
+    // #1580: Claudify joins them on that line, not the first one, where
+    // it would push GitHub off the screen. The fixture has no checkout,
+    // so it is the "Copy prompt" form, with its full reason: the second
+    // line wraps, so there is room for the sentence.
+    const claudify = within(bar).getByRole("button", { name: /copy prompt/i });
+    expect(claudify.closest(".basis-full")).toBeTruthy();
+    expect(
+      within(bar).getByText(/No local checkout of octocat\/hello-world was found in the scanned folders/),
+    ).toBeTruthy();
+  });
+
+  /// #1580: every control in the phone header has the 44px floor.
+  ///
+  /// jsdom performs no layout, so this asserts the classes that set the
+  /// floor rather than a measured height. They sit on the bar and reach
+  /// every button and link inside it, so a button added later (as
+  /// Claudify was) cannot miss them.
+  it("gives every control in the phone header a 44px tap target", () => {
+    stubViewport(390);
+    viewer.current = "hubot";
+    const { container } = view();
+    const bar = container.querySelector(".sticky") as HTMLElement;
+    expect(bar.className).toContain("[&_button]:min-h-11");
+    expect(bar.className).toContain("[&_button]:min-w-11");
+    expect(bar.className).toContain("[&_a]:min-h-11");
+    // And the controls it has to reach are inside it.
+    expect(within(bar).getAllByRole("button").length).toBeGreaterThanOrEqual(4);
+    expect(within(bar).getByRole("link", { name: /github/i })).toBeTruthy();
+  });
+
+  /// The desktop keeps its own sizes: the floor is a finger rule.
+  it("does not force the phone's tap targets on the desktop header", () => {
+    stubViewport(1400);
+    const { container } = view();
+    const bar = container.querySelector(".sticky") as HTMLElement;
+    expect(bar.className).not.toContain("min-h-11");
   });
 
   it("keeps the desktop header on one line", () => {
@@ -179,6 +215,76 @@ describe("PrDetailView layout", () => {
     expect(bar.children).toHaveLength(2);
     expect(within(bar).getByRole("button", { name: "Approve" })).toBeTruthy();
     expect(within(bar).getByRole("button", { name: /^merge$/i })).toBeTruthy();
+    // #1580: Claudify is in the cluster, before the GitHub link, so it
+    // does not push GitHub off the end of the line.
+    const cluster = bar.children[1] as HTMLElement;
+    const claudify = within(cluster).getByRole("button", { name: /copy prompt/i });
+    const github = within(cluster).getByRole("link", { name: /github/i });
+    expect(
+      claudify.compareDocumentPosition(github) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    // The one-line bar carries the SHORT reason, with the sentence in
+    // the title and for a screen reader (the "Won't count" pattern).
+    const short = within(cluster).getByText("No local checkout");
+    expect(short.getAttribute("aria-hidden")).toBe("true");
+    expect(short.parentElement?.getAttribute("title")).toMatch(
+      /^No local checkout of octocat\/hello-world was found in the scanned folders/,
+    );
+    // Header-sized, like the buttons beside it.
+    expect(claudify.className).toContain("px-2.5 py-1");
+  });
+
+  /// #1580: Claudify sat at the very bottom, below every comment. It
+  /// is in the sticky header on both layouts now, and not also below.
+  for (const [label, width] of [
+    ["phone", 390],
+    ["desktop", 1400],
+  ] as const) {
+    it(`renders Claudify in the sticky header, once, on ${label}`, () => {
+      stubViewport(width);
+      claudifyState.repos = [
+        { identity: "octocat/hello-world", name: "hello-world", path: "/code/hello-world", worktrees: [] },
+      ];
+      try {
+        const { container } = view();
+        const bar = container.querySelector(".sticky") as HTMLElement;
+        expect(within(bar).getByRole("button", { name: /claudify/i })).toBeTruthy();
+        expect(screen.getAllByRole("button", { name: /claudify/i })).toHaveLength(1);
+      } finally {
+        claudifyState.repos = [];
+      }
+    });
+  }
+
+  /// #1580: the bottom "View on GitHub" duplicated the header's link.
+  /// Exactly ONE way to open the pull request on GitHub remains, and it
+  /// is the pinned one -- on either layout, and for a merged PR whose
+  /// bottom row still exists for Delete branch.
+  for (const [label, width, over] of [
+    ["open PR on a phone", 390, {}],
+    ["open PR on the desktop", 1400, {}],
+    ["merged PR with a live branch", 1400, { state: "MERGED", head_ref_id: "REF_1" }],
+  ] as const) {
+    it(`has exactly one link to the pull request on GitHub: ${label}`, () => {
+      stubViewport(width);
+      const { container } = view(over);
+      const links = [...container.querySelectorAll("a")].filter(
+        (a) => a.getAttribute("href") === "https://github.com/octocat/hello-world/pull/42",
+      );
+      expect(links).toHaveLength(1);
+      expect(links[0].closest(".sticky")).toBeTruthy();
+      expect(screen.queryByText(/view on github/i)).toBeNull();
+    });
+  }
+
+  /// #1580: with GitHub and Claudify gone from the bottom row, an open
+  /// PR has nothing to put there, and the row is not rendered empty.
+  it("renders no empty row where the bottom actions were", () => {
+    stubViewport(1400);
+    const { container } = view();
+    const root = container.firstElementChild as HTMLElement;
+    const empty = [...root.children].filter((c) => c.childNodes.length === 0);
+    expect(empty).toEqual([]);
   });
 
   /// #1278, on BOTH layouts.
@@ -256,7 +362,7 @@ describe("PrDetailView layout", () => {
     expect(seen.length).toBeGreaterThan(0);
   });
 
-  it("still offers review, comment, threads and the footer actions on a phone", () => {
+  it("still offers review, comment, threads and every action on a phone", () => {
     stubViewport(390);
     viewer.current = "hubot";
     view({
@@ -277,7 +383,9 @@ describe("PrDetailView layout", () => {
         },
       ],
     });
-    expect(screen.getByText(/view on github/i)).toBeTruthy();
+    // GitHub and Claudify are in the header since #1580; Delete branch
+    // is still below.
+    expect(screen.getByRole("link", { name: /github/i })).toBeTruthy();
     expect(screen.getByRole("button", { name: /copy prompt/i })).toBeTruthy();
     expect(screen.getByRole("button", { name: /delete branch/i })).toBeTruthy();
     expect(screen.getByText("Why?")).toBeTruthy();
@@ -765,7 +873,7 @@ describe("PrDetailView", () => {
   it("offers a review box but still no diff", () => {
     view();
     expect(screen.getByRole("textbox")).toBeTruthy();
-    expect(screen.getByRole("link", { name: /view on github/i })).toBeTruthy();
+    expect(screen.getByRole("link", { name: /github/i })).toBeTruthy();
     expect(screen.queryByText(/^@@/)).toBeNull();
   });
 
@@ -807,7 +915,10 @@ describe("PrDetailView", () => {
     it("is offered once the PR has merged and the branch still exists", () => {
       state.data = { ...detail(), state: "MERGED", head_ref_id: "REF_1" };
       render(<PrDetailView repo="o/r" number={1} onBack={() => {}} />);
-      expect(screen.getByRole("button", { name: /delete branch/i })).toBeTruthy();
+      const del = screen.getByRole("button", { name: /delete branch/i });
+      // #1580 moved Claudify up and left this where it was: destructive,
+      // below the evidence, and never one of the pinned header actions.
+      expect(del.closest(".sticky")).toBeNull();
     });
 
     // Deleting the head ref of an OPEN pull request closes it off.
