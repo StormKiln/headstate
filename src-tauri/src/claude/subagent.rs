@@ -783,27 +783,17 @@ mod tests {
 
     /// A throwaway directory, removed on drop. The shape `usage.rs` and
     /// `transcript.rs` tests use.
-    struct Tmp(PathBuf);
+    /// A `TempDir` no other run can name, removed when dropped (#1554).
+    struct Tmp(tempfile::TempDir);
     impl Tmp {
         fn new(tag: &str) -> Self {
-            let p = std::env::temp_dir().join(format!(
-                "headstate-subagent-{tag}-{}-{:?}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            std::fs::create_dir_all(&p).unwrap();
-            Tmp(p)
+            Tmp(tempfile::Builder::new()
+                .prefix(&format!("headstate-subagent-{tag}-"))
+                .tempdir()
+                .unwrap())
         }
         fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-    impl Drop for Tmp {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            self.0.path()
         }
     }
 
@@ -1188,7 +1178,7 @@ mod tests {
     #[test]
     fn a_pr_link_record_is_collected() {
         let tmp = Tmp::new("prlink");
-        let path = tmp.0.join("s1.jsonl");
+        let path = tmp.path().join("s1.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(
             f,
@@ -1212,7 +1202,7 @@ mod tests {
     #[test]
     fn repeated_mentions_of_one_pr_collapse_to_the_first() {
         let tmp = Tmp::new("prdedup");
-        let path = tmp.0.join("s1.jsonl");
+        let path = tmp.path().join("s1.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
         for ts in [
             "2026-09-11T14:00:00.000Z",
@@ -1241,7 +1231,7 @@ mod tests {
     #[test]
     fn distinct_pull_requests_are_kept_apart() {
         let tmp = Tmp::new("prmulti");
-        let path = tmp.0.join("s1.jsonl");
+        let path = tmp.path().join("s1.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
         for n in [1u64, 2] {
             writeln!(
@@ -1261,7 +1251,7 @@ mod tests {
     #[test]
     fn the_file_name_decides_the_session_not_the_record() {
         let tmp = Tmp::new("prauth");
-        let path = tmp.0.join("real-session.jsonl");
+        let path = tmp.path().join("real-session.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(
             f,
@@ -1301,7 +1291,7 @@ mod tests {
     #[test]
     fn a_gh_pr_create_result_links_its_pull_request() {
         let tmp = Tmp::new("ghcreate");
-        let path = tmp.0.join("s1.jsonl");
+        let path = tmp.path().join("s1.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
         bash_call(
             &mut f,
@@ -1326,7 +1316,7 @@ mod tests {
     #[test]
     fn only_a_successful_create_with_one_bare_url_links() {
         let tmp = Tmp::new("ghcreate-not");
-        let path = tmp.0.join("s1.jsonl");
+        let path = tmp.path().join("s1.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
         // Failed: the branch already has a PR, which gh names.
         bash_call(
@@ -1370,7 +1360,7 @@ mod tests {
     #[test]
     fn only_real_pr_link_records_count() {
         let tmp = Tmp::new("prnoise");
-        let path = tmp.0.join("s1.jsonl");
+        let path = tmp.path().join("s1.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, r#"{{"type":"user","text":"see the pr-link above"}}"#).unwrap();
         writeln!(f, r#"{{"type":"assistant","text":"opened a PR"}}"#).unwrap();

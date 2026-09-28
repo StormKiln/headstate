@@ -1148,22 +1148,23 @@ mod tests {
         }
 
         /// A transcript on disk, so `summarise_whole` has something real
-        /// to read. Removed when the guard drops.
-        struct Tmp(std::path::PathBuf);
+        /// to read. In its own `TempDir`, removed when the guard drops
+        /// (#1554).
+        struct Tmp(
+            std::path::PathBuf,
+            // Never read: held so the directory lives exactly as long as this.
+            #[allow(dead_code)] tempfile::TempDir,
+        );
         impl Tmp {
             fn new(name: &str, messages: usize) -> Self {
-                let p = std::env::temp_dir().join(format!("headstate-backfill-{name}.jsonl"));
+                let dir = tempfile::TempDir::new().unwrap();
+                let p = dir.path().join(format!("headstate-backfill-{name}.jsonl"));
                 let line = r#"{"type":"assistant","message":{"model":"claude-opus-5","usage":{"input_tokens":7,"output_tokens":11,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
                 let body = std::iter::repeat_n(line, messages)
                     .collect::<Vec<_>>()
                     .join("\n");
                 std::fs::write(&p, body).unwrap();
-                Self(p)
-            }
-        }
-        impl Drop for Tmp {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_file(&self.0);
+                Self(p, dir)
             }
         }
 
@@ -1207,7 +1208,8 @@ mod tests {
         #[test]
         fn a_transcript_over_the_budget_is_read_whole() {
             let conn = db();
-            let p = std::env::temp_dir().join("headstate-backfill-over-budget.jsonl");
+            let dir = tempfile::TempDir::new().unwrap();
+            let p = dir.path().join("headstate-backfill-over-budget.jsonl");
             // One record, then padding past the cap. The padding lines
             // are not usage records, so they change no figure -- they
             // exist only to push the file past `BUDGET_BYTES`.
@@ -1223,7 +1225,6 @@ mod tests {
 
             record_usage(&conn, "s", &usage(1, true), "2026-09-01T00:00:00Z").unwrap();
             backfill_one(&conn, "s", &p, "2026-09-02T00:00:00Z").unwrap();
-            let _ = std::fs::remove_file(&p);
 
             let truncated: i64 = conn
                 .query_row(

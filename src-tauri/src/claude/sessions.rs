@@ -1442,7 +1442,8 @@ mod tests {
     /// pointed at whatever tree the terminal was in.
     #[test]
     fn an_existing_cwd_produces_a_cd_prefixed_command() {
-        let dir = std::env::temp_dir().join("headstate-cwd-exists-918");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("headstate-cwd-exists-918");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.to_string_lossy().into_owned();
         let state = check_cwd(Some(&path));
@@ -1460,7 +1461,6 @@ mod tests {
             "{}",
             got.command
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A missing directory gets the bare command AND a warning.
@@ -1530,14 +1530,14 @@ mod tests {
         // A path under a FILE gives NotADirectory/NotFound depending on
         // the platform, so the assertion is on the shape rather than on
         // one errno: it must never be `Exists`.
-        let file = std::env::temp_dir().join("headstate-cwd-is-a-file-918");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("headstate-cwd-is-a-file-918");
         std::fs::write(&file, b"x").unwrap();
         assert_eq!(
             check_cwd(Some(&file.to_string_lossy())),
             CwdState::Gone,
             "a FILE is not a directory `cd` can enter"
         );
-        let _ = std::fs::remove_file(&file);
         assert_eq!(check_cwd(None), CwdState::NotRecorded);
         assert_eq!(check_cwd(Some("")), CwdState::NotRecorded);
     }
@@ -1621,7 +1621,8 @@ mod tests {
     /// guard against someone "simplifying" the two into one call.
     #[test]
     fn a_live_transcript_exists_where_the_cwd_check_would_call_it_gone() {
-        let dir = std::env::temp_dir().join("headstate-transcript-919");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("headstate-transcript-919");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("c8518222.jsonl");
         std::fs::write(&file, b"{}\n").unwrap();
@@ -1638,8 +1639,6 @@ mod tests {
             "the cwd check requires a directory, which is exactly why the transcript \
              needs its own check rather than reusing this one"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A directory at the transcript's path is not a transcript.
@@ -1650,13 +1649,13 @@ mod tests {
     /// transcript is the silent-nothing failure in a different costume.
     #[test]
     fn a_directory_at_the_transcript_path_is_not_a_transcript() {
-        let dir = std::env::temp_dir().join("headstate-transcript-isdir-919");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("headstate-transcript-isdir-919");
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(
             check_transcript(Some(&dir.to_string_lossy())),
             CwdState::Gone
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A missing transcript is `Gone`, and a session with none recorded
@@ -1669,8 +1668,8 @@ mod tests {
     /// file that was never missing.
     #[test]
     fn a_missing_transcript_is_gone_and_an_unrecorded_one_is_not() {
-        let missing = std::env::temp_dir().join("headstate-919-no-such-transcript.jsonl");
-        let _ = std::fs::remove_file(&missing);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("headstate-919-no-such-transcript.jsonl");
         assert_eq!(
             check_transcript(Some(&missing.to_string_lossy())),
             CwdState::Gone
@@ -1702,7 +1701,8 @@ mod tests {
     #[test]
     fn a_transcript_that_could_not_be_checked_is_not_reported_as_gone() {
         use std::os::unix::fs::PermissionsExt;
-        let root = std::env::temp_dir().join("headstate-919-eacces");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("headstate-919-eacces");
         let locked = root.join("locked");
         std::fs::create_dir_all(&locked).unwrap();
         let file = locked.join("c8518222.jsonl");
@@ -1719,7 +1719,6 @@ mod tests {
         // undeletable directory into the temp dir -- the pattern
         // `transcript::tests::an_unreadable_project_directory...` uses.
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let _ = std::fs::remove_dir_all(&root);
 
         // Running as root defeats the sabotage: root reads through mode
         // 000. Skip rather than assert a falsehood -- a test that only
@@ -1789,7 +1788,8 @@ mod tests {
     /// derived from the other.
     #[test]
     fn a_gone_cwd_leaves_the_transcript_state_untouched() {
-        let dir = std::env::temp_dir().join("headstate-919-both-states");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("headstate-919-both-states");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("c8518222.jsonl");
         std::fs::write(&file, b"{}\n").unwrap();
@@ -1823,8 +1823,6 @@ mod tests {
             "the transcript survives the worktree, which is the whole point of \
              carrying two states"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- #917: the list ----
@@ -2444,7 +2442,8 @@ mod tests {
     /// lost information rather than the transport did.
     #[test]
     fn the_detail_carries_what_the_list_no_longer_does() {
-        let dir = std::env::temp_dir().join("headstate-985-detail-fields");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("headstate-985-detail-fields");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("s1.jsonl");
         std::fs::write(&file, b"{}\n").unwrap();
@@ -2493,8 +2492,6 @@ mod tests {
             Some("2026-09-02T00:00:00Z")
         );
         assert_eq!(row.cwd_state, CwdState::Exists);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The four fields search covers are on EVERY list row.

@@ -544,20 +544,20 @@ mod tests {
     /// time this shipped".
     struct Fixture {
         dir: std::path::PathBuf,
+        /// Owns `dir`, and removes it when the fixture drops (#1554).
+        _tmp: tempfile::TempDir,
     }
 
     impl Fixture {
         fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "headstate-repos-{tag}-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0)
-            ));
-            std::fs::create_dir_all(&dir).expect("fixture root");
-            Self { dir }
+            let tmp = tempfile::Builder::new()
+                .prefix(&format!("headstate-repos-{tag}-"))
+                .tempdir()
+                .expect("fixture root");
+            Self {
+                dir: tmp.path().to_path_buf(),
+                _tmp: tmp,
+            }
         }
 
         fn write(&self, rel: &str, body: &[u8]) {
@@ -593,12 +593,6 @@ mod tests {
 
         fn add_all(&self) {
             self.git(&["add", "-A"]);
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 
