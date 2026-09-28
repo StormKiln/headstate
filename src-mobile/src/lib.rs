@@ -334,9 +334,8 @@ mod tests {
 
     #[test]
     fn the_vault_key_is_made_once_and_read_back() {
-        let dir =
-            std::env::temp_dir().join(format!("headstate-companion-key-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("headstate-companion-key");
         std::fs::create_dir_all(&dir).unwrap();
         let a = super::vault_key(&dir).unwrap();
         let b = super::vault_key(&dir).unwrap();
@@ -344,6 +343,5 @@ mod tests {
         assert_eq!(a.len(), super::store::VAULT_KEY_LEN);
         std::fs::write(dir.join(super::store::VAULT_KEY_FILE), b"short").unwrap();
         assert!(super::vault_key(&dir).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

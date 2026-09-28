@@ -867,38 +867,37 @@ mod tests {
     // discovery must not depend on PATH alone.
     #[test]
     fn finds_gh_via_path() {
-        let tmp = std::env::temp_dir().join(format!("hs-gh-path-{}", std::process::id()));
+        let t = tempfile::TempDir::new().unwrap();
+        let tmp = t.path().join("path");
         let bin = fake_gh(&tmp);
         // Injected, not edited: replacing the process PATH broke every
         // concurrent `git` spawn in the suite (#481).
         assert_eq!(find_gh_with(&[], tmp.to_str(), None), Some(bin.clone()));
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn explicit_override_wins_over_path() {
-        let a = std::env::temp_dir().join(format!("hs-gh-a-{}", std::process::id()));
-        let b = std::env::temp_dir().join(format!("hs-gh-b-{}", std::process::id()));
+        let t = tempfile::TempDir::new().unwrap();
+        let a = t.path().join("a");
+        let b = t.path().join("b");
         fake_gh(&a);
         let want = fake_gh(&b);
         assert_eq!(
             find_gh_with(&[], a.to_str(), want.to_str()),
             Some(want.clone())
         );
-        std::fs::remove_dir_all(&a).ok();
-        std::fs::remove_dir_all(&b).ok();
     }
 
     // An override pointing at nothing must fall through, not hard-fail.
     #[test]
     fn bogus_override_falls_back_to_path() {
-        let tmp = std::env::temp_dir().join(format!("hs-gh-fb-{}", std::process::id()));
+        let t = tempfile::TempDir::new().unwrap();
+        let tmp = t.path().join("fb");
         let bin = fake_gh(&tmp);
         assert_eq!(
             find_gh_with(&[], tmp.to_str(), Some("/nonexistent/gh")),
             Some(bin.clone())
         );
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     // THE REGRESSION TEST for the v1.0.0 hang. A GUI-launched .app gets
@@ -907,9 +906,10 @@ mod tests {
     // installed" to a user whose terminal `gh` works fine.
     #[test]
     fn finds_gh_outside_path_via_fallback_dirs() {
-        let brew = std::env::temp_dir().join(format!("hs-gh-brew-{}", std::process::id()));
+        let t = tempfile::TempDir::new().unwrap();
+        let brew = t.path().join("brew");
         let want = fake_gh(&brew);
-        let empty = std::env::temp_dir().join(format!("hs-gh-nopath-{}", std::process::id()));
+        let empty = t.path().join("nopath");
         std::fs::create_dir_all(&empty).unwrap();
         let fallbacks = [brew.to_str().unwrap()];
         // A PATH with no gh on it at all, as a GUI app sees.
@@ -917,13 +917,12 @@ mod tests {
             find_gh_with(&fallbacks, empty.to_str(), None),
             Some(want.clone())
         );
-        std::fs::remove_dir_all(&brew).ok();
-        std::fs::remove_dir_all(&empty).ok();
     }
 
     #[test]
     fn returns_none_when_gh_is_nowhere() {
-        let empty = std::env::temp_dir().join(format!("hs-gh-empty-{}", std::process::id()));
+        let t = tempfile::TempDir::new().unwrap();
+        let empty = t.path().join("empty");
         std::fs::create_dir_all(&empty).unwrap();
         // Only meaningful if the machine has no gh in a fallback dir.
         if GH_FALLBACK_DIRS
@@ -932,7 +931,6 @@ mod tests {
         {
             assert_eq!(find_gh_with(GH_FALLBACK_DIRS, empty.to_str(), None), None);
         }
-        std::fs::remove_dir_all(&empty).ok();
     }
 
     /// The executable name must follow the platform. Windows installs
@@ -948,7 +946,8 @@ mod tests {
     /// that is the bug. On Unix it must, since that is the real name.
     #[test]
     fn a_bare_gh_file_matches_only_where_that_is_the_real_name() {
-        let tmp = std::env::temp_dir().join(format!("hs-gh-bare-{}", std::process::id()));
+        let t = tempfile::TempDir::new().unwrap();
+        let tmp = t.path().join("bare");
         std::fs::create_dir_all(&tmp).unwrap();
         let bare = tmp.join("gh");
         std::fs::write(&bare, "x").unwrap();
@@ -959,7 +958,6 @@ mod tests {
         } else {
             assert_eq!(found, Some(bare.clone()));
         }
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// The fallback list is per-platform, so it must never contain paths

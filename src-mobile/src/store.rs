@@ -224,14 +224,15 @@ mod tests {
         }
     }
 
-    fn temp_snapshot(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "headstate-companion-store-{tag}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join(SNAPSHOT_FILE)
+    /// A snapshot path in its own `TempDir` (#1554). Keep the guard alive
+    /// for the test: the directory goes when it drops.
+    fn temp_snapshot(tag: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("headstate-companion-store-{tag}-"))
+            .tempdir()
+            .unwrap();
+        let path = dir.path().join(SNAPSHOT_FILE);
+        (dir, path)
     }
 
     /// The production backend, end to end: a value written through one
@@ -239,7 +240,7 @@ mod tests {
     /// same key, and a wrong key cannot open it.
     #[test]
     fn stronghold_persists_across_reopen_and_refuses_the_wrong_key() {
-        let path = temp_snapshot("reopen");
+        let (_tmp, path) = temp_snapshot("reopen");
         let key = vec![7u8; VAULT_KEY_LEN];
         {
             let store = StrongholdStore::open(&path, key.clone()).unwrap();
@@ -255,6 +256,5 @@ mod tests {
         assert_eq!(third.get("desktops").unwrap(), None);
 
         assert!(StrongholdStore::open(&path, vec![8u8; VAULT_KEY_LEN]).is_err());
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

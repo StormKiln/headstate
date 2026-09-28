@@ -194,31 +194,72 @@ mod live {
     use super::*;
     use crate::store::open_db;
 
-    /// Writes to the REAL database the running app uses, proving the
-    /// migration and round-trip work on live data rather than a temp file.
-    /// Cleans up after itself. Run manually:
+    /// Proves the migration and a settings round-trip work on the shape of
+    /// this machine's live data, rather than on a fresh temp file. Run
+    /// manually, on macOS:
     /// `cargo test --lib live_settings -- --ignored --nocapture`
+    ///
+    /// On a COPY (#1554). This used to open the real database, overwrite
+    /// the owner's configured worktree directories, and restore them
+    /// afterwards -- so a panic anywhere between the two lost the setting.
+    /// The real files are only read here, by `std::fs::copy`; `open_db`,
+    /// which migrates, and every write run against the copy in a
+    /// `TempDir`, which is dropped with everything in it.
     #[test]
-    #[ignore]
+    #[ignore = "a live probe: reads this machine's app database"]
     fn live_settings_round_trip() {
-        let path = std::path::PathBuf::from(std::env::var("HOME").unwrap())
-            .join("Library/Application Support/com.pktstorm.headstate/headstate.db");
-        let conn = open_db(&path).unwrap();
-
-        let before: Option<Vec<String>> = get(&conn, keys::WORKTREE_DIRS).unwrap();
-        set(&conn, keys::WORKTREE_DIRS, &vec!["/tmp/probe".to_string()]).unwrap();
-        let read: Option<Vec<String>> = get(&conn, keys::WORKTREE_DIRS).unwrap();
-        println!("LIVE round-trip: {read:?}");
+        let real = {
+            let _home = crate::auth::test_home::real_for_a_live_probe();
+            crate::auth::home_dir()
+                .expect("a home directory")
+                .join("Library")
+                .join("Application Support")
+                .join("com.pktstorm.headstate")
+        };
+        let (before, read) = round_trip_on_a_copy(&real);
+        println!("LIVE (copy) before: {before:?}, round-trip: {read:?}");
         assert_eq!(read, Some(vec!["/tmp/probe".to_string()]));
+    }
 
-        // Restore whatever was there, so a manual run leaves no trace.
-        match before {
-            Some(v) => set(&conn, keys::WORKTREE_DIRS, &v).unwrap(),
-            None => {
-                conn.execute("DELETE FROM settings WHERE key = ?1", [keys::WORKTREE_DIRS])
-                    .unwrap();
+    /// Copies the app database in `dir` into a fresh `TempDir`, migrates
+    /// the COPY, and round-trips `WORKTREE_DIRS` on it. Returns the value
+    /// before and after. `dir` is only read, by `std::fs::copy`.
+    fn round_trip_on_a_copy(dir: &std::path::Path) -> (Option<Vec<String>>, Option<Vec<String>>) {
+        let copy = tempfile::TempDir::new().unwrap();
+        for name in ["headstate.db", "headstate.db-wal"] {
+            let from = dir.join(name);
+            if from.is_file() {
+                std::fs::copy(&from, copy.path().join(name)).unwrap();
             }
         }
-        println!("LIVE restored");
+        let path = copy.path().join("headstate.db");
+        assert!(path.is_file(), "no app database under {}", dir.display());
+        let conn = open_db(&path).unwrap();
+        let before = get(&conn, keys::WORKTREE_DIRS).unwrap();
+        set(&conn, keys::WORKTREE_DIRS, &vec!["/tmp/probe".to_string()]).unwrap();
+        (before, get(&conn, keys::WORKTREE_DIRS).unwrap())
+    }
+
+    /// The helper the live probe uses, against a generated database: the
+    /// copy takes the round-trip, and the source is byte-for-byte what it
+    /// was.
+    #[test]
+    fn the_round_trip_changes_the_copy_and_not_the_source() {
+        let source = tempfile::TempDir::new().unwrap();
+        let db = source.path().join("headstate.db");
+        {
+            let conn = open_db(&db).unwrap();
+            set(&conn, keys::WORKTREE_DIRS, &vec!["/src/a".to_string()]).unwrap();
+        }
+        let bytes = std::fs::read(&db).unwrap();
+        let (before, read) = round_trip_on_a_copy(source.path());
+        assert_eq!(before, Some(vec!["/src/a".to_string()]));
+        assert_eq!(read, Some(vec!["/tmp/probe".to_string()]));
+        assert_eq!(std::fs::read(&db).unwrap(), bytes, "the source was written");
+        let conn = open_db(&db).unwrap();
+        assert_eq!(
+            get::<Vec<String>>(&conn, keys::WORKTREE_DIRS).unwrap(),
+            Some(vec!["/src/a".to_string()])
+        );
     }
 }

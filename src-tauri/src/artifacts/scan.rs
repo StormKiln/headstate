@@ -708,21 +708,23 @@ dist/
 mod streaming_tests {
     use super::*;
 
-    struct Tmp(std::path::PathBuf);
+    /// A `TempDir` no other run can name, removed when dropped (#1554).
+    /// `.0` is its path, so the tests read as they did.
+    struct Tmp(
+        std::path::PathBuf,
+        // Never read: held so the directory lives exactly as long as this.
+        #[allow(dead_code)] tempfile::TempDir,
+    );
     impl Tmp {
         fn new(name: &str) -> Self {
-            let p = std::env::temp_dir().join(format!("headstate-scan-{name}"));
-            let _ = std::fs::remove_dir_all(&p);
-            std::fs::create_dir_all(&p).unwrap();
-            Self(p)
+            let dir = tempfile::Builder::new()
+                .prefix(&format!("headstate-scan-{name}-"))
+                .tempdir()
+                .unwrap();
+            Self(dir.path().to_path_buf(), dir)
         }
         fn s(&self) -> String {
             self.0.to_string_lossy().into_owned()
-        }
-    }
-    impl Drop for Tmp {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 

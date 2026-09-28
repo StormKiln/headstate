@@ -683,7 +683,8 @@ mod tests {
     fn a_cwd_that_is_a_file_is_reported_as_missing() {
         // `is_dir`, not `exists`: a path that became a file is not
         // somewhere a `cd` can land either.
-        let f = std::env::temp_dir().join("headstate-launch-cwd-test");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("headstate-launch-cwd-test");
         std::fs::write(&f, b"x").unwrap();
         let e = launch(
             "open -a Terminal {command}",
@@ -691,7 +692,6 @@ mod tests {
             Some(&f.to_string_lossy()),
         )
         .unwrap_err();
-        let _ = std::fs::remove_file(&f);
         assert!(matches!(e, LaunchError::CwdMissing { .. }), "{e:?}");
     }
 
@@ -806,9 +806,9 @@ mod tests {
     /// that the breakout did not run.
     #[test]
     fn nothing_in_a_brief_can_escape_its_quoting() {
-        let dir = std::env::temp_dir();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
         let canary = dir.join("headstate-1292-canary");
-        let _ = std::fs::remove_file(&canary);
 
         // Every shape a Markdown brief can legitimately contain, plus a
         // deliberate quote-breakout attempt.
@@ -849,7 +849,6 @@ mod tests {
                 "a brief escaped its quoting and ran a command: {p:?}"
             );
         }
-        let _ = std::fs::remove_file(&canary);
     }
 
     /// The `cd` is quoted, so a repository path cannot inject.
@@ -1123,8 +1122,8 @@ mod tests {
             );
             let retargeted = format!("{before}{head}-e 'do shell script (item 1 of argv)'{tail}");
 
-            let canary = std::env::temp_dir().join(format!("headstate-1309-dispatch-{app}"));
-            let _ = std::fs::remove_file(&canary);
+            let tmp = tempfile::TempDir::new().unwrap();
+            let canary = tmp.path().join(format!("headstate-1309-dispatch-{app}"));
             let command = format!(
                 "touch {}",
                 super::super::sessions::shell_quote(&canary.to_string_lossy())
@@ -1153,7 +1152,6 @@ mod tests {
                 "{app} preset's script shape did not run the command -- osascript \
                  accepted it but the command never reached a shell: {retargeted}"
             );
-            let _ = std::fs::remove_file(&canary);
         }
     }
 
@@ -1240,8 +1238,8 @@ mod tests {
                 continue;
             }
 
-            let canary = std::env::temp_dir().join(format!("headstate-1302-canary-{app}"));
-            let _ = std::fs::remove_file(&canary);
+            let tmp = tempfile::TempDir::new().unwrap();
+            let canary = tmp.path().join(format!("headstate-1302-canary-{app}"));
             let command = format!(
                 "touch {}",
                 super::super::sessions::shell_quote(&canary.to_string_lossy(),)
@@ -1268,7 +1266,6 @@ mod tests {
                 "{app} preset opened without running the command -- \
                  this is the #1302 bug: {tpl}"
             );
-            let _ = std::fs::remove_file(&canary);
             checked += 1;
         }
 

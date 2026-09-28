@@ -406,18 +406,19 @@ pub mod tail {
 mod tail_tests {
     use super::tail::{self, TailError};
 
-    /// A temp file holding `body`, removed when the guard drops.
-    struct Tmp(std::path::PathBuf);
+    /// A file holding `body` in its own `TempDir`, removed when the guard
+    /// drops (#1554).
+    struct Tmp(
+        std::path::PathBuf,
+        // Never read: held so the directory lives exactly as long as this.
+        #[allow(dead_code)] tempfile::TempDir,
+    );
     impl Tmp {
         fn new(name: &str, body: &[u8]) -> Self {
-            let p = std::env::temp_dir().join(format!("headstate-tail-{name}"));
+            let dir = tempfile::TempDir::new().unwrap();
+            let p = dir.path().join(format!("headstate-tail-{name}"));
             std::fs::write(&p, body).unwrap();
-            Self(p)
-        }
-    }
-    impl Drop for Tmp {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
+            Self(p, dir)
         }
     }
 
@@ -496,8 +497,8 @@ mod tail_tests {
         // A log that was never written is the normal state of a fresh
         // install. Reporting it as a failure sends a user looking for a
         // problem that is not there.
-        let p = std::env::temp_dir().join("headstate-tail-definitely-absent");
-        let _ = std::fs::remove_file(&p);
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("headstate-tail-definitely-absent");
         match tail::read(&p, 1024).unwrap_err() {
             TailError::NotFound { path } => assert!(path.contains("definitely-absent")),
             other => panic!("expected NotFound, got {other:?}"),

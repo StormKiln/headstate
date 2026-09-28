@@ -190,3 +190,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util"] }
 # The stand-in desktop gzips a reply the way the real listener does
 # (#1478). Already in this graph via png and zip.
 flate2 = "1"
+# Test fixtures in a directory no concurrent run can name, removed on
+# drop (#1554). Already in this graph at this version.
+tempfile = "3"

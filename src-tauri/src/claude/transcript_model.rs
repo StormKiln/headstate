@@ -2322,14 +2322,8 @@ mod tests {
     /// A subagent call links to its transcript under `subagents/`.
     #[test]
     fn subagent_call_links_to_its_transcript() {
-        let dir = std::env::temp_dir().join(format!(
-            "headstate-tmodel-sub-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("headstate-tmodel-sub");
         let parent = dir.join("session-1.jsonl");
         let sub = dir.join("session-1").join("subagents");
         std::fs::create_dir_all(&sub).unwrap();
@@ -2382,7 +2376,6 @@ mod tests {
         assert!(
             matches!(&page.messages[0].blocks[0], TranscriptBlock::ToolResult(o) if o.subagent.is_none())
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #1504: a task tool's result carries the id a create was given --
@@ -2809,17 +2802,13 @@ mod tests {
         );
     }
 
-    fn tmp_file(tag: &str, contents: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "headstate-tmodel-{tag}-{}-{}.jsonl",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+    /// A transcript file in its own `TempDir` (#1554). Keep the guard
+    /// alive for the test: the file goes when it drops.
+    fn tmp_file(tag: &str, contents: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join(format!("headstate-tmodel-{tag}.jsonl"));
         std::fs::write(&p, contents).unwrap();
-        p
+        (dir, p)
     }
 
     /// The full text of a clipped block comes back by address, and is
@@ -2835,7 +2824,7 @@ mod tests {
             ),
         ];
         // CRLF, so the fetch's line handling is exercised on Windows endings.
-        let p = tmp_file("full", &body(&recs).replace('\n', "\r\n"));
+        let (_tmp, p) = tmp_file("full", &body(&recs).replace('\n', "\r\n"));
         let page = tail(&p).unwrap();
         let TranscriptBlock::ToolCall {
             result: Some(out), ..
@@ -2852,14 +2841,13 @@ mod tests {
         assert!(block_text(&p, "missing", 0, None).is_err());
         assert!(block_text(&p, "^+1", 0, None).is_err());
         assert!(block_text(&p, "a1/model", 0, None).is_err());
-        let _ = std::fs::remove_file(&p);
     }
 
     /// The fetch is bounded too, and says so.
     #[test]
     fn full_text_is_bounded() {
         let huge = "y".repeat(FULL_TEXT_CHARS + 5);
-        let p = tmp_file(
+        let (_tmp, p) = tmp_file(
             "bound",
             &body(&[user(
                 "u1",
@@ -2875,7 +2863,6 @@ mod tests {
                 total_chars: FULL_TEXT_CHARS + 5
             })
         );
-        let _ = std::fs::remove_file(&p);
     }
 
     /// A tail that starts mid-file drops the partial first line, says it
@@ -2891,14 +2878,13 @@ mod tests {
             serde_json::json!({"type": "permission-mode", "permissionMode": "auto"}),
             user("u1", serde_json::json!("hi")),
         ];
-        let p = tmp_file("mid", &body(&recs));
+        let (_tmp, p) = tmp_file("mid", &body(&recs));
         let page = tail(&p).unwrap();
         assert!(page.truncated);
         assert!(page.bytes_read <= preview::TAIL_BYTES);
         assert_eq!(page.messages.len(), 2, "{:#?}", page.messages);
         assert_eq!(page.messages[0].id_source, IdSource::Unanchored);
         assert_eq!(page.messages[1].id, "u1");
-        let _ = std::fs::remove_file(&p);
     }
 
     /// Every message and tool output carries its record's file offset,
@@ -2912,7 +2898,7 @@ mod tests {
             call("a1", "t1"),
             result("r1", "t1")
         );
-        let p = tmp_file("offsets", &text);
+        let (_tmp, p) = tmp_file("offsets", &text);
         let page = tail(&p).unwrap();
         let bytes = std::fs::read(&p).unwrap();
         let starts =
@@ -2937,7 +2923,6 @@ mod tests {
             }
         }
         assert_eq!(seen, 3);
-        let _ = std::fs::remove_file(&p);
     }
 
     /// With the record's offset as a hint, the full-text fetch reads that
@@ -2956,7 +2941,7 @@ mod tests {
                 serde_json::json!([{"type": "tool_result", "tool_use_id": "t1", "content": long}]),
             ),
         ];
-        let p = tmp_file("hint", &body(&recs));
+        let (_tmp, p) = tmp_file("hint", &body(&recs));
         let page = tail(&p).unwrap();
         let TranscriptBlock::ToolCall {
             result: Some(out), ..
@@ -2974,7 +2959,6 @@ mod tests {
             assert_eq!(how, Located::Scan, "{stale:?}");
             assert_eq!(again, full);
         }
-        let _ = std::fs::remove_file(&p);
     }
 
     /// A hinted fetch of a record far larger than the fetch returns
@@ -2989,7 +2973,7 @@ mod tests {
         );
         rec["toolUseResult"] = serde_json::json!({"stdout": huge});
         let recs = [user("u0", serde_json::json!("go")), call("a1", "t1"), rec];
-        let p = tmp_file("hint-huge", &body(&recs));
+        let (_tmp, p) = tmp_file("hint-huge", &body(&recs));
         let at = std::fs::read_to_string(&p).unwrap().find("\"r1\"").unwrap();
         let start = std::fs::read(&p).unwrap()[..at]
             .iter()
@@ -3005,6 +2989,5 @@ mod tests {
                 total_chars: huge.len()
             })
         );
-        let _ = std::fs::remove_file(&p);
     }
 }

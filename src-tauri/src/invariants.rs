@@ -191,10 +191,24 @@ mod tests {
     /// production text at all. Taking the path as a parameter is what
     /// stops the next walk from forgetting to ask.
     fn production(file: &Path, src: &str) -> String {
-        if test_only_files().contains(&canonical(file)) {
-            return String::new();
-        }
         let mut out = String::new();
+        for (line, test) in src.lines().zip(test_mask(file, src)) {
+            if !test {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// For each of `src.lines()`, whether it is TEST code: the complement
+    /// of [`production`], which is built from it, so the two can never
+    /// disagree about where a test module ends.
+    fn test_mask(file: &Path, src: &str) -> Vec<bool> {
+        if test_only_files().contains(&canonical(file)) {
+            return vec![true; src.lines().count()];
+        }
+        let mut out = Vec::new();
         // `Some(true)` while the skipped item's own header line
         // (`mod tests {`, `fn helper() {`) is still to be consumed: that
         // line is itself at column 0, so looking for the terminator
@@ -206,6 +220,7 @@ mod tests {
             match skipping {
                 Some(true) => {
                     skipping = Some(false);
+                    out.push(true);
                     continue;
                 }
                 Some(false) => {
@@ -216,6 +231,7 @@ mod tests {
                     if top_level && starts_an_item(line) {
                         skipping = None;
                     } else {
+                        out.push(true);
                         continue;
                     }
                 }
@@ -223,10 +239,10 @@ mod tests {
             }
             if line.trim_start().starts_with("#[cfg(test)]") {
                 skipping = Some(true);
+                out.push(true);
                 continue;
             }
-            out.push_str(line);
-            out.push('\n');
+            out.push(false);
         }
         out
     }
@@ -4471,14 +4487,6 @@ fn suggestion(f: &Finding) -> String {
             "Windows `USERPROFILE` for where winget and Scoop put `gh`: \
              read-only PATH candidates, never under `.claude`.",
         ),
-        (
-            "src-tauri/packages/tools.rs",
-            "fallback_dirs",
-            "`$HOME` for package managers' bin directories: read-only PATH \
-             candidates, never under `.claude`. Routing it through \
-             `home_dir` would change tool lookup on Windows, which #1535 \
-             did not set out to do.",
-        ),
     ];
 
     /// Spellings that resolve the home directory around `auth::home_dir`:
@@ -4493,6 +4501,45 @@ fn suggestion(f: &Finding) -> String {
         "home::home_dir",
         "directories::",
     ];
+
+    /// Calls that write, as an `#[ignore]` probe reaching the real home
+    /// might spell them (#1554): the filesystem's, and the store's --
+    /// `open_db` migrates the file it opens, so it is a write too.
+    ///
+    /// Matched in the probe's OWN body only. A write inside a function the
+    /// probe calls is invisible, which is why a probe that must write
+    /// hands a real path to a helper that COPIES it into a `TempDir` first
+    /// (`store::settings`' `live_settings_round_trip`), and that helper is
+    /// tested against a fixture like any other code.
+    const PROBE_WRITES: &[&str] = &[
+        "fs::write(",
+        "File::create(",
+        "OpenOptions",
+        "create_dir(",
+        "create_dir_all(",
+        "remove_file(",
+        "remove_dir(",
+        "remove_dir_all(",
+        "fs::rename(",
+        "fs::copy(",
+        "set_permissions(",
+        "open_db(",
+        ".execute(",
+        ".execute_batch(",
+        "set(&conn",
+        "settings::set(",
+    ];
+
+    /// Live probes whose flagged write goes to a `TempDir` the probe made,
+    /// as `(file, probe, call, why)`, each read and verified. Each must
+    /// still match, so an entry cannot outlive the line it excuses.
+    const PROBE_WRITES_TO_A_TEMPDIR: &[(&str, &str, &str, &str)] = &[(
+        "src-tauri/claude/search.rs",
+        "real_corpus",
+        ".execute_batch(",
+        "checkpoints the bench's own index database, built in a TempDir, \
+         before measuring its size; the real corpus is only read",
+    )];
 
     /// Whether `line` contains `token` as a whole path segment: `dirs::`
     /// must not match `scan_dirs::`, which is a module in this tree.
@@ -4549,6 +4596,38 @@ fn suggestion(f: &Finding) -> String {
         let ignored = ignored_test_spans(&lines);
         let in_ignored = |n: usize| ignored.iter().any(|(a, b)| (*a..*b).contains(&n));
         let mut out = Vec::new();
+        // An `#[ignore]` probe may READ the real home, never write it
+        // (#1554). One that reaches the real home -- the opt-in, or a
+        // home token read directly -- is flagged for any write API in
+        // its own body.
+        for &(a, b) in &ignored {
+            let code = || (a..b).filter(|&n| !is_comment(lines[n]));
+            let real = code().any(|n| {
+                lines[n].contains("real_for_a_live_probe")
+                    || HOME_TOKENS.iter().any(|t| has_token(lines[n], t))
+            });
+            if !real {
+                continue;
+            }
+            let probe = fn_declared(lines[a]).unwrap_or("");
+            for n in code() {
+                if let Some(w) = PROBE_WRITES.iter().find(|w| has_token(lines[n], w)) {
+                    if let Some(&(f, g, _, _)) = PROBE_WRITES_TO_A_TEMPDIR
+                        .iter()
+                        .find(|(f, g, t, _)| *f == rel && *g == probe && t == w)
+                    {
+                        used.insert((f, g));
+                        continue;
+                    }
+                    out.push(format!(
+                        "{rel}:{}: `{w}` in an #[ignore] probe that reaches the real home, \
+                         which it may only read: {}",
+                        n + 1,
+                        lines[n].trim()
+                    ));
+                }
+            }
+        }
         for (n, line) in lines.iter().enumerate() {
             if is_comment(line) || in_ignored(n) {
                 continue;
@@ -4621,7 +4700,11 @@ fn suggestion(f: &Finding) -> String {
     ///    is exempt: a person runs it on purpose to measure this machine,
     ///    never CI or the merge queue. The opt-in that gives such a probe
     ///    the real home, `test_home::real_for_a_live_probe`, may appear
-    ///    ONLY in an `#[ignore]` test.
+    ///    ONLY in an `#[ignore]` test. And such a probe may only READ:
+    ///    one that reaches the real home and writes in its own body is
+    ///    flagged (#1554), because `store::settings`' probe once overwrote
+    ///    a setting in the owner's app database and restored it after an
+    ///    assertion that could panic.
     ///
     /// # What it cannot see
     ///
@@ -4632,11 +4715,16 @@ fn suggestion(f: &Finding) -> String {
     ///   sees no home rather than the fixture. That fails safe -- nothing
     ///   real is reached -- but such a test sees "no home", not its
     ///   fixture.
-    /// - **What an `#[ignore]` probe does with the real home.** The opt-in
-    ///   says it must only read; nothing here checks that.
+    /// - **A write an `#[ignore]` probe makes out of sight.** A probe that
+    ///   reaches the real home is flagged for any [`PROBE_WRITES`] call in
+    ///   its own body (#1554), but not for one in a function it calls, one
+    ///   spelled otherwise (a `std::process::Command`, a crate's own
+    ///   save), or one aimed at a `TempDir` it made -- that last is a
+    ///   false positive, and the way out is a copying helper tested on a
+    ///   fixture, as `store::settings` does.
     /// - **The allowlisted readers' callers.** A test reaching
-    ///   `tools::fallback_dirs` still reads real PATH candidate
-    ///   directories. Read-only, and nothing under `.claude`.
+    ///   `auth::user_fallback_dirs` still reads real PATH candidate
+    ///   directories on Windows. Read-only, and nothing under `.claude`.
     /// - **Other crates' tests at runtime.** The source half reads
     ///   `src-mobile` and the step-up crate as text; neither resolves a
     ///   home today.
@@ -4685,12 +4773,14 @@ fn suggestion(f: &Finding) -> String {
         assert!(ignored >= 40, "found only {ignored} #[ignore] tests");
         let stale: Vec<_> = HOME_READERS
             .iter()
-            .filter(|(f, g, _)| !used.contains(&(*f, *g)))
-            .map(|(f, g, _)| format!("{f}::{g}"))
+            .map(|(f, g, _)| (f, g))
+            .chain(PROBE_WRITES_TO_A_TEMPDIR.iter().map(|(f, g, _, _)| (f, g)))
+            .filter(|(f, g)| !used.contains(&(**f, **g)))
+            .map(|(f, g)| format!("{f}::{g}"))
             .collect();
         assert!(
             stale.is_empty(),
-            "these HOME_READERS entries no longer match any home read; \
+            "these HOME_READERS or PROBE_WRITES_TO_A_TEMPDIR entries no longer match; \
              delete them: {stale:?}"
         );
         assert!(
@@ -4809,5 +4899,196 @@ mod tests {
             "{found:#?}"
         );
         assert!(used.is_empty());
+    }
+
+    /// An `#[ignore]` probe that reaches the real home is flagged for a
+    /// write in its body, and one that only reads, or writes without the
+    /// real home, is not (#1554).
+    #[test]
+    fn the_home_scan_flags_a_live_probe_that_writes() {
+        let fixture = "\
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[ignore]
+    fn writes_through_the_opt_in() {
+        let _home = crate::auth::test_home::real_for_a_live_probe();
+        // std::fs::remove_file(p) in a comment is a mention
+        std::fs::write(p, b\"x\").unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn writes_through_the_variable() {
+        let home = std::env::var(\"HOME\").unwrap();
+        let conn = open_db(&path).unwrap();
+        conn.execute(\"DELETE FROM settings\", []).unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn only_reads() {
+        let _home = crate::auth::test_home::real_for_a_live_probe();
+        let _ = std::fs::read_to_string(p);
+        let (a, b) = round_trip_on_a_copy(&real);
+    }
+
+    #[test]
+    #[ignore]
+    fn writes_with_no_real_home() {
+        let t = tempfile::TempDir::new().unwrap();
+        std::fs::write(t.path().join(\"x\"), b\"x\").unwrap();
+    }
+}
+";
+        for src in [fixture.to_string(), fixture.replace('\n', "\r\n")] {
+            let mut used = std::collections::BTreeSet::new();
+            let (found, ignored) = home_offenders("src-tauri/x.rs", &src, &mut used);
+            assert_eq!(ignored, 4);
+            let lines: Vec<&str> = found.iter().map(|f| f.split(':').nth(1).unwrap()).collect();
+            // The opt-in's write (8), and the variable's `open_db` (15)
+            // and `execute` (16). Not the comment (7), not the reader, not
+            // the probe that never reaches the real home.
+            assert_eq!(lines, ["8", "15", "16"], "{found:#?}");
+        }
+    }
+
+    // ---- Invariant: no test names a path in the shared temp dir (#1554) --
+
+    /// Every test line in `lines` (per `mask`) that joins a name onto the
+    /// shared `std::env::temp_dir()`, whether `rustfmt` kept the call on
+    /// one line or broke it before `.join(`.
+    fn shared_temp_offenders(rel: &str, lines: &[&str], mask: &[bool]) -> Vec<String> {
+        let mut out = Vec::new();
+        for (n, line) in lines.iter().enumerate() {
+            if !mask.get(n).copied().unwrap_or(false) || is_comment(line) {
+                continue;
+            }
+            let split = line.trim_end().ends_with("temp_dir()")
+                && lines
+                    .get(n + 1)
+                    .is_some_and(|next| next.trim_start().starts_with(".join("));
+            if line.contains("temp_dir().join(") || split {
+                out.push(format!("{rel}:{}: {}", n + 1, line.trim()));
+            }
+        }
+        out
+    }
+
+    /// No test builds a path in the SHARED temp directory (#1554).
+    ///
+    /// # The defect
+    ///
+    /// Tests named fixtures `temp_dir().join("headstate-…-917")` and
+    /// cleaned up with `remove_dir_all` on that computed path. About a
+    /// hundred sibling worktrees run `cargo test` on one machine, often at
+    /// once, so two runs meet on one fixed name and one run's cleanup
+    /// deletes the other's fixture mid-test. And cleanup by computed path
+    /// is the shape of the 2026-09-27 incident, where a bench's
+    /// `remove_file` ran on a real transcript after an edit silently
+    /// failed to apply.
+    ///
+    /// `tempfile::TempDir` makes a directory no other run can name, and
+    /// removes it when dropped: there is no path to compute.
+    ///
+    /// # What it cannot see
+    ///
+    /// - **The temp dir held in a variable first**: `let d =
+    ///   std::env::temp_dir();` and then `d.join(…)`. Bare `temp_dir()`
+    ///   used as an existing directory to run in -- `launch.rs` and
+    ///   `overview.rs` do -- is safe and is not flagged, so the join on a
+    ///   variable cannot be told from it by text.
+    /// - **Production code.** Only test lines are scanned; nothing in
+    ///   production joins onto the temp dir today.
+    /// - **Another spelling of a shared location**: a literal `/tmp/…`.
+    #[test]
+    fn no_test_names_a_path_in_the_shared_temp_dir() {
+        let (mut files, mut test_lines) = (0usize, 0usize);
+        let mut offenders = Vec::new();
+        for (crate_name, root) in crate_roots() {
+            for file in rust_files(&root) {
+                let rel = file
+                    .strip_prefix(&root)
+                    .unwrap_or(&file)
+                    .display()
+                    .to_string();
+                // Skipped by PATH: this file names the pattern in prose
+                // and in its fixtures.
+                if rel.contains("invariants.rs") {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&file) else {
+                    continue;
+                };
+                let src = src.replace("\r\n", "\n");
+                let lines: Vec<&str> = src.lines().collect();
+                let mask = test_mask(&file, &src);
+                test_lines += mask.iter().filter(|t| **t).count();
+                files += 1;
+                offenders.extend(shared_temp_offenders(
+                    &format!("{crate_name}/{}", rel.replace('\\', "/")),
+                    &lines,
+                    &mask,
+                ));
+            }
+        }
+        // Self-guards: a walk that read nothing, or a mask that marked no
+        // test code, would pass while checking nothing.
+        assert!(files > 150, "read only {files} files");
+        assert!(test_lines > 50_000, "only {test_lines} test lines found");
+        assert!(
+            offenders.is_empty(),
+            "a test builds a path in the shared temp directory, which every \
+             concurrent `cargo test` on this machine shares: a fixed name \
+             collides, and cleanup by computed path deletes whatever is there \
+             (#1554). Use `tempfile::TempDir::new()` and join onto its \
+             `path()`; it is removed when dropped. Offending lines:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// The scan behind [`no_test_names_a_path_in_the_shared_temp_dir`],
+    /// against a fixture: it flags each spelling in test code, and stays
+    /// silent on production code, comments and the safe shapes.
+    #[test]
+    fn the_shared_temp_scan_flags_each_spelling_and_nothing_safe() {
+        let fixture = "\
+fn production() -> PathBuf {
+    std::env::temp_dir().join(\"shipped\")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fixed() {
+        let d = std::env::temp_dir().join(\"headstate-917\");
+    }
+
+    #[test]
+    fn wrapped() {
+        let d = std::env::temp_dir()
+            .join(format!(\"headstate-{}\", std::process::id()));
+    }
+
+    #[test]
+    fn safe() {
+        // std::env::temp_dir().join(\"x\") in a comment is a mention
+        let t = tempfile::TempDir::new().unwrap();
+        let d = t.path().join(\"x\");
+        let cwd = std::env::temp_dir();
+    }
+}
+";
+        let file = Path::new("no/such/fixture.rs");
+        for src in [fixture.to_string(), fixture.replace('\n', "\r\n")] {
+            let src = src.replace("\r\n", "\n");
+            let lines: Vec<&str> = src.lines().collect();
+            let mask = test_mask(file, &src);
+            let found = shared_temp_offenders("x.rs", &lines, &mask);
+            let at: Vec<&str> = found.iter().map(|f| f.split(':').nth(1).unwrap()).collect();
+            // The fixed name (9) and the wrapped call (14). Not production
+            // (2), the comment (20) or the safe shapes (21-23).
+            assert_eq!(at, ["9", "14"], "{found:#?}");
+        }
     }
 }

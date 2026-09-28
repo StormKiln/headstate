@@ -1590,27 +1590,17 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
 
-    struct Tmp(PathBuf);
+    /// A `TempDir` no other run can name, removed when dropped (#1554).
+    struct Tmp(tempfile::TempDir);
     impl Tmp {
         fn new(tag: &str) -> Self {
-            let p = std::env::temp_dir().join(format!(
-                "headstate-preview-{tag}-{}-{:?}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            std::fs::create_dir_all(&p).unwrap();
-            Tmp(p)
+            Tmp(tempfile::Builder::new()
+                .prefix(&format!("headstate-preview-{tag}-"))
+                .tempdir()
+                .unwrap())
         }
         fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-    impl Drop for Tmp {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            self.0.path()
         }
     }
 

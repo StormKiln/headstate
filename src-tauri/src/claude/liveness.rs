@@ -1802,8 +1802,8 @@ mod tests {
     /// direction.
     #[test]
     fn an_absent_registry_directory_is_not_a_failure() {
-        let dir = std::env::temp_dir().join("headstate-no-such-registry-917");
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("headstate-no-such-registry-917");
         let got = read_registry(&dir);
         assert_eq!(got.failure, None);
         assert!(got.entries.is_empty());
@@ -1813,8 +1813,8 @@ mod tests {
     /// as unreadable ones.
     #[test]
     fn key_files_beside_the_records_are_not_parse_failures() {
-        let dir = std::env::temp_dir().join("headstate-registry-keys-917");
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("headstate-registry-keys-917");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("14779.abc123.key"), "not json at all").unwrap();
         std::fs::write(
@@ -1833,7 +1833,6 @@ mod tests {
         );
         assert_eq!(got.entries.len(), 1);
         assert_eq!(got.entries["s1"].pid, 14779);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A malformed record is COUNTED, not skipped.
@@ -1842,14 +1841,13 @@ mod tests {
     /// has to reach the caller.
     #[test]
     fn a_malformed_record_is_reported_rather_than_skipped() {
-        let dir = std::env::temp_dir().join("headstate-registry-bad-917");
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("headstate-registry-bad-917");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("1.json"), "{ not json").unwrap();
         let got = read_registry(&dir);
         assert_eq!(got.failure, None, "one bad file is not a failed listing");
         assert_eq!(got.unreadable.len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A probe answering per pid, including the working directory
@@ -1914,9 +1912,8 @@ mod tests {
     /// files leaves `unnamed` empty and fails this.
     #[test]
     fn a_key_with_no_json_is_kept_as_an_unnamed_record() {
-        let dir =
-            std::env::temp_dir().join(format!("headstate-registry-1315-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("headstate-registry-1315");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("4242.0123456789abcdef.key"),
@@ -1936,7 +1933,6 @@ mod tests {
         std::fs::write(dir.join("notapid.key"), "{}").unwrap();
 
         let got = read_registry(&dir);
-        let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(got.failure, None);
         assert!(got.unreadable.is_empty(), "{:?}", got.unreadable);

@@ -220,9 +220,10 @@ mod tests {
     /// bug -- and Docker Desktop's binaries live inside the .app bundle.
     #[test]
     fn finds_docker_outside_path_via_fallbacks() {
-        let tmp = std::env::temp_dir().join(format!("hs-dk-fb-{}", std::process::id()));
+        let t = tempfile::TempDir::new().unwrap();
+        let tmp = t.path().join("fb");
         let want = fake_docker(&tmp);
-        let empty = std::env::temp_dir().join(format!("hs-dk-empty-{}", std::process::id()));
+        let empty = t.path().join("empty");
         std::fs::create_dir_all(&empty).unwrap();
 
         // The environment is INJECTED, not edited. Editing it changed
@@ -233,24 +234,21 @@ mod tests {
             find_docker_with(&fallbacks, empty.to_str(), None),
             Some(want.clone())
         );
-        std::fs::remove_dir_all(&tmp).ok();
-        std::fs::remove_dir_all(&empty).ok();
     }
 
     /// The override is the escape hatch for a non-standard install, and
     /// the only thing a user can act on themselves.
     #[test]
     fn the_override_wins_over_path() {
-        let a = std::env::temp_dir().join(format!("hs-dk-a-{}", std::process::id()));
-        let b = std::env::temp_dir().join(format!("hs-dk-b-{}", std::process::id()));
+        let t = tempfile::TempDir::new().unwrap();
+        let a = t.path().join("a");
+        let b = t.path().join("b");
         fake_docker(&a);
         let want = fake_docker(&b);
         assert_eq!(
             find_docker_with(&[], a.to_str(), want.to_str()),
             Some(want.clone())
         );
-        std::fs::remove_dir_all(&a).ok();
-        std::fs::remove_dir_all(&b).ok();
     }
 
     /// Fallback paths must belong to this platform: searching a Windows
