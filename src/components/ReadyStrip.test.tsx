@@ -11,6 +11,10 @@ import type { ReactElement, ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: () => Promise.resolve() }));
+const copyFn = vi.hoisted(() => vi.fn<(text: string) => Promise<string | null>>());
+const toastFns = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn() }));
+vi.mock("@/lib/clipboard", () => ({ copyText: copyFn }));
+vi.mock("sonner", () => ({ toast: toastFns }));
 
 /// The Tauri bridge is the only thing mocked: the strip's pusher hook,
 /// the transport and the wrappers are real, so what these tests control
@@ -389,6 +393,29 @@ describe("ReadyStrip last pusher", () => {
   const mine = pr(1, "Mine");
   const theirs = pr(2, "Theirs");
 
+  // #1578: the copy is of what is SHOWN -- after this filter -- and
+  // carries a known pusher, but never an undecided one.
+  it("copies the rows the last-push filter leaves, with known pushers only", async () => {
+    copyFn.mockReset();
+    copyFn.mockResolvedValue(null);
+    const unknown = pr(3, "Unknown");
+    pusherAnswers = [
+      answer(mine, RULE_ON, { state: "known", login: "me" }),
+      answer(theirs, RULE_ON, { state: "known", login: "someone" }),
+      answer(unknown, RULE_ON, { state: "unknown", reason: "log lags" }),
+    ];
+    render(<ReadyStrip prs={[mine, theirs, unknown]} onOpen={vi.fn()} />);
+    await waitFor(() => expect(screen.queryByText("Mine")).toBeNull());
+    fireEvent.click(screen.getByRole("button", { name: "Copy as markdown" }));
+    await waitFor(() => expect(copyFn).toHaveBeenCalledTimes(1));
+    const md = copyFn.mock.calls[0][0];
+    expect(md).toContain("2 pull requests");
+    expect(md).not.toContain("[Mine]");
+    expect(md).toMatch(/\[Theirs\].*last push by @someone/);
+    const unknownLine = md.split("\n").find((l) => l.startsWith("- [Unknown]")) ?? "";
+    expect(unknownLine).not.toMatch(/push/);
+  });
+
   it("asks for every row's pusher with its head and base", async () => {
     render(<ReadyStrip prs={[mine]} onOpen={vi.fn()} />);
     await waitFor(() =>
@@ -530,5 +557,96 @@ describe("ReadyStrip last pusher", () => {
     fireEvent.click(trigger);
     fireEvent.click(screen.getByRole("menuitemradio", { name: "Hide all I pushed last" }));
     expect(useFilters.getState().filtersByView["to-review"].readyMyPushes).toBe("hide");
+  });
+});
+
+describe("ReadyStrip copy as markdown (#1578)", () => {
+  beforeEach(() => {
+    copyFn.mockReset();
+    copyFn.mockResolvedValue(null);
+    toastFns.success.mockReset();
+    toastFns.error.mockReset();
+  });
+
+  const row = (number: number, ready_at: string, over: Partial<PullRequest> = {}): PullRequest => ({
+    ...ready,
+    number,
+    title: `PR ${number}`,
+    ready_at,
+    ...over,
+  });
+
+  it("copies what is shown: the filtered rows, in the strip's order", async () => {
+    render(
+      <ReadyStrip
+        prs={[
+          row(3, "2026-09-03T00:00:00Z"),
+          // Filtered out of the strip, so it must not be copied.
+          row(9, "2026-08-01T00:00:00Z", { ci: "failure" }),
+          row(1, "2026-09-01T00:00:00Z"),
+        ]}
+        onOpen={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Copy as markdown" }));
+    await waitFor(() => expect(copyFn).toHaveBeenCalledTimes(1));
+    const md = copyFn.mock.calls[0][0];
+    expect(md).toContain("2 pull requests");
+    expect(md).not.toContain("PR 9");
+    expect(md.indexOf("[PR 1]")).toBeGreaterThan(-1);
+    expect(md.indexOf("[PR 1]")).toBeLessThan(md.indexOf("[PR 3]"));
+    await waitFor(() =>
+      expect(toastFns.success).toHaveBeenCalledWith(
+        "Copied 2 pull requests as markdown",
+        expect.anything(),
+      ),
+    );
+  });
+
+  // #1577's floor flag reaches the copy: a count that may be short is
+  // qualified, an exact one is not.
+  it("qualifies an unresolved count the row marks as a floor", async () => {
+    render(
+      <ReadyStrip
+        prs={[
+          row(1, "2026-09-01T00:00:00Z", { unresolved_threads: 3, unresolved_threads_floor: true }),
+          row(2, "2026-09-02T00:00:00Z", { unresolved_threads: 2, unresolved_threads_floor: false }),
+        ]}
+        onOpen={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Copy as markdown" }));
+    await waitFor(() => expect(copyFn).toHaveBeenCalledTimes(1));
+    const md = copyFn.mock.calls[0][0];
+    expect(md).toMatch(/\[PR 1\].*at least 3 unresolved conversations/);
+    expect(md).toMatch(/\[PR 2\].* 2 unresolved conversations/);
+    expect(md).not.toMatch(/\[PR 2\].*at least/);
+  });
+
+  it("follows the sort the reader chose", async () => {
+    render(
+      <ReadyStrip
+        prs={[row(1, "2026-09-01T00:00:00Z"), row(3, "2026-09-03T00:00:00Z")]}
+        onOpen={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /sort/i }));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Newest ready first" }));
+    fireEvent.click(screen.getByRole("button", { name: "Copy as markdown" }));
+    await waitFor(() => expect(copyFn).toHaveBeenCalledTimes(1));
+    const md = copyFn.mock.calls[0][0];
+    expect(md.indexOf("[PR 3]")).toBeLessThan(md.indexOf("[PR 1]"));
+  });
+
+  it("says so when the clipboard refuses", async () => {
+    copyFn.mockResolvedValue("This window has no clipboard access.");
+    render(<ReadyStrip prs={[row(1, "2026-09-01T00:00:00Z")]} onOpen={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Copy as markdown" }));
+    await waitFor(() =>
+      expect(toastFns.error).toHaveBeenCalledWith("Could not copy the markdown", {
+        description: "This window has no clipboard access.",
+      }),
+    );
+    expect(toastFns.success).not.toHaveBeenCalled();
   });
 });

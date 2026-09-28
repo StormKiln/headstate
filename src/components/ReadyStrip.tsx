@@ -20,6 +20,8 @@ import {
   partitionSummary,
   type ReadyPusher,
 } from "@/lib/readyPusher";
+import { type ReadyRow, lastPusherOf, readyListMarkdown } from "@/lib/readyMarkdown";
+import { CopyMarkdownButton } from "./CopyMarkdownButton";
 
 /// Both labels name the FIELD, not just the direction (#1277).
 ///
@@ -266,6 +268,16 @@ export function ReadyStrip({
   const part = partitionReady(all, pushers.of, mode);
   const ready = part.shown;
 
+  // The rows as SHOWN -- after the last-push filter, in the sort. The
+  // list below and "Copy as markdown" both read this, so the copy cannot
+  // disagree with the screen (#1578). A count with no floor flag (an
+  // older desktop's payload) is a floor, as the chip reads it.
+  const shown: ReadyRow[] = ready.map((pr) => ({
+    pr,
+    lastPusher: lastPusherOf(pushers.of(pr).pusher),
+    unresolvedIsFloor: pr.unresolved_threads_floor !== false,
+  }));
+
   if (all.length === 0) {
     return <p className="px-4 py-2 text-xs text-[#8b949e]">Nothing ready to review.</p>;
   }
@@ -275,10 +287,21 @@ export function ReadyStrip({
       <h2 className="flex items-center gap-2 border-b border-[#3fb950]/30 px-4 py-2 text-sm font-semibold text-[#3fb950]">
         <CircleCheck className="h-4 w-4" aria-hidden="true" />
         Ready for review ({ready.length})
+        {/* Beside the sort, and built on click from `shown` -- the rows
+            on screen, in their order (#1578). */}
+        <CopyMarkdownButton
+          label="Copy as markdown"
+          markdown={() => readyListMarkdown(shown, { now: new Date() })}
+          copied={() => ({
+            title: `Copied ${shown.length} ${shown.length === 1 ? "pull request" : "pull requests"} as markdown`,
+            description: "Paste it into a chat or a Claude session.",
+          })}
+          className="ml-auto font-normal"
+        />
         <DropdownMenu>
           <DropdownMenuTrigger
             render={
-              <Button variant="ghost" size="sm" className="ml-auto font-normal">
+              <Button variant="ghost" size="sm" className="font-normal">
                 {/* The current order is spelled out rather than hidden
                     behind a bare "Sort" until it is changed. This list
                     having a non-obvious default is the whole point, and a
@@ -314,7 +337,7 @@ export function ReadyStrip({
         summary={partitionSummary(part, mode)}
       />
       <ul>
-        {ready.map((pr) => (
+        {shown.map(({ pr }) => (
           <li key={`${pr.repo}#${pr.number}`} className="text-sm">
             {onOpen ? (
               <div
