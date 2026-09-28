@@ -373,6 +373,17 @@ pub struct PrComment {
     pub author: String,
     pub created_at: String,
     pub body: String,
+    /// GitHub says the author is a `Bot` (an app or integration account)
+    /// rather than a person (#1581). Read from the author's `__typename`,
+    /// which both comment selections ask for, so `false` means "GitHub
+    /// named some other kind of author, or none" -- never "not asked".
+    ///
+    /// The view folds repeated comments by kind, and the rule is looser
+    /// for a bot than for a person: a person's comment is never folded
+    /// on a heading that merely looks alike. Defaulted so a payload
+    /// without the field reads as a person, the conservative side.
+    #[serde(default)]
+    pub author_is_bot: bool,
 }
 
 /// One review conversation: an inline comment thread anchored to a line.

@@ -588,6 +588,19 @@ export interface RepoFile {
 /// Separate from `PullRequest`, which is a list row fetched 100 at a time
 /// on a poll loop -- carrying a body and comments there would make every
 /// tick haul data almost no row needs.
+///
+/// One comment, on the conversation or in a review thread. Mirrors
+/// `github::model::PrComment`.
+export interface PrComment {
+  author: string;
+  created_at: string;
+  body: string;
+  /// GitHub says the author is a `Bot` rather than a person (#1581).
+  /// False for a person, a deleted account, or no answer -- the side the
+  /// repeated-comment fold treats most conservatively.
+  author_is_bot: boolean;
+}
+
 /// One review conversation on a pull request.
 export interface ReviewThread {
   /// The thread's node id, which the resolve and reply commands take --
@@ -610,7 +623,7 @@ export interface ReviewThread {
   viewer_can_reply: boolean;
   viewer_can_resolve: boolean;
   viewer_can_unresolve: boolean;
-  comments: { author: string; created_at: string; body: string }[];
+  comments: PrComment[];
   /// The true total, which can exceed `comments.length` -- the query
   /// pages thread comments at 10.
   comment_count: number;
@@ -670,7 +683,7 @@ export interface PrDetail {
   changed_files: number;
   unresolved_threads: number;
   comment_count: number;
-  comments: { author: string; created_at: string; body: string }[];
+  comments: PrComment[];
   /// The review conversations -- inline threads anchored to a file and
   /// line. A DIFFERENT object from `comments` above, which are flat
   /// top-level comments: only threads can be resolved, so merging the two
