@@ -113,12 +113,29 @@ It earns a place in `lint` once steady state is measured under budget on
 `main` with the `save-if` fix in place. Until then it is the thing you run
 when CI timings look unreproducible, and it answers in one API call.
 
+---- WHO MAY WRITE, checked from the tree (#1556) ----
+
+Every other finding here is a measurement. One is not: which refs are
+allowed to SAVE is decided by `save-if` in the tree, and it went wrong
+once in a way the budget could only see after the damage. #906 let the
+merge queue save "because it is the last build before a merge lands";
+but a save is scoped to the ref that wrote it, a queue ref is deleted
+when its merge lands, and nothing reads the entry again. On 2026-09-27
+one such entry, 1.69GB and never accessed after it was written, took
+the repository to 9.45GiB of its 10GiB quota.
+
+So `save_policy()` reads the workflow files and requires every
+`Swatinem/rust-cache` step to save on `main` ONLY, and every
+`actions/cache` step to be restore-only. That finding follows from the
+diff under test, needs no network, and so BLOCKS in every mode --
+`--advisory` included -- and runs before the API is asked anything.
+
 ---- WHERE IT IS ENFORCED, and why a local run only warns (#1505) ----
 
 "Blocking" findings were said to "follow from a diff". From a LOCAL run
 they cannot: what this measures is `main`'s cache, and since `save-if`
-only `main` and the merge queue write it -- never the branch being
-linted. A class over its ceiling reflects a diff that ALREADY MERGED.
+only `main` writes it (the merge queue stopped in #1556) -- never the
+branch being linted. A class over its ceiling reflects a diff that ALREADY MERGED.
 So `make lint` failed on every branch for a state none of them caused:
 on 2026-09-26 build-Darwin sat at 0.94GB against 0.9, and every local
 gate went red until the ceiling moved -- which trains people to read a
@@ -141,6 +158,7 @@ So the split is now by WHERE, not only by what:
 import argparse
 import json
 import os
+import pathlib
 import re
 import subprocess
 import sys
@@ -150,6 +168,13 @@ GIB = 1024**3
 # GitHub's per-repository Actions cache quota. Not ours to choose; the
 # budget below has to live inside it.
 QUOTA_GIB = 10.0
+
+# Past this fraction of the quota, the total is reported even while it is
+# still under (#1556). At 9.45 of 10GiB nothing is evicted yet, but the
+# next dependency bump writes a new generation of every class at once --
+# the largest alone is ~1.7GB -- so "under quota" was not a reassurance
+# anyone should have been given on that day.
+QUOTA_WARN_FRACTION = 0.9
 
 # The ceiling for EVERYTHING, chosen with headroom under the quota rather
 # than pressed against it. At 7.37GB measured steady state this leaves
@@ -270,6 +295,108 @@ def _is_base(entry: dict) -> bool:
     return ref == BASE_REF or _is_tag(ref)
 
 
+# A merge-queue ref as the caches API reports it:
+# `refs/heads/gh-readonly-queue/main/pr-1499-<sha>`. Matched on the
+# segment rather than a full prefix so the flat `refs/heads/` spelling and
+# any nesting the API adds (it nests tags, see `_is_tag`) both match.
+QUEUE_SEGMENT = "gh-readonly-queue/"
+
+
+def _is_queue(ref: str) -> bool:
+    return QUEUE_SEGMENT in ref
+
+
+# The only `save-if` a rust-cache step may carry (#1556). An exact string
+# rather than a parse of the expression: the question is "did someone
+# widen who saves", and any edit to this line is exactly that question.
+MAIN_ONLY_SAVE_IF = "${{ github.ref == 'refs/heads/main' }}"
+
+_RUST_CACHE_USE = re.compile(r"^\s*(?:-\s+)?uses:\s*Swatinem/rust-cache@")
+# `actions/cache@` and `actions/cache/save@` both write; only
+# `actions/cache/restore@` is read-only.
+_ACTIONS_CACHE_WRITE = re.compile(r"^\s*(?:-\s+)?uses:\s*actions/cache(?:/save)?@")
+_SAVE_IF = re.compile(r"^\s*save-if:\s*(.*?)\s*$")
+
+
+def _step_lines(lines: list[str], at: int) -> list[str]:
+    """The lines of the step whose `uses:` is on line `at`, `uses:` excluded.
+
+    The step's keys sit at the column `uses` starts at; it continues
+    through deeper-indented lines, blanks and comments, and ends at the
+    first line indented LESS -- which is also where the next `- ` item
+    begins.
+    """
+    key_col = lines[at].index("uses:")
+    body: list[str] = []
+    for nxt in lines[at + 1 :]:
+        stripped = nxt.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if len(nxt) - len(nxt.lstrip()) < key_col:
+            break
+        body.append(nxt)
+    return body
+
+
+def save_policy(files: dict[str, str]) -> list[str]:
+    """Findings for any cache step that may WRITE on a ref other than `main`.
+
+    `files` maps a path (for the message) to its text. Pure, so the
+    self-test can drive it with fixtures; `workflow_files()` supplies the
+    real tree.
+    """
+    findings: list[str] = []
+    rust_cache_steps = 0
+    for path, text in sorted(files.items()):
+        lines = text.replace("\r\n", "\n").split("\n")
+        for i, line in enumerate(lines):
+            if line.lstrip().startswith("#"):
+                continue
+            if _ACTIONS_CACHE_WRITE.match(line):
+                findings.append(
+                    f"{path}:{i + 1} uses a cache action that SAVES on whatever ref runs "
+                    f"it. Use `actions/cache/restore`, or save from `main` only and "
+                    f"extend `save_policy()` to recognise how (#1556)"
+                )
+            if not _RUST_CACHE_USE.match(line):
+                continue
+            rust_cache_steps += 1
+            values = [m.group(1) for m in map(_SAVE_IF.match, _step_lines(lines, i)) if m]
+            if not values:
+                findings.append(
+                    f"{path}:{i + 1} runs `Swatinem/rust-cache` with no `save-if`, and "
+                    f"its default saves on EVERY ref -- pull requests, tags and the "
+                    f"merge queue each write an entry only they can read (#901, #1556). "
+                    f"Add `save-if: {MAIN_ONLY_SAVE_IF}`"
+                )
+            elif values[-1] != MAIN_ONLY_SAVE_IF:
+                findings.append(
+                    f"{path}:{i + 1} has `save-if: {values[-1]}`; it must be exactly "
+                    f"`{MAIN_ONLY_SAVE_IF}`. An entry is scoped to the ref that writes "
+                    f"it, so any other ref's save is read by nothing but that ref -- a "
+                    f"merge-queue run's 1.69GB entry was never read once (#1556)"
+                )
+    # The floor, as everywhere in this file: finding no rust-cache step at
+    # all is not a clean policy, it is a scan that looked in the wrong place.
+    if rust_cache_steps == 0:
+        findings.append(
+            "no `Swatinem/rust-cache` step was found in the workflow files, so the "
+            "save policy was not checked at all. .github/actions/setup/action.yml "
+            "is where it lives; if it moved, point `workflow_files()` at it"
+        )
+    return findings
+
+
+def workflow_files() -> dict[str, str]:
+    """Every composite action and workflow in the tree, by repo-relative path."""
+    root = pathlib.Path(__file__).resolve().parent.parent
+    github = root / ".github"
+    paths: list[pathlib.Path] = []
+    for pattern in ("actions/*/action.yml", "actions/*/action.yaml", "workflows/*.yml", "workflows/*.yaml"):
+        paths += sorted(github.glob(pattern))
+    return {p.relative_to(root).as_posix(): p.read_text(encoding="utf-8") for p in paths}
+
+
 def verdict(entries: list[dict]) -> tuple[list[str], list[str]]:
     """BUDGET findings, split by WHO CAN FIX THEM (#1107).
 
@@ -358,6 +485,37 @@ def verdict(entries: list[dict]) -> tuple[list[str], list[str]]:
             f"so a run can evict the entry the next run needs (#901). This counts "
             f"every entry, including any no budget covers -- the quota does not "
             f"care which class an entry belongs to"
+        )
+
+    elif quota_used >= QUOTA_WARN_FRACTION * QUOTA_GIB:
+        # AMBIENT: under the quota, but not by enough to absorb one
+        # dependency bump, which writes a new generation of every class.
+        largest = max(e["size_in_bytes"] for e in entries) / GIB
+        ambient.append(
+            f"the repository holds {quota_used:.2f}GB in total, "
+            f"{100 * quota_used / QUOTA_GIB:.0f}% of GitHub's {QUOTA_GIB}GB quota. "
+            f"Nothing is evicted yet, but the largest entry alone is {largest:.2f}GB, "
+            f"and a dependency bump writes a new generation of every class at once "
+            f"(#1556)"
+        )
+
+    # MERGE-QUEUE ENTRIES, which nothing reads (#1556). `save_policy()`
+    # stops new ones being written; this is the live-data half, so a
+    # regression that slipped past it -- or residue from before it -- is
+    # named rather than folded anonymously into `leftovers()`.
+    queued: dict[str, float] = {}
+    for e in entries:
+        ref = e.get("ref", "")
+        if _is_queue(ref):
+            queued[ref] = queued.get(ref, 0.0) + e["size_in_bytes"] / GIB
+    if queued:
+        where = ", ".join(f"{ref} ({gb:.2f}GB)" for ref, gb in sorted(queued.items()))
+        ambient.append(
+            f"merge-queue refs hold {sum(queued.values()):.2f}GB: {where}. A queue ref "
+            f"is deleted when its merge lands, so nothing ever reads these. Queue runs "
+            f"are restore-only since #1556: an entry written after that means "
+            f"`save-if` regressed; one written before it is residue that drains after "
+            f"seven idle days, or can be deleted by id through the caches API"
         )
 
     # Group by class so both "one entry grew" and "two generations are
@@ -449,7 +607,8 @@ def leftovers(entries: list[dict]) -> dict[str, float]:
     """{ref: GB} for caches held by refs other than the base, largest first.
 
     Reported, never failed on. Since `save-if` these should only be
-    entries predating it or written by a tag/merge-group run, and GitHub
+    entries predating it, or ones a third-party action writes on its own
+    (the release gate's `setup-ruby` bundler cache on each tag), and GitHub
     reclaims them on merge or after seven idle days -- so a branch cannot
     fix them and must not be blocked by them. They are shown because they
     DO count against the 10GB quota, which is what makes them worth
@@ -516,6 +675,18 @@ def main() -> int:
     )
     args = ap.parse_args()
 
+    # The save policy first, and in every mode: it is read from the tree,
+    # so it needs no network and follows from the diff under test (#1556).
+    policy = save_policy(workflow_files())
+    if policy:
+        print("A cache step may write on a ref other than `main`:")
+        for p in policy:
+            print(f"  {p}")
+        print()
+        print("Failing on this in every mode, --advisory included: unlike the")
+        print("cache's size, this is decided by the branch under test.")
+        return 1
+
     measured = measure()
     if isinstance(measured, str):
         # The skip path. Exits 0 WITHOUT --require on purpose, which is
@@ -546,6 +717,16 @@ def report(measured: list[dict], advisory: bool) -> int:
     base_total = sum(e["size_in_bytes"] for e in measured if _is_base(e)) / GIB
     held = leftovers(measured)
 
+    # Usage against the QUOTA, first and unconditionally (#1556). The
+    # budget below is a ceiling someone chose; the quota is the one GitHub
+    # evicts at, and it counts every entry, budgeted or not.
+    print(
+        f"Actions cache: {total:.2f}GB of GitHub's {QUOTA_GIB}GB quota "
+        f"({100 * total / QUOTA_GIB:.0f}%) across {len(measured)} entries; "
+        f"{base_total:.2f}GB of that on `main` and release tags."
+    )
+    print()
+
     # Reported either way, because it is the number that explains a
     # surprising eviction even when the budget itself is fine.
     if held:
@@ -561,7 +742,7 @@ def report(measured: list[dict], advisory: bool) -> int:
     # a NOTICE, because a branch cannot act on it (#1107).
     if ambient:
         print(
-            f"The repository's cache is outside its budget "
+            f"The repository's cache is outside its budget or near its quota "
             f"({base_total:.2f}GB on `main` and release tags, {total:.2f}GB in total):"
         )
         for p in ambient:

@@ -374,6 +374,140 @@ if exit_code(MEASURED_0927, advisory=False) != 0:
     failures.append("the healthy 2026-09-27 state must pass the enforcing run")
 
 
+# ---- WHO MAY WRITE (#1556) ----
+#
+# `save_policy()` reads the tree, not the API. The merge queue saved from
+# #906 on, because #906 argued it should, and one of its entries --
+# 1.69GB, never read -- took the repository to 94% of the quota. Each
+# case below is a way that could come back.
+
+MAIN_ONLY = guard.MAIN_ONLY_SAVE_IF
+
+
+def rust_cache_step(save_if: str | None, then: str = "") -> str:
+    lines = [
+        "runs:",
+        "  using: composite",
+        "  steps:",
+        "    - uses: Swatinem/rust-cache@0000000000000000000000000000000000000000 # v2",
+        "      with:",
+        "        workspaces: src-tauri",
+        "        # save-if: ${{ true }}   <- a comment, never a setting",
+    ]
+    if save_if is not None:
+        lines.append(f"        save-if: {save_if}")
+    return "\n".join(lines) + "\n" + then
+
+
+def policy_blocks(name: str, files: dict[str, str], should_block: bool) -> None:
+    got = guard.save_policy(files)
+    if bool(got) != should_block:
+        want = "a finding" if should_block else "no finding"
+        failures.append(f"{name}\n    expected {want}, got {got!r}")
+
+
+# The tree as committed must satisfy its own policy -- the half that
+# fails if the fix is reverted.
+policy_blocks("the committed workflows save on `main` only", guard.workflow_files(), False)
+if not any("rust-cache" in t for t in guard.workflow_files().values()):
+    failures.append("workflow_files() did not find the setup action's rust-cache step")
+
+policy_blocks("main-only save-if passes", {"a.yml": rust_cache_step(MAIN_ONLY)}, False)
+policy_blocks(
+    "the pre-#1556 merge-queue save-if is rejected",
+    {"a.yml": rust_cache_step(
+        "${{ github.ref == 'refs/heads/main' || github.event_name == 'merge_group' }}"
+    )},
+    True,
+)
+policy_blocks(
+    "a rust-cache step with NO save-if is rejected (its default saves everywhere)",
+    {"a.yml": rust_cache_step(None)},
+    True,
+)
+# A save-if in the NEXT step must not be credited to this one, or a step
+# boundary bug would pass a step that saves on every ref.
+policy_blocks(
+    "a later step's save-if does not satisfy an earlier rust-cache step",
+    {"a.yml": rust_cache_step(
+        None,
+        "    - uses: some/other@0000000000000000000000000000000000000000\n"
+        f"      with:\n        save-if: {MAIN_ONLY}\n",
+    )},
+    True,
+)
+# The `- name:` then `uses:` layout, which workflows use more than the
+# composite action does.
+policy_blocks(
+    "a named step's rust-cache is found and checked",
+    {"w.yml": (
+        "jobs:\n  j:\n    steps:\n      - name: cache\n"
+        "        uses: Swatinem/rust-cache@0000000000000000000000000000000000000000\n"
+        "        with:\n          save-if: ${{ true }}\n"
+    )},
+    True,
+)
+policy_blocks(
+    "CRLF line endings are read the same",
+    {"a.yml": rust_cache_step(MAIN_ONLY).replace("\n", "\r\n")},
+    False,
+)
+policy_blocks(
+    "actions/cache (which saves) is rejected",
+    {"a.yml": rust_cache_step(MAIN_ONLY),
+     "w.yml": "steps:\n  - uses: actions/cache@0000000000000000000000000000000000000000\n"},
+    True,
+)
+policy_blocks(
+    "actions/cache/save is rejected",
+    {"a.yml": rust_cache_step(MAIN_ONLY),
+     "w.yml": "steps:\n  - uses: actions/cache/save@0000000000000000000000000000000000000000\n"},
+    True,
+)
+policy_blocks(
+    "actions/cache/restore is read-only and passes",
+    {"a.yml": rust_cache_step(MAIN_ONLY),
+     "w.yml": "steps:\n  - uses: actions/cache/restore@0000000000000000000000000000000000000000\n"},
+    False,
+)
+# THE FLOOR: no rust-cache step found is a scan that looked in the wrong
+# place, not a clean policy.
+policy_blocks("finding no rust-cache step at all is a finding", {"w.yml": "on: push\n"}, True)
+policy_blocks("finding no files at all is a finding", {}, True)
+
+# The live-data half: an entry on a queue ref is NAMED, and does not
+# block -- a branch cannot delete it.
+QUEUE_REF = "refs/heads/gh-readonly-queue/main/pr-1-0000000000000000000000000000000000000000"
+ambient_only(
+    "a merge-queue entry is reported by name, not blocked on",
+    MEASURED_0927 + [entry("v0-rust-platform-Linux-x64-6ff13d87-84ed4606", 1.689, QUEUE_REF)],
+)
+_b, _amb = guard.verdict(MEASURED_0927 + [entry("v0-rust-platform-Linux-x64-6ff13d87-84ed4606", 1.689, QUEUE_REF)])
+if not any("merge-queue refs hold" in a and QUEUE_REF in a for a in _amb):
+    failures.append(f"a merge-queue entry must be named in an ambient notice; got {_amb!r}")
+_b, _amb = guard.verdict(MEASURED_0927 + [entry("v0-rust-lint-Darwin-arm64-1-2", 0.4, "refs/pull/1/merge")])
+if any("merge-queue" in a for a in _amb):
+    failures.append("a pull-request ref must not be reported as a merge-queue ref")
+
+# NEAR THE QUOTA, the other half of #1556's ask. 2026-09-27 exactly: the
+# 7.76GB steady state plus the 1.69GB queue entry is 9.45GB -- under the
+# quota and under no other rule's notice before this, yet one bump away
+# from evicting. It must be reported; the steady state alone must not.
+_near = MEASURED_0927 + [entry("v0-rust-platform-Linux-x64-6ff13d87-84ed4606", 1.689, "refs/pull/1/merge")]
+_b, _amb = guard.verdict(_near)
+if not any("% of GitHub's" in a for a in _amb):
+    failures.append(f"9.45 of 10GB must be reported as near the quota; got {_amb!r}")
+_b, _amb = guard.verdict(MEASURED_0927)
+if any("% of GitHub's" in a for a in _amb):
+    failures.append(f"the 7.76GB steady state must not be reported as near the quota; got {_amb!r}")
+
+# And the report states usage against the quota on EVERY run, including a
+# clean one, which is where nobody would otherwise see the number.
+exit_code(MEASURED_0927, advisory=False)
+if "of GitHub's 10.0GB quota (" not in exit_code.last:
+    failures.append(f"a clean report must still state usage against the quota; got {exit_code.last!r}")
+
+
 if failures:
     print("check-cache-budget.py self-test FAILED:")
     for f in failures:

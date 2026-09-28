@@ -262,7 +262,7 @@ runs:
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
         workspaces: ${{ inputs.rust-workspaces }}
-        # ---- Only `main` WRITES the cache. Every ref still READS it (#901) ----
+        # ---- Only `main` WRITES the cache. Every ref still READS it (#901, #1556) ----
         #
         # The repository was at 9.92GB of a 10GB Actions cache quota and
         # evicting mid-day, which is how run 34713149169 came to report
@@ -365,8 +365,29 @@ runs:
         #   - Adding cache scope, which is what #889 proposed and #895
         #     reverted on exactly this evidence.
         #
-        # The merge queue saves too: a merge-group run is the last build
-        # before a merge lands, so it is as worth warming as `main`.
+        # THE MERGE QUEUE NO LONGER SAVES (#1556). It used to, on the
+        # argument that a merge-group run is the last build before a merge
+        # lands and so "as worth warming as `main`". The build is; the
+        # ENTRY is not. A save is scoped to the ref that wrote it, and a
+        # queue ref (`gh-readonly-queue/main/pr-N-<sha>`) is deleted the
+        # moment its merge lands -- nothing ever builds on it again, and
+        # `main` cannot read another branch's entries.
+        #
+        # MEASURED 2026-09-27: the queue run for #1499 wrote
+        # `v0-rust-platform-Linux-x64-6ff13d87-84ed4606`, 1.69GB, on its
+        # queue ref at 00:34. Its `last_accessed_at` never moved off its
+        # `created_at`. `main` wrote the SAME key for itself at 00:52. The
+        # repository then held 10.14e9 bytes (9.45GiB) of its 10GiB quota,
+        # and that one write-once entry was 18% of it.
+        #
+        # It only ever bit on the runs that mattered most: rust-cache skips
+        # the save on an exact primary-key hit, so a queue run saves only
+        # when its lockfile hash differs from `main`'s -- i.e. on a
+        # dependency bump, which is precisely when every class writes a
+        # full-size new generation at once.
+        #
+        # A queue run still RESTORES `main`'s entries (every ref reads the
+        # default branch, as above), so it loses nothing but the write.
         #
         # TAGS NO LONGER SAVE (#1107), and the reason they used to was a
         # half-truth. `release.yml` does wait on a tag run's CI, so a tag
@@ -386,4 +407,4 @@ runs:
         # One line on purpose. A folded scalar keeps the newlines INSIDE
         # `${{ }}`, and an expression is not the place to find out which
         # whitespace GitHub's parser forgives.
-        save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'merge_group' }}
+        save-if: ${{ github.ref == 'refs/heads/main' }}
