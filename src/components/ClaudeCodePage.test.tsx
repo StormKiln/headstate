@@ -390,6 +390,9 @@ const session = (over: Partial<WholeSession> = {}): ClaudeSession => {
     // agree; here they are one value so that a UI test cannot
     // accidentally depend on them differing.
     liveness: w.liveness,
+    // #1569. Absent unless a test says otherwise: "not reported", which
+    // renders as the pane always did.
+    stoppable: w.stoppable,
     transcript_state: w.transcript_state,
     resume: w.resume,
     runs: w.runs,
@@ -3640,6 +3643,43 @@ describe("stopping a session", () => {
     // and the two saying the same thing is correct -- a section that
     // withheld the button without a reason is what this pins against.
     expect(screen.getAllByText(/the registry could not be read/i).length).toBeGreaterThan(0);
+  });
+
+  /// #1569. A session can read running from a source Stop does not
+  /// confirm a pid from. The pane must not offer a Stop that can only
+  /// refuse, and must say stopping is unavailable rather than showing
+  /// nothing -- in the reader's terms, naming no internals.
+  ///
+  /// SABOTAGE: made the pane's `stoppable === false` branch unreachable.
+  /// This FAILED: the review button was offered. Restored, passed.
+  it("offers no stop for a running session whose process Stop cannot confirm", () => {
+    state.list = listOf([
+      session({ liveness: { state: "running", pid: 4242, status: null }, stoppable: false }),
+    ]);
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.queryByRole("button", { name: /review stopping it/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /stop this session/i })).toBeNull();
+    const says = screen.getByText(/stopping it from Headstate is not available/i);
+    expect(says.textContent).toMatch(/running as pid 4242/);
+    expect(says.textContent).toMatch(/window it is running in/);
+    // No internals: not the registry, a hook, a run, or a `.key`.
+    expect(says.textContent).not.toMatch(/registry|hook|\.key|\.json|run record/i);
+    // And it never claims the session is not running.
+    expect(says.textContent).not.toMatch(/not running/i);
+    expect(proposeFn).not.toHaveBeenCalled();
+  });
+
+  /// The pair: a session Stop CAN confirm still gets the review, with
+  /// `stoppable: true` as the backend now sends it.
+  it("still offers the stop for a running session Stop can confirm", () => {
+    state.list = listOf([
+      session({ liveness: { state: "running", pid: 14779, status: "busy" }, stoppable: true }),
+    ]);
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.getByRole("button", { name: /review stopping it/i })).toBeTruthy();
+    expect(screen.queryByText(/not available/i)).toBeNull();
   });
 
   /// The evidence is shown BEFORE any stop is offered, and the last turn

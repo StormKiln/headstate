@@ -310,6 +310,30 @@ describe("the companion offers the view and hides only the Local actions", () =>
     expect(mute.set).toHaveBeenCalledWith(true);
   });
 
+  /// Stop is desktop-only, and the phone says where it can be done
+  /// (#1219). But for a running session the desktop cannot stop either
+  /// (#1569), "from the Mac" would send the reader to a button that is not
+  /// there, so it says stopping is not available instead.
+  ///
+  /// SABOTAGE: made the phone test `stoppable === undefined` instead of
+  /// `=== false`. This FAILED on the non-stoppable half. Restored, passed.
+  it("points a stoppable session at the Mac, and says a non-stoppable one cannot be stopped", () => {
+    const running = { state: "running" as const, pid: 4242, status: null };
+    state.list = listOf([session({ liveness: running })]);
+    const { unmount } = render(<ClaudeCodePage />);
+    open("HeadState GitHub issues filing");
+    expect(screen.getByText(/can only be stopped from the Mac/i)).toBeTruthy();
+    expect(screen.queryByText(/not available, because/i)).toBeNull();
+    unmount();
+
+    state.list = listOf([session({ liveness: running, stoppable: false })]);
+    render(<ClaudeCodePage />);
+    open("HeadState GitHub issues filing");
+    expect(screen.getByText(/stopping it from Headstate is not available/i)).toBeTruthy();
+    expect(screen.queryByText(/can only be stopped from the Mac/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: /stop/i })).toBeNull();
+  });
+
   /// The view says WHOSE sessions these are. A phone showing a session
   /// list with no such line reads as "this phone's sessions", which is
   /// never true -- the companion runs none.

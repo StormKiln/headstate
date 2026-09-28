@@ -3391,7 +3391,15 @@ pub async fn claude_md_advice_launch_preview(
 /// Returns the registry and the probe together because they are one
 /// observation: a probe refreshed against a different set of pids than
 /// the registry listed would pair a start time against the wrong entry.
-fn registry_and_probe() -> (
+///
+/// The probe also covers the `.key`-only records and every un-ended run's
+/// pid (#1569). None of those can be CONFIRMED for a stop, but a refusal
+/// must know whether one of them is this session running, or it reports a
+/// running session as not running -- and a pid missing from a refreshed
+/// table reads as gone.
+fn registry_and_probe(
+    runs: Option<&std::collections::HashMap<String, Vec<crate::claude::liveness::Run>>>,
+) -> (
     crate::claude::liveness::Registry,
     crate::claude::liveness::SysinfoProbe,
 ) {
@@ -3402,9 +3410,28 @@ fn registry_and_probe() -> (
             ..Default::default()
         },
     };
-    let pids: Vec<u32> = registry.entries.values().map(|e| e.pid).collect();
+    let mut pids: Vec<u32> = registry.probe_pids();
+    for run in runs.into_iter().flat_map(|r| r.values()).flatten() {
+        if run.ended_at.is_none() {
+            pids.push(run.pid);
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
     let probe = crate::claude::liveness::SysinfoProbe::for_pids(&pids);
     (registry, probe)
+}
+
+/// Every session's hook-recorded runs, read NOW, or why they could not be.
+///
+/// For [`crate::claude::stop::Runs`]: the error is carried to the refusal
+/// rather than read as "no runs", which would say a session is not running
+/// when nothing was checked (#1569).
+fn stop_runs(
+    db: &std::path::Path,
+) -> Result<std::collections::HashMap<String, Vec<crate::claude::liveness::Run>>, String> {
+    let conn = open_db(db).map_err(|e| e.to_string())?;
+    crate::claude::sessions::runs_by_session(&conn).map_err(|e| e.to_string())
 }
 
 /// Propose stopping one or more live sessions, with the evidence (#1219).
@@ -3435,11 +3462,17 @@ pub async fn claude_propose_stop(
 ) -> Result<Vec<crate::claude::stop::StopProposal>, String> {
     let db = db_path(&app);
     tauri::async_runtime::spawn_blocking(move || {
-        let (registry, probe) = registry_and_probe();
+        let runs = stop_runs(&db);
+        let (registry, probe) = registry_and_probe(runs.as_ref().ok());
         let conn = open_db(&db).ok();
         let now = chrono::Utc::now().timestamp();
-        let proposals =
-            crate::claude::stop::propose(&probe, &registry, &session_ids, |id, started_at| {
+        let runs = runs.as_ref().map_err(String::as_str);
+        let proposals = crate::claude::stop::propose(
+            &probe,
+            &registry,
+            runs,
+            &session_ids,
+            |id, started_at| {
                 let entry = registry.entries.get(id);
                 // Read through `sessions::detail`, the SAME reader the
                 // detail pane uses, so the proposal and the pane cannot
@@ -3470,7 +3503,8 @@ pub async fn claude_propose_stop(
                         .and_then(|p| crate::claude::preview::tail(std::path::Path::new(p)).ok())
                         .and_then(|preview| last_turn_text(&preview)),
                 }
-            });
+            },
+        );
         Ok(proposals)
     })
     .await
@@ -3544,14 +3578,19 @@ fn last_turn_text(preview: &crate::claude::preview::Preview) -> Option<String> {
 #[tauri::command]
 #[cfg(unix)]
 pub async fn claude_stop_session(
+    app: AppHandle,
     session_id: String,
 ) -> Result<crate::claude::stop::StopOutcome, String> {
+    let db = db_path(&app);
     tauri::async_runtime::spawn_blocking(move || {
         // BOTH re-derived on this call. Nothing about the process is
         // carried in from the proposal that put the button on screen.
-        let (registry, probe) = registry_and_probe();
-        let confirmed =
-            crate::claude::stop::confirm(&probe, &registry, &session_id).map_err(|r| r.why())?;
+        // The runs only word a refusal (#1569); they never confirm a pid.
+        let runs = stop_runs(&db);
+        let (registry, probe) = registry_and_probe(runs.as_ref().ok());
+        let runs = runs.as_ref().map_err(String::as_str);
+        let confirmed = crate::claude::stop::confirm(&probe, &registry, runs, &session_id)
+            .map_err(|r| r.why())?;
         crate::claude::stop::stop(&crate::claude::stop::UnixSignaller, &confirmed)
     })
     .await
