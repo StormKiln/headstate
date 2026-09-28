@@ -177,8 +177,44 @@ const CLAUDIFY_CLASS =
 const PLAIN_CLASS =
   "flex w-fit items-center gap-1.5 rounded border border-[#30363d] px-3 py-1.5 text-sm hover:bg-[#161b22]";
 
+/// The header's button size (#1580): the pinned Approve, Merge and GitHub
+/// beside it are `px-2.5 py-1`, and one taller button in a one-line bar
+/// reads as a different kind of control.
+function compactClass(cls: string): string {
+  return cls.replace("px-3 py-1.5", "px-2.5 py-1");
+}
+
+/// The short form of `unavailableReason`, for the one-line desktop header
+/// (#1580), which has no room for the sentence. The full sentence goes in
+/// the title and to a screen reader, as the header's "Won't count toward
+/// merging" does (#1451).
+function shortReason(checkout: CheckoutState): string | null {
+  switch (checkout.kind) {
+    case "pending":
+      return "Looking for a checkout…";
+    case "failed":
+      return "Could not look for a checkout";
+    case "none":
+      // Qualified like the sentence: a partial scan found nothing only
+      // in what it could read.
+      return checkout.unreadable > 0 ? "No checkout in the readable folders" : "No local checkout";
+    case "found":
+      return null;
+  }
+}
+
 /// The button, for the pull request detail view.
-export function PrClaudifyButton({ pr }: { pr: PullRequest | PrDetail }) {
+///
+/// `compact` is the one-line desktop header (#1580): header-sized, with
+/// the unavailable reason in its short form. The phone header wraps onto
+/// its own line, so it keeps the full sentence.
+export function PrClaudifyButton({
+  pr,
+  compact = false,
+}: {
+  pr: PullRequest | PrDetail;
+  compact?: boolean;
+}) {
   const state = usePrClaudify(pr);
   const [dialog, setDialog] = useState<PrClaudifyDialog | null>(null);
   const { checkout, terminalConfigured } = state;
@@ -191,7 +227,7 @@ export function PrClaudifyButton({ pr }: { pr: PullRequest | PrDetail }) {
           type="button"
           // Disabled only while the scan is still answering, with the
           // reason beside it -- the "found" answer usually arrives from
-          // the Worktrees cache before anyone reaches this footer.
+          // the Worktrees cache before anyone reaches for it.
           disabled={checkout.kind === "pending"}
           aria-busy={checkout.kind === "pending" ? true : undefined}
           onClick={() => activate(pr, state, setDialog)}
@@ -202,13 +238,17 @@ export function PrClaudifyButton({ pr }: { pr: PullRequest | PrDetail }) {
                 : `Copy a command that starts Claude Code on this pull request in ${checkout.path}`
               : undefined
           }
-          className={CLAUDIFY_CLASS}
+          className={compact ? compactClass(CLAUDIFY_CLASS) : CLAUDIFY_CLASS}
         >
           <Sparkles className="h-3.5 w-3.5" aria-hidden="true" />
           Claudify
         </button>
       ) : (
-        <button type="button" onClick={() => activate(pr, state, setDialog)} className={PLAIN_CLASS}>
+        <button
+          type="button"
+          onClick={() => activate(pr, state, setDialog)}
+          className={compact ? compactClass(PLAIN_CLASS) : PLAIN_CLASS}
+        >
           <Bot className="h-3.5 w-3.5" aria-hidden="true" />
           Copy prompt
         </button>
@@ -216,9 +256,17 @@ export function PrClaudifyButton({ pr }: { pr: PullRequest | PrDetail }) {
       {reason !== null ? (
         <span
           role={checkout.kind === "failed" ? "alert" : undefined}
+          title={compact ? reason : undefined}
           className={`text-xs ${checkout.kind === "failed" ? "text-[#f85149]" : "text-[#8b949e]"}`}
         >
-          {reason}
+          {compact ? (
+            <>
+              <span aria-hidden="true">{shortReason(checkout)}</span>
+              <span className="sr-only">{reason}</span>
+            </>
+          ) : (
+            reason
+          )}
         </span>
       ) : null}
       <PrClaudifyDialogs dialog={dialog} onClose={() => setDialog(null)} />

@@ -208,7 +208,7 @@ function SessionLinks({ links }: { links: readonly ClaudePrLink[] }) {
 /// Modelled on GitHub's PR page minus what does not belong in a triage
 /// tool: no file diff, no commit history, no posting comments. Headstate
 /// is for deciding and acting; reviewing code belongs in GitHub or an
-/// editor, and "View on GitHub" covers the rest.
+/// editor, and the header's GitHub link covers the rest.
 export function PrDetailView({
   repo,
   number,
@@ -259,8 +259,8 @@ export function PrDetailView({
   const [deleting, setDeleting] = useState(false);
   const rerunnable = pr ? rerunnableRun(pr.checks) : null;
   // The same actions in a different arrangement: on a phone the sticky
-  // header stacks the action buttons under the back link, and the
-  // footer wraps, rather than dropping anything.
+  // header stacks the action buttons under the back link rather than
+  // dropping anything.
   const isMobile = useIsMobile();
   // The viewer's own verdict, read the same way ReviewBox reads it: the
   // pull request's aggregate `review` says CHANGES_REQUESTED when
@@ -412,6 +412,17 @@ export function PrDetailView({
         </span>
       ) : null}
       <PrActions pr={pr} compact conversations={gate.mergeBlocked} />
+      {/* Claudify (#1455), which replaced "Copy for agent", pinned here
+          since #1580: it sat at the very bottom, below every comment,
+          so reaching it on a long pull request meant scrolling the whole
+          thread. Worth more here than on a row: this view has the
+          per-check names and URLs, the size and the description, so the
+          prompt names the jobs that actually failed and adapts its
+          review criteria.
+
+          `compact` on the desktop's one-line bar only; the phone's
+          second line wraps, so it has room for the full reason. */}
+      <PrClaudifyButton pr={pr} compact={!isMobile} />
     </>
   );
 
@@ -454,11 +465,17 @@ export function PrDetailView({
           would be wrong on one of the two layouts this component
           serves. The fallback keeps the bar pinned somewhere sane if
           the variable is ever missing -- in jsdom, for instance, where
-          nothing publishes it. */}
+          nothing publishes it.
+
+          On the phone every control in the bar gets the 44px floor
+          (`.tap-target`'s numbers, #1580), set once here rather than on
+          each button: the Merge and Approve buttons come from
+          `PrActions` and the row above, and one missed button is one
+          control too small for a finger. */}
       <div
         className={
           isMobile
-            ? "sticky z-10 -mx-4 flex flex-wrap items-center gap-2 border-b border-[#30363d] bg-[#0d1117] px-4 py-2"
+            ? "sticky z-10 -mx-4 flex flex-wrap items-center gap-2 border-b border-[#30363d] bg-[#0d1117] px-4 py-2 [&_a]:min-h-11 [&_button]:min-h-11 [&_button]:min-w-11"
             : "sticky z-10 -mx-4 flex items-center gap-2 border-b border-[#30363d] bg-[#0d1117] px-4 py-2"
         }
         style={{ top: "var(--app-header-h, 0px)" }}
@@ -478,7 +495,15 @@ export function PrDetailView({
             page and makes them ambiguous to a screen reader, which
             reads every copy. Only one pull request is ever open, so
             the pinned buttons cannot be about a different one. */}
-        <div className="ml-auto flex shrink-0 items-center gap-2">
+        {/* `flex-wrap` and `min-w-0` rather than `shrink-0` since
+            Claudify joined the cluster (#1580). Measured in Chromium at
+            the narrowest desktop panel (a 1000px window less the
+            256px sidebar), the common case fits on one line; the worst
+            case -- "Won't count toward merging" AND no local checkout,
+            each with its short note -- ran about 60px past the edge,
+            which put GitHub off-screen. Wrapping, right-aligned, makes
+            that case two lines instead. */}
+        <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-2">
           {isMobile ? null : pinnedActions}
           <ExternalLink
             href={pr.url}
@@ -730,29 +755,22 @@ export function PrDetailView({
         </Section>
       ) : null}
 
-      <div className={isMobile ? "flex flex-wrap items-center gap-2" : "flex items-center gap-2"}>
-        <ExternalLink
-          href={pr.url}
-          className="flex w-fit items-center gap-1.5 rounded border border-[#30363d] px-3 py-1.5 text-sm hover:bg-[#161b22]"
-        >
-          <ExternalLinkIcon className="h-3.5 w-3.5" aria-hidden="true" />
-          View on GitHub
-        </ExternalLink>
-        {/* Claudify (#1455), which replaced "Copy for agent". Worth more
-            here than on a row: this view has the per-check names and
-            URLs, the size and the description, so the prompt names the
-            jobs that actually failed and adapts its review criteria. */}
-        <PrClaudifyButton pr={pr} />
+      {/* Only once the PR has MERGED, and only while the branch still
+          exists. 31 of the last 60 merged PRs on a real account still
+          held a live remote branch -- the app's own thesis (agents
+          create branches, PRs merge, leftovers stay) applied to the
+          one domain where it did nothing.
 
-        {/* Only once the PR has MERGED, and only while the branch still
-            exists. 31 of the last 60 merged PRs on a real account still
-            held a live remote branch -- the app's own thesis (agents
-            create branches, PRs merge, leftovers stay) applied to the
-            one domain where it did nothing.
+          Deleting the head ref of an OPEN pull request closes it off,
+          so the gate is re-checked on the Rust side too.
 
-            Deleting the head ref of an OPEN pull request closes it off,
-            so the gate is re-checked on the Rust side too. */}
-        {pr.state === "MERGED" && pr.head_ref_id ? (
+          ALONE down here since #1580. "View on GitHub" duplicated the
+          header's link and went; Claudify moved up into the header.
+          Delete branch stays below the evidence because it is
+          destructive, and the row is not rendered at all when there is
+          nothing to put in it. */}
+      {pr.state === "MERGED" && pr.head_ref_id ? (
+        <div className="flex items-center gap-2">
           <button
             type="button"
             // ASKS, rather than deleting (#845). This fired
@@ -767,8 +785,8 @@ export function PrDetailView({
             // DESTRUCTIVE styling, the classes every other destructive
             // button in the app uses. The old `className` was
             // BYTE-IDENTICAL to "View on GitHub" and "Copy for agent"
-            // directly above it -- two actions that change nothing --
-            // so the control that destroyed a shared ref was the one
+            // that then sat beside it -- two actions that change nothing
+            // -- so the control that destroyed a shared ref was the one
             // thing in the row with no visual warning at all.
             className="flex w-fit items-center gap-1.5 rounded border border-[#f85149]/40 px-3 py-1.5 text-sm text-[#f85149] hover:bg-[#f85149]/10"
           >
@@ -778,8 +796,8 @@ export function PrDetailView({
                 "Delete…". */}
             Delete branch…
           </button>
-        ) : null}
-      </div>
+        </div>
+      ) : null}
 
       {/* The confirmation (#845).
 
