@@ -2,8 +2,9 @@ name: Cache budget
 
 # Enforces scripts/check-cache-budget.py's per-class ceilings where they
 # are actually crossed: on `main`, whose cache is the only one that
-# persists. Only `main` and the merge queue WRITE the Actions cache
-# (`save-if` in .github/actions/setup/action.yml), so a class over its
+# persists. Only `main` WRITES the Actions cache -- not pull requests,
+# tags or, since #1556, the merge queue (`save-if` in
+# .github/actions/setup/action.yml) -- so a class over its
 # ceiling reflects something that already merged. A local `make lint`
 # therefore only warns (#1505), and this is where the check can fail.
 #

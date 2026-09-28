@@ -21,6 +21,9 @@ between runs without anyone touching the repo**. Consequences:
   there, because no branch writes the cache it measures (#1505). The scheduled
   `.github/workflows/cache-budget.yml` enforces it; its job name is in
   `release.yml`'s `ignore-checks` so a red run cannot burn a release tag.
+- One part is NOT a measurement: `save_policy()` reads the workflow files and
+  fails in every mode if any cache step can save on a ref other than `main`.
+  Merge-queue, PR and tag entries are read by nothing but their own ref (#1556).
 - Never tell someone "that one always fails" — that instruction was given twice
   in one cycle and was wrong both times; the check was passing.
 
