@@ -71,7 +71,7 @@
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use super::liveness::{derive_at, Liveness, ProcessProbe, Registry, Run, SysinfoProbe};
+use super::liveness::{derive_at, Liveness, ProcessProbe, Registry, Run, SysinfoProbe, Unnamed};
 
 /// Whether the directory a session ran in is still there.
 ///
@@ -670,6 +670,21 @@ pub(crate) fn list_with(
     conn: &Connection,
     registry: &Registry,
 ) -> Result<SessionList, rusqlite::Error> {
+    list_probed(conn, registry, SysinfoProbe::for_pids)
+}
+
+/// [`list_with`], with the process probe built by `probe_for` from the
+/// pids any row's liveness could turn on.
+///
+/// The seam the overview's agreement test drives (#1534): it has to run
+/// the SAME list the overview counts from against a process table it
+/// chooses, and a real `sysinfo` refresh cannot be made to hold a live
+/// `.key`-only process on demand.
+pub(crate) fn list_probed<P: ProcessProbe>(
+    conn: &Connection,
+    registry: &Registry,
+    probe_for: impl FnOnce(&[u32]) -> P,
+) -> Result<SessionList, rusqlite::Error> {
     let runs = runs_by_session(conn)?;
 
     // Only the pids that could be alive. A refresh of the whole process
@@ -683,7 +698,7 @@ pub(crate) fn list_with(
     }
     pids.sort_unstable();
     pids.dedup();
-    let probe = SysinfoProbe::for_pids(&pids);
+    let probe = probe_for(&pids);
 
     let rows = stored_rows(conn)?;
     let children = children_by_parent(conn)?;
@@ -1010,7 +1025,14 @@ fn detail_with(
         return Ok(None);
     };
 
-    let runs = runs_for_session(conn, session_id)?;
+    // EVERY session's runs, not just this one's (#1534): whether a
+    // `.key`-only process is this session, another one, or nobody known
+    // is a question about all of them, and answering it from one row's
+    // runs would let the detail pane name a process the list leaves
+    // unnamed. `runs_by_session` is also the list's ordering, which
+    // `derive` depends on (#965).
+    let all_runs = runs_by_session(conn)?;
+    let runs = all_runs.get(session_id).cloned().unwrap_or_default();
 
     let mut pids: Vec<u32> = registry.probe_pids();
     for r in runs.iter().filter(|r| r.ended_at.is_none()) {
@@ -1019,6 +1041,7 @@ fn detail_with(
     pids.sort_unstable();
     pids.dedup();
     let probe = SysinfoProbe::for_pids(&pids);
+    let unnamed = Unnamed::resolve(&probe, &registry, &all_runs);
 
     // The same cwd precedence the list uses: a live session republishes
     // its own, and the stored one is all a dead session has. Stated in
@@ -1031,7 +1054,14 @@ fn detail_with(
         .or_else(|| stored.cwd.clone());
     // With the cwd, so a `.key`-only session elsewhere on the machine
     // does not hedge this one (#1315).
-    let liveness = derive_at(&probe, &registry, session_id, cwd.as_deref(), &runs);
+    let liveness = derive_at(
+        &probe,
+        &registry,
+        &unnamed,
+        session_id,
+        cwd.as_deref(),
+        &runs,
+    );
     let cwd_state = check_cwd(cwd.as_deref());
 
     let kind = super::subagent::Kind::classify(cwd.as_deref());
@@ -1185,29 +1215,6 @@ pub fn opening_prompt(
     })
 }
 
-/// One session's recorded runs, newest first.
-///
-/// `ORDER BY started_at DESC` exactly as [`runs_by_session`] does, and
-/// that is load-bearing rather than tidiness: `derive` reads
-/// `runs.first()` to decide whether the newest run crashed (#965), so a
-/// different order here would give the detail pane a different verdict
-/// from the list for the same session.
-fn runs_for_session(conn: &Connection, session_id: &str) -> Result<Vec<Run>, rusqlite::Error> {
-    let mut stmt = conn.prepare(
-        "SELECT pid, pid_start_time, ended_at, end_reason
-         FROM claude_run WHERE session_id = ?1 ORDER BY started_at DESC",
-    )?;
-    let rows = stmt.query_map([session_id], |r| {
-        Ok(Run {
-            pid: r.get::<_, i64>(0)? as u32,
-            pid_start_time: r.get(1)?,
-            ended_at: r.get(2)?,
-            end_reason: r.get(3)?,
-        })
-    })?;
-    rows.collect()
-}
-
 /// Every recorded run, newest first, grouped by session.
 fn runs_by_session(
     conn: &Connection,
@@ -1262,6 +1269,9 @@ fn assemble<P: ProcessProbe>(
 ) -> SessionList {
     let empty: Vec<Run> = Vec::new();
     let mut reasons = Reasons::default();
+    // Once for the whole list, over every row's runs: which session a
+    // `.key`-only process is cannot be decided one row at a time (#1534).
+    let unnamed = Unnamed::resolve(probe, registry, runs);
     let sessions = stored
         .into_iter()
         .map(|s| {
@@ -1283,7 +1293,14 @@ fn assemble<P: ProcessProbe>(
             // The cwd narrows which rows a `.key`-only session could be
             // (#1315): without it, one terminal launch would hedge every
             // historical row.
-            let liveness = derive_at(probe, registry, &s.session_id, cwd.as_deref(), session_runs);
+            let liveness = derive_at(
+                probe,
+                registry,
+                &unnamed,
+                &s.session_id,
+                cwd.as_deref(),
+                session_runs,
+            );
             // Stays on the list row: the Resumable and Directory-gone
             // chips switch on it, and those counts are over the whole
             // corpus.
@@ -1332,10 +1349,10 @@ fn assemble<P: ProcessProbe>(
         // Stated once for the list, beside the rows it hedged: a session
         // that is running and on no row is exactly what "the list is
         // complete" would hide (#1315).
-        registry_unnamed: super::liveness::unnamed_sessions(probe, registry)
-            .into_iter()
-            .map(|u| u.line)
-            .collect(),
+        //
+        // Only the processes nothing NAMED: one a hook-recorded run
+        // identifies is on its own row, as running (#1534).
+        registry_unnamed: unnamed.sessions.into_iter().map(|u| u.line).collect(),
     }
 }
 

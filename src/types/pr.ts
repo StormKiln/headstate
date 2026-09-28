@@ -2538,8 +2538,9 @@ export interface WireClaudeSessionList {
 /// The headline figures on the Claude Code overview (#921).
 ///
 /// Every field is a COUNT over sessions Headstate has a row for. The
-/// three cwd states are mutually exclusive and sum with `running` to
-/// `sessions`, so a reader can check the page's arithmetic -- which is
+/// three cwd states are mutually exclusive and sum with `running` and
+/// `liveness_unknown` to `sessions`, so a reader can check the page's
+/// arithmetic -- which is
 /// the point of carrying `cwd_unknown` at all rather than folding it into
 /// the larger bucket.
 ///
@@ -2550,9 +2551,15 @@ export interface ClaudeCounts {
   /// hero number -- "1,461 sessions ever" answers nothing on its own,
   /// which is why #921's total-sessions tile is cut.
   sessions: number;
-  /// Running right now, derived from the live registry checked against
-  /// the process table. Trustworthy only while `live_failure` is null.
+  /// Running right now: the rows the session list calls `running`.
+  /// Trustworthy only while `live_failure` is null, and a floor while
+  /// `live_unreadable` or `live_unnamed` is non-empty.
   running: number;
+  /// Rows the session list could not call running or stopped (#1534).
+  /// In NO directory bucket: `resumable`, `archived` and `cwd_unknown` are
+  /// all "stopped, and ...", and offering Resume on a session that may be
+  /// alive starts a second copy of it.
+  liveness_unknown: number;
   /// Not running, and the recorded directory still exists.
   ///
   /// **The page's headline.** 248 of 1,461 on the development machine:
@@ -2709,6 +2716,11 @@ export interface ClaudeOverview {
   /// Registry records present but unusable. Each one hides a session that
   /// may be running, so a non-empty list makes `counts.running` a floor.
   live_unreadable: string[];
+  /// Claude Code processes running with no session record that nothing
+  /// could name (#1315, #1534), one line each. Also makes `counts.running`
+  /// a floor. A process a hook-recorded run names is counted in `running`
+  /// instead.
+  live_unnamed: string[];
 }
 
 /// One project's worth of reports.

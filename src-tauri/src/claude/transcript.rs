@@ -367,9 +367,9 @@ pub struct Scan {
     /// `ENOENT` on the root and `EACCES` on the root are opposite facts
     /// with opposite remedies, and one `Err` arm collapsed them. This is
     /// the `NotFound` half, carried in a field [`Scan::is_partial`] does
-    /// not consult -- `live.rs`'s `read_registry` already draws exactly
+    /// not consult -- `liveness.rs`'s `read_registry` already draws exactly
     /// this line for `~/.claude/sessions` and
-    /// `a_missing_registry_is_a_settled_empty_answer` is its test, with
+    /// `an_absent_registry_directory_is_not_a_failure` is its test, with
     /// the comment "absent is the answer, not an error". The two halves of
     /// `~/.claude` now agree.
     ///
@@ -1179,7 +1179,7 @@ mod tests {
     /// the empty list on every machine that has never run Claude Code.
     /// Nothing could not be read there; there is nothing to read.
     ///
-    /// `live.rs`'s `a_missing_registry_is_a_settled_empty_answer` is the
+    /// `liveness.rs`'s `an_absent_registry_directory_is_not_a_failure` is the
     /// same assertion about the other half of `~/.claude`, and the two
     /// halves now agree -- which is the inconsistency #970 is about.
     ///

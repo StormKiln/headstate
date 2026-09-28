@@ -2006,6 +2006,38 @@ describe("filtering the session list by state", () => {
     expect(rowNames().length).toBe(4);
   });
 
+  /// **#1534.** A row this list could not tell about is not Resumable,
+  /// even when its directory exists.
+  ///
+  /// The overview's "Ready to resume" and its Resumable tile count only
+  /// rows the list calls `dead`, and the tile opens this chip, so the chip
+  /// must agree -- a Resume offered on a session that may be running
+  /// starts a second copy of it. SABOTAGE: restoring `!== "running"` in
+  /// the Resumable arm of `matchesClaudeFilter` puts Kite in the chip.
+  it("does not offer a row whose liveness could not be established as resumable", () => {
+    state.list = listOf([
+      session({
+        session_id: "r-1",
+        name: "Kestrel",
+        cwd_state: { state: "exists" },
+        liveness: { state: "dead", why: "pid 1 is no longer running" },
+      }),
+      session({
+        session_id: "hedged-1",
+        name: "Kite",
+        cwd_state: { state: "exists" },
+        liveness: { state: "unknown", why: "pid 5151 could be this one" },
+      }),
+    ]);
+    renderView();
+
+    const group = screen.getByRole("group", { name: /filter sessions by state/i });
+    expect(within(group).getByRole("button", { name: /^Resumable 1/i })).toBeTruthy();
+    fireEvent.click(chip("Resumable"));
+    expect(screen.queryByRole("button", { name: /Kite/i })).toBeNull();
+    expect(screen.getByRole("button", { name: /Kestrel/i })).toBeTruthy();
+  });
+
   /// The chip and the search box COMPOSE, and the count line says which
   /// denominator it is reporting against.
   ///

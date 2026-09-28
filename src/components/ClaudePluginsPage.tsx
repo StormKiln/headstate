@@ -253,7 +253,7 @@ function Loaded({
 
       {inventory_absent && installed.length === 0 && (
         // Measured, and the answer is none. Not a failure, and not
-        // dressed as one -- `live.rs` draws this same line for a missing
+        // dressed as one -- `liveness.rs` draws this same line for a missing
         // session registry.
         <p className="mt-4 text-sm text-[#8b949e]">
           No plugins are installed. Claude Code keeps its inventory in{" "}

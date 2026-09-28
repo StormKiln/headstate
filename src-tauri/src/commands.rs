@@ -6003,8 +6003,22 @@ pub fn claude_live_pass(db: &std::path::Path) -> Result<ClaudeLiveState, String>
 
         // The sweep first: it is what resolves `procStart` into the
         // confirmed start times the consumer stores as `pid_start_time`.
-        let swept = crate::claude::registry::sweep(&crate::claude::registry::dir_in(&home))?;
-        let start_times = crate::claude::crash::start_times(&swept);
+        let registry_dir = crate::claude::registry::dir_in(&home);
+        let swept = crate::claude::registry::sweep(&registry_dir)?;
+        let mut start_times = crate::claude::crash::start_times(&swept);
+        // And the confirmed start times of the `.key`-only processes a
+        // terminal launch leaves (#1534). The sweep reads only `.json`
+        // records, so without these a terminal-launched session's run is
+        // stored with a NULL start time and its process can never be
+        // named. A `.json`'s own time wins where both exist.
+        let keyed = crate::claude::liveness::read_registry(&registry_dir);
+        if !keyed.unnamed.is_empty() {
+            let pids: Vec<u32> = keyed.unnamed.iter().map(|u| u.pid).collect();
+            let probe = crate::claude::liveness::SysinfoProbe::for_pids(&pids);
+            for (pid, t) in crate::claude::liveness::unnamed_start_times(&probe, &keyed) {
+                start_times.entry(pid).or_insert(t);
+            }
+        }
 
         let mut conn = open_db(db).map_err(|e| e.to_string())?;
         let sweep = crate::claude::crash::record(&mut conn, &swept)?;
@@ -6128,8 +6142,8 @@ pub fn claude_live_pass(db: &std::path::Path) -> Result<ClaudeLiveState, String>
 
 /// Aggregates for the Claude Code overview page (#921, epic #910).
 ///
-/// Counts over the sessions already in the cache, plus the set of ids the
-/// live registry says are running. It derives NO liveness of its own --
+/// Counts over the sessions already in the cache, each classified by the
+/// session list's own verdict for its row. It derives NO liveness of its own --
 /// see `claude/overview.rs`, which argues why a second derivation on the
 /// same page is a defect rather than a convenience.
 ///
@@ -6157,15 +6171,11 @@ pub async fn claude_overview(
 ) -> Result<crate::claude::overview::OverviewReport, String> {
     let db = db_path(&app);
     tauri::async_runtime::spawn_blocking(move || {
-        let live = crate::claude::live::running_ids_default();
+        // Every row's verdict comes off the session list itself (#1534),
+        // so this page cannot offer Resume on a row the list calls "could
+        // not tell".
         let conn = open_db(&db).map_err(|e| e.to_string())?;
-        let overview = crate::claude::overview::aggregate(&conn, &live.ids, chrono::Utc::now())
-            .map_err(|e| e.to_string())?;
-        Ok(crate::claude::overview::OverviewReport {
-            overview,
-            live_failure: live.failure,
-            live_unreadable: live.unreadable,
-        })
+        crate::claude::overview::report(&conn, chrono::Utc::now()).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
