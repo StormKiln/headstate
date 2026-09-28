@@ -3323,6 +3323,12 @@ function uptimeLabel(secs: number | null): string | null {
   return `${secs}s`;
 }
 
+/// What the pane says for a running session Headstate will not signal
+/// (#1569): the fact, why in the reader's terms, and what they can do.
+/// One sentence for the desktop and the phone, so the two cannot drift.
+const STOP_UNAVAILABLE =
+  "Stopping it from Headstate is not available, because the session has not confirmed which process is its own. End it from the window it is running in.";
+
 /// Stop a live session, proposed with its evidence (#1219).
 ///
 /// # Why this exists at all
@@ -3351,6 +3357,13 @@ function uptimeLabel(secs: number | null): string | null {
 /// -- so neither gets the affordance, and `unknown` says why rather than
 /// rendering nothing. `claude_stop_session` is `Class::Local`, so the
 /// phone is behind `IS_MOBILE_BUILD` with a sentence in its place.
+///
+/// # Running is not the same as stoppable (#1569)
+///
+/// A session can read running from a source the stop does not accept as
+/// proof of which process to signal. `detail.stoppable` says whether it
+/// does; when it is `false` the section states that stopping is not
+/// available here instead of offering a button that could only refuse.
 function StopSession({
   session: s,
   detail: d,
@@ -3409,9 +3422,14 @@ function StopSession({
     return (
       <section className="rounded-md border border-[#30363d] bg-[#161b22] p-3">
         <h3 className="text-xs font-semibold text-[#e6edf3]">Stopping this session</h3>
+        {/* `false` only: absent is a desktop that did not report it, and
+            then the Mac sentence is the one that was always shown. Saying
+            "from the Mac" for a session the Mac cannot stop either would
+            send the reader to a button that is not there (#1569). */}
         <p className="mt-1.5 text-xs text-[#8b949e]">
-          A session can only be stopped from the Mac it is running on, so this is not available
-          here.
+          {d.stoppable === false
+            ? STOP_UNAVAILABLE
+            : "A session can only be stopped from the Mac it is running on, so this is not available here."}
         </p>
       </section>
     );
@@ -3430,6 +3448,20 @@ function StopSession({
         <p className="mt-1.5 text-xs text-[#8b949e]">
           Whether this session is running could not be confirmed, so nothing can be signalled
           without guessing at which process is meant. {live.why}
+        </p>
+      </section>
+    );
+  }
+
+  // Running, but not under a pid Stop confirms (#1569). No button: one
+  // here could only refuse. `=== false`, because absent is "not reported"
+  // and the stop re-checks for itself anyway.
+  if (d.stoppable === false) {
+    return (
+      <section className="rounded-md border border-[#30363d] bg-[#161b22] p-3">
+        <h3 className="text-xs font-semibold text-[#e6edf3]">Stopping this session</h3>
+        <p className="mt-1.5 text-xs text-[#8b949e]">
+          This session is running as pid {live.pid}. {STOP_UNAVAILABLE}
         </p>
       </section>
     );

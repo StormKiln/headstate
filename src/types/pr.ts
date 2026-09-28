@@ -1892,6 +1892,19 @@ export interface ClaudeSessionDetail {
   /// where the reason is shown, so it states one as fresh as the verdict
   /// it explains.
   liveness: Liveness;
+  /// Whether Stop's own check confirms, on this read, which process is
+  /// this session's (#1569).
+  ///
+  /// NOT implied by a `running` liveness: a session can read running from
+  /// a source Stop does not confirm a pid from, and the pane must not
+  /// offer a Stop that can only refuse. `false` on a running session
+  /// means "running, and stopping it from Headstate is not available".
+  ///
+  /// Optional so a cached detail from before this field existed, or a
+  /// desktop older than it answering the phone, deserialises. ABSENT is
+  /// "not reported", not `false`: the pane then offers the review as it
+  /// used to, and the stop's own re-check refuses truthfully if it must.
+  stoppable?: boolean;
   /// Whether the transcript file is still on disk (#919).
   ///
   /// A SEPARATE reading from `cwd_state`, never derived from it: 0% of
@@ -1972,9 +1985,16 @@ export interface ClaudeSessionDetail {
 /// `not_running`. It is "we could not establish the start time", and the
 /// stop is refused on it -- signalling on a guess is how an unrelated
 /// process that inherited the pid gets killed.
+///
+/// `running_unconfirmable` must never be collapsed into `not_running`
+/// either (#1569). The session IS running; Headstate declines to signal
+/// it because the process was not confirmed the way a stop requires.
+/// `runs_unreadable` is "we did not look", not "it is not running".
 type ClaudeStopRefusal =
   | { kind: "registry_unreadable"; why: string }
   | { kind: "not_running"; why: string }
+  | { kind: "running_unconfirmable"; pid: number }
+  | { kind: "runs_unreadable"; why: string }
   | { kind: "pid_reused"; pid: number; drift_secs: number }
   | { kind: "unconfirmable"; why: string }
   | { kind: "cap_reached"; cap: number };

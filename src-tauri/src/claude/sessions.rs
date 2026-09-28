@@ -559,6 +559,19 @@ pub struct SessionDetail {
     pub first_seen_at: String,
     /// Derived NOW, for this one session.
     pub liveness: Liveness,
+    /// Whether Stop's own check confirms, on this read, which process is
+    /// this session's (#1569).
+    ///
+    /// NOT implied by a `Running` liveness. Since #1534 a session reads
+    /// `Running` from a hook-recorded run, or from a `.key`-only process
+    /// such a run names, and `claude::stop::confirm` accepts neither as
+    /// proof of which pid to signal -- it accepts only the session's own
+    /// registry `.json`. The pane offers Stop only when this is `true`,
+    /// and says stopping is unavailable when the session is running and
+    /// this is `false`, rather than offering a button that can only
+    /// refuse. Computed by calling `confirm` itself, so the pane and the
+    /// stop cannot disagree about what counts as confirmed.
+    pub stoppable: bool,
     /// Whether the transcript file is still on disk (#919).
     pub transcript_state: CwdState,
     /// The command to copy, already resolved against the cwd's state.
@@ -1021,6 +1034,20 @@ fn detail_with(
     session_id: &str,
     registry: Registry,
 ) -> Result<Option<SessionDetail>, rusqlite::Error> {
+    detail_probed(conn, session_id, registry, SysinfoProbe::for_pids)
+}
+
+/// [`detail_with`] against a process table built by `make_probe` from the
+/// pids this read needs.
+///
+/// Split so a test can put a `Running` verdict on the pane from a fixture
+/// probe (#1569): the real table cannot be told that a pid is alive.
+fn detail_probed<P: ProcessProbe>(
+    conn: &Connection,
+    session_id: &str,
+    registry: Registry,
+    make_probe: impl FnOnce(&[u32]) -> P,
+) -> Result<Option<SessionDetail>, rusqlite::Error> {
     let Some(stored) = stored_row(conn, session_id)? else {
         return Ok(None);
     };
@@ -1040,7 +1067,7 @@ fn detail_with(
     }
     pids.sort_unstable();
     pids.dedup();
-    let probe = SysinfoProbe::for_pids(&pids);
+    let probe = make_probe(&pids);
     let unnamed = Unnamed::resolve(&probe, &registry, &all_runs);
 
     // The same cwd precedence the list uses: a live session republishes
@@ -1063,6 +1090,10 @@ fn detail_with(
         &runs,
     );
     let cwd_state = check_cwd(cwd.as_deref());
+    // The SAME function the stop runs, against this read. The probe
+    // already covers every registry entry's pid, which is all `confirm`
+    // signals on; the runs only word its refusals.
+    let stoppable = super::stop::confirm(&probe, &registry, Ok(&all_runs), session_id).is_ok();
 
     let kind = super::subagent::Kind::classify(cwd.as_deref());
     let subagents = subagent_children(conn, session_id)?;
@@ -1110,6 +1141,7 @@ fn detail_with(
         transcript_path: stored.transcript_path,
         first_seen_at: stored.first_seen_at,
         liveness,
+        stoppable,
         runs: runs.len(),
         registry_failure: registry.failure,
         kind,
@@ -1216,7 +1248,11 @@ pub fn opening_prompt(
 }
 
 /// Every recorded run, newest first, grouped by session.
-fn runs_by_session(
+///
+/// `pub` for `claude::stop`'s refusal (#1569), which must derive the
+/// same `Running` this module does to know when "the registry does not
+/// list it" is not "it is not running".
+pub fn runs_by_session(
     conn: &Connection,
 ) -> Result<std::collections::HashMap<String, Vec<Run>>, rusqlite::Error> {
     let mut stmt = conn.prepare(
@@ -3062,5 +3098,62 @@ mod tests {
             None,
             "inference-only is the normal pre-hook state, not a contradiction"
         );
+    }
+
+    /// **#1569.** The detail says whether Stop can confirm the pid, and a
+    /// `Running` liveness does not imply it.
+    ///
+    /// A session `Running` from a hook-recorded run reads `stoppable:
+    /// false`, because `stop::confirm` accepts only the registry `.json`;
+    /// one the `.json` confirms reads `true`; a dead one reads `false`.
+    /// The pane offers Stop on this field, so a `true` for the first would
+    /// put back the button that could only refuse.
+    ///
+    /// SABOTAGE: set `stoppable` from `liveness.is_running()`. This FAILED
+    /// with "a hook run is not a pid Stop confirms". Restored, passed.
+    #[test]
+    fn the_detail_says_whether_stop_can_confirm_the_pid() {
+        let alive = |_: &[u32]| Fake(Ok(Some(PROC_START_EPOCH)));
+        let gone = |_: &[u32]| Fake(Ok(None));
+
+        let conn = db();
+        insert(&conn, "s1", None, Some("2026-09-01T00:00:00Z"));
+        conn.execute(
+            "INSERT INTO claude_run (session_id, pid, pid_start_time, source, started_at)
+             VALUES ('s1', 4242, ?1, 'hook', '2026-09-01T00:00:00Z')",
+            rusqlite::params![PROC_START],
+        )
+        .unwrap();
+
+        // Running from the hook run alone: the registry lists nothing.
+        let d = detail_probed(&conn, "s1", Registry::default(), alive)
+            .unwrap()
+            .expect("stored");
+        assert!(d.liveness.is_running(), "{:?}", d.liveness);
+        assert!(!d.stoppable, "a hook run is not a pid Stop confirms");
+
+        // Running from the registry `.json`: stoppable.
+        let mut reg = Registry::default();
+        reg.entries.insert(
+            "s1".into(),
+            RegistryEntry {
+                pid: 14779,
+                session_id: "s1".into(),
+                proc_start: Some(PROC_START.into()),
+                ..Default::default()
+            },
+        );
+        let d = detail_probed(&conn, "s1", reg.clone(), alive)
+            .unwrap()
+            .expect("stored");
+        assert!(d.liveness.is_running(), "{:?}", d.liveness);
+        assert!(d.stoppable, "the .json confirms it");
+
+        // Dead: nothing to stop.
+        let d = detail_probed(&conn, "s1", reg, gone)
+            .unwrap()
+            .expect("stored");
+        assert!(!d.liveness.is_running(), "{:?}", d.liveness);
+        assert!(!d.stoppable);
     }
 }
