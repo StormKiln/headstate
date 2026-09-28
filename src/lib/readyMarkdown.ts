@@ -8,7 +8,9 @@ import type { Pusher } from "./readyPusher";
 /// ONE function for both, on purpose: the issues name this seam. A
 /// second copy for the prompt would drift from the one people paste, and
 /// then Claude would be told about a different set of facts than the
-/// reader saw. `readyListMarkdown` is the only entry point.
+/// reader saw. `readyListMarkdown` is the only entry point; `forAgent`
+/// ADDS a header line and lines under each item, and never changes the
+/// item lines both share.
 ///
 /// # What it lists
 ///
@@ -20,9 +22,11 @@ import type { Pusher } from "./readyPusher";
 ///
 /// - A ready time that is absent or unparseable is "ready time unknown",
 ///   never an age (`readyAge` states why).
-/// - The last pusher appears only when KNOWN. "Not checked" (nobody
-///   asked) and "unknown" (asked, could not tell) both leave it out, and
-///   neither is ever written as "not you".
+/// - On the shared line the last pusher appears only when KNOWN. On the
+///   agent's lines it is always stated: a login, "not checked" (nobody
+///   asked) or "unknown" (asked, could not tell). Neither of the last two
+///   is ever written as "not you" -- the one reading that would let
+///   Claude approve a pull request the viewer pushed last.
 /// - An unresolved-conversation count that may be a floor is written as
 ///   one ("at least 3"). An absent count is "unresolved conversations
 ///   unknown", not zero.
@@ -69,6 +73,11 @@ export interface ReadyRow {
 export interface ReadyListOptions {
   /// When the list was built. Passed in, so the output is testable.
   now: Date;
+  /// Add what an agent needs to re-check each pull request itself
+  /// (#1579): the repository and number, the head commit, and the last
+  /// pusher in every state, under a header that labels every value as a
+  /// snapshot.
+  forAgent?: boolean;
 }
 
 /// Escape a title so it cannot break the list or its link.
@@ -129,6 +138,12 @@ function unresolvedText(row: ReadyRow): string {
   return n === 0 ? "no unresolved conversations" : counted;
 }
 
+function pusherText(p: LastPusher | undefined): string {
+  if (p === undefined || p.state === "not-checked") return "not checked";
+  if (p.state === "unknown") return "unknown (checked, could not be determined)";
+  return `@${p.login}`;
+}
+
 /// The line for one pull request: every field the strip knows.
 function entryLine(row: ReadyRow, now: Date): string {
   const { pr } = row;
@@ -154,9 +169,24 @@ function stamp(now: Date): string {
 
 /// The strip's rows as a markdown list. See the module docs.
 export function readyListMarkdown(rows: readonly ReadyRow[], opts: ReadyListOptions): string {
-  const { now } = opts;
+  const { now, forAgent = false } = opts;
   const count = plural(rows.length, "pull request", "pull requests");
   const lines: string[] = [`**Ready for review**: ${count}, as of ${stamp(now)}.`, ""];
-  for (const row of rows) lines.push(entryLine(row, now));
+  if (forAgent) {
+    lines.push(
+      "Everything after each link is Headstate's snapshot from that time, not a live value. " +
+        "Re-check each one yourself before acting on it.",
+      "",
+    );
+  }
+  for (const row of rows) {
+    lines.push(entryLine(row, now));
+    if (forAgent) {
+      const { pr } = row;
+      lines.push(`  - repository: ${pr.repo}, number: ${pr.number}`);
+      lines.push(`  - head commit: ${pr.head_oid ? codeSpan(pr.head_oid) : "unknown"}`);
+      lines.push(`  - last pusher: ${pusherText(row.lastPusher)}`);
+    }
+  }
   return lines.join("\n") + "\n";
 }

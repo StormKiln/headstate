@@ -22,6 +22,7 @@ import {
 } from "@/lib/readyPusher";
 import { type ReadyRow, lastPusherOf, readyListMarkdown } from "@/lib/readyMarkdown";
 import { CopyMarkdownButton } from "./CopyMarkdownButton";
+import { ReadyClaudify } from "./ReadyClaudify";
 
 /// Both labels name the FIELD, not just the direction (#1277).
 ///
@@ -298,6 +299,9 @@ export function ReadyStrip({
           })}
           className="ml-auto font-normal"
         />
+        {/* The same rows, handed to Claude to approve and merge what is
+            eligible (#1579). It only starts Claude; see ReadyClaudify. */}
+        <ReadyClaudify rows={shown} />
         <DropdownMenu>
           <DropdownMenuTrigger
             render={
