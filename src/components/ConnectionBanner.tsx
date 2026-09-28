@@ -100,7 +100,7 @@ export function ConnectionBanner({ updatedAt = 0 }: { updatedAt?: number } = {})
   // GitHub timestamp is noise on top of it.
   const line =
     state.kind === "connected" && updatedAt > 0
-      ? `${text} · updated ${relativeTime(new Date(updatedAt).toISOString())}`
+      ? `${text} · PRs updated ${relativeTime(new Date(updatedAt).toISOString())}`
       : text;
   return (
     <>
