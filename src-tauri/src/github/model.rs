@@ -158,6 +158,19 @@ pub struct PullRequest {
     /// something `PRS_QUERY` can carry under its cost guard (#312).
     #[serde(default)]
     pub unresolved_threads: u64,
+    /// Whether `unresolved_threads` may be SHORT of the truth (#1577).
+    ///
+    /// The count is taken over the threads that arrived, and the list
+    /// query asks for one page of them (#802). When that page came back
+    /// FULL there may be more beyond it, so the count is a floor and the
+    /// UI must print it as one ("3+"), never as a total.
+    ///
+    /// Defaults to TRUE: a snapshot cached before this field existed
+    /// cannot say whether its page was full, and a floor printed as a
+    /// floor is honest where an exact-looking floor is not. The next
+    /// poll replaces it.
+    #[serde(default = "may_be_a_floor")]
+    pub unresolved_threads_floor: bool,
     /// Logins whose review is still outstanding.
     ///
     /// Empty is ORDINARY, not missing data: repositories that assign
@@ -309,6 +322,12 @@ pub struct History {
     pub opened_week_previous: u64,
     pub month_current: u64,
     pub month_previous: u64,
+}
+
+/// `unresolved_threads_floor`'s default for a payload that predates it:
+/// "may be short". See the field.
+fn may_be_a_floor() -> bool {
+    true
 }
 
 impl PullRequest {
@@ -656,6 +675,7 @@ mod attention_tests {
             labels: vec![],
             comment_count: 0,
             unresolved_threads: 0,
+            unresolved_threads_floor: false,
             requested_reviewers: Vec::new(),
             assignees: Vec::new(),
             latest_reviews: Vec::new(),

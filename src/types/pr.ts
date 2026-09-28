@@ -67,6 +67,14 @@ export interface PullRequest {
   /// Review conversations still open on the current code. Resolved and
   /// outdated threads are excluded.
   unresolved_threads: number;
+  /// Whether `unresolved_threads` may be SHORT of the truth (#1577): the
+  /// list query's thread page came back full, so the count is a floor
+  /// (#802) and must print as "N+", never as a total.
+  ///
+  /// OPTIONAL because a payload from an older desktop to the companion
+  /// has no such key. Absent reads as "may be short" -- the qualified
+  /// answer -- never as exact.
+  unresolved_threads_floor?: boolean;
   /// Logins whose review is still outstanding.
   ///
   /// Empty is ORDINARY: repositories that assign reviewers through a
