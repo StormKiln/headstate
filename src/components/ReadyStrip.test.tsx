@@ -262,3 +262,54 @@ describe("ReadyStrip age", () => {
     expect(ageOf(1).textContent).toBe("1d");
   });
 });
+
+/// #1577: open conversations on a row the strip calls ready.
+describe("ReadyStrip unresolved conversations", () => {
+  const withThreads = (
+    unresolved_threads: number,
+    unresolved_threads_floor: boolean | undefined,
+  ): PullRequest => ({ ...ready, unresolved_threads, unresolved_threads_floor });
+
+  it("tags a row with open conversations and carries the count", () => {
+    const { container } = render(<ReadyStrip prs={[withThreads(3, false)]} onOpen={vi.fn()} />);
+    const chip = container.querySelector("[data-unresolved]");
+    expect(chip?.textContent).toBe("3");
+    expect(chip?.getAttribute("data-unresolved")).toBe("exact");
+    expect(chip?.getAttribute("title")).toBe("3 unresolved conversations");
+    // The row's accessible name carries the count, not only the colour.
+    expect(screen.getByRole("button", { name: /3 unresolved conversations/ })).toBeTruthy();
+  });
+
+  it("shows nothing for zero", () => {
+    const { container } = render(<ReadyStrip prs={[withThreads(0, false)]} onOpen={vi.fn()} />);
+    expect(container.querySelector("[data-unresolved]")).toBeNull();
+    expect(screen.queryByText(/unresolved conversation/)).toBeNull();
+  });
+
+  it("qualifies a count that may be a floor, never printing it as exact", () => {
+    const { container } = render(<ReadyStrip prs={[withThreads(3, true)]} onOpen={vi.fn()} />);
+    const chip = container.querySelector("[data-unresolved]");
+    expect(chip?.textContent).toBe("3+");
+    expect(chip?.getAttribute("title")).toBe("At least 3 unresolved conversations");
+    expect(
+      screen.getByRole("button", { name: /at least 3 unresolved conversations/ }),
+    ).toBeTruthy();
+  });
+
+  // A payload from an older desktop has no flag: qualified, not exact.
+  it("qualifies a count whose floor flag is absent", () => {
+    const { container } = render(<ReadyStrip prs={[withThreads(2, undefined)]} onOpen={vi.fn()} />);
+    expect(container.querySelector("[data-unresolved]")?.textContent).toBe("2+");
+  });
+
+  it("singular for one", () => {
+    render(<ReadyStrip prs={[withThreads(1, false)]} onOpen={vi.fn()} />);
+    expect(screen.getByRole("button", { name: /\b1 unresolved conversation(?!s)/ })).toBeTruthy();
+  });
+
+  it("tags a plain-link row too", () => {
+    const { container } = render(<ReadyStrip prs={[withThreads(4, false)]} />);
+    expect(container.querySelector("[data-unresolved]")?.textContent).toBe("4");
+    expect(screen.getByText(", 4 unresolved conversations")).toBeTruthy();
+  });
+});
