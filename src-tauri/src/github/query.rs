@@ -60,6 +60,17 @@ query($q: String!, $first: Int!, $after: String) {
         }
         headRefName headRefOid baseRefName
         headRef { id }
+        # Where the head branch lives (#1576): the Ready for review strip
+        # asks THAT repository's activity log who pushed the head, and a
+        # fork's head is not in the base. Not a connection, so not priced.
+        # MEASURED free, 2026-09-28, this document with its `#` lines
+        # stripped, `gh api graphql -F first=25` on
+        # `repo:kubernetes/kubernetes is:pr is:open`, three runs each:
+        # cost 2 before and 2 after, wall clock 7.3-8.4s before and
+        # 8.1-9.2s after, inside the run-to-run spread. All 25 heads on
+        # that run were forks, so without this the strip could ask about
+        # none of them. `MEASURED_COST` in `poll.rs` stands.
+        headRepository { nameWithOwner }
         author { login }
         repository { nameWithOwner }
         # `mergeStateStatus` is the single most expensive field here, and

@@ -1,12 +1,53 @@
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render as rtlRender,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { ReactElement, ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: () => Promise.resolve() }));
 
+/// The Tauri bridge is the only thing mocked: the strip's pusher hook,
+/// the transport and the wrappers are real, so what these tests control
+/// is exactly what the desktop command would answer (#1576).
+const invoke = vi.hoisted(() =>
+  vi.fn<(cmd: string, args?: Record<string, unknown>) => Promise<unknown>>(),
+);
+vi.mock("@tauri-apps/api/core", () => ({ invoke }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(() => Promise.resolve(() => {})) }));
+
 import { ReadyStrip } from "./ReadyStrip";
 import { PR_FIXTURES } from "../fixtures/prs";
 import { useFilters } from "@/store/filters";
-import type { PullRequest } from "@/types/pr";
+import type { PullRequest, RowPusher } from "@/types/pr";
+
+/// What `get_ready_pushers` answers; `[]` (nothing checked) by default.
+let pusherAnswers: RowPusher[] = [];
+let viewerLogin: Promise<unknown> = Promise.resolve("me");
+
+beforeEach(() => {
+  pusherAnswers = [];
+  viewerLogin = Promise.resolve("me");
+  invoke.mockReset();
+  invoke.mockImplementation((cmd: string) => {
+    if (cmd === "get_viewer") return viewerLogin;
+    if (cmd === "get_ready_pushers") return Promise.resolve(pusherAnswers);
+    return Promise.resolve(undefined);
+  });
+});
+
+function render(ui: ReactElement) {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={qc}>{children}</QueryClientProvider>
+  );
+  return rtlRender(ui, { wrapper });
+}
 
 afterEach(cleanup);
 
@@ -311,5 +352,183 @@ describe("ReadyStrip unresolved conversations", () => {
     const { container } = render(<ReadyStrip prs={[withThreads(4, false)]} />);
     expect(container.querySelector("[data-unresolved]")?.textContent).toBe("4");
     expect(screen.getByText(", 4 unresolved conversations")).toBeTruthy();
+  });
+});
+
+/// #1576: rows the viewer pushed last -- tagged, and filtered.
+describe("ReadyStrip last pusher", () => {
+  const HEAD = "1111111111111111111111111111111111111111";
+  const pr = (number: number, title: string): PullRequest => ({
+    ...ready,
+    number,
+    title,
+    head_oid: HEAD,
+    head_repo: "acme/widget",
+  });
+  type Rules = RowPusher["rules"];
+  const RULE_ON: Rules = {
+    state: "read",
+    require_last_push_approval: true,
+    required_review_thread_resolution: false,
+  };
+  const RULE_OFF: Rules = { ...RULE_ON, require_last_push_approval: false };
+  const UNREAD: Rules = { state: "unreadable", reason: "404" };
+  const answer = (
+    p: PullRequest,
+    rules: Rules,
+    last_pusher: RowPusher["last_pusher"],
+    head_oid = HEAD,
+  ): RowPusher => ({ repo: p.repo, number: p.number, head_oid, rules, last_pusher });
+  const setMode = (readyMyPushes: "auto" | "hide" | "show") =>
+    useFilters.setState({
+      filtersByView: { ...EMPTY, "to-review": { readyMyPushes } },
+      view: "to-review",
+    });
+  const status = () => document.querySelector("[data-my-pushes-status]")?.textContent ?? "";
+
+  const mine = pr(1, "Mine");
+  const theirs = pr(2, "Theirs");
+
+  it("asks for every row's pusher with its head and base", async () => {
+    render(<ReadyStrip prs={[mine]} onOpen={vi.fn()} />);
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("get_ready_pushers", {
+        rows: [
+          {
+            repo: mine.repo,
+            number: 1,
+            base: mine.base_ref,
+            head_repo: "acme/widget",
+            head_ref: mine.head_ref,
+            head_oid: HEAD,
+          },
+        ],
+      }),
+    );
+  });
+
+  it("hides automatically only a known viewer push under a rule read as true", async () => {
+    pusherAnswers = [
+      answer(mine, RULE_ON, { state: "known", login: "me" }),
+      answer(theirs, RULE_ON, { state: "known", login: "someone" }),
+    ];
+    render(<ReadyStrip prs={[mine, theirs]} onOpen={vi.fn()} />);
+    await waitFor(() => expect(screen.queryByText("Mine")).toBeNull());
+    expect(screen.getByText("Theirs")).toBeTruthy();
+    expect(screen.getByText(/ready for review \(1\)/i)).toBeTruthy();
+    expect(status()).toBe("1 hidden: you pushed last and your approval can't count");
+  });
+
+  it("never hides automatically when the rule is off or could not be read", async () => {
+    const other = pr(3, "Unread rules");
+    pusherAnswers = [
+      answer(mine, RULE_OFF, { state: "known", login: "me" }),
+      answer(other, UNREAD, { state: "known", login: "me" }),
+    ];
+    render(<ReadyStrip prs={[mine, other]} onOpen={vi.fn()} />);
+    await waitFor(() => expect(document.querySelectorAll("[data-pushed-by-you]")).toHaveLength(2));
+    expect(screen.getByText("Mine")).toBeTruthy();
+    expect(screen.getByText("Unread rules")).toBeTruthy();
+    // The unread rule is what the filter could not decide.
+    expect(status()).toBe("1 could not be decided");
+  });
+
+  it("never auto-hides an unknown or not-checked pusher, and counts both", async () => {
+    const unknown = pr(3, "Unknown");
+    pusherAnswers = [
+      answer(mine, RULE_ON, { state: "declined", reason: "budget" }),
+      answer(unknown, RULE_ON, { state: "unknown", reason: "log lags" }),
+    ];
+    render(<ReadyStrip prs={[mine, unknown]} onOpen={vi.fn()} />);
+    await waitFor(() => expect(status()).toBe("1 not checked yet · 1 could not be decided"));
+    expect(screen.getByText("Mine")).toBeTruthy();
+    expect(screen.getByText("Unknown")).toBeTruthy();
+    // An undecided row is not tagged either: no false "your push".
+    expect(document.querySelector("[data-pushed-by-you]")).toBeNull();
+  });
+
+  it("tags a known viewer push, with the fact in the accessible name", async () => {
+    setMode("show");
+    pusherAnswers = [
+      answer(mine, RULE_ON, { state: "known", login: "me" }),
+      answer(theirs, RULE_ON, { state: "known", login: "someone" }),
+    ];
+    render(<ReadyStrip prs={[mine, theirs]} onOpen={vi.fn()} />);
+    await waitFor(() => expect(document.querySelector("[data-pushed-by-you]")).not.toBeNull());
+    expect(document.querySelectorAll("[data-pushed-by-you]")).toHaveLength(1);
+    expect(
+      screen.getByRole("button", {
+        name: /^Mine.*you pushed the latest commit, so your approval won't count here/,
+      }),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^Theirs/ }).textContent).not.toMatch(/you pushed/);
+    // Show hides nothing and says nothing.
+    expect(status()).toBe("");
+  });
+
+  it("the manual filter hides every known viewer push and says how many", async () => {
+    setMode("hide");
+    const unknown = pr(3, "Unknown");
+    pusherAnswers = [
+      answer(mine, RULE_OFF, { state: "known", login: "me" }),
+      answer(theirs, RULE_OFF, { state: "known", login: "someone" }),
+      answer(unknown, RULE_OFF, { state: "unknown", reason: "log lags" }),
+    ];
+    render(<ReadyStrip prs={[mine, theirs, unknown]} onOpen={vi.fn()} />);
+    await waitFor(() => expect(screen.queryByText("Mine")).toBeNull());
+    expect(screen.getByText("Theirs")).toBeTruthy();
+    expect(screen.getByText("Unknown")).toBeTruthy();
+    expect(status()).toBe("1 hidden: you pushed last · 1 could not be decided");
+  });
+
+  // The pusher of an old head says nothing about the new one.
+  it("ignores an answer about a head the row has moved off", async () => {
+    setMode("hide");
+    pusherAnswers = [
+      answer(mine, RULE_ON, { state: "known", login: "me" }, "2222222222222222222222222222222222222222"),
+    ];
+    render(<ReadyStrip prs={[mine]} onOpen={vi.fn()} />);
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("get_ready_pushers", expect.anything()));
+    await waitFor(() => expect(status()).toBe("1 not checked yet"));
+    expect(screen.getByText("Mine")).toBeTruthy();
+    expect(document.querySelector("[data-pushed-by-you]")).toBeNull();
+  });
+
+  // A viewer login that could not be read is "could not tell", and hides
+  // nothing: the pusher is never compared against a guess.
+  it("hides nothing when the viewer's login could not be read", async () => {
+    setMode("hide");
+    viewerLogin = Promise.reject(new Error("no client"));
+    viewerLogin.catch(() => {});
+    pusherAnswers = [answer(mine, RULE_ON, { state: "known", login: "me" })];
+    render(<ReadyStrip prs={[mine]} onOpen={vi.fn()} />);
+    await waitFor(() => expect(status()).toBe("1 could not be decided"));
+    expect(screen.getByText("Mine")).toBeTruthy();
+  });
+
+  // Everything hidden is not "nothing ready": the strip stays, and says why.
+  it("keeps the strip when every row is hidden", async () => {
+    pusherAnswers = [answer(mine, RULE_ON, { state: "known", login: "me" })];
+    render(<ReadyStrip prs={[mine]} onOpen={vi.fn()} />);
+    await waitFor(() => expect(screen.queryByText("Mine")).toBeNull());
+    expect(screen.queryByText(/nothing ready to review/i)).toBeNull();
+    expect(status()).toBe("1 hidden: you pushed last and your approval can't count");
+  });
+
+  it("says it is checking while the first answer is on its way", () => {
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "get_ready_pushers" ? new Promise(() => {}) : viewerLogin,
+    );
+    render(<ReadyStrip prs={[mine]} onOpen={vi.fn()} />);
+    expect(status()).toBe("Checking who pushed last…");
+  });
+
+  it("persists the choice like the sort", () => {
+    render(<ReadyStrip prs={[mine]} onOpen={vi.fn()} />);
+    const trigger = screen.getByRole("button", { name: /pull requests you pushed last/i });
+    expect(trigger.textContent).toContain("auto");
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Hide all I pushed last" }));
+    expect(useFilters.getState().filtersByView["to-review"].readyMyPushes).toBe("hide");
   });
 });

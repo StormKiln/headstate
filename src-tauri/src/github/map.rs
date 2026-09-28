@@ -560,6 +560,9 @@ fn map_node(node: &Value) -> Option<PullRequest> {
         head_ref: node["headRefName"].as_str().unwrap_or_default().to_string(),
         head_oid: node["headRefOid"].as_str().unwrap_or_default().to_string(),
         head_ref_id: node["headRef"]["id"].as_str().map(str::to_string),
+        head_repo: node["headRepository"]["nameWithOwner"]
+            .as_str()
+            .map(str::to_string),
         base_ref: node["baseRefName"].as_str().unwrap_or_default().to_string(),
         ready_at: ready_at(node, created_at, is_draft),
         created_at,
@@ -1106,6 +1109,16 @@ mod tests {
             .expect("the field is on the wire");
         let pr: PullRequest = serde_json::from_value(v).unwrap();
         assert!(pr.unresolved_threads_floor);
+    }
+
+    /// #1576: the list row carries where its head lives, so the strip can
+    /// ask a fork's activity log. A deleted fork is `None`, not the base.
+    #[test]
+    fn a_list_row_carries_its_head_repository_or_none() {
+        let mut v = node_with_threads(json!([]));
+        assert_eq!(map_search(&v)[0].head_repo, None);
+        v["authored"]["nodes"][0]["headRepository"] = json!({"nameWithOwner": "fork/a"});
+        assert_eq!(map_search(&v)[0].head_repo.as_deref(), Some("fork/a"));
     }
 
     #[test]

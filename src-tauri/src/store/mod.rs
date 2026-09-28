@@ -66,6 +66,7 @@ mod tests {
             head_ref: "feature/x".into(),
             head_oid: "deadbeef".into(),
             head_ref_id: None,
+            head_repo: None,
             base_ref: "main".into(),
             author: "octocat".into(),
             is_draft: false,

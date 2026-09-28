@@ -1,5 +1,6 @@
 import type { PullRequest, Stats } from "../types/pr";
 import type { AdviceGrouping } from "./adviceGrouping";
+import type { MyPushesMode } from "./readyPusher";
 
 export const STALE_DAYS = 3;
 
@@ -43,6 +44,14 @@ export interface Filters {
   /// or need a store migration, for a word nobody sees. They mean "by
   /// ready-for-review time" now.
   readySort?: "oldest-opened" | "newest-opened";
+  /// What the Ready for review strip does with rows the viewer pushed
+  /// last (#1576). Absent is `"auto"`; see `MyPushesMode`.
+  ///
+  /// Here for the reason `readySort` is: a view preference, persisted by
+  /// `partialize` with no second mechanism. NOT counted by
+  /// `activeFilterCount`: that badge is about the list the filter bar
+  /// narrows, and the strip states its own hidden count beside it.
+  readyMyPushes?: MyPushesMode;
   /// How the CLAUDE.md advice list is organised (#1291). Defaults to
   /// `"check"` -- by-check tables (#1344) -- when absent.
   ///
@@ -146,6 +155,7 @@ export function activeFilterCount(filters: Filters): number {
       key === "query" ||
       key === "sort" ||
       key === "readySort" ||
+      key === "readyMyPushes" ||
       key === "adviceGrouping" ||
       navigation.has(key)
     )

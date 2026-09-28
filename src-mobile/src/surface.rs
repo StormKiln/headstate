@@ -71,6 +71,9 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("get_pr_detail", Class::Read),
     // The review gates (#1451, #1454). A Read; two REST reads, advisory.
     ("get_review_gates", Class::Read),
+    // The Ready for review strip's batched pushers (#1576). A Read; REST reads
+    // capped per call and inside the budget, advisory.
+    ("get_ready_pushers", Class::Read),
     ("get_viewer", Class::Read),
     ("build_target", Class::Read),
     ("latest_release", Class::Read),
