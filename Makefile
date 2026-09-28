@@ -1,7 +1,7 @@
 .PHONY: dev build test test-rust test-ui lint lint-rust lint-ui lint-deps fmt icons \
 	mobile-frontend lint-mobile test-mobile check-mobile-ios check-mobile-android \
 	deny-mobile deny-stepup ios-init android-init icons-mobile ios-device android-device \
-	deny test-race check-intel doctor bench-transcript bench-transcript-browser
+	deny test-race check-intel doctor bench-transcript bench-transcript-browser shadcn-add
 
 # ---- Mobile companion (src-mobile) ---------------------------------------
 #
@@ -466,6 +466,28 @@ lint-ui:
 fmt:
 	cd crates/headstate-stepup && cargo fmt
 	cd src-tauri && cargo fmt
+
+# Add a shadcn component: `make shadcn-add C=tabs`.
+#
+# Not a bare `yarn shadcn add` (#1558). The shadcn registry now writes
+# `import { cn } from "cn"` into every component and adds shadcn's `cn`
+# npm package as a dependency. No components.json alias maps a bare
+# package name, so the CLI copies the import through as written. Our
+# `cn` is `@/lib/utils`. So this points the import back at it and removes
+# the direct dependency. `yarn remove` keeps the `cn@^0.2.4` lock entry
+# that the shadcn CLI itself depends on. `src/lib/cnImport.test.ts` fails
+# if either step is skipped. Test files are left alone: that test's own
+# fixtures spell the bad import on purpose, and rewriting them would
+# disarm it.
+shadcn-add:
+	@test -n "$(C)" || { echo "usage: make shadcn-add C=<component>"; exit 2; }
+	yarn shadcn add $(C)
+	@grep -rlE --include='*.ts' --include='*.tsx' --exclude='*.test.ts' --exclude='*.test.tsx' \
+		"from ['\"]cn['\"]" src | while read -r f; do \
+		perl -pi -e "s/from ([\"'])cn\1/from \1\@\/lib\/utils\1/" "$$f"; \
+		echo "rewrote the cn import in $$f"; \
+	done
+	@if grep -q '"cn":' package.json; then yarn remove cn; fi
 
 # Requires Pillow: pip install -r scripts/requirements.txt
 #
