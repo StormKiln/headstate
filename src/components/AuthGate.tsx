@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
+import { useFilters, viewLabel } from "../store/filters";
 import { useEffect, type ReactNode } from "react";
-import { clearPollError, usePollError, useStoreError } from "../api/hooks";
+import { clearPollError, usePollError, useStoreError, useUiPrefs } from "../api/hooks";
 import { ReportLink } from "./ReportLink";
 import { getAuthState } from "../api/tauri";
 import { useConnectionState } from "@/api/connection";
@@ -69,6 +70,12 @@ export function AuthGate({ children }: { children: ReactNode }) {
   // value this component already holds.
   const pollErr = commandError(pollError ?? "");
   const storeError = useStoreError();
+  // For "Report this" on the poll banner (#1575), which passed neither
+  // and so filed a report with no view and no diagnostics line. This
+  // component is under the query provider, unlike the crash panel, so
+  // it can read both. `undefined` while prefs load is "unknown", not off.
+  const currentView = useFilters((s) => s.view);
+  const { prefs } = useUiPrefs();
   // `local` on the desktop build by construction, so `offline` below is
   // always false there and every branch after it renders exactly what it
   // rendered before.
@@ -182,7 +189,11 @@ export function AuthGate({ children }: { children: ReactNode }) {
                 Opens a PREFILLED form rather than posting: the user is
                 the only one who can confirm nothing sensitive survived
                 scrubbing. */}
-            <ReportLink error={pollError} />
+            <ReportLink
+              error={pollError}
+              view={viewLabel(currentView)}
+              diagnostics={prefs?.diagnostic_logging}
+            />
             {/* The token is read once at startup and held for the process
                 lifetime, so a revoked or expired one 401s forever with the
                 list silently going stale. A relaunch is the actual fix;

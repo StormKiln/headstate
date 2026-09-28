@@ -1,6 +1,7 @@
 import { toast } from "sonner";
 import { useActiveFilters } from "@/store/filters";
 import { ExternalLink } from "./ExternalLink";
+import { LATEST_RELEASE_URL } from "../lib/repo";
 import { getVersion } from "@tauri-apps/api/app";
 import { latestRelease } from "../api/tauri";
 import { UpdateDialog } from "./UpdateDialog";
@@ -340,7 +341,7 @@ export function StatusBar({ updatedAt }: { updatedAt: number }) {
           worth interrupting for. */}
       {newer ? (
         <ExternalLink
-          href="https://github.com/pktstorm/headstate/releases/latest"
+          href={LATEST_RELEASE_URL}
           className="text-[#58a6ff] hover:underline"
           title={`Headstate ${newer} is available`}
         >

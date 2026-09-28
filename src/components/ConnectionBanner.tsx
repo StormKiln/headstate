@@ -4,11 +4,12 @@ import { REQUIRED_PROTOCOL_VERSION, desktopTooOld } from "@/lib/protocol";
 import { useIsMobile } from "@/lib/useIsMobile";
 import { relativeTime } from "@/lib/time";
 import { ExternalLink } from "./ExternalLink";
+import { LATEST_RELEASE_URL } from "@/lib/repo";
 import { SettingsDialog } from "./SettingsDialog";
 
 /// Where "update Headstate on your desktop" sends the user: the desktop
 /// is what needs replacing, and the phone cannot do that for it.
-const DESKTOP_RELEASES = "https://github.com/pktstorm/headstate/releases/latest";
+const DESKTOP_RELEASES = LATEST_RELEASE_URL;
 
 /// `pt-safe` because this is the top-most element of the phone's shell:
 /// with `viewport-fit=cover` the page paints into the notch strip, and

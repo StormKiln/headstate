@@ -82,6 +82,7 @@ import type {
   TranscriptPageDirection,
 } from "../types/transcript";
 import type { OpeningPrompt, SessionDigest } from "../types/sessionDigest";
+import type { DiagnosticBundle } from "../types/report";
 
 export interface AuthState {
   ok: boolean;
@@ -1163,6 +1164,12 @@ export const readLogTail = (maxBytes?: number) =>
   call<LogTail>("read_log_tail", { maxBytes: maxBytes ?? null });
 
 export const revealLog = () => call<string>("reveal_log");
+
+/// Everything "Report this" can say about the desktop, redacted (#1575).
+///
+/// `Class::Read`: on the phone this describes the paired desktop, whose
+/// poll the phone's banner reports.
+export const diagnosticBundle = () => call<DiagnosticBundle>("diagnostic_bundle");
 
 /// Every scope a session actually loads: the repository, plus
 /// `~/.claude/CLAUDE.md` and any `CLAUDE.local.md` (#1131).

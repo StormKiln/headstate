@@ -36,6 +36,10 @@ interface Props {
 
 interface State {
   error: Error | null;
+  /// The component stack, for the report (#1575). Arrives in
+  /// `componentDidCatch`, after the error; `null` until then or if React
+  /// supplied none.
+  componentStack: string | null;
 }
 
 /// Whether this looks like a lazy chunk that could not be fetched.
@@ -55,7 +59,7 @@ function isChunkLoadFailure(e: Error): boolean {
 }
 
 export class ViewErrorBoundary extends Component<Props, State> {
-  state: State = { error: null };
+  state: State = { error: null, componentStack: null };
 
   static getDerivedStateFromError(error: Error): Partial<State> {
     return { error };
@@ -66,6 +70,9 @@ export class ViewErrorBoundary extends Component<Props, State> {
     // release build the console is the only record of it -- the same
     // reasoning the root boundary states.
     console.error(`Unhandled render error in ${this.props.view}:`, error, info.componentStack);
+    // And kept, so "Report this" carries it -- it was logged here and
+    // then dropped, while the root boundary already attached its own.
+    this.setState({ componentStack: info.componentStack ?? null });
   }
 
   /// Recover this view only.
@@ -80,7 +87,7 @@ export class ViewErrorBoundary extends Component<Props, State> {
   /// not be made to fail a test, because there is no path where the
   /// children survive the panel.
   private retry = (): void => {
-    this.setState({ error: null });
+    this.setState({ error: null, componentStack: null });
   };
 
   render(): ReactNode {
@@ -114,6 +121,7 @@ export class ViewErrorBoundary extends Component<Props, State> {
           report={!chunk}
           reportView={this.props.view}
           reportDiagnostics={this.props.diagnostics}
+          reportComponentStack={this.state.componentStack ?? undefined}
         >
           <p className="mt-2 text-xs text-[#8b949e]">
             {/* Says what SURVIVED, which is the whole point of the

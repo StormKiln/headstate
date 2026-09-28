@@ -507,6 +507,12 @@ pub const SURFACE: &[(&str, Class)] = &[
     // `reveal_log` cannot close, because there is no Finder here to
     // reveal into. That one stays Local; this shows the text.
     ("read_log_tail", Class::Read),
+    // Read: everything "Report this" can say about the DESKTOP (#1575) --
+    // its poll history, `gh`, install and log tail, redacted. Served to
+    // the phone because the poll its banner reports runs on the desktop,
+    // and every part is already a Read on its own (`build_target`,
+    // `tool_versions`, `read_log_tail`, `get_poll_interval`).
+    ("diagnostic_bundle", Class::Read),
     ("reveal_log", Class::Local),
     // Reveals a session's directory or transcript in the DESKTOP's file
     // manager (#917). Local: this phone cannot see that Finder, which is

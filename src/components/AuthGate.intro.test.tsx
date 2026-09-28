@@ -5,6 +5,7 @@ vi.mock("../api/hooks", () => ({
   usePollError: () => null,
   useStoreError: () => null,
   clearPollError: vi.fn(),
+  useUiPrefs: () => ({ prefs: undefined, set: vi.fn() }),
 }));
 vi.mock("../splash", () => ({ dismissSplash: vi.fn() }));
 vi.mock("../api/tauri", () => ({

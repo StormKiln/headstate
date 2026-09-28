@@ -23,6 +23,7 @@ pub mod poll;
 pub mod redact;
 pub mod release_notes;
 pub mod remote;
+pub mod report;
 pub mod repos;
 pub mod store;
 pub mod tools;
@@ -289,6 +290,7 @@ pub fn run() {
             commands::background_health,
             commands::tool_versions,
             commands::read_log_tail,
+            commands::diagnostic_bundle,
             commands::reveal_log,
             commands::pull_checkout,
             commands::fetch_refs,
