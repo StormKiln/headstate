@@ -89,6 +89,10 @@ const state = vi.hoisted(() => ({
   orphanSizeFailed: false,
 }));
 
+/// How many worktree rows have rendered (#1582), counted through the one
+/// hook every row calls.
+const rowRenders = vi.hoisted(() => ({ count: 0 }));
+
 const toastSuccess = vi.hoisted(() => vi.fn());
 const toastError = vi.hoisted(() => vi.fn());
 // `info` is its own channel, not a success with different words: a prune
@@ -143,7 +147,13 @@ vi.mock("../api/hooks", () => ({
   useUpdateProgress: () => null,
   useCancelUpdateRun: () => () => Promise.resolve(),
   // Not opened in these tests: the disclosure is closed by default.
-  useAssessment: () => ({ data: undefined, isLoading: false }),
+  //
+  // Called once per row RENDER, which is what makes it the row-render
+  // counter for #1582's test below.
+  useAssessment: () => {
+    rowRenders.count += 1;
+    return { data: undefined, isLoading: false };
+  },
   // The cleanup manifest joins worktrees to the images they own, so the
   // page now reads Docker state -- but only while the confirmation is
   // open, which is why the default here is an empty list.
@@ -3782,6 +3792,69 @@ describe("WorktreesPage", () => {
       // answer -- so this mixture was unreachable, and on the reporting
       // machine the all-skeleton state was permanent.
       expect(container.querySelectorAll('[title="checking…"]').length).toBeGreaterThan(0);
+    });
+
+    /// A verdict landing re-renders ITS row, not the repository (#1582).
+    ///
+    /// The page re-renders once per frame while verdicts stream, and each
+    /// render used to rebuild every row: on a 141-worktree repository,
+    /// 141 row renders per verdict. MEASURED in the Worktrees browser
+    /// harness at 4x CPU throttling, that held the main thread at 89% and
+    /// delivered verdicts up to 7.5 s late, while the window was in front.
+    it("re-renders only the row whose verdict landed", () => {
+      state.classified = undefined;
+      const paths = Array.from({ length: 40 }, (_, i) => `/code/wt-${i}`);
+      state.repos = [
+        {
+          identity: null,
+          name: "proj",
+          path: "/code/proj",
+          worktrees: paths.map((path) => wt({ path, safety: { kind: "pending" } })),
+        },
+      ];
+      state.classifying = true;
+      state.partialVerdicts = new Map();
+      const { rerender } = render(<WorktreesPage />);
+      expect(rowRenders.count).toBeGreaterThanOrEqual(40);
+
+      rowRenders.count = 0;
+      state.partialVerdicts = new Map([
+        [paths[7], wt({ path: paths[7], safety: { kind: "safe" } })],
+      ]);
+      rerender(<WorktreesPage />);
+      // The row that changed, and nothing else.
+      expect(rowRenders.count).toBe(1);
+      expect(screen.getByText(/merged, pushed/i)).toBeTruthy();
+      expect(screen.getByText(/39 to go/)).toBeTruthy();
+    });
+
+    /// A memoised row still acts on the page's CURRENT state (#1582).
+    ///
+    /// The handlers a row holds are stable wrappers, so a row that did
+    /// not re-render must still reach the latest page closure: a
+    /// shift-click range built from a stale visible order would select
+    /// the wrong rows.
+    it("a row that did not re-render still selects against the current list", () => {
+      state.classified = undefined;
+      const paths = ["/code/a", "/code/b", "/code/c", "/code/d"];
+      state.repos = [
+        {
+          identity: null,
+          name: "proj",
+          path: "/code/proj",
+          worktrees: paths.map((path) => wt({ path, safety: { kind: "pending" } })),
+        },
+      ];
+      state.classifying = true;
+      state.partialVerdicts = new Map();
+      const { rerender } = render(<WorktreesPage />);
+      state.partialVerdicts = new Map([[paths[1], wt({ path: paths[1], safety: { kind: "safe" } })]]);
+      rerender(<WorktreesPage />);
+
+      const boxes = screen.getAllByRole("checkbox", { name: /select/i });
+      fireEvent.click(boxes[0]);
+      fireEvent.click(boxes[3], { shiftKey: true });
+      expect(useFilters.getState().checked).toEqual(expect.arrayContaining(paths));
     });
 
     /// One unclassifiable worktree must not suppress the others.

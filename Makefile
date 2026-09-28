@@ -1,7 +1,7 @@
 .PHONY: dev build test test-rust test-ui lint lint-rust lint-ui lint-deps fmt icons \
 	mobile-frontend lint-mobile test-mobile check-mobile-ios check-mobile-android \
 	deny-mobile deny-stepup ios-init android-init icons-mobile ios-device android-device \
-	deny test-race check-intel doctor bench-transcript bench-transcript-browser shadcn-add
+	deny test-race check-intel doctor bench-transcript bench-transcript-browser bench-worktrees-browser shadcn-add
 
 # ---- Mobile companion (src-mobile) ---------------------------------------
 #
@@ -170,6 +170,18 @@ bench-transcript-browser:
 	&& yarn vite build -c vite.harness.config.ts \
 	&& node scripts/transcript-browser-bench.mjs "$$out"; status=$$?; \
 	[ -n "$(BENCH_TRANSCRIPT_OUT)" ] || rm -rf "$$out"; exit $$status
+
+# The Worktrees page in a browser (#1582): builds the harness page
+# (vite.harness-worktrees.config.ts, into dist-harness-worktrees), mounts
+# the real WorktreesPage over a generated repository of N worktrees and
+# streams a classification pass into it, timing every commit, the lag of
+# each verdict's delivery, and where the CPU went. Generated fixtures
+# only; it reads nothing from the machine. N, PRS, RATES, SIZES and
+# THROTTLE are passed through (see the script's header). Not in `test` or
+# CI, for bench-transcript's reason: its figures describe the machine.
+bench-worktrees-browser:
+	yarn vite build -c vite.harness-worktrees.config.ts \
+	&& node scripts/worktrees-browser-bench.mjs
 
 # ---- Parity with CI (#853) -----------------------------------------------
 #

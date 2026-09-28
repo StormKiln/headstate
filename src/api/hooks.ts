@@ -2957,7 +2957,17 @@ export function useWorktreeSafety(repoPath: string | undefined, listed?: Worktre
     queryKey: ["worktree-safety", repoPath],
     queryFn: () => classifyWorktrees(repoPath as string),
     enabled: Boolean(repoPath),
-    staleTime: 30_000,
+    // NOT refetched on focus, and stale only after five minutes (#1582).
+    // A pass on a 141-worktree repository takes minutes, so the old 30s
+    // `staleTime` plus the app-wide focus refetch meant that leaving the
+    // window and coming back started a SECOND whole pass on top of the
+    // first. The verdicts change when the user acts -- a removal, a
+    // fetch, a pull -- and each of those invalidates this key itself.
+    // The desktop also joins a request to a pass already running for the
+    // same repository, so an invalidation mid-pass waits for that pass
+    // rather than starting another.
+    staleTime: 5 * 60_000,
+    refetchOnWindowFocus: false,
     retry: false,
   });
 

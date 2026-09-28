@@ -562,6 +562,29 @@ export function prForWorktree(
   );
 }
 
+/// `prForWorktree` for every row of one repository, indexed once (#1582).
+///
+/// The page asked `prForWorktree` per row on every render, which is a
+/// scan of every open pull request per row: 141 rows against 1,000 PRs is
+/// 141,000 comparisons, and the page re-renders once per frame while
+/// verdicts stream in. MEASURED in the Worktrees browser harness at 4x CPU
+/// throttling, that join was 8% of the main thread during a pass.
+///
+/// The same answer as `prForWorktree`, including which PR wins when two
+/// share a branch: the FIRST in list order, as `find` returns. Build it
+/// once per PR list and repository, then look up per row.
+export function pullRequestsByBranch(
+  prs: PullRequest[],
+  repoIdentity: string | null,
+): (branch: string) => PullRequest | null {
+  if (!repoIdentity) return () => null;
+  const byBranch = new Map<string, PullRequest>();
+  for (const p of prs) {
+    if (p.repo === repoIdentity && p.head_ref && !byBranch.has(p.head_ref)) byBranch.set(p.head_ref, p);
+  }
+  return (branch) => (branch ? (byBranch.get(branch) ?? null) : null);
+}
+
 /// The main checkout of a pull request's repository, or null (#1455).
 ///
 /// The reverse of `prForWorktree`: that one joins a directory to its

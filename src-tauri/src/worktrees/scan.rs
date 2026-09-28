@@ -62,14 +62,73 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
 
 /// [`git_output_with`] over the resolved git binary.
 pub(crate) fn git_output(dir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+    #[cfg(test)]
+    if let Some(fake) = fake_git::for_dir(dir) {
+        return git_output_with(&fake, dir, args);
+    }
     git_output_with(crate::auth::git_program(), dir, args)
+}
+
+/// A stand-in git for the directories one test names (#1582).
+///
+/// `git_program` is resolved once per process, so a test cannot swap it
+/// without swapping it for every test running beside it. This maps a
+/// directory PREFIX -- inside the test's own `TempDir`, so no two tests
+/// share one -- to a program, and every git call under that prefix runs
+/// it instead. That is how a test gets a git that hangs inside a real
+/// classification.
+#[cfg(test)]
+pub(crate) mod fake_git {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static FAKES: Mutex<Vec<(PathBuf, PathBuf)>> = Mutex::new(Vec::new());
+
+    /// Run `program` for every git call in a directory under `prefix`,
+    /// until the returned guard drops. Unix only, like the one test that
+    /// uses it: its fake git is a shell script.
+    #[cfg(unix)]
+    pub(crate) fn install(prefix: &Path, program: &Path) -> Installed {
+        FAKES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((prefix.to_path_buf(), program.to_path_buf()));
+        Installed(prefix.to_path_buf())
+    }
+
+    #[cfg(unix)]
+    pub(crate) struct Installed(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            FAKES
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retain(|(p, _)| p != &self.0);
+        }
+    }
+
+    /// Matched on the path's string form: a worktree's path is a sibling
+    /// of the repository's (`proj`, `proj-f0`), so a prefix can name the
+    /// worktrees without naming the repository.
+    pub(crate) fn for_dir(dir: &Path) -> Option<PathBuf> {
+        let dir = dir.to_string_lossy();
+        FAKES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|(p, _)| dir.starts_with(p.to_string_lossy().as_ref()))
+            .map(|(_, prog)| prog.clone())
+    }
 }
 
 /// A bounded git call with its exit status kept, for a caller that reads
 /// it: `git check-ignore` exits 1 for "not ignored" and 128 for "not a
 /// repository", and [`git`] folds both into one `Err`. `Err` here means
 /// the call never ran or never answered -- a spawn that failed three
-/// times, or the timeout -- never a git that ran and said no.
+/// times, a spent [`budget`], or the timeout -- never a git that ran and
+/// said no.
 ///
 /// `program` is a parameter so a test can prove what a missing binary
 /// produces without touching the resolved one.
@@ -78,6 +137,11 @@ pub(crate) fn git_output_with(
     dir: &Path,
     args: &[&str],
 ) -> Result<std::process::Output, String> {
+    // The budget this thread's caller installed, if any (#1582). Asked
+    // BEFORE the spawn: a classification whose budget is spent must stop
+    // spending, and the cheapest git call is the one never started.
+    let limit = budget::admit()?;
+
     // RETRIED on a spawn failure.
     //
     // Spawning git intermittently fails with ENOENT under process
@@ -96,14 +160,19 @@ pub(crate) fn git_output_with(
     // a slow one.
     let mut spawned = None;
     for _ in 0..3 {
-        match Command::new(program)
-            .arg("-C")
+        let mut cmd = Command::new(program);
+        cmd.arg("-C")
             .arg(dir)
             .args(args)
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-        {
+            .stderr(std::process::Stdio::piped());
+        // Its own process group, so expiry can kill git AND whatever it
+        // started (a fetch's `ssh`, a `remote-https` helper). Killing only
+        // git would leave a child holding the pipes open, and the reader
+        // threads below with them (#1582).
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        match cmd.spawn() {
             Ok(c) => {
                 spawned = Some(Ok(c));
                 break;
@@ -116,35 +185,279 @@ pub(crate) fn git_output_with(
         Some(Err(e)) => return Err(e.to_string()),
         None => return Err("could not spawn git".to_string()),
     };
+    wait_bounded(child, limit)
+}
 
-    // A thread that BLOCKS on the child, rather than polling it. Polling
-    // was measurably wrong here: a flat 20ms interval took the full scan
-    // from 35s to 71s, and even 1ms-with-backoff left it at 48s, because
-    // several thousand calls each paid up to an interval of dead time.
-    // Blocking costs nothing on the common path and still bounds the
-    // pathological one.
+/// [`git_output`] with `input` written to git's stdin, for the commands
+/// that read a stream (`patch-id`, `log --stdin`) (#1582).
+///
+/// The same budget, process group and kill-on-expiry as every other call
+/// here. The input is written on its own thread, so a git that produces
+/// output before it has read all of its input cannot deadlock against a
+/// writer that is waiting for it to read.
+fn git_piped(dir: &Path, args: &[&str], input: Vec<u8>) -> Result<std::process::Output, String> {
+    let limit = budget::admit()?;
+    #[cfg(test)]
+    let program =
+        fake_git::for_dir(dir).unwrap_or_else(|| crate::auth::git_program().to_path_buf());
+    #[cfg(not(test))]
+    let program = crate::auth::git_program();
+    let mut cmd = Command::new(program);
+    cmd.arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    if let Some(mut stdin) = child.stdin.take() {
+        std::thread::spawn(move || {
+            use std::io::Write;
+            // A git that exits early closes the pipe; the write error that
+            // follows is expected, and the exit status says what happened.
+            let _ = stdin.write_all(&input);
+        });
+    }
+    wait_bounded(child, limit)
+}
+
+/// Wait for a spawned git, and KILL it when `limit` expires (#1582).
+///
+/// Threads that BLOCK on the pipes, rather than polling the child.
+/// Polling was measurably wrong here: a flat 20ms interval took the full
+/// scan from 35s to 71s, and even 1ms-with-backoff left it at 48s,
+/// because several thousand calls each paid up to an interval of dead
+/// time. Blocking costs nothing on the common path and still bounds the
+/// pathological one.
+///
+/// The child stays HERE, not inside a waiting thread. The version before
+/// #1582 moved it into `wait_with_output` on a thread, which left no
+/// handle to kill it with, so a timed-out git was abandoned rather than
+/// stopped and ran on for as long as it liked -- one of the ways a
+/// 141-worktree classification kept spending after its rows had already
+/// "timed out". Now the pipes are read on threads, the wait here is only
+/// for both to close, and on expiry git's whole process group is killed
+/// and reaped before this returns. No git outlives its budget.
+///
+/// Two readers, not one: a git that fills the stderr pipe while its
+/// stdout is still open would block on the write forever if only one of
+/// them were being drained.
+fn wait_bounded(
+    mut child: std::process::Child,
+    limit: budget::Limit,
+) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
     let (tx, rx) = std::sync::mpsc::channel();
-    let handle = std::thread::spawn(move || {
-        let result = child.wait_with_output();
-        // The receiver is gone on timeout; that is expected, not an error.
-        let _ = tx.send(result);
+    std::thread::spawn(move || {
+        let err_reader = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            stderr.map(|mut e| e.read_to_end(&mut buf)).transpose()?;
+            Ok::<_, std::io::Error>(buf)
+        });
+        let mut out = Vec::new();
+        let read = stdout.map(|mut o| o.read_to_end(&mut out)).transpose();
+        let err = err_reader
+            .join()
+            .unwrap_or_else(|_| Err(std::io::Error::other("stderr reader panicked")));
+        // The receiver is gone on expiry; that is expected, not an error.
+        let _ = tx.send(read.and(err).map(|err| (out, err)));
     });
 
-    match rx.recv_timeout(GIT_TIMEOUT) {
-        Ok(Ok(out)) => {
-            let _ = handle.join();
-            Ok(out)
+    match rx.recv_timeout(limit.wait) {
+        Ok(Ok((stdout, stderr))) => {
+            // Both pipes closed, so git has exited or is about to: this
+            // wait is the reap, not a second unbounded wait.
+            let status = child.wait().map_err(|e| e.to_string())?;
+            Ok(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            })
         }
-        Ok(Err(e)) => Err(e.to_string()),
-        // The thread is left running rather than detached-and-killed:
-        // `wait_with_output` owns the child, so there is no handle here
-        // to kill it with. It exits when git does, and the scan moves on
-        // treating this worktree as Unknown -- which is the honest
-        // answer for a call that never came back.
-        Err(_) => Err(format!(
-            "git did not respond within {}s",
-            GIT_TIMEOUT.as_secs()
-        )),
+        Ok(Err(e)) => {
+            kill_group(&mut child);
+            Err(e.to_string())
+        }
+        Err(_) => {
+            kill_group(&mut child);
+            Err(limit.expired())
+        }
+    }
+}
+
+/// Kill a spawned git and everything in its process group, then reap it.
+///
+/// The group is signalled BEFORE `wait`, while the child is unreaped, so
+/// its pid cannot have been reused by anything else.
+fn kill_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // `process_group(0)` made git its own group leader, so its pid is
+        // the group id. SAFETY: `kill` takes no pointers; a stale id is
+        // an `ESRCH`, never undefined behaviour.
+        let pgid = child.id() as libc::pid_t;
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A per-thread budget over this module's git calls (#1582).
+///
+/// `classify` is a straight-line sequence of git calls spread over a
+/// dozen helpers, none of which take a deadline, and `content_landed`
+/// alone spends up to four calls per CHANGED FILE. Threading a deadline
+/// through every helper would touch all of them and still miss the next
+/// one written. So the budget is installed around the classification, on
+/// the thread that runs it, and [`git_output_with`] -- the one place every
+/// git call goes through -- consults it:
+///
+/// - before a spawn, a spent budget refuses the call: past the deadline,
+///   or past the call ceiling;
+/// - a call that is admitted waits at most until the deadline (never
+///   longer than `GIT_TIMEOUT`), and is KILLED when it expires.
+///
+/// A refused or killed call is an `Err`, like any other git failure. The
+/// helpers already map a failure to "cannot say" or to the conservative
+/// verdict; `classify_within` then reads [`budget::Spent`] and replaces
+/// whatever verdict came out with `Unknown` carrying the reason, because
+/// a verdict computed from calls that were refused might be wrong.
+pub(crate) mod budget {
+    use std::cell::RefCell;
+    use std::time::{Duration, Instant};
+
+    /// Why a budget stopped admitting calls.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Spent {
+        /// The deadline passed.
+        Time,
+        /// The call ceiling was reached.
+        Calls,
+    }
+
+    struct Budget {
+        deadline: Instant,
+        ceiling: u32,
+        used: u32,
+        spent: Option<Spent>,
+    }
+
+    thread_local! {
+        static BUDGET: RefCell<Option<Budget>> = const { RefCell::new(None) };
+    }
+
+    /// How long an admitted call may wait, and what to say when it ran
+    /// out.
+    pub(crate) struct Limit {
+        pub(crate) wait: Duration,
+        /// Whether `wait` is the budget's deadline rather than
+        /// `GIT_TIMEOUT`, which decides the message and records `Spent`.
+        by_deadline: bool,
+    }
+
+    impl Limit {
+        /// The error for a call that ran out of `wait`. Records the
+        /// budget as spent when it was the deadline that ran out.
+        pub(crate) fn expired(&self) -> String {
+            if self.by_deadline {
+                mark(Spent::Time);
+                "stopped: the classification's time budget ran out".to_string()
+            } else {
+                format!(
+                    "git did not respond within {}s",
+                    super::GIT_TIMEOUT.as_secs()
+                )
+            }
+        }
+    }
+
+    fn mark(why: Spent) {
+        BUDGET.with(|b| {
+            if let Some(b) = b.borrow_mut().as_mut() {
+                b.spent.get_or_insert(why);
+            }
+        });
+    }
+
+    /// Admit one git call, or refuse it because the budget is spent.
+    pub(crate) fn admit() -> Result<Limit, String> {
+        BUDGET.with(|b| {
+            let mut b = b.borrow_mut();
+            let Some(b) = b.as_mut() else {
+                return Ok(Limit {
+                    wait: super::GIT_TIMEOUT,
+                    by_deadline: false,
+                });
+            };
+            if b.used >= b.ceiling {
+                b.spent.get_or_insert(Spent::Calls);
+                return Err(format!(
+                    "not run: the classification's budget of {} git calls is spent",
+                    b.ceiling
+                ));
+            }
+            let left = b.deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                b.spent.get_or_insert(Spent::Time);
+                return Err("not run: the classification's time budget ran out".to_string());
+            }
+            b.used += 1;
+            Ok(Limit {
+                wait: left.min(super::GIT_TIMEOUT),
+                by_deadline: left < super::GIT_TIMEOUT,
+            })
+        })
+    }
+
+    /// What one budgeted run spent.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct Report {
+        /// Git calls admitted.
+        pub(crate) calls: u32,
+        /// Why the budget stopped admitting calls, if it did.
+        pub(crate) spent: Option<Spent>,
+    }
+
+    /// Run `f` with a budget of `ceiling` git calls until `deadline`, on
+    /// this thread. Removed again afterwards, including on a panic, so a
+    /// pooled thread never carries one run's budget into the next.
+    pub(crate) fn with<R>(deadline: Instant, ceiling: u32, f: impl FnOnce() -> R) -> (R, Report) {
+        struct Uninstall;
+        impl Drop for Uninstall {
+            fn drop(&mut self) {
+                BUDGET.with(|b| b.borrow_mut().take());
+            }
+        }
+        BUDGET.with(|b| {
+            *b.borrow_mut() = Some(Budget {
+                deadline,
+                ceiling,
+                used: 0,
+                spent: None,
+            })
+        });
+        let guard = Uninstall;
+        let out = f();
+        let report = BUDGET.with(|b| {
+            b.borrow()
+                .as_ref()
+                .map(|b| Report {
+                    calls: b.used,
+                    spent: b.spent,
+                })
+                .unwrap_or(Report {
+                    calls: 0,
+                    spent: None,
+                })
+        });
+        drop(guard);
+        (out, report)
     }
 }
 
@@ -1688,9 +2001,6 @@ fn descends_from_branch(dir: &Path, default_branch: &str, base: &str) -> Safety 
 /// favourable, and it removes the pathological case the old loop had:
 /// no match meant maximum work.
 fn batch_contains_patch(dir: &Path, candidates: &str, want: &str) -> Safety {
-    use std::io::Write;
-    use std::process::Stdio;
-
     let shas: Vec<&str> = candidates
         .lines()
         .map(str::trim)
@@ -1703,42 +2013,23 @@ fn batch_contains_patch(dir: &Path, candidates: &str, want: &str) -> Safety {
     // `--no-walk` treats each SHA as its own root, and `-p` gives each
     // one its own diff -- the squash commit's contents, which is what
     // the per-candidate `sha^..sha` was computing.
-    let Ok(mut log) = Command::new(crate::auth::git_program())
-        .arg("-C")
-        .arg(dir)
-        .args(["log", "--stdin", "--no-walk", "-p", "--format=commit %H"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return Safety::Unmerged;
-    };
-    if let Some(mut stdin) = log.stdin.take() {
-        let _ = stdin.write_all(shas.join("\n").as_bytes());
-    }
-    let Ok(log_out) = log.wait_with_output() else {
+    //
+    // Through `git_piped`, so both processes are bounded and budgeted
+    // like every other git call here (#1582). They were the two
+    // classification calls with NO bound at all: a plain
+    // `wait_with_output`, which a hung git would have held forever.
+    let Ok(log_out) = git_piped(
+        dir,
+        &["log", "--stdin", "--no-walk", "-p", "--format=commit %H"],
+        shas.join("\n").into_bytes(),
+    ) else {
         return Safety::Unmerged;
     };
     if log_out.stdout.is_empty() {
         return Safety::Unmerged;
     }
 
-    let Ok(mut pid) = Command::new(crate::auth::git_program())
-        .arg("-C")
-        .arg(dir)
-        .args(["patch-id", "--stable"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return Safety::Unmerged;
-    };
-    if let Some(mut stdin) = pid.stdin.take() {
-        let _ = stdin.write_all(&log_out.stdout);
-    }
-    let Ok(out) = pid.wait_with_output() else {
+    let Ok(out) = git_piped(dir, &["patch-id", "--stable"], log_out.stdout) else {
         return Safety::Unmerged;
     };
 
@@ -1765,32 +2056,14 @@ fn batch_contains_patch(dir: &Path, candidates: &str, want: &str) -> Safety {
 /// make that a property of where they came from rather than of this
 /// code.
 fn patch_id(dir: &Path, from: &str, to: &str) -> Option<String> {
-    use std::io::Write;
-    use std::process::Stdio;
-
-    let diff = Command::new(crate::auth::git_program())
-        .arg("-C")
-        .arg(dir)
-        .args(["diff", from, to])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    // Bounded and budgeted like every other git call (#1582); see
+    // `batch_contains_patch`.
+    let diff = git_output(dir, &["diff", from, to]).ok()?;
     if !diff.status.success() || diff.stdout.is_empty() {
         return None;
     }
 
-    let mut child = Command::new(crate::auth::git_program())
-        .arg("-C")
-        .arg(dir)
-        .args(["patch-id", "--stable"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    child.stdin.take()?.write_all(&diff.stdout).ok()?;
-    let out = child.wait_with_output().ok()?;
+    let out = git_piped(dir, &["patch-id", "--stable"], diff.stdout).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -2712,75 +2985,177 @@ fn safety_label(s: &Safety) -> &'static str {
     }
 }
 
-/// `classify`, abandoning the worktree once `budget` is spent (#830).
+/// How many git calls one worktree's classification may make (#1582).
 ///
-/// Returns whether the verdict is a real one. `false` means the budget
-/// ran out and `w.safety` is now `Unknown`, which callers count
-/// SEPARATELY from a verdict -- see `classify_repo_streaming`.
+/// `CLASSIFY_TIMEOUT` bounds the TIME and this bounds the WORK. Time alone
+/// let a branch touching hundreds of files spend its whole 45s, on eight
+/// workers at once, in `content_landed`'s four calls per changed file, and
+/// a pass slowed by anything else (sizing on the same disk, a second pass)
+/// spent the same calls more slowly. A ceiling on calls turns such a
+/// branch into "could not classify" as soon as it is clear it is one,
+/// whatever the machine's speed.
 ///
-/// The work runs on a BORROWED THREAD and the caller stops waiting on
-/// it; it is not cancelled, because nothing here can cancel it. `classify`
-/// is a straight-line sequence of `Command::spawn`/`wait` calls with no
-/// cancellation point, and the `git` helper does not hand back a handle
-/// to kill the child with -- its own comment says so, for exactly this
-/// reason. So the honest description is "gives up on", not "stops".
+/// MEASURED by `live_classification_cost_per_worktree`, which now counts
+/// calls: every one of this repository's 8 worktrees (unmerged branches,
+/// the common case) took exactly 20. Above that the cost is
+/// `content_landed`'s, up to four calls per changed file, so a ceiling of
+/// 600 admits a branch of ~145 changed files. The slowest worktree ever
+/// measured here (3.3s, `CLASSIFY_TIMEOUT`'s table) is ~330 calls at the
+/// ~10 ms a call costs, so it stays inside the ceiling too, and 600 calls
+/// at that rate is ~6s, well inside the 45s time budget.
+const CLASSIFY_GIT_CALLS: u32 = 600;
+
+/// How long past its own budget a classification thread is waited for.
 ///
-/// The abandoned thread exits when its git calls do, and it costs one
-/// thread, not one POOL thread: this is `std::thread`, deliberately
-/// OUTSIDE tokio's blocking pool. That distinction is the one
-/// `GIT_TIMEOUT` documents -- a hung call that parks a pool thread
-/// "wedges every worktree operation until restart" -- and routing the
-/// abandonment through the pool would reproduce it at worktree
-/// granularity.
+/// Every git call inside the budget is killed at the deadline, so the
+/// thread returns within milliseconds of it, carrying the reason it
+/// stopped. This covers that gap. A thread still running after it is
+/// stuck in something that is not a git call (a `stat` on a hung mount),
+/// and is given up on as before.
+const CLASSIFY_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What one worktree's classification spent, and whether it produced a
+/// verdict.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Classified {
+    /// Git calls made, when the classification came back to say.
+    pub(crate) calls: Option<u32>,
+    /// Why it stopped before a verdict, or `None` for a real verdict.
+    pub(crate) stopped: Option<budget::Spent>,
+}
+
+impl Classified {
+    /// Whether `w.safety` is a real verdict rather than `Unknown` for a
+    /// spent budget.
+    #[cfg(test)]
+    pub(crate) fn is_verdict(&self) -> bool {
+        self.stopped.is_none()
+    }
+
+    /// For the diagnostic log: the verdict's name, or why it stopped.
+    fn describe(&self, w: &Worktree, budget: std::time::Duration) -> String {
+        let calls = self
+            .calls
+            .map_or_else(String::new, |n| format!(" ({n} git calls)"));
+        match self.stopped {
+            None => format!("{}{calls}", safety_label(&w.safety)),
+            Some(budget::Spent::Time) => {
+                format!("STOPPED after {}s{calls}", budget.as_secs())
+            }
+            Some(budget::Spent::Calls) => {
+                format!("STOPPED after {CLASSIFY_GIT_CALLS} git calls")
+            }
+        }
+    }
+}
+
+/// `classify`, STOPPED once `budget` or `CLASSIFY_GIT_CALLS` is spent
+/// (#830, #1582).
+///
+/// A spent budget leaves `w.safety` as `Unknown` carrying which budget
+/// ran out, and callers count that SEPARATELY from a verdict -- see
+/// `classify_repo_streaming`.
+///
+/// The work runs on its own thread with a [`budget`] installed, so every
+/// git call it makes checks the deadline and the call ceiling before it
+/// starts, and one still running at the deadline is killed. Before #1582
+/// the caller merely stopped WAITING: the thread ran on, still issuing
+/// git calls each bounded only by `GIT_TIMEOUT` and unbounded in number,
+/// and every 45s up to `CLASSIFY_WORKERS` more such orphans could start
+/// against the live workers. Now the thread returns within milliseconds
+/// of the deadline, and no git it started outlives it.
+///
+/// PARTIAL IS NOT NOTHING. What the thread did establish before the
+/// budget ran out -- the upstream, the last commit -- is kept; only the
+/// VERDICT is replaced, because a verdict computed from calls that were
+/// refused might be wrong, and this one guards deletion. `merged_at` goes
+/// with it, since it is only meaningful beside a merged verdict.
+///
+/// It is `std::thread`, deliberately OUTSIDE tokio's blocking pool: the
+/// distinction `GIT_TIMEOUT` documents -- a hung call that parks a pool
+/// thread "wedges every worktree operation until restart" -- applies to
+/// the non-git hang `CLASSIFY_GRACE` still gives up on.
 ///
 /// `Unknown` rather than a new variant. The enum already has the arm for
 /// "we could not say", every consumer already treats it as never-safe
 /// (`is_safe` is a two-variant allowlist), and the message is what makes
-/// it actionable. A new `Timeout` variant would need handling in every
-/// match in both languages to say the same thing this one already says.
+/// it actionable.
 fn classify_within(
     w: &mut Worktree,
     repo: &Path,
     default_branch: &str,
     budget: std::time::Duration,
-) -> bool {
+) -> Classified {
+    classify_within_calls(w, repo, default_branch, budget, CLASSIFY_GIT_CALLS)
+}
+
+/// [`classify_within`] with the call ceiling as a parameter, so a test
+/// can reach it with a fixture branch of a few files.
+fn classify_within_calls(
+    w: &mut Worktree,
+    repo: &Path,
+    default_branch: &str,
+    budget: std::time::Duration,
+    ceiling: u32,
+) -> Classified {
     // The main checkout is decided without a single git call
     // (`worktree_safety` returns on `is_main` first), so spending a
     // thread and a channel on it is pure overhead on the one row every
     // repository has.
     if w.is_main {
         classify(w, repo, default_branch);
-        return true;
+        return Classified {
+            calls: None,
+            stopped: None,
+        };
     }
 
     let (tx, rx) = std::sync::mpsc::channel();
-    // A CLONE crosses the thread boundary, not a borrow. `w` is behind a
-    // `&mut` the caller still owns, and the whole point is that this
-    // thread may outlive the wait -- so it cannot be allowed to keep
-    // writing into the caller's row after the budget expires. It writes
-    // into its own copy and sends that back; on timeout the copy is
-    // simply dropped, whenever it finally arrives.
+    // A CLONE crosses the thread boundary, not a borrow: `w` is behind a
+    // `&mut` the caller still owns, and if the thread outlives the wait
+    // (`CLASSIFY_GRACE`) it must not keep writing into the caller's row.
     let mut owned = w.clone();
     let repo = repo.to_path_buf();
     let branch = default_branch.to_string();
+    let deadline = std::time::Instant::now() + budget;
     std::thread::spawn(move || {
-        classify(&mut owned, &repo, &branch);
-        // The receiver is gone on timeout; that is expected, not an
-        // error -- the `git` helper's channel has the same contract.
-        let _ = tx.send(owned);
+        let ((), report) = budget::with(deadline, ceiling, || {
+            classify(&mut owned, &repo, &branch);
+        });
+        // The receiver is gone if the grace ran out; that is expected,
+        // not an error -- the `git` helper's channel has the same
+        // contract.
+        let _ = tx.send((owned, report));
     });
 
-    match rx.recv_timeout(budget) {
-        Ok(done) => {
+    let stopped = |w: &mut Worktree, why: budget::Spent| {
+        w.safety = Safety::Unknown(match why {
+            budget::Spent::Time => {
+                format!("classification did not finish within {}s", budget.as_secs())
+            }
+            budget::Spent::Calls => {
+                format!("classification stopped after {ceiling} git calls")
+            }
+        });
+        w.merged_at = None;
+    };
+    match rx.recv_timeout(budget + CLASSIFY_GRACE) {
+        Ok((done, report)) => {
             *w = done;
-            true
+            if let Some(why) = report.spent {
+                stopped(w, why);
+            }
+            Classified {
+                calls: Some(report.calls),
+                stopped: report.spent,
+            }
         }
         Err(_) => {
-            w.safety = Safety::Unknown(format!(
-                "classification did not finish within {}s",
-                budget.as_secs()
-            ));
-            false
+            stopped(w, budget::Spent::Time);
+            Classified {
+                calls: None,
+                stopped: Some(budget::Spent::Time),
+            }
         }
     }
 }
@@ -2853,6 +3228,17 @@ pub fn classify_repo_streaming(
     repo_path: &str,
     report: &mut (dyn FnMut(&Worktree) + Send),
 ) -> Result<(), String> {
+    classify_repo_streaming_within(repo_path, CLASSIFY_TIMEOUT, report)
+}
+
+/// [`classify_repo_streaming`] with the per-worktree time budget as a
+/// parameter, so a test can run a pass of worktrees that all time out in
+/// a second rather than in minutes.
+fn classify_repo_streaming_within(
+    repo_path: &str,
+    budget: std::time::Duration,
+    report: &mut (dyn FnMut(&Worktree) + Send),
+) -> Result<(), String> {
     let dir = Path::new(repo_path);
     // An empty vec on git failure resolved as SUCCESS, which left rows
     // stuck on "checking..." forever while the header confidently read
@@ -2880,22 +3266,19 @@ pub fn classify_repo_streaming(
                 // all, so a stall was indistinguishable from a slow
                 // repository. The total says "slow"; this says WHICH.
                 let started = std::time::Instant::now();
-                let ok = classify_within(&mut w, dir, branch, CLASSIFY_TIMEOUT);
+                let ran = classify_within(&mut w, dir, branch, budget);
+                // The VERDICT's name only, or why it stopped, and how many
+                // git calls it made (#1582). Not the `Debug` of the whole
+                // value: `Unknown` and `Locked` carry git's own free-text
+                // reason, which can name a branch or a path, and the
+                // diagnostic log is something a user pastes into an issue
+                // (`get_pr_detail` makes the same call about a repository
+                // name).
                 crate::diag!(
                     "[diag] worktree-safety {} {}ms {}",
                     w.path,
                     started.elapsed().as_millis(),
-                    if ok {
-                        // The VERDICT's name only. Not the `Debug` of the
-                        // whole value: `Unknown` and `Locked` carry git's
-                        // own free-text reason, which can name a branch
-                        // or a path, and the diagnostic log is something
-                        // a user pastes into an issue (`get_pr_detail`
-                        // makes the same call about a repository name).
-                        safety_label(&w.safety).to_string()
-                    } else {
-                        format!("ABANDONED after {}s", CLASSIFY_TIMEOUT.as_secs())
-                    }
+                    ran.describe(&w, budget)
                 );
                 // A poisoned lock means another worker panicked
                 // mid-report. Dropping this one verdict beats panicking
@@ -2980,16 +3363,12 @@ pub fn classify_main_checkout(repo_path: &str) -> Result<Worktree, String> {
     // `classify_repo_streaming` logs in: the total says a view was slow,
     // this says WHICH repository made it slow.
     let started = std::time::Instant::now();
-    let ok = classify_within(&mut w, dir, &branch, CLASSIFY_TIMEOUT);
+    let ran = classify_within(&mut w, dir, &branch, CLASSIFY_TIMEOUT);
     crate::diag!(
         "[diag] repo-upstream {} {}ms {}",
         w.path,
         started.elapsed().as_millis(),
-        if ok {
-            safety_label(&w.safety).to_string()
-        } else {
-            format!("ABANDONED after {}s", CLASSIFY_TIMEOUT.as_secs())
-        }
+        ran.describe(&w, CLASSIFY_TIMEOUT)
     );
 
     // An abandoned classification leaves `safety` as `Unknown` and
@@ -8507,9 +8886,12 @@ prunable gitdir file points to non-existent location
             let target = tmp.path().join("proj-f0");
 
             let mut w = wt(target.to_str().unwrap());
-            let ok = classify_within(&mut w, &repo, "main", std::time::Duration::ZERO);
+            let ran = classify_within(&mut w, &repo, "main", std::time::Duration::ZERO);
 
-            assert!(!ok, "a budget that is already spent must report failure");
+            assert!(
+                !ran.is_verdict(),
+                "a budget that is already spent must report failure"
+            );
             assert!(
                 matches!(&w.safety, Safety::Unknown(m) if m.contains("did not finish")),
                 "an abandoned worktree must say it could not be classified, \
@@ -8528,7 +8910,7 @@ prunable gitdir file points to non-existent location
             // the Unknown above is the BOUND firing rather than a broken
             // classifier.
             let mut w = wt(target.to_str().unwrap());
-            assert!(classify_within(&mut w, &repo, "main", CLASSIFY_TIMEOUT));
+            assert!(classify_within(&mut w, &repo, "main", CLASSIFY_TIMEOUT).is_verdict());
             assert!(
                 !matches!(&w.safety, Safety::Unknown(m) if m.contains("did not finish")),
                 "a worktree with a real budget must reach a real verdict: {:?}",
@@ -8715,6 +9097,227 @@ prunable gitdir file points to non-existent location
                 "an unreadable repository must say so; resolving as an \
                  empty success is what left rows on 'checking...' while \
                  the header read '0 safe to remove': {err}"
+            );
+        }
+
+        /// A git that will not answer, standing in for the real one in a
+        /// test's own directories (#1582).
+        ///
+        /// Each invocation appends its pid, starts a CHILD of its own that
+        /// also records its pid -- the `ssh` of a fetch, in miniature --
+        /// and then sleeps far longer than any test waits. So every pid in
+        /// the file is a process that is still running unless something
+        /// killed it.
+        #[cfg(unix)]
+        fn hanging_git(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+            use std::os::unix::fs::PermissionsExt;
+            let pids = dir.join("pids");
+            let script = dir.join("hanging-git");
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\necho $$ >> '{p}'\nsleep 60 &\necho $! >> '{p}'\nsleep 60\n",
+                    p = pids.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            (script, pids)
+        }
+
+        /// The pids a `hanging_git` recorded.
+        #[cfg(unix)]
+        fn recorded(pids: &Path) -> Vec<i32> {
+            std::fs::read_to_string(pids)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .collect()
+        }
+
+        /// Whether a pid names a live process. An exited child of the
+        /// test is reaped by `wait_bounded`; an orphaned grandchild is
+        /// reaped by init, which is why callers poll.
+        #[cfg(unix)]
+        fn alive(pid: i32) -> bool {
+            // SAFETY: signal 0 only checks the pid; no pointers.
+            unsafe { libc::kill(pid, 0) == 0 }
+        }
+
+        #[cfg(unix)]
+        fn all_gone_within(pids: &[i32], limit: std::time::Duration) -> Vec<i32> {
+            let until = std::time::Instant::now() + limit;
+            loop {
+                let live: Vec<i32> = pids.iter().copied().filter(|p| alive(*p)).collect();
+                if live.is_empty() || std::time::Instant::now() >= until {
+                    return live;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+
+        /// A git call still running when its budget expires is KILLED,
+        /// with everything it started, and the budget records why
+        /// (#1582, candidate 1).
+        ///
+        /// Before #1582 the helper moved the child into
+        /// `wait_with_output` on a thread and, on timeout, simply stopped
+        /// waiting: the child and its children ran on. Across a
+        /// 141-worktree pass that is a steady accumulation of git
+        /// processes competing with the live workers.
+        #[cfg(unix)]
+        #[test]
+        fn a_git_call_past_its_budget_is_killed_with_what_it_started() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (script, pids) = hanging_git(tmp.path());
+            let started = std::time::Instant::now();
+            let deadline = started + std::time::Duration::from_millis(300);
+            let (out, report) = super::super::budget::with(deadline, 100, || {
+                super::super::git_output_with(&script, tmp.path(), &["status"])
+            });
+            let took = started.elapsed();
+
+            let err = out.expect_err("a git that never answers must not succeed");
+            assert!(err.contains("time budget"), "{err}");
+            assert_eq!(report.spent, Some(super::super::budget::Spent::Time));
+            assert!(
+                took < std::time::Duration::from_secs(5),
+                "the call must end at its deadline, not at GIT_TIMEOUT: {took:?}"
+            );
+            let seen = recorded(&pids);
+            assert_eq!(seen.len(), 2, "git and the child it started: {seen:?}");
+            let live = all_gone_within(&seen, std::time::Duration::from_secs(3));
+            assert!(
+                live.is_empty(),
+                "no git may outlive its budget, nor anything it started: {live:?} still running"
+            );
+        }
+
+        /// A pass in which EVERY worktree times out ends in about two
+        /// budgets for twice as many worktrees as workers, and leaves no
+        /// git running (#1582, candidate 1; the issue's regression test).
+        ///
+        /// Each worktree's first git call hangs. With the budget
+        /// enforced inside the git helper, that call is killed at the
+        /// deadline and every later call in the same classification is
+        /// refused without a spawn, so each worktree costs exactly ONE
+        /// git process and one budget. Before #1582 the pass still
+        /// REPORTED on time -- `classify_within` stopped waiting -- but
+        /// each abandoned thread went on to its next git call, so the
+        /// count of processes grew past one per worktree and none of them
+        /// was ever killed. The budget here is 1s instead of 45s so the
+        /// test runs in seconds; `classify_repo_streaming` passes
+        /// `CLASSIFY_TIMEOUT` through the same code.
+        #[cfg(unix)]
+        #[test]
+        fn a_pass_where_every_worktree_times_out_stops_every_git() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            // Canonical, so the paths git reports match the prefix the
+            // fake is installed for (`/private/var` against `/var`).
+            let root = tmp.path().canonicalize().unwrap();
+            let n = CLASSIFY_WORKERS * 2;
+            let repo = repo_with_worktrees(&root, n);
+            let (script, pids) = hanging_git(&root);
+            // The worktrees only (`proj-f0`...), not the repository, so
+            // the listing itself still runs real git.
+            let _fake = super::super::fake_git::install(&root.join("proj-f"), &script);
+
+            let budget = std::time::Duration::from_secs(1);
+            let started = std::time::Instant::now();
+            let seen = Mutex::new(Vec::new());
+            super::super::classify_repo_streaming_within(
+                repo.to_str().unwrap(),
+                budget,
+                &mut |w| {
+                    seen.lock()
+                        .unwrap()
+                        .push((w.path.clone(), w.safety.clone()));
+                },
+            )
+            .unwrap();
+            let took = started.elapsed();
+
+            let seen = seen.into_inner().unwrap();
+            assert_eq!(seen.len(), n + 1, "every worktree is reported");
+            let timed_out = seen
+                .iter()
+                .filter(|(_, s)| matches!(s, Safety::Unknown(m) if m.contains("did not finish")))
+                .count();
+            assert_eq!(timed_out, n, "every worktree ran out of time: {seen:?}");
+            // Two rounds of eight, each one budget long, plus the grace
+            // and the listing. Far below the 30s one git call could take.
+            assert!(
+                took < budget * 2 + std::time::Duration::from_secs(4),
+                "{n} timed-out worktrees on {CLASSIFY_WORKERS} workers took {took:?}"
+            );
+            // Each git runs in the background, so let any in-flight spawn
+            // record itself before counting.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let all = recorded(&pids);
+            assert_eq!(
+                all.len(),
+                n * 2,
+                "one git per worktree (and its one child), then nothing: a \
+                 classification whose budget is spent must stop spending"
+            );
+            let live = all_gone_within(&all, std::time::Duration::from_secs(3));
+            assert!(
+                live.is_empty(),
+                "every git a timed-out classification started must be dead: {live:?}"
+            );
+        }
+
+        /// Past its CALL budget a worktree is `Unknown` with the reason,
+        /// never a verdict built from calls that were not made (#1582,
+        /// candidate 4).
+        ///
+        /// The fixture branch is unmerged, the verdict that costs the most
+        /// calls. With too few calls allowed, the helpers that were
+        /// refused would each have fallen back to a conservative answer,
+        /// and the result would read as a confident "not merged". Qualify
+        /// or suppress: it is suppressed to `Unknown`, saying why.
+        #[test]
+        fn past_its_call_budget_a_worktree_is_unknown_with_the_reason() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let repo = repo_with_worktrees(tmp.path(), 1);
+            let target = tmp.path().join("proj-f0");
+
+            let mut w = wt(target.to_str().unwrap());
+            let ran =
+                super::super::classify_within_calls(&mut w, &repo, "main", CLASSIFY_TIMEOUT, 2);
+            assert_eq!(ran.stopped, Some(super::super::budget::Spent::Calls));
+            assert_eq!(ran.calls, Some(2), "exactly the ceiling was spent");
+            assert!(
+                matches!(&w.safety, Safety::Unknown(m) if m.contains("stopped after 2 git calls")),
+                "{:?}",
+                w.safety
+            );
+            assert!(!w.safety.is_safe());
+
+            // The same worktree with the production ceiling reaches a real
+            // verdict, well inside it.
+            let mut w = wt(target.to_str().unwrap());
+            let ran = classify_within(&mut w, &repo, "main", CLASSIFY_TIMEOUT);
+            assert!(ran.is_verdict(), "{:?}", w.safety);
+            assert!(ran
+                .calls
+                .is_some_and(|n| n > 2 && n < super::super::CLASSIFY_GIT_CALLS));
+        }
+
+        /// A budget is gone once its run ends, so a pooled or reused
+        /// thread never refuses an unrelated git call with a budget it
+        /// did not install.
+        #[test]
+        fn a_budget_ends_with_its_run() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let repo = repo_with_worktrees(tmp.path(), 0);
+            let (_, report) = super::super::budget::with(std::time::Instant::now(), 0, || {
+                assert!(super::super::git(&repo, &["rev-parse", "HEAD"]).is_err());
+            });
+            assert!(report.spent.is_some());
+            assert!(
+                super::super::git(&repo, &["rev-parse", "HEAD"]).is_ok(),
+                "the spent budget leaked past its run"
             );
         }
 
@@ -10377,14 +10980,31 @@ mod live {
 
         let whole = std::time::Instant::now();
         let mut each: Vec<(u128, String)> = Vec::new();
+        // Git calls per worktree too (#1582), under a budget that cannot
+        // run out, so `CLASSIFY_GIT_CALLS` is set from a measurement.
+        let mut calls: Vec<u32> = Vec::new();
         for w in &listed {
             let mut w = w.clone();
             let t = std::time::Instant::now();
-            classify(&mut w, &repo, &default);
+            let ((), report) = budget::with(
+                std::time::Instant::now() + std::time::Duration::from_secs(3600),
+                u32::MAX,
+                || classify(&mut w, &repo, &default),
+            );
             each.push((t.elapsed().as_millis(), w.path.clone()));
+            calls.push(report.calls);
         }
         let total = whole.elapsed();
         each.sort_unstable();
+        calls.sort_unstable();
+        let q = |v: f64| calls[((calls.len() as f64 - 1.0) * v).round() as usize];
+        println!(
+            "git calls per worktree: p50={} p90={} p99={} max={}",
+            q(0.50),
+            q(0.90),
+            q(0.99),
+            calls.last().copied().unwrap_or(0),
+        );
 
         let at = |q: f64| each[((each.len() as f64 - 1.0) * q).round() as usize].0;
         println!(

@@ -1014,15 +1014,43 @@ pub async fn classify_worktrees(
     app: AppHandle,
     repo_path: String,
 ) -> Result<Vec<crate::worktrees::Worktree>, String> {
-    // One budget across every filesystem scan (#1149), held by the
-    // walk itself rather than by this future -- see `scan_blocking`.
-    // Two failure modes, both real: the join can fail if the blocking
-    // task panicked, and classification itself can fail if git refuses.
+    // ONE pass per repository at a time (#1582). A second request while a
+    // pass runs JOINS it -- it waits for the same result, and the rows it
+    // is showing fill from the same `worktree-safety` events -- rather
+    // than starting a second pass beside the first. Before this, a focus
+    // refetch, or an invalidation after a removal, started a whole second
+    // pass on a 141-worktree repository while the first was still
+    // running: twice the workers, twice the git, on the same disk.
+    let key = repo_path.clone();
+    classify_passes()
+        .join_or_start(&key, move || classify_pass(app, repo_path))
+        .await?
+}
+
+/// The passes running now, one per repository path.
+fn classify_passes() -> &'static SingleFlight<Result<Vec<crate::worktrees::Worktree>, String>> {
+    static PASSES: std::sync::OnceLock<
+        SingleFlight<Result<Vec<crate::worktrees::Worktree>, String>>,
+    > = std::sync::OnceLock::new();
+    PASSES.get_or_init(SingleFlight::new)
+}
+
+/// One classification pass: the offline verdicts, streamed, then GitHub's
+/// record of merges. See `classify_worktrees`.
+async fn classify_pass(
+    app: AppHandle,
+    repo_path: String,
+) -> Result<Vec<crate::worktrees::Worktree>, String> {
+    // Under CLASSIFICATION's permits, not the scan permits the size walks
+    // hold (#1582) -- see `classify_permits`. Held by the walk itself
+    // rather than by this future, as `scan_blocking` explains. Two
+    // failure modes, both real: the join can fail if the blocking task
+    // panicked, and classification itself can fail if git refuses.
     // Flattened rather than swallowed, so an unreadable repo surfaces as
     // an error instead of as zero worktrees.
     let emitter = app.clone();
     let path = repo_path.clone();
-    let rows = scan_blocking(move || {
+    let rows = classify_blocking(move || {
         let mut out = Vec::new();
         crate::worktrees::classify_repo_streaming(&path, &mut |w| {
             // Emitted per worktree rather than batched, for the reason
@@ -1250,6 +1278,131 @@ fn scan_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
             .unwrap_or(4);
         std::sync::Arc::new(tokio::sync::Semaphore::new(n))
     })
+}
+
+/// Classification's OWN permits, apart from the scan permits (#1582).
+///
+/// Classification used to draw from `scan_permits`, the same budget as
+/// every size walk. The Worktrees page starts both passes at once, and a
+/// size walk is long -- MEASURED, 21.40s for one 200 GB checkout, and
+/// minutes across a repository of 141 -- so the walks could hold every
+/// permit while classification waited behind them. #1582's report fits
+/// that: over five minutes before the "checking what is safe to remove"
+/// countdown began at all.
+///
+/// Its own class rather than a place at the front of the same queue,
+/// because the two do different work for different ends. Sizing is a disk
+/// walk and only informational; classification is git processes, and it
+/// is the answer the user ACTS on -- nothing on the page can be removed
+/// until it arrives. A priority inside one semaphore would still make a
+/// classification wait for a walk that already holds a permit to finish.
+///
+/// Two, because a pass is already `CLASSIFY_WORKERS` threads wide and
+/// `classify_worktrees` runs one pass per repository: two lets a second
+/// repository's pass start while the first finishes, without letting a
+/// burst of repository switches put dozens of git workers on one disk.
+///
+/// `classify_repo_upstream` stays on the scan permits: it is one worktree
+/// per repository for the overview's table, fired for every repository
+/// at once, and giving it this class would queue the Worktrees page's
+/// pass behind ~38 of them.
+fn classify_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static PERMITS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(2)))
+}
+
+/// `scan_blocking`, under classification's own permits (#1582). The
+/// permit is held by the walk, for `scan_blocking`'s reason (#1467).
+async fn classify_blocking<T, F>(walk: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    blocking_under(classify_permits().clone(), walk).await
+}
+
+/// At most one run of a keyed job at a time; a second request while one
+/// runs JOINS it and receives the same result (#1582).
+///
+/// The run is SPAWNED, not driven by whichever caller started it: a
+/// caller that goes away (the phone's call timeout, a page unmount) must
+/// not cancel a pass other callers are waiting on, and could not stop the
+/// blocking work underneath anyway. Its entry is removed when the run
+/// ends, including by a panic, so the next request after it starts
+/// fresh.
+pub(crate) struct SingleFlight<T> {
+    running: std::sync::Mutex<
+        std::collections::HashMap<String, tokio::sync::watch::Receiver<Option<T>>>,
+    >,
+}
+
+impl<T: Clone + Send + Sync + 'static> SingleFlight<T> {
+    pub(crate) fn new() -> Self {
+        Self {
+            running: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Join the run for `key` if there is one, or start one with `start`.
+    ///
+    /// `Err` only when the run ended without a result, which is a panic
+    /// inside it: "stopped" rather than a fabricated answer.
+    pub(crate) async fn join_or_start<F, Fut>(
+        &'static self,
+        key: &str,
+        start: F,
+    ) -> Result<T, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T> + Send + 'static,
+    {
+        let mut rx = {
+            let mut running = self.running.lock().unwrap_or_else(|p| p.into_inner());
+            match running.get(key) {
+                Some(rx) => rx.clone(),
+                None => {
+                    let (tx, rx) = tokio::sync::watch::channel(None);
+                    running.insert(key.to_string(), rx.clone());
+                    let run = start();
+                    let done = Finished {
+                        flight: self,
+                        key: key.to_string(),
+                    };
+                    tauri::async_runtime::spawn(async move {
+                        let out = run.await;
+                        // Removed BEFORE the result is published, so a
+                        // request that arrives after it starts a new run
+                        // instead of joining a finished one.
+                        drop(done);
+                        let _ = tx.send(Some(out));
+                    });
+                    rx
+                }
+            }
+        };
+        let out = match rx.wait_for(Option::is_some).await {
+            Ok(v) => v.clone().ok_or_else(|| "waited for a result".to_string()),
+            Err(_) => Err("the classification stopped before it finished".to_string()),
+        };
+        out
+    }
+}
+
+/// Removes a run's entry when the run ends, however it ends.
+struct Finished<T: 'static> {
+    flight: &'static SingleFlight<T>,
+    key: String,
+}
+
+impl<T> Drop for Finished<T> {
+    fn drop(&mut self) {
+        self.flight
+            .running
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.key);
+    }
 }
 
 /// Take a permit from `permits`. Owned, so it can outlive the future
@@ -7653,6 +7806,108 @@ mod tests {
             1,
             "and every permit is back once both walks are done"
         );
+    }
+
+    /// Two overlapping classification requests for one repository run ONE
+    /// pass, and both get its result (#1582, candidate 2).
+    ///
+    /// A focus refetch, or an invalidation after a removal, used to start
+    /// a whole second pass on a 141-worktree repository while the first
+    /// was still running. The second caller now joins the first.
+    #[tokio::test]
+    async fn overlapping_requests_for_one_key_share_one_run() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+        static FLIGHT: std::sync::LazyLock<super::SingleFlight<Result<u32, String>>> =
+            std::sync::LazyLock::new(super::SingleFlight::new);
+        let starts = Arc::new(AtomicUsize::new(0));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let s = starts.clone();
+        let first = tokio::spawn(
+            FLIGHT.join_or_start("/code/acme/widget", move || async move {
+                s.fetch_add(1, Ordering::SeqCst);
+                let _ = release_rx.await;
+                Ok(7)
+            }),
+        );
+        while starts.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let s = starts.clone();
+        let second = tokio::spawn(
+            FLIGHT.join_or_start("/code/acme/widget", move || async move {
+                s.fetch_add(1, Ordering::SeqCst);
+                Ok(8)
+            }),
+        );
+        // The first caller goes away, as the phone does at its deadline.
+        // The run is not its to cancel: the second is still waiting on it.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        first.abort();
+        let _ = first.await;
+        release_tx.send(()).expect("the run is still waiting");
+
+        let got = tokio::time::timeout(Duration::from_secs(10), second)
+            .await
+            .expect("the joined request finished")
+            .expect("joined");
+        assert_eq!(
+            got,
+            Ok(Ok(7)),
+            "the second request gets the FIRST run's result"
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 1, "one run, not two");
+
+        // Once it has finished, the next request starts a fresh run.
+        let s = starts.clone();
+        let again = FLIGHT
+            .join_or_start("/code/acme/widget", move || async move {
+                s.fetch_add(1, Ordering::SeqCst);
+                Ok(9)
+            })
+            .await;
+        assert_eq!(again, Ok(Ok(9)));
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+    }
+
+    /// A run that ends without a result (a panic) says it stopped, and
+    /// does not leave its key joined to a run that will never answer.
+    #[tokio::test]
+    async fn a_run_that_panics_is_an_error_and_is_not_joined_again() {
+        static FLIGHT: std::sync::LazyLock<super::SingleFlight<Result<u32, String>>> =
+            std::sync::LazyLock::new(super::SingleFlight::new);
+        let got = FLIGHT
+            .join_or_start("/code/acme/gadget", || async { panic!("the pass failed") })
+            .await;
+        assert!(got.is_err(), "no result is not a result: {got:?}");
+        let again = FLIGHT
+            .join_or_start("/code/acme/gadget", || async { Ok(3) })
+            .await;
+        assert_eq!(again, Ok(Ok(3)), "the next request starts a fresh run");
+    }
+
+    /// Classification holds a permit of its OWN class, not a scan permit
+    /// (#1582, candidate 3), so it cannot queue behind the size walks.
+    /// No other test draws on classification's permits, so the count
+    /// inside the walk is this walk's alone.
+    #[tokio::test]
+    async fn classification_holds_its_own_permit_not_a_scan_permit() {
+        let before = super::classify_permits().available_permits();
+        let inside = super::classify_blocking(|| super::classify_permits().available_permits())
+            .await
+            .expect("ran");
+        assert_eq!(
+            inside,
+            before - 1,
+            "the classification walk must hold one of classification's permits"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(super::classify_permits(), super::scan_permits()),
+            "classification's permits must not be the scan permits the size walks hold"
+        );
+        assert_eq!(super::classify_permits().available_permits(), before);
     }
 
     /// #1124: the three constants must agree, since `AUTH_ERR` is
