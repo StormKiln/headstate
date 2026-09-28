@@ -277,8 +277,29 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
       // caveat exists to remove: an incomplete board with no word about
       // collection reads as broken, which is what was reported against
       // v5.23.3 (#1115). The page does not need a frame to know that
-      // collection is pending -- it knows the board is incomplete.
-      "Collection starting.";
+      // collection is pending -- the board says which days it still owes.
+      //
+      // This is PENDING, not Unknown: nothing has been checked and failed,
+      // and a frame replaces it the moment one arrives for this scope.
+      //
+      // Gated on the board's OWN statement that collection can change it,
+      // not on incompleteness alone. A board can be incomplete for reasons
+      // no collection cures -- GitHub refused fields, or a slice over the
+      // result cap with every day already covered -- and a board built
+      // with no storage behind it (`accumulating: false`) has nothing
+      // writing down more. Promising collection to either would be a claim
+      // nobody can keep (#841's fail-open).
+      //
+      // "Queued", not "starting": the hook holds no frame after a scope
+      // SWITCH either, when the worker may have been collecting this scope
+      // for an hour. "Starting" would be false there; "queued" is true in
+      // both cases.
+      board &&
+        board.accumulating &&
+        board.daysTotal > 0 &&
+        board.daysCovered < board.daysTotal
+      ? "The remaining days are queued for collection."
+      : undefined;
   const caveat = board
     ? partialityCaveat(
         backfill

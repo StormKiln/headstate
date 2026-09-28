@@ -70,7 +70,9 @@ describe("ConnectionBanner", () => {
     render(<ConnectionBanner updatedAt={Date.now() - 10 * 60_000} />);
     const banner = screen.getByRole("button", { name: /octocat's laptop/ });
     expect(banner.textContent).toContain("reachable");
-    expect(banner.textContent).toContain("updated 10 minutes ago");
+    // "PRs updated", not a bare "updated": the timestamp is the PR poll's,
+    // and a subjectless one reads as a claim about everything (#1115).
+    expect(banner.textContent).toContain("PRs updated 10 minutes ago");
   });
 
   /// Without a GitHub timestamp the line is just the desktop, rather
