@@ -336,6 +336,214 @@ pub async fn review_gates(
     ReviewGates { rules, last_pusher }
 }
 
+// ---------------------------------------------------------------------
+// The Ready for review strip (#1576)
+// ---------------------------------------------------------------------
+
+/// One strip row's question: who pushed its head, and what its base's
+/// rules say.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PusherAsk {
+    pub repo: String,
+    pub number: u64,
+    pub base: String,
+    /// Where the head lives; `None` for a deleted fork or an old snapshot.
+    pub head_repo: Option<String>,
+    pub head_ref: String,
+    pub head_oid: String,
+}
+
+/// One strip row's answer. `head_oid` is echoed so the frontend can drop
+/// an answer about a head the row has since moved off.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RowPusher {
+    pub repo: String,
+    pub number: u64,
+    pub head_oid: String,
+    pub rules: BaseRules,
+    /// Never `NotNeeded` here: the strip's tag wants the pusher whatever
+    /// the rules say. `Declined` is "not checked" -- the budget, the
+    /// per-refresh cap, or no head repository to ask -- and the strip
+    /// renders it as not checked, never as a verdict.
+    pub last_pusher: LastPusher,
+}
+
+/// At most this many activity reads per strip refresh. The rest are
+/// declined for THIS refresh and asked on a later one, so a strip of
+/// eighty rows costs thirty requests, not eighty, and none of it twice:
+/// answers are cached by head commit.
+pub const STRIP_LOOKUP_CAP: usize = 30;
+
+/// Activity reads in flight at once. `BATCH_CONCURRENCY`'s figure in
+/// `commands.rs`, for the same reason: well inside GitHub's secondary
+/// limits while finishing a batch promptly.
+const STRIP_CONCURRENCY: usize = 4;
+
+/// Known pushers, by (head repository, head commit). A pusher cannot
+/// change without the head commit changing, so an entry never goes stale;
+/// only `Known` is cached, because an `Unknown` is often the activity log
+/// lagging a fresh push and the next refresh may read it.
+static PUSHER_CACHE: Mutex<Option<HashMap<(String, String), String>>> = Mutex::new(None);
+
+/// Past this many entries the cache is dropped and refilled. A crude
+/// bound, and enough: the strip holds dozens of rows, not thousands.
+const PUSHER_CACHE_CAP: usize = 4096;
+
+fn cached_pusher(head_repo: &str, head_oid: &str) -> Option<String> {
+    let guard = PUSHER_CACHE.lock().ok()?;
+    guard
+        .as_ref()?
+        .get(&(head_repo.to_string(), head_oid.to_string()))
+        .cloned()
+}
+
+fn store_pusher(head_repo: &str, head_oid: &str, login: &str) {
+    if let Ok(mut guard) = PUSHER_CACHE.lock() {
+        let map = guard.get_or_insert_with(HashMap::new);
+        if map.len() >= PUSHER_CACHE_CAP {
+            map.clear();
+        }
+        map.insert(
+            (head_repo.to_string(), head_oid.to_string()),
+            login.to_string(),
+        );
+    }
+}
+
+/// Rules and pusher for every row of the strip, spending only within the
+/// REST budget.
+///
+/// - Rules: one read per distinct (repository, base), through
+///   `base_rules` and its ten-minute cache.
+/// - Pushers: from the cache by (head repository, head commit), else one
+///   activity read each, for at most `STRIP_LOOKUP_CAP` rows in the
+///   order given (the strip's own order, so the top rows are answered
+///   first), `STRIP_CONCURRENCY` at a time. Past the cap or the budget a
+///   row is `Declined`: not checked, which is not "unknown".
+///
+/// Every read has its own `per_request` ceiling and every answer is kept
+/// as it lands, so one hung lookup costs its own row and nothing else
+/// (partial is not nothing, #1044). Never fails: a lost task becomes that
+/// row's `Unknown`.
+pub async fn strip_pushers(
+    client: &GitHubClient,
+    budget: &Budget,
+    asks: &[PusherAsk],
+    per_request: Duration,
+) -> Vec<RowPusher> {
+    // Rules first, per distinct (repo, base), concurrently: most answer
+    // from the cache, and a slow one must not hold up the rest.
+    let mut keys: Vec<(String, String)> = Vec::new();
+    for a in asks {
+        let key = (a.repo.clone(), a.base.clone());
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    let mut rules: HashMap<(String, String), BaseRules> = HashMap::new();
+    for chunk in keys.chunks(STRIP_CONCURRENCY) {
+        let mut set = tokio::task::JoinSet::new();
+        for (repo, base) in chunk.iter().cloned() {
+            let (client, budget) = (client.clone(), budget.clone());
+            set.spawn(async move {
+                let r =
+                    tokio::time::timeout(per_request, base_rules(&client, &budget, &repo, &base))
+                        .await
+                        .unwrap_or_else(|_| BaseRules::Unreadable {
+                            reason: format!("timed out after {}s", per_request.as_secs()),
+                        });
+                ((repo, base), r)
+            });
+        }
+        while let Some(res) = set.join_next().await {
+            // A lost task leaves its key out; the row reads Unreadable below.
+            if let Ok((key, r)) = res {
+                rules.insert(key, r);
+            }
+        }
+    }
+
+    // Pushers: answer from the cache where possible, and pick which of
+    // the rest this refresh may ask about.
+    let mut pushers: Vec<Option<LastPusher>> = vec![None; asks.len()];
+    let mut to_ask: Vec<usize> = Vec::new();
+    for (i, a) in asks.iter().enumerate() {
+        let Some(repo) = a.head_repo.as_deref() else {
+            // Nothing to ask, and it costs no slot under the cap. The
+            // base repository is never asked in its place.
+            pushers[i] = Some(LastPusher::Declined {
+                reason: "the head repository is not known".into(),
+            });
+            continue;
+        };
+        if let Some(login) = cached_pusher(repo, &a.head_oid) {
+            pushers[i] = Some(LastPusher::Known { login });
+            continue;
+        }
+        if to_ask.len() < STRIP_LOOKUP_CAP {
+            to_ask.push(i);
+        } else {
+            pushers[i] = Some(LastPusher::Declined {
+                reason: "not checked on this refresh".into(),
+            });
+        }
+    }
+
+    for chunk in to_ask.chunks(STRIP_CONCURRENCY) {
+        let mut set = tokio::task::JoinSet::new();
+        for &i in chunk {
+            let (client, budget, a) = (client.clone(), budget.clone(), asks[i].clone());
+            set.spawn(async move {
+                let p = tokio::time::timeout(
+                    per_request,
+                    last_pusher(
+                        &client,
+                        &budget,
+                        a.head_repo.as_deref(),
+                        &a.head_ref,
+                        &a.head_oid,
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| LastPusher::Unknown {
+                    reason: format!("timed out after {}s", per_request.as_secs()),
+                });
+                (i, p)
+            });
+        }
+        while let Some(res) = set.join_next().await {
+            // A panicked task has lost its index; its row stays `None`
+            // and becomes Unknown below rather than vanishing.
+            if let Ok((i, p)) = res {
+                if let (LastPusher::Known { login }, Some(repo)) =
+                    (&p, asks[i].head_repo.as_deref())
+                {
+                    store_pusher(repo, &asks[i].head_oid, login);
+                }
+                pushers[i] = Some(p);
+            }
+        }
+    }
+
+    asks.iter()
+        .zip(pushers)
+        .map(|(a, p)| RowPusher {
+            repo: a.repo.clone(),
+            number: a.number,
+            head_oid: a.head_oid.clone(),
+            rules: rules
+                .get(&(a.repo.clone(), a.base.clone()))
+                .cloned()
+                .unwrap_or_else(|| BaseRules::Unreadable {
+                    reason: "the lookup failed".into(),
+                }),
+            last_pusher: p.unwrap_or_else(|| LastPusher::Unknown {
+                reason: "the lookup failed".into(),
+            }),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,5 +905,195 @@ mod tests {
         let client = client_for(&server).await;
         let p = last_pusher(&client, &Budget::new(), None, "feat/x", HEAD).await;
         assert!(matches!(p, LastPusher::Declined { .. }), "{p:?}");
+    }
+
+    fn ask(repo: &str, number: u64, head_oid: &str) -> PusherAsk {
+        PusherAsk {
+            repo: repo.into(),
+            number,
+            base: "main".into(),
+            head_repo: Some(repo.into()),
+            head_ref: format!("feat/{number}"),
+            head_oid: head_oid.into(),
+        }
+    }
+
+    /// #1576: a known pusher is cached by HEAD COMMIT. The same head asks
+    /// GitHub once however many refreshes; a new head asks again, because
+    /// only a push moves it and that push may be someone else's.
+    #[tokio::test]
+    async fn strip_pushers_are_cached_by_head_commit() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/strip-org/strip-one/rules/branches/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([pr_rule(true, false)])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/strip-org/strip-one/activity"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                push("push", HEAD, "viewer"),
+                push("push", OTHER, "someone")
+            ])))
+            .mount(&server)
+            .await;
+        let client = client_for(&server).await;
+        let budget = Budget::seeded_rest_for_test(5000);
+        for _ in 0..2 {
+            let out =
+                strip_pushers(&client, &budget, &[ask("strip-org/strip-one", 1, HEAD)], T).await;
+            assert_eq!(
+                out[0].last_pusher,
+                LastPusher::Known {
+                    login: "viewer".into()
+                }
+            );
+            assert!(matches!(
+                out[0].rules,
+                BaseRules::Read {
+                    require_last_push_approval: true,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(
+            budget.rest_requests(),
+            2,
+            "one rules read, one activity read"
+        );
+
+        // A different head is a different question: asked again. The log
+        // names OTHER's pusher only as the second entry, so it is Unknown
+        // -- and never borrowed from HEAD's cached answer.
+        let out = strip_pushers(&client, &budget, &[ask("strip-org/strip-one", 1, OTHER)], T).await;
+        assert!(
+            matches!(out[0].last_pusher, LastPusher::Unknown { .. }),
+            "{out:?}"
+        );
+        assert_eq!(budget.rest_requests(), 3);
+    }
+
+    /// An Unknown is not cached: the log often lags a fresh push, and the
+    /// next refresh should read it again.
+    #[tokio::test]
+    async fn an_unknown_strip_pusher_is_asked_again() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/strip-org/strip-two/rules/branches/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/strip-org/strip-two/activity"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = client_for(&server).await;
+        let budget = Budget::seeded_rest_for_test(5000);
+        for _ in 0..2 {
+            let out =
+                strip_pushers(&client, &budget, &[ask("strip-org/strip-two", 2, HEAD)], T).await;
+            assert!(
+                matches!(out[0].last_pusher, LastPusher::Unknown { .. }),
+                "{out:?}"
+            );
+        }
+    }
+
+    /// Past the per-refresh cap a row is NOT CHECKED -- `Declined`, never
+    /// `Unknown` -- and nothing is sent for it. The rows inside the cap
+    /// are the first ones, in the order the strip gave.
+    #[tokio::test]
+    async fn rows_past_the_strip_cap_are_not_checked() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/strip-org/strip-three/rules/branches/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/strip-org/strip-three/activity"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(STRIP_LOOKUP_CAP as u64)
+            .mount(&server)
+            .await;
+        let client = client_for(&server).await;
+        let asks: Vec<PusherAsk> = (0..STRIP_LOOKUP_CAP as u64 + 2)
+            .map(|n| ask("strip-org/strip-three", n, &format!("{n:040}")))
+            .collect();
+        let out = strip_pushers(&client, &Budget::seeded_rest_for_test(5000), &asks, T).await;
+        assert_eq!(out.len(), asks.len(), "every row answered, none dropped");
+        for (i, row) in out.iter().enumerate() {
+            assert_eq!(row.number, i as u64, "answers stay in the rows' order");
+            if i < STRIP_LOOKUP_CAP {
+                assert!(
+                    matches!(row.last_pusher, LastPusher::Unknown { .. }),
+                    "{row:?}"
+                );
+            } else {
+                assert!(
+                    matches!(row.last_pusher, LastPusher::Declined { .. }),
+                    "{row:?}"
+                );
+            }
+        }
+    }
+
+    /// A spent REST budget sends nothing and says so: rules and pusher are
+    /// both `Declined` (we did not ask), which the strip counts as not
+    /// checked and never hides on.
+    #[tokio::test]
+    async fn a_spent_budget_leaves_strip_rows_not_checked() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let client = client_for(&server).await;
+        let out = strip_pushers(
+            &client,
+            &Budget::seeded_rest_for_test(10),
+            &[ask("strip-org/strip-four", 4, HEAD)],
+            T,
+        )
+        .await;
+        assert!(
+            matches!(out[0].rules, BaseRules::Declined { .. }),
+            "{out:?}"
+        );
+        assert!(
+            matches!(out[0].last_pusher, LastPusher::Declined { .. }),
+            "{out:?}"
+        );
+    }
+
+    /// No head repository: declined without a request, and it does not
+    /// use up a slot under the cap.
+    #[tokio::test]
+    async fn a_strip_row_without_a_head_repository_is_not_asked() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/strip-org/strip-five/rules/branches/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/strip-org/strip-five/activity"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let client = client_for(&server).await;
+        let mut a = ask("strip-org/strip-five", 5, HEAD);
+        a.head_repo = None;
+        let out = strip_pushers(&client, &Budget::seeded_rest_for_test(5000), &[a], T).await;
+        assert!(
+            matches!(out[0].last_pusher, LastPusher::Declined { .. }),
+            "{out:?}"
+        );
     }
 }

@@ -107,6 +107,15 @@ pub struct PullRequest {
     /// tells "already cleaned up" from "still there".
     #[serde(default)]
     pub head_ref_id: Option<String>,
+    /// The repository the head branch lives in, `owner/name` (#1576).
+    ///
+    /// The same field `PrDetail` carries, for the same reason: the Ready
+    /// for review strip asks THIS repository who pushed the head, and a
+    /// fork's head is not in the base repository. `None` once the fork is
+    /// deleted, and for a snapshot cached before the field existed; the
+    /// pusher is then not asked, never guessed from the base.
+    #[serde(default)]
+    pub head_repo: Option<String>,
     pub base_ref: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -663,6 +672,7 @@ mod attention_tests {
             head_ref: "feature/x".into(),
             head_oid: "deadbeef".into(),
             head_ref_id: None,
+            head_repo: None,
             base_ref: "main".into(),
             created_at: t,
             ready_at: Some(t),

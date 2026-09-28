@@ -1,4 +1,4 @@
-import { CircleCheck, MessageCircleWarning } from "lucide-react";
+import { CircleCheck, GitCommitHorizontal, MessageCircleWarning } from "lucide-react";
 import type { PullRequest } from "@/types/pr";
 import { type Filters, readyForReview, sortReadyForReview } from "@/lib/derive";
 import { useActiveFilters, useFilters } from "@/store/filters";
@@ -12,6 +12,14 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { ExternalLink } from "./ExternalLink";
 import { READY_TONE_CLASS, readyAge, useNow } from "@/lib/readyAge";
+import { useReadyPushers } from "@/api/hooks";
+import {
+  approvalWontCount,
+  type MyPushesMode,
+  partitionReady,
+  partitionSummary,
+  type ReadyPusher,
+} from "@/lib/readyPusher";
 
 /// Both labels name the FIELD, not just the direction (#1277).
 ///
@@ -111,6 +119,97 @@ function UnresolvedChip({
   );
 }
 
+/// The viewer pushed this row's head commit (#1576).
+///
+/// Shown ONLY when the activity log named the viewer as the pusher of the
+/// head the row shows. A row not checked, or checked and undecided, shows
+/// nothing -- not a "someone else" it does not know. The text carries the
+/// fact, the colour only repeats it, and the accessible name says it, with
+/// the consequence when the base's rules were read as requiring someone
+/// else's approval of the last push.
+function PushedByYouChip({ pusher }: { pusher: ReadyPusher }) {
+  if (pusher.pusher.state !== "viewer") return null;
+  const label = approvalWontCount(pusher)
+    ? "you pushed the latest commit, so your approval won't count here"
+    : "you pushed the latest commit";
+  return (
+    <>
+      <span
+        data-pushed-by-you
+        title={label.charAt(0).toUpperCase() + label.slice(1)}
+        aria-hidden="true"
+        className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border border-[#4493f8]/40 px-1.5 py-0.5 text-xs text-[#4493f8]"
+      >
+        <GitCommitHorizontal className="h-3 w-3" aria-hidden="true" />
+        your push
+      </span>
+      <span className="sr-only">, {label}</span>
+    </>
+  );
+}
+
+/// The choice for rows the viewer pushed last, and what it hid (#1576).
+const MY_PUSHES_OPTIONS: { value: MyPushesMode; label: string; short: string }[] = [
+  { value: "auto", label: "Hide where my approval can't count", short: "auto" },
+  { value: "hide", label: "Hide all I pushed last", short: "hidden" },
+  { value: "show", label: "Show all", short: "shown" },
+];
+
+/// The strip's last-pusher control and its status line (#1576).
+///
+/// Under the header rather than in it: the header carries the strip's
+/// list-wide actions, and this is a filter over the rows below.
+///
+/// The status line says how many rows are hidden and how many the filter
+/// could not decide, as counts. While the first answer is on its way it
+/// says so, rather than counting every row as "not checked".
+function MyPushesBar({
+  mode,
+  onMode,
+  checking,
+  summary,
+}: {
+  mode: MyPushesMode;
+  onMode: (m: MyPushesMode) => void;
+  checking: boolean;
+  summary: string | null;
+}) {
+  const current = MY_PUSHES_OPTIONS.find((o) => o.value === mode) ?? MY_PUSHES_OPTIONS[0];
+  return (
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-[#3fb950]/20 px-4 py-1 text-xs text-[#8b949e]">
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          render={
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-6 px-1.5 text-xs font-normal"
+              aria-label={`Pull requests you pushed last: ${current.label}`}
+            >
+              Pushed last by you: {current.short}
+            </Button>
+          }
+        />
+        <DropdownMenuContent>
+          <DropdownMenuRadioGroup
+            value={mode}
+            onValueChange={(value) => onMode(value as MyPushesMode)}
+          >
+            {MY_PUSHES_OPTIONS.map((opt) => (
+              <DropdownMenuRadioItem key={opt.value} value={opt.value}>
+                {opt.label}
+              </DropdownMenuRadioItem>
+            ))}
+          </DropdownMenuRadioGroup>
+        </DropdownMenuContent>
+      </DropdownMenu>
+      <span role="status" data-my-pushes-status>
+        {mode !== "show" && checking ? "Checking who pushed last…" : summary}
+      </span>
+    </div>
+  );
+}
+
 /// Pinned above the review queue: what is ready to review right now.
 ///
 /// The counterpart to `PrioritiesStrip` on My pull requests. That one
@@ -153,13 +252,21 @@ export function ReadyStrip({
   // Read unconditionally, above the early return: hooks cannot sit below
   // one, and the empty state needs no sort but the rules of hooks do not
   // care.
-  const { readySort } = useActiveFilters();
+  const { readySort, readyMyPushes } = useActiveFilters();
   const setFilter = useFilters((s) => s.setFilter);
   const now = useNow(AGE_TICK_MS);
 
-  const ready = sortReadyForReview(prs.filter(readyForReview), readySort);
+  // `all` is every row the predicate admits; `ready` is what the viewer's
+  // last-push choice leaves showing (#1576). The header counts and lists
+  // `ready`; the bar under it says how many were hidden and how many
+  // could not be decided.
+  const all = sortReadyForReview(prs.filter(readyForReview), readySort);
+  const pushers = useReadyPushers(all);
+  const mode: MyPushesMode = readyMyPushes ?? "auto";
+  const part = partitionReady(all, pushers.of, mode);
+  const ready = part.shown;
 
-  if (ready.length === 0) {
+  if (all.length === 0) {
     return <p className="px-4 py-2 text-xs text-[#8b949e]">Nothing ready to review.</p>;
   }
 
@@ -200,6 +307,12 @@ export function ReadyStrip({
           </DropdownMenuContent>
         </DropdownMenu>
       </h2>
+      <MyPushesBar
+        mode={mode}
+        onMode={(m) => setFilter("readyMyPushes", m)}
+        checking={pushers.isPending}
+        summary={partitionSummary(part, mode)}
+      />
       <ul>
         {ready.map((pr) => (
           <li key={`${pr.repo}#${pr.number}`} className="text-sm">
@@ -222,6 +335,7 @@ export function ReadyStrip({
                     {pr.repo}#{pr.number} · {pr.author}
                   </span>
                 </span>
+                <PushedByYouChip pusher={pushers.of(pr)} />
                 <UnresolvedChip count={pr.unresolved_threads} floor={pr.unresolved_threads_floor} />
                 <ReadyAgeChip readyAt={pr.ready_at} now={now} />
               </div>
@@ -235,6 +349,7 @@ export function ReadyStrip({
                     {pr.repo}#{pr.number} · {pr.author}
                   </span>
                 </span>
+                <PushedByYouChip pusher={pushers.of(pr)} />
                 <UnresolvedChip count={pr.unresolved_threads} floor={pr.unresolved_threads_floor} />
                 <ReadyAgeChip readyAt={pr.ready_at} now={now} />
               </div>

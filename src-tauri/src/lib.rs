@@ -303,6 +303,7 @@ pub fn run() {
             commands::count_reviewing,
             commands::get_pr_detail,
             commands::get_review_gates,
+            commands::get_ready_pushers,
             commands::act_on_pr,
             commands::merge_stack,
             commands::build_target,

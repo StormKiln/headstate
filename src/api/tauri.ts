@@ -63,6 +63,8 @@ import type {
   PrDetail,
   PullRequest,
   ReviewGates,
+  PusherAsk,
+  RowPusher,
   Stats,
   StatsBoard,
   StatsOutcome,
@@ -865,6 +867,13 @@ export const getReviewGates = (
   headOid: string,
 ) =>
   call<ReviewGates>("get_review_gates", { repo, base, headRepo, headRef, headOid });
+
+/// Rules and last pusher for every Ready for review row (#1576). Pushers
+/// cached by head commit, rules per (repo, base), new reads capped per
+/// call and inside the REST budget; a row past either is `declined` (not
+/// checked). Never rejects for a GitHub failure.
+export const getReadyPushers = (rows: PusherAsk[]) =>
+  call<RowPusher[]>("get_ready_pushers", { rows });
 
 /// Disk sizes for one repo's worktrees, as `[path, bytes]` pairs.
 ///

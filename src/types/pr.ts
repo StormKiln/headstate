@@ -75,6 +75,11 @@ export interface PullRequest {
   /// has no such key. Absent reads as "may be short" -- the qualified
   /// answer -- never as exact.
   unresolved_threads_floor?: boolean;
+  /// The repository the head branch lives in, `owner/name` (#1576): the
+  /// fork for a pull request from one, `null` once the fork is deleted.
+  /// OPTIONAL because an older desktop's payload has no such key; absent
+  /// means the pusher is not asked, never asked of the base instead.
+  head_repo?: string | null;
   /// Logins whose review is still outstanding.
   ///
   /// Empty is ORDINARY: repositories that assign reviewers through a
@@ -3903,6 +3908,32 @@ type LastPusher =
   | { state: "unknown"; reason: string };
 
 export interface ReviewGates {
+  rules: BaseRules;
+  last_pusher: LastPusher;
+}
+
+/// One Ready for review row's question (#1576). Mirrors
+/// `github::gates::PusherAsk`.
+export interface PusherAsk {
+  repo: string;
+  number: number;
+  base: string;
+  head_repo: string | null;
+  head_ref: string;
+  head_oid: string;
+}
+
+/// One Ready for review row's answer (#1576). Mirrors
+/// `github::gates::RowPusher`.
+///
+/// `last_pusher` is never `not_needed` here. `declined` means NOT CHECKED
+/// -- the budget, the per-refresh cap, or no head repository to ask --
+/// and is never a verdict. `head_oid` is echoed so an answer about a head
+/// the row has since moved off is dropped rather than applied.
+export interface RowPusher {
+  repo: string;
+  number: number;
+  head_oid: string;
   rules: BaseRules;
   last_pusher: LastPusher;
 }

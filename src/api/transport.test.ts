@@ -235,6 +235,16 @@ const ROWS: Row[] = [
     "get_review_gates",
     { repo, base: "main", headRepo: "fork/r", headRef: "feat/x", headOid: "abc123" },
   ),
+  row(
+    api.getReadyPushers,
+    [[{ repo, number: 7, base: "main", head_repo: "fork/r", head_ref: "feat/x", head_oid: "abc123" }]],
+    "get_ready_pushers",
+    {
+      rows: [
+        { repo, number: 7, base: "main", head_repo: "fork/r", head_ref: "feat/x", head_oid: "abc123" },
+      ],
+    },
+  ),
   row(api.sizeWorktrees, [repoPath], "size_worktrees", { repoPath }),
   row(api.pullCheckout, [path], "pull_checkout", { path }),
   row(api.fetchRefs, [path], "fetch_refs", { path }),

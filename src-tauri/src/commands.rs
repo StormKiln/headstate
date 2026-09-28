@@ -868,6 +868,42 @@ pub async fn get_review_gates(
     Ok(out)
 }
 
+/// Each strip lookup's own ceiling (#1576). Shorter than `FETCH_TIMEOUT`:
+/// these are advisory, run a chunk at a time, and a hung one should cost
+/// its row, not half a minute of the whole strip.
+const STRIP_PER_REQUEST: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Who pushed each Ready for review row's head, and what each base's
+/// rules say (#1576).
+///
+/// The strip's batched counterpart of `get_review_gates`, built from the
+/// same parts (`github::gates`): rules cached per (repository, base),
+/// pushers cached per (head repository, head commit), and at most
+/// `STRIP_LOOKUP_CAP` new activity reads per call, inside the REST
+/// budget. A row past the cap or the budget comes back `Declined` -- not
+/// checked -- so the strip never mistakes "we did not ask" for "we could
+/// not tell" (#1050).
+///
+/// Never an `Err` for a GitHub failure; `Err` is only "no client".
+#[tauri::command]
+pub async fn get_ready_pushers(
+    client: State<'_, GhClient>,
+    rows: Vec<crate::github::gates::PusherAsk>,
+) -> Result<Vec<crate::github::gates::RowPusher>, String> {
+    // Names are not logged, for the reason `get_pr_detail` gives.
+    crate::diag!("[diag] cmd get_ready_pushers start rows={}", rows.len());
+    let started = std::time::Instant::now();
+    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+    let budget = crate::github::stats::Budget::new();
+    let out = crate::github::gates::strip_pushers(&client, &budget, &rows, STRIP_PER_REQUEST).await;
+    crate::diag!(
+        "[diag] cmd get_ready_pushers end {}ms rest_requests={}",
+        started.elapsed().as_millis(),
+        budget.rest_requests()
+    );
+    Ok(out)
+}
+
 #[tauri::command]
 /// A previously stored scan, for the cold start (#1152).
 ///

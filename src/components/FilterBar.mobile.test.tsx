@@ -61,6 +61,9 @@ describe("activeFilterCount", () => {
     expect(activeFilterCount({ query: "auth", sort: "newest" })).toBe(0);
     expect(activeFilterCount({ readySort: "newest-opened" })).toBe(0);
     expect(activeFilterCount({ adviceGrouping: "file" })).toBe(0);
+    // #1576: the strip's last-pusher choice hides strip rows, not list
+    // rows, and the strip states its own hidden count.
+    expect(activeFilterCount({ readyMyPushes: "hide" })).toBe(0);
     expect(
       activeFilterCount({
         query: "auth",
