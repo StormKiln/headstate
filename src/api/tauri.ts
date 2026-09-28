@@ -1251,6 +1251,16 @@ export const claudeIndexCoverage = () =>
 /// below that hook sees an index.
 export const claudeSessions = () => call<WireClaudeSessionList>("claude_sessions");
 
+/// The sessions that produced a pull request with this number, in every
+/// repository the link table holds (#1545). The search box's lookup: a
+/// bare `#1234` names no repository, and a qualified one is matched
+/// case-insensitively by the caller. Also the PR detail panel's lookup
+/// since #1557, which retired `claude_sessions_for_pr`: its exact
+/// `owner/repo` match missed every link a transferred repository kept
+/// under its old owner.
+export const claudeSessionsForPrNumber = (number: number) =>
+  call<ClaudePrLink[]>("claude_sessions_for_pr_number", { number });
+
 /// What ONE selected session knows that the list does not carry (#985).
 ///
 /// `Class::Read`, so the phone gets it -- and the phone is who the split
@@ -1262,17 +1272,6 @@ export const claudeSessions = () => call<WireClaudeSessionList>("claude_sessions
 /// session deleted between two polls produces. That is an ANSWER; a
 /// rejection means the database could not be read. The view words them
 /// differently and must never collapse them (#846).
-/// The sessions that produced one pull request (#1132).
-export const claudeSessionsForPr = (repo: string, number: number) =>
-  call<ClaudePrLink[]>("claude_sessions_for_pr", { repo, number });
-
-/// The sessions that produced a pull request with this number, in every
-/// repository the link table holds (#1545). The search box's lookup: a
-/// bare `#1234` names no repository, and a qualified one is matched
-/// case-insensitively by the caller.
-export const claudeSessionsForPrNumber = (number: number) =>
-  call<ClaudePrLink[]>("claude_sessions_for_pr_number", { number });
-
 export const claudeSessionDetail = (sessionId: string) =>
   call<ClaudeSessionDetail | null>("claude_session_detail", { sessionId });
 

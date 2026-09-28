@@ -5506,9 +5506,21 @@ pub async fn claude_import_transcripts(
 ) -> Result<crate::claude::store::Imported, String> {
     let db = db_path(&app);
     tauri::async_runtime::spawn_blocking(move || {
+        // Taken BEFORE the scan reads a byte: a transcript appended while
+        // the scan runs has an mtime after this, so the live pass's
+        // incremental link read covers it (#1557).
+        let since_ms = chrono::Utc::now().timestamp_millis();
         let scan = crate::claude::scan_default()?;
         let mut conn = open_db(&db).map_err(|e| e.to_string())?;
-        crate::claude::store::import(&mut conn, scan).map_err(|e| e.to_string())
+        let imported = crate::claude::store::import(&mut conn, scan).map_err(|e| e.to_string())?;
+        // After the import committed, never before: see `linkscan::reset`.
+        // A failure costs freshness, not links -- the import has just
+        // written them all -- so it is logged rather than failing the
+        // import it followed.
+        if let Err(e) = crate::claude::linkscan::reset(&conn, since_ms) {
+            log::warn!("claude: could not reset the pull request link cursor: {e}");
+        }
+        Ok(imported)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -5738,6 +5750,34 @@ pub async fn claude_transcript_opening_prompt(
     .map_err(|e| e.to_string())?
 }
 
+/// The sessions that produced a pull request with this number, in every
+/// repository the link table holds (#1545).
+///
+/// The search box's lookup. A bare `#1234` names no repository, and the
+/// tracked open pull requests it used to be resolved against do not hold
+/// the merged ones -- so the PR a session made was usually not searched
+/// for at all. `store::sessions_for_pr_number` carries the measurement.
+///
+/// Also the PR detail panel's lookup since #1557, which retired
+/// `claude_sessions_for_pr`. That command matched `repo = ?` exactly, so
+/// a pull request shown under a transferred repository's NEW owner found
+/// none of the links written under the old one. The panel now asks by
+/// number and picks its answer with `matchPrLinks`, as the search does,
+/// and the two share one cached answer per number.
+#[tauri::command]
+pub async fn claude_sessions_for_pr_number(
+    app: AppHandle,
+    number: u64,
+) -> Result<Vec<crate::claude::subagent::PrLink>, String> {
+    let db = db_path(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&db).map_err(|e| e.to_string())?;
+        crate::claude::store::sessions_for_pr_number(&conn, number).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// What ONE Claude Code session knows that the list does not carry (#985).
 ///
 /// The other half of the split above: the resume command, the transcript
@@ -5758,48 +5798,6 @@ pub async fn claude_transcript_opening_prompt(
 /// The liveness comes back derived on THIS read rather than copied from
 /// the list's, because the detail pane is where the reason is shown and
 /// a reason should be as fresh as the verdict it explains.
-#[tauri::command]
-/// The sessions that produced one pull request (#1132).
-///
-/// Headstate knew about pull requests and knew about Claude sessions,
-/// and the two never met -- while the transcripts carried the join key
-/// all along. `preview.rs`'s own record census counts 634 `pr-link`
-/// records in a 19,725-record sample and nothing read one.
-pub async fn claude_sessions_for_pr(
-    app: AppHandle,
-    repo: String,
-    number: u64,
-) -> Result<Vec<crate::claude::subagent::PrLink>, String> {
-    let db = db_path(&app);
-    tauri::async_runtime::spawn_blocking(move || {
-        let conn = open_db(&db).map_err(|e| e.to_string())?;
-        crate::claude::store::sessions_for_pr(&conn, &repo, number).map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-/// The sessions that produced a pull request with this number, in every
-/// repository the link table holds (#1545).
-///
-/// The search box's lookup. A bare `#1234` names no repository, and the
-/// tracked open pull requests it used to be resolved against do not hold
-/// the merged ones -- so the PR a session made was usually not searched
-/// for at all. `store::sessions_for_pr_number` carries the measurement.
-#[tauri::command]
-pub async fn claude_sessions_for_pr_number(
-    app: AppHandle,
-    number: u64,
-) -> Result<Vec<crate::claude::subagent::PrLink>, String> {
-    let db = db_path(&app);
-    tauri::async_runtime::spawn_blocking(move || {
-        let conn = open_db(&db).map_err(|e| e.to_string())?;
-        crate::claude::store::sessions_for_pr_number(&conn, number).map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
 #[tauri::command]
 pub async fn claude_session_detail(
     app: tauri::AppHandle,
@@ -6085,13 +6083,33 @@ pub fn claude_live_pass(db: &std::path::Path) -> Result<ClaudeLiveState, String>
         // doc for why stopping before the file reads cannot lose an
         // unreadable transcript.
         let indexed = match crate::claude::corpus_default() {
-            Ok(scan) => match crate::claude::search::index_pass(&mut conn, &scan) {
-                Ok(done) => Some(done),
-                Err(e) => {
-                    log::warn!("claude: the transcript index pass failed: {e}");
-                    None
+            Ok(scan) => {
+                // Pull request links written since the last import
+                // (#1557), over the same listing: bounded, incremental,
+                // and a failure here fails neither the pass nor the
+                // index. `claude::linkscan` carries the design. Counts
+                // only in the log -- never a path or a link.
+                match crate::claude::linkscan::refresh(
+                    &mut conn,
+                    &scan,
+                    crate::claude::linkscan::BYTES_PER_PASS,
+                ) {
+                    Ok(r) if r.deferred > 0 => log::info!(
+                        "claude: pull request links: {} added this pass, {} files left for the next",
+                        r.links_added,
+                        r.deferred
+                    ),
+                    Ok(_) => {}
+                    Err(e) => log::warn!("claude: the pull request link pass failed: {e}"),
                 }
-            },
+                match crate::claude::search::index_pass(&mut conn, &scan) {
+                    Ok(done) => Some(done),
+                    Err(e) => {
+                        log::warn!("claude: the transcript index pass failed: {e}");
+                        None
+                    }
+                }
+            }
             Err(e) => {
                 log::warn!("claude: could not scan the corpus to index it: {e}");
                 None

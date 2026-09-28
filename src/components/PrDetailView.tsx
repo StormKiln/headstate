@@ -66,12 +66,6 @@ function CheckRow({ name, state, url }: { name: string; state: string; url: stri
   );
 }
 
-/// The pull request detail view.
-///
-/// Modelled on GitHub's PR page minus what does not belong in a triage
-/// tool: no file diff, no commit history, no posting comments. Headstate
-/// is for deciding and acting; reviewing code belongs in GitHub or an
-/// editor, and "View on GitHub" covers the rest.
 /// The Claude sessions that produced this pull request (#1211).
 ///
 /// The `pr-link` record has been read since #1132 and surfaced in one
@@ -88,77 +82,133 @@ function CheckRow({ name, state, url }: { name: string; state: string; url: stri
 /// as "no session" would be a confident wrong answer about someone
 /// else's work, so the panel is absent entirely rather than empty --
 /// the same choice `SessionPullRequests` makes for the same reason.
+///
+/// # The same repository under another owner (#1557)
+///
+/// A link keeps the repository's name from when the PR was opened, so a
+/// transferred repository's older links carry the old owner. When no
+/// session recorded THIS `owner/repo#N` but sessions recorded the same
+/// repository name under another owner, the panel says exactly that and
+/// lists them under it -- the fact the reader can check, not a claim
+/// that they wrote this PR. The search's note states the same case the
+/// same way.
 function PrSessions({ repo, number }: { repo: string; number: number }) {
   const q = useClaudeSessionsForPr(repo, number, true);
-  // Rows without a usable `session_id` are DROPPED rather than rendered
-  // (#1288).
-  //
-  // The contract is asserted where a contract can be asserted -- in
-  // Rust, by `PrLink`'s `pr_link_serialises_snake_case` and by
-  // `invariants.rs`'s
-  // `every_mirrored_type_agrees_with_its_rust_wire_spelling`, which
-  // compare the real serialised keys against this file's type. This
-  // filter is not a second spelling of that contract and deliberately
-  // does NOT read `sessionId`: accepting both spellings would make the
-  // wire unfalsifiable and let the next drift through in silence.
-  //
-  // What it buys is proportionality. `PrLink` serialised `sessionId`
-  // for a release and `l.session_id.slice(0, 8)` threw on `undefined`,
-  // which took down the ENTIRE pull request page -- title, checks,
-  // diff, review -- over a provenance footnote. This panel already
-  // treats a failed lookup as silent for exactly that reason: it is not
-  // the subject of the page. A malformed row now costs its own line and
-  // nothing else.
-  const links = (q.data ?? []).filter(
-    (l: ClaudePrLink) => typeof l?.session_id === "string" && l.session_id.length > 0,
-  );
-
-  // Nothing to say: no link recorded here, or the lookup failed. A
+  // Nothing to say while in flight, and nothing on a failed lookup. A
   // failed lookup is deliberately silent rather than an error panel --
   // this is provenance, not the subject of the page, and a red box
   // about a secondary join would crowd out the PR the user came for.
-  if (links.length === 0) return null;
+  // Silent is not "no session": nothing here is worded as an absence.
+  if (q.state !== "done") return null;
+  const links = usable(q.links);
+  const elsewhere = usable(q.elsewhere);
 
+  if (links.length > 0) {
+    return (
+      <Section title="Written by" count={links.length}>
+        <SessionLinks links={links} />
+      </Section>
+    );
+  }
+  if (elsewhere.length > 0) {
+    return (
+      <Section title="Sessions" count={elsewhere.length}>
+        <p className="mb-1 text-xs text-[#8b949e]" data-testid="pr-sessions-elsewhere">
+          No session recorded {repo}#{number}. {elsewhere.length === 1 ? "This session" : "These sessions"}{" "}
+          recorded {refsOf(elsewhere)}, the same repository name under another owner:
+        </p>
+        <SessionLinks links={elsewhere} />
+      </Section>
+    );
+  }
+  // No link recorded here: absent, per the section above.
+  return null;
+}
+
+/// Rows with a usable `session_id`, one per session.
+///
+/// Rows without one are DROPPED rather than rendered (#1288).
+///
+/// The contract is asserted where a contract can be asserted -- in
+/// Rust, by `PrLink`'s `pr_link_serialises_snake_case` and by
+/// `invariants.rs`'s
+/// `every_mirrored_type_agrees_with_its_rust_wire_spelling`, which
+/// compare the real serialised keys against this file's type. This
+/// filter is not a second spelling of that contract and deliberately
+/// does NOT read `sessionId`: accepting both spellings would make the
+/// wire unfalsifiable and let the next drift through in silence.
+///
+/// What it buys is proportionality. `PrLink` serialised `sessionId`
+/// for a release and `l.session_id.slice(0, 8)` threw on `undefined`,
+/// which took down the ENTIRE pull request page -- title, checks,
+/// diff, review -- over a provenance footnote. A malformed row now
+/// costs its own line and nothing else.
+///
+/// One per session because a session can hold the same PR twice, under
+/// two spellings of the repository (#1557): its `pr-link` record and
+/// the `gh pr create` result that also links it.
+function usable(links: readonly ClaudePrLink[]): ClaudePrLink[] {
+  const seen = new Set<string>();
+  return links.filter((l: ClaudePrLink) => {
+    if (typeof l?.session_id !== "string" || l.session_id.length === 0) return false;
+    if (seen.has(l.session_id)) return false;
+    seen.add(l.session_id);
+    return true;
+  });
+}
+
+/// The pull requests a set of links names, as prose: `a/b#1`, or
+/// `a/b#1 and c/b#1`.
+function refsOf(links: readonly ClaudePrLink[]): string {
+  const refs = [...new Set(links.map((l) => `${l.repo}#${l.number}`))].sort();
+  return refs.length <= 2 ? refs.join(" and ") : `${refs.slice(0, -1).join(", ")} and ${refs.at(-1)}`;
+}
+
+function SessionLinks({ links }: { links: readonly ClaudePrLink[] }) {
   return (
-    <Section title="Written by" count={links.length}>
-      <ul className="space-y-0.5">
-        {links.map((l: ClaudePrLink) => (
-          <li key={l.session_id} className="text-xs">
-            <button
-              type="button"
-              onClick={() => {
-                // `setView` FIRST, and the order is load-bearing: it
-                // resets `claudePage` to "overview" and clears
-                // `claudeSelected`, so the natural-reading order --
-                // select, then page, then view -- lands on the overview
-                // with nothing selected.
-                //
-                // This is #920's bug in a new place. The store's own
-                // `showClaudeSessions` comment records it: "that jump
-                // had to call `setView` BEFORE `setFilter`... the
-                // natural-reading order filed the value under the page
-                // being left and the destination opened on its
-                // default." A test asserting only the view would not
-                // have noticed; the one asserting all three caught it.
-                const st = useFilters.getState();
-                st.setView("claude-code");
-                st.setClaudePage("sessions");
-                st.selectClaudeSession(l.session_id);
-              }}
-              className="text-[#58a6ff] hover:underline"
-            >
-              {l.session_id.slice(0, 8)}
-            </button>
-            {l.first_seen_at ? (
-              <span className="ml-2 text-[#8b949e]">first linked {l.first_seen_at}</span>
-            ) : null}
-          </li>
-        ))}
-      </ul>
-    </Section>
+    <ul className="space-y-0.5">
+      {links.map((l: ClaudePrLink) => (
+        <li key={l.session_id} className="text-xs">
+          <button
+            type="button"
+            onClick={() => {
+              // `setView` FIRST, and the order is load-bearing: it
+              // resets `claudePage` to "overview" and clears
+              // `claudeSelected`, so the natural-reading order --
+              // select, then page, then view -- lands on the overview
+              // with nothing selected.
+              //
+              // This is #920's bug in a new place. The store's own
+              // `showClaudeSessions` comment records it: "that jump
+              // had to call `setView` BEFORE `setFilter`... the
+              // natural-reading order filed the value under the page
+              // being left and the destination opened on its
+              // default." A test asserting only the view would not
+              // have noticed; the one asserting all three caught it.
+              const st = useFilters.getState();
+              st.setView("claude-code");
+              st.setClaudePage("sessions");
+              st.selectClaudeSession(l.session_id);
+            }}
+            className="text-[#58a6ff] hover:underline"
+          >
+            {l.session_id.slice(0, 8)}
+          </button>
+          {l.first_seen_at ? (
+            <span className="ml-2 text-[#8b949e]">first linked {l.first_seen_at}</span>
+          ) : null}
+        </li>
+      ))}
+    </ul>
   );
 }
 
+/// The pull request detail view.
+///
+/// Modelled on GitHub's PR page minus what does not belong in a triage
+/// tool: no file diff, no commit history, no posting comments. Headstate
+/// is for deciding and acting; reviewing code belongs in GitHub or an
+/// editor, and "View on GitHub" covers the rest.
 export function PrDetailView({
   repo,
   number,

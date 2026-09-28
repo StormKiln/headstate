@@ -32,7 +32,12 @@ vi.mock("./tauri", async (orig) => ({
   getPullRequests: () => Promise.resolve([]),
 }));
 
-import { useClaudeSessionsForPrQuery, type PrQueryState } from "./hooks";
+import {
+  useClaudeSessionsForPr,
+  useClaudeSessionsForPrQuery,
+  type PrQueryState,
+  type PrSessionsState,
+} from "./hooks";
 
 /// The hook's answer, rendered as JSON so an assertion can read the
 /// whole state value rather than a flag derived from it.
@@ -221,8 +226,8 @@ describe("useClaudeSessionsForPrQuery", () => {
 
   /// Typing away from a reference and back again does not re-ask.
   ///
-  /// `staleTime: Infinity` plus react-query's ordinary cache retention
-  /// means the second visit is served from cache -- and the timer
+  /// A minute's `staleTime` (#1557) plus react-query's ordinary cache
+  /// retention means the second visit is served from cache -- and the timer
   /// scheduled for the intermediate query is cleared rather than firing
   /// late against a query that has moved on. Both halves matter: a
   /// debounce that fired for `acme/api#99` after the user had already
@@ -256,5 +261,78 @@ describe("useClaudeSessionsForPrQuery", () => {
     rerender(wrap(<Probe query="notarization" />));
     await settle();
     expect(got()).toEqual({ state: "off" });
+  });
+});
+
+/// The PR detail panel's lookup (#1557): the same number lookup and the
+/// same `matchPrLinks`, so a transferred repository's older links are
+/// found and stated rather than missed.
+function PanelProbe({ repo, number }: { repo: string; number: number }) {
+  const q: PrSessionsState = useClaudeSessionsForPr(repo, number, true);
+  return <output data-testid="panel">{JSON.stringify(q)}</output>;
+}
+
+const panel = (): PrSessionsState => JSON.parse(screen.getByTestId("panel").textContent ?? "null");
+
+describe("useClaudeSessionsForPr", () => {
+  /// SABOTAGE: match the exact repository only -- or drop `elsewhere` --
+  /// and the old-owner row is lost.
+  it("returns the same repository under another owner as elsewhere", async () => {
+    answer.table = [link("s1", "old-owner/api", 7), link("s2", "acme/ui", 7)];
+    render(wrap(<PanelProbe repo="acme/api" number={7} />));
+    await settle();
+    const q = panel();
+    expect(q.state === "done" && q.links).toEqual([]);
+    expect(q.state === "done" && q.elsewhere.map((l) => l.session_id)).toEqual(["s1"]);
+  });
+
+  it("reports a rejected lookup as a failure, not as no session", async () => {
+    answer.reject = "database is locked";
+    render(wrap(<PanelProbe repo="acme/api" number={7} />));
+    await settle();
+    expect(panel()).toEqual({ state: "failed", error: "database is locked" });
+  });
+
+  /// One cached answer per number: whichever of the search and the panel
+  /// asks first warms the other.
+  it("shares the search's cached answer for the same number", async () => {
+    answer.table = [link("s1", "acme/api", 7)];
+    render(
+      wrap(
+        <>
+          <Probe query="#7" />
+          <PanelProbe repo="acme/api" number={7} />
+        </>,
+      ),
+    );
+    await settle();
+    expect(asked).toEqual(["#7"]);
+    const q = panel();
+    expect(q.state === "done" && q.links.map((l) => l.session_id)).toEqual(["s1"]);
+  });
+
+  /// A PR opened since the last read: the live pass adds its link within
+  /// a minute, and the panel re-asks on that cadence while it has no
+  /// session for its PR -- then stops once it has one.
+  ///
+  /// SABOTAGE: `refetchInterval: false` and the late link is never seen.
+  it("re-asks while it has no session, and stops once it finds one", async () => {
+    render(wrap(<PanelProbe repo="acme/api" number={7} />));
+    await settle();
+    expect(panel()).toEqual({ state: "done", links: [], elsewhere: [] });
+
+    answer.table = [link("s1", "acme/api", 7)];
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    await settle();
+    const q = panel();
+    expect(q.state === "done" && q.links.map((l) => l.session_id)).toEqual(["s1"]);
+
+    const before = asked.length;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(180_000);
+    });
+    expect(asked.length).toBe(before);
   });
 });

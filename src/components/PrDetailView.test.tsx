@@ -4,10 +4,13 @@ import { useFilters } from "../store/filters";
 import type { PrDetail, ReviewGates } from "@/types/pr";
 import { stubViewport } from "@/test-utils";
 import { scopeEffect } from "@/lib/branchDelete";
+import { matchPrLinks } from "@/lib/claudePrs";
 
 const state = vi.hoisted(() => ({
   /// Sessions linked to this PR, for the reverse-link tests (#1211).
   prSessions: [] as { session_id: string; repo: string; number: number; url: string; first_seen_at: string | null }[],
+  /// The lookup rejected (#1557): nothing is known about who wrote it.
+  prSessionsFailed: false,
   data: undefined as PrDetail | undefined,
   isLoading: false,
   // True while `usePrDetail` is serving the clicked row's own facts in
@@ -46,7 +49,14 @@ vi.mock("sonner", () => ({ toast: { success: toastSuccess, error: vi.fn() } }));
 vi.mock("../api/hooks", () => ({
   // No linked session by default: the panel renders nothing, which is
   // what every other assertion in this file assumes (#1211).
-  useClaudeSessionsForPr: () => ({ data: state.prSessions }),
+  //
+  // The REAL `matchPrLinks` over the number lookup's rows (#1557), so the
+  // panel's other-owner case is exercised through the same picking the
+  // hook does rather than a hand-built answer.
+  useClaudeSessionsForPr: (repo: string, number: number) =>
+    state.prSessionsFailed
+      ? { state: "failed", error: "database is locked" }
+      : { state: "done", ...matchPrLinks(state.prSessions, { repo, number }) },
   usePrDetail: () => ({ ...state, error: "boom", refetch: vi.fn() }),
   useActOnPr: () => vi.fn(() => Promise.resolve()),
   useDeleteHeadBranch: () => deleteBranch,
@@ -1151,6 +1161,7 @@ describe("PrDetailView", () => {
 describe("PrDetailView and the session that wrote the PR", () => {
   beforeEach(() => {
     state.prSessions = [];
+    state.prSessionsFailed = false;
   });
 
   it("renders nothing when this machine holds no transcript for the PR", () => {
@@ -1166,8 +1177,8 @@ describe("PrDetailView and the session that wrote the PR", () => {
     state.prSessions = [
       {
         session_id: "e5df3bd1-1b5f-40cf-8d4b-5e0cc8939abc",
-        repo: "acme/api",
-        number: 7,
+        repo: "octocat/hello-world",
+        number: 42,
         url: "https://github.com/acme/api/pull/7",
         first_seen_at: "2026-09-01",
       },
@@ -1184,8 +1195,8 @@ describe("PrDetailView and the session that wrote the PR", () => {
     state.prSessions = [
       {
         session_id: "abc12345-0000-0000-0000-000000000000",
-        repo: "acme/api",
-        number: 7,
+        repo: "octocat/hello-world",
+        number: 42,
         url: "https://github.com/acme/api/pull/7",
         first_seen_at: null,
       },
@@ -1221,8 +1232,8 @@ describe("PrDetailView and the session that wrote the PR", () => {
     state.prSessions = [
       {
         sessionId: "ca5ece11-0000-0000-0000-000000000000",
-        repo: "acme/api",
-        number: 7,
+        repo: "octocat/hello-world",
+        number: 42,
         url: "https://github.com/acme/api/pull/7",
         firstSeenAt: "2026-09-01",
       },
@@ -1237,12 +1248,58 @@ describe("PrDetailView and the session that wrote the PR", () => {
     expect(screen.queryByRole("button", { name: "ca5ece11" })).toBeNull();
   });
 
+  // A transferred repository (#1557). The links written before the
+  // transfer keep the OLD owner, and the panel used to ask for exactly
+  // the new one -- so it found nothing. It now states the other-owner
+  // record as a fact and lists those sessions under it, without calling
+  // them the PR's authors.
+  it("states sessions recorded under another owner, as a fact and not as authors", () => {
+    state.prSessions = [
+      {
+        session_id: "0ld0wner-0000-0000-0000-000000000000",
+        repo: "acme/hello-world",
+        number: 42,
+        url: "u",
+        first_seen_at: null,
+      },
+      // Another repository's #42 is not this one under another name.
+      { session_id: "0therrep-0000-0000-0000-000000000000", repo: "acme/api", number: 42, url: "u", first_seen_at: null },
+    ];
+    view();
+    const note = screen.getByTestId("pr-sessions-elsewhere");
+    expect(note.textContent).toContain("No session recorded octocat/hello-world#42.");
+    expect(note.textContent).toContain("acme/hello-world#42, the same repository name under another owner");
+    expect(screen.getByRole("button", { name: "0ld0wner" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "0therrep" })).toBeNull();
+    // Not "Written by": that would be the guess.
+    expect(screen.queryByText(/Written by/)).toBeNull();
+  });
+
+  it("matches its own repository case-insensitively, as an author", () => {
+    state.prSessions = [
+      { session_id: "ca5e1e55-0000-0000-0000-000000000000", repo: "OctoCat/Hello-World", number: 42, url: "u", first_seen_at: null },
+    ];
+    view();
+    expect(screen.getByText(/Written by/)).toBeTruthy();
+    expect(screen.queryByTestId("pr-sessions-elsewhere")).toBeNull();
+  });
+
+  it("says nothing -- and never 'no session' -- when the lookup failed", () => {
+    state.prSessionsFailed = true;
+    state.prSessions = [
+      { session_id: "aaaaaaaa-0000-0000-0000-000000000000", repo: "octocat/hello-world", number: 42, url: "u", first_seen_at: null },
+    ];
+    view();
+    expect(screen.queryByText(/Written by/)).toBeNull();
+    expect(screen.queryByText(/No session/)).toBeNull();
+  });
+
   it("lists every session when more than one produced it", () => {
     // A PR can be the work of several sessions — a first pass and a
     // fix-up after review is the common shape.
     state.prSessions = [
-      { session_id: "aaaaaaaa-0000-0000-0000-000000000000", repo: "acme/api", number: 7, url: "u", first_seen_at: null },
-      { session_id: "bbbbbbbb-0000-0000-0000-000000000000", repo: "acme/api", number: 7, url: "u", first_seen_at: null },
+      { session_id: "aaaaaaaa-0000-0000-0000-000000000000", repo: "octocat/hello-world", number: 42, url: "u", first_seen_at: null },
+      { session_id: "bbbbbbbb-0000-0000-0000-000000000000", repo: "octocat/hello-world", number: 42, url: "u", first_seen_at: null },
     ];
     view();
     expect(screen.getByRole("button", { name: "aaaaaaaa" })).toBeTruthy();

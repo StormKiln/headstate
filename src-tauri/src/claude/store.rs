@@ -198,12 +198,6 @@ fn upsert(conn: &Connection, t: &Transcript, now: &str) -> Result<(), rusqlite::
     Ok(())
 }
 
-/// Write a completed [`Scan`] into `claude_session`.
-///
-/// One transaction, so a rescan interrupted halfway leaves the previous
-/// contents rather than a half-merged list. Per-session write failures
-/// are collected and reported instead of aborting the import: one
-/// malformed row must not cost the user the other 1,429.
 /// The pull requests one session produced (#1132).
 pub fn prs_for_session(
     conn: &Connection,
@@ -215,32 +209,6 @@ pub fn prs_for_session(
           ORDER BY first_seen_at, repo, number",
     )?;
     let rows = q.query_map([session_id], |r| {
-        Ok(super::subagent::PrLink {
-            session_id: r.get(0)?,
-            repo: r.get(1)?,
-            number: r.get::<_, i64>(2)? as u64,
-            url: r.get(3)?,
-            first_seen_at: r.get(4)?,
-        })
-    })?;
-    rows.collect()
-}
-
-/// The sessions that produced one pull request (#1132).
-///
-/// The reverse direction, and the one the PR view asks. Indexed on
-/// `(repo, number)` so it does not scan the table.
-pub fn sessions_for_pr(
-    conn: &Connection,
-    repo: &str,
-    number: u64,
-) -> Result<Vec<super::subagent::PrLink>, rusqlite::Error> {
-    let mut q = conn.prepare(
-        "SELECT session_id, repo, number, url, first_seen_at
-           FROM claude_session_pr WHERE repo = ?1 AND number = ?2
-          ORDER BY first_seen_at, session_id",
-    )?;
-    let rows = q.query_map(rusqlite::params![repo, number as i64], |r| {
         Ok(super::subagent::PrLink {
             session_id: r.get(0)?,
             repo: r.get(1)?,
@@ -454,6 +422,12 @@ pub fn usage_profile(conn: &Connection) -> Result<super::usage::Profile, rusqlit
     Ok(out)
 }
 
+/// Write a completed [`Scan`] into `claude_session`.
+///
+/// One transaction, so a rescan interrupted halfway leaves the previous
+/// contents rather than a half-merged list. Per-session write failures
+/// are collected and reported instead of aborting the import: one
+/// malformed row must not cost the user the other 1,429.
 pub fn import(conn: &mut Connection, scan: Scan) -> Result<Imported, rusqlite::Error> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut out = Imported {
@@ -1392,8 +1366,9 @@ mod tests {
         assert_eq!(forward.len(), 2, "one session can produce several");
 
         // Reverse: which sessions produced this. The direction the PR
-        // view asks, and the one the app could not answer at all.
-        let reverse = sessions_for_pr(&conn, "acme/api", 7).unwrap();
+        // view asks, and the one the app could not answer at all. By
+        // number since #1557; the caller picks the repository.
+        let reverse = sessions_for_pr_number(&conn, 7).unwrap();
         assert_eq!(reverse.len(), 2);
         assert!(reverse.iter().any(|l| l.session_id == "s1"));
         assert!(reverse.iter().any(|l| l.session_id == "s2"));

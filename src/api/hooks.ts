@@ -60,7 +60,7 @@ import type { PageCursor, SessionActivity, TranscriptMessage } from "@/types/tra
 import { createCoalescer } from "@/lib/coalesce";
 import { createLimiter, withDeadline } from "@/lib/limiter";
 import { IS_MOBILE_BUILD } from "@/lib/target";
-import { matchPrLinks, parsePrQuery } from "@/lib/claudePrs";
+import { matchPrLinks, parsePrQuery, type PrQuery } from "@/lib/claudePrs";
 import {
   toolVersions,
   readLogTail,
@@ -153,7 +153,6 @@ import {
   claudeIndexCoverage,
   claudeSessions,
   claudeSessionDetail,
-  claudeSessionsForPr,
   claudeSessionsForPrNumber,
   claudeTranscriptPage,
   claudeTranscriptFind,
@@ -1936,6 +1935,44 @@ export function useSessionActivity(): ReadonlySet<string> {
   return active;
 }
 
+/// How long a pull request link lookup is trusted (#1557).
+///
+/// The link table is no longer written only by the import: the live pass
+/// adds links written since, once a minute (`claude::linkscan`). So an
+/// answer can move between imports, and caching it forever would keep a
+/// just-opened PR unfound however often the table caught up. One minute,
+/// the cadence of the pass that can change the answer. The query itself
+/// is one indexed read of a table of about a thousand rows.
+const PR_LINKS_STALE_MS = 60_000;
+
+/// The one lookup the search box and the PR detail panel share (#1557).
+///
+/// Same key, same function, same freshness -- so whichever asks first
+/// warms the other, and a Rescan's invalidation reaches both.
+function prLinksByNumber(number: number, enabled: boolean) {
+  return {
+    queryKey: ["claude-sessions-for-pr-number", number] as const,
+    queryFn: () => claudeSessionsForPrNumber(number),
+    enabled: enabled && number > 0,
+    staleTime: PR_LINKS_STALE_MS,
+    // A machine with no imported transcripts answers with an empty
+    // list, not an error. Retrying an empty answer three times delays
+    // saying so.
+    retry: false,
+  };
+}
+
+/// What the PR detail panel's lookup found (#1211, #1557).
+///
+/// The same four states as `PrQueryState`, for the same reason: a failed
+/// lookup has said nothing about who wrote the PR, and must never be
+/// worded as "no session".
+export type PrSessionsState =
+  | { state: "off" }
+  | { state: "loading" }
+  | { state: "done"; links: ClaudePrLink[]; elsewhere: ClaudePrLink[] }
+  | { state: "failed"; error: string };
+
 /// The Claude sessions that produced this pull request (#1211).
 ///
 /// The reverse of `SessionDetail.pull_requests`, and the more useful
@@ -1944,25 +1981,45 @@ export function useSessionActivity(): ReadonlySet<string> {
 /// whose titles collide -- `preview.rs` measures 286 of 1,438 sessions
 /// sharing a title with another.
 ///
-/// `staleTime: Infinity` and no poll. A `pr-link` record is written
-/// once, when the PR is opened, and never changes afterwards; a session
-/// that produced a PR does not stop having produced it. Polling would
-/// re-ask a question whose answer is immutable.
+/// # By number, then matched (#1557)
+///
+/// It asked `claude_sessions_for_pr` for exactly `owner/repo`, and a
+/// link records the repository as it was named when the PR was opened.
+/// So a PR shown under a transferred repository's NEW owner found none
+/// of the links written before the transfer. It now asks by number and
+/// picks the answer with `matchPrLinks`, exactly as the search does:
+/// the same repository compared case-insensitively, and the same name
+/// under another owner returned apart as `elsewhere`, for the panel to
+/// state as a fact rather than list as a match.
+///
+/// # Re-asked while it has no answer
+///
+/// A PR opened a minute ago is exactly the one whose link the live pass
+/// may not have read yet. While the panel has no session for its PR it
+/// re-asks on the pass's cadence; once it has one it stops, because a
+/// session that produced a PR does not stop having produced it.
 ///
 /// `enabled` because this is a secondary panel on a detail view that
 /// already fetches the PR itself -- a closed detail should not pay for
 /// it.
-export function useClaudeSessionsForPr(repo: string, number: number, enabled: boolean) {
-  return useQuery<ClaudePrLink[]>({
-    queryKey: ["claude-sessions-for-pr", repo, number],
-    queryFn: () => claudeSessionsForPr(repo, number),
-    enabled: enabled && repo !== "" && number > 0,
-    staleTime: Infinity,
-    // A machine with no imported transcripts answers with an empty
-    // list, not an error. Retrying an empty answer three times delays
-    // the panel saying so.
-    retry: false,
+export function useClaudeSessionsForPr(
+  repo: string,
+  number: number,
+  enabled: boolean,
+): PrSessionsState {
+  const on = enabled && repo !== "" && number > 0;
+  const query: PrQuery = { repo, number };
+  const lookup = useQuery<ClaudePrLink[]>({
+    ...prLinksByNumber(number, on),
+    refetchInterval: (q) =>
+      q.state.data !== undefined && matchPrLinks(q.state.data, query).links.length > 0
+        ? false
+        : PR_LINKS_STALE_MS,
   });
+  if (!on) return { state: "off" };
+  if (lookup.isError) return { state: "failed", error: prLookupError(lookup.error) };
+  if (lookup.data === undefined) return { state: "loading" };
+  return { state: "done", ...matchPrLinks(lookup.data, query) };
 }
 
 /// What a PR-shaped search query resolved to (#1280, #1545).
@@ -2069,16 +2126,9 @@ export function useClaudeSessionsForPrQuery(query: string, enabled: boolean): Pr
   // matched case-insensitively in `matchPrLinks` rather than by an exact
   // `repo = ?` that missed `Acme/API` against `acme/api`.
   const number = live?.number ?? 0;
-  const lookup = useQuery<ClaudePrLink[]>({
-    queryKey: ["claude-sessions-for-pr-number", number],
-    queryFn: () => claudeSessionsForPrNumber(number),
-    enabled: enabled && live !== null,
-    // Infinity, and refreshed by the page's Rescan: the link table only
-    // changes when the transcripts are imported, so re-asking between
-    // imports would re-read an answer that cannot have moved.
-    staleTime: Infinity,
-    retry: false,
-  });
+  // Shared with the PR detail panel (#1557): one key, one answer per
+  // number, whichever asks first.
+  const lookup = useQuery<ClaudePrLink[]>(prLinksByNumber(number, enabled && live !== null));
 
   // Derived during render rather than stored, so there is no effect
   // writing state and no frame where the two disagree.
@@ -2127,11 +2177,9 @@ export function useClaudeSessions(enabled: boolean) {
     rescan: async () => {
       await qc.invalidateQueries({ queryKey: ["claude-import"] });
       await qc.invalidateQueries({ queryKey: ["claude-sessions"] });
-      // The pull request links are written by the same import (#1545),
-      // and their lookups are cached forever between imports -- so a PR
-      // opened since the last one stays unfound until these go too.
+      // The pull request links are rewritten by the same import (#1545),
+      // so their lookups go too rather than waiting out their minute.
       await qc.invalidateQueries({ queryKey: ["claude-sessions-for-pr-number"] });
-      await qc.invalidateQueries({ queryKey: ["claude-sessions-for-pr"] });
     },
   };
 }

@@ -402,11 +402,10 @@ pub const SURFACE: &[(&str, Class)] = &[
     // crosses the pairing transport every ten seconds, and this is the
     // call that lets it stop carrying the detail for 1,474 rows to render
     // one.
-    // Read: one indexed query (#1132).
-    ("claude_sessions_for_pr", Class::Read),
-    // #1545: the search box's lookup by number alone. Read for the same
-    // reason: one query of the same link table, returning the same
-    // `PrLink` rows, which carry no transcript text.
+    // #1545: the search box's lookup by number alone, and the PR detail
+    // panel's since #1557 retired `claude_sessions_for_pr`. Read: one
+    // query of the link table, returning `PrLink` rows, which carry no
+    // transcript text.
     ("claude_sessions_for_pr_number", Class::Read),
     ("claude_session_detail", Class::Read),
     // #1486. A compact per-session status -- liveness, waiting kind, the
@@ -1231,12 +1230,6 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         .await),
         "claude_index_coverage" => res(commands::claude_index_coverage(app.clone()).await),
         "claude_sessions" => res(commands::claude_sessions(app.clone()).await),
-        "claude_sessions_for_pr" => {
-            res(
-                commands::claude_sessions_for_pr(app.clone(), a.get("repo")?, a.get("number")?)
-                    .await,
-            )
-        }
         "claude_sessions_for_pr_number" => {
             res(commands::claude_sessions_for_pr_number(app.clone(), a.get("number")?).await)
         }
