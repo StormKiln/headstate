@@ -4,6 +4,9 @@ import { describe, expect, it } from "vitest";
 // deliberately carries no `@types/node` -- see `vite.config.ts`, which
 // resolves its own paths with `import.meta.url` for the same reason.
 import modelRs from "../../src-tauri/src/worktrees/model.rs?raw";
+// Every `Safety` variant as Rust serialises it, pinned by
+// `safety_serialises_as_the_frontend_fixture_says` in that file (#1437).
+import safetyFixture from "../../src-tauri/tests/fixtures/safety_variants.json?raw";
 import testSource from "./worktrees.test.ts?raw";
 import type {
   ClaudeSession, Lock, Safety, Worktree, WorktreeRepo } from "@/types/pr";
@@ -19,6 +22,7 @@ import {
   lockHolderIsGone,
   lockHolderNote,
   lockReason,
+  mainCheckoutFor,
   pathBasename,
   prForWorktree,
   safetyReason,
@@ -55,12 +59,18 @@ describe("isSafe", () => {
     // whole point of the fix, since treating it as never-pushed left
     // every merged worktree unremovable.
     expect(isSafe({ kind: "merged_upstream_deleted" })).toBe(true);
+    // #1439: merged content on a branch with no tracking config. Same
+    // evidence; it used to read "never pushed" and could not be removed.
+    expect(isSafe({ kind: "merged_no_upstream" })).toBe(true);
     // #819: a branchless checkout contained in the default branch. The
     // evidence is the same `merged_into` bar the two above clear --
     // ancestry or an exact patch-id match -- and what this row LACKS is a
     // branch, which is the thing removal would otherwise lose. Four such
     // rows on the reporting machine were `unknown` with no action at all.
     expect(isSafe({ kind: "detached_merged", detail: "detached at v1.13.0~30" })).toBe(true);
+    // #1440: GitHub's record of a merged pull request containing HEAD,
+    // under the strict rule. Mirrors `Safety::MergedAsPr` in model.rs.
+    expect(isSafe({ kind: "merged_as_pr", detail: 7 })).toBe(true);
     for (const s of [
       { kind: "main_checkout" },
       { kind: "dirty", detail: 3 },
@@ -145,8 +155,11 @@ describe("isSafe", () => {
       modelRs.indexOf("\n}", modelRs.indexOf("pub enum Safety {")),
     );
     expect(block.length).toBeGreaterThan(0);
+    // A struct variant (`InProgress {`) counts too. The pattern once
+    // accepted only unit and tuple variants, so `InProgress` was never in
+    // this set and its misspelt TS kind went unnoticed (#1437).
     const rustVariants = new Set(
-      [...block.matchAll(/^\s{4}([A-Z][A-Za-z]*)(?:\(|,|\s*$)/gm)].map((m) => m[1]),
+      [...block.matchAll(/^\s{4}([A-Z][A-Za-z]*)(?:\(|,|\s*\{|\s*$)/gm)].map((m) => m[1]),
     );
     // A sanity floor: if the regex stops matching, an empty set would make
     // this test pass while checking nothing.
@@ -195,6 +208,23 @@ describe("safetyReason", () => {
     expect(gone).toContain("upstream deleted");
     // It must NOT read like the state it was being confused with.
     expect(gone).not.toContain("only here");
+    // #1439: merged, and the branch has no tracking config. It must say
+    // merged and must not repeat the claim it replaced.
+    const untracked = safetyReason({ kind: "merged_no_upstream" });
+    expect(untracked).toContain("merged");
+    expect(untracked).toContain("no upstream");
+    expect(untracked).not.toContain("only here");
+    expect(untracked).not.toContain("never pushed");
+  });
+
+  // #1440: the row names the route -- the pull request GitHub merged --
+  // so it cannot be mistaken for the offline verdict, and is green.
+  it("names the pull request when GitHub vouched for the merge", () => {
+    const reason = safetyReason({ kind: "merged_as_pr", detail: 42 });
+    expect(reason).toContain("merged as #42");
+    expect(reason).toContain("GitHub");
+    expect(reason).not.toContain("not merged");
+    expect(safetyTone({ kind: "merged_as_pr", detail: 42 })).toContain("3fb950");
   });
 
   // The bug in #701: a scratch branch was described as holding commits
@@ -427,6 +457,8 @@ describe("safetyTone", () => {
     expect(safetyTone({ kind: "never_pushed" })).not.toContain("3fb950");
     // Green, like `safe`: same verdict, different evidence (#732).
     expect(safetyTone({ kind: "merged_upstream_deleted" })).toContain("3fb950");
+    // #1439: in `isSafe`, so green.
+    expect(safetyTone({ kind: "merged_no_upstream" })).toContain("3fb950");
     // Green for the same reason again (#819). Green on this page means
     // one-click removable, `isSafe` includes this kind, and the two must
     // not disagree -- a green row with a disabled button, or a grey row
@@ -653,6 +685,32 @@ describe("pathBasename", () => {
 
   it("returns the input when there is no separator at all", () => {
     expect(pathBasename("proj")).toBe("proj");
+  });
+});
+
+/// #1455: the reverse join, pull request to the checkout Claudify starts in.
+describe("mainCheckoutFor", () => {
+  const repo = (identity: string | null, path: string, bare = false) =>
+    ({ identity, name: path, path, worktrees: [], bare }) as WorktreeRepo;
+
+  it("matches on the remote identity, case-insensitively", () => {
+    const repos = [repo("octocat/other", "/code/a"), repo("OctoCat/API", "/code/b")];
+    expect(mainCheckoutFor(repos, "octocat/api")).toBe("/code/b");
+  });
+
+  /// None rather than a guess: no identity, a bare clone, or no scan yet.
+  it("returns null when nothing can host the session", () => {
+    expect(mainCheckoutFor([repo(null, "/code/api")], "octocat/api")).toBeNull();
+    expect(mainCheckoutFor([repo("octocat/api", "/code/api.git", true)], "octocat/api")).toBeNull();
+    expect(mainCheckoutFor(undefined, "octocat/api")).toBeNull();
+    expect(mainCheckoutFor([repo("octocat/api", "/code/api")], "")).toBeNull();
+  });
+
+  /// Several clones: the same one every time, not the walk's order.
+  it("picks the first clone by path when there are several", () => {
+    const repos = [repo("octocat/api", "/code/z-api"), repo("octocat/api", "/code/a-api")];
+    expect(mainCheckoutFor(repos, "octocat/api")).toBe("/code/a-api");
+    expect(mainCheckoutFor([...repos].reverse(), "octocat/api")).toBe("/code/a-api");
   });
 });
 
@@ -1217,7 +1275,7 @@ describe("an operation in progress", () => {
   const inProgress = (
     op: "rebase" | "merge" | "cherryPick" | "revert" | "bisect",
     conflicts: number | null,
-  ): Safety => ({ kind: "inProgress", op, conflicts });
+  ): Safety => ({ kind: "in_progress", detail: { op, conflicts } });
 
   it("names the operation and the conflict count", () => {
     expect(safetyReason(inProgress("rebase", 3))).toBe(
@@ -1251,5 +1309,60 @@ describe("an operation in progress", () => {
     const w = forceWarning(inProgress("rebase", 2));
     expect(w).toContain("rebase");
     expect(w).toMatch(/finish or abort/i);
+  });
+});
+
+/// #1437: the frontend against what Rust ACTUALLY sends.
+///
+/// Every test above builds its `Safety` by hand, in this file's own
+/// spelling, so the two sides were never compared: Rust sent
+/// `in_progress` with its fields under `detail`, this side matched
+/// `inProgress`, and every in-progress row read "could not determine:
+/// [object Object]". The fixture is Rust's serialisation, pinned by a
+/// Rust test, so a rename on either side fails one of the two.
+describe("the Safety wire contract", () => {
+  const variants = JSON.parse(safetyFixture) as Safety[];
+
+  it("reads a fixture that covers every kind", () => {
+    // A floor, so a fixture that stopped parsing into anything could not
+    // make the loops below pass vacuously.
+    expect(new Set(variants.map((v) => v.kind)).size).toBeGreaterThanOrEqual(15);
+  });
+
+  it("describes every variant by name, never as an unreadable payload", () => {
+    for (const s of variants) {
+      const label = JSON.stringify(s);
+      for (const text of [safetyReason(s), forceWarning(s)]) {
+        expect(text, label).not.toContain("[object Object]");
+        expect(text, label).not.toContain("undefined");
+        expect(text, label).not.toContain("unrecognised state");
+      }
+      // The fallback wording belongs to `unknown` alone: anything else
+      // reaching it means this side did not recognise the kind.
+      if (s.kind === "unknown") {
+        expect(safetyReason(s), label).toContain("could not determine");
+      } else {
+        expect(safetyReason(s), label).not.toContain("could not determine");
+      }
+    }
+  });
+
+  it("names the operation for every in-progress variant", () => {
+    const inProgress = variants.filter((v) => v.kind === "in_progress");
+    expect(inProgress.length).toBe(5);
+    for (const s of inProgress) {
+      expect(safetyReason(s), JSON.stringify(s)).toMatch(
+        /^(rebase|merge|cherry-pick|revert|bisect) in progress/,
+      );
+    }
+  });
+
+  /// The default branch, for a kind the backend might add before this
+  /// side learns it: say so by name, never stringify the payload.
+  it("names an unrecognised kind instead of printing its payload", () => {
+    const future = { kind: "some_future_state", detail: { a: 1 } } as unknown as Safety;
+    const text = safetyReason(future);
+    expect(text).toBe("unrecognised state: some_future_state");
+    expect(text).not.toContain("[object Object]");
   });
 });

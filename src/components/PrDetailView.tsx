@@ -1,5 +1,5 @@
 import { ExternalLink } from "./ExternalLink";
-import { ArrowLeft, Trash2, Bot, Check, CircleDot, CircleSlash, ExternalLink as ExternalLinkIcon, X } from "lucide-react";
+import { ArrowLeft, Trash2, Check, CircleDot, CircleSlash, ExternalLink as ExternalLinkIcon, X } from "lucide-react";
 import { toast } from "sonner";
 import {
   useClaudeSessionsForPr,
@@ -7,22 +7,25 @@ import {
   useDeleteHeadBranch,
   usePrDetail,
   useRerunChecks,
+  useReviewGates,
   useReviewPr,
   useViewer,
 } from "../api/hooks";
+import { gateVerdict } from "../lib/reviewGates";
 import { useState } from "react";
 import type { ReviewVerdictName } from "../api/tauri";
 import type { ClaudePrLink } from "../types/pr";
 import { useFilters } from "../store/filters";
-import { agentPrompt, toAgentContext } from "../lib/agentPrompt";
 import { rerunnableRun } from "../lib/rerun";
 import { useIsMobile } from "../lib/useIsMobile";
 import { Markdown } from "./Markdown";
-import { copyText } from "../lib/clipboard";
+import { PrClaudifyButton } from "./PrClaudify";
 import { CommentRow } from "./CommentRow";
 import { ReviewThreads } from "./ReviewThreads";
+import { PrDates } from "./PrDates";
 import { Section } from "./Section";
 import { PrActions } from "./PrActions";
+import { StackBadge } from "./StackBadge";
 import { ReviewBox } from "./ReviewBox";
 import { QueryError, errorMessage } from "./QueryError";
 import { scopeEffect } from "../lib/branchDelete";
@@ -63,12 +66,6 @@ function CheckRow({ name, state, url }: { name: string; state: string; url: stri
   );
 }
 
-/// The pull request detail view.
-///
-/// Modelled on GitHub's PR page minus what does not belong in a triage
-/// tool: no file diff, no commit history, no posting comments. Headstate
-/// is for deciding and acting; reviewing code belongs in GitHub or an
-/// editor, and "View on GitHub" covers the rest.
 /// The Claude sessions that produced this pull request (#1211).
 ///
 /// The `pr-link` record has been read since #1132 and surfaced in one
@@ -85,77 +82,133 @@ function CheckRow({ name, state, url }: { name: string; state: string; url: stri
 /// as "no session" would be a confident wrong answer about someone
 /// else's work, so the panel is absent entirely rather than empty --
 /// the same choice `SessionPullRequests` makes for the same reason.
+///
+/// # The same repository under another owner (#1557)
+///
+/// A link keeps the repository's name from when the PR was opened, so a
+/// transferred repository's older links carry the old owner. When no
+/// session recorded THIS `owner/repo#N` but sessions recorded the same
+/// repository name under another owner, the panel says exactly that and
+/// lists them under it -- the fact the reader can check, not a claim
+/// that they wrote this PR. The search's note states the same case the
+/// same way.
 function PrSessions({ repo, number }: { repo: string; number: number }) {
   const q = useClaudeSessionsForPr(repo, number, true);
-  // Rows without a usable `session_id` are DROPPED rather than rendered
-  // (#1288).
-  //
-  // The contract is asserted where a contract can be asserted -- in
-  // Rust, by `PrLink`'s `pr_link_serialises_snake_case` and by
-  // `invariants.rs`'s
-  // `every_mirrored_type_agrees_with_its_rust_wire_spelling`, which
-  // compare the real serialised keys against this file's type. This
-  // filter is not a second spelling of that contract and deliberately
-  // does NOT read `sessionId`: accepting both spellings would make the
-  // wire unfalsifiable and let the next drift through in silence.
-  //
-  // What it buys is proportionality. `PrLink` serialised `sessionId`
-  // for a release and `l.session_id.slice(0, 8)` threw on `undefined`,
-  // which took down the ENTIRE pull request page -- title, checks,
-  // diff, review -- over a provenance footnote. This panel already
-  // treats a failed lookup as silent for exactly that reason: it is not
-  // the subject of the page. A malformed row now costs its own line and
-  // nothing else.
-  const links = (q.data ?? []).filter(
-    (l: ClaudePrLink) => typeof l?.session_id === "string" && l.session_id.length > 0,
-  );
-
-  // Nothing to say: no link recorded here, or the lookup failed. A
+  // Nothing to say while in flight, and nothing on a failed lookup. A
   // failed lookup is deliberately silent rather than an error panel --
   // this is provenance, not the subject of the page, and a red box
   // about a secondary join would crowd out the PR the user came for.
-  if (links.length === 0) return null;
+  // Silent is not "no session": nothing here is worded as an absence.
+  if (q.state !== "done") return null;
+  const links = usable(q.links);
+  const elsewhere = usable(q.elsewhere);
 
+  if (links.length > 0) {
+    return (
+      <Section title="Written by" count={links.length}>
+        <SessionLinks links={links} />
+      </Section>
+    );
+  }
+  if (elsewhere.length > 0) {
+    return (
+      <Section title="Sessions" count={elsewhere.length}>
+        <p className="mb-1 text-xs text-[#8b949e]" data-testid="pr-sessions-elsewhere">
+          No session recorded {repo}#{number}. {elsewhere.length === 1 ? "This session" : "These sessions"}{" "}
+          recorded {refsOf(elsewhere)}, the same repository name under another owner:
+        </p>
+        <SessionLinks links={elsewhere} />
+      </Section>
+    );
+  }
+  // No link recorded here: absent, per the section above.
+  return null;
+}
+
+/// Rows with a usable `session_id`, one per session.
+///
+/// Rows without one are DROPPED rather than rendered (#1288).
+///
+/// The contract is asserted where a contract can be asserted -- in
+/// Rust, by `PrLink`'s `pr_link_serialises_snake_case` and by
+/// `invariants.rs`'s
+/// `every_mirrored_type_agrees_with_its_rust_wire_spelling`, which
+/// compare the real serialised keys against this file's type. This
+/// filter is not a second spelling of that contract and deliberately
+/// does NOT read `sessionId`: accepting both spellings would make the
+/// wire unfalsifiable and let the next drift through in silence.
+///
+/// What it buys is proportionality. `PrLink` serialised `sessionId`
+/// for a release and `l.session_id.slice(0, 8)` threw on `undefined`,
+/// which took down the ENTIRE pull request page -- title, checks,
+/// diff, review -- over a provenance footnote. A malformed row now
+/// costs its own line and nothing else.
+///
+/// One per session because a session can hold the same PR twice, under
+/// two spellings of the repository (#1557): its `pr-link` record and
+/// the `gh pr create` result that also links it.
+function usable(links: readonly ClaudePrLink[]): ClaudePrLink[] {
+  const seen = new Set<string>();
+  return links.filter((l: ClaudePrLink) => {
+    if (typeof l?.session_id !== "string" || l.session_id.length === 0) return false;
+    if (seen.has(l.session_id)) return false;
+    seen.add(l.session_id);
+    return true;
+  });
+}
+
+/// The pull requests a set of links names, as prose: `a/b#1`, or
+/// `a/b#1 and c/b#1`.
+function refsOf(links: readonly ClaudePrLink[]): string {
+  const refs = [...new Set(links.map((l) => `${l.repo}#${l.number}`))].sort();
+  return refs.length <= 2 ? refs.join(" and ") : `${refs.slice(0, -1).join(", ")} and ${refs.at(-1)}`;
+}
+
+function SessionLinks({ links }: { links: readonly ClaudePrLink[] }) {
   return (
-    <Section title="Written by" count={links.length}>
-      <ul className="space-y-0.5">
-        {links.map((l: ClaudePrLink) => (
-          <li key={l.session_id} className="text-xs">
-            <button
-              type="button"
-              onClick={() => {
-                // `setView` FIRST, and the order is load-bearing: it
-                // resets `claudePage` to "overview" and clears
-                // `claudeSelected`, so the natural-reading order --
-                // select, then page, then view -- lands on the overview
-                // with nothing selected.
-                //
-                // This is #920's bug in a new place. The store's own
-                // `showClaudeSessions` comment records it: "that jump
-                // had to call `setView` BEFORE `setFilter`... the
-                // natural-reading order filed the value under the page
-                // being left and the destination opened on its
-                // default." A test asserting only the view would not
-                // have noticed; the one asserting all three caught it.
-                const st = useFilters.getState();
-                st.setView("claude-code");
-                st.setClaudePage("sessions");
-                st.selectClaudeSession(l.session_id);
-              }}
-              className="text-[#58a6ff] hover:underline"
-            >
-              {l.session_id.slice(0, 8)}
-            </button>
-            {l.first_seen_at ? (
-              <span className="ml-2 text-[#8b949e]">first linked {l.first_seen_at}</span>
-            ) : null}
-          </li>
-        ))}
-      </ul>
-    </Section>
+    <ul className="space-y-0.5">
+      {links.map((l: ClaudePrLink) => (
+        <li key={l.session_id} className="text-xs">
+          <button
+            type="button"
+            onClick={() => {
+              // `setView` FIRST, and the order is load-bearing: it
+              // resets `claudePage` to "overview" and clears
+              // `claudeSelected`, so the natural-reading order --
+              // select, then page, then view -- lands on the overview
+              // with nothing selected.
+              //
+              // This is #920's bug in a new place. The store's own
+              // `showClaudeSessions` comment records it: "that jump
+              // had to call `setView` BEFORE `setFilter`... the
+              // natural-reading order filed the value under the page
+              // being left and the destination opened on its
+              // default." A test asserting only the view would not
+              // have noticed; the one asserting all three caught it.
+              const st = useFilters.getState();
+              st.setView("claude-code");
+              st.setClaudePage("sessions");
+              st.selectClaudeSession(l.session_id);
+            }}
+            className="text-[#58a6ff] hover:underline"
+          >
+            {l.session_id.slice(0, 8)}
+          </button>
+          {l.first_seen_at ? (
+            <span className="ml-2 text-[#8b949e]">first linked {l.first_seen_at}</span>
+          ) : null}
+        </li>
+      ))}
+    </ul>
   );
 }
 
+/// The pull request detail view.
+///
+/// Modelled on GitHub's PR page minus what does not belong in a triage
+/// tool: no file diff, no commit history, no posting comments. Headstate
+/// is for deciding and acting; reviewing code belongs in GitHub or an
+/// editor, and "View on GitHub" covers the rest.
 export function PrDetailView({
   repo,
   number,
@@ -185,6 +238,13 @@ export function PrDetailView({
   // ReviewBox reads that as "might not be mine" rather than "is mine",
   // so a failed viewer fetch never silently removes the approve button.
   const { data: viewer } = useViewer();
+  // The base branch's review rules (#1451, #1454). Undefined while pending
+  // and when unreadable alike -- both render nothing new -- so `gate` is
+  // all-null until a rule is actually READ.
+  const { data: gates } = useReviewGates(pr, isPlaceholderData);
+  const gate = pr
+    ? gateVerdict(gates, pr, viewer, isPlaceholderData)
+    : { approveWontCount: null, approveCaveat: null, mergeBlocked: null };
   const [reviewing, setReviewing] = useState<ReviewVerdictName | null>(null);
   const rerun = useRerunChecks();
   const [rerunning, setRerunning] = useState(false);
@@ -241,7 +301,13 @@ export function PrDetailView({
     submit.then(
       () => {
         done();
-        toast.success(`${label} ${pr.repo}#${pr.number}`);
+        // The after-approve state: an approval that will not count toward
+        // merging still reads "Approved", so the toast says what it means
+        // (#1451).
+        toast.success(`${label} ${pr.repo}#${pr.number}`, {
+          description:
+            verdict === "approve" && gate.approveWontCount ? gate.approveWontCount : undefined,
+        });
       },
       (e: unknown) => {
         done();
@@ -322,7 +388,7 @@ export function PrDetailView({
           title={
             approvedByViewer
               ? "You have already approved this pull request"
-              : "Approve without a comment"
+              : (gate.approveWontCount ?? "Approve without a comment")
           }
           className={`rounded px-2.5 py-1 text-sm font-medium ${
             approvedByViewer || reviewing !== null
@@ -337,7 +403,15 @@ export function PrDetailView({
               : "Approve"}
         </button>
       ) : null}
-      <PrActions pr={pr} compact />
+      {/* The header has no room for the sentence, so it carries the short
+          form beside the button, with the full one in its title and in
+          the body's review box (#1451). */}
+      {viewer !== undefined && viewer !== pr.author && gate.approveWontCount ? (
+        <span className="text-xs font-medium text-[#d29922]" title={gate.approveWontCount}>
+          Won't count toward merging
+        </span>
+      ) : null}
+      <PrActions pr={pr} compact conversations={gate.mergeBlocked} />
     </>
   );
 
@@ -443,6 +517,10 @@ export function PrDetailView({
               <span>draft</span>
             </>
           ) : null}
+          {/* Opened, ready for review, last commit (#1457); each omitted
+              when it cannot be read. */}
+          <PrDates pr={pr} />
+          <StackBadge stack={pr.stack} />
           {/* The ONE metadata fact the list row does not carry: the list
               query does not select additions, deletions or changedFiles
               (see `PRS_QUERY`). So while this is the seeded placeholder
@@ -474,7 +552,7 @@ export function PrDetailView({
         </p>
       </div>
 
-      <PrActions pr={pr} />
+      <PrActions pr={pr} conversations={gate.mergeBlocked} />
 
       {/* Available on EVERY pull request, not only the review queue.
           Gating this on which list you arrived from would mean the same
@@ -486,6 +564,8 @@ export function PrDetailView({
         viewer={viewer}
         author={pr.author}
         latestReviews={pr.latest_reviews}
+        approveWontCount={gate.approveWontCount}
+        approveCaveat={gate.approveCaveat}
         busy={reviewing}
         onSubmit={submitReview}
       />
@@ -619,6 +699,16 @@ export function PrDetailView({
         // hides nothing worth a click.
         <Section title="Comments" count={pr.comment_count}>
           <div className="flex flex-col gap-2">
+          {/* At the TOP, and naming which ones are missing (#1453). The
+              query fetches the newest comments, so what is cut is the
+              oldest, and the reader should know that before scrolling
+              rather than after. */}
+          {pr.comment_count > pr.comments.length ? (
+            <p className="text-xs text-[#8b949e]">
+              Showing the newest {pr.comments.length} of {pr.comment_count} — older ones are on
+              GitHub.
+            </p>
+          ) : null}
           {/* Each comment collapses on its OWN, rather than the whole
               block collapsing together. One section for fifty comments
               meant finding a particular one required expanding all of
@@ -636,12 +726,6 @@ export function PrDetailView({
               defaultOpen={pr.comments.length === 1}
             />
           ))}
-          {/* GitHub is where you reply; this view is for deciding. */}
-          {pr.comment_count > pr.comments.length ? (
-            <p className="text-xs text-[#8b949e]">
-              Showing {pr.comments.length} of {pr.comment_count}. See the rest on GitHub.
-            </p>
-          ) : null}
           </div>
         </Section>
       ) : null}
@@ -654,27 +738,11 @@ export function PrDetailView({
           <ExternalLinkIcon className="h-3.5 w-3.5" aria-hidden="true" />
           View on GitHub
         </ExternalLink>
-        {/* Worth more here than on a row: this view has the per-check
-            names and URLs, so the prompt names the jobs that actually
-            failed rather than saying the checks were not loaded. */}
-        <button
-          type="button"
-          onClick={() =>
-            void copyText(agentPrompt(toAgentContext(pr))).then((failure) =>
-              failure === null
-                ? toast.success("Prompt copied — paste it to an agent")
-                : // The REASON, which the previous version discarded.
-                  // "Could not copy" alone leaves the user with nothing
-                  // to act on, and an absent clipboard did not even
-                  // reach this handler.
-                  toast.error("Could not copy the prompt", { description: failure }),
-            )
-          }
-          className="flex w-fit items-center gap-1.5 rounded border border-[#30363d] px-3 py-1.5 text-sm hover:bg-[#161b22]"
-        >
-          <Bot className="h-3.5 w-3.5" aria-hidden="true" />
-          Copy for agent
-        </button>
+        {/* Claudify (#1455), which replaced "Copy for agent". Worth more
+            here than on a row: this view has the per-check names and
+            URLs, the size and the description, so the prompt names the
+            jobs that actually failed and adapts its review criteria. */}
+        <PrClaudifyButton pr={pr} />
 
         {/* Only once the PR has MERGED, and only while the branch still
             exists. 31 of the last 60 merged PRs on a real account still

@@ -38,6 +38,8 @@ import { useState } from "react";
 
 import { useClaudeIndexCoverage, useClaudeTranscriptSearch } from "../api/hooks";
 import { errorMessage } from "./QueryError";
+import { MaskedText } from "./MaskedText";
+import { maskingNote, unsearchedNote } from "@/lib/masked";
 
 /// How much of the corpus is searchable, in words.
 ///
@@ -172,7 +174,12 @@ export function ClaudeTranscriptSearch({ enabled = true }: { enabled?: boolean }
       ) : null}
 
       {search.data !== undefined ? (
-        <SearchResult answer={search.data} />
+        <>
+          {unsearchedNote(search.data.masking) !== null ? (
+            <p className="text-[11px] text-[#8b949e]">{unsearchedNote(search.data.masking)}</p>
+          ) : null}
+          <SearchResult answer={search.data} />
+        </>
       ) : null}
     </section>
   );
@@ -192,7 +199,10 @@ function SearchResult({
   if (verdict.kind === "not_asked") return null;
 
   if (verdict.kind === "matches") {
+    const note = maskingNote(answer.masking);
     return (
+      <>
+      {note !== null ? <p className="text-[11px] text-[#8b949e]">{note}</p> : null}
       <ul className="flex flex-col gap-1">
         {verdict.hits.map((h) => (
           <li
@@ -200,7 +210,9 @@ function SearchResult({
             className="rounded-md border border-[#30363d] bg-[#161b22] px-3 py-2 text-xs text-[#c9d1d9]"
           >
             <span className="font-mono text-[11px] text-[#8b949e]">{h.session_id}</span>
-            <p className="mt-1">{h.snippet}</p>
+            <p className="mt-1">
+              <MaskedText text={h.snippet} />
+            </p>
             {/* A hit is a hit either way, but a truncated session's
                 CONTENT is only partly indexed, so the row says so rather
                 than implying the whole transcript was searched. */}
@@ -212,6 +224,7 @@ function SearchResult({
           </li>
         ))}
       </ul>
+      </>
     );
   }
 

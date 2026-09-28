@@ -44,18 +44,106 @@
 //! - `POST /v1/pair`: `remote/pairing.rs`. 200 with a `PairOutcome`;
 //!   400 for a body that does not decode; otherwise `PairError::http_status`.
 //! - `POST /v1/call/{command}`: `remote/surface.rs` and `remote/stepup.rs`.
-//!   200 with the command's JSON result; 404 unknown command, 403
-//!   desktop-only command or not paired, 400 for a body that is not JSON
+//!   200 with the command's JSON result (transcript text masked per
+//!   `remote/privacy.rs`); 404 unknown command, 403 desktop-only command,
+//!   not paired, or a transcript read or reveal this device is not
+//!   allowed; 400 for a body that is not JSON
 //!   or does not decode as the command's arguments, 500 when the command
 //!   itself failed (the body is its message); a destructive command's
 //!   signature is checked first and refused with `StepUpError::http_status`.
 //!
 //! Error bodies are plain text: the message the matching error type
 //! prints, which is written to be safe to send.
+//!
+//! # Compression, and why CRIME/BREACH does not bite here (#1478)
+//!
+//! `/v1/call/*` responses are gzipped when the request says
+//! `Accept-Encoding: gzip`, which the phone's client does. That route
+//! and nothing else: `/v1/hello` is tiny, `/v1/pair` carries the
+//! pairing exchange and gains nothing from it, and `/v1/events` is an
+//! event stream that must flush frame by frame (tower-http's default
+//! predicate would skip `text/event-stream` anyway; the route scoping
+//! says so rather than relying on it). A request that does not ask gets
+//! the same bytes it always did, so a companion built before this
+//! change keeps working. Bodies of 32 bytes or fewer are sent as they
+//! are, which is tower-http's default. gzip, not zstd: see
+//! `src-tauri/Cargo.toml`.
+//!
+//! Why: transcript pages are the largest thing the phone asks for and
+//! the most compressible. Tool output is repetitive text, and the page
+//! is JSON around it. Compression makes a page cheaper to MOVE. It does
+//! not raise any per-page byte budget: every command still bounds its
+//! own response, as before.
+//!
+//! **The attack shape.** Compression plus encryption leaks through
+//! length. When one compressed body holds both a secret and text an
+//! attacker chose, a guess that matches part of the secret compresses
+//! better, and the ciphertext gets shorter. CRIME read this from
+//! compressed request headers. BREACH reads it from compressed HTTP
+//! response bodies, and that is the case that applies here: our
+//! responses do mix the two.
+//!
+//! - **Attacker-influenced text.** A transcript is full of it: web
+//!   pages an agent fetched, files it read, issue and PR text other
+//!   people wrote. PR lists and details carry titles and bodies by
+//!   anyone who can open a PR.
+//! - **Secrets.** No Headstate credential is ever in a response body.
+//!   The phone is authenticated by its TLS client certificate, which is
+//!   not HTTP. The step-up signature travels in a REQUEST header, and
+//!   requests are not compressed, so CRIME's shape is absent. The GitHub
+//!   token never leaves the desktop. What CAN be in a body is a secret
+//!   inside the user's own data: a token pasted into a prompt, an env
+//!   dump, a `.env` read. Transcripts routinely hold these (#1488).
+//! - **Observing lengths.** Anyone on the same LAN can see TLS record
+//!   sizes. TLS 1.3 hides the content, not the length.
+//!
+//! **The precondition that fails.** BREACH needs the attacker to
+//! DRIVE the victim: to make it issue many requests, each reflecting a
+//! different guess next to the same secret, and to see the length of
+//! each response. That typically takes hundreds to thousands of adaptive
+//! requests. In a browser, a hostile page does this for free: it
+//! triggers cross-site requests that carry the victim's cookie. Here
+//! nothing can:
+//!
+//! - The only client is the paired app. It holds a pinned client
+//!   certificate, and it sends requests when its user navigates or on
+//!   its own polling timer. No web origin can make it send one. The
+//!   arguments are the app's own (a path, a cursor), never attacker
+//!   text.
+//! - The attacker's text is not reflected from a request. It has to be
+//!   WRITTEN INTO THE DATA first, for example by getting an agent on the
+//!   desktop to fetch a page they control. Each guess then costs one
+//!   round of "make the agent ingest new text, wait for the phone to
+//!   poll". That new text then has to land in the same response as an
+//!   unchanged secret. A live-follow page (`claude_transcript_page`
+//!   after a cursor) returns only the records after that cursor, so the secret
+//!   would have to be re-written next to every guess.
+//!
+//! So the attack needs a LAN observer who also controls content that a
+//! running agent reads repeatedly, while that agent keeps echoing the
+//! same secret. That is not impossible, but it is far from BREACH's
+//! cheap, drivable oracle. And its target, a secret in a transcript,
+//! already crosses to the phone today. The mitigation that removes the
+//! secret itself is #1488's masking: it happens on the desktop, before
+//! the body is built, so a masked secret is in neither the plaintext nor
+//! the compressed length.
+//!
+//! **Scoping.** "Compress only transcript responses" would not reduce
+//! the risk: transcripts are the one response where attacker text and
+//! secrets are MOST mixed. The only scoping that lowers risk is to leave
+//! transcripts uncompressed, and that gives up the whole benefit for an
+//! attack the argument above says is impractical. So compression covers
+//! every `/v1/call/*` response, and the risk is handled where it lives,
+//! by masking. One case is left to that issue: a "reveal" response,
+//! which by design carries an unmasked secret, should be served
+//! uncompressed. Answering it with `Content-Encoding: identity` already
+//! does that, because tower-http leaves a response that already names an
+//! encoding untouched.
 
 use crate::remote::events::{self, Hub};
 use crate::remote::identity::{fingerprint_of, Identity};
 use crate::remote::pairing::{self, PairRequest, PairingState, PeerCert};
+use crate::remote::privacy;
 use crate::remote::stepup::{self, NonceWindow};
 use crate::remote::surface::{self, Class, RemoteError};
 use crate::store::devices::PairedDevice;
@@ -546,13 +634,36 @@ async fn call(
             return refusal(e.http_status(), e.to_string());
         }
     }
+    // Transcript text leaves the desktop only through here, and only as
+    // `remote/privacy.rs` allows this device: refused when its switch is
+    // off, masked unless it may reveal and asked to (#1488). After the
+    // step-up check, so a destructive command's signature covers the
+    // arguments the phone actually sent.
+    let (args, plan) = match privacy::admit(&command, args, privacy::Access::from(&device)) {
+        Ok(admitted) => admitted,
+        Err(e) => return refusal(403, e.to_string()),
+    };
     let result = st.host.dispatch(&command, args, &device.name).await;
     if class == Class::Destructive {
         // The attempt is the news, whether or not it succeeded.
         st.host.notify_destructive(&device.name, &command);
     }
     match result {
-        Ok(value) => Json(value).into_response(),
+        Ok(value) => {
+            let revealed = plan.reveals();
+            let mut response = Json(plan.finish(&command, value)).into_response();
+            if revealed {
+                // An unmasked secret is never compressed: masking is what
+                // defeats BREACH here (see the module docs), and a reveal
+                // is the one answer masking does not cover. tower-http
+                // leaves a response that already names an encoding alone.
+                response.headers_mut().insert(
+                    axum::http::header::CONTENT_ENCODING,
+                    axum::http::HeaderValue::from_static("identity"),
+                );
+            }
+            response
+        }
         Err(e) => refusal_for(e),
     }
 }
@@ -587,12 +698,28 @@ fn refusal_for(e: RemoteError) -> Response {
     }
 }
 
+/// gzip for `/v1/call/*` responses, when the request asks for it. The
+/// module docs argue the scope and the CRIME/BREACH review (#1478).
+/// Every other codec is switched off by name. Cargo unifies features, so
+/// if another crate in the tree enabled tower-http's `compression-br`,
+/// brotli would otherwise switch itself on here, unreviewed.
+fn compression() -> tower_http::compression::CompressionLayer {
+    tower_http::compression::CompressionLayer::new()
+        .gzip(true)
+        .no_br()
+        .no_deflate()
+        .no_zstd()
+}
+
 fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/hello", get(hello))
         .route(events::PATH, get(events))
         .route(PAIR_PATH, post(pair))
-        .route(&format!("{CALL_PREFIX}{{command}}"), post(call))
+        .route(
+            &format!("{CALL_PREFIX}{{command}}"),
+            post(call).layer(compression()),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_paired,
@@ -857,6 +984,8 @@ pub(crate) mod tests {
             mldsa_pubkey: None,
             paired_at: "2026-09-05T00:00:00Z".into(),
             last_seen: None,
+            transcripts_allowed: true,
+            reveal_allowed: false,
         }
     }
 
@@ -892,12 +1021,15 @@ pub(crate) mod tests {
 
     /// A `CommandHost` that runs nothing and remembers everything: what
     /// it was asked to dispatch, and which destructive calls it was told
-    /// to announce. Answers `{"ran": <command>}` unless told to fail.
+    /// to announce. Answers `{"ran": <command>}` unless told to fail, or
+    /// `reply_with` when a test needs a particular answer to come back
+    /// through the listener (a transcript, to see it masked).
     #[derive(Default)]
     pub(crate) struct RecordingHost {
         pub(crate) calls: Mutex<Vec<(String, Value, String)>>,
         pub(crate) notices: Mutex<Vec<(String, String)>>,
         pub(crate) fail_with: Mutex<Option<RemoteError>>,
+        pub(crate) reply_with: Mutex<Option<Value>>,
     }
 
     impl CommandHost for RecordingHost {
@@ -915,7 +1047,12 @@ pub(crate) mod tests {
                 ));
                 match self.fail_with.lock().unwrap().clone() {
                     Some(e) => Err(e),
-                    None => Ok(serde_json::json!({ "ran": command })),
+                    None => Ok(self
+                        .reply_with
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or_else(|| serde_json::json!({ "ran": command }))),
                 }
             })
         }

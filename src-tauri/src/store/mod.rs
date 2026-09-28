@@ -73,6 +73,7 @@ mod tests {
             author: "octocat".into(),
             is_draft: false,
             created_at: Utc::now(),
+            ready_at: None,
             updated_at: Utc::now(),
             ci: CiState::Success,
             merge: MergeState::Mergeable,

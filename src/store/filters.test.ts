@@ -207,6 +207,64 @@ describe("the Claude Code session filter", () => {
   });
 });
 
+/// #1546: a selected session's pane has two tabs, Details and Transcript,
+/// and the choice is one value kept while moving between sessions.
+describe("the Claude Code session tab", () => {
+  beforeEach(() =>
+    useFilters.setState({
+      view: "claude-code",
+      claudePage: "sessions",
+      claudeSelected: undefined,
+      claudeSessionTab: "details",
+      claudeTranscriptAt: "latest",
+    }),
+  );
+
+  /// The deep link selects the session AND the tab, in one write.
+  it("opens a session on its Transcript tab from another view", () => {
+    useFilters.setState({ view: "my-prs" });
+    useFilters.getState().openClaudeTranscript("abc-123", "marker");
+    const s = useFilters.getState();
+    expect(s.view).toBe("claude-code");
+    expect(s.claudeSelected).toBe("abc-123");
+    expect(s.claudeSessionTab).toBe("transcript");
+    expect(s.claudeTranscriptAt).toBe("marker");
+  });
+
+  /// The tab survives a change of session; the "since you left" marker
+  /// does not, because it was asked for about one session.
+  it("keeps the tab across sessions but not the marker", () => {
+    useFilters.getState().openClaudeTranscript("abc-123", "marker");
+    useFilters.getState().selectClaudeSession("def-456");
+    const s = useFilters.getState();
+    expect(s.claudeSessionTab).toBe("transcript");
+    expect(s.claudeTranscriptAt).toBe("latest");
+  });
+
+  /// Choosing a tab is a fresh opening, at the newest message.
+  it("opens at the newest message when the tab is chosen by hand", () => {
+    useFilters.getState().openClaudeTranscript("abc-123", "marker");
+    useFilters.getState().setClaudeSessionTab("details");
+    useFilters.getState().setClaudeSessionTab("transcript");
+    expect(useFilters.getState().claudeTranscriptAt).toBe("latest");
+  });
+
+  /// Leaving the view resets it with the selection, and it is never
+  /// persisted, for `claudeSelected`'s reason.
+  it("resets to Details when the view changes, and is not persisted", () => {
+    useFilters.getState().openClaudeTranscript("abc-123");
+    const partialize = useFilters.persist.getOptions().partialize!;
+    const kept = partialize(useFilters.getState()) as Record<string, unknown>;
+    expect(kept).not.toHaveProperty("claudeSessionTab");
+
+    useFilters.getState().setView("worktrees");
+    expect(useFilters.getState().claudeSessionTab).toBe("details");
+    useFilters.getState().setView("claude-code");
+    useFilters.getState().showClaudeSessions("all");
+    expect(useFilters.getState().claudeSessionTab).toBe("details");
+  });
+});
+
 /// The advice panel's grouping is a view PREFERENCE, so it survives a
 /// relaunch -- the other side of the `claudeFilter` test above (#1291).
 ///

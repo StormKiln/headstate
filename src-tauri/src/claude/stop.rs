@@ -83,9 +83,26 @@
 //! a session should be stopped; it states what is true about one and lets
 //! the user decide.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
-use super::liveness::{ProcessProbe, Registry, START_TOLERANCE_SECS};
+use super::liveness::{
+    derive_at, Liveness, ProcessProbe, Registry, Run, Unnamed, START_TOLERANCE_SECS,
+};
+
+/// Every session's hook-recorded runs, keyed by session id, or why they
+/// could not be read.
+///
+/// Stop confirms a pid ONLY from the session's own registry `.json`; see
+/// [`confirm`]. The runs are here for the refusal, not the confirmation:
+/// since #1534 a session can read `Running` from a hook-recorded run, or
+/// from a `.key`-only process such a run names, and for those sessions
+/// "the registry does not list this session" is true while "there is no
+/// process to stop" is false (#1569). The runs are what tell the two
+/// apart, so a failure to read them is carried rather than defaulted to
+/// empty -- an empty map would turn "we did not look" into "not running".
+pub type Runs<'a> = Result<&'a HashMap<String, Vec<Run>>, &'a str>;
 
 /// How many stops one proposal pass may put in front of the user.
 ///
@@ -122,8 +139,25 @@ pub enum Refusal {
     /// The registry directory could not be listed at all, so the entry
     /// proving this session is alive may be one we could not see.
     RegistryUnreadable { why: String },
-    /// The registry listed fine and does not mention this session.
+    /// The registry listed fine and does not mention this session, or
+    /// lists a pid that is gone -- AND nothing else says it is running.
     NotRunning { why: String },
+    /// The session IS running, but not under a pid Stop may signal
+    /// (#1569).
+    ///
+    /// Since #1534 `liveness` reads `Running` from a hook-recorded run,
+    /// or from a `.key`-only process such a run names by an exact start
+    /// time. [`confirm`] accepts only the session's own registry `.json`
+    /// as proof of which process to signal, and widening that is a
+    /// separate decision because a stop is destructive. So this is NOT
+    /// `NotRunning`: the process is there, and Headstate declines to
+    /// signal it. Reporting it as "not running" was "we did not ask"
+    /// worded as "they did not answer".
+    RunningUnconfirmable { pid: u32 },
+    /// The registry does not list this session, and its recorded runs --
+    /// the only other place a running process could be named -- could
+    /// not be read. Not `NotRunning`: the check was not completed.
+    RunsUnreadable { why: String },
     /// The pid is there, but the start times disagree -- a different
     /// process is wearing the number. **This is the refusal that matters
     /// most**: signalling here destroys unrelated work.
@@ -145,6 +179,15 @@ impl Refusal {
                  process could not be confirmed and nothing was signalled"
             ),
             Refusal::NotRunning { why } => why.clone(),
+            Refusal::RunningUnconfirmable { pid } => format!(
+                "this session is running as pid {pid}, but it has not confirmed which process is \
+                 its own, and Headstate only stops a process a session has confirmed -- nothing \
+                 was signalled; end it from the window it is running in"
+            ),
+            Refusal::RunsUnreadable { why } => format!(
+                "this session's recorded runs could not be read ({why}), so whether it is running \
+                 could not be checked and nothing was signalled"
+            ),
             Refusal::PidReused { pid, drift_secs } => format!(
                 "pid {pid} is running but started {drift_secs}s from the recorded time, so the \
                  number has been reused by a different process -- nothing was signalled"
@@ -196,9 +239,14 @@ impl ConfirmedPid {
 /// order: a registry that could not be listed poisons every answer and is
 /// checked before the entry lookup, because a miss in a partially-read map
 /// is not evidence of anything.
+///
+/// `runs` never CONFIRMS anything. It is read only when the answer would
+/// otherwise be [`Refusal::NotRunning`], to check that nothing else says
+/// the session is running (#1569) -- see [`not_running`].
 pub fn confirm<P: ProcessProbe>(
     probe: &P,
     registry: &Registry,
+    runs: Runs<'_>,
     session_id: &str,
 ) -> Result<ConfirmedPid, Refusal> {
     if let Some(why) = &registry.failure {
@@ -218,11 +266,15 @@ pub fn confirm<P: ProcessProbe>(
                 ),
             });
         }
-        return Err(Refusal::NotRunning {
-            why: "the live session registry was read and does not list this session, so there \
-                  is no process to stop"
+        return Err(not_running(
+            probe,
+            registry,
+            runs,
+            session_id,
+            "the live session registry was read and does not list this session, so there is no \
+             process to stop"
                 .into(),
-        });
+        ));
     };
 
     let Some(text) = entry.proc_start.as_deref() else {
@@ -249,13 +301,21 @@ pub fn confirm<P: ProcessProbe>(
                 entry.pid
             ),
         }),
-        Ok(None) => Err(Refusal::NotRunning {
-            why: format!(
+        // The registry's pid is gone -- but a crashed session resumed
+        // from a terminal leaves its old `.json` behind and runs on as a
+        // `.key`-only process a hook-recorded run may name (#1534), so
+        // the dead entry is not the last word either.
+        Ok(None) => Err(not_running(
+            probe,
+            registry,
+            runs,
+            session_id,
+            format!(
                 "pid {} is in the live session registry but is no longer running, so there is \
                  nothing to stop",
                 entry.pid
             ),
-        }),
+        )),
         // The SAME pairing `liveness::derive` uses, with the same
         // tolerance, reached through the same constant. Reinventing it
         // here would give the app two answers to one question.
@@ -268,6 +328,38 @@ pub fn confirm<P: ProcessProbe>(
             pid: entry.pid,
             drift_secs: (actual - recorded).abs(),
         }),
+    }
+}
+
+/// The refusal for a session the registry does not show running: either
+/// `NotRunning` with `why`, or -- when `liveness` says it IS running from
+/// a source Stop does not confirm from -- [`Refusal::RunningUnconfirmable`]
+/// (#1569).
+///
+/// Derived through `liveness`'s own [`Unnamed::resolve`] and [`derive_at`],
+/// over every session's runs, so this cannot disagree with the badge the
+/// detail pane shows. No cwd is passed: the cwd only decides whether an
+/// unnamed process HEDGES a `Dead` into `Unknown`, never whether a row is
+/// `Running`.
+///
+/// Nothing here is a confirmation. The pid in the refusal is shown, never
+/// signalled.
+fn not_running<P: ProcessProbe>(
+    probe: &P,
+    registry: &Registry,
+    runs: Runs<'_>,
+    session_id: &str,
+    why: String,
+) -> Refusal {
+    let runs = match runs {
+        Ok(runs) => runs,
+        Err(e) => return Refusal::RunsUnreadable { why: e.to_string() },
+    };
+    let unnamed = Unnamed::resolve(probe, registry, runs);
+    let own = runs.get(session_id).map(Vec::as_slice).unwrap_or(&[]);
+    match derive_at(probe, registry, &unnamed, session_id, None, own) {
+        Liveness::Running { pid, .. } => Refusal::RunningUnconfirmable { pid },
+        _ => Refusal::NotRunning { why },
     }
 }
 
@@ -440,6 +532,7 @@ pub struct StopProposal {
 pub fn propose<P: ProcessProbe>(
     probe: &P,
     registry: &Registry,
+    runs: Runs<'_>,
     session_ids: &[String],
     evidence_for: impl Fn(&str, Option<i64>) -> StopEvidence,
 ) -> Vec<StopProposal> {
@@ -459,7 +552,7 @@ pub fn propose<P: ProcessProbe>(
             continue;
         }
         considered += 1;
-        match confirm(probe, registry, id) {
+        match confirm(probe, registry, runs, id) {
             Ok(c) => out.push(StopProposal {
                 session_id: id.clone(),
                 action: "proposed".into(),

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ClaudePrLink } from "@/types/pr";
-import { groupPrsByRepo, parsePrQuery, reposForNumber } from "./claudePrs";
+import { groupPrsByRepo, matchPrLinks, parsePrQuery } from "./claudePrs";
 
 const link = (repo: string, number: number): ClaudePrLink => ({
   session_id: `s-${repo}-${number}`,
@@ -98,7 +98,7 @@ describe("groupPrsByRepo", () => {
 describe("parsePrQuery", () => {
   /// The four shapes that reach the backend. `#1234` and `1234` name no
   /// repository, which is what `repo: null` says and what
-  /// `reposForNumber` below is for.
+  /// `matchPrLinks` below answers across every repository (#1545).
   it.each([
     ["#1234", null, 1234],
     ["1234", null, 1234],
@@ -150,30 +150,44 @@ describe("parsePrQuery", () => {
   });
 });
 
-describe("reposForNumber", () => {
-  const prs = [
-    { repo: "acme/ui", number: 7 },
-    { repo: "acme/api", number: 7 },
-    { repo: "acme/api", number: 8 },
-    { repo: "acme/api", number: 7 },
-  ];
+describe("matchPrLinks", () => {
+  const l = (session_id: string, repo: string, number: number) => ({
+    session_id,
+    repo,
+    number,
+    url: `https://github.com/${repo}/pull/${number}`,
+    first_seen_at: null,
+  });
+  const table = [l("s1", "acme/api", 7), l("s2", "acme/ui", 7), l("s3", "acme/api", 8)];
 
-  /// Every repository carrying that number, deduplicated and in one
-  /// settled order -- picking one would be a guess about which pull
-  /// request the user meant.
-  it("names every repository holding that number", () => {
-    expect(reposForNumber(prs, 7)).toEqual(["acme/api", "acme/ui"]);
+  /// #1545: a bare number is every repository's -- picking one would be
+  /// a guess about which pull request the user meant.
+  it("gives a bare number every repository's links for it", () => {
+    const got = matchPrLinks(table, { repo: null, number: 7 });
+    expect(got.links.map((x) => x.session_id)).toEqual(["s1", "s2"]);
+    expect(got.elsewhere).toEqual([]);
   });
 
-  it("names nothing for a number no tracked pull request has", () => {
-    expect(reposForNumber(prs, 99)).toEqual([]);
+  it("gives a qualified number only its own repository's, compared case-insensitively", () => {
+    expect(matchPrLinks(table, { repo: "Acme/UI", number: 7 }).links.map((x) => x.session_id)).toEqual([
+      "s2",
+    ]);
   });
 
-  /// `undefined` is the pull request list not having loaded, which is a
-  /// different thing from it holding no match -- and the caller renders
-  /// both as "could not tell which repository", never as "no session
-  /// recorded". Guarded here so a `.filter` on undefined cannot throw.
-  it("names nothing when the pull request list has not loaded", () => {
-    expect(reposForNumber(undefined, 7)).toEqual([]);
+  /// A transferred repository's older links carry the old owner. They
+  /// are named, not matched -- and only when nothing matched.
+  it("reports the same repository name under another owner only when nothing matched", () => {
+    const moved = [l("s1", "old-owner/api", 7), l("s2", "acme/ui", 7)];
+    const miss = matchPrLinks(moved, { repo: "acme/api", number: 7 });
+    expect(miss.links).toEqual([]);
+    expect(miss.elsewhere.map((x) => x.session_id)).toEqual(["s1"]);
+
+    const hit = matchPrLinks([...moved, l("s3", "acme/api", 7)], { repo: "acme/api", number: 7 });
+    expect(hit.links.map((x) => x.session_id)).toEqual(["s3"]);
+    expect(hit.elsewhere).toEqual([]);
+  });
+
+  it("ignores links for another number", () => {
+    expect(matchPrLinks(table, { repo: null, number: 99 })).toEqual({ links: [], elsewhere: [] });
   });
 });

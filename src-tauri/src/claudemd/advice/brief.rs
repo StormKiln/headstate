@@ -116,8 +116,8 @@ fn suggestion(f: &Finding) -> String {
                  duplicate it."
                     .to_string()
             }
-            (Severity::Unknown, _) => "No edit. Make the transcript named in the evidence \
-                 readable, or leave it: the findings above stand without it, as floors."
+            (Severity::Unknown, _) => "No edit. Make the transcripts named in the evidence \
+                 readable, or leave them: the findings above stand without them, as floors."
                 .to_string(),
             (_, Subject::Directory { path }) => format!(
                 "If the evidence shows a rule the sessions had to learn, create \
@@ -160,13 +160,14 @@ fn suggestion(f: &Finding) -> String {
 
 /// The gaps producer's suggestion, by the shape of its finding.
 ///
-/// Five shapes, told apart by what `gaps.rs` writes into the finding and
+/// Four shapes, told apart by what `gaps.rs` writes into the finding and
 /// pinned there by `the_brief_suggestion_follows_the_finding_shape`: an
 /// Unknown opening "session-edit signal unavailable" is a store that
 /// could not be queried; any other Unknown is a directory that could
 /// not be listed; a sentence opening with a count is a group whose
-/// members the evidence lists; "role name only" is a weak candidate;
-/// anything else is one strong directory. A helper rather than a nested
+/// members the evidence lists; anything else is one strong directory.
+/// A "role name only" candidate is a Note (#1397), which [`render`]
+/// gives no suggestion, so it never reaches here. A helper rather than a nested
 /// `match` because the wildcard guard in `invariants.rs` reads every arm
 /// between the `Check` match's braces.
 fn gaps_suggestion(f: &Finding) -> String {
@@ -183,6 +184,12 @@ fn gaps_suggestion(f: &Finding) -> String {
                 again; until then no CLAUDE.md or rule is suggested for the directories listed."
             .to_string();
     }
+    if f.severity == Severity::Unknown && f.finding.contains("whether git ignores") {
+        return "No edit. Make git runnable in this repository and run the advice again; until \
+                then no CLAUDE.md is suggested for the directories listed, since any of them \
+                may be build output git ignores."
+            .to_string();
+    }
     if f.severity == Severity::Unknown {
         return format!(
             "Make `{dir}` listable, or add it to the CLAUDE.md walk's skip list if it holds no \
@@ -197,12 +204,6 @@ fn gaps_suggestion(f: &Finding) -> String {
              on them, and the rules from the root file that apply here with a different \
              twist. Keep it to what is true only here; a per-member file is for a member that \
              carried a signal of its own."
-        )
-    } else if f.finding.contains("role name only") {
-        format!(
-            "Add `{dir}/CLAUDE.md` only if a convention is true only here: what the directory \
-             is for, and any rule from the root file that applies here with a different \
-             twist. A role name alone is not a gap, so leave it if there is nothing to say."
         )
     } else {
         format!(

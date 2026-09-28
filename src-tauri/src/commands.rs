@@ -621,6 +621,57 @@ pub async fn act_on_pr(
     }
 }
 
+/// Merge, or add to the merge queue, a native GitHub stack up to and
+/// including `number` (#1468).
+///
+/// GitHub merges a stacked pull request only through its asynchronous
+/// merge API, and that lands every open pull request beneath `number` as
+/// well. The frontend confirms with that list before calling this; this
+/// command carries out what was agreed and reports how it ended.
+///
+/// `action` is `merge_queue` or `direct_merge`. `expected_head` is the head
+/// the user was looking at, so GitHub refuses rather than landing commits
+/// they never saw.
+///
+/// The REST pool is checked BEFORE submitting: declining to ask is reported
+/// as that, not as GitHub refusing.
+#[tauri::command]
+pub async fn merge_stack(
+    client: State<'_, GhClient>,
+    waker: State<'_, crate::poll::Waker>,
+    repo: String,
+    number: u64,
+    action: String,
+    expected_head: String,
+) -> Result<crate::github::stack_merge::StackMergeOutcome, String> {
+    use crate::github::stack_merge::{StackMergeAction, StackMergeOutcome};
+    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+    let action = StackMergeAction::parse(&action)?;
+    let budget = crate::github::stats::Budget::new();
+    if !budget.permits_rest(1) {
+        return Err(
+            "Not submitted: GitHub's REST rate limit is nearly spent. Try again after it resets."
+                .into(),
+        );
+    }
+    let out = client
+        .merge_stack(&repo, number, action, &expected_head, &budget)
+        .await;
+    match &out {
+        Ok(StackMergeOutcome::Failed { message }) => {
+            log::warn!("{repo}#{number} stack merge failed: {message}")
+        }
+        Ok(outcome) => {
+            log::info!("{repo}#{number} stack merge: {outcome:?}");
+            // Merged, queued or still running: the list should catch up now
+            // rather than a poll interval later.
+            waker.0.notify_one();
+        }
+        Err(e) => log::warn!("{repo}#{number} stack merge could not run: {e}"),
+    }
+    out
+}
+
 /// Re-run the failed jobs of a pull request's CI.
 ///
 /// Takes the workflow RUN id, which the detail query now fetches per
@@ -1100,6 +1151,57 @@ pub async fn get_pr_detail(
     out
 }
 
+/// Whether the viewer's approval can count, and whether conversations must
+/// be resolved before merge, for one pull request (#1451, #1454).
+///
+/// Separate from `get_pr_detail` rather than folded into it, for three
+/// reasons: it is REST, from a different rate-limit pool, and must not sit
+/// inside that command's 30-second chain; the rules half is cached per
+/// (repository, base) and most opens answer from memory; and every failure
+/// here is ADVISORY -- it renders nothing new -- where a detail failure is
+/// an error the view has to show.
+///
+/// Never an `Err` for a GitHub failure: those fold into
+/// `BaseRules::Unreadable` / `LastPusher::Unknown`, and a budget refusal
+/// into `Declined`, so the view can tell "we did not ask" from "GitHub did
+/// not answer" (#1050). `Err` is only "no client".
+///
+/// `head_repo` is `None` when the detail has not arrived or the fork is
+/// gone; the pusher is then declined rather than guessed from the base.
+#[tauri::command]
+pub async fn get_review_gates(
+    client: State<'_, GhClient>,
+    repo: String,
+    base: String,
+    head_repo: Option<String>,
+    head_ref: String,
+    head_oid: String,
+) -> Result<crate::github::gates::ReviewGates, String> {
+    // Repository and branch names are not logged, for the reason
+    // `get_pr_detail` gives.
+    crate::diag!("[diag] cmd get_review_gates start");
+    let started = std::time::Instant::now();
+    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+    let budget = crate::github::stats::Budget::new();
+    let out = crate::github::gates::review_gates(
+        &client,
+        &budget,
+        &repo,
+        &base,
+        head_repo.as_deref(),
+        &head_ref,
+        &head_oid,
+        crate::poll::FETCH_TIMEOUT,
+    )
+    .await;
+    crate::diag!(
+        "[diag] cmd get_review_gates end {}ms rest_requests={}",
+        started.elapsed().as_millis(),
+        budget.rest_requests()
+    );
+    Ok(out)
+}
+
 #[tauri::command]
 /// A previously stored scan, for the cold start (#1152).
 ///
@@ -1246,27 +1348,40 @@ pub async fn classify_worktrees(
     app: AppHandle,
     repo_path: String,
 ) -> Result<Vec<crate::worktrees::Worktree>, String> {
-    // One budget across every filesystem scan (#1149). Held for
-    // the whole walk: releasing early would let the next caller
-    // start while this one still has eight threads on the disk.
-    let _permit = scan_permit().await?;
+    // One budget across every filesystem scan (#1149), held by the
+    // walk itself rather than by this future -- see `scan_blocking`.
     // Two failure modes, both real: the join can fail if the blocking
     // task panicked, and classification itself can fail if git refuses.
     // Flattened rather than swallowed, so an unreadable repo surfaces as
     // an error instead of as zero worktrees.
-    tauri::async_runtime::spawn_blocking(move || {
+    let emitter = app.clone();
+    let path = repo_path.clone();
+    let rows = scan_blocking(move || {
         let mut out = Vec::new();
-        crate::worktrees::classify_repo_streaming(&repo_path, &mut |w| {
+        crate::worktrees::classify_repo_streaming(&path, &mut |w| {
             // Emitted per worktree rather than batched, for the reason
             // `size_worktrees` gives: batching would reintroduce exactly
             // the wait this exists to remove.
-            let _ = app.emit("worktree-safety", w);
+            let _ = emitter.emit("worktree-safety", w);
             out.push(w.clone());
         })?;
-        Ok(out)
+        Ok::<_, String>(out)
     })
-    .await
-    .map_err(|e| e.to_string())?
+    .await??;
+    // The disk walk is done and its permit went with it; the lookup
+    // below is network, not disk, and must not hold the next scan out.
+
+    // GitHub's record of a merge, AFTER the offline pass (#1440). Every
+    // verdict above is already on screen; this can only turn some
+    // `unmerged`/`unpushed` rows into `merged_as_pr`, and every way it can
+    // fail leaves them exactly as they are. Upgraded rows are re-emitted
+    // so the streamed view agrees with the returned set.
+    let client = app.state::<GhClient>().0.clone();
+    let (rows, changed) = crate::worktrees::github::enrich(client, &repo_path, rows).await;
+    for i in changed {
+        let _ = app.emit("worktree-safety", &rows[i]);
+    }
+    Ok(rows)
 }
 
 /// One repository's main checkout, classified. See `classify_worktrees`.
@@ -1321,17 +1436,11 @@ pub async fn classify_worktrees(
 pub async fn classify_repo_upstream(
     repo_path: String,
 ) -> Result<crate::worktrees::Worktree, String> {
-    // One budget across every filesystem scan (#1149). Held for
-    // the whole walk: releasing early would let the next caller
-    // start while this one still has eight threads on the disk.
-    let _permit = scan_permit().await?;
+    // One budget across every filesystem scan (#1149), held by the
+    // walk itself rather than by this future -- see `scan_blocking`.
     // Blocking git work: off the async runtime's worker threads, the
     // same treatment `list_worktrees` above gives the walk.
-    tauri::async_runtime::spawn_blocking(move || {
-        crate::worktrees::classify_main_checkout(&repo_path)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    scan_blocking(move || crate::worktrees::classify_main_checkout(&repo_path)).await?
 }
 
 /// Disk sizes for one repo's worktrees, as `(path, bytes)` pairs.
@@ -1361,11 +1470,9 @@ pub async fn size_worktrees(
     app: AppHandle,
     repo_path: String,
 ) -> Result<Vec<(String, Option<u64>)>, String> {
-    // One budget across every filesystem scan (#1149). Held for
-    // the whole walk: releasing early would let the next caller
-    // start while this one still has eight threads on the disk.
-    let _permit = scan_permit().await?;
-    tauri::async_runtime::spawn_blocking(move || {
+    // One budget across every filesystem scan (#1149), held by the
+    // walk itself rather than by this future -- see `scan_blocking`.
+    scan_blocking(move || {
         let mut out = Vec::new();
         crate::worktrees::size_repo_streaming(&repo_path, &mut |path, bytes| {
             // Emitted per worktree rather than batched: batching would
@@ -1375,8 +1482,7 @@ pub async fn size_worktrees(
         })?;
         Ok(out)
     })
-    .await
-    .map_err(|e| e.to_string())?
+    .await?
 }
 
 /// Regenerable build output under the configured scan roots.
@@ -1389,10 +1495,8 @@ pub async fn size_worktrees(
 /// shaped the worktree view.
 #[tauri::command]
 pub async fn scan_artifacts(app: AppHandle) -> Result<Vec<crate::artifacts::Artifact>, String> {
-    // One budget across every filesystem scan (#1149). Held for
-    // the whole walk: releasing early would let the next caller
-    // start while this one still has eight threads on the disk.
-    let _permit = scan_permit().await?;
+    // One budget across every filesystem scan (#1149), held by the
+    // walk itself rather than by this future -- see `scan_blocking`.
     // The SAME roots the worktree view scans. A second directory setting
     // would be one more thing to keep in sync, and a user who has told
     // the app where their code lives has already answered this question.
@@ -1404,14 +1508,13 @@ pub async fn scan_artifacts(app: AppHandle) -> Result<Vec<crate::artifacts::Arti
     // how many roots are left.
     let emitter = app.clone();
     let scanned = dirs.clone();
-    let (out, failed) = tauri::async_runtime::spawn_blocking(move || {
+    let (out, failed) = scan_blocking(move || {
         crate::artifacts::scan::scan_streaming(&scanned, &mut |p| {
             use tauri::Emitter;
             let _ = emitter.emit("artifact-scan-progress", p);
         })
     })
-    .await
-    .map_err(|e| e.to_string())?;
+    .await?;
     // A root that could not be read is NAMED, never silently dropped:
     // an empty list for a configured directory reads as an answer about
     // it (#846).
@@ -1469,35 +1572,89 @@ pub async fn scan_artifacts(app: AppHandle) -> Result<Vec<crate::artifacts::Arti
 /// A `OnceLock` rather than `const_new` because the width is computed:
 /// `available_parallelism` can fail, and four is the figure the
 /// measurement above already justified.
-fn scan_permits() -> &'static tokio::sync::Semaphore {
-    static PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+///
+/// In an `Arc` so a permit can be OWNED, and so moved onto the blocking
+/// pool with the walk it pays for -- see `scan_blocking` (#1467).
+fn scan_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static PERMITS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
     PERMITS.get_or_init(|| {
         let n = std::thread::available_parallelism()
             .map(|n| n.get().clamp(2, 8))
             .unwrap_or(4);
-        tokio::sync::Semaphore::new(n)
+        std::sync::Arc::new(tokio::sync::Semaphore::new(n))
     })
 }
 
-/// Take a scan permit, held for the whole walk.
+/// Take a permit from `permits`. Owned, so it can outlive the future
+/// that took it -- which is the point (#1467).
 ///
 /// `acquire` only fails when the semaphore is closed, which never
 /// happens for a process-lifetime static -- but the error is reported
 /// rather than unwrapped, because a panic here would take down a scan
 /// for a condition that has a perfectly good message.
-async fn scan_permit() -> Result<tokio::sync::SemaphorePermit<'static>, String> {
-    scan_permits()
-        .acquire()
+async fn permit_from(
+    permits: std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
+    permits
+        .acquire_owned()
         .await
         .map_err(|e| format!("could not schedule the scan: {e}"))
 }
 
+/// Run a filesystem walk on the blocking pool under a scan permit that
+/// the WALK holds, for as long as the walk actually runs (#1467).
+///
+/// The permit used to be a local of the async command, with the walk in
+/// `spawn_blocking` below it. When the caller went away -- the phone's
+/// `CALL_TIMEOUT` closing the connection, which drops the dispatch
+/// future -- the permit was dropped with the future, but the blocking
+/// walk kept going, because `spawn_blocking` cannot be cancelled. The
+/// next call took the freed permit and started a second walk beside it,
+/// so the #1149 cap was exceeded exactly when the disk was already slow
+/// enough for a caller to give up.
+///
+/// Moving the permit into the closure ties it to the work rather than to
+/// whoever is waiting for the work. An abandoned walk still finishes --
+/// nothing can stop it -- but it now finishes holding its permit, and
+/// the next caller waits for it as it should.
+///
+/// The only way a command should reach the blocking pool for a scan;
+/// `every_filesystem_scan_takes_a_permit` holds the walks to it.
+async fn scan_blocking<T, F>(walk: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    blocking_under(scan_permits().clone(), walk).await
+}
+
+/// `scan_blocking` against a given semaphore, so a test can hold a
+/// budget of its own instead of the process-wide one every other test
+/// is also drawing on.
+pub(crate) async fn blocking_under<T, F>(
+    permits: std::sync::Arc<tokio::sync::Semaphore>,
+    walk: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let permit = permit_from(permits).await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        // Dropped when the walk returns, and not before -- whether or not
+        // anyone is still awaiting this.
+        let _permit = permit;
+        walk()
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn size_artifacts(paths: Vec<String>) -> Result<Vec<(String, u64, Option<u64>)>, String> {
-    // Held for the whole walk. `acquire` only fails if the semaphore is
-    // closed, which never happens for a static.
-    let _permit = scan_permit().await?;
-    tauri::async_runtime::spawn_blocking(move || {
+    // Held for the whole walk, by the walk -- see `scan_blocking`.
+    scan_blocking(move || {
         // DIAGNOSTIC LOGGING (Settings > diagnostic log). Per-directory,
         // for the same reason as `size_venvs`: the total says the batch
         // was slow, this says which entry made it slow.
@@ -1526,7 +1683,6 @@ pub async fn size_artifacts(paths: Vec<String>) -> Result<Vec<(String, u64, Opti
         out
     })
     .await
-    .map_err(|e| e.to_string())
 }
 
 /// Remove artifact directories, re-verifying each at delete time.
@@ -1575,14 +1731,12 @@ pub async fn remove_artifacts(
 /// paint before that finishes.
 #[tauri::command]
 pub async fn scan_venvs(app: AppHandle) -> Result<Vec<crate::caches::Venv>, String> {
-    // One budget across every filesystem scan (#1149). Held for
-    // the whole walk: releasing early would let the next caller
-    // start while this one still has eight threads on the disk.
-    let _permit = scan_permit().await?;
+    // One budget across every filesystem scan (#1149), held by the
+    // walk itself rather than by this future -- see `scan_blocking`.
     let roots = get_worktree_dirs(app.clone());
     let emitter = app.clone();
     let scanned = roots.clone();
-    let out = tauri::async_runtime::spawn_blocking(move || {
+    let out = scan_blocking(move || {
         let dirs = crate::caches::project_dirs_streaming(&scanned, &mut |p| {
             use tauri::Emitter;
             // Every 200 directories, not every one: the walk visits
@@ -1605,8 +1759,7 @@ pub async fn scan_venvs(app: AppHandle) -> Result<Vec<crate::caches::Venv>, Stri
         );
         crate::caches::scan_poetry(&dirs)
     })
-    .await
-    .map_err(|e| e.to_string())?;
+    .await?;
     // 9-40 s measured, every cold start, against a blank page (#1152).
     remember_scan(&app, crate::store::scans::ScanKind::Venvs, &roots, &out);
     Ok(out)
@@ -1622,8 +1775,7 @@ pub async fn scan_venvs(app: AppHandle) -> Result<Vec<crate::caches::Venv>, Stri
 pub async fn size_venvs(paths: Vec<String>) -> Result<Vec<(String, u64, Option<u64>)>, String> {
     // Shares the artifact cap: both walk the same disk, and a venv batch
     // competing with a 54-way artifact fan-out is the same contention.
-    let _permit = scan_permit().await?;
-    tauri::async_runtime::spawn_blocking(move || {
+    scan_blocking(move || {
         // DIAGNOSTIC LOGGING (Settings > diagnostic log).
         //
         // PER-VENV, not just a total: these are walked serially in one
@@ -1659,7 +1811,6 @@ pub async fn size_venvs(paths: Vec<String>) -> Result<Vec<(String, u64, Option<u
         out
     })
     .await
-    .map_err(|e| e.to_string())
 }
 
 /// Remove Poetry virtualenvs, re-verifying each at delete time.
@@ -2156,7 +2307,11 @@ pub async fn claude_md_effective(
 /// The definitions inventory is built the way `claude_definitions`
 /// builds it -- user root, this repository's `.claude`, installed
 /// plugins -- so a skill a CLAUDE.md names is checked against every
-/// scope Claude Code would load it from. Each root that could not be
+/// scope Claude Code would load it from. Unlike there, the plugins are
+/// only the installs that apply to this repository
+/// (`plugins::for_repository`, #1364): another repository's project
+/// install, or a version a more specific scope replaces, is not loaded
+/// here and is not analysed here. Each root that could not be
 /// resolved is a `ScopeRefusal` in the inventory rather than a reason
 /// to drop the whole thing: the rot and skills producers read those
 /// refusals and report a skill they cannot find as Unknown, not missing.
@@ -2197,13 +2352,27 @@ pub async fn claude_md_advice(
         let home = crate::claudemd::home();
         // The definitions inventory, built once here for every producer
         // that reads it: the user root, THIS repository's `.claude` and
-        // every installed plugin, the roots `claude_definitions` walks
-        // minus the other repositories. A plugin list that could not be
-        // read is a refusal inside the inventory, as it is there.
+        // the plugin installs that apply to THIS repository (#1364) --
+        // not every install `claude_definitions` lists, which includes
+        // other repositories' project installs and superseded versions.
+        // A plugin list that could not be read is a refusal inside the
+        // inventory, as it is there, and so is an install whose
+        // applicability could not be decided.
         let user = defs::user_root();
-        let (plugins, plugin_refusal) = installed_plugin_roots();
+        let (installed, plugin_refusal) = installed_plugins();
+        let installed = crate::claude::plugins::for_repository(installed, &repo);
+        let plugins = plugin_roots(installed.applied);
         let roots = defs::roots(user.clone(), std::slice::from_ref(&repo), &plugins);
         let mut inv = defs::scan_scopes(&roots);
+        for (p, detail) in installed.undecided {
+            inv.unreadable.push(defs::ScopeRefusal {
+                source: defs::Source::Plugin {
+                    name: p.name,
+                    path: p.install_path.unwrap_or_default(),
+                },
+                detail,
+            });
+        }
         if user.is_none() {
             inv.unreadable.push(defs::ScopeRefusal {
                 source: defs::Source::User,
@@ -2277,14 +2446,29 @@ pub async fn read_claude_md(path: String) -> Result<String, String> {
 /// user may have started editing since.
 ///
 /// Logged with path and branch, so "where did that go?" has an answer.
+///
+/// Signed in, the gate has a second route (#1440): a row the offline
+/// checks refuse as unmerged or unpushed is put to GitHub, fresh, and
+/// removed only if a merged pull request contains its HEAD. See
+/// `worktrees::github`.
 #[tauri::command]
-pub async fn remove_worktree(repo_path: String, worktree_path: String) -> Result<(), String> {
+pub async fn remove_worktree(
+    client: State<'_, GhClient>,
+    repo_path: String,
+    worktree_path: String,
+) -> Result<(), String> {
     let wt = worktree_path.clone();
     let repo = repo_path.clone();
-    let result =
-        tauri::async_runtime::spawn_blocking(move || crate::worktrees::remove_worktree(&repo, &wt))
-            .await
-            .map_err(|e| e.to_string())?;
+    let client = client.0.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || match client {
+        Some(c) => {
+            let ask = crate::worktrees::github::blocking_ask(c, repo.clone());
+            crate::worktrees::remove_worktree_asking(&repo, &wt, &ask)
+        }
+        None => crate::worktrees::remove_worktree(&repo, &wt),
+    })
+    .await
+    .map_err(|e| e.to_string())?;
 
     match &result {
         Ok(()) => log::info!("removed worktree {worktree_path}"),
@@ -2640,6 +2824,61 @@ pub fn docker_start() -> Result<(), String> {
     crate::docker::start_engine()
 }
 
+/// One `worktree-removal-progress` frame: the `done`th of `total`
+/// removals has finished, and whether it removed the worktree.
+///
+/// # Which row, without a path (#1544)
+///
+/// The list used to change only when the whole batch returned, so a
+/// hundred-row removal showed an unchanged list for 30 seconds. Saying
+/// which row went needs a join key, and the obvious one -- the path --
+/// is exactly what this event must not carry: it is on the remote
+/// allowlist and forwarded to the phone, and a progress event is not a
+/// place to leak what the user is working on.
+///
+/// So the key is the INDEX. `remove_worktrees_with_progress` reports in
+/// the order of the paths it was given, so frame `done` is
+/// `worktree_paths[done - 1]` -- a list the calling webview already
+/// holds, because it sent it. A local-only Tauri `Channel` was the other
+/// option and was rejected: removal is offered on the phone
+/// (`remove_worktrees` is dispatched remotely), and a `Channel` cannot
+/// cross the remote transport, so the phone would have kept the bug.
+///
+/// `run` is the caller's own token, echoed back unchanged. The event is
+/// app-global and two removals can overlap -- one from the desktop, one
+/// from the phone -- and an index is meaningless against the other
+/// run's list: mapped there, it would drop a row that is still on disk.
+/// A number, never a string, so it cannot carry anything but a number.
+/// `None` for a caller that sent none; such a frame names no run, and a
+/// listener must not map it onto its own.
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeRemovalFrame {
+    pub run: Option<u64>,
+    pub done: usize,
+    pub total: usize,
+    pub removed: bool,
+}
+
+impl WorktreeRemovalFrame {
+    /// The frame for one finished removal. The ONLY place a frame is
+    /// built, and it takes the outcome whole so that what reaches the
+    /// wire is decided here: a boolean, never the path or the reason.
+    pub fn of(
+        run: Option<u64>,
+        done: usize,
+        total: usize,
+        outcome: &crate::worktrees::RemovalOutcome,
+    ) -> Self {
+        Self {
+            run,
+            done,
+            total,
+            removed: outcome.error.is_none(),
+        }
+    }
+}
+
 #[tauri::command]
 /// Remove several worktrees, reporting each one's outcome.
 ///
@@ -2647,10 +2886,14 @@ pub fn docker_start() -> Result<(), String> {
 /// not one bulk deletion. Each is re-checked at delete time, so a
 /// worktree that went dirty since the scan is refused while the rest
 /// proceed.
+///
+/// `run_id` is echoed on every [`WorktreeRemovalFrame`] so the caller
+/// can tell its own frames from another run's.
 pub async fn remove_worktrees(
     app: AppHandle,
     repo_path: String,
     worktree_paths: Vec<String>,
+    run_id: Option<u64>,
 ) -> Result<Vec<crate::worktrees::RemovalOutcome>, String> {
     // `spawn_blocking`, unlike the previous version. Removal is
     // sequential git plumbing at a few hundred milliseconds each, so
@@ -2658,14 +2901,21 @@ pub async fn remove_worktrees(
     // which also stalled the poll loop and every other command. The
     // single-worktree command already did this; the bulk one, which
     // blocks far longer, did not.
+    // The same second route `remove_worktree` has (#1440), asked only for
+    // rows the offline gate refuses as unmerged or unpushed.
+    let client = app.state::<GhClient>().0.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let ask = client.map(|c| crate::worktrees::github::blocking_ask(c, repo_path.clone()));
+        let ask_ref = ask.as_ref().map(|a| a as crate::worktrees::github::Ask<'_>);
         let outcomes = crate::worktrees::remove_worktrees_with_progress(
             &repo_path,
             &worktree_paths,
-            |done, total| {
-                // Counts only -- never paths. A progress event is not a
-                // place to leak what the user is working on.
-                let _ = app.emit("worktree-removal-progress", (done, total));
+            ask_ref,
+            |done, total, outcome| {
+                // Counts and a flag -- never paths. A progress event is
+                // not a place to leak what the user is working on.
+                let frame = WorktreeRemovalFrame::of(run_id, done, total, outcome);
+                let _ = app.emit("worktree-removal-progress", frame);
             },
         );
         let failed = outcomes.iter().filter(|o| o.error.is_some()).count();
@@ -3126,6 +3376,176 @@ pub async fn claude_launch_session_preview(
     preview_in_terminal(&app, &built.command, terms)
 }
 
+/// The main checkout a pull request's Claudify may start in (#1455).
+///
+/// The frontend names the directory it chose (from the same scan), and
+/// this CHECKS that choice rather than trusting it. Three conditions,
+/// each its own refusal because each has a different remedy:
+///
+/// - `repo_path` is one of the scanned repositories -- the rule
+///   [`scanned_repo_root`] states: without it, "start `claude` in the
+///   checkout" is "start `claude` in any directory the caller names".
+/// - That repository's `identity` (from its `origin` remote) is the
+///   pull request's `owner/repo`. Compared case-insensitively, because
+///   GitHub's names are, and `mainCheckoutFor` in `src/lib/worktrees.ts`
+///   applies the same rule to pick it.
+/// - It is not bare. A bare repository has no working tree to run in.
+///
+/// Compared on CANONICAL paths, for `scanned_repo_root`'s reason: two
+/// spellings of one directory must not read as two repositories. The
+/// path returned is the SCAN's spelling, which is the one the user saw.
+///
+/// Pure over the scan so it can be tested without an `AppHandle`.
+fn pr_checkout(
+    repos: &[crate::worktrees::Repo],
+    repo_path: &str,
+    pr_repo: &str,
+) -> Result<String, String> {
+    let want = std::path::Path::new(repo_path)
+        .canonicalize()
+        .map_err(|e| format!("{repo_path}: could not be read: {e}"))?;
+    let scanned = repos
+        .iter()
+        .find(|r| {
+            std::path::Path::new(&r.path)
+                .canonicalize()
+                .is_ok_and(|p| p == want)
+        })
+        .ok_or_else(|| format!("{repo_path} is no longer one of the scanned repositories"))?;
+    let same_repo = scanned
+        .identity
+        .as_deref()
+        .is_some_and(|id| id.eq_ignore_ascii_case(pr_repo));
+    if !same_repo {
+        return Err(format!(
+            "{repo_path} is a checkout of {}, not {pr_repo}",
+            scanned
+                .identity
+                .as_deref()
+                .unwrap_or("a repository with no origin remote")
+        ));
+    }
+    if scanned.bare {
+        return Err(format!(
+            "{repo_path} is a bare repository, so there is no checkout to start in"
+        ));
+    }
+    Ok(scanned.path.clone())
+}
+
+/// The line a pull request's Claudify runs: `cd <checkout> && claude <prompt>`.
+///
+/// Built HERE, by [`crate::claude::launch::prompt_command`], so the
+/// copy path and the launch path carry the same bytes and the quoting is
+/// the one that module's docs verify end to end.
+///
+/// # The prompt comes from the caller, and why that is bounded
+///
+/// Unlike `claude_launch_worktree` and `claude_md_advice_launch`, the
+/// prompt is composed by the frontend (`src/lib/agentPrompt.ts`) from
+/// the pull request it is showing -- the backend holds no copy of that
+/// fetch to rebuild it from. What keeps this from being "run whatever you
+/// are given" is that the prompt never becomes shell: `prompt_command`
+/// single-quotes it into ONE argv slot of `claude`, the directory is
+/// re-derived by [`pr_checkout`], and the launch is `Class::Local` with
+/// the whole argv shown before it runs (#1214). An empty prompt, or one
+/// with a NUL byte no argv can carry, is refused rather than launched.
+fn pr_claude_command(prompt: &str, checkout: &str) -> Result<String, String> {
+    if prompt.trim().is_empty() {
+        return Err("there is no prompt to start Claude Code on".to_string());
+    }
+    if prompt.contains('\0') {
+        return Err("the prompt contains a NUL byte, which no command line can carry".to_string());
+    }
+    Ok(crate::claude::launch::prompt_command(prompt, checkout))
+}
+
+/// [`pr_checkout`] against the LIVE scan, then the line to run.
+///
+/// Re-scanned rather than read from a cache, for `scanned_repo_root`'s
+/// reason: a selection the page made minutes ago must not authorise a
+/// directory that has since gone.
+async fn pr_claudify_line(
+    app: AppHandle,
+    repo_path: &str,
+    pr_repo: &str,
+    prompt: &str,
+) -> Result<(String, String), String> {
+    let scan = list_worktrees(app).await?;
+    let checkout = pr_checkout(&scan.repos, repo_path, pr_repo)?;
+    let line = pr_claude_command(prompt, &checkout)?;
+    Ok((checkout, line))
+}
+
+#[tauri::command]
+/// The command that hands a pull request to Claude Code, for copying (#1455).
+///
+/// `Class::Read`, like `claudify_command`: it returns a string and runs
+/// nothing, and a phone can show it to be typed at the desktop.
+/// `claude_installed` is advisory, exactly as there -- the line is
+/// returned either way.
+pub async fn claudify_pr_command(
+    app: AppHandle,
+    repo_path: String,
+    pr_repo: String,
+    prompt: String,
+) -> Result<ClaudifyCommand, String> {
+    let (_, command) = pr_claudify_line(app, &repo_path, &pr_repo, &prompt).await?;
+    // `find_claude` walks PATH and the fallback directories; off the
+    // runtime for #1090's reason.
+    let claude_installed = tauri::async_runtime::spawn_blocking(crate::auth::find_claude)
+        .await
+        .map_err(|e| format!("could not look for Claude Code: {e}"))?
+        .is_some();
+    Ok(ClaudifyCommand {
+        command,
+        claude_installed,
+    })
+}
+
+#[tauri::command]
+/// Open the configured terminal on Claude Code in a pull request's main
+/// checkout (#1455).
+///
+/// `Class::Local`, for the reason [`claude_launch_worktree`] states: it
+/// opens a window on THIS machine. The terms are tokens refused before
+/// anything is built, exactly as there, and the checkout is the launch's
+/// working directory, so `launch`'s gone-directory refusal covers a
+/// checkout deleted since the scan.
+pub async fn claude_launch_pr(
+    app: AppHandle,
+    repo_path: String,
+    pr_repo: String,
+    prompt: String,
+    model: Option<String>,
+    permission_mode: Option<String>,
+) -> Result<(), String> {
+    let terms = crate::claude::terms::Terms::parse(model.as_deref(), permission_mode.as_deref())
+        .map_err(|e| e.to_string())?;
+    let (checkout, line) = pr_claudify_line(app.clone(), &repo_path, &pr_repo, &prompt).await?;
+    launch_in_terminal(&app, line, terms, Some(checkout)).await
+}
+
+#[tauri::command]
+/// The exact argv `claude_launch_pr` would spawn (#1214, #1455).
+///
+/// `Class::Local`, for the reason [`claude_launch_worktree_preview`]
+/// states. The same [`pr_claudify_line`] as the launch, so the preview
+/// cannot describe a different line from the one that runs.
+pub async fn claude_launch_pr_preview(
+    app: AppHandle,
+    repo_path: String,
+    pr_repo: String,
+    prompt: String,
+    model: Option<String>,
+    permission_mode: Option<String>,
+) -> Result<LaunchPreview, String> {
+    let terms = crate::claude::terms::Terms::parse(model.as_deref(), permission_mode.as_deref())
+        .map_err(|e| e.to_string())?;
+    let (_, line) = pr_claudify_line(app.clone(), &repo_path, &pr_repo, &prompt).await?;
+    preview_in_terminal(&app, &line, terms)
+}
+
 /// Which brief a Claudify acts on (#1292).
 ///
 /// An index into `Report.findings`, or the whole report. Deliberately
@@ -3305,7 +3725,15 @@ pub async fn claude_md_advice_launch_preview(
 /// Returns the registry and the probe together because they are one
 /// observation: a probe refreshed against a different set of pids than
 /// the registry listed would pair a start time against the wrong entry.
-fn registry_and_probe() -> (
+///
+/// The probe also covers the `.key`-only records and every un-ended run's
+/// pid (#1569). None of those can be CONFIRMED for a stop, but a refusal
+/// must know whether one of them is this session running, or it reports a
+/// running session as not running -- and a pid missing from a refreshed
+/// table reads as gone.
+fn registry_and_probe(
+    runs: Option<&std::collections::HashMap<String, Vec<crate::claude::liveness::Run>>>,
+) -> (
     crate::claude::liveness::Registry,
     crate::claude::liveness::SysinfoProbe,
 ) {
@@ -3316,9 +3744,28 @@ fn registry_and_probe() -> (
             ..Default::default()
         },
     };
-    let pids: Vec<u32> = registry.entries.values().map(|e| e.pid).collect();
+    let mut pids: Vec<u32> = registry.probe_pids();
+    for run in runs.into_iter().flat_map(|r| r.values()).flatten() {
+        if run.ended_at.is_none() {
+            pids.push(run.pid);
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
     let probe = crate::claude::liveness::SysinfoProbe::for_pids(&pids);
     (registry, probe)
+}
+
+/// Every session's hook-recorded runs, read NOW, or why they could not be.
+///
+/// For [`crate::claude::stop::Runs`]: the error is carried to the refusal
+/// rather than read as "no runs", which would say a session is not running
+/// when nothing was checked (#1569).
+fn stop_runs(
+    db: &std::path::Path,
+) -> Result<std::collections::HashMap<String, Vec<crate::claude::liveness::Run>>, String> {
+    let conn = open_db(db).map_err(|e| e.to_string())?;
+    crate::claude::sessions::runs_by_session(&conn).map_err(|e| e.to_string())
 }
 
 /// Propose stopping one or more live sessions, with the evidence (#1219).
@@ -3349,11 +3796,17 @@ pub async fn claude_propose_stop(
 ) -> Result<Vec<crate::claude::stop::StopProposal>, String> {
     let db = db_path(&app);
     tauri::async_runtime::spawn_blocking(move || {
-        let (registry, probe) = registry_and_probe();
+        let runs = stop_runs(&db);
+        let (registry, probe) = registry_and_probe(runs.as_ref().ok());
         let conn = open_db(&db).ok();
         let now = chrono::Utc::now().timestamp();
-        let proposals =
-            crate::claude::stop::propose(&probe, &registry, &session_ids, |id, started_at| {
+        let runs = runs.as_ref().map_err(String::as_str);
+        let proposals = crate::claude::stop::propose(
+            &probe,
+            &registry,
+            runs,
+            &session_ids,
+            |id, started_at| {
                 let entry = registry.entries.get(id);
                 // Read through `sessions::detail`, the SAME reader the
                 // detail pane uses, so the proposal and the pane cannot
@@ -3375,7 +3828,7 @@ pub async fn claude_propose_stop(
                         .map(|c| c.auto as u32),
                     // The LAST TURN, which the issue requires be shown
                     // before acting. Read through the same bounded
-                    // `preview::tail` the transcript pane uses; `None`
+                    // `preview::tail` the old preview pane used; `None`
                     // when it could not be read, which the UI states
                     // rather than rendering a blank as "it said nothing".
                     last_turn: detail
@@ -3384,7 +3837,8 @@ pub async fn claude_propose_stop(
                         .and_then(|p| crate::claude::preview::tail(std::path::Path::new(p)).ok())
                         .and_then(|preview| last_turn_text(&preview)),
                 }
-            });
+            },
+        );
         Ok(proposals)
     })
     .await
@@ -3458,14 +3912,19 @@ fn last_turn_text(preview: &crate::claude::preview::Preview) -> Option<String> {
 #[tauri::command]
 #[cfg(unix)]
 pub async fn claude_stop_session(
+    app: AppHandle,
     session_id: String,
 ) -> Result<crate::claude::stop::StopOutcome, String> {
+    let db = db_path(&app);
     tauri::async_runtime::spawn_blocking(move || {
         // BOTH re-derived on this call. Nothing about the process is
         // carried in from the proposal that put the button on screen.
-        let (registry, probe) = registry_and_probe();
-        let confirmed =
-            crate::claude::stop::confirm(&probe, &registry, &session_id).map_err(|r| r.why())?;
+        // The runs only word a refusal (#1569); they never confirm a pid.
+        let runs = stop_runs(&db);
+        let (registry, probe) = registry_and_probe(runs.as_ref().ok());
+        let runs = runs.as_ref().map_err(String::as_str);
+        let confirmed = crate::claude::stop::confirm(&probe, &registry, runs, &session_id)
+            .map_err(|r| r.why())?;
         crate::claude::stop::stop(&crate::claude::stop::UnixSignaller, &confirmed)
     })
     .await
@@ -5414,9 +5873,21 @@ pub async fn claude_import_transcripts(
 ) -> Result<crate::claude::store::Imported, String> {
     let db = db_path(&app);
     tauri::async_runtime::spawn_blocking(move || {
+        // Taken BEFORE the scan reads a byte: a transcript appended while
+        // the scan runs has an mtime after this, so the live pass's
+        // incremental link read covers it (#1557).
+        let since_ms = chrono::Utc::now().timestamp_millis();
         let scan = crate::claude::scan_default()?;
         let mut conn = open_db(&db).map_err(|e| e.to_string())?;
-        crate::claude::store::import(&mut conn, scan).map_err(|e| e.to_string())
+        let imported = crate::claude::store::import(&mut conn, scan).map_err(|e| e.to_string())?;
+        // After the import committed, never before: see `linkscan::reset`.
+        // A failure costs freshness, not links -- the import has just
+        // written them all -- so it is logged rather than failing the
+        // import it followed.
+        if let Err(e) = crate::claude::linkscan::reset(&conn, since_ms) {
+            log::warn!("claude: could not reset the pull request link cursor: {e}");
+        }
+        Ok(imported)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -5465,13 +5936,19 @@ pub async fn claude_import_transcripts(
 /// [`SearchAnswer`]: crate::claude::search::SearchAnswer
 /// [`Verdict`]: crate::claude::search::Verdict
 /// [`Coverage`]: crate::claude::search::Coverage
+///
+/// `matching` is which text `query` is matched against (#1519), as
+/// `claude_transcript_find` states: absent from the webview, written by
+/// `remote::privacy::admit` for a phone.
 #[tauri::command]
 pub async fn claude_search_transcripts(
     app: tauri::AppHandle,
     query: String,
     limit: Option<usize>,
+    matching: Option<crate::remote::privacy::Matching>,
 ) -> Result<crate::claude::search::SearchAnswer, String> {
     let db = db_path(&app);
+    let matching = matching.unwrap_or(crate::remote::privacy::Matching::Unmasked);
     tauri::async_runtime::spawn_blocking(move || {
         let conn = open_db(&db).map_err(|e| e.to_string())?;
         // A fresh scan for the denominator and the unreadable set, so
@@ -5510,7 +5987,7 @@ pub async fn claude_search_transcripts(
                 Vec::new()
             }
         };
-        crate::claude::search::search(&conn, &query, limit.unwrap_or(50), unreadable)
+        crate::claude::search::search(&conn, &query, limit.unwrap_or(50), unreadable, matching)
             .map_err(|e| e.to_string())
     })
     .await
@@ -5597,6 +6074,77 @@ pub async fn claude_sessions(
     .map_err(|e| e.to_string())?
 }
 
+/// A compact status per session, for the phone's notifications (#1486).
+///
+/// `Class::Read` on the remote surface: it is what the phone's background
+/// refresh window reads to decide "finished", "waiting" and "errored".
+/// It carries NO transcript text -- identifiers, a closed vocabulary and
+/// timestamps only (`claude::digest`'s module docs, and its
+/// `digest_carries_no_transcript_text` test) -- which is why it has no
+/// row in `remote/privacy.rs`'s `TRANSCRIPT_TEXT`: there is nothing in it
+/// to mask.
+#[tauri::command]
+pub async fn claude_session_digest(
+    app: tauri::AppHandle,
+) -> Result<crate::claude::digest::SessionDigest, String> {
+    let db = db_path(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&db).map_err(|e| e.to_string())?;
+        crate::claude::digest::read(&conn, chrono::Utc::now()).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The first thing the user typed in ONE session (#1486), for the phone's
+/// opt-in lock-screen snippet.
+///
+/// Transcript text, so it is listed in `remote/privacy.rs`'s
+/// `TRANSCRIPT_TEXT` and masked before it crosses -- and refused outright
+/// for a phone whose "read session transcripts" switch is off. Named
+/// `transcript` so the masking invariant would catch a missing row.
+#[tauri::command]
+pub async fn claude_transcript_opening_prompt(
+    app: tauri::AppHandle,
+    session_id: String,
+) -> Result<crate::claude::sessions::OpeningPrompt, String> {
+    let db = db_path(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&db).map_err(|e| e.to_string())?;
+        crate::claude::sessions::opening_prompt(&conn, &session_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The sessions that produced a pull request with this number, in every
+/// repository the link table holds (#1545).
+///
+/// The search box's lookup. A bare `#1234` names no repository, and the
+/// tracked open pull requests it used to be resolved against do not hold
+/// the merged ones -- so the PR a session made was usually not searched
+/// for at all. `store::sessions_for_pr_number` carries the measurement.
+///
+/// Also the PR detail panel's lookup since #1557, which retired
+/// `claude_sessions_for_pr`. That command matched `repo = ?` exactly, so
+/// a pull request shown under a transferred repository's NEW owner found
+/// none of the links written under the old one. The panel now asks by
+/// number and picks its answer with `matchPrLinks`, as the search does,
+/// and the two share one cached answer per number.
+#[tauri::command]
+pub async fn claude_sessions_for_pr_number(
+    app: AppHandle,
+    number: u64,
+) -> Result<Vec<crate::claude::subagent::PrLink>, String> {
+    let db = db_path(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&db).map_err(|e| e.to_string())?;
+        crate::claude::store::sessions_for_pr_number(&conn, number).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// What ONE Claude Code session knows that the list does not carry (#985).
 ///
 /// The other half of the split above: the resume command, the transcript
@@ -5617,27 +6165,6 @@ pub async fn claude_sessions(
 /// The liveness comes back derived on THIS read rather than copied from
 /// the list's, because the detail pane is where the reason is shown and
 /// a reason should be as fresh as the verdict it explains.
-#[tauri::command]
-/// The sessions that produced one pull request (#1132).
-///
-/// Headstate knew about pull requests and knew about Claude sessions,
-/// and the two never met -- while the transcripts carried the join key
-/// all along. `preview.rs`'s own record census counts 634 `pr-link`
-/// records in a 19,725-record sample and nothing read one.
-pub async fn claude_sessions_for_pr(
-    app: AppHandle,
-    repo: String,
-    number: u64,
-) -> Result<Vec<crate::claude::subagent::PrLink>, String> {
-    let db = db_path(&app);
-    tauri::async_runtime::spawn_blocking(move || {
-        let conn = open_db(&db).map_err(|e| e.to_string())?;
-        crate::claude::store::sessions_for_pr(&conn, &repo, number).map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
 #[tauri::command]
 pub async fn claude_session_detail(
     app: tauri::AppHandle,
@@ -5843,8 +6370,22 @@ pub fn claude_live_pass(db: &std::path::Path) -> Result<ClaudeLiveState, String>
 
         // The sweep first: it is what resolves `procStart` into the
         // confirmed start times the consumer stores as `pid_start_time`.
-        let swept = crate::claude::registry::sweep(&crate::claude::registry::dir_in(&home))?;
-        let start_times = crate::claude::crash::start_times(&swept);
+        let registry_dir = crate::claude::registry::dir_in(&home);
+        let swept = crate::claude::registry::sweep(&registry_dir)?;
+        let mut start_times = crate::claude::crash::start_times(&swept);
+        // And the confirmed start times of the `.key`-only processes a
+        // terminal launch leaves (#1534). The sweep reads only `.json`
+        // records, so without these a terminal-launched session's run is
+        // stored with a NULL start time and its process can never be
+        // named. A `.json`'s own time wins where both exist.
+        let keyed = crate::claude::liveness::read_registry(&registry_dir);
+        if !keyed.unnamed.is_empty() {
+            let pids: Vec<u32> = keyed.unnamed.iter().map(|u| u.pid).collect();
+            let probe = crate::claude::liveness::SysinfoProbe::for_pids(&pids);
+            for (pid, t) in crate::claude::liveness::unnamed_start_times(&probe, &keyed) {
+                start_times.entry(pid).or_insert(t);
+            }
+        }
 
         let mut conn = open_db(db).map_err(|e| e.to_string())?;
         let sweep = crate::claude::crash::record(&mut conn, &swept)?;
@@ -5923,13 +6464,33 @@ pub fn claude_live_pass(db: &std::path::Path) -> Result<ClaudeLiveState, String>
         // doc for why stopping before the file reads cannot lose an
         // unreadable transcript.
         let indexed = match crate::claude::corpus_default() {
-            Ok(scan) => match crate::claude::search::index_pass(&mut conn, &scan) {
-                Ok(done) => Some(done),
-                Err(e) => {
-                    log::warn!("claude: the transcript index pass failed: {e}");
-                    None
+            Ok(scan) => {
+                // Pull request links written since the last import
+                // (#1557), over the same listing: bounded, incremental,
+                // and a failure here fails neither the pass nor the
+                // index. `claude::linkscan` carries the design. Counts
+                // only in the log -- never a path or a link.
+                match crate::claude::linkscan::refresh(
+                    &mut conn,
+                    &scan,
+                    crate::claude::linkscan::BYTES_PER_PASS,
+                ) {
+                    Ok(r) if r.deferred > 0 => log::info!(
+                        "claude: pull request links: {} added this pass, {} files left for the next",
+                        r.links_added,
+                        r.deferred
+                    ),
+                    Ok(_) => {}
+                    Err(e) => log::warn!("claude: the pull request link pass failed: {e}"),
                 }
-            },
+                match crate::claude::search::index_pass(&mut conn, &scan) {
+                    Ok(done) => Some(done),
+                    Err(e) => {
+                        log::warn!("claude: the transcript index pass failed: {e}");
+                        None
+                    }
+                }
+            }
             Err(e) => {
                 log::warn!("claude: could not scan the corpus to index it: {e}");
                 None
@@ -5948,8 +6509,8 @@ pub fn claude_live_pass(db: &std::path::Path) -> Result<ClaudeLiveState, String>
 
 /// Aggregates for the Claude Code overview page (#921, epic #910).
 ///
-/// Counts over the sessions already in the cache, plus the set of ids the
-/// live registry says are running. It derives NO liveness of its own --
+/// Counts over the sessions already in the cache, each classified by the
+/// session list's own verdict for its row. It derives NO liveness of its own --
 /// see `claude/overview.rs`, which argues why a second derivation on the
 /// same page is a defect rather than a convenience.
 ///
@@ -5977,15 +6538,11 @@ pub async fn claude_overview(
 ) -> Result<crate::claude::overview::OverviewReport, String> {
     let db = db_path(&app);
     tauri::async_runtime::spawn_blocking(move || {
-        let live = crate::claude::live::running_ids_default();
+        // Every row's verdict comes off the session list itself (#1534),
+        // so this page cannot offer Resume on a row the list calls "could
+        // not tell".
         let conn = open_db(&db).map_err(|e| e.to_string())?;
-        let overview = crate::claude::overview::aggregate(&conn, &live.ids, chrono::Utc::now())
-            .map_err(|e| e.to_string())?;
-        Ok(crate::claude::overview::OverviewReport {
-            overview,
-            live_failure: live.failure,
-            live_unreadable: live.unreadable,
-        })
+        crate::claude::overview::report(&conn, chrono::Utc::now()).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -6142,7 +6699,8 @@ pub async fn claude_definitions(
     // `list_worktrees` states. It surfaces as a `ScopeRefusal` below.
     tauri::async_runtime::spawn_blocking(move || {
         let (repos, repo_refusals) = defs::project_roots(&dirs);
-        let (plugins, plugin_refusal) = installed_plugin_roots();
+        let (installed, plugin_refusal) = installed_plugins();
+        let plugins = plugin_roots(installed);
         let roots = defs::roots(Some(user), &repos, &plugins);
         let mut out = defs::scan_scopes(&roots);
         // A directory we could not even walk LOOKING for a `.claude` can
@@ -6172,16 +6730,13 @@ pub async fn claude_definitions(
     .map_err(|e| e.to_string())
 }
 
-/// Installed plugins as `(name, install_path)`, plus why the inventory
+/// Every install in `installed_plugins.json`, plus why the inventory
 /// could not be read.
 ///
 /// Reads the same `installed_plugins.json` `claude_plugins` does, via
 /// `plugins::parse_inventory`, so the two pages name plugins
-/// identically. A plugin with no recorded install path is SKIPPED rather
-/// than guessed at: `plugins.rs`'s ownership table records what a
-/// derived path rule costs, and inventing one here would attribute a
-/// stranger's definitions to a plugin.
-fn installed_plugin_roots() -> (Vec<(String, String)>, Option<String>) {
+/// identically.
+fn installed_plugins() -> (Vec<crate::claude::plugins::InstalledPlugin>, Option<String>) {
     let Some(dir) = crate::claude::plugins::plugins_dir() else {
         // Unreachable in practice -- the caller already refused without a
         // home -- but stated rather than unwrapped.
@@ -6198,14 +6753,21 @@ fn installed_plugin_roots() -> (Vec<(String, String)>, Option<String>) {
         Err(e) => return (Vec::new(), Some(format!("{}: {e}", path.display()))),
     };
     match crate::claude::plugins::parse_inventory(&body) {
-        Ok(list) => (
-            list.into_iter()
-                .filter_map(|p| p.install_path.map(|ip| (p.name, ip)))
-                .collect(),
-            None,
-        ),
+        Ok(list) => (list, None),
         Err(e) => (Vec::new(), Some(format!("{}: {e}", path.display()))),
     }
+}
+
+/// Installs as the `(name, install_path)` roots `definitions::roots`
+/// takes. A plugin with no recorded install path is SKIPPED rather than
+/// guessed at: `plugins.rs`'s ownership table records what a derived
+/// path rule costs, and inventing one here would attribute a stranger's
+/// definitions to a plugin.
+fn plugin_roots(installed: Vec<crate::claude::plugins::InstalledPlugin>) -> Vec<(String, String)> {
+    installed
+        .into_iter()
+        .filter_map(|p| p.install_path.map(|ip| (p.name, ip)))
+        .collect()
 }
 
 #[tauri::command]
@@ -6386,8 +6948,8 @@ fn transcript_path_in(root: &std::path::Path, path: &str) -> Result<std::path::P
 ///
 /// `Class::Read`. It reads one file under `~/.claude/projects` and writes
 /// nothing, and the phone wants this answer for the same reason the
-/// desktop does -- see `claude_transcript_tail` below, which argues the
-/// path guard both commands share.
+/// desktop does -- see `claude_transcript_page` below, which shares
+/// the same path guard.
 ///
 /// # Absent is not zero
 ///
@@ -6424,86 +6986,112 @@ pub async fn claude_session_usage(path: String) -> Result<crate::claude::usage::
         .map_err(|e| e.to_string())?
 }
 
-/// The tail of one session's transcript, as conversation (#982).
+/// One clipped block's full text, by the record's uuid and the block's
+/// index (#1475).
 ///
-/// The only way to read a transcript's CONTENT. Until now the one action
-/// that touched a transcript was Reveal in Finder, which is `Class::Local`
-/// and hands the user a JSONL file -- so a companion user who could see
-/// that a session died could not see one word of what it was doing.
+/// The "show all 38,210 characters" behind a per-block clip. Full text
+/// comes through this bounded fetch rather than by lifting the per-block
+/// cap on the page: see `transcript_model::block_text` for the design.
 ///
-/// `Class::Read`, and this is the one Claude action where the phone's
-/// case is stronger than the desktop's: the desktop user can `cat` the
-/// file and the companion user cannot reach the machine. The response is
-/// bounded inside the command -- a 256 KB window, at most 200 messages,
-/// each block clamped -- which is the property that makes exposing it
-/// over the transport safe rather than a second set of limits to keep in
-/// sync, the same rule `stats_board` is classed by.
+/// `offset` is the record's `offset` from the page that showed the block
+/// (#1220): with it the fetch reads that one record, streamed, instead of
+/// scanning the file. `null`, or an offset that no longer names the
+/// record, falls back to the scan.
 ///
-/// # Absent is not zero
-///
-/// An `Err` means the transcript could not be READ. A `Preview` with no
-/// messages means the window held no conversation, and its
-/// `non_conversation_records` and `unparseable_records` say which.
+/// `Class::Read`: reads one `.jsonl` through the `claude_transcript_path`
+/// guard and writes nothing. Bounded server-side at
+/// `transcript_model::FULL_TEXT_CHARS`, and the response says when that
+/// bound bit, so the phone cannot be handed a 38 MB tool result by
+/// asking for one.
 #[tauri::command]
-pub async fn claude_transcript_tail(
+pub async fn claude_transcript_block_text(
     path: String,
-) -> Result<crate::claude::preview::Preview, String> {
-    let p = claude_transcript_path(&path)?;
-    tauri::async_runtime::spawn_blocking(move || crate::claude::preview::tail(&p))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-/// One incremental step of following a live transcript (#1208).
-///
-/// The companion to `claude_transcript_tail`, and the reason it is a
-/// separate command rather than a parameter: `tail` answers "show me this
-/// session" and reads a 256 KB window every time. This answers "what has
-/// changed since byte N", and on an unchanged file reads no transcript
-/// bytes at all.
-///
-/// # Why polling, and not a watcher
-///
-/// `claude/handoff.rs:9-19` argues it for its own file and the argument
-/// is the same here: `notify` is not a dependency, and a dead FSEvents
-/// stream on macOS reports "no new records" indistinguishably from "the
-/// watch died". Silence is the one failure a pane that claims to be
-/// following must never produce. A poll that stops is visible, because
-/// the pane states when it last read. #1201 is open on the same question
-/// for the filesystem scans.
-///
-/// # `Class::Read`
-///
-/// Same grounds as `claude_transcript_tail`: one `.jsonl` under
-/// `~/.claude/projects`, read-only, resolved through the same
-/// `claude_transcript_path` guard. Its response is bounded by the same
-/// constants -- a 256 KB window on any re-read, at most 200 messages,
-/// each block clamped -- plus a 64 KB fingerprint probe, so a phone
-/// following a 76 MB transcript is handed the same bounded answer the
-/// desktop is.
-///
-/// `cursor` is opaque to the caller: it is handed back exactly as it was
-/// received. `None` means "I have nothing, read me a window", which is
-/// the first poll after the pane opens.
-///
-/// # Absent is not zero
-///
-/// An `Err` means the transcript could not be READ -- including that it
-/// is GONE, which differs from `handoff.rs`'s case 4 on purpose: a
-/// missing handoff file is a machine without the hook installed, while a
-/// transcript that vanished mid-follow is a real failure the pane must
-/// state. A `Follow` with no messages and `bytes_read: 0` means we read
-/// it and the session wrote nothing, which is the session being idle --
-/// a different fact from the follow having stopped, and the UI must not
-/// render them the same way (#846, #1042).
-#[tauri::command]
-pub async fn claude_transcript_follow(
-    path: String,
-    cursor: Option<crate::claude::preview::Cursor>,
-) -> Result<crate::claude::preview::Follow, String> {
+    message_id: String,
+    index: usize,
+    offset: Option<u64>,
+) -> Result<crate::claude::transcript_model::TranscriptBlockText, String> {
     let p = claude_transcript_path(&path)?;
     tauri::async_runtime::spawn_blocking(move || {
-        crate::claude::preview::follow(&p, cursor.as_ref())
+        crate::claude::transcript_model::block_text(&p, &message_id, index, offset)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// One bounded page of a transcript, before or after a cursor (#1220).
+///
+/// The viewer's way to "what happened earlier" in a transcript of any
+/// size: pages of `transcript_model::TranscriptMessage`, read backwards
+/// from the end or from any cursor a previous page returned, each one
+/// O(page) wherever it lands. See `claude::transcript_page` for the
+/// bounds, the oversized-record rule, the position estimate and where
+/// pages are merged (the client, by id, with the seam info each page
+/// carries).
+///
+/// `limit` is the most messages wanted, clamped to
+/// `transcript_page::PAGE_MESSAGES`; `null` means that maximum.
+///
+/// `Class::Read`, and the phone's case is STRONGER than the desktop's:
+/// the desktop user can `cat` the file and the companion user cannot
+/// reach the machine. One `.jsonl` under `~/.claude/projects` through
+/// the `claude_transcript_path` guard, nothing written. Bounded INSIDE the command whatever the
+/// caller asks: at most `PAGE_MESSAGES` messages and
+/// `transcript_page::PAGE_READ_BOUND` bytes read into memory, and a
+/// record over `RECORD_HOLD_BYTES` streamed and clipped rather than
+/// held -- so a paired phone paging through a 70 MB transcript is handed
+/// one bounded page per call, never the file.
+///
+/// The position index it consults is built on a worker thread the first
+/// time a transcript is paged; the call never waits for it, and says
+/// which basis its position figures rest on.
+#[tauri::command]
+pub async fn claude_transcript_page(
+    path: String,
+    anchor: crate::claude::transcript_page::PageAnchor,
+    direction: crate::claude::transcript_page::PageDirection,
+    limit: Option<usize>,
+) -> Result<crate::claude::transcript_page::TranscriptWindow, String> {
+    let p = claude_transcript_path(&path)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::claude::transcript_page::page(&p, &anchor, direction, limit)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Find messages anywhere in ONE transcript (#1484): the turn outline
+/// when `query` is null, otherwise every message whose text contains it.
+///
+/// Not `claude_search_transcripts`, which answers a different question:
+/// it searches the corpus index, one row per SESSION built from the
+/// first 8 MB of each file, and returns sessions and snippets -- no
+/// message ids, and nothing past the 8 MB bound. The viewer needs the
+/// message, anywhere in a file of any size, so this streams the one
+/// file. Each hit carries a page cursor at its record, so the viewer
+/// reads the page holding it with `claude_transcript_page`.
+///
+/// `Class::Read` on `claude_transcript_page`'s grounds: one `.jsonl`
+/// through the `claude_transcript_path` guard, nothing written. Bounded
+/// inside the command whatever the caller asks: one record held at a
+/// time, at most `transcript_page::FIND_HITS` hits, and
+/// `transcript_page::FIND_DEADLINE` of scanning, past which it answers
+/// with what it found and says where it stopped.
+///
+/// `matching` is which text `query` is matched against (#1519). The
+/// webview never sends it and matches the real text. A phone's call has
+/// it written by `remote::privacy::admit` -- masked unless the call
+/// reveals -- so a phone cannot use hit-or-miss to test for a secret.
+#[tauri::command]
+pub async fn claude_transcript_find(
+    path: String,
+    query: Option<String>,
+    limit: Option<usize>,
+    matching: Option<crate::remote::privacy::Matching>,
+) -> Result<crate::claude::transcript_page::TranscriptFind, String> {
+    let p = claude_transcript_path(&path)?;
+    let matching = matching.unwrap_or(crate::remote::privacy::Matching::Unmasked);
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::claude::transcript_page::find(&p, query.as_deref(), limit, matching)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -6613,7 +7201,7 @@ pub async fn repo_tree(
 /// 256 KB window, the binary refusal and the containment guard -- which
 /// is the property that makes the `Read` row safe rather than a second
 /// set of limits to keep in sync, the rule `stats_board` is classed by
-/// and `claude_transcript_tail` restates. A phone that asks for the
+/// and `claude_transcript_page` restates. A phone that asks for the
 /// 275 MB tracked zip is handed 256 KB with the truncation stated,
 /// because this command never reads more.
 ///
@@ -7041,6 +7629,108 @@ pub async fn claude_permission_ownership(
 }
 
 #[cfg(test)]
+mod pr_claudify_tests {
+    use super::{pr_checkout, pr_claude_command};
+    use crate::worktrees::Repo;
+
+    fn repo(identity: Option<&str>, path: &std::path::Path, bare: bool) -> Repo {
+        Repo {
+            identity: identity.map(str::to_string),
+            name: "r".to_string(),
+            path: path.to_string_lossy().into_owned(),
+            bare,
+            ..Repo::default()
+        }
+    }
+
+    /// The scanned checkout of the PR's repository is accepted, matched
+    /// case-insensitively, and returned in the SCAN's spelling.
+    #[test]
+    fn a_scanned_checkout_of_the_prs_repository_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let repos = vec![
+            repo(Some("octocat/spoon-knife"), other.path(), false),
+            repo(Some("OctoCat/Hello-World"), dir.path(), false),
+        ];
+        let got =
+            pr_checkout(&repos, &dir.path().to_string_lossy(), "octocat/hello-world").unwrap();
+        assert_eq!(got, dir.path().to_string_lossy());
+    }
+
+    /// A directory the scan does not hold is refused, even when it
+    /// exists: otherwise the caller chooses where `claude` starts.
+    #[test]
+    fn a_directory_outside_the_scan_is_refused() {
+        let scanned = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let repos = vec![repo(Some("octocat/hello-world"), scanned.path(), false)];
+        let e = pr_checkout(
+            &repos,
+            &elsewhere.path().to_string_lossy(),
+            "octocat/hello-world",
+        )
+        .unwrap_err();
+        assert!(e.contains("no longer one of the scanned"), "{e}");
+    }
+
+    /// A scanned checkout of a DIFFERENT repository is refused, as is a
+    /// bare clone of the right one and a checkout with no remote.
+    #[test]
+    fn a_checkout_of_another_repository_or_a_bare_clone_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+
+        let other = vec![repo(Some("octocat/spoon-knife"), dir.path(), false)];
+        let e = pr_checkout(&other, &path, "octocat/hello-world").unwrap_err();
+        assert!(e.contains("octocat/spoon-knife"), "{e}");
+
+        let none = vec![repo(None, dir.path(), false)];
+        let e = pr_checkout(&none, &path, "octocat/hello-world").unwrap_err();
+        assert!(e.contains("no origin remote"), "{e}");
+
+        let bare = vec![repo(Some("octocat/hello-world"), dir.path(), true)];
+        let e = pr_checkout(&bare, &path, "octocat/hello-world").unwrap_err();
+        assert!(e.contains("bare"), "{e}");
+    }
+
+    /// `cd <checkout> && claude <prompt>`, with both quoted so neither a
+    /// path nor a prompt can become a second shell word.
+    #[test]
+    fn the_line_cds_into_the_checkout_and_quotes_the_prompt() {
+        let line = pr_claude_command(
+            "Review octocat/hello-world#42\n\n  git fetch origin 'x'\\''y'\n$(whoami)",
+            "/code/it's here",
+        )
+        .unwrap();
+        assert_eq!(
+            line,
+            "cd '/code/it'\\''s here' && claude 'Review octocat/hello-world#42\n\n  \
+             git fetch origin '\\''x'\\''\\'\\'''\\''y'\\''\n$(whoami)'"
+        );
+    }
+
+    /// An empty prompt or one no argv can carry is refused, not launched.
+    #[test]
+    fn an_empty_or_nul_prompt_is_refused() {
+        assert!(pr_claude_command("  \n", "/code/r").is_err());
+        assert!(pr_claude_command("a\0b", "/code/r").is_err());
+    }
+
+    /// The terms dialog's flags (#1214) land after `claude`, before the
+    /// prompt -- the line is one `splice` recognises, not a new shape.
+    #[test]
+    fn the_chosen_terms_land_between_claude_and_the_prompt() {
+        let line = pr_claude_command("Review it", "/code/r").unwrap();
+        let terms = crate::claude::terms::Terms::parse(Some("opus"), None).unwrap();
+        assert_eq!(
+            terms.splice(&line),
+            "cd '/code/r' && claude --model opus 'Review it'"
+        );
+    }
+}
+
+#[cfg(test)]
 mod claudify_tests {
     use super::{brief_of, ClaudifyTarget};
     use crate::claudemd::advice::{Check, Evidence, Finding, Locator, Report, Severity, Subject};
@@ -7120,6 +7810,75 @@ mod claudify_tests {
 
 #[cfg(test)]
 mod tests {
+    /// `worktree-removal-progress` is forwarded to the phone, so its
+    /// frame must never carry a path (#1544). Built from REAL outcomes
+    /// of a real batch -- each carrying a path and a refusal that names
+    /// it -- through the one constructor the command uses, and the
+    /// serialised frame is checked for the paths, their basenames, and
+    /// for any key beyond the four it is allowed.
+    #[test]
+    fn a_removal_frame_carries_no_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = dir.path().to_string_lossy().to_string();
+        let paths: Vec<String> = (0..3)
+            .map(|i| {
+                dir.path()
+                    .join(format!("private-wt-{i}"))
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+
+        let mut frames = Vec::new();
+        let outcomes =
+            crate::worktrees::remove_worktrees_with_progress(&repo, &paths, None, |d, t, o| {
+                frames.push(super::WorktreeRemovalFrame::of(Some(7), d, t, o));
+            });
+        assert_eq!(frames.len(), 3);
+        assert!(
+            outcomes.iter().all(|o| o.error.is_some()),
+            "every path is missing, so every outcome is a refusal carrying text"
+        );
+
+        for f in &frames {
+            let json = serde_json::to_value(f).unwrap();
+            let mut keys: Vec<&str> = json
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(keys, vec!["done", "removed", "run", "total"], "{json}");
+            let text = json.to_string();
+            for p in &paths {
+                let base = std::path::Path::new(p)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                assert!(!text.contains(&base), "frame leaks {base}: {text}");
+            }
+            assert!(!text.contains(&repo), "frame leaks the repo path: {text}");
+        }
+        assert!(frames.iter().all(|f| !f.removed && f.run == Some(7)));
+    }
+
+    /// `removed` is the outcome's success, and nothing else.
+    #[test]
+    fn a_removal_frame_says_removed_only_for_a_success() {
+        let ok = crate::worktrees::RemovalOutcome {
+            path: "/x/a".into(),
+            error: None,
+        };
+        let refused = crate::worktrees::RemovalOutcome {
+            path: "/x/b".into(),
+            error: Some("dirty".into()),
+        };
+        assert!(super::WorktreeRemovalFrame::of(None, 1, 2, &ok).removed);
+        assert!(!super::WorktreeRemovalFrame::of(None, 2, 2, &refused).removed);
+    }
+
     /// #1149: one budget across every filesystem scan.
     ///
     /// `SIZE_LIMIT` bounded two commands and nothing else, while
@@ -7155,7 +7914,9 @@ mod tests {
     async fn a_permit_is_returned_when_the_scan_ends() {
         let before = super::scan_permits().available_permits();
         {
-            let _p = super::scan_permit().await.expect("a permit is available");
+            let _p = super::permit_from(super::scan_permits().clone())
+                .await
+                .expect("a permit is available");
             assert_eq!(
                 super::scan_permits().available_permits(),
                 before - 1,
@@ -7166,6 +7927,59 @@ mod tests {
             super::scan_permits().available_permits(),
             before,
             "and dropping it must return the permit"
+        );
+    }
+
+    /// #1467: a walk its caller abandoned keeps its permit until the walk
+    /// itself finishes, and the next caller waits for it.
+    ///
+    /// The phone's `CALL_TIMEOUT` drops the dispatch future, and
+    /// `spawn_blocking` cannot be cancelled, so the walk runs on. With the
+    /// permit held by the future it was released at once and a second
+    /// walk started beside the first -- exceeding the #1149 cap exactly
+    /// when the disk was slow. A budget of its own, so no other test's
+    /// scan can move the count.
+    #[tokio::test]
+    async fn an_abandoned_walk_keeps_its_permit_until_it_finishes() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        let first = tokio::spawn(super::blocking_under(permits.clone(), move || {
+            let _ = started_tx.send(());
+            // The walk: still on the disk until the test lets it go.
+            let _ = release_rx.recv();
+        }));
+        started_rx.await.expect("the walk started");
+        // The caller gives up, as the phone does at its deadline.
+        first.abort();
+        let _ = first.await;
+        assert_eq!(
+            permits.available_permits(),
+            0,
+            "an abandoned walk that is still running must still hold its permit"
+        );
+
+        let second = tokio::spawn(super::blocking_under(permits.clone(), || 7));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !second.is_finished(),
+            "the next walk must wait for the abandoned one, not start beside it"
+        );
+
+        release_tx.send(()).expect("the walk is waiting");
+        let got = tokio::time::timeout(Duration::from_secs(10), second)
+            .await
+            .expect("the next walk ran once the first finished")
+            .expect("joined")
+            .expect("ran");
+        assert_eq!(got, 7);
+        assert_eq!(
+            permits.available_permits(),
+            1,
+            "and every permit is back once both walks are done"
         );
     }
 
@@ -7216,29 +8030,19 @@ mod tests {
     mod transcript_path {
         use super::super::transcript_path_in;
         use std::io::Write;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
 
-        struct Tmp(PathBuf);
+        /// A `TempDir` no other run can name, removed when dropped (#1554).
+        struct Tmp(tempfile::TempDir);
         impl Tmp {
             fn new(tag: &str) -> Self {
-                let p = std::env::temp_dir().join(format!(
-                    "headstate-tpath-{tag}-{}-{:?}",
-                    std::process::id(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos()
-                ));
-                std::fs::create_dir_all(&p).unwrap();
-                Tmp(p)
+                Tmp(tempfile::Builder::new()
+                    .prefix(&format!("headstate-tpath-{tag}-"))
+                    .tempdir()
+                    .unwrap())
             }
             fn path(&self) -> &Path {
-                &self.0
-            }
-        }
-        impl Drop for Tmp {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
+                self.0.path()
             }
         }
 
@@ -7932,27 +8736,20 @@ mod tests {
     /// #945: the field's own placeholder is `~/code`, and typing it used to
     /// be rejected with `not a directory: ~/code`.
     ///
-    /// Asserted against the REAL home directory rather than a temporary
-    /// one. Setting `HOME` would be a process-wide mutation in a test
-    /// binary that runs in parallel, which is the shape that makes other
-    /// tests fail for reasons they cannot see -- and there is no env lock
-    /// in this crate to serialise against. `expand_tilde` reads
-    /// `auth::home_dir`, so the real value is the honest input anyway.
-    ///
-    /// Uses a directory that must exist inside any home on any platform:
-    /// the home itself, via bare `~`.
+    /// Against a FIXTURE home (#1535). `expand_tilde` reads
+    /// `auth::home_dir`, which in a test build answers the thread's
+    /// `test_home` -- so no process-wide `HOME` mutation, and nothing the
+    /// test does can touch the developer's real home. Until #1535 these
+    /// two tests used the real one, and the second created and removed a
+    /// directory in it.
     #[test]
     fn validate_dirs_expands_a_bare_tilde_to_the_home_directory() {
-        let Some(home) = crate::auth::home_dir() else {
-            // No HOME in this environment, so there is nothing `~` could
-            // mean. Skipped rather than asserted, and said out loud.
-            eprintln!("skipped: no home directory in this environment");
-            return;
-        };
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::auth::test_home::set(home.path());
         let out = validate_dirs(vec!["~".into()]).expect("a bare ~ is the home directory");
         assert_eq!(
             out,
-            vec![home.to_string_lossy().into_owned()],
+            vec![home.path().to_string_lossy().into_owned()],
             "the stored value must be the EXPANDED path, not `~`: one consumer \
              reads it and re-expanding at every read is the same rule in two places"
         );
@@ -7961,25 +8758,30 @@ mod tests {
     /// `~/<subdir>` is the placeholder's actual shape.
     #[test]
     fn validate_dirs_expands_a_tilde_prefixed_subdirectory() {
-        let Some(home) = crate::auth::home_dir() else {
-            eprintln!("skipped: no home directory in this environment");
-            return;
-        };
-        // Created inside the real home so the `is_dir()` check passes on a
-        // path we control, then removed. A name unlikely to collide.
-        let name = ".headstate-tilde-test";
-        let dir = home.join(name);
-        std::fs::create_dir_all(&dir).expect("create a scratch dir in home");
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::auth::test_home::set(home.path());
+        let dir = home.path().join("code");
+        std::fs::create_dir_all(&dir).unwrap();
 
-        let out = validate_dirs(vec![format!("~/{name}")]);
-
-        // Removed BEFORE asserting, so a failure cannot leave it behind.
-        let _ = std::fs::remove_dir(&dir);
+        let out = validate_dirs(vec!["~/code".into()]);
 
         assert_eq!(
             out.expect("~/<subdir> must expand"),
             vec![dir.to_string_lossy().into_owned()]
         );
+    }
+
+    /// With no home, `~` is refused rather than expanded against nothing.
+    ///
+    /// A test build has no home unless it sets one (#1535), so this is
+    /// also the shape every other test in the binary sees.
+    #[test]
+    fn validate_dirs_refuses_a_tilde_when_there_is_no_home() {
+        assert!(
+            crate::auth::home_dir().is_none(),
+            "a test build has no home"
+        );
+        assert!(validate_dirs(vec!["~/code".into()]).is_err());
     }
 
     /// `~otheruser/...` is NOT expanded, and the refusal is the point.

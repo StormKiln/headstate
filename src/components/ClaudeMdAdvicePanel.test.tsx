@@ -414,8 +414,15 @@ describe("ClaudeMdAdvicePanel", () => {
     open();
     expect(screen.getAllByText(/the repository could not be listed/).length).toBeGreaterThan(0);
     expect(screen.getByText(/could not check/)).toBeTruthy();
-    expect(screen.getByRole("alert").textContent).toContain("at least the findings");
     expect(screen.getByRole("alert").textContent).toContain("1 of 1 checks could not run");
+    // #1409: the entries are CHECKS. The notice once announced them as
+    // "1 path could not be read" and then restated the count as checks --
+    // and with nothing found it read "the 0 findings below are at least
+    // the findings", which is the empty-as-clean reading it exists to stop.
+    expect(screen.getByRole("alert").textContent).toMatch(
+      /^1 of 1 checks could not run, so the empty list below is not a clean result\./,
+    );
+    expect(screen.getByRole("alert").textContent).not.toMatch(/path/);
     expect(screen.queryByText(/nothing found/)).toBeNull();
   });
 
@@ -721,6 +728,34 @@ describe("ClaudeMdAdvicePanel", () => {
     expect(within(row).getByRole("button", { name: "Copy brief" })).toBeTruthy();
   });
 
+  /// #1389: an Unknown is "checked, could not decide". Its remedy is to let
+  /// the check decide, not an edit a session can make, so it offers no
+  /// Claudify either -- only Problem and Advice, which recommend a change,
+  /// do. Copy brief stays on every row.
+  it("offers Claudify only on findings that recommend a change", () => {
+    claudify.terminal = "open -a Terminal {command}";
+    state.data = report({
+      findings: [
+        finding({ check: "transcripts", severity: "unknown", finding: "could not read three" }),
+        finding({ check: "rot", severity: "advice", finding: "an advice row" }),
+        finding({ check: "rot", severity: "problem", finding: "a problem row" }),
+      ],
+      checks: [
+        { check: "transcripts", run: { state: "ran", findings: 1 } },
+        { check: "rot", run: { state: "ran", findings: 2 } },
+      ],
+    });
+    open();
+    const unknown = screen.getByRole("row", { name: /could not read three/ });
+    expect(within(unknown).queryByRole("button", { name: "Claudify" })).toBeNull();
+    expect(within(unknown).getByText("Could not decide")).toBeTruthy();
+    expect(within(unknown).getByRole("button", { name: "Copy brief" })).toBeTruthy();
+    for (const name of [/an advice row/, /a problem row/]) {
+      const row = screen.getByRole("row", { name });
+      expect(within(row).getByRole("button", { name: "Claudify" })).toBeTruthy();
+    }
+  });
+
   /// A short report opens expanded: collapsing three findings would hide
   /// them behind a click for nothing.
   it("opens a short report expanded", () => {
@@ -834,6 +869,74 @@ describe("ClaudeMdAdvicePanel", () => {
     expect(headings.some((h) => h.startsWith("src/"))).toBe(true);
     // A skill carries the name it is invoked with, not just its path.
     expect(headings.some((h) => h.includes("skill: verify"))).toBe(true);
+  });
+
+  /// #1387: a path BESIDE the repository that shares its name as a
+  /// prefix (`<repo>-other/...`) is not inside it, so it is shown whole.
+  /// A bare `startsWith` shortened it to the fragment `-other/...`.
+  it("shows a sibling that shares the repository's prefix in full, never as a fragment", () => {
+    const sibling = `${REPO}-other/CLAUDE.md`;
+    state.data = report({
+      findings: [
+        finding({
+          subject: { kind: "claudeMd", path: sibling, scope: "global", section: null },
+          evidence: [{ at: { kind: "file", path: sibling, line: 3 }, measured: "beside, not inside" }],
+          finding: "about the sibling",
+        }),
+        finding({
+          subject: { kind: "claudeMd", path: `${REPO}/CLAUDE.md`, scope: "repo", section: null },
+          evidence: [],
+          finding: "about the inside file",
+        }),
+      ],
+      checks: [{ check: "imports", run: { state: "ran", findings: 2 } }],
+    });
+    open();
+    group("file");
+    const headings = screen.getAllByRole("heading").map((h) => h.textContent ?? "");
+    // The sibling keeps its whole path; nothing starts with the fragment.
+    expect(headings.some((h) => h.startsWith(sibling))).toBe(true);
+    expect(headings.some((h) => h.startsWith("-other"))).toBe(false);
+    // The evidence locator, behind its disclosure since #1344.
+    fireEvent.click(screen.getByRole("button", { name: "Evidence (1)" }));
+    expect(screen.getByText("beside, not inside", { exact: false }).textContent).toBe(
+      `${sibling}:3 — beside, not inside`,
+    );
+    // A file genuinely inside is still shortened.
+    expect(headings.some((h) => h.startsWith("CLAUDE.md"))).toBe(true);
+  });
+
+  /// #1366: a finding about the repository itself is labelled "repository
+  /// root" everywhere the panel shortens a path -- the by-file heading,
+  /// the Where column and an evidence locator -- and never `/` or an
+  /// empty string, which read as the filesystem root or as nothing.
+  it("labels the repository itself as the repository root, never / or empty", () => {
+    state.data = report({
+      findings: [
+        finding({
+          check: "gaps",
+          severity: "unknown",
+          subject: { kind: "directory", path: REPO },
+          evidence: [{ at: { kind: "file", path: REPO, line: null }, measured: "the measured fact" }],
+          finding: "about the root",
+        }),
+      ],
+      checks: [{ check: "gaps", run: { state: "ran", findings: 1 } }],
+    });
+    open();
+    group("file");
+    const headings = screen.getAllByRole("heading").map((h) => h.textContent ?? "");
+    expect(headings.some((h) => h.startsWith("repository root"))).toBe(true);
+    expect(headings.some((h) => h.startsWith("/") || h.startsWith("repository root/"))).toBe(false);
+    // The Where column.
+    const cells = screen.getAllByRole("cell").map((c) => c.textContent ?? "");
+    expect(cells).toContain("repository root");
+    expect(cells.some((c) => c === "/" || c === "")).toBe(false);
+    // The evidence locator.
+    fireEvent.click(screen.getByRole("button", { name: "Evidence (1)" }));
+    expect(screen.getByText("the measured fact", { exact: false }).textContent).toBe(
+      "repository root — the measured fact",
+    );
   });
 
   /// #846 in the view organised by check: a check that could not run and
@@ -1135,5 +1238,95 @@ describe("ClaudeMdAdvicePanel", () => {
     await waitFor(() =>
       expect(claudify.preview).toHaveBeenCalledWith(REPO, { kind: "finding", index: 2 }),
     );
+  });
+
+  /// What the last click put on the clipboard.
+  const copied = () => (copyFn.mock.calls as unknown as string[][]).at(-1)?.[0] ?? "";
+
+  /// "Copy as markdown" (#1399): a report of two groups, one of which
+  /// is a check that could not run.
+  const twoGroups = () =>
+    report({
+      findings: [
+        finding({ check: "imports", finding: "an imports finding" }),
+        finding({ check: "rot", severity: "advice", finding: "a rot finding", evidence: [] }),
+      ],
+      checks: [
+        { check: "imports", run: { state: "ran", findings: 1 } },
+        { check: "rot", run: { state: "ran", findings: 1 } },
+        { check: "skills", run: { state: "unknown", reason: "the skills directory could not be listed" } },
+      ],
+    });
+
+  it("copies only its own group, beside the heading rather than inside it", async () => {
+    state.data = twoGroups();
+    open();
+    const button = screen.getByRole("button", { name: "Copy group as markdown: rot" });
+    // Not inside the heading: a click on it must not toggle the group.
+    expect(button.closest("h3")).toBeNull();
+    const toggle = screen.getAllByRole("button", { expanded: true }).find((b) =>
+      (b.textContent ?? "").startsWith("rot"),
+    );
+    fireEvent.click(button);
+    expect(toggle?.getAttribute("aria-expanded")).toBe("true");
+    const md = copied();
+    expect(md).toMatch(/^### rot \(1 advice\)/);
+    expect(md).toContain("a rot finding");
+    expect(md).not.toContain("an imports finding");
+    await waitFor(() =>
+      expect(toastFns.success).toHaveBeenCalledWith("Copied 1 finding as markdown", expect.anything()),
+    );
+  });
+
+  it("offers a group copy on a check that could not run, and says it is included", async () => {
+    state.data = twoGroups();
+    open();
+    fireEvent.click(screen.getByRole("button", { name: "Copy group as markdown: skills" }));
+    expect(copied()).toContain("the skills directory could not be listed");
+    await waitFor(() =>
+      expect(toastFns.success).toHaveBeenCalledWith("Copied 0 findings as markdown", {
+        description: expect.stringContaining("One check that could not run is included"),
+      }),
+    );
+  });
+
+  it("copies the whole report as markdown from the top line", async () => {
+    state.data = twoGroups();
+    open();
+    fireEvent.click(screen.getByRole("button", { name: "Copy all as markdown" }));
+    const md = copied();
+    expect(md).toContain(`## CLAUDE.md advice for \`${REPO}\``);
+    expect(md).toContain("by Headstate 7.4.0");
+    expect(md).toContain("### imports (1 problem)");
+    expect(md).toContain("### rot (1 advice)");
+    expect(md).toContain("### skills (could not check)");
+    // The reader's report, not the agent's.
+    expect(md).not.toContain("the brief");
+    await waitFor(() =>
+      expect(toastFns.success).toHaveBeenCalledWith("Copied 2 findings as markdown", expect.anything()),
+    );
+  });
+
+  it("copies in the grouping on screen", () => {
+    state.data = twoGroups();
+    open();
+    group("file");
+    fireEvent.click(screen.getByRole("button", { name: "Copy all as markdown" }));
+    const md = copied();
+    expect(md).toContain("### CLAUDE.md (1 problem, 1 advice)");
+    expect(md).toContain("### Could not check");
+  });
+
+  it("toasts the reason when the markdown could not be copied", async () => {
+    state.data = twoGroups();
+    copyFn.mockResolvedValue("This window has no clipboard access.");
+    open();
+    fireEvent.click(screen.getByRole("button", { name: "Copy all as markdown" }));
+    await waitFor(() =>
+      expect(toastFns.error).toHaveBeenCalledWith("Could not copy the markdown", {
+        description: "This window has no clipboard access.",
+      }),
+    );
+    expect(toastFns.success).not.toHaveBeenCalled();
   });
 });

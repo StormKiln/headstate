@@ -469,21 +469,6 @@ fn scan_ids(text: &str) -> Vec<String> {
     out
 }
 
-/// Build the parent map from every session transcript.
-///
-/// Reads each file line by line -- NOT into one buffer -- because the
-/// largest real transcript is 32 MB and the corpus is 0.86 GB, and the
-/// point of the scan is that it never holds a whole corpus in memory.
-///
-/// Unbounded per file, deliberately: see the module docs for the measured
-/// first-mention offsets that rule out #959's 8 MB budget.
-///
-/// # Errors
-///
-/// None. A transcript that cannot be opened or read is recorded in
-/// [`Map::unreadable`] and the pass continues -- one unreadable file must
-/// not cost the attribution of every other agent, and the count is
-/// carried so the UI can say the rollup may be short.
 /// One pull request a session touched (#1132).
 ///
 /// From the `pr-link` records Claude Code writes. `preview.rs`'s own
@@ -494,7 +479,7 @@ fn scan_ids(text: &str) -> Vec<String> {
 /// # Serialised snake_case, deliberately (#1288)
 ///
 /// NO `rename_all` here. This struct is returned by
-/// `claude_sessions_for_pr` and nested in [`sessions::SessionDetail`],
+/// `claude_sessions_for_pr_number` and nested in [`sessions::SessionDetail`],
 /// and its TypeScript mirror `ClaudePrLink` -- like `ClaudeSession`,
 /// `ClaudeSessionDetail` and the rest of `src/types/pr.ts` -- declares
 /// snake_case. `SessionDetail` itself carries no `rename_all`, so a
@@ -559,11 +544,180 @@ fn pr_link_in(line: &str, session_id: &str) -> Option<PrLink> {
     })
 }
 
+/// Every pull request link in one transcript, read line by line (#1557).
+///
+/// Two sources, one per line:
+///
+/// 1. The `pr-link` record Claude Code writes when a session opens or
+///    touches a pull request. The primary source, and the only one before
+///    #1557.
+/// 2. A `gh pr create` Bash call whose SUCCESSFUL result carries the new
+///    pull request's URL. Measured for #1545 on the owner's corpus: 1,021
+///    PRs were created through `gh pr create` with a URL in the result,
+///    and 8 main-session ones have no `pr-link` record -- most likely
+///    written by Claude Code versions older than the record.
+///
+/// # Why the second source is precise
+///
+/// It needs BOTH halves: an assistant `tool_use` of the `Bash` tool whose
+/// command contains `gh pr create`, and the `tool_result` with that same
+/// `tool_use_id`. The result counts only when it is not `is_error` and
+/// exactly ONE of its lines is a bare pull request URL, which is what
+/// `gh pr create` prints on success. A failed create ("a pull request for
+/// branch ... already exists: URL") is an error result, and a result
+/// with two bare URLs is ambiguous -- both are skipped rather than
+/// guessed at. A command that merely MENTIONS the phrase in a PR body
+/// prints a comment or view URL, not a bare `.../pull/N` line.
+///
+/// # Why it is cheap
+///
+/// Every line pays two substring tests at most. A line is parsed only if
+/// it contains `gh pr create` and `"tool_use"`, or -- only while a create
+/// is pending -- `"tool_result"` and `/pull/`. The `pr-link` gate is the
+/// one [`pr_link_in`] already had.
+///
+/// The pending set is per FILE: a `tool_use_id` is only meaningful inside
+/// the transcript that issued it. An incremental read that stops between
+/// a create and its result loses that pairing, and the `pr-link` record is
+/// what still links it; see `claude::linkscan`.
+#[derive(Debug, Default)]
+pub(crate) struct LinkReader {
+    pending: std::collections::HashSet<String>,
+}
+
+impl LinkReader {
+    /// The link this line records, if any.
+    pub(crate) fn line(&mut self, line: &str, session_id: &str) -> Option<PrLink> {
+        if let Some(link) = pr_link_in(line, session_id) {
+            return Some(link);
+        }
+        if line.contains("gh pr create") && line.contains("\"tool_use\"") {
+            self.note_creates(line);
+            return None;
+        }
+        if self.pending.is_empty() || !line.contains("\"tool_result\"") || !line.contains("/pull/")
+        {
+            return None;
+        }
+        self.created(line, session_id)
+    }
+
+    /// Remember each `gh pr create` Bash call this assistant record makes.
+    fn note_creates(&mut self, line: &str) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            return;
+        };
+        let Some(blocks) = v.pointer("/message/content").and_then(|c| c.as_array()) else {
+            return;
+        };
+        for b in blocks {
+            let is_create = b.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                && b.get("name").and_then(|t| t.as_str()) == Some("Bash")
+                && b.pointer("/input/command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c.contains("gh pr create"));
+            if let (true, Some(id)) = (is_create, b.get("id").and_then(|i| i.as_str())) {
+                self.pending.insert(id.to_string());
+            }
+        }
+    }
+
+    /// The pull request a pending create's successful result names.
+    fn created(&mut self, line: &str, session_id: &str) -> Option<PrLink> {
+        let v: serde_json::Value = serde_json::from_str(line).ok()?;
+        let blocks = v.pointer("/message/content")?.as_array()?;
+        for b in blocks {
+            if b.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+                continue;
+            }
+            let Some(id) = b.get("tool_use_id").and_then(|i| i.as_str()) else {
+                continue;
+            };
+            if !self.pending.remove(id) {
+                continue;
+            }
+            if b.get("is_error").and_then(|e| e.as_bool()) == Some(true) {
+                continue;
+            }
+            let Some(content) = b.get("content") else {
+                continue;
+            };
+            let text = result_text(content);
+            let mut urls = text.lines().filter_map(|l| pr_url(l.trim()));
+            let (Some((repo, number, url)), None) = (urls.next(), urls.next()) else {
+                continue;
+            };
+            return Some(PrLink {
+                session_id: session_id.to_string(),
+                repo,
+                number,
+                url,
+                first_seen_at: v
+                    .get("timestamp")
+                    .and_then(|t| t.as_str())
+                    .map(str::to_string),
+            });
+        }
+        None
+    }
+}
+
+/// A `tool_result`'s text: a plain string, or the text blocks of an array.
+fn result_text(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// A bare pull request URL, as `(owner/repo, N, url)`.
+///
+/// The WHOLE line, so a comment link (`.../pull/N#issuecomment-...`), a
+/// files tab or a URL inside prose does not count.
+fn pr_url(line: &str) -> Option<(String, u64, String)> {
+    let rest = line.strip_prefix("https://github.com/")?;
+    let mut parts = rest.split('/');
+    let (owner, repo, pull, n) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || pull != "pull" {
+        return None;
+    }
+    let slug_ok = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    };
+    if !slug_ok(owner) || !slug_ok(repo) || n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((format!("{owner}/{repo}"), n.parse().ok()?, line.to_string()))
+}
+
+/// Build the parent map from every session transcript.
+///
+/// Reads each file line by line -- NOT into one buffer -- because the
+/// largest real transcript is 32 MB and the corpus is 0.86 GB, and the
+/// point of the scan is that it never holds a whole corpus in memory.
+///
+/// Unbounded per file, deliberately: see the module docs for the measured
+/// first-mention offsets that rule out #959's 8 MB budget.
+///
+/// # Errors
+///
+/// None. A transcript that cannot be opened or read is recorded in
+/// [`Map::unreadable`] and the pass continues -- one unreadable file must
+/// not cost the attribution of every other agent, and the count is
+/// carried so the UI can say the rollup may be short.
 pub fn build(paths: &[PathBuf]) -> Map {
     use std::io::BufRead;
 
     let mut map = Map::default();
     for path in paths {
+        let mut links = LinkReader::default();
         let session_id = match path.file_stem().and_then(|s| s.to_str()) {
             Some(s) => s.to_owned(),
             None => continue,
@@ -589,7 +743,7 @@ pub fn build(paths: &[PathBuf]) -> Map {
             // records are scattered through the file rather than in the
             // head -- so a second pass would double a 969 ms cost to
             // collect something already streaming past.
-            if let Some(link) = pr_link_in(&line, &session_id) {
+            if let Some(link) = links.line(&line, &session_id) {
                 map.pr_links.push(link);
             }
             let Some((at, ids)) = mentions_in(&line) else {
@@ -629,27 +783,17 @@ mod tests {
 
     /// A throwaway directory, removed on drop. The shape `usage.rs` and
     /// `transcript.rs` tests use.
-    struct Tmp(PathBuf);
+    /// A `TempDir` no other run can name, removed when dropped (#1554).
+    struct Tmp(tempfile::TempDir);
     impl Tmp {
         fn new(tag: &str) -> Self {
-            let p = std::env::temp_dir().join(format!(
-                "headstate-subagent-{tag}-{}-{:?}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            std::fs::create_dir_all(&p).unwrap();
-            Tmp(p)
+            Tmp(tempfile::Builder::new()
+                .prefix(&format!("headstate-subagent-{tag}-"))
+                .tempdir()
+                .unwrap())
         }
         fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-    impl Drop for Tmp {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            self.0.path()
         }
     }
 
@@ -992,6 +1136,7 @@ mod tests {
     #[test]
     #[ignore]
     fn real_corpus_parent_map() {
+        let _home = crate::auth::test_home::real_for_a_live_probe();
         let Some(root) = crate::claude::transcript::projects_dir() else {
             return;
         };
@@ -1033,7 +1178,7 @@ mod tests {
     #[test]
     fn a_pr_link_record_is_collected() {
         let tmp = Tmp::new("prlink");
-        let path = tmp.0.join("s1.jsonl");
+        let path = tmp.path().join("s1.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(
             f,
@@ -1057,7 +1202,7 @@ mod tests {
     #[test]
     fn repeated_mentions_of_one_pr_collapse_to_the_first() {
         let tmp = Tmp::new("prdedup");
-        let path = tmp.0.join("s1.jsonl");
+        let path = tmp.path().join("s1.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
         for ts in [
             "2026-09-11T14:00:00.000Z",
@@ -1086,7 +1231,7 @@ mod tests {
     #[test]
     fn distinct_pull_requests_are_kept_apart() {
         let tmp = Tmp::new("prmulti");
-        let path = tmp.0.join("s1.jsonl");
+        let path = tmp.path().join("s1.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
         for n in [1u64, 2] {
             writeln!(
@@ -1106,7 +1251,7 @@ mod tests {
     #[test]
     fn the_file_name_decides_the_session_not_the_record() {
         let tmp = Tmp::new("prauth");
-        let path = tmp.0.join("real-session.jsonl");
+        let path = tmp.path().join("real-session.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(
             f,
@@ -1118,12 +1263,104 @@ mod tests {
         assert_eq!(build(&[path]).pr_links[0].session_id, "real-session");
     }
 
+    /// One Bash `tool_use` and its `tool_result`, as Claude Code writes
+    /// them, for the `gh pr create` tests (#1557).
+    fn bash_call(f: &mut std::fs::File, id: &str, command: &str, result: &str, is_error: bool) {
+        let call = serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-09-11T12:00:00.000Z",
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": command}}
+            ]}
+        });
+        let answer = serde_json::json!({
+            "type": "user",
+            "timestamp": "2026-09-11T12:00:05.000Z",
+            "message": {"role": "user", "content": [
+                {"tool_use_id": id, "type": "tool_result", "content": result, "is_error": is_error}
+            ]},
+            "toolUseResult": {"stdout": result, "stderr": "", "interrupted": false}
+        });
+        writeln!(f, "{call}").unwrap();
+        writeln!(f, "{answer}").unwrap();
+    }
+
+    /// #1557: a `gh pr create` whose result carries the new PR's URL
+    /// links the session, with no `pr-link` record at all -- the shape
+    /// of the 8 main-session PRs #1545 measured without one.
+    #[test]
+    fn a_gh_pr_create_result_links_its_pull_request() {
+        let tmp = Tmp::new("ghcreate");
+        let path = tmp.path().join("s1.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        bash_call(
+            &mut f,
+            "toolu_1",
+            "git push -u origin fix && gh pr create --title t --body b",
+            "Warning: 1 uncommitted change\nhttps://github.com/acme/api/pull/41\n",
+            false,
+        );
+        drop(f);
+
+        let map = build(&[path]);
+        assert_eq!(map.pr_links.len(), 1);
+        let l = &map.pr_links[0];
+        assert_eq!((l.repo.as_str(), l.number), ("acme/api", 41));
+        assert_eq!(l.session_id, "s1");
+        assert_eq!(l.first_seen_at.as_deref(), Some("2026-09-11T12:00:05.000Z"));
+    }
+
+    /// #1557: precise, not merely hopeful. Each of these carries a pull
+    /// request URL somewhere and none of them is a PR this session
+    /// created.
+    #[test]
+    fn only_a_successful_create_with_one_bare_url_links() {
+        let tmp = Tmp::new("ghcreate-not");
+        let path = tmp.path().join("s1.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Failed: the branch already has a PR, which gh names.
+        bash_call(
+            &mut f,
+            "toolu_1",
+            "gh pr create --fill",
+            "a pull request for branch \"fix\" into branch \"main\" already exists:\nhttps://github.com/acme/api/pull/1",
+            true,
+        );
+        // Not a create: a view prints a bare URL too.
+        bash_call(
+            &mut f,
+            "toolu_2",
+            "gh pr view 2 --json url -q .url",
+            "https://github.com/acme/api/pull/2",
+            false,
+        );
+        // Two bare URLs: which one was created is a guess.
+        bash_call(
+            &mut f,
+            "toolu_3",
+            "gh pr create --fill; gh pr view 9 --json url -q .url",
+            "https://github.com/acme/api/pull/3\nhttps://github.com/acme/api/pull/9",
+            false,
+        );
+        // A comment link is not a bare PR URL.
+        bash_call(
+            &mut f,
+            "toolu_4",
+            "gh pr comment 4 --body 'use gh pr create next time'",
+            "https://github.com/acme/api/pull/4#issuecomment-1",
+            false,
+        );
+        drop(f);
+
+        assert!(build(&[path]).pr_links.is_empty());
+    }
+
     /// A record that is not a pr-link, and a line that merely contains
     /// the words, must not produce one.
     #[test]
     fn only_real_pr_link_records_count() {
         let tmp = Tmp::new("prnoise");
-        let path = tmp.0.join("s1.jsonl");
+        let path = tmp.path().join("s1.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, r#"{{"type":"user","text":"see the pr-link above"}}"#).unwrap();
         writeln!(f, r#"{{"type":"assistant","text":"opened a PR"}}"#).unwrap();

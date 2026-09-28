@@ -34,6 +34,15 @@ export interface PullRequest extends PrIdentity {
   head_ref_id: string | null;
   base_ref: string;
   created_at: string;
+  /// When it became ready for review (#1407): the latest ready-for-review
+  /// event, or `created_at` for one that was never a draft -- the same
+  /// moment, not a fallback.
+  ///
+  /// `null` is UNKNOWN (current draft, a time GitHub did not return or
+  /// that did not parse). OPTIONAL because a snapshot cached by an older
+  /// build, or a payload from an older desktop to the companion, has no
+  /// such key. Both render as "age unknown", never as zero.
+  ready_at?: string | null;
   updated_at: string;
   ci: CiState;
   merge: MergeState;
@@ -253,10 +262,21 @@ export type Safety =
   /// `conflicts` is `null` when `git status` could not be read: an
   /// unreadable status is not zero conflicts, and the operation is in
   /// progress either way.
+  ///
+  /// Spelled and shaped as serde writes it: `rename_all = "snake_case"`
+  /// with `content = "detail"`, so the kind is `in_progress` and the
+  /// struct payload sits under `detail`. This side once said
+  /// `inProgress` with the fields flattened, matched nothing, and every
+  /// such row read "could not determine: [object Object]" (#1437).
+  /// `src-tauri/tests/fixtures/safety_variants.json` is pinned to the
+  /// Rust enum's serialisation and read by `worktrees.test.ts`, which
+  /// holds the two together.
   | {
-      kind: "inProgress";
-      op: "rebase" | "merge" | "cherryPick" | "revert" | "bisect";
-      conflicts: number | null;
+      kind: "in_progress";
+      detail: {
+        op: "rebase" | "merge" | "cherryPick" | "revert" | "bisect";
+        conflicts: number | null;
+      };
     }
   | { kind: "unpushed"; detail: number }
   | { kind: "never_pushed" }
@@ -266,6 +286,12 @@ export type Safety =
   /// `safe` so the row can say which evidence it used, because this one
   /// cannot be re-checked against a remote that no longer exists.
   | { kind: "merged_upstream_deleted" }
+  /// Merged, on a branch with no tracking config at all -- a
+  /// contributor's PR fetched locally, say (#1439). Removable: the work
+  /// is on the default branch. Not `never_pushed`, which claims commits
+  /// exist only here, and not `merged_upstream_deleted`, which claims a
+  /// tracking config outlived its remote branch; there was never one.
+  | { kind: "merged_no_upstream" }
   /// A branchless checkout whose HEAD is already contained in the default
   /// branch (#819). Removable.
   ///
@@ -283,6 +309,16 @@ export type Safety =
   /// `unknown` before #819, with no action at all: four on the reporting
   /// machine, every one provably an ancestor of the default branch.
   | { kind: "detached_merged"; detail: string }
+  /// GitHub records this branch's pull request -- number `detail` -- as
+  /// merged into the default branch, and the worktree's HEAD is that
+  /// PR's head commit or an ancestor of it (#1440). Removable.
+  ///
+  /// Only ever an UPGRADE of `unmerged` or `unpushed`, made after the
+  /// offline scan when GitHub could be asked. The offline squash checks
+  /// fade once the default branch edits the same files again; this is
+  /// the route that does not. Its own kind so the row can say which
+  /// evidence it used -- the number is the thing a user can check.
+  | { kind: "merged_as_pr"; detail: number }
   /// The branch was created and never committed to -- a scratch
   /// worktree. Distinct from `never_pushed`, which claims commits exist
   /// only here: for a branch with none, that claim is false, and the
@@ -581,6 +617,16 @@ export interface PrDetail {
   url: string;
   state: string;
   is_draft: boolean;
+  /// When it was opened, when it became ready for review, and the head
+  /// commit's `committedDate` (#1457). `ready_at` is `PullRequest.ready_at`'s
+  /// derivation; `last_commit_at` is the committer's clock, not the push.
+  ///
+  /// `null` is UNKNOWN and the header omits it -- never "0s ago". OPTIONAL
+  /// because a payload from an older desktop to the companion has no such
+  /// keys, and the list-row placeholder has no commit time to offer.
+  created_at?: string | null;
+  ready_at?: string | null;
+  last_commit_at?: string | null;
   body: string;
   author: string;
   repo: string;
@@ -589,6 +635,11 @@ export interface PrDetail {
   /// click can tell GitHub which commit the user was looking at.
   head_oid: string;
   head_ref_id: string | null;
+  /// Where the head branch lives, `owner/name` (#1451): the fork for a
+  /// fork's pull request, null once the fork is deleted. Optional because
+  /// the seeded placeholder does not carry it -- the list query does not
+  /// select it -- and absent must not be read as "same repository".
+  head_repo?: string | null;
   base_ref: string;
   merge_status: string;
   review: string;
@@ -663,6 +714,49 @@ export interface PrDetail {
   /// mid-fetch, so a total BELOW the length is possible and is not a
   /// negative shortfall.
   checks_total: number;
+  /// Where this pull request sits in a stack, asked of GitHub directly
+  /// (#1452) rather than inferred from the rows on screen.
+  ///
+  /// OPTIONAL because the detail view is seeded from a list row before the
+  /// fetch lands, and the row cannot know: absent means NOT ASKED YET, which
+  /// is neither "unknown" (asked, could not tell) nor "none" (not stacked).
+  stack?: PrStack;
+}
+
+/// A pull request's place in a stack; see `PrStack` in `github/model.rs`.
+///
+/// `native` is GitHub's own stack (`gh stack`), whose numbers are exact and
+/// which GitHub merges only through its stack merge. Otherwise the stack is
+/// the base chain, walked a bounded distance each way: `position_exact` /
+/// `size_exact` false means the walk stopped early and the number is a
+/// FLOOR, to be rendered with "at least".
+export type PrStack =
+  | { kind: "unknown" }
+  | { kind: "none" }
+  | {
+      kind: "stacked";
+      native: boolean;
+      stack_number: number | null;
+      /// 1 is the pull request closest to the trunk.
+      position: number;
+      size: number;
+      position_exact: boolean;
+      size_exact: boolean;
+      /// The open pull request directly beneath this one, when known.
+      below: number | null;
+      /// A native stack's entries, bottom first (#1468); empty otherwise.
+      members?: StackMember[];
+      /// True when `members` is GitHub's whole list.
+      members_complete?: boolean;
+    };
+
+/// One entry of a native stack (#1468).
+export interface StackMember {
+  position: number;
+  number: number;
+  title: string;
+  /// `open`, `merged` or `closed`.
+  state: string;
 }
 
 /// How an image's provenance was established. A recorded fact and a
@@ -1409,6 +1503,30 @@ type ClaudeSearchVerdict =
   | { kind: "none_yet"; indexed: number; total: number }
   | { kind: "not_asked" };
 
+/// What the desktop did to the transcript text in one answer before it
+/// crossed to a phone (#1488). Mirrors `remote::privacy::Masking`.
+///
+/// Present only on answers to a paired phone. The desktop's own window
+/// is never masked, so its answers carry none -- absence means "not
+/// masked by construction", not "nothing matched". Masked spans are
+/// `⟦hidden:<kind>⟧` markers in the text; `src/lib/masked.ts` splits them.
+export interface TranscriptMasking {
+  /// Spans replaced by a marker in this answer.
+  hidden: number;
+  /// Unmasked because the phone asked and this device may reveal.
+  revealed: boolean;
+  /// Whether asking to reveal would be honoured, so the button is only
+  /// offered when it can work.
+  reveal_allowed: boolean;
+  /// Transcript fields were set to `null` because this device may not
+  /// read transcripts: the text exists and was not sent.
+  withheld: boolean;
+  /// This answer's query was matched against the masked text (#1519):
+  /// text hidden as a likely secret was not searched. Optional because a
+  /// desktop from before #1519 does not send it.
+  matched_masked?: boolean;
+}
+
 /// A search result and the coverage that qualifies it, together.
 ///
 /// One object, deliberately: handing a caller the hits and making the
@@ -1417,6 +1535,8 @@ type ClaudeSearchVerdict =
 export interface ClaudeSearchAnswer {
   verdict: ClaudeSearchVerdict;
   coverage: ClaudeIndexCoverage;
+  /// On a phone's answer only. See `TranscriptMasking`.
+  masking?: TranscriptMasking;
 }
 
 /// A liveness exactly as it arrives on the wire, with its reason
@@ -1625,6 +1745,8 @@ export interface ClaudeAgentTypes {
 interface WireClaudeSession {
   session_id: string;
   name: string | null;
+  /// #1133. Optional for the reason `ClaudeSession.opening_prompt` is.
+  opening_prompt?: string | null;
   cwd: string | null;
   git_branch: string | null;
   last_activity_at: string | null;
@@ -1770,6 +1892,19 @@ export interface ClaudeSessionDetail {
   /// where the reason is shown, so it states one as fresh as the verdict
   /// it explains.
   liveness: Liveness;
+  /// Whether Stop's own check confirms, on this read, which process is
+  /// this session's (#1569).
+  ///
+  /// NOT implied by a `running` liveness: a session can read running from
+  /// a source Stop does not confirm a pid from, and the pane must not
+  /// offer a Stop that can only refuse. `false` on a running session
+  /// means "running, and stopping it from Headstate is not available".
+  ///
+  /// Optional so a cached detail from before this field existed, or a
+  /// desktop older than it answering the phone, deserialises. ABSENT is
+  /// "not reported", not `false`: the pane then offers the review as it
+  /// used to, and the stop's own re-check refuses truthfully if it must.
+  stoppable?: boolean;
   /// Whether the transcript file is still on disk (#919).
   ///
   /// A SEPARATE reading from `cwd_state`, never derived from it: 0% of
@@ -1850,9 +1985,16 @@ export interface ClaudeSessionDetail {
 /// `not_running`. It is "we could not establish the start time", and the
 /// stop is refused on it -- signalling on a guess is how an unrelated
 /// process that inherited the pid gets killed.
+///
+/// `running_unconfirmable` must never be collapsed into `not_running`
+/// either (#1569). The session IS running; Headstate declines to signal
+/// it because the process was not confirmed the way a stop requires.
+/// `runs_unreadable` is "we did not look", not "it is not running".
 type ClaudeStopRefusal =
   | { kind: "registry_unreadable"; why: string }
   | { kind: "not_running"; why: string }
+  | { kind: "running_unconfirmable"; pid: number }
+  | { kind: "runs_unreadable"; why: string }
   | { kind: "pid_reused"; pid: number; drift_secs: number }
   | { kind: "unconfirmable"; why: string }
   | { kind: "cap_reached"; cap: number };
@@ -2232,34 +2374,6 @@ export interface ClaudeCostState {
   has_unknown_model_cost: boolean;
 }
 
-/// One content block of a previewed message (#982).
-///
-/// A tagged union rather than a flattened string, because the kinds
-/// answer different questions and render differently: text is what was
-/// said, a tool call is what was done, and a tool result is usually far
-/// too long to show whole.
-export type ClaudePreviewBlock =
-  | { kind: "text"; text: string; truncated: boolean }
-  | { kind: "thinking"; text: string; truncated: boolean }
-  /// A tool call, with its arguments PARSED rather than discarded
-  /// (#1209). `id` is the key its result names.
-  | { kind: "tool_use"; name: string; id: string | null; args: ClaudeToolArgs }
-  | {
-      kind: "tool_result";
-      text: string;
-      truncated: boolean;
-      tool_use_id: string | null;
-      /// `null` when the record carried no `is_error` at all, which is
-      /// not the same as `false`.
-      is_error: boolean | null;
-      change: ClaudeFileChange | null;
-    }
-  /// A block kind this build does not know. Reported rather than
-  /// dropped: Claude Code owns this format, and a pane that silently
-  /// omitted a future kind would show an exchange with an invisible hole
-  /// in it.
-  | { kind: "other"; block_type: string };
-
 /// A tool call's arguments, as the shape that tool actually takes
 /// (#1209).
 ///
@@ -2294,6 +2408,33 @@ export type ClaudeToolArgs =
       prompt: string;
       truncated: boolean;
     }
+  /// The whole checklist, as the call set it (#1483).
+  | { tool: "todo_write"; todos: ClaudeTodo[]; todos_omitted: number }
+  | { tool: "web_fetch"; url: string; prompt: string; truncated: boolean }
+  | { tool: "web_search"; query: string; truncated: boolean }
+  /// One item added to the session's task list (#1504). The input has
+  /// no id: the id it was given is in the result's `task`.
+  | {
+      tool: "task_create";
+      subject: string;
+      description: string | null;
+      active_form: string | null;
+      truncated: boolean;
+    }
+  /// A change to one task (#1504). `status: null` is "not changed",
+  /// never "pending". `fields` names every key the call set, known or
+  /// not.
+  | {
+      tool: "task_update";
+      task_id: string | null;
+      status: string | null;
+      subject: string | null;
+      active_form: string | null;
+      fields: string[];
+      truncated: boolean;
+    }
+  | { tool: "task_get"; task_id: string | null }
+  | { tool: "task_list" }
   /// A tool whose shape this build does not know: its argument keys, so
   /// the reader can see Headstate is behind rather than that the call
   /// was empty.
@@ -2301,6 +2442,19 @@ export type ClaudeToolArgs =
   /// No `input` was recorded at all. DISTINCT from `other` with no keys
   /// -- absent is not zero.
   | { tool: "none" };
+
+/** @public */
+/// One item of a `TodoWrite` checklist. Mirrors
+/// `claude::preview::Todo`.
+///
+/// `status` is verbatim (`pending`, `in_progress`, `completed`) and
+/// `null` when the item carried none, which is not "pending".
+export interface ClaudeTodo {
+  content: string;
+  status: string | null;
+  active_form: string | null;
+  truncated: boolean;
+}
 
 interface ClaudeReplacement {
   old_string: string;
@@ -2313,7 +2467,6 @@ interface ClaudeReplacement {
 ///
 /// Not exported: reached only through `ClaudeFileChange`, and `yarn
 /// knip` is right that a second name for the same shape earns nothing.
-/// The same call `ClaudePreviewMessage` makes.
 ///
 /// `recorded` carries the file's surrounding lines as they actually
 /// were, from a `structuredPatch` the transcript wrote down.
@@ -2356,189 +2509,6 @@ type ClaudeDiffLine =
   | { op: "added"; text: string }
   | { op: "removed"; text: string };
 
-/// How a tool call and its result did or did not meet (#1209).
-///
-/// The three unmatched states do NOT mean the same thing, and the UI
-/// renders three different sentences for them. See `resolveOrphan`.
-export type ClaudePairing = "paired" | "call_above_window" | "unanswered" | "unkeyed";
-
-/// One previewed message.
-///
-/// Exported since #1208: `useClaudeTranscriptFollow` accumulates these
-/// across polls, so the conversation lives in a `ClaudePreviewMessage[]`
-/// of its own rather than only inside a `ClaudePreview`.
-/// `yarn knip` is right that a second name for the same shape earns
-/// nothing. The same call `ResumeCommand` above makes, and exporting it
-/// the moment something else needs it is one word.
-export interface ClaudePreviewMessage {
-  /// `"assistant"` or `"user"`.
-  role: string;
-  /// RFC 3339, or `null` for a record that carried none. Never
-  /// substituted: a fabricated time cannot be told from a real one.
-  timestamp: string | null;
-  model: string | null;
-  blocks: ClaudePreviewBlock[];
-}
-
-/// What the window could say about a session's worktree (#1206).
-///
-/// Not exported for the reason `ClaudePreviewMessage` is not: it is
-/// reached only through `ClaudeLifecycle.worktree`.
-///
-/// A TAGGED union, mirroring the Rust enum, because the three states
-/// must stay three states: `unknown` is "no record in the window", which
-/// is NOT a statement that the session is outside a worktree, while
-/// `not_in_worktree` is a measured negative (82% of real records). A
-/// renderer that treats them alike reports "unknown" for the 82% that
-/// are a definite answer.
-///
-/// `original_branch` and `original_head_commit` are the facts the
-/// path-based session-to-worktree join cannot recover once the directory
-/// is gone (#1137). Every field is nullable and none is substituted.
-type ClaudeWorktree =
-  | { state: "unknown" }
-  | { state: "not_in_worktree" }
-  | {
-      state: "in";
-      original_cwd: string | null;
-      worktree_path: string | null;
-      worktree_name: string | null;
-      worktree_branch: string | null;
-      original_branch: string | null;
-      original_head_commit: string | null;
-    };
-
-/// The prompt queue as a BALANCE, not a list (#1206).
-///
-/// Only ever reached through `ClaudeLifecycle.queue`, which is `null`
-/// when the read was truncated -- so a value of this shape always
-/// accounts for every operation in the file.
-interface ClaudeQueue {
-  enqueued: number;
-  dequeued: number;
-  /// Prompts taken off the queue WITHOUT running, by reason, VERBATIM.
-  /// `absorbed_mid_turn` is a prompt the user typed that never ran as
-  /// its own turn. Never bucketed into "other": a vocabulary that grew
-  /// is information.
-  removed: [string, number][];
-  /// `remove` records that named no reason -- not the same fact as any
-  /// named reason.
-  removed_unexplained: number;
-  /// Operations that are none of the three documented kinds, verbatim.
-  unknown_operations: [string, number][];
-}
-
-/// What the lifecycle records in the window said (#1206).
-///
-/// Every field is nullable, and in each case `null` means NOT OBSERVED,
-/// never zero and never a default. A renderer that substitutes a benign
-/// value for any of these is the #846 defect.
-///
-/// Not exported, for the reason `ClaudePreviewMessage` is not: it is
-/// reached only through `ClaudePreview.lifecycle`, and `yarn knip` is
-/// right that a second name for the same shape earns nothing. The
-/// surfaces that consume these records are separate issues; exporting it
-/// the moment one of them needs it is one word.
-interface ClaudeLifecycle {
-  /// `null` whenever the read was truncated, however many
-  /// `queue-operation` records the window held. The window cuts the
-  /// middle of things: an `enqueue` outside it whose `dequeue` is inside
-  /// gives a negative queue, and the reverse gives a phantom pending
-  /// prompt. Both are wrong answers that look right.
-  queue: ClaudeQueue | null;
-  /// The newest `permission-mode` value in the window, VERBATIM.
-  ///
-  /// `null` is the COMMON case -- the record is written on CHANGE, not
-  /// continuously, so a session that set its mode early and ran for
-  /// hours has it outside the window. It must render as absent, NEVER as
-  /// "ask every time", "auto" or any other default.
-  permission_mode: string | null;
-  /// Three-valued, and the middle value is the common one. See
-  /// `ClaudeWorktree`: `unknown` and `not_in_worktree` must never render
-  /// the same way.
-  worktree: ClaudeWorktree;
-}
-
-/// The tail of one transcript, as conversation (#982).
-///
-/// Rust side: `src-tauri/src/claude/preview.rs`, which argues the 256 KB
-/// window, the record-type allowlist, and why both are reported.
-export interface ClaudePreview {
-  /// Oldest first, so it reads as a conversation.
-  messages: ClaudePreviewMessage[];
-  /// Whether anything before these messages was NOT read. The pane must
-  /// say so: a reader who cannot tell a short conversation from a
-  /// truncated one has been told something false by omission (#846).
-  truncated: boolean;
-  bytes_read: number;
-  file_bytes: number;
-  /// Records in the window that were machinery rather than conversation.
-  /// 44.2% of real records are, so a pane showing six messages out of a
-  /// 300-record window has to say where the rest went.
-  non_conversation_records: number;
-  /// Lines in the window that would not parse at all. DISTINCT from the
-  /// count above: one is a record we understood and chose not to show,
-  /// the other is one we could not read.
-  unparseable_records: number;
-  /// What the lifecycle records in the window said (#1206). Read rather
-  /// than counted-and-dropped, and NOT included in
-  /// `non_conversation_records` -- that count means "we opened this and
-  /// threw it away", and these are no longer thrown away.
-  lifecycle: ClaudeLifecycle;
-  /// Every `tool_use_id` in the window and how it paired (#1209).
-  ///
-  /// A side table rather than a field on the block, because pairing is a
-  /// fact about the WINDOW: the same call is paired in a window that
-  /// reached its result and unanswered in one that stopped a line short.
-  pairings: Record<string, ClaudePairing>;
-  /// Calls in the window with no result in it. What a non-zero count
-  /// MEANS depends on whether the session is still running, which this
-  /// does not decide.
-  unanswered_calls: number;
-  /// Results whose call is older than the window. Non-zero is the normal
-  /// consequence of a tail read, not a defect.
-  results_above_window: number;
-}
-
-/// Where a follow left off, and what the file looked like there (#1208).
-///
-/// Opaque: the pane stores it and hands it straight back. Rust side:
-/// `preview::Cursor`, which argues every field.
-export interface ClaudeFollowCursor {
-  offset: number;
-  /// SHA256 of the bounded region BEHIND `offset`. This is how a
-  /// compaction that rewrote history without shrinking the file is
-  /// caught -- see `ClaudeFollow.reread`.
-  behind_digest: string;
-  behind_bytes: number;
-}
-
-/// Why a follow read replaced what the pane had instead of extending it.
-///
-/// Three distinct facts, and the pane must switch on this rather than
-/// infer from the message count. `"rewritten_behind"` is the case
-/// `handoff.rs` does not have: compaction rewrote history behind the
-/// cursor and the file did not shrink, so no length comparison catches
-/// it and an append would splice new content onto a history that no
-/// longer exists.
-export type ClaudeReread = "first" | "shrank" | "rewritten_behind";
-
-/// One incremental step of following a live transcript (#1208).
-export interface ClaudeFollow {
-  /// On an append, ONLY the new messages. On a re-read, a whole fresh
-  /// window. `reread` says which, and the caller must not guess.
-  preview: ClaudePreview;
-  /// `null` is the ordinary append.
-  reread: ClaudeReread | null;
-  cursor: ClaudeFollowCursor;
-  /// Transcript bytes read, excluding the fingerprint probe. `0` means
-  /// the file did not change -- the session is idle, which is a
-  /// different fact from the follow having stopped.
-  bytes_read: number;
-  fingerprint_bytes_read: number;
-  file_bytes: number;
-}
-
 /// The session list, INCLUDING what could not be read (#917).
 ///
 /// `registry_failure` is the reason this is a envelope rather than a
@@ -2557,6 +2527,15 @@ export interface ClaudeSessionList {
   /// Registry files that could not be parsed. Each one hides a session
   /// whose liveness cannot be stated.
   registry_unreadable: string[];
+  /// Claude Code processes running with no session record (#1315), one
+  /// line each ("pid N, running in <folder>"). No row can show them as
+  /// running, so the list is not complete while this is non-empty.
+  registry_unnamed: string[];
+  /// On a phone's answer only (#1488, #1485). `withheld` means every
+  /// `opening_prompt` was set to `null` because this phone may not read
+  /// transcripts: a null prompt then says nothing about the session.
+  /// Carried through `hydrateClaudeSessions` so the list can say so.
+  masking?: TranscriptMasking;
 }
 
 /// The session list exactly as it arrives, before the reasons are
@@ -2571,13 +2550,17 @@ export interface WireClaudeSessionList {
   reasons: string[];
   registry_failure: string | null;
   registry_unreadable: string[];
+  registry_unnamed: string[];
+  /// On a phone's answer only. See `TranscriptMasking`.
+  masking?: TranscriptMasking;
 }
 
 /// The headline figures on the Claude Code overview (#921).
 ///
 /// Every field is a COUNT over sessions Headstate has a row for. The
-/// three cwd states are mutually exclusive and sum with `running` to
-/// `sessions`, so a reader can check the page's arithmetic -- which is
+/// three cwd states are mutually exclusive and sum with `running` and
+/// `liveness_unknown` to `sessions`, so a reader can check the page's
+/// arithmetic -- which is
 /// the point of carrying `cwd_unknown` at all rather than folding it into
 /// the larger bucket.
 ///
@@ -2588,9 +2571,15 @@ export interface ClaudeCounts {
   /// hero number -- "1,461 sessions ever" answers nothing on its own,
   /// which is why #921's total-sessions tile is cut.
   sessions: number;
-  /// Running right now, derived from the live registry checked against
-  /// the process table. Trustworthy only while `live_failure` is null.
+  /// Running right now: the rows the session list calls `running`.
+  /// Trustworthy only while `live_failure` is null, and a floor while
+  /// `live_unreadable` or `live_unnamed` is non-empty.
   running: number;
+  /// Rows the session list could not call running or stopped (#1534).
+  /// In NO directory bucket: `resumable`, `archived` and `cwd_unknown` are
+  /// all "stopped, and ...", and offering Resume on a session that may be
+  /// alive starts a second copy of it.
+  liveness_unknown: number;
   /// Not running, and the recorded directory still exists.
   ///
   /// **The page's headline.** 248 of 1,461 on the development machine:
@@ -2709,6 +2698,10 @@ export interface ClaudeRestartList {
   /// Records present but unusable. Each hides a session that may be
   /// running, so the list is a floor.
   registry_unreadable: string[];
+  /// Sessions running with no session record (#1315). They cannot be
+  /// listed -- nothing names the session to resume -- so the list is a
+  /// floor while any exist.
+  registry_unnamed: string[];
 }
 
 /// Everything the Claude Code overview draws, plus what it could not
@@ -2743,6 +2736,11 @@ export interface ClaudeOverview {
   /// Registry records present but unusable. Each one hides a session that
   /// may be running, so a non-empty list makes `counts.running` a floor.
   live_unreadable: string[];
+  /// Claude Code processes running with no session record that nothing
+  /// could name (#1315, #1534), one line each. Also makes `counts.running`
+  /// a floor. A process a hook-recorded run names is counted in `running`
+  /// instead.
+  live_unnamed: string[];
 }
 
 /// One project's worth of reports.
@@ -2917,6 +2915,21 @@ export type BackfillPhase =
 export type BranchDeleteFrame =
   | { kind: "checking"; repo: string; done: number; total: number }
   | { kind: "deleting"; repo: string; done: number; total: number; failed: number };
+
+/// One `worktree-removal-progress` frame (#1544). Mirrors
+/// `commands::WorktreeRemovalFrame`.
+///
+/// No path: the event is forwarded to the phone. Frame `done` is the
+/// outcome of the `done - 1`th path the caller sent, so the caller
+/// that holds that ordered list can drop the row by index. `run` is the
+/// caller's own token echoed back; a frame whose `run` is not yours is
+/// another run's, and its index means nothing against your list.
+export interface WorktreeRemovalFrame {
+  run: number | null;
+  done: number;
+  total: number;
+  removed: boolean;
+}
 
 /// One moment of the machine's health, mirroring the Rust
 /// `health::Sample` in `src-tauri/src/health/mod.rs`.
@@ -3854,4 +3867,34 @@ export interface PluginsReport {
   /// and came from the cache.
   scanned: number;
   elapsed_ms: number;
+}
+
+/// The base branch's ruleset requirements, or why they are not known
+/// (#1451, #1454). Mirrors `github::gates::BaseRules`.
+///
+/// `read` with a requirement `false` means no RULESET asks for it -- NOT
+/// that nothing does: classic branch protection is invisible to the
+/// endpoint without admin. Nothing renders "not required" from it.
+type BaseRules =
+  | {
+      state: "read";
+      require_last_push_approval: boolean;
+      required_review_thread_resolution: boolean;
+    }
+  /// We did not ask (budget, or nothing to ask about).
+  | { state: "declined"; reason: string }
+  /// We asked and GitHub did not answer usably.
+  | { state: "unreadable"; reason: string };
+
+/// Who pushed the head commit. Mirrors `github::gates::LastPusher`.
+type LastPusher =
+  | { state: "known"; login: string }
+  /// Not looked up: no readable rule makes it matter.
+  | { state: "not_needed" }
+  | { state: "declined"; reason: string }
+  | { state: "unknown"; reason: string };
+
+export interface ReviewGates {
+  rules: BaseRules;
+  last_pusher: LastPusher;
 }

@@ -1,9 +1,7 @@
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   ClaudeImported,
-  ClaudePreview,
-  ClaudeReread,
   ClaudeSession,
   ClaudeSessionDetail,
   ClaudeSessionList,
@@ -11,12 +9,13 @@ import type {
   ClaudeUsage,
   ClaudeObservation,
   ClaudeSubagentRollup,
-  Liveness,
   Worktree,
   WorktreeRepo,
 } from "@/types/pr";
 import { useFilters } from "@/store/filters";
 import type { PrQueryState } from "@/api/hooks";
+import type { TranscriptMessage, TranscriptPage } from "@/types/transcript";
+import { liveOf } from "./transcript/fixtures";
 
 const copyFn = vi.hoisted(() => vi.fn(() => Promise.resolve(null as string | null)));
 const revealFn = vi.hoisted(() => vi.fn(() => Promise.resolve("/code/app")));
@@ -75,25 +74,6 @@ const state = vi.hoisted(() => ({
   /// the fixture keeps them apart rather than using one value for both.
   events: undefined as ClaudeObservation | undefined,
   eventsFailed: false,
-  /// What `useClaudeTranscriptTail` returns (#982), on the same
-  /// three-way split and for the same reason.
-  preview: undefined as ClaudePreview | undefined,
-  previewFailed: false,
-  /// Every path `useClaudeTranscriptTail` was asked for while `enabled`
-  /// was false, so the "behind a disclosure" property is testable: the
-  /// preview costs a 256 KB read over the pairing transport and must not
-  /// happen on selection.
-  previewEnabledFor: [] as (string | null)[],
-  /// #1208. THREE states, never two: "following", "idle" (we read and
-  /// the session wrote nothing) and "stopped" (we are not reading). The
-  /// fixture keeps them apart because collapsing two of them is the
-  /// exact #846/#1042 defect the pane must not have.
-  following: "following" as "following" | "idle" | "stopped",
-  /// When the follow last heard from disk, epoch ms. `0` is "never yet".
-  lastReadAt: 0,
-  /// The last read that REPLACED history rather than extending it.
-  /// `null` is the ordinary append.
-  reread: null as { why: ClaudeReread; at: number } | null,
   /// What `useClaudeSessionDetail` returns (#985), keyed by session id.
   ///
   /// A MAP rather than one value, because the split made "the detail for
@@ -115,19 +95,32 @@ const state = vi.hoisted(() => ({
   /// real hook returns.
   ///
   /// The state is set whole rather than derived from a flag, because the
-  /// whole feature is that these five do not collapse into one another:
-  /// `done` with no links ("we asked, nothing is recorded"), `failed`
-  /// ("the database did not answer") and `unresolved` ("we could not
-  /// tell which repository, so we never asked") are three different
-  /// sentences, and a fixture with one boolean could not express the
-  /// difference well enough to test it.
+  /// whole feature is that these do not collapse into one another:
+  /// `done` with no links ("we asked, nothing is recorded") and `failed`
+  /// ("the database did not answer") are different sentences, and a
+  /// fixture with one boolean could not express the difference well
+  /// enough to test it.
   prQuery: { state: "off" } as PrQueryState,
   /// Every query string the lookup hook was handed, so a test can assert
   /// that ordinary prose never reaches it.
   prQueriesSeen: [] as string[],
+  /// What `useClaudeTranscriptLive` has read (#1476): `undefined` is
+  /// still reading, `transcriptFailed` the rejection.
+  transcript: undefined as TranscriptPage | undefined,
+  transcriptFailed: false,
+  /// Every path the viewer's read was ENABLED for, so a test can assert
+  /// it is not paid for on selection.
+  transcriptAskedFor: [] as (string | null)[],
+  /// The sessions `useSessionActivity` says the desktop saw writing just
+  /// now (#1477), for the rows' "active now" badge.
+  activeNow: new Set<string>(),
+  /// The `sessionId` each transcript follow was given, so a test can
+  /// assert the open session's nudges reach its follow.
+  transcriptSessionIds: [] as (string | null | undefined)[],
 }));
 
 vi.mock("../api/hooks", () => ({
+  useSessionActivity: () => state.activeNow,
   // Empty by default, which is what every assertion in this file about
   // "Copy resume command" assumes (#1126). Set per-test to reach the
   // launch path.
@@ -210,42 +203,46 @@ vi.mock("../api/hooks", () => ({
     state.prQueriesSeen.push(query);
     return state.prQuery;
   },
-  // #982, now a FOLLOW (#1208). Records what it was asked for and whether
-  // the disclosure was open, so a test can assert the read does not
-  // happen on selection.
-  //
-  // The fixture keeps `preview` as the shape #982 used and derives the
-  // follow's flattened return from it, so the pre-existing content tests
-  // still pin what they always pinned. `following`, `lastReadAt` and
-  // `reread` are the new surface and have their own fixtures.
-  useClaudeTranscriptFollow: (path: string | null, enabled: boolean) => {
-    if (enabled) state.previewEnabledFor.push(path);
-    const pv = state.preview;
-    return {
-      messages: pv?.messages ?? [],
-      following: state.following,
-      lastReadAt: state.lastReadAt,
-      reread: state.reread,
-      window:
-        pv === undefined
-          ? null
-          : {
-              truncated: pv.truncated,
-              file_bytes: pv.file_bytes,
-              bytes_read: pv.bytes_read,
-              non_conversation_records: pv.non_conversation_records,
-              unparseable_records: pv.unparseable_records,
-            },
-      pairings: pv?.pairings ?? {},
-      isError: state.previewFailed,
-      error: state.previewFailed ? "Permission denied" : undefined,
-      isLoading: enabled && !state.previewFailed && pv === undefined,
-      pollMs: 3_000,
-    };
+  // The viewer's live, paged data (#1476).
+  useClaudeTranscriptLive: (
+    path: string | null,
+    options: { enabled?: boolean; sessionId?: string | null },
+  ) => {
+    if (options.enabled ?? true) state.transcriptAskedFor.push(path);
+    state.transcriptSessionIds.push(options.sessionId);
+    return liveOf(state.transcript, state.transcriptFailed ? "Permission denied" : undefined);
   },
 }));
 vi.mock("sonner", () => ({ toast: { success: toastSuccess, error: toastError } }));
 vi.mock("../lib/clipboard", () => ({ copyText: copyFn }));
+/// The phone's per-session mute (#1486), which the phone-build describes
+/// below render. The companion's own command, so stubbed rather than
+/// reached through a transport.
+vi.mock("@/api/phoneNotify", () => ({
+  useSessionMute: () => ({ muted: false, set: () => Promise.resolve(), loaded: true }),
+}));
+/// Which build the page thinks it is, switchable per describe (#1480).
+/// The phone build's transcript pane has its own describe below
+/// (#1514): a getter, read on every access, rather than the constant the
+/// real module folds to. Everything else in this file stays the desktop.
+const target = vi.hoisted(() => ({ mobile: false }));
+vi.mock("@/lib/target", () => ({
+  get IS_MOBILE_BUILD() {
+    return target.mobile;
+  },
+  get IS_DESKTOP_BUILD() {
+    return !target.mobile;
+  },
+}));
+/// Run a describe's tests as the phone build.
+function asThePhoneBuild() {
+  beforeEach(() => {
+    target.mobile = true;
+  });
+  afterEach(() => {
+    target.mobile = false;
+  });
+}
 /// The #1214 additions: the vocabulary Rust admits and the argv it
 /// would spawn, both served rather than listed in TypeScript.
 const launchTerms = vi.hoisted(() =>
@@ -393,6 +390,9 @@ const session = (over: Partial<WholeSession> = {}): ClaudeSession => {
     // agree; here they are one value so that a UI test cannot
     // accidentally depend on them differing.
     liveness: w.liveness,
+    // #1569. Absent unless a test says otherwise: "not reported", which
+    // renders as the pane always did.
+    stoppable: w.stoppable,
     transcript_state: w.transcript_state,
     resume: w.resume,
     runs: w.runs,
@@ -445,6 +445,7 @@ const listOf = (
   sessions,
   registry_failure: null,
   registry_unreadable: [],
+  registry_unnamed: [],
   ...over,
 });
 
@@ -511,46 +512,6 @@ const costState = (over: Partial<ClaudeCostState> = {}): ClaudeCostState => ({
   ...over,
 });
 
-/// One transcript tail (#982).
-const preview = (over: Partial<ClaudePreview> = {}): ClaudePreview => ({
-  messages: [
-    {
-      role: "user",
-      timestamp: "2026-09-13T11:00:00Z",
-      model: null,
-      blocks: [{ kind: "text", text: "run the tests", truncated: false }],
-    },
-    {
-      role: "assistant",
-      timestamp: "2026-09-13T11:00:05Z",
-      model: "claude-opus-5",
-      blocks: [
-        { kind: "text", text: "Running them now.", truncated: false },
-        {
-          kind: "tool_use",
-          name: "Bash",
-          id: "toolu_base",
-          args: { tool: "bash", command: "cargo test", description: null, truncated: false },
-        },
-      ],
-    },
-  ],
-  truncated: false,
-  bytes_read: 183_237,
-  file_bytes: 183_237,
-  non_conversation_records: 0,
-  unparseable_records: 0,
-  lifecycle: {
-    queue: null,
-    permission_mode: null,
-    worktree: { state: "unknown" },
-  },
-  pairings: { toolu_base: "unanswered" },
-  unanswered_calls: 1,
-  results_above_window: 0,
-  ...over,
-});
-
 beforeEach(() => {
   // BEFORE `session()` below, which repopulates it: a detail left over
   // from a previous test would answer for an id this one never defined,
@@ -580,21 +541,16 @@ beforeEach(() => {
   // cannot answer for a session this one never described.
   proposeFn.mockReset();
   stopFn.mockReset();
-  state.preview = preview();
-  state.previewFailed = false;
-  state.previewEnabledFor = [];
   // #1280. `off` is the honest default: almost nothing typed into this
   // box is a pull request reference, so the lookup is idle for every
   // test that does not set it.
   state.prQuery = { state: "off" };
   state.prQueriesSeen = [];
-  // #1208. A FOLLOWING follow that has read once, by default: the state
-  // the pane is in for the overwhelming majority of the tests below, and
-  // an explicit default so a test that cares about "idle" or "stopped"
-  // has to say so rather than inherit it.
-  state.following = "following";
-  state.lastReadAt = Date.UTC(2026, 0, 1, 12, 4, 31);
-  state.reread = null;
+  state.transcript = undefined;
+  state.transcriptFailed = false;
+  state.transcriptAskedFor = [];
+  state.activeNow = new Set();
+  state.transcriptSessionIds = [];
   // A LOADED, empty listing by default -- not `undefined`. `undefined`
   // means "still loading or unreadable", and leaving it there would make
   // every unrelated test render the wrong one of the #920 section's three
@@ -622,6 +578,8 @@ beforeEach(() => {
     claudeSelected: undefined,
     claudeFilter: "all",
     claudeShowSubagents: false,
+    claudeSessionTab: "details",
+    claudeTranscriptAt: "latest",
   });
   copyFn.mockClear();
   revealFn.mockClear();
@@ -950,6 +908,45 @@ describe("liveness renders as three states, not two", () => {
   });
 });
 
+/// #1477: other sessions' nudges only mark their rows; they never read.
+describe("the list's active-now badge (#1477)", () => {
+  it("marks a running session the desktop saw writing, and no other row", () => {
+    state.list = listOf([
+      session({
+        session_id: "writing",
+        name: "Writing now",
+        liveness: { state: "running", pid: 7, status: "busy" },
+      }),
+      session({
+        session_id: "quiet",
+        name: "Running and quiet",
+        liveness: { state: "running", pid: 8, status: "idle" },
+      }),
+    ]);
+    state.activeNow = new Set(["writing"]);
+    renderView();
+    const badges = screen.getAllByTestId("active-now");
+    expect(badges).toHaveLength(1);
+    expect(badges[0].closest("button")?.getAttribute("aria-label")).toBe("Writing now");
+  });
+
+  /// A nudge beside "Not running" would contradict the row: the verdict
+  /// wins until the next poll.
+  it("is not drawn beside a verdict that is not Running", () => {
+    state.list = listOf([
+      session({ session_id: "stale", name: "Stale verdict" }),
+      session({
+        session_id: "unknown",
+        name: "Could not tell",
+        liveness: { state: "unknown", why: "registry unreadable" },
+      }),
+    ]);
+    state.activeNow = new Set(["stale", "unknown"]);
+    renderView();
+    expect(screen.queryByTestId("active-now")).toBeNull();
+  });
+});
+
 describe("the resume command carries the cwd that makes it work", () => {
   it("offers the cd-prefixed command with no caveat when the directory exists", () => {
     renderView();
@@ -1051,7 +1048,11 @@ describe("the resume command carries the cwd that makes it work", () => {
       state.terminal = "open -a Terminal {command}";
       renderView();
       open("HeadState GitHub issues filing");
-      fireEvent.change(await screen.findByLabelText(/model/i), {
+      // The select renders before the served vocabulary arrives, with
+      // only its empty option; a change to "sonnet" in that window is a
+      // no-op and the launch carries no model. Wait for the option.
+      await screen.findByRole("option", { name: "sonnet" });
+      fireEvent.change(screen.getByLabelText(/model/i), {
         target: { value: "sonnet" },
       });
       fireEvent.click(screen.getByRole("button", { name: /resume in terminal/i }));
@@ -1227,6 +1228,30 @@ describe("absent is not zero", () => {
     });
     renderView();
     expect(screen.getByText(/1 live-session record could not be read/i)).toBeTruthy();
+  });
+
+  /// A session running with no record naming it is stated, with its
+  /// pid and folder, above rows that still render (#1315). Without this
+  /// the list reads as complete while a session runs on no row.
+  it("names a running session that no row can show", () => {
+    state.list = listOf([session()], {
+      registry_unnamed: ["pid 4242, running in /Users/acme/code/widget"],
+    });
+    renderView();
+    expect(
+      screen.getByText(/a claude code session is running that is not matched to any row below/i),
+    ).toBeTruthy();
+    expect(screen.getByText(/same folder read as .could not tell./i)).toBeTruthy();
+    expect(screen.getByText("pid 4242, running in /Users/acme/code/widget")).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: /HeadState GitHub/i }).length).toBeGreaterThan(0);
+  });
+
+  /// And says nothing when there is none: a banner that always showed
+  /// would teach the reader to ignore it.
+  it("says nothing about unmatched sessions when there are none", () => {
+    state.list = listOf([session()]);
+    renderView();
+    expect(screen.queryByText(/not matched to any row below/i)).toBeNull();
   });
 
   /// A partial rescan says how much is missing, above a list that still
@@ -1982,6 +2007,38 @@ describe("filtering the session list by state", () => {
     // But the four genuinely dead ones ARE there, so this is a real
     // narrowing and not an empty chip.
     expect(rowNames().length).toBe(4);
+  });
+
+  /// **#1534.** A row this list could not tell about is not Resumable,
+  /// even when its directory exists.
+  ///
+  /// The overview's "Ready to resume" and its Resumable tile count only
+  /// rows the list calls `dead`, and the tile opens this chip, so the chip
+  /// must agree -- a Resume offered on a session that may be running
+  /// starts a second copy of it. SABOTAGE: restoring `!== "running"` in
+  /// the Resumable arm of `matchesClaudeFilter` puts Kite in the chip.
+  it("does not offer a row whose liveness could not be established as resumable", () => {
+    state.list = listOf([
+      session({
+        session_id: "r-1",
+        name: "Kestrel",
+        cwd_state: { state: "exists" },
+        liveness: { state: "dead", why: "pid 1 is no longer running" },
+      }),
+      session({
+        session_id: "hedged-1",
+        name: "Kite",
+        cwd_state: { state: "exists" },
+        liveness: { state: "unknown", why: "pid 5151 could be this one" },
+      }),
+    ]);
+    renderView();
+
+    const group = screen.getByRole("group", { name: /filter sessions by state/i });
+    expect(within(group).getByRole("button", { name: /^Resumable 1/i })).toBeTruthy();
+    fireEvent.click(chip("Resumable"));
+    expect(screen.queryByRole("button", { name: /Kite/i })).toBeNull();
+    expect(screen.getByRole("button", { name: /Kestrel/i })).toBeTruthy();
   });
 
   /// The chip and the search box COMPOSE, and the count line says which
@@ -2909,726 +2966,6 @@ describe("what Claude Code recorded a session cost", () => {
   });
 });
 
-/// #982. Reading a transcript in the app.
-describe("reading a transcript rather than revealing it", () => {
-  /// Behind a disclosure, and the read does NOT start on selection: a
-  /// 256 KB read per row, over the pairing transport on the phone, for a
-  /// pane the user may not want.
-  ///
-  /// **The sabotage test for the gate.** Pass `true` instead of `open` to
-  /// `useClaudeTranscriptTail` and this fails on the first assertion.
-  it("does not read the transcript until asked", () => {
-    renderView();
-    open("HeadState GitHub issues filing");
-    expect(state.previewEnabledFor).toEqual([]);
-    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
-    expect(state.previewEnabledFor).toContain(
-      "/Users/acme/.claude/projects/slug/e5dff3bd.jsonl",
-    );
-  });
-
-  /// The four block kinds, four renderings. A renderer that assumed text
-  /// would show nothing for the 12,903 of 13,425 assistant messages that
-  /// stop on `tool_use`.
-  it("renders text, thinking, a tool call and a tool result each as itself", () => {
-    state.preview = preview({
-      messages: [
-        {
-          role: "assistant",
-          timestamp: "2026-09-13T11:00:05Z",
-          model: "claude-opus-5",
-          blocks: [
-            { kind: "text", text: "Looking now.", truncated: false },
-            { kind: "thinking", text: "weighing it up", truncated: false },
-            {
-              kind: "tool_use",
-              name: "Bash",
-              id: "toolu_1",
-              args: {
-                tool: "bash",
-                command: "cargo test",
-                description: null,
-                truncated: false,
-              },
-            },
-            {
-              kind: "tool_result",
-              text: "3 tests passed",
-              truncated: false,
-              tool_use_id: "toolu_1",
-              is_error: false,
-              change: null,
-            },
-          ],
-        },
-      ],
-    });
-    renderView();
-    open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
-    expect(screen.getByText("Looking now.")).toBeTruthy();
-    expect(screen.getByText("weighing it up")).toBeTruthy();
-    // The name AND the parsed arguments (#1209). "Ran Bash" and "ran
-    // `cargo test`" are not the same sentence, and the second is the one
-    // that stops a user leaving for a terminal.
-    expect(screen.getByText("Bash")).toBeTruthy();
-    expect(screen.getByText(/cargo test/)).toBeTruthy();
-    expect(screen.getByText(/3 tests passed/)).toBeTruthy();
-  });
-
-  // -----------------------------------------------------------------
-  // Tool pairing, arguments and diffs (#1209).
-  // -----------------------------------------------------------------
-
-  /// A helper for a transcript whose one call never got a result.
-  ///
-  /// The three orphan cases below differ ONLY in the session's liveness,
-  /// so the transcript is held constant and the liveness varied. That is
-  /// the claim under test: one recorded fact, three meanings, and the
-  /// meaning comes from `liveness.rs` rather than from the transcript.
-  const unansweredCall = () =>
-    preview({
-      messages: [
-        {
-          role: "assistant",
-          timestamp: "2026-09-13T11:00:05Z",
-          model: "claude-opus-5",
-          blocks: [
-            {
-              kind: "tool_use",
-              name: "Bash",
-              id: "toolu_open",
-              args: {
-                tool: "bash",
-                command: "cargo test --all",
-                description: null,
-                truncated: false,
-              },
-            },
-          ],
-        },
-      ],
-      pairings: { toolu_open: "unanswered" },
-      unanswered_calls: 1,
-    });
-
-  /// Orphan case 2 of 3: a call with no result on a RUNNING session.
-  ///
-  /// Nothing is wrong. The result has not been written yet.
-  it("says an unanswered call on a running session is still executing", () => {
-    state.list = listOf([
-      session({ liveness: { state: "running", pid: 14779, status: "busy" } }),
-    ]);
-    state.preview = unansweredCall();
-    renderView();
-    open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
-    expect(screen.getByText(/still running, so the call may still be executing/i)).toBeTruthy();
-    // And emphatically NOT the crash wording, which would report a
-    // healthy session as a dead one.
-    expect(screen.queryByText(/did not come back/i)).toBeNull();
-  });
-
-  /// Orphan case 3 of 3: a call with no result on a DEAD session.
-  ///
-  /// This is the signature of a crash mid tool call, and it is real
-  /// information -- it says WHERE the session died, which is exactly what
-  /// a user about to resume it wants. Rendering it the same as case 2
-  /// throws away the only one of the two worth surfacing.
-  it("says an unanswered call on a dead session never came back", () => {
-    state.list = listOf([
-      session({ liveness: { state: "dead", why: "pid 14779 is no longer running" } }),
-    ]);
-    state.preview = unansweredCall();
-    renderView();
-    open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
-    expect(screen.getByText(/no result was recorded.*did not come back/i)).toBeTruthy();
-    expect(screen.queryByText(/may still be executing/i)).toBeNull();
-  });
-
-  /// And the tri-state's third arm, which is not a shade of dead.
-  ///
-  /// A check that could not be completed must not report a crash: the
-  /// session may be alive and mid-work. `Liveness`'s own rule, applied
-  /// where it is rendered.
-  it("does not call an unanswered call a crash when liveness is unknown", () => {
-    state.list = listOf([
-      session({
-        liveness: { state: "unknown", why: "could not read the live session registry" },
-      }),
-    ]);
-    state.preview = unansweredCall();
-    renderView();
-    open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
-    expect(
-      screen.getByText(/whether the call is still running could not be determined/i),
-    ).toBeTruthy();
-    expect(screen.queryByText(/did not come back/i)).toBeNull();
-    expect(screen.queryByText(/may still be executing/i)).toBeNull();
-  });
-
-  /// Orphan case 1 of 3: a result whose call is above the window.
-  ///
-  /// The 256 KB tail cut between the call and its result. Nothing is
-  /// wrong with the session at all, so this must read as a fact about the
-  /// WINDOW and not about the session -- and in particular must not wear
-  /// either of the two call-side wordings.
-  it("says an orphan result's call is above the window, not that it is missing", () => {
-    state.preview = preview({
-      messages: [
-        {
-          role: "user",
-          timestamp: "2026-09-13T11:00:05Z",
-          model: null,
-          blocks: [
-            {
-              kind: "tool_result",
-              text: "output with nothing that asked for it",
-              truncated: false,
-              tool_use_id: "toolu_gone",
-              is_error: null,
-              change: null,
-            },
-          ],
-        },
-      ],
-      pairings: { toolu_gone: "call_above_window" },
-      unanswered_calls: 0,
-      results_above_window: 1,
-    });
-    renderView();
-    open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
-    expect(screen.getByText(/the call this answers is above the window/i)).toBeTruthy();
-    // The distinction that makes the feature worth having: this is not
-    // the crash case and not the in-flight case.
-    expect(screen.queryByText(/did not come back/i)).toBeNull();
-    expect(screen.queryByText(/may still be executing/i)).toBeNull();
-  });
-
-  /// All three orphan cases produce DIFFERENT sentences.
-  ///
-  /// Asserted as one claim as well as three, because the failure this
-  /// guards against is collapse: a refactor that routed two of them
-  /// through one message would leave each individual test above passing
-  /// on a substring while the distinction was gone.
-  it("gives each of the three orphan cases its own distinct message", () => {
-    const said = (liveness: Liveness, view: ClaudePreview) => {
-      state.list = listOf([session({ liveness })]);
-      state.preview = view;
-      const { unmount } = renderView();
-      open("HeadState GitHub issues filing");
-      fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
-      // Read through `screen`, not the render's own `container`:
-      // `renderView` mounts into the shared document body and `open`
-      // queries it globally, so a per-render container can lag the pane
-      // these assertions are actually about.
-      const text = document.body.textContent ?? "";
-      unmount();
-      cleanup();
-      return text;
-    };
-
-    const aboveWindow = said(
-      { state: "dead", why: "pid 1 is no longer running" },
-      preview({
-        messages: [
-          {
-            role: "user",
-            timestamp: "2026-09-13T11:00:05Z",
-            model: null,
-            blocks: [
-              {
-                kind: "tool_result",
-                text: "orphan output",
-                truncated: false,
-                tool_use_id: "toolu_gone",
-                is_error: null,
-                change: null,
-              },
-            ],
-          },
-        ],
-        pairings: { toolu_gone: "call_above_window" },
-        results_above_window: 1,
-      }),
-    );
-    const stillRunning = said(
-      { state: "running", pid: 14779, status: "busy" },
-      unansweredCall(),
-    );
-    const neverCameBack = said(
-      { state: "dead", why: "pid 14779 is no longer running" },
-      unansweredCall(),
-    );
-
-    // Three panes, three different sentences. Pairwise, because
-    // "at least two differ" would pass with two of the three collapsed.
-    expect(aboveWindow).not.toEqual(stillRunning);
-    expect(stillRunning).not.toEqual(neverCameBack);
-    expect(aboveWindow).not.toEqual(neverCameBack);
-    expect(aboveWindow).toMatch(/above the window/i);
-    expect(stillRunning).toMatch(/still be executing/i);
-    expect(neverCameBack).toMatch(/did not come back/i);
-  });
-
-  /// A recorded diff and a reconstructed one are LABELLED differently.
-  ///
-  /// The substance of the diff half of #1209. A diff built from content
-  /// the transcript wrote down shows the surrounding lines as the file
-  /// actually was; one reconstructed from `old_string`/`new_string` has
-  /// no context at all. Rendering both as "a diff" tells the reader the
-  /// second has context it does not have.
-  it("labels a recorded diff differently from a reconstructed one", () => {
-    state.preview = preview({
-      messages: [
-        {
-          role: "user",
-          timestamp: "2026-09-13T11:00:05Z",
-          model: null,
-          blocks: [
-            {
-              kind: "tool_result",
-              text: "ok",
-              truncated: false,
-              tool_use_id: "t1",
-              is_error: false,
-              change: {
-                file_path: "/a.rs",
-                source: "recorded",
-                hunks: [
-                  {
-                    old_start: 10,
-                    new_start: 10,
-                    lines: [
-                      { op: "context", text: "fn main() {" },
-                      { op: "removed", text: "  let x = 1;" },
-                      { op: "added", text: "  let x = 2;" },
-                    ],
-                    lines_omitted: 0,
-                  },
-                ],
-                hunks_omitted: 0,
-                created: false,
-              },
-            },
-            {
-              kind: "tool_result",
-              text: "ok",
-              truncated: false,
-              tool_use_id: "t2",
-              is_error: false,
-              change: {
-                file_path: "/b.rs",
-                source: "reconstructed",
-                hunks: [
-                  {
-                    old_start: null,
-                    new_start: null,
-                    lines: [
-                      { op: "removed", text: "let y = 1;" },
-                      { op: "added", text: "let y = 2;" },
-                    ],
-                    lines_omitted: 0,
-                  },
-                ],
-                hunks_omitted: 0,
-                created: null,
-              },
-            },
-          ],
-        },
-      ],
-      pairings: { t1: "call_above_window", t2: "call_above_window" },
-      results_above_window: 2,
-    });
-    renderView();
-    open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
-
-    // The recorded one says its context is real.
-    expect(
-      screen.getByText(/recorded at the time, so the surrounding lines are the file as it was/i),
-    ).toBeTruthy();
-    // The reconstructed one says it has none -- and says WHY, so the
-    // reader does not read the absence as "nothing else changed".
-    expect(
-      screen.getByText(/reconstructed from the replaced text alone.*no surrounding lines/i),
-    ).toBeTruthy();
-    // And the forbidden third construction leaves no trace: nothing
-    // claims to have read the file as it is now.
-    expect(screen.queryByText(/current contents/i)).toBeNull();
-  });
-
-  /// A clipped diff says so, PER HUNK.
-  ///
-  /// Two hunks, one clipped and one not. A single pane-level notice would
-  /// pass a test that only looked for the words; it would not tell the
-  /// reader which of the two regions is short, and the reader would read
-  /// the intact hunk as complete either way.
-  it("says which hunk was clipped rather than warning once for the pane", () => {
-    state.preview = preview({
-      messages: [
-        {
-          role: "user",
-          timestamp: "2026-09-13T11:00:05Z",
-          model: null,
-          blocks: [
-            {
-              kind: "tool_result",
-              text: "ok",
-              truncated: false,
-              tool_use_id: "t1",
-              is_error: false,
-              change: {
-                file_path: "/big.rs",
-                source: "recorded",
-                hunks: [
-                  {
-                    old_start: 1,
-                    new_start: 1,
-                    lines: [{ op: "added", text: "one of many" }],
-                    lines_omitted: 40,
-                  },
-                  {
-                    old_start: 900,
-                    new_start: 900,
-                    lines: [{ op: "added", text: "all of it" }],
-                    lines_omitted: 0,
-                  },
-                ],
-                hunks_omitted: 3,
-                created: false,
-              },
-            },
-          ],
-        },
-      ],
-      pairings: { t1: "call_above_window" },
-      results_above_window: 1,
-    });
-    renderView();
-    open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
-
-    // The clipped hunk says how much is missing.
-    expect(screen.getAllByText(/40 more lines in this hunk are not shown/i)).toHaveLength(1);
-    // And EXACTLY ONE hunk carries a clip notice at all. Counting every
-    // notice, not only the one with the right number, is what makes this
-    // a per-hunk claim: a notice hoisted to the pane and repeated under
-    // each hunk still renders the right sentence under the clipped one,
-    // and would pass a test that only looked for that sentence. It
-    // renders "0 more lines … are not shown" under the intact one, which
-    // is a false statement about a hunk that is complete.
-    expect(screen.getAllByText(/more lines? in this hunk are not shown/i)).toHaveLength(1);
-    // And the whole-file omission is its own separate statement, because
-    // "this hunk is short" and "three regions are missing entirely" are
-    // different facts.
-    expect(
-      screen.getByText(/3 more changed regions in this file are not shown/i),
-    ).toBeTruthy();
-  });
-
-  /// A tool this build does not know reports its KEYS.
-  ///
-  /// `Block::Other`'s guarantee, one level down: not dropped (a call with
-  /// an invisible hole in it) and not dumped (the 40 KB blob the original
-  /// reasoning was right to refuse).
-  it("names an unknown tool's argument keys without showing their values", () => {
-    state.preview = preview({
-      messages: [
-        {
-          role: "assistant",
-          timestamp: "2026-09-13T11:00:05Z",
-          model: "claude-opus-5",
-          blocks: [
-            {
-              kind: "tool_use",
-              name: "mcp__enclave__enclave_sql",
-              id: "tm",
-              args: { tool: "other", keys: ["enclave", "query"] },
-            },
-          ],
-        },
-      ],
-      pairings: { tm: "paired" },
-      unanswered_calls: 0,
-    });
-    renderView();
-    open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
-    expect(screen.getByText(/does not know how to show/i)).toBeTruthy();
-    expect(screen.getByText(/enclave, query/)).toBeTruthy();
-  });
-
-  /// **The sabotage test for the truncation label.** Delete the
-  /// `data.truncated` branch and this fails. A pane that silently showed
-  /// a tail is #846 in its purest form: the reader cannot tell a short
-  /// conversation from a truncated one, and #910's own design asked for
-  /// "a 'showing the last N lines of a large file' label".
-  it("says it is showing a tail, and of how large a file", () => {
-    state.preview = preview({
-      truncated: true,
-      bytes_read: 262_144,
-      file_bytes: 76_740_099,
-    });
-    renderView();
-    open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
-    expect(screen.getByText(/the last 2 messages/i)).toBeTruthy();
-    expect(screen.getByText(/of a 73\.2 MB transcript/i)).toBeTruthy();
-    expect(screen.getByText(/earlier exchanges are not shown/i)).toBeTruthy();
-  });
-
-  /// The happy-path pair: a transcript read whole says so, rather than
-  /// wearing a tail label it has not earned. 97.4% of the corpus is under
-  /// 1 MB, so this is the common case.
-  it("says it is showing everything when it read the whole file", () => {
-    renderView();
-    open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
-    expect(screen.getByText(/all 2 messages in this transcript/i)).toBeTruthy();
-    expect(screen.queryByText(/earlier exchanges are not shown/i)).toBeNull();
-  });
-
-  /// 44.2% of records are machinery. A pane showing two messages out of a
-  /// 300-record window has to say where the rest went, or the reader
-  /// concludes the reader is broken -- the same argument
-  /// `subagent_files_skipped` carries one banner up.
-  it("says how many records in the window were bookkeeping", () => {
-    state.preview = preview({ non_conversation_records: 298 });
-    renderView();
-    open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
-    expect(screen.getByText(/298 bookkeeping records in the last window/i)).toBeTruthy();
-  });
-
-  /// A future block kind is NAMED, never dropped. Claude Code owns this
-  /// format, and a pane that silently omitted an unknown kind would show
-  /// an exchange with an invisible hole in it.
-  it("names a block kind it does not know rather than omitting it", () => {
-    state.preview = preview({
-      messages: [
-        {
-          role: "assistant",
-          timestamp: null,
-          model: null,
-          blocks: [{ kind: "other", block_type: "image" }],
-        },
-      ],
-    });
-    renderView();
-    open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
-    expect(screen.getByText("image")).toBeTruthy();
-    expect(screen.getByText(/does not know how to show/i)).toBeTruthy();
-  });
-
-  /// The #846 arm, and it is ordered before the empty one: `data` is
-  /// undefined on a rejection exactly as it is before the first read.
-  it("names a failed read rather than showing an empty conversation", () => {
-    state.previewFailed = true;
-    state.preview = undefined;
-    renderView();
-    open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
-    expect(screen.getByText(/could not read its transcript/i)).toBeTruthy();
-    expect(screen.getByText(/not the same as the session having said nothing/i)).toBeTruthy();
-  });
-
-  /// Read, and there genuinely was no conversation. Distinguished from
-  /// the failure above and from an empty file, because "300 machinery
-  /// records" and "an empty file" are different facts.
-  it("distinguishes a window with no conversation from a failed read", () => {
-    state.preview = preview({
-      messages: [],
-      non_conversation_records: 300,
-      unparseable_records: 2,
-    });
-    renderView();
-    open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
-    expect(screen.getByText(/no conversation in the last/i)).toBeTruthy();
-    expect(screen.getByText(/300 bookkeeping records and 2 that could not be read/i))
-      .toBeTruthy();
-    expect(screen.queryByText(/could not read its transcript/i)).toBeNull();
-  });
-
-  /// The tri-state's three wordings, not one shared shrug.
-  /// `revealRefusal`'s doc argues at length that collapsing `gone` and
-  /// `unknown` destroys the point of the third state, and this pane uses
-  /// the same function so the two controls cannot drift.
-  it("refuses a gone transcript differently from one it could not check", () => {
-    state.list = listOf([session({ transcript_state: { state: "gone" } })]);
-    renderView();
-    open("HeadState GitHub issues filing");
-    // Scoped to this section's own sentence, because the disabled Reveal
-    // transcript button is stating the same refusal clause a few lines
-    // up. Two identical sentences side by side read as two failures,
-    // which is why this one carries a prefix naming what IT cannot do.
-    expect(
-      screen.getByText(/there is nothing to read here: the path no longer exists/i),
-    ).toBeTruthy();
-    expect(screen.queryByRole("button", { name: /follow the transcript/i })).toBeNull();
-  });
-
-  it("names the reason a transcript check failed", () => {
-    state.list = listOf([
-      session({ transcript_state: { state: "unknown", why: "Permission denied" } }),
-    ]);
-    renderView();
-    open("HeadState GitHub issues filing");
-    // `unknown` is worded DIFFERENTLY from `gone` above, which is the
-    // whole point of the tri-state: the path may well be there and the
-    // remedy is to fix whatever blocked the check.
-    expect(
-      screen.getByText(
-        /there is nothing to read here: could not check whether it exists \(Permission denied\)/i,
-      ),
-    ).toBeTruthy();
-    expect(screen.queryByText(/no longer exists/i)).toBeNull();
-  });
-});
-
-/// Following a live transcript (#1208).
-///
-/// The list polls every 10 s and sorts running sessions first, so the app
-/// draws attention to a working agent -- and before #1208 the pane it
-/// opened onto was a snapshot frozen at the moment of the click. The most
-/// valuable view in the app was its most stale one.
-///
-/// These tests are about the HONESTY of the follow rather than about its
-/// content, which the section above already pins.
-describe("following a transcript as it is written", () => {
-  /// Requirement 2, and the one this codebase keeps having to re-apply
-  /// (#846, #1042): "this session is idle" and "we stopped following" are
-  /// different facts with different remedies.
-  ///
-  /// Asserted as DISTINCT STRINGS, in both directions. A test that only
-  /// checked "some text appears" would pass against a pane that rendered
-  /// one shared shrug for both, which is exactly the defect.
-  it("says a session is idle in different words from a follow that stopped", () => {
-    state.following = "idle";
-    renderView();
-    open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
-    const idle = screen.getByTestId("follow-status").textContent ?? "";
-
-    cleanup();
-    state.following = "stopped";
-    renderView();
-    open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
-    const stopped = screen.getByTestId("follow-status").textContent ?? "";
-
-    expect(idle).not.toEqual(stopped);
-    // And each says its OWN thing, so "distinct" is not two equally
-    // uninformative shrugs that merely differ.
-    expect(idle).toMatch(/idle/i);
-    expect(idle).toMatch(/nothing new has been written/i);
-    expect(idle).not.toMatch(/stopped/i);
-    expect(stopped).toMatch(/stopped following/i);
-    expect(stopped).not.toMatch(/idle/i);
-  });
-
-  /// The third rendering, distinct from BOTH of the above. An actively
-  /// following pane must not read like an idle one.
-  it("says it is following in different words again", () => {
-    renderView();
-    open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
-    const following = screen.getByTestId("follow-status").textContent ?? "";
-    expect(following).toMatch(/^Following\./);
-    expect(following).not.toMatch(/idle/i);
-    expect(following).not.toMatch(/stopped/i);
-  });
-
-  /// Requirement 1 and 3: the pane states WHEN it last read, and that
-  /// value CHANGES as it re-reads.
-  ///
-  /// To the second, not to the minute: a follow polls every 3 s, and a
-  /// label that only moved once a minute could not show a reader that it
-  /// is still reading. `clockTime` elsewhere on this page is HH:MM and
-  /// right for its own question; this one is not that.
-  it("states when it last read, and the time moves as it re-reads", () => {
-    state.lastReadAt = Date.UTC(2026, 0, 1, 12, 4, 31);
-    renderView();
-    open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
-    const first = screen.getByTestId("follow-status").textContent ?? "";
-    expect(first).toMatch(/last read at \d\d:\d\d:\d\d/i);
-
-    cleanup();
-    // Seven seconds later: two polls on.
-    state.lastReadAt = Date.UTC(2026, 0, 1, 12, 4, 38);
-    renderView();
-    open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
-    const second = screen.getByTestId("follow-status").textContent ?? "";
-
-    expect(second).not.toEqual(first);
-    expect(second).toMatch(/last read at \d\d:\d\d:\d\d/i);
-  });
-
-  /// A follow that has STOPPED still states when it last read, and that
-  /// value does NOT keep moving. It is the frozen clock that makes a dead
-  /// follow visibly dead -- a relative phrase re-rendered from the wall
-  /// clock would keep counting and read as live-but-quiet.
-  it("a stopped follow still says when it last read", () => {
-    state.following = "stopped";
-    state.lastReadAt = Date.UTC(2026, 0, 1, 12, 4, 31);
-    renderView();
-    open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
-    const text = screen.getByTestId("follow-status").textContent ?? "";
-    expect(text).toMatch(/stopped following/i);
-    expect(text).toMatch(/nothing has been read since \d\d:\d\d:\d\d/i);
-  });
-
-  /// Requirement 3 of the ticket's honesty list: if the read detected the
-  /// file changed behind the offset, SAY SO. It is the fifth case
-  /// `handoff.rs` has no entry for, and a pane that swapped the
-  /// conversation silently would leave the reader unable to tell a
-  /// re-read from a very talkative agent.
-  it("says when history was rewritten behind the offset, in its own words", () => {
-    state.reread = { why: "rewritten_behind", at: Date.UTC(2026, 0, 1, 12, 4, 31) };
-    renderView();
-    open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
-    const said = screen.getByTestId("follow-reread").textContent ?? "";
-    expect(said).toMatch(/changed behind where we had read to/i);
-    expect(said).toMatch(/compaction rewrote the history/i);
-    expect(said).toMatch(/read again rather than appended to/i);
-  });
-
-  /// And a truncation is worded DIFFERENTLY from a rewrite. Both re-read,
-  /// but the reasons are not the same fact: one is a file that shrank and
-  /// a length comparison caught, the other is a file that did not.
-  it("words a truncation differently from a rewrite behind the offset", () => {
-    state.reread = { why: "shrank", at: Date.UTC(2026, 0, 1, 12, 4, 31) };
-    renderView();
-    open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
-    const shrank = screen.getByTestId("follow-reread").textContent ?? "";
-    expect(shrank).toMatch(/replaced or truncated/i);
-    expect(shrank).not.toMatch(/compaction/i);
-  });
-
-  /// The FIRST read is a re-read too, mechanically -- it has no cursor to
-  /// extend. It must not be announced: "we read this from the start" is
-  /// noise on every single open, and a banner that fires every time is a
-  /// banner nobody reads when it matters.
-  it("does not announce the first read as a re-read", () => {
-    state.reread = { why: "first", at: Date.UTC(2026, 0, 1, 12, 4, 31) };
-    renderView();
-    open("HeadState GitHub issues filing");
-    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
-    expect(screen.queryByTestId("follow-reread")).toBeNull();
-  });
-});
-
 /// #977: the session row announced "pressed" -- a toggle the user had just
 /// operated, inviting a second press to un-press it. The list is
 /// single-select (`selectClaudeSession` into one slot), so that second
@@ -4196,6 +3533,27 @@ describe("the opening prompt", () => {
     expect(screen.getByText("One")).toBeTruthy();
     expect(screen.queryByText("Two")).toBeNull();
   });
+
+  /// #1485, from #1481: a phone that may not read transcripts gets every
+  /// prompt as `null`, and the list says so rather than showing rows that
+  /// look like sessions with no prompt.
+  it("says when a phone's prompts were withheld", () => {
+    state.list = listOf([session({ name: "Fix the retry", opening_prompt: null })], {
+      masking: { hidden: 0, revealed: false, reveal_allowed: false, withheld: true },
+    });
+    renderView();
+    expect(screen.getByTestId("sessions-prompts-withheld").textContent).toContain(
+      "Transcripts are turned off for this phone on the desktop",
+    );
+  });
+
+  it("says nothing about withholding when nothing was withheld", () => {
+    state.list = listOf([session({ name: "Fix the retry", opening_prompt: null })], {
+      masking: { hidden: 0, revealed: false, reveal_allowed: true, withheld: false },
+    });
+    renderView();
+    expect(screen.queryByTestId("sessions-prompts-withheld")).toBeNull();
+  });
 });
 
 /// #1135: what the transcript corpus costs on disk.
@@ -4285,6 +3643,43 @@ describe("stopping a session", () => {
     // and the two saying the same thing is correct -- a section that
     // withheld the button without a reason is what this pins against.
     expect(screen.getAllByText(/the registry could not be read/i).length).toBeGreaterThan(0);
+  });
+
+  /// #1569. A session can read running from a source Stop does not
+  /// confirm a pid from. The pane must not offer a Stop that can only
+  /// refuse, and must say stopping is unavailable rather than showing
+  /// nothing -- in the reader's terms, naming no internals.
+  ///
+  /// SABOTAGE: made the pane's `stoppable === false` branch unreachable.
+  /// This FAILED: the review button was offered. Restored, passed.
+  it("offers no stop for a running session whose process Stop cannot confirm", () => {
+    state.list = listOf([
+      session({ liveness: { state: "running", pid: 4242, status: null }, stoppable: false }),
+    ]);
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.queryByRole("button", { name: /review stopping it/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /stop this session/i })).toBeNull();
+    const says = screen.getByText(/stopping it from Headstate is not available/i);
+    expect(says.textContent).toMatch(/running as pid 4242/);
+    expect(says.textContent).toMatch(/window it is running in/);
+    // No internals: not the registry, a hook, a run, or a `.key`.
+    expect(says.textContent).not.toMatch(/registry|hook|\.key|\.json|run record/i);
+    // And it never claims the session is not running.
+    expect(says.textContent).not.toMatch(/not running/i);
+    expect(proposeFn).not.toHaveBeenCalled();
+  });
+
+  /// The pair: a session Stop CAN confirm still gets the review, with
+  /// `stoppable: true` as the backend now sends it.
+  it("still offers the stop for a running session Stop can confirm", () => {
+    state.list = listOf([
+      session({ liveness: { state: "running", pid: 14779, status: "busy" }, stoppable: true }),
+    ]);
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.getByRole("button", { name: /review stopping it/i })).toBeTruthy();
+    expect(screen.queryByText(/not available/i)).toBeNull();
   });
 
   /// The evidence is shown BEFORE any stop is offered, and the last turn
@@ -4608,7 +4003,7 @@ describe("searching for a pull request finds the session that produced it", () =
   /// because neither title contains `1234`.
   it("shows the session the link table attributes the pull request to", () => {
     two();
-    state.prQuery = { state: "done", ref: "acme/api#1234", links: [link("owner-1")] };
+    state.prQuery = { state: "done", ref: "acme/api#1234", links: [link("owner-1")], elsewhere: [] };
     renderView();
     type("acme/api#1234");
 
@@ -4620,8 +4015,8 @@ describe("searching for a pull request finds the session that produced it", () =
   });
 
   /// The found sentence names the REPOSITORY, and reads it off the
-  /// links rather than off the query. A bare `#1234` was resolved
-  /// against the tracked pull requests, so the query itself never said
+  /// links rather than off the query. A bare `#1234` is looked up in
+  /// every repository (#1545), so the query itself never said
   /// which repository answered -- and with two of them carrying that
   /// number, "2 sessions produced #1234" would leave the reader unable
   /// to tell which is which.
@@ -4640,6 +4035,7 @@ describe("searching for a pull request finds the session that produced it", () =
         { ...link("owner-1"), repo: "acme/api" },
         { ...link("owner-2"), repo: "acme/ui" },
       ],
+      elsewhere: [],
     };
     renderView();
     type("1234");
@@ -4662,7 +4058,7 @@ describe("searching for a pull request finds the session that produced it", () =
       session({ session_id: "owner-1", name: "Kestrel" }),
       session({ session_id: "other-1", name: "Merlin" }),
     ]);
-    state.prQuery = { state: "done", ref: "#1234", links: [link("owner-1")] };
+    state.prQuery = { state: "done", ref: "#1234", links: [link("owner-1")], elsewhere: [] };
     renderView();
     type("1234");
 
@@ -4685,7 +4081,7 @@ describe("searching for a pull request finds the session that produced it", () =
     two();
 
     // 1. The lookup RAN and the link table holds nothing. A finding.
-    state.prQuery = { state: "done", ref: "acme/api#1234", links: [] };
+    state.prQuery = { state: "done", ref: "acme/api#1234", links: [], elsewhere: [] };
     renderView();
     type("acme/api#1234");
     const recorded = screen.getByTestId("pr-query-note").textContent ?? "";
@@ -4698,7 +4094,6 @@ describe("searching for a pull request finds the session that produced it", () =
     state.prQuery = {
       state: "failed",
       ref: "acme/api#1234",
-      links: [],
       error: "database is locked",
     };
     renderView();
@@ -4729,20 +4124,49 @@ describe("searching for a pull request finds the session that produced it", () =
     expect(searchEmpty).toBe(noMatch);
   });
 
-  /// A fourth state, and also not any of the three: a bare number whose
-  /// repository could not be named. The lookup is keyed on
-  /// `(repo, number)`, so nothing was asked -- and "we did not ask" must
-  /// not be reported as "they did not answer" (#1050).
-  it("says it could not tell which repository a bare number is in", () => {
-    two();
-    state.prQuery = { state: "unresolved", number: 1234 };
+  /// #1545: "shown below" is counted. A session the lookup found can be
+  /// hidden by the chip or the subagent toggle, and the note must not
+  /// promise a row the reader then cannot find.
+  ///
+  /// SABOTAGE: always render ", shown below." and this fails.
+  it("says when the filter hides the session the lookup found", () => {
+    state.list = listOf([
+      session({ session_id: "other-1", name: "Merlin" }),
+      session({
+        session_id: "owner-1",
+        name: "Kestrel",
+        kind: { kind: "subagent", agent_id: "a1" },
+      }),
+    ]);
+    state.prQuery = { state: "done", ref: "acme/api#1234", links: [link("owner-1")], elsewhere: [] };
     renderView();
-    type("1234");
+    type("acme/api#1234");
+
+    expect(screen.queryByRole("button", { name: /Kestrel/i })).toBeNull();
+    const note = screen.getByTestId("pr-query-note").textContent ?? "";
+    expect(note).toMatch(/1 session produced acme\/api#1234/i);
+    expect(note).toMatch(/none is shown/i);
+    expect(note).not.toMatch(/shown below/i);
+  });
+
+  /// #1545: a transferred repository's older links carry the old owner.
+  /// A qualified miss names where the number WAS recorded, without
+  /// adding those rows to the list on a guess.
+  it("names the same repository under another owner when a qualified search misses", () => {
+    two();
+    state.prQuery = {
+      state: "done",
+      ref: "acme/api#1234",
+      links: [],
+      elsewhere: [{ ...link("owner-1"), repo: "old-owner/api" }],
+    };
+    renderView();
+    type("acme/api#1234");
 
     const note = screen.getByTestId("pr-query-note").textContent ?? "";
-    expect(note).toMatch(/could not tell which repository/i);
-    expect(note).not.toMatch(/no session recorded/i);
-    expect(note).not.toMatch(/could not look up/i);
+    expect(note).toMatch(/no session recorded for acme\/api#1234/i);
+    expect(note).toMatch(/old-owner\/api#1234/);
+    expect(screen.queryByRole("button", { name: /Kestrel/i })).toBeNull();
   });
 
   /// Nothing is denied while the answer is still coming. "No session
@@ -4756,24 +4180,6 @@ describe("searching for a pull request finds the session that produced it", () =
     expect(screen.queryByTestId("pr-query-note")).toBeNull();
   });
 
-  /// PARTIAL is not nothing (#1044). One repository answered and another
-  /// rejected: the rows that were found still show, above a line saying
-  /// the lookup did not fully succeed.
-  it("keeps the links that did answer when another lookup failed", () => {
-    two();
-    state.prQuery = {
-      state: "failed",
-      ref: "#1234",
-      links: [link("owner-1")],
-      error: "database is locked",
-    };
-    renderView();
-    type("1234");
-
-    expect(screen.getByRole("button", { name: /Kestrel/i })).toBeTruthy();
-    expect(screen.getByTestId("pr-query-note").textContent).toMatch(/could not look up/i);
-  });
-
   /// The #1200 highlighting keeps working: a session matched by pull
   /// request has no matching text in the five searched fields, so its
   /// row draws with nothing marked and still reads as a row.
@@ -4783,7 +4189,7 @@ describe("searching for a pull request finds the session that produced it", () =
   /// above it too, which is why both are here.
   it("renders a row matched only by pull request with nothing highlighted", () => {
     two();
-    state.prQuery = { state: "done", ref: "acme/api#1234", links: [link("owner-1")] };
+    state.prQuery = { state: "done", ref: "acme/api#1234", links: [link("owner-1")], elsewhere: [] };
     const { container } = renderView();
     type("acme/api#1234");
 
@@ -4791,5 +4197,305 @@ describe("searching for a pull request finds the session that produced it", () =
     expect(row.textContent).toMatch(/Kestrel/);
     expect(within(row).queryAllByRole("mark")).toHaveLength(0);
     expect(container.querySelectorAll("mark")).toHaveLength(0);
+  });
+});
+
+/// The transcript viewer's host (#1479): since #1546 the Transcript tab
+/// on a selected session's pane.
+///
+/// What the viewer does with scrolling is
+/// `transcript/TranscriptViewer.test.tsx`'s subject; these pin that the
+/// host renders it, only when asked, for the right session, that the tab
+/// is the one way in, and that each empty state says which kind of empty
+/// it is.
+describe("the transcript viewer", () => {
+  const message = (id: string, text: string, prompt: boolean): TranscriptMessage => ({
+    id,
+    id_source: "uuid",
+    turn_id: prompt ? id : "u1",
+    kind: prompt ? { kind: "user_prompt", origin: null } : { kind: "assistant" },
+    timestamp: null,
+    model: null,
+    api_message_id: null,
+    usage: null,
+    duration_ms: null,
+    is_meta: false,
+    is_sidechain: false,
+    offset: null,
+    oversized_bytes: null,
+    blocks: [{ kind: "text", index: 0, text, clip: null }],
+  });
+  const page = (over: Partial<TranscriptPage> = {}): TranscriptPage => ({
+    messages: [message("u1", "run the tests", true), message("a1", "Running them now.", false)],
+    truncated: false,
+    bytes_read: 183_237,
+    file_bytes: 183_237,
+    machinery_records: [],
+    unparseable_records: 0,
+    duplicate_records: 0,
+    ...over,
+  });
+
+  /// The pane's two tabs (#1546), by role, as a screen reader reaches them.
+  const tab = (name: "Details" | "Transcript") => screen.getByRole("tab", { name });
+  const selected = (name: "Details" | "Transcript") => tab(name).getAttribute("aria-selected");
+  /// The open tab's panel.
+  const panel = () => screen.getByRole("tabpanel");
+  const second = "0b5c9d1e-2f3a-4b5c-8d7e-9f0a1b2c3d4e";
+
+  it("is behind the Transcript tab, and then shows the conversation as a log", () => {
+    state.transcript = page();
+    renderView();
+    open("HeadState GitHub issues filing");
+    // A selection lands on Details, and costs no transcript read.
+    expect(selected("Details")).toBe("true");
+    expect(selected("Transcript")).toBe("false");
+    expect(state.transcriptAskedFor).toEqual([]);
+    expect(screen.queryByRole("log")).toBeNull();
+
+    fireEvent.click(tab("Transcript"));
+    expect(selected("Transcript")).toBe("true");
+    expect(state.transcriptAskedFor).toContain("/Users/acme/.claude/projects/slug/e5dff3bd.jsonl");
+    // The follow is told whose transcript it is, so that session's
+    // activity nudges read at once (#1477).
+    expect(state.transcriptSessionIds).toContain("e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2");
+    const log = within(panel()).getByRole("log");
+    expect(within(log).getByText("run the tests")).toBeTruthy();
+    expect(within(log).getByText("Running them now.")).toBeTruthy();
+    // The desktop renderer replaced the old preview on the desktop (#1480).
+    expect(screen.queryByRole("button", { name: /follow the transcript/i })).toBeNull();
+    expect(screen.queryByText(/what it was doing/i)).toBeNull();
+    // Only one panel is mounted: the detail is not under the transcript.
+    expect(screen.getAllByRole("tabpanel")).toHaveLength(1);
+  });
+
+  /// #1546: the tab is the ONE way in. The old pane in the detail
+  /// ("Show the transcript", "Open in full window") and the full window's
+  /// "← Session detail" are gone, so there is nothing else to press.
+  it("leaves no second way in", () => {
+    state.transcript = page();
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(screen.queryByRole("button", { name: /show the transcript/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /open in full window/i })).toBeNull();
+    fireEvent.click(tab("Transcript"));
+    expect(screen.queryByRole("button", { name: /session detail/i })).toBeNull();
+  });
+
+  it("says when the transcript was only read from its end", () => {
+    state.transcript = page({ truncated: true, file_bytes: 5 * 1024 * 1024 });
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(tab("Transcript"));
+    // Said as a position, an estimate when it is one, with where the rest
+    // is: earlier messages page in as the reader scrolls up (#1476).
+    expect(screen.getByTestId("transcript-truncated").textContent).toBe(
+      "Showing messages ~1–2 (estimate). Earlier messages load as you scroll up.",
+    );
+  });
+
+  it("does not render a failed read as an empty transcript", () => {
+    state.transcriptFailed = true;
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(tab("Transcript"));
+    expect(screen.getByText(/could not read its transcript \(Permission denied\)/i)).toBeTruthy();
+    expect(screen.queryByText(/holds no conversation/i)).toBeNull();
+  });
+
+  it("tells a still-reading transcript from an empty one", () => {
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(tab("Transcript"));
+    expect(screen.getByText(/reading its transcript…/i)).toBeTruthy();
+  });
+
+  /// With the preview retired from the desktop (#1480), the tab states
+  /// the refusal itself -- once, in the preview's words, and with nothing
+  /// offered that cannot work.
+  ///
+  /// **Sabotage:** drop the `revealRefusal` arm in `SessionTranscriptTab`,
+  /// and the sentence is gone.
+  it("says why there is nothing to read, once, in the Transcript tab", () => {
+    state.list = listOf([session({ transcript_state: { state: "gone" } })]);
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(tab("Transcript"));
+    expect(
+      within(panel()).getByText(/there is nothing to read here: the path no longer exists/i),
+    ).toBeTruthy();
+    expect(screen.getAllByText(/there is nothing to read here/i)).toHaveLength(1);
+    expect(screen.queryByRole("log")).toBeNull();
+    expect(state.transcriptAskedFor).toEqual([]);
+  });
+
+  /// #1514: the phone build shows the same viewer, and the old preview
+  /// pane ("What it was doing", "Follow the transcript") is gone from it.
+  /// The refusal it used to state is stated by the viewer's tab.
+  describe("on the phone build", () => {
+    asThePhoneBuild();
+
+    it("says why there is nothing to read, once, in the Transcript tab", () => {
+      state.list = listOf([session({ transcript_state: { state: "gone" } })]);
+      renderView();
+      open("HeadState GitHub issues filing");
+      fireEvent.click(tab("Transcript"));
+      expect(
+        within(panel()).getByText(/there is nothing to read here: the path no longer exists/i),
+      ).toBeTruthy();
+      expect(screen.getAllByText(/there is nothing to read here/i)).toHaveLength(1);
+    });
+
+    /// `unknown` is worded differently from `gone`: the path may well be
+    /// there, and the remedy is to fix whatever blocked the check.
+    it("names the reason a transcript check failed", () => {
+      state.list = listOf([
+        session({ transcript_state: { state: "unknown", why: "Permission denied" } }),
+      ]);
+      renderView();
+      open("HeadState GitHub issues filing");
+      fireEvent.click(tab("Transcript"));
+      expect(
+        within(panel()).getByText(
+          /there is nothing to read here: could not check whether it exists \(Permission denied\)/i,
+        ),
+      ).toBeTruthy();
+      expect(screen.queryByText(/no longer exists/i)).toBeNull();
+    });
+
+    /// Behind the tab, as the preview was behind a click: a read over the
+    /// pairing transport must not happen on selection.
+    it("renders the viewer rather than the old preview, and reads only when asked", () => {
+      state.transcript = page();
+      renderView();
+      open("HeadState GitHub issues filing");
+      expect(screen.queryByText(/what it was doing/i)).toBeNull();
+      expect(screen.queryByRole("button", { name: /follow the transcript/i })).toBeNull();
+      expect(state.transcriptAskedFor).toEqual([]);
+
+      fireEvent.click(tab("Transcript"));
+      expect(state.transcriptAskedFor).toContain(
+        "/Users/acme/.claude/projects/slug/e5dff3bd.jsonl",
+      );
+      expect(within(panel()).getByText("run the tests")).toBeTruthy();
+    });
+  });
+
+  /// #1546: the tab choice is ONE value for the pane, kept while the
+  /// reader moves between sessions -- in both directions.
+  ///
+  /// **Sabotage:** reset `claudeSessionTab` to `"details"` in
+  /// `selectClaudeSession`, and the second session opens on Details.
+  it("keeps the tab while moving between sessions, showing the new session's transcript", () => {
+    state.transcript = page();
+    state.list = listOf([session(), session({ session_id: second, name: "Second session" })]);
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(tab("Transcript"));
+    state.transcriptSessionIds = [];
+
+    open("Second session");
+    expect(selected("Transcript")).toBe("true");
+    expect(within(panel()).getByRole("heading", { name: "Second session" })).toBeTruthy();
+    // The follow now belongs to the session on screen, not the one left.
+    expect(new Set(state.transcriptSessionIds)).toEqual(new Set([second]));
+
+    // And Details sticks the same way, reading nothing.
+    fireEvent.click(tab("Details"));
+    state.transcriptAskedFor = [];
+    open("HeadState GitHub issues filing");
+    expect(selected("Details")).toBe("true");
+    expect(state.transcriptAskedFor).toEqual([]);
+  });
+
+  /// #1546 and #1489: `tablist` semantics, and the arrow keys move
+  /// between the tabs and activate the one they land on.
+  it("is a labelled tablist the arrow keys move through", async () => {
+    state.transcript = page();
+    renderView();
+    open("HeadState GitHub issues filing");
+    const list = screen.getByRole("tablist", { name: "Session" });
+    expect(within(list).getAllByRole("tab").map((t) => t.textContent)).toEqual([
+      "Details",
+      "Transcript",
+    ]);
+    // Each panel is labelled by its tab.
+    expect(panel().getAttribute("aria-labelledby")).toBe(tab("Details").id);
+
+    act(() => tab("Details").focus());
+    fireEvent.keyDown(tab("Details"), { key: "ArrowRight" });
+    // Base UI moves focus in a microtask.
+    await act(async () => {});
+    expect(document.activeElement).toBe(tab("Transcript"));
+    expect(selected("Transcript")).toBe("true");
+    expect(within(panel()).getByRole("log")).toBeTruthy();
+
+    fireEvent.keyDown(tab("Transcript"), { key: "ArrowLeft" });
+    await act(async () => {});
+    expect(document.activeElement).toBe(tab("Details"));
+    expect(selected("Details")).toBe("true");
+  });
+
+  /// The viewer is the ONE scroll container on the Transcript tab: the
+  /// panel and the pane around it add none, and fill the height instead.
+  it("adds no second scroller around the viewer", () => {
+    state.transcript = page();
+    renderView();
+    open("HeadState GitHub issues filing");
+    fireEvent.click(tab("Transcript"));
+    const log = within(panel()).getByRole("log");
+    const scrollers: string[] = [];
+    for (let el = log.parentElement; el && el !== document.body; el = el.parentElement) {
+      if (/overflow-(y-)?(auto|scroll)/.test(el.className)) {
+        scrollers.push(el.getAttribute("data-slot") ?? el.outerHTML.slice(0, 80));
+      }
+    }
+    expect(scrollers).toEqual(["message-scroller-viewport"]);
+    expect(panel().className).toMatch(/\bflex-1\b/);
+    expect(panel().className).toMatch(/\bmin-h-0\b/);
+  });
+
+  it("is reachable from another view in one action, on the Transcript tab", () => {
+    state.transcript = page();
+    useFilters.setState({ view: "my-prs" });
+    useFilters.getState().openClaudeTranscript("e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2");
+    const f = useFilters.getState();
+    expect(f.view).toBe("claude-code");
+    expect(f.claudePage).toBe("sessions");
+    expect(f.claudeSelected).toBe("e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2");
+    expect(f.claudeSessionTab).toBe("transcript");
+    renderView();
+    expect(selected("Transcript")).toBe("true");
+    expect(within(panel()).getByRole("log")).toBeTruthy();
+  });
+
+  /// A deep link from the Details tab of ANOTHER session still lands on
+  /// the linked session's transcript.
+  it("opens the linked session's Transcript tab over another session's Details", () => {
+    state.transcript = page();
+    state.list = listOf([session(), session({ session_id: second, name: "Second session" })]);
+    renderView();
+    open("HeadState GitHub issues filing");
+    expect(selected("Details")).toBe("true");
+    act(() => useFilters.getState().openClaudeTranscript(second));
+    expect(selected("Transcript")).toBe("true");
+    expect(within(panel()).getByRole("heading", { name: "Second session" })).toBeTruthy();
+  });
+
+  /// #1485: the session header is hosted by the Transcript tab, above the
+  /// transcript -- and above the refusal too, where a running session
+  /// with no transcript yet must still read as running.
+  it("hosts the session header, even when there is no transcript yet", () => {
+    state.list = listOf([
+      session({
+        liveness: { state: "running", pid: 4242, status: null },
+        transcript_path: null,
+        transcript_state: { state: "not-recorded" },
+      }),
+    ]);
+    useFilters.getState().openClaudeTranscript("e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2");
+    renderView();
+    const header = within(screen.getByTestId("transcript-tab")).getByTestId("transcript-header");
+    expect(within(header).getByText("Running, no transcript yet")).toBeTruthy();
   });
 });

@@ -199,12 +199,15 @@ function ThreadCard({ thread, repo, number, forceOpen = false }: {
                 <Markdown>{c.body}</Markdown>
               </div>
             ))}
-            {/* The query pages thread comments at 10; claiming to show
-                all of them would be a quiet lie. */}
+            {/* The query pages thread comments at 10, from the START --
+                the opener is the remark the replies answer (#1453). So
+                what is missing is the NEWEST replies, and the notice sits
+                where they would be and says so: the last reply shown is
+                not the latest. */}
             {thread.comment_count > thread.comments.length ? (
               <p className="text-xs text-[#8b949e]">
-                Showing {thread.comments.length} of {thread.comment_count}. See the rest
-                on GitHub.
+                Showing the first {thread.comments.length} of {thread.comment_count} — newer
+                replies are on GitHub.
               </p>
             ) : null}
           </div>

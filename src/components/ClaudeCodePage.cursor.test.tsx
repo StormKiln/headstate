@@ -27,6 +27,8 @@ const state = vi.hoisted(() => ({
 }));
 
 vi.mock("../api/hooks", () => ({
+  // #1477's "active now" set: no session nudged in this file.
+  useSessionActivity: () => new Set<string>(),
   // #1280's reverse lookup. `off` -- nothing typed here is a pull
   // request reference -- which is what every assertion in this file
   // assumes; `ClaudeCodePage.test.tsx` is where the other states are
@@ -100,6 +102,7 @@ const listOf = (n: number): ClaudeSessionList => ({
   sessions: Array.from({ length: n }, (_, i) => session(i)),
   registry_failure: null,
   registry_unreadable: [],
+  registry_unnamed: [],
 });
 
 beforeEach(() => {

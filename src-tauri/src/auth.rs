@@ -96,11 +96,6 @@ fn searched_locations() -> String {
     dirs.join(", ")
 }
 
-/// Per-user install locations that cannot be written as constants.
-///
-/// winget and Scoop install under the user's profile, so the path depends
-/// on who is logged in. Empty on non-Windows, where the constants above
-/// already cover the realistic locations.
 /// The user's home directory.
 ///
 /// Windows sets `USERPROFILE`, not `HOME` -- only Git-Bash and MSYS
@@ -109,12 +104,92 @@ fn searched_locations() -> String {
 /// read `HOME` unconditionally, which left a first-run Windows user with
 /// an empty worktrees view AND cost the Docker page its provenance,
 /// since image origins resolve against those same directories.
+///
+/// # A test build has no real home (#1535)
+///
+/// Under `cfg(test)` this answers [`test_home::current`] -- `None`
+/// unless the test set a fixture home -- and never reads the process
+/// environment. Every path this app derives under `~/.claude` (the
+/// session registry, the transcript corpus, the handoff file, the global
+/// `CLAUDE.md`) starts here, so no test can reach the developer's real
+/// `~/.claude` by any call chain, however indirect. Tests that read the
+/// real registry passed or failed on whatever happened to be running
+/// (#1315): a merge-queue flake waiting to burn a release commit
+/// (#1048). `invariants.rs` checks that nothing resolves the home
+/// directory around this function.
 pub fn home_dir() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    return test_home::current();
+    #[cfg(not(test))]
+    env_home()
+}
+
+/// The home directory the environment names. The one place it is read.
+fn env_home() -> Option<std::path::PathBuf> {
     std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
         .ok()
         .map(std::path::PathBuf::from)
 }
 
+/// What [`home_dir`] answers inside a test build.
+///
+/// Per THREAD, so one test's fixture home cannot leak into a test running
+/// beside it, and restored on drop, so it cannot leak into the next test
+/// the same thread runs. A thread the code under test spawns does not
+/// inherit it and sees no home at all -- the safe direction.
+#[cfg(test)]
+pub mod test_home {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static HOME: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// The home this thread's test set, or `None`.
+    pub fn current() -> Option<PathBuf> {
+        HOME.with(|h| h.borrow().clone())
+    }
+
+    /// Restores the previous home when dropped.
+    #[must_use = "the home is restored when this is dropped"]
+    pub struct Scoped(Option<PathBuf>);
+
+    impl Drop for Scoped {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            HOME.with(|h| *h.borrow_mut() = prev);
+        }
+    }
+
+    fn replace(with: Option<PathBuf>) -> Scoped {
+        Scoped(HOME.with(|h| std::mem::replace(&mut *h.borrow_mut(), with)))
+    }
+
+    /// Make `home` this thread's home directory until the guard drops.
+    ///
+    /// A temp directory: this is how a test exercises code that derives
+    /// paths from the home directory.
+    pub fn set(home: &Path) -> Scoped {
+        replace(Some(home.to_path_buf()))
+    }
+
+    /// The REAL home, for a live probe that measures this machine.
+    ///
+    /// Allowed only inside an `#[ignore]` test -- one a person runs on
+    /// purpose, never CI or the merge queue -- and `invariants.rs`
+    /// enforces that. Such a probe may READ real data. It must never
+    /// write, move or delete anything under the home it gets here.
+    pub fn real_for_a_live_probe() -> Scoped {
+        replace(super::env_home())
+    }
+}
+
+/// Per-user install locations that cannot be written as constants.
+///
+/// winget and Scoop install under the user's profile, so the path depends
+/// on who is logged in. Empty on non-Windows, where the constants above
+/// already cover the realistic locations.
 fn user_fallback_dirs() -> Vec<String> {
     if !cfg!(windows) {
         return Vec::new();
@@ -792,38 +867,37 @@ mod tests {
     // discovery must not depend on PATH alone.
     #[test]
     fn finds_gh_via_path() {
-        let tmp = std::env::temp_dir().join(format!("hs-gh-path-{}", std::process::id()));
+        let t = tempfile::TempDir::new().unwrap();
+        let tmp = t.path().join("path");
         let bin = fake_gh(&tmp);
         // Injected, not edited: replacing the process PATH broke every
         // concurrent `git` spawn in the suite (#481).
         assert_eq!(find_gh_with(&[], tmp.to_str(), None), Some(bin.clone()));
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn explicit_override_wins_over_path() {
-        let a = std::env::temp_dir().join(format!("hs-gh-a-{}", std::process::id()));
-        let b = std::env::temp_dir().join(format!("hs-gh-b-{}", std::process::id()));
+        let t = tempfile::TempDir::new().unwrap();
+        let a = t.path().join("a");
+        let b = t.path().join("b");
         fake_gh(&a);
         let want = fake_gh(&b);
         assert_eq!(
             find_gh_with(&[], a.to_str(), want.to_str()),
             Some(want.clone())
         );
-        std::fs::remove_dir_all(&a).ok();
-        std::fs::remove_dir_all(&b).ok();
     }
 
     // An override pointing at nothing must fall through, not hard-fail.
     #[test]
     fn bogus_override_falls_back_to_path() {
-        let tmp = std::env::temp_dir().join(format!("hs-gh-fb-{}", std::process::id()));
+        let t = tempfile::TempDir::new().unwrap();
+        let tmp = t.path().join("fb");
         let bin = fake_gh(&tmp);
         assert_eq!(
             find_gh_with(&[], tmp.to_str(), Some("/nonexistent/gh")),
             Some(bin.clone())
         );
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     // THE REGRESSION TEST for the v1.0.0 hang. A GUI-launched .app gets
@@ -832,9 +906,10 @@ mod tests {
     // installed" to a user whose terminal `gh` works fine.
     #[test]
     fn finds_gh_outside_path_via_fallback_dirs() {
-        let brew = std::env::temp_dir().join(format!("hs-gh-brew-{}", std::process::id()));
+        let t = tempfile::TempDir::new().unwrap();
+        let brew = t.path().join("brew");
         let want = fake_gh(&brew);
-        let empty = std::env::temp_dir().join(format!("hs-gh-nopath-{}", std::process::id()));
+        let empty = t.path().join("nopath");
         std::fs::create_dir_all(&empty).unwrap();
         let fallbacks = [brew.to_str().unwrap()];
         // A PATH with no gh on it at all, as a GUI app sees.
@@ -842,13 +917,12 @@ mod tests {
             find_gh_with(&fallbacks, empty.to_str(), None),
             Some(want.clone())
         );
-        std::fs::remove_dir_all(&brew).ok();
-        std::fs::remove_dir_all(&empty).ok();
     }
 
     #[test]
     fn returns_none_when_gh_is_nowhere() {
-        let empty = std::env::temp_dir().join(format!("hs-gh-empty-{}", std::process::id()));
+        let t = tempfile::TempDir::new().unwrap();
+        let empty = t.path().join("empty");
         std::fs::create_dir_all(&empty).unwrap();
         // Only meaningful if the machine has no gh in a fallback dir.
         if GH_FALLBACK_DIRS
@@ -857,7 +931,6 @@ mod tests {
         {
             assert_eq!(find_gh_with(GH_FALLBACK_DIRS, empty.to_str(), None), None);
         }
-        std::fs::remove_dir_all(&empty).ok();
     }
 
     /// The executable name must follow the platform. Windows installs
@@ -873,7 +946,8 @@ mod tests {
     /// that is the bug. On Unix it must, since that is the real name.
     #[test]
     fn a_bare_gh_file_matches_only_where_that_is_the_real_name() {
-        let tmp = std::env::temp_dir().join(format!("hs-gh-bare-{}", std::process::id()));
+        let t = tempfile::TempDir::new().unwrap();
+        let tmp = t.path().join("bare");
         std::fs::create_dir_all(&tmp).unwrap();
         let bare = tmp.join("gh");
         std::fs::write(&bare, "x").unwrap();
@@ -884,7 +958,6 @@ mod tests {
         } else {
             assert_eq!(found, Some(bare.clone()));
         }
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// The fallback list is per-platform, so it must never contain paths

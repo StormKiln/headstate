@@ -40,7 +40,7 @@ export function HelpButton({ topic }: { topic: HelpTopicId }) {
       >
         <HelpCircle className="h-3.5 w-3.5" aria-hidden="true" />
       </button>
-      <SheetContent className="w-full overflow-y-auto sm:max-w-md">
+      <SheetContent className="w-full max-w-md overflow-y-auto">
         <SheetHeader>
           <SheetTitle>{title}</SheetTitle>
         </SheetHeader>

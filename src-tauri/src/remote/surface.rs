@@ -36,6 +36,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::commands;
 use crate::remote::error_kind::CommandError;
+use crate::remote::privacy::{self, Matching};
 
 /// What a command does, which decides what a phone must present to run it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,6 +146,11 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("get_reviewing", Class::Read),
     ("count_reviewing", Class::Read),
     ("get_pr_detail", Class::Read),
+    // The review gates (#1451, #1454): two REST reads, base-branch rules and
+    // the head's last pusher. A Read -- it writes nothing -- and exposed,
+    // because the phone renders the same detail view and the same Approve
+    // and Merge buttons these gates qualify.
+    ("get_review_gates", Class::Read),
     ("get_viewer", Class::Read),
     ("build_target", Class::Read),
     ("latest_release", Class::Read),
@@ -158,7 +164,7 @@ pub const SURFACE: &[(&str, Class)] = &[
     // companion's whole purpose yet. Apply `Class::Local`'s stated test --
     // could the phone act on the answer? -- and it is plainly yes; a
     // listing and a file are exactly what a person away from their desk
-    // wants. `claude_transcript_tail` makes the stronger form of the
+    // wants. `claude_transcript_page` makes the stronger form of the
     // argument and it transfers verbatim: "the desktop user can `cat` the
     // file and the companion user cannot reach the machine." A repository
     // browser is that argument repeated for every file in 38
@@ -306,6 +312,16 @@ pub const SURFACE: &[(&str, Class)] = &[
     // anything -- Local is about what a command DOES, not about which
     // screen its caller sits on.
     ("claude_launch_terms", Class::Read),
+    // A pull request's Claudify (#1455), the worktree trio's shape
+    // exactly: the copy command returns a STRING the phone can show, so
+    // Read, like `claudify_command`; the launch opens a terminal WINDOW
+    // on the desktop and the preview describes that window's argv, so
+    // both are Local, like `claude_launch_worktree` and its preview.
+    // All three re-derive the checkout against the live scan, so the
+    // phone cannot name a directory the desktop's scan does not hold.
+    ("claudify_pr_command", Class::Read),
+    ("claude_launch_pr", Class::Local),
+    ("claude_launch_pr_preview", Class::Local),
     ("check_packages", Class::Read),
     ("packages_markdown", Class::Read),
     // Read: the effective context a session loads, across scopes
@@ -395,9 +411,25 @@ pub const SURFACE: &[(&str, Class)] = &[
     // crosses the pairing transport every ten seconds, and this is the
     // call that lets it stop carrying the detail for 1,474 rows to render
     // one.
-    // Read: one indexed query (#1132).
-    ("claude_sessions_for_pr", Class::Read),
+    // #1545: the search box's lookup by number alone, and the PR detail
+    // panel's since #1557 retired `claude_sessions_for_pr`. Read: one
+    // query of the link table, returning `PrLink` rows, which carry no
+    // transcript text.
+    ("claude_sessions_for_pr_number", Class::Read),
     ("claude_session_detail", Class::Read),
+    // #1486. A compact per-session status -- liveness, waiting kind, the
+    // last turn's end and outcome -- for the phone's best-effort
+    // notifications. Read: the same list derivation as `claude_sessions`
+    // plus one query of the hook table, bounded to 50 rows. Carries NO
+    // transcript text, so it has no `TRANSCRIPT_TEXT` row in
+    // `remote/privacy.rs`; `claude::digest` pins its field set.
+    ("claude_session_digest", Class::Read),
+    // #1486. One session's opening prompt, for the lock-screen snippet
+    // the phone shows only when its owner opts in. Read, and transcript
+    // text: listed in `remote/privacy.rs` as `Whole`, so it is masked
+    // before it crosses and refused for a phone whose "read session
+    // transcripts" switch is off.
+    ("claude_transcript_opening_prompt", Class::Read),
     // #1002. Reads each attributed child transcript with #959's bounded
     // summariser and the app's own database; writes nothing. The phone
     // wants the rollup for the same reason the desktop does.
@@ -511,39 +543,50 @@ pub const SURFACE: &[(&str, Class)] = &[
     // Read: one aggregate query over stored rows (#1134).
     ("claude_usage_profile", Class::Read),
     ("claude_session_usage", Class::Read),
-    // The tail of one session's transcript, as conversation (#982).
+    // One session's transcript (#982, #1475, #1220): one clipped
+    // block's full text by record id, and one bounded page before or
+    // after a cursor -- how the viewer reaches "what happened earlier" in
+    // a 70 MB file.
     //
     // `Read`, and the phone's case here is STRONGER than the desktop's.
-    // `claude_reveal_path` is `Class::Local`, so until now a companion
-    // user who could see that a session died could not see one word of
-    // what it was doing -- the desktop user can `cat` the file and the
-    // companion user cannot reach the machine at all.
+    // `claude_reveal_path` is `Class::Local`, so without these a
+    // companion user who could see that a session died could not see one
+    // word of what it was doing -- the desktop user can `cat` the file
+    // and the companion user cannot reach the machine at all.
     //
-    // It reads one `.jsonl` under `~/.claude/projects` and writes
+    // Each reads one `.jsonl` under `~/.claude/projects` and writes
     // nothing; `~/.claude` stays read-only, per `claude/mod.rs`'s two
-    // stated exceptions, neither of which this is.
-    //
-    // The response is bounded inside the command -- a 256 KB window, at
-    // most 200 messages, each block clamped -- so the phone cannot be
-    // handed a 76 MB file by asking for one. Both commands resolve their
+    // stated exceptions, neither of which this is. Both resolve their
     // path argument against `~/.claude/projects` before reading, because
     // unlike `claude_reveal_path` a `Read` command's argument arrives
     // from a paired device rather than from this machine's own frontend;
     // `claude_transcript_path` in `commands.rs` argues it.
-    ("claude_transcript_tail", Class::Read),
-    // One incremental step of following a live transcript (#1208).
     //
-    // `Read` on exactly the grounds the row above carries, and the phone
-    // benefits more than the desktop again: a companion user watching a
-    // running agent gets the transcript as it is written rather than a
-    // snapshot frozen at the moment they tapped.
+    // Both are bounded INSIDE the command whatever the phone asks for:
+    // the full-text fetch at `transcript_model::FULL_TEXT_CHARS` with the
+    // clip stated, and a page at `PAGE_MESSAGES` messages and
+    // `transcript_page::PAGE_READ_BOUND` bytes read into memory per call,
+    // with a record larger than a page streamed and clipped rather than
+    // held. The phone can page through the whole file, one bounded page
+    // per round trip, and is never handed the file.
     //
-    // It reads LESS than the row above, not more. `tail` pulls a 256 KB
-    // window per call; this reads from the cursor the caller returns, so
-    // a poll over a transcript that did not change moves no transcript
-    // bytes at all -- only the bounded 64 KB fingerprint that detects a
-    // compaction having rewritten history behind the cursor.
-    ("claude_transcript_follow", Class::Read),
+    // What crosses is not what the webview sees (#1488): every command
+    // returning transcript text is listed in `remote/privacy.rs`'s
+    // `TRANSCRIPT_TEXT`, and the listener masks likely secrets in it and
+    // honours the per-device switches before it leaves this machine.
+    //
+    // #1514 retired `claude_transcript_tail`, `claude_transcript_follow`
+    // and `claude_transcript_messages`: the old preview pane was their
+    // last consumer, and the paged viewer reads only these two.
+    ("claude_transcript_block_text", Class::Read),
+    ("claude_transcript_page", Class::Read),
+    // Find messages anywhere in that transcript: the turn outline, or
+    // the messages whose text holds a query (#1484). `Read` on the same
+    // grounds, and bounded inside the command however large the file:
+    // one record held at a time, at most `FIND_HITS` hits, and a
+    // deadline past which it answers with what it found. Its snippets
+    // are masked at the boundary like any page (`privacy.rs`).
+    ("claude_transcript_find", Class::Read),
     // Whether the Claude Code hooks are in `~/.claude/settings.json`
     // (#915).
     //
@@ -605,6 +648,18 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("rerun_checks", Class::Write),
     ("update_pr_branch", Class::Write),
     ("set_auto_merge", Class::Write),
+    // Merge or queue a native GitHub stack through the async merge API
+    // (#1468).
+    //
+    // WRITE, not Destructive. It lands several pull requests at once, which
+    // is why the UI confirms with every one listed -- but `Destructive` here
+    // means DELETING something (files, branches, images, volumes) and
+    // carries the step-up signature for that. A merge deletes nothing, and
+    // `act_on_pr`'s merge and enqueue, the single-PR form of this same act,
+    // are `Write` above. Classing the stack form higher would make the phone
+    // demand a signature for merging three PRs that it does not demand for
+    // merging one.
+    ("merge_stack", Class::Write),
     ("mark_assessed", Class::Write),
     ("clear_assessed", Class::Write),
     ("set_cleanup_prefs", Class::Write),
@@ -817,6 +872,11 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("respond_to_pairing", Class::Local),
     ("list_paired_devices", Class::Local),
     ("revoke_paired_device", Class::Local),
+    // What a phone may read of the session transcripts, and whether it
+    // may unmask them (#1488). `Local` for the reason the rows above
+    // are: a phone that could widen its own access would make the switch
+    // meaningless -- the owner decides at the desktop, per device.
+    ("set_paired_device_access", Class::Local),
     ("get_remote_enabled", Class::Local),
     ("set_remote_enabled", Class::Local),
     // The Claude Code hook installer (#915). All three, deliberately.
@@ -1099,6 +1159,15 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "get_pr_detail" => {
             res(commands::get_pr_detail(app.state(), a.get("repo")?, a.get("number")?).await)
         }
+        "get_review_gates" => res(commands::get_review_gates(
+            app.state(),
+            a.get("repo")?,
+            a.get("base")?,
+            a.get("headRepo")?,
+            a.get("headRef")?,
+            a.get("headOid")?,
+        )
+        .await),
         "get_viewer" => res(commands::get_viewer(app.state()).await),
         "build_target" => ok(commands::build_target()),
         "latest_release" => ok(commands::latest_release(app.clone()).await),
@@ -1174,6 +1243,14 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         // `Class::Local` and `admit` rejects them before this match is
         // reached. `claude_launch_terms` is `Class::Read`, so it does.
         "claude_launch_terms" => ok(commands::claude_launch_terms()),
+        // Read; its two Local siblings have no arm, like the four above.
+        "claudify_pr_command" => res(commands::claudify_pr_command(
+            app.clone(),
+            a.get("repoPath")?,
+            a.get("prRepo")?,
+            a.get("prompt")?,
+        )
+        .await),
         "check_packages" => res(commands::check_packages(a.get("repoPath")?).await),
         "packages_markdown" => ok(commands::packages_markdown(
             a.get("repoPath")?,
@@ -1189,22 +1266,26 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         // inline held this listener for the length of the file.
         "read_claude_md" => res(commands::read_claude_md(a.get("path")?).await),
         "claude_import_transcripts" => res(commands::claude_import_transcripts(app.clone()).await),
-        "claude_search_transcripts" => {
-            res(
-                commands::claude_search_transcripts(app.clone(), a.get("query")?, a.get("limit")?)
-                    .await,
-            )
-        }
+        // Both query matchers read the `Matching` `privacy::admit` wrote
+        // (#1519), failing closed to masked when it is absent.
+        "claude_search_transcripts" => res(commands::claude_search_transcripts(
+            app.clone(),
+            a.get("query")?,
+            a.get("limit")?,
+            Some(Matching::for_remote(a.get(privacy::MATCH_ARG)?)),
+        )
+        .await),
         "claude_index_coverage" => res(commands::claude_index_coverage(app.clone()).await),
         "claude_sessions" => res(commands::claude_sessions(app.clone()).await),
-        "claude_sessions_for_pr" => {
-            res(
-                commands::claude_sessions_for_pr(app.clone(), a.get("repo")?, a.get("number")?)
-                    .await,
-            )
+        "claude_sessions_for_pr_number" => {
+            res(commands::claude_sessions_for_pr_number(app.clone(), a.get("number")?).await)
         }
         "claude_session_detail" => {
             res(commands::claude_session_detail(app.clone(), a.get("sessionId")?).await)
+        }
+        "claude_session_digest" => res(commands::claude_session_digest(app.clone()).await),
+        "claude_transcript_opening_prompt" => {
+            res(commands::claude_transcript_opening_prompt(app.clone(), a.get("sessionId")?).await)
         }
         "claude_subagent_rollup" => {
             res(commands::claude_subagent_rollup(app.clone(), a.get("sessionId")?).await)
@@ -1221,10 +1302,27 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "claude_restart_list" => res(commands::claude_restart_list(app.clone()).await),
         "claude_usage_profile" => res(commands::claude_usage_profile(app.clone()).await),
         "claude_session_usage" => res(commands::claude_session_usage(a.get("path")?).await),
-        "claude_transcript_tail" => res(commands::claude_transcript_tail(a.get("path")?).await),
-        "claude_transcript_follow" => {
-            res(commands::claude_transcript_follow(a.get("path")?, a.get("cursor")?).await)
-        }
+        "claude_transcript_block_text" => res(commands::claude_transcript_block_text(
+            a.get("path")?,
+            a.get("messageId")?,
+            a.get("index")?,
+            a.get("offset")?,
+        )
+        .await),
+        "claude_transcript_page" => res(commands::claude_transcript_page(
+            a.get("path")?,
+            a.get("anchor")?,
+            a.get("direction")?,
+            a.get("limit")?,
+        )
+        .await),
+        "claude_transcript_find" => res(commands::claude_transcript_find(
+            a.get("path")?,
+            a.get("query")?,
+            a.get("limit")?,
+            Some(Matching::for_remote(a.get(privacy::MATCH_ARG)?)),
+        )
+        .await),
         "claude_hooks_inventory" => res(commands::claude_hooks_inventory()),
         "claude_effective_settings" => {
             res(commands::claude_effective_settings(a.get("repoPath")?).await)
@@ -1321,6 +1419,15 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             a.get("expectedHead")?,
         )
         .await),
+        "merge_stack" => res(commands::merge_stack(
+            app.state(),
+            app.state(),
+            a.get("repo")?,
+            a.get("number")?,
+            a.get("action")?,
+            a.get("expectedHead")?,
+        )
+        .await),
         "set_auto_merge" => res(commands::set_auto_merge(
             app.state(),
             app.state(),
@@ -1398,12 +1505,16 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             )
         }
         "remove_worktree" => {
-            res(commands::remove_worktree(a.get("repoPath")?, a.get("worktreePath")?).await)
+            res(
+                commands::remove_worktree(app.state(), a.get("repoPath")?, a.get("worktreePath")?)
+                    .await,
+            )
         }
         "remove_worktrees" => res(commands::remove_worktrees(
             app.clone(),
             a.get("repoPath")?,
             a.get("worktreePaths")?,
+            a.get("runId")?,
         )
         .await),
         "remove_worktree_forced" => res(commands::remove_worktree_forced(
@@ -1542,6 +1653,7 @@ mod tests {
             "respond_to_pairing",
             "list_paired_devices",
             "revoke_paired_device",
+            "set_paired_device_access",
             "get_remote_enabled",
             "set_remote_enabled",
         ] {

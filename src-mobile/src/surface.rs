@@ -78,6 +78,8 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("get_reviewing", Class::Read),
     ("count_reviewing", Class::Read),
     ("get_pr_detail", Class::Read),
+    // The review gates (#1451, #1454). A Read; two REST reads, advisory.
+    ("get_review_gates", Class::Read),
     ("get_viewer", Class::Read),
     ("build_target", Class::Read),
     ("latest_release", Class::Read),
@@ -87,7 +89,7 @@ pub const SURFACE: &[(&str, Class)] = &[
     // most 256 KB of one of its files, and neither writes anything.
     //
     // The sharpest case of the companion's purpose yet, and the same
-    // argument `claude_transcript_tail` below makes about itself: the
+    // argument `claude_transcript_page` below makes about itself: the
     // desktop user can `cat` the file and the phone cannot reach the
     // machine at all.
     //
@@ -187,6 +189,12 @@ pub const SURFACE: &[(&str, Class)] = &[
     // anything -- Local is about what a command DOES, not about which
     // screen its caller sits on.
     ("claude_launch_terms", Class::Read),
+    // A pull request's Claudify (#1455): the copy command returns a
+    // string the phone can show (Read); the launch and its preview are a
+    // terminal window on the desktop and that window's argv (Local).
+    ("claudify_pr_command", Class::Read),
+    ("claude_launch_pr", Class::Local),
+    ("claude_launch_pr_preview", Class::Local),
     ("check_packages", Class::Read),
     ("packages_markdown", Class::Read),
     // Read: the effective context a session loads, across scopes
@@ -233,9 +241,16 @@ pub const SURFACE: &[(&str, Class)] = &[
     // link every ten seconds and was carrying every session's detail to
     // render one; it now carries what the list draws, and the phone asks
     // for the rest only when the user opens a session.
-    // Read: one indexed query (#1132).
-    ("claude_sessions_for_pr", Class::Read),
+    // #1545: the lookup by number alone, for the search box and (since
+    // #1557 retired `claude_sessions_for_pr`) the PR detail panel; no
+    // transcript text.
+    ("claude_sessions_for_pr_number", Class::Read),
     ("claude_session_detail", Class::Read),
+    // #1486: what the background window reads to notify about sessions.
+    // No transcript text; see the desktop's surface.rs.
+    ("claude_session_digest", Class::Read),
+    // #1486: the opt-in lock-screen snippet. Masked on the desktop.
+    ("claude_transcript_opening_prompt", Class::Read),
     ("claude_subagent_rollup", Class::Read),
     // The hook's failure and denial profile for one session, and
     // across all of them (#1062, #1063, #1064). Reads only.
@@ -307,27 +322,25 @@ pub const SURFACE: &[(&str, Class)] = &[
     // Read: one aggregate query over stored rows (#1134).
     ("claude_usage_profile", Class::Read),
     ("claude_session_usage", Class::Read),
-    // The tail of one of the DESKTOP's transcripts, as conversation
-    // (#982). Read: one bounded tail read, writing nothing.
+    // One of the DESKTOP's transcripts (#982, #1475, #1220): one clipped
+    // block's full text by record id, and one bounded page before or
+    // after a cursor. Read: bounded reads, writing nothing.
     //
-    // The one Claude action where the phone's case is STRONGER than the
+    // The one Claude read where the phone's case is STRONGER than the
     // desktop's. `claude_reveal_path` is `Local` and absent from this
-    // table, so until now a companion user could see that a session died
-    // and could not see a word of what it was doing -- the desktop user
-    // can `cat` the file, and the phone cannot reach the machine.
+    // table, so without these a companion user could see that a session
+    // died and could not see a word of what it was doing -- the desktop
+    // user can `cat` the file, and the phone cannot reach the machine.
     //
-    // Bounded inside the command (256 KB, 200 messages, clamped blocks)
-    // so asking for the desktop's 76 MB transcript cannot hand the phone
-    // 76 MB. See the desktop copy for the path guard both commands share.
-    ("claude_transcript_tail", Class::Read),
-    // Following that transcript as it is written (#1208). Same `Read`
-    // grounds as the row above, and the phone's case is the stronger one
-    // again: the companion user cannot reach the machine, so a frozen
-    // snapshot of a RUNNING agent is the worst view in the app.
-    //
-    // Bounded by the same constants, and cheaper per poll than the row
-    // above: it reads from a cursor rather than a fixed 256 KB window.
-    ("claude_transcript_follow", Class::Read),
+    // Bounded inside the command per call whatever the phone asks, so
+    // asking for the desktop's 76 MB transcript cannot hand the phone
+    // 76 MB. See the desktop copy for the path guard both commands share,
+    // and for the three transcript commands #1514 retired.
+    ("claude_transcript_block_text", Class::Read),
+    ("claude_transcript_page", Class::Read),
+    // Find messages anywhere in that transcript (#1484). Read on the
+    // same grounds, bounded inside the command; see the desktop copy.
+    ("claude_transcript_find", Class::Read),
     // Whether the DESKTOP's hooks are installed (#915). Read: one file
     // read, no side effects, and "is that desktop recording?" is a real
     // away-from-desk question.
@@ -385,6 +398,18 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("rerun_checks", Class::Write),
     ("update_pr_branch", Class::Write),
     ("set_auto_merge", Class::Write),
+    // Merge or queue a native GitHub stack through the async merge API
+    // (#1468).
+    //
+    // WRITE, not Destructive. It lands several pull requests at once, which
+    // is why the UI confirms with every one listed -- but `Destructive` here
+    // means DELETING something (files, branches, images, volumes) and
+    // carries the step-up signature for that. A merge deletes nothing, and
+    // `act_on_pr`'s merge and enqueue, the single-PR form of this same act,
+    // are `Write` above. Classing the stack form higher would make the phone
+    // demand a signature for merging three PRs that it does not demand for
+    // merging one.
+    ("merge_stack", Class::Write),
     ("mark_assessed", Class::Write),
     ("clear_assessed", Class::Write),
     ("set_cleanup_prefs", Class::Write),
@@ -512,6 +537,9 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("respond_to_pairing", Class::Local),
     ("list_paired_devices", Class::Local),
     ("revoke_paired_device", Class::Local),
+    // #1488: a phone must not widen its own transcript access. See the
+    // desktop table.
+    ("set_paired_device_access", Class::Local),
     ("get_remote_enabled", Class::Local),
     ("set_remote_enabled", Class::Local),
     // The Claude Code hook installer (#915). All three `Local`: they edit

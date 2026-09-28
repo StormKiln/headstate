@@ -5,13 +5,8 @@ import type {
   ClaudeAgentTypes,
   ClaudeCompactions,
   ClaudeCostState,
-  ClaudeFileChange,
-  ClaudePairing,
-  ClaudePreviewBlock,
   ClaudePrLink,
-  ClaudeReread,
   ClaudeSession,
-  ClaudeToolArgs,
   ClaudeObservation,
   ClaudeProfile,
   ClaudeSessionDetail,
@@ -29,7 +24,7 @@ import {
   useClaudeSessions,
   useClaudeSessionsForPrQuery,
   type PrQueryState,
-  useClaudeTranscriptFollow,
+  useSessionActivity,
   useWorktrees,
   useUiPrefs,
 } from "@/api/hooks";
@@ -58,6 +53,13 @@ import {
 import { type ClaudeSessionFilter, useFilters } from "@/store/filters";
 import { QueryError, errorMessage } from "./QueryError";
 import { ExternalLink } from "./ExternalLink";
+import { MaskedText } from "./MaskedText";
+import { PhoneTranscript } from "./transcript/phone/PhoneTranscript";
+import { SessionMuteToggle } from "./SessionMuteToggle";
+import { useTranscriptRenderer } from "./transcript/phone/renderer";
+import { DesktopTranscript } from "./transcript/DesktopTranscript";
+import { TranscriptHeader } from "./transcript/TranscriptHeader";
+import { SessionTabs } from "./transcript/SessionTabs";
 
 /// The sessions list is virtualized, and this is the note that used to
 /// be `RENDER_CAP = 200` (#1200).
@@ -197,7 +199,10 @@ import { ExternalLink } from "./ExternalLink";
 /// every title and prompt containing those digits. `parsePrQuery`
 /// carries the full argument for which shapes trigger it.
 ///
-/// # Absent is not zero: ten conditions, ten renderings
+/// # Absent is not zero: nine conditions, nine renderings
+///
+/// Ten until #1545, which removed "a bare `#1234` whose repository we
+/// cannot name": the lookup is by number alone now, so it is always made.
 ///
 /// | condition | rendering |
 /// |---|---|
@@ -210,9 +215,8 @@ import { ExternalLink } from "./ExternalLink";
 /// | genuinely nothing | `NoSessions` -- only when the read SUCCEEDED and nothing was narrowed |
 /// | the PR lookup ran and found nothing | "No session recorded for `owner/repo#1234`" (#1280) -- a finding about the link table |
 /// | the PR lookup FAILED | "Could not look up ..." -- not a finding at all, and never worded as the row above |
-/// | a bare `#1234` whose repo we cannot name | "Could not tell which repository ..." -- we never asked (#1050) |
 ///
-/// The last three are `PrQueryNote`'s, which argues each wording where
+/// The last two are `PrQueryNote`'s, which argues each wording where
 /// it is rendered. They are stated beside the COUNTS rather than in the
 /// empty list, because they are true whether or not the text filter also
 /// matched something -- a pull request with no recorded session and a
@@ -306,6 +310,7 @@ export function ClaudeCodePage() {
       <Banners
         registryFailure={list.data?.registry_failure ?? null}
         registryUnreadable={list.data?.registry_unreadable ?? []}
+        registryUnnamed={list.data?.registry_unnamed ?? []}
         imported={imported}
         onRescan={rescan}
       />
@@ -322,26 +327,29 @@ export function ClaudeCodePage() {
           </div>
         ) : null}
 
+        {/* No scroll here: a session's tabs own it (#1546). Details
+            scrolls inside its panel, and on the Transcript tab the
+            viewer is the one scroll container. */}
         <div
           className={
-            isMobile
-              ? showingList
-                ? "hidden"
-                : "flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto p-4"
-              : "min-w-0 flex-1 overflow-y-auto p-4"
+            isMobile && showingList ? "hidden" : "flex min-h-0 min-w-0 flex-1 flex-col p-4"
           }
         >
           {isMobile && !showingList ? (
             <button
               type="button"
               onClick={() => selectSession(undefined)}
-              className="tap-target -ml-1 mb-2 flex items-center self-start rounded px-2 text-sm text-[#58a6ff] hover:bg-[#161b22]"
+              className="tap-target -ml-1 mb-2 flex shrink-0 items-center self-start rounded px-2 text-sm text-[#58a6ff] hover:bg-[#161b22]"
             >
               ← All sessions
             </button>
           ) : null}
           {active ? (
-            <SessionDetail session={active} now={now} />
+            <SessionPane
+              session={active}
+              now={now}
+              withheld={list.data?.masking?.withheld === true}
+            />
           ) : matched.ordered.length === 0 ? (
             // NOT "choose a session" (#978). There is nothing to choose,
             // and an instruction a reader cannot follow makes them
@@ -409,7 +417,12 @@ export function matchesClaudeFilter(s: ClaudeSession, filter: ClaudeSessionFilte
       // It is also the right predicate on its own terms: resuming a
       // session that is already alive starts a SECOND copy of it, which is
       // the failure both banners on the overview are worded to prevent.
-      return s.liveness.state !== "running" && s.cwd_state.state === "exists";
+      //
+      // `dead`, not `!== "running"` (#1534). A row this list says it could
+      // not tell about -- a terminal-launched session may be running in
+      // its folder -- is not resumable, and the overview's "Ready to
+      // resume" stopped offering it for the same reason.
+      return s.liveness.state === "dead" && s.cwd_state.state === "exists";
     case "gone":
       // Same subtraction, same reason -- `overview.rs` counts `archived`
       // as "not running + cwd gone", and the three cwd buckets plus
@@ -464,9 +477,7 @@ function useMatchedSessions() {
   const prOwners = useMemo(
     () =>
       new Set(
-        prQuery.state === "done" || prQuery.state === "failed"
-          ? prQuery.links.map((l) => l.session_id)
-          : [],
+        prQuery.state === "done" ? prQuery.links.map((l) => l.session_id) : [],
       ),
     [prQuery],
   );
@@ -643,17 +654,34 @@ const CLAUDE_CHIPS: ReadonlyArray<{
 /// Collapsing any two of these is the defect #846 and #1044 are both
 /// about. "No session recorded for #1234" is a finding: we asked the
 /// link table and it holds nothing, which is the ordinary answer for a
-/// pull request opened by hand, by CI, or before this machine imported
-/// its transcripts. "Could not look up #1234" is not a finding at all --
+/// pull request opened by hand, by CI, or since the transcripts were
+/// last read -- the link table is written by the import (#1545), and
+/// topped up about once a minute by the live pass since #1557, so a
+/// just-opened PR can be a minute behind. "Could not look up #1234" is not a finding at all --
 /// the database did not answer, and the pull request may well have a
 /// session we simply could not see. Rendering the second as the first
 /// would tell a user their session is gone on the strength of a failed
 /// read.
 ///
-/// A fourth state exists and is also not any of the three: a bare
-/// `#1234` whose repository could not be named. The lookup is keyed on
-/// `(repo, number)`, so no query was issued -- and "we never asked" must
-/// not be reported as "they did not answer" (#1050).
+/// A bare `#1234` used to have a fourth wording, "Could not tell which
+/// repository", for a number the tracked open pull requests could not
+/// place -- which was every merged one. #1545 looks the number up in
+/// the link table directly, so it is always asked and that state is gone.
+///
+/// # "shown below" is counted, not assumed (#1545)
+///
+/// The list is also narrowed by the chip and the subagent toggle, and a
+/// session the lookup found can be outside both. The note says how many
+/// of them the list actually shows, rather than promising rows the
+/// reader then cannot find.
+///
+/// # A qualified miss says where the number WAS found
+///
+/// A link keeps the repository's name from when the PR was opened, so a
+/// transferred repository's older links carry the old owner. When
+/// `owner/repo#1234` matched nothing but the same repository name under
+/// another owner did, the note names it -- as a fact the reader can
+/// search for, not as rows added to the list on a guess.
 ///
 /// Nothing is rendered while the lookup is in flight. A row that is
 /// about to appear must not first be denied: "No session recorded"
@@ -662,8 +690,8 @@ const CLAUDE_CHIPS: ReadonlyArray<{
 /// The pull requests a set of links names, as prose.
 ///
 /// Read off the LINKS rather than off the query, because a bare
-/// `#1234` was resolved through the tracked pull request list and the
-/// query never said which repository answered. Almost always one; two
+/// `#1234` is looked up in every repository and the query never said
+/// which repository answered. Almost always one; two
 /// only when two repositories both carry that number, and then naming
 /// both is the point.
 function prRefsOf(links: readonly ClaudePrLink[]): string {
@@ -671,16 +699,8 @@ function prRefsOf(links: readonly ClaudePrLink[]): string {
   return refs.length <= 2 ? refs.join(" and ") : `${refs.slice(0, -1).join(", ")} and ${refs.at(-1)}`;
 }
 
-function PrQueryNote({ q }: { q: PrQueryState }) {
+function PrQueryNote({ q, shown }: { q: PrQueryState; shown: ReadonlySet<string> }) {
   if (q.state === "off" || q.state === "loading") return null;
-  if (q.state === "unresolved") {
-    return (
-      <p className="mt-1 text-[11px] text-[#8b949e]" data-testid="pr-query-note">
-        Could not tell which repository #{q.number} is in, so no session was looked up. Search{" "}
-        <code className="text-[#e6edf3]">owner/repo#{q.number}</code> to ask directly.
-      </p>
-    );
-  }
   if (q.state === "failed") {
     return (
       <p className="mt-1 text-[11px] text-[#d29922]" data-testid="pr-query-note">
@@ -692,11 +712,20 @@ function PrQueryNote({ q }: { q: PrQueryState }) {
   if (q.links.length === 0) {
     return (
       <p className="mt-1 text-[11px] text-[#8b949e]" data-testid="pr-query-note">
-        No session recorded for {q.ref}. It may have been opened by hand, by CI, or before this
-        machine imported its transcripts.
+        No session recorded for {q.ref}. It may have been opened by hand, by CI, or since the
+        transcripts were last read — Rescan transcripts reads them again.
+        {q.elsewhere.length > 0 ? (
+          <>
+            {" "}
+            Sessions did record {prRefsOf(q.elsewhere)}; search{" "}
+            <code className="text-[#e6edf3]">#{q.elsewhere[0].number}</code> to see them.
+          </>
+        ) : null}
       </p>
     );
   }
+  const sessions = new Set(q.links.map((l) => l.session_id));
+  const visible = [...sessions].filter((id) => shown.has(id)).length;
   return (
     <p className="mt-1 text-[11px] text-[#8b949e]" data-testid="pr-query-note">
       {/* The rows are in the list below and carry NO highlight: a
@@ -704,13 +733,18 @@ function PrQueryNote({ q }: { q: PrQueryState }) {
           five searched fields, which #1200's find-over-data highlighting
           correctly renders as nothing marked. This line is what tells
           the reader why those rows are there. */}
-      {q.links.length === 1 ? "1 session" : `${q.links.length} sessions`} produced{" "}
+      {sessions.size === 1 ? "1 session" : `${sessions.size} sessions`} produced{" "}
       {/* The REPOSITORY, from the links rather than from the query. A
-          bare `#1234` was resolved against the tracked pull requests, so
-          `q.ref` is `#1234` and does not say which repository answered
-          -- and "1 session produced #1234" leaves the reader unable to
-          tell which of two repositories' `#1234` they are looking at. */}
-      {prRefsOf(q.links)}, shown below.
+          bare `#1234` is looked up in every repository, so `q.ref` is
+          `#1234` and does not say which repository answered -- and
+          "1 session produced #1234" leaves the reader unable to tell
+          which of two repositories' `#1234` they are looking at. */}
+      {prRefsOf(q.links)}
+      {visible === sessions.size
+        ? ", shown below."
+        : visible === 0
+          ? ". None is shown: the current filter hides them."
+          : `. ${visible} of them shown below; the current filter hides the rest.`}
     </p>
   );
 }
@@ -724,6 +758,10 @@ export function ClaudeSessionColumn() {
   // WHY it is empty, and only the scan knows whether `~/.claude/projects`
   // is there. Same query as the page's, so this costs a cache hit.
   const { now, imported } = useClaudeSessions(true);
+  // Which sessions the desktop saw writing just now (#1477), for the
+  // rows' "active now" badge. Every session's nudges land here; only the
+  // open transcript's make a read.
+  const activeNow = useSessionActivity();
   const query = useFilters((f) => f.claudeQuery);
   const setQuery = useFilters((f) => f.setClaudeQuery);
   const filter = useFilters((f) => f.claudeFilter);
@@ -732,6 +770,8 @@ export function ClaudeSessionColumn() {
   const setShowSubagents = useFilters((f) => f.setClaudeShowSubagents);
   const selected = useFilters((f) => f.claudeSelected);
   const selectSession = useFilters((f) => f.selectClaudeSession);
+  const openTranscript = useFilters((f) => f.openClaudeTranscript);
+  const isMobile = useIsMobile();
   // The single app-wide keyboard cursor (#953). One cursor, owned by
   // whichever view has claimed it -- `filters.ts` holds one value and
   // #953 forbids a second, because two lists owning two cursors is the
@@ -959,7 +999,20 @@ export function ClaudeSessionColumn() {
               : `${matched.ordered.length.toLocaleString()} of ${all.length.toLocaleString()} sessions`}
           {matched.live.length > 0 ? ` · ${matched.live.length} running now` : ""}
         </p>
-        <PrQueryNote q={prQuery} />
+        {/* On a phone that may not read transcripts, every opening
+            prompt arrives as `null` (#1488). Without this the rows show
+            nothing where the prompt was, which reads as sessions that
+            had none, and a search over prompts finds nothing (#1485). */}
+        {list.data?.masking?.withheld ? (
+          <p className="mt-1 text-[11px] text-[#8b949e]" data-testid="sessions-prompts-withheld">
+            Transcripts are turned off for this phone on the desktop, so opening prompts are not
+            shown or searched.
+          </p>
+        ) : null}
+        <PrQueryNote
+          q={prQuery}
+          shown={new Set((matched?.ordered ?? []).map((s) => s.session_id))}
+        />
       </div>
       <div
         ref={scrollRef}
@@ -1015,6 +1068,7 @@ export function ClaudeSessionColumn() {
                   session={s}
                   now={now}
                   active={s.session_id === selected}
+                  activeNow={activeNow.has(s.session_id)}
                   // The keyboard cursor, drawn as a ring (#953). `PrList`
                   // passes it the same way and for the same reason: only
                   // the list knows a row's index, and the cursor is an
@@ -1027,7 +1081,13 @@ export function ClaudeSessionColumn() {
                   // the ring is drawn over the blue rather than instead
                   // of it.
                   cursored={cursor === i}
-                  onSelect={() => selectSession(s.session_id)}
+                  // On the phone a session opens at its Transcript tab, as
+                  // a conversation does in the Claude app (#1481, #1546);
+                  // its Details tab is one tap away. The desktop keeps
+                  // whichever tab the pane was already on.
+                  onSelect={() =>
+                    isMobile ? openTranscript(s.session_id) : selectSession(s.session_id)
+                  }
                 />
               );
             })}
@@ -1146,11 +1206,13 @@ function NoSessions({
 function Banners({
   registryFailure,
   registryUnreadable,
+  registryUnnamed,
   imported,
   onRescan,
 }: {
   registryFailure: string | null;
   registryUnreadable: string[];
+  registryUnnamed: string[];
   imported: ReturnType<typeof useClaudeSessions>["imported"];
   onRescan: () => Promise<void>;
 }) {
@@ -1196,6 +1258,29 @@ function Banners({
           {registryUnreadable.length} live-session record
           {registryUnreadable.length === 1 ? "" : "s"} could not be read, so any session they
           describe reads as “could not tell”.
+        </div>
+      ) : null}
+      {/* #1315: a session launched from a terminal runs with no record
+          naming it, so no row can show it as running. Grey like the two
+          above -- it is a gap in what could be established, not a fault
+          to act on -- and it names each process, because "some session is
+          running somewhere" is not something a reader can check. */}
+      {registryUnnamed.length > 0 ? (
+        <div
+          role="status"
+          className="rounded-md border border-[#30363d] bg-[#161b22] px-3 py-2 text-xs text-[#8b949e]"
+        >
+          {registryUnnamed.length === 1
+            ? "A Claude Code session is running that is not matched to any row below"
+            : `${registryUnnamed.length} Claude Code sessions are running that are not matched to any row below`}
+          . Sessions in the same folder read as “could not tell”.
+          <ul className="mt-1 list-disc pl-4">
+            {registryUnnamed.map((line) => (
+              <li key={line} className="break-all">
+                {line}
+              </li>
+            ))}
+          </ul>
         </div>
       ) : null}
       {/* The rescan's own failure, separately from the list's. They are
@@ -1371,6 +1456,29 @@ function LivenessBadge({ liveness }: { liveness: Liveness }) {
   );
 }
 
+/// "active now" (#1477): the desktop saw this session's transcript change
+/// within the last few seconds. Subtle on purpose -- a word and a small
+/// pulsing dot beside "Running", not a colour change of the row -- and
+/// only ever an addition: a row without it is not claimed to be quiet,
+/// because a nudge can be lost.
+///
+/// `motion-safe` so the pulse stops for a reader who asked for less
+/// motion; the word carries the meaning either way.
+function ActiveNow({ muted }: { muted: boolean }) {
+  return (
+    <span
+      className={`flex shrink-0 items-center gap-1 ${muted ? "text-white" : "text-[#3fb950]"}`}
+      data-testid="active-now"
+    >
+      <span
+        className="h-1.5 w-1.5 rounded-full bg-current motion-safe:animate-pulse"
+        aria-hidden="true"
+      />
+      active now
+    </span>
+  );
+}
+
 /// The wall-clock time a notification was recorded, as `HH:MM`.
 ///
 /// #1067 asks for "last seen waiting at HH:MM" in so many words, and a
@@ -1536,7 +1644,10 @@ function Highlight({ value }: { value: string }) {
   const parts = useMemo(() => segments(value, query), [value, query]);
   // No search: render the string itself rather than a single-element
   // span, so the common case adds no DOM.
-  if (parts.length === 1 && !parts[0].hit) return <>{value}</>;
+  // `MaskedText` because the opening prompt renders through here, and on
+  // a phone it may carry a span the desktop masked (#1488). Identity on
+  // every other field.
+  if (parts.length === 1 && !parts[0].hit) return <MaskedText text={value} />;
   return (
     <>
       {parts.map((part, i) =>
@@ -1548,7 +1659,9 @@ function Highlight({ value }: { value: string }) {
             {part.text}
           </mark>
         ) : (
-          <span key={i}>{part.text}</span>
+          <span key={i}>
+            <MaskedText text={part.text} />
+          </span>
         ),
       )}
     </>
@@ -1559,10 +1672,16 @@ function SessionEntry({
   session: s,
   now,
   active,
+  activeNow = false,
   cursored = false,
   onSelect,
 }: {
   session: ClaudeSession;
+  /// The desktop saw this session's transcript change in the last few
+  /// seconds (#1477). Drawn only beside a Running verdict: a nudge next
+  /// to "Not running" would contradict the row, and the verdict is the
+  /// fresher claim until the next poll says otherwise.
+  activeNow?: boolean;
   /// The poll's timestamp. See the page's doc comment: never
   /// `Date.now()`.
   now: number;
@@ -1631,6 +1750,7 @@ function SessionEntry({
         }`}
       >
         <LivenessBadge liveness={s.liveness} />
+        {activeNow && s.liveness.state === "running" ? <ActiveNow muted={active} /> : null}
         {/* A DATE on every row, not only in the detail. 147 sessions in
             the largest directory share a title with a sibling (mostly
             repeated `/security-review` runs), so the title alone cannot
@@ -1840,7 +1960,11 @@ function SessionDetail({
               evidence for it, which is the arrangement #1219 exists to
               avoid (#1219). */}
           <StopSession session={s} detail={detail.data} />
-          <TranscriptPreview detail={detail.data} />
+          {/* #1486: this phone's per-session mute. The companion's own
+              setting, so the phone build only. */}
+          {IS_MOBILE_BUILD && <SessionMuteToggle sessionId={s.session_id} />}
+          {/* The transcript is the pane's other tab (#1546), not a
+              section here: one way in. */}
         </>
       )}
       {/* OUTSIDE the detail gate: the jump is derived from `cwd` and
@@ -3199,6 +3323,12 @@ function uptimeLabel(secs: number | null): string | null {
   return `${secs}s`;
 }
 
+/// What the pane says for a running session Headstate will not signal
+/// (#1569): the fact, why in the reader's terms, and what they can do.
+/// One sentence for the desktop and the phone, so the two cannot drift.
+const STOP_UNAVAILABLE =
+  "Stopping it from Headstate is not available, because the session has not confirmed which process is its own. End it from the window it is running in.";
+
 /// Stop a live session, proposed with its evidence (#1219).
 ///
 /// # Why this exists at all
@@ -3227,6 +3357,13 @@ function uptimeLabel(secs: number | null): string | null {
 /// -- so neither gets the affordance, and `unknown` says why rather than
 /// rendering nothing. `claude_stop_session` is `Class::Local`, so the
 /// phone is behind `IS_MOBILE_BUILD` with a sentence in its place.
+///
+/// # Running is not the same as stoppable (#1569)
+///
+/// A session can read running from a source the stop does not accept as
+/// proof of which process to signal. `detail.stoppable` says whether it
+/// does; when it is `false` the section states that stopping is not
+/// available here instead of offering a button that could only refuse.
 function StopSession({
   session: s,
   detail: d,
@@ -3285,9 +3422,14 @@ function StopSession({
     return (
       <section className="rounded-md border border-[#30363d] bg-[#161b22] p-3">
         <h3 className="text-xs font-semibold text-[#e6edf3]">Stopping this session</h3>
+        {/* `false` only: absent is a desktop that did not report it, and
+            then the Mac sentence is the one that was always shown. Saying
+            "from the Mac" for a session the Mac cannot stop either would
+            send the reader to a button that is not there (#1569). */}
         <p className="mt-1.5 text-xs text-[#8b949e]">
-          A session can only be stopped from the Mac it is running on, so this is not available
-          here.
+          {d.stoppable === false
+            ? STOP_UNAVAILABLE
+            : "A session can only be stopped from the Mac it is running on, so this is not available here."}
         </p>
       </section>
     );
@@ -3306,6 +3448,20 @@ function StopSession({
         <p className="mt-1.5 text-xs text-[#8b949e]">
           Whether this session is running could not be confirmed, so nothing can be signalled
           without guessing at which process is meant. {live.why}
+        </p>
+      </section>
+    );
+  }
+
+  // Running, but not under a pid Stop confirms (#1569). No button: one
+  // here could only refuse. `=== false`, because absent is "not reported"
+  // and the stop re-checks for itself anyway.
+  if (d.stoppable === false) {
+    return (
+      <section className="rounded-md border border-[#30363d] bg-[#161b22] p-3">
+        <h3 className="text-xs font-semibold text-[#e6edf3]">Stopping this session</h3>
+        <p className="mt-1.5 text-xs text-[#8b949e]">
+          This session is running as pid {live.pid}. {STOP_UNAVAILABLE}
         </p>
       </section>
     );
@@ -3420,555 +3576,150 @@ function StopSession({
   );
 }
 
-/// A clock time for "when we last read", to the SECOND, from epoch ms.
+/// A selected session's pane (#1546): its Details and its Transcript, as
+/// two tabs.
 ///
-/// `clockTime` above is HH:MM and right for its question -- when did a
-/// session stop, matched against the reader's own day. This one is the
-/// wrong question at that resolution: a follow polls every 3 seconds, and
-/// a label that only changes once a minute cannot show the reader that it
-/// is still reading. Requirement 3 of #1208 is that the value CHANGES as
-/// it re-reads.
-///
-/// An absolute time rather than "3 seconds ago", and that is the honesty
-/// requirement rather than a style choice: a relative phrase re-rendered
-/// from the clock keeps counting after the follow has stopped, so a dead
-/// follow reads as a live one that is merely quiet. A fixed "12:04:31"
-/// that stops advancing is visibly stopped.
-///
-/// No clock read in here either -- the instant is the argument, and it
-/// comes from the query's `dataUpdatedAt`. See the page's doc comment on
-/// why that rule is absolute in this file.
-function readClockTime(ms: number): string {
-  const at = new Date(ms);
-  if (Number.isNaN(at.getTime())) return "an unknown time";
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${p(at.getHours())}:${p(at.getMinutes())}:${p(at.getSeconds())}`;
-}
-
-/// What a follow that re-read rather than appended should say.
-///
-/// Three reasons, three sentences. The third is the one `handoff.rs` has
-/// no case for: compaction rewrote history behind our offset without the
-/// file shrinking, so nothing about its LENGTH gave it away.
-function rereadReason(why: ClaudeReread): string {
-  switch (why) {
-    case "first":
-      return "read from the start";
-    case "shrank":
-      return "the transcript was replaced or truncated, so it was read again from the start";
-    case "rewritten_behind":
-      return "the transcript changed behind where we had read to — a compaction rewrote the history — so it was read again rather than appended to";
-  }
-}
-
-function TranscriptPreview({ detail: d }: { detail: ClaudeSessionDetail }) {
-  const [open, setOpen] = useState(false);
-  // `transcript_state`, never `cwd_state` (#919, and
-  // `ClaudeSessionDetail`'s own doc): 0% of transcripts are gone against
-  // 83% of cwds. Both live on the detail since #985.
-  const refusal = revealRefusal(d.transcript_path, d.transcript_state);
-  // #1208: a FOLLOW, not a one-shot tail. The list sorts running sessions
-  // first and then this pane used to show a snapshot frozen at the moment
-  // the user clicked -- the most valuable view in the app was its most
-  // stale one.
-  const {
-    messages,
-    following,
-    lastReadAt,
-    reread,
-    window,
-    pairings,
-    isError,
-    error,
-    isLoading,
-  } = useClaudeTranscriptFollow(d.transcript_path, open && refusal === null);
-
+/// The transcript was a full-window route that replaced the detail
+/// (#1479), reached from a "show the transcript" pane inside it. It is a
+/// tab now and the route is gone, so there is one way in. Which tab shows
+/// is `claudeSessionTab`, one choice for the pane that stays put while
+/// the reader moves between sessions (the store says why);
+/// `openClaudeTranscript` selects the session AND this tab, which is how
+/// a notification and the phone's list land on it.
+function SessionPane({
+  session: s,
+  now,
+  withheld,
+}: {
+  session: ClaudeSession;
+  now: number;
+  /// This phone may not read transcripts (the list's `masking`).
+  withheld: boolean;
+}) {
+  const tab = useFilters((f) => f.claudeSessionTab);
+  const setTab = useFilters((f) => f.setClaudeSessionTab);
   return (
-    <section className="rounded-md border border-[#30363d] bg-[#161b22] p-3">
-      <h3 className="text-xs font-semibold text-[#e6edf3]">What it was doing</h3>
-      {/* The refusal is NAMED, with the tri-state's three distinct
-          wordings rather than one shared shrug -- `revealRefusal`'s doc
-          argues at length why collapsing `gone` and `unknown` destroys
-          the point of the third state. Reused rather than re-worded, so
-          this pane and the Reveal transcript button cannot come to
-          disagree about the same file.
-
-          Prefixed with what THIS control cannot do, because on the
-          desktop the disabled Reveal button states the same refusal a few
-          lines up, and two identical sentences side by side read as two
-          separate failures -- the rule `ClaudeCodePage`'s own error arm
-          and `WorktreeJump` both follow. The refusal clause itself stays
-          verbatim, so the distinction between `gone` and `unknown`
-          survives the prefix. */}
-      {refusal !== null ? (
-        <p className="mt-2 text-xs text-[#8b949e]">
-          There is nothing to read here: {refusal}.
-        </p>
-      ) : !open ? (
-        <>
-          <p className="mt-2 text-xs text-[#8b949e]">
-            The last few exchanges, followed as they are written, to see what this session is doing
-            now.
-          </p>
-          <button
-            type="button"
-            onClick={() => setOpen(true)}
-            className="tap-target mt-3 flex items-center gap-1.5 rounded-md border border-[#30363d] bg-[#21262d] px-2 py-1 text-xs text-[#e6edf3] hover:bg-[#30363d]"
-          >
-            <Terminal className="h-3 w-3" aria-hidden="true" />
-            Follow the transcript
-          </button>
-        </>
-      ) : isError ? (
-        // BEFORE the empty arm (#846): `messages` is empty on a rejection
-        // exactly as it is before the first read.
-        <p className="mt-2 text-xs text-[#8b949e]">
-          Could not read its transcript
-          {errorMessage(error) ? ` (${errorMessage(error)})` : ""}. This is not the same as the
-          session having said nothing.
-        </p>
-      ) : isLoading && lastReadAt === 0 ? (
-        <p className="mt-2 text-xs text-[#8b949e]">Reading its transcript…</p>
-      ) : (
-        <>
-          {/* WHEN WE LAST READ, always, and in three distinct wordings
-              (#1208, and the #846/#1042 rule this codebase keeps having
-              to re-apply).
-
-              "This session is idle" and "we stopped following" are
-              different facts with different remedies, and a pane that
-              shared one rendering between them would tell the reader a
-              running agent is quiet when in truth nobody is looking. The
-              third state -- actively following -- is distinct again. */}
-          <p className="mt-2 text-xs text-[#8b949e]" data-testid="follow-status">
-            {following === "stopped"
-              ? `Stopped following. Nothing has been read since ${readClockTime(lastReadAt)}.`
-              : following === "idle"
-                ? `This session is idle: nothing new has been written. Last read at ${readClockTime(lastReadAt)}.`
-                : `Following. Last read at ${readClockTime(lastReadAt)}.`}
-          </p>
-          {/* A re-read is STATED rather than silently swapping the
-              conversation under the reader. `rewritten_behind` is the
-              case a length comparison cannot catch. */}
-          {reread !== null && reread.why !== "first" ? (
-            <p className="mt-1 text-xs text-[#d29922]" data-testid="follow-reread">
-              At {readClockTime(reread.at)}, {rereadReason(reread.why)}.
-            </p>
-          ) : null}
-          {messages.length === 0 ? (
-            // Read, and there was no conversation in the window. The
-            // counts say which kind of nothing it was, because "300
-            // machinery records" and "an empty file" are different facts.
-            <p className="mt-2 text-xs text-[#8b949e]">
-              {window !== null &&
-              (window.non_conversation_records > 0 || window.unparseable_records > 0)
-                ? `No conversation in the last ${formatKb(window.bytes_read)} — ${window.non_conversation_records.toLocaleString()} bookkeeping record${window.non_conversation_records === 1 ? "" : "s"} and ${window.unparseable_records.toLocaleString()} that could not be read.`
-                : "Its transcript holds no conversation to show."}
-            </p>
-          ) : (
-            <>
-              {/* The cap, STATED, and this is where it matters most: a reader
-                  who cannot tell a short conversation from a truncated one has
-                  been told something false by omission. #910's own words asked
-                  for "a 'showing the last N lines of a large file' label", and
-                  the 39 real files over 1 MB are where it binds. */}
-              <p className="mt-2 text-xs text-[#8b949e]">
-                {window?.truncated
-                  ? `The last ${messages.length.toLocaleString()} message${messages.length === 1 ? "" : "s"} of a ${formatKb(window.file_bytes)} transcript. Earlier exchanges are not shown.`
-                  : `All ${messages.length.toLocaleString()} message${messages.length === 1 ? "" : "s"} in this transcript.`}
-                {window !== null && window.non_conversation_records > 0
-                  ? ` ${window.non_conversation_records.toLocaleString()} bookkeeping record${window.non_conversation_records === 1 ? "" : "s"} in the last window are not conversation and are not shown.`
-                  : ""}
-              </p>
-              <ol className="mt-3 space-y-2">
-                {messages.map((m, i) => (
-                  <li
-                    // The index is the key on purpose: transcript records
-                    // carry no stable id this reads, and two identical
-                    // messages in a row are a real thing a session does. The
-                    // list is only ever appended to or replaced whole, never
-                    // reordered or filtered, so the index IS the identity.
-                    key={i}
-                    className="rounded border border-[#30363d] bg-[#0d1117] p-2"
-                  >
-                    <div className="flex flex-wrap items-center gap-x-2 text-[11px] text-[#8b949e]">
-                      <span className="font-semibold text-[#e6edf3]">
-                        {m.role === "assistant" ? "Claude" : "You"}
-                      </span>
-                      {m.model ? <span>{m.model}</span> : null}
-                    </div>
-                    <div className="mt-1 space-y-1">
-                      {m.blocks.length === 0 ? (
-                        <p className="text-xs text-[#6e7681]">(nothing in this message)</p>
-                      ) : (
-                        m.blocks.map((b, j) => (
-                          <PreviewBlock
-                            key={j}
-                            block={b}
-                            pairings={pairings}
-                            // The session's liveness, passed DOWN rather
-                            // than re-derived (#1209). `liveness.rs` owns
-                            // "is this running" and two answers to one
-                            // question disagree the first time either
-                            // changes.
-                            liveness={d.liveness}
-                          />
-                        ))
-                      )}
-                    </div>
-                  </li>
-                ))}
-              </ol>
-            </>
-          )}
-        </>
-      )}
-    </section>
+    <SessionTabs
+      value={tab}
+      onValueChange={setTab}
+      details={<SessionDetail session={s} now={now} />}
+      transcript={<SessionTranscriptTab session={s} now={now} withheld={withheld} />}
+    />
   );
 }
 
-/// Bytes as KB or MB, whichever reads better.
+/// The Transcript tab (#1546): the session header (#1485) over the
+/// viewer, which is the tab's one scroll container.
 ///
-/// The figures here span 256 KB windows and 76 MB files, and "78,586 KB"
-/// is not a sentence anybody reads.
-function formatKb(bytes: number): string {
-  return bytes >= 1024 * 1024
-    ? `${(bytes / (1024 * 1024)).toFixed(1)} MB`
-    : `${Math.round(bytes / 1024).toLocaleString()} KB`;
-}
-
-/// A call with no result, said in the way the session's state makes true
-/// (#1209).
-///
-/// # Why this is not one sentence
-///
-/// A `tool_use` with no `tool_result` in the window means one of two
-/// completely different things, and which one depends on whether the
-/// process is still alive:
-///
-/// - **Running** — it is still executing. Nothing is wrong; the result
-///   has not been written yet.
-/// - **Dead** — it never came back. That is the signature of a crash mid
-///   tool call, and it is real information: it says WHERE the session
-///   died, which is exactly what a user resuming it wants to know.
-///
-/// Rendering both as "no result" throws away the second, which is the
-/// only one of the two worth surfacing. This is the house rule stated in
-/// `CLAUDE.md` — "Pending and Unknown are different states" — applied to
-/// a third pair.
-///
-/// `unknown` is a third wording again, and mandatory for `Liveness`'s own
-/// reason: a check that could not be completed is not a shade of dead. A
-/// pane that rendered it as "it never came back" would report a crash for
-/// a session that may be mid-work.
-function UnansweredNote({ liveness }: { liveness: Liveness }) {
-  switch (liveness.state) {
-    case "running":
-      return (
-        <p className="text-[11px] text-[#8b949e]">
-          No result yet — this session is still running, so the call may still be executing.
-        </p>
-      );
-    case "dead":
-      // The crash signature. Worded as a FACT about the recording, not a
-      // diagnosis: we know no result was written, and inferring the
-      // cause from that would be a second claim we cannot support.
-      return (
-        <p className="text-[11px] text-[#d29922]">
-          No result was recorded, and this session is no longer running — the call did not come
-          back.
-        </p>
-      );
-    case "unknown":
-      return (
-        <p className="text-[11px] text-[#8b949e]">
-          No result was recorded. Whether the call is still running could not be determined.
-        </p>
-      );
-  }
-}
-
-/// One tool call's arguments, rendered as the shape that tool takes
-/// (#1209).
-///
-/// Per tool, because they answer different questions: a command is read
-/// as a command, a path as a path, a pattern as a pattern. The `other`
-/// arm keeps the guarantee `Block::Other` makes one level up — a tool
-/// this build does not know is NAMED with its argument keys, so the
-/// reader can tell "Headstate is behind" from "the call was empty".
-function ToolArguments({ args }: { args: ClaudeToolArgs }) {
-  const clipped = (t: boolean) =>
-    t ? <span className="text-[#8b949e]"> … (clipped)</span> : null;
-  const mono = "font-mono text-[11px] text-[#e6edf3]";
-
-  switch (args.tool) {
-    case "bash":
-      return (
-        <div className="mt-0.5">
-          {args.description ? (
-            <p className="text-[11px] text-[#8b949e]">{args.description}</p>
-          ) : null}
-          <pre className="mt-0.5 max-h-24 overflow-auto whitespace-pre-wrap break-words rounded bg-[#161b22] p-1.5 text-[11px] text-[#e6edf3]">
-            {args.command}
-            {args.truncated ? "\n… (clipped)" : ""}
-          </pre>
-        </div>
-      );
-    case "read":
-      return (
-        <p className="mt-0.5 text-[11px] text-[#8b949e]">
-          <span className={mono}>{args.file_path}</span>
-          {/* A window, when one was asked for. Absent is not zero: no
-              offset means the whole file, not offset 0 of nothing. */}
-          {args.offset !== null || args.limit !== null
-            ? ` (from line ${args.offset ?? 1}${args.limit !== null ? `, ${args.limit} lines` : ""})`
-            : ""}
-        </p>
-      );
-    case "write":
-      return (
-        <div className="mt-0.5">
-          <p className="text-[11px] text-[#8b949e]">
-            Wrote <span className={mono}>{args.file_path}</span>
-          </p>
-          <pre className="mt-0.5 max-h-24 overflow-auto whitespace-pre-wrap break-words rounded bg-[#161b22] p-1.5 text-[11px] text-[#8b949e]">
-            {args.content}
-            {args.truncated ? "\n… (clipped)" : ""}
-          </pre>
-        </div>
-      );
-    case "edit":
-      // The ARGUMENTS of an edit, which are the replacement itself. The
-      // diff with context, when one was recorded, comes back on the
-      // result — see `FileChangeView`.
-      return (
-        <div className="mt-0.5">
-          <p className="text-[11px] text-[#8b949e]">
-            <span className={mono}>{args.file_path}</span>
-            {args.replace_all ? " (every occurrence)" : ""}
-          </p>
-          {clipped(args.truncated)}
-        </div>
-      );
-    case "multi_edit":
-      return (
-        <p className="mt-0.5 text-[11px] text-[#8b949e]">
-          <span className={mono}>{args.file_path}</span> —{" "}
-          {args.edits.length.toLocaleString()} replacement
-          {args.edits.length === 1 ? "" : "s"}
-          {/* STATED, not silent. A budget with the total named is the
-              rule `MAX_MESSAGES` follows. */}
-          {args.edits_omitted > 0
-            ? `, and ${args.edits_omitted.toLocaleString()} more not shown`
-            : ""}
-        </p>
-      );
-    case "grep":
-      return (
-        <p className="mt-0.5 text-[11px] text-[#8b949e]">
-          <span className={mono}>{args.pattern}</span>
-          {args.path ? <> in <span className={mono}>{args.path}</span></> : null}
-          {args.output_mode ? ` (${args.output_mode})` : ""}
-        </p>
-      );
-    case "glob":
-      return (
-        <p className="mt-0.5 text-[11px] text-[#8b949e]">
-          <span className={mono}>{args.pattern}</span>
-          {args.path ? <> in <span className={mono}>{args.path}</span></> : null}
-        </p>
-      );
-    case "task":
-      return (
-        <div className="mt-0.5">
-          <p className="text-[11px] text-[#8b949e]">
-            {args.description ?? "A delegated task"}
-            {args.subagent_type ? ` (${args.subagent_type})` : ""}
-          </p>
-          <p className="mt-0.5 whitespace-pre-wrap break-words text-[11px] text-[#6e7681]">
-            {args.prompt}
-            {clipped(args.truncated)}
-          </p>
-        </div>
-      );
-    case "other":
-      // NAMED, never dropped and never dumped. The keys say whether
-      // Headstate simply does not know this tool yet; the values are the
-      // blob that tells a reader nothing.
-      return args.keys.length === 0 ? null : (
-        <p className="mt-0.5 text-[11px] text-[#6e7681]">
-          Arguments this version of Headstate does not know how to show:{" "}
-          <span className="font-mono">{args.keys.join(", ")}</span>
-        </p>
-      );
-    case "none":
-      // Distinct from `other` with no keys, and said so: "nothing was
-      // recorded" is not "we did not recognise what was recorded".
-      return <p className="mt-0.5 text-[11px] text-[#6e7681]">No arguments were recorded.</p>;
-  }
-}
-
-/// A file change, LABELLED with what it was built from (#1209).
-///
-/// The label is the substance, not decoration. A `recorded` diff shows
-/// the lines around the change as the file actually was, because the
-/// transcript wrote them down. A `reconstructed` one shows only the text
-/// that was replaced and what replaced it, because nothing else was
-/// recorded — and a reader who cannot tell the two apart will read the
-/// second as a narrow change when it may have been anything.
-///
-/// The third option — reading the file off disk now — would give every
-/// edit context and is refused. The file has changed since; that is what
-/// a session does. Presenting today's content as the content at the time
-/// of the edit is fabrication, and worse than a gap because it has the
-/// credible shape of a real diff.
-function FileChangeView({ change }: { change: ClaudeFileChange }) {
+/// The header sits above the transcript once the detail is read --
+/// including when there is no transcript to show, since a running
+/// session with none yet is exactly when "running" matters. When there
+/// is none, the tab states WHY ("There is nothing to read here: …"), on
+/// the desktop and the phone alike (#1480, #1514).
+function SessionTranscriptTab({
+  session: s,
+  now,
+  withheld,
+}: {
+  session: ClaudeSession;
+  now: number;
+  withheld: boolean;
+}) {
+  const detail = useClaudeSessionDetail(s.session_id, true);
+  // A notification's tap opens at the "since you left" marker (#1484).
+  const openAt = useFilters((f) => f.claudeTranscriptAt);
+  const phone = useTranscriptRenderer() === "phone";
   return (
-    <div className="mt-1 rounded border border-[#30363d] bg-[#0d1117] p-1.5">
-      <p className="text-[11px] text-[#8b949e]">
-        {change.created === true ? "Created " : "Changed "}
-        <span className="font-mono text-[#e6edf3]">{change.file_path ?? "a file"}</span>
-      </p>
-      {/* The two sources, worded so they cannot be mistaken for each
-          other. */}
-      <p className="mt-0.5 text-[10px] text-[#6e7681]">
-        {change.source === "recorded"
-          ? "From the diff recorded at the time, so the surrounding lines are the file as it was."
-          : "Reconstructed from the replaced text alone — the transcript recorded no surrounding lines, so none are shown."}
-      </p>
-      {change.hunks.map((h, i) => (
-        <div key={i} className="mt-1">
-          {h.old_start !== null ? (
-            <p className="text-[10px] text-[#6e7681]">Line {h.old_start.toLocaleString()}</p>
-          ) : null}
-          <pre className="overflow-auto whitespace-pre-wrap break-words text-[11px] leading-tight">
-            {h.lines.map((l, j) => (
-              <span
-                key={j}
-                className={
-                  l.op === "added"
-                    ? "block bg-[#0f2e17] text-[#7ee787]"
-                    : l.op === "removed"
-                      ? "block bg-[#3a1418] text-[#ff7b72]"
-                      : "block text-[#8b949e]"
-                }
-              >
-                {l.op === "added" ? "+" : l.op === "removed" ? "-" : " "}
-                {l.text}
-              </span>
-            ))}
-          </pre>
-          {/* PER HUNK. A clipped diff that does not say so is a lie about
-              what changed, and saying it once for the pane does not tell
-              the reader WHICH region is short. */}
-          {h.lines_omitted > 0 ? (
-            <p className="text-[10px] text-[#d29922]">
-              {h.lines_omitted.toLocaleString()} more line
-              {h.lines_omitted === 1 ? "" : "s"} in this hunk are not shown.
-            </p>
-          ) : null}
-        </div>
-      ))}
-      {change.hunks_omitted > 0 ? (
-        <p className="mt-0.5 text-[10px] text-[#d29922]">
-          {change.hunks_omitted.toLocaleString()} more changed region
-          {change.hunks_omitted === 1 ? "" : "s"} in this file are not shown.
-        </p>
+    <div className="flex min-h-0 flex-1 flex-col gap-2" data-testid="transcript-tab">
+      <h2 className="min-w-0 shrink-0 truncate text-sm font-semibold text-[#e6edf3]">
+        {s.name ?? s.session_id}
+      </h2>
+      {detail.data ? (
+        <TranscriptHeader
+          session={s}
+          detail={detail.data}
+          now={now}
+          variant={phone ? "phone" : "desktop"}
+          withheld={withheld}
+          subagentRollup={<SessionSubagents detail={detail.data} />}
+        />
       ) : null}
+      {detail.isError ? (
+        <QueryError
+          title="No transcript for this session"
+          message="This session's detail could not be read, so where its transcript is is not known."
+          onRetry={() => void detail.refetch()}
+        />
+      ) : detail.data === null ? (
+        <p className="text-xs text-[#8b949e]">
+          This session is no longer in the store, so there is nothing more to show about it.
+        </p>
+      ) : detail.data === undefined ? (
+        <p className="text-xs text-[#8b949e]">Reading the rest of this session…</p>
+      ) : revealRefusal(detail.data.transcript_path, detail.data.transcript_state) !== null ? (
+        <p className="text-xs text-[#8b949e]">
+          There is nothing to read here:{" "}
+          {revealRefusal(detail.data.transcript_path, detail.data.transcript_state)}.
+        </p>
+      ) : (
+        <TranscriptFor detail={detail.data} openAt={openAt} />
+      )}
     </div>
   );
 }
 
-/// One content block of a previewed message.
+/// One session's transcript, in the renderer its layout calls for
+/// (#1481): the phone's bubbles, or the desktop's.
 ///
-/// Five kinds, five renderings, because they answer different questions:
-/// text is what was said, a tool call is what was DONE, and a tool result
-/// is usually far too long to show whole. Flattening them into prose is
-/// how 12,903 of 13,425 assistant messages would have rendered as nothing
-/// (they stop on `tool_use`).
-function PreviewBlock({
-  block: b,
-  pairings,
-  liveness,
+/// By layout (`useTranscriptRenderer`, which is `useIsMobile()`), not by
+/// build -- see `transcript/phone/renderer.ts`.
+function TranscriptFor({
+  detail: d,
+  openAt = "latest",
 }: {
-  block: ClaudePreviewBlock;
-  pairings: Record<string, ClaudePairing>;
-  liveness: Liveness;
+  detail: ClaudeSessionDetail;
+  openAt?: "latest" | "marker";
 }) {
-  switch (b.kind) {
-    case "text":
-      return (
-        <p className="whitespace-pre-wrap break-words text-xs text-[#e6edf3]">
-          {b.text}
-          {b.truncated ? <span className="text-[#8b949e]"> … (clipped)</span> : null}
-        </p>
-      );
-    case "thinking":
-      // Dimmed rather than hidden: 195 of 1,500 sampled blocks are
-      // thinking, and a reader scanning for "what was it doing" wants it
-      // out of the way but not gone.
-      return (
-        <p className="whitespace-pre-wrap break-words text-xs italic text-[#6e7681]">
-          {b.text}
-          {b.truncated ? " … (clipped)" : ""}
-        </p>
-      );
-    case "tool_use": {
-      // The name AND the parsed arguments (#1209). The original reading
-      // was right that a 40 KB blob tells a reader nothing; it was wrong
-      // that the remedy is to show nothing. "Ran Bash" and "ran
-      // `cargo test`" are not the same sentence.
-      const pairing = b.id === null ? "unkeyed" : (pairings[b.id] ?? "unanswered");
-      return (
-        <div className="text-xs text-[#8b949e]">
-          <p>
-            Ran <span className="font-mono text-[#e6edf3]">{b.name}</span>
-          </p>
-          <ToolArguments args={b.args} />
-          {/* The two call-side orphan cases, resolved against the ONE
-              liveness answer this app has. A call still in flight and a
-              call that never came back are different facts, and the
-              second is the signature of a crash. */}
-          {pairing === "unanswered" ? <UnansweredNote liveness={liveness} /> : null}
-        </div>
-      );
-    }
-    case "tool_result": {
-      const orphaned = b.tool_use_id !== null && pairings[b.tool_use_id] === "call_above_window";
-      return (
-        <div>
-          {/* The result-side orphan. NOT a missing call -- a call we did
-              not read, because the 256 KB window began after it. Nothing
-              is wrong with the session, so this must not wear the
-              wording the crash case wears. */}
-          {orphaned ? (
-            <p className="text-[11px] text-[#8b949e]">
-              The call this answers is above the window — it is older than the part of the
-              transcript that was read.
-            </p>
-          ) : null}
-          {b.is_error === true ? (
-            <p className="text-[11px] text-[#f85149]">The tool reported an error.</p>
-          ) : null}
-          <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-[#161b22] p-1.5 text-[11px] text-[#8b949e]">
-            {b.text || "(no output)"}
-            {b.truncated ? "\n… (clipped)" : ""}
-          </pre>
-          {b.change !== null ? <FileChangeView change={b.change} /> : null}
-        </div>
-      );
-    }
-    case "other":
-      // NAMED, not dropped. Claude Code owns this format, and a pane that
-      // silently omitted a future block kind would show an exchange with
-      // an invisible hole in it.
-      return (
-        <p className="text-xs text-[#6e7681]">
-          A <span className="font-mono">{b.block_type}</span> block, which this version of
-          Headstate does not know how to show.
-        </p>
-      );
+  const renderer = useTranscriptRenderer();
+  if (renderer === "phone" && d.transcript_path) {
+    return (
+      <PhoneTranscript
+        path={d.transcript_path}
+        liveness={d.liveness}
+        sessionId={d.session_id}
+        waiting={d.waiting}
+        openAt={openAt}
+      />
+    );
   }
+  return <SessionTranscript detail={d} openAt={openAt} />;
+}
+
+/// One session's transcript on the desktop layout: the terminal
+/// renderer (#1480, `DesktopTranscript`), over #1476's live, paged
+/// follow. `TranscriptFor` sends the phone layout to #1481's bubbles
+/// instead.
+function SessionTranscript({
+  detail: d,
+  openAt,
+}: {
+  detail: ClaudeSessionDetail;
+  openAt: "latest" | "marker";
+}) {
+  // Reached only past `revealRefusal`, which refuses a missing path; said
+  // rather than rendered as an empty transcript if that ever changes.
+  if (!d.transcript_path) {
+    return <p className="text-xs text-[#8b949e]">This session recorded no transcript path.</p>;
+  }
+  return (
+    <DesktopTranscript
+      path={d.transcript_path}
+      liveness={d.liveness}
+      sessionId={d.session_id}
+      waiting={d.waiting}
+      openAt={openAt}
+    />
+  );
 }
 
 /// A reveal button that is DISABLED with a reason rather than absent

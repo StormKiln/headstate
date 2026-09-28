@@ -17,6 +17,10 @@
 //! - The desktop may be reachable at several addresses (LAN, overlay);
 //!   [`Client`] tries them in order with a short connect timeout each
 //!   and remembers the one that answered.
+//! - Every request says `Accept-Encoding: gzip`, and reqwest decodes a
+//!   gzipped reply before `json_body` sees it (#1478). The desktop gzips
+//!   `/v1/call/*` responses only. `src-tauri/src/remote/listener.rs`
+//!   argues why that is safe from CRIME/BREACH.
 //!
 //! # Errors the caller acts on
 //!
@@ -28,6 +32,14 @@
 //! handshake failure". Everything network-shaped is
 //! [`ClientError::Unreachable`], which the next address, or the next
 //! retry, may fix.
+//!
+//! [`ClientError::TimedOut`] is NOT network-shaped, and is kept apart
+//! from `Unreachable` on purpose (#1466). The connection was made and
+//! the desktop simply had not answered within [`CALL_TIMEOUT`] -- which
+//! is evidence about that one command, not about the path. Other calls
+//! on the same connection may be succeeding at that very moment, so a
+//! caller must not mark the desktop unreachable or restart the event
+//! stream over it.
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{aws_lc_rs, CryptoProvider, WebPkiSupportedAlgorithms};
@@ -121,6 +133,11 @@ pub enum ClientError {
     /// Could not reach the desktop at any address.
     #[error("desktop unreachable: {0}")]
     Unreachable(String),
+    /// The desktop was reached -- TCP and TLS both completed -- but did
+    /// not finish answering within the call's timeout. About this call,
+    /// not the connection: see the module docs (#1466).
+    #[error("the desktop took too long to answer: {0}")]
+    TimedOut(String),
     /// The desktop answered with a non-2xx status; `message` is its body.
     #[error("{message}")]
     Status { status: u16, message: String },
@@ -350,6 +367,18 @@ impl Client {
         addrs: Vec<String>,
         port: u16,
     ) -> Result<Self, ClientError> {
+        Self::with_call_timeout(identity, server_fp, addrs, port, CALL_TIMEOUT)
+    }
+
+    /// [`Client::new`] with a call timeout other than [`CALL_TIMEOUT`],
+    /// so a test can watch a call time out without waiting two minutes.
+    pub(crate) fn with_call_timeout(
+        identity: &SessionIdentity,
+        server_fp: &str,
+        addrs: Vec<String>,
+        port: u16,
+        call_timeout: Duration,
+    ) -> Result<Self, ClientError> {
         if addrs.is_empty() {
             return Err(ClientError::Unreachable("no addresses to try".into()));
         }
@@ -367,7 +396,7 @@ impl Client {
                 .map_err(|e| ClientError::Protocol(format!("HTTP client: {e}")))
         };
         Ok(Self {
-            calls: build(base().timeout(CALL_TIMEOUT))?,
+            calls: build(base().timeout(call_timeout))?,
             stream: build(base().read_timeout(STREAM_READ_TIMEOUT))?,
             addrs,
             port,
@@ -535,8 +564,21 @@ impl Client {
                 // a working address was still in flight, and the user
                 // was shown a security warning for a connection that
                 // succeeded ten seconds later (#645).
+                //
+                // A TIMEOUT is kept going too, although the desktop was
+                // reached. The race only ever carries `hello`, `pair` and
+                // the stream's opening -- a command goes to one address,
+                // outside this loop (#657) -- and each of those answers
+                // in milliseconds, so one that sat out the whole call
+                // timeout is likelier a path that stalled after
+                // connecting than a desktop that is busy. By the time it
+                // times out every other address has long since settled
+                // anyway, so continuing costs nothing. It ranks above
+                // `Unreachable` below, so if nothing else answers the
+                // caller is told the desktop was slow, not absent.
                 Err(
                     e @ (ClientError::Unreachable(_)
+                    | ClientError::TimedOut(_)
                     | ClientError::Handshake(_)
                     | ClientError::FingerprintMismatch),
                 ) => {
@@ -571,6 +613,7 @@ impl Client {
                 }
                 Err(
                     e @ (ClientError::Unreachable(_)
+                    | ClientError::TimedOut(_)
                     | ClientError::Handshake(_)
                     | ClientError::FingerprintMismatch),
                 ) => {
@@ -599,8 +642,9 @@ impl Client {
         // handshake refusal is not hidden behind a timeout on some other
         // interface -- while the detail still lists every address.
         Err(match worst {
-            2 => ClientError::FingerprintMismatch,
-            1 => ClientError::Handshake(detail),
+            3 => ClientError::FingerprintMismatch,
+            2 => ClientError::Handshake(detail),
+            1 => ClientError::TimedOut(detail),
             _ => ClientError::Unreachable(detail),
         })
     }
@@ -880,13 +924,18 @@ fn tls_error<'a>(err: &'a (dyn std::error::Error + 'static)) -> Option<&'a rustl
 }
 
 /// How much a failure tells us, for choosing which one to report when
-/// every address failed. A timeout says the least; our own verifier
-/// rejecting the certificate says the most, and is the one the user must
-/// see even if three other interfaces merely timed out (#645).
+/// every address failed. A connect timeout says the least; our own
+/// verifier rejecting the certificate says the most, and is the one the
+/// user must see even if three other interfaces merely timed out (#645).
+///
+/// Anything above zero means the desktop was FOUND -- a TLS peer answered
+/// -- which is what skips the mDNS browse. A call that timed out after
+/// connecting counts (#1466): the desktop is there, it was slow.
 fn rank(err: &ClientError) -> u8 {
     match err {
-        ClientError::FingerprintMismatch => 2,
-        ClientError::Handshake(_) => 1,
+        ClientError::FingerprintMismatch => 3,
+        ClientError::Handshake(_) => 2,
+        ClientError::TimedOut(_) => 1,
         _ => 0,
     }
 }
@@ -910,6 +959,15 @@ fn classify(err: reqwest::Error) -> ClientError {
     }
     if err.is_decode() {
         return ClientError::Protocol(err.to_string());
+    }
+    // A timeout that is not the CONNECT timing out is the call's own
+    // timeout (or the body read) running out on a connection that was
+    // made: the desktop is there and slow, not gone (#1466).
+    // `connect_timeout` also reports `is_timeout`, but reqwest raises it
+    // from inside the connector, so it carries `is_connect` as well and
+    // stays `Unreachable` -- a dead address is what that timeout means.
+    if err.is_timeout() && !err.is_connect() {
+        return ClientError::TimedOut(err.to_string());
     }
     ClientError::Unreachable(err.to_string())
 }
@@ -1226,7 +1284,9 @@ mod tests {
     async fn unreachable_names_every_address_that_was_tried() {
         let id = identity();
         // Both TEST-NET-1: nothing routes there, so both fail and the
-        // error has to account for both.
+        // error has to account for both. Where they fail by CONNECT
+        // timeout this also holds `classify` to calling that unreachable
+        // rather than a slow desktop (#1466).
         let client = Client::new(
             &id,
             "aa:bb",
@@ -1375,12 +1435,29 @@ mod tests {
         );
     }
 
+    /// A desktop that has gone away keeps its port: nothing else can bind
+    /// it while the test still needs it gone.
+    ///
+    /// `drop(server)` freed the port, and in a parallel run another
+    /// test's server took it -- the phone then met a stranger's
+    /// certificate and reported a fingerprint mismatch, not
+    /// "unreachable". That failed CI on a release candidate.
+    #[tokio::test]
+    async fn a_desktop_that_went_away_keeps_its_port() {
+        let server = TestServer::start().await;
+        server.go_away();
+        assert!(
+            std::net::TcpListener::bind(("127.0.0.1", server.port())).is_err(),
+            "the port must stay held so no other test's server can answer on it"
+        );
+    }
+
     #[tokio::test]
     async fn no_address_answering_is_unreachable() {
         let id = identity();
         let server = TestServer::start().await;
         let port = server.port();
-        drop(server);
+        server.go_away();
         let client = Client::new(&id, &"ab".repeat(32), vec!["127.0.0.1".into()], port).unwrap();
         assert!(matches!(
             client.hello().await,
@@ -1419,6 +1496,88 @@ mod tests {
             .filter(|r| r.path == "/v1/call/list_branches")
             .count();
         assert_eq!(calls, 1, "the command must reach the desktop once");
+    }
+
+    /// A command the desktop is still working on when the call's timeout
+    /// runs out is a TIMEOUT, not an unreachable desktop (#1466).
+    ///
+    /// The distinction is what lets the caller leave the connection and
+    /// the event stream alone: the connection was made, the desktop is
+    /// there, and it was slow on this one command.
+    #[tokio::test]
+    async fn a_call_the_desktop_is_slow_to_answer_is_a_timeout() {
+        let id = identity();
+        let server = TestServer::start().await;
+        server.pair(&id.fingerprint());
+        server.reply("/v1/call/size_worktrees", Reply::Stall);
+        let client = Client::with_call_timeout(
+            &id,
+            &server.fp,
+            vec![server.addr()],
+            server.port(),
+            Duration::from_millis(500),
+        )
+        .unwrap();
+        let err = client
+            .call("size_worktrees", &json!({"paths": ["/srv/r"]}), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ClientError::TimedOut(_)), "{err:?}");
+        assert!(err.to_string().contains("took too long"), "{err}");
+        // And the connection it timed out on still works.
+        client.hello().await.unwrap();
+    }
+
+    /// The other half: a desktop that is GONE -- the port refuses the
+    /// connection -- is still unreachable, even on a client whose call
+    /// timeout is short enough to be confused with one.
+    #[tokio::test]
+    async fn a_refused_connection_on_a_call_is_still_unreachable() {
+        let id = identity();
+        let server = TestServer::start().await;
+        server.pair(&id.fingerprint());
+        server.reply("/v1/call/get_stats", Reply::json(200, json!({})));
+        let client = Client::with_call_timeout(
+            &id,
+            &server.fp,
+            vec![server.addr()],
+            server.port(),
+            Duration::from_millis(500),
+        )
+        .unwrap();
+        // Answered once, so the call goes straight to the known address
+        // rather than through `hello`'s race.
+        client.call("get_stats", &json!({}), None).await.unwrap();
+        server.go_away();
+        let err = client
+            .call("get_stats", &json!({}), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ClientError::Unreachable(_)), "{err:?}");
+    }
+
+    /// When the only address reached the desktop and then timed out, the
+    /// race reports the timeout rather than burying it as unreachable --
+    /// the desktop was found, it was slow.
+    #[tokio::test]
+    async fn a_hello_that_times_out_everywhere_is_a_timeout() {
+        let id = identity();
+        let server = TestServer::start().await;
+        server.pair(&id.fingerprint());
+        server.reply("/v1/hello", Reply::Stall);
+        let client = Client::with_call_timeout(
+            &id,
+            &server.fp,
+            vec![server.addr()],
+            server.port(),
+            Duration::from_millis(500),
+        )
+        .unwrap();
+        let err = client.hello().await.unwrap_err();
+        let ClientError::TimedOut(detail) = &err else {
+            panic!("expected TimedOut, got {err:?}");
+        };
+        assert!(detail.contains(&server.addr()), "{detail}");
     }
 
     /// A signed call reaches the desktop ONCE, however many addresses
@@ -1525,6 +1684,47 @@ mod tests {
                 status: 500,
                 message: "gh auth status failed".into()
             }
+        );
+    }
+
+    /// #1478: a call asks for gzip, and a gzipped reply decodes to the
+    /// JSON the desktop sent. The page is transcript-shaped and large
+    /// enough that the stand-in desktop's gzip is doing real work.
+    #[tokio::test]
+    async fn a_call_asks_for_gzip_and_decodes_a_gzipped_reply() {
+        let id = identity();
+        let server = TestServer::start().await;
+        server.pair(&id.fingerprint());
+        let lines: Vec<String> = (0..400)
+            .map(|i| format!("test module_{}::case_{i} ... ok", i % 17))
+            .collect();
+        let page = json!({"messages": [{"text": lines.join("\n")}], "truncated": false});
+        server.reply(
+            "/v1/call/claude_transcript_page",
+            Reply::GzipJson {
+                status: 200,
+                body: page.to_string(),
+            },
+        );
+        let client = Client::new(&id, &server.fp, vec![server.addr()], server.port()).unwrap();
+        let out = client
+            .call(
+                "claude_transcript_page",
+                &json!({"path": "p.jsonl", "anchor": {"kind": "end"}, "direction": "before", "limit": null}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, page);
+        let req = server
+            .requests()
+            .into_iter()
+            .find(|r| r.path == "/v1/call/claude_transcript_page")
+            .unwrap();
+        let accept = req.header("accept-encoding").unwrap_or("");
+        assert!(
+            accept.split(',').any(|c| c.trim() == "gzip"),
+            "the call must ask for gzip; it sent Accept-Encoding {accept:?}"
         );
     }
 }

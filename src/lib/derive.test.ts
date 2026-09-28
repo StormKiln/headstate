@@ -129,10 +129,13 @@ describe("applyFilters", () => {
 });
 
 describe("sortReadyForReview", () => {
-  const at = (number: number, created_at: string): PullRequest => ({
+  // Every row OPENED at the same instant, so only `ready_at` can order
+  // them: a sort still reading `created_at` returns its input untouched.
+  const at = (number: number, ready_at: string | null | undefined): PullRequest => ({
     ...PR_FIXTURES[0],
     number,
-    created_at,
+    created_at: "2026-08-01T00:00:00Z",
+    ready_at,
   });
 
   // Deliberately handed in NEWEST-first order, so a function that returns
@@ -144,11 +147,11 @@ describe("sortReadyForReview", () => {
     at(1, "2026-09-01T00:00:00Z"),
   ];
 
-  it("defaults to oldest opened first", () => {
+  it("defaults to oldest ready first", () => {
     expect(sortReadyForReview(NEWEST_FIRST).map((pr) => pr.number)).toEqual([1, 2, 3]);
   });
 
-  it("orders newest opened first when asked", () => {
+  it("orders newest ready first when asked", () => {
     const oldestFirst = [...NEWEST_FIRST].reverse();
     expect(sortReadyForReview(oldestFirst, "newest-opened").map((pr) => pr.number)).toEqual(
       [3, 2, 1],
@@ -166,19 +169,19 @@ describe("sortReadyForReview", () => {
   /// the top of the queue, where it would claim to be the longest-waiting
   /// work and push genuinely old pull requests down. Last is the honest
   /// place for "we do not know".
-  it("sorts an unparseable created_at last, not first", () => {
+  it("sorts an unparseable ready_at last, not first", () => {
     const withJunk = [at(9, "not a date"), ...NEWEST_FIRST];
     expect(sortReadyForReview(withJunk).map((pr) => pr.number)).toEqual([1, 2, 3, 9]);
   });
 
-  it("sorts a missing created_at last, not first", () => {
+  it("sorts a missing ready_at last, not first", () => {
     const withEmpty = [at(9, ""), ...NEWEST_FIRST];
     expect(sortReadyForReview(withEmpty).map((pr) => pr.number)).toEqual([1, 2, 3, 9]);
   });
 
   // Last in BOTH directions. "Unknown" is not a date to be flipped -- on
   // newest-first it would otherwise land at the top for the same reason.
-  it("keeps undated rows last under newest-opened too", () => {
+  it("keeps undated rows last under newest-first too", () => {
     const withJunk = [at(9, "not a date"), ...NEWEST_FIRST];
     expect(sortReadyForReview(withJunk, "newest-opened").map((pr) => pr.number)).toEqual(
       [3, 2, 1, 9],
@@ -188,6 +191,27 @@ describe("sortReadyForReview", () => {
   it("leaves several undated rows in a stable order among themselves", () => {
     const many = [at(8, ""), at(9, "nonsense"), ...NEWEST_FIRST];
     expect(sortReadyForReview(many).map((pr) => pr.number)).toEqual([1, 2, 3, 8, 9]);
+  });
+
+  // Unknown -- a snapshot from before the field existed, or a time GitHub
+  // did not return -- is undated, and goes last. It must NOT fall back to
+  // `created_at`, which would rank a week-long draft as the longest wait.
+  it("sorts an absent or null ready_at last, not by when it was opened", () => {
+    const unknown = [
+      { ...at(8, undefined), created_at: "2020-01-01T00:00:00Z" },
+      { ...at(9, null), created_at: "2020-01-01T00:00:00Z" },
+      ...NEWEST_FIRST,
+    ];
+    expect(sortReadyForReview(unknown).map((pr) => pr.number)).toEqual([1, 2, 3, 8, 9]);
+  });
+
+  // #1407's point: a pull request opened long ago but marked ready
+  // recently has waited only since then, and sorts as recent.
+  it("sorts a long draft by when it became ready, not when it was opened", () => {
+    const longDraft = { ...at(7, "2026-09-04T00:00:00Z"), created_at: "2026-06-01T00:00:00Z" };
+    expect(sortReadyForReview([longDraft, ...NEWEST_FIRST]).map((pr) => pr.number)).toEqual([
+      1, 2, 3, 7,
+    ]);
   });
 });
 

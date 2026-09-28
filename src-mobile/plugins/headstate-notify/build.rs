@@ -20,7 +20,7 @@
 //! constants and skips any plugin with no `android/` directory. A plugin
 //! with an Android folder and no Kotlin would fail it, correctly.
 
-const COMMANDS: &[&str] = &["permission", "request_permission", "post"];
+const COMMANDS: &[&str] = &["permission", "request_permission", "post", "take_tapped"];
 
 fn main() {
     tauri_plugin::Builder::new(COMMANDS).ios_path("ios").build();

@@ -52,6 +52,23 @@
 //!    health categories are all off makes two requests, not three. A
 //!    background window is a few seconds of granted time and a request
 //!    whose answer is discarded spends some of it.
+//!
+//! # Session notifications (#1486)
+//!
+//! Between the pull requests and health, a window reads
+//! `claude_session_digest` -- a bounded, content-free status per Claude
+//! Code session -- and announces what `notify::session_transitions` says
+//! changed: a turn finished, a session is waiting for input or
+//! permission, a turn errored. Two more reads on the seam, both named in
+//! `the_seam_offers_only_what_a_window_needs`:
+//!
+//! - `session_digest`, only when session notifications are on. When they
+//!   are off, the stored marks are dropped instead, so switching them on
+//!   is a first sync and not a burst of everything since.
+//! - `session_prompt`, once per ANNOUNCED session and only when the owner
+//!   turned the lock-screen snippet on. Masked on the desktop.
+//!
+//! Best-effort like everything else here, and the settings say so.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -66,13 +83,14 @@ use crate::companion::Companion;
 /// A boxed request to the desktop.
 pub type DesktopFuture<T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send>>;
 
-/// The three requests the background path may make. Deliberately
-/// nothing else: no stream, no write commands.
+/// The requests the background path may make. Deliberately nothing
+/// else: no stream, no write commands.
 ///
-/// `health_alerts` joined `hello` and `get_cached` for #789. The seam
-/// grew by exactly one READ, and the test below was updated to name it
-/// rather than loosened -- the seam exists so "this path cannot open the
-/// stream" is a structural fact, and a third read does not weaken that.
+/// `health_alerts` joined `hello` and `get_cached` for #789, and
+/// `session_digest` and `session_prompt` for #1486. The seam grew by
+/// READS only, and the test below was updated to name each rather than
+/// loosened -- the seam exists so "this path cannot open the stream" is a
+/// structural fact, and another read does not weaken that.
 pub trait Desktop: Send + Sync {
     /// `GET /v1/hello`. Proves the desktop is there and still knows us.
     fn hello(&self) -> DesktopFuture<()>;
@@ -83,6 +101,12 @@ pub trait Desktop: Send + Sync {
     /// series. The phone holds no copy of any threshold -- see
     /// `notify.rs` on why that is the point rather than a convenience.
     fn health_alerts(&self) -> DesktopFuture<String>;
+    /// `claude_session_digest` (#1486): a bounded status per session,
+    /// carrying no transcript text. JSON verbatim.
+    fn session_digest(&self) -> DesktopFuture<String>;
+    /// `claude_transcript_opening_prompt` for one session (#1486): the
+    /// opt-in lock-screen snippet, masked on the desktop. JSON verbatim.
+    fn session_prompt(&self, session_id: &str) -> DesktopFuture<String>;
 }
 
 /// Where the list goes: the snapshot store, so the app opens fresh.
@@ -117,6 +141,16 @@ pub trait Notifier: Send + Sync {
     /// The phone's record of which health conditions it has already
     /// announced, so a standing condition is said once.
     fn health_fired(&self) -> Arc<std::sync::Mutex<crate::notify::Fired>>;
+    /// What the last session pass saw (#1486).
+    fn sessions_seen(&self) -> crate::notify::SessionsPrevious;
+    /// Remember this session pass's marks.
+    fn remember_sessions(&self, seen: &crate::notify::SessionsSeen) -> Result<(), String>;
+    /// Drop the session marks: the next pass is a first sync.
+    fn forget_sessions(&self) -> Result<(), String>;
+    /// Sessions the owner muted on this phone.
+    fn session_mutes(&self) -> crate::notify::SessionMutes;
+    /// Post one session notification, carrying the session a tap opens.
+    fn post_session(&self, title: &str, body: &str, session: &str) -> Result<(), String>;
 }
 
 impl Desktop for Companion {
@@ -144,6 +178,29 @@ impl Desktop for Companion {
                 .await
                 .map_err(|e| e.to_string())?;
             serde_json::to_string(&alerts).map_err(|e| e.to_string())
+        })
+    }
+
+    fn session_digest(&self) -> DesktopFuture<String> {
+        let client = self.client();
+        Box::pin(async move {
+            let digest = client?
+                .call("claude_session_digest", &json!({}), None)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_string(&digest).map_err(|e| e.to_string())
+        })
+    }
+
+    fn session_prompt(&self, session_id: &str) -> DesktopFuture<String> {
+        let client = self.client();
+        let args = json!({ "sessionId": session_id });
+        Box::pin(async move {
+            let prompt = client?
+                .call("claude_transcript_opening_prompt", &args, None)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_string(&prompt).map_err(|e| e.to_string())
         })
     }
 }
@@ -251,6 +308,8 @@ async fn notify_pass(desktop: &Arc<dyn Desktop>, notifier: &Arc<dyn Notifier>, p
         }
     }
 
+    session_pass(desktop, notifier, &prefs).await;
+
     // Health. Not asked for at all when nothing would be posted: a
     // background window is a few seconds of granted time, and a request
     // whose answer is discarded spends some of it.
@@ -286,6 +345,60 @@ async fn notify_pass(desktop: &Arc<dyn Desktop>, notifier: &Arc<dyn Notifier>, p
     for (title, body) in transitions {
         if let Err(e) = notifier.post(&title, &body) {
             log::info!("notify: could not announce a health change: {e}");
+        }
+    }
+}
+
+/// The session half of a window (#1486). Fails at nothing, like the rest
+/// of the notification pass.
+async fn session_pass(
+    desktop: &Arc<dyn Desktop>,
+    notifier: &Arc<dyn Notifier>,
+    prefs: &crate::notify::PhoneNotifyPrefs,
+) {
+    use crate::notify;
+
+    if !prefs.wants_sessions() {
+        // Not asked for, and the marks dropped: switching sessions back
+        // on must be a first sync, not a burst of everything since.
+        if let Err(e) = notifier.forget_sessions() {
+            log::info!("notify: could not drop the session marks: {e}");
+        }
+        return;
+    }
+    let json = match desktop.session_digest().await {
+        Ok(json) => json,
+        Err(e) => {
+            // A desktop too old to have the command, or one that went
+            // away since `hello`. The marks are left alone.
+            log::info!("notify: could not read the desktop's sessions: {e}");
+            return;
+        }
+    };
+    let Some(digest) = notify::decode_digest(&json) else {
+        // Unreadable is not "no sessions": leave the marks alone, for
+        // the back-door-burst reason `notify::Decoded` documents.
+        log::info!("notify: the session status could not be read; leaving the marks alone");
+        return;
+    };
+    for event in notify::advance_sessions(notifier.as_ref(), &digest) {
+        let snippet = if prefs.session_snippet {
+            match desktop.session_prompt(&event.session_id).await {
+                Ok(json) => notify::decode_prompt(&json),
+                Err(e) => {
+                    // Refused for a phone that may not read transcripts,
+                    // or a desktop without the command. The notification
+                    // goes out without the snippet.
+                    log::info!("notify: no snippet for a session notification: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let (title, body) = notify::session_notification(&event, snippet.as_deref());
+        if let Err(e) = notifier.post_session(&title, &body, &event.session_id) {
+            log::info!("notify: could not announce a session change: {e}");
         }
     }
 }
@@ -351,6 +464,8 @@ mod tests {
         Hello,
         GetCached,
         HealthAlerts,
+        SessionDigest,
+        SessionPrompt,
     }
 
     struct FakeDesktop {
@@ -358,6 +473,11 @@ mod tests {
         hello: Result<(), String>,
         cached: Result<String, String>,
         health: Result<String, String>,
+        /// What `session_digest` answers. `Err` by default: a desktop
+        /// with no sessions command, which is what every #789 test above
+        /// was written against.
+        digest: Mutex<Result<String, String>>,
+        prompt: Result<String, String>,
     }
 
     impl FakeDesktop {
@@ -367,6 +487,8 @@ mod tests {
                 hello,
                 cached,
                 health: Ok("[]".into()),
+                digest: Mutex::new(Err("no sessions command".into())),
+                prompt: Err("no prompt command".into()),
             })
         }
         /// A desktop that also has health conditions to report.
@@ -376,6 +498,8 @@ mod tests {
                 hello: Ok(()),
                 cached: Ok(cached.into()),
                 health: Ok(health.into()),
+                digest: Mutex::new(Err("no sessions command".into())),
+                prompt: Err("no prompt command".into()),
             })
         }
         fn requests(&self) -> Vec<Request> {
@@ -397,6 +521,16 @@ mod tests {
         fn health_alerts(&self) -> DesktopFuture<String> {
             self.log.lock().unwrap().push(Request::HealthAlerts);
             let r = self.health.clone();
+            Box::pin(async move { r })
+        }
+        fn session_digest(&self) -> DesktopFuture<String> {
+            self.log.lock().unwrap().push(Request::SessionDigest);
+            let r = self.digest.lock().unwrap().clone();
+            Box::pin(async move { r })
+        }
+        fn session_prompt(&self, _session_id: &str) -> DesktopFuture<String> {
+            self.log.lock().unwrap().push(Request::SessionPrompt);
+            let r = self.prompt.clone();
             Box::pin(async move { r })
         }
     }
@@ -425,6 +559,10 @@ mod tests {
         posted: Mutex<Vec<(String, String)>>,
         remembered: Mutex<Vec<Vec<crate::notify::Pr>>>,
         fired: Arc<Mutex<crate::notify::Fired>>,
+        sessions: Mutex<crate::notify::SessionsPrevious>,
+        mutes: Mutex<crate::notify::SessionMutes>,
+        /// `(title, body, session)` for every session notification.
+        session_posts: Mutex<Vec<(String, String, String)>>,
     }
 
     impl FakeNotifier {
@@ -442,6 +580,9 @@ mod tests {
                 posted: Mutex::new(vec![]),
                 remembered: Mutex::new(vec![]),
                 fired: Arc::new(Mutex::new(crate::notify::Fired::default())),
+                sessions: Mutex::new(crate::notify::SessionsPrevious::First),
+                mutes: Mutex::new(crate::notify::SessionMutes::default()),
+                session_posts: Mutex::new(vec![]),
             })
         }
         /// Everything on, paired, posting succeeds.
@@ -493,6 +634,28 @@ mod tests {
         }
         fn health_fired(&self) -> Arc<Mutex<crate::notify::Fired>> {
             self.fired.clone()
+        }
+        fn sessions_seen(&self) -> crate::notify::SessionsPrevious {
+            self.sessions.lock().unwrap().clone()
+        }
+        fn remember_sessions(&self, seen: &crate::notify::SessionsSeen) -> Result<(), String> {
+            *self.sessions.lock().unwrap() = crate::notify::SessionsPrevious::Known(seen.clone());
+            Ok(())
+        }
+        fn forget_sessions(&self) -> Result<(), String> {
+            *self.sessions.lock().unwrap() = crate::notify::SessionsPrevious::First;
+            Ok(())
+        }
+        fn session_mutes(&self) -> crate::notify::SessionMutes {
+            self.mutes.lock().unwrap().clone()
+        }
+        fn post_session(&self, title: &str, body: &str, session: &str) -> Result<(), String> {
+            self.session_posts.lock().unwrap().push((
+                title.to_string(),
+                body.to_string(),
+                session.to_string(),
+            ));
+            self.post_result.clone()
         }
     }
 
@@ -596,7 +759,16 @@ mod tests {
             .filter_map(|l| l.trim().strip_prefix("fn "))
             .map(|l| l.split('(').next().unwrap())
             .collect();
-        assert_eq!(methods, vec!["hello", "get_cached", "health_alerts"]);
+        assert_eq!(
+            methods,
+            vec![
+                "hello",
+                "get_cached",
+                "health_alerts",
+                "session_digest",
+                "session_prompt"
+            ]
+        );
         assert!(
             !body.iter().any(|l| l.contains("events")),
             "no stream on the seam"
@@ -730,10 +902,12 @@ mod tests {
             },
         );
         let _ = run_notifying(&desktop, &notifier);
+        // The session digest is asked for -- sessions are on by default
+        // (#1486) -- but health is not.
         assert_eq!(
             desktop.requests(),
-            vec![Request::Hello, Request::GetCached],
-            "two requests, not three"
+            vec![Request::Hello, Request::GetCached, Request::SessionDigest],
+            "no health request"
         );
         assert!(notifier.posted().is_empty());
     }
@@ -805,7 +979,11 @@ mod tests {
         );
         let _ = run_notifying(&desktop, &notifier);
         assert!(notifier.posted().is_empty());
-        assert_eq!(desktop.requests(), vec![Request::Hello, Request::GetCached]);
+        // Sessions are asked for (on by default, #1486); health is not.
+        assert_eq!(
+            desktop.requests(),
+            vec![Request::Hello, Request::GetCached, Request::SessionDigest]
+        );
     }
 
     /// A desktop too old to answer `health_alerts` costs the health
@@ -818,6 +996,8 @@ mod tests {
             hello: Ok(()),
             cached: Ok(NOTIFIABLE.into()),
             health: Err("`health_alerts` is not a Headstate command".into()),
+            digest: Mutex::new(Err("no sessions command".into())),
+            prompt: Err("no prompt command".into()),
         });
         let notifier = FakeNotifier::new(crate::notify::Previous::Known(vec![]));
         let (result, sink) = run_notifying(&desktop, &notifier);
@@ -907,6 +1087,160 @@ mod tests {
         assert_eq!(result, Ok(()));
         assert_eq!(desktop.requests(), vec![Request::Hello, Request::GetCached]);
         assert_eq!(*sink.saved.lock().unwrap(), vec![NOTIFIABLE.to_string()]);
+    }
+
+    // ---- Sessions (#1486) -----------------------------------------------
+
+    fn digest_json(as_of: &str, rows: &str) -> String {
+        format!(r#"{{"as_of":"{as_of}","total":1,"sessions":[{rows}]}}"#)
+    }
+
+    const IDLE_ROW: &str = r#"{"session_id":"s-1","project":"hello-world","liveness":"running","waiting":null,"last_turn":null}"#;
+    const FINISHED_ROW: &str = r#"{"session_id":"s-1","project":"hello-world","liveness":"running","waiting":null,"last_turn":{"ended_at":"2026-09-26T12:05:00Z","outcome":{"state":"completed"}}}"#;
+
+    fn with_digest(json: String) -> Arc<FakeDesktop> {
+        let d = FakeDesktop::new(Ok(()), Ok("[]".into()));
+        *d.digest.lock().unwrap() = Ok(json);
+        d
+    }
+
+    /// Two windows: the first is a first sync and silent, the second
+    /// announces the turn that finished between them -- carrying the
+    /// session id, which is what a tap on it opens.
+    #[test]
+    fn a_session_that_finishes_between_windows_is_announced_with_its_link() {
+        let notifier = FakeNotifier::new(crate::notify::Previous::Known(vec![]));
+        let first = with_digest(digest_json("2026-09-26T12:00:00Z", FINISHED_ROW));
+        let _ = run_notifying(&first, &notifier);
+        assert!(
+            notifier.session_posts.lock().unwrap().is_empty(),
+            "first sync"
+        );
+
+        let second = with_digest(digest_json(
+            "2026-09-26T12:30:00Z",
+            &FINISHED_ROW.replace("12:05:00Z", "12:25:00Z"),
+        ));
+        let (result, _) = run_notifying(&second, &notifier);
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            *notifier.session_posts.lock().unwrap(),
+            vec![(
+                "hello-world".to_string(),
+                "Finished".to_string(),
+                "s-1".to_string()
+            )]
+        );
+        assert!(
+            !second.requests().contains(&Request::SessionPrompt),
+            "no snippet unless the owner asked for one"
+        );
+    }
+
+    /// With sessions off, the digest is not even asked for, and the marks
+    /// are dropped -- so switching them back on is a first sync.
+    #[test]
+    fn sessions_off_asks_for_nothing_and_turning_them_on_is_a_first_sync() {
+        let off = crate::notify::PhoneNotifyPrefs {
+            sessions: false,
+            ..Default::default()
+        };
+        let notifier = FakeNotifier::with_prefs(crate::notify::Previous::Known(vec![]), off);
+        *notifier.sessions.lock().unwrap() =
+            crate::notify::SessionsPrevious::Known(crate::notify::SessionsSeen {
+                v: 1,
+                as_of: "2026-09-26T11:00:00Z".into(),
+                sessions: Default::default(),
+            });
+        let desktop = with_digest(digest_json("2026-09-26T12:00:00Z", FINISHED_ROW));
+        let _ = run_notifying(&desktop, &notifier);
+        assert!(!desktop.requests().contains(&Request::SessionDigest));
+        assert_eq!(
+            *notifier.sessions.lock().unwrap(),
+            crate::notify::SessionsPrevious::First
+        );
+    }
+
+    /// The snippet, when on, is asked for per ANNOUNCED session and
+    /// follows the state. A refused snippet still sends the notification.
+    #[test]
+    fn the_snippet_is_fetched_only_when_on_and_only_for_an_announcement() {
+        let on = crate::notify::PhoneNotifyPrefs {
+            session_snippet: true,
+            ..Default::default()
+        };
+        let notifier = FakeNotifier::with_prefs(crate::notify::Previous::Known(vec![]), on);
+        let _ = run_notifying(
+            &with_digest(digest_json("2026-09-26T12:00:00Z", IDLE_ROW)),
+            &notifier,
+        );
+        let d = Arc::new(FakeDesktop {
+            log: Mutex::new(vec![]),
+            hello: Ok(()),
+            cached: Ok("[]".into()),
+            health: Ok("[]".into()),
+            digest: Mutex::new(Ok(digest_json("2026-09-26T12:30:00Z", FINISHED_ROW))),
+            prompt: Ok(r#"{"prompt":"fix the flaky test","masking":{"hidden":0}}"#.into()),
+        });
+        let _ = run_notifying(&d, &notifier);
+        assert_eq!(
+            d.requests()
+                .iter()
+                .filter(|r| **r == Request::SessionPrompt)
+                .count(),
+            1
+        );
+        assert_eq!(
+            notifier.session_posts.lock().unwrap()[0].1,
+            "Finished\nfix the flaky test"
+        );
+    }
+
+    /// A desktop too old to answer the digest costs session
+    /// notifications and nothing else.
+    #[test]
+    fn a_desktop_without_the_digest_does_not_fail_the_window() {
+        let notifier = FakeNotifier::new(crate::notify::Previous::Known(vec![]));
+        let desktop = FakeDesktop::new(Ok(()), Ok(NOTIFIABLE.into()));
+        let (result, _) = run_notifying(&desktop, &notifier);
+        assert_eq!(result, Ok(()));
+        assert_eq!(notifier.titles(), vec!["Add a spoon"]);
+        assert_eq!(
+            *notifier.sessions.lock().unwrap(),
+            crate::notify::SessionsPrevious::First,
+            "the marks are left alone"
+        );
+    }
+
+    /// **The foreground half shares the background's marks**, so a
+    /// transition toasted while the app was open is not notified again
+    /// by the next window -- and the session on screen gets no toast.
+    #[test]
+    fn a_toasted_transition_is_not_notified_again_and_the_viewed_session_is_skipped() {
+        let notifier = FakeNotifier::new(crate::notify::Previous::Known(vec![]));
+        let two = |as_of: &str, at: &str| {
+            let a = FINISHED_ROW.replace("12:05:00Z", at);
+            let b = a.replace("s-1", "s-2");
+            with_digest(digest_json(as_of, &format!("{a},{b}")))
+        };
+        let _ = run_notifying(&two("2026-09-26T12:00:00Z", "11:55:00Z"), &notifier);
+
+        let fg = two("2026-09-26T12:10:00Z", "12:05:00Z");
+        let toasts = tauri::async_runtime::block_on(crate::notify::foreground_toasts(
+            notifier.as_ref(),
+            fg.as_ref(),
+            Some("s-1"),
+        ))
+        .unwrap();
+        assert_eq!(toasts.len(), 1);
+        assert_eq!(toasts[0].session_id, "s-2");
+        assert_eq!(toasts[0].body, "Finished");
+
+        let _ = run_notifying(&two("2026-09-26T12:20:00Z", "12:05:00Z"), &notifier);
+        assert!(
+            notifier.session_posts.lock().unwrap().is_empty(),
+            "already told, in the app"
+        );
     }
 
     // ---- The real client, against the loopback server ---------------
@@ -1021,7 +1355,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .received_at;
-        drop(server);
+        server.go_away();
         // The subscriber notices the dead stream on its own; the window
         // must not be what tells it.
         until(|| c.connection_state().state == State::Unreachable).await;

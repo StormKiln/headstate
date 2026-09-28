@@ -54,7 +54,10 @@ export function freshnessLabel(
     case "fresh":
       return {
         text: refreshing ? "Up to date, re-checking now" : "Up to date",
-        detail: freshness.recomputed ? `${ran}, just now` : `${ran}; nothing has changed since`,
+        // How it became fresh, not a second time stamp (#1424): `ran`
+        // already says when. ", just now" here read "Checked just now,
+        // just now" on a new report and contradicted an older one.
+        detail: freshness.recomputed ? `${ran}; every check ran` : `${ran}; nothing has changed since`,
         tone: refreshing ? "stale" : "current",
       };
     case "cached":

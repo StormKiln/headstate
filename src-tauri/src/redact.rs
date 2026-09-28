@@ -49,6 +49,17 @@ static PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
     ]
 });
 
+/// The token pattern above, for `remote/privacy.rs`'s transcript masking
+/// (#1488).
+///
+/// Shared by reference rather than copied: a gh token that the log
+/// refuses must also be refused on its way to a phone, and two copies of
+/// one pattern are how the TS/Rust pair above drifted before (#850). The
+/// literal stays here, where `redaction.mirror.test.ts` reads it.
+pub(crate) fn github_token_pattern() -> &'static Regex {
+    &PATTERNS[0].0
+}
+
 /// Replace anything that must not be written to the log.
 ///
 /// Returns an owned `String` even when nothing matched. The alternative

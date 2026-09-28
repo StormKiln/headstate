@@ -367,9 +367,9 @@ pub struct Scan {
     /// `ENOENT` on the root and `EACCES` on the root are opposite facts
     /// with opposite remedies, and one `Err` arm collapsed them. This is
     /// the `NotFound` half, carried in a field [`Scan::is_partial`] does
-    /// not consult -- `live.rs`'s `read_registry` already draws exactly
+    /// not consult -- `liveness.rs`'s `read_registry` already draws exactly
     /// this line for `~/.claude/sessions` and
-    /// `a_missing_registry_is_a_settled_empty_answer` is its test, with
+    /// `an_absent_registry_directory_is_not_a_failure` is its test, with
     /// the comment "absent is the answer, not an error". The two halves of
     /// `~/.claude` now agree.
     ///
@@ -986,27 +986,17 @@ mod tests {
     use std::io::Write;
 
     /// A throwaway directory, removed on drop.
-    struct Tmp(PathBuf);
+    /// A `TempDir` no other run can name, removed when dropped (#1554).
+    struct Tmp(tempfile::TempDir);
     impl Tmp {
         fn new(tag: &str) -> Self {
-            let p = std::env::temp_dir().join(format!(
-                "headstate-transcript-{tag}-{}-{:?}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            std::fs::create_dir_all(&p).unwrap();
-            Tmp(p)
+            Tmp(tempfile::Builder::new()
+                .prefix(&format!("headstate-transcript-{tag}-"))
+                .tempdir()
+                .unwrap())
         }
         fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-    impl Drop for Tmp {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            self.0.path()
         }
     }
 
@@ -1179,7 +1169,7 @@ mod tests {
     /// the empty list on every machine that has never run Claude Code.
     /// Nothing could not be read there; there is nothing to read.
     ///
-    /// `live.rs`'s `a_missing_registry_is_a_settled_empty_answer` is the
+    /// `liveness.rs`'s `an_absent_registry_directory_is_not_a_failure` is the
     /// same assertion about the other half of `~/.claude`, and the two
     /// halves now agree -- which is the inconsistency #970 is about.
     ///
@@ -1539,6 +1529,7 @@ mod tests {
     #[test]
     #[ignore = "needs the developer's own ~/.claude/projects"]
     fn real_corpus() {
+        let _home = crate::auth::test_home::real_for_a_live_probe();
         let Some(root) = projects_dir() else {
             eprintln!("no home directory; nothing to measure");
             return;
@@ -1608,7 +1599,7 @@ mod tests {
     #[test]
     fn the_first_user_prompt_is_captured() {
         let tmp = Tmp::new("prompt");
-        let path = tmp.0.join("s1.jsonl");
+        let path = tmp.path().join("s1.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(
             f,
@@ -1631,7 +1622,7 @@ mod tests {
     #[test]
     fn only_the_first_prompt_is_kept() {
         let tmp = Tmp::new("firstprompt");
-        let path = tmp.0.join("s1.jsonl");
+        let path = tmp.path().join("s1.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
         for text in ["the opening ask", "a later follow-up"] {
             writeln!(
@@ -1653,7 +1644,7 @@ mod tests {
     #[test]
     fn a_long_multibyte_prompt_clamps_without_panicking() {
         let tmp = Tmp::new("clamp");
-        let path = tmp.0.join("s1.jsonl");
+        let path = tmp.path().join("s1.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
         let long = "é".repeat(500);
         writeln!(
@@ -1674,7 +1665,7 @@ mod tests {
     #[test]
     fn a_session_with_no_user_record_has_no_prompt() {
         let tmp = Tmp::new("noprompt");
-        let path = tmp.0.join("s1.jsonl");
+        let path = tmp.path().join("s1.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, r#"{{"type":"system","cwd":"/code/w"}}"#).unwrap();
         writeln!(
@@ -1694,7 +1685,7 @@ mod tests {
     #[test]
     fn a_block_array_prompt_is_read() {
         let tmp = Tmp::new("blocks");
-        let path = tmp.0.join("s1.jsonl");
+        let path = tmp.path().join("s1.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(
             f,
@@ -1715,7 +1706,7 @@ mod tests {
     #[test]
     fn session_and_subagent_bytes_are_counted_apart() {
         let tmp = Tmp::new("bytes");
-        let root = tmp.0.join("projects");
+        let root = tmp.path().join("projects");
         let slug = root.join("slug");
         std::fs::create_dir_all(slug.join("s1").join("subagents")).unwrap();
 
@@ -1742,7 +1733,7 @@ mod tests {
     #[test]
     fn an_empty_corpus_reports_zero_rather_than_nothing() {
         let tmp = Tmp::new("emptybytes");
-        let root = tmp.0.join("projects");
+        let root = tmp.path().join("projects");
         std::fs::create_dir_all(root.join("slug")).unwrap();
 
         let got = scan(&root);

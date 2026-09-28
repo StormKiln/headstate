@@ -308,8 +308,8 @@ mod tests {
         // on a non-repository passes with the gate deleted. That
         // version of this test was written, failed its own sabotage,
         // and was replaced.
-        let d = std::env::temp_dir().join("headstate-submodule-gate-real");
-        let _ = std::fs::remove_dir_all(&d);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = tmp.path().join("headstate-submodule-gate-real");
         std::fs::create_dir_all(&d).unwrap();
         let ok = std::process::Command::new("git")
             .args(["init", "-q"])
@@ -336,7 +336,6 @@ mod tests {
         let t = std::time::Instant::now();
         let _ = read(&d);
         let ungated = t.elapsed();
-        let _ = std::fs::remove_dir_all(&d);
 
         assert!(
             gated * 4 < ungated,
@@ -347,10 +346,10 @@ mod tests {
 
     #[test]
     fn a_repository_with_gitmodules_is_asked() {
-        let d = std::env::temp_dir().join("headstate-submodule-some");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = tmp.path().join("headstate-submodule-some");
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join(".gitmodules"), b"[submodule \"x\"]\n").unwrap();
         assert!(has_submodules(&d));
-        let _ = std::fs::remove_file(d.join(".gitmodules"));
     }
 }

@@ -42,19 +42,30 @@ export function PartialScanNotice({
   /// least N orphans" are different claims and a shared phrasing would
   /// be vaguer than either.
   consequence,
+  /// What each entry IS (#1409). Paths by default -- every scan surface
+  /// sends `<path>: <why>`. The CLAUDE.md advice panel sends CHECKS
+  /// (`<check>: <why>`), and announcing those as "1 path could not be
+  /// read" named the wrong thing; `checks` carries the total so the lead
+  /// can say "N of M checks could not run" once, instead of the surface
+  /// restating it in its consequence.
+  checks,
 }: {
   unreadable: readonly string[];
   consequence: string;
+  checks?: { total: number };
 }) {
   if (unreadable.length === 0) return null;
   const n = unreadable.length;
+  const lead = checks
+    ? `${n} of ${checks.total} checks could not run`
+    : `${n} path${n === 1 ? "" : "s"} could not be read`;
   return (
     <div
       role="alert"
       className="border-b border-[#30363d] bg-[#161b22] px-4 py-2 text-xs text-[#8b949e]"
     >
       <p>
-        {n} path{n === 1 ? "" : "s"} could not be read, so {consequence}
+        {lead}, so {consequence}
       </p>
       {/* Every entry, not the first few. There are at most a handful in
           practice -- one per unreadable directory under the scan roots --

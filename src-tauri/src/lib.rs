@@ -314,7 +314,9 @@ pub fn run() {
             commands::get_gitlab_detail,
             commands::gitlab_action_capabilities,
             commands::gitlab_action,
+            commands::get_review_gates,
             commands::act_on_pr,
+            commands::merge_stack,
             commands::build_target,
             commands::get_viewer,
             commands::rerun_checks,
@@ -364,16 +366,19 @@ pub fn run() {
             commands::claude_search_transcripts,
             commands::claude_index_coverage,
             commands::claude_sessions,
-            commands::claude_sessions_for_pr,
+            commands::claude_sessions_for_pr_number,
             commands::claude_session_detail,
+            commands::claude_session_digest,
+            commands::claude_transcript_opening_prompt,
             commands::claude_subagent_rollup,
             commands::claude_session_events,
             commands::claude_event_profile,
             commands::claude_reveal_path,
             commands::claude_usage_profile,
             commands::claude_session_usage,
-            commands::claude_transcript_tail,
-            commands::claude_transcript_follow,
+            commands::claude_transcript_block_text,
+            commands::claude_transcript_page,
+            commands::claude_transcript_find,
             commands::claude_poll_live,
             commands::claude_overview,
             commands::claude_coverage,
@@ -443,6 +448,9 @@ pub fn run() {
             commands::claude_stop_session,
             commands::claude_launch_worktree_preview,
             commands::claude_launch_session_preview,
+            commands::claudify_pr_command,
+            commands::claude_launch_pr,
+            commands::claude_launch_pr_preview,
             commands::claude_launch_terms,
             commands::assessed_worktrees,
             commands::remove_worktree_forced,
@@ -465,6 +473,7 @@ pub fn run() {
             remote::pairing::respond_to_pairing,
             remote::pairing::list_paired_devices,
             remote::pairing::revoke_paired_device,
+            remote::pairing::set_paired_device_access,
             remote::gate::get_remote_enabled,
             remote::gate::set_remote_enabled,
         ])
@@ -1068,6 +1077,12 @@ pub fn run() {
             // the signed-in login through it. Off by default; this only
             // binds a port when the setting says so.
             remote::gate::setup(&app.handle().clone());
+
+            // The session activity nudge (#1477): a one-second stat of
+            // RUNNING sessions' transcripts, emitting a content-free
+            // `claude-session-activity` on change. Its own thread, not
+            // the 60-second health loop's: its whole point is latency.
+            claude::activity::spawn(app.handle().clone());
 
             Ok(())
         })

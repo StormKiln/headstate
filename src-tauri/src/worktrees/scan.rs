@@ -469,9 +469,11 @@ pub fn worktree_safety(
         return Safety::Empty;
     }
 
-    // No upstream means nothing was ever pushed: these commits exist only
-    // here. Checked BEFORE merge status, because a branch name that looks
-    // merged tells you nothing about commits that never left the machine.
+    // No upstream used to mean "nothing was ever pushed: these commits
+    // exist only here", checked BEFORE merge status. That was right about
+    // a branch NAME that looks merged and wrong about CONTENT that
+    // provably is: see #1439 below, where the merge question is now asked
+    // first on the no-tracking-config path.
     //
     // `has_upstream` is passed in rather than re-probed: the caller
     // already asked, and this was one of two identical `rev-parse @{u}`
@@ -565,8 +567,35 @@ pub fn worktree_safety(
         if wt.branch.is_empty() {
             return detached_safety(dir, default_branch);
         }
+        // Merge status BEFORE the missing tracking config, and the order
+        // is the whole of #1439.
+        //
+        // `was_ever_pushed` reads only `branch.<name>.remote`, and a
+        // missing key is weaker evidence than "commits exist only here"
+        // claims. A contributor's PR fetched with `git fetch origin
+        // pull/N/head:prN`, or any branch checked out without
+        // `--track`, has no such key, yet its work may be on the default
+        // branch already. On the reporting machine two such worktrees
+        // read in red "never pushed" weeks after their PRs were
+        // squash-merged; the aggregate diff of each had exactly the same
+        // `patch-id --stable` as its squash commit on main.
+        //
+        // This does NOT widen the gate. `merged_into` is the same check
+        // every other branch faces: ancestry, per-commit patch-ids, or
+        // an exact aggregate patch-id. The only rows that change are
+        // ones it has already proven are on the default branch. Anything
+        // it does not answer `Safe` for, whether unmerged or undecided,
+        // keeps the refusal it had before.
+        //
+        // Its own variant rather than `MergedUpstreamDeleted`. That label
+        // says the tracking config outlived the remote branch, and here
+        // there was never a tracking config: the same objection
+        // `detached_safety` makes for a branchless checkout.
         if !was_ever_pushed(dir) {
-            return Safety::NeverPushed;
+            return match merged_into(dir, default_branch) {
+                Safety::Safe => Safety::MergedNoUpstream,
+                _ => Safety::NeverPushed,
+            };
         }
         return match merged_into(dir, default_branch) {
             Safety::Safe => Safety::MergedUpstreamDeleted,
@@ -918,7 +947,8 @@ fn holder_is_running(holder: LockHolder) -> bool {
 ///
 /// This function therefore asks exactly the merge question and nothing
 /// else. There is no path from here to `NeverPushed`, `Unpushed`,
-/// `MergedUpstreamDeleted` or `Empty`, and that is the #776 property
+/// `MergedUpstreamDeleted`, `MergedNoUpstream` or `Empty`, and that is
+/// the #776 property
 /// stated as code rather than as a comment:
 ///
 /// - `NeverPushed` / `Unpushed` are claims about a branch's relationship
@@ -2081,9 +2111,19 @@ const SIZE_WORKERS: usize = 8;
 /// Unreadable entries are skipped rather than failing the whole
 /// measurement -- a permission error on one file should not turn a real
 /// size into "unknown".
+///
+/// Test-only, and with nothing excluded: the "everything under the path"
+/// rule the tests below pin is the walk's own. What `size_paths` excludes
+/// on top of it -- the OTHER worktrees nested inside this one (#1441) --
+/// is a property of the set of rows, not of one directory.
 #[cfg(test)]
 fn dir_size(path: &Path) -> u64 {
-    dir_size_within(path, std::time::Duration::MAX).unwrap_or(0)
+    dir_size_within(
+        path,
+        std::time::Duration::MAX,
+        &std::collections::HashSet::new(),
+    )
+    .unwrap_or(0)
 }
 
 /// How long ONE worktree's walk may run before it is abandoned.
@@ -2097,13 +2137,18 @@ fn dir_size(path: &Path) -> u64 {
 ///
 /// MEASURED on this machine, and the reason a single tree can be
 /// unbounded at all: 26 of 42 worktrees in one checkout live UNDER the
-/// main checkout, in a `worktrees` directory beneath it. So the parent's
-/// walk subsumes all 26 -- 235.02 GB and 1,125,352 files -- and every
-/// one of those bytes is then walked a second time as a worktree in its
-/// own right. The parent measured 265.15 GB in 38.63s where a leaf
-/// worktree measured 0.30 GB in 0.16s: a 240x spread within one
-/// repository. Add nesting two levels deep, or a network mount that
-/// answers `read_dir` slowly, and the parent's walk has no finish.
+/// main checkout, in a `worktrees` directory beneath it. Before #1441 the
+/// parent's walk subsumed all 26 -- 235.02 GB and 1,125,352 files -- and
+/// every one of those bytes was then walked a second time as a worktree
+/// in its own right. The parent measured 265.15 GB in 38.63s where a
+/// leaf worktree measured 0.30 GB in 0.16s: a 240x spread within one
+/// repository. That was a double count as well as a slow walk (#1441:
+/// a 153 GB main row whose nested worktrees summed to ~44 GB), and the
+/// walk now stops at every directory that is another worktree's row --
+/// see `size_paths`. The bound still stands, because nesting was only
+/// ONE way to be unbounded: a single real tree with millions of files,
+/// or a network mount that answers `read_dir` slowly, has no finish
+/// either, and the exclusion does nothing for those.
 ///
 /// 60s, not `GIT_TIMEOUT`'s 30s: 38.63s for a real parent checkout is a
 /// legitimate answer and must not be thrown away. The bound exists to
@@ -2120,6 +2165,18 @@ const SIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// checkout is the worst possible wrong answer. Callers propagate the
 /// `Option` all the way to the cell so the UI can say so.
 ///
+/// A directory in `skip` is not entered. `size_paths` passes the other
+/// worktrees of the same repository, so a worktree nested inside this
+/// one -- `<repo>/.claude/worktrees/x`, or one linked worktree inside
+/// another -- is counted on its OWN row and not a second time here
+/// (#1441). Only directories strictly BELOW `path` are compared, so
+/// `path` being in `skip` itself (it is: `skip` is every row) does not
+/// empty the walk. The comparison is exact `Path` equality, which is
+/// why both sides must be canonicalised the same way first: every child
+/// is `root.join(name)`, so a canonical root yields canonical children
+/// (symlinks are never entered), and on Windows both carry the same
+/// verbatim `\\?\` prefix.
+///
 /// The deadline is checked once per DIRECTORY rather than once per
 /// entry. A directory is the unit that can be pathological -- a network
 /// mount whose `read_dir` blocks, a permission wall -- and checking
@@ -2133,7 +2190,11 @@ const SIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// number is an artifact of which directories happened to pop off the
 /// stack first, not a bound the user can act on, and it would render
 /// indistinguishably from a real measurement.
-fn dir_size_within(path: &Path, budget: std::time::Duration) -> Option<u64> {
+fn dir_size_within(
+    path: &Path,
+    budget: std::time::Duration,
+    skip: &std::collections::HashSet<std::path::PathBuf>,
+) -> Option<u64> {
     let started = std::time::Instant::now();
     let mut total = 0u64;
     let mut stack = vec![path.to_path_buf()];
@@ -2150,13 +2211,76 @@ fn dir_size_within(path: &Path, budget: std::time::Duration) -> Option<u64> {
                 continue;
             }
             if meta.is_dir() {
-                stack.push(e.path());
+                let child = e.path();
+                if !skip.contains(&child) {
+                    stack.push(child);
+                }
             } else {
                 total += meta.len();
             }
         }
     }
     Some(total)
+}
+
+/// How long `size_paths` waits for ALL its rows' paths to canonicalise.
+///
+/// Canonicalising is a handful of `lstat`s per path and normally takes
+/// microseconds, so this bound exists only to convert "never" into
+/// "kept as given" -- the #769 rule applied to the step before the walk.
+/// Without it one dead mount among the rows would hold up every row's
+/// size, which is exactly the stall #769 removed from the walk itself.
+const CANONICAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Each of `paths` canonicalised by `canon`, or kept as given if that
+/// fails or has not answered within `budget` (shared by all paths, not
+/// per path).
+///
+/// One detached thread per path, NOT joined: a `canonicalize` blocked on
+/// a mount that never answers cannot be interrupted, and joining it would
+/// re-create the stall this function exists to bound. The abandoned
+/// thread's later answer goes to a dropped receiver and is discarded. A
+/// thread that cannot be spawned leaves its path as given, like a
+/// timeout.
+///
+/// `canon` is a parameter so the timeout can be tested with a stand-in
+/// that blocks, rather than needing a real mount that does.
+fn canonical_rows(
+    paths: &[String],
+    budget: std::time::Duration,
+    canon: fn(&Path) -> std::io::Result<std::path::PathBuf>,
+) -> Vec<std::path::PathBuf> {
+    let mut roots: Vec<std::path::PathBuf> = paths.iter().map(std::path::PathBuf::from).collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut pending = 0usize;
+    for (i, p) in roots.iter().enumerate() {
+        let (tx, p) = (tx.clone(), p.clone());
+        let spawned = std::thread::Builder::new()
+            .name("worktree-canonicalize".into())
+            .spawn(move || {
+                // The receiver is gone once the budget is spent; a late
+                // answer has nowhere to go and nothing waiting on it.
+                let _ = tx.send((i, canon(&p)));
+            });
+        if spawned.is_ok() {
+            pending += 1;
+        }
+    }
+    drop(tx);
+    let deadline = std::time::Instant::now() + budget;
+    while pending > 0 {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left) {
+            Ok((i, Ok(canonical))) => {
+                roots[i] = canonical;
+                pending -= 1;
+            }
+            Ok((_, Err(_))) => pending -= 1,
+            // Timed out: whatever is still pending keeps its given path.
+            Err(_) => break,
+        }
+    }
+    roots
 }
 
 /// Size every path in `paths`, `SIZE_WORKERS` at a time.
@@ -2180,12 +2304,39 @@ fn dir_size_within(path: &Path, budget: std::time::Duration) -> Option<u64> {
 /// column stalled at N-1 forever with no row able to say why. A worker
 /// that gives up and reports keeps the cursor moving, which is what
 /// stops one bad directory from stalling the other 110.
+///
+/// Each byte is counted on EXACTLY ONE row (#1441). The paths are the
+/// rows of one page, so a directory that is itself one of them is not
+/// entered by any other row's walk: the main checkout stops at
+/// `<repo>/.worktrees/x`, and a linked worktree stops at a worktree
+/// nested inside it, however deep. Before this the main checkout's row
+/// included every worktree under it -- 153 GB against a real 71 GB, with
+/// the nested rows (~44 GB) counted twice -- and the rows could not be
+/// summed. A directory that is NOT a row (a submodule, an unrelated
+/// clone) is still counted where it sits; it has no row of its own.
+///
+/// Canonicalised up front, so the comparison survives a path that
+/// reached git through a symlink (macOS `/var` vs `/private/var`) and
+/// Windows' verbatim `\\?\C:\` form -- but under `CANONICAL_BUDGET`, see
+/// `canonical_rows`. Reports still carry the path AS GIVEN, since that
+/// is the row's key.
+///
+/// QUALIFICATION: a row whose path could not be canonicalised in time
+/// (or at all) is kept as given. It still matches a parent that spells
+/// it the same way, but one reached by a different spelling may then
+/// count it a second time. That is the only cost, and it is bounded to
+/// that row: such a path is most likely on a mount that is not
+/// answering, so its own walk will most likely report "could not
+/// measure" anyway.
 fn size_paths(paths: &[String], report: &(dyn Fn(&str, Option<u64>) + Sync)) {
+    let roots = canonical_rows(paths, CANONICAL_BUDGET, |p| std::fs::canonicalize(p));
+    let rows: std::collections::HashSet<std::path::PathBuf> = roots.iter().cloned().collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let workers = SIZE_WORKERS.min(paths.len().max(1));
     std::thread::scope(|scope| {
         for _ in 0..workers {
             let next = &next;
+            let (roots, rows) = (&roots, &rows);
             scope.spawn(move || loop {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some(p) = paths.get(i) else { break };
@@ -2197,7 +2348,7 @@ fn size_paths(paths: &[String], report: &(dyn Fn(&str, Option<u64>) + Sync)) {
                 // reason `size_venvs` logs per venv: the total says
                 // "slow", this says WHICH.
                 let started = std::time::Instant::now();
-                let bytes = dir_size_within(Path::new(p), SIZE_TIMEOUT);
+                let bytes = dir_size_within(&roots[i], SIZE_TIMEOUT, rows);
                 crate::diag!(
                     "[diag] worktree-size {} {}ms {}",
                     p,
@@ -2343,9 +2494,29 @@ const CLASSIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45)
 /// (#1136).
 ///
 /// Verified against real repositories rather than inferred: a conflicted
-/// `git rebase` leaves `REBASE_HEAD` and `rebase-merge/`, a conflicted
-/// `git merge` leaves `MERGE_HEAD`, and `git cherry-pick` leaves
-/// `CHERRY_PICK_HEAD`.
+/// `git merge` leaves `MERGE_HEAD`, `git cherry-pick` leaves
+/// `CHERRY_PICK_HEAD`, `git revert` leaves `REVERT_HEAD`, and a bisect
+/// leaves `BISECT_LOG`. Each of those is removed when its operation
+/// finishes -- by the commit or `--continue`, or by `bisect reset`.
+///
+/// A rebase is detected by its `rebase-merge/` or `rebase-apply/`
+/// DIRECTORY only, which is what git's own `wt-status.c` uses. NOT by
+/// `REBASE_HEAD` (#1438): a conflicted rebase writes it, but git 2.50.1
+/// leaves it behind once the rebase completes with `--continue` or
+/// `--skip`, and after an interactive rebase that stopped to edit. So
+/// `REBASE_HEAD` proves only that a rebase stopped at some point, and
+/// reading it as "in progress" classed every worktree ever rebased
+/// through a conflict as mid-rebase -- and so unremovable -- for the
+/// rest of its life.
+///
+/// A multi-commit cherry-pick or revert is also detected by its
+/// `sequencer/` directory (#1446). Stopped on a conflict it has both the
+/// `*_HEAD` ref and `sequencer/`; once the conflict is resolved and
+/// COMMITTED, the ref goes and `sequencer/` is the only marker left,
+/// while `git status` still says "Cherry-pick currently in progress" and
+/// the rest of the plan waits in `sequencer/todo`. Measured on git
+/// 2.50.1: `--continue`, `--abort` and `--quit` each remove it, so unlike
+/// `REBASE_HEAD` it does not outlive its operation.
 ///
 /// Paths are built with `PathBuf::join`, never `format!`: Windows
 /// `canonicalize` returns verbatim `\\?\C:\` paths and this has cost
@@ -2359,13 +2530,13 @@ fn operation_in_progress(dir: &Path) -> Option<GitOperation> {
     let git_dir = git(dir, &["rev-parse", "--absolute-git-dir"]).ok()?;
     let git_dir = Path::new(git_dir.trim());
 
-    // Ordered most- to least-specific. `rebase-merge` is checked
-    // alongside `REBASE_HEAD` because an interactive rebase stopped
-    // between commits has the directory without the ref.
+    // Ordered most- to least-specific. No `REBASE_HEAD`: it outlives a
+    // finished rebase (see above), and the directories cover every
+    // rebase that is actually running, including an interactive one
+    // stopped between commits, which has the directory without the ref.
     for (marker, op) in [
         ("rebase-merge", GitOperation::Rebase),
         ("rebase-apply", GitOperation::Rebase),
-        ("REBASE_HEAD", GitOperation::Rebase),
         ("MERGE_HEAD", GitOperation::Merge),
         ("CHERRY_PICK_HEAD", GitOperation::CherryPick),
         ("REVERT_HEAD", GitOperation::Revert),
@@ -2374,6 +2545,20 @@ fn operation_in_progress(dir: &Path) -> Option<GitOperation> {
         if git_dir.join(marker).exists() {
             return Some(op);
         }
+    }
+    // Last, because between commits it is the ONLY marker (#1446). The
+    // todo's first instruction names the operation. An unreadable or
+    // unrecognised todo still means a sequence is in flight -- absent is
+    // not zero -- so it falls back to cherry-pick, the command that
+    // writes a sequencer far more often than revert.
+    let sequencer = git_dir.join("sequencer");
+    if sequencer.is_dir() {
+        let todo = std::fs::read_to_string(sequencer.join("todo")).unwrap_or_default();
+        let first = todo.split_whitespace().next();
+        return Some(match first {
+            Some("revert") => GitOperation::Revert,
+            _ => GitOperation::CherryPick,
+        });
     }
     None
 }
@@ -2508,7 +2693,11 @@ fn safety_label(s: &Safety) -> &'static str {
         Safety::Unpushed(_) => "unpushed",
         Safety::NeverPushed => "never_pushed",
         Safety::MergedUpstreamDeleted => "merged_upstream_deleted",
+        Safety::MergedNoUpstream => "merged_no_upstream",
         Safety::DetachedMerged(_) => "detached_merged",
+        // The number is not carried, for the reason above: it names a
+        // pull request in what may be a private repository.
+        Safety::MergedAsPr(_) => "merged_as_pr",
         Safety::Empty => "empty",
         Safety::Unmerged => "unmerged",
         Safety::Locked(_) => "locked",
@@ -3209,7 +3398,7 @@ mod tests {
             .collect();
 
         let seen = std::cell::RefCell::new(Vec::new());
-        let outcomes = remove_worktrees_with_progress(&repo, &paths, |done, total| {
+        let outcomes = remove_worktrees_with_progress(&repo, &paths, None, |done, total, _| {
             seen.borrow_mut().push((done, total));
         });
 
@@ -3221,12 +3410,43 @@ mod tests {
         );
     }
 
+    /// Call `done` carries the outcome of `worktree_paths[done - 1]`
+    /// (#1544). The webview maps each progress frame onto its own
+    /// ordered target list by that index alone -- the frame has no path
+    /// -- so a callback out of order would drop the WRONG row from the
+    /// list while the right one stayed on disk.
+    #[test]
+    fn each_progress_call_carries_the_outcome_at_that_index() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = dir.path().to_string_lossy().to_string();
+        let paths: Vec<String> = (0..3)
+            .map(|i| {
+                dir.path()
+                    .join(format!("nope-{i}"))
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+
+        let seen = std::cell::RefCell::new(Vec::new());
+        remove_worktrees_with_progress(&repo, &paths, None, |done, _, o| {
+            seen.borrow_mut().push((done, o.path.clone()));
+        });
+
+        let want: Vec<(usize, String)> = paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i + 1, p.clone()))
+            .collect();
+        assert_eq!(seen.into_inner(), want);
+    }
+
     /// An empty batch must report nothing rather than a bare (0, 0),
     /// which a UI would render as a stuck progress line.
     #[test]
     fn an_empty_batch_reports_no_progress() {
         let seen = std::cell::RefCell::new(Vec::new());
-        let outcomes = remove_worktrees_with_progress("/tmp", &[], |d, t| {
+        let outcomes = remove_worktrees_with_progress("/tmp", &[], None, |d, t, _| {
             seen.borrow_mut().push((d, t));
         });
         assert!(seen.into_inner().is_empty());
@@ -3965,6 +4185,120 @@ prunable gitdir file points to non-existent location
             Safety::NeverPushed
         );
         let _ = repo;
+    }
+
+    /// A branch with no tracking config, built the way a contributor's
+    /// fetched PR is: commits of its own, never `--track`ed, never
+    /// `push -u`ed. When `squash` is true, main gains ONE commit holding
+    /// the branch's whole diff, as "Squash and merge" does; otherwise main
+    /// moves on without it.
+    ///
+    /// Two commits on the branch, not one, so per-commit `git cherry`
+    /// cannot match the squash and the aggregate patch-id is what proves
+    /// it. That is the shape #1439 measured.
+    fn untracked_branch_fixture(
+        squash: bool,
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let (tmp, repo, wt) = repo_with_worktree("contrib");
+        let run_in = |dir: &Path, args: &[&str]| {
+            let out = Command::new(crate::auth::git_program())
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .envs([
+                    ("GIT_AUTHOR_NAME", "octocat"),
+                    ("GIT_COMMITTER_NAME", "octocat"),
+                    ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+                    ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        std::fs::write(wt.join("a.txt"), "first half\n").unwrap();
+        run_in(&wt, &["add", "-A"]);
+        run_in(&wt, &["commit", "-q", "-m", "first half"]);
+        std::fs::write(wt.join("b.txt"), "second half\n").unwrap();
+        run_in(&wt, &["add", "-A"]);
+        run_in(&wt, &["commit", "-q", "-m", "second half"]);
+
+        if squash {
+            std::fs::write(repo.join("a.txt"), "first half\n").unwrap();
+            std::fs::write(repo.join("b.txt"), "second half\n").unwrap();
+            run_in(&repo, &["add", "-A"]);
+            run_in(&repo, &["commit", "-q", "-m", "both halves (#1)"]);
+        } else {
+            std::fs::write(repo.join("other.txt"), "unrelated\n").unwrap();
+            run_in(&repo, &["add", "-A"]);
+            run_in(&repo, &["commit", "-q", "-m", "something else"]);
+        }
+        (tmp, repo, wt)
+    }
+
+    /// #1439: a branch with no tracking config whose work was
+    /// squash-merged must not read "never pushed -- commits exist only
+    /// here". The content is on main, so it is merged and removable.
+    #[test]
+    fn a_merged_branch_with_no_tracking_config_is_not_never_pushed() {
+        let (_t, _repo, wt) = untracked_branch_fixture(true);
+
+        // The premises, or the test proves nothing: no config key, so
+        // `was_ever_pushed` answers false exactly as in the bug, and the
+        // tip is NOT an ancestor of main, so only the patch-id route can
+        // find the merge.
+        assert!(
+            !was_ever_pushed(&wt),
+            "fixture must have no tracking config"
+        );
+        assert!(
+            git(&wt, &["merge-base", "--is-ancestor", "HEAD", "main"]).is_err(),
+            "fixture must be a squash, not an ancestor"
+        );
+
+        let w = Worktree {
+            path: wt.to_string_lossy().into_owned(),
+            branch: "contrib".into(),
+            ..Default::default()
+        };
+        let s = worktree_safety(&w, "main", false, Some(0));
+        assert_eq!(s, Safety::MergedNoUpstream);
+        assert!(
+            s.is_safe(),
+            "merged content must be removable: {}",
+            s.reason()
+        );
+        assert!(s.reason().contains("merged"), "{}", s.reason());
+        assert!(
+            !s.reason().contains("only here"),
+            "the claim #1439 retracts: {}",
+            s.reason()
+        );
+    }
+
+    /// The other direction, and the one that protects work: with no
+    /// tracking config and commits main does not have, the branch is
+    /// still `NeverPushed`. Asking the merge question first must not
+    /// soften the refusal for content that did not land.
+    #[test]
+    fn an_unmerged_branch_with_no_tracking_config_is_still_never_pushed() {
+        let (_t, _repo, wt) = untracked_branch_fixture(false);
+        assert!(
+            !was_ever_pushed(&wt),
+            "fixture must have no tracking config"
+        );
+
+        let w = Worktree {
+            path: wt.to_string_lossy().into_owned(),
+            branch: "contrib".into(),
+            ..Default::default()
+        };
+        let s = worktree_safety(&w, "main", false, Some(0));
+        assert_eq!(s, Safety::NeverPushed);
+        assert!(!s.is_safe(), "unmerged local-only work must be refused");
     }
 
     /// `was_ever_pushed` reads the CHECKOUT's own branch. A detached
@@ -6074,8 +6408,12 @@ prunable gitdir file points to non-existent location
 
         // The fixture's branch is genuinely unmerged, so a bulk call
         // naming it must refuse rather than delete.
-        let outcomes =
-            remove_worktrees_with_progress(repo_s, &[wt.to_string_lossy().into_owned()], |_, _| {});
+        let outcomes = remove_worktrees_with_progress(
+            repo_s,
+            &[wt.to_string_lossy().into_owned()],
+            None,
+            |_, _, _| {},
+        );
         assert_eq!(outcomes.len(), 1);
         assert!(
             outcomes[0].error.is_some(),
@@ -6098,7 +6436,8 @@ prunable gitdir file points to non-existent location
                 "/nonexistent/path".to_string(),
                 wt.to_string_lossy().into_owned(),
             ],
-            |_, _| {},
+            None,
+            |_, _, _| {},
         );
         assert_eq!(outcomes.len(), 2, "every input must get an outcome");
         assert!(outcomes.iter().all(|o| o.error.is_some()));
@@ -7537,7 +7876,11 @@ prunable gitdir file points to non-existent location
     /// (#754), and that a walk which will not finish becomes "could not
     /// measure" rather than nothing at all (#769).
     mod sizing {
-        use super::super::{dir_size, dir_size_within, size_paths, SIZE_TIMEOUT, SIZE_WORKERS};
+        use super::super::{
+            canonical_rows, dir_size, dir_size_within, size_paths, size_repo, SIZE_TIMEOUT,
+            SIZE_WORKERS,
+        };
+        use std::collections::HashSet;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Mutex;
 
@@ -7717,7 +8060,7 @@ prunable gitdir file points to non-existent location
             // Zero budget: the deadline is already spent when the first
             // directory pops, so this cannot depend on machine speed.
             assert_eq!(
-                dir_size_within(&root, std::time::Duration::ZERO),
+                dir_size_within(&root, std::time::Duration::ZERO, &HashSet::new()),
                 None,
                 "a walk that runs out of budget must say it could not \
                  measure; returning a number claims an answer it does \
@@ -7727,7 +8070,7 @@ prunable gitdir file points to non-existent location
             // The same tree measures fine with a real budget, so the
             // None above is the BOUND firing and not a broken walk.
             assert_eq!(
-                dir_size_within(&root, SIZE_TIMEOUT),
+                dir_size_within(&root, SIZE_TIMEOUT, &HashSet::new()),
                 Some(400),
                 "40 levels of one 10-byte file must still measure"
             );
@@ -7744,10 +8087,12 @@ prunable gitdir file points to non-existent location
         ///
         /// MEASURED on this machine, for why one tree can be unbounded
         /// at all: 26 of 42 worktrees in one checkout live UNDERNEATH
-        /// the main checkout, so the parent's walk subsumes all 26 --
-        /// 235.02 GB and 1,125,352 files, walked once as the parent and
-        /// again as 26 worktrees. The parent took 38.63s where a leaf
-        /// took 0.16s, a 240x spread inside one repository.
+        /// the main checkout, so before #1441 the parent's walk subsumed
+        /// all 26 -- 235.02 GB and 1,125,352 files, walked once as the
+        /// parent and again as 26 worktrees. The parent took 38.63s where
+        /// a leaf took 0.16s, a 240x spread inside one repository. The
+        /// walk now stops at nested worktrees, but one huge tree or a
+        /// slow mount is unbounded all the same, so this still holds.
         ///
         /// Asserts that EVERY path is reported, the slow one included.
         /// Reporting the other N-1 is not enough: the row for the bad
@@ -7772,6 +8117,7 @@ prunable gitdir file points to non-existent location
                     super::super::dir_size_within(
                         std::path::Path::new(p),
                         std::time::Duration::ZERO,
+                        &HashSet::new(),
                     )
                 } else {
                     b
@@ -7802,6 +8148,219 @@ prunable gitdir file points to non-existent location
                     assert_eq!(*b, Some(100), "a measurable tree keeps its real size");
                 }
             }
+        }
+
+        /// A worktree nested inside another row is counted on its own row
+        /// and NOT again inside the row that contains it (#1441).
+        ///
+        /// The main checkout's row read 153 GB where the whole checkout
+        /// was 71 GB, because nine worktrees lived under it and were
+        /// walked twice: once as themselves and once as part of the
+        /// parent. Covers both shapes -- a worktree under the main
+        /// checkout, and one under a LINKED worktree -- and that a plain
+        /// directory which is not a row is still counted where it sits.
+        #[test]
+        fn a_nested_worktree_is_counted_on_its_own_row_only() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let main = tmp.path().join("main");
+            tree(tmp.path(), "main", 1, 100);
+            // Not a row: a vendored directory belongs to the checkout.
+            tree(&main.join("vendor"), "lib", 1, 7);
+            let outer = tree(&main.join(".worktrees"), "outer", 1, 1_000);
+            let inner = tree(
+                &std::path::Path::new(&outer).join(".worktrees"),
+                "inner",
+                1,
+                10_000,
+            );
+            let main = main.to_string_lossy().to_string();
+            let paths = vec![main.clone(), outer.clone(), inner.clone()];
+
+            let seen = Mutex::new(std::collections::HashMap::new());
+            size_paths(&paths, &|p: &str, b: Option<u64>| {
+                seen.lock().unwrap().insert(p.to_string(), b);
+            });
+            let seen = seen.into_inner().unwrap();
+
+            assert_eq!(
+                seen[&main],
+                Some(107),
+                "the main checkout must not include the worktrees under it"
+            );
+            assert_eq!(
+                seen[&outer],
+                Some(1_000),
+                "a linked worktree must not include one nested inside it"
+            );
+            assert_eq!(seen[&inner], Some(10_000), "the nested row keeps its bytes");
+            // The rows now sum to what is actually on disk.
+            let sum: u64 = seen.values().map(|b| b.unwrap()).sum();
+            assert_eq!(sum, dir_size(std::path::Path::new(&main)));
+        }
+
+        /// Rows are compared after canonicalisation, not as spelled.
+        ///
+        /// The nested row arrives through a symlinked parent while the
+        /// main checkout arrives by its real path -- the macOS `/var`
+        /// versus `/private/var` shape, and on Windows the verbatim
+        /// `\\?\` prefix `canonicalize` adds. Compared as spelled, the
+        /// two never match and the double count of #1441 survives.
+        #[test]
+        #[cfg(unix)]
+        fn nested_rows_match_however_their_paths_are_spelled() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let real = tmp.path().join("real");
+            let main = tree(&real, "main", 1, 100);
+            tree(&real.join("main").join(".worktrees"), "x", 1, 1_000);
+            let link = tmp.path().join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            let nested = link
+                .join("main")
+                .join(".worktrees")
+                .join("x")
+                .to_string_lossy()
+                .to_string();
+
+            let seen = Mutex::new(std::collections::HashMap::new());
+            size_paths(&[main.clone(), nested.clone()], &|p: &str, b| {
+                seen.lock().unwrap().insert(p.to_string(), b);
+            });
+            let seen = seen.into_inner().unwrap();
+            assert_eq!(seen[&main], Some(100));
+            assert_eq!(seen[&nested], Some(1_000));
+        }
+
+        /// Canonicalising the rows is bounded: a path that never answers
+        /// is kept as given, and the rest are not held up by it.
+        ///
+        /// #769's shape, one step earlier. The walk was bounded so one
+        /// dead mount could not stall every row; an UNBOUNDED
+        /// canonicalise before the walk would put that stall straight
+        /// back. The stand-in blocks for an hour, standing in for a mount
+        /// that never answers -- a real hanging mount cannot be made in
+        /// a test.
+        #[test]
+        fn canonicalising_the_rows_cannot_stall_on_one_path() {
+            fn canon(p: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+                if p.ends_with("hangs") {
+                    std::thread::sleep(std::time::Duration::from_secs(3_600));
+                }
+                if p.ends_with("fails") {
+                    return Err(std::io::Error::other("no such path"));
+                }
+                Ok(std::path::Path::new("canonical").join(p))
+            }
+            let paths = vec!["a".to_string(), "hangs".into(), "fails".into()];
+
+            let started = std::time::Instant::now();
+            let roots = canonical_rows(&paths, std::time::Duration::from_millis(200), canon);
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(30),
+                "a path that never answers must not hold up the others: \
+                 took {:?}",
+                started.elapsed()
+            );
+            assert_eq!(
+                roots,
+                vec![
+                    std::path::Path::new("canonical").join("a"),
+                    std::path::PathBuf::from("hangs"),
+                    std::path::PathBuf::from("fails"),
+                ],
+                "answered paths are canonical; timed-out and failed ones \
+                 are kept as given"
+            );
+        }
+
+        /// The same, end to end through `git worktree list`: a file
+        /// written into a nested worktree moves that row and no other.
+        ///
+        /// Measured as a DELTA so the fixture's own `.git` bytes do not
+        /// have to be predicted. Before #1441 the main checkout's row
+        /// grew by every byte written into either nested worktree.
+        #[test]
+        fn size_repo_counts_a_nested_worktree_once() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let ident = [
+                ("GIT_AUTHOR_NAME", "octocat"),
+                ("GIT_COMMITTER_NAME", "octocat"),
+                ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+                ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+            ];
+            let run = |dir: &std::path::Path, args: &[&str]| {
+                let out = std::process::Command::new(crate::auth::git_program())
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .envs(ident)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "git {args:?}");
+            };
+            let repo = tmp.path().join("proj");
+            std::fs::create_dir_all(&repo).unwrap();
+            run(&repo, &["init", "-q", "-b", "main"]);
+            std::fs::write(repo.join("f"), "base\n").unwrap();
+            run(&repo, &["add", "-A"]);
+            run(&repo, &["commit", "-q", "-m", "base"]);
+            // One under the main checkout, one under THAT linked worktree.
+            let inner = repo.join(".worktrees").join("inner");
+            run(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "inner",
+                    inner.to_str().unwrap(),
+                ],
+            );
+            let deeper = inner.join(".worktrees").join("deeper");
+            run(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "deeper",
+                    deeper.to_str().unwrap(),
+                ],
+            );
+
+            let measure = || {
+                let sizes = size_repo(repo.to_str().unwrap()).unwrap();
+                assert_eq!(sizes.len(), 3, "main plus two worktrees: {sizes:?}");
+                let find = |suffix: &std::path::Path| {
+                    sizes
+                        .iter()
+                        .find(|(p, _)| std::path::Path::new(p).ends_with(suffix))
+                        .and_then(|(_, b)| *b)
+                        .unwrap_or_else(|| panic!("no size for {suffix:?} in {sizes:?}"))
+                };
+                (
+                    find(std::path::Path::new("proj")),
+                    find(&std::path::Path::new(".worktrees").join("inner")),
+                    find(&std::path::Path::new(".worktrees").join("deeper")),
+                )
+            };
+
+            let before = measure();
+            std::fs::write(inner.join("blob"), vec![b'x'; 1_000]).unwrap();
+            std::fs::write(deeper.join("blob"), vec![b'x'; 30_000]).unwrap();
+            let after = measure();
+
+            assert_eq!(
+                after.0, before.0,
+                "the main checkout must not grow when a nested worktree does"
+            );
+            assert_eq!(
+                after.1,
+                before.1 + 1_000,
+                "a linked worktree grows by its own bytes, not its nested one's"
+            );
+            assert_eq!(after.2, before.2 + 30_000);
         }
 
         /// The bound is generous enough not to reject honest walks.
@@ -8821,6 +9380,7 @@ mod live {
                 Safety::Unpushed(_) => "unpushed",
                 Safety::NeverPushed => "never_pushed",
                 Safety::MergedUpstreamDeleted => "merged_upstream_deleted",
+                Safety::MergedNoUpstream => "merged_no_upstream",
                 // The tally that produced the #819 column of the
                 // measured table in `worktree_safety`. Counted
                 // separately from `safe` on purpose: the whole question
@@ -8828,6 +9388,9 @@ mod live {
                 // moving into `never_pushed`, and a merged total would
                 // hide both halves.
                 Safety::DetachedMerged(_) => "detached_merged",
+                // Never produced by this offline scan (#1440): only the
+                // GitHub enrichment in `worktrees::github` reaches it.
+                Safety::MergedAsPr(_) => "merged_as_pr",
                 Safety::Empty => "empty",
                 Safety::Unmerged => "unmerged",
                 Safety::Locked(_) => "locked",
@@ -10087,10 +10650,23 @@ pub fn fetch_refs(path: &str) -> Result<String, String> {
     git(dir, args)
 }
 
+/// `github` is the same delete-time GitHub check `remove_worktree_asking`
+/// takes (#1440), asked only for a row the offline gate would refuse as
+/// unmerged or unpushed. `None` is the offline gate alone.
+///
+/// `on_progress` gets `(done, total, outcome)` after each removal, in
+/// the ORDER of `worktree_paths`: call `done` is always the outcome of
+/// `worktree_paths[done - 1]`. That ordering is a contract, not an
+/// accident of the loop (#1544): the webview holds the same ordered
+/// list, so a caller can report WHICH row went by index alone and keep
+/// the path out of anything it emits. The outcome is handed over whole
+/// so the CALLER decides what leaves the process; this module emits
+/// nothing.
 pub fn remove_worktrees_with_progress(
     repo_path: &str,
     worktree_paths: &[String],
-    mut on_progress: impl FnMut(usize, usize),
+    github: Option<super::github::Ask<'_>>,
+    mut on_progress: impl FnMut(usize, usize, &RemovalOutcome),
 ) -> Vec<RemovalOutcome> {
     let total = worktree_paths.len();
     worktree_paths
@@ -10099,12 +10675,12 @@ pub fn remove_worktrees_with_progress(
         .map(|(i, p)| {
             let outcome = RemovalOutcome {
                 path: p.clone(),
-                error: remove_worktree(repo_path, p).err(),
+                error: remove_inner(repo_path, p, false, github).err(),
             };
             // AFTER the removal, so the count means "done", not
             // "started" -- a progress bar that reaches 100% before the
             // work finishes is worse than none.
-            on_progress(i + 1, total);
+            on_progress(i + 1, total, &outcome);
             outcome
         })
         .collect()
@@ -10154,7 +10730,27 @@ fn canonical_key(p: &Path) -> String {
 /// administrative files, where a raw delete leaves a stale entry making
 /// the repo report a worktree that no longer exists.
 pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> Result<(), String> {
-    remove_inner(repo_path, worktree_path, false)
+    remove_inner(repo_path, worktree_path, false, None)
+}
+
+/// [`remove_worktree`], with GitHub's record of a merge as a second
+/// route through the gate (#1440).
+///
+/// The offline gate runs first and unchanged. Only when it refuses a row
+/// as `Unmerged` or `Unpushed` -- the two verdicts the scan's GitHub
+/// enrichment can upgrade -- is `github` asked, FRESH, about the branch,
+/// and the answer must pass `github::qualifying_pr` against the HEAD
+/// git reports right now. Anything else keeps the offline refusal.
+///
+/// Fresh rather than trusted from the scan for the reason the offline
+/// gate is: the scan is a snapshot. A commit made since would sit past
+/// the PR's head, and the strict rule refuses exactly that.
+pub fn remove_worktree_asking(
+    repo_path: &str,
+    worktree_path: &str,
+    github: super::github::Ask<'_>,
+) -> Result<(), String> {
+    remove_inner(repo_path, worktree_path, false, Some(github))
 }
 
 /// Remove a worktree the safety gate would refuse.
@@ -10188,10 +10784,15 @@ pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> Result<(), Strin
 /// worktree still fails here, loudly, rather than being torn out from
 /// under whatever holds it.
 pub fn remove_worktree_forced(repo_path: &str, worktree_path: &str) -> Result<(), String> {
-    remove_inner(repo_path, worktree_path, true)
+    remove_inner(repo_path, worktree_path, true, None)
 }
 
-fn remove_inner(repo_path: &str, worktree_path: &str, allow_unsafe: bool) -> Result<(), String> {
+fn remove_inner(
+    repo_path: &str,
+    worktree_path: &str,
+    allow_unsafe: bool,
+    github: Option<super::github::Ask<'_>>,
+) -> Result<(), String> {
     let repo = Path::new(repo_path);
     let target = Path::new(worktree_path);
 
@@ -10233,7 +10834,11 @@ fn remove_inner(repo_path: &str, worktree_path: &str, allow_unsafe: bool) -> Res
         };
         let safety = worktree_safety(wt, &branch, has_upstream, ahead);
         if !safety.is_safe() {
-            return Err(format!("not safe to remove: {}", safety.reason()));
+            // GitHub's record of a merge, as a second route (#1440). It can
+            // only let through what the offline gate refused as unmerged or
+            // unpushed; every other refusal -- dirty, in progress, locked --
+            // returns here exactly as before.
+            super::github::gate(wt, &safety, github)?;
         }
     } else {
         log::warn!("removing {worktree_path} past the safety gate, by explicit confirmation");
@@ -10663,6 +11268,200 @@ mod in_progress_tests {
 
         assert_eq!(operation_in_progress(dir), None);
         assert_eq!(conflicted_files(dir), Some(0), "and nothing is conflicted");
+    }
+
+    /// #1438: a conflicted rebase that was FINISHED is not in progress.
+    ///
+    /// Git leaves `REBASE_HEAD` behind after `rebase --continue`, so a
+    /// marker list that included it reported this worktree as mid-rebase
+    /// forever -- and blocked its removal. The state had never been
+    /// modelled: every earlier test stopped at the conflict or aborted.
+    #[test]
+    fn a_finished_conflicted_rebase_is_not_in_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        conflicting(dir);
+        assert!(run(dir, &["checkout", "-q", "feat"]));
+        let _ = run(dir, &["rebase", "main"]);
+        assert_eq!(
+            operation_in_progress(dir),
+            Some(GitOperation::Rebase),
+            "precondition: stopped on the conflict"
+        );
+
+        std::fs::write(dir.join("f.txt"), "resolved\n").unwrap();
+        assert!(run(dir, &["add", "f.txt"]));
+        let continued = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rebase", "--continue"])
+            .envs(IDENT)
+            .env("GIT_EDITOR", "true")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(continued, "rebase --continue must succeed");
+        assert!(
+            !dir.join(".git").join("rebase-merge").exists(),
+            "precondition: the rebase finished"
+        );
+        // The residue that caused #1438. Not asserted, because a future
+        // git that tidies it up is not a failure of this code; but
+        // reported, since `None` below then passes without exercising it.
+        if !dir.join(".git").join("REBASE_HEAD").exists() {
+            eprintln!("this git does not leave REBASE_HEAD behind");
+        }
+
+        assert_eq!(operation_in_progress(dir), None);
+    }
+
+    /// The other markers ARE cleared when their operation finishes --
+    /// measured rather than assumed, because `REBASE_HEAD` showed that a
+    /// marker an operation writes need not be removed by it.
+    #[test]
+    fn finished_merge_cherry_pick_revert_and_bisect_are_not_in_progress() {
+        let resolve_and_commit = |dir: &Path| {
+            std::fs::write(dir.join("f.txt"), "resolved\n").unwrap();
+            assert!(run(dir, &["add", "f.txt"]));
+            assert!(run(dir, &["commit", "-q", "--no-edit"]));
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        conflicting(dir);
+        let _ = run(dir, &["merge", "feat"]);
+        assert_eq!(operation_in_progress(dir), Some(GitOperation::Merge));
+        resolve_and_commit(dir);
+        assert_eq!(operation_in_progress(dir), None, "merge committed");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        conflicting(dir);
+        let _ = run(dir, &["cherry-pick", "feat"]);
+        assert_eq!(operation_in_progress(dir), Some(GitOperation::CherryPick));
+        resolve_and_commit(dir);
+        assert_eq!(operation_in_progress(dir), None, "cherry-pick committed");
+
+        // Reverting a commit that a later one rewrote the same line of
+        // conflicts, which is the stopped state being finished here.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        conflicting(dir);
+        assert!(run(dir, &["checkout", "-q", "feat"]));
+        std::fs::write(dir.join("f.txt"), "later\n").unwrap();
+        assert!(run(dir, &["commit", "-q", "-am", "later"]));
+        let _ = run(dir, &["revert", "--no-edit", "HEAD~1"]);
+        assert_eq!(operation_in_progress(dir), Some(GitOperation::Revert));
+        resolve_and_commit(dir);
+        assert_eq!(operation_in_progress(dir), None, "revert committed");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        conflicting(dir);
+        assert!(run(dir, &["bisect", "start"]));
+        assert!(run(dir, &["bisect", "bad"]));
+        assert!(run(dir, &["bisect", "good", "HEAD~1"]));
+        assert_eq!(operation_in_progress(dir), Some(GitOperation::Bisect));
+        assert!(run(dir, &["bisect", "reset"]));
+        assert_eq!(operation_in_progress(dir), None, "bisect reset");
+    }
+
+    /// Two commits on `feat` after its base: the first conflicts with
+    /// `main`, the second (a new file) does not. Picking or reverting
+    /// both stops on the first with the second still queued.
+    fn two_step_sequence(dir: &Path) {
+        conflicting(dir);
+        assert!(run(dir, &["checkout", "-q", "feat"]));
+        std::fs::write(dir.join("g.txt"), "second\n").unwrap();
+        assert!(run(dir, &["add", "g.txt"]));
+        assert!(run(dir, &["commit", "-q", "-m", "second"]));
+        assert!(run(dir, &["checkout", "-q", "main"]));
+    }
+
+    /// #1446: a multi-commit cherry-pick paused BETWEEN commits.
+    ///
+    /// Once the conflict is resolved and committed, `CHERRY_PICK_HEAD` is
+    /// gone and `sequencer/` is all that is left -- the worktree is clean,
+    /// so without this it read as removable while the rest of the pick
+    /// plan waited in `sequencer/todo`.
+    #[test]
+    fn a_cherry_pick_paused_between_commits_is_in_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        two_step_sequence(dir);
+        let _ = run(dir, &["cherry-pick", "feat~1", "feat"]);
+        assert_eq!(operation_in_progress(dir), Some(GitOperation::CherryPick));
+
+        std::fs::write(dir.join("f.txt"), "resolved\n").unwrap();
+        assert!(run(dir, &["add", "f.txt"]));
+        assert!(run(dir, &["commit", "-q", "--no-edit"]));
+        assert!(
+            !dir.join(".git").join("CHERRY_PICK_HEAD").exists(),
+            "precondition: only the sequencer is left"
+        );
+        assert!(dir.join(".git").join("sequencer").is_dir(), "precondition");
+        assert_eq!(operation_in_progress(dir), Some(GitOperation::CherryPick));
+
+        let continued = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["cherry-pick", "--continue"])
+            .envs(IDENT)
+            .env("GIT_EDITOR", "true")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(continued, "cherry-pick --continue must succeed");
+        assert_eq!(operation_in_progress(dir), None, "the sequence finished");
+    }
+
+    /// The same state for `revert`, named as a revert rather than
+    /// defaulting to cherry-pick: the todo's first word says which.
+    #[test]
+    fn a_revert_paused_between_commits_is_in_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        conflicting(dir);
+        assert!(run(dir, &["checkout", "-q", "feat"]));
+        std::fs::write(dir.join("f.txt"), "later\n").unwrap();
+        assert!(run(dir, &["commit", "-q", "-am", "later"]));
+        std::fs::write(dir.join("g.txt"), "extra\n").unwrap();
+        assert!(run(dir, &["add", "g.txt"]));
+        assert!(run(dir, &["commit", "-q", "-m", "extra"]));
+        // Reverting "theirs" (HEAD~2) conflicts with "later", and "extra"
+        // (HEAD) is queued after it, so the sequence stops on the first
+        // with work left.
+        let _ = run(dir, &["revert", "--no-edit", "HEAD~2", "HEAD"]);
+        assert_eq!(operation_in_progress(dir), Some(GitOperation::Revert));
+
+        std::fs::write(dir.join("f.txt"), "resolved\n").unwrap();
+        assert!(run(dir, &["add", "f.txt"]));
+        assert!(run(dir, &["commit", "-q", "--no-edit"]));
+        assert!(
+            !dir.join(".git").join("REVERT_HEAD").exists(),
+            "precondition: only the sequencer is left"
+        );
+        assert!(dir.join(".git").join("sequencer").is_dir(), "precondition");
+        assert_eq!(operation_in_progress(dir), Some(GitOperation::Revert));
+    }
+
+    /// And the sequencer does not outlive an abandoned sequence: `--abort`
+    /// and `--quit` both clear it, so this cannot become #1438 again.
+    #[test]
+    fn abandoning_a_paused_sequence_clears_the_state() {
+        for end in ["--abort", "--quit"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path();
+            two_step_sequence(dir);
+            let _ = run(dir, &["cherry-pick", "feat~1", "feat"]);
+            std::fs::write(dir.join("f.txt"), "resolved\n").unwrap();
+            assert!(run(dir, &["add", "f.txt"]));
+            assert!(run(dir, &["commit", "-q", "--no-edit"]));
+            assert!(operation_in_progress(dir).is_some(), "precondition");
+
+            assert!(run(dir, &["cherry-pick", end]), "cherry-pick {end}");
+            assert_eq!(operation_in_progress(dir), None, "after {end}");
+        }
     }
 
     /// An ABORTED rebase leaves no markers, so the row goes back to

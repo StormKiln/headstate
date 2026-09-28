@@ -191,10 +191,24 @@ mod tests {
     /// production text at all. Taking the path as a parameter is what
     /// stops the next walk from forgetting to ask.
     fn production(file: &Path, src: &str) -> String {
-        if test_only_files().contains(&canonical(file)) {
-            return String::new();
-        }
         let mut out = String::new();
+        for (line, test) in src.lines().zip(test_mask(file, src)) {
+            if !test {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// For each of `src.lines()`, whether it is TEST code: the complement
+    /// of [`production`], which is built from it, so the two can never
+    /// disagree about where a test module ends.
+    fn test_mask(file: &Path, src: &str) -> Vec<bool> {
+        if test_only_files().contains(&canonical(file)) {
+            return vec![true; src.lines().count()];
+        }
+        let mut out = Vec::new();
         // `Some(true)` while the skipped item's own header line
         // (`mod tests {`, `fn helper() {`) is still to be consumed: that
         // line is itself at column 0, so looking for the terminator
@@ -206,6 +220,7 @@ mod tests {
             match skipping {
                 Some(true) => {
                     skipping = Some(false);
+                    out.push(true);
                     continue;
                 }
                 Some(false) => {
@@ -216,6 +231,7 @@ mod tests {
                     if top_level && starts_an_item(line) {
                         skipping = None;
                     } else {
+                        out.push(true);
                         continue;
                     }
                 }
@@ -223,10 +239,10 @@ mod tests {
             }
             if line.trim_start().starts_with("#[cfg(test)]") {
                 skipping = Some(true);
+                out.push(true);
                 continue;
             }
-            out.push_str(line);
-            out.push('\n');
+            out.push(false);
         }
         out
     }
@@ -543,50 +559,291 @@ mod tests {
         );
     }
 
+    /// The name of the function a line DECLARES, if it declares one: `fn
+    /// NAME` at any indentation, after any visibility (`pub`, `pub(crate)`,
+    /// `pub(super)`, `pub(in path)`) and any qualifiers (`const`, `async`,
+    /// `unsafe`, `extern "ABI"`, `default`), in any order `rustc` accepts.
+    ///
+    /// The one place this vocabulary lives (#1555). Two lookups used to
+    /// spell it separately: `enclosing_fn` knew four literal prefixes and
+    /// missed `pub(crate) fn`, `async fn` and every method below four
+    /// columns, while the #1535 home scan grew its own because of it.
+    fn fn_declared(line: &str) -> Option<&str> {
+        let mut t = line.trim();
+        loop {
+            let before = t;
+            if let Some(r) = t.strip_prefix("pub") {
+                if let Some(r) = r.strip_prefix('(') {
+                    t = r.split_once(')')?.1.trim_start();
+                } else if r.starts_with(' ') {
+                    t = r.trim_start();
+                }
+            }
+            for q in ["const ", "async ", "unsafe ", "default "] {
+                if let Some(r) = t.strip_prefix(q) {
+                    t = r.trim_start();
+                }
+            }
+            if let Some(r) = t.strip_prefix("extern ") {
+                t = r.trim_start();
+                if let Some(r) = t.strip_prefix('"') {
+                    t = r.split_once('"')?.1.trim_start();
+                }
+            }
+            if t == before {
+                break;
+            }
+        }
+        let name = t.strip_prefix("fn ")?.split(['(', '<']).next()?.trim();
+        (!name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')).then_some(name)
+    }
+
+    /// The function around line `n` of `lines`, as `(name, first line, one
+    /// past the last line)`, or `None` when the line is in no function.
+    ///
+    /// The nearest declaration above whose body still CONTAINS the line,
+    /// rather than merely the nearest declaration above: a hit after a
+    /// nested helper has closed belongs to the function the helper sits
+    /// in, not to the helper. A body ends at the `}` in the column its
+    /// declaration started in (see [`item_end`] for why that is reliable
+    /// here), or on its own line when the declaration ends in `}` or `;`
+    /// -- a one-liner, or a trait method with no body.
+    fn fn_around<'a>(lines: &[&'a str], n: usize) -> Option<(&'a str, usize, usize)> {
+        for i in (0..=n).rev() {
+            let l = lines[i].trim_end_matches('\r');
+            if is_comment(l) {
+                continue;
+            }
+            let Some(name) = fn_declared(l) else {
+                continue;
+            };
+            let end = if l.ends_with('}') || l.ends_with(';') {
+                i + 1
+            } else {
+                let indent = l.len() - l.trim_start().len();
+                lines
+                    .iter()
+                    .enumerate()
+                    .skip(i + 1)
+                    .find(|(_, x)| {
+                        let x = x.trim_end_matches('\r');
+                        x.trim() == "}" && x.len() - x.trim_start().len() == indent
+                    })
+                    .map_or(lines.len(), |(j, _)| j + 1)
+            };
+            if n < end {
+                return Some((name, i, end));
+            }
+        }
+        None
+    }
+
     /// The body of the function containing byte offset `at`, as text.
     ///
-    /// Scoped between the nearest preceding `fn` and the next top-level
-    /// item, so a check has to be in THIS function rather than merely
+    /// Scoped to THAT function -- from its declaration to its own closing
+    /// brace -- so a check has to be in this function rather than merely
     /// somewhere in a file that has many. `every_stats_query_meters_itself`
     /// records what getting this wrong costs: an earlier version anchored
     /// on the first mention of a name instead of its definition, read the
     /// wrong region, and reported a defect at a location that did not have
     /// one.
     ///
+    /// # Any declaration, any depth (#1555)
+    ///
+    /// This used to search backwards for four literal prefixes -- `fn `
+    /// and `pub fn ` at columns 0 and 4 -- and end at the next column-0
+    /// `fn` or `}`. So a hit inside a `pub(crate) fn`, an `async fn` or a
+    /// method eight columns in was attributed to whichever recognised
+    /// function came before it, and a method's "body" ran on to the end of
+    /// its `impl`, taking in every sibling after it. A guard reading that
+    /// region could find its check in a sibling and pass over the defect.
+    /// [`fn_declared`] now recognises every form, and [`fn_around`] ends
+    /// the body at the function's own brace.
+    ///
+    /// Auditing every caller against the old lookup found one guard passing
+    /// for the wrong reason: `every_cross_crate_constant_is_read_from_both_sides`
+    /// counted `PROTOCOL_VERSION` as covered because a mobile test's
+    /// "body" ran 369 lines on, into a test comparing the phone's copy with
+    /// itself. No test read both copies until `src-mobile/src/mirrored.rs`
+    /// gained one.
+    ///
+    /// A hit in no function at all -- a module-level `const` holding an
+    /// `include_str!`, say -- returns `<none>` and the rest of the file from
+    /// the hit's line: reading too much, which fails toward a false
+    /// positive rather than a silent pass.
+    ///
     /// Returns the name as well, so a failure can say which function.
     fn enclosing_fn(src: &str, at: usize) -> (String, String) {
-        let before = &src[..at];
-        let start = ["\nfn ", "\npub fn ", "\n    fn ", "\n    pub fn "]
-            .iter()
-            .filter_map(|m| before.rfind(m))
-            .max()
-            .unwrap_or(0);
-        let body = &src[start..];
-        // To the next item, searched FROM the hit rather than from the
-        // start of the body.
-        //
-        // `body.find(m)` finds each pattern's FIRST occurrence, which may
-        // already be behind the hit -- and filtering those out discards
-        // the pattern entirely instead of looking for its next occurrence,
-        // so the body runs on to whichever pattern happens to appear
-        // later. The same mistake in `client.rs`' refusal guard gave one
-        // function a body spanning six others, which made that guard pass
-        // over the defect it was written for. It was caught by reverting
-        // the fix and watching the guard NOT fail.
-        let rel = at - start;
-        let end = ["\nfn ", "\npub fn ", "\n}\n"]
-            .iter()
-            .filter_map(|m| body[rel..].find(m).map(|e| rel + e))
-            .min()
-            .unwrap_or(body.len());
-        let body = &body[..end];
-        let name = body
-            .split_once("fn ")
-            .and_then(|(_, r)| r.split(['(', '<']).next())
-            .unwrap_or("<unknown>")
-            .trim()
-            .to_string();
-        (name, body.to_string())
+        let lines: Vec<&str> = src.split('\n').collect();
+        let n = src[..at].matches('\n').count();
+        match fn_around(&lines, n) {
+            Some((name, a, b)) => (name.to_string(), lines[a..b].join("\n")),
+            None => ("<none>".to_string(), lines[n..].join("\n")),
+        }
+    }
+
+    /// [`enclosing_fn`] names, and bounds, the function around a hit in
+    /// every declaration form -- and in none that is not one (#1555).
+    ///
+    /// Every form below but `plain` and `public` was missed by the old
+    /// four-prefix lookup, which named the function ABOVE instead, and the
+    /// method's body ran on into `sibling`. `outer`'s hit, after `helper`
+    /// has closed, is where a lookup taking the nearest declaration rather
+    /// than the one CONTAINING the hit goes wrong.
+    #[test]
+    fn enclosing_fn_finds_every_declaration_form() {
+        let fixture = "\
+fn plain() {
+    HIT_plain;
+}
+
+pub fn public() {
+    HIT_public;
+}
+
+pub(crate) fn crate_visible() {
+    HIT_crate_visible;
+}
+
+pub(super) fn parent_visible() {
+    HIT_parent_visible;
+}
+
+pub(in crate::a) fn path_visible() {
+    HIT_path_visible;
+}
+
+async fn asynchronous() {
+    HIT_asynchronous;
+}
+
+pub async fn public_async() {
+    HIT_public_async;
+}
+
+pub(crate) const unsafe fn qualified() {
+    HIT_qualified;
+}
+
+unsafe extern \"C\" fn foreign() {
+    HIT_foreign;
+}
+
+fn generic<T>(t: T) -> T {
+    HIT_generic;
+}
+
+fn one_liner() -> u8 { 1 }
+
+static AFTER_ONE_LINER: u8 = HIT_none_1;
+
+impl Thing {
+    pub(crate) async fn method(&self) {
+        HIT_method;
+    }
+
+    fn sibling(&self) {
+        HIT_sibling;
+    }
+}
+
+mod a {
+    mod b {
+        impl Deep {
+            pub(super) fn deep() {
+                HIT_deep;
+            }
+        }
+    }
+}
+
+trait Shape {
+    fn area(&self) -> f64;
+}
+
+static AFTER_TRAIT: u8 = HIT_none_2;
+
+fn outer() {
+    fn helper() {
+        HIT_helper;
+    }
+    HIT_outer;
+}
+
+fn multi_line(
+    a: u8,
+) -> u8 {
+    HIT_multi_line;
+}
+
+static TABLE: &str = HIT_none_3;
+";
+        const FORMS: &[&str] = &[
+            "plain",
+            "public",
+            "crate_visible",
+            "parent_visible",
+            "path_visible",
+            "asynchronous",
+            "public_async",
+            "qualified",
+            "foreign",
+            "generic",
+            "method",
+            "sibling",
+            "deep",
+            "helper",
+            "outer",
+            "multi_line",
+        ];
+        for src in [fixture.to_string(), fixture.replace('\n', "\r\n")] {
+            for form in FORMS {
+                let marker = format!("HIT_{form};");
+                let at = src.find(&marker).expect("marker in fixture");
+                let (name, body) = enclosing_fn(&src, at);
+                assert_eq!(
+                    name, *form,
+                    "the hit in `{form}` was attributed to `{name}`"
+                );
+                // Bounded to that function: no other function's marker,
+                // except the helper nested inside `outer`.
+                let own = format!("HIT_{form}");
+                let others: Vec<&str> = body
+                    .match_indices("HIT_")
+                    .map(|(i, _)| body[i..].split(';').next().unwrap_or(""))
+                    .filter(|m| *m != own && !(*form == "outer" && *m == "HIT_helper"))
+                    .collect();
+                assert!(
+                    others.is_empty(),
+                    "`{form}`'s body reads into {others:?}:\n{body}"
+                );
+            }
+            // In no function. The first two are where a body that does
+            // not end on its own line -- a one-liner's, a bodiless trait
+            // method's -- would run on and claim them.
+            for marker in ["HIT_none_1", "HIT_none_2", "HIT_none_3"] {
+                let at = src.find(marker).expect("marker in fixture");
+                assert_eq!(
+                    enclosing_fn(&src, at).0,
+                    "<none>",
+                    "{marker} is in a static, not a function"
+                );
+            }
+        }
+
+        // And silent on what only looks like one.
+        for line in [
+            "let f: fn(u8) = x;",
+            "    // fn commented() {",
+            "    unsafe {",
+            "    async move {",
+            "publish fn_x() {",
+            "impl Fn(u8) for X {",
+            "    x.fn_call();",
+            "pub struct Fn;",
+        ] {
+            assert_eq!(fn_declared(line), None, "{line:?} declares no function");
+        }
     }
 
     // ---- Invariant 1: recursive deletion ---------------------------------
@@ -1026,8 +1283,8 @@ mod tests {
                 //
                 // A Windows checkout with `core.autocrlf` has CRLF, so a
                 // pattern containing a bare `\n` -- which is how
-                // `enclosing_fn` finds a function's start -- matches
-                // nothing there. It would return a body beginning at
+                // `enclosing_fn` found a function's start before #1555 --
+                // matches nothing there. It would return a body beginning at
                 // offset 0, i.e. the whole file, making every constant
                 // look covered: a silent pass, on one platform only.
                 //
@@ -3155,11 +3412,11 @@ mod tests {
         // scan while leaving this path broken. The `guard` skill names
         // scoping too coarsely as one of the three ways this repo has
         // already got a guard wrong.
-        // Offset INTO the signature rather than at its first byte:
-        // `enclosing_fn` searches backwards for the nearest preceding
-        // `fn `, so anchoring on the `f` of the definition finds the
-        // function BEFORE this one. The guard caught that on its own
-        // first run, which is the cheapest place to catch it.
+        // Offset INTO the signature rather than at its first byte: before
+        // #1555 `enclosing_fn` searched backwards for the nearest preceding
+        // `\nfn `, so anchoring on the `f` of the definition found the
+        // function BEFORE this one. The guard caught that on its own first
+        // run. The lookup is by line now, so either offset works.
         let at = src.find("fn note_stats_viewer(").expect(
             "note_stats_viewer not found; if the identity check moved, \
              move this guard with it rather than deleting it",
@@ -3279,6 +3536,15 @@ mod tests {
     /// Derived from the walk functions the command layer calls, not from
     /// a list of command names, per #844's lesson that a hand-written
     /// list cannot cover the item nobody remembered to add.
+    ///
+    /// And the permit must be held BY THE WALK, not by the command's
+    /// future (#1467). A permit taken in the async fn above a
+    /// `spawn_blocking` is released when the caller gives up, while the
+    /// walk -- which nothing can cancel -- runs on, and the next caller
+    /// starts a second one beside it. So the walk must sit inside
+    /// `scan_blocking`'s closure, which moves an owned permit onto the
+    /// blocking pool with it: the nearest of `scan_blocking(` and
+    /// `spawn_blocking(` above the walk has to be the former.
     #[test]
     fn every_filesystem_scan_takes_a_permit() {
         let src = std::fs::read_to_string(
@@ -3313,11 +3579,10 @@ mod tests {
                     continue;
                 }
 
-                // The enclosing `#[tauri::command]`, NOT the enclosing
-                // function: every one of these sits inside a
-                // `spawn_blocking` closure, so `enclosing_fn` returns
-                // the closure and the permit -- which is taken at the
-                // top of the command -- is outside it.
+                // The enclosing `#[tauri::command]`, found directly. Every
+                // command is a `pub async fn`, which `enclosing_fn` did
+                // not recognise before #1555: it named the function above
+                // the command instead.
                 //
                 // So the search runs backwards from the call to the
                 // nearest command attribute, and the region between
@@ -3326,20 +3591,31 @@ mod tests {
                     continue;
                 };
                 checked += 1;
-                let region = &prod[cmd..hit];
+                // Code only: the rule's own prose, in comments above the
+                // call, names both functions.
+                let region = prod[cmd..hit]
+                    .replace("\r\n", "\n")
+                    .lines()
+                    .filter(|l| !is_comment(l))
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 let name = region
                     .split("pub async fn ")
                     .nth(1)
                     .or_else(|| region.split("pub fn ").nth(1))
                     .and_then(|r| r.split('(').next())
                     .unwrap_or("<unnamed>");
+                let gated = region.rfind("scan_blocking(");
+                let bare = region.rfind("spawn_blocking(");
                 assert!(
-                    region.contains("scan_permit().await?"),
-                    "commands.rs: `{name}` starts a filesystem walk ({walk}) without \
-                     taking a scan permit. The frontend fires one of these per \
-                     repository and each spawns up to eight OS threads, so an ungated \
-                     one puts ~300 walkers on one disk -- measured at 17.6 seconds for \
-                     groups of two (#1149). Add `let _permit = scan_permit().await?;`."
+                    gated.is_some_and(|g| bare.is_none_or(|b| g > b)),
+                    "commands.rs: `{name}` starts a filesystem walk ({walk}) outside \
+                     `scan_blocking`. The frontend fires one of these per repository and \
+                     each spawns up to eight OS threads, so an ungated one puts ~300 \
+                     walkers on one disk -- measured at 17.6 seconds for groups of two \
+                     (#1149). And a permit held by the command rather than the walk is \
+                     released when the caller gives up while the walk runs on (#1467). \
+                     Run the walk as `scan_blocking(move || ...).await`."
                 );
             }
         }
@@ -3613,6 +3889,147 @@ fn suggestion(f: &Finding) -> String {
         assert_eq!(seen, 1);
         assert_eq!(offenders.len(), 3, "{offenders:?}");
         assert!(offenders[0].starts_with("5: "), "{offenders:?}");
+    }
+
+    /// Every remote command that returns transcript text is masked at the
+    /// remote boundary (#1488).
+    ///
+    /// # The defect this prevents
+    ///
+    /// `remote/privacy.rs` masks secrets in transcript text before it
+    /// leaves for a phone, and it does so for exactly the commands in its
+    /// `TRANSCRIPT_TEXT` table. The 7.9 read model and paged reads (#1475,
+    /// #1220) add transcript commands after that table was written. A new
+    /// one registered on the surface and not listed there would send a
+    /// phone every token in the transcript -- green in every behavioural
+    /// test, because the command itself works.
+    ///
+    /// # What is asserted
+    ///
+    /// A non-`Local` row of `surface::SURFACE` is transcript-bearing when
+    /// its NAME says "transcript", or its function's RETURN TYPE names
+    /// `transcript`, `preview::` or `search::` (the modules transcript
+    /// text is read in). Each must have a `TRANSCRIPT_TEXT` row or a named
+    /// exemption below saying why its answer holds no text. And every
+    /// `TRANSCRIPT_TEXT` row must be a live remote command, so a renamed
+    /// command cannot leave a stale row that masks nothing.
+    ///
+    /// # What this cannot see
+    ///
+    /// A command named and typed with no hint of transcripts that
+    /// nonetheless returns transcript text. The name and module
+    /// conventions are what it leans on; `claude_sessions`' opening prompt
+    /// is such a case, found by reading, and listed by hand.
+    #[test]
+    fn every_transcript_command_is_masked_at_the_remote_boundary() {
+        use crate::remote::privacy;
+        use crate::remote::surface::{Class, SURFACE};
+
+        /// Transcript-sounding commands whose answers carry no transcript
+        /// TEXT, with why.
+        const NO_TEXT: &[(&str, &str)] = &[
+            (
+                "claude_import_transcripts",
+                "returns counts of files scanned and indexed",
+            ),
+            (
+                "claude_index_coverage",
+                "returns counts of indexed transcripts, no snippets",
+            ),
+        ];
+
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let files: Vec<(PathBuf, String)> = rust_files(&manifest.join("src"))
+            .into_iter()
+            .filter(|f| !f.ends_with("invariants.rs"))
+            .filter_map(|f| {
+                let src = std::fs::read_to_string(&f).ok()?.replace("\r\n", "\n");
+                let prod = production(&f, &src);
+                Some((f, prod))
+            })
+            .collect();
+
+        // The signature of a `pub fn` / `pub async fn` named `name`, and
+        // where it is, from production code only.
+        let signature = |name: &str| -> Option<(String, String)> {
+            for (file, src) in &files {
+                for needle in [format!("pub async fn {name}("), format!("pub fn {name}(")] {
+                    if let Some(at) = src.find(&needle) {
+                        let rest = &src[at..];
+                        let end = rest.find("{\n").unwrap_or(rest.len());
+                        let line = src[..at].lines().count() + 1;
+                        let rel = file.strip_prefix(manifest).unwrap_or(file);
+                        return Some((
+                            rest[..end].to_string(),
+                            format!("{}", rel.display())
+                                + &format!(" (near line {line} of its production text)"),
+                        ));
+                    }
+                }
+            }
+            None
+        };
+
+        let mut found = 0usize;
+        let mut bearing = 0usize;
+        let mut offenders = Vec::new();
+        for (name, class) in SURFACE {
+            if *class == Class::Local {
+                continue;
+            }
+            let sig = signature(name);
+            if sig.is_some() {
+                found += 1;
+            }
+            let returns = sig
+                .as_ref()
+                .and_then(|(s, _)| s.split_once("->").map(|(_, r)| r.to_ascii_lowercase()))
+                .unwrap_or_default();
+            let by_name = name.contains("transcript");
+            let by_type = ["transcript", "preview::", "search::"]
+                .iter()
+                .any(|m| returns.contains(m));
+            if !(by_name || by_type) {
+                continue;
+            }
+            bearing += 1;
+            if privacy::carries(name).is_some() || NO_TEXT.iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            let at = sig.map(|(_, at)| at).unwrap_or_else(|| "?".into());
+            offenders.push(format!(
+                "{name} ({at}) returns transcript text by its name or type but has no row in \
+                 remote/privacy.rs TRANSCRIPT_TEXT -- add one (Whole or Fields), or add it to \
+                 NO_TEXT here with why its answer holds no text"
+            ));
+        }
+        for (name, _) in privacy::TRANSCRIPT_TEXT {
+            if !SURFACE.iter().any(|(n, c)| n == name && *c != Class::Local) {
+                offenders.push(format!(
+                    "remote/privacy.rs TRANSCRIPT_TEXT lists `{name}`, which is not a remote \
+                     command in remote/surface.rs SURFACE -- a stale row masks nothing"
+                ));
+            }
+        }
+        for (name, _) in NO_TEXT {
+            if !SURFACE.iter().any(|(n, _)| n == name) {
+                offenders.push(format!(
+                    "NO_TEXT exempts `{name}`, which is no longer a command"
+                ));
+            }
+        }
+
+        // Self-guards: the scan found the commands' functions at all, and
+        // saw the three transcript commands known today.
+        assert!(
+            found > 80,
+            "found the signatures of only {found} remote commands; the `pub fn` scan is broken"
+        );
+        assert!(
+            bearing >= 3,
+            "saw only {bearing} transcript-bearing command(s); the markers are broken"
+        );
+        assert!(offenders.is_empty(), "{}", offenders.join("\n"));
     }
 
     /// A `Mirrors `rust::path::Type`` doc comment is a claim about the
@@ -4048,5 +4465,630 @@ fn suggestion(f: &Finding) -> String {
             return Some((file.clone(), rename_all, fields));
         }
         None
+    }
+
+    // ---- Invariant: no test reaches the real home directory (#1535) ------
+
+    /// The functions allowed to read the home directory from the process
+    /// environment, as `(file, fn, why)`. Everything else goes through
+    /// `auth::home_dir`, which a test build answers from a fixture.
+    ///
+    /// Each entry must still match something, so one cannot outlive the
+    /// code it excuses.
+    const HOME_READERS: &[(&str, &str, &str)] = &[
+        (
+            "src-tauri/auth.rs",
+            "env_home",
+            "THE resolver. `home_dir` calls it only outside a test build.",
+        ),
+        (
+            "src-tauri/auth.rs",
+            "user_fallback_dirs",
+            "Windows `USERPROFILE` for where winget and Scoop put `gh`: \
+             read-only PATH candidates, never under `.claude`.",
+        ),
+    ];
+
+    /// Spellings that resolve the home directory around `auth::home_dir`:
+    /// the environment variables themselves, and the crates and the `std`
+    /// function that read them.
+    const HOME_TOKENS: &[&str] = &[
+        "\"HOME\"",
+        "\"USERPROFILE\"",
+        "env::home_dir",
+        "dirs::",
+        "dirs_next::",
+        "home::home_dir",
+        "directories::",
+    ];
+
+    /// Calls that write, as an `#[ignore]` probe reaching the real home
+    /// might spell them (#1554): the filesystem's, and the store's --
+    /// `open_db` migrates the file it opens, so it is a write too.
+    ///
+    /// Matched in the probe's OWN body only. A write inside a function the
+    /// probe calls is invisible, which is why a probe that must write
+    /// hands a real path to a helper that COPIES it into a `TempDir` first
+    /// (`store::settings`' `live_settings_round_trip`), and that helper is
+    /// tested against a fixture like any other code.
+    const PROBE_WRITES: &[&str] = &[
+        "fs::write(",
+        "File::create(",
+        "OpenOptions",
+        "create_dir(",
+        "create_dir_all(",
+        "remove_file(",
+        "remove_dir(",
+        "remove_dir_all(",
+        "fs::rename(",
+        "fs::copy(",
+        "set_permissions(",
+        "open_db(",
+        ".execute(",
+        ".execute_batch(",
+        "set(&conn",
+        "settings::set(",
+    ];
+
+    /// Live probes whose flagged write goes to a `TempDir` the probe made,
+    /// as `(file, probe, call, why)`, each read and verified. Each must
+    /// still match, so an entry cannot outlive the line it excuses.
+    const PROBE_WRITES_TO_A_TEMPDIR: &[(&str, &str, &str, &str)] = &[(
+        "src-tauri/claude/search.rs",
+        "real_corpus",
+        ".execute_batch(",
+        "checkpoints the bench's own index database, built in a TempDir, \
+         before measuring its size; the real corpus is only read",
+    )];
+
+    /// Whether `line` contains `token` as a whole path segment: `dirs::`
+    /// must not match `scan_dirs::`, which is a module in this tree.
+    fn has_token(line: &str, token: &str) -> bool {
+        line.match_indices(token).any(|(at, _)| {
+            !token.starts_with(|c: char| c.is_alphanumeric())
+                || !line[..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        })
+    }
+
+    /// The line spans `[fn line, end)` of every `#[ignore]` test in
+    /// `lines`, whichever side of `#[test]` the `#[ignore]` is on.
+    fn ignored_test_spans(lines: &[&str]) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim_start();
+            if t != "#[test]" && !t.starts_with("#[tokio::test") {
+                continue;
+            }
+            let Some(fn_at) = (i + 1..lines.len().min(i + 6)).find(|j| {
+                let l = lines[*j].trim_start();
+                l.starts_with("fn ") || l.starts_with("async fn ")
+            }) else {
+                continue;
+            };
+            let above = (0..i)
+                .rev()
+                .take_while(|j| lines[*j].trim_start().starts_with("#["));
+            let ignored = (i + 1..fn_at)
+                .chain(above)
+                .any(|j| lines[j].trim_start().starts_with("#[ignore"));
+            if ignored {
+                let indent = lines[fn_at].len() - lines[fn_at].trim_start().len();
+                out.push((fn_at, item_end(lines, fn_at, indent)));
+            }
+        }
+        out
+    }
+
+    /// Every line of `src` (the file at `rel`) that breaks the rule, and
+    /// the [`HOME_READERS`] entries it used. See
+    /// [`no_test_resolves_the_real_home_directory`].
+    fn home_offenders(
+        rel: &str,
+        src: &str,
+        used: &mut std::collections::BTreeSet<(&'static str, &'static str)>,
+    ) -> (Vec<String>, usize) {
+        // `\r\n` first: the spans are found line by line.
+        let src = src.replace("\r\n", "\n");
+        let lines: Vec<&str> = src.lines().collect();
+        let ignored = ignored_test_spans(&lines);
+        let in_ignored = |n: usize| ignored.iter().any(|(a, b)| (*a..*b).contains(&n));
+        let mut out = Vec::new();
+        // An `#[ignore]` probe may READ the real home, never write it
+        // (#1554). One that reaches the real home -- the opt-in, or a
+        // home token read directly -- is flagged for any write API in
+        // its own body.
+        for &(a, b) in &ignored {
+            let code = || (a..b).filter(|&n| !is_comment(lines[n]));
+            let real = code().any(|n| {
+                lines[n].contains("real_for_a_live_probe")
+                    || HOME_TOKENS.iter().any(|t| has_token(lines[n], t))
+            });
+            if !real {
+                continue;
+            }
+            let probe = fn_declared(lines[a]).unwrap_or("");
+            for n in code() {
+                if let Some(w) = PROBE_WRITES.iter().find(|w| has_token(lines[n], w)) {
+                    if let Some(&(f, g, _, _)) = PROBE_WRITES_TO_A_TEMPDIR
+                        .iter()
+                        .find(|(f, g, t, _)| *f == rel && *g == probe && t == w)
+                    {
+                        used.insert((f, g));
+                        continue;
+                    }
+                    out.push(format!(
+                        "{rel}:{}: `{w}` in an #[ignore] probe that reaches the real home, \
+                         which it may only read: {}",
+                        n + 1,
+                        lines[n].trim()
+                    ));
+                }
+            }
+        }
+        for (n, line) in lines.iter().enumerate() {
+            if is_comment(line) || in_ignored(n) {
+                continue;
+            }
+            if line.contains("real_for_a_live_probe") && !line.contains("fn real_for_a_live_probe")
+            {
+                out.push(format!(
+                    "{rel}:{}: the real home, outside an #[ignore] test: {}",
+                    n + 1,
+                    line.trim()
+                ));
+                continue;
+            }
+            if !HOME_TOKENS.iter().any(|t| has_token(line, t)) {
+                continue;
+            }
+            // The shared lookup (#1555). This scan used to carry its own,
+            // because `enclosing_fn` then missed `pub(crate) fn`:
+            // sabotaging `claudemd::home` was reported as the function
+            // above it. A line in no function is `<none>`, which can only
+            // fail to match an allowlist entry -- a false positive, never a
+            // silent pass.
+            let name = fn_around(&lines, n).map_or("<none>", |(name, _, _)| name);
+            if let Some(&(f, g, _)) = HOME_READERS
+                .iter()
+                .find(|(f, g, _)| *f == rel && *g == name)
+            {
+                used.insert((f, g));
+                continue;
+            }
+            out.push(format!("{rel}:{}: in `{name}`: {}", n + 1, line.trim()));
+        }
+        (out, ignored.len())
+    }
+
+    /// No test resolves the developer's real home directory, so none can
+    /// reach the real `~/.claude` (#1535).
+    ///
+    /// # The defect
+    ///
+    /// `sessions::detail()` tests read the REAL `~/.claude/sessions`, so
+    /// they passed or failed on whatever was running (#1315 hit it), and a
+    /// machine-dependent test in the merge queue can burn a release commit
+    /// (#1048). Looking for the rest found 51 tests reaching the real home
+    /// through `auth::home_dir` -- the registry, the transcript corpus
+    /// through the handoff consumer -- and 203 more through
+    /// `claudemd::home`'s own `$HOME` read. Two wrote there: a tilde test
+    /// made and removed a directory in the real home, and the Poetry
+    /// removal tests made venvs and symlinks in the real cache and removed
+    /// them by computed path, the shape of the 2026-09-27 incident.
+    ///
+    /// # Why the rule is at the resolver and not at each test
+    ///
+    /// A source scan cannot follow a call, and every one of those tests
+    /// reached the home indirectly -- `consume` walks the corpus, `detail`
+    /// reads the registry. So `auth::home_dir` answers a per-thread
+    /// FIXTURE home in a test build, `None` unless the test set one. That
+    /// holds whatever the call chain. Two tests then check the two things
+    /// that would defeat it, the first in `a_test_build_has_no_real_home`:
+    ///
+    /// 1. **Runtime**: the resolver and the paths derived from it -- the
+    ///    registry, the corpus, the global `CLAUDE.md`'s home, the Poetry
+    ///    cache -- are absent here, and follow a fixture home when one is
+    ///    set. Asserting the derived paths is what shows they go THROUGH
+    ///    the resolver rather than around it.
+    /// 2. **Source**: nothing reads the home directory around the
+    ///    resolver -- the `HOME` or `USERPROFILE` variables, `dirs::`,
+    ///    `home::home_dir`, `std::env::home_dir` -- except the functions
+    ///    in [`HOME_READERS`], each with its reason. An `#[ignore]` test
+    ///    is exempt: a person runs it on purpose to measure this machine,
+    ///    never CI or the merge queue. The opt-in that gives such a probe
+    ///    the real home, `test_home::real_for_a_live_probe`, may appear
+    ///    ONLY in an `#[ignore]` test. And such a probe may only READ:
+    ///    one that reaches the real home and writes in its own body is
+    ///    flagged (#1554), because `store::settings`' probe once overwrote
+    ///    a setting in the owner's app database and restored it after an
+    ///    assertion that could panic.
+    ///
+    /// # What it cannot see
+    ///
+    /// - **A read spelled some other way**: the variable name built at
+    ///   runtime or held in a `const`, `std::env::vars()` iterated, or a
+    ///   hard-coded absolute path. Only the spellings above are matched.
+    /// - **A home on another thread.** A thread the code under test spawns
+    ///   sees no home rather than the fixture. That fails safe -- nothing
+    ///   real is reached -- but such a test sees "no home", not its
+    ///   fixture.
+    /// - **A write an `#[ignore]` probe makes out of sight.** A probe that
+    ///   reaches the real home is flagged for any [`PROBE_WRITES`] call in
+    ///   its own body (#1554), but not for one in a function it calls, one
+    ///   spelled otherwise (a `std::process::Command`, a crate's own
+    ///   save), or one aimed at a `TempDir` it made -- that last is a
+    ///   false positive, and the way out is a copying helper tested on a
+    ///   fixture, as `store::settings` does.
+    /// - **The allowlisted readers' callers.** A test reaching
+    ///   `auth::user_fallback_dirs` still reads real PATH candidate
+    ///   directories on Windows. Read-only, and nothing under `.claude`.
+    /// - **Other crates' tests at runtime.** The source half reads
+    ///   `src-mobile` and the step-up crate as text; neither resolves a
+    ///   home today.
+    ///
+    /// PROVEN BY SABOTAGE, both directions: see
+    /// `the_home_scan_flags_each_bypass_and_nothing_safe`, and the PR for
+    /// #1535 for the sabotage of the live tree.
+    #[test]
+    fn no_test_resolves_the_real_home_directory() {
+        // 2. Source. The runtime half is
+        // `a_test_build_has_no_real_home`, a separate test so that each
+        // half can be seen failing on its own: on a machine with a real
+        // Poetry cache, a bypass in `cache_dir` trips the runtime check
+        // first and would otherwise hide whether this one sees it.
+        let mut used = std::collections::BTreeSet::new();
+        let mut offenders = Vec::new();
+        let (mut files, mut ignored) = (0usize, 0usize);
+        for (crate_name, root) in crate_roots() {
+            for file in rust_files(&root) {
+                let rel = file
+                    .strip_prefix(&root)
+                    .unwrap_or(&file)
+                    .display()
+                    .to_string();
+                // Skipped by PATH: this file names every token in prose
+                // and in its fixtures.
+                if rel.contains("invariants.rs") {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&file) else {
+                    continue;
+                };
+                // `/` whatever the platform, so the allowlist matches on
+                // Windows too.
+                let rel = format!("{crate_name}/{}", rel.replace('\\', "/"));
+                let (found, n) = home_offenders(&rel, &src, &mut used);
+                offenders.extend(found);
+                ignored += n;
+                files += 1;
+            }
+        }
+        // Self-guards: a walk that read nothing, or an `#[ignore]` matcher
+        // that found none, would pass while exempting or checking nothing
+        // -- 51 ignored tests and 181 files existed when this was written.
+        assert!(files > 150, "read only {files} files");
+        assert!(ignored >= 40, "found only {ignored} #[ignore] tests");
+        let stale: Vec<_> = HOME_READERS
+            .iter()
+            .map(|(f, g, _)| (f, g))
+            .chain(PROBE_WRITES_TO_A_TEMPDIR.iter().map(|(f, g, _, _)| (f, g)))
+            .filter(|(f, g)| !used.contains(&(**f, **g)))
+            .map(|(f, g)| format!("{f}::{g}"))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "these HOME_READERS or PROBE_WRITES_TO_A_TEMPDIR entries no longer match; \
+             delete them: {stale:?}"
+        );
+        assert!(
+            offenders.is_empty(),
+            "the home directory is resolved around `auth::home_dir`, which a \
+             test build answers from a fixture (#1535). Call \
+             `crate::auth::home_dir()` instead -- in a test, set a fixture \
+             home with `crate::auth::test_home::set(tempdir)`. A probe that \
+             must measure this machine belongs in an `#[ignore]` test, with \
+             `test_home::real_for_a_live_probe()`. Offending lines:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// The runtime half of [`no_test_resolves_the_real_home_directory`]:
+    /// in a test build the resolver answers no home, the paths derived
+    /// from it are absent too, and they follow a fixture home when one is
+    /// set -- which is what shows they go THROUGH the resolver.
+    #[test]
+    fn a_test_build_has_no_real_home() {
+        use crate::claude::{liveness, transcript};
+
+        // The runtime half; see the doc.
+        assert_eq!(
+            crate::auth::home_dir(),
+            None,
+            "a test build must have no home unless the test sets one"
+        );
+        assert_eq!(crate::claudemd::home(), None);
+        assert_eq!(liveness::registry_dir(), None);
+        assert_eq!(transcript::projects_dir(), None);
+        assert_eq!(crate::caches::poetry::cache_dir(), None);
+        let fixture = tempfile::TempDir::new().unwrap();
+        {
+            let _home = crate::auth::test_home::set(fixture.path());
+            let claude = fixture.path().join(".claude");
+            assert_eq!(liveness::registry_dir(), Some(claude.join("sessions")));
+            assert_eq!(transcript::projects_dir(), Some(claude.join("projects")));
+            assert_eq!(crate::claudemd::home(), Some(fixture.path().to_path_buf()));
+        }
+        assert_eq!(
+            crate::auth::home_dir(),
+            None,
+            "the fixture home is dropped with its guard"
+        );
+    }
+
+    /// The scan behind [`no_test_resolves_the_real_home_directory`],
+    /// against fixtures: it flags each bypass, and stays silent on each
+    /// safe shape -- including under CRLF.
+    #[test]
+    fn the_home_scan_flags_each_bypass_and_nothing_safe() {
+        let fixture = "\
+fn production_reader() -> Option<String> {
+    std::env::var(\"HOME\").ok()
+}
+
+fn via_a_crate() {
+    let _ = dirs::home_dir();
+}
+
+pub(crate) fn env_home() -> Option<String> {
+    std::env::var(\"USERPROFILE\").ok()
+}
+
+fn safe() {
+    // std::env::var(\"HOME\") in a comment is a mention
+    let _ = crate::auth::home_dir();
+    let _ = crate::worktrees::scan_dirs::x();
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_plain_test() {
+        let _ = std::env::var_os(\"HOME\");
+    }
+
+    #[test]
+    fn a_plain_test_opting_in() {
+        let _home = crate::auth::test_home::real_for_a_live_probe();
+    }
+
+    #[test]
+    #[ignore = \"a live probe\"]
+    fn a_probe() {
+        let _home = crate::auth::test_home::real_for_a_live_probe();
+        let _ = std::env::var(\"HOME\");
+    }
+
+    #[ignore]
+    #[test]
+    fn a_probe_ignored_above() {
+        let _ = std::env::var(\"HOME\");
+    }
+}
+";
+        for src in [fixture.to_string(), fixture.replace('\n', "\r\n")] {
+            let mut used = std::collections::BTreeSet::new();
+            let (found, ignored) = home_offenders("src-tauri/auth.rs", &src, &mut used);
+            assert_eq!(ignored, 2, "both #[ignore] placements are found");
+            let lines: Vec<&str> = found.iter().map(|f| f.split(':').nth(1).unwrap()).collect();
+            // Flagged: the production read (2), the crate (6), the plain
+            // test (23) and its opt-in (28). Silent: the allowlisted
+            // `env_home` (10), the comment and the safe calls (14-16), and
+            // both probes.
+            assert_eq!(lines, ["2", "6", "23", "28"], "{found:#?}");
+            assert!(used.contains(&("src-tauri/auth.rs", "env_home")));
+        }
+        // The allowlist is by file AND function: the same `env_home`
+        // elsewhere is flagged.
+        let mut used = std::collections::BTreeSet::new();
+        let (found, _) = home_offenders("src-tauri/other.rs", fixture, &mut used);
+        assert!(
+            found.iter().any(|f| f.contains("in `env_home`")),
+            "{found:#?}"
+        );
+        assert!(used.is_empty());
+    }
+
+    /// An `#[ignore]` probe that reaches the real home is flagged for a
+    /// write in its body, and one that only reads, or writes without the
+    /// real home, is not (#1554).
+    #[test]
+    fn the_home_scan_flags_a_live_probe_that_writes() {
+        let fixture = "\
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[ignore]
+    fn writes_through_the_opt_in() {
+        let _home = crate::auth::test_home::real_for_a_live_probe();
+        // std::fs::remove_file(p) in a comment is a mention
+        std::fs::write(p, b\"x\").unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn writes_through_the_variable() {
+        let home = std::env::var(\"HOME\").unwrap();
+        let conn = open_db(&path).unwrap();
+        conn.execute(\"DELETE FROM settings\", []).unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn only_reads() {
+        let _home = crate::auth::test_home::real_for_a_live_probe();
+        let _ = std::fs::read_to_string(p);
+        let (a, b) = round_trip_on_a_copy(&real);
+    }
+
+    #[test]
+    #[ignore]
+    fn writes_with_no_real_home() {
+        let t = tempfile::TempDir::new().unwrap();
+        std::fs::write(t.path().join(\"x\"), b\"x\").unwrap();
+    }
+}
+";
+        for src in [fixture.to_string(), fixture.replace('\n', "\r\n")] {
+            let mut used = std::collections::BTreeSet::new();
+            let (found, ignored) = home_offenders("src-tauri/x.rs", &src, &mut used);
+            assert_eq!(ignored, 4);
+            let lines: Vec<&str> = found.iter().map(|f| f.split(':').nth(1).unwrap()).collect();
+            // The opt-in's write (8), and the variable's `open_db` (15)
+            // and `execute` (16). Not the comment (7), not the reader, not
+            // the probe that never reaches the real home.
+            assert_eq!(lines, ["8", "15", "16"], "{found:#?}");
+        }
+    }
+
+    // ---- Invariant: no test names a path in the shared temp dir (#1554) --
+
+    /// Every test line in `lines` (per `mask`) that joins a name onto the
+    /// shared `std::env::temp_dir()`, whether `rustfmt` kept the call on
+    /// one line or broke it before `.join(`.
+    fn shared_temp_offenders(rel: &str, lines: &[&str], mask: &[bool]) -> Vec<String> {
+        let mut out = Vec::new();
+        for (n, line) in lines.iter().enumerate() {
+            if !mask.get(n).copied().unwrap_or(false) || is_comment(line) {
+                continue;
+            }
+            let split = line.trim_end().ends_with("temp_dir()")
+                && lines
+                    .get(n + 1)
+                    .is_some_and(|next| next.trim_start().starts_with(".join("));
+            if line.contains("temp_dir().join(") || split {
+                out.push(format!("{rel}:{}: {}", n + 1, line.trim()));
+            }
+        }
+        out
+    }
+
+    /// No test builds a path in the SHARED temp directory (#1554).
+    ///
+    /// # The defect
+    ///
+    /// Tests named fixtures `temp_dir().join("headstate-…-917")` and
+    /// cleaned up with `remove_dir_all` on that computed path. About a
+    /// hundred sibling worktrees run `cargo test` on one machine, often at
+    /// once, so two runs meet on one fixed name and one run's cleanup
+    /// deletes the other's fixture mid-test. And cleanup by computed path
+    /// is the shape of the 2026-09-27 incident, where a bench's
+    /// `remove_file` ran on a real transcript after an edit silently
+    /// failed to apply.
+    ///
+    /// `tempfile::TempDir` makes a directory no other run can name, and
+    /// removes it when dropped: there is no path to compute.
+    ///
+    /// # What it cannot see
+    ///
+    /// - **The temp dir held in a variable first**: `let d =
+    ///   std::env::temp_dir();` and then `d.join(…)`. Bare `temp_dir()`
+    ///   used as an existing directory to run in -- `launch.rs` and
+    ///   `overview.rs` do -- is safe and is not flagged, so the join on a
+    ///   variable cannot be told from it by text.
+    /// - **Production code.** Only test lines are scanned; nothing in
+    ///   production joins onto the temp dir today.
+    /// - **Another spelling of a shared location**: a literal `/tmp/…`.
+    #[test]
+    fn no_test_names_a_path_in_the_shared_temp_dir() {
+        let (mut files, mut test_lines) = (0usize, 0usize);
+        let mut offenders = Vec::new();
+        for (crate_name, root) in crate_roots() {
+            for file in rust_files(&root) {
+                let rel = file
+                    .strip_prefix(&root)
+                    .unwrap_or(&file)
+                    .display()
+                    .to_string();
+                // Skipped by PATH: this file names the pattern in prose
+                // and in its fixtures.
+                if rel.contains("invariants.rs") {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&file) else {
+                    continue;
+                };
+                let src = src.replace("\r\n", "\n");
+                let lines: Vec<&str> = src.lines().collect();
+                let mask = test_mask(&file, &src);
+                test_lines += mask.iter().filter(|t| **t).count();
+                files += 1;
+                offenders.extend(shared_temp_offenders(
+                    &format!("{crate_name}/{}", rel.replace('\\', "/")),
+                    &lines,
+                    &mask,
+                ));
+            }
+        }
+        // Self-guards: a walk that read nothing, or a mask that marked no
+        // test code, would pass while checking nothing.
+        assert!(files > 150, "read only {files} files");
+        assert!(test_lines > 50_000, "only {test_lines} test lines found");
+        assert!(
+            offenders.is_empty(),
+            "a test builds a path in the shared temp directory, which every \
+             concurrent `cargo test` on this machine shares: a fixed name \
+             collides, and cleanup by computed path deletes whatever is there \
+             (#1554). Use `tempfile::TempDir::new()` and join onto its \
+             `path()`; it is removed when dropped. Offending lines:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// The scan behind [`no_test_names_a_path_in_the_shared_temp_dir`],
+    /// against a fixture: it flags each spelling in test code, and stays
+    /// silent on production code, comments and the safe shapes.
+    #[test]
+    fn the_shared_temp_scan_flags_each_spelling_and_nothing_safe() {
+        let fixture = "\
+fn production() -> PathBuf {
+    std::env::temp_dir().join(\"shipped\")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fixed() {
+        let d = std::env::temp_dir().join(\"headstate-917\");
+    }
+
+    #[test]
+    fn wrapped() {
+        let d = std::env::temp_dir()
+            .join(format!(\"headstate-{}\", std::process::id()));
+    }
+
+    #[test]
+    fn safe() {
+        // std::env::temp_dir().join(\"x\") in a comment is a mention
+        let t = tempfile::TempDir::new().unwrap();
+        let d = t.path().join(\"x\");
+        let cwd = std::env::temp_dir();
+    }
+}
+";
+        let file = Path::new("no/such/fixture.rs");
+        for src in [fixture.to_string(), fixture.replace('\n', "\r\n")] {
+            let src = src.replace("\r\n", "\n");
+            let lines: Vec<&str> = src.lines().collect();
+            let mask = test_mask(file, &src);
+            let found = shared_temp_offenders("x.rs", &lines, &mask);
+            let at: Vec<&str> = found.iter().map(|f| f.split(':').nth(1).unwrap()).collect();
+            // The fixed name (9) and the wrapped call (14). Not production
+            // (2), the comment (20) or the safe shapes (21-23).
+            assert_eq!(at, ["9", "14"], "{found:#?}");
+        }
     }
 }

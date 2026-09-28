@@ -1,5 +1,9 @@
 import { useState } from "react";
-import { usePairedDevices, useRevokePairedDevice } from "../api/hooks";
+import {
+  usePairedDevices,
+  useRevokePairedDevice,
+  useSetPairedDeviceAccess,
+} from "../api/hooks";
 import type { PairedDevice } from "../api/tauri";
 import { relativeTime } from "@/lib/time";
 import { formatFingerprint } from "@/lib/fingerprint";
@@ -14,6 +18,70 @@ function pairedOn(iso: string): string {
     month: "short",
     day: "numeric",
   });
+}
+
+/// One phone's two transcript switches (#1488).
+///
+/// Transcripts are on and reveal is off by default. Reveal is disabled
+/// rather than hidden while transcripts are off: it means nothing then,
+/// and a box that vanished would read as a setting that was lost. Its
+/// stored value is kept, so turning transcripts back on restores it.
+function TranscriptAccess({ device: d }: { device: PairedDevice }) {
+  const setAccess = useSetPairedDeviceAccess();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const save = (transcripts: boolean, reveal: boolean) => {
+    setBusy(true);
+    setError(null);
+    setAccess(d.id, transcripts, reveal)
+      .catch((e: unknown) =>
+        setError(typeof e === "string" ? e : "Could not change this phone's access"),
+      )
+      .finally(() => setBusy(false));
+  };
+
+  return (
+    <div className="mt-1 flex flex-col gap-1 text-xs">
+      <label className="flex items-start gap-2">
+        <input
+          type="checkbox"
+          className="mt-0.5"
+          checked={d.transcripts_allowed}
+          disabled={busy}
+          onChange={(e) => save(e.target.checked, d.reveal_allowed)}
+        />
+        <span className="flex flex-col">
+          <span className="text-[#e6edf3]">Allow this phone to read session transcripts</span>
+          <span className="text-[#8b949e]">
+            Claude Code conversation text, transcript search results and opening prompts.
+            Likely secrets such as tokens, keys and passwords are hidden before the text
+            leaves this computer.
+          </span>
+        </span>
+      </label>
+      <label className="flex items-start gap-2">
+        <input
+          type="checkbox"
+          className="mt-0.5"
+          checked={d.reveal_allowed}
+          disabled={busy || !d.transcripts_allowed}
+          onChange={(e) => save(d.transcripts_allowed, e.target.checked)}
+        />
+        <span className="flex flex-col">
+          <span className="text-[#e6edf3]">Allow this phone to reveal hidden text</span>
+          <span className="text-[#8b949e]">
+            The phone can ask for transcript text with nothing hidden.
+          </span>
+        </span>
+      </label>
+      {error ? (
+        <p role="alert" className="text-[#f85149]">
+          {error}
+        </p>
+      ) : null}
+    </div>
+  );
 }
 
 /// Settings > Phone > **Paired devices**.
@@ -82,6 +150,7 @@ export function PairedDevicesList() {
                 >
                   {formatFingerprint(d.cert_fp)}
                 </code>
+                <TranscriptAccess device={d} />
               </div>
               <button
                 type="button"

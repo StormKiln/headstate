@@ -153,11 +153,22 @@ jobs:
       # github.run_number, so it climbs past a stale mark as easily as a
       # current one. Drift was invisible to its only reader.
       #
-      # Asked here because `lint` always runs and is a required check, so
-      # the gap surfaces on the next PR after a release rather than at
-      # the next release attempt (#787). --require because a token exists
-      # here: an unreachable Releases API is a real failure in CI, where
-      # locally it is just a laptop offline.
+      # Asked here because `lint` always runs, so the gap surfaces on the
+      # next PR after a release rather than at the next release attempt
+      # (#787). --require because a token exists here: an unreachable
+      # Releases API is a real failure in CI, where locally it is just a
+      # laptop offline.
+      #
+      # A STALE mark only WARNS here (#1418): an annotation naming the
+      # one-line fix, exit 0. It used to fail, and that failed every open
+      # PR and the merge queue after each mobile release until the mark
+      # PR merged -- a failure unrelated to the PR under test. It cannot
+      # fail on the `push` to main or a schedule instead, because the
+      # desktop release gate reads every check-run attempt on a main
+      # commit and one red attempt burns it. So the split is: warn per
+      # commit, enforce at the next mobile release, whose Preflight runs
+      # this script with `--release` and refuses to build while the mark
+      # lags. A missing or unparseable mark file still fails here.
       #
       # Except in the merge queue. A `merge_group` run rebuilds a PR that
       # passed this exact step, with `--require`, minutes earlier; the
@@ -165,10 +176,9 @@ jobs:
       # queue adds is the combined tree, and this step reads no tree at
       # all -- so a Releases API hiccup here can only dequeue a PR that
       # was already known good, and cost it a rebase and a full requeue.
-      # Without `--require` a STALE mark still fails (the script exits 1
-      # on `mark < highest` either way); only "could not look" is allowed
-      # through, and it says so in the log. The pull_request run, the
-      # `push` to main and the tag run keep `--require`.
+      # Without `--require` only "could not look" is allowed through, and
+      # it says so in the log. The pull_request run, the `push` to main
+      # and the tag run keep `--require`.
       - name: Mobile build high-water mark
         env:
           GH_TOKEN: ${{ github.token }}

@@ -1,14 +1,15 @@
 import { ExternalLink } from "./ExternalLink";
 import { useWritesPaused } from "@/lib/useWritesPaused";
 import { copyText } from "../lib/clipboard";
-import { Bot, Copy, ExternalLink as ExternalLinkIcon, MoreHorizontal } from "lucide-react";
+import { Copy, ExternalLink as ExternalLinkIcon, MoreHorizontal } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { useActOnPr, useSetAutoMerge, useUpdatePrBranch } from "../api/hooks";
 import type { PrActionName } from "../api/tauri";
+import { stackBlocksQueue, stackFactsFromList } from "../lib/stack";
 import { inverseOf } from "../lib/undo";
-import { agentPrompt, toAgentContext } from "../lib/agentPrompt";
 import type { PullRequest } from "../types/pr";
+import { PrClaudifyDialogs, PrClaudifyMenuItem, type PrClaudifyDialog } from "./PrClaudify";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 
 /// Why a row-level action is unavailable, or null when offered.
@@ -22,7 +23,7 @@ import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 /// the actual obstacle ("merge conflicts") rather than the catch-all.
 /// Anything not listed here is left to GitHub, which refuses with a
 /// toast -- better than guessing wrongly in the client.
-function unavailable(pr: PullRequest, action: PrActionName): string | null {
+function unavailable(pr: PullRequest, action: PrActionName, stackedOn?: number): string | null {
   switch (action) {
     case "merge":
       if (pr.is_draft) return "drafts cannot be merged";
@@ -36,7 +37,9 @@ function unavailable(pr: PullRequest, action: PrActionName): string | null {
       // saying so up front beats a toast after the round trip.
       if (pr.is_draft) return "drafts cannot be queued";
       if (pr.merge === "conflicted") return "merge conflicts";
-      return null;
+      // The same gate as the detail view's, on the evidence a row has
+      // (#1452): `deriveStacked`'s parent, when the parent is in the list.
+      return stackBlocksQueue(stackFactsFromList(stackedOn));
     default:
       return null;
   }
@@ -74,7 +77,16 @@ const LABEL: Record<PrActionName, string> = {
 /// `canWrite` is false on the review view: merging or closing someone
 /// else's pull request is usually not yours to do, and offering an action
 /// that fails with a permissions error is worse than not offering it.
-export function PrKebab({ pr, canWrite = true }: { pr: PullRequest; canWrite?: boolean }) {
+export function PrKebab({
+  pr,
+  canWrite = true,
+  stackedOn,
+}: {
+  pr: PullRequest;
+  canWrite?: boolean;
+  /// The open PR this one is stacked on, from `deriveStacked` (#1452).
+  stackedOn?: number;
+}) {
   // Null on the desktop and whenever the paired desktop is reachable,
   // so this changes nothing there.
   const paused = useWritesPaused();
@@ -83,6 +95,9 @@ export function PrKebab({ pr, canWrite = true }: { pr: PullRequest; canWrite?: b
   const setAuto = useSetAutoMerge();
   const [open, setOpen] = useState(false);
   const [pending, setPending] = useState<PrActionName | null>(null);
+  // Held here rather than in the menu item: the menu closes on click,
+  // and the dialog must outlive it.
+  const [claudify, setClaudify] = useState<PrClaudifyDialog | null>(null);
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -161,7 +176,7 @@ export function PrKebab({ pr, canWrite = true }: { pr: PullRequest; canWrite?: b
                 // Paused beats specific: naming "merge conflicts" for
                 // a desktop the phone cannot reach describes the wrong
                 // obstacle, and fixing it would not help.
-                const why = paused ?? unavailable(pr, action);
+                const why = paused ?? unavailable(pr, action, stackedOn);
                 return (
                   <button
                     key={action}
@@ -237,22 +252,15 @@ export function PrKebab({ pr, canWrite = true }: { pr: PullRequest; canWrite?: b
 
           {canWrite ? <div className="my-1 border-t border-[#30363d]" /> : null}
 
-          <button
-            type="button"
-            role="menuitem"
-            onClick={() => {
+          {/* Claudify (#1455). Mounted only while the menu is open, so
+              rendering a list of rows does not start a worktree scan. */}
+          <PrClaudifyMenuItem
+            pr={pr}
+            onPick={(d) => {
               setOpen(false);
-              void copyText(agentPrompt(toAgentContext(pr))).then((failure) =>
-                failure === null
-                  ? toast.success("Prompt copied — paste it to an agent")
-                  : toast.error("Could not copy the prompt", { description: failure }),
-              );
+              if (d !== null) setClaudify(d);
             }}
-            className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm text-[#e6edf3] hover:bg-[#21262d]"
-          >
-            <Bot className="h-3.5 w-3.5" aria-hidden="true" />
-            Copy for agent
-          </button>
+          />
           <button
             type="button"
             role="menuitem"
@@ -316,6 +324,8 @@ export function PrKebab({ pr, canWrite = true }: { pr: PullRequest; canWrite?: b
           </DialogContent>
         </Dialog>
       ) : null}
+
+      <PrClaudifyDialogs dialog={claudify} onClose={() => setClaudify(null)} />
     </div>
   );
 }

@@ -189,6 +189,8 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+use crate::remote::privacy::Matching;
+
 /// How much of one session's transcript is indexed.
 ///
 /// The same 8 MB bound `usage::BUDGET_BYTES` uses, and for the same
@@ -435,14 +437,16 @@ impl Indexed {
 /// multiplies the index size, and it makes `"type"` match all 1,482
 /// sessions, which is a search that returns everything and therefore
 /// answers nothing.
-fn readable_text(path: &Path, budget: u64) -> Result<(String, bool), String> {
+///
+/// Returns the text twice: as written, and masked as a phone would be
+/// shown it (#1519), each string masked on its own -- see [`Readable`].
+fn readable_text(path: &Path, budget: u64) -> Result<Readable, String> {
     let file = std::fs::File::open(path)
         .map_err(|e| format!("{}: could not open it: {e}", path.display()))?;
     let mut reader = BufReader::new(file);
 
-    let mut out = String::new();
+    let mut out = Readable::default();
     let mut read: u64 = 0;
-    let mut truncated = false;
     let mut line = String::new();
     loop {
         line.clear();
@@ -453,7 +457,7 @@ fn readable_text(path: &Path, budget: u64) -> Result<(String, bool), String> {
             // session: whatever was gathered is still true text, and it
             // is recorded as truncated so the shortfall is visible.
             Err(_) => {
-                truncated = true;
+                out.truncated = true;
                 break;
             }
         };
@@ -462,11 +466,36 @@ fn readable_text(path: &Path, budget: u64) -> Result<(String, bool), String> {
             collect_text(&v, &mut out);
         }
         if read >= budget {
-            truncated = true;
+            out.truncated = true;
             break;
         }
     }
-    Ok((out, truncated))
+    Ok(out)
+}
+
+/// One transcript's searchable text, as [`readable_text`] extracts it.
+#[derive(Debug, Default)]
+struct Readable {
+    /// The text as written: what the desktop's own search matches.
+    body: String,
+    /// The same text as `remote::privacy::mask_text` leaves it: what a
+    /// phone's search matches (#1519). Masked string by string, the way
+    /// a phone is shown each block, rather than as one concatenation --
+    /// a private key clamped at the end of one prompt would otherwise
+    /// swallow every prompt after it.
+    body_masked: String,
+    /// Read only to the budget.
+    truncated: bool,
+}
+
+impl Readable {
+    fn push(&mut self, s: &str) {
+        self.body.push_str(s);
+        self.body.push('\n');
+        self.body_masked
+            .push_str(&crate::remote::privacy::mask_text(s).0);
+        self.body_masked.push('\n');
+    }
 }
 
 /// Pull the human-readable strings out of one transcript record.
@@ -477,19 +506,15 @@ fn readable_text(path: &Path, budget: u64) -> Result<(String, bool), String> {
 /// mostly file contents and command output, which would dominate the
 /// index and make a search for a word the user typed return every
 /// session that ever read a file containing it.
-fn collect_text(v: &serde_json::Value, out: &mut String) {
+fn collect_text(v: &serde_json::Value, out: &mut Readable) {
     let Some(msg) = v.get("message") else { return };
     match msg.get("content") {
-        Some(serde_json::Value::String(s)) => {
-            out.push_str(s);
-            out.push('\n');
-        }
+        Some(serde_json::Value::String(s)) => out.push(s),
         Some(serde_json::Value::Array(blocks)) => {
             for b in blocks {
                 if b.get("type").and_then(|t| t.as_str()) == Some("text") {
                     if let Some(s) = b.get("text").and_then(|t| t.as_str()) {
-                        out.push_str(s);
-                        out.push('\n');
+                        out.push(s);
                     }
                 }
             }
@@ -595,7 +620,7 @@ pub fn index_pass(conn: &mut Connection, scan: &super::Scan) -> Result<Indexed, 
 
     let tx = conn.transaction()?;
     for (t, size, mtime) in todo.into_iter().take(SESSIONS_PER_PASS) {
-        let (text, truncated) = match readable_text(Path::new(&t.path), INDEX_BUDGET_BYTES) {
+        let text = match readable_text(Path::new(&t.path), INDEX_BUDGET_BYTES) {
             Ok(v) => v,
             Err(e) => {
                 // THE reporting path #1145 asked for. Counted, carried
@@ -604,6 +629,7 @@ pub fn index_pass(conn: &mut Connection, scan: &super::Scan) -> Result<Indexed, 
                 continue;
             }
         };
+        let truncated = text.truncated;
         if truncated {
             out.truncated += 1;
         }
@@ -624,8 +650,9 @@ pub fn index_pass(conn: &mut Connection, scan: &super::Scan) -> Result<Indexed, 
             continue;
         }
         if let Err(e) = tx.execute(
-            "INSERT INTO claude_transcript_fts (session_id, body) VALUES (?1, ?2)",
-            rusqlite::params![&t.session_id, &text],
+            "INSERT INTO claude_transcript_fts (session_id, body, body_masked)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![&t.session_id, &text.body, &text.body_masked],
         ) {
             out.write_failures
                 .push(format!("{}: could not index it: {e}", t.session_id));
@@ -730,6 +757,19 @@ fn fts_query(raw: &str) -> Option<String> {
     Some(terms.join(" AND "))
 }
 
+/// The index column a query is confined to, and its position for
+/// `snippet()`, by [`Matching`] (#1519).
+///
+/// Confined explicitly both ways: an unfiltered FTS5 query searches
+/// EVERY indexed column, so the desktop's query would also hit the
+/// marker words (`hidden`, `api`, `key`) in `body_masked`.
+fn column(matching: Matching) -> (&'static str, i64) {
+    match matching {
+        Matching::Unmasked => ("body", 1),
+        Matching::Masked => ("body_masked", 2),
+    }
+}
+
 /// Search the index, and say how much of the corpus that was.
 ///
 /// **This is the function the ticket is about.** The branch at the
@@ -742,11 +782,17 @@ fn fts_query(raw: &str) -> Option<String> {
 /// result that hit the cap is still a statement about the whole indexed
 /// corpus, and `Verdict::Matches` being non-empty is what the caller
 /// renders regardless.
+///
+/// `matching` picks the text the query is matched against (#1519): the
+/// real text for the desktop's window, the masked copy for a phone, so a
+/// phone's hit or miss says nothing about a secret. Coverage is the same
+/// either way -- both columns are written in one row, by one pass.
 pub fn search(
     conn: &Connection,
     query: &str,
     limit: usize,
     unreadable: Vec<String>,
+    matching: Matching,
 ) -> Result<SearchAnswer, rusqlite::Error> {
     let cov = coverage(conn, unreadable)?;
 
@@ -764,9 +810,11 @@ pub fn search(
         });
     };
 
+    let (col, col_index) = column(matching);
+    let expr = format!("{{{col}}} : ({expr})");
     let mut q = conn.prepare(
         "SELECT f.session_id,
-                snippet(claude_transcript_fts, 1, '[', ']', ' … ', 24),
+                snippet(claude_transcript_fts, ?3, '[', ']', ' … ', 24),
                 COALESCE(l.truncated, 0)
            FROM claude_transcript_fts f
            LEFT JOIN claude_index_ledger l ON l.session_id = f.session_id
@@ -774,7 +822,7 @@ pub fn search(
           ORDER BY rank
           LIMIT ?2",
     )?;
-    let rows = q.query_map(rusqlite::params![&expr, limit as i64], |r| {
+    let rows = q.query_map(rusqlite::params![&expr, limit as i64, col_index], |r| {
         Ok(Hit {
             session_id: r.get(0)?,
             snippet: r.get(1)?,
@@ -878,7 +926,7 @@ mod tests {
         )
         .unwrap();
 
-        let answer = search(&conn, "kubernetes", 20, vec![]).unwrap();
+        let answer = search(&conn, "kubernetes", 20, vec![], Matching::Unmasked).unwrap();
 
         assert_eq!(
             answer.verdict,
@@ -925,7 +973,7 @@ mod tests {
         )
         .unwrap();
 
-        let answer = search(&conn, "kubernetes", 20, vec![]).unwrap();
+        let answer = search(&conn, "kubernetes", 20, vec![], Matching::Unmasked).unwrap();
         assert_eq!(
             answer.verdict,
             Verdict::None,
@@ -949,7 +997,9 @@ mod tests {
             [],
         )
         .unwrap();
-        let partial = search(&conn, "nothing", 20, vec![]).unwrap().verdict;
+        let partial = search(&conn, "nothing", 20, vec![], Matching::Unmasked)
+            .unwrap()
+            .verdict;
 
         conn.execute("UPDATE claude_index_state SET corpus_sessions = 0", [])
             .unwrap();
@@ -961,7 +1011,9 @@ mod tests {
         .unwrap();
         conn.execute("UPDATE claude_index_state SET corpus_sessions = 1", [])
             .unwrap();
-        let complete = search(&conn, "nothing", 20, vec![]).unwrap().verdict;
+        let complete = search(&conn, "nothing", 20, vec![], Matching::Unmasked)
+            .unwrap()
+            .verdict;
 
         assert_ne!(
             partial, complete,
@@ -981,7 +1033,7 @@ mod tests {
     #[test]
     fn an_unknown_corpus_size_is_not_a_complete_index() {
         let conn = db();
-        let answer = search(&conn, "anything", 20, vec![]).unwrap();
+        let answer = search(&conn, "anything", 20, vec![], Matching::Unmasked).unwrap();
         assert_eq!(
             answer.verdict,
             Verdict::NoneYet {
@@ -1040,7 +1092,7 @@ mod tests {
              an index with a hole has not searched the corpus"
         );
 
-        let answer = search(&conn, "kubernetes", 20, done.unreadable).unwrap();
+        let answer = search(&conn, "kubernetes", 20, done.unreadable, Matching::Unmasked).unwrap();
         assert!(
             matches!(answer.verdict, Verdict::NoneYet { .. }),
             "so a miss stays qualified rather than settled"
@@ -1093,9 +1145,15 @@ mod tests {
             "one session on disk is not searchable, so the corpus is not covered"
         );
         assert!(matches!(
-            search(&conn, "kubernetes", 20, done.all_unreadable())
-                .unwrap()
-                .verdict,
+            search(
+                &conn,
+                "kubernetes",
+                20,
+                done.all_unreadable(),
+                Matching::Unmasked
+            )
+            .unwrap()
+            .verdict,
             Verdict::NoneYet { .. }
         ));
 
@@ -1180,7 +1238,9 @@ mod tests {
         // And the content is really there, not merely counted.
         for conn in [&from_listing, &from_scan] {
             assert!(matches!(
-                search(conn, "fsevents", 20, vec![]).unwrap().verdict,
+                search(conn, "fsevents", 20, vec![], Matching::Unmasked)
+                    .unwrap()
+                    .verdict,
                 Verdict::Matches { .. }
             ));
         }
@@ -1254,7 +1314,7 @@ mod tests {
         // The subagent's distinctive word is not findable, and the
         // parent's is -- so this is a test of the exclusion and not of a
         // broken index.
-        let sub_hit = search(&conn, "zzzsubagentonlyzzz", 20, vec![]).unwrap();
+        let sub_hit = search(&conn, "zzzsubagentonlyzzz", 20, vec![], Matching::Unmasked).unwrap();
         assert!(
             !matches!(sub_hit.verdict, Verdict::Matches { .. }),
             "a subagent transcript must not be searchable: it has no \
@@ -1262,7 +1322,7 @@ mod tests {
              never a session"
         );
 
-        let parent = search(&conn, "fsevents", 20, vec![]).unwrap();
+        let parent = search(&conn, "fsevents", 20, vec![], Matching::Unmasked).unwrap();
         let Verdict::Matches { hits } = parent.verdict else {
             panic!("the parent session must be findable, or this test proves nothing");
         };
@@ -1287,6 +1347,55 @@ mod tests {
         assert_eq!(second.unchanged, 1);
     }
 
+    /// #1519's tests, on the corpus search: a secret is not findable by
+    /// any of its pieces from a phone's masked matching, is findable
+    /// from the desktop's (and a revealing phone's) unmasked matching,
+    /// and ordinary words are still found with the secret masked in the
+    /// snippet. Each matching is confined to its own column, so the
+    /// desktop does not hit the marker words in the masked copy.
+    #[test]
+    fn a_secret_is_searchable_only_by_unmasked_matching() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_session(
+            root,
+            "slug",
+            "s1",
+            "deploy the widget with sk-ant-api03-SECRETsecret0123456789 today",
+        );
+        write_session(root, "slug", "s2", "then check the gadget");
+        let mut conn = db();
+        index_pass(&mut conn, &crate::claude::scan(root)).unwrap();
+
+        let ids = |q: &str, m: Matching| -> Vec<String> {
+            match search(&conn, q, 20, vec![], m).unwrap().verdict {
+                Verdict::Matches { hits } => hits.into_iter().map(|h| h.session_id).collect(),
+                // A complete index: an empty answer is a plain "none".
+                Verdict::None => Vec::new(),
+                other => panic!("{q}: {other:?}"),
+            }
+        };
+        for piece in ["SECRETsecret0123456789", "api03"] {
+            assert_eq!(ids(piece, Matching::Unmasked), vec!["s1"], "{piece}");
+            assert!(ids(piece, Matching::Masked).is_empty(), "{piece}");
+        }
+
+        let Verdict::Matches { hits } = search(&conn, "widget", 20, vec![], Matching::Masked)
+            .unwrap()
+            .verdict
+        else {
+            panic!("an ordinary word is found by masked matching");
+        };
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].snippet.contains("hidden"), "{}", hits[0].snippet);
+        assert!(!hits[0].snippet.contains("SECRET"), "{}", hits[0].snippet);
+        assert_eq!(ids("gadget", Matching::Masked), vec!["s2"]);
+
+        // The marker's words are in the masked column only.
+        assert_eq!(ids("hidden", Matching::Masked), vec!["s1"]);
+        assert!(ids("hidden", Matching::Unmasked).is_empty());
+    }
+
     /// A transcript that GREW is re-indexed, so a session stays
     /// findable by what was added to it after it was first indexed.
     ///
@@ -1305,7 +1414,7 @@ mod tests {
         let mut conn = db();
         index_pass(&mut conn, &crate::claude::scan(root)).unwrap();
         assert!(!matches!(
-            search(&conn, "zzzsaidlaterzzz", 20, vec![])
+            search(&conn, "zzzsaidlaterzzz", 20, vec![], Matching::Unmasked)
                 .unwrap()
                 .verdict,
             Verdict::Matches { .. }
@@ -1322,7 +1431,7 @@ mod tests {
         assert_eq!(second.indexed, 1, "the grown transcript was re-read");
         assert_eq!(second.unchanged, 0);
 
-        let found = search(&conn, "zzzsaidlaterzzz", 20, vec![]).unwrap();
+        let found = search(&conn, "zzzsaidlaterzzz", 20, vec![], Matching::Unmasked).unwrap();
         let Verdict::Matches { hits } = found.verdict else {
             panic!("a session must be findable by what was appended to it");
         };
@@ -1331,9 +1440,15 @@ mod tests {
         // And the OLD content is still findable: a re-index replaces the
         // row rather than leaving two, and rather than losing the head.
         assert!(matches!(
-            search(&conn, "the first thing said", 20, vec![])
-                .unwrap()
-                .verdict,
+            search(
+                &conn,
+                "the first thing said",
+                20,
+                vec![],
+                Matching::Unmasked
+            )
+            .unwrap()
+            .verdict,
             Verdict::Matches { .. }
         ));
     }
@@ -1349,7 +1464,9 @@ mod tests {
         let mut conn = db();
         index_pass(&mut conn, &crate::claude::scan(root)).unwrap();
         assert!(matches!(
-            search(&conn, "fsevents", 20, vec![]).unwrap().verdict,
+            search(&conn, "fsevents", 20, vec![], Matching::Unmasked)
+                .unwrap()
+                .verdict,
             Verdict::Matches { .. }
         ));
 
@@ -1357,7 +1474,9 @@ mod tests {
         index_pass(&mut conn, &crate::claude::scan(root)).unwrap();
         assert!(
             !matches!(
-                search(&conn, "fsevents", 20, vec![]).unwrap().verdict,
+                search(&conn, "fsevents", 20, vec![], Matching::Unmasked)
+                    .unwrap()
+                    .verdict,
                 Verdict::Matches { .. }
             ),
             "a hit on a transcript that no longer exists offers a resume \
@@ -1390,11 +1509,13 @@ mod tests {
         // Unquoted, `foo-bar` parses as "foo NOT bar" and `C++` is a
         // syntax error. Both must come back as ordinary searches.
         assert!(matches!(
-            search(&conn, "foo-bar", 20, vec![]).unwrap().verdict,
+            search(&conn, "foo-bar", 20, vec![], Matching::Unmasked)
+                .unwrap()
+                .verdict,
             Verdict::Matches { .. }
         ));
-        assert!(search(&conn, "C++", 20, vec![]).is_ok());
-        assert!(search(&conn, "NEAR", 20, vec![]).is_ok());
+        assert!(search(&conn, "C++", 20, vec![], Matching::Unmasked).is_ok());
+        assert!(search(&conn, "NEAR", 20, vec![], Matching::Unmasked).is_ok());
     }
 
     /// The bound is real and is REPORTED, so a partly-indexed
@@ -1429,7 +1550,7 @@ mod tests {
         // The word past the bound is genuinely not searchable, which is
         // exactly why `truncated` has to be reported.
         assert!(!matches!(
-            search(&conn, "zzzpastthebudgetzzz", 20, vec![])
+            search(&conn, "zzzpastthebudgetzzz", 20, vec![], Matching::Unmasked)
                 .unwrap()
                 .verdict,
             Verdict::Matches { .. }
@@ -1511,6 +1632,7 @@ mod tests {
     #[test]
     #[ignore = "needs the developer's own ~/.claude/projects"]
     fn real_corpus() {
+        let _home = crate::auth::test_home::real_for_a_live_probe();
         let Some(root) = crate::claude::transcript::projects_dir() else {
             eprintln!("no home directory");
             return;
@@ -1605,6 +1727,38 @@ mod tests {
             db_bytes as f64 / 1_073_741_824.0
         );
 
+        // What #1519's masked copy costs: its share of the stored text,
+        // and the masking itself, timed apart from the pass it rides in.
+        let (body_bytes, masked_bytes): (i64, i64) = conn
+            .query_row(
+                "SELECT COALESCE(SUM(length(body)), 0), COALESCE(SUM(length(body_masked)), 0)
+                   FROM claude_transcript_fts",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let bodies: Vec<String> = conn
+            .prepare("SELECT body FROM claude_transcript_fts")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let hidden: usize = bodies
+            .iter()
+            .map(|b| crate::remote::privacy::mask_text(b).1)
+            .sum();
+        println!(
+            "indexed text              {:.1} MB, masked copy {:.1} MB  <- #1519",
+            body_bytes as f64 / 1_048_576.0,
+            masked_bytes as f64 / 1_048_576.0
+        );
+        println!(
+            "masking it all            {} ms, {hidden} spans  <- #1519",
+            started.elapsed().as_millis()
+        );
+
         let cov = coverage(&conn, scan.unreadable_files.clone()).unwrap();
         println!("coverage                  {} of {}", cov.indexed, cov.total);
 
@@ -1643,7 +1797,14 @@ mod tests {
         );
         for q in ["fsevents", "migration", &control] {
             let t = std::time::Instant::now();
-            let a = search(&conn, q, 50, scan.unreadable_files.clone()).unwrap();
+            let a = search(
+                &conn,
+                q,
+                50,
+                scan.unreadable_files.clone(),
+                Matching::Unmasked,
+            )
+            .unwrap();
             let hits = match &a.verdict {
                 Verdict::Matches { hits } => hits.len(),
                 _ => 0,
@@ -1746,7 +1907,7 @@ mod tests {
         assert!(coverage(&conn, vec![]).unwrap().is_complete());
 
         for empty in ["", "   ", "\t"] {
-            let answer = search(&conn, empty, 20, vec![]).unwrap();
+            let answer = search(&conn, empty, 20, vec![], Matching::Unmasked).unwrap();
             assert_eq!(
                 answer.verdict,
                 Verdict::NotAsked,

@@ -25,6 +25,7 @@ pub mod advice;
 pub mod imports;
 pub mod refs;
 pub mod rules;
+pub mod skill_files;
 pub mod text;
 pub mod tokens;
 
@@ -727,8 +728,13 @@ pub(crate) fn expand_home_in(raw: &str, home: &Path) -> Option<PathBuf> {
 }
 
 /// The user's home directory, when there is one.
+///
+/// Through [`crate::auth::home_dir`], the one resolver, rather than a read
+/// of `$HOME` of its own (#1535). That one a test build cannot reach; and
+/// it reads `USERPROFILE` on Windows, where a GUI app has no `HOME`, so
+/// the global `~/.claude/CLAUDE.md` was never found there.
 pub(crate) fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    crate::auth::home_dir()
 }
 
 #[cfg(test)]

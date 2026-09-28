@@ -44,12 +44,18 @@ different pipeline with a different tag prefix. Nothing here touches it.
    store; the pre-release is created only after both uploads succeed.
    The build number is in the job log ("Version 0.2.0, build 57") and in
    the pre-release notes.
-4. When the build appears in TestFlight and on the Play internal track
+4. **Raise the build mark (one-line PR).** Set the last line of
+   `.github/mobile-build-high-water-mark` to that build number and merge it.
+   The run's summary prints this as a required follow-up with the exact
+   value. Until it merges, CI warns on every commit, and the next mobile
+   release refuses to run (see
+   [The build number never goes backwards](#the-build-number-never-goes-backwards)).
+5. When the build appears in TestFlight and on the Play internal track
    (a few minutes of processing each), run
    [the pairing walkthrough](mobile-pairing-walkthrough.md) on a real iPhone
    and a real Android device, recording **that build number** in the run
    record.
-5. Promote manually, from the App Store Connect and Play Console web UIs,
+6. Promote manually, from the App Store Connect and Play Console web UIs,
    only after a clean run against that exact build. Automation stops at the
    testing tracks on purpose.
 
@@ -275,19 +281,33 @@ Preflight compares against `.github/mobile-build-high-water-mark` and fails
 in the first job with the cause named. **Raise that file whenever a build
 reaches TestFlight or Play.**
 
-You no longer have to remember to. CI's `lint` job runs
-`scripts/check-mobile-build-mark.py`, which fails when the file is below the
-`build<N>` of the newest published mobile asset and names the value to
-write — so a missed bump surfaces on the next PR instead of at the next
-release.
+You no longer have to remember to. The release run's summary names the
+value as a required follow-up (step 4 above), and
+`scripts/check-mobile-build-mark.py` compares the file with the `build<N>`
+of the newest published mobile asset in two places:
 
-That guard exists because Preflight could never catch this. Preflight tests
-`BUILD_NUMBER > HIGH`, and `run_number` climbs every run, so a mark lagging
-by three still passes — run 29 cleared a mark of 25 as easily as 28.
+- **Per commit** (CI's `lint` job and `make lint`): a lagging mark is a
+  warning annotation naming the value to write. It does not fail.
+- **At the next mobile release** (Preflight, with `--release`): a lagging
+  mark fails the run before anything is built. Raise the mark on `main`,
+  then tag a commit that has it.
+
+That guard exists because the duplicate check could never catch this. It
+tests `BUILD_NUMBER > HIGH`, and `run_number` climbs every run, so a mark
+lagging by three still passes — run 29 cleared a mark of 25 as easily as 28.
 Staleness was invisible to the file's only reader, which is how it drifted
 before six consecutive releases without one of them failing (#787). The cost
 was never a blocked release; it was this file naming the wrong number to
 whoever is debugging a genuine duplicate rejection.
+
+Why it warns per commit instead of failing (#1418): it used to fail `lint`,
+and every open PR and the merge queue went red after each mobile release
+until the one-line mark PR merged, for a reason unrelated to any of them.
+The failure could not move to the `push` run on `main` or to a scheduled
+job either: the desktop release gate reads every check-run attempt on a
+commit, so one red attempt on `main` burns that commit for releases. A
+mobile release attaches to no `main` commit, so that is where it is
+enforced. A missing or unparseable mark file still fails everywhere.
 
 Numbers being non-contiguous per version (0.1.7 → 9, 0.1.12 → 14) is this
 system working, not drift: a rejected upload still consumes its number, and

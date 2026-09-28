@@ -205,6 +205,14 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 hyper = { version = "1", default-features = false, features = ["server", "http1"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 tower-service = "0.3"
+# gzip on `/v1/call/*` responses to the phone (#1478). tower-http is
+# already in the tree (0.6, via reqwest); `compression-gzip` adds
+# async-compression, compression-codecs and compression-core, gzip over
+# the flate2 already in the tree. gzip rather than zstd: zstd would add
+# zstd-sys, a C library, to both graphs for a smaller win on text this
+# compressible. Why only the call routes, and why the CRIME/BREACH shape
+# does not apply, is argued in `remote/listener.rs`.
+tower-http = { version = "0.6", default-features = false, features = ["compression-gzip"] }
 # The `/v1/events` stream (`remote/events.rs`): axum's `Sse` takes a
 # `Stream`, and `stream::unfold` is what turns a broadcast receiver plus
 # a revocation watch into one without a hand-written poll function.
@@ -341,6 +349,11 @@ sysinfo = { version = "0.39", default-features = false, features = ["system", "d
 libc = "0.2"
 
 [dev-dependencies]
+# Decodes the listener's gzip bodies in the loopback tests (#1478), which
+# read raw HTTP rather than go through a client that would decode them
+# and hide the byte count being measured. Already in the tree (tauri's
+# updater and png) at this version.
+flate2 = "1"
 temp-env = "0.3"
 tempfile = "3"
 wiremock = "0.6"

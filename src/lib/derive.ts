@@ -35,10 +35,13 @@ export interface Filters {
   /// The values name the FIELD, not just the direction. "Oldest first" is
   /// ambiguous between "opened oldest" and "waiting for review longest",
   /// and those are different PRs whenever something sat in draft -- which
-  /// is the ambiguity #1277 was filed about. `PullRequest` carries
-  /// `created_at` and `updated_at` only, with no ready-for-review
-  /// timestamp fetched anywhere, so this sorts on `created_at` and says so
-  /// rather than implying an answer it does not have.
+  /// is the ambiguity #1277 was filed about.
+  ///
+  /// Since #1407 the strip sorts on `ready_at` and its labels say "ready".
+  /// The VALUES keep their `-opened` spelling because they are persisted:
+  /// renaming them would silently reset every stored choice to the default
+  /// or need a store migration, for a word nobody sees. They mean "by
+  /// ready-for-review time" now.
   readySort?: "oldest-opened" | "newest-opened";
   /// How the CLAUDE.md advice list is organised (#1291). Defaults to
   /// `"check"` -- by-check tables (#1344) -- when absent.
@@ -357,7 +360,7 @@ export function readyForReview(pr: PullRequest): boolean {
   );
 }
 
-/// The "Ready for review" strip's order, oldest OPENED first by default.
+/// The "Ready for review" strip's order, oldest READY first by default.
 ///
 /// A review queue is the one list where oldest-first is the right
 /// default: a pull request that has been waiting three days is the one
@@ -366,17 +369,20 @@ export function readyForReview(pr: PullRequest): boolean {
 /// the main PR list, which are newest-first so they answer "what was I
 /// just doing" -- hence `readySort` rather than reusing `sort` (#1277).
 ///
-/// Sorts on `created_at`, which is WHEN THE PULL REQUEST WAS OPENED, not
-/// when it was marked ready for review. Those differ whenever something
-/// sat in draft, and the second is the better answer to "how long has
-/// this been waiting" -- but `PullRequest` carries `created_at` and
-/// `updated_at` only, and no ready-for-review timestamp is fetched
-/// anywhere in the app. Rather than guess, the control's labels name the
-/// field ("Oldest opened first"), so a reader can tell which question
-/// they are getting an answer to. Fetching `readyForReviewAt` is a
-/// separate change.
+/// Sorts on `ready_at`, WHEN IT BECAME READY FOR REVIEW (#1407), not
+/// `created_at`, when it was opened. Those differ whenever something sat
+/// in draft, and only the first answers "how long has this been waiting":
+/// a pull request drafted for a week and marked ready an hour ago has
+/// waited an hour. The control's labels name the field ("Oldest ready
+/// first"), as they have since #1277, so a reader can tell which question
+/// they are getting an answer to.
 ///
-/// A missing or unparseable `created_at` sorts LAST in both directions,
+/// An unknown `ready_at` does NOT fall back to `created_at`. Unknown
+/// covers a snapshot cached before the field existed, which could be a
+/// week-long draft; dating it from when it was opened would put it at
+/// the top as the longest wait.
+///
+/// A missing, null or unparseable `ready_at` sorts LAST in both directions,
 /// never first. `new Date("")` is `NaN`, and a `NaN` comparator result
 /// is treated as 0 by `Array.prototype.sort` -- which leaves such a row
 /// wherever it happened to be, including the top. At the top of a review
@@ -390,10 +396,12 @@ export function sortReadyForReview(
   prs: PullRequest[],
   sort: NonNullable<Filters["readySort"]> = "oldest-opened",
 ): PullRequest[] {
-  const opened = (pr: PullRequest) => new Date(pr.created_at).getTime();
+  // `new Date(null)` is the epoch, not NaN, so absent is mapped to NaN
+  // explicitly rather than sorting as the oldest wait there is.
+  const ready = (pr: PullRequest) => (pr.ready_at ? new Date(pr.ready_at).getTime() : NaN);
   return [...prs].sort((a, b) => {
-    const x = opened(a);
-    const y = opened(b);
+    const x = ready(a);
+    const y = ready(b);
     // Undated rows go last regardless of direction, and keep a stable
     // order among themselves.
     const xBad = Number.isNaN(x);

@@ -1,0 +1,52 @@
+name: Cache budget
+
+# Enforces scripts/check-cache-budget.py's per-class ceilings where they
+# are actually crossed: on `main`, whose cache is the only one that
+# persists. Only `main` WRITES the Actions cache -- not pull requests,
+# tags or, since #1556, the merge queue (`save-if` in
+# .github/actions/setup/action.yml) -- so a class over its
+# ceiling reflects something that already merged. A local `make lint`
+# therefore only warns (#1505), and this is where the check can fail.
+#
+# A schedule rather than a push trigger. The cache is written by the CI
+# run a push starts, so a check on the push would race the very save it
+# means to measure.
+#
+# THIS JOB'S NAME IS IN release.yml's `ignore-checks`. A scheduled run's
+# check attaches to `main`'s head commit, and the desktop release gate
+# requires EVERY check run on a tagged commit to be `success` -- so a red
+# budget run on the commit being tagged would burn the tag over a cache
+# size, which says nothing about whether the build is releasable. Rename
+# the job and the release gate starts waiting on it again.
+on:
+  schedule:
+    # Daily, off the hour to avoid GitHub's top-of-hour schedule backlog.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cache-budget:
+    # Well under a minute measured: one paginated API read. The ceiling
+    # only stops a hang inheriting the 360-minute default (#885).
+    timeout-minutes: 10
+    # `actions: read` is what the caches API needs; explicit so the
+    # workflow default above cannot silently blind it.
+    permissions:
+      contents: read
+      actions: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # --require: here a token exists, so an unreachable API is a failure
+      # to see rather than a laptop offline. No --advisory: this is the
+      # run that enforces.
+      - name: Actions cache budget
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/check-cache-budget.test.py
+          python3 scripts/check-cache-budget.py --require

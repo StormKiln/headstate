@@ -132,6 +132,7 @@ function Row({
   onToggle,
   sizePending,
   sizeUnmeasurable = false,
+  sizeUnmeasuredWhy = UNMEASURED_HINT,
   removing = false,
   assessed = false,
   onForce,
@@ -203,6 +204,11 @@ function Row({
   /// measure" must never read as "this tree is empty", which is an
   /// invitation to delete a checkout nobody has measured.
   sizeUnmeasurable?: boolean;
+  /// Why no size is coming, for the "not measured" hint. Defaults to the
+  /// walk-budget reason (#769); a pass that failed outright carries its
+  /// own reason instead, because "a very large tree" is the wrong thing
+  /// to tell someone whose desktop did not answer (#1459).
+  sizeUnmeasuredWhy?: string;
   /// The repo this worktree belongs to. Needed to assess it: git has to
   /// be run from the repo, not the worktree.
   repoPath: string;
@@ -529,7 +535,7 @@ function Row({
             `sizePending` would leave the skeleton up for the rest of the
             pass. */}
         {sizeUnmeasurable ? (
-          <span className="cursor-help text-[#6e7681]" title={UNMEASURED_HINT}>
+          <span className="cursor-help text-[#6e7681]" title={sizeUnmeasuredWhy}>
             not measured
           </span>
         ) : sizePending && wt.size_bytes === null ? (
@@ -1106,6 +1112,14 @@ export function WorktreesPage() {
   const toggleChecked = useFilters((st) => st.toggleChecked);
   const setChecked = useFilters((st) => st.setChecked);
   const clearChecked = useFilters((st) => st.clearChecked);
+  /// Untick one removed path. Reads the store NOW rather than the
+  /// render's `checked`: a bulk removal calls this row by row over tens
+  /// of seconds, and a closure over the click-time list would re-tick
+  /// every row an earlier call had cleared.
+  const untick = (path: string) => {
+    const now = useFilters.getState().checked;
+    if (now.includes(path)) setChecked(now.filter((k) => k !== path));
+  };
   const anchor = useFilters((st) => st.anchor);
   const setAnchor = useFilters((st) => st.setAnchor);
 
@@ -1187,6 +1201,19 @@ export function WorktreesPage() {
   // one reading the size cell's own comment says is wrong, because it
   // claims a measurement that never happened.
   const sizingFailed = sizesQuery.isError;
+  // Why the pass failed, in the reader's terms, for the rows it left
+  // without a number (#1459). On the phone that is most often the
+  // desktop not answering in time, which is nothing to do with the tree.
+  const sizingError = sizesQuery.error as unknown;
+  const sizingFailedWhy = sizingFailed
+    ? `Sizes for this repository could not be measured: ${
+        typeof sizingError === "string"
+          ? sizingError
+          : sizingError instanceof Error
+            ? sizingError.message
+            : "the request failed"
+      }`
+    : undefined;
   const remove = useRemoveWorktree();
 
   /// Copy rather than spawn. The command lands in the user's own shell,
@@ -1449,8 +1476,16 @@ export function WorktreesPage() {
     /// This row's own walk was abandoned, OR the whole repository's
     /// sizing pass failed. Either way no number is coming for it, and
     /// the row must say so instead of holding a skeleton.
-    sizeUnmeasurable: (sizes?.has(w.path) && sizes.get(w.path) === null) || sizingFailed,
-  })), [rows, verdicts, sizes, sizingFailed]);
+    //
+    // A size that DID arrive survives the pass failing (#1459). The
+    // stream delivers each worktree's size as it is walked, so a pass
+    // that timed out after measuring forty rows has forty real numbers;
+    // blanking them to "not measured" because the forty-first did not
+    // finish discards measured data -- partial is not nothing. Only a
+    // row with no answer at all takes the pass's failure.
+    sizeUnmeasurable: sizes?.has(w.path) ? sizes.get(w.path) === null : sizingFailed,
+    sizeUnmeasuredWhy: sizes?.has(w.path) ? UNMEASURED_HINT : sizingFailedWhy,
+  })), [rows, verdicts, sizes, sizingFailed, sizingFailedWhy]);
 
   // SORTING VS STREAMING (#771).
   //
@@ -3254,7 +3289,14 @@ export function WorktreesPage() {
                   const targets = selectedVisible.map((w) => w.path);
                   setBulkBusy(true);
                   setSelectionOpen(false);
-                  removeMany(selected?.path ?? "", targets).then(
+                  // Unticked as EACH one goes (#1544), and only the
+                  // paths actually removed, so a refused row stays
+                  // ticked and the user can see what did not go. As it
+                  // goes rather than at the end, because a run that
+                  // fails midway would otherwise leave removed paths
+                  // ticked -- counted as "hidden by the current
+                  // filters" in the next confirmation.
+                  removeMany(selected?.path ?? "", targets, untick).then(
                     (outcomes) => {
                       setBulkBusy(false);
                       const failed = outcomes.filter((o) => o.error !== null);
@@ -3270,12 +3312,6 @@ export function WorktreesPage() {
                           { description: failed.map((f) => `${f.path}: ${f.error}`).join("\n") },
                         );
                       }
-                      // Cleared only on the paths actually acted on, so
-                      // a refused row stays ticked and the user can see
-                      // what did not go.
-                      setChecked(checked.filter((k) => !outcomes.some(
-                        (o) => o.path === k && o.error === null,
-                      )));
                     },
                     (e: unknown) => {
                       setBulkBusy(false);
@@ -3360,7 +3396,7 @@ export function WorktreesPage() {
                   // their app back.
                   setBulkBusy(true);
                   setBulkOpen(false);
-                  removeMany(selected?.path ?? "", targets).then(
+                  removeMany(selected?.path ?? "", targets, untick).then(
                     (outcomes) => {
                       setBulkBusy(false);
                       const failed = outcomes.filter((o) => o.error !== null);
@@ -3489,6 +3525,7 @@ export function WorktreesPage() {
               onForget={forget}
               sizePending={sizing}
               sizeUnmeasurable={wt.sizeUnmeasurable}
+              sizeUnmeasuredWhy={wt.sizeUnmeasuredWhy}
               removing={removing === wt.path}
             />
           ))

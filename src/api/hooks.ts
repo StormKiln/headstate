@@ -1,15 +1,13 @@
 import { type QueryClient, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { IS_MOBILE_BUILD } from "../lib/target";
 import { type View, useFilters } from "../store/filters";
 import { listen, type UnlistenFn } from "./transport";
 import { safeUnlisten } from "./unlisten";
 import { receiptAdvisory } from "./sourceRefresh";
 import { clearAuthoredError, patchSourceRows, readAuthored, refreshWithState, useSourceRefresh } from "./sourceRefreshHooks";
 import { timeCall, timed } from "./diag";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import type {
-  ClaudePairing,
   AlertReport,
   ClaudeMdAdviceMode,
   Artifact,
@@ -21,10 +19,6 @@ import type {
   ClaudeOverview,
   ClaudeCoverage,
   PluginsReport,
-  ClaudePreviewMessage,
-  ClaudeFollow,
-  ClaudeFollowCursor,
-  ClaudeReread,
   ClaudeUsage,
   ClaudeSubagentRollup,
   ClaudeObservation,
@@ -47,6 +41,7 @@ import type {
   Upstream,
   Venv,
   Worktree,
+  WorktreeRemovalFrame,
   WorktreeScan,
 } from "../types/pr";
 import type {
@@ -59,10 +54,15 @@ import type {
   ToolReport,
   TaskHealth,
   LogTail,
+  RemovalOutcome,
   ScanKind,
 } from "./tauri";
-import { createCoalescer, type Scheduler } from "@/lib/coalesce";
-import { parsePrQuery, reposForNumber } from "@/lib/claudePrs";
+import { type FollowLive, TranscriptFollower } from "@/lib/transcriptFollow";
+import type { PageCursor, SessionActivity, TranscriptMessage } from "@/types/transcript";
+import { createCoalescer } from "@/lib/coalesce";
+import { createLimiter, withDeadline } from "@/lib/limiter";
+import { IS_MOBILE_BUILD } from "@/lib/target";
+import { matchPrLinks, parsePrQuery, type PrQuery } from "@/lib/claudePrs";
 import {
   toolVersions,
   readLogTail,
@@ -98,10 +98,13 @@ import {
   listPairedDevices,
   respondToPairing,
   revokePairedDevice,
+  setPairedDeviceAccess,
   type PairingQrPayload,
   type PairingRequest,
   actOnPr,
+  mergeStack,
   getPrDetail,
+  getReviewGates,
   getWorktreeDirs,
   classifyRepoUpstream,
   classifyWorktrees,
@@ -151,8 +154,9 @@ import {
   claudeIndexCoverage,
   claudeSessions,
   claudeSessionDetail,
-  claudeSessionsForPr,
-  claudeTranscriptFollow,
+  claudeSessionsForPrNumber,
+  claudeTranscriptPage,
+  claudeTranscriptFind,
   claudeHooksStatus,
   claudeInstallHooks,
   claudeReinstallHooks,
@@ -572,6 +576,29 @@ export function useActOnPr() {
       void qc.invalidateQueries({ queryKey: ["pr-detail", repo, number] });
       void qc.invalidateQueries({ queryKey: ["reviewing"] });
       await refreshPrs(qc);
+    });
+}
+
+/// Merge or queue a native GitHub stack (#1468), then bring the detail
+/// and the list up to date.
+///
+/// Refreshes on EVERY outcome, including `failed` and `in_progress`: an
+/// atomic failure changes nothing, but a stack still in progress may land
+/// at any moment, and a stale "Merge stack" button invites a second
+/// submission.
+export function useMergeStack() {
+  const qc = useQueryClient();
+  return (
+    repo: string,
+    number: number,
+    action: "merge_queue" | "direct_merge",
+    expectedHead: string,
+  ) =>
+    mergeStack(repo, number, action, expectedHead).then((outcome) => {
+      void qc.invalidateQueries({ queryKey: ["pr-detail", repo, number] });
+      void qc.invalidateQueries({ queryKey: ["reviewing"] });
+      void refreshPrs(qc);
+      return outcome;
     });
 }
 
@@ -1533,6 +1560,9 @@ export function hydrateClaudeSessions(wire: WireClaudeSessionList): ClaudeSessio
       return {
         session_id: s.session_id,
         name: s.name,
+        // #1133. Was missing from this copy, so the opening prompt never
+        // reached the row; `?? null` because a cached list may predate it.
+        opening_prompt: s.opening_prompt ?? null,
         cwd: s.cwd,
         git_branch: s.git_branch,
         last_activity_at: s.last_activity_at,
@@ -1553,6 +1583,10 @@ export function hydrateClaudeSessions(wire: WireClaudeSessionList): ClaudeSessio
     }),
     registry_failure: wire.registry_failure,
     registry_unreadable: wire.registry_unreadable,
+    registry_unnamed: wire.registry_unnamed,
+    // Carried, not dropped (#1485): a withheld opening prompt must read as
+    // "turned off for this phone", not as a session that had none.
+    ...(wire.masking ? { masking: wire.masking } : {}),
   };
 }
 
@@ -1586,6 +1620,260 @@ export function useClaudeSessionDetail(sessionId: string | null, enabled: boolea
   });
 }
 
+/// Whether the document is visible, for the transcript follow (#1476):
+/// hidden -- the window minimised, or the phone's app backgrounded --
+/// stops the reads entirely. Absent `document` reads as visible.
+function subscribeVisibility(onChange: () => void): () => void {
+  document.addEventListener("visibilitychange", onChange);
+  return () => document.removeEventListener("visibilitychange", onChange);
+}
+function documentVisible(): boolean {
+  return typeof document === "undefined" || document.visibilityState !== "hidden";
+}
+
+/// What liveness says about whether a session is writing, as the follow
+/// reads it (`transcriptFollow.ts`).
+function followLive(liveness: Liveness): FollowLive {
+  switch (liveness.state) {
+    case "running":
+      return "running";
+    case "unknown":
+      return "unknown";
+    case "dead":
+      return "not-running";
+  }
+}
+
+/// One transcript, live, paged and bounded (#1476): the viewer's data.
+///
+/// Everything is argued in `src/lib/transcriptFollow.ts`: the newest
+/// page first, older pages on `loadOlder`, live growth on an adaptive
+/// cadence that stops while hidden, at most `MAX_RESIDENT` messages held,
+/// and a rewrite answered by re-anchoring on the reader's message id.
+/// This hook binds it to a path and to React.
+///
+/// Not react-query, deliberately: the transcript is the SUM of many
+/// reads, joined by id, and the cursor each read continues from is an
+/// input the next one needs, which a single react-query entry
+/// cannot hold. Nothing else shares this cache.
+///
+/// `reveal` is the phone's Reveal (#1481, #1488): a separate follower,
+/// so the masked one stays underneath and a refused reveal leaves the
+/// masked text on screen. `enabled: false` pauses a follower and keeps
+/// what it holds.
+///
+/// `sessionId` is the session whose MAIN transcript `path` is: a
+/// `claude-session-activity` nudge for it reads at once (#1477), and a
+/// nudge for any other session is ignored here. Omitted for a subagent's
+/// transcript, which the desktop does not stat -- that one follows on
+/// its cadence alone, as every transcript does when a nudge is lost.
+export function useClaudeTranscriptLive(
+  path: string | null,
+  options: {
+    liveness: Liveness;
+    enabled?: boolean;
+    reveal?: boolean;
+    /// Open at this message id when it is within reach (#1486).
+    openAt?: string | null;
+    /// The session `path` belongs to, for its activity nudges (#1477).
+    sessionId?: string | null;
+  },
+) {
+  const { liveness, enabled = true, reveal = false, openAt = null, sessionId = null } = options;
+  const on = enabled && path !== null && path !== "";
+  const key = `${reveal ? "reveal" : "masked"}:${path ?? ""}`;
+  const make = () =>
+    new TranscriptFollower(
+      (anchor, direction) => claudeTranscriptPage(path as string, anchor, direction, null, reveal),
+      { openAt },
+    );
+  // A follower belongs to ONE file: a cursor is an offset into it. A new
+  // path is a new follower, swapped during render so the pane never
+  // shows one transcript's messages under another's header.
+  const [held, setHeld] = useState(() => ({ key, follower: make() }));
+  let follower = held.follower;
+  if (held.key !== key) {
+    follower = make();
+    setHeld({ key, follower });
+  }
+
+  const visible = useSyncExternalStore(subscribeVisibility, documentVisible, () => true);
+  const live = followLive(liveness);
+  useEffect(() => follower.setLive(live), [follower, live]);
+  useEffect(() => {
+    follower.setVisible(visible);
+    // A backgrounded phone is where iOS reclaims memory first.
+    if (!visible && IS_MOBILE_BUILD) follower.relievePressure();
+  }, [follower, visible]);
+  useEffect(() => {
+    if (!on) return;
+    follower.start();
+    return () => follower.stop();
+  }, [follower, on]);
+  // Through the transport seam, so the phone hears it too.
+  useEffect(() => {
+    if (!on || sessionId === null || sessionId === "") return;
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    listen<SessionActivity>(SESSION_ACTIVITY_EVENT, (e) => {
+      // Another session's nudge is the list's news, not this pane's.
+      if (e.payload.session_id !== sessionId) return;
+      follower.nudge(e.payload.size);
+    }).then(
+      (fn) => {
+        if (cancelled) safeUnlisten(fn);
+        else unlisten = fn;
+      },
+      () => {},
+    );
+    return () => {
+      cancelled = true;
+      safeUnlisten(unlisten);
+    };
+  }, [follower, on, sessionId]);
+
+  const snapshot = useSyncExternalStore(follower.subscribe, follower.getSnapshot);
+  const actions = useMemo(
+    () => ({
+      loadOlder: () => void follower.loadOlder(),
+      loadNewer: () => void follower.loadNewer(),
+      jumpToLatest: () => void follower.jumpToLatest(),
+      refresh: () => follower.refresh(),
+      setViewport: (first: string, last: string) => follower.setViewport(first, last),
+      seek: (id: string, at: PageCursor | null) => follower.seek(id, at),
+      loadOlderUntil: (wanted: (m: TranscriptMessage) => boolean) =>
+        follower.loadOlderUntil(wanted),
+    }),
+    [follower],
+  );
+  return { ...snapshot, ...actions };
+}
+
+/// Find messages anywhere in one transcript (#1484): the turn outline
+/// when `query` is `null`, otherwise the messages holding it.
+///
+/// Asked only while `enabled` -- the outline panel or the find box is
+/// open -- because it streams the whole file. `retry: false`: a find
+/// that failed is said, not silently re-run. Not polled: the outline of
+/// a growing session is re-asked when the panel is reopened, and the
+/// newest turns are in the follow's own pages meanwhile.
+export function useClaudeTranscriptFind(
+  path: string | null,
+  query: string | null,
+  options: { enabled: boolean; reveal?: boolean },
+) {
+  const { enabled, reveal = false } = options;
+  return useQuery({
+    queryKey: ["claude-transcript-find", path, query, reveal],
+    queryFn: () => claudeTranscriptFind(path as string, query, null, reveal),
+    enabled: enabled && path !== null && path !== "" && (query === null || query.trim() !== ""),
+    staleTime: 0,
+    gcTime: 60_000,
+    retry: false,
+  });
+}
+
+/// What `useClaudeTranscriptLive` returns: what a host passes down.
+export type TranscriptLive = ReturnType<typeof useClaudeTranscriptLive>;
+
+/// The desktop's content-free nudge that a running session's transcript
+/// changed (#1477). `claude::activity` on the desktop; on the phone's
+/// allowlist as well, so the phone hears it through the transport.
+export const SESSION_ACTIVITY_EVENT = "claude-session-activity";
+
+/// How long a nudge keeps a session "active now" in the list. Nudges come
+/// about once a second while a session writes, so a few missed ones do
+/// not flicker the badge, and a session that went quiet loses it soon.
+export const ACTIVE_NOW_MS = 10_000;
+
+/// The sessions the desktop saw writing in the last `ACTIVE_NOW_MS`
+/// (#1477), for the list's "active now" badge.
+///
+/// Every nudge, for every session: the list is where other sessions'
+/// nudges go -- they never read a transcript. Empty until a nudge
+/// arrives, which is what a session that has not written looks like
+/// too; the badge is only ever an addition to a row, never a claim that
+/// an unbadged session is quiet, since a nudge can be lost.
+///
+/// Expiry is a timer per session, not a clock read at render, so a
+/// repaint for any other reason cannot move a badge.
+export function useSessionActivity(): ReadonlySet<string> {
+  const [active, setActive] = useState<ReadonlySet<string>>(() => new Set());
+  useEffect(() => {
+    const timers = new Map<string, ReturnType<typeof setTimeout>>();
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    listen<SessionActivity>(SESSION_ACTIVITY_EVENT, (e) => {
+      const id = e.payload.session_id;
+      const held = timers.get(id);
+      if (held !== undefined) clearTimeout(held);
+      timers.set(
+        id,
+        setTimeout(() => {
+          timers.delete(id);
+          setActive((prev) => {
+            if (!prev.has(id)) return prev;
+            const next = new Set(prev);
+            next.delete(id);
+            return next;
+          });
+        }, ACTIVE_NOW_MS),
+      );
+      setActive((prev) => (prev.has(id) ? prev : new Set(prev).add(id)));
+    }).then(
+      (fn) => {
+        if (cancelled) safeUnlisten(fn);
+        else unlisten = fn;
+      },
+      () => {},
+    );
+    return () => {
+      cancelled = true;
+      safeUnlisten(unlisten);
+      for (const t of timers.values()) clearTimeout(t);
+    };
+  }, []);
+  return active;
+}
+
+/// How long a pull request link lookup is trusted (#1557).
+///
+/// The link table is no longer written only by the import: the live pass
+/// adds links written since, once a minute (`claude::linkscan`). So an
+/// answer can move between imports, and caching it forever would keep a
+/// just-opened PR unfound however often the table caught up. One minute,
+/// the cadence of the pass that can change the answer. The query itself
+/// is one indexed read of a table of about a thousand rows.
+const PR_LINKS_STALE_MS = 60_000;
+
+/// The one lookup the search box and the PR detail panel share (#1557).
+///
+/// Same key, same function, same freshness -- so whichever asks first
+/// warms the other, and a Rescan's invalidation reaches both.
+function prLinksByNumber(number: number, enabled: boolean) {
+  return {
+    queryKey: ["claude-sessions-for-pr-number", number] as const,
+    queryFn: () => claudeSessionsForPrNumber(number),
+    enabled: enabled && number > 0,
+    staleTime: PR_LINKS_STALE_MS,
+    // A machine with no imported transcripts answers with an empty
+    // list, not an error. Retrying an empty answer three times delays
+    // saying so.
+    retry: false,
+  };
+}
+
+/// What the PR detail panel's lookup found (#1211, #1557).
+///
+/// The same four states as `PrQueryState`, for the same reason: a failed
+/// lookup has said nothing about who wrote the PR, and must never be
+/// worded as "no session".
+export type PrSessionsState =
+  | { state: "off" }
+  | { state: "loading" }
+  | { state: "done"; links: ClaudePrLink[]; elsewhere: ClaudePrLink[] }
+  | { state: "failed"; error: string };
+
 /// The Claude sessions that produced this pull request (#1211).
 ///
 /// The reverse of `SessionDetail.pull_requests`, and the more useful
@@ -1594,51 +1882,76 @@ export function useClaudeSessionDetail(sessionId: string | null, enabled: boolea
 /// whose titles collide -- `preview.rs` measures 286 of 1,438 sessions
 /// sharing a title with another.
 ///
-/// `staleTime: Infinity` and no poll. A `pr-link` record is written
-/// once, when the PR is opened, and never changes afterwards; a session
-/// that produced a PR does not stop having produced it. Polling would
-/// re-ask a question whose answer is immutable.
+/// # By number, then matched (#1557)
+///
+/// It asked `claude_sessions_for_pr` for exactly `owner/repo`, and a
+/// link records the repository as it was named when the PR was opened.
+/// So a PR shown under a transferred repository's NEW owner found none
+/// of the links written before the transfer. It now asks by number and
+/// picks the answer with `matchPrLinks`, exactly as the search does:
+/// the same repository compared case-insensitively, and the same name
+/// under another owner returned apart as `elsewhere`, for the panel to
+/// state as a fact rather than list as a match.
+///
+/// # Re-asked while it has no answer
+///
+/// A PR opened a minute ago is exactly the one whose link the live pass
+/// may not have read yet. While the panel has no session for its PR it
+/// re-asks on the pass's cadence; once it has one it stops, because a
+/// session that produced a PR does not stop having produced it.
 ///
 /// `enabled` because this is a secondary panel on a detail view that
 /// already fetches the PR itself -- a closed detail should not pay for
 /// it.
-export function useClaudeSessionsForPr(repo: string, number: number, enabled: boolean) {
-  return useQuery<ClaudePrLink[]>({
-    queryKey: ["claude-sessions-for-pr", repo, number],
-    queryFn: () => claudeSessionsForPr(repo, number),
-    enabled: enabled && repo !== "" && number > 0,
-    staleTime: Infinity,
-    // A machine with no imported transcripts answers with an empty
-    // list, not an error. Retrying an empty answer three times delays
-    // the panel saying so.
-    retry: false,
+export function useClaudeSessionsForPr(
+  repo: string,
+  number: number,
+  enabled: boolean,
+): PrSessionsState {
+  const on = enabled && repo !== "" && number > 0;
+  const query: PrQuery = { repo, number };
+  const lookup = useQuery<ClaudePrLink[]>({
+    ...prLinksByNumber(number, on),
+    refetchInterval: (q) =>
+      q.state.data !== undefined && matchPrLinks(q.state.data, query).links.length > 0
+        ? false
+        : PR_LINKS_STALE_MS,
   });
+  if (!on) return { state: "off" };
+  if (lookup.isError) return { state: "failed", error: prLookupError(lookup.error) };
+  if (lookup.data === undefined) return { state: "loading" };
+  return { state: "done", ...matchPrLinks(lookup.data, query) };
 }
 
-/// What a PR-shaped search query resolved to (#1280).
+/// What a PR-shaped search query resolved to (#1280, #1545).
 ///
-/// FOUR states, and the reason they are four rather than three is the
-/// rule this codebase keeps re-applying (#846, #1044): an absence has to
-/// say which absence it is.
+/// An absence has to say which absence it is (#846, #1044):
 ///
 /// | state | what happened |
 /// |---|---|
 /// | `"off"` | the query is not a pull request reference -- nothing was asked |
-/// | `"unresolved"` | a bare number whose repository we could not name, so no lookup ran |
-/// | `"loading"` | a lookup is in flight |
-/// | `"done"` | every lookup answered; `links` may be empty, which is a real answer |
-/// | `"failed"` | at least one lookup rejected; `links` holds what did answer |
+/// | `"loading"` | the lookup is in flight |
+/// | `"done"` | the lookup answered; `links` may be empty, which is a real answer |
+/// | `"failed"` | the lookup rejected -- nothing is known about who wrote the PR |
 ///
 /// `"done"` with an empty `links` is the finding "no session recorded
 /// for this PR". `"failed"` is NOT that, and the caller must never word
 /// them alike -- a database that could not be read has said nothing
 /// about who wrote the PR.
+///
+/// There was an `"unresolved"` state until #1545: a bare `#1234` whose
+/// repository the tracked OPEN pull requests could not name, for which
+/// no lookup ran. The lookup is now by number alone, so every reference
+/// is asked about and the "we never asked" case no longer exists.
+///
+/// `elsewhere` is `matchPrLinks`'s: links for the same repository name
+/// under another owner, when a qualified query matched nothing. They are
+/// NOT in `links` and the list does not show them.
 export type PrQueryState =
   | { state: "off" }
-  | { state: "unresolved"; number: number }
   | { state: "loading"; ref: string }
-  | { state: "done"; ref: string; links: ClaudePrLink[] }
-  | { state: "failed"; ref: string; links: ClaudePrLink[]; error: string };
+  | { state: "done"; ref: string; links: ClaudePrLink[]; elsewhere: ClaudePrLink[] }
+  | { state: "failed"; ref: string; error: string };
 
 /// How long the search box rests before a PR reference reaches the
 /// backend (#1280).
@@ -1684,7 +1997,6 @@ function prLookupError(err: unknown): string {
 /// what is typed here, and only a query that really names a pull request
 /// ever starts a timer.
 export function useClaudeSessionsForPrQuery(query: string, enabled: boolean): PrQueryState {
-  const qc = useQueryClient();
   const parsed = useMemo(() => parsePrQuery(query), [query]);
   // The parse RESULT is debounced, not the raw text. Two prefixes that
   // parse to the same reference -- which cannot happen for a number, but
@@ -1709,48 +2021,24 @@ export function useClaudeSessionsForPrQuery(query: string, enabled: boolean): Pr
   const ref = settled === key ? key : "";
   const live = ref === "" ? null : parsed;
 
-  // The tracked pull requests, read from cache (#1280). `staleTime:
-  // Infinity` on that query means this is a cache read and not a fetch,
-  // so a bare `#1234` costs no extra round trip to learn its repository.
-  const prs = useQuery({ queryKey: ["prs"], queryFn: () => readAuthored(qc), staleTime: Infinity, enabled });
-  const repos = useMemo(() => {
-    if (live === null) return [];
-    if (live.repo !== null) return [live.repo];
-    return reposForNumber(prs.data, live.number);
-  }, [live, prs.data]);
-
-  const results = useQueries({
-    queries: repos.map((repo) => ({
-      // The SAME key `useClaudeSessionsForPr` uses, so a PR detail view
-      // already opened for this pull request has warmed this and the
-      // search answers from cache.
-      queryKey: ["claude-sessions-for-pr", repo, live?.number ?? 0],
-      queryFn: () => claudeSessionsForPr(repo, live?.number ?? 0),
-      enabled: enabled && live !== null,
-      staleTime: Infinity,
-      retry: false,
-    })),
-  });
+  // By NUMBER alone (#1545), for every form of reference. The link table
+  // is itself the list of repositories that can answer, so a bare
+  // `#1234` needs no repository resolved first -- and a qualified one is
+  // matched case-insensitively in `matchPrLinks` rather than by an exact
+  // `repo = ?` that missed `Acme/API` against `acme/api`.
+  const number = live?.number ?? 0;
+  // Shared with the PR detail panel (#1557): one key, one answer per
+  // number, whichever asks first.
+  const lookup = useQuery<ClaudePrLink[]>(prLinksByNumber(number, enabled && live !== null));
 
   // Derived during render rather than stored, so there is no effect
   // writing state and no frame where the two disagree.
-  if (live === null) return { state: "off" };
-  if (repos.length === 0) {
-    // A bare number we could not attach to a repository. NOT an empty
-    // lookup: nothing was asked, and saying "no session recorded" here
-    // would claim a finding we never went looking for.
-    return { state: "unresolved", number: live.number };
-  }
-  if (results.some((r) => r.isLoading)) return { state: "loading", ref };
-  const links = results.flatMap((r) => r.data ?? []);
-  const failed = results.find((r) => r.isError);
-  if (failed) {
-    // PARTIAL is not nothing (#1044): whichever repos answered keep
-    // their links, and the caller renders them alongside the failure
-    // rather than instead of it.
-    return { state: "failed", ref, links, error: prLookupError(failed.error) };
-  }
-  return { state: "done", ref, links };
+  // Disabled is "off", not "loading": nothing was asked, and a lookup
+  // that will never run must not render as one in flight (#1042).
+  if (live === null || !enabled) return { state: "off" };
+  if (lookup.isError) return { state: "failed", ref, error: prLookupError(lookup.error) };
+  if (lookup.data === undefined) return { state: "loading", ref };
+  return { state: "done", ref, ...matchPrLinks(lookup.data, live) };
 }
 
 export function useClaudeSessions(enabled: boolean) {
@@ -1790,6 +2078,9 @@ export function useClaudeSessions(enabled: boolean) {
     rescan: async () => {
       await qc.invalidateQueries({ queryKey: ["claude-import"] });
       await qc.invalidateQueries({ queryKey: ["claude-sessions"] });
+      // The pull request links are rewritten by the same import (#1545),
+      // so their lookups go too rather than waiting out their minute.
+      await qc.invalidateQueries({ queryKey: ["claude-sessions-for-pr-number"] });
     },
   };
 }
@@ -1833,7 +2124,11 @@ export function useClaudeUsageProfile(enabled = true) {
   });
 }
 
-export function useClaudeSessionUsage(path: string | null) {
+///
+/// `live` re-reads on `USAGE_LIVE_MS` while the session runs (#1485): the
+/// transcript header shows "so far" figures, and a running session's
+/// grow. Off by default, so every other caller keeps its one read.
+export function useClaudeSessionUsage(path: string | null, live = false) {
   return useQuery<ClaudeUsage>({
     queryKey: ["claude-usage", path],
     queryFn: () => claudeSessionUsage(path as string),
@@ -1842,9 +2137,14 @@ export function useClaudeSessionUsage(path: string | null) {
     // a rejected query that reads as a failure.
     enabled: path !== null && path !== "",
     staleTime: Infinity,
+    refetchInterval: live && path ? USAGE_LIVE_MS : false,
     retry: false,
   });
 }
+
+/// How often a running session's usage is re-read for the header. A
+/// whole-transcript read, so slower than the list's poll.
+const USAGE_LIVE_MS = 60_000;
 
 /// What one session's subagents cost, as a figure of its own (#1002).
 ///
@@ -1998,251 +2298,6 @@ export function useClaudePlugins(enabled = true) {
     staleTime: Infinity,
     retry: false,
   });
-}
-
-// `useClaudeTranscriptTail` (#982) was here. #1208 replaced it: it was
-// `staleTime: Infinity` with no `refetchInterval`, so the pane opened
-// onto a snapshot frozen at the moment of the click, and the app spends
-// its ten-second poll drawing attention to RUNNING sessions. The read it
-// wrapped -- `claude_transcript_tail` -- is still a registered
-// `Class::Read` command, so a paired device that wants one bounded
-// window rather than a follow can still ask for one.
-
-/// How often an open follow re-reads the transcript.
-///
-/// 3 seconds, deliberately FASTER than `CLAUDE_POLL_MS`'s 10, and the
-/// asymmetry is the point of #1208. The list polls at 10 s because it
-/// answers "which of 1,474 sessions is alive"; a follow answers "what is
-/// this one agent doing right now", which is a question the user is
-/// actively watching, and 10 s of lag there is what made the most
-/// valuable view in the app its most stale one.
-///
-/// It is affordable only because the read is incremental: a poll over a
-/// transcript that did not change moves zero transcript bytes and reads
-/// one bounded 64 KB fingerprint, against the 256 KB `tail` would pull
-/// every tick. A `tail` on a 3-second timer is the thing this exists
-/// instead of.
-const FOLLOW_POLL_MS = 3_000;
-
-/// Following one session's transcript as it is written (#1208).
-///
-/// # Why polling, and not a filesystem watcher
-///
-/// `src-tauri/src/claude/handoff.rs:9-19` argues it for its own file:
-/// `notify` is not a dependency, and on macOS a dead FSEvents stream
-/// reports "no new content" indistinguishably from "the watch died".
-/// Silence is the one failure a pane claiming to follow must never
-/// produce. A poll that stops is legible -- `lastReadAt` below stops
-/// advancing and the pane says so in words. #1201 is open on the same
-/// question for the filesystem scans.
-///
-/// # Why the messages are accumulated here and not re-fetched
-///
-/// The command returns only what is NEW since the cursor. That is what
-/// makes a 3-second poll affordable, and it means the rendered
-/// conversation lives in this hook rather than in the query cache: the
-/// query's `data` is one increment, and the conversation is the sum of
-/// them.
-///
-/// Appends are coalesced through `createCoalescer` (#1150) for the
-/// reason that module exists: a burst of records during a busy tool loop
-/// would otherwise be one full re-render of up to 200 messages each. The
-/// scheduler is injected so a test can flush deterministically, exactly
-/// as `coalesce.ts` intends.
-///
-/// # Three states, three renderings
-///
-/// `following` is what the caller switches on, and the three values must
-/// not be collapsed (#846, #1042):
-///
-/// - `"following"` -- the poll is running.
-/// - `"idle"` -- the poll is running and the transcript is not changing.
-///   We read, and the session wrote nothing.
-/// - `"stopped"` -- we are NOT reading any more, because the pane was
-///   closed, the path went away, or the read failed.
-///
-/// "This session is idle" and "we stopped following" are different
-/// facts with different remedies, and a pane that rendered them the same
-/// way would be telling the reader a running agent is quiet when in
-/// truth nobody is looking.
-export function useClaudeTranscriptFollow(
-  path: string | null,
-  enabled: boolean,
-  schedule?: Scheduler,
-) {
-  const on = enabled && path !== null && path !== "";
-
-  /// Everything the follow has accumulated, TAGGED with the file it came
-  /// from.
-  ///
-  /// One state object rather than four, and the tag is what makes the
-  /// path change safe without an effect: a cursor is an offset into ONE
-  /// file, and carrying one across a selection would read one
-  /// transcript's history at another's offset. Comparing the tag during
-  /// render discards it in the same pass the new path arrives in, so the
-  /// pane never renders one session's messages under another's header --
-  /// which a reset in an effect would allow for exactly one frame.
-  const [acc, setAcc] = useState<{
-    path: string | null;
-    messages: ClaudePreviewMessage[];
-    reread: { why: ClaudeReread; at: number } | null;
-    window: {
-      truncated: boolean;
-      file_bytes: number;
-      bytes_read: number;
-      non_conversation_records: number;
-      unparseable_records: number;
-    } | null;
-    pairings: Record<string, ClaudePairing>;
-  }>(() => ({ path, messages: [], reread: null, window: null, pairings: {} }));
-
-  // Computed DURING RENDER, never set from an effect: React's own
-  // "adjusting state when a prop changes" rule, and this file's.
-  const fresh = { path, messages: [], reread: null, window: null, pairings: {} };
-  const state = acc.path === path ? acc : fresh;
-
-  /// Where the last read left off.
-  ///
-  /// A REF, not state, and this is the one thing here that must be:
-  /// the cursor is an INPUT to the next fetch, read inside `queryFn`
-  /// rather than rendered. Held in state it would be captured by the
-  /// closure at render time, so a poll that fired before React committed
-  /// the previous result would re-send a spent cursor -- and the case-5
-  /// fingerprint would then report a rewrite on a file nobody rewrote.
-  ///
-  /// Written only from inside `queryFn`, never during render. It is
-  /// discarded alongside the messages it indexes, in the same callback,
-  /// because a cursor is an offset into ONE file and carrying one across
-  /// a selection would read one transcript's history at another's offset.
-  const cursor = useRef<ClaudeFollowCursor | null>(null);
-  const cursorFor = useRef<string | null>(path);
-
-  /// Batched appends (#1150).
-  ///
-  /// Built once, in a lazy `useState` initialiser rather than assigned to
-  /// a ref during render: a burst of records during a busy tool loop
-  /// would otherwise be one full re-render of up to 200 messages each,
-  /// and the scheduler is injected so a test can flush deterministically
-  /// -- exactly what `coalesce.ts` exists for.
-  ///
-  /// It appends onto whatever the CURRENT accumulation is, and only when
-  /// the batch still belongs to the file it was read from: a batch in
-  /// flight when the selection changed belongs to the previous
-  /// transcript.
-  const [coalescer] = useState(() =>
-    createCoalescer<{ path: string | null; message: ClaudePreviewMessage }>((batch) => {
-      setAcc((prev) => {
-        const mine = batch.filter((b) => b.path === prev.path).map((b) => b.message);
-        if (mine.length === 0) return prev;
-        return { ...prev, messages: [...prev.messages, ...mine] };
-      });
-    }, schedule),
-  );
-  useEffect(
-    () =>
-      // Stopped rather than left dangling on unmount, so a batch in
-      // flight does not try to set state on a closed pane --
-      // `createCoalescer.stop`'s own contract.
-      () =>
-        coalescer.stop(),
-    [coalescer],
-  );
-
-  const query = useQuery<ClaudeFollow>({
-    // The cursor is deliberately NOT in the key. It changes on every
-    // poll, and a key that changed every poll would make each read a
-    // fresh cache entry -- unbounded growth, and `refetchInterval` would
-    // have nothing stable to tick against.
-    queryKey: ["claude-transcript-follow", path],
-    queryFn: async () => {
-      // A cursor belongs to ONE file. If the selection moved since it
-      // was stored, it is discarded here rather than sent -- reading a
-      // new transcript at the old one's offset would splice two
-      // conversations together and the fingerprint would report it as a
-      // rewrite, which it is not.
-      const sending = cursorFor.current === path ? cursor.current : null;
-      const got = await claudeTranscriptFollow(path as string, sending);
-      cursor.current = got.cursor;
-      cursorFor.current = path;
-      const win = {
-        truncated: got.preview.truncated,
-        file_bytes: got.file_bytes,
-        bytes_read: got.bytes_read,
-        non_conversation_records: got.preview.non_conversation_records,
-        unparseable_records: got.preview.unparseable_records,
-      };
-      if (got.reread !== null) {
-        // A re-read REPLACES. Anything the coalescer is still holding
-        // belongs to the history that no longer exists, so it is dropped
-        // rather than appended after the replacement -- which is the
-        // whole point of the fifth case: appending here would splice new
-        // content onto a history that is gone.
-        coalescer.stop();
-        const at = Date.now();
-        // Re-based onto a fresh accumulation when the path moved under
-        // the request: the answer is still for `path`, so it is kept --
-        // but it must not be merged into the PREVIOUS file's messages.
-        setAcc({
-          path,
-          messages: got.preview.messages,
-          reread: { why: got.reread as ClaudeReread, at },
-          window: win,
-          pairings: got.preview.pairings,
-        });
-      } else {
-        setAcc((prev) =>
-          prev.path === path
-            ? { ...prev, window: win, pairings: got.preview.pairings }
-            : { path, messages: [], reread: null, window: win, pairings: got.preview.pairings },
-        );
-        for (const message of got.preview.messages) coalescer.push({ path, message });
-      }
-      return got;
-    },
-    enabled: on,
-    refetchInterval: on ? FOLLOW_POLL_MS : false,
-    // Shorter than the interval so each tick is a real read rather than
-    // a cache hit, the same relationship `useClaudeSessions` sets.
-    staleTime: FOLLOW_POLL_MS - 500,
-    // `retry: false`, this feature's rule: the failures a transcript read
-    // has -- gone, unreadable, refused path -- are settled refusals, and
-    // three silent re-reads only delay the pane saying the follow
-    // stopped.
-    retry: false,
-  });
-
-  /// When we last actually heard from disk.
-  ///
-  /// `dataUpdatedAt`, not `Date.now()`: it advances once per successful
-  /// read and stops dead when the follow does, which is exactly the edge
-  /// the honesty requirement asks for. A clock read during render would
-  /// tick on forever and make a stopped follow look live.
-  const lastReadAt = query.dataUpdatedAt;
-
-  /// Three states, never two. See the hook's docs.
-  const following: "following" | "idle" | "stopped" = !on
-    ? "stopped"
-    : query.isError
-      ? "stopped"
-      : // Read, and the file had not changed: the session is idle. Only
-        // once a read has actually succeeded -- before that we are
-        // starting, not idle.
-        query.data !== undefined && query.data.bytes_read === 0 && query.data.reread === null
-        ? "idle"
-        : "following";
-
-  return {
-    messages: state.messages,
-    following,
-    lastReadAt,
-    reread: state.reread,
-    window: state.window,
-    pairings: state.pairings,
-    isError: query.isError,
-    error: query.error,
-    isLoading: query.isLoading,
-    pollMs: FOLLOW_POLL_MS,
-  };
 }
 
 /// How often the Claude Code overview re-reads.
@@ -2471,6 +2526,12 @@ function seedFromRow(row: PullRequest): PrDetail {
     // lowercases GitHub's `state`.
     state: "open",
     is_draft: row.is_draft,
+    // The row's own dates (#1457), so the header's age is there from the
+    // first frame. The row has no commit time: absent until the detail
+    // lands, and the header omits it rather than guessing.
+    created_at: row.created_at,
+    ready_at: row.ready_at ?? null,
+    last_commit_at: null,
     body: "",
     author: row.author,
     repo: row.repo,
@@ -2590,6 +2651,40 @@ export function usePrDetail(repo: string | undefined, number: number | undefined
     // background cost.
     refetchInterval: (query) =>
       query.state.data?.merge_status === "unknown" ? 3_000 : false,
+  });
+}
+
+/// The base branch's review rules and the head's last pusher, for the
+/// detail view (#1451, #1454).
+///
+/// Waits for the REAL detail: the seeded placeholder has no `head_repo`
+/// (the list query does not select it), and asking without one would
+/// come back "pusher declined" and cache that under a key the real
+/// answer then has to displace. `head_repo` is `undefined` only on the
+/// placeholder -- the real detail carries a string or null.
+///
+/// Keyed on the head commit, so a push re-asks who pushed. The rules half
+/// is cached per (repo, base) on the Rust side, so re-asking is cheap.
+export function useReviewGates(pr: PrDetail | undefined, isPlaceholder: boolean) {
+  const ready = pr !== undefined && !isPlaceholder && pr.head_repo !== undefined;
+  return useQuery({
+    queryKey: [
+      "review-gates",
+      pr?.repo,
+      pr?.base_ref,
+      pr?.head_repo ?? null,
+      pr?.head_ref,
+      pr?.head_oid,
+    ],
+    queryFn: () => {
+      const p = pr as PrDetail;
+      return getReviewGates(p.repo, p.base_ref, p.head_repo ?? null, p.head_ref, p.head_oid);
+    },
+    enabled: ready,
+    staleTime: 60_000,
+    // The command folds every GitHub failure into a state; a rejection is
+    // only "no client", which a retry cannot fix.
+    retry: 0,
   });
 }
 
@@ -2822,6 +2917,7 @@ export function useWorktreeSafety(repoPath: string | undefined, listed?: Worktre
 /// row promising a number for 15 minutes.
 function useStreamingSizes(): Map<string, number | null> {
   const [sizes, setSizes] = useState<Map<string, number | null>>(() => new Map());
+  useRefetchFailedSizesOnReconnect();
 
   useEffect(() => {
     // The same guarded teardown as every other listener here -- see
@@ -2866,6 +2962,108 @@ function useStreamingSizes(): Map<string, number | null> {
   return sizes;
 }
 
+/// How many `size_worktrees` calls the phone has in flight at once
+/// (#1459). See `src/lib/limiter.ts` for why the phone queues its own
+/// calls. Two, the floor of the desktop's own scan-permit pool
+/// (`scan_permits` in `commands.rs` clamps to 2..=8), so the phone never
+/// asks for more walks than the smallest desktop admits at once, and
+/// there is no idle permit while the phone has more waiting.
+///
+/// Unbounded on the desktop, which is exactly what it was: its invoke
+/// has no deadline, so a call waiting on a permit costs nothing but
+/// time, and the desktop's permits already bound the disk.
+const PHONE_SIZE_CALLS = 2;
+
+const sizeCalls = createLimiter(IS_MOBILE_BUILD ? PHONE_SIZE_CALLS : Number.POSITIVE_INFINITY);
+
+/// The phone's backstop for a size call that never settles (#1459).
+///
+/// The companion already bounds every call at `CALL_TIMEOUT` (120s,
+/// `src-mobile/src/client.rs`) and rejects when it passes, so this is
+/// NOT the deadline a user normally meets. It exists because a promise
+/// that never settles leaves the query fetching forever -- a skeleton
+/// nothing moves out of Pending, which is #1042's shape and #1459's
+/// symptom. Whatever the reason the companion's answer did not arrive
+/// (an older companion, a response lost in the webview bridge), the row
+/// must end up saying it could not be measured.
+///
+/// Longer than `CALL_TIMEOUT` so it can never pre-empt the companion's
+/// own, more specific, message; `hooks.worktreeSizes.test.tsx` reads the
+/// Rust constant to hold that. Started when the call is SENT, after any
+/// wait in `sizeCalls`, so queueing never counts against it.
+export const PHONE_SIZE_DEADLINE_MS = 135_000;
+
+/// One repository's sizes, through the phone's queue and deadline.
+function measureSizes(repoPath: string): Promise<Map<string, number | null>> {
+  return sizeCalls
+    .run(repoPath, () =>
+      IS_MOBILE_BUILD
+        ? withDeadline(
+            sizeWorktrees(repoPath),
+            PHONE_SIZE_DEADLINE_MS,
+            "the desktop did not answer in time",
+          )
+        : sizeWorktrees(repoPath),
+    )
+    .then((pairs) => new Map(pairs));
+}
+
+/// Retry the size queries that FAILED once the phone reconnects (#1459).
+///
+/// A size call fails on the phone when the desktop was unreachable or
+/// the call outlived `CALL_TIMEOUT`. Either way the query settles in
+/// error, the rows say "not measured", and -- with `retry: false` --
+/// nothing asks again until a focus change happens to. The companion
+/// emits `connection-state` each time it (re)opens the event stream, so
+/// a transition INTO `connected` is the moment a retry can succeed.
+///
+/// Only settled failures. A call still in flight keeps going: its
+/// settled answer carries every size the stream may have dropped across
+/// the reconnect, so re-issuing it would only start a second walk of the
+/// same tree on the desktop -- a JS-side refetch cannot cancel the first,
+/// which the companion is still waiting on. And never a success:
+/// `staleTime` governs those as it always has.
+///
+/// `cancelRefetch: false` because both size hooks mount this on the
+/// Worktrees page; the second call must join the first refetch, not
+/// cancel and restart it.
+///
+/// Phone only. The desktop has no connection to lose, and no one emits
+/// `connection-state` there.
+function useRefetchFailedSizesOnReconnect(): void {
+  const qc = useQueryClient();
+  useEffect(() => {
+    if (!IS_MOBILE_BUILD) return;
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    let previous: string | undefined;
+    listen<{ state?: string }>("connection-state", (e) => {
+      const state = e.payload?.state;
+      const reconnected = state === "connected" && previous !== "connected";
+      previous = state;
+      if (!reconnected) return;
+      void qc.refetchQueries(
+        {
+          queryKey: ["worktree-sizes"],
+          type: "active",
+          predicate: (q) => q.state.status === "error" && q.state.fetchStatus === "idle",
+        },
+        { cancelRefetch: false },
+      );
+    }).then(
+      (fn) => {
+        if (cancelled) safeUnlisten(fn);
+        else unlisten = fn;
+      },
+      () => {},
+    );
+    return () => {
+      cancelled = true;
+      safeUnlisten(unlisten);
+    };
+  }, [qc]);
+}
+
 /// Disk sizes for one repo's worktrees, keyed by path.
 ///
 /// The slowest of the three passes by far, so it is last: the list
@@ -2885,10 +3083,7 @@ export function useWorktreeSizes(repoPath: string | undefined) {
   const partial = useStreamingSizes();
   const query = useQuery({
     queryKey: ["worktree-sizes", repoPath],
-    queryFn: async () => {
-      const pairs = await sizeWorktrees(repoPath as string);
-      return new Map(pairs);
-    },
+    queryFn: () => measureSizes(repoPath as string),
     enabled: Boolean(repoPath),
     staleTime: 5 * 60 * 1000,
     // NOT the default `retry: 3`. This query is a full filesystem walk
@@ -2900,6 +3095,13 @@ export function useWorktreeSizes(repoPath: string | undefined) {
     // repeats a very expensive operation to get the same answer.
     retry: false,
   });
+  // The repository on screen goes first (#1459). When it was opened
+  // from All repositories, its call may still be waiting behind every
+  // other repository's on the phone; this is the one the user is
+  // looking at.
+  useEffect(() => {
+    if (repoPath) sizeCalls.promote(repoPath);
+  }, [repoPath]);
   return { ...query, partial };
 }
 
@@ -2932,7 +3134,7 @@ export function useAllWorktreeSizes(repoPaths: string[], enabled: boolean) {
   const results = useQueries({
     queries: repoPaths.map((path) => ({
       queryKey: ["worktree-sizes", path],
-      queryFn: async () => new Map(await sizeWorktrees(path)),
+      queryFn: () => measureSizes(path),
       enabled,
       staleTime: 5 * 60 * 1000,
       // Same reason as the single-repo hook: four sequential walks of a
@@ -3328,62 +3530,126 @@ export function useRemoveWorktree() {
     });
 }
 
-/// Remove every safe worktree in a repo.
+/// Drop removed worktrees from every cached list that could show them.
 ///
-/// Drops the successful paths from the cache rather than invalidating,
-/// for the same reason a single removal does: re-classifying 146
-/// worktrees takes ~51s, and removing worktrees cannot change any other
-/// worktree's safety.
+/// EVERY cached classification, not just the selected repository's.
+/// The bulk button's targets come from what is DISPLAYED, which on the
+/// all-repositories view spans many repos -- while this used to update
+/// only the selected one, so rows in other repositories came straight
+/// back from their stale cache. Filtering every cached list by path is
+/// safe regardless of which repository a path belongs to: a path not in
+/// a list leaves it unchanged.
+///
+/// The base listing too, and by EDITING it rather than only
+/// invalidating. The page renders `classified ?? selected?.worktrees`,
+/// so when the classification has not arrived it falls back to this
+/// list, and invalidation alone leaves the removed rows on screen until
+/// the refetch lands.
+///
+/// `unreadable` is carried through UNCHANGED (#951). Removing a worktree
+/// says nothing about a path the scan could not read, so dropping the
+/// report here would clear the partial-scan banner on an unrelated
+/// action -- and the next refetch would bring it back.
+function dropRemovedWorktrees(qc: QueryClient, removed: ReadonlySet<string>) {
+  qc.setQueriesData<Worktree[]>({ queryKey: ["worktree-safety"] }, (old) =>
+    old?.filter((w) => !removed.has(w.path)),
+  );
+  qc.setQueryData<WorktreeScan>(["worktrees"], (old) =>
+    old && {
+      ...old,
+      repos: old.repos.map((r) => ({
+        ...r,
+        worktrees: r.worktrees.filter((w) => !removed.has(w.path)),
+      })),
+    },
+  );
+}
+
+/// A token for one bulk removal, echoed on its progress frames.
+///
+/// A number, because the Rust side accepts nothing else and the event
+/// it rides on is forwarded to the phone. Random rather than a counter:
+/// the desktop and the phone each run their own copy of this module, so
+/// two counters would both start at 1 and collide on the first overlap.
+function newRemovalRun(): number {
+  return Math.floor(Math.random() * Number.MAX_SAFE_INTEGER);
+}
+
+/// Remove several worktrees, dropping each row as ITS removal succeeds.
+///
+/// Drops paths from the cache rather than invalidating, for the same
+/// reason a single removal does: re-classifying 146 worktrees takes
+/// ~51s, and removing worktrees cannot change any other worktree's
+/// safety.
+///
+/// # One row at a time (#1544)
+///
+/// The cache used to change only when the whole batch returned, so a
+/// hundred-row removal -- sequential at a few hundred ms each -- left
+/// the list unchanged for 30 seconds. Each `worktree-removal-progress`
+/// frame now says whether ITS removal succeeded, and frame `done` is the
+/// outcome of `worktreePaths[done - 1]`: the frame carries no path,
+/// because the event is forwarded to the phone, and this list is the
+/// one this call sent, so the index is enough. Only frames bearing this
+/// call's `run` are mapped; another run's index names a row in a list
+/// this call never saw.
+///
+/// A refused row is never dropped: `removed: false` does nothing here,
+/// and the final outcomes -- which the caller's toast reads -- are the
+/// record of why.
+///
+/// # Partial is not nothing
+///
+/// If the call rejects midway, the rows already dropped STAY dropped:
+/// they are gone from disk, and restoring them would show deleted work
+/// as present. The repository listing is invalidated either way so the
+/// next read is the truth.
+///
+/// `onRemoved` is called once per removed path, as it goes.
 export function useRemoveWorktrees() {
   const qc = useQueryClient();
-  return (repoPath: string, worktreePaths: string[]) =>
-    removeWorktrees(repoPath, worktreePaths).then((outcomes) => {
-      const removed = new Set(
-        outcomes.filter((o) => o.error === null).map((o) => o.path),
-      );
-      // EVERY cached classification, not just `repoPath`'s.
-      //
-      // The bulk button's targets come from what is DISPLAYED, which on
-      // the all-repositories view spans many repos -- while this only
-      // ever updated the selected one. So worktrees in other
-      // repositories were really removed, the toast correctly said so,
-      // and their rows came straight back because their cache still
-      // held them. `repoPath` is also "" when nothing is selected, and
-      // then this updated a key that does not exist at all.
-      //
-      // Filtering every cached list by path is safe regardless of which
-      // repository a path belongs to: a path that is not in a list
-      // leaves it unchanged.
-      qc.setQueriesData<Worktree[]>({ queryKey: ["worktree-safety"] }, (old) =>
-        old?.filter((w) => !removed.has(w.path)),
-      );
-      // The base listing too, and by EDITING it rather than only
-      // invalidating.
-      //
-      // The page renders `classified ?? selected?.worktrees` -- so when
-      // the classification has not arrived (or was cleared), it falls
-      // back to this list. Invalidation alone leaves the stale rows on
-      // screen until the refetch lands, which is what "the same 3
-      // worktrees are still listed" was: they really were removed, and
-      // the fallback was still serving them.
-      //
-      // `unreadable` is carried through UNCHANGED (#951). Removing a
-      // worktree says nothing about a path the scan could not read, so
-      // dropping the report here would clear the partial-scan banner on
-      // an unrelated action -- and the next refetch would bring it back,
-      // which is how a warning becomes noise nobody trusts.
-      qc.setQueryData<WorktreeScan>(["worktrees"], (old) =>
-        old && {
-          ...old,
-          repos: old.repos.map((r) => ({
-            ...r,
-            worktrees: r.worktrees.filter((w) => !removed.has(w.path)),
-          })),
-        },
-      );
-      void qc.invalidateQueries({ queryKey: ["worktrees"] });
+  return async (
+    repoPath: string,
+    worktreePaths: string[],
+    onRemoved?: (path: string) => void,
+  ): Promise<RemovalOutcome[]> => {
+    const run = newRemovalRun();
+    const dropped = new Set<string>();
+    const drop = (paths: string[]) => {
+      const fresh = paths.filter((p) => !dropped.has(p));
+      if (fresh.length === 0) return;
+      for (const p of fresh) dropped.add(p);
+      dropRemovedWorktrees(qc, new Set(fresh));
+      for (const p of fresh) onRemoved?.(p);
+    };
+
+    // Subscribed BEFORE the call, or the first frames could land before
+    // anything listens. A listener that cannot be installed costs only
+    // the live updates: the outcomes below still drop every removed row.
+    let unlisten: UnlistenFn | undefined;
+    try {
+      unlisten = await listen<WorktreeRemovalFrame>("worktree-removal-progress", (e) => {
+        const f = e.payload;
+        if (f.run !== run || !f.removed) return;
+        const path = worktreePaths[f.done - 1];
+        if (path !== undefined) drop([path]);
+      });
+    } catch {
+      unlisten = undefined;
+    }
+
+    try {
+      const outcomes = await removeWorktrees(repoPath, worktreePaths, run);
+      // The outcomes are the record: anything a frame did not deliver
+      // (a frame lost in transit, or arriving after this) is dropped
+      // here, and a refusal is not.
+      drop(outcomes.filter((o) => o.error === null).map((o) => o.path));
       return outcomes;
-    });
+    } finally {
+      safeUnlisten(unlisten);
+      void qc.invalidateQueries({ queryKey: ["worktrees"] });
+    }
+  };
 }
 
 /// Which worktrees have been assessed, so the row can say so.
@@ -4476,6 +4742,20 @@ export function useRevokePairedDevice() {
   };
 }
 
+/// Set what one phone may read of the session transcripts (#1488). The
+/// list is refreshed whichever way the call ends, so the checkboxes show
+/// what is stored rather than what was clicked.
+export function useSetPairedDeviceAccess() {
+  const qc = useQueryClient();
+  return async (id: number, transcriptsAllowed: boolean, revealAllowed: boolean) => {
+    try {
+      await setPairedDeviceAccess(id, transcriptsAllowed, revealAllowed);
+    } finally {
+      await qc.invalidateQueries({ queryKey: ["paired-devices"] });
+    }
+  };
+}
+
 /// The phone waiting on the user's decision, or null.
 ///
 /// A queue rather than "latest wins": two phones scanning in quick
@@ -4519,17 +4799,18 @@ export function usePairingRequest(): { request: PairingRequest | null; dismiss: 
 ///
 /// The button previously showed a single boolean for what can be ~30
 /// seconds of sequential deletion, so a long batch was
-/// indistinguishable from a hang. The Rust side emits (done, total)
-/// after EACH removal -- including failures, or a batch where several
-/// fail appears to stall.
+/// indistinguishable from a hang. The Rust side emits a frame after
+/// EACH removal -- including failures, or a batch where several fail
+/// appears to stall. Only the counts are read here; which rows went is
+/// `useRemoveWorktrees`' business.
 export function useRemovalProgress(): { done: number; total: number } | null {
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
 
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;
     let cancelled = false;
-    listen<[number, number]>("worktree-removal-progress", (e) => {
-      const [done, total] = e.payload;
+    listen<WorktreeRemovalFrame>("worktree-removal-progress", (e) => {
+      const { done, total } = e.payload;
       // Clears on the last one rather than leaving "106 of 106" on
       // screen after the work is over.
       setProgress(done >= total ? null : { done, total });

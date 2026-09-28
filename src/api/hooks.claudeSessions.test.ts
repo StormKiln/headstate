@@ -50,6 +50,7 @@ const wire = (over: Partial<WireClaudeSessionList> = {}): WireClaudeSessionList 
   reasons: [DEAD],
   registry_failure: null,
   registry_unreadable: [],
+  registry_unnamed: [],
   ...over,
 });
 
@@ -243,10 +244,16 @@ describe("hydrateClaudeSessions", () => {
   /// must not have quietly dropped either.
   it("carries the registry failure and the unreadable list through", () => {
     const got = hydrateClaudeSessions(
-      wire({ registry_failure: "Permission denied", registry_unreadable: ["4242.json"] }),
+      wire({
+        registry_failure: "Permission denied",
+        registry_unreadable: ["4242.json"],
+        registry_unnamed: ["pid 4243, running in /Users/acme/code/widget"],
+      }),
     );
     expect(got.registry_failure).toBe("Permission denied");
     expect(got.registry_unreadable).toEqual(["4242.json"]);
+    // #1315: a field-by-field copy is where a new list field vanishes.
+    expect(got.registry_unnamed).toEqual(["pid 4243, running in /Users/acme/code/widget"]);
   });
 
   /// The honest total, which is #985's stated trap.
@@ -292,5 +299,29 @@ describe("hydrateClaudeSessions", () => {
     expect(row.name).toBe("about s1");
     expect(row.cwd).toBe("/code/widget");
     expect(row.git_branch).toBe("feat/spoon");
+  });
+});
+
+/// #1133's opening prompt and #1488's masking, which this field-by-field
+/// copy used to drop (#1485): the row never showed a prompt, and a phone
+/// with transcripts turned off could not say why it had none.
+describe("hydrateClaudeSessions carries the opening prompt and the masking", () => {
+  it("keeps the opening prompt, which search also covers", () => {
+    const base = wire().sessions[0];
+    const got = hydrateClaudeSessions(
+      wire({ sessions: [{ ...base, opening_prompt: "tidy the widget" }] }),
+    );
+    expect(got.sessions[0].opening_prompt).toBe("tidy the widget");
+  });
+
+  it("an older answer with no prompt field reads as null, not undefined", () => {
+    expect(hydrateClaudeSessions(wire()).sessions[0].opening_prompt).toBeNull();
+  });
+
+  it("carries a phone's masking, so a withheld prompt can be said", () => {
+    const masking = { hidden: 0, revealed: false, reveal_allowed: false, withheld: true };
+    expect(hydrateClaudeSessions(wire({ masking })).masking).toEqual(masking);
+    // The desktop's own answer has none, and gains none.
+    expect("masking" in hydrateClaudeSessions(wire())).toBe(false);
   });
 });

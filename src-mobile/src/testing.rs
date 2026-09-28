@@ -61,6 +61,13 @@ pub(crate) enum Reply {
         frames: Vec<(String, String)>,
         hold: bool,
     },
+    /// Read the request and never answer it: a desktop that is up, has
+    /// accepted the connection, and is still working (#1466).
+    Stall,
+    /// A JSON body, gzipped when the request's `Accept-Encoding` names
+    /// gzip and sent plain otherwise. That is what the real listener does
+    /// on `/v1/call/*` (#1478).
+    GzipJson { status: u16, body: String },
 }
 
 impl Reply {
@@ -99,6 +106,9 @@ struct Shared {
     /// The scheme the last client CertificateVerify was checked with.
     last_sig: Mutex<Option<SignatureScheme>>,
     end_streams: Notify,
+    /// Set by [`TestServer::go_away`]: every new connection is closed
+    /// before the handshake, while the port stays bound.
+    gone: AtomicBool,
 }
 
 /// The desktop's client-cert rule: paired, or the pairing window is
@@ -290,6 +300,22 @@ impl TestServer {
     pub fn end_streams(&self) {
         self.shared.end_streams.notify_waiters();
     }
+    /// The desktop goes away, as far as the phone can tell: held streams
+    /// end and every new connection is closed before the TLS handshake,
+    /// so a connect fails the way it does against a dead desktop.
+    ///
+    /// Use this instead of `drop(server)` when a test needs the desktop
+    /// GONE. Dropping frees the port, and under a parallel test run
+    /// another test's server can bind it -- the phone then reaches a
+    /// stranger with a different certificate and reports a fingerprint
+    /// mismatch instead of "unreachable". That burned a release commit
+    /// (`a_window_while_the_desktop_is_away_touches_nothing`, CI, the
+    /// merge of #1470). Keeping the listener bound makes the port
+    /// impossible to reuse for as long as the server lives.
+    pub fn go_away(&self) {
+        self.shared.gone.store(true, Ordering::SeqCst);
+        self.shared.end_streams.notify_waiters();
+    }
     /// The QR a desktop would show for this server.
     pub fn qr(&self, token_b64url: &str, exp: i64) -> String {
         json!({
@@ -310,6 +336,10 @@ async fn accept_loop(listener: TcpListener, acceptor: TlsAcceptor, shared: Arc<S
         let Ok((tcp, _)) = listener.accept().await else {
             return;
         };
+        if shared.gone.load(Ordering::SeqCst) {
+            drop(tcp);
+            continue;
+        }
         let acceptor = acceptor.clone();
         let shared = shared.clone();
         tokio::spawn(async move {
@@ -341,6 +371,9 @@ async fn accept_loop(listener: TcpListener, acceptor: TlsAcceptor, shared: Arc<S
                 .get(&req.path)
                 .cloned()
                 .unwrap_or_else(|| default_reply(&req));
+            let accepts_gzip = req
+                .header("accept-encoding")
+                .is_some_and(|v| v.split(',').any(|c| c.trim() == "gzip"));
             shared.requests.lock().unwrap().push(req);
             match reply {
                 Reply::Body {
@@ -367,6 +400,15 @@ async fn accept_loop(listener: TcpListener, acceptor: TlsAcceptor, shared: Arc<S
                     }
                     let _ = tls.write_all(b"0\r\n\r\n").await;
                     let _ = tls.shutdown().await;
+                }
+                Reply::GzipJson { status, body } => {
+                    let _ = write_gzip_json(&mut tls, status, &body, accepts_gzip).await;
+                }
+                Reply::Stall => {
+                    // Held until the client gives up and closes its end,
+                    // which is what a real slow desktop sees.
+                    let mut sink = [0u8; 64];
+                    while matches!(tls.read(&mut sink).await, Ok(n) if n > 0) {}
                 }
             }
         });
@@ -454,6 +496,29 @@ async fn write_body<S: AsyncWriteExt + Unpin>(
     );
     s.write_all(head.as_bytes()).await?;
     s.write_all(body.as_bytes()).await?;
+    s.shutdown().await
+}
+
+/// A JSON body, gzipped only if the client asked for it.
+async fn write_gzip_json<S: AsyncWriteExt + Unpin>(
+    s: &mut S,
+    status: u16,
+    body: &str,
+    accepts_gzip: bool,
+) -> std::io::Result<()> {
+    if !accepts_gzip {
+        return write_body(s, status, "application/json", body).await;
+    }
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut enc, body.as_bytes())?;
+    let gz = enc.finish()?;
+    let head = format!(
+        "HTTP/1.1 {status} OK\r\ncontent-type: application/json\r\n\
+         content-encoding: gzip\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        gz.len()
+    );
+    s.write_all(head.as_bytes()).await?;
+    s.write_all(&gz).await?;
     s.shutdown().await
 }
 

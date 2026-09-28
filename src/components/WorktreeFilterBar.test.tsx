@@ -14,7 +14,9 @@ const ALL_KINDS = [
   "unpushed",
   "never_pushed",
   "merged_upstream_deleted",
+  "merged_no_upstream",
   "detached_merged",
+  "merged_as_pr",
   "unmerged",
   "locked",
   "prunable",
@@ -63,7 +65,9 @@ describe("the worktree facet list", () => {
       ["dirty", { kind: "dirty", detail: 2 }],
       ["unpushed", { kind: "unpushed", detail: 1 }],
       ["never_pushed", { kind: "never_pushed" }],
+      ["merged_no_upstream", { kind: "merged_no_upstream" }],
       ["unmerged", { kind: "unmerged" }],
+      ["merged_as_pr", { kind: "merged_as_pr", detail: 7 }],
     ];
     for (const [kind, safety] of checked) {
       const facet = WORKTREE_FACETS.find((f) => f.kind === kind);

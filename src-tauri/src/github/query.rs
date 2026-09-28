@@ -38,6 +38,26 @@ query($q: String!, $first: Int!, $after: String) {
     nodes {
       ... on PullRequest {
         id number title url isDraft createdAt updatedAt
+        # When it became ready for review (#1407), which is `createdAt`
+        # only for a pull request that was never a draft. Filtered to the
+        # one event type and paged `last: 1`, because `map.rs`'s
+        # `ready_at` reads the LAST node as the ready time.
+        #
+        # No `totalCount`: the page is the latest event by construction,
+        # so there is no truncation to report.
+        #
+        # MEASURED free, 2026-09-24, this document extracted with its `#`
+        # comment lines stripped, `gh api graphql -F first=25`, before
+        # and after adding this line, three runs each: cost 2 before and
+        # 2 after on `author:@me`, `review-requested:@me`,
+        # `repo:kubernetes/kubernetes` and `repo:vercel/next.js`, and 2
+        # and 2 on those two repositories plus rust-lang/rust and
+        # microsoft/vscode in one search. Wall clock moved within the
+        # run-to-run spread (6.8-8.8s after against 7.4-8.8s before on
+        # kubernetes/kubernetes). `MEASURED_COST` in `poll.rs` stands.
+        timelineItems(itemTypes: [READY_FOR_REVIEW_EVENT], last: 1) {
+          nodes { ... on ReadyForReviewEvent { createdAt } }
+        }
         headRefName headRefOid baseRefName
         headRef { id }
         author { login }
@@ -473,9 +493,30 @@ query($owner: String!, $repo: String!, $number: Int!) {
       additions deletions changedFiles
       headRefName headRefOid baseRefName
         headRef { id }
+      # Where the head branch lives, so the review gates (#1451) ask the
+      # FORK who pushed a fork's head. An object, not a connection:
+      # MEASURED live 2026-09-25, this document costs 1 point with and
+      # without it.
+      headRepository { nameWithOwner }
       createdAt updatedAt
+      # When it became ready for review (#1457): the list query's own
+      # selection, read by the same `map.rs` `ready_at`, so the header
+      # and the row it was opened from date the pull request alike.
+      timelineItems(itemTypes: [READY_FOR_REVIEW_EVENT], last: 1) {
+        nodes { ... on ReadyForReviewEvent { createdAt } }
+      }
       author { login }
-      comments(first: 50) {
+      # The NEWEST 50, not the oldest (#1453). `first:` pages from the
+      # start of a connection, so a pull request with 80 comments showed
+      # its 50 oldest and dropped every newer one -- and the view renders
+      # oldest to newest, so the last row read as the latest while the
+      # latest was the one missing. `last:` still returns its page in
+      # chronological order, so the rendering is unchanged; only WHICH
+      # 50 arrive is. MEASURED 2026-09-25 on a pull request with 2,500
+      # comments: `last: 50` returned the newest 50 oldest-first, at cost
+      # 1; and this whole document, before and after this change, cost 1
+      # in three runs each.
+      comments(last: 50) {
         totalCount
         nodes { author { login } createdAt body }
       }
@@ -511,6 +552,15 @@ query($owner: String!, $repo: String!, $number: Int!) {
       # actual defect -- a reviewer deciding from a complete-looking view
       # of 20 of 25 threads decides on partial information without being
       # told it is partial.
+      #
+      # `first:` rather than the `last:` the comments above moved to
+      # (#1453), deliberately. The list query counts its badge from the
+      # FIRST 100 threads, and the header's unresolved count
+      # comes from the threads that arrived here: paging from opposite
+      # ends would let a row and the view it opens disagree about the
+      # same pull request above 100 threads. The view does not read the
+      # threads as a timeline either -- `ReviewThreads.tsx` sorts open
+      # ones first -- so "the last row is not the latest" does not arise.
       reviewThreads(first: 100) {
         totalCount
         nodes {
@@ -535,6 +585,14 @@ query($owner: String!, $repo: String!, $number: Int!) {
           # twenty-first THREAD could be an unanswered blocking question
           # the view never admitted existed. Different severity, and only
           # the second one was silent.
+          #
+          # And `first:`, not the `last:` the conversation comments above
+          # moved to (#1453). A thread's FIRST comment is its subject --
+          # the review remark the replies answer -- so `last: 10` would
+          # show a long thread as replies to a question it no longer
+          # carries. The cost of keeping the opener is that the newest
+          # replies are the ones cut, and `ReviewThreads.tsx` says exactly
+          # that rather than the bare "see the rest".
           comments(first: 10) {
             totalCount
             nodes { author { login } createdAt body }
@@ -570,8 +628,12 @@ query($owner: String!, $repo: String!, $number: Int!) {
       # covers any realistic pull request and the viewer's entry is
       # found by matching login.
       latestReviews(first: 20) { nodes { state author { login } } }
+      # `committedDate` is the head commit's own date for the header's
+      # "last commit" (#1457). The COMMITTER's clock, not the push: a
+      # rebase or a late push leaves it earlier than the push, which is
+      # why the view never calls it one.
       commits(last: 1) {
-        nodes { commit { statusCheckRollup {
+        nodes { commit { committedDate statusCheckRollup {
           state
           # 100 is the connection maximum. The page is NOT the cost --
           # measured on the list query, `first: 1` and `first: 20` cost
@@ -656,6 +718,87 @@ query ChecksPage($owner: String!, $repo: String!, $number: Int!, $after: String!
   }
 }"#;
 
+/// Where one pull request sits in a stack, looking DOWN toward the trunk
+/// (#1452).
+///
+/// A separate document from `PR_DETAIL_QUERY`, deliberately. The detail
+/// query turns any refused field into an error for the whole view (#854),
+/// and `stackEntry` is new enough that a server without it is plausible;
+/// a stack lookup that fails must cost the badge, not the pull request.
+/// It also runs CONCURRENTLY with the detail query (`fetch_pr_detail`),
+/// so it adds a point, not a round trip.
+///
+/// - `stackEntry` is GitHub's native stack (`gh stack`), with position and
+///   size as GitHub counts them. VERIFIED live against the schema
+///   2026-09-25: `PullRequest.stackEntry: PullRequestStackEntry` with
+///   `position: Int!` ("1 is the closest to the base branch") and
+///   `stack { number size }`.
+/// - The nested `baseRef.associatedPullRequests` is the base CHAIN, for
+///   stacks made any other way. `Ref.associatedPullRequests` is "pull
+///   requests with this ref as the HEAD ref" -- VERIFIED live: on a PR
+///   based on `main` it returns nothing, where a head-or-base reading would
+///   have returned every PR into `main`. So a non-empty answer on the BASE
+///   ref is the open pull request this one is stacked on. Four hops; the
+///   deepest selects no `baseRef`, which is how the mapper tells "the walk
+///   ran out" from "the chain ended".
+/// - `first: 2`, not 1, so two open pull requests from one branch read as
+///   ambiguous rather than as whichever GitHub listed first.
+/// - `defaultBranchRef` ends the walk with certainty: a base that IS the
+///   trunk has nothing below it.
+///
+/// MEASURED live 2026-09-25 (`gh api graphql`, this document verbatim):
+/// **cost 1**.
+pub const PR_STACK_QUERY: &str = r#"
+query PrStack($owner: String!, $repo: String!, $number: Int!) {
+  rateLimit { cost remaining resetAt }
+  repository(owner: $owner, name: $repo) {
+    defaultBranchRef { name }
+    pullRequest(number: $number) {
+      number headRefName baseRefName isCrossRepository
+      # `entries` is the native stack's whole membership, bottom first
+      # (#1468): the stack-merge confirmation names every open pull
+      # request a merge would land. 50 is past any stack `gh stack` makes;
+      # `totalCount` says when it is not, and the merge is then not
+      # offered. MEASURED live 2026-09-25 with this field: still cost 1.
+      stackEntry { position stack { number size
+        entries(first: 50) { totalCount nodes { position pullRequest { number title state } } }
+      } }
+      baseRef { associatedPullRequests(states: OPEN, first: 2) { nodes {
+        number baseRefName
+        baseRef { associatedPullRequests(states: OPEN, first: 2) { nodes {
+          number baseRefName
+          baseRef { associatedPullRequests(states: OPEN, first: 2) { nodes {
+            number baseRefName
+            baseRef { associatedPullRequests(states: OPEN, first: 2) { nodes {
+              number baseRefName
+            } } }
+          } } }
+        } } }
+      } } }
+    }
+  }
+}"#;
+
+/// One hop UP a stack: the open pull requests based on `$base` (#1452).
+///
+/// The upward direction cannot be nested the way `PR_STACK_QUERY` nests the
+/// downward one -- nothing on a `Ref` or a `PullRequest` lists the pull
+/// requests that TARGET it, so each hop needs the previous hop's head
+/// branch as a variable. The walk is therefore serial and bounded
+/// (`stack::UP_HOPS`), and a walk that stops early reports its total as a
+/// floor rather than a count.
+///
+/// MEASURED live 2026-09-25: **cost 1** per hop.
+pub const PR_STACK_UP_QUERY: &str = r#"
+query PrStackUp($owner: String!, $repo: String!, $base: String!) {
+  rateLimit { cost remaining resetAt }
+  repository(owner: $owner, name: $repo) {
+    pullRequests(baseRefName: $base, states: OPEN, first: 2) {
+      nodes { number headRefName isCrossRepository }
+    }
+  }
+}"#;
+
 /// The authenticated user's login, and what asking cost.
 ///
 /// # Why this is a named const and not an inline literal (#844)
@@ -708,6 +851,52 @@ query($q: String!) {
   matching: search(query: $q, type: ISSUE) { issueCount }
 }
 "#;
+
+/// How many branch names one merged-PR lookup asks about (#1440).
+///
+/// 36, the ceiling this app already chunks aliased searches at: GitHub
+/// answers 502 above roughly 44 aliases in one document. MEASURED live
+/// 2026-09-25: 36 aliases at `first: 10` cost ONE rate-limit point.
+pub const MERGED_HEADS_CHUNK: usize = 36;
+
+/// Merged pull requests for up to [`MERGED_HEADS_CHUNK`] head branch
+/// names in one repository (#1440).
+///
+/// The worktree view's merge detection is offline and content-based, and
+/// it loses a squash-merged branch as soon as the default branch edits the
+/// same files again. GitHub's record of the merge does not decay that way,
+/// so this document asks for it -- as a POSITIVE signal only; see
+/// `worktrees::github` for the strict rule the answer has to pass.
+///
+/// Each alias `hN` is bound to the variable `$hN`, so a branch name is
+/// never spliced into the document text: branch names are arbitrary
+/// strings the user (or an agent) chose, and quoting them by hand is how a
+/// name containing `"` becomes a malformed or different query.
+///
+/// `defaultBranchRef` is asked for because the rule needs the base to be
+/// the default branch as GITHUB names it, not as a local ref happens to.
+/// `headRefOid` is the exact commit GitHub merged, which is what the rule
+/// compares the worktree's HEAD against. `first: 10` because branch names
+/// are reused; a name merged more than ten times is simply not upgraded,
+/// which is the safe direction.
+pub fn merged_heads_query(n: usize) -> String {
+    let mut vars = String::new();
+    let mut aliases = String::new();
+    for i in 0..n {
+        vars.push_str(&format!(", $h{i}: String!"));
+        aliases.push_str(&format!(
+            "    h{i}: pullRequests(headRefName: $h{i}, states: MERGED, first: 10, \
+             orderBy: {{field: UPDATED_AT, direction: DESC}}) \
+             {{ nodes {{ number headRefOid baseRefName }} }}\n"
+        ));
+    }
+    format!(
+        "query($owner: String!, $name: String!{vars}) {{\n  \
+         rateLimit {{ cost remaining resetAt }}\n  \
+         repository(owner: $owner, name: $name) {{\n    \
+         defaultBranchRef {{ name }}\n{aliases}  }}\n}}\n"
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -910,6 +1099,103 @@ mod tests {
         );
     }
 
+    /// #1453: the conversation comments are the NEWEST page, and each
+    /// review thread's comments are its FIRST page.
+    ///
+    /// Opposite directions on purpose. `first: 50` on the conversation
+    /// kept the 50 oldest of a long discussion, so the last row the view
+    /// rendered read as the latest while every newer comment was missing.
+    /// A thread is the other way round: its first comment is the remark
+    /// the replies answer, and `last:` would cut exactly that. No mapper
+    /// test can see either -- they feed `json!` literals in whatever order
+    /// they like -- so only the document can pin it.
+    ///
+    /// Comment lines are stripped first: the query documents both choices
+    /// in prose right above the fields, and a guard matching its own
+    /// pattern inside a comment is #874's mistake.
+    #[test]
+    fn the_detail_query_asks_for_the_newest_comments_and_each_threads_opener() {
+        let code: String = PR_DETAIL_QUERY
+            .replace("\r\n", "\n")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (before_threads, threads) = code
+            .split_once("reviewThreads(")
+            .expect("the detail query asks for review threads");
+
+        let conversation = before_threads
+            .split_once("comments(")
+            .expect("the conversation comments sit before the threads")
+            .1
+            .split_once(')')
+            .expect("the connection closes")
+            .0;
+        assert_eq!(
+            conversation.trim(),
+            "last: 50",
+            "the conversation must fetch its NEWEST comments; `comments({conversation})` \
+             drops the latest ones on a long pull request while the view reads as current"
+        );
+
+        let per_thread = threads
+            .split_once("comments(")
+            .expect("each thread asks for its comments")
+            .1
+            .split_once(')')
+            .expect("the connection closes")
+            .0;
+        assert!(
+            per_thread.contains("first:"),
+            "a thread's page must start at its opener; `comments({per_thread})` would \
+             show replies to a remark it no longer carries"
+        );
+    }
+
+    /// #1457: the detail query asks for everything the header's dates are
+    /// read from -- `ready_at`'s fields, the same filtered `last: 1`
+    /// timeline page the list query pins, and the head commit's
+    /// `committedDate`.
+    ///
+    /// The mapper tests supply these themselves, so a document that stopped
+    /// asking would leave them green while the header silently lost its
+    /// dates (the #847 hole).
+    #[test]
+    fn the_detail_query_asks_for_the_dates_its_header_shows() {
+        let code: String = PR_DETAIL_QUERY
+            .replace("\r\n", "\n")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for f in fields_read_by(&["ready_at"]) {
+            assert!(
+                code.contains(&f),
+                "`ready_at` reads `{f}` and PR_DETAIL_QUERY does not select it"
+            );
+        }
+        assert!(
+            code.contains("timelineItems(itemTypes: [READY_FOR_REVIEW_EVENT], last: 1)"),
+            "the ready time is the LAST ready-for-review event, and only that event type"
+        );
+        assert!(
+            code.contains("... on ReadyForReviewEvent { createdAt }"),
+            "the event's own `createdAt` must be selected on the event fragment"
+        );
+        let head = code
+            .split_once("commits(last: 1)")
+            .expect("the head commit")
+            .1;
+        assert!(
+            head.split_once("statusCheckRollup")
+                .expect("the rollup")
+                .0
+                .contains("committedDate"),
+            "the head commit must select its own `committedDate` for \"last commit\""
+        );
+    }
+
     /// Every PAGED connection in the list query's node selection must
     /// select `totalCount`, or its truncation is silent again (#1089).
     ///
@@ -953,7 +1239,11 @@ mod tests {
         // `commits`/`contexts` carry no count the UI renders, and the
         // check list's own total is selected in the DETAIL query where it
         // is shown.
-        const EXEMPT: [&str; 3] = ["reviewThreads", "commits", "contexts"];
+        //
+        // `timelineItems` is `last: 1` of one event type (#1407): the page
+        // IS the answer, the latest ready-for-review event, so there is no
+        // truncation for a count to reveal.
+        const EXEMPT: [&str; 4] = ["reviewThreads", "commits", "contexts", "timelineItems"];
 
         let mut rest = nodes;
         let mut checked = 0;
@@ -1553,5 +1843,140 @@ mod tests {
              NO_SHAPE_GUARD with a reason (#854).",
             unguarded.join("\n  ")
         );
+    }
+
+    /// #1407: the list query asks for what `ready_at` reads, and ONLY the
+    /// ready-for-review event.
+    ///
+    /// The mapper tests feed `json!` literals that supply `timelineItems`
+    /// themselves, so dropping it from the document would leave them green
+    /// while every row read as UNKNOWN -- the #847 hole. And the mapper
+    /// takes the LAST node as "when it became ready", which is only true
+    /// while the connection is filtered to `READY_FOR_REVIEW_EVENT` and
+    /// paged `last: 1`: widen `itemTypes` and the last node could be a
+    /// label or a comment, dating the PR from that instead.
+    #[test]
+    fn the_list_query_asks_for_the_ready_for_review_event_only() {
+        let doc: String = PRS_QUERY
+            .replace("\r\n", "\n")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let nodes = doc
+            .split_once("... on PullRequest {")
+            .expect("the node selection")
+            .1;
+        for f in fields_read_by(&["ready_at"]) {
+            assert!(
+                nodes.contains(&f),
+                "`ready_at` reads `{f}` and PRS_QUERY does not select it; every \
+                 row would read as age unknown"
+            );
+        }
+        let args = nodes
+            .split_once("timelineItems(")
+            .expect("timelineItems is asked for")
+            .1
+            .split_once(')')
+            .expect("the connection closes")
+            .0;
+        assert!(
+            args.contains("itemTypes: [READY_FOR_REVIEW_EVENT]"),
+            "`timelineItems({args})` must be filtered to READY_FOR_REVIEW_EVENT \
+             alone: the mapper reads the last node as the ready time"
+        );
+        assert!(
+            args.contains("last: 1"),
+            "`timelineItems({args})` must take the LATEST event: a pull request \
+             marked ready, drafted again and re-marked became ready the second time"
+        );
+        assert!(
+            nodes.contains("... on ReadyForReviewEvent { createdAt }"),
+            "the event's own `createdAt` must be selected on the event fragment"
+        );
+    }
+
+    /// #1440: the merged-PR lookup asks for every field the strict rule
+    /// reads, and binds each branch name as a VARIABLE.
+    ///
+    /// `worktrees::github::map_merged_heads` reads `number`, `headRefOid`
+    /// and `baseRefName` per node and `defaultBranchRef { name }` once. A
+    /// mapper test feeds `json!` literals that supply those itself, so a
+    /// document that stopped asking for `headRefOid` would leave it green
+    /// while no row could ever qualify -- or, worse, one that stopped
+    /// filtering to `MERGED` would hand an open PR's head to a rule that
+    /// assumes it merged.
+    #[test]
+    fn the_merged_heads_query_asks_for_what_the_rule_reads() {
+        let q = merged_heads_query(3);
+        for f in [
+            "defaultBranchRef { name }",
+            "number",
+            "headRefOid",
+            "baseRefName",
+            "rateLimit { cost remaining resetAt }",
+        ] {
+            assert!(q.contains(f), "merged_heads_query must select `{f}`");
+        }
+        // One alias per name, each filtered to MERGED and bound to its
+        // own variable rather than to spliced text.
+        assert_eq!(q.matches("states: MERGED").count(), 3);
+        for i in 0..3 {
+            assert!(q.contains(&format!("$h{i}: String!")), "variable h{i}");
+            assert!(
+                q.contains(&format!("h{i}: pullRequests(headRefName: $h{i},")),
+                "alias h{i} must read its own variable"
+            );
+        }
+        assert!(
+            q.split_once("repository(owner: $owner, name: $name)")
+                .is_some(),
+            "the aliases must sit inside the repository they are about"
+        );
+    }
+
+    /// `PR_STACK_QUERY` asks for what `stack::parse_down` reads (#1452).
+    ///
+    /// The mapper tests feed `json!` literals, so a document that stopped
+    /// asking for `stackEntry` would leave every native stack reading as
+    /// "not stacked" with the suite green -- and "not stacked" is the
+    /// answer that re-offers the queue GitHub refuses.
+    #[test]
+    fn the_stack_query_asks_for_what_the_walk_reads() {
+        let q = PR_STACK_QUERY;
+        for f in [
+            "rateLimit { cost remaining resetAt }",
+            "defaultBranchRef { name }",
+            "number headRefName baseRefName isCrossRepository",
+            "stackEntry { position stack { number size",
+            "entries(first: 50) { totalCount nodes { position pullRequest { number title state } } }",
+        ] {
+            assert!(q.contains(f), "PR_STACK_QUERY must select `{f}`");
+        }
+        // Four hops down, each asking for the parent's number and base, and
+        // the deepest selecting NO `baseRef` -- that absence is how the
+        // mapper tells "ran out of hops" from "the chain ended".
+        let hop = "baseRef { associatedPullRequests(states: OPEN, first: 2) { nodes {";
+        assert_eq!(q.matches(hop).count(), 4, "four nested hops");
+        let deepest = q.rsplit_once(hop).map(|(_, r)| r).unwrap();
+        assert!(deepest.contains("number baseRefName"));
+        assert!(
+            !deepest.contains("baseRef {"),
+            "the deepest hop selects no baseRef"
+        );
+    }
+
+    /// `PR_STACK_UP_QUERY` asks for what `stack::parse_up` reads.
+    #[test]
+    fn the_stack_up_query_asks_for_what_the_walk_reads() {
+        let q = PR_STACK_UP_QUERY;
+        for f in [
+            "rateLimit { cost remaining resetAt }",
+            "pullRequests(baseRefName: $base, states: OPEN, first: 2)",
+            "nodes { number headRefName isCrossRepository }",
+        ] {
+            assert!(q.contains(f), "PR_STACK_UP_QUERY must select `{f}`");
+        }
     }
 }

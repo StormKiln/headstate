@@ -183,6 +183,35 @@ jobs:
             exit 1
           fi
 
+      # The step above only catches a DECREASE: BUILD_NUMBER climbs every
+      # run, so it clears a stale mark as easily as a current one (#787).
+      # This one catches the LAG -- a mark below the newest shipped
+      # `build<N>` asset -- and refuses the release until the committed
+      # record is right.
+      #
+      # This is where staleness is ENFORCED (#1418). Per commit, CI's
+      # `lint` only warns: failing there reddened every open PR and the
+      # merge queue after each mobile release, and the failure cannot
+      # move to push or scheduled runs on main because the desktop
+      # release gate reads every check-run attempt on a main commit. A
+      # mobile release attaches to no main commit, so failing here burns
+      # nothing, before twenty minutes of building.
+      #
+      # --require: a release is not the place to guess. If the Releases
+      # API cannot be read, the lag was not checked, and that fails too.
+      # GH_REPO because `gh` otherwise infers the repository from the
+      # checkout's remote; named explicitly so it cannot pick the wrong
+      # one. contents:read (this job's permission) covers listing and
+      # viewing releases.
+      - name: The build mark does not lag a shipped build
+        if: env.DRY_RUN != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 scripts/check-mobile-build-mark.py --require --release
+
       - uses: ./.github/actions/setup
         with:
           rust-components: clippy, rustfmt
@@ -567,6 +596,29 @@ jobs:
               print(result["success-message"])
           PY
           echo "TestFlight: version $VERSION, build $BUILD_NUMBER. Processing takes a few minutes."
+
+      # The store has now seen BUILD_NUMBER, so the committed mark lags
+      # it until someone raises it -- and the next mobile release's
+      # "build mark does not lag" step will refuse to run until they do.
+      # Said here, in the run summary, at the moment the number is
+      # consumed, rather than left for a CI warning to surface (#1418).
+      # Here and not in `publish`: a publish that fails after this upload
+      # still leaves the number consumed, so the follow-up still applies.
+      - name: Required follow-up (raise the build mark)
+        if: env.DRY_RUN != 'true'
+        run: |
+          set -euo pipefail
+          MARK_FILE=.github/mobile-build-high-water-mark
+          LINE="Set the last line of $MARK_FILE to $BUILD_NUMBER (a one-line PR to main)."
+          echo "::notice title=Required follow-up::$LINE"
+          {
+            echo "## Required follow-up: raise the mobile build mark"
+            echo
+            echo "Build **$BUILD_NUMBER** has reached TestFlight. $LINE"
+            echo
+            echo "Until it merges, CI warns on every commit, and the next mobile"
+            echo "release refuses to run. See docs/mobile-release-process.md."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

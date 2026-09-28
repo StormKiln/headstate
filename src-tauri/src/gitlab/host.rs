@@ -206,6 +206,7 @@ mod tests {
             return;
         };
         let dir = tempfile::tempdir().unwrap();
+        let _home = crate::auth::test_home::set(dir.path());
         let config = dir.path().join("config.yml");
         let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
             Ok(listener) => listener,
@@ -259,7 +260,6 @@ mod tests {
                 .env_clear()
                 .args(["api", "--hostname", "gitlab.example", "version"])
                 .current_dir(dir.path())
-                .env("HOME", dir.path())
                 .env("GLAB_CONFIG_DIR", dir.path())
                 .env("XDG_CONFIG_HOME", dir.path())
                 .env("XDG_CONFIG_DIRS", dir.path())
@@ -289,7 +289,6 @@ mod tests {
                 .env_clear()
                 .args(["config", "get", key, "--host", "gitlab.example"])
                 .current_dir(dir.path())
-                .env("HOME", dir.path())
                 .env("GLAB_CONFIG_DIR", dir.path())
                 .env("XDG_CONFIG_HOME", dir.path())
                 .env("XDG_CONFIG_DIRS", dir.path())
@@ -309,7 +308,6 @@ mod tests {
             let out = guarded
                 .args(["config", "get", key, "--host", "gitlab.example"])
                 .current_dir(dir.path())
-                .env("HOME", dir.path())
                 .env("GLAB_CONFIG_DIR", dir.path())
                 .env("XDG_CONFIG_HOME", dir.path())
                 .env("XDG_CONFIG_DIRS", dir.path())

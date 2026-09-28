@@ -31,6 +31,13 @@ aria-current={current(id === view)}   // "true" | undefined
 
 `aria-current` is for navigation; `aria-pressed` is for toggles.
 
+## Adding a shadcn component
+
+Use `make shadcn-add C=<name>`, not `yarn shadcn add`. The registry writes
+`import { cn } from "cn"` and adds the `cn` npm package. The target points the
+import at `@/lib/utils` and removes the package. `src/lib/cnImport.test.ts`
+fails if either is left behind (#1558).
+
 ## A component and its host can land in different PRs
 
 #1038 built a table and #1039 built the page meant to host it. Both PRs were

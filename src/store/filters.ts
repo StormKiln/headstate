@@ -2,6 +2,7 @@ import type { PrIdentity } from "../types/identity";
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import type { Filters } from "../lib/derive";
+import type { TranscriptShow } from "../components/transcript/filters";
 
 /// zustand holds UI state only. Server data lives in TanStack Query and is
 /// never duplicated here.
@@ -291,6 +292,9 @@ export type ClaudePage = "sessions" | "overview" | "plugins";
 /// body, which proposes one rather than smuggling it in here.
 export type ClaudeSessionFilter = "all" | "resumable" | "gone" | "running" | "ended";
 
+/// The two tabs on a selected session's pane (#1546).
+export type ClaudeSessionTab = "details" | "transcript";
+
 interface FilterStore {
   /// Filters are PER VIEW: a repo selected in My PRs must not leak into
   /// Worktrees, which has an entirely different repo list.
@@ -487,6 +491,35 @@ interface FilterStore {
   /// which is the reason `selectedPr` gives for the same choice.
   claudeSelected: string | undefined;
   selectClaudeSession: (id: string | undefined) => void;
+  /// Which tab the selected session's pane shows (#1546): its Details or
+  /// its Transcript.
+  ///
+  /// ONE choice for the pane, not one per session: it stays put while
+  /// the reader moves between sessions, so reading down the list with
+  /// the Transcript tab open shows each session's transcript in turn,
+  /// and a reader on Details is never dropped into a read they did not
+  /// ask for. A per-session map would also have to decide what an entry
+  /// means for a session that has since gone; one value cannot go stale.
+  ///
+  /// The transcript's one way in. This app routes through the store
+  /// rather than a URL, so "deep-linkable" means ONE action that any
+  /// caller -- a notification, the phone's list -- can fire to land on
+  /// it: `openClaudeTranscript` sets the page, the selected session and
+  /// this tab in one `set` (after `setView` when coming from another
+  /// view), for the reason `showClaudeSessions` gives about pairings a
+  /// caller could order wrongly.
+  ///
+  /// Not persisted, for `claudeSelected`'s reason, and reset to Details
+  /// when the view is left.
+  claudeSessionTab: ClaudeSessionTab;
+  setClaudeSessionTab: (tab: ClaudeSessionTab) => void;
+  /// Where the transcript opens (#1484): `"marker"` at this device's
+  /// "since you left" marker -- a notification's tap -- or `"latest"`,
+  /// the newest turn. Set by `openClaudeTranscript`; picking another
+  /// session or tab puts it back to `"latest"`, so the marker applies to
+  /// the one session and the one opening it was asked for.
+  claudeTranscriptAt: "latest" | "marker";
+  openClaudeTranscript: (id: string, at?: "latest" | "marker") => void;
   /// Where inside the selected repository the browser is (#1034).
   ///
   /// Repository-relative, `""` for the root, and it names a DIRECTORY --
@@ -551,6 +584,19 @@ interface FilterStore {
   /// eyes and screen, not about which list they happen to be reading.
   density: "comfortable" | "dense";
   setDensity: (density: "comfortable" | "dense") => void;
+  /// How tightly the desktop transcript renderer packs its rows (#1480).
+  ///
+  /// Its own setting rather than `density`: a transcript is read, not
+  /// scanned, and a reader who packs PR rows tight may still want
+  /// comfortable prose. Global for the reason `density` is, and
+  /// persisted with it.
+  transcriptDensity: "comfortable" | "compact";
+  setTranscriptDensity: (density: "comfortable" | "compact") => void;
+  /// What the transcript shows (#1484): thinking, tool calls, system
+  /// records, sidechains. Per device, persisted with the density; read
+  /// through `showFrom`, which treats a missing key as shown.
+  transcriptShow: Partial<TranscriptShow>;
+  setTranscriptShow: (show: TranscriptShow) => void;
   /// The PR the detail view is showing, or null for the list.
   ///
   /// Deliberately NOT persisted: reopening the app on a detail page for a
@@ -643,11 +689,15 @@ export const PERSIST_KEY = "headstate-filters";
 
 export const useFilters = create<FilterStore>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       filtersByView: { ...EMPTY_FILTERS },
       view: "my-prs",
       density: "comfortable",
       setDensity: (density) => set({ density }),
+      transcriptDensity: "comfortable",
+      setTranscriptDensity: (transcriptDensity) => set({ transcriptDensity }),
+      transcriptShow: {},
+      setTranscriptShow: (transcriptShow) => set({ transcriptShow }),
       setFilter: (key, value) =>
         set((s) => ({
           filtersByView: {
@@ -762,6 +812,8 @@ export const useFilters = create<FilterStore>()(
           // stale-control failure in the other direction.
           claudeShowSubagents: false,
           claudeSelected: undefined,
+          claudeSessionTab: "details",
+          claudeTranscriptAt: "latest",
           // And the browser's position (#1034), for the reason this
           // block gives throughout: a position inside one view means
           // nothing on another, and coming back to a file panel opened
@@ -800,9 +852,28 @@ export const useFilters = create<FilterStore>()(
           // number is a promise about what the next screen shows.
           claudeShowSubagents: false,
           claudeSelected: undefined,
+          claudeSessionTab: "details",
+          claudeTranscriptAt: "latest",
         }),
       claudeSelected: undefined,
-      selectClaudeSession: (claudeSelected) => set({ claudeSelected }),
+      selectClaudeSession: (claudeSelected) =>
+        set({ claudeSelected, claudeTranscriptAt: "latest" }),
+      claudeSessionTab: "details",
+      setClaudeSessionTab: (claudeSessionTab) =>
+        set({ claudeSessionTab, claudeTranscriptAt: "latest" }),
+      claudeTranscriptAt: "latest",
+      openClaudeTranscript: (id, at = "latest") => {
+        // Arriving from another view takes `setView`'s resets first --
+        // the selection, the bulk checks, the cursor -- rather than a
+        // second copy of that list here that could drift from it.
+        if (get().view !== "claude-code") get().setView("claude-code");
+        set({
+          claudePage: "sessions",
+          claudeSelected: id,
+          claudeSessionTab: "transcript",
+          claudeTranscriptAt: at,
+        });
+      },
       repoPath: "",
       // Descending or going up CLEARS the file being read, in one `set`
       // rather than two calls a caller has to order (#1034). The pairing
@@ -994,6 +1065,8 @@ export const useFilters = create<FilterStore>()(
         // the v4 migration drops, so the next launch would read it back
         // and the axis would survive its own removal.
         density: s.density,
+        transcriptDensity: s.transcriptDensity,
+        transcriptShow: s.transcriptShow,
       }),
     },
   ),

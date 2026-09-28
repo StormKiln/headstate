@@ -145,7 +145,11 @@ const ROWS: Row[] = [
   // the MAIN CHECKOUT only, where that one classifies every worktree.
   row(api.classifyRepoUpstream, [repoPath], "classify_repo_upstream", { repoPath }),
   row(api.actOnPr, [id, repo, number, action], "act_on_pr", { id, repo, number, action }),
-  row(api.removeWorktrees, [repoPath, worktreePaths], "remove_worktrees", { repoPath, worktreePaths }),
+  row(api.removeWorktrees, [repoPath, worktreePaths, 7], "remove_worktrees", {
+    repoPath,
+    worktreePaths,
+    runId: 7,
+  }),
   row(api.latestRelease, [], "latest_release"),
   row(api.dockerState, [], "docker_state"),
   row(api.dockerBuilds, [], "docker_builds"),
@@ -189,6 +193,32 @@ const ROWS: Row[] = [
     },
   ),
   row(api.claudeLaunchTerms, [], "claude_launch_terms"),
+  // #1455. The prompt travels as TEXT and the directory as the page's
+  // choice; Rust re-checks the directory and builds the line.
+  row(
+    api.claudifyPrCommand,
+    [repoPath, "octocat/hello-world", "Review it"],
+    "claudify_pr_command",
+    { repoPath, prRepo: "octocat/hello-world", prompt: "Review it" },
+  ),
+  row(
+    api.claudeLaunchPr,
+    [repoPath, "octocat/hello-world", "Review it", { model: "opus", permissionMode: "plan" }],
+    "claude_launch_pr",
+    {
+      repoPath,
+      prRepo: "octocat/hello-world",
+      prompt: "Review it",
+      model: "opus",
+      permissionMode: "plan",
+    },
+  ),
+  row(
+    api.claudeLaunchPrPreview,
+    [repoPath, "octocat/hello-world", "Review it"],
+    "claude_launch_pr_preview",
+    { repoPath, prRepo: "octocat/hello-world", prompt: "Review it", model: null, permissionMode: null },
+  ),
   row(
     api.claudeLaunchWorktreePreview,
     [repoPath, worktreePath, branch, { model: "opus" }],
@@ -202,6 +232,7 @@ const ROWS: Row[] = [
     { sessionId: "sess-1", cwd: "/tmp/x", model: null, permissionMode: "acceptEdits" },
   ),
   row(api.setAutoMerge, [id, repo, number, expectedHead, enable], "set_auto_merge", { id, repo, number, expectedHead, enable }),
+  row(api.mergeStack, [repo, number, "merge_queue", expectedHead], "merge_stack", { repo, number, action: "merge_queue", expectedHead }),
   row(api.deleteHeadBranch, [refId, repo, number, branch, merged], "delete_head_branch", { refId, repo, number, branch, merged }),
   row(api.updatePrBranch, [id, repo, number, expectedHead], "update_pr_branch", { id, repo, number, expectedHead }),
   row(api.actOnPrs, [prs, action], "act_on_prs", { prs, action }),
@@ -209,6 +240,12 @@ const ROWS: Row[] = [
   row(api.getGitLabDetail, [gitlabIdentity], "get_gitlab_detail", { identity: gitlabIdentity }),
   row(api.getGitLabActionCapabilities, [gitlabIdentity], "gitlab_action_capabilities", { identity: gitlabIdentity }),
   row(api.gitLabAction, [gitlabRequest], "gitlab_action", { request: gitlabRequest }),
+  row(
+    api.getReviewGates,
+    [repo, "main", "fork/r", "feat/x", "abc123"],
+    "get_review_gates",
+    { repo, base: "main", headRepo: "fork/r", headRef: "feat/x", headOid: "abc123" },
+  ),
   row(api.sizeWorktrees, [repoPath], "size_worktrees", { repoPath }),
   row(api.pullCheckout, [path], "pull_checkout", { path }),
   row(api.fetchRefs, [path], "fetch_refs", { path }),
@@ -302,8 +339,12 @@ const ROWS: Row[] = [
   // reads above it needs no resolution guard: the id is looked up in
   // Headstate's OWN table, so an id the store does not have returns
   // `null` rather than reaching the filesystem.
-  row(api.claudeSessionsForPr, ["acme/api", 7], "claude_sessions_for_pr", { repo: "acme/api", number: 7 }),
+  row(api.claudeSessionsForPrNumber, [7], "claude_sessions_for_pr_number", { number: 7 }),
   row(api.claudeSessionDetail, ["s1"], "claude_session_detail", { sessionId: "s1" }),
+  row(api.claudeSessionDigest, [], "claude_session_digest"),
+  row(api.claudeTranscriptOpeningPrompt, ["s1"], "claude_transcript_opening_prompt", {
+    sessionId: "s1",
+  }),
   row(api.claudeOverview, [], "claude_overview"),
   // #1212. No arguments: the report is over Headstate's own cache in
   // full, so there is nothing for a remote caller to steer.
@@ -318,14 +359,35 @@ const ROWS: Row[] = [
   row(api.claudeSubagentRollup, ["s1"], "claude_subagent_rollup", { sessionId: "s1" }),
   row(api.claudeSessionEvents, ["s1"], "claude_session_events", { sessionId: "s1" }),
   row(api.claudeEventProfile, [], "claude_event_profile"),
-  row(api.claudeTranscriptTail, [path], "claude_transcript_tail", { path }),
-  // #1208. `cursor` rides as an explicit `null` on the first poll rather
-  // than being omitted: the Rust argument is an `Option`, and a key that
-  // is present-and-null and a key that is absent must not become two
-  // different wire shapes for one call.
-  row(api.claudeTranscriptFollow, [path, null], "claude_transcript_follow", {
+  // #1475. Resolves `path` through `claude_transcript_path` like every
+  // transcript read. The block-text fetch addresses a block by its
+  // record's id and its index, camelCased on the wire as every
+  // multi-word argument is.
+  // #1220 adds the record's offset as a hint (`null` to scan).
+  row(api.claudeTranscriptBlockText, [path, "u1", 2, false, 4096], "claude_transcript_block_text", {
     path,
-    cursor: null,
+    messageId: "u1",
+    index: 2,
+    offset: 4096,
+  }),
+  // #1220. The anchor is a tagged object, snake_case inside as every
+  // transcript wire type is; the argument NAMES are the command's own.
+  row(
+    api.claudeTranscriptPage,
+    [path, { kind: "cursor", offset: 8192, behind_digest: "ab12" }, "after", 50],
+    "claude_transcript_page",
+    {
+      path,
+      anchor: { kind: "cursor", offset: 8192, behind_digest: "ab12" },
+      direction: "after",
+      limit: 50,
+    },
+  ),
+  // #1484. `query: null` is the outline, and is sent as null.
+  row(api.claudeTranscriptFind, [path, "needle", 20], "claude_transcript_find", {
+    path,
+    query: "needle",
+    limit: 20,
   }),
   row(api.claudeRevealPath, [path], "claude_reveal_path", { path }),
   row(api.readClaudeMd, [path], "read_claude_md", { path }),
@@ -354,6 +416,11 @@ const ROWS: Row[] = [
   row(api.respondToPairing, [requestId, approve, replaceExisting], "respond_to_pairing", { requestId, approve, replaceExisting }),
   row(api.listPairedDevices, [], "list_paired_devices"),
   row(api.revokePairedDevice, [deviceId], "revoke_paired_device", { id: deviceId }),
+  row(api.setPairedDeviceAccess, [deviceId, true, false], "set_paired_device_access", {
+    id: deviceId,
+    transcriptsAllowed: true,
+    revealAllowed: false,
+  }),
   // Both take no arguments: the health sample is of THIS machine and
   // the history is bounded on the Rust side, so there is nothing for a
   // caller to scope or to ask for more of.
@@ -457,6 +524,30 @@ describe("tauri.ts wrappers through the transport", () => {
     });
   });
 
+  /// The phone's Reveal (#1481, #1488) asks with `reveal: true`, and
+  /// ONLY then carries the key. Unlike `terms` above, `reveal` is not an
+  /// argument of either command: it is a directive to the remote
+  /// boundary, which strips it before dispatch (`privacy::admit`). So
+  /// the default shape is the rows above, byte for byte, and the key
+  /// appears only on the call that means it.
+  it("asks the desktop to reveal only when the caller says so", async () => {
+    await api.claudeTranscriptPage("/p.jsonl", { kind: "end" }, "before", null, true);
+    expect(local.call).toHaveBeenLastCalledWith("claude_transcript_page", {
+      path: "/p.jsonl",
+      anchor: { kind: "end" },
+      direction: "before",
+      limit: null,
+      reveal: true,
+    });
+    await api.claudeTranscriptBlockText("/p.jsonl", "u1", 2, true);
+    expect(local.call).toHaveBeenLastCalledWith("claude_transcript_block_text", {
+      path: "/p.jsonl",
+      messageId: "u1",
+      index: 2,
+      reveal: true,
+    });
+  });
+
   /// The pre-#1214 call shape still works and still says "no terms".
   ///
   /// A separate assertion rather than a second ROWS entry, because
@@ -536,6 +627,20 @@ const POLL_EVENTS: [string, () => unknown][] = [
   // work on the desktop and silently never fire on the phone, which is
   // the client with no window to leave open and wait in.
   ["stats-backfill-progress", () => hooks.useStatsBackfill("board|merged|*|org:X")],
+  // The fifteenth (#1477). A content-free nudge that a running session's
+  // transcript changed: the list's "active now" set hears every one, and
+  // the open transcript's follow hears its own session's. Through the seam
+  // for the reason every row here is: the phone is the client that most
+  // needs it, and a direct Tauri `listen` would never fire there.
+  ["claude-session-activity", hooks.useSessionActivity],
+  [
+    "claude-session-activity",
+    () =>
+      hooks.useClaudeTranscriptLive("/tmp/x.jsonl", {
+        liveness: { state: "dead", why: "fixture" },
+        sessionId: "s-1",
+      }),
+  ],
 ];
 
 function wrapper({ children }: { children: ReactNode }) {

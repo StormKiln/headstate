@@ -112,7 +112,7 @@ export function ConnectionBanner({ updatedAt = 0, githubAuthAvailable = true, se
   const gitlabSummary = gitlabQueueSummary(gitlab);
   const connected = state.kind === "connected";
   const githubFreshness = connected && githubEnabled && githubAuthAvailable === true && updatedAt > 0
-    ? ` · ${selection === "both" ? "GitHub " : ""}updated ${relativeTime(new Date(updatedAt).toISOString())}` : "";
+    ? ` · ${selection === "both" ? "GitHub updated" : "PRs updated"} ${relativeTime(new Date(updatedAt).toISOString())}` : "";
   const line = `${described.text}${githubFreshness}${connected && selection !== "github" ? ` · ${gitlabSummary.text}` : ""}`;
   const dot = connected && selection !== "github" && gitlabSummary.warning ? "bg-[#d29922]" : described.dot;
   return (

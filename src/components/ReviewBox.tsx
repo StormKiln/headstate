@@ -17,6 +17,8 @@ export function ReviewBox({
   viewer,
   author,
   latestReviews,
+  approveWontCount = null,
+  approveCaveat = null,
 }: {
   onSubmit: (verdict: ReviewVerdictName, body: string) => void;
   /// Which verdict is in flight, or null. All three disable together:
@@ -27,6 +29,13 @@ export function ReviewBox({
   author: string;
   /// Every reviewer's latest verdict, used to find the viewer's own.
   latestReviews?: { author: string; state: string }[];
+  /// The base branch requires the latest push to be approved by someone
+  /// else, and the viewer pushed it (#1451). The sentence to show. Approve
+  /// stays ENABLED: GitHub records the approval, it just does not count
+  /// toward merging, and the reviewer may still want it on record.
+  approveWontCount?: string | null;
+  /// The same rule with the pusher unknown: a qualifier, Approve stays.
+  approveCaveat?: string | null;
 }) {
   const [body, setBody] = useState("");
 
@@ -94,6 +103,7 @@ export function ReviewBox({
               type="button"
               disabled={!v.enabled || busy !== null}
               onClick={() => onSubmit(v.name, body)}
+              title={v.name === "approve" && approveWontCount ? approveWontCount : undefined}
               className={`rounded px-3 py-1.5 text-sm ${
                 v.name === "approve"
                   ? "bg-[#238636] font-medium text-white hover:bg-[#1a7f37] disabled:opacity-50"
@@ -107,6 +117,15 @@ export function ReviewBox({
           <span className="text-xs text-[#8b949e]">
             GitHub does not allow approving your own pull request.
           </span>
+        ) : approveWontCount ? (
+          // Prominent, and shown before AND after approving: the approval
+          // is recorded either way, so the one thing the reviewer must not
+          // take from "Approved" is that the merge is now unblocked.
+          <span role="status" className="text-sm font-medium text-[#d29922]">
+            {approveWontCount}
+          </span>
+        ) : approveCaveat ? (
+          <span className="text-xs text-[#8b949e]">{approveCaveat}</span>
         ) : null}
         {/* The other half of "did my click work": a verdict that is not
             an approval still deserves saying out loud, since the button

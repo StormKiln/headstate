@@ -1,7 +1,10 @@
 import { createContext, useContext } from "react";
 import type { ReactNode } from "react";
 import { ExternalLink } from "./ExternalLink";
-import rehypeSanitize from "rehype-sanitize";
+import { PROSE, clean } from "./markdownProse";
+import rehypeRaw from "rehype-raw";
+import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
+import type { Options as SanitizeSchema } from "rehype-sanitize";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -16,22 +19,27 @@ import remarkGfm from "remark-gfm";
 /// as this component's own parent, so it can simply say so.
 const InPre = createContext(false);
 
-/// A list nested in another list must not add the outer list's
-/// vertical margin -- see `List`.
-const InList = createContext(false);
-
-/// Strips react-markdown's `node` before it reaches the DOM.
+/// The sanitiser's schema: GitHub's own default, tightened in two ways.
 ///
-/// Every component override receives the hast AST node as a `node`
-/// prop. Spreading props onto an intrinsic element hands React an
-/// attribute it does not know, and React 19 stringifies it: every
-/// element this file overrides carried a literal
-/// `node="[object Object]"` in the rendered markup.
-function clean<P extends { node?: unknown }>(props: P): Omit<P, "node"> {
-  const rest = { ...props };
-  delete rest.node;
-  return rest;
-}
+/// - `open` is removed from every element. A `<details>` block must start
+///   COLLAPSED at every depth (#1456): CI bots nest large reports three
+///   levels deep, and an author's `<details open>` would unfold all of it
+///   the moment the comment is expanded. The reader opens what they want.
+/// - `<style>` is STRIPPED, contents and all. The default schema only
+///   unwraps an element it does not allow, which would print a style
+///   sheet's source as body text.
+///
+/// Everything else -- the tag allowlist, the `javascript:`-refusing
+/// protocol list, the absence of every `on*` and `style` attribute, the
+/// dropping of HTML comments -- is the default's, unchanged.
+const SCHEMA: SanitizeSchema = {
+  ...defaultSchema,
+  strip: [...(defaultSchema.strip ?? []), "style"],
+  attributes: {
+    ...defaultSchema.attributes,
+    "*": (defaultSchema.attributes?.["*"] ?? []).filter((a) => a !== "open"),
+  },
+};
 
 /// Renders untrusted Markdown from GitHub.
 ///
@@ -40,6 +48,11 @@ function clean<P extends { node?: unknown }>(props: P): Omit<P, "node"> {
 ///
 /// - `rehype-sanitize` strips scripts, event handlers and iframes. A
 ///   maintained sanitiser, not a hand-rolled regex.
+/// - Raw HTML IS parsed (`rehype-raw`), so `<details>` and `<summary>`
+///   render as real collapsible elements (#1456). It runs BEFORE the
+///   sanitiser, so everything it produces passes through the same
+///   allowlist as markdown-generated HTML. The order is the security
+///   property: raw HTML parsed after sanitising would be unsanitised.
 /// - Links open in the SYSTEM BROWSER via the opener plugin, never in the
 ///   app webview, so a link can never navigate the app itself.
 /// - The token lives in Rust memory and is never exposed to the webview,
@@ -53,7 +66,7 @@ export function Markdown({ children }: { children: string }) {
     <div className="text-sm leading-relaxed text-[#e6edf3]">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        rehypePlugins={[rehypeSanitize]}
+        rehypePlugins={[rehypeRaw, [rehypeSanitize, SCHEMA]]}
         components={{
           // `href` is optional in react-markdown's props but required
           // by ExternalLink, and an anchor with no target is not a link
@@ -78,48 +91,17 @@ export function Markdown({ children }: { children: string }) {
           img: (props) => (
             <img {...clean(props)} alt={props.alt ?? ""} className="max-w-full rounded" />
           ),
-          // VERTICAL RHYTHM. `prose-headstate` on the wrapper was
-          // never defined anywhere -- it appears once, on that div, with
-          // no matching rule -- so every block element fell back to the
-          // CSS reset, which strips margins. The blank lines in the
-          // source WERE parsed; the resulting <p>s just had nothing
-          // between them.
-          p: (props) => <p {...clean(props)} className="my-2" />,
-          ul: (props) => <List {...clean(props)} ordered={false} />,
-          ol: (props) => <List {...clean(props)} ordered={true} />,
-          li: (props) => <Item {...clean(props)} />,
-          blockquote: (props) => (
-            <blockquote
-              {...clean(props)}
-              className="my-2 border-l-2 border-[#30363d] pl-3 text-[#8b949e]"
-            />
+          ...PROSE,
+          // Collapsed by default: `open` is never passed, and the schema
+          // has already removed any the author wrote. The browser owns
+          // the toggle from there, so each level opens on its own.
+          details: ({ children }) => (
+            <details className="my-2 rounded border border-[#30363d] px-3 py-1">
+              {children}
+            </details>
           ),
-          hr: (props) => <hr {...clean(props)} className="my-4 border-[#30363d]" />,
-          // A heading needs more space ABOVE than below: it belongs to
-          // the text that follows it, and equal margins make it float
-          // between two sections instead of introducing one.
-          h1: (props) => <h1 {...clean(props)} className="mb-2 mt-5 text-base font-semibold" />,
-          h2: (props) => <h2 {...clean(props)} className="mb-2 mt-5 text-sm font-semibold" />,
-          h3: (props) => <h3 {...clean(props)} className="mb-1 mt-4 text-sm font-semibold" />,
-          // A comment body starts at whatever level its author felt
-          // like. Without these, h4-h6 fall through to the CSS reset
-          // and render at body size and body weight -- a heading
-          // indistinguishable from the paragraph under it.
-          h4: (props) => <h4 {...clean(props)} className="mb-1 mt-4 text-sm font-semibold" />,
-          h5: (props) => <h5 {...clean(props)} className="mb-1 mt-4 text-sm font-semibold" />,
-          h6: (props) => (
-            <h6 {...clean(props)} className="mb-1 mt-4 text-sm font-semibold text-[#8b949e]" />
-          ),
-          table: (props) => (
-            // `border-collapse`, or every cell's border doubles against
-            // its neighbour's and the table reads as a heavy grid.
-            <div className="my-3 overflow-x-auto">
-              <table {...clean(props)} className="w-full border-collapse text-xs" />
-            </div>
-          ),
-          td: (props) => <td {...clean(props)} className="border border-[#30363d] px-2 py-1" />,
-          th: (props) => (
-            <th {...clean(props)} className="border border-[#30363d] px-2 py-1 font-semibold" />
+          summary: ({ children }) => (
+            <summary className="cursor-pointer select-none py-1 font-semibold">{children}</summary>
           ),
         }}
       >
@@ -147,47 +129,3 @@ function Code({ className, ...props }: { className?: string; children?: ReactNod
     <code {...props} className="rounded bg-[#161b22] px-1 py-0.5 font-mono text-xs" />
   );
 }
-
-/// A NESTED list drops its vertical margin: `my-2` inside the parent's
-/// `li` stacks on that item's own spacing and opens a gap in the middle
-/// of a list that should read as one block.
-///
-/// The bullet is decided per ITEM, by `Item`, not here -- see there.
-///
-/// `className` is dropped (this computes its own) but everything else
-/// is passed through: an `<ol>` starting at `3.` carries `start`, and
-/// swallowing it would silently renumber the list from 1.
-function List({ ordered, start, children }: ListProps) {
-  const nested = useContext(InList);
-  const Tag = ordered ? "ol" : "ul";
-  return (
-    <InList value={true}>
-      <Tag
-        start={start}
-        className={`${nested ? "mt-1" : "my-2"} ${ordered ? "list-decimal" : "list-disc"} space-y-1 pl-5`}
-      >
-        {children}
-      </Tag>
-    </InList>
-  );
-}
-
-/// A task item is a checkbox, not a bullet.
-///
-/// GFM renders `- [ ]` as an `<input type="checkbox">` and marks the
-/// item `task-list-item`; the list's `list-disc` then gave it a bullet
-/// AND a box. Suppressing the marker on the LIST is wrong -- GFM puts
-/// `contains-task-list` on a list with even one task item, and a mixed
-/// list would lose the bullets from its ordinary items too. Only the
-/// task items themselves drop their marker.
-function Item({ className, ...props }: { className?: string; children?: ReactNode }) {
-  const task = (className ?? "").includes("task-list-item");
-  return <li {...props} className={task ? "list-none -ml-5 pl-5" : undefined} />;
-}
-
-type ListProps = {
-  ordered: boolean;
-  className?: string;
-  start?: number;
-  children?: ReactNode;
-};

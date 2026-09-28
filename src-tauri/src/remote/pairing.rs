@@ -585,6 +585,29 @@ impl PairingState {
         }
         Ok(removed)
     }
+
+    /// Set what one device may read of the session transcripts (#1488),
+    /// and refresh the listener's copy so the very next call is judged by
+    /// the new setting. Returns whether the device still existed.
+    pub fn set_transcript_access(
+        &self,
+        conn: &Connection,
+        id: i64,
+        transcripts_allowed: bool,
+        reveal_allowed: bool,
+    ) -> Result<bool, StoreError> {
+        let changed =
+            devices::set_transcript_access(conn, id, transcripts_allowed, reveal_allowed)?;
+        if changed {
+            log::info!(
+                "device {id}: transcripts {}, reveal {}",
+                if transcripts_allowed { "on" } else { "off" },
+                if reveal_allowed { "on" } else { "off" }
+            );
+            self.refresh_devices(conn);
+        }
+        Ok(changed)
+    }
 }
 
 fn event_for(request_id: u64, device: &NewDevice) -> PairingRequestEvent {
@@ -743,6 +766,10 @@ pub struct PairedDeviceSummary {
     pub has_mldsa: bool,
     pub paired_at: String,
     pub last_seen: Option<String>,
+    /// "Allow this phone to read session transcripts" (#1488).
+    pub transcripts_allowed: bool,
+    /// "Allow this phone to reveal hidden text" (#1488).
+    pub reveal_allowed: bool,
 }
 
 impl From<PairedDevice> for PairedDeviceSummary {
@@ -754,6 +781,8 @@ impl From<PairedDevice> for PairedDeviceSummary {
             has_mldsa: d.mldsa_pubkey.is_some(),
             paired_at: d.paired_at,
             last_seen: d.last_seen,
+            transcripts_allowed: d.transcripts_allowed,
+            reveal_allowed: d.reveal_allowed,
         }
     }
 }
@@ -856,6 +885,32 @@ pub fn revoke_paired_device(
         .revoke(&conn, id)
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+/// Settings > Paired devices: what one phone may read of the session
+/// transcripts (#1488).
+///
+/// Both switches in one call, because they are one decision: reveal
+/// means nothing for a phone that may not read transcripts at all, and
+/// the UI disables it then. Stored as sent rather than coerced, so
+/// turning transcripts back on restores the reveal choice the owner made.
+///
+/// Fails naming the device when it was revoked in the meantime -- a
+/// setting saved on nothing must not look saved.
+#[tauri::command]
+pub fn set_paired_device_access(
+    app: AppHandle,
+    state: State<'_, Arc<PairingState>>,
+    id: i64,
+    transcripts_allowed: bool,
+    reveal_allowed: bool,
+) -> Result<(), String> {
+    let conn = open_db(&crate::commands::db_path(&app)).map_err(|e| e.to_string())?;
+    match state.set_transcript_access(&conn, id, transcripts_allowed, reveal_allowed) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("this phone is no longer paired".into()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 #[cfg(test)]

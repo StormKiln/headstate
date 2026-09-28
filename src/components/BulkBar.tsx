@@ -3,6 +3,8 @@ import { useState } from "react";
 import { toast } from "sonner";
 import { useActOnPrs } from "../api/hooks";
 import type { PrActionName } from "../api/tauri";
+import { deriveStacked } from "../lib/derive";
+import { stackBlocksQueue, stackFactsFromList } from "../lib/stack";
 import { useFilters } from "../store/filters";
 import type { PullRequest } from "../types/pr";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
@@ -53,6 +55,23 @@ function noOp(pr: PullRequest, action: PrActionName): string | null {
   }
 }
 
+/// Why this action should not be SENT for this pull request, or null.
+///
+/// `noOp` (already in that state) plus the one refusal the list can
+/// predict: queueing a pull request stacked on another open one, which
+/// GitHub refuses (#1452). Stacking comes from `deriveStacked` over the
+/// whole list passed in, so a parent outside that list is not seen -- the
+/// detail view asks GitHub and gates on more; this gates on what it has.
+function skipReason(
+  pr: PullRequest,
+  action: PrActionName,
+  stacked: Map<string, number>,
+): string | null {
+  const same = noOp(pr, action);
+  if (same !== null) return same;
+  return action === "enqueue" ? stackBlocksQueue(stackFactsFromList(stacked.get(pr.id))) : null;
+}
+
 /// The bar shown while rows are selected.
 ///
 /// Every action confirms here, not just Close. A single merge applies
@@ -69,6 +88,8 @@ export function BulkBar({ prs }: { prs: PullRequest[] }) {
   // narrowed after selecting cannot silently shrink the batch.
   const selected = prs.filter((pr) => checked.includes(prKey(pr)));
   if (selected.length === 0) return null;
+  const stacked = deriveStacked(prs);
+  const skip = (pr: PullRequest, action: PrActionName) => skipReason(pr, action, stacked);
 
   // Split the SELECTION for the pending action, without changing it.
   //
@@ -85,8 +106,8 @@ export function BulkBar({ prs }: { prs: PullRequest[] }) {
   // true. Filtering the selection when rows are ticked would bake one
   // action's notion of redundancy into the selection itself, which is
   // the silent shrink under another name (#752).
-  const applicable = pending ? selected.filter((pr) => noOp(pr, pending) === null) : selected;
-  const skipped = pending ? selected.filter((pr) => noOp(pr, pending) !== null) : [];
+  const applicable = pending ? selected.filter((pr) => skip(pr, pending) === null) : selected;
+  const skipped = pending ? selected.filter((pr) => skip(pr, pending) !== null) : [];
 
   const run = (action: PrActionName) => {
     // The current command is GitHub.com-only. Fail the whole selection before
@@ -100,7 +121,7 @@ export function BulkBar({ prs }: { prs: PullRequest[] }) {
     // shown exactly which ones those are and confirmed against that
     // count, so this acts on what was agreed rather than on a batch
     // three of whose members were always going to be refused.
-    const targets = selected.filter((pr) => noOp(pr, action) === null);
+    const targets = selected.filter((pr) => skip(pr, action) === null);
     if (targets.length === 0) {
       // Nothing to do, and saying so beats a "0 updated" toast that
       // reads like the batch silently failed.
@@ -123,9 +144,12 @@ export function BulkBar({ prs }: { prs: PullRequest[] }) {
           // updated ones. The toast used to say "8 updated" when five
           // changed, which is the dishonesty #752 is about -- and a
           // count alone would leave the user wondering which three.
+          // "already in that state" only when it is true of every skipped
+          // row; a stacked one was skipped because GitHub would refuse it.
+          const allSame = selected.every((pr) => targets.includes(pr) || noOp(pr, action) !== null);
           const also =
             selected.length > targets.length
-              ? ` — ${selected.length - targets.length} skipped, already in that state`
+              ? ` — ${selected.length - targets.length} skipped${allSame ? ", already in that state" : ""}`
               : "";
           toast.success(`${ok} pull request${ok === 1 ? "" : "s"} updated${also}`);
           clearChecked();
@@ -157,7 +181,20 @@ export function BulkBar({ prs }: { prs: PullRequest[] }) {
     // page already hit this and fixed it for its own confirm dialog.
     // `z-10` clears the rows; the opaque background stops text showing
     // through as they scroll under it.
-    <div className="sticky top-0 z-10 mb-3 flex flex-wrap items-center gap-2 rounded-md border border-[#1f6feb] bg-[#0d1a2f] px-3 py-2 text-sm">
+    //
+    // NOT `top-0` (#1286, the same cause as #1278). The app header is
+    // itself `sticky top-0 z-20` in this same `<main>`, opaque, one
+    // z-layer up -- so at `top-0` this bar pinned exactly where the
+    // header already sits and was painted over: pinned and invisible,
+    // which looks identical to not sticking. `--app-header-h` is the
+    // header's measured height, published onto `<main>` by
+    // `useStickyHeaderOffset`; measured because the phone header (69px,
+    // a 44px tap-target hamburger) is taller than the desktop's (45px).
+    // The fallback applies only where nothing publishes it (jsdom).
+    <div
+      className="sticky z-10 mb-3 flex flex-wrap items-center gap-2 rounded-md border border-[#1f6feb] bg-[#0d1a2f] px-3 py-2 text-sm"
+      style={{ top: "var(--app-header-h, 0px)" }}
+    >
       <span className="font-medium">
         {selected.length} selected
       </span>
@@ -198,7 +235,10 @@ export function BulkBar({ prs }: { prs: PullRequest[] }) {
               // rather than appearing to have lost rows (#752).
               <p className="mt-2 text-sm text-[#d29922]">
                 {selected.length} selected — {skipped.length}{" "}
-                {skipped[0] ? noOp(skipped[0], pending) : ""}, so {skipped.length === 1 ? "it" : "they"}{" "}
+                {new Set(skipped.map((pr) => skip(pr, pending))).size === 1
+                  ? skip(skipped[0], pending)
+                  : "cannot be changed (see below)"}
+                , so {skipped.length === 1 ? "it" : "they"}{" "}
                 will be skipped.
               </p>
             ) : null}
@@ -211,7 +251,7 @@ export function BulkBar({ prs }: { prs: PullRequest[] }) {
                 shrink the unfiltered-list rule exists to prevent. */}
             <ul className="mt-3 max-h-64 overflow-y-auto text-sm text-[#8b949e]">
               {selected.map((pr) => {
-                const why = pending ? noOp(pr, pending) : null;
+                const why = pending ? skip(pr, pending) : null;
                 return (
                   <li key={prKey(pr)} className={`py-0.5 ${why ? "opacity-60" : ""}`}>
                     {pr.repo}#{pr.number} — {pr.title}

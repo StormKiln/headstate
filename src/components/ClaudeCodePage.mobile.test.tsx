@@ -1,7 +1,6 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
-  ClaudePreview,
   ClaudeSession,
   ClaudeSessionDetail,
   ClaudeSessionList,
@@ -11,6 +10,8 @@ import type {
 } from "@/types/pr";
 import { useFilters } from "@/store/filters";
 import { stubViewport } from "@/test-utils";
+import type { TranscriptPage } from "@/types/transcript";
+import { liveOf } from "./transcript/fixtures";
 
 /// The companion OFFERS this view and hides only what cannot work (#922).
 ///
@@ -52,15 +53,14 @@ const state = vi.hoisted(() => ({
   list: undefined as ClaudeSessionList | undefined,
   now: Date.parse("2026-09-13T12:00:00Z"),
   /// #959 and #982. Both commands are `Class::Read`, so unlike the two
-  /// reveal buttons the phone DOES get them -- and the preview is the one
-  /// Claude action whose phone case is stronger than the desktop's, since
+  /// reveal buttons the phone DOES get them -- and the transcript is the
+  /// one Claude read whose phone case is stronger than the desktop's, since
   /// `claude_reveal_path` is `Local` and there is otherwise no path to a
   /// transcript's content at all. Filled here so the tests below can
   /// assert that, rather than only that the Local controls are gone.
   usage: undefined as ClaudeUsage | undefined,
   rollup: undefined as ClaudeSubagentRollup | undefined,
   events: undefined as ClaudeObservation | undefined,
-  preview: undefined as ClaudePreview | undefined,
   /// One session's detail, keyed by id (#985). `Class::Read`, so the
   /// phone gets this too -- and the phone is who the split is for: the
   /// list crosses the pairing transport every ten seconds and was
@@ -69,9 +69,16 @@ const state = vi.hoisted(() => ({
   /// Every id the detail hook was asked for while enabled, so the tests
   /// below can assert the phone fetches ONE.
   detailAskedFor: [] as string[],
+  /// #1479's viewer feed. The phone reads it through the remote surface
+  /// exactly as the desktop reads it locally (`Class::Read`).
+  transcript: undefined as TranscriptPage | undefined,
+  /// The `sessionId` each transcript follow was given (#1477).
+  transcriptSessionIds: [] as (string | null | undefined)[],
 }));
 
 vi.mock("../api/hooks", () => ({
+  // #1477's "active now" set: no session nudged in this file.
+  useSessionActivity: () => new Set<string>(),
   // #1280's reverse lookup. `off` -- nothing typed here is a pull
   // request reference -- which is what every assertion in this file
   // assumes; `ClaudeCodePage.test.tsx` is where the other states are
@@ -123,33 +130,19 @@ vi.mock("../api/hooks", () => ({
       refetch: refetchFn,
     };
   },
-  // #1208: a FOLLOW. The phone's case for it is the stronger one -- the
-  // companion user cannot reach the machine, so a frozen snapshot of a
-  // RUNNING agent is the worst view in the app.
-  useClaudeTranscriptFollow: (path: string | null, enabled: boolean) => ({
-    messages: state.preview?.messages ?? [],
-    following: "following" as const,
-    lastReadAt: Date.UTC(2026, 0, 1, 12, 4, 31),
-    reread: null,
-    window:
-      state.preview === undefined
-        ? null
-        : {
-            truncated: state.preview.truncated,
-            file_bytes: state.preview.file_bytes,
-            bytes_read: state.preview.bytes_read,
-            non_conversation_records: state.preview.non_conversation_records,
-            unparseable_records: state.preview.unparseable_records,
-          },
-    isError: false,
-    error: undefined,
-    isLoading: enabled && path !== null && state.preview === undefined,
-    pollMs: 3_000,
-  }),
+  useClaudeTranscriptLive: (_path: string | null, options?: { sessionId?: string | null }) => {
+    state.transcriptSessionIds.push(options?.sessionId);
+    return liveOf(state.transcript);
+  },
 }));
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 vi.mock("../lib/clipboard", () => ({ copyText: copyFn }));
 vi.mock("../api/tauri", () => ({ claudeRevealPath: revealFn }));
+/// #1486: the per-session mute is the companion's own setting.
+const mute = vi.hoisted(() => ({ set: vi.fn(() => Promise.resolve()) }));
+vi.mock("@/api/phoneNotify", () => ({
+  useSessionMute: () => ({ muted: false, set: mute.set, loaded: true }),
+}));
 
 const { ClaudeCodePage } = await import("./ClaudeCodePage");
 
@@ -219,6 +212,7 @@ const listOf = (sessions: ClaudeSession[]): ClaudeSessionList => ({
   sessions,
   registry_failure: null,
   registry_unreadable: [],
+  registry_unnamed: [],
 });
 
 beforeEach(() => {
@@ -243,36 +237,20 @@ beforeEach(() => {
     // here renders.
     recorded_cost: null,
   };
-  state.preview = {
-    messages: [
-      {
-        role: "assistant",
-        timestamp: "2026-09-13T11:00:05Z",
-        model: "claude-opus-5",
-        blocks: [{ kind: "text", text: "Running the tests now.", truncated: false }],
-      },
-    ],
-    truncated: false,
-    bytes_read: 183_237,
-    file_bytes: 183_237,
-    non_conversation_records: 0,
-    unparseable_records: 0,
-    lifecycle: {
-      queue: null,
-      permission_mode: null,
-      worktree: { state: "unknown" },
-    },
-    pairings: {},
-    unanswered_calls: 0,
-    results_above_window: 0,
-  };
   // 390px: an iPhone 15's CSS width, comfortably under `MOBILE_BREAKPOINT`.
   stubViewport(390);
   // The search text and the selection live in the store since #939, and it
   // is a module singleton -- so a selection made by one test would open a
   // detail screen in the next one before it clicked anything, which on the
   // phone means the LIST is the thing that is hidden.
-  useFilters.setState({ claudeQuery: "", claudeSelected: undefined });
+  useFilters.setState({
+    claudeQuery: "",
+    claudeSelected: undefined,
+    claudeSessionTab: "details",
+    claudeTranscriptAt: "latest",
+  });
+  state.transcript = undefined;
+  state.transcriptSessionIds = [];
   copyFn.mockClear();
   revealFn.mockClear();
 });
@@ -281,8 +259,12 @@ afterEach(() => {
   stubViewport(null);
 });
 
+/// Open a session's DETAIL screen. Since #1481 a row opens the session
+/// at its transcript, as the Claude app opens a conversation; since
+/// #1546 the detail is the pane's "Details" tab.
 function open(name: string) {
   fireEvent.click(screen.getByRole("button", { name: new RegExp(name, "i") }));
+  fireEvent.click(screen.getByRole("tab", { name: "Details" }));
 }
 
 describe("the companion offers the view and hides only the Local actions", () => {
@@ -317,6 +299,39 @@ describe("the companion offers the view and hides only the Local actions", () =>
     expect(screen.getAllByText(/not running/i).length).toBeGreaterThan(0);
     open("HeadState GitHub issues filing");
     expect(screen.getByText(/pid 14779 is no longer running/i)).toBeTruthy();
+  });
+
+  /// #1486: the phone can mute ONE session's notifications from its
+  /// detail, without switching session notifications off.
+  it("offers a per-session mute on the phone", () => {
+    render(<ClaudeCodePage />);
+    open("HeadState GitHub issues filing");
+    fireEvent.click(screen.getByRole("checkbox", { name: /mute this session/i }));
+    expect(mute.set).toHaveBeenCalledWith(true);
+  });
+
+  /// Stop is desktop-only, and the phone says where it can be done
+  /// (#1219). But for a running session the desktop cannot stop either
+  /// (#1569), "from the Mac" would send the reader to a button that is not
+  /// there, so it says stopping is not available instead.
+  ///
+  /// SABOTAGE: made the phone test `stoppable === undefined` instead of
+  /// `=== false`. This FAILED on the non-stoppable half. Restored, passed.
+  it("points a stoppable session at the Mac, and says a non-stoppable one cannot be stopped", () => {
+    const running = { state: "running" as const, pid: 4242, status: null };
+    state.list = listOf([session({ liveness: running })]);
+    const { unmount } = render(<ClaudeCodePage />);
+    open("HeadState GitHub issues filing");
+    expect(screen.getByText(/can only be stopped from the Mac/i)).toBeTruthy();
+    expect(screen.queryByText(/not available, because/i)).toBeNull();
+    unmount();
+
+    state.list = listOf([session({ liveness: running, stoppable: false })]);
+    render(<ClaudeCodePage />);
+    open("HeadState GitHub issues filing");
+    expect(screen.getByText(/stopping it from Headstate is not available/i)).toBeTruthy();
+    expect(screen.queryByText(/can only be stopped from the Mac/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: /stop/i })).toBeNull();
   });
 
   /// The view says WHOSE sessions these are. A phone showing a session
@@ -509,18 +524,49 @@ describe("the companion offers the view and hides only the Local actions", () =>
   /// session died and not one word of what it was doing. The desktop user
   /// can `cat` the file; the phone cannot reach the machine at all.
   ///
-  /// **Sabotage:** wrap `<TranscriptPreview>` in `!IS_MOBILE_BUILD` in
-  /// `ClaudeCodePage` and this fails while every other test stays green.
-  it("lets the phone read a transcript, because claude_transcript_tail is Class::Read", () => {
+  /// Since #1514 the session's transcript is the viewer, in the phone
+  /// renderer, over `claude_transcript_page` (`Class::Read`); the old
+  /// preview pane is gone from this build. Since #1546 it is the pane's
+  /// Transcript tab.
+  it("lets the phone read a transcript in the viewer, because claude_transcript_page is Class::Read", () => {
+    state.transcript = {
+      messages: [
+        {
+          id: "a1",
+          id_source: "uuid",
+          turn_id: "a1",
+          kind: { kind: "assistant" },
+          timestamp: null,
+          model: null,
+          api_message_id: null,
+          usage: null,
+          duration_ms: null,
+          is_meta: false,
+          is_sidechain: false,
+          offset: null,
+          oversized_bytes: null,
+          blocks: [{ kind: "text", index: 0, text: "Running the tests now.", clip: null }],
+        },
+      ],
+      truncated: false,
+      bytes_read: 1_000,
+      file_bytes: 1_000,
+      machinery_records: [],
+      unparseable_records: 0,
+      duplicate_records: 0,
+    };
     render(<ClaudeCodePage />);
     open("HeadState GitHub issues filing");
 
-    // Behind the disclosure on the phone as on the desktop: a 256 KB read
-    // over the pairing transport is exactly what must not happen on every
-    // selection.
-    expect(screen.getByRole("button", { name: /follow the transcript/i })).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: /follow the transcript/i }));
-    expect(screen.getByText("Running the tests now.")).toBeTruthy();
+    // The old preview pane is not rendered beside it (#1514).
+    expect(screen.queryByText(/what it was doing/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: /follow the transcript/i })).toBeNull();
+    // On Details, no transcript is mounted and none is followed.
+    expect(screen.queryByTestId("phone-transcript")).toBeNull();
+    fireEvent.click(screen.getByRole("tab", { name: "Transcript" }));
+    const pane = screen.getByRole("tabpanel");
+    expect(within(pane).getByText("Running the tests now.")).toBeTruthy();
+    expect(within(pane).getByTestId("phone-transcript")).toBeTruthy();
   });
 
   /// The viewport stub is load-bearing and is asserted rather than
@@ -543,5 +589,89 @@ describe("the companion offers the view and hides only the Local actions", () =>
     expect(screen.getByRole("button", { name: /HeadState GitHub issues filing/i })).toBeTruthy();
     open("HeadState GitHub issues filing");
     expect(screen.getByRole("button", { name: /all sessions/i })).toBeTruthy();
+  });
+});
+
+/// #1481, #1546: on the phone a session row opens the session's screen
+/// at its Transcript tab, beside the "← All sessions" back link.
+describe("the transcript viewer on the phone", () => {
+  const prompt = (): TranscriptPage => ({
+    messages: [
+      {
+        id: "u1",
+        id_source: "uuid",
+        turn_id: "u1",
+        kind: { kind: "user_prompt", origin: null },
+        timestamp: null,
+        model: null,
+        api_message_id: null,
+        usage: null,
+        duration_ms: null,
+        is_meta: false,
+        is_sidechain: false,
+        offset: null,
+        oversized_bytes: null,
+        blocks: [{ kind: "text", index: 0, text: "run the tests", clip: null }],
+      },
+    ],
+    truncated: false,
+    bytes_read: 1_000,
+    file_bytes: 1_000,
+    machinery_records: [],
+    unparseable_records: 0,
+    duplicate_records: 0,
+  });
+
+  /// The entry point (#1481): the list opens the session on its
+  /// Transcript tab, in the phone renderer -- the prompt is a bubble, not
+  /// the placeholder's "You" header.
+  it("opens from the session list on the Transcript tab, in the phone renderer", () => {
+    state.transcript = prompt();
+    render(<ClaudeCodePage />);
+    fireEvent.click(screen.getByRole("button", { name: /HeadState GitHub issues filing/i }));
+
+    expect(screen.getByRole("tab", { name: "Transcript" }).getAttribute("aria-selected")).toBe(
+      "true",
+    );
+    const tab = screen.getByTestId("transcript-tab");
+    expect(tab.textContent).toContain("run the tests");
+    expect(tab.querySelector('[data-slot="bubble"]')).not.toBeNull();
+    expect(screen.getByTestId("phone-transcript")).toBeTruthy();
+    // Told whose transcript it is, so this session's nudges read at once
+    // on the phone and nobody else's do (#1477).
+    expect(state.transcriptSessionIds.length).toBeGreaterThan(0);
+    expect(new Set(state.transcriptSessionIds)).toEqual(
+      new Set(["e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2"]),
+    );
+  });
+
+  /// The tabs and the back link share the phone screen: Details and back
+  /// again by tab, and the list by the back link.
+  ///
+  /// The memory bound (#1476) holds across the switch: on Details the
+  /// phone transcript is UNMOUNTED, so no pages are held for it.
+  ///
+  /// **Sabotage:** pass `keepMounted` to the Transcript panel and the
+  /// phone transcript is still in the tree on Details.
+  it("reaches Details by tab, keeps no transcript mounted there, and the list by its back link", () => {
+    state.transcript = prompt();
+    render(<ClaudeCodePage />);
+    fireEvent.click(screen.getByRole("button", { name: /HeadState GitHub issues filing/i }));
+    expect(screen.getByRole("button", { name: /all sessions/i })).toBeTruthy();
+    expect(screen.getByRole("tablist", { name: "Session" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("tab", { name: "Details" }));
+    expect(screen.queryByTestId("transcript-tab")).toBeNull();
+    expect(screen.queryByTestId("phone-transcript")).toBeNull();
+    expect(screen.getByText(/pid 14779 is no longer running/i)).toBeTruthy();
+
+    // And from the detail, back into the transcript.
+    fireEvent.click(screen.getByRole("tab", { name: "Transcript" }));
+    expect(screen.getByTestId("phone-transcript")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /all sessions/i }));
+    expect(screen.queryByTestId("transcript-tab")).toBeNull();
+    expect(screen.queryByRole("tablist")).toBeNull();
+    expect(useFilters.getState().claudeSelected).toBeUndefined();
   });
 });

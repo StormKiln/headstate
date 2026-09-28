@@ -251,6 +251,8 @@ mod tests {
                     .map(|k| k.expanded_key().verifying_key().encode().to_vec()),
                 paired_at: "2026-09-05T00:00:00Z".into(),
                 last_seen: None,
+                transcripts_allowed: true,
+                reveal_allowed: false,
             }
         }
 

@@ -53,6 +53,7 @@ import { StatusBar } from "./components/StatusBar";
 import { SystemHealthSidebar } from "./components/SystemHealthSidebar";
 import { ConnectionBanner } from "./components/ConnectionBanner";
 import { StaleRibbon } from "./components/StaleRibbon";
+import { SessionNotifications } from "./components/SessionNotifications";
 import { IS_DESKTOP_BUILD, IS_MOBILE_BUILD } from "./lib/target";
 import { usePullToRefresh } from "./lib/usePullToRefresh";
 import { useStickyHeaderOffset } from "./lib/useStickyHeaderOffset";
@@ -730,6 +731,10 @@ export default function App() {
           of mind, and `ConnectionBanner` was the only component in the
           app reading the connection state at all. */}
       <StaleRibbon />
+      {/* #1486: a tapped session notification opens its transcript, and
+          other sessions' transitions toast while the app is open. The
+          companion's own commands, so the phone build only. */}
+      {IS_MOBILE_BUILD && <SessionNotifications />}
       <div className="flex min-h-0 flex-1">
       {isMobile ? (
         // The same sidebar component, in a sheet. Its own `w-64` and

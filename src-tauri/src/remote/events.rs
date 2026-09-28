@@ -3,7 +3,7 @@
 //!
 //! # How events get here
 //!
-//! The poll loop and a few commands `app.emit(...)` the nine events in
+//! The poll loop and a few commands `app.emit(...)` the events in
 //! [`EVENT_NAMES`], which the frontend's hooks listen for. The hub taps
 //! them with `listen_any` on the `AppHandle`, one listener per name,
 //! rather than by wrapping each emit site in a helper that also pushes
@@ -160,6 +160,29 @@ pub const EVENT_NAMES: &[&str] = &[
     // foreground. Without this the phone shows a caveat that never moves,
     // which is indistinguishable from one that is broken.
     "stats-backfill-progress",
+    // The fifteenth, and the first about a Claude Code session (#1477):
+    // `{ session_id, size, seq }` when a RUNNING session's transcript
+    // changed, so a phone reading that transcript fetches within about a
+    // second instead of waiting out its poll's backoff.
+    //
+    // It carries NO transcript text, and must never start to. #1488's
+    // masking covers `/v1/call` answers only; nothing on this list is
+    // masked, so an event is only safe to add here if nothing in it came
+    // out of a transcript. `claude::activity`'s
+    // `the_payload_carries_no_transcript_content` pins the field set.
+    //
+    // Weighed on the same test as the entries above, and it passes
+    // trivially: `claude_sessions`, an allowlisted Read, already RETURNS
+    // every session id to this phone, and a byte size says only that the
+    // file changed -- which the phone's next page read would say anyway.
+    // No path, no name, no counts.
+    //
+    // Volume: emitted only on change, at most `MAX_PER_TICK` (8) per
+    // second however many sessions are writing, and none while nothing
+    // is. A nudge lost to a lag cut or a reconnect costs latency only:
+    // the follow keeps its own poll. `claude::activity`'s module docs
+    // carry the worst case against `CAPACITY`.
+    "claude-session-activity",
 ];
 
 /// The event name the opening snapshot frame is sent under, so the
@@ -173,7 +196,13 @@ pub const KEEP_ALIVE: Duration = Duration::from_secs(15);
 /// burstiest producer is `worktree-removal-progress`, one frame per
 /// worktree removed; a phone keeps up with that unless its socket has
 /// stopped draining, and then ending the stream is the right answer.
-const CAPACITY: usize = 256;
+///
+/// The steadiest producer is `claude-session-activity` (#1477): only on
+/// change, and capped at `claude::activity::MAX_PER_TICK` frames per
+/// second however many sessions are writing -- so nudges alone take at
+/// least `CAPACITY / MAX_PER_TICK` = 32 s of a socket not draining to
+/// fill this, and a nudge lost to the cut costs latency, not data.
+pub(crate) const CAPACITY: usize = 256;
 
 /// One event as the webview received it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -771,6 +800,16 @@ pub(crate) mod tests {
             Some(("poll-error".into(), "\"rate limited\"".into()))
         );
         server.handle.stop().await;
+    }
+
+    /// The nudges' worst case fits the buffer with room to spare: a
+    /// subscriber is not cut by nudges alone until its socket has
+    /// stopped draining for `CAPACITY / MAX_PER_TICK` ticks (#1477).
+    #[test]
+    fn nudges_alone_take_thirty_seconds_of_a_stalled_socket_to_fill_the_buffer() {
+        let ticks = CAPACITY / crate::claude::activity::MAX_PER_TICK;
+        let secs = ticks as u64 * crate::claude::activity::TICK.as_secs();
+        assert!(secs >= 30, "only {secs}s of nudges fill CAPACITY");
     }
 
     #[test]

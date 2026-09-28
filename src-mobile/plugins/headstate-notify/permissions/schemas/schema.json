@@ -329,6 +329,18 @@
           "type": "string",
           "const": "deny-request-permission",
           "markdownDescription": "Denies the request_permission command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the take_tapped command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-take-tapped",
+          "markdownDescription": "Enables the take_tapped command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the take_tapped command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-take-tapped",
+          "markdownDescription": "Denies the take_tapped command without any pre-configured scope."
         }
       ]
     }

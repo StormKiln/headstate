@@ -12,6 +12,16 @@
 //! `Gemfile`, Gradle, an Xcode bundle whether or not SPM is resolved, and
 //! a `pyproject.toml` no recognised tool owns.
 //!
+//! An Xcode project under `<app>/gen/apple`, or a Gradle build under
+//! `<app>/gen/android`, where `<app>` holds a Tauri config
+//! (`tauri.conf.json`, `tauri.conf.json5` or `Tauri.toml`), is not a
+//! toolchain (#1396). It is the project `tauri ios init` or `tauri android
+//! init` generates, and the Tauri CLI drives it (`tauri ios build`);
+//! nobody runs `xcodebuild` on it directly, so offering `xcodebuild build`
+//! for it was a gap nobody could close. The rule is exactly Tauri's
+//! documented layout and no wider: a hand-made Xcode project elsewhere,
+//! or a `gen/apple` with no Tauri config beside `gen`, is still detected.
+//!
 //! Two of `detect.rs`'s helpers swallow read errors (`has_xcode_spm` and
 //! `has_project_file` return `false` when `read_dir` fails, and an
 //! unreadable `pyproject.toml` with no lockfile falls through to nothing).
@@ -32,14 +42,29 @@
 //! never "recommends". A manager token inside a path (`src-tauri/Cargo.toml`)
 //! fails the first-token rule and counts for nothing.
 //!
+//! Leading `NAME=value` environment assignments are skipped before the
+//! first token, as in a script body (#1412: `CI=1 yarn test` names yarn's
+//! test). For `make` and `just` the target is the first positional word:
+//! options are skipped, and so is the value of one that takes a value
+//! (`-C dir`, `-f file`, `--justfile file`, a number after `-j`), so
+//! `make -j4 lint` names lint and `make -C lint` names nothing. A target
+//! run with `-C` or `-f` names its verb, but its recipe is not followed
+//! (below).
+//!
 //! The files searched are every CLAUDE.md the scan loaded, their imports,
 //! and the repository's `.claude/rules/*.md` (`claudemd::rules`, #1340),
 //! path-scoped or not: a rule loads when a session works where its
-//! `paths:` point, as a nested CLAUDE.md does. The sentence counts the two
-//! apart ("none of the 4 files read or 10 rules names …"). A file two
-//! CLAUDE.md files both import is one file read, not two (#1350). Docs linked
-//! from a CLAUDE.md by an ordinary markdown link are not searched: they
-//! are not loaded into a session, so they instruct nothing until read.
+//! `paths:` point, as a nested CLAUDE.md does. So are the skills
+//! (`claudemd::skill_files`, #1394): every `SKILL.md` under the
+//! repository's `.claude/skills` and the user's `~/.claude/skills`, the
+//! walk the transcripts producer's "already written" corpus uses (#1370).
+//! A gate documented in a skill the root CLAUDE.md points at is
+//! documented; plugin skills are out of scope (#1365). The sentence counts
+//! the three apart ("none of the 7 files read, 2 rules or 4 skills names
+//! …"). A file two CLAUDE.md files both import is one file read, not two
+//! (#1350). Docs linked from a CLAUDE.md by an ordinary markdown link are
+//! not searched: they are not loaded into a session, so they instruct
+//! nothing until read.
 //!
 //! The target-to-verb map is by name (`test*`, `lint*`, `fmt*|format*`,
 //! `build*`, `dev|run|start|serve`, `deploy|release|publish`). A target
@@ -55,10 +80,72 @@
 //! `jest`, `mocha` and `playwright test` to test, `tsc` and `vite build`
 //! to build. A command running another script (`npm run <s>`) maps `<s>`
 //! by name, else by its body, one level only. One script can offer
-//! several verbs, and a loaded file naming it names all of them. The tool
-//! map applies to bodies only: a loaded file naming `npx prettier` still
-//! names no script. Makefile and justfile recipes are not read this way:
-//! their bodies are shell and the target parser does not read them.
+//! several verbs, and a loaded file naming it names all of them.
+//!
+//! The same tool map reads a binary a loaded file runs through a manager
+//! (#1392): `yarn vitest run`, `npx prettier --check .`, `pnpm exec
+//! eslint`, `bunx tsc`, `yarn dlx`, `bun x`, and `yarn|pnpm|bun [run]
+//! <bin>`. This reverses #1341's decision that the map applies to bodies
+//! only ("`npx prettier` in a CLAUDE.md still names nothing"): on this
+//! repository `src/CLAUDE.md` names `yarn vitest run`, which is what the
+//! `test` script runs, and the test gap it produced was false. A command
+//! that runs a tool directly names what that tool does. The command is
+//! credited to the manager that ran it (`npx`, `yarn`), so it covers the
+//! JS family's verb and no other toolchain's. A script of the same name
+//! takes precedence (`yarn test` is the script, and `yarn vitest` runs a
+//! script called `vitest` when one exists); `npm run` runs scripts only;
+//! a manager's own subcommand (`yarn install`) names nothing.
+//!
+//! A body that runs a repository script file (`bash <file>`, `sh <file>`,
+//! `node <file>`, `./<file>`) is followed into it one level (#1376: a
+//! `verify` running `bash tools/verify.sh`, which ran prettier, was
+//! reported as naming no format command). The file resolves against the
+//! package's directory and must stay under the repository, checked
+//! lexically and again through symlinks; one outside it is never read.
+//! Its non-comment lines (`#`, `//`) are read with the same tool map, and
+//! a file it runs in turn is not followed. Lines are read by their first
+//! words, so a tool a `node` file spawns from inside a JS expression is
+//! not found. A file that could not be read, or lies outside the
+//! repository, makes that script's verbs Unknown, not uncovered: a gap a
+//! loaded file naming the script might cover is a [`Severity::Unknown`]
+//! finding naming the file, and the script is not listed as "other". A
+//! script nothing names changes nothing. A script file is followed from a
+//! package.json body only: a make recipe running one (`./scripts/x.sh`)
+//! maps by its first word, which names nothing.
+//!
+//! A make or just target a loaded file names also names what its recipe
+//! runs (#1393: `make lint` ran `cargo clippy` through `lint-rust`, and
+//! the cargo lint gap was reported anyway). `packages::scripts` reads each
+//! target's prerequisites and recipe lines from the file the target was
+//! parsed from; the target is followed through its prerequisites and any
+//! recipe line calling the same manager (`$(MAKE) <t>`, `make <t>`, `just
+//! <t>`), recursively, each target once. `-C`, `-f` and `--justfile` point
+//! at another file, which is not followed. Each recipe command is mapped
+//! as a loaded file's would be, split at `&&`, `||`, `;` and `|`, with
+//! `NAME=value` assignments and shell keywords (`do`, `then`) skipped: `cd
+//! a && cargo clippy` is cargo's lint and `yarn vitest run` yarn's test. A
+//! makefile variable assigned a literal (`CARGO := cargo`) is read; a
+//! command still starting with any other variable reference is not a
+//! literal and is skipped. A target named for a verb credits that verb
+//! and no other, to the toolchain each command runs: a command counts when
+//! it maps to that verb or to none (`yarn knip` under `lint` is yarn's
+//! lint), and a typecheck (`tsc`) under a lint target is lint. A command
+//! mapping only to another verb counts for nothing: on this repository
+//! `make lint` runs `lint-ui`, whose `yarn tsc -b` the tool map calls
+//! build, and a lint target does not document how to build the app, so
+//! crediting it would hide the build gap (a false negative, the defect
+//! #1393 fixed turned around). A target named for no verb (`verify`,
+//! `check`) credits whatever each command maps to: `tsc -b && vitest`
+//! there is build and test. A recipe reaching a target
+//! the file does not define is reaching a file, unless the makefile is
+//! open-ended (`scripts::makefile_is_open_ended`: an `include` or a `%`
+//! pattern rule), when that target might be defined where the parser
+//! cannot see: the gaps the named target might cover are
+//! [`Severity::Unknown`], naming the target, for every toolchain. So are
+//! they when whether the makefile is open-ended could not be read (#1411):
+//! the Unknown names the makefile and the io error, because a failed read
+//! is not a closed makefile. A target name two makefiles share takes the
+//! union of what either runs.
 //!
 //! A JS launcher is read through to the tool it runs (#1323): `npx`,
 //! `bunx`, `pnpm exec`, `bun x` and `pnpm nx` name what follows them, and
@@ -78,15 +165,44 @@
 //! never a package.json `test` script, because a Rust suite being named
 //! says nothing about whether the JS suite is.
 //!
+//! A binary a JS manager runs (#1392) is credited to that manager, so
+//! `npx prettier` covers the JS family's format and nothing else. What a
+//! named target's recipe runs (#1393) is credited to the manager that
+//! runs it in the recipe, not to `make`: `make lint` reaching `cargo
+//! clippy` covers cargo's lint, as `cargo clippy` named directly would,
+//! and make's own lint by name as before. Which verb it credits is the
+//! target's own when its name has one (above).
+//!
+//! # One finding per verb
+//!
+//! Each uncovered verb is one finding, listing every toolchain that offers
+//! it and nothing covers (#1395): on this repository `make dev` is `yarn
+//! tauri dev`, which builds and runs the Rust side, and `yarn dev`, `cargo
+//! run` and `make dev` were three findings for one workflow. The sentence
+//! names each toolchain with only the members offering the verb ("cargo
+//! (Cargo.toml at src-tauri) offers `run`"), then what each offers, then
+//! every command nothing names; the evidence cites each offer where it was
+//! found. Only the scripts, targets or subcommands for that verb are
+//! listed, not everything a toolchain offers (#1376). Whether a toolchain
+//! is covered is still decided per toolchain, by the rule above; this
+//! changes only how the uncovered ones are grouped. A toolchain whose
+//! negative cannot be decided is not folded into the Advice finding: the
+//! same verb gets a second, [`Severity::Unknown`], finding for those.
+//!
+//! `cargo run` is offered only for a crate with a binary target:
+//! `src/main.rs`, `src/bin/`, or `[[bin]]` in `Cargo.toml`. A library
+//! crate cannot be run.
+//!
 //! # A negative needs a complete scan
 //!
 //! A positive ("`make lint` is named at `CLAUDE.md:13`") stands whatever
 //! else was unreadable. A negative ("nothing names `make build`") is an
 //! [`Severity::Advice`] finding only when every file a session would load
 //! was read: no unreadable scope, directory or file in the scan, no
-//! unreadable import, no file this producer failed to re-read, and no
-//! `.claude/rules` directory or rule that exists and could not be read.
-//! Otherwise the same (toolchain, verb) is a [`Severity::Unknown`] finding
+//! unreadable import, no file this producer failed to re-read, no
+//! `.claude/rules` directory or rule that exists and could not be read,
+//! and no skills directory or `SKILL.md` that exists and could not be
+//! read (#1394). Otherwise the verb's finding is [`Severity::Unknown`],
 //! naming what could not be read. `skipped_dirs` qualifies nothing; it is
 //! a documented exclusion.
 //!
@@ -108,9 +224,9 @@
 
 use super::{Check, Context, Evidence, Finding, Locator, Producer, Severity, Subject};
 use crate::claudemd::rules::{self, Rules};
-use crate::claudemd::{text, EffectiveScan, ImportNode, Scope};
+use crate::claudemd::{skill_files, text, EffectiveScan, ImportNode, Scope};
 use crate::packages::detect::projects;
-use crate::packages::scripts::{self, Manifest};
+use crate::packages::scripts::{self, Manifest, Target};
 use crate::packages::Ecosystem;
 use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet};
@@ -127,7 +243,8 @@ impl Producer for Coverage {
     fn run(&self, cx: &Context) -> Result<Vec<Finding>, String> {
         let detection = detect(cx.repo);
         let rules = rules::read(cx.repo);
-        let search = documented(cx.scan, &detection.script_verbs, &rules);
+        let skills = skill_files::read(cx.repo, cx.home);
+        let search = documented(cx.scan, &detection, &rules, &skills);
         let subject = subject_for(cx.repo, cx.scan);
         let mut out = Vec::new();
 
@@ -190,28 +307,27 @@ impl Producer for Coverage {
         for t in &detection.toolchains {
             groups.entry(t.toolchain).or_default().push(t);
         }
+        let verbs: BTreeSet<Verb> = detection
+            .toolchains
+            .iter()
+            .flat_map(|t| t.offers.iter().map(|o| o.verb))
+            .collect();
 
-        for (kind, members) in &groups {
-            let label = format!(
-                "{} ({})",
-                kind.name(),
-                members
+        // One finding per uncovered verb, listing every toolchain that
+        // offers it and nothing covers (#1395). Whether each toolchain is
+        // covered is #1327's rule, unchanged. A toolchain whose negative
+        // cannot be decided goes in a second, Unknown, finding for the
+        // same verb: Advice and Unknown are different states.
+        for verb in verbs {
+            let mut decided: Vec<Gap> = Vec::new();
+            let mut undecided: Vec<Gap> = Vec::new();
+            for (kind, members) in &groups {
+                if !members
                     .iter()
-                    .map(|m| m.label.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            let offered: Vec<String> = dedup(
-                members
-                    .iter()
-                    .flat_map(|m| m.offers.iter().map(|o| format!("`{}`", o.what))),
-            );
-            let mut verbs: BTreeSet<Verb> = BTreeSet::new();
-            for m in members {
-                verbs.extend(m.offers.iter().map(|o| o.verb));
-            }
-
-            for verb in verbs {
+                    .any(|m| m.offers.iter().any(|o| o.verb == verb))
+                {
+                    continue;
+                }
                 let named = search
                     .named
                     .iter()
@@ -219,114 +335,199 @@ impl Producer for Coverage {
                 if named {
                     continue;
                 }
-                let candidates: Vec<String> = dedup(members.iter().flat_map(|m| {
-                    m.offers
-                        .iter()
-                        .filter(|o| o.verb == verb)
-                        .map(|o| format!("`{}`", o.command))
-                }));
-                let mut evidence: Vec<Evidence> = members
+                // A named script or target whose file could not be read
+                // might run this verb: Unknown, never uncovered (#1376,
+                // #1393).
+                let mut blockers: Vec<&(PathBuf, String)> = Vec::new();
+                for u in search
+                    .unfollowed
                     .iter()
-                    .flat_map(|m| m.offers.iter().filter(|o| o.verb == verb))
-                    .map(|o| Evidence {
-                        at: Locator::File {
-                            path: o.file.to_string_lossy().to_string(),
-                            line: o.line,
-                        },
-                        measured: o.measured.clone(),
-                    })
-                    .collect();
-                for m in members.iter().filter(|m| !m.other.is_empty()) {
-                    evidence.push(Evidence {
-                        at: Locator::File {
-                            path: m.manifest.to_string_lossy().to_string(),
-                            line: None,
-                        },
-                        measured: format!(
-                            "not mapped to a verb, not counted: {}",
-                            m.other
-                                .iter()
-                                .map(|o| format!("`{o}`"))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ),
-                    });
-                }
-                evidence.push(Evidence {
-                    at: Locator::File {
-                        path: subject.path().to_string(),
-                        line: None,
-                    },
-                    measured: search.measured(),
-                });
-
-                let plural = |n: usize| if n == 1 { "" } else { "s" };
-                let nothing_names = match (search.files.len(), search.rules.len()) {
-                    (0, 0) => format!(
-                        "no CLAUDE.md loads for this repository, so nothing names {}",
-                        or_list(&candidates)
-                    ),
-                    (0, r) => format!(
-                        "no CLAUDE.md loads for this repository, and none of the {r} rule{} \
-                         names {}",
-                        plural(r),
-                        or_list(&candidates)
-                    ),
-                    (n, 0) => format!(
-                        "none of the {n} file{} read names {}",
-                        plural(n),
-                        or_list(&candidates)
-                    ),
-                    (n, r) => format!(
-                        "none of the {n} file{} read or {r} rule{} names {}",
-                        plural(n),
-                        plural(r),
-                        or_list(&candidates)
-                    ),
-                };
-
-                if unreadable.is_empty() {
-                    out.push(Finding::new(
-                        Check::Toolchain,
-                        Severity::Advice,
-                        subject.clone(),
-                        evidence,
-                        format!("{label} offers {}; {nothing_names}", offered.join(", ")),
-                    ));
-                } else {
-                    for u in &unreadable {
-                        evidence.push(Evidence {
-                            at: Locator::File {
-                                path: u.clone(),
-                                line: None,
-                            },
-                            measured: "not readable".to_string(),
-                        });
+                    .filter(|u| u.manager.as_deref().is_none_or(|m| kind.covered_by(m)))
+                {
+                    for r in &u.reasons {
+                        if !blockers.contains(&r) {
+                            blockers.push(r);
+                        }
                     }
-                    out.push(Finding::new(
-                        Check::Toolchain,
-                        Severity::Unknown,
-                        subject.clone(),
-                        evidence,
-                        format!(
-                            "{label} offers {}; whether any loaded file names {} could not be \
-                             decided: {} not readable",
-                            offered.join(", "),
-                            or_list(&candidates),
-                            unreadable
-                                .iter()
-                                .map(|u| format!("`{u}`"))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ),
-                    ));
                 }
+                let gap = Gap {
+                    kind: *kind,
+                    members,
+                    blockers,
+                };
+                if unreadable.is_empty() && gap.blockers.is_empty() {
+                    decided.push(gap);
+                } else {
+                    undecided.push(gap);
+                }
+            }
+            if !decided.is_empty() {
+                out.push(gap_finding(verb, &decided, &search, &subject, &[]));
+            }
+            if !undecided.is_empty() {
+                out.push(gap_finding(
+                    verb,
+                    &undecided,
+                    &search,
+                    &subject,
+                    &unreadable,
+                ));
             }
         }
 
         out.extend(lint_leakage(cx.repo, cx.scan, &detection.formatter_configs));
         Ok(out)
     }
+}
+
+/// One toolchain that offers a verb nothing covers.
+struct Gap<'a> {
+    kind: Toolchain,
+    /// Every member of the kind; only those offering the verb are named.
+    members: &'a [&'a DetectedToolchain],
+    /// What a named command reaches and could not be read.
+    blockers: Vec<&'a (PathBuf, String)>,
+}
+
+/// The one finding for `verb` over `gaps` (#1395): each toolchain and
+/// the members offering it, what each offers, and the commands nothing
+/// names. Advice when `unreadable` is empty and no gap has blockers;
+/// otherwise Unknown, naming what could not be read.
+fn gap_finding(
+    verb: Verb,
+    gaps: &[Gap],
+    search: &Search,
+    subject: &Subject,
+    unreadable: &[String],
+) -> Finding {
+    let offers = |g: &Gap| -> Vec<Offer> {
+        g.members
+            .iter()
+            .flat_map(|m| m.offers.iter().filter(|o| o.verb == verb).cloned())
+            .collect()
+    };
+    let mut clauses: Vec<String> = Vec::new();
+    let mut candidates: Vec<String> = Vec::new();
+    let mut evidence: Vec<Evidence> = Vec::new();
+    let mut blockers: Vec<&(PathBuf, String)> = Vec::new();
+    for g in gaps {
+        // Only the members offering this verb: a library crate is not
+        // named in a sentence about `cargo run` (#1395).
+        let labels: Vec<&str> = g
+            .members
+            .iter()
+            .filter(|m| m.offers.iter().any(|o| o.verb == verb))
+            .map(|m| m.label.as_str())
+            .collect();
+        // Only the scripts for this verb, not every script (#1376).
+        let offered = dedup(offers(g).iter().map(|o| format!("`{}`", o.what)));
+        clauses.push(format!(
+            "{} ({}) offers {}",
+            g.kind.name(),
+            labels.join(", "),
+            offered.join(", ")
+        ));
+        for c in offers(g).iter().map(|o| format!("`{}`", o.command)) {
+            if !candidates.contains(&c) {
+                candidates.push(c);
+            }
+        }
+        evidence.extend(offers(g).into_iter().map(|o| Evidence {
+            at: Locator::File {
+                path: o.file.to_string_lossy().to_string(),
+                line: o.line,
+            },
+            measured: o.measured,
+        }));
+        for m in g.members.iter().filter(|m| !m.other.is_empty()) {
+            evidence.push(Evidence {
+                at: Locator::File {
+                    path: m.manifest.to_string_lossy().to_string(),
+                    line: None,
+                },
+                measured: format!(
+                    "not mapped to a verb, not counted: {}",
+                    m.other
+                        .iter()
+                        .map(|o| format!("`{o}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        }
+        for b in &g.blockers {
+            if !blockers.contains(b) {
+                blockers.push(b);
+            }
+        }
+    }
+    evidence.push(Evidence {
+        at: Locator::File {
+            path: subject.path().to_string(),
+            line: None,
+        },
+        measured: search.measured(),
+    });
+    for (path, why) in &blockers {
+        evidence.push(Evidence {
+            at: Locator::File {
+                path: path.to_string_lossy().to_string(),
+                line: None,
+            },
+            measured: why.clone(),
+        });
+    }
+    for u in unreadable {
+        evidence.push(Evidence {
+            at: Locator::File {
+                path: u.clone(),
+                line: None,
+            },
+            measured: "not readable".to_string(),
+        });
+    }
+
+    let offered = and_list(&clauses);
+    let (severity, sentence) = if unreadable.is_empty() && blockers.is_empty() {
+        (
+            Severity::Advice,
+            format!("{offered}; {}", search.nothing_names(&candidates)),
+        )
+    } else if unreadable.is_empty() {
+        (
+            Severity::Unknown,
+            format!(
+                "{offered}; whether any loaded file names {} could not be decided: {}",
+                or_list(&candidates),
+                blockers
+                    .iter()
+                    .map(|(_, why)| why.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        )
+    } else {
+        (
+            Severity::Unknown,
+            format!(
+                "{offered}; whether any loaded file names {} could not be decided: {} not \
+                 readable",
+                or_list(&candidates),
+                unreadable
+                    .iter()
+                    .map(|u| format!("`{u}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
+    };
+    Finding::new(
+        Check::Toolchain,
+        severity,
+        subject.clone(),
+        evidence,
+        sentence,
+    )
 }
 
 /// The brief's suggestion for one of this producer's findings.
@@ -405,10 +606,19 @@ fn dedup<I: IntoIterator<Item = String>>(items: I) -> Vec<String> {
 
 /// `a`, `a or b`, `a, b or c`.
 fn or_list(items: &[String]) -> String {
+    joined(items, "or")
+}
+
+/// `a`, `a and b`, `a, b and c`.
+fn and_list(items: &[String]) -> String {
+    joined(items, "and")
+}
+
+fn joined(items: &[String], word: &str) -> String {
     match items.len() {
         0 => String::new(),
         1 => items[0].clone(),
-        n => format!("{} or {}", items[..n - 1].join(", "), items[n - 1]),
+        n => format!("{} {word} {}", items[..n - 1].join(", "), items[n - 1]),
     }
 }
 
@@ -455,7 +665,10 @@ fn verb_by_name(name: &str) -> Option<Verb> {
 fn verb_of(manager: &str, args: &[&str]) -> Option<Verb> {
     let first = args.first().copied();
     match manager {
-        "make" | "just" => first.and_then(verb_by_name),
+        "make" | "just" => positional_args(manager, args)
+            .first()
+            .copied()
+            .and_then(verb_by_name),
         // All three run a package.json script without `run`.
         "yarn" | "pnpm" | "bun" => match first {
             Some("run") => args.get(1).copied().and_then(verb_by_name),
@@ -576,8 +789,8 @@ fn script_run<'a>(manager: &str, args: &[&'a str]) -> Option<&'a str> {
     }
 }
 
-/// The verb a JS tool run from a script body names (#1341). Only in a
-/// body: a loaded file naming `npx prettier` is not naming a script.
+/// The verb a JS tool names: run from a script body (#1341), or run
+/// directly through a manager in a loaded file (#1392).
 fn js_tool_verb(tool: &str, args: &[&str]) -> Option<Verb> {
     let first = args.first().copied();
     match tool {
@@ -596,19 +809,71 @@ fn js_tool_verb(tool: &str, args: &[&str]) -> Option<Verb> {
     }
 }
 
+/// The verb a manager running a JS binary names (#1392): `npx <bin>`,
+/// `bunx <bin>`, `pnpm exec <bin>`, `yarn dlx <bin>` and `bun x <bin>`
+/// (already read through by [`unwrap_launcher`], so `tool` differs from
+/// `launcher`), or `yarn|pnpm|bun [run] <bin>` where `<bin>` is not a
+/// script. A script of that name takes precedence (`is_script`), and so
+/// does a name the script map already reads (`yarn test` is the script).
+/// `npm run` runs scripts only, never a binary.
+fn js_binary_verb(
+    launcher: &str,
+    tool: &str,
+    args: &[&str],
+    is_script: &dyn Fn(&str) -> bool,
+) -> Option<Verb> {
+    if tool != launcher {
+        return js_tool_verb(tool, args);
+    }
+    if !matches!(tool, "yarn" | "pnpm" | "bun") {
+        return None;
+    }
+    let (bin, rest) = match args {
+        ["run", bin, rest @ ..] | [bin, rest @ ..] => (*bin, rest),
+        [] => return None,
+    };
+    if bin == "run" || is_script(bin) || verb_by_name(bin).is_some() {
+        return None;
+    }
+    js_tool_verb(bin, rest)
+}
+
+/// What a package.json script's body runs: its verbs, and the script
+/// files it runs that could not be read or lie outside the repository,
+/// each with the path and what was measured (#1376).
+#[derive(Debug, Default)]
+struct Body {
+    verbs: Vec<Verb>,
+    unknown: Vec<(PathBuf, String)>,
+}
+
+/// Where a script body runs: the package's directory, which a relative
+/// script file resolves against, and the repository it must stay under.
+struct Files<'a> {
+    dir: &'a Path,
+    repo: &'a Path,
+}
+
 /// The verbs a package.json script's body runs (#1341), in order, each
 /// once. The body is split at `&&`, `||`, `;` and `|`; leading `NAME=value`
 /// assignments are skipped and a launcher is read through
 /// ([`unwrap_launcher`]). A command running another script maps it by name,
 /// else, when `follow` is set, by that script's own body with `follow`
 /// cleared: one level, so a cycle cannot loop and a chain is not chased.
-fn body_verbs(body: &str, bodies: &BTreeMap<&str, &str>, follow: bool) -> Vec<Verb> {
-    let mut out = Vec::new();
+///
+/// With `files`, a command running a repository script file (`bash|sh
+/// <file>`, `node <file>`, `./<file>`) maps by that file's non-comment
+/// lines, read with `files` cleared: one level (#1376). A file that could
+/// not be read, or lies outside the repository, is in `unknown`.
+fn body_verbs(
+    body: &str,
+    bodies: &BTreeMap<&str, &str>,
+    follow: bool,
+    files: Option<&Files>,
+) -> Body {
+    let mut out = Body::default();
     for segment in split_chain(body) {
-        let tokens: Vec<&str> = segment
-            .split_whitespace()
-            .skip_while(|t| is_assignment(t))
-            .collect();
+        let tokens = command_words(segment);
         let Some(first) = tokens.first() else {
             continue;
         };
@@ -620,22 +885,111 @@ fn body_verbs(body: &str, bodies: &BTreeMap<&str, &str>, follow: bool) -> Vec<Ve
         } else if let Some(s) = script_run(tool, args) {
             match verb_by_name(s) {
                 Some(v) => vec![v],
-                None if follow => bodies
-                    .get(s)
-                    .map(|b| body_verbs(b, bodies, false))
-                    .unwrap_or_default(),
-                None => Vec::new(),
+                None => match bodies.get(s) {
+                    Some(b) if follow => {
+                        let inner = body_verbs(b, bodies, false, files);
+                        out.unknown.extend(inner.unknown);
+                        inner.verbs
+                    }
+                    Some(_) => Vec::new(),
+                    // Not a script: a binary the manager runs (#1392).
+                    None => js_binary_verb(first, tool, args, &|n| bodies.contains_key(n))
+                        .into_iter()
+                        .collect(),
+                },
+            }
+        } else if let (Some(at), Some(file)) = (files, script_file(tool, args)) {
+            match read_script_file(file, at) {
+                Ok(text) => {
+                    let mut verbs = Vec::new();
+                    for line in text.replace("\r\n", "\n").split('\n') {
+                        let t = line.trim_start();
+                        if t.is_empty() || t.starts_with('#') || t.starts_with("//") {
+                            continue;
+                        }
+                        verbs.extend(body_verbs(line, bodies, false, None).verbs);
+                    }
+                    verbs
+                }
+                Err(unknown) => {
+                    out.unknown.push(unknown);
+                    Vec::new()
+                }
             }
         } else {
             Vec::new()
         };
         for v in found {
-            if !out.contains(&v) {
-                out.push(v);
+            if !out.verbs.contains(&v) {
+                out.verbs.push(v);
             }
         }
     }
     out
+}
+
+/// The repository script file a command runs, as written: the first
+/// non-flag argument of `bash`, `sh` or `node`, or a `./` command. `bash
+/// -c` runs a string, not a file.
+fn script_file<'a>(tool: &'a str, args: &[&'a str]) -> Option<&'a str> {
+    let file = match tool {
+        "bash" | "sh" if args.contains(&"-c") => None,
+        "bash" | "sh" | "node" => args.iter().copied().find(|a| !a.starts_with('-')),
+        t if t.len() > 2 && t.starts_with("./") => Some(t),
+        _ => None,
+    }?;
+    let file = file.trim_matches(['"', '\'']);
+    (!file.is_empty()).then_some(file)
+}
+
+/// Lexical normalisation: `.` dropped, `..` popped.
+fn normalise(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// A script file's text, when it is under the repository and readable.
+/// Otherwise the path and what was measured: a file outside the
+/// repository is not read at all, which is said as such, never as a
+/// read that failed. Checked lexically first, then through symlinks.
+fn read_script_file(file: &str, at: &Files) -> Result<String, (PathBuf, String)> {
+    let path = normalise(&at.dir.join(file));
+    let outside = |p: &Path| {
+        (
+            p.to_path_buf(),
+            format!("`{file}` is outside the repository, so it was not read"),
+        )
+    };
+    if Path::new(file).is_absolute() || !path.starts_with(normalise(at.repo)) {
+        return Err(outside(&path));
+    }
+    let unreadable = |e: std::io::Error| (path.clone(), format!("`{file}` could not be read: {e}"));
+    let real = std::fs::canonicalize(&path).map_err(unreadable)?;
+    let root = std::fs::canonicalize(at.repo).map_err(unreadable)?;
+    if !real.starts_with(&root) {
+        return Err(outside(&path));
+    }
+    std::fs::read_to_string(&real).map_err(unreadable)
+}
+
+/// The words of one command, less the `NAME=value` environment
+/// assignments before it (#1341, #1412): `CI=1 yarn test` is `yarn test`.
+/// Shared by a loaded file's commands and a script body's, so the two
+/// cannot disagree about which word is the manager.
+fn command_words(segment: &str) -> Vec<&str> {
+    segment
+        .split_whitespace()
+        .skip_while(|t| is_assignment(t))
+        .collect()
 }
 
 /// `NAME=value` before a command: an environment assignment.
@@ -782,6 +1136,24 @@ pub struct Detection {
     /// `verify` runs (#1341). A name two manifests share takes the union
     /// of what either runs.
     pub script_verbs: BTreeMap<String, Vec<Verb>>,
+    /// The script files a package.json script named for no verb runs and
+    /// that could not be read or lie outside the repository, by script
+    /// name, each with the file and what was measured (#1376). A loaded
+    /// file naming such a script names verbs nobody could read, so a gap
+    /// it might cover is Unknown.
+    pub script_unknown: BTreeMap<String, Vec<(PathBuf, String)>>,
+    /// Every package.json script name, in any manifest: `yarn <name>`
+    /// runs the script, not a binary of that name (#1392).
+    pub script_names: BTreeSet<String>,
+    /// What each make or just target's recipe runs, followed through its
+    /// prerequisites, by (manager, target), so a loaded file naming
+    /// `make lint` names what `lint` runs (#1393). A name two makefiles
+    /// share takes the union.
+    pub target_runs: TargetRuns,
+    /// What a target's recipe reaches and could not be read, by
+    /// (manager, target): a target an open-ended makefile might define,
+    /// or a script whose file could not be read (#1393).
+    pub target_unknown: TargetUnknown,
 }
 
 /// The same bound and the same exclusions as `detect::projects`, so the
@@ -911,6 +1283,7 @@ pub fn detect(repo: &Path) -> Detection {
                                 .collect();
                             for s in &list {
                                 let name = &s.name;
+                                out.script_names.insert(name.clone());
                                 let command = if *eco == Ecosystem::Yarn {
                                     format!("yarn {name}")
                                 } else {
@@ -918,10 +1291,24 @@ pub fn detect(repo: &Path) -> Detection {
                                 };
                                 // By name first; by body only when the
                                 // name maps to nothing (#1341).
+                                let mut unknown = false;
                                 let (verbs, measured) = match verb_by_name(name) {
                                     Some(verb) => (vec![verb], format!("script `{name}`")),
                                     None => {
-                                        let verbs = body_verbs(&s.body, &bodies, true);
+                                        let at = Files { dir: &dir, repo };
+                                        let body = body_verbs(&s.body, &bodies, true, Some(&at));
+                                        if !body.unknown.is_empty() {
+                                            unknown = true;
+                                            let known =
+                                                out.script_unknown.entry(name.clone()).or_default();
+                                            for (path, why) in body.unknown {
+                                                let why = format!("script `{name}` runs {why}");
+                                                if !known.iter().any(|(_, w)| *w == why) {
+                                                    known.push((path, why));
+                                                }
+                                            }
+                                        }
+                                        let verbs = body.verbs;
                                         if !verbs.is_empty() {
                                             let known =
                                                 out.script_verbs.entry(name.clone()).or_default();
@@ -940,7 +1327,9 @@ pub fn detect(repo: &Path) -> Detection {
                                         )
                                     }
                                 };
-                                if verbs.is_empty() {
+                                // A script whose file could not be read is
+                                // Unknown, not "not mapped" (#1376).
+                                if verbs.is_empty() && !unknown {
                                     t.other.push(name.clone());
                                 }
                                 for verb in verbs {
@@ -1005,11 +1394,15 @@ pub fn detect(repo: &Path) -> Detection {
                     t.offers.push(fixed(Verb::Test, "cargo", "test", &m));
                     t.offers.push(fixed(Verb::Lint, "cargo", "clippy", &m));
                     t.offers.push(fixed(Verb::Format, "cargo", "fmt", &m));
-                    // `cargo run` only where there is a binary to run.
+                    // `cargo run` only where there is a binary to run:
+                    // `[[bin]]`, `src/main.rs` or `src/bin/` (#1395). A
+                    // library crate offers none.
+                    let src = dir.join("src");
                     let has_bin = doc.get("bin").is_some()
                         || names_of
-                            .get(dir.join("src").as_path())
-                            .is_some_and(|ns| ns.iter().any(|n| n == "main.rs"));
+                            .get(src.as_path())
+                            .is_some_and(|ns| ns.iter().any(|n| n == "main.rs"))
+                        || src.join("bin").is_dir();
                     if has_bin {
                         t.offers.push(fixed(Verb::Run, "cargo", "run", &m));
                     }
@@ -1116,6 +1509,55 @@ pub fn detect(repo: &Path) -> Detection {
                         offers: Vec::new(),
                         other: Vec::new(),
                     };
+                    // What each target's recipe runs (#1393), read
+                    // from the file the target was parsed from.
+                    let open = if kind == Toolchain::Make {
+                        scripts::makefile_is_open_ended(dir)
+                    } else {
+                        Ok(None)
+                    };
+                    let no_targets = BTreeMap::new();
+                    let no_unknown = BTreeMap::new();
+                    let cx = Scripts {
+                        verbs: &out.script_verbs,
+                        unknown: &out.script_unknown,
+                        names: &out.script_names,
+                        targets: &no_targets,
+                        target_unknown: &no_unknown,
+                    };
+                    let found: Vec<_> = mine
+                        .iter()
+                        .map(|target| {
+                            let (runs, unknown) = recipe_runs(
+                                manager,
+                                &target.name,
+                                &mine,
+                                &t.manifest,
+                                open.as_ref().copied().map_err(String::as_str),
+                                &cx,
+                            );
+                            (target.name.clone(), runs, unknown)
+                        })
+                        .collect();
+                    for (name, runs, unknown) in found {
+                        let key = (manager.to_string(), name);
+                        if !runs.is_empty() {
+                            let known = out.target_runs.entry(key.clone()).or_default();
+                            for r in runs {
+                                if !known.contains(&r) {
+                                    known.push(r);
+                                }
+                            }
+                        }
+                        if !unknown.is_empty() {
+                            let known = out.target_unknown.entry(key).or_default();
+                            for u in unknown {
+                                if !known.contains(&u) {
+                                    known.push(u);
+                                }
+                            }
+                        }
+                    }
                     for target in mine {
                         match verb_by_name(&target.name) {
                             Some(verb) => t.offers.push(Offer {
@@ -1174,6 +1616,7 @@ pub fn detect(repo: &Path) -> Detection {
         ]
         .into_iter()
         .find(|g| has(g))
+        .filter(|_| !tauri_generated(dir, "android"))
         {
             let m = dir.join(g);
             let manager = if has("gradlew") {
@@ -1195,11 +1638,15 @@ pub fn detect(repo: &Path) -> Detection {
             });
         }
 
-        if let Some(bundle) = names.iter().find(|n| {
-            Path::new(n)
-                .extension()
-                .is_some_and(|x| x == "xcodeproj" || x == "xcworkspace")
-        }) {
+        if let Some(bundle) = names
+            .iter()
+            .find(|n| {
+                Path::new(n)
+                    .extension()
+                    .is_some_and(|x| x == "xcodeproj" || x == "xcworkspace")
+            })
+            .filter(|_| !tauri_generated(dir, "apple"))
+        {
             let m = dir.join(bundle);
             out.toolchains.push(DetectedToolchain {
                 toolchain: Toolchain::Xcode,
@@ -1251,6 +1698,21 @@ pub fn detect(repo: &Path) -> Detection {
     out.toolchains
         .sort_by(|a, b| a.toolchain.cmp(&b.toolchain).then(a.dir.cmp(&b.dir)));
     out
+}
+
+/// The config files Tauri 2 reads from an app directory.
+const TAURI_CONFIGS: &[&str] = &["tauri.conf.json", "tauri.conf.json5", "Tauri.toml"];
+
+/// Whether `dir` is `<app>/gen/<platform>` for a Tauri app `<app>`: the
+/// project `tauri ios init` or `tauri android init` generates, which the
+/// Tauri CLI drives (#1396). Nothing else is excluded.
+fn tauri_generated(dir: &Path, platform: &str) -> bool {
+    dir.file_name().is_some_and(|n| n == platform)
+        && dir
+            .parent()
+            .filter(|g| g.file_name().is_some_and(|n| n == "gen"))
+            .and_then(Path::parent)
+            .is_some_and(|app| TAURI_CONFIGS.iter().any(|c| app.join(c).is_file()))
 }
 
 /// The tools a `pyproject.toml` configures: `[tool.pytest…]` offers
@@ -1310,13 +1772,60 @@ pub struct Search {
     /// Every `.claude/rules` file read (#1340), counted apart from
     /// `files` so the sentence can say which is which.
     pub rules: Vec<PathBuf>,
+    /// Every `SKILL.md` read (#1394), counted apart from both.
+    pub skills: Vec<PathBuf>,
     pub spans: usize,
     pub fenced_lines: usize,
     /// Files the scan listed and this producer could not re-read.
     pub unreadable: Vec<String>,
+    /// Named scripts whose script file could not be read (#1376).
+    pub unfollowed: Vec<Unfollowed>,
+}
+
+/// A command a loaded file names that runs something this producer could
+/// not read: a package.json script whose script file could not be read or
+/// lies outside the repository (#1376), or a make target whose recipe
+/// reaches a target an open-ended makefile might define (#1393).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unfollowed {
+    /// The manager whose toolchains the unread part could cover; `None`
+    /// when it could be any (a target the parser cannot see).
+    pub manager: Option<String>,
+    pub reasons: Vec<(PathBuf, String)>,
 }
 
 impl Search {
+    /// "none of the 7 files read, 2 rules or 4 skills names `x`": what was
+    /// searched, each kind counted apart (#1340, #1394), and a kind with
+    /// none left out.
+    fn nothing_names(&self, candidates: &[String]) -> String {
+        let plural = |n: usize| if n == 1 { "" } else { "s" };
+        let mut others: Vec<String> = Vec::new();
+        if !self.rules.is_empty() {
+            let r = self.rules.len();
+            others.push(format!("{r} rule{}", plural(r)));
+        }
+        if !self.skills.is_empty() {
+            let k = self.skills.len();
+            others.push(format!("{k} skill{}", plural(k)));
+        }
+        let named = or_list(candidates);
+        match self.files.len() {
+            0 if others.is_empty() => {
+                format!("no CLAUDE.md loads for this repository, so nothing names {named}")
+            }
+            0 => format!(
+                "no CLAUDE.md loads for this repository, and none of the {} names {named}",
+                or_list(&others)
+            ),
+            n => {
+                let mut all = vec![format!("{n} file{} read", plural(n))];
+                all.extend(others);
+                format!("none of the {} names {named}", or_list(&all))
+            }
+        }
+    }
+
     /// The count and how it was counted, for the evidence.
     fn measured(&self) -> String {
         let listed = |what: &str, paths: &[PathBuf]| {
@@ -1336,11 +1845,13 @@ impl Search {
                 }
             )
         };
-        let rules = if self.rules.is_empty() {
-            String::new()
-        } else {
-            format!(", {}", listed("rule", &self.rules))
-        };
+        let mut rules = String::new();
+        if !self.rules.is_empty() {
+            rules.push_str(&format!(", {}", listed("rule", &self.rules)));
+        }
+        if !self.skills.is_empty() {
+            rules.push_str(&format!(", {}", listed("skill", &self.skills)));
+        }
         format!(
             "{}{rules}, {} span{} and {} fenced line{} searched",
             listed("file", &self.files),
@@ -1383,14 +1894,24 @@ fn loaded_files(scan: &EffectiveScan) -> Vec<PathBuf> {
     out
 }
 
-/// What the loaded files and the repository's rules name, through
-/// `text::spans` and `text::fences`. A rule the reader could not read is
-/// already in `rules.unreadable`, which the caller counts.
+/// What the loaded files, the repository's rules and the skills name,
+/// through `text::spans` and `text::fences`. A rule the reader could not
+/// read is already in `rules.unreadable`, which the caller counts; a
+/// skill that could not be read, or a skills directory that could not be
+/// listed, goes in [`Search::unreadable`] (#1394).
 pub fn documented(
     scan: &EffectiveScan,
-    script_verbs: &BTreeMap<String, Vec<Verb>>,
+    detection: &Detection,
     rules: &Rules,
+    skills: &skill_files::Skills,
 ) -> Search {
+    let scripts = Scripts {
+        verbs: &detection.script_verbs,
+        unknown: &detection.script_unknown,
+        names: &detection.script_names,
+        targets: &detection.target_runs,
+        target_unknown: &detection.target_unknown,
+    };
     let mut out = Search::default();
     for path in loaded_files(scan) {
         let text = match std::fs::read_to_string(&path) {
@@ -1401,26 +1922,75 @@ pub fn documented(
                 continue;
             }
         };
-        search_text(&mut out, &path, &text, script_verbs);
+        search_text(&mut out, &path, &text, &scripts);
         out.files.push(path);
     }
     for rule in &rules.files {
-        search_text(&mut out, &rule.path, &rule.text, script_verbs);
+        search_text(&mut out, &rule.path, &rule.text, &scripts);
         out.rules.push(rule.path.clone());
+    }
+    for (dir, e) in &skills.unreadable {
+        out.unreadable.push(format!("{dir} ({e})"));
+    }
+    for (path, _) in &skills.files {
+        let path = PathBuf::from(path);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                search_text(&mut out, &path, &text, &scripts);
+                out.skills.push(path);
+            }
+            Err(e) => out
+                .unreadable
+                .push(format!("{} ({e})", path.to_string_lossy())),
+        }
     }
     out
 }
 
+/// What detection learned about package.json scripts, for the search.
+struct Scripts<'a> {
+    verbs: &'a BTreeMap<String, Vec<Verb>>,
+    unknown: &'a BTreeMap<String, Vec<(PathBuf, String)>>,
+    /// Every script name, so `yarn <name>` is read as the script (#1392).
+    names: &'a BTreeSet<String>,
+    /// What a make or just target's recipe runs, by (manager, target)
+    /// (#1393).
+    targets: &'a TargetRuns,
+    /// What a target's recipe reaches and could not be read (#1393).
+    target_unknown: &'a TargetUnknown,
+}
+
+/// What each make or just target's recipe runs, by (manager, target).
+pub type TargetRuns = BTreeMap<(String, String), Vec<(String, Verb)>>;
+/// What each target's recipe reaches and could not be read.
+pub type TargetUnknown = BTreeMap<(String, String), Vec<Unfollowed>>;
+
+impl Scripts<'_> {
+    /// The named scripts in one span or fenced line whose script file
+    /// could not be read, into `out`.
+    fn unfollowed(&self, text: &str, out: &mut Vec<Unfollowed>) {
+        for (manager, script) in scripts_named(text) {
+            if let Some(reasons) = self.unknown.get(&script) {
+                out.push(Unfollowed {
+                    manager: Some(manager),
+                    reasons: reasons.clone(),
+                });
+            }
+        }
+        for (manager, target) in targets_named(text) {
+            if let Some(unknown) = self.target_unknown.get(&(manager, target)) {
+                out.extend(unknown.iter().cloned());
+            }
+        }
+    }
+}
+
 /// One file's spans and fenced lines into `out`.
-fn search_text(
-    out: &mut Search,
-    path: &Path,
-    text: &str,
-    script_verbs: &BTreeMap<String, Vec<Verb>>,
-) {
+fn search_text(out: &mut Search, path: &Path, text: &str, scripts: &Scripts) {
     for s in text::spans(text) {
         out.spans += 1;
-        for (manager, verb) in commands_with(&s.text, script_verbs) {
+        scripts.unfollowed(&s.text, &mut out.unfollowed);
+        for (manager, verb) in commands_with(&s.text, scripts) {
             out.named.push(Named {
                 manager,
                 verb,
@@ -1436,7 +2006,8 @@ fn search_text(
                 continue;
             }
             out.fenced_lines += 1;
-            for (manager, verb) in commands_with(line, script_verbs) {
+            scripts.unfollowed(line, &mut out.unfollowed);
+            for (manager, verb) in commands_with(line, scripts) {
                 out.named.push(Named {
                     manager,
                     verb,
@@ -1449,22 +2020,33 @@ fn search_text(
     }
 }
 
-/// [`commands_with`] and no script bodies.
+/// [`commands_with`] and no scripts.
 #[cfg(test)]
 fn commands_in(text: &str) -> Vec<(String, Verb)> {
-    commands_with(text, &BTreeMap::new())
+    commands_with(
+        text,
+        &Scripts {
+            verbs: &BTreeMap::new(),
+            unknown: &BTreeMap::new(),
+            names: &BTreeSet::new(),
+            targets: &BTreeMap::new(),
+            target_unknown: &BTreeMap::new(),
+        },
+    )
 }
 
 /// The verbs one span or one fenced line names. A line can chain
 /// commands (`cd src-tauri && cargo test --lib`), so each segment is read
 /// on its own; a `$ ` prompt is stripped. A script whose name maps to no
-/// verb names what its body runs, from `script_verbs` (#1341).
-fn commands_with(text: &str, script_verbs: &BTreeMap<String, Vec<Verb>>) -> Vec<(String, Verb)> {
+/// verb names what its body runs, from `scripts.verbs` (#1341). A binary
+/// a JS manager runs names what the tool map says, credited to that
+/// manager (#1392).
+fn commands_with(text: &str, scripts: &Scripts) -> Vec<(String, Verb)> {
     let mut out = Vec::new();
     for segment in split_chain(text) {
         let segment = segment.trim();
         let segment = segment.strip_prefix("$ ").unwrap_or(segment);
-        let tokens: Vec<&str> = segment.split_whitespace().collect();
+        let tokens = command_words(segment);
         let Some(first) = tokens.first() else {
             continue;
         };
@@ -1472,13 +2054,299 @@ fn commands_with(text: &str, script_verbs: &BTreeMap<String, Vec<Verb>>) -> Vec<
             "./gradlew" | "gradlew" => "gradle",
             other => other,
         };
+        let launcher = manager;
         let (manager, args) = unwrap_launcher(manager, &tokens[1..]);
         if manager == "nx" {
             out.extend(nx_verbs(args).into_iter().map(|v| ("nx".to_string(), v)));
         } else if let Some(verb) = verb_of(manager, args) {
             out.push((manager.to_string(), verb));
-        } else if let Some(verbs) = script_run(manager, args).and_then(|s| script_verbs.get(s)) {
+        } else if let Some(verbs) = script_run(manager, args).and_then(|s| scripts.verbs.get(s)) {
             out.extend(verbs.iter().map(|v| (manager.to_string(), *v)));
+        } else if let Some(verb) =
+            js_binary_verb(launcher, manager, args, &|n| scripts.names.contains(n))
+        {
+            out.push((launcher.to_string(), verb));
+        }
+        // A named target names what its recipe runs, too (#1393).
+        if matches!(manager, "make" | "just") {
+            for target in target_args(manager, args) {
+                if let Some(runs) = scripts
+                    .targets
+                    .get(&(manager.to_string(), target.to_string()))
+                {
+                    out.extend(runs.iter().cloned());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The targets a `make` or `just` command runs: its
+/// [`positional_args`]. Nothing when a flag points it at another file or
+/// directory (`-C`, `-f`, `--justfile`): those are not this makefile's
+/// targets.
+fn target_args<'a>(manager: &str, args: &[&'a str]) -> Vec<&'a str> {
+    // Per manager (#1415): `-d` is just's working directory but make's
+    // DEBUG flag, so one shared list read `make -d lint` as another
+    // directory and stopped following it.
+    let elsewhere: &[&str] = match manager {
+        "make" => &["-C", "-f", "--file", "--makefile", "--directory"],
+        "just" => &["-f", "-d", "--justfile", "--working-directory"],
+        _ => &[],
+    };
+    if args.iter().any(|a| {
+        elsewhere.contains(a)
+            || elsewhere.iter().any(|f| {
+                if f.starts_with("--") {
+                    a.starts_with(&format!("{f}="))
+                } else {
+                    // An attached short value (`-Csub`, `-fother.mk`,
+                    // `-dsub`). Only `-C` was caught before #1415, so
+                    // `make -fother.mk lint` was followed through THIS
+                    // directory's makefile -- coverage credited from a file
+                    // the command never runs.
+                    a.len() > f.len() && a.starts_with(f)
+                }
+            })
+    }) {
+        return Vec::new();
+    }
+    positional_args(manager, args)
+}
+
+/// The positional words of a `make` or `just` command, in order: its
+/// targets (for just, a recipe and its arguments), less options, the
+/// value of an option that takes one, and `NAME=value` overrides
+/// (#1412: `make -j4 lint` runs `lint`, `make -C sub lint` runs `lint`
+/// in `sub`, and `make -C lint` runs no named target). Whether the
+/// command runs this directory's makefile is [`target_args`]' question,
+/// not this one's.
+fn positional_args<'a>(manager: &str, args: &[&'a str]) -> Vec<&'a str> {
+    let takes_value = |flag: &str| match manager {
+        "make" => matches!(
+            flag,
+            "-C" | "-f"
+                | "-I"
+                | "-o"
+                | "-W"
+                | "--directory"
+                | "--file"
+                | "--makefile"
+                | "--include-dir"
+                | "--old-file"
+                | "--assume-old"
+                | "--new-file"
+                | "--assume-new"
+                | "--what-if"
+        ),
+        "just" => matches!(
+            flag,
+            "-f" | "-d"
+                | "--justfile"
+                | "--working-directory"
+                | "--dotenv-filename"
+                | "--dotenv-path"
+                | "--shell"
+                | "--color"
+        ),
+        _ => false,
+    };
+    // `-j` and `-l` take a number, or nothing: `make -j lint` runs lint.
+    let takes_number =
+        |flag: &str| manager == "make" && matches!(flag, "-j" | "-l" | "--jobs" | "--load-average");
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        i += 1;
+        if a.starts_with('-') {
+            if takes_value(a)
+                || (takes_number(a) && args.get(i).is_some_and(|n| n.parse::<f64>().is_ok()))
+            {
+                i += 1;
+            }
+            continue;
+        }
+        if !is_assignment(a) {
+            out.push(a);
+        }
+    }
+    out
+}
+
+/// The make and just targets one span or fenced line runs, with the
+/// manager running each: the same segments [`commands_with`] reads.
+fn targets_named(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for segment in split_chain(text) {
+        let segment = segment.trim();
+        let segment = segment.strip_prefix("$ ").unwrap_or(segment);
+        let tokens = command_words(segment);
+        if let Some(manager @ ("make" | "just")) = tokens.first().copied() {
+            for t in target_args(manager, &tokens[1..]) {
+                out.push((manager.to_string(), t.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// What running `name` runs, through its prerequisites and its recipe,
+/// each target once (#1393). `targets` are the ones parsed from the one
+/// makefile or justfile at `manifest`; a recipe line calling the same
+/// manager (`$(MAKE) x`, `just x`) follows `x` in that file, and one
+/// pointed at another file is mapped by name only. Each recipe command
+/// is mapped with [`commands_with`], split at `&&`, `||`, `;` and `|`,
+/// with shell keywords (`do`, `then`) and `NAME=value` assignments
+/// skipped. A command that still starts with a variable reference is
+/// not a literal and is skipped.
+///
+/// A target named for a verb (`lint`, `test-rust`) credits that verb and
+/// no other: a command counts when it maps to that verb, or to no verb at
+/// all (credited to its first token), and a typecheck (`tsc`) counts under
+/// a lint target. A command mapping only to another verb (`vite build`
+/// under `lint`) counts for nothing. A target named for no verb (`verify`,
+/// `check`) credits whatever each command maps to.
+///
+/// A target the file does not define is a file prerequisite, unless the
+/// makefile is open-ended (`open` is `Ok(Some(why))`): then it might be
+/// defined where the parser cannot see, and it is Unknown, never nothing.
+/// So is it when whether the makefile is open-ended could not be read
+/// (`open` is `Err`, #1411): a failed read is not "closed".
+fn recipe_runs(
+    manager: &str,
+    name: &str,
+    targets: &[&Target],
+    manifest: &Path,
+    open: Result<Option<&str>, &str>,
+    scripts: &Scripts,
+) -> (Vec<(String, Verb)>, Vec<Unfollowed>) {
+    struct Walk<'a> {
+        manager: &'a str,
+        targets: &'a [&'a Target],
+        manifest: &'a Path,
+        open: Result<Option<&'a str>, &'a str>,
+        scripts: &'a Scripts<'a>,
+        /// The named target's own verb, when its name maps to one.
+        verb: Option<Verb>,
+        seen: BTreeSet<String>,
+        runs: Vec<(String, Verb)>,
+        unknown: Vec<Unfollowed>,
+    }
+    fn visit(w: &mut Walk, name: &str) {
+        if !w.seen.insert(name.to_string()) {
+            return;
+        }
+        let Some(target) = w.targets.iter().find(|t| t.name == name) else {
+            let why = match w.open {
+                Ok(None) => None,
+                Ok(Some(why)) => Some(format!(
+                    "target `{name}` is not one the parser can see, and `{}` {why}",
+                    w.manifest.to_string_lossy()
+                )),
+                Err(e) => Some(format!(
+                    "target `{name}` is not one the parser can see, and whether `{}` includes other files could not be read: {e}",
+                    w.manifest.to_string_lossy()
+                )),
+            };
+            if let Some(why) = why {
+                w.unknown.push(Unfollowed {
+                    manager: None,
+                    reasons: vec![(w.manifest.to_path_buf(), why)],
+                });
+            }
+            return;
+        };
+        for p in &target.prereqs {
+            visit(w, p);
+        }
+        for line in &target.recipe {
+            for segment in split_chain(line) {
+                let tokens: Vec<&str> = segment
+                    .split_whitespace()
+                    .skip_while(|t| {
+                        matches!(*t, "do" | "then" | "else" | "{" | "(") || is_assignment(t)
+                    })
+                    .collect();
+                let Some(head) = tokens.first() else {
+                    continue;
+                };
+                if head.starts_with('$') {
+                    continue;
+                }
+                if *head == w.manager {
+                    for t in target_args(w.manager, &tokens[1..]) {
+                        visit(w, t);
+                    }
+                }
+                let command = tokens.join(" ");
+                let mapped = commands_with(&command, w.scripts);
+                let credited: Vec<(String, Verb)> = match w.verb {
+                    None => mapped,
+                    Some(v) if mapped.iter().any(|(_, m)| *m == v) => {
+                        mapped.into_iter().filter(|(_, m)| *m == v).collect()
+                    }
+                    Some(v) if mapped.is_empty() || (v == Verb::Lint && is_typecheck(&tokens)) => {
+                        let first = match *head {
+                            "./gradlew" | "gradlew" => "gradle",
+                            other => other,
+                        };
+                        vec![(first.to_string(), v)]
+                    }
+                    Some(_) => Vec::new(),
+                };
+                for run in credited {
+                    if !w.runs.contains(&run) {
+                        w.runs.push(run);
+                    }
+                }
+                w.scripts.unfollowed(&command, &mut w.unknown);
+            }
+        }
+    }
+    let mut w = Walk {
+        manager,
+        targets,
+        manifest,
+        open,
+        scripts,
+        verb: verb_by_name(name),
+        seen: BTreeSet::new(),
+        runs: Vec::new(),
+        unknown: Vec::new(),
+    };
+    visit(&mut w, name);
+    (w.runs, w.unknown)
+}
+
+/// Whether a command runs `tsc`, directly, through a launcher, or as
+/// `yarn|pnpm|bun [run] tsc`: a typecheck, which the tool map calls build
+/// and a lint target runs as lint.
+fn is_typecheck(tokens: &[&str]) -> bool {
+    let Some(first) = tokens.first() else {
+        return false;
+    };
+    let (tool, args) = unwrap_launcher(first, &tokens[1..]);
+    tool == "tsc"
+        || (matches!(tool, "yarn" | "pnpm" | "bun")
+            && matches!(args, ["tsc", ..] | ["run", "tsc", ..]))
+}
+
+/// The package.json scripts one span or fenced line runs, with the
+/// manager running each: the same segments [`commands_with`] reads.
+fn scripts_named(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for segment in split_chain(text) {
+        let segment = segment.trim();
+        let segment = segment.strip_prefix("$ ").unwrap_or(segment);
+        let tokens = command_words(segment);
+        let Some(first) = tokens.first() else {
+            continue;
+        };
+        let (manager, args) = unwrap_launcher(first, &tokens[1..]);
+        if let Some(s) = script_run(manager, args) {
+            out.push((manager.to_string(), s.to_string()));
         }
     }
     out
@@ -1847,8 +2715,8 @@ mod tests {
         assert_eq!(f.severity, Severity::Advice);
         assert_eq!(
             f.finding,
-            "yarn (package.json + yarn.lock at root) offers `test`, `lint`; none of the 1 file \
-             read names `yarn test`"
+            "yarn (package.json + yarn.lock at root) offers `test`; none of the 1 file read \
+             names `yarn test`"
         );
         assert_eq!(f.subject.path(), repo.join("CLAUDE.md").to_string_lossy());
         assert!(
@@ -1894,44 +2762,41 @@ mod tests {
         fs::write(repo.join("CLAUDE.md"), "Be careful.\n").unwrap();
 
         let report = run_over(&repo, &home);
-        let make: Vec<&Finding> = toolchain_findings(&report)
-            .into_iter()
-            .filter(|f| f.finding.starts_with("make ("))
-            .collect();
-        let sentences: Vec<&str> = make.iter().map(|f| f.finding.as_str()).collect();
+        let found = toolchain_findings(&report);
+        let sentences: Vec<&str> = found.iter().map(|f| f.finding.as_str()).collect();
+        // One finding per verb, each listing yarn's script and make's
+        // target (#1395).
         assert_eq!(
             sentences,
             vec![
-                "make (Makefile at root) offers `test`, `lint`; none of the 1 file read names \
-                 `make test`",
-                "make (Makefile at root) offers `test`, `lint`; none of the 1 file read names \
-                 `make lint`",
+                "yarn (package.json + yarn.lock at root) offers `test` and make (Makefile at \
+                 root) offers `test`; none of the 1 file read names `yarn test` or `make test`",
+                "yarn (package.json + yarn.lock at root) offers `lint` and make (Makefile at \
+                 root) offers `lint`; none of the 1 file read names `yarn lint` or `make lint`",
             ]
         );
         let makefile = repo.join("Makefile").to_string_lossy().to_string();
         assert!(
-            make[0]
+            found[0]
                 .brief
                 .contains(&format!("`{makefile}:2` — target `test`")),
             "{}",
-            make[0].brief
+            found[0].brief
         );
         assert!(
-            make[1]
+            found[1]
                 .brief
                 .contains(&format!("`{makefile}:5` — target `lint`")),
             "{}",
-            make[1].brief
+            found[1].brief
         );
-        // The yarn gaps are there too: four findings in all.
-        assert_eq!(toolchain_findings(&report).len(), 4, "{report:#?}");
 
         fs::remove_file(repo.join("CLAUDE.md")).unwrap();
         let report = run_over(&repo, &home);
         let found = toolchain_findings(&report);
         let f = found
             .iter()
-            .find(|f| f.finding.ends_with("`make test`"))
+            .find(|f| f.finding.contains("`make test`"))
             .expect("the make test gap");
         assert_eq!(
             f.subject,
@@ -1940,8 +2805,10 @@ mod tests {
             }
         );
         assert!(
-            f.finding
-                .ends_with("no CLAUDE.md loads for this repository, so nothing names `make test`"),
+            f.finding.ends_with(
+                "no CLAUDE.md loads for this repository, so nothing names `yarn test` or \
+                 `make test`"
+            ),
             "{}",
             f.finding
         );
@@ -2107,8 +2974,8 @@ mod tests {
         assert_eq!(found[0].severity, Severity::Advice);
         assert_eq!(
             found[0].finding,
-            "make (Makefile at root) offers `test`, `lint`; none of the 1 file read or 2 rules \
-             names `make lint`"
+            "make (Makefile at root) offers `lint`; none of the 1 file read or 2 rules names \
+             `make lint`"
         );
         let searched = found[0]
             .evidence
@@ -2175,6 +3042,97 @@ mod tests {
         );
     }
 
+    /// #1394's test: a `make test` named only in a repository skill is
+    /// not a gap, nor is a `make fmt` named only in a user skill, and
+    /// the gap that remains counts the skills apart from the files and
+    /// rules it read.
+    #[test]
+    fn a_command_named_in_a_skill_counts_and_the_skills_are_counted() {
+        let (_t, repo, home) = fixture();
+        fs::write(
+            repo.join("Makefile"),
+            "test:\n\ttrue\nlint:\n\ttrue\nfmt:\n\ttrue\n",
+        )
+        .unwrap();
+        fs::write(repo.join("CLAUDE.md"), "Nothing here.\n").unwrap();
+        let gate = repo.join(".claude").join("skills").join("gate");
+        fs::create_dir_all(&gate).unwrap();
+        fs::write(
+            gate.join("SKILL.md"),
+            "---\nname: gate\n---\nRun `make test`.\n",
+        )
+        .unwrap();
+        let mine = home.join(".claude").join("skills").join("tidy");
+        fs::create_dir_all(&mine).unwrap();
+        fs::write(mine.join("SKILL.md"), "```\nmake fmt\n```\n").unwrap();
+        let rules = repo.join(".claude").join("rules");
+        fs::create_dir_all(&rules).unwrap();
+        fs::write(rules.join("style.md"), "Be terse.\n").unwrap();
+
+        let report = run_over(&repo, &home);
+        let found = toolchain_findings(&report);
+        assert_eq!(found.len(), 1, "{report:#?}");
+        assert_eq!(found[0].severity, Severity::Advice);
+        assert_eq!(
+            found[0].finding,
+            "make (Makefile at root) offers `lint`; none of the 1 file read, 1 rule or 2 skills \
+             names `make lint`"
+        );
+        let searched = found[0]
+            .evidence
+            .iter()
+            .find(|e| e.measured.contains("file read"))
+            .expect("the search evidence");
+        assert!(
+            searched.measured.contains("2 skills read")
+                && searched
+                    .measured
+                    .contains(&gate.join("SKILL.md").to_string_lossy().to_string()),
+            "{}",
+            searched.measured
+        );
+
+        // The negative can fail: without the skills, test and fmt are
+        // gaps again.
+        fs::remove_dir_all(repo.join(".claude").join("skills")).unwrap();
+        fs::remove_dir_all(home.join(".claude").join("skills")).unwrap();
+        assert_eq!(toolchain_findings(&run_over(&repo, &home)).len(), 3);
+    }
+
+    /// A skill that exists and cannot be read makes the negative Unknown,
+    /// never "not named" (#1351's rule, #1394).
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_skill_makes_the_negative_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_t, repo, home) = fixture();
+        fs::write(repo.join("Makefile"), "test:\n\ttrue\n").unwrap();
+        fs::write(repo.join("CLAUDE.md"), "Nothing here.\n").unwrap();
+        let gate = repo.join(".claude").join("skills").join("gate");
+        fs::create_dir_all(&gate).unwrap();
+        let skill = gate.join("SKILL.md");
+        fs::write(&skill, "Run `make lint`.\n").unwrap();
+        let report = run_over(&repo, &home);
+        assert_eq!(
+            toolchain_findings(&report)[0].severity,
+            Severity::Advice,
+            "{report:#?}"
+        );
+
+        fs::set_permissions(&skill, fs::Permissions::from_mode(0o000)).unwrap();
+        let report = run_over(&repo, &home);
+        fs::set_permissions(&skill, fs::Permissions::from_mode(0o644)).unwrap();
+        let found = toolchain_findings(&report);
+        assert_eq!(found.len(), 1, "{report:#?}");
+        assert_eq!(found[0].severity, Severity::Unknown, "{}", found[0].finding);
+        assert!(
+            found[0].finding.contains("SKILL.md (") && found[0].finding.ends_with("` not readable"),
+            "{}",
+            found[0].finding
+        );
+    }
+
     /// Fixture 5: an unreadable `package.json` is Unknown with the io
     /// error as evidence, never "no scripts". The regression guard for
     /// absent-is-not-zero (#846).
@@ -2232,10 +3190,7 @@ mod tests {
 
         // Prose: the lint gap stands.
         let prose = gaps("Run make lint before pushing.\n");
-        assert!(
-            prose.iter().any(|s| s.ends_with("names `make lint`")),
-            "{prose:?}"
-        );
+        assert!(prose.iter().any(|s| s.contains("`make lint`")), "{prose:?}");
 
         // Fenced: cleared.
         let fenced = gaps("```bash\nmake lint\n```\n");
@@ -2258,10 +3213,7 @@ mod tests {
         // A path whose token is a manager counts for nothing.
         let path = gaps("Edit `src-tauri/Cargo.toml` and `cargo/test`.\n");
         assert!(path.iter().any(|s| s.contains("`cargo test`")), "{path:?}");
-        assert!(
-            path.iter().any(|s| s.ends_with("names `make lint`")),
-            "{path:?}"
-        );
+        assert!(path.iter().any(|s| s.contains("`make lint`")), "{path:?}");
     }
 
     /// Lint leakage: a style line with a formatter config that sets it is
@@ -2366,7 +3318,11 @@ mod tests {
         assert_eq!(verb_by_name("icons"), None);
         assert_eq!(verb_by_name("check-mobile-ios"), None);
 
-        assert_eq!(commands_in("yarn vitest run"), vec![]);
+        // #1392: a binary run through a manager maps by the tool map.
+        assert_eq!(
+            commands_in("yarn vitest run"),
+            vec![("yarn".into(), Verb::Test)]
+        );
         assert_eq!(
             commands_in("yarn run build"),
             vec![("yarn".into(), Verb::Build)]
@@ -2442,7 +3398,7 @@ mod tests {
         );
         assert_eq!(commands_in("bun run dev"), vec![("bun".into(), Verb::Run)]);
         // A launcher with nothing verb-shaped after it names nothing.
-        assert_eq!(commands_in("npx prettier --write ."), vec![]);
+        assert_eq!(commands_in("npx playwright install"), vec![]);
         assert_eq!(commands_in("pnpm install"), vec![]);
         assert_eq!(commands_in("nx graph"), vec![]);
         assert_eq!(commands_in("npx"), vec![]);
@@ -2464,16 +3420,17 @@ mod tests {
         fs::write(repo.join("yarn.lock"), "").unwrap();
         fs::write(repo.join("Cargo.toml"), "[package]\nname = \"octocat\"\n").unwrap();
 
+        // The test commands the one test finding lists (#1395).
         let test_gaps = |body: &str| -> Vec<String> {
             fs::write(repo.join("CLAUDE.md"), body).unwrap();
-            toolchain_findings(&run_over(&repo, &home))
+            let found = toolchain_findings(&run_over(&repo, &home))
                 .iter()
                 .map(|f| f.finding.clone())
-                .filter(|s| {
-                    s.ends_with("`make test-unit`")
-                        || s.ends_with("`yarn test`")
-                        || s.ends_with("`cargo test`")
-                })
+                .collect::<Vec<_>>();
+            ["`make test-unit`", "`yarn test`", "`cargo test`"]
+                .into_iter()
+                .filter(|c| found.iter().any(|s| s.contains(c)))
+                .map(str::to_string)
                 .collect()
         };
 
@@ -2491,7 +3448,204 @@ mod tests {
         // `cargo test` alone covers make's test target, not yarn's.
         let gaps = test_gaps("Run `cargo test`.\n");
         assert_eq!(gaps.len(), 1, "{gaps:?}");
-        assert!(gaps[0].ends_with("`yarn test`"), "{gaps:?}");
+        assert_eq!(gaps[0], "`yarn test`", "{gaps:?}");
+    }
+
+    /// #1392: a manager running a binary names what the binary does,
+    /// through the same tool map script bodies use, and the command is
+    /// credited to the manager that ran it. A script of the same name
+    /// takes precedence, and a manager subcommand names nothing.
+    #[test]
+    fn a_binary_run_through_a_manager_maps_by_the_tool_map() {
+        assert_eq!(
+            commands_in("npx prettier --check ."),
+            vec![("npx".into(), Verb::Format)]
+        );
+        assert_eq!(
+            commands_in("pnpm exec eslint ."),
+            vec![("pnpm".into(), Verb::Lint)]
+        );
+        assert_eq!(
+            commands_in("bunx tsc -b"),
+            vec![("bunx".into(), Verb::Build)]
+        );
+        assert_eq!(
+            commands_in("yarn run jest --ci"),
+            vec![("yarn".into(), Verb::Test)]
+        );
+        assert_eq!(
+            commands_in("pnpm playwright test"),
+            vec![("pnpm".into(), Verb::Test)]
+        );
+        assert_eq!(
+            commands_in("yarn vite build"),
+            vec![("yarn".into(), Verb::Build)]
+        );
+        assert_eq!(commands_in("yarn install"), vec![]);
+        assert_eq!(commands_in("yarn vite"), vec![]);
+        // `npm run` runs scripts only, never a binary.
+        assert_eq!(commands_in("npm run vitest"), vec![]);
+
+        // A script named `vitest` is what `yarn vitest` runs.
+        let names: BTreeSet<String> = ["vitest".to_string()].into_iter().collect();
+        let none = BTreeMap::new();
+        let scripts = Scripts {
+            verbs: &none,
+            unknown: &BTreeMap::new(),
+            names: &names,
+            targets: &BTreeMap::new(),
+            target_unknown: &BTreeMap::new(),
+        };
+        assert_eq!(commands_with("yarn vitest run", &scripts), vec![]);
+        // `npx` runs the binary whatever the scripts are called.
+        assert_eq!(
+            commands_with("npx vitest run", &scripts),
+            vec![("npx".into(), Verb::Test)]
+        );
+
+        // In a script body too: `yarn vitest` is vitest unless a script
+        // of that name exists.
+        let bodies: BTreeMap<&str, &str> =
+            [("fmt", "yarn prettier --write .")].into_iter().collect();
+        assert_eq!(
+            body_verbs("yarn vitest run && yarn fmt", &bodies, true, None).verbs,
+            vec![Verb::Test, Verb::Format]
+        );
+    }
+
+    /// #1412: a leading `NAME=value` is an environment assignment, not
+    /// the manager, in a loaded file as in a script body.
+    #[test]
+    fn a_leading_assignment_is_skipped_before_the_manager() {
+        assert_eq!(
+            commands_in("CI=1 yarn test"),
+            vec![("yarn".into(), Verb::Test)]
+        );
+        assert_eq!(
+            commands_in("$ CI=1 RUST_LOG=debug cargo test --lib"),
+            vec![("cargo".into(), Verb::Test)]
+        );
+        // An assignment alone runs nothing.
+        assert_eq!(commands_in("CI=1"), vec![]);
+        // What `unfollowed` reads sees the same command.
+        assert_eq!(
+            scripts_named("CI=1 yarn verify"),
+            vec![("yarn".to_string(), "verify".to_string())]
+        );
+        assert_eq!(
+            targets_named("CI=1 make lint"),
+            vec![("make".to_string(), "lint".to_string())]
+        );
+    }
+
+    /// #1412: options before a make or just target are skipped, and so is
+    /// the value of an option that takes one. A `-C`/`-f` target names
+    /// its verb but its recipe is not followed (#1408's rule).
+    #[test]
+    fn options_before_a_make_or_just_target_are_skipped() {
+        assert_eq!(
+            commands_in("make -j4 lint"),
+            vec![("make".into(), Verb::Lint)]
+        );
+        assert_eq!(
+            commands_in("make -k V=1 test"),
+            vec![("make".into(), Verb::Test)]
+        );
+        assert_eq!(
+            commands_in("just --dry-run test"),
+            vec![("just".into(), Verb::Test)]
+        );
+        assert_eq!(
+            commands_in("make -f other.mk build"),
+            vec![("make".into(), Verb::Build)]
+        );
+        assert_eq!(
+            commands_in("just --justfile other.just fmt"),
+            vec![("just".into(), Verb::Format)]
+        );
+        // `-C lint` is a directory called lint, not the lint target.
+        assert_eq!(commands_in("make -C lint"), vec![]);
+
+        let runs: TargetRuns = [(
+            ("make".to_string(), "lint".to_string()),
+            vec![("cargo".to_string(), Verb::Lint)],
+        )]
+        .into_iter()
+        .collect();
+        let scripts = Scripts {
+            verbs: &BTreeMap::new(),
+            unknown: &BTreeMap::new(),
+            names: &BTreeSet::new(),
+            targets: &runs,
+            target_unknown: &BTreeMap::new(),
+        };
+        // Followed: the flag no longer hides the target.
+        assert_eq!(
+            commands_with("make -j4 lint", &scripts),
+            vec![("make".into(), Verb::Lint), ("cargo".into(), Verb::Lint)]
+        );
+        // Named, not followed: `-C sub` is another makefile.
+        assert_eq!(
+            commands_with("make -C sub lint", &scripts),
+            vec![("make".into(), Verb::Lint)]
+        );
+        // #1415: make's `-d` is DEBUG, not a directory, so it is followed.
+        assert_eq!(
+            commands_with("make -d lint", &scripts),
+            vec![("make".into(), Verb::Lint), ("cargo".into(), Verb::Lint)]
+        );
+        // #1415: an attached `-fFILE` runs another makefile -- named, never
+        // followed through THIS directory's makefile (which would credit
+        // coverage from a file the command never runs).
+        assert_eq!(
+            commands_with("make -fother.mk lint", &scripts),
+            vec![("make".into(), Verb::Lint)]
+        );
+        // just's `-d` IS its working directory: named, not followed.
+        let just_runs: TargetRuns = [(
+            ("just".to_string(), "lint".to_string()),
+            vec![("cargo".to_string(), Verb::Lint)],
+        )]
+        .into_iter()
+        .collect();
+        let just_scripts = Scripts {
+            targets: &just_runs,
+            ..scripts
+        };
+        assert_eq!(
+            commands_with("just -d sub lint", &just_scripts),
+            vec![("just".into(), Verb::Lint)]
+        );
+        assert_eq!(
+            commands_with("just -dsub lint", &just_scripts),
+            vec![("just".into(), Verb::Lint)]
+        );
+    }
+
+    /// #1392's test: a CLAUDE.md naming `yarn vitest run` covers yarn's
+    /// `test` script, and `npx prettier --check .` covers `format`.
+    /// `yarn install` still names nothing, so the negative can fail.
+    #[test]
+    fn a_manager_running_a_binary_covers_the_scripts_verb() {
+        let (_t, repo, home) = fixture();
+        fs::write(
+            repo.join("package.json"),
+            r#"{"scripts":{"test":"vitest run","format":"prettier --write ."}}"#,
+        )
+        .unwrap();
+        fs::write(repo.join("yarn.lock"), "").unwrap();
+
+        fs::write(repo.join("CLAUDE.md"), "Run `yarn install`.\n").unwrap();
+        let found = toolchain_findings(&run_over(&repo, &home)).len();
+        assert_eq!(found, 2, "test and format are both gaps");
+
+        fs::write(
+            repo.join("CLAUDE.md"),
+            "Run `yarn vitest run` and `npx prettier --check .`.\n",
+        )
+        .unwrap();
+        let report = run_over(&repo, &home);
+        assert!(toolchain_findings(&report).is_empty(), "{report:#?}");
     }
 
     /// #1341: a script body maps by the tools it runs, split at `&&`,
@@ -2507,7 +3661,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let v = |body: &str| body_verbs(body, &bodies, true);
+        let v = |body: &str| body_verbs(body, &bodies, true, None).verbs;
         assert_eq!(
             v("prettier --check $(git diff --name-only) && eslint . && vitest run"),
             vec![Verb::Format, Verb::Lint, Verb::Test]
@@ -2584,6 +3738,386 @@ mod tests {
         );
     }
 
+    /// A package.json whose `verify` runs `body`, beside `test`,
+    /// `test:unit`, `lint` and `lint:fix` scripts, and a CLAUDE.md naming
+    /// `npm run verify` only.
+    fn verify_app(repo: &Path, body: &str) {
+        fs::write(
+            repo.join("package.json"),
+            format!(
+                r#"{{"scripts":{{"test":"vitest","test:unit":"vitest run","lint":"eslint .","lint:fix":"eslint --fix .","verify":"{body}"}}}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            repo.join("CLAUDE.md"),
+            "Run `npm run verify` before pushing.\n",
+        )
+        .unwrap();
+    }
+
+    /// #1376's test: `verify` runs `bash tools/v.sh`, which runs prettier
+    /// and eslint, so naming `npm run verify` covers format and lint. The
+    /// one finding, for test, lists only the test scripts; a comment line
+    /// in the file maps nothing.
+    #[test]
+    fn a_script_body_is_followed_into_a_repository_script_file() {
+        let (_t, repo, home) = fixture();
+        verify_app(&repo, "bash tools/v.sh");
+        fs::create_dir_all(repo.join("tools")).unwrap();
+        fs::write(
+            repo.join("tools").join("v.sh"),
+            "#!/bin/sh\nset -e\n# npx vitest run\nnpx prettier --check $(git diff --name-only)\neslint .\n",
+        )
+        .unwrap();
+
+        let report = run_over(&repo, &home);
+        let found = toolchain_findings(&report);
+        assert_eq!(found.len(), 1, "{report:#?}");
+        assert_eq!(found[0].severity, Severity::Advice);
+        assert_eq!(
+            found[0].finding,
+            "npm (package.json at root) offers `test`, `test:unit`; none of the 1 file read \
+             names `npm run test` or `npm run test:unit`"
+        );
+
+        // The negative can fail: without the file, `verify` maps to
+        // nothing it can be shown to run, and format is not offered.
+        let detection = detect(&repo);
+        let verify: Vec<Verb> = detection.toolchains[0]
+            .offers
+            .iter()
+            .filter(|o| o.what == "verify")
+            .map(|o| o.verb)
+            .collect();
+        assert_eq!(verify, vec![Verb::Format, Verb::Lint]);
+    }
+
+    /// The launchers followed, each one level: `sh`, `node` and `./`. A
+    /// file the followed file runs is not read.
+    #[test]
+    fn script_files_are_followed_one_level_by_each_launcher() {
+        let (_t, repo, _home) = fixture();
+        let tools = repo.join("tools");
+        fs::create_dir_all(&tools).unwrap();
+        fs::write(tools.join("f.sh"), "prettier --write .\n").unwrap();
+        fs::write(tools.join("t.mjs"), "// eslint .\nvitest run\n").unwrap();
+        fs::write(tools.join("outer.sh"), "bash tools/f.sh\n").unwrap();
+        let bodies = BTreeMap::new();
+        let at = Files {
+            dir: &repo,
+            repo: &repo,
+        };
+        let v = |body: &str| body_verbs(body, &bodies, true, Some(&at));
+        assert_eq!(v("sh tools/f.sh").verbs, vec![Verb::Format]);
+        assert_eq!(v("bash -e \"tools/f.sh\"").verbs, vec![Verb::Format]);
+        assert_eq!(
+            v("./tools/f.sh && node tools/t.mjs").verbs,
+            vec![Verb::Format, Verb::Test]
+        );
+        assert_eq!(v("bash tools/outer.sh").verbs, vec![]);
+        assert!(v("bash tools/outer.sh").unknown.is_empty());
+        assert_eq!(v("bash -c 'prettier .'").verbs, vec![]);
+        assert!(v("bash -c 'prettier .'").unknown.is_empty());
+
+        // A symlink under the repository to a file outside it is not
+        // read: the check is made through symlinks too.
+        #[cfg(unix)]
+        {
+            let outside = _t.path().join("outside.sh");
+            fs::write(&outside, "eslint .\n").unwrap();
+            std::os::unix::fs::symlink(&outside, tools.join("link.sh")).unwrap();
+            let body = v("bash tools/link.sh");
+            assert_eq!(body.verbs, vec![]);
+            assert!(
+                body.unknown[0].1.contains("outside the repository"),
+                "{:?}",
+                body.unknown
+            );
+        }
+    }
+
+    /// A script file that cannot be read, or lies outside the repository,
+    /// makes the named script's verbs Unknown, never uncovered; the
+    /// outside file is not read. A script nothing names changes nothing.
+    #[test]
+    fn an_unreadable_or_outside_script_file_is_unknown_not_uncovered() {
+        for (body, says) in [
+            ("bash tools/missing.sh", "could not be read"),
+            ("bash ../outside.sh", "outside the repository"),
+        ] {
+            let (t, repo, home) = fixture();
+            // Readable, and would cover lint and test if it were read.
+            fs::write(t.path().join("outside.sh"), "eslint .\nvitest\n").unwrap();
+            verify_app(&repo, body);
+
+            let report = run_over(&repo, &home);
+            let found = toolchain_findings(&report);
+            assert_eq!(found.len(), 2, "{body}: {report:#?}");
+            for f in &found {
+                assert_eq!(f.severity, Severity::Unknown, "{body}: {f:#?}");
+                assert!(f.finding.contains("could not be decided"), "{}", f.finding);
+                assert!(
+                    f.evidence.iter().any(
+                        |e| e.measured.contains("script `verify`") && e.measured.contains(says)
+                    ),
+                    "{body}: {:?}",
+                    f.evidence
+                );
+            }
+
+            // Nothing names `verify`: its file cannot cover anything.
+            fs::write(repo.join("CLAUDE.md"), "Be careful.\n").unwrap();
+            let report = run_over(&repo, &home);
+            let found = toolchain_findings(&report);
+            assert_eq!(found.len(), 2, "{body}: {report:#?}");
+            assert!(
+                found.iter().all(|f| f.severity == Severity::Advice),
+                "{body}: {report:#?}"
+            );
+        }
+    }
+
+    /// A root crate and a Makefile, and the findings' sentences when
+    /// the CLAUDE.md is `claude`.
+    fn crate_and_makefile(repo: &Path, home: &Path, makefile: &str, claude: &str) -> Vec<Finding> {
+        fs::write(repo.join("Cargo.toml"), "[package]\nname = \"octocat\"\n").unwrap();
+        fs::write(repo.join("Makefile"), makefile).unwrap();
+        fs::write(repo.join("CLAUDE.md"), claude).unwrap();
+        toolchain_findings(&run_over(repo, home))
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// #1393's test: a named make target covers what its recipe runs,
+    /// through its prerequisites, split at `&&`. Naming `make fmt`
+    /// instead leaves the cargo lint gap, so the negative can fail.
+    #[test]
+    fn a_named_make_target_covers_what_its_recipe_runs() {
+        let (_t, repo, home) = fixture();
+        let makefile = "lint: lint-rust\nlint-rust:\n\tcd a && cargo clippy\nfmt:\n\ttrue\n";
+        let clippy = |found: &[Finding]| {
+            found
+                .iter()
+                .filter(|f| f.finding.contains("`cargo clippy`"))
+                .count()
+        };
+
+        let found = crate_and_makefile(&repo, &home, makefile, "Run `make lint`.\n");
+        assert_eq!(clippy(&found), 0, "{found:#?}");
+
+        let found = crate_and_makefile(&repo, &home, makefile, "Run `make fmt`.\n");
+        assert_eq!(clippy(&found), 1, "{found:#?}");
+        assert_eq!(found[0].severity, Severity::Advice);
+    }
+
+    /// `$(MAKE) <target>` is followed, a literal variable is read, a
+    /// cycle ends, a JS binary in a recipe maps (#1392), and a
+    /// non-literal command is skipped.
+    #[test]
+    fn recipes_follow_make_calls_and_variables_and_stop_at_cycles() {
+        let (_t, repo, _home) = fixture();
+        yarn_app(&repo);
+        fs::write(repo.join("Cargo.toml"), "[package]\nname = \"octocat\"\n").unwrap();
+        fs::write(
+            repo.join("Makefile"),
+            "CARGO := cargo\nDYN = $(shell which cargo)\n\
+             check: loop\n\t@$(MAKE) --no-print-directory inner\n\t$(DYN) build\n\
+             loop: check\n\
+             inner:\n\tVITE_TARGET=x $(CARGO) test && yarn vitest run\n\
+             elsewhere:\n\t$(MAKE) -C sub fmt\n\
+             fmt:\n\tcargo fmt\n",
+        )
+        .unwrap();
+        let d = detect(&repo);
+        let runs = |t: &str| {
+            d.target_runs
+                .get(&("make".to_string(), t.to_string()))
+                .cloned()
+        };
+        assert_eq!(
+            runs("check"),
+            Some(vec![
+                ("cargo".to_string(), Verb::Test),
+                ("yarn".to_string(), Verb::Test),
+            ])
+        );
+        // `-C sub` is another makefile's target: mapped by name (#1412),
+        // not followed into this file's `fmt`, so no `cargo fmt`.
+        assert_eq!(
+            runs("elsewhere"),
+            Some(vec![("make".to_string(), Verb::Format)])
+        );
+        assert!(d.target_unknown.is_empty(), "{:?}", d.target_unknown);
+    }
+
+    /// A target named for a verb credits only that verb: `make lint`
+    /// running `tsc -b` covers yarn's lint (a typecheck in a lint target
+    /// is lint) and not its build, and `vite build` there counts for
+    /// nothing. A target named for no verb falls back to each command's
+    /// own verb: `make verify` running `tsc -b && vitest` covers build and
+    /// test.
+    #[test]
+    fn a_verb_named_target_credits_only_its_own_verb() {
+        let (_t, repo, home) = fixture();
+        fs::write(
+            repo.join("package.json"),
+            r#"{"scripts":{"build":"tsc -b","test":"vitest","lint":"eslint ."}}"#,
+        )
+        .unwrap();
+        fs::write(repo.join("yarn.lock"), "").unwrap();
+        fs::write(
+            repo.join("Makefile"),
+            "lint:\n\tyarn tsc -b && npx vite build\nverify:\n\tnpx tsc -b && npx vitest\n",
+        )
+        .unwrap();
+        let yarn_gaps = |claude: &str| -> Vec<String> {
+            fs::write(repo.join("CLAUDE.md"), claude).unwrap();
+            let found: Vec<String> = toolchain_findings(&run_over(&repo, &home))
+                .iter()
+                .map(|f| f.finding.clone())
+                .collect();
+            ["`yarn build`", "`yarn test`", "`yarn lint`"]
+                .into_iter()
+                .filter(|c| found.iter().any(|s| s.contains(c)))
+                .map(str::to_string)
+                .collect()
+        };
+
+        assert_eq!(
+            yarn_gaps("Run `make lint`.\n"),
+            vec!["`yarn build`", "`yarn test`"]
+        );
+        assert_eq!(yarn_gaps("Run `make verify`.\n"), vec!["`yarn lint`"]);
+
+        let d = detect(&repo);
+        let runs = |t: &str| {
+            d.target_runs
+                .get(&("make".to_string(), t.to_string()))
+                .cloned()
+        };
+        assert_eq!(runs("lint"), Some(vec![("yarn".to_string(), Verb::Lint)]));
+        assert_eq!(
+            runs("verify"),
+            Some(vec![
+                ("npx".to_string(), Verb::Build),
+                ("npx".to_string(), Verb::Test)
+            ])
+        );
+    }
+
+    /// A prerequisite the parser cannot see is a file when the makefile
+    /// is closed, and Unknown when an `include` could define it: the
+    /// negative it would decide becomes Unknown, never Advice.
+    #[test]
+    fn a_missing_prerequisite_of_an_open_ended_makefile_is_unknown() {
+        let (_t, repo, home) = fixture();
+        let closed = "lint: lint-rust\n\ttrue\n";
+        let found = crate_and_makefile(&repo, &home, closed, "Run `make lint`.\n");
+        let gap = found
+            .iter()
+            .find(|f| f.finding.contains("`cargo clippy`"))
+            .expect("the cargo lint gap");
+        assert_eq!(gap.severity, Severity::Advice, "{gap:#?}");
+
+        let open = "include rules.mk\nlint: lint-rust\n\ttrue\n";
+        let found = crate_and_makefile(&repo, &home, open, "Run `make lint`.\n");
+        let gap = found
+            .iter()
+            .find(|f| f.finding.contains("`cargo clippy`"))
+            .expect("the cargo lint gap, undecided");
+        assert_eq!(gap.severity, Severity::Unknown, "{gap:#?}");
+        assert!(
+            gap.finding.contains("`lint-rust`") && gap.finding.contains("includes other files"),
+            "{}",
+            gap.finding
+        );
+
+        // Nothing names `make lint`: the open makefile decides nothing.
+        let found = crate_and_makefile(&repo, &home, open, "Nothing.\n");
+        assert!(
+            found.iter().all(|f| f.severity == Severity::Advice),
+            "{found:#?}"
+        );
+    }
+
+    /// #1411: when whether the makefile is open-ended could not be read,
+    /// a prerequisite the parser cannot see is Unknown, naming the
+    /// makefile and the error: never a file, never nothing.
+    #[test]
+    fn a_missing_prerequisite_when_openness_is_unreadable_is_unknown() {
+        let lint = Target {
+            name: "lint".to_string(),
+            file: "Makefile".to_string(),
+            line: 1,
+            prereqs: vec!["lint-rust".to_string()],
+            recipe: Vec::new(),
+        };
+        let targets = [&lint];
+        let cx = Scripts {
+            verbs: &BTreeMap::new(),
+            unknown: &BTreeMap::new(),
+            names: &BTreeSet::new(),
+            targets: &BTreeMap::new(),
+            target_unknown: &BTreeMap::new(),
+        };
+        let (runs, unknown) = recipe_runs(
+            "make",
+            "lint",
+            &targets,
+            Path::new("Makefile"),
+            Err("Makefile: Permission denied"),
+            &cx,
+        );
+        assert!(runs.is_empty(), "{runs:?}");
+        assert_eq!(unknown.len(), 1, "{unknown:?}");
+        let (at, why) = &unknown[0].reasons[0];
+        assert_eq!(at, Path::new("Makefile"));
+        assert!(
+            why.contains("`lint-rust`") && why.contains("Permission denied"),
+            "{why}"
+        );
+    }
+
+    /// #1411: an unreadable makefile is Unknown with the io error, never
+    /// "nothing names" a target in it.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_makefile_is_unknown_not_unnamed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_t, repo, home) = fixture();
+        fs::write(repo.join("Cargo.toml"), "[package]\nname = \"octocat\"\n").unwrap();
+        let makefile = repo.join("Makefile");
+        fs::write(&makefile, "lint: lint-rust\n\ttrue\n").unwrap();
+        fs::write(repo.join("CLAUDE.md"), "Run `make nope`.\n").unwrap();
+        fs::set_permissions(&makefile, fs::Permissions::from_mode(0o000)).unwrap();
+        let blocked = fs::read(&makefile).is_err();
+        let report = run_over(&repo, &home);
+        fs::set_permissions(&makefile, fs::Permissions::from_mode(0o644)).unwrap();
+        if !blocked {
+            eprintln!("skipped: mode 0o000 did not block the read (running as root?)");
+            return;
+        }
+
+        let found = toolchain_findings(&report);
+        assert!(
+            found.iter().any(|f| f.severity == Severity::Unknown
+                && f.evidence
+                    .iter()
+                    .any(|e| e.measured.contains("Makefile")
+                        && e.measured.contains("Permission denied"))),
+            "{found:#?}"
+        );
+        assert!(
+            !found
+                .iter()
+                .any(|f| f.severity == Severity::Advice && f.finding.contains("`make ")),
+            "a target in an unreadable makefile is never reported unnamed: {found:#?}"
+        );
+    }
+
     /// Detection over the added markers, each read through this module's
     /// own walk.
     #[test]
@@ -2647,6 +4181,249 @@ mod tests {
         assert!(by(Toolchain::Bundler).offers.is_empty());
     }
 
+    /// Four build toolchains: yarn with a `build` script, a binary
+    /// crate, a Makefile `build` target and a hand-made Xcode project.
+    fn four_builds(repo: &Path) {
+        fs::write(
+            repo.join("package.json"),
+            r#"{"scripts":{"build":"vite build"}}"#,
+        )
+        .unwrap();
+        fs::write(repo.join("yarn.lock"), "").unwrap();
+        fs::write(repo.join("Cargo.toml"), "[package]\nname = \"octocat\"\n").unwrap();
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src").join("main.rs"), "fn main() {}\n").unwrap();
+        fs::write(repo.join("Makefile"), "build:\n\tyarn build\n").unwrap();
+        fs::create_dir_all(repo.join("ios").join("App.xcodeproj")).unwrap();
+    }
+
+    /// #1395's test: four toolchains offering `build` and nothing named
+    /// is ONE build finding listing four offers, with each toolchain's
+    /// evidence. #1327's coverage rules still decide what is listed:
+    /// `cargo build` named covers cargo and make (a task runner takes any
+    /// manager), and the finding lists the other two.
+    #[test]
+    fn one_finding_per_uncovered_verb_lists_every_toolchains_offers() {
+        let (_t, repo, home) = fixture();
+        four_builds(&repo);
+        fs::write(repo.join("CLAUDE.md"), "Nothing.\n").unwrap();
+
+        let report = run_over(&repo, &home);
+        let found = toolchain_findings(&report);
+        let build: Vec<&&Finding> = found
+            .iter()
+            .filter(|f| f.finding.contains("`build`"))
+            .collect();
+        assert_eq!(build.len(), 1, "{found:#?}");
+        let f = build[0];
+        assert_eq!(f.severity, Severity::Advice);
+        assert_eq!(
+            f.finding,
+            "yarn (package.json + yarn.lock at root) offers `build`, cargo (Cargo.toml at root) \
+             offers `build`, make (Makefile at root) offers `build` and xcode (App.xcodeproj at \
+             ios) offers `build`; none of the 1 file read names `yarn build`, `cargo build`, \
+             `make build` or `xcodebuild build`"
+        );
+        for manifest in ["package.json", "Cargo.toml", "Makefile", "App.xcodeproj"] {
+            assert!(
+                f.evidence.iter().any(|e| matches!(
+                    &e.at,
+                    Locator::File { path, .. } if path.ends_with(manifest)
+                )),
+                "{manifest}: {:?}",
+                f.evidence
+            );
+        }
+        // One finding per verb in all: build, test, lint, fmt and run.
+        assert_eq!(found.len(), 5, "{found:#?}");
+
+        fs::write(repo.join("CLAUDE.md"), "Run `cargo build`.\n").unwrap();
+        let report = run_over(&repo, &home);
+        let found = toolchain_findings(&report);
+        let build: Vec<&&Finding> = found
+            .iter()
+            .filter(|f| f.finding.contains("`build`"))
+            .collect();
+        assert_eq!(build.len(), 1, "{found:#?}");
+        assert!(
+            build[0].finding.starts_with(
+                "yarn (package.json + yarn.lock at root) offers `build` and xcode \
+                 (App.xcodeproj at ios) offers `build`;"
+            ),
+            "{}",
+            build[0].finding
+        );
+    }
+
+    /// #1395: within one verb, a toolchain whose negative can be decided
+    /// and one whose cannot are two findings, Advice and Unknown, never
+    /// one: the npm test gap depends on a script file nobody could read,
+    /// the cargo one does not.
+    #[test]
+    fn decided_and_undecided_toolchains_are_not_merged() {
+        let (_t, repo, home) = fixture();
+        verify_app(&repo, "bash tools/missing.sh");
+        fs::write(repo.join("Cargo.toml"), "[package]\nname = \"octocat\"\n").unwrap();
+        let report = run_over(&repo, &home);
+        let test: Vec<&Finding> = toolchain_findings(&report)
+            .into_iter()
+            .filter(|f| f.finding.contains("`cargo test`") || f.finding.contains("`npm run test`"))
+            .collect();
+        assert_eq!(test.len(), 2, "{test:#?}");
+        let advice = test
+            .iter()
+            .find(|f| f.severity == Severity::Advice)
+            .unwrap();
+        let unknown = test
+            .iter()
+            .find(|f| f.severity == Severity::Unknown)
+            .unwrap();
+        assert!(
+            advice.finding.starts_with("cargo (") && !advice.finding.contains("npm"),
+            "{}",
+            advice.finding
+        );
+        assert!(
+            unknown.finding.starts_with("npm (") && !unknown.finding.contains("cargo"),
+            "{}",
+            unknown.finding
+        );
+    }
+
+    /// #1395: `cargo run` is offered only for a crate with a binary
+    /// target (`src/main.rs`, `src/bin/`, `[[bin]]`), and a finding's
+    /// label names only the crates that offer its verb.
+    #[test]
+    fn a_library_crate_offers_no_run_and_is_not_labelled_for_it() {
+        let (_t, repo, home) = fixture();
+        for (dir, manifest, file) in [
+            (
+                "app",
+                "[package]\nname = \"app\"\n",
+                Some(("src", "main.rs")),
+            ),
+            (
+                "tool",
+                "[package]\nname = \"tool\"\n",
+                Some(("src/bin", "x.rs")),
+            ),
+            (
+                "declared",
+                "[package]\nname = \"d\"\n[[bin]]\nname = \"d\"\n",
+                None,
+            ),
+            (
+                "lib",
+                "[package]\nname = \"lib\"\n",
+                Some(("src", "lib.rs")),
+            ),
+        ] {
+            let d = repo.join(dir);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("Cargo.toml"), manifest).unwrap();
+            if let Some((sub, name)) = file {
+                let at = sub.split('/').fold(d.clone(), |p, c| p.join(c));
+                fs::create_dir_all(&at).unwrap();
+                fs::write(at.join(name), "").unwrap();
+            }
+        }
+        fs::write(repo.join("CLAUDE.md"), "Nothing.\n").unwrap();
+
+        let d = detect(&repo);
+        let runs: Vec<String> = d
+            .toolchains
+            .iter()
+            .filter(|t| t.offers.iter().any(|o| o.verb == Verb::Run))
+            .map(|t| t.label.clone())
+            .collect();
+        assert_eq!(
+            runs,
+            vec![
+                "Cargo.toml at app",
+                "Cargo.toml at declared",
+                "Cargo.toml at tool"
+            ]
+        );
+
+        let report = run_over(&repo, &home);
+        let found = toolchain_findings(&report);
+        let run = found
+            .iter()
+            .find(|f| f.finding.contains("`cargo run`"))
+            .expect("the run gap");
+        assert!(
+            run.finding.starts_with(
+                "cargo (Cargo.toml at app, Cargo.toml at declared, Cargo.toml at tool) offers \
+                 `run`;"
+            ),
+            "{}",
+            run.finding
+        );
+        let build = found
+            .iter()
+            .find(|f| f.finding.contains("`cargo build`"))
+            .expect("the build gap");
+        assert!(
+            build.finding.contains("Cargo.toml at lib"),
+            "{}",
+            build.finding
+        );
+    }
+
+    /// #1396's test: an Xcode project under `<dir>/gen/apple` and a
+    /// Gradle build under `<dir>/gen/android`, where `<dir>` holds a
+    /// `tauri.conf.json`, are Tauri's generated projects, not toolchains.
+    /// The rule is that narrow: a hand-made project elsewhere, or a
+    /// `gen/apple` with no Tauri config beside `gen`, is still detected.
+    #[test]
+    fn tauri_generated_mobile_projects_are_not_toolchains() {
+        let (_t, repo, _home) = fixture();
+        let app = repo.join("app");
+        fs::create_dir_all(app.join("gen").join("apple").join("x.xcodeproj")).unwrap();
+        fs::create_dir_all(app.join("gen").join("android")).unwrap();
+        fs::write(app.join("gen").join("android").join("build.gradle.kts"), "").unwrap();
+        fs::write(app.join("tauri.conf.json"), "{}").unwrap();
+        fs::create_dir_all(repo.join("ios").join("x.xcodeproj")).unwrap();
+        // Not beside a Tauri config: `other` has none.
+        fs::create_dir_all(
+            repo.join("other")
+                .join("gen")
+                .join("apple")
+                .join("y.xcodeproj"),
+        )
+        .unwrap();
+
+        let d = detect(&repo);
+        // By directory, not label: a label's separator is the platform's.
+        let dirs = |k: Toolchain| -> Vec<PathBuf> {
+            d.toolchains
+                .iter()
+                .filter(|t| t.toolchain == k)
+                .map(|t| t.dir.clone())
+                .collect()
+        };
+        assert_eq!(
+            dirs(Toolchain::Xcode),
+            vec![
+                repo.join("ios"),
+                repo.join("other").join("gen").join("apple")
+            ]
+        );
+        assert!(dirs(Toolchain::Gradle).is_empty(), "{d:#?}");
+
+        // The negative can fail: without the config, both are detected.
+        fs::remove_file(app.join("tauri.conf.json")).unwrap();
+        let d = detect(&repo);
+        assert_eq!(
+            d.toolchains
+                .iter()
+                .filter(|t| t.dir.starts_with(&app))
+                .count(),
+            2,
+            "{d:#?}"
+        );
+    }
+
     /// A Cargo workspace is one toolchain whose label counts its
     /// members, and `cargo run` is offered only where a binary exists.
     #[test]
@@ -2697,12 +4474,16 @@ mod tests {
             eprintln!("  [{:?}] {}", f.severity, f.finding);
         }
         // `make lint`, `make test-mobile`, `cargo fmt` and `cargo test
-        // --lib` are named, so none of these is a gap.
+        // --lib` are named, so none of these is a gap. `yarn vitest run`
+        // names yarn's test (#1392). `make lint` runs `lint-rust`, which
+        // runs `cargo clippy` (#1393).
         for named in [
             "`make lint`",
             "`make test-mobile`",
             "`cargo fmt`",
             "`cargo test`",
+            "`yarn test`",
+            "`cargo clippy`",
         ] {
             assert!(
                 !found.iter().any(|f| f.finding.contains(named)),
@@ -2710,13 +4491,46 @@ mod tests {
                 found.iter().map(|f| &f.finding).collect::<Vec<_>>()
             );
         }
-        // `make build` and `make dev` exist and nothing names them.
-        for gap in ["`make build`", "`make dev`", "`yarn test`"] {
+        // `cargo build` and `make dev` exist and nothing names them.
+        for gap in ["`cargo build`", "`make dev`"] {
             assert!(
                 found.iter().any(|f| f.finding.contains(gap)),
                 "{gap} is a gap here: {:?}",
                 found.iter().map(|f| &f.finding).collect::<Vec<_>>()
             );
         }
+        // Build and dev are each ONE finding listing every offer (#1395),
+        // and the step-up crate, a library, offers no `cargo run`.
+        let sentences: Vec<&String> = found.iter().map(|f| &f.finding).collect();
+        let build: Vec<&&String> = sentences
+            .iter()
+            .filter(|s| s.contains("`cargo build`"))
+            .collect();
+        assert_eq!(build.len(), 1, "{sentences:#?}");
+        // `make lint` runs `yarn tsc -b`, a typecheck, which a lint target
+        // does not credit as build: the build gap stands.
+        assert!(
+            build[0].contains("`yarn build`") && build[0].contains("`make build`"),
+            "{}",
+            build[0]
+        );
+        let run: Vec<&&String> = sentences
+            .iter()
+            .filter(|s| s.contains("`make dev`"))
+            .collect();
+        assert_eq!(run.len(), 1, "{sentences:#?}");
+        assert!(
+            run[0].contains("`yarn dev`") && run[0].contains("`cargo run`"),
+            "{}",
+            run[0]
+        );
+        assert!(!run[0].contains("headstate-stepup"), "{}", run[0]);
+        // The verify skill is read (#1394).
+        assert!(run[0].contains(" skills names "), "{}", run[0]);
+        // `src-mobile/gen/apple` is Tauri's generated project (#1396).
+        assert!(
+            !sentences.iter().any(|s| s.contains("xcodebuild")),
+            "{sentences:#?}"
+        );
     }
 }

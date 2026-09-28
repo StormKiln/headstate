@@ -82,6 +82,35 @@ export function PhoneNotifyPanel() {
           />
           The paired Mac&apos;s CPU is busy with nothing in particular
         </label>
+        {/* #1486. The global switch for Claude Code session notifications;
+            a single session is muted from its own detail. */}
+        <label className="flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            disabled={!enabled}
+            checked={prefs?.sessions ?? true}
+            onChange={() => prefs && void set({ ...prefs, sessions: !prefs.sessions })}
+          />
+          Sessions: a turn finished, one is waiting for you, or one errored
+        </label>
+        {/* Nested under Sessions and OFF by default: the lock screen
+            names the project and the state, and nothing from the
+            conversation unless the owner asks for it here. */}
+        <label className="ml-6 flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            disabled={!enabled || !(prefs?.sessions ?? true)}
+            checked={prefs?.session_snippet ?? false}
+            onChange={() =>
+              prefs && void set({ ...prefs, session_snippet: !prefs.session_snippet })
+            }
+          />
+          Show the session&apos;s opening prompt in the notification
+        </label>
+        <p className="ml-6 text-xs text-[#8b949e]">
+          Best-effort, delivery can be delayed by iOS. Without the prompt, a session
+          notification shows only the project and its state.
+        </p>
       </div>
       <p className="text-xs text-[#8b949e]">
         Health notifications are about the Mac you paired with, not this phone, and

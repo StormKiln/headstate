@@ -148,13 +148,21 @@ fn between_markers(out: &str) -> Option<&str> {
 /// the home directory, which is exactly what a GUI app's PATH omits.
 pub fn fallback_dirs() -> Vec<String> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        let h = home.to_string_lossy();
-        dirs.push(format!("{h}/.local/bin"));
-        dirs.push(format!("{h}/.cargo/bin"));
-        dirs.push(format!("{h}/.dotnet/tools"));
-        dirs.push(format!("{h}/.volta/bin"));
-        dirs.push(format!("{h}/.bun/bin"));
+    // Through the one resolver (#1554), which a test build answers from a
+    // fixture and which reads `USERPROFILE` on Windows, where `HOME` is
+    // usually unset. Joined, not formatted, for the verbatim-path reason
+    // the root CLAUDE.md gives.
+    if let Some(home) = crate::auth::home_dir() {
+        for rel in [
+            [".local", "bin"],
+            [".cargo", "bin"],
+            [".dotnet", "tools"],
+            [".volta", "bin"],
+            [".bun", "bin"],
+        ] {
+            let dir: PathBuf = rel.iter().fold(home.clone(), |p, part| p.join(part));
+            dirs.push(dir.to_string_lossy().into_owned());
+        }
     }
     dirs.extend(
         [
@@ -272,6 +280,30 @@ mod tests {
 
         let found = find("faketool", &[dir.as_str()]);
         assert_eq!(found, Some(exe));
+    }
+
+    /// The per-user directories come from `auth::home_dir`, not from
+    /// `$HOME` (#1554): under a fixture home they are the fixture's, and
+    /// with no home there are none -- while the fixed system directories
+    /// are there either way.
+    #[test]
+    fn the_home_fallbacks_follow_the_resolver() {
+        let fixture = tempfile::TempDir::new().unwrap();
+        let cargo_bin = fixture.path().join(".cargo").join("bin");
+        let with_home = {
+            let _home = crate::auth::test_home::set(fixture.path());
+            fallback_dirs()
+        };
+        assert!(
+            with_home.contains(&cargo_bin.to_string_lossy().into_owned()),
+            "{with_home:?}"
+        );
+        let without = fallback_dirs();
+        assert!(
+            !without.iter().any(|d| d.contains(".cargo")),
+            "no home, no per-user directories: {without:?}"
+        );
+        assert!(without.contains(&"/usr/bin".to_string()));
     }
 
     /// The login-shell fallback must be LAST.

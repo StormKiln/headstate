@@ -2,6 +2,8 @@ import { useState } from "react";
 import { toast } from "sonner";
 import { useActOnPr } from "../api/hooks";
 import type { PrActionName } from "../api/tauri";
+import { stackBlocksMerge, stackBlocksQueue, stackGate, stackMergePlan } from "../lib/stack";
+import { StackMerge } from "./StackMerge";
 import { inverseOf } from "../lib/undo";
 import type { PrDetail } from "../types/pr";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
@@ -12,11 +14,30 @@ import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 /// "checks failing" teaches, where an absent item just looks broken. That
 /// matters here -- 14 of 25 open PRs on this account are DIRTY or
 /// UNSTABLE, so merge is unavailable more often than not.
-function unavailable(pr: PrDetail, action: PrActionName): string | null {
+///
+/// `conversations` is the review-gate reason (#1454): the base branch's
+/// rules require resolution and threads are open. It names the actual
+/// blocker where "a required review or check is missing" could not, and
+/// it gates ENQUEUE as well -- the queue refuses the entry for the same
+/// reason. Only when GitHub itself has not said `clean`: GitHub knows
+/// about bypass permissions this view cannot see, and a clean verdict is
+/// its final word.
+function unavailable(
+  pr: PrDetail,
+  action: PrActionName,
+  conversations: string | null = null,
+): string | null {
+  const byConversations =
+    conversations !== null && pr.merge_status !== "clean" ? conversations : null;
   switch (action) {
-    case "merge":
+    case "merge": {
+      // A native stack merges only through GitHub's stack merge (#1452).
+      // First, because no other obstacle clearing would make this work.
+      const stacked = stackBlocksMerge(stackGate(pr.stack, pr.number));
+      if (stacked) return stacked;
       if (pr.is_draft) return "drafts cannot be merged";
       if (pr.merge_status === "dirty") return "merge conflicts";
+      if (byConversations) return byConversations;
       if (pr.merge_status === "blocked") return "a required review or check is missing";
       if (pr.merge_status === "unstable") return "checks are failing";
       if (pr.merge_status === "behind") return "the branch is behind its base";
@@ -37,6 +58,14 @@ function unavailable(pr: PrDetail, action: PrActionName): string | null {
       // answer that costs something.
       if (pr.merge_status !== "clean") return "GitHub has not confirmed this can merge";
       return null;
+    }
+    // Two gates, the STACK first (#1452): resolving conversations would not
+    // make GitHub accept a stacked pull request into the queue, while
+    // merging the one beneath (or merging the stack as a stack) is the step
+    // that has to come first either way. Open conversations (#1454) are the
+    // next blocker once the stack is out of the way.
+    case "enqueue":
+      return stackBlocksQueue(stackGate(pr.stack, pr.number)) ?? byConversations;
     case "ready":
       return pr.is_draft ? null : "already ready for review";
     case "draft":
@@ -76,8 +105,12 @@ const LABEL: Record<PrActionName, string> = {
 export function PrActions({
   pr,
   compact = false,
+  conversations = null,
 }: {
   pr: PrDetail;
+  /// Why merge and enqueue must wait on conversations, from the base
+  /// branch's rules (#1454), or null when nothing is known to require it.
+  conversations?: string | null;
   /// Render ONLY the primary merge action, for the sticky header.
   ///
   /// Reuses this component rather than reimplementing the button there:
@@ -173,12 +206,28 @@ export function PrActions({
   return (
     <div className="flex flex-wrap items-center gap-2">
       {offered.map((action) => {
-        const why = unavailable(pr, action);
+        const why = unavailable(pr, action, conversations);
         const primary = action === primaryMerge && action !== "dequeue";
         // Closing a pull request is destructive and irreversible from
         // here (`inverseOf` deliberately gives close no undo), so it is
         // the one action that must not look like its neutral neighbours.
         const destructive = action === "close";
+        // A native stack GitHub can merge is merged AS a stack (#1468): the
+        // primary action becomes the stack merge, which confirms with every
+        // pull request it lands. Same availability reason as the plain
+        // button would have had.
+        const lands = stackMergePlan(pr.stack, pr.number);
+        if (lands !== null && (action === "merge" || action === "enqueue")) {
+          return (
+            <StackMerge
+              key={action}
+              pr={pr}
+              lands={lands}
+              queue={action === "enqueue"}
+              why={why}
+            />
+          );
+        }
         return (
           <button
             key={action}
@@ -206,8 +255,20 @@ export function PrActions({
       {/* Suppressed in the header, where there is no room for a
           sentence -- the disabled button keeps its `title`, and the full
           explanation is still in the open in the body below. */}
-      {!compact && unavailable(pr, "merge") && !pr.is_draft ? (
-        <span className="text-xs text-[#8b949e]">Cannot merge: {unavailable(pr, "merge")}</span>
+      {!compact && unavailable(pr, "merge", conversations) && !pr.is_draft ? (
+        <span className="text-xs text-[#8b949e]">
+          Cannot merge: {unavailable(pr, "merge", conversations)}
+        </span>
+      ) : null}
+      {/* The reason a disabled "Add to merge queue" is disabled (#1452),
+          unless the line above already said the same thing. */}
+      {!compact &&
+      primaryMerge === "enqueue" &&
+      unavailable(pr, "enqueue", conversations) &&
+      unavailable(pr, "enqueue", conversations) !== unavailable(pr, "merge", conversations) ? (
+        <span className="text-xs text-[#8b949e]">
+          Cannot queue: {unavailable(pr, "enqueue", conversations)}
+        </span>
       ) : null}
 
       {pending ? (

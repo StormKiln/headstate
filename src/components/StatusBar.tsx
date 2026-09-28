@@ -123,14 +123,25 @@ export function StatusBar({ updatedAt, githubAuthAvailable = true, selection = "
     // Says what STOPPED, not what failed: nothing the user did went
     // wrong, and the numbers on screen are real -- they are simply not
     // being refreshed any more. The log is where the panic itself is.
+    //
+    // Every state, not only "ok": "Checking GitHub…" and "Could not reach
+    // GitHub" made the same app-wide claim from the same one-subsystem
+    // evidence. The failure is also stated as what did not happen, not as
+    // a cause -- `poll-error` carries a rejected token, a rate limit and a
+    // GraphQL objection as well as a timeout (`ClientError::is_transient`),
+    // so "could not reach" was often the wrong reason.
+    //
+    // "panicked" alone speaks for more than pull requests, and correctly:
+    // the panic flag is set by ANY background task, the stats backfill
+    // included.
     panicked: "Background updates stopped — see the log",
     authUnavailable: "GitHub is not refreshing — sign in on the desktop",
     authUnknown: "GitHub status unavailable",
-    fetching: "Checking GitHub…",
+    fetching: "Checking PRs…",
     ok: "PRs up to date",
-    retrying: "Retrying…",
+    retrying: "Retrying PRs…",
     stale: "Could not refresh PRs",
-    failed: "Could not reach GitHub",
+    failed: "Could not load PRs",
   } as const;
   const { seconds, set } = usePollInterval();
   const [settingsOpen, setSettingsOpen] = useState(false);

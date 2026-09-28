@@ -74,11 +74,20 @@
 //! the page two answers to one question, and the two would disagree the
 //! first time either changed.
 //!
-//! What this module does instead is count over the SAME rows the list
-//! already resolved. `running_session_ids` comes in as a parameter, from
-//! whatever already asked the machine, and everything else is SQL over
-//! `claude_session` / `claude_run`. There is no process probe in this
-//! file and no registry read.
+//! They DID, until #1534. This page used to count from `live.rs`, a seam
+//! written before #917 landed that answered only "which ids are
+//! positively running". Everything outside that set was offered for
+//! resumption -- including rows the session list called "could not
+//! tell" because a terminal-launched session was running in their folder
+//! (#1315). A Resume beside a session that may be alive starts a second
+//! copy of it.
+//!
+//! So the page now counts from the session list ITSELF: [`report`] runs
+//! [`super::sessions::list_with`] and reads each row's verdict off it, the
+//! way the phone's digest does. The per-row answer here is the list's
+//! answer by construction, not by two derivations agreeing, and `live.rs`
+//! is gone. Everything else is SQL over `claude_session` / `claude_run`.
+//! There is no process probe in this file.
 //!
 //! # Absent is not zero, and a chart is the worst place to break it
 //!
@@ -95,7 +104,7 @@
 //! as data -- [`Counts::cwd_unknown`] is sessions whose directory could
 //! not be checked, and it is neither "exists" nor "gone".
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -174,8 +183,20 @@ pub struct Counts {
     pub sessions: usize,
     /// Sessions whose process is running right now.
     ///
-    /// Counted from the ids the caller resolved, never re-derived here.
+    /// Counted from the session list's verdicts, never re-derived here.
+    /// A FLOOR while `live_unreadable` or `live_unnamed` is non-empty.
     pub running: usize,
+    /// Sessions the list could not call running or stopped (#1534), whose
+    /// directory is not gone.
+    ///
+    /// Kept out of `resumable` and `cwd_unknown`, which are "stopped,
+    /// and ...": offering one of these for resumption is the
+    /// contradiction #1534 removed -- the list beside this page says
+    /// "could not tell" for the same row, and resuming a live session
+    /// starts a second copy. One whose directory IS gone is in `archived`,
+    /// which is a fact about the directory and matches the list's
+    /// "Directory gone" chip.
+    pub liveness_unknown: usize,
     /// Not running, and the recorded directory still exists.
     ///
     /// **The page's headline number.** 246 of 1,461 here -- the sessions
@@ -184,6 +205,10 @@ pub struct Counts {
     /// resurrection predicate.
     pub resumable: usize,
     /// Not running, and the recorded directory is gone.
+    ///
+    /// "Not running" as the list's chip means it: stopped, or could not
+    /// tell (#1534). The directory is gone either way, and this count is
+    /// what the "Directory gone" chip it opens contains.
     ///
     /// 1,212 of 1,461 here, so this is the NORMAL state and must not be
     /// rendered as damage. These are still resumable by id -- `claude
@@ -206,8 +231,9 @@ pub struct Counts {
     /// was KILLED rather than one that exited: `SessionEnd` does not
     /// fire on SIGKILL, which is the epic's founding measurement.
     ///
-    /// Counted from runs whose session is not currently running, so a
-    /// live session's own open run is not reported as an orphan.
+    /// Counted from runs whose session the list calls STOPPED, so a live
+    /// session's own open run is not reported as an orphan, and nor is
+    /// the open run of a session nobody could tell about.
     pub orphaned_runs: usize,
     /// Sessions the hook has never observed at all (`runs = 0`).
     ///
@@ -290,6 +316,78 @@ pub struct OverviewReport {
     /// session that may be running, so a non-empty list makes
     /// `counts.running` a floor rather than a count.
     pub live_unreadable: Vec<String>,
+    /// Claude Code processes running with no session record that nothing
+    /// could name (#1315, #1534), one line each. Also makes
+    /// `counts.running` a floor: each is running and on no row.
+    ///
+    /// Only the UNNAMED ones. A `.key`-only process a hook-recorded run
+    /// identifies is counted in `running`, on its own session's row.
+    pub live_unnamed: Vec<String>,
+}
+
+/// One row's liveness, as the session list derived it.
+///
+/// The list's own three states and nothing else. Coarser than
+/// [`super::liveness::Liveness`] because a count needs no reason, and
+/// deliberately not a `bool`: "running" and "not running" is the two-state
+/// reading that offered Resume on a row the list could not decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Running,
+    Stopped,
+    Unknown,
+}
+
+/// Every row's verdict, keyed by session id, off one session list.
+pub fn verdicts(list: &super::sessions::SessionList) -> HashMap<String, Verdict> {
+    use super::sessions::ListLiveness;
+    list.sessions
+        .iter()
+        .map(|r| {
+            let v = match r.liveness {
+                ListLiveness::Running { .. } => Verdict::Running,
+                ListLiveness::Dead { .. } => Verdict::Stopped,
+                ListLiveness::Unknown { .. } => Verdict::Unknown,
+            };
+            (r.session_id.clone(), v)
+        })
+        .collect()
+}
+
+/// The overview, from one registry read and the session list derived
+/// from it.
+///
+/// `probe_for` builds the process probe from the pids any row could turn
+/// on; production passes `SysinfoProbe::for_pids`. A seam rather than a
+/// hard-coded probe so the agreement with the list can be tested against
+/// a process table the test chooses.
+pub fn report_with<P: super::liveness::ProcessProbe>(
+    conn: &Connection,
+    registry: &super::liveness::Registry,
+    probe_for: impl FnOnce(&[u32]) -> P,
+    today: chrono::DateTime<chrono::Utc>,
+) -> Result<OverviewReport, rusqlite::Error> {
+    let list = super::sessions::list_probed(conn, registry, probe_for)?;
+    let overview = aggregate(conn, &verdicts(&list), today)?;
+    Ok(OverviewReport {
+        overview,
+        live_failure: list.registry_failure,
+        live_unreadable: list.registry_unreadable,
+        live_unnamed: list.registry_unnamed,
+    })
+}
+
+/// [`report_with`] against the live registry and the real process table.
+pub fn report(
+    conn: &Connection,
+    today: chrono::DateTime<chrono::Utc>,
+) -> Result<OverviewReport, rusqlite::Error> {
+    report_with(
+        conn,
+        &super::sessions::live_registry(),
+        super::liveness::SysinfoProbe::for_pids,
+        today,
+    )
 }
 
 /// A stored row, before the directory check.
@@ -304,31 +402,19 @@ struct Row {
 
 /// Aggregate the stored corpus for the overview.
 ///
-/// `running_session_ids` is the set of sessions the caller has already
-/// established are alive -- #917's liveness derivation, passed in rather
-/// than repeated. An EMPTY set is ambiguous on its own ("nothing is
-/// running" or "we could not look"), and this function does not try to
-/// resolve that: the caller knows which, and the view says so from its
-/// own `live_failure`. What this guarantees is only that a session IN the
-/// set is never counted as resumable, so a live session the caller told
-/// us about can never appear in the list offering to resurrect it.
+/// `verdicts` is the session list's answer for each row -- see
+/// [`report_with`], the only production caller. Only a [`Verdict::Stopped`]
+/// row is classified by its directory, so only a row the list calls
+/// stopped can be offered for resumption.
 ///
-/// # The direction this cannot guarantee, and who has to say so
+/// # A row with no verdict is `Unknown`
 ///
-/// The converse does not hold, and it is the half worth stating because
-/// it is the one that misleads an ACTION. A session is classified as
-/// resumable exactly when it is NOT in the set and its directory exists.
-/// So a session that is running but absent from the set -- because the
-/// registry could not be listed, or because its record could not be
-/// parsed -- lands in the resumable list, and resuming a session that is
-/// already alive starts a second copy of it.
-///
-/// That is not fixable here: this function is given a set and cannot know
-/// whether the set is complete. It is the caller's failure to report, and
-/// [`OverviewReport`] carries `live_failure` and `live_unreadable` for
-/// exactly that reason -- the page names the over-count in both banners
-/// rather than claiming the figures below are unaffected, which is true
-/// of the history and false of the one figure a user acts on.
+/// The list and this function read the database one after the other, so a
+/// row the importer added in between has no verdict. It is counted in
+/// `liveness_unknown` rather than treated as stopped: the old two-state
+/// reading ("not in the running set, so resumable") is the one that
+/// offered a live session for resumption, and a missing answer is not a
+/// "no".
 ///
 /// # Cost
 ///
@@ -339,7 +425,7 @@ struct Row {
 /// `tests::real_corpus_overview`, which is why there is no cache here.
 pub fn aggregate(
     conn: &Connection,
-    running_session_ids: &HashSet<String>,
+    verdicts: &HashMap<String, Verdict>,
     today: chrono::DateTime<chrono::Utc>,
 ) -> Result<Overview, rusqlite::Error> {
     let rows = stored_rows(conn)?;
@@ -357,11 +443,22 @@ pub fn aggregate(
     let mut resumable: Vec<ResumableRow> = Vec::new();
 
     for row in &rows {
-        let running = running_session_ids.contains(&row.session_id);
-        if running {
-            counts.running += 1;
-        } else {
-            match check_cwd(row.cwd.as_deref()) {
+        let verdict = verdicts
+            .get(&row.session_id)
+            .copied()
+            .unwrap_or(Verdict::Unknown);
+        match verdict {
+            Verdict::Running => counts.running += 1,
+            // A gone directory is a fact about the DIRECTORY, whatever
+            // the process is doing, and the list's "Directory gone" chip
+            // admits unknown liveness for that reason -- so `archived`
+            // does too, and the tile still opens a list of its own size.
+            // Anything else the list could not decide is offered nowhere.
+            Verdict::Unknown => match check_cwd(row.cwd.as_deref()) {
+                Cwd::Gone => counts.archived += 1,
+                Cwd::Exists | Cwd::Unknown => counts.liveness_unknown += 1,
+            },
+            Verdict::Stopped => match check_cwd(row.cwd.as_deref()) {
                 Cwd::Exists => {
                     counts.resumable += 1;
                     resumable.push(ResumableRow {
@@ -374,16 +471,16 @@ pub fn aggregate(
                 }
                 Cwd::Gone => counts.archived += 1,
                 Cwd::Unknown => counts.cwd_unknown += 1,
-            }
+            },
         }
 
         match runs.get(&row.session_id) {
             None => counts.never_observed += 1,
             Some(summary) => {
-                // Only a session we do NOT believe is running: a live
+                // Only a session the list calls stopped: a live
                 // session's open run is the run of the thing that is
-                // alive, not an orphan.
-                if !running {
+                // alive, and one we could not tell about may be.
+                if verdict == Verdict::Stopped {
                     counts.orphaned_runs += summary.open;
                 }
             }
@@ -522,8 +619,22 @@ mod tests {
         .unwrap();
     }
 
-    fn none() -> HashSet<String> {
-        HashSet::new()
+    /// Every stored session called stopped: the verdict map a list with
+    /// nothing running would give, which is what the directory and
+    /// window tests below are about.
+    fn stopped(conn: &Connection) -> HashMap<String, Verdict> {
+        let mut stmt = conn
+            .prepare("SELECT session_id FROM claude_session")
+            .unwrap();
+        let ids = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap);
+        ids.map(|id| (id, Verdict::Stopped)).collect()
+    }
+
+    fn with(pairs: &[(&str, Verdict)]) -> HashMap<String, Verdict> {
+        pairs.iter().map(|(id, v)| (id.to_string(), *v)).collect()
     }
 
     fn today() -> chrono::DateTime<chrono::Utc> {
@@ -562,7 +673,7 @@ mod tests {
             Some("2026-09-12T10:00:00Z"),
         );
 
-        let out = aggregate(&conn, &none(), today()).unwrap();
+        let out = aggregate(&conn, &stopped(&conn), today()).unwrap();
         assert_eq!(
             out.counts.cwd_unknown, 1,
             "the stat failed, so we cannot say"
@@ -583,7 +694,7 @@ mod tests {
     fn a_session_with_no_recorded_directory_is_not_counted_as_gone() {
         let conn = db();
         insert(&conn, "nocwd", None, "2026-09-12T10:00:00Z", None);
-        let out = aggregate(&conn, &none(), today()).unwrap();
+        let out = aggregate(&conn, &stopped(&conn), today()).unwrap();
         assert_eq!(out.counts.cwd_unknown, 1);
         assert_eq!(out.counts.archived, 0);
     }
@@ -615,9 +726,8 @@ mod tests {
             Some("2026-09-12T11:00:00Z"),
         );
 
-        let mut running = HashSet::new();
-        running.insert("live".to_string());
-        let out = aggregate(&conn, &running, today()).unwrap();
+        let verdicts = with(&[("live", Verdict::Running), ("dead", Verdict::Stopped)]);
+        let out = aggregate(&conn, &verdicts, today()).unwrap();
 
         assert_eq!(out.counts.running, 1);
         assert_eq!(out.counts.resumable, 1, "only the dead one");
@@ -630,38 +740,69 @@ mod tests {
         );
     }
 
-    /// A session missing from the set IS counted resumable, and that is
-    /// the caller's problem to report.
+    /// **#1534.** A session the list could not decide is NEVER offered for
+    /// resumption, and neither is one with no verdict at all.
     ///
-    /// Pinned rather than left implicit, because it is the one direction
-    /// `aggregate` cannot get right on its own and the page's banners are
-    /// the whole mitigation. If this behaviour ever changed -- if some
-    /// future edit tried to guess at liveness here -- the banners would
-    /// become wrong in the other direction, and a reader of this file
-    /// would have no way to know the wording depends on it.
+    /// This used to be the opposite test: `aggregate` took a set of
+    /// running ids, so a session missing from it was counted resumable and
+    /// the page's banners were the whole mitigation. That is the reading
+    /// that offered Resume on a row the list called "could not tell".
+    ///
+    /// Sabotage: classifying `Verdict::Unknown` (or a missing verdict) by
+    /// its directory, as the old `!running` branch did, puts both rows in
+    /// `resumable` and in the list.
     #[test]
-    fn a_session_absent_from_the_running_set_is_counted_resumable() {
+    fn a_session_the_list_could_not_decide_is_never_offered_as_resumable() {
         let conn = db();
         let dir = std::env::temp_dir();
         let cwd = dir.to_str().unwrap();
+        for id in ["could-not-tell", "no-verdict"] {
+            insert(
+                &conn,
+                id,
+                Some(cwd),
+                "2026-09-13T10:00:00Z",
+                Some("2026-09-13T11:00:00Z"),
+            );
+        }
+        // And one whose directory is gone: that is a fact about the
+        // directory, so it is `archived` -- the list's "Directory gone"
+        // chip admits unknown liveness -- and it is still not offered.
+        let gone = dir.join("headstate-1534-deleted-worktree");
         insert(
             &conn,
-            "actually-running",
-            Some(cwd),
+            "could-not-tell-gone",
+            gone.to_str(),
             "2026-09-13T10:00:00Z",
-            Some("2026-09-13T11:00:00Z"),
+            None,
         );
+        conn.execute(
+            "INSERT INTO claude_run (session_id, pid, started_at, ended_at)
+             VALUES ('could-not-tell', 4242, '2026-09-13T10:00:00Z', NULL)",
+            [],
+        )
+        .unwrap();
 
-        // The caller could not read the registry, so it passes an empty
-        // set even though this session is alive.
-        let out = aggregate(&conn, &none(), today()).unwrap();
-        assert_eq!(
-            out.counts.resumable, 1,
-            "this function is given a set and cannot know it is incomplete"
-        );
+        let verdicts = with(&[
+            ("could-not-tell", Verdict::Unknown),
+            ("could-not-tell-gone", Verdict::Unknown),
+        ]);
+        let out = aggregate(&conn, &verdicts, today()).unwrap();
+        assert_eq!(out.counts.liveness_unknown, 2);
+        assert_eq!(out.counts.archived, 1);
+        assert_eq!(out.counts.resumable, 0, "either may be alive");
+        assert!(out.resumable.is_empty(), "{:?}", out.resumable);
         assert_eq!(out.counts.running, 0);
-        // Which is exactly why `OverviewReport` carries `live_failure`
-        // and the page says a running session may be counted here.
+        assert_eq!(
+            out.counts.orphaned_runs, 0,
+            "an open run of a session that may be alive is not an orphan"
+        );
+        // The buckets still add up, so a reader can check the arithmetic.
+        let c = &out.counts;
+        assert_eq!(
+            c.running + c.liveness_unknown + c.resumable + c.archived + c.cwd_unknown,
+            c.sessions
+        );
     }
 
     /// #921's predicate is reported, and it is zero for imported history.
@@ -674,7 +815,7 @@ mod tests {
     fn an_imported_session_is_never_observed_rather_than_orphaned() {
         let conn = db();
         insert(&conn, "imported", None, "2026-09-12T10:00:00Z", None);
-        let out = aggregate(&conn, &none(), today()).unwrap();
+        let out = aggregate(&conn, &stopped(&conn), today()).unwrap();
         assert_eq!(out.counts.never_observed, 1);
         assert_eq!(
             out.counts.orphaned_runs, 0,
@@ -699,16 +840,14 @@ mod tests {
         )
         .unwrap();
 
-        let out = aggregate(&conn, &none(), today()).unwrap();
+        let out = aggregate(&conn, &stopped(&conn), today()).unwrap();
         assert_eq!(out.counts.orphaned_runs, 1);
         assert_eq!(out.counts.never_observed, 0, "this one WAS observed");
 
         // And a live session's own open run is not an orphan: it is the
         // run of the thing that is alive. Sabotage: counting `open`
         // unconditionally reports every running session as a crash.
-        let mut running = HashSet::new();
-        running.insert("killed".to_string());
-        let live = aggregate(&conn, &running, today()).unwrap();
+        let live = aggregate(&conn, &with(&[("killed", Verdict::Running)]), today()).unwrap();
         assert_eq!(
             live.counts.orphaned_runs, 0,
             "the open run belongs to the process that is running"
@@ -724,7 +863,7 @@ mod tests {
     fn the_activity_window_is_complete_and_zero_filled() {
         let conn = db();
         insert(&conn, "one", None, "2026-09-13T09:00:00Z", None);
-        let out = aggregate(&conn, &none(), today()).unwrap();
+        let out = aggregate(&conn, &stopped(&conn), today()).unwrap();
 
         assert_eq!(out.activity.len() as i64, ACTIVITY_DAYS);
         assert_eq!(out.activity.first().unwrap().day, "2026-08-15");
@@ -747,7 +886,7 @@ mod tests {
     fn a_session_older_than_the_window_is_counted_but_not_charted() {
         let conn = db();
         insert(&conn, "ancient", None, "2026-01-01T09:00:00Z", None);
-        let out = aggregate(&conn, &none(), today()).unwrap();
+        let out = aggregate(&conn, &stopped(&conn), today()).unwrap();
         assert_eq!(out.counts.sessions, 1);
         assert_eq!(
             out.activity.iter().map(|d| d.started).sum::<usize>(),
@@ -766,7 +905,7 @@ mod tests {
     fn a_non_utc_timestamp_buckets_by_its_utc_day() {
         let conn = db();
         insert(&conn, "offset", None, "2026-09-12T22:00:00-05:00", None);
-        let out = aggregate(&conn, &none(), today()).unwrap();
+        let out = aggregate(&conn, &stopped(&conn), today()).unwrap();
         let day = out
             .activity
             .iter()
@@ -794,7 +933,7 @@ mod tests {
                 Some(&format!("2026-09-{:02}T00:00:00Z", i + 1)),
             );
         }
-        let out = aggregate(&conn, &none(), today()).unwrap();
+        let out = aggregate(&conn, &stopped(&conn), today()).unwrap();
 
         assert_eq!(out.counts.resumable, RESUMABLE_SHOWN + 5, "the real total");
         assert_eq!(out.resumable.len(), RESUMABLE_SHOWN, "the stated subset");
@@ -827,7 +966,7 @@ mod tests {
             "2026-09-10T00:00:00Z",
             Some("2026-09-10T01:00:00Z"),
         );
-        let out = aggregate(&conn, &none(), today()).unwrap();
+        let out = aggregate(&conn, &stopped(&conn), today()).unwrap();
         assert_eq!(
             out.resumable
                 .iter()
@@ -846,7 +985,7 @@ mod tests {
     /// here and "could not tell" there.
     #[test]
     fn an_empty_corpus_is_a_complete_window_of_zeros() {
-        let out = aggregate(&db(), &none(), today()).unwrap();
+        let out = aggregate(&db(), &HashMap::new(), today()).unwrap();
         assert_eq!(out.counts, Counts::default());
         assert_eq!(out.activity.len() as i64, ACTIVITY_DAYS);
         assert!(out.activity.iter().all(|d| d.started == 0));
@@ -870,7 +1009,7 @@ mod tests {
     fn a_failed_query_is_an_error_and_never_a_page_of_zeros() {
         let conn = Connection::open_in_memory().unwrap();
         // No migration, so `claude_session` does not exist.
-        let err = aggregate(&conn, &none(), today());
+        let err = aggregate(&conn, &HashMap::new(), today());
         assert!(
             err.is_err(),
             "a query that could not run must not become a struct of zeros"
@@ -888,12 +1027,13 @@ mod tests {
     #[test]
     #[ignore = "needs the real ~/.claude corpus; run with --ignored"]
     fn real_corpus_overview() {
+        let _home = crate::auth::test_home::real_for_a_live_probe();
         let scan = crate::claude::scan_default().expect("a real ~/.claude/projects");
         let mut conn = db();
         crate::claude::store::import(&mut conn, scan).unwrap();
 
         let t0 = std::time::Instant::now();
-        let out = aggregate(&conn, &none(), chrono::Utc::now()).unwrap();
+        let out = aggregate(&conn, &stopped(&conn), chrono::Utc::now()).unwrap();
         let elapsed = t0.elapsed();
 
         println!("sessions            {}", out.counts.sessions);
@@ -908,31 +1048,31 @@ mod tests {
         );
         println!("aggregate elapsed   {:?}", elapsed);
 
-        // And again WITH the live registry, which is the path the command
-        // actually takes -- so a live session is proved to be subtracted
-        // from the resumable count rather than offered for resurrection.
-        let live = crate::claude::live::running_ids_default();
+        // And again through `report`, which is the path the command
+        // actually takes: the session list's verdicts over the live
+        // registry. Only a row the list calls stopped may be offered.
         let t1 = std::time::Instant::now();
-        let with_live = aggregate(&conn, &live.ids, chrono::Utc::now()).unwrap();
-        println!("--- with the live registry ---");
-        println!("live ids            {}", live.ids.len());
-        println!("running             {}", with_live.counts.running);
-        println!("resumable           {}", with_live.counts.resumable);
-        println!("live failure        {:?}", live.failure);
-        println!("elapsed             {:?}", t1.elapsed());
-        assert_eq!(
-            with_live.counts.running,
-            live.ids.len(),
-            "every live id must be a session we have a row for"
+        let live = report(&conn, chrono::Utc::now()).unwrap();
+        println!("--- through the session list ---");
+        println!("running             {}", live.overview.counts.running);
+        println!(
+            "could not tell      {}",
+            live.overview.counts.liveness_unknown
         );
-        // The whole point of passing the set in: a running session is not
-        // in the resumable list.
+        println!("resumable           {}", live.overview.counts.resumable);
+        println!("live failure        {:?}", live.live_failure);
+        println!("live unnamed        {:?}", live.live_unnamed);
+        println!("elapsed             {:?}", t1.elapsed());
+        let list =
+            crate::claude::sessions::list_with(&conn, &crate::claude::sessions::live_registry())
+                .unwrap();
+        let stopped = verdicts(&list);
         assert!(
-            with_live
+            live.overview
                 .resumable
                 .iter()
-                .all(|r| !live.ids.contains(&r.session_id)),
-            "a live session must never be offered as resumable"
+                .all(|r| stopped.get(&r.session_id) == Some(&Verdict::Stopped)),
+            "only a row the list calls stopped may be offered as resumable"
         );
 
         assert!(out.counts.sessions > 100, "a real corpus");

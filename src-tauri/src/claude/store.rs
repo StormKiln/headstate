@@ -198,12 +198,6 @@ fn upsert(conn: &Connection, t: &Transcript, now: &str) -> Result<(), rusqlite::
     Ok(())
 }
 
-/// Write a completed [`Scan`] into `claude_session`.
-///
-/// One transaction, so a rescan interrupted halfway leaves the previous
-/// contents rather than a half-merged list. Per-session write failures
-/// are collected and reported instead of aborting the import: one
-/// malformed row must not cost the user the other 1,429.
 /// The pull requests one session produced (#1132).
 pub fn prs_for_session(
     conn: &Connection,
@@ -226,21 +220,39 @@ pub fn prs_for_session(
     rows.collect()
 }
 
-/// The sessions that produced one pull request (#1132).
+/// The sessions that produced a pull request with this NUMBER, in any
+/// repository (#1545).
 ///
-/// The reverse direction, and the one the PR view asks. Indexed on
-/// `(repo, number)` so it does not scan the table.
-pub fn sessions_for_pr(
+/// What the search box asks when the query is a bare `#1234` or `1234`.
+/// It used to resolve the repository from the tracked OPEN pull requests
+/// first, so a merged one -- the usual state of "the PR that session
+/// made" by the time anyone searches for it -- named no repository, and
+/// nothing was looked up. Measured on the owner's link table: 8 of 1,034
+/// linked pull requests were in that open list.
+///
+/// The link table itself is the list of repositories that can answer, so
+/// the number is looked up there directly. Every repository carrying it
+/// comes back -- two repos can both hold a `#1234`, and choosing one
+/// would be a guess -- and the caller names each.
+///
+/// Also what a QUALIFIED query uses, filtered in the caller, because
+/// `owner/repo` is case-insensitive on GitHub and a transferred
+/// repository keeps its old owner in the links written before the
+/// transfer. An exact `repo = ?` match missed both.
+///
+/// No index on `number` alone: the table holds one row per (session,
+/// PR) -- 1,034 on the owner's machine -- so the scan is sub-millisecond
+/// and an index would be a migration for nothing measurable.
+pub fn sessions_for_pr_number(
     conn: &Connection,
-    repo: &str,
     number: u64,
 ) -> Result<Vec<super::subagent::PrLink>, rusqlite::Error> {
     let mut q = conn.prepare(
         "SELECT session_id, repo, number, url, first_seen_at
-           FROM claude_session_pr WHERE repo = ?1 AND number = ?2
-          ORDER BY first_seen_at, session_id",
+           FROM claude_session_pr WHERE number = ?1
+          ORDER BY repo, first_seen_at, session_id",
     )?;
-    let rows = q.query_map(rusqlite::params![repo, number as i64], |r| {
+    let rows = q.query_map([number as i64], |r| {
         Ok(super::subagent::PrLink {
             session_id: r.get(0)?,
             repo: r.get(1)?,
@@ -410,6 +422,12 @@ pub fn usage_profile(conn: &Connection) -> Result<super::usage::Profile, rusqlit
     Ok(out)
 }
 
+/// Write a completed [`Scan`] into `claude_session`.
+///
+/// One transaction, so a rescan interrupted halfway leaves the previous
+/// contents rather than a half-merged list. Per-session write failures
+/// are collected and reported instead of aborting the import: one
+/// malformed row must not cost the user the other 1,429.
 pub fn import(conn: &mut Connection, scan: Scan) -> Result<Imported, rusqlite::Error> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut out = Imported {
@@ -1130,22 +1148,23 @@ mod tests {
         }
 
         /// A transcript on disk, so `summarise_whole` has something real
-        /// to read. Removed when the guard drops.
-        struct Tmp(std::path::PathBuf);
+        /// to read. In its own `TempDir`, removed when the guard drops
+        /// (#1554).
+        struct Tmp(
+            std::path::PathBuf,
+            // Never read: held so the directory lives exactly as long as this.
+            #[allow(dead_code)] tempfile::TempDir,
+        );
         impl Tmp {
             fn new(name: &str, messages: usize) -> Self {
-                let p = std::env::temp_dir().join(format!("headstate-backfill-{name}.jsonl"));
+                let dir = tempfile::TempDir::new().unwrap();
+                let p = dir.path().join(format!("headstate-backfill-{name}.jsonl"));
                 let line = r#"{"type":"assistant","message":{"model":"claude-opus-5","usage":{"input_tokens":7,"output_tokens":11,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
                 let body = std::iter::repeat_n(line, messages)
                     .collect::<Vec<_>>()
                     .join("\n");
                 std::fs::write(&p, body).unwrap();
-                Self(p)
-            }
-        }
-        impl Drop for Tmp {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_file(&self.0);
+                Self(p, dir)
             }
         }
 
@@ -1189,7 +1208,8 @@ mod tests {
         #[test]
         fn a_transcript_over_the_budget_is_read_whole() {
             let conn = db();
-            let p = std::env::temp_dir().join("headstate-backfill-over-budget.jsonl");
+            let dir = tempfile::TempDir::new().unwrap();
+            let p = dir.path().join("headstate-backfill-over-budget.jsonl");
             // One record, then padding past the cap. The padding lines
             // are not usage records, so they change no figure -- they
             // exist only to push the file past `BUDGET_BYTES`.
@@ -1205,7 +1225,6 @@ mod tests {
 
             record_usage(&conn, "s", &usage(1, true), "2026-09-01T00:00:00Z").unwrap();
             backfill_one(&conn, "s", &p, "2026-09-02T00:00:00Z").unwrap();
-            let _ = std::fs::remove_file(&p);
 
             let truncated: i64 = conn
                 .query_row(
@@ -1348,11 +1367,48 @@ mod tests {
         assert_eq!(forward.len(), 2, "one session can produce several");
 
         // Reverse: which sessions produced this. The direction the PR
-        // view asks, and the one the app could not answer at all.
-        let reverse = sessions_for_pr(&conn, "acme/api", 7).unwrap();
+        // view asks, and the one the app could not answer at all. By
+        // number since #1557; the caller picks the repository.
+        let reverse = sessions_for_pr_number(&conn, 7).unwrap();
         assert_eq!(reverse.len(), 2);
         assert!(reverse.iter().any(|l| l.session_id == "s1"));
         assert!(reverse.iter().any(|l| l.session_id == "s2"));
+    }
+
+    /// #1545: a bare number is looked up in the link table itself, across
+    /// every repository that carries it -- merged or not, tracked or not.
+    #[test]
+    fn a_number_alone_finds_its_sessions_in_every_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::store::open_db(&dir.path().join("t.db")).unwrap();
+        for (session, repo, n) in [
+            ("s1", "acme/api", 7),
+            ("s2", "acme/ui", 7),
+            ("s3", "acme/api", 8),
+        ] {
+            conn.execute(
+                "INSERT OR REPLACE INTO claude_session_pr
+                     (session_id, repo, number, url, first_seen_at)
+                 VALUES (?1, ?2, ?3, 'u', '2026-09-11T12:00:00Z')",
+                rusqlite::params![session, repo, n],
+            )
+            .unwrap();
+        }
+
+        let got = sessions_for_pr_number(&conn, 7).unwrap();
+        let pairs: Vec<(&str, &str)> = got
+            .iter()
+            .map(|l| (l.session_id.as_str(), l.repo.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [("s1", "acme/api"), ("s2", "acme/ui")],
+            "both repositories' #7, ordered by repository, and not #8"
+        );
+        assert!(
+            sessions_for_pr_number(&conn, 9).unwrap().is_empty(),
+            "a number no session linked is an empty answer, not an error"
+        );
     }
 
     /// The primary key is the dedup rule made structural: a session

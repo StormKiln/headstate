@@ -9,8 +9,44 @@ import tailwindcss from "@tailwindcss/vite";
 // `@types/node` for `node:path`/`__dirname`/`process.cwd()`.
 const root = new URL(".", import.meta.url).pathname;
 
+/// Gives refractor's entity decoder its DOM-free build (#1482).
+///
+/// refractor, the syntax highlighter, runs ONLY in a web worker
+/// (`src/lib/highlight.worker.ts`), and reaches
+/// `decode-named-character-reference` through `parse-entities`. That
+/// package's `browser` export decodes entities by writing them into
+/// `document.createElement("i")` -- and a worker has no `document`, so
+/// the first highlight threw and every block stayed plain. Vite resolves
+/// with the `browser` condition for worker code too; this sends that ONE
+/// importer to the package's plain build instead. micromark, which the
+/// main thread's markdown uses, keeps the DOM build (smaller: no entity
+/// table), because only `parse-entities` is redirected.
+///
+/// In BOTH plugin lists: the worker BUILD applies only `worker.plugins`,
+/// while the dev server serves worker modules through the main pipeline.
+/// Fails the build loudly if the plain build moves, rather than
+/// shipping a worker that silently never highlights.
+const workerSafeEntities = {
+  name: "worker-safe-entities",
+  enforce: "pre" as const,
+  async resolveId(
+    this: { resolve: (s: string, i?: string, o?: { skipSelf: boolean }) => Promise<{ id: string } | null> },
+    source: string,
+    importer: string | undefined,
+  ) {
+    if (source !== "decode-named-character-reference" || !importer?.includes("/parse-entities/")) {
+      return null;
+    }
+    const dom = await this.resolve(source, importer, { skipSelf: true });
+    const plain = dom?.id.replace(/index\.dom\.js$/, "index.js");
+    const found = plain && plain !== dom?.id ? await this.resolve(plain, importer, { skipSelf: true }) : null;
+    if (!found) throw new Error(`worker-safe-entities: no DOM-free build beside ${dom?.id ?? source}`);
+    return found.id;
+  },
+};
+
 export default defineConfig(({ mode }) => ({
-  plugins: [react(), tailwindcss()],
+  plugins: [react(), tailwindcss(), workerSafeEntities],
   resolve: { alias: { "@": new URL("./src", import.meta.url).pathname } },
   // Which transport `src/api/transport.ts` picks. Defined here rather
   // than defaulted at the use site so a build with the variable unset
@@ -42,6 +78,11 @@ export default defineConfig(({ mode }) => ({
     host: loadEnv(mode, root, "TAURI_DEV_HOST").TAURI_DEV_HOST ?? false,
   },
   build: { target: "safari15", sourcemap: true },
+  // ES-module workers, not Vite's default IIFE: the syntax-highlighting
+  // worker (`src/lib/highlight.worker.ts`, #1482) loads each grammar as
+  // its own chunk on demand, and an IIFE bundle cannot code-split. The
+  // build target already assumes Safari 15, which runs module workers.
+  worker: { format: "es", plugins: () => [workerSafeEntities] },
   test: {
     // Vitest's default glob walks the whole tree, and this project keeps
     // git worktrees at `.worktrees/<branch>/`. A bare `vitest run` then

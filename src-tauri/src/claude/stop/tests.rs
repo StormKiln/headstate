@@ -44,9 +44,16 @@ fn registry() -> Registry {
             name: Some("widget-c3".into()),
             status: Some("busy".into()),
             version: Some("2.0.1".into()),
+            status_updated_at: None,
         },
     );
     r
+}
+
+/// No session has any hook-recorded run: the state of every session the
+/// registry alone describes, which is what every test before #1569 meant.
+fn no_runs() -> HashMap<String, Vec<Run>> {
+    HashMap::new()
 }
 
 fn no_evidence(_id: &str, _started: Option<i64>) -> StopEvidence {
@@ -133,8 +140,13 @@ impl Signaller for FakeSignal {
 /// fabricated one would be testing a different type from the one that
 /// ships.
 fn confirmed() -> ConfirmedPid {
-    confirm(&FakeProbe(Ok(Some(PROC_START_EPOCH))), &registry(), "s1")
-        .expect("the matching start time must confirm")
+    confirm(
+        &FakeProbe(Ok(Some(PROC_START_EPOCH))),
+        &registry(),
+        Ok(&no_runs()),
+        "s1",
+    )
+    .expect("the matching start time must confirm")
 }
 
 // ---------------------------------------------------------------------
@@ -151,7 +163,12 @@ fn confirmed() -> ConfirmedPid {
 fn a_pid_whose_start_time_does_not_match_is_refused() {
     // Eight hours later: the number was recycled by something unrelated.
     let drifted = PROC_START_EPOCH + 8 * 3600;
-    let got = confirm(&FakeProbe(Ok(Some(drifted))), &registry(), "s1");
+    let got = confirm(
+        &FakeProbe(Ok(Some(drifted))),
+        &registry(),
+        Ok(&no_runs()),
+        "s1",
+    );
     assert_eq!(
         got,
         Err(Refusal::PidReused {
@@ -174,11 +191,22 @@ fn a_pid_whose_start_time_does_not_match_is_refused() {
 #[test]
 fn the_pid_pairing_uses_livenesss_own_tolerance() {
     let inside = PROC_START_EPOCH + START_TOLERANCE_SECS;
-    assert!(confirm(&FakeProbe(Ok(Some(inside))), &registry(), "s1").is_ok());
+    assert!(confirm(
+        &FakeProbe(Ok(Some(inside))),
+        &registry(),
+        Ok(&no_runs()),
+        "s1"
+    )
+    .is_ok());
 
     let outside = PROC_START_EPOCH + START_TOLERANCE_SECS + 1;
     assert!(matches!(
-        confirm(&FakeProbe(Ok(Some(outside))), &registry(), "s1"),
+        confirm(
+            &FakeProbe(Ok(Some(outside))),
+            &registry(),
+            Ok(&no_runs()),
+            "s1"
+        ),
         Err(Refusal::PidReused { .. })
     ));
 }
@@ -192,6 +220,7 @@ fn an_unconfirmable_start_time_refuses_rather_than_guessing() {
         confirm(
             &FakeProbe(Err("Operation not permitted".into())),
             &registry(),
+            Ok(&no_runs()),
             "s1"
         ),
         Err(Refusal::Unconfirmable { .. })
@@ -201,7 +230,12 @@ fn an_unconfirmable_start_time_refuses_rather_than_guessing() {
     let mut r = registry();
     r.entries.get_mut("s1").unwrap().proc_start = None;
     assert!(matches!(
-        confirm(&FakeProbe(Ok(Some(PROC_START_EPOCH))), &r, "s1"),
+        confirm(
+            &FakeProbe(Ok(Some(PROC_START_EPOCH))),
+            &r,
+            Ok(&no_runs()),
+            "s1"
+        ),
         Err(Refusal::Unconfirmable { .. })
     ));
 
@@ -209,7 +243,12 @@ fn an_unconfirmable_start_time_refuses_rather_than_guessing() {
     let mut r = registry();
     r.entries.get_mut("s1").unwrap().proc_start = Some("11 Sep 09:43:48".into());
     assert!(matches!(
-        confirm(&FakeProbe(Ok(Some(PROC_START_EPOCH))), &r, "s1"),
+        confirm(
+            &FakeProbe(Ok(Some(PROC_START_EPOCH))),
+            &r,
+            Ok(&no_runs()),
+            "s1"
+        ),
         Err(Refusal::Unconfirmable { .. })
     ));
 }
@@ -222,7 +261,12 @@ fn an_unreadable_registry_refuses_before_any_lookup() {
     let mut r = registry();
     r.failure = Some("Permission denied".into());
     assert!(matches!(
-        confirm(&FakeProbe(Ok(Some(PROC_START_EPOCH))), &r, "s1"),
+        confirm(
+            &FakeProbe(Ok(Some(PROC_START_EPOCH))),
+            &r,
+            Ok(&no_runs()),
+            "s1"
+        ),
         Err(Refusal::RegistryUnreadable { .. })
     ));
 }
@@ -232,7 +276,7 @@ fn an_unreadable_registry_refuses_before_any_lookup() {
 #[test]
 fn a_session_whose_process_has_exited_is_not_running_rather_than_unconfirmable() {
     assert!(matches!(
-        confirm(&FakeProbe(Ok(None)), &registry(), "s1"),
+        confirm(&FakeProbe(Ok(None)), &registry(), Ok(&no_runs()), "s1"),
         Err(Refusal::NotRunning { .. })
     ));
 }
@@ -470,6 +514,7 @@ fn a_refusal_is_recorded_as_a_refusal() {
     let reused = propose(
         &FakeProbe(Ok(Some(PROC_START_EPOCH + 8 * 3600))),
         &r,
+        Ok(&no_runs()),
         &["s1".into(), "s2".into(), "s3".into()],
         no_evidence,
     );
@@ -512,6 +557,7 @@ fn a_refusal_is_recorded_as_a_refusal() {
     let live = propose(
         &FakeProbe(Ok(Some(PROC_START_EPOCH))),
         &registry(),
+        Ok(&no_runs()),
         &["s1".into()],
         no_evidence,
     );
@@ -531,6 +577,7 @@ fn the_per_run_cap_refuses_rather_than_truncating() {
     let rows = propose(
         &FakeProbe(Ok(None)),
         &Registry::default(),
+        Ok(&no_runs()),
         &ids,
         no_evidence,
     );
@@ -631,5 +678,217 @@ fn a_confirmed_pid_has_no_constructor_but_confirm() {
             !body.contains(field),
             "`ConfirmedPid` must keep its fields private: {field}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------
+// #1569: a session Running by a source Stop does not confirm from.
+// ---------------------------------------------------------------------
+
+/// A process table the test writes out pid by pid.
+///
+/// [`FakeProbe`] answers every pid alike, which cannot say "the
+/// registry's pid is gone but the run's is alive" -- the shape a crashed
+/// session resumed from a terminal leaves.
+struct TableProbe(HashMap<u32, i64>);
+impl ProcessProbe for TableProbe {
+    fn start_time(&self, pid: u32) -> Result<Option<i64>, String> {
+        Ok(self.0.get(&pid).copied())
+    }
+}
+
+/// The pid a terminal-launched session runs as.
+const KEY_PID: u32 = 4242;
+
+/// [`PROC_START`] as a hook-recorded run stores it.
+const PROC_START_RFC3339: &str = "2026-09-11T09:43:48+00:00";
+
+/// An un-ended hook-recorded run of `pid`, started at [`PROC_START`].
+fn open_run(pid: u32) -> Run {
+    Run {
+        pid,
+        pid_start_time: Some(PROC_START_RFC3339.into()),
+        ended_at: None,
+        ..Default::default()
+    }
+}
+
+/// `r`, plus the `.key` a terminal launch leaves for [`KEY_PID`] with no
+/// `.json` beside it.
+fn key_only(r: Registry) -> Registry {
+    Registry {
+        unnamed: vec![crate::claude::liveness::UnnamedRecord {
+            pid: KEY_PID,
+            proc_start: Some(PROC_START.into()),
+            path: "/Users/acme/.claude/sessions/4242.deadbeef.key".into(),
+        }],
+        ..r
+    }
+}
+
+/// Both the confirm and the proposal refuse `id` as running-but-
+/// unconfirmable at `pid`, and neither calls it not running.
+fn assert_running_unconfirmable<P: ProcessProbe>(
+    what: &str,
+    probe: &P,
+    registry: &Registry,
+    runs: &HashMap<String, Vec<Run>>,
+    id: &str,
+    pid: u32,
+) {
+    let got = confirm(probe, registry, Ok(runs), id);
+    assert_eq!(
+        got,
+        Err(Refusal::RunningUnconfirmable { pid }),
+        "{what}: confirm"
+    );
+
+    let rows = propose(probe, registry, Ok(runs), &[id.to_string()], no_evidence);
+    assert_eq!(rows.len(), 1, "{what}");
+    assert_eq!(rows[0].action, "refused", "{what}");
+    assert!(rows[0].pid.is_none(), "{what}: a refusal carries no pid");
+    assert_eq!(
+        rows[0].refusal,
+        Some(Refusal::RunningUnconfirmable { pid }),
+        "{what}: propose"
+    );
+
+    // The sentence says it IS running and that nothing was sent -- and
+    // never that there is no process, which is the #1569 defect.
+    let why = rows[0].why.clone().unwrap_or_default();
+    assert!(why.contains("is running"), "{what}: {why}");
+    assert!(why.contains("nothing was signalled"), "{what}: {why}");
+    assert!(!why.contains("not running"), "{what}: {why}");
+    assert!(!why.contains("no process"), "{what}: {why}");
+    assert!(!why.contains("does not list"), "{what}: {why}");
+}
+
+/// **#1569, the hook-run case.** The registry was read whole and does
+/// not list the session, but an un-ended hook-recorded run names a pid
+/// whose start time matches: `liveness` says `Running`. Stop does not
+/// confirm from a run, so it refuses -- as running, not as absent.
+///
+/// SABOTAGE: made `not_running` map a `Running` liveness to
+/// `NotRunning` (the pre-fix answer). This FAILED with `Err(NotRunning {
+/// why: "the live session registry was read and does not list this
+/// session, so there is no process to stop" })` where
+/// `RunningUnconfirmable { pid: 4242 }` was expected. Restored, passed.
+#[test]
+fn a_session_running_from_a_hook_run_is_refused_as_unconfirmable_not_as_not_running() {
+    let probe = TableProbe(HashMap::from([(KEY_PID, PROC_START_EPOCH)]));
+    let runs = HashMap::from([("s-hook".to_string(), vec![open_run(KEY_PID)])]);
+    assert_running_unconfirmable(
+        "hook run",
+        &probe,
+        &Registry::default(),
+        &runs,
+        "s-hook",
+        KEY_PID,
+    );
+}
+
+/// **#1569, the named key-only case.** A `.key`-only process whose start
+/// time EXACTLY matches an un-ended run is that run's session (#1534), so
+/// `liveness` says `Running`. Both shapes: a session the registry never
+/// listed, and a crashed session resumed from a terminal whose old
+/// `.json` still names a pid that is gone -- the second is the one that
+/// reached the OTHER `NotRunning` arm, "no longer running".
+///
+/// SABOTAGE: as above. This FAILED on the never-listed shape with
+/// `Err(NotRunning { .. "does not list this session" .. })` where
+/// `RunningUnconfirmable { pid: 4242 }` was expected. Restored, passed.
+#[test]
+fn a_named_key_only_session_is_refused_as_unconfirmable_not_as_not_running() {
+    let probe = TableProbe(HashMap::from([(KEY_PID, PROC_START_EPOCH)]));
+    let runs = HashMap::from([("s1".to_string(), vec![open_run(KEY_PID)])]);
+
+    let never_listed = key_only(Registry::default());
+    // `registry()` lists s1 at PID, which the probe does not have.
+    let orphaned = key_only(registry());
+
+    for (what, reg) in [
+        ("never listed", &never_listed),
+        ("orphaned .json", &orphaned),
+    ] {
+        assert_running_unconfirmable(what, &probe, reg, &runs, "s1", KEY_PID);
+    }
+}
+
+/// **#1569, no regression.** A session the registry `.json` confirms is
+/// still stoppable, and the runs -- even one naming the same pid -- change
+/// nothing about that.
+///
+/// SABOTAGE: made `confirm` return `RunningUnconfirmable` before the
+/// entry lookup whenever `liveness` read `Running`. This FAILED -- the
+/// `.json`-confirmed session was refused -- along with seven other tests
+/// that stop a confirmed pid. Restored, passed.
+#[test]
+fn a_registry_confirmed_session_is_still_stoppable_with_runs_present() {
+    let probe = TableProbe(HashMap::from([(PID, PROC_START_EPOCH)]));
+    let runs = HashMap::from([("s1".to_string(), vec![open_run(PID)])]);
+    let c = confirm(&probe, &registry(), Ok(&runs), "s1").expect("the .json confirms it");
+    assert_eq!(c.pid(), PID);
+
+    let rows = propose(&probe, &registry(), Ok(&runs), &["s1".into()], no_evidence);
+    assert_eq!(rows[0].action, "proposed");
+    assert_eq!(rows[0].pid, Some(PID));
+}
+
+/// **#1569, still dead.** A session nothing says is running is still
+/// `NotRunning`: a registry pid that is gone with only ended runs, and a
+/// session with no record anywhere.
+///
+/// And a pid whose start time does not match what the run and the
+/// `.key` recorded is a DIFFERENT process wearing the number: nothing
+/// names it, so the session is not running, and it is never confirmed or
+/// signalled. The start-time rule any widening of Stop must keep.
+///
+/// SABOTAGE: made `not_running` return `RunningUnconfirmable` for every
+/// session. This FAILED, as did the two older `NotRunning` tests.
+/// Restored, passed.
+#[test]
+fn a_dead_session_is_still_not_running() {
+    let empty = TableProbe(HashMap::new());
+    let ended = Run {
+        ended_at: Some("2026-09-11T10:00:00Z".into()),
+        ..open_run(PID)
+    };
+    let runs = HashMap::from([("s1".to_string(), vec![ended])]);
+    assert!(matches!(
+        confirm(&empty, &registry(), Ok(&runs), "s1"),
+        Err(Refusal::NotRunning { .. })
+    ));
+    assert!(matches!(
+        confirm(&empty, &Registry::default(), Ok(&no_runs()), "s-gone"),
+        Err(Refusal::NotRunning { .. })
+    ));
+
+    // The pid is alive, but started eight hours after both records.
+    let reused = TableProbe(HashMap::from([(KEY_PID, PROC_START_EPOCH + 8 * 3600)]));
+    let runs = HashMap::from([("s1".to_string(), vec![open_run(KEY_PID)])]);
+    let got = confirm(&reused, &key_only(Registry::default()), Ok(&runs), "s1");
+    assert!(
+        matches!(got, Err(Refusal::NotRunning { .. })),
+        "a reused pid is not this session: {got:?}"
+    );
+}
+
+/// Runs that could not be read are "we did not look", never "not
+/// running" (#1569).
+///
+/// SABOTAGE: mapped `not_running`'s `Err` arm to `NotRunning`. This
+/// FAILED ("expected RunsUnreadable, got Err(NotRunning ..)"). Restored,
+/// passed.
+#[test]
+fn unreadable_runs_are_not_read_as_not_running() {
+    let got = confirm(
+        &TableProbe(HashMap::new()),
+        &Registry::default(),
+        Err("database is locked"),
+        "s1",
+    );
+    match got {
+        Err(Refusal::RunsUnreadable { why }) => assert!(why.contains("locked"), "{why}"),
+        other => panic!("expected RunsUnreadable, got {other:?}"),
     }
 }

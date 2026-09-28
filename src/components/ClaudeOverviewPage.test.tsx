@@ -36,6 +36,7 @@ const restartFn = vi.hoisted(() =>
       uncertain: [],
       registry_failure: null,
       registry_unreadable: [],
+      registry_unnamed: [],
     } as unknown),
   ),
 );
@@ -148,6 +149,7 @@ import { ACTIVITY_DAYS } from "./ClaudeOverviewPage";
 const counts = (over: Partial<ClaudeCounts> = {}): ClaudeCounts => ({
   sessions: 1461,
   running: 3,
+  liveness_unknown: 0,
   resumable: 248,
   archived: 1210,
   cwd_unknown: 0,
@@ -177,6 +179,7 @@ const overview = (over: Partial<ClaudeOverview> = {}): ClaudeOverview => ({
   ],
   live_failure: null,
   live_unreadable: [],
+  live_unnamed: [],
   ...over,
 });
 
@@ -372,29 +375,32 @@ describe("ClaudeOverviewPage", () => {
   /// directory. Sabotage B: rendering `counts.running` regardless shows
   /// "0 running", which is #841's fail-open in the place a user acts on it
   /// -- "nothing is running" is what makes Resume look safe.
+  ///
+  /// Since #1534 the backend takes every row's verdict from the session
+  /// list, and with no registry read every row is "could not tell" -- so
+  /// `resumable` arrives as 0 by ABSENCE. Sabotage C: rendering
+  /// `counts.resumable` regardless shows "0" resumable and "no session can
+  /// be resumed", a confident answer nobody measured.
   it("says it could not tell what is running, and keeps the stored figures", () => {
     state.data = overview({
       live_failure: "could not read /Users/me/.claude/sessions: Permission denied",
-      counts: counts({ running: 0 }),
+      counts: counts({ running: 0, resumable: 0, liveness_unknown: 251 }),
+      resumable: [],
     });
     render(<ClaudeOverviewPage />);
 
     expect(screen.getByText(/Could not tell which sessions are running/)).toBeTruthy();
     expect(screen.getByText(/Permission denied/)).toBeTruthy();
-    // "Could not tell", NOT "0".
-    expect(screen.getByText("Could not tell")).toBeTruthy();
-    // The stored aggregates survive.
-    expect(screen.getByText("248")).toBeTruthy();
+    // "Could not tell", NOT "0" -- for running AND for resumable.
+    expect(screen.getAllByText("Could not tell")).toHaveLength(2);
+    expect(screen.queryByText("0")).toBeNull();
+    expect(screen.queryByText(/No session can be resumed/)).toBeNull();
+    expect(screen.getByText(/none is offered here/)).toBeTruthy();
+    // The stored aggregates that do not depend on liveness survive.
+    expect(screen.getByText("1,210")).toBeTruthy();
     expect(screen.getByTestId("sessions-chart")).toBeTruthy();
-    // And it names the OVER-count, not just the under-count. `aggregate`
-    // classifies a session as resumable exactly when it is not in the
-    // running set, so a registry we could not read leaves every live
-    // session counted as resumable -- and resuming one that is already
-    // alive starts a second copy of it. Sabotage: the wording this
-    // replaced said the figures below "are unaffected", which is true of
-    // the history and false of the one figure a user acts on.
-    expect(screen.getByText(/nothing could be subtracted/)).toBeTruthy();
-    expect(screen.getByText(/starts a second copy/)).toBeTruthy();
+    // And it says what the reader can act on: nothing is offered to resume.
+    expect(screen.getByText(/No session is offered to resume/)).toBeTruthy();
   });
 
   /// A registry we COULD read, reporting nothing running, is a real answer.
@@ -420,13 +426,41 @@ describe("ClaudeOverviewPage", () => {
     expect(screen.getByText(/at least 3 rather than exactly 3/)).toBeTruthy();
     // The number is still shown: it is a floor, not an absence.
     expect(screen.getByText("3")).toBeTruthy();
-    // And the other direction, which is the one that misleads an ACTION:
-    // a session the unreadable record hides is missing from the running
-    // set, so `aggregate` classifies it by its directory and it can land
-    // in the resumable list while still running.
-    expect(
-      screen.getByText(/counted as resumable while in fact still running/),
-    ).toBeTruthy();
+    // And what it means for an ACTION. Since #1534 the rows such a
+    // session could be are "could not tell" and are not offered, so the
+    // banner says that rather than warning of an over-count that no
+    // longer happens.
+    expect(screen.getByText(/is not offered to resume/)).toBeTruthy();
+    expect(screen.queryByText(/counted as resumable/)).toBeNull();
+  });
+
+  /// **#1534.** A session running with no session record makes "running"
+  /// a floor too, and is stated as what it is -- not as an unusable record.
+  ///
+  /// Sabotage: deriving the banner from `live_unreadable` alone, as it was
+  /// before, drops it entirely here and "running" reads as exact.
+  it("says the running count is a floor when a session runs with no record", () => {
+    state.data = overview({
+      live_unnamed: ["pid 5151, running in /Users/me/code/app"],
+    });
+    render(<ClaudeOverviewPage />);
+    expect(screen.getByText(/1 Claude Code session is running without a session record/)).toBeTruthy();
+    expect(screen.getByText(/at least 3 rather than exactly 3/)).toBeTruthy();
+    expect(screen.getByText(/pid 5151/)).toBeTruthy();
+    expect(screen.queryByText(/could not be used/)).toBeNull();
+  });
+
+  /// **#1534.** Rows the list could not decide qualify the Resumable
+  /// figure and are counted, never dropped and never offered.
+  ///
+  /// Sabotage: leaving the hint unqualified states 248 as the whole count
+  /// when 5 more may be resumable once they can be told apart.
+  it("qualifies resumable when some sessions could not be told apart from running", () => {
+    state.data = overview({ counts: counts({ liveness_unknown: 5 }) });
+    render(<ClaudeOverviewPage />);
+    expect(screen.getByText(/at least this many/)).toBeTruthy();
+    expect(screen.getByText(/5 more could not be told apart from running/)).toBeTruthy();
+    expect(screen.getByText(/5 that may be running, not offered to resume/)).toBeTruthy();
   });
 
   /// #921's predicate is reported, including when it is zero.
@@ -715,15 +749,16 @@ describe("the overview's figures lead somewhere", () => {
   /// **The absent-is-not-zero guard, as navigation.** A tile whose figure
   /// could not be established is not clickable.
   ///
-  /// `running` is the one place a figure becomes `null` on this page: a live
-  /// registry that could not be listed gives no answer about what is
-  /// running. A link from a tile reading "Could not tell" would open a
-  /// Running filter that is empty for a reason the destination does not
-  /// state, and the reader would take the emptiness for the answer -- the
+  /// `running` and `resumable` are the places a figure becomes `null` on
+  /// this page: a live registry that could not be listed gives no answer
+  /// about what is running, and so none about what is safe to resume
+  /// (#1534). A link from a tile reading "Could not tell" would open a
+  /// filter that is empty for a reason the destination does not state, and
+  /// the reader would take the emptiness for the answer -- the
   /// confident-wrong-answer failure arrived at by navigation instead of a 0.
   ///
   /// SABOTAGE: drop the `|| value === null` from `Tile`'s early return and
-  /// this fails, because the tile becomes a button.
+  /// this fails, because the tiles become buttons.
   it("does not make a tile clickable when its figure could not be established", () => {
     state.data = overview({ live_failure: "could not list ~/.claude/sessions" });
     render(<ClaudeOverviewPage />);
@@ -735,10 +770,12 @@ describe("the overview's figures lead somewhere", () => {
     expect(screen.getAllByText(/could not tell/i).length).toBeGreaterThan(0);
     // And is NOT a control.
     expect(screen.queryByRole("button", { name: /^Running now:/i })).toBeNull();
-    // While the other two still are, which is what stops this test passing
-    // for the wrong reason -- a page that made nothing clickable would
-    // satisfy the assertion above.
-    expect(screen.getByRole("button", { name: /^Resumable:/i })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^Resumable:/i })).toBeNull();
+    // While the directory tile still is -- a gone directory is a fact
+    // whatever the process is doing -- which is what stops this test
+    // passing for the wrong reason: a page that made nothing clickable
+    // would satisfy the assertions above.
+    expect(screen.getByRole("button", { name: /^Directory gone:/i })).toBeTruthy();
   });
 
   /// The "Ready to resume" card offers the rest, which is the half of the
@@ -859,6 +896,7 @@ describe("the restart export card", () => {
     uncertain: [],
     registry_failure: null,
     registry_unreadable: [],
+    registry_unnamed: [],
     ...over,
   });
 

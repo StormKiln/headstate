@@ -142,6 +142,10 @@ pub struct RestartList {
     /// Registry records present but unusable, with why. Each one hides a
     /// session that may be running, so the list is a floor.
     pub registry_unreadable: Vec<String>,
+    /// Claude Code processes running with no session record (#1315), one
+    /// line each. They cannot be listed -- nothing names the session to
+    /// resume -- so the list is a floor while any exist.
+    pub registry_unnamed: Vec<String>,
 }
 
 impl RestartList {
@@ -161,7 +165,9 @@ impl RestartList {
     /// where a record could not be parsed, which is the confident number
     /// that might be wrong.
     pub fn may_be_short(&self) -> bool {
-        self.registry_failure.is_some() || !self.registry_unreadable.is_empty()
+        self.registry_failure.is_some()
+            || !self.registry_unreadable.is_empty()
+            || !self.registry_unnamed.is_empty()
     }
 }
 
@@ -187,6 +193,7 @@ pub fn restart_list(list: &super::sessions::SessionList) -> RestartList {
     let mut out = RestartList {
         registry_failure: list.registry_failure.clone(),
         registry_unreadable: list.registry_unreadable.clone(),
+        registry_unnamed: list.registry_unnamed.clone(),
         ..Default::default()
     };
 
@@ -274,6 +281,7 @@ mod tests {
             reasons,
             registry_failure: None,
             registry_unreadable: Vec::new(),
+            registry_unnamed: Vec::new(),
         }
     }
 
@@ -407,6 +415,24 @@ mod tests {
             out.may_be_short(),
             "a record that could not be parsed hides a session that may be running"
         );
+    }
+
+    /// A running session with no session record makes the list a floor
+    /// (#1315), and its line travels with it.
+    ///
+    /// It cannot be an entry -- there is no id to resume -- so the only
+    /// honest place for it is the shortfall. A caller that ignored it
+    /// would print "0 sessions" over a live terminal session before a
+    /// reboot.
+    #[test]
+    fn an_unnamed_running_session_alone_makes_the_list_a_floor() {
+        let mut l = list(Vec::new(), Vec::new());
+        l.registry_unnamed = vec!["pid 4242, running in /Users/acme/code/widget".into()];
+        let out = restart_list(&l);
+
+        assert!(out.may_be_short(), "a live session is missing from it");
+        assert_eq!(out.registry_unnamed, l.registry_unnamed);
+        assert_eq!(out.total(), 0, "and it is not invented into an entry");
     }
 
     /// An `Unknown` liveness is INCLUDED, in its own half.

@@ -12,6 +12,10 @@
 //! runs off the poll loop.
 
 mod assess;
+/// GitHub's record of a merged pull request, as a positive merge signal
+/// run AFTER the offline scan (#1440). The one exception to "nothing here
+/// talks to GitHub" above, and deliberately outside `scan`.
+pub mod github;
 mod model;
 pub(crate) mod scan;
 /// Submodule state per worktree (#1138).
@@ -32,7 +36,7 @@ pub use model::{Repo, Safety, Worktree};
 pub(crate) use scan::git;
 pub use scan::{
     classify_main_checkout, classify_repo_streaming, fetch_refs, head_oid, prune_worktrees,
-    pull_checkout, remove_orphan, remove_worktree, remove_worktree_forced,
+    pull_checkout, remove_orphan, remove_worktree, remove_worktree_asking, remove_worktree_forced,
     remove_worktrees_with_progress, repo_identity, scan_dirs_fast_reporting, size_repo_streaming,
     unlock_worktree, RemovalOutcome, RepoScan,
 };

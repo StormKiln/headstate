@@ -181,6 +181,29 @@ pub enum Safety {
     /// bug: a branch whose PR merged and whose remote was then deleted
     /// was reported as commits existing only on this machine.
     MergedUpstreamDeleted,
+    /// Merged, on a branch that has no tracking config at all (#1439).
+    /// Removable.
+    ///
+    /// A contributor's PR fetched with `git fetch origin pull/N/head:prN`,
+    /// or any branch checked out without `--track`, has no
+    /// `branch.<name>.remote`. That used to short-circuit to
+    /// `NeverPushed` before the merge check ran, so a branch whose work
+    /// was provably on the default branch read "commits exist only here".
+    ///
+    /// Distinct from `NeverPushed` because it is the opposite verdict:
+    /// `merged_into` found the content on the default branch, so nothing
+    /// exists only here, whatever the config says.
+    ///
+    /// Distinct from `MergedUpstreamDeleted` because that label says the
+    /// tracking config outlived the remote branch, and here there never
+    /// was one. The same objection `DetachedMerged` makes for a
+    /// branchless checkout.
+    ///
+    /// In `is_safe`: the evidence is `merged_into`'s, unchanged (ancestry
+    /// or an exact patch-id match), the identical bar `Safe` and
+    /// `MergedUpstreamDeleted` clear. An unmerged branch with no
+    /// tracking config is still `NeverPushed`.
+    MergedNoUpstream,
     /// A branchless checkout whose HEAD is already on the default
     /// branch (#819). Removable.
     ///
@@ -210,6 +233,41 @@ pub enum Safety {
     /// rows were `Unknown`, with no action at all: four on the reporting
     /// machine, every one provably an ancestor of the default branch.
     DetachedMerged(String),
+    /// GitHub records this branch's pull request as MERGED, and this
+    /// worktree holds nothing that pull request did not (#1440). Carries
+    /// the pull request's number. Removable.
+    ///
+    /// # Why a second route exists at all
+    ///
+    /// The offline checks (`merged_into`) look for the branch's CONTENT on
+    /// the default branch, and both of their squash signals decay: the
+    /// aggregate patch-id hashes context lines, and `content_landed` needs
+    /// every touched file unchanged since. Once the default branch edits
+    /// those files again, a squash-merged branch reads "not merged" -- 3
+    /// of 4 such rows on the reporting machine were PRs GitHub had
+    /// merged. The busier the repository, the sooner it happens.
+    ///
+    /// # The rule is strict, and only ever UPGRADES
+    ///
+    /// Reached only from `Unmerged` or `Unpushed`, and only when a merged
+    /// pull request's base is the default branch AND this worktree's HEAD
+    /// is exactly its `headRefOid` or an ancestor of it -- the PR carried
+    /// every commit the worktree has, never fewer. A local commit past the
+    /// PR's head is work GitHub never saw, and does not qualify. See
+    /// `worktrees::github::qualifying_pr`.
+    ///
+    /// A GitHub lookup that failed, was refused, or was never made leaves
+    /// the offline verdict exactly as it was. "We did not ask" is not
+    /// "GitHub said no", and nothing here ever moves a verdict DOWN.
+    ///
+    /// # Its own variant rather than `Safe`
+    ///
+    /// For the reason `MergedUpstreamDeleted` exists: the ROUTE differs
+    /// and the row must say which one it took. `Safe` means the content
+    /// was found on the default branch; this means GitHub vouched for the
+    /// merge and the content was NOT found locally, so the number is the
+    /// evidence the user can go and check.
+    MergedAsPr(u64),
     /// The branch was created and never committed to.
     ///
     /// Its own state rather than a flavour of `Safe` or `NeverPushed`,
@@ -483,9 +541,20 @@ impl Safety {
         // when there is no directory) and the note on `Empty` above (a
         // large previously-refused population must not be promoted as a
         // side effect of a wording fix).
+        //
+        // `MergedAsPr` joined in #1440, and it is a widening of the EVIDENCE
+        // rather than of the rows: GitHub's record of a merged pull request
+        // whose head contains this worktree's HEAD. It is only ever produced
+        // from a clean, unlocked, not-in-progress row (it upgrades `Unmerged`
+        // and `Unpushed`, which those states outrank), and the delete-time
+        // gate re-asks GitHub rather than trusting the scan.
         matches!(
             self,
-            Safety::Safe | Safety::MergedUpstreamDeleted | Safety::DetachedMerged(_)
+            Safety::Safe
+                | Safety::MergedUpstreamDeleted
+                | Safety::MergedNoUpstream
+                | Safety::DetachedMerged(_)
+                | Safety::MergedAsPr(_)
         )
     }
 
@@ -523,6 +592,10 @@ impl Safety {
             }
             Safety::NeverPushed => "never pushed — commits exist only here".into(),
             Safety::MergedUpstreamDeleted => "merged; upstream deleted".into(),
+            // MERGED FIRST, then the missing config (#1439). "Never
+            // pushed" would repeat the claim this variant exists to
+            // retract; "no upstream" says only what was observed.
+            Safety::MergedNoUpstream => "merged; no upstream configured".into(),
             // MERGED FIRST, then the detachment (#819).
             //
             // The old wording for this row was "could not determine:
@@ -543,6 +616,10 @@ impl Safety {
             Safety::DetachedMerged(at) => {
                 format!("merged — {at}, no branch to delete")
             }
+            // Names the ROUTE (#1440): the number is GitHub's evidence and
+            // the thing a user can go and check, where "merged" alone
+            // would read like the offline verdict it is not.
+            Safety::MergedAsPr(n) => format!("merged as #{n} on GitHub"),
             // Says what is TRUE of the branch, not what the app will
             // let you do about it. "Nothing to lose" is the fact the
             // user was trying to establish by hand; whether the Remove
@@ -786,7 +863,12 @@ mod tests {
         for s in [
             Safety::Safe,
             Safety::MergedUpstreamDeleted,
+            // #1439: merged content on a branch with no tracking config.
+            // Same `merged_into` evidence as the two above.
+            Safety::MergedNoUpstream,
             Safety::DetachedMerged("detached at v1.13.0~30".into()),
+            // #1440: GitHub's record of the merge, under the strict rule.
+            Safety::MergedAsPr(7),
         ] {
             assert!(s.is_safe(), "{s:?} is one of the merged states");
         }
@@ -816,6 +898,18 @@ mod tests {
         }
     }
 
+    /// A GitHub-vouched merge says which route produced it (#1440).
+    ///
+    /// The number is the evidence: it is what separates this verdict from
+    /// the offline `Safe`, and what the user can open to check.
+    #[test]
+    fn a_github_merge_names_its_pull_request() {
+        let r = Safety::MergedAsPr(42).reason();
+        assert!(r.contains("#42"), "{r}");
+        assert!(r.contains("GitHub"), "{r}");
+        assert!(!r.contains("not merged"), "{r}");
+    }
+
     /// The default must never be deletable. A partially-constructed
     /// `Worktree` is what a bug leaves behind, and this is the one place
     /// where getting it wrong deletes someone's work.
@@ -839,5 +933,100 @@ mod tests {
         assert!(unknown.reason().contains("could not determine"));
         assert_ne!(Safety::Pending.reason(), unknown.reason());
         assert!(!Safety::Pending.is_safe());
+    }
+
+    /// One of every `Safety` variant, in the fixture's order.
+    ///
+    /// `InProgress` appears once per `GitOperation`, because the op name
+    /// is itself a wire string the frontend matches (`cherryPick`), and
+    /// once with an unreadable conflict count.
+    fn every_safety_variant() -> Vec<Safety> {
+        let in_progress = |op, conflicts| Safety::InProgress { op, conflicts };
+        let all = vec![
+            Safety::Safe,
+            Safety::MainCheckout,
+            Safety::Dirty(3),
+            in_progress(GitOperation::Rebase, Some(2)),
+            in_progress(GitOperation::Merge, Some(1)),
+            in_progress(GitOperation::CherryPick, Some(0)),
+            in_progress(GitOperation::Revert, None),
+            in_progress(GitOperation::Bisect, None),
+            Safety::Unpushed(2),
+            Safety::NeverPushed,
+            Safety::MergedUpstreamDeleted,
+            Safety::MergedNoUpstream,
+            Safety::DetachedMerged("v1.0.0~3".into()),
+            Safety::MergedAsPr(7),
+            Safety::Empty,
+            Safety::Orphaned,
+            Safety::Unmerged,
+            Safety::Locked(Lock {
+                reason: Some("some tool (pid 123)".into()),
+                age_days: Some(2),
+                holder_running: Some(false),
+                underlying: Box::new(Safety::Unmerged),
+            }),
+            Safety::Prunable("gitdir file points to non-existent location".into()),
+            Safety::Pending,
+            Safety::Unknown("git exited 128".into()),
+        ];
+        // Exhaustive on purpose, with no wildcard arm: a new variant
+        // fails to compile here until someone adds it to the list above
+        // -- and so to the fixture the frontend is tested against.
+        for s in &all {
+            match s {
+                Safety::Safe
+                | Safety::MainCheckout
+                | Safety::Dirty(_)
+                | Safety::InProgress { .. }
+                | Safety::Unpushed(_)
+                | Safety::NeverPushed
+                | Safety::MergedUpstreamDeleted
+                | Safety::MergedNoUpstream
+                | Safety::DetachedMerged(_)
+                | Safety::MergedAsPr(_)
+                | Safety::Empty
+                | Safety::Orphaned
+                | Safety::Unmerged
+                | Safety::Locked(_)
+                | Safety::Prunable(_)
+                | Safety::Pending
+                | Safety::Unknown(_) => {}
+            }
+        }
+        all
+    }
+
+    /// The wire format of `Safety`, pinned to a checked-in fixture that
+    /// the frontend's own tests read (#1437).
+    ///
+    /// The two sides were each tested only against themselves: Rust
+    /// serialised `InProgress` as `in_progress` with its fields under
+    /// `detail`, the TS mirror declared `inProgress` with them
+    /// flattened, and every in-progress row rendered "could not
+    /// determine: [object Object]" from the day the state shipped.
+    /// `src/lib/worktrees.test.ts` feeds each entry of this fixture
+    /// through `safetyReason`, so a rename on either side now fails a
+    /// test on one side or the other.
+    ///
+    /// On a deliberate change, replace the fixture with the `actual`
+    /// this failure prints.
+    #[test]
+    fn safety_serialises_as_the_frontend_fixture_says() {
+        let actual = serde_json::to_string_pretty(&every_safety_variant()).unwrap();
+        // CRLF-normalised: a Windows checkout may convert line endings,
+        // and that is not a change to the wire format.
+        let fixture =
+            include_str!("../../tests/fixtures/safety_variants.json").replace("\r\n", "\n");
+        assert_eq!(
+            actual.trim(),
+            fixture.trim(),
+            "Safety's JSON no longer matches the fixture the frontend is tested \
+             against. actual:\n{actual}"
+        );
+        // And it reads back: the fixture is not merely a string that
+        // happens to match, it is a valid `Safety` list.
+        let back: Vec<Safety> = serde_json::from_str(&fixture).unwrap();
+        assert_eq!(back, every_safety_variant());
     }
 }

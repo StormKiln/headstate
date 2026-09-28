@@ -667,27 +667,63 @@ pub fn remove_venvs(
 mod removal_tests {
     use super::*;
 
-    /// Every test here needs a venv INSIDE the real cache directory,
-    /// because containment is checked against it. Creating one there is
-    /// acceptable -- it is named so it cannot collide, and each test
-    /// removes it.
-    struct TempVenv {
-        path: std::path::PathBuf,
+    /// A Poetry cache in a FIXTURE home, made this thread's home until
+    /// dropped.
+    ///
+    /// Containment is checked against `poetry::cache_dir()`, so every test
+    /// here needs its venv inside whatever that answers. Until #1535 that
+    /// was the developer's REAL cache: the tests created directories and
+    /// symlinks in it and removed them by computed path, and on a machine
+    /// with no Poetry cache -- CI -- they returned early and tested
+    /// nothing. The home is now a temp directory, so they run everywhere
+    /// and clean up by dropping it.
+    struct FixtureCache {
+        dir: std::path::PathBuf,
+        // Declared before the directory, so the home is restored before
+        // the directory it names is removed.
+        _home: crate::auth::test_home::Scoped,
+        _root: tempfile::TempDir,
     }
 
-    impl TempVenv {
-        fn new(name: &str) -> Option<Self> {
-            let cache = poetry::cache_dir()?;
-            let path = cache.join(name);
-            std::fs::create_dir_all(path.join("lib")).ok()?;
-            std::fs::write(path.join("pyvenv.cfg"), "home = /x").ok()?;
-            Some(Self { path })
+    impl FixtureCache {
+        fn new() -> Self {
+            let root = tempfile::TempDir::new().unwrap();
+            let dir = root
+                .path()
+                .join(".cache")
+                .join("pypoetry")
+                .join("virtualenvs");
+            std::fs::create_dir_all(&dir).unwrap();
+            let home = crate::auth::test_home::set(root.path());
+            assert_eq!(
+                poetry::cache_dir().as_deref(),
+                Some(dir.as_path()),
+                "the fixture is the cache `remove_venv` checks against"
+            );
+            Self {
+                dir,
+                _home: home,
+                _root: root,
+            }
         }
     }
 
-    impl Drop for TempVenv {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
+    /// A venv-shaped directory inside a [`FixtureCache`].
+    struct TempVenv {
+        path: std::path::PathBuf,
+        _cache: FixtureCache,
+    }
+
+    impl TempVenv {
+        fn new(name: &str) -> Self {
+            let cache = FixtureCache::new();
+            let path = cache.dir.join(name);
+            std::fs::create_dir_all(path.join("lib")).unwrap();
+            std::fs::write(path.join("pyvenv.cfg"), "home = /x").unwrap();
+            Self {
+                path,
+                _cache: cache,
+            }
         }
     }
 
@@ -696,9 +732,7 @@ mod removal_tests {
 
     #[test]
     fn removes_an_orphan() {
-        let Some(v) = TempVenv::new(ORPHAN) else {
-            return; // no Poetry cache on this machine
-        };
+        let v = TempVenv::new(ORPHAN);
         remove_venv(
             &v.path.to_string_lossy(),
             &ProjectDirs::complete(vec![]),
@@ -717,9 +751,7 @@ mod removal_tests {
     /// undersized-set failure in its most direct form.
     #[test]
     fn refuses_when_the_project_scan_did_not_finish() {
-        let Some(v) = TempVenv::new("headstate-test-trunc-ZZZZZZZZ-py3.99") else {
-            return; // no Poetry cache on this machine
-        };
+        let v = TempVenv::new("headstate-test-trunc-ZZZZZZZZ-py3.99");
         let truncated = ProjectDirs {
             dirs: vec![],
             truncated: true,
@@ -744,9 +776,7 @@ mod removal_tests {
         let hash = poetry::venv_token(t.path());
         let name = format!("headstate-test-live-{hash}-py3.99");
 
-        let Some(v) = TempVenv::new(&name) else {
-            return;
-        };
+        let v = TempVenv::new(&name);
         let err = remove_venv(
             &v.path.to_string_lossy(),
             &ProjectDirs::complete(vec![project]),
@@ -770,9 +800,7 @@ mod removal_tests {
         let project = t.path().to_string_lossy().to_string();
         let hash = poetry::venv_token(t.path());
         let name = format!("headstate-test-stale-{hash}-py3.99");
-        let Some(v) = TempVenv::new(&name) else {
-            return;
-        };
+        let v = TempVenv::new(&name);
 
         let err = remove_venv(
             &v.path.to_string_lossy(),
@@ -793,9 +821,7 @@ mod removal_tests {
         let project = t.path().to_string_lossy().to_string();
         let hash = poetry::venv_token(t.path());
         let name = format!("headstate-test-fresh-{hash}-py3.99");
-        let Some(v) = TempVenv::new(&name) else {
-            return;
-        };
+        let v = TempVenv::new(&name);
 
         // Files were written moments ago by TempVenv::new.
         let err = remove_venv(
@@ -822,10 +848,8 @@ mod removal_tests {
         let hash = poetry::venv_token(t.path());
         let name = format!("headstate-test-noidle-{hash}-py3.99");
 
-        let Some(cache) = poetry::cache_dir() else {
-            return;
-        };
-        let path = cache.join(&name);
+        let cache = FixtureCache::new();
+        let path = cache.dir.join(&name);
         // No files inside: `measure` cannot date it.
         std::fs::create_dir_all(&path).unwrap();
 
@@ -838,7 +862,6 @@ mod removal_tests {
             },
         )
         .unwrap_err();
-        let _ = std::fs::remove_dir_all(&path);
         assert!(err.contains("could not tell"), "{err}");
     }
 
@@ -846,9 +869,7 @@ mod removal_tests {
     /// on the machine hashes to it.
     #[test]
     fn an_orphan_needs_no_opt_in() {
-        let Some(v) = TempVenv::new("headstate-test-noopt-ZZZZZZZZ-py3.99") else {
-            return;
-        };
+        let v = TempVenv::new("headstate-test-noopt-ZZZZZZZZ-py3.99");
         remove_venv(
             &v.path.to_string_lossy(),
             &ProjectDirs::complete(vec![]),
@@ -908,9 +929,7 @@ mod removal_tests {
     /// put there by hand is not a venv and not ours to delete.
     #[test]
     fn refuses_a_directory_that_is_not_a_venv_name() {
-        let Some(v) = TempVenv::new("headstate-test-plain-directory") else {
-            return;
-        };
+        let v = TempVenv::new("headstate-test-plain-directory");
         let err = remove_venv(
             &v.path.to_string_lossy(),
             &ProjectDirs::complete(vec![]),
@@ -925,13 +944,10 @@ mod removal_tests {
     #[test]
     #[cfg(unix)]
     fn refuses_a_symlink() {
-        let Some(cache) = poetry::cache_dir() else {
-            return;
-        };
+        let cache = FixtureCache::new();
         let real = tempfile::TempDir::new().unwrap();
         std::fs::write(real.path().join("keep.txt"), "important").unwrap();
-        let link = cache.join("headstate-test-link-ZZZZZZZZ-py3.99");
-        let _ = std::fs::remove_file(&link);
+        let link = cache.dir.join("headstate-test-link-ZZZZZZZZ-py3.99");
         std::os::unix::fs::symlink(real.path(), &link).unwrap();
 
         let err = remove_venv(
@@ -940,16 +956,13 @@ mod removal_tests {
             RemovalPolicy::default(),
         )
         .unwrap_err();
-        let _ = std::fs::remove_file(&link);
         assert!(err.contains("symlink"), "{err}");
         assert!(real.path().join("keep.txt").exists(), "target untouched");
     }
 
     #[test]
     fn reports_each_removal_independently() {
-        let Some(v) = TempVenv::new("headstate-test-batch-ZZZZZZZZ-py3.99") else {
-            return;
-        };
+        let v = TempVenv::new("headstate-test-batch-ZZZZZZZZ-py3.99");
         let out = remove_venvs(
             &[
                 v.path.to_string_lossy().to_string(),
@@ -968,21 +981,23 @@ mod removal_tests {
 mod walk_progress_tests {
     use super::*;
 
-    struct Tmp(std::path::PathBuf);
+    /// A `TempDir` no other run can name, removed when dropped (#1554).
+    /// `.0` is its path, so the tests read as they did.
+    struct Tmp(
+        std::path::PathBuf,
+        // Never read: held so the directory lives exactly as long as this.
+        #[allow(dead_code)] tempfile::TempDir,
+    );
     impl Tmp {
         fn new(name: &str) -> Self {
-            let p = std::env::temp_dir().join(format!("headstate-walk-{name}"));
-            let _ = std::fs::remove_dir_all(&p);
-            std::fs::create_dir_all(&p).unwrap();
-            Self(p)
+            let dir = tempfile::Builder::new()
+                .prefix(&format!("headstate-walk-{name}-"))
+                .tempdir()
+                .unwrap();
+            Self(dir.path().to_path_buf(), dir)
         }
         fn s(&self) -> String {
             self.0.to_string_lossy().into_owned()
-        }
-    }
-    impl Drop for Tmp {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 

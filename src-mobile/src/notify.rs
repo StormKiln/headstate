@@ -324,6 +324,19 @@ pub struct PhoneNotifyPrefs {
     /// making a reasonable choice.
     #[serde(default = "yes")]
     pub health_cpu: bool,
+    /// Claude Code sessions on the desktop: a turn finished, a session
+    /// is waiting for input or permission, or a turn errored (#1486).
+    /// The global switch; each session can also be muted on its own
+    /// ([`SessionMutes`]).
+    #[serde(default = "yes")]
+    pub sessions: bool,
+    /// Whether a session notification shows the session's opening
+    /// prompt under its state (#1486). OFF by default, and `serde`'s
+    /// plain default for a stored preference written before it existed:
+    /// the lock screen names the project and the state and nothing
+    /// else unless the owner asks for more.
+    #[serde(default)]
+    pub session_snippet: bool,
 }
 
 /// Serde needs a function, not a literal, for a defaulted bool. Named
@@ -340,6 +353,8 @@ impl Default for PhoneNotifyPrefs {
             new_pr: true,
             health_battery: true,
             health_cpu: true,
+            sessions: true,
+            session_snippet: false,
         }
     }
 }
@@ -348,6 +363,11 @@ impl PhoneNotifyPrefs {
     /// Whether a newly-appeared pull request should be announced.
     pub fn wants_new_pr(&self) -> bool {
         self.enabled && self.new_pr
+    }
+
+    /// Whether session transitions should be announced at all (#1486).
+    pub fn wants_sessions(&self) -> bool {
+        self.enabled && self.sessions
     }
 
     /// Whether a health condition with this key should be announced.
@@ -593,6 +613,7 @@ impl<R: tauri::Runtime> crate::background::Notifier for PhoneNotifier<R> {
             .post(&tauri_plugin_headstate_notify::Notification {
                 title: title.to_string(),
                 body: body.to_string(),
+                session: None,
             })
             .map_err(|e| e.to_string())
     }
@@ -600,6 +621,547 @@ impl<R: tauri::Runtime> crate::background::Notifier for PhoneNotifier<R> {
     fn health_fired(&self) -> std::sync::Arc<std::sync::Mutex<Fired>> {
         self.fired.clone()
     }
+
+    fn sessions_seen(&self) -> SessionsPrevious {
+        self.companion.sessions_seen()
+    }
+
+    fn remember_sessions(&self, seen: &SessionsSeen) -> Result<(), String> {
+        self.companion.record_sessions_seen(seen)
+    }
+
+    fn forget_sessions(&self) -> Result<(), String> {
+        self.companion.forget_sessions_seen()
+    }
+
+    fn session_mutes(&self) -> SessionMutes {
+        self.companion.session_mutes()
+    }
+
+    fn post_session(&self, title: &str, body: &str, session: &str) -> Result<(), String> {
+        use tauri_plugin_headstate_notify::HeadstateNotifyExt;
+        self.app
+            .headstate_notify()
+            .post(&tauri_plugin_headstate_notify::Notification {
+                title: title.to_string(),
+                body: body.to_string(),
+                session: Some(session.to_string()),
+            })
+            .map_err(|e| e.to_string())
+    }
+}
+
+// ---------------------------------------------------------------------
+// Claude Code sessions (#1486)
+// ---------------------------------------------------------------------
+//
+// # What is announced, and from what
+//
+// The desktop's `claude_session_digest` answers, per session, an id, a
+// project label, whether it is waiting on the user NOW (and since when),
+// and the last turn's end time and outcome -- and NO transcript text
+// (`claude::digest` on the desktop pins that). Three transitions come out
+// of comparing it against what the last pass saw:
+//
+// - **finished**: a turn ended, completed, later than the last one seen.
+// - **now waiting**: a wait began later than the last one seen, for
+//   input (`idle_prompt`) or for a permission (`permission_prompt`).
+// - **errored**: a turn ended in a `StopFailure`.
+//
+// Every one is keyed on a TIMESTAMP the desktop stated, and announced
+// only when that timestamp moves forward. That is what makes it one
+// notification per transition rather than one per poll: a session that
+// has been waiting for an hour carries the same `since` on every pass,
+// and a time that did not move is not news.
+//
+// # Absence is never a transition
+//
+// A session missing from the digest, a `last_turn` of `None`, a
+// `waiting` of `None`: none of them announces anything, and none of them
+// erases what was remembered. `None` is "the desktop could not say", not
+// "it stopped" -- a session that exits, or drops out of the bounded
+// digest, is not news, and forgetting its marks would make its last
+// event look new when it came back.
+//
+// # First sync, and sessions this phone has never seen
+//
+// [`SessionsPrevious::First`] announces nothing, as [`Previous::First`]
+// does for pull requests and for the same reason. After that, a session
+// with no marks is compared against the previous pass's `as_of` -- the
+// DESKTOP's clock at that pass -- so an event from before the phone last
+// looked is history, and one after it is news.
+//
+// # One notification per session per pass
+//
+// A background window may find a session that finished a turn AND is now
+// waiting for input, because `idle_prompt` follows the end of a turn.
+// Those are one story, so one notification, chosen by
+// [`SessionState::rank`]: errored, then waiting for a permission, then
+// finished, then waiting for input. Every mark still advances.
+//
+// # Delivery is best-effort
+//
+// These ride the same background refresh window as #789's, which iOS
+// grants when it chooses. The settings say "best-effort, delivery can be
+// delayed by iOS" where this is switched on. Instant delivery needs an
+// APNs relay, which is #1492.
+
+/// One session as the digest states it: what a transition needs, and
+/// nothing else. Decoded leniently -- unknown fields from a newer
+/// desktop are ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DigestSession {
+    pub session_id: String,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub waiting: Option<DigestWaiting>,
+    #[serde(default)]
+    pub last_turn: Option<DigestTurn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DigestWaiting {
+    pub kind: String,
+    pub since: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DigestTurn {
+    pub ended_at: String,
+    pub outcome: DigestOutcome,
+}
+
+/// How a turn ended. An outcome this build does not know decodes as
+/// [`DigestOutcome::Other`] rather than failing the row, and announces
+/// nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum DigestOutcome {
+    Completed,
+    Failed {
+        #[serde(default)]
+        error_type: Option<String>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+/// The digest, as the phone reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Digest {
+    pub as_of: String,
+    pub sessions: Vec<DigestSession>,
+}
+
+/// Decode a `claude_session_digest` answer. `None` when it is not one --
+/// which the caller treats as "leave the marks alone", never as an
+/// empty digest (the back-door burst [`Decoded`] documents).
+pub fn decode_digest(json: &str) -> Option<Digest> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let as_of = value.get("as_of")?.as_str()?.to_string();
+    let rows = value.get("sessions")?.as_array()?;
+    let sessions = rows
+        .iter()
+        .filter_map(|v| serde_json::from_value::<DigestSession>(v.clone()).ok())
+        .collect();
+    Some(Digest { as_of, sessions })
+}
+
+/// What happened to one session, as the notification states it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionState {
+    /// A turn ended and completed.
+    Finished,
+    /// Waiting for the user's next message (`idle_prompt`).
+    WaitingForInput,
+    /// Waiting for the user to allow something (`permission_prompt`).
+    WaitingForPermission,
+    /// A turn ended in a failure; Claude Code's `error_type` code.
+    Errored(Option<String>),
+}
+
+impl SessionState {
+    /// Which of two states for one session in one pass is announced.
+    /// Higher wins: a failure is the most urgent thing to know, a
+    /// permission prompt blocks work until answered, and "finished" says
+    /// more than the "waiting for input" that follows every finished
+    /// turn.
+    fn rank(&self) -> u8 {
+        match self {
+            SessionState::Errored(_) => 4,
+            SessionState::WaitingForPermission => 3,
+            SessionState::Finished => 2,
+            SessionState::WaitingForInput => 1,
+        }
+    }
+
+    /// The state, as the lock screen says it.
+    pub fn phrase(&self) -> String {
+        match self {
+            SessionState::Finished => "finished".into(),
+            SessionState::WaitingForInput => "waiting for your input".into(),
+            SessionState::WaitingForPermission => "waiting for your permission".into(),
+            SessionState::Errored(Some(code)) => {
+                format!("stopped with an error ({})", code.replace('_', " "))
+            }
+            SessionState::Errored(None) => "stopped with an error".into(),
+        }
+    }
+}
+
+/// One transition to announce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEvent {
+    pub session_id: String,
+    pub project: Option<String>,
+    pub state: SessionState,
+}
+
+/// What the phone remembers about one session between passes: the
+/// newest event times it has seen. Times, not states, because the
+/// transitions are "a time moved forward".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMarks {
+    #[serde(default)]
+    pub waiting_since: Option<String>,
+    #[serde(default)]
+    pub turn_ended_at: Option<String>,
+    /// Whether the turn at `turn_ended_at` was seen as failed. Lets a
+    /// failure recorded a moment after the idle transition correct a
+    /// "finished" into "errored" without the time having moved.
+    #[serde(default)]
+    pub turn_failed: bool,
+}
+
+/// Store key for [`SessionsSeen`].
+pub const SESSIONS_SEEN_KEY: &str = "notify_sessions_seen";
+
+/// What the last session pass saw.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionsSeen {
+    pub v: u32,
+    /// The digest's `as_of` at that pass: the DESKTOP's clock.
+    pub as_of: String,
+    pub sessions: std::collections::BTreeMap<String, SessionMarks>,
+}
+
+const SESSIONS_SEEN_VERSION: u32 = 1;
+
+/// [`Previous`], for sessions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionsPrevious {
+    /// No session pass has completed since install, or since sessions
+    /// were last switched off. Announce NOTHING.
+    First,
+    Known(SessionsSeen),
+}
+
+/// Sessions the owner muted on this phone, by id.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMutes {
+    pub sessions: std::collections::BTreeSet<String>,
+}
+
+/// Store key for [`SessionMutes`].
+pub const SESSION_MUTES_KEY: &str = "notify_session_mutes";
+
+/// The result of one pass: what to announce, and what to remember.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionTransitions {
+    pub announce: Vec<SessionEvent>,
+    pub next: SessionsSeen,
+}
+
+fn instant(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|d| d.with_timezone(&chrono::Utc))
+}
+
+/// Whether `current` is strictly later than `before`. An unparseable
+/// `current` is never news; an absent or unparseable `before` is nothing
+/// to compare against, so any readable `current` is later than it. The
+/// caller decides what `before` is -- a session's own mark, or the
+/// previous pass's clock for a session with none.
+fn later(current: &str, before: Option<&str>) -> bool {
+    let Some(now) = instant(current) else {
+        return false;
+    };
+    match before.and_then(instant) {
+        Some(then) => now > then,
+        None => true,
+    }
+}
+
+/// The later of two optional stamps, by time. An unparseable one loses.
+fn newest(a: Option<&str>, b: Option<&str>) -> Option<String> {
+    match (a, b) {
+        (Some(a), Some(b)) => match (instant(a), instant(b)) {
+            (Some(ta), Some(tb)) => Some(if tb > ta { b } else { a }.to_string()),
+            (Some(_), None) => Some(a.to_string()),
+            (None, Some(_)) => Some(b.to_string()),
+            (None, None) => Some(a.to_string()),
+        },
+        (Some(a), None) => Some(a.to_string()),
+        (None, Some(b)) => Some(b.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// The session transitions between the last pass and this digest.
+///
+/// Pure: no store, no clock, no notification API. `muted` sessions are
+/// left out of `announce` and their marks STILL advance, so unmuting one
+/// announces what happens next rather than what happened while it was
+/// muted.
+pub fn session_transitions(
+    previous: &SessionsPrevious,
+    digest: &Digest,
+    muted: &SessionMutes,
+) -> SessionTransitions {
+    let (known, floor) = match previous {
+        SessionsPrevious::First => (None, None),
+        SessionsPrevious::Known(seen) => (Some(&seen.sessions), Some(seen.as_of.as_str())),
+    };
+    let mut announce = Vec::new();
+    let mut next = std::collections::BTreeMap::new();
+    for row in &digest.sessions {
+        let before = known.and_then(|k| k.get(&row.session_id));
+        // A session with marks compares against them; one without is
+        // compared against the previous pass's clock.
+        let bar = |mark: Option<&String>| -> Option<String> {
+            match before {
+                Some(_) => mark.cloned(),
+                None => floor.map(str::to_string),
+            }
+        };
+        let mut candidates: Vec<SessionState> = Vec::new();
+
+        if let Some(w) = &row.waiting {
+            let prev = bar(before.and_then(|b| b.waiting_since.as_ref()));
+            if later(&w.since, prev.as_deref()) {
+                match w.kind.as_str() {
+                    "permission_prompt" => candidates.push(SessionState::WaitingForPermission),
+                    "idle_prompt" => candidates.push(SessionState::WaitingForInput),
+                    // A kind this build does not know is not announced:
+                    // the desktop only states `Now` for the two prompt
+                    // types, so this is a newer desktop's vocabulary,
+                    // and a notification that cannot say what it is
+                    // waiting for is worse than none.
+                    _ => {}
+                }
+            }
+        }
+        if let Some(t) = &row.last_turn {
+            let prev = bar(before.and_then(|b| b.turn_ended_at.as_ref()));
+            let failed = matches!(t.outcome, DigestOutcome::Failed { .. });
+            let moved = later(&t.ended_at, prev.as_deref());
+            // The same turn, first seen as completed and now as failed:
+            // the failure landed after the pass that saw the idle write.
+            let corrected = before.is_some_and(|b| {
+                failed && !b.turn_failed && b.turn_ended_at.as_deref() == Some(t.ended_at.as_str())
+            });
+            if moved || corrected {
+                match &t.outcome {
+                    DigestOutcome::Completed if moved => candidates.push(SessionState::Finished),
+                    DigestOutcome::Failed { error_type } => {
+                        candidates.push(SessionState::Errored(error_type.clone()))
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if known.is_some() && !muted.sessions.contains(&row.session_id) {
+            if let Some(state) = candidates.into_iter().max_by_key(SessionState::rank) {
+                announce.push(SessionEvent {
+                    session_id: row.session_id.clone(),
+                    project: row.project.clone(),
+                    state,
+                });
+            }
+        }
+
+        // Marks only ever move FORWARD, and absence keeps what was known.
+        let prev = before.cloned().unwrap_or_default();
+        let (turn_ended_at, turn_failed) = match &row.last_turn {
+            Some(t) if later(&t.ended_at, prev.turn_ended_at.as_deref()) => (
+                Some(t.ended_at.clone()),
+                matches!(t.outcome, DigestOutcome::Failed { .. }),
+            ),
+            Some(t) if prev.turn_ended_at.as_deref() == Some(t.ended_at.as_str()) => (
+                prev.turn_ended_at.clone(),
+                prev.turn_failed || matches!(t.outcome, DigestOutcome::Failed { .. }),
+            ),
+            _ => (prev.turn_ended_at.clone(), prev.turn_failed),
+        };
+        next.insert(
+            row.session_id.clone(),
+            SessionMarks {
+                waiting_since: newest(
+                    prev.waiting_since.as_deref(),
+                    row.waiting.as_ref().map(|w| w.since.as_str()),
+                ),
+                turn_ended_at,
+                turn_failed,
+            },
+        );
+    }
+    // Sessions absent from this digest keep their marks: absence is not
+    // a transition, and forgetting would make their last event news when
+    // they reappear. Bounded by what the desktop's digest has ever
+    // returned in the recency window; pruned when the marks are older
+    // than the digest's own window.
+    if let Some(known) = known {
+        let horizon = instant(&digest.as_of).map(|t| t - chrono::TimeDelta::hours(48));
+        for (id, marks) in known {
+            if next.contains_key(id) {
+                continue;
+            }
+            let newest_mark = newest(
+                marks.waiting_since.as_deref(),
+                marks.turn_ended_at.as_deref(),
+            );
+            let stale = match (horizon, newest_mark.as_deref().and_then(instant)) {
+                (Some(h), Some(t)) => t < h,
+                // No time to judge by: nothing to announce from it later
+                // either, so keeping it buys nothing.
+                (_, None) => true,
+                (None, Some(_)) => false,
+            };
+            if !stale {
+                next.insert(id.clone(), marks.clone());
+            }
+        }
+    }
+    SessionTransitions {
+        announce,
+        next: SessionsSeen {
+            v: SESSIONS_SEEN_VERSION,
+            as_of: digest.as_of.clone(),
+            sessions: next,
+        },
+    }
+}
+
+/// Longest opening-prompt snippet shown on a lock screen, in characters.
+pub const SNIPPET_CHARS: usize = 100;
+
+/// The notification for one session transition: the project as the
+/// title and the state as the body, and nothing else unless the owner
+/// turned the snippet on.
+///
+/// "hello-world" / "Waiting for your input". Never the session's name:
+/// that is Claude Code's `aiTitle`, written from the conversation, and
+/// the digest does not carry it for exactly that reason.
+pub fn session_notification(event: &SessionEvent, snippet: Option<&str>) -> (String, String) {
+    let title = event
+        .project
+        .clone()
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| "Claude Code session".to_string());
+    let mut body = capitalise(&event.state.phrase());
+    if let Some(s) = snippet.map(str::trim).filter(|s| !s.is_empty()) {
+        body.push('\n');
+        body.push_str(&clamp_chars(s, SNIPPET_CHARS));
+    }
+    (title, body)
+}
+
+fn capitalise(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(first) => first.to_uppercase().chain(c).collect(),
+        None => String::new(),
+    }
+}
+
+/// At most `max` characters, with an ellipsis when cut. By `char`, so a
+/// multi-byte character is never split.
+fn clamp_chars(s: &str, max: usize) -> String {
+    let one_line = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= max {
+        return one_line;
+    }
+    let mut out: String = one_line.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// The opening prompt out of a `claude_transcript_opening_prompt`
+/// answer, or `None` for anything else.
+pub fn decode_prompt(json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    value.get("prompt")?.as_str().map(str::to_string)
+}
+
+/// Serialises the read-compare-write of the session marks, so the
+/// foreground toast poll and a background window cannot both announce
+/// one transition. Held for no `.await`: the digest is fetched before it
+/// is taken.
+static SESSIONS_PASS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Compare a digest against the stored marks, store the new marks, and
+/// return what to announce. The one place both delivery paths go
+/// through, so a transition toasted in the foreground is not notified
+/// again from the background, or the other way round.
+pub fn advance_sessions<N: crate::background::Notifier + ?Sized>(
+    notifier: &N,
+    digest: &Digest,
+) -> Vec<SessionEvent> {
+    let _guard = SESSIONS_PASS.lock().unwrap_or_else(|e| e.into_inner());
+    let t = session_transitions(&notifier.sessions_seen(), digest, &notifier.session_mutes());
+    if let Err(e) = notifier.remember_sessions(&t.next) {
+        // As for pull requests: a store that keeps failing makes every
+        // pass a first sync, which announces nothing -- the feature is
+        // silently dead, so this is a warning.
+        log::warn!("notify: could not record what the session pass saw: {e}");
+    }
+    t.announce
+}
+
+/// One in-app toast (#1486): a transition that happened while the app
+/// was open, for a session other than the one on screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionToast {
+    pub session_id: String,
+    pub title: String,
+    pub body: String,
+}
+
+/// The foreground half: the same transitions as a background window,
+/// returned to the webview instead of posted. `viewing` is left out --
+/// the owner is looking at it -- but its marks still advance.
+pub async fn foreground_toasts<N, D>(
+    notifier: &N,
+    desktop: &D,
+    viewing: Option<&str>,
+) -> Result<Vec<SessionToast>, String>
+where
+    N: crate::background::Notifier + ?Sized,
+    D: crate::background::Desktop + ?Sized,
+{
+    let prefs = notifier.prefs();
+    if !prefs.wants_sessions() {
+        return Ok(Vec::new());
+    }
+    let json = desktop.session_digest().await?;
+    let Some(digest) = decode_digest(&json) else {
+        return Err("the desktop's session status could not be read".into());
+    };
+    Ok(advance_sessions(notifier, &digest)
+        .into_iter()
+        .filter(|e| Some(e.session_id.as_str()) != viewing)
+        .map(|e| {
+            let (title, body) = session_notification(&e, None);
+            SessionToast {
+                session_id: e.session_id,
+                title,
+                body,
+            }
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------
@@ -628,13 +1190,69 @@ pub fn set_phone_notify_prefs(
     // Counts only -- which repositories or machines are involved is not
     // a setting and is never logged (CONTRIBUTING, check-privacy.sh).
     log::info!(
-        "notify: enabled={} new_pr={} battery={} cpu={}",
+        "notify: enabled={} new_pr={} battery={} cpu={} sessions={} snippet={}",
         prefs.enabled,
         prefs.new_pr,
         prefs.health_battery,
-        prefs.health_cpu
+        prefs.health_cpu,
+        prefs.sessions,
+        prefs.session_snippet
     );
     state.set_notify_prefs(&prefs)
+}
+
+/// The sessions muted on this phone (#1486), by id.
+#[tauri::command]
+pub fn get_session_mutes(
+    state: tauri::State<'_, std::sync::Arc<crate::companion::Companion>>,
+) -> Vec<String> {
+    state.session_mutes().sessions.into_iter().collect()
+}
+
+/// Mute or unmute one session's notifications on this phone (#1486).
+///
+/// A muted session's marks keep advancing, so unmuting it announces
+/// what happens NEXT rather than what happened while it was muted.
+#[tauri::command]
+pub fn set_session_muted(
+    state: tauri::State<'_, std::sync::Arc<crate::companion::Companion>>,
+    session_id: String,
+    muted: bool,
+) -> Result<(), String> {
+    // Never the id: which sessions are muted is not worth a log line.
+    log::info!(
+        "notify: a session was {}",
+        if muted { "muted" } else { "unmuted" }
+    );
+    state.set_session_muted(&session_id, muted)
+}
+
+/// The in-app toasts for session transitions while the app is open
+/// (#1486). `viewing` is the session on screen, which gets none.
+#[tauri::command]
+pub async fn poll_session_toasts<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, std::sync::Arc<crate::companion::Companion>>,
+    viewing: Option<String>,
+) -> Result<Vec<SessionToast>, String> {
+    let companion = state.inner().clone();
+    let notifier = PhoneNotifier::new(companion.clone(), app);
+    foreground_toasts(&notifier, companion.as_ref(), viewing.as_deref()).await
+}
+
+/// The session of the notification the owner last tapped, cleared as it
+/// is read (#1486). `None` on a platform with no notifications.
+#[tauri::command]
+pub fn take_notification_session<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Option<String> {
+    use tauri_plugin_headstate_notify::HeadstateNotifyExt;
+    match app.headstate_notify().take_tapped() {
+        Ok(session) => session,
+        Err(tauri_plugin_headstate_notify::Error::Unavailable) => None,
+        Err(e) => {
+            log::info!("notify: could not read the tapped notification: {e}");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -940,6 +1558,12 @@ mod tests {
         assert!(p.new_pr, "a missing field is the default, not false");
         assert!(p.health_battery);
         assert!(p.health_cpu);
+        assert!(p.sessions, "session notifications default on");
+        assert!(
+            !p.session_snippet,
+            "the lock-screen snippet defaults OFF, including for a stored preference \
+             written before it existed"
+        );
     }
 
     // ---- Decoding ----------------------------------------------------
@@ -1058,5 +1682,350 @@ mod tests {
     fn extra_fields_from_a_newer_desktop_are_ignored() {
         let alerts = decode_health(r#"[{"key":"low","title":"t","body":"b","severity":"warn"}]"#);
         assert_eq!(alerts.len(), 1);
+    }
+
+    // ---- Sessions (#1486) ---------------------------------------------
+
+    fn session(id: &str) -> DigestSession {
+        DigestSession {
+            session_id: id.into(),
+            project: Some("hello-world".into()),
+            waiting: None,
+            last_turn: None,
+        }
+    }
+
+    fn waiting(mut s: DigestSession, kind: &str, since: &str) -> DigestSession {
+        s.waiting = Some(DigestWaiting {
+            kind: kind.into(),
+            since: since.into(),
+        });
+        s
+    }
+
+    fn turn(mut s: DigestSession, ended_at: &str, failed: Option<&str>) -> DigestSession {
+        s.last_turn = Some(DigestTurn {
+            ended_at: ended_at.into(),
+            outcome: match failed {
+                Some(code) => DigestOutcome::Failed {
+                    error_type: Some(code.into()),
+                },
+                None => DigestOutcome::Completed,
+            },
+        });
+        s
+    }
+
+    fn digest(as_of: &str, sessions: Vec<DigestSession>) -> Digest {
+        Digest {
+            as_of: as_of.into(),
+            sessions,
+        }
+    }
+
+    /// Run one pass against the marks the previous one left, as the
+    /// phone does.
+    fn pass(prev: &mut SessionsPrevious, d: &Digest, muted: &SessionMutes) -> Vec<SessionEvent> {
+        let t = session_transitions(prev, d, muted);
+        *prev = SessionsPrevious::Known(t.next);
+        t.announce
+    }
+
+    fn states(events: &[SessionEvent]) -> Vec<(String, SessionState)> {
+        events
+            .iter()
+            .map(|e| (e.session_id.clone(), e.state.clone()))
+            .collect()
+    }
+
+    /// **No burst on first sync.** A fresh install finds ten sessions,
+    /// every one of which has finished a turn or is waiting -- and
+    /// announces none of them, while remembering all of them so the NEXT
+    /// pass has something to compare against.
+    #[test]
+    fn a_first_session_sync_announces_nothing() {
+        let rows: Vec<DigestSession> = (0..10)
+            .map(|i| {
+                let s = turn(session(&format!("s{i}")), "2026-09-26T11:00:00Z", None);
+                waiting(s, "permission_prompt", "2026-09-26T11:01:00Z")
+            })
+            .collect();
+        let mut prev = SessionsPrevious::First;
+        let d = digest("2026-09-26T12:00:00Z", rows);
+        assert!(pass(&mut prev, &d, &SessionMutes::default()).is_empty());
+        // And the same digest again is still nothing: it was remembered.
+        assert!(pass(&mut prev, &d, &SessionMutes::default()).is_empty());
+    }
+
+    /// **One notification per transition, not per poll.** A session
+    /// that finished once and then sits idle for five more polls is
+    /// announced once.
+    #[test]
+    fn a_standing_state_is_announced_once() {
+        let mut prev = SessionsPrevious::First;
+        let none = SessionMutes::default();
+        pass(
+            &mut prev,
+            &digest("2026-09-26T12:00:00Z", vec![session("s1")]),
+            &none,
+        );
+        let finished = digest(
+            "2026-09-26T12:10:00Z",
+            vec![turn(session("s1"), "2026-09-26T12:05:00Z", None)],
+        );
+        assert_eq!(
+            states(&pass(&mut prev, &finished, &none)),
+            vec![("s1".to_string(), SessionState::Finished)]
+        );
+        for _ in 0..5 {
+            assert!(pass(&mut prev, &finished, &none).is_empty(), "re-announced");
+        }
+        // The NEXT turn is news again.
+        let again = digest(
+            "2026-09-26T12:30:00Z",
+            vec![turn(session("s1"), "2026-09-26T12:25:00Z", None)],
+        );
+        assert_eq!(pass(&mut prev, &again, &none).len(), 1);
+    }
+
+    /// A new wait is news; the same wait, polled again, is not. Input
+    /// and permission are different states.
+    #[test]
+    fn waiting_for_input_and_for_permission_are_announced_per_episode() {
+        let mut prev = SessionsPrevious::First;
+        let none = SessionMutes::default();
+        pass(
+            &mut prev,
+            &digest("2026-09-26T12:00:00Z", vec![session("s1"), session("s2")]),
+            &none,
+        );
+        let d = digest(
+            "2026-09-26T12:10:00Z",
+            vec![
+                waiting(session("s1"), "idle_prompt", "2026-09-26T12:05:00Z"),
+                waiting(session("s2"), "permission_prompt", "2026-09-26T12:06:00Z"),
+            ],
+        );
+        assert_eq!(
+            states(&pass(&mut prev, &d, &none)),
+            vec![
+                ("s1".to_string(), SessionState::WaitingForInput),
+                ("s2".to_string(), SessionState::WaitingForPermission),
+            ]
+        );
+        assert!(pass(&mut prev, &d, &none).is_empty());
+    }
+
+    /// A failed turn is "errored", with Claude Code's code in the copy.
+    #[test]
+    fn a_failed_turn_is_announced_as_errored() {
+        let mut prev = SessionsPrevious::First;
+        let none = SessionMutes::default();
+        pass(
+            &mut prev,
+            &digest("2026-09-26T12:00:00Z", vec![session("s1")]),
+            &none,
+        );
+        let d = digest(
+            "2026-09-26T12:10:00Z",
+            vec![turn(
+                session("s1"),
+                "2026-09-26T12:05:00Z",
+                Some("rate_limit"),
+            )],
+        );
+        let events = pass(&mut prev, &d, &none);
+        assert_eq!(
+            states(&events),
+            vec![(
+                "s1".to_string(),
+                SessionState::Errored(Some("rate_limit".into()))
+            )]
+        );
+        let (_, body) = session_notification(&events[0], None);
+        assert_eq!(body, "Stopped with an error (rate limit)");
+    }
+
+    /// A failure recorded a moment after the pass that saw the idle
+    /// write corrects "finished" into "errored" -- once.
+    #[test]
+    fn a_late_failure_for_the_same_turn_is_announced_once() {
+        let mut prev = SessionsPrevious::First;
+        let none = SessionMutes::default();
+        pass(
+            &mut prev,
+            &digest("2026-09-26T12:00:00Z", vec![session("s1")]),
+            &none,
+        );
+        let at = "2026-09-26T12:05:00.000Z";
+        let first = digest("2026-09-26T12:05:01Z", vec![turn(session("s1"), at, None)]);
+        assert_eq!(pass(&mut prev, &first, &none).len(), 1);
+        let late = digest(
+            "2026-09-26T12:10:00Z",
+            vec![turn(session("s1"), at, Some("overloaded"))],
+        );
+        assert_eq!(
+            states(&pass(&mut prev, &late, &none)),
+            vec![(
+                "s1".to_string(),
+                SessionState::Errored(Some("overloaded".into()))
+            )]
+        );
+        assert!(pass(&mut prev, &late, &none).is_empty());
+    }
+
+    /// Finished AND now waiting for input, seen in one pass, is one
+    /// story and one notification: "finished".
+    #[test]
+    fn one_session_is_one_notification_per_pass() {
+        let mut prev = SessionsPrevious::First;
+        let none = SessionMutes::default();
+        pass(
+            &mut prev,
+            &digest("2026-09-26T12:00:00Z", vec![session("s1")]),
+            &none,
+        );
+        let s = turn(session("s1"), "2026-09-26T12:05:00Z", None);
+        let s = waiting(s, "idle_prompt", "2026-09-26T12:06:00Z");
+        let events = pass(&mut prev, &digest("2026-09-26T12:10:00Z", vec![s]), &none);
+        assert_eq!(
+            states(&events),
+            vec![("s1".to_string(), SessionState::Finished)]
+        );
+    }
+
+    /// **Mute honoured.** A muted session announces nothing, its marks
+    /// still advance, and unmuting it announces what happens NEXT rather
+    /// than what happened while it was muted.
+    #[test]
+    fn a_muted_session_is_silent_and_unmuting_is_not_a_backlog() {
+        let mut prev = SessionsPrevious::First;
+        let muted = SessionMutes {
+            sessions: ["s1".to_string()].into_iter().collect(),
+        };
+        let none = SessionMutes::default();
+        pass(
+            &mut prev,
+            &digest("2026-09-26T12:00:00Z", vec![session("s1"), session("s2")]),
+            &muted,
+        );
+        let d = digest(
+            "2026-09-26T12:10:00Z",
+            vec![
+                turn(session("s1"), "2026-09-26T12:05:00Z", None),
+                turn(session("s2"), "2026-09-26T12:05:00Z", None),
+            ],
+        );
+        assert_eq!(
+            states(&pass(&mut prev, &d, &muted)),
+            vec![("s2".to_string(), SessionState::Finished)],
+            "only the unmuted session"
+        );
+        assert!(
+            pass(&mut prev, &d, &none).is_empty(),
+            "unmuting must not announce what happened while muted"
+        );
+    }
+
+    /// Absence is never a transition, and never erases a mark: a session
+    /// that drops out of the digest and comes back with the same turn
+    /// end is not news.
+    #[test]
+    fn a_session_that_disappears_and_returns_is_not_news() {
+        let mut prev = SessionsPrevious::First;
+        let none = SessionMutes::default();
+        let with = digest(
+            "2026-09-26T12:00:00Z",
+            vec![turn(session("s1"), "2026-09-26T11:55:00Z", None)],
+        );
+        pass(&mut prev, &with, &none);
+        assert!(pass(&mut prev, &digest("2026-09-26T12:10:00Z", vec![]), &none).is_empty());
+        let back = digest(
+            "2026-09-26T12:20:00Z",
+            vec![turn(session("s1"), "2026-09-26T11:55:00Z", None)],
+        );
+        assert!(pass(&mut prev, &back, &none).is_empty());
+        // `last_turn: None` does not erase the mark either.
+        pass(
+            &mut prev,
+            &digest("2026-09-26T12:30:00Z", vec![session("s1")]),
+            &none,
+        );
+        assert!(pass(&mut prev, &back, &none).is_empty());
+    }
+
+    /// A session this phone has never seen is compared against the
+    /// previous pass's clock: an event after it is news, one before it
+    /// is history.
+    #[test]
+    fn a_new_session_is_judged_against_the_last_pass() {
+        let mut prev = SessionsPrevious::First;
+        let none = SessionMutes::default();
+        pass(&mut prev, &digest("2026-09-26T12:00:00Z", vec![]), &none);
+        let d = digest(
+            "2026-09-26T12:10:00Z",
+            vec![
+                turn(session("new"), "2026-09-26T12:05:00Z", None),
+                turn(session("old"), "2026-09-26T11:00:00Z", None),
+            ],
+        );
+        assert_eq!(
+            states(&pass(&mut prev, &d, &none)),
+            vec![("new".to_string(), SessionState::Finished)]
+        );
+    }
+
+    /// **The lock screen names the project and the state, and nothing
+    /// else** -- unless the snippet is on, when the opening prompt
+    /// follows, clamped.
+    #[test]
+    fn the_lock_screen_text_is_project_and_state_only() {
+        let e = SessionEvent {
+            session_id: "s1".into(),
+            project: Some("hello-world".into()),
+            state: SessionState::WaitingForInput,
+        };
+        assert_eq!(
+            session_notification(&e, None),
+            (
+                "hello-world".to_string(),
+                "Waiting for your input".to_string()
+            )
+        );
+        let long = "x".repeat(300);
+        let (_, body) = session_notification(&e, Some(&long));
+        let snippet = body.split_once('\n').unwrap().1;
+        assert_eq!(snippet.chars().count(), SNIPPET_CHARS);
+        assert!(snippet.ends_with('…'));
+        // No project: a generic name, never the session id or a title.
+        let anon = SessionEvent { project: None, ..e };
+        assert_eq!(session_notification(&anon, None).0, "Claude Code session");
+    }
+
+    /// The digest decodes leniently, and an unreadable one is `None`
+    /// -- never an empty digest that would wipe the marks.
+    #[test]
+    fn the_digest_decodes_leniently_and_unreadable_is_not_empty() {
+        let json = r#"{"as_of":"2026-09-26T12:00:00Z","total":2,"sessions":[
+            {"session_id":"s1","project":"hello-world","liveness":"running",
+             "waiting":{"kind":"idle_prompt","since":"2026-09-26T11:59:00Z"},
+             "last_turn":{"ended_at":"2026-09-26T11:58:00Z","outcome":{"state":"failed","error_type":"overloaded"}}},
+            {"session_id":"s2","liveness":"dead","waiting":null,"last_turn":
+             {"ended_at":"2026-09-26T11:00:00Z","outcome":{"state":"from-the-future"}}},
+            {"no_id":true}
+        ]}"#;
+        let d = decode_digest(json).unwrap();
+        assert_eq!(d.sessions.len(), 2);
+        assert_eq!(
+            d.sessions[1].last_turn.as_ref().unwrap().outcome,
+            DigestOutcome::Other
+        );
+        assert_eq!(decode_digest("[]"), None);
+        assert_eq!(decode_digest("not json"), None);
+        assert_eq!(
+            decode_prompt(r#"{"prompt":"fix the flaky test","masking":{"hidden":0}}"#).as_deref(),
+            Some("fix the flaky test")
+        );
+        assert_eq!(decode_prompt(r#"{"prompt":null}"#), None);
     }
 }
