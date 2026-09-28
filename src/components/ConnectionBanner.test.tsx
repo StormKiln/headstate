@@ -107,7 +107,7 @@ describe("ConnectionBanner", () => {
     expect(screen.queryByRole("button")).toBeNull();
     const banner = screen.getByRole("link");
     expect(banner.getAttribute("href")).toBe(
-      "https://github.com/pktstorm/headstate/releases/latest",
+      "https://github.com/StormKiln/headstate/releases/latest",
     );
     expect(banner.textContent).toContain("Update Headstate on your desktop");
     // Names the minimum, and what the desktop reported.
@@ -117,7 +117,7 @@ describe("ConnectionBanner", () => {
     );
     expect(banner.textContent).not.toContain("reachable");
     fireEvent.click(banner);
-    expect(openUrl).toHaveBeenCalledWith("https://github.com/pktstorm/headstate/releases/latest");
+    expect(openUrl).toHaveBeenCalledWith("https://github.com/StormKiln/headstate/releases/latest");
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 

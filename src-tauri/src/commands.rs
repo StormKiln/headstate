@@ -1901,6 +1901,32 @@ pub async fn read_log_tail(
 }
 
 #[tauri::command]
+/// Everything "Report this" can say about this machine, redacted (#1575).
+///
+/// `Class::Read`, and served to a paired phone. The poll whose failure
+/// the phone's banner shows runs HERE, so the phone's report is about
+/// this machine's poll, `gh` and log -- and every part of the bundle is
+/// already a Read on its own (`build_target`, `tool_versions`,
+/// `read_log_tail`, `get_poll_interval`). Refusing the bundle would
+/// withhold nothing and cost the phone's report its whole substance.
+///
+/// Infallible: every part that cannot be gathered is `None` with a note,
+/// so a report is never lost to one lookup (#1044).
+pub async fn diagnostic_bundle(app: AppHandle) -> crate::report::DiagnosticBundle {
+    use tauri::Manager;
+    let version = app.package_info().version.to_string();
+    let interval = app
+        .try_state::<crate::poll::PollInterval>()
+        .map(|s| s.0.load(std::sync::atomic::Ordering::Relaxed));
+    let log_file = app
+        .path()
+        .app_log_dir()
+        .ok()
+        .map(|d| d.join("headstate.log"));
+    crate::report::bundle(version, interval, log_file).await
+}
+
+#[tauri::command]
 pub fn reveal_log(app: AppHandle) -> Result<String, String> {
     use tauri::Manager;
     let dir = app
@@ -3808,8 +3834,12 @@ pub async fn latest_release(app: AppHandle) -> Option<String> {
     // Through the authenticated client, which already exists -- rather
     // than adding an HTTP dependency for one request. The endpoint is
     // public, so this works whether or not the token has any scopes.
+    //
+    // The canonical owner (#1575): the repository moved, and this named
+    // the old one. `release_notes::REPO` and `src/lib/repo.ts` spell the
+    // same slug, and tests on both sides assert they agree.
     let json: serde_json::Value = octocrab::instance()
-        .get("/repos/pktstorm/headstate/releases/latest", None::<&()>)
+        .get("/repos/StormKiln/headstate/releases/latest", None::<&()>)
         .await
         .ok()?;
     let tag = json.get("tag_name")?.as_str()?.trim_start_matches('v');

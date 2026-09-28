@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 import { installUpdate } from "../api/updater";
 import { ExternalLink } from "./ExternalLink";
+import { LATEST_RELEASE_URL } from "../lib/repo";
 
 /// Announces a new release once per version.
 ///
@@ -94,7 +95,7 @@ export function UpdateDialog({
               before replacing their app should not have to choose
               between that and updating. */}
           <ExternalLink
-            href="https://github.com/pktstorm/headstate/releases/latest"
+            href={LATEST_RELEASE_URL}
             className="rounded border border-[#30363d] px-3 py-1.5 text-sm hover:bg-[#161b22]"
           >
             Release notes

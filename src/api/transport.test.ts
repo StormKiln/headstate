@@ -272,6 +272,7 @@ const ROWS: Row[] = [
   row(api.toolVersions, [], "tool_versions"),
   row(api.readLogTail, [4096], "read_log_tail", { maxBytes: 4096 }),
   row(api.revealLog, [], "reveal_log"),
+  row(api.diagnosticBundle, [], "diagnostic_bundle"),
   row(api.claudeMdEffective, [repoPath], "claude_md_effective", { repoPath }),
   // `mode` is omitted by the caller and sent as explicit `null` (#1293):
   // the Rust side takes `Option<Mode>` and defaults to `Cached`, and a

@@ -21,6 +21,7 @@ export function QueryError({
   report = false,
   reportView,
   reportDiagnostics,
+  reportComponentStack,
   children,
 }: {
   title: string;
@@ -41,6 +42,8 @@ export function QueryError({
   /// `undefined` is "not known", which the report omits rather than
   /// printing as "off" (#1042).
   reportDiagnostics?: boolean;
+  /// A render crash's component stack, when the caller caught one.
+  reportComponentStack?: string;
   children?: ReactNode;
 }) {
   // DELEGATED here rather than at each of the dozen call sites (#1124).
@@ -90,6 +93,7 @@ export function QueryError({
               error={message ?? title}
               view={reportView}
               diagnostics={reportDiagnostics}
+              componentStack={reportComponentStack}
               className="text-sm underline hover:no-underline"
             />
           ) : null}

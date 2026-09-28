@@ -50,7 +50,7 @@ pub enum Target {
 /// for a reader to notice -- a menu pointing at one repository while
 /// the update check reads another would be silently wrong in a way no
 /// test would otherwise catch.
-pub const REPO: &str = "pktstorm/headstate";
+pub const REPO: &str = "StormKiln/headstate";
 
 impl Target {
     /// The URL to open.
@@ -103,7 +103,7 @@ mod tests {
         assert_eq!(t, Target::Tag("6.0.1".into()));
         assert_eq!(
             t.url(),
-            "https://github.com/pktstorm/headstate/releases/tag/v6.0.1"
+            "https://github.com/StormKiln/headstate/releases/tag/v6.0.1"
         );
         assert_eq!(t.label(), "Release notes for v6.0.1");
     }
@@ -114,7 +114,7 @@ mod tests {
     fn an_unstamped_dev_build_points_at_the_index_not_a_bogus_tag() {
         let t = target_for(UNSTAMPED);
         assert_eq!(t, Target::Index);
-        assert_eq!(t.url(), "https://github.com/pktstorm/headstate/releases");
+        assert_eq!(t.url(), "https://github.com/StormKiln/headstate/releases");
         assert!(
             !t.url().contains("0.1.0"),
             "linked to the placeholder version"

@@ -1131,6 +1131,10 @@ pub fn spawn(
                     Ok(res) => res,
                     Err(_) => Err(ClientError::Timeout(FETCH_TIMEOUT.as_secs())),
                 };
+            // For "Report this" (#1575): how long the search took, timeout
+            // included, before the review queue spends the rest.
+            let fetch_ms = tick_started.elapsed().as_millis() as u64;
+            let mut reviewing_outcome = "ok";
 
             // The review queue: for the ready-to-review notification AND
             // for the To Review page's cache.
@@ -1162,15 +1166,18 @@ pub fn spawn(
                     // next tick is about to ask the same question with a
                     // full budget.
                     crate::diag!("[diag] poll reviewing skipped: tick budget spent");
+                    reviewing_outcome = "skipped";
                     None
                 } else {
                     match tokio::time::timeout(remaining, client.fetch_reviewing()).await {
                         Ok(Ok(list)) => Some(list),
                         Ok(Err(e)) => {
                             crate::diag!("[diag] poll reviewing failed: {e}");
+                            reviewing_outcome = "failed";
                             None
                         }
                         Err(_) => {
+                            reviewing_outcome = "timed out";
                             crate::diag!(
                                 "[diag] poll reviewing timed out after {}ms of tick budget",
                                 remaining.as_millis()
@@ -1188,6 +1195,19 @@ pub fn spawn(
                     Err(e) => format!("err: {e}"),
                 }
             );
+            // What the report says about this tick, taken before `fetched`
+            // is consumed. Redacted here: the history is read by a command
+            // a paired phone may call.
+            let tick_failure: Option<(String, Option<u64>)> = match &fetched {
+                Ok(_) => None,
+                Err(e) => Some((
+                    crate::redact::redact(&e.to_string()),
+                    match e {
+                        ClientError::Timeout(s) => Some(*s),
+                        _ => None,
+                    },
+                )),
+            };
             match fetched {
                 Ok((prs, total)) => {
                     // Compare against the tick before this one. `previous`
@@ -1332,6 +1352,17 @@ pub fn spawn(
             // failure leaves the data stale, and the bar has no other way to
             // learn that. See `tick_state`.
             let _ = app.emit("poll-state", ending_state);
+            let ok = tick_failure.is_none();
+            let (error, timed_out_after_secs) = tick_failure.unzip();
+            crate::report::record_tick(crate::report::PollTickRecord {
+                at_unix_ms: crate::report::now_unix_ms(),
+                ok,
+                fetch_ms,
+                error,
+                timed_out_after_secs: timed_out_after_secs.flatten(),
+                attempt: consecutive_failures,
+                reviewing: reviewing_outcome.to_string(),
+            });
 
             // Whichever comes first: the cadence elapsing, or someone
             // asking for a refresh. `Notify` stores one permit, so a
@@ -1343,6 +1374,7 @@ pub fn spawn(
                 interval_secs.load(Ordering::Relaxed),
             );
             crate::diag!("[diag] poll tick sleeping {}s", sleep_for.as_secs());
+            crate::report::note_wait(sleep_for.as_secs());
             tokio::select! {
                 _ = tokio::time::sleep(interval_for_secs(
                     // A view that does not show PR data polls at the
