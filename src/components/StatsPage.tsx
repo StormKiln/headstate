@@ -153,7 +153,23 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
   // uses it: two early returns sit between, and a hook after one of them
   // runs in a different order on the renders that take it. React's own
   // lint caught this; the caveat reads the value a hundred lines below.
-  const backfill = useStatsBackfill(boardQ.data?.scopeKey);
+  const liveFrame = useStatsBackfill(boardQ.data?.scopeKey);
+  // Seeded from the last frame the collector emitted for this scope (#1570),
+  // which the board carries when the scope is registered. The events are
+  // fire-and-forget, so after a scope switch the hook holds nothing until the
+  // next tick reaches this scope -- which can be many minutes away while the
+  // collector has been walking it all along. The seed is what a page open
+  // the whole time would be showing; a live frame replaces it on arrival.
+  //
+  // Matched on the scope key as the hook matches its frames, so a seed can
+  // never put another scope's coverage under this heading.
+  const registration = boardQ.data?.backfill;
+  const seedFrame =
+    registration?.state === "registered" &&
+    registration.lastFrame?.scopeKey === boardQ.data?.scopeKey
+      ? registration.lastFrame
+      : null;
+  const backfill = liveFrame ?? seedFrame;
   // Ticks once a second toward the backend's own next-tick time, so the
   // caveat visibly moves between frames rather than only when one lands.
   // Wall-clock driven (`useCountdown`), so a webview throttled in the
@@ -263,6 +279,28 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
   // What the collection is DOING, beside what it is missing. Only from a
   // live frame: a board with no frame has nothing to say about activity,
   // and inventing a phase for it would be a claim nobody measured.
+  //
+  // Gated on the board's OWN statement that collection can change it, not on
+  // incompleteness alone. A board can be incomplete for reasons no collection
+  // cures -- GitHub refused fields, or a slice over the result cap with every
+  // day already covered -- and a board built with no storage behind it
+  // (`accumulating: false`) has nothing writing down more. Promising
+  // collection to either would be a claim nobody can keep (#841's fail-open).
+  const daysOwed =
+    !!board && board.accumulating && board.daysTotal > 0 && board.daysCovered < board.daysTotal;
+  // The scope could not be registered, so NOTHING will collect the days it
+  // owes (#1570). A FAILURE, rendered as one and never as "queued": no frame
+  // will ever arrive to replace a queued line, which is the Pending-forever
+  // shape of #1042. No retry is offered (#1050): nothing on this page can
+  // re-run the registration.
+  //
+  // Yields to a frame, live or seeded. A frame means the collector IS walking
+  // this scope -- registered by an earlier load -- and saying otherwise
+  // beside its progress would contradict it.
+  const notCollecting =
+    !backfill && daysOwed && registration?.state === "failed"
+      ? `The remaining days are not being collected: this scope could not be recorded (${registration.reason}).`
+      : undefined;
   const activity = backfill
     ? backfillActivity(backfill.phase, secsToNextTick, {
         daysCovered: backfill.daysCovered,
@@ -280,24 +318,14 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
       // collection is pending -- the board says which days it still owes.
       //
       // This is PENDING, not Unknown: nothing has been checked and failed,
-      // and a frame replaces it the moment one arrives for this scope.
+      // and a frame replaces it the moment one arrives for this scope. It
+      // is TRUE only because the scope is registered: a failed
+      // registration is `notCollecting` above, never this line (#1570).
       //
-      // Gated on the board's OWN statement that collection can change it,
-      // not on incompleteness alone. A board can be incomplete for reasons
-      // no collection cures -- GitHub refused fields, or a slice over the
-      // result cap with every day already covered -- and a board built
-      // with no storage behind it (`accumulating: false`) has nothing
-      // writing down more. Promising collection to either would be a claim
-      // nobody can keep (#841's fail-open).
-      //
-      // "Queued", not "starting": the hook holds no frame after a scope
-      // SWITCH either, when the worker may have been collecting this scope
-      // for an hour. "Starting" would be false there; "queued" is true in
-      // both cases.
-      board &&
-        board.accumulating &&
-        board.daysTotal > 0 &&
-        board.daysCovered < board.daysTotal
+      // "Queued", not "starting": a registered scope the collector has not
+      // reached since the app started has no seed frame either, and
+      // "starting" would be false if it is queued behind others.
+      daysOwed && !notCollecting
       ? "The remaining days are queued for collection."
       : undefined;
   const caveat = board
@@ -466,6 +494,12 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
                   and told it unchanged for ten minutes, concludes the page
                   is broken (#1103). */}
               {activity ? <span className="ml-1 opacity-80">{activity}</span> : null}
+              {/* A failure, styled as one (#1570): the amber around it says
+                  "partial", and a collection that will not happen is not
+                  a shade of partial. */}
+              {notCollecting ? (
+                <span className="ml-1 text-[#f85149]">{notCollecting}</span>
+              ) : null}
             </div>
           ) : null}
           {half === "mine" ? (

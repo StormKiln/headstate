@@ -3402,6 +3402,33 @@ static TABLE: &str = HIT_none_3;
              {cache_return}: a scope the user has already opened would never be registered, so \
              the backfill would never walk the one scope they are looking at (#1109)"
         );
+
+        // AFTER the identity check (#1570). `stats_cache_read` runs
+        // `note_stats_viewer`, which clears `pr_backfill_scope` when the
+        // account changed -- so a registration made before it is wiped on
+        // the load that made it, and the page is told "registered" about a
+        // row that is gone.
+        let identity = body
+            .find("stats_cache_read(")
+            .expect("stats_board must read the cache through stats_cache_read");
+        assert!(
+            identity < register,
+            "stats_board registers its scope at byte {register}, before the identity check in \
+             stats_cache_read at {identity}: an account change would clear the registration \
+             this load then reports to the page as made (#1570)"
+        );
+
+        // And the cached board carries THIS load's outcome. Without the
+        // assignment a cache hit would report whatever `Default` says
+        // rather than whether registration just succeeded.
+        let assign = body
+            .find("cached.backfill = ")
+            .expect("a cached board must be given this load's backfill registration (#1570)");
+        assert!(
+            assign < cache_return,
+            "stats_board assigns the cached board's backfill at byte {assign}, after it returns \
+             at {cache_return} (#1570)"
+        );
     }
 
     #[test]

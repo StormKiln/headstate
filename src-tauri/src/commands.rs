@@ -4485,6 +4485,9 @@ fn note_stats_viewer(conn: &rusqlite::Connection, viewer: &str) {
                 Ok(m) => log::info!("dropped {m} backfill scopes for that identity"),
                 Err(e) => log::warn!("could not clear the backfill scopes: {e}"),
             }
+            // And the frames remembered for those scopes (#1570), which
+            // would otherwise seed the next page with the old coverage.
+            forget_backfill_frames();
         }
         Err(e) => log::warn!("could not record the stats viewer: {e}"),
     }
@@ -4626,28 +4629,61 @@ const MAX_PROBE_ROUNDS: u64 = 4;
 ///
 /// A failure costs the backfill, never the board: the user's answer does
 /// not depend on a bookkeeping write, and the next load registers again.
+///
+/// # Why the outcome is RETURNED (#1570)
+///
+/// It used to be logged and dropped. The page then could not tell a scope
+/// queued behind others from one that was never registered, so a failed
+/// registration rendered "queued for collection" forever: a Pending that
+/// nothing would ever move out of, which is #1042's shape. The `Err` is
+/// the reason the page shows instead.
 async fn note_scope_seen(
     db: std::path::PathBuf,
     registration: crate::store::pr_backfill_scope::BackfillScope,
     now: chrono::DateTime<chrono::Utc>,
-) {
-    let _ = tauri::async_runtime::spawn_blocking(move || {
-        let Ok(conn) = open_db(&db) else {
-            log::warn!("could not open the database to register this scope for backfill");
-            return;
-        };
-        if let Err(e) = crate::store::pr_backfill_scope::note_seen(&conn, &registration, now) {
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&db).map_err(|e| {
+            log::warn!("could not open the database to register this scope for backfill: {e}");
+            "the local database could not be opened".to_string()
+        })?;
+        crate::store::pr_backfill_scope::note_seen(&conn, &registration, now).map_err(|e| {
             log::warn!("could not register this scope for backfill: {e}");
-        } else {
-            crate::diag!(
-                "[diag] backfill scope registered key={} kind={} horizon={}",
-                registration.scope_key,
-                registration.scope_kind,
-                registration.horizon_days
-            );
-        }
+            e.to_string()
+        })?;
+        crate::diag!(
+            "[diag] backfill scope registered key={} kind={} horizon={}",
+            registration.scope_key,
+            registration.scope_kind,
+            registration.horizon_days
+        );
+        Ok(())
     })
-    .await;
+    .await
+    .map_err(|e| {
+        log::warn!("the backfill registration task failed: {e}");
+        "the registration did not complete".to_string()
+    })?
+}
+
+/// What the page is told about this scope's backfill (#1570).
+///
+/// A failed registration carries its reason and NO frame: the page renders
+/// it as a failure, never as "queued", because nothing will ever arrive to
+/// replace a queued line for a scope the worker does not know about.
+///
+/// A registered one carries the last frame the worker emitted for this
+/// scope since the app started, if any. That is what a page left open the
+/// whole time would be showing, so a scope switch lands on it at once
+/// rather than on the generic queued line -- the worker may have been
+/// collecting this scope for an hour.
+fn backfill_registration(outcome: Result<(), String>, scope_key: &str) -> BackfillRegistration {
+    match outcome {
+        Ok(()) => BackfillRegistration::Registered(BackfillRegistered {
+            last_frame: last_backfill_frame(scope_key),
+        }),
+        Err(reason) => BackfillRegistration::Failed(BackfillRegistrationFailed { reason }),
+    }
 }
 
 /// Per-author aggregates for one scope: #826's Mine and Others views and
@@ -4792,7 +4828,8 @@ pub async fn stats_board(
     let key = crate::store::stats::key(crate::store::stats::Kind::Board, &q.cache_key(&viewer));
     // Off the runtime since #1090; see `stats_cache_read`.
     let db = db_path(&app);
-    // REGISTERED BEFORE THE CACHE IS READ, not after the fetch (#1109).
+    // REGISTERED BEFORE A CACHED BOARD CAN RETURN, not after the fetch
+    // (#1109).
     //
     // This used to live on the accumulate path, which a cache hit returns
     // before reaching -- so the scope a user had already opened once was
@@ -4815,7 +4852,6 @@ pub async fn stats_board(
         measure: measure_name.to_string(),
         horizon_days: crate::github::stats::backfill::HORIZON_DAYS.max(clamp_days(days) as u32),
     };
-    note_scope_seen(db.clone(), registration.clone(), now).await;
     let hit = stats_cache_read(
         db.clone(),
         viewer.clone(),
@@ -4825,13 +4861,31 @@ pub async fn stats_board(
         now,
     )
     .await?;
+    // AFTER `stats_cache_read`, and that is load-bearing (#1570). The read
+    // runs `note_stats_viewer`, and a changed identity clears
+    // `pr_backfill_scope` -- so a registration made before it was wiped on
+    // the very load that made it, while this command went on to report it
+    // as registered. Registering after the identity check means the row
+    // the outcome describes is the row that is there.
+    //
+    // It is still before the cache-hit return below, which is #1109's
+    // requirement. The invariant that guards #1109 holds both orderings.
+    let backfill = backfill_registration(
+        note_scope_seen(db.clone(), registration, now).await,
+        &q.cache_key(&viewer),
+    );
     if let Some(payload) = hit {
-        if let Ok(cached) = serde_json::from_str::<StatsBoard>(&payload) {
+        if let Ok(mut cached) = serde_json::from_str::<StatsBoard>(&payload) {
             crate::diag!(
                 "[diag] cmd stats_board cache hit authors={} complete={}",
                 cached.board.rows.len(),
                 cached.board.complete
             );
+            // THIS load's outcome, never the stored one: a cached board is
+            // an answer about a window, while registration is about now.
+            // The field is not deserialised at all (`skip_deserializing`),
+            // so a stale row cannot carry an old "registered" through.
+            cached.backfill = backfill;
             return Ok(cached);
         }
         // Same handling as `stats_count`'s: a payload that will not parse
@@ -4897,13 +4951,13 @@ pub async fn stats_board(
                 req.window.to.clone(),
                 loaded,
                 now,
-                registration.clone(),
             )
             .await;
             Ok(StatsBoard {
                 viewer: viewer.clone(),
                 scope_key: scope_key.clone(),
                 board,
+                backfill,
             })
         }
         Err(e) => Err(e),
@@ -5009,19 +5063,10 @@ async fn accumulate_board(
     window_end: String,
     loaded: crate::github::stats::board::LoadedBoard,
     now: chrono::DateTime<chrono::Utc>,
-    registration: crate::store::pr_backfill_scope::BackfillScope,
 ) -> crate::github::stats::Board {
     let fallback = loaded.board.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        accumulate_board_blocking(
-            &db,
-            &scope_key,
-            &window_start,
-            &window_end,
-            loaded,
-            now,
-            &registration,
-        )
+        accumulate_board_blocking(&db, &scope_key, &window_start, &window_end, loaded, now)
     })
     .await
     // A panicked join means the accumulation did not happen. The
@@ -5039,7 +5084,6 @@ fn accumulate_board_blocking(
     window_end: &str,
     loaded: crate::github::stats::board::LoadedBoard,
     now: chrono::DateTime<chrono::Utc>,
-    registration: &crate::store::pr_backfill_scope::BackfillScope,
 ) -> crate::github::stats::Board {
     use crate::store::pr_history;
 
@@ -5077,18 +5121,12 @@ fn accumulate_board_blocking(
         Ok(n) => log::info!("pruned {n} accumulated pull requests past the bound"),
         Err(e) => log::warn!("could not prune accumulated pull requests: {e}"),
     }
-    // Register the scope so the background worker can advance it (#1092).
-    // A scope is walked because a user OPENED it -- background spend
-    // follows demonstrated interest rather than everything a token can
-    // see, which is what keeps `Scope::All` from becoming an unbounded
-    // walk nobody asked for.
-    //
-    // A failure here costs the backfill, never the board: the user's
-    // answer is already assembled and must not depend on a bookkeeping
-    // write.
-    if let Err(e) = crate::store::pr_backfill_scope::note_seen(&conn, registration, now) {
-        log::warn!("could not register this scope for backfill: {e}");
-    }
+    // No registration here since #1570. `stats_board` registers the scope
+    // once, after the identity check and before either return, and reports
+    // the outcome to the page. A second, silent registration here only
+    // existed to repair the first being wiped by an identity change on the
+    // same load -- an ordering `stats_board` no longer has -- and a second
+    // outcome would be one more that could disagree with the reported one.
     let Ok(stored) = pr_history::load(&conn, scope_key, window_start, window_end) else {
         log::warn!("could not read accumulated pull requests back");
         return board;
@@ -5142,6 +5180,64 @@ pub struct StatsBoard {
     pub scope_key: String,
     #[serde(flatten)]
     pub board: crate::github::stats::Board,
+    /// Whether this scope is registered for the background backfill, and
+    /// the worker's last frame for it (#1570).
+    ///
+    /// `skip_deserializing` because a cached board is read back from
+    /// `stats_cache`, and registration is a fact about THIS load, not
+    /// about the window the cached answer describes. `stats_board` sets it
+    /// on every return; the `Default` only exists to let serde build the
+    /// struct before that assignment.
+    #[serde(skip_deserializing)]
+    pub backfill: BackfillRegistration,
+}
+
+/// Whether a scope is registered for the backfill (#1570).
+///
+/// Two states, never collapsed into "no frame yet". Registered-with-no-frame
+/// is PENDING: the worker will reach this scope and a frame will replace
+/// the page's queued line. Failed is a FAILURE: nothing will ever arrive,
+/// so a queued line would be a Pending that nothing moves out of -- #1042's
+/// shape, which is what this type exists to make unrepresentable.
+///
+/// Newtype variants over named structs rather than inline fields, so each
+/// payload has a TypeScript interface the mirrored-type invariant checks.
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum BackfillRegistration {
+    Registered(BackfillRegistered),
+    Failed(BackfillRegistrationFailed),
+}
+
+impl Default for BackfillRegistration {
+    /// Only for `StatsBoard`'s `skip_deserializing`; overwritten before any
+    /// board is returned. A FAILURE rather than a registration if that ever
+    /// stopped being true: an unreported registration must not read as
+    /// queued, which is the exact lie #1570 removed.
+    fn default() -> Self {
+        BackfillRegistration::Failed(BackfillRegistrationFailed {
+            reason: "the registration was not reported".to_string(),
+        })
+    }
+}
+
+/// A registered scope, with the worker's last frame for it if there is one.
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct BackfillRegistered {
+    /// `None` until the worker has emitted a frame for this scope since the
+    /// app started. Never a zeroed frame: "0 of 30 days" is a measurement,
+    /// and nothing has measured this scope yet.
+    pub last_frame: Option<StatsBackfillFrame>,
+}
+
+/// A scope whose registration failed, and why.
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct BackfillRegistrationFailed {
+    /// Shown to the reader as the cause. The storage error's own text, or
+    /// a plain statement when the database could not be opened at all.
+    pub reason: String,
 }
 
 /// The scoped daily activity series: merged and opened counts per day.
@@ -7482,6 +7578,145 @@ mod claudify_tests {
 
 #[cfg(test)]
 mod tests {
+    /// Serialises the tests that CLEAR the remembered frames against the
+    /// ones that read one back. Keys keep the others apart; a clear is the
+    /// one operation a key cannot scope.
+    static FRAMES_CLEAR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A frame for a scope key no other test uses. The remembered frames
+    /// are process-wide, so each test owns its key rather than sharing one.
+    fn frame_for(scope_key: &str, days_covered: usize) -> super::StatsBackfillFrame {
+        super::StatsBackfillFrame {
+            scope_key: scope_key.to_string(),
+            days_covered,
+            days_total: 30,
+            collected: 400,
+            total: Some(500),
+            phase: crate::github::stats::backfill::BackfillPhase::Working,
+            next_tick_at_ms: None,
+        }
+    }
+
+    /// A failed registration reaches the page AS a failure, with its
+    /// reason (#1570).
+    ///
+    /// It used to be logged and dropped, so the page showed "queued for
+    /// collection" for a scope nothing would ever collect. The wire shape
+    /// is asserted, not just the enum, because the page branches on
+    /// `state` and a rename would silently turn every failure back into
+    /// the queued line.
+    #[test]
+    fn a_failed_registration_reports_its_reason_and_no_frame() {
+        let key = "board|merged|*|org:acme-1570-failed";
+        // A frame exists for the key, and a failure must still not carry
+        // it: the page would render the frame's progress and hide the
+        // failure behind it.
+        super::remember_backfill_frame(&frame_for(key, 12));
+        let r = super::backfill_registration(Err("database error: disk I/O error".into()), key);
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "state": "failed", "reason": "database error: disk I/O error" })
+        );
+    }
+
+    /// A registered scope with a frame already emitted carries that frame,
+    /// so a scope switch shows it at once (#1570).
+    #[test]
+    fn a_registered_scope_carries_its_last_frame() {
+        let _clear = FRAMES_CLEAR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let key = "board|merged|*|org:acme-1570-stored";
+        super::remember_backfill_frame(&frame_for(key, 6));
+        // The LAST frame, not the first.
+        super::remember_backfill_frame(&frame_for(key, 18));
+        let r = super::backfill_registration(Ok(()), key);
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["state"], "registered");
+        assert_eq!(json["lastFrame"]["scopeKey"], key);
+        assert_eq!(json["lastFrame"]["daysCovered"], 18);
+        assert_eq!(json["lastFrame"]["total"], 500);
+    }
+
+    /// Registered with nothing emitted yet is Pending: `null`, never a
+    /// zeroed frame, which would read as "0 of 30 days measured".
+    #[test]
+    fn a_registered_scope_with_no_frame_carries_null() {
+        let key = "board|merged|*|org:acme-1570-none";
+        let r = super::backfill_registration(Ok(()), key);
+        assert_eq!(
+            serde_json::to_value(&r).unwrap(),
+            serde_json::json!({ "state": "registered", "lastFrame": null })
+        );
+    }
+
+    /// Another scope's frame is not this scope's.
+    #[test]
+    fn a_registered_scope_does_not_carry_another_scopes_frame() {
+        super::remember_backfill_frame(&frame_for("board|merged|*|org:acme-1570-a", 9));
+        let r = super::backfill_registration(Ok(()), "board|merged|*|org:acme-1570-b");
+        assert_eq!(
+            serde_json::to_value(&r).unwrap()["lastFrame"],
+            serde_json::Value::Null
+        );
+    }
+
+    /// A cached board never carries a stored registration back out.
+    ///
+    /// `StatsBoard` is written to `stats_cache` whole, `backfill` included,
+    /// and read back on a cache hit. The field is `skip_deserializing` so a
+    /// row written while the scope was registered cannot report it as
+    /// registered on a later load whose registration failed; `stats_board`
+    /// assigns this load's outcome. If that assignment were ever lost, the
+    /// default is a FAILURE, never a queued-looking registration.
+    #[test]
+    fn a_cached_board_does_not_read_back_its_registration() {
+        let payload = serde_json::json!({
+            "viewer": "octocat",
+            "scopeKey": "board|merged|*|org:acme",
+            "rows": [],
+            "total": null,
+            "retrieved": 0,
+            "complete": false,
+            "truncatedSlices": [],
+            "refusedFields": 0,
+            "slices": 0,
+            "rounds": 0,
+            "spend": { "points": 0, "requests": 0, "unmetered": 0, "remaining": null, "resetAt": null },
+            "slowest": [],
+            "largest": [],
+            "repoCounts": [],
+            "accumulated": 0,
+            "accumulating": true,
+            "daysCovered": 0,
+            "daysTotal": 30,
+            "backfill": { "state": "registered", "lastFrame": null }
+        });
+        let back: super::StatsBoard = serde_json::from_value(payload).unwrap();
+        assert!(
+            matches!(back.backfill, super::BackfillRegistration::Failed(_)),
+            "a cached row's registration was read back: {:?}",
+            back.backfill
+        );
+    }
+
+    /// The identity change drops the remembered frames with the tables
+    /// they describe.
+    ///
+    /// Asserted on a key this test owns, and without asserting the map is
+    /// empty afterwards: other tests remember frames concurrently, so only
+    /// this key's absence is this test's to check. Holds
+    /// `FRAMES_CLEAR_LOCK` so the clear cannot land inside another test's
+    /// remember-then-read.
+    #[test]
+    fn forgetting_the_frames_drops_a_remembered_one() {
+        let _clear = FRAMES_CLEAR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let key = "board|merged|*|org:acme-1570-forget";
+        super::remember_backfill_frame(&frame_for(key, 3));
+        assert!(super::last_backfill_frame(key).is_some());
+        super::forget_backfill_frames();
+        assert!(super::last_backfill_frame(key).is_none());
+    }
+
     /// `worktree-removal-progress` is forwarded to the phone, so its
     /// frame must never carry a path (#1544). Built from REAL outcomes
     /// of a real batch -- each carrying a path and a refusal that names
@@ -9030,18 +9265,57 @@ pub struct StatsBackfillFrame {
 /// down, and a background walk must not fail because nothing was
 /// listening.
 pub fn emit_stats_backfill(app: &AppHandle, report: &crate::github::stats::backfill::Report) {
-    let _ = app.emit(
-        STATS_BACKFILL_PROGRESS,
-        StatsBackfillFrame {
-            scope_key: report.scope_key.clone(),
-            days_covered: report.days_covered,
-            days_total: report.days_total,
-            collected: report.collected,
-            total: report.total,
-            phase: report.phase.clone(),
-            next_tick_at_ms: report.next_tick_at_ms,
-        },
-    );
+    let frame = StatsBackfillFrame {
+        scope_key: report.scope_key.clone(),
+        days_covered: report.days_covered,
+        days_total: report.days_total,
+        collected: report.collected,
+        total: report.total,
+        phase: report.phase.clone(),
+        next_tick_at_ms: report.next_tick_at_ms,
+    };
+    remember_backfill_frame(&frame);
+    let _ = app.emit(STATS_BACKFILL_PROGRESS, frame);
+}
+
+/// The last frame emitted per scope, so a page that was not listening
+/// when it went out can still start from it (#1570).
+///
+/// The events are fire-and-forget: a page that opens a scope, or switches
+/// to one, after the worker's last tick for it holds no frame until the
+/// next one, which the rotation can put many minutes away. Kept in memory
+/// rather than stored, because a frame's phase and next-tick time describe
+/// THIS process's worker; after a restart they would be claims about a
+/// worker that no longer exists.
+///
+/// Bounded by the registered scopes, which are the only keys the worker
+/// emits for, and cleared with them on an identity change.
+fn backfill_frames(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, StatsBackfillFrame>> {
+    static FRAMES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, StatsBackfillFrame>>,
+    > = std::sync::OnceLock::new();
+    FRAMES.get_or_init(Default::default)
+}
+
+fn remember_backfill_frame(frame: &StatsBackfillFrame) {
+    if let Ok(mut frames) = backfill_frames().lock() {
+        frames.insert(frame.scope_key.clone(), frame.clone());
+    }
+}
+
+/// The last frame emitted for `scope_key`, or `None` when none has been.
+fn last_backfill_frame(scope_key: &str) -> Option<StatsBackfillFrame> {
+    backfill_frames().lock().ok()?.get(scope_key).cloned()
+}
+
+/// Drop every remembered frame. The identity change clears the tables
+/// the frames describe, and a frame left behind would seed a page with
+/// coverage that no longer exists.
+fn forget_backfill_frames() {
+    if let Ok(mut frames) = backfill_frames().lock() {
+        frames.clear();
+    }
 }
 
 /// The event name a branch scan reports its progress under.
