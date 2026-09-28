@@ -118,6 +118,7 @@ mod tests {
     const DESKTOP_DISCOVERY: &str = include_str!("../../src-tauri/src/remote/discovery.rs");
     const DESKTOP_EVENTS: &str = include_str!("../../src-tauri/src/remote/events.rs");
     const DESKTOP_IDENTITY: &str = include_str!("../../src-tauri/src/remote/identity.rs");
+    const DESKTOP_LISTENER: &str = include_str!("../../src-tauri/src/remote/listener.rs");
     const STEPUP: &str = include_str!("../../crates/headstate-stepup/src/lib.rs");
 
     /// Guards the guard. Every assertion below is only as good as this
@@ -243,6 +244,27 @@ mod tests {
         assert_eq!(
             crate::events::SNAPSHOT_EVENT,
             str_const(DESKTOP_EVENTS, "SNAPSHOT_EVENT", "remote/events.rs")
+        );
+    }
+
+    /// The wire protocol version: what the desktop's `/v1/hello` reports
+    /// and its QR embeds, and what this client speaks.
+    ///
+    /// `connection.rs` calls a desktop below this crate's number too old
+    /// to drive, and `events.rs` warns on any other number, so a bump on
+    /// one side alone tells a phone that its own desktop is the wrong
+    /// version. Until #1555 no single test read both copies. The desktop's
+    /// guard counted this pair as covered only because it read
+    /// `events.rs`' `the_allowlist_matches_the_desktops` on to the end of
+    /// its module, where another test compares this crate's copy with
+    /// itself. The chain through `QR_VERSION` holds both ends, but across
+    /// three tests in two crates, which no guard can see as one.
+    #[test]
+    fn the_protocol_version_matches_the_desktop() {
+        assert_eq!(
+            u64::from(crate::client::PROTOCOL_VERSION),
+            int_const(DESKTOP_LISTENER, "PROTOCOL_VERSION", "remote/listener.rs"),
+            "the desktop and the phone must speak one protocol"
         );
     }
 

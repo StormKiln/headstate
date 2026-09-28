@@ -543,50 +543,291 @@ mod tests {
         );
     }
 
+    /// The name of the function a line DECLARES, if it declares one: `fn
+    /// NAME` at any indentation, after any visibility (`pub`, `pub(crate)`,
+    /// `pub(super)`, `pub(in path)`) and any qualifiers (`const`, `async`,
+    /// `unsafe`, `extern "ABI"`, `default`), in any order `rustc` accepts.
+    ///
+    /// The one place this vocabulary lives (#1555). Two lookups used to
+    /// spell it separately: `enclosing_fn` knew four literal prefixes and
+    /// missed `pub(crate) fn`, `async fn` and every method below four
+    /// columns, while the #1535 home scan grew its own because of it.
+    fn fn_declared(line: &str) -> Option<&str> {
+        let mut t = line.trim();
+        loop {
+            let before = t;
+            if let Some(r) = t.strip_prefix("pub") {
+                if let Some(r) = r.strip_prefix('(') {
+                    t = r.split_once(')')?.1.trim_start();
+                } else if r.starts_with(' ') {
+                    t = r.trim_start();
+                }
+            }
+            for q in ["const ", "async ", "unsafe ", "default "] {
+                if let Some(r) = t.strip_prefix(q) {
+                    t = r.trim_start();
+                }
+            }
+            if let Some(r) = t.strip_prefix("extern ") {
+                t = r.trim_start();
+                if let Some(r) = t.strip_prefix('"') {
+                    t = r.split_once('"')?.1.trim_start();
+                }
+            }
+            if t == before {
+                break;
+            }
+        }
+        let name = t.strip_prefix("fn ")?.split(['(', '<']).next()?.trim();
+        (!name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')).then_some(name)
+    }
+
+    /// The function around line `n` of `lines`, as `(name, first line, one
+    /// past the last line)`, or `None` when the line is in no function.
+    ///
+    /// The nearest declaration above whose body still CONTAINS the line,
+    /// rather than merely the nearest declaration above: a hit after a
+    /// nested helper has closed belongs to the function the helper sits
+    /// in, not to the helper. A body ends at the `}` in the column its
+    /// declaration started in (see [`item_end`] for why that is reliable
+    /// here), or on its own line when the declaration ends in `}` or `;`
+    /// -- a one-liner, or a trait method with no body.
+    fn fn_around<'a>(lines: &[&'a str], n: usize) -> Option<(&'a str, usize, usize)> {
+        for i in (0..=n).rev() {
+            let l = lines[i].trim_end_matches('\r');
+            if is_comment(l) {
+                continue;
+            }
+            let Some(name) = fn_declared(l) else {
+                continue;
+            };
+            let end = if l.ends_with('}') || l.ends_with(';') {
+                i + 1
+            } else {
+                let indent = l.len() - l.trim_start().len();
+                lines
+                    .iter()
+                    .enumerate()
+                    .skip(i + 1)
+                    .find(|(_, x)| {
+                        let x = x.trim_end_matches('\r');
+                        x.trim() == "}" && x.len() - x.trim_start().len() == indent
+                    })
+                    .map_or(lines.len(), |(j, _)| j + 1)
+            };
+            if n < end {
+                return Some((name, i, end));
+            }
+        }
+        None
+    }
+
     /// The body of the function containing byte offset `at`, as text.
     ///
-    /// Scoped between the nearest preceding `fn` and the next top-level
-    /// item, so a check has to be in THIS function rather than merely
+    /// Scoped to THAT function -- from its declaration to its own closing
+    /// brace -- so a check has to be in this function rather than merely
     /// somewhere in a file that has many. `every_stats_query_meters_itself`
     /// records what getting this wrong costs: an earlier version anchored
     /// on the first mention of a name instead of its definition, read the
     /// wrong region, and reported a defect at a location that did not have
     /// one.
     ///
+    /// # Any declaration, any depth (#1555)
+    ///
+    /// This used to search backwards for four literal prefixes -- `fn `
+    /// and `pub fn ` at columns 0 and 4 -- and end at the next column-0
+    /// `fn` or `}`. So a hit inside a `pub(crate) fn`, an `async fn` or a
+    /// method eight columns in was attributed to whichever recognised
+    /// function came before it, and a method's "body" ran on to the end of
+    /// its `impl`, taking in every sibling after it. A guard reading that
+    /// region could find its check in a sibling and pass over the defect.
+    /// [`fn_declared`] now recognises every form, and [`fn_around`] ends
+    /// the body at the function's own brace.
+    ///
+    /// Auditing every caller against the old lookup found one guard passing
+    /// for the wrong reason: `every_cross_crate_constant_is_read_from_both_sides`
+    /// counted `PROTOCOL_VERSION` as covered because a mobile test's
+    /// "body" ran 369 lines on, into a test comparing the phone's copy with
+    /// itself. No test read both copies until `src-mobile/src/mirrored.rs`
+    /// gained one.
+    ///
+    /// A hit in no function at all -- a module-level `const` holding an
+    /// `include_str!`, say -- returns `<none>` and the rest of the file from
+    /// the hit's line: reading too much, which fails toward a false
+    /// positive rather than a silent pass.
+    ///
     /// Returns the name as well, so a failure can say which function.
     fn enclosing_fn(src: &str, at: usize) -> (String, String) {
-        let before = &src[..at];
-        let start = ["\nfn ", "\npub fn ", "\n    fn ", "\n    pub fn "]
-            .iter()
-            .filter_map(|m| before.rfind(m))
-            .max()
-            .unwrap_or(0);
-        let body = &src[start..];
-        // To the next item, searched FROM the hit rather than from the
-        // start of the body.
-        //
-        // `body.find(m)` finds each pattern's FIRST occurrence, which may
-        // already be behind the hit -- and filtering those out discards
-        // the pattern entirely instead of looking for its next occurrence,
-        // so the body runs on to whichever pattern happens to appear
-        // later. The same mistake in `client.rs`' refusal guard gave one
-        // function a body spanning six others, which made that guard pass
-        // over the defect it was written for. It was caught by reverting
-        // the fix and watching the guard NOT fail.
-        let rel = at - start;
-        let end = ["\nfn ", "\npub fn ", "\n}\n"]
-            .iter()
-            .filter_map(|m| body[rel..].find(m).map(|e| rel + e))
-            .min()
-            .unwrap_or(body.len());
-        let body = &body[..end];
-        let name = body
-            .split_once("fn ")
-            .and_then(|(_, r)| r.split(['(', '<']).next())
-            .unwrap_or("<unknown>")
-            .trim()
-            .to_string();
-        (name, body.to_string())
+        let lines: Vec<&str> = src.split('\n').collect();
+        let n = src[..at].matches('\n').count();
+        match fn_around(&lines, n) {
+            Some((name, a, b)) => (name.to_string(), lines[a..b].join("\n")),
+            None => ("<none>".to_string(), lines[n..].join("\n")),
+        }
+    }
+
+    /// [`enclosing_fn`] names, and bounds, the function around a hit in
+    /// every declaration form -- and in none that is not one (#1555).
+    ///
+    /// Every form below but `plain` and `public` was missed by the old
+    /// four-prefix lookup, which named the function ABOVE instead, and the
+    /// method's body ran on into `sibling`. `outer`'s hit, after `helper`
+    /// has closed, is where a lookup taking the nearest declaration rather
+    /// than the one CONTAINING the hit goes wrong.
+    #[test]
+    fn enclosing_fn_finds_every_declaration_form() {
+        let fixture = "\
+fn plain() {
+    HIT_plain;
+}
+
+pub fn public() {
+    HIT_public;
+}
+
+pub(crate) fn crate_visible() {
+    HIT_crate_visible;
+}
+
+pub(super) fn parent_visible() {
+    HIT_parent_visible;
+}
+
+pub(in crate::a) fn path_visible() {
+    HIT_path_visible;
+}
+
+async fn asynchronous() {
+    HIT_asynchronous;
+}
+
+pub async fn public_async() {
+    HIT_public_async;
+}
+
+pub(crate) const unsafe fn qualified() {
+    HIT_qualified;
+}
+
+unsafe extern \"C\" fn foreign() {
+    HIT_foreign;
+}
+
+fn generic<T>(t: T) -> T {
+    HIT_generic;
+}
+
+fn one_liner() -> u8 { 1 }
+
+static AFTER_ONE_LINER: u8 = HIT_none_1;
+
+impl Thing {
+    pub(crate) async fn method(&self) {
+        HIT_method;
+    }
+
+    fn sibling(&self) {
+        HIT_sibling;
+    }
+}
+
+mod a {
+    mod b {
+        impl Deep {
+            pub(super) fn deep() {
+                HIT_deep;
+            }
+        }
+    }
+}
+
+trait Shape {
+    fn area(&self) -> f64;
+}
+
+static AFTER_TRAIT: u8 = HIT_none_2;
+
+fn outer() {
+    fn helper() {
+        HIT_helper;
+    }
+    HIT_outer;
+}
+
+fn multi_line(
+    a: u8,
+) -> u8 {
+    HIT_multi_line;
+}
+
+static TABLE: &str = HIT_none_3;
+";
+        const FORMS: &[&str] = &[
+            "plain",
+            "public",
+            "crate_visible",
+            "parent_visible",
+            "path_visible",
+            "asynchronous",
+            "public_async",
+            "qualified",
+            "foreign",
+            "generic",
+            "method",
+            "sibling",
+            "deep",
+            "helper",
+            "outer",
+            "multi_line",
+        ];
+        for src in [fixture.to_string(), fixture.replace('\n', "\r\n")] {
+            for form in FORMS {
+                let marker = format!("HIT_{form};");
+                let at = src.find(&marker).expect("marker in fixture");
+                let (name, body) = enclosing_fn(&src, at);
+                assert_eq!(
+                    name, *form,
+                    "the hit in `{form}` was attributed to `{name}`"
+                );
+                // Bounded to that function: no other function's marker,
+                // except the helper nested inside `outer`.
+                let own = format!("HIT_{form}");
+                let others: Vec<&str> = body
+                    .match_indices("HIT_")
+                    .map(|(i, _)| body[i..].split(';').next().unwrap_or(""))
+                    .filter(|m| *m != own && !(*form == "outer" && *m == "HIT_helper"))
+                    .collect();
+                assert!(
+                    others.is_empty(),
+                    "`{form}`'s body reads into {others:?}:\n{body}"
+                );
+            }
+            // In no function. The first two are where a body that does
+            // not end on its own line -- a one-liner's, a bodiless trait
+            // method's -- would run on and claim them.
+            for marker in ["HIT_none_1", "HIT_none_2", "HIT_none_3"] {
+                let at = src.find(marker).expect("marker in fixture");
+                assert_eq!(
+                    enclosing_fn(&src, at).0,
+                    "<none>",
+                    "{marker} is in a static, not a function"
+                );
+            }
+        }
+
+        // And silent on what only looks like one.
+        for line in [
+            "let f: fn(u8) = x;",
+            "    // fn commented() {",
+            "    unsafe {",
+            "    async move {",
+            "publish fn_x() {",
+            "impl Fn(u8) for X {",
+            "    x.fn_call();",
+            "pub struct Fn;",
+        ] {
+            assert_eq!(fn_declared(line), None, "{line:?} declares no function");
+        }
     }
 
     // ---- Invariant 1: recursive deletion ---------------------------------
@@ -1026,8 +1267,8 @@ mod tests {
                 //
                 // A Windows checkout with `core.autocrlf` has CRLF, so a
                 // pattern containing a bare `\n` -- which is how
-                // `enclosing_fn` finds a function's start -- matches
-                // nothing there. It would return a body beginning at
+                // `enclosing_fn` found a function's start before #1555 --
+                // matches nothing there. It would return a body beginning at
                 // offset 0, i.e. the whole file, making every constant
                 // look covered: a silent pass, on one platform only.
                 //
@@ -3155,11 +3396,11 @@ mod tests {
         // scan while leaving this path broken. The `guard` skill names
         // scoping too coarsely as one of the three ways this repo has
         // already got a guard wrong.
-        // Offset INTO the signature rather than at its first byte:
-        // `enclosing_fn` searches backwards for the nearest preceding
-        // `fn `, so anchoring on the `f` of the definition finds the
-        // function BEFORE this one. The guard caught that on its own
-        // first run, which is the cheapest place to catch it.
+        // Offset INTO the signature rather than at its first byte: before
+        // #1555 `enclosing_fn` searched backwards for the nearest preceding
+        // `\nfn `, so anchoring on the `f` of the definition found the
+        // function BEFORE this one. The guard caught that on its own first
+        // run. The lookup is by line now, so either offset works.
         let at = src.find("fn note_stats_viewer(").expect(
             "note_stats_viewer not found; if the identity check moved, \
              move this guard with it rather than deleting it",
@@ -3322,11 +3563,10 @@ mod tests {
                     continue;
                 }
 
-                // The enclosing `#[tauri::command]`, NOT the enclosing
-                // function: every one of these sits inside a
-                // `spawn_blocking` closure, so `enclosing_fn` returns
-                // the closure and the permit -- which is taken at the
-                // top of the command -- is outside it.
+                // The enclosing `#[tauri::command]`, found directly. Every
+                // command is a `pub async fn`, which `enclosing_fn` did
+                // not recognise before #1555: it named the function above
+                // the command instead.
                 //
                 // So the search runs backwards from the call to the
                 // nearest command attribute, and the region between
@@ -4295,41 +4535,6 @@ fn suggestion(f: &Finding) -> String {
         out
     }
 
-    /// The name of the function line `n` is in: the nearest `fn` above it
-    /// that is indented less, with any visibility, `const`, `async` or
-    /// `unsafe` in front.
-    ///
-    /// Its own lookup rather than [`enclosing_fn`], whose patterns do not
-    /// include `pub(crate) fn`: sabotaging `claudemd::home` -- a
-    /// `pub(crate) fn` -- was reported as `read_file_reporting`, the
-    /// function above it. A line in no function at all (a `static`, say)
-    /// is named after the function before it, which can only fail to match
-    /// an allowlist entry: a false positive, never a silent pass.
-    fn fn_enclosing_line(lines: &[&str], n: usize) -> String {
-        let indent = |l: &str| l.len() - l.trim_start().len();
-        let depth = indent(lines[n]);
-        for l in lines[..n].iter().rev() {
-            if indent(l) >= depth {
-                continue;
-            }
-            let mut t = l.trim_start();
-            if let Some(r) = t.strip_prefix("pub") {
-                t = match r.strip_prefix('(') {
-                    Some(r) => r.split_once(')').map_or(r, |(_, r)| r),
-                    None => r,
-                }
-                .trim_start();
-            }
-            for q in ["const ", "async ", "unsafe "] {
-                t = t.strip_prefix(q).unwrap_or(t);
-            }
-            if let Some(r) = t.strip_prefix("fn ") {
-                return r.split(['(', '<']).next().unwrap_or("").to_string();
-            }
-        }
-        "<none>".to_string()
-    }
-
     /// Every line of `src` (the file at `rel`) that breaks the rule, and
     /// the [`HOME_READERS`] entries it used. See
     /// [`no_test_resolves_the_real_home_directory`].
@@ -4360,7 +4565,13 @@ fn suggestion(f: &Finding) -> String {
             if !HOME_TOKENS.iter().any(|t| has_token(line, t)) {
                 continue;
             }
-            let name = fn_enclosing_line(&lines, n);
+            // The shared lookup (#1555). This scan used to carry its own,
+            // because `enclosing_fn` then missed `pub(crate) fn`:
+            // sabotaging `claudemd::home` was reported as the function
+            // above it. A line in no function is `<none>`, which can only
+            // fail to match an allowlist entry -- a false positive, never a
+            // silent pass.
+            let name = fn_around(&lines, n).map_or("<none>", |(name, _, _)| name);
             if let Some(&(f, g, _)) = HOME_READERS
                 .iter()
                 .find(|(f, g, _)| *f == rel && *g == name)
