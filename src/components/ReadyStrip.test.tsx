@@ -416,6 +416,19 @@ describe("ReadyStrip last pusher", () => {
     expect(unknownLine).not.toMatch(/push/);
   });
 
+  // #1579: the batch Claudify is handed the rows SHOWN. Every row hidden
+  // leaves it nothing, so it is disabled with the reason, not hidden.
+  it("disables the batch Claudify, with its reason, when the filter hides every row", async () => {
+    pusherAnswers = [answer(mine, RULE_ON, { state: "known", login: "me" })];
+    render(<ReadyStrip prs={[mine]} onOpen={vi.fn()} />);
+    await waitFor(() => expect(screen.queryByText("Mine")).toBeNull());
+    const claudify = screen.getByRole("button", { name: /Claudify|Copy prompt/ }) as HTMLButtonElement;
+    expect(claudify.disabled).toBe(true);
+    expect(document.querySelector("[data-ready-claudify-reason]")?.textContent).toMatch(
+      /No pull requests are showing/,
+    );
+  });
+
   it("asks for every row's pusher with its head and base", async () => {
     render(<ReadyStrip prs={[mine]} onOpen={vi.fn()} />);
     await waitFor(() =>

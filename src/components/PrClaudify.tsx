@@ -50,8 +50,17 @@ export type CheckoutState =
   | { kind: "none"; unreadable: number }
   | { kind: "failed"; error: string };
 
-/// Everything a Claudify control needs about one pull request.
-function usePrClaudify(pr: PullRequest | PrDetail) {
+/// The first of `repos` with a main checkout on this machine, and whether
+/// a terminal is configured -- what every pull request Claudify needs
+/// before it can start (#1455, shared with the strip's batch in #1579).
+///
+/// `repo` is the repository whose checkout was found, or `null` when none
+/// was. For one pull request `repos` is just its own.
+export function useClaudifyCheckout(repos: readonly string[]): {
+  checkout: CheckoutState;
+  repo: string | null;
+  terminalConfigured: boolean;
+} {
   const scan = useWorktrees();
   const { prefs } = useUiPrefs();
   // The Worktrees page's own test (#1126): never on the phone, where
@@ -61,20 +70,29 @@ function usePrClaudify(pr: PullRequest | PrDetail) {
   // Read before narrowing on `data`: the hook re-shapes the query
   // result, and TypeScript then narrows `error` away in that branch.
   const error: unknown = scan.error;
-  let checkout: CheckoutState;
   if (scan.data === undefined) {
-    checkout = scan.isError
+    const checkout: CheckoutState = scan.isError
       ? {
           kind: "failed",
           error: typeof error === "string" ? error : "the scan did not finish",
         }
       : { kind: "pending" };
-  } else {
-    const path = mainCheckoutFor(scan.data, pr.repo);
-    checkout =
-      path === null ? { kind: "none", unreadable: scan.unreadable.length } : { kind: "found", path };
+    return { checkout, repo: null, terminalConfigured };
   }
+  for (const repo of repos) {
+    const path = mainCheckoutFor(scan.data, repo);
+    if (path !== null) return { checkout: { kind: "found", path }, repo, terminalConfigured };
+  }
+  return {
+    checkout: { kind: "none", unreadable: scan.unreadable.length },
+    repo: null,
+    terminalConfigured,
+  };
+}
 
+/// Everything a Claudify control needs about one pull request.
+function usePrClaudify(pr: PullRequest | PrDetail) {
+  const { checkout, terminalConfigured } = useClaudifyCheckout([pr.repo]);
   const path = checkout.kind === "found" ? checkout.path : undefined;
   const prompt = agentPrompt(toAgentContext(pr, path));
   return { checkout, terminalConfigured, prompt };
@@ -85,9 +103,32 @@ function usePrClaudify(pr: PullRequest | PrDetail) {
 /// State that OUTLIVES the control that opened it. The kebab closes its
 /// menu on click, which unmounts the menu item, so the dialog belongs to
 /// the kebab and this is what it holds.
+///
+/// `subject` titles the dialog ("acme/widget#12"); `about` finishes its
+/// sentences ("this pull request"). `repo` is the repository `checkout`
+/// must be a checkout of -- Rust re-checks it.
 export type PrClaudifyDialog =
-  | { kind: "launch"; repo: string; number: number; checkout: string; prompt: string }
-  | { kind: "phone"; repo: string; number: number; command: string; claudeInstalled: boolean };
+  | {
+      kind: "launch";
+      repo: string;
+      subject: string;
+      about: string;
+      checkout: string;
+      prompt: string;
+    }
+  | { kind: "phone"; subject: string; about: string; command: string; claudeInstalled: boolean };
+
+/// What a Claudify is about to start, however it was pressed.
+export interface ClaudifyStart {
+  /// The repository the checkout belongs to, or the pull request's own
+  /// when there is no checkout.
+  repo: string;
+  subject: string;
+  about: string;
+  checkout: CheckoutState;
+  terminalConfigured: boolean;
+  prompt: string;
+}
 
 /// Copy the prompt alone -- the route when there is no checkout to run in.
 function copyPromptOnly(prompt: string) {
@@ -102,7 +143,8 @@ function copyPromptOnly(prompt: string) {
 /// on the phone, to a dialog.
 function copyClaudify(
   repo: string,
-  number: number,
+  subject: string,
+  about: string,
   checkout: string,
   prompt: string,
   open: (d: PrClaudifyDialog) => void,
@@ -112,7 +154,7 @@ function copyClaudify(
       // The phone has no terminal and no usable clipboard; show the line
       // for the machine it runs on, as the Worktrees phone dialog does.
       if (IS_MOBILE_BUILD) {
-        open({ kind: "phone", repo, number, command, claudeInstalled: claude_installed });
+        open({ kind: "phone", subject, about, command, claudeInstalled: claude_installed });
         return;
       }
       const failure = await copyText(command);
@@ -122,7 +164,7 @@ function copyClaudify(
       }
       toast.success("Command copied to the clipboard", {
         description: claude_installed
-          ? "Paste it in your terminal to start Claude Code on this pull request."
+          ? `Paste it in your terminal to start Claude Code on ${about}.`
           : "Paste it in your terminal. Claude Code was not found on this machine.",
       });
     },
@@ -133,27 +175,37 @@ function copyClaudify(
   );
 }
 
-/// What pressing Claudify does, decided in ONE place so the button and
-/// the menu item cannot drift (the Worktrees page's `claudify` rule).
-function activate(
-  pr: PullRequest | PrDetail,
-  state: ReturnType<typeof usePrClaudify>,
-  open: (d: PrClaudifyDialog) => void,
-) {
-  const { checkout, terminalConfigured, prompt } = state;
+/// What pressing Claudify does, decided in ONE place so the button, the
+/// menu item and the strip's batch (#1579) cannot drift (the Worktrees
+/// page's `claudify` rule).
+export function startClaudify(s: ClaudifyStart, open: (d: PrClaudifyDialog) => void) {
+  const { repo, subject, about, checkout, terminalConfigured, prompt } = s;
   if (checkout.kind !== "found") {
     copyPromptOnly(prompt);
     return;
   }
   if (terminalConfigured) {
-    open({ kind: "launch", repo: pr.repo, number: pr.number, checkout: checkout.path, prompt });
+    open({ kind: "launch", repo, subject, about, checkout: checkout.path, prompt });
   } else {
-    copyClaudify(pr.repo, pr.number, checkout.path, prompt, open);
+    copyClaudify(repo, subject, about, checkout.path, prompt, open);
   }
 }
 
+function activate(
+  pr: PullRequest | PrDetail,
+  state: ReturnType<typeof usePrClaudify>,
+  open: (d: PrClaudifyDialog) => void,
+) {
+  startClaudify(
+    { ...state, repo: pr.repo, subject: `${pr.repo}#${pr.number}`, about: "this pull request" },
+    open,
+  );
+}
+
 /// Why there is no Claudify, as a sentence the reader can act on.
-function unavailableReason(repo: string, checkout: CheckoutState): string | null {
+/// `repo` names what was looked for: a repository, or a phrase for
+/// several ("any of their repositories").
+export function unavailableReason(repo: string, checkout: CheckoutState): string | null {
   switch (checkout.kind) {
     case "pending":
       return `Looking for a local checkout of ${repo}…`;
@@ -172,15 +224,15 @@ function unavailableReason(repo: string, checkout: CheckoutState): string | null
 
 /// The Claudify styling from the Worktrees row -- purple, with the
 /// sparkles -- at the size of the buttons beside it here.
-const CLAUDIFY_CLASS =
+export const CLAUDIFY_CLASS =
   "flex w-fit items-center gap-1.5 rounded border border-[#8957e5]/40 px-3 py-1.5 text-sm text-[#a371f7] hover:bg-[#8957e5]/10 disabled:opacity-50";
-const PLAIN_CLASS =
+export const PLAIN_CLASS =
   "flex w-fit items-center gap-1.5 rounded border border-[#30363d] px-3 py-1.5 text-sm hover:bg-[#161b22]";
 
 /// The header's button size (#1580): the pinned Approve, Merge and GitHub
 /// beside it are `px-2.5 py-1`, and one taller button in a one-line bar
 /// reads as a different kind of control.
-function compactClass(cls: string): string {
+export function compactClass(cls: string): string {
   return cls.replace("px-3 py-1.5", "px-2.5 py-1");
 }
 
@@ -188,7 +240,7 @@ function compactClass(cls: string): string {
 /// (#1580), which has no room for the sentence. The full sentence goes in
 /// the title and to a screen reader, as the header's "Won't count toward
 /// merging" does (#1451).
-function shortReason(checkout: CheckoutState): string | null {
+export function shortReason(checkout: CheckoutState): string | null {
   switch (checkout.kind) {
     case "pending":
       return "Looking for a checkout…";
@@ -350,12 +402,12 @@ export function PrClaudifyDialogs({
       <Dialog open onOpenChange={close}>
         <DialogContent className="max-w-lg">
           <DialogTitle>
-            Claudify {dialog.repo}#{dialog.number}
+            Claudify {dialog.subject}
           </DialogTitle>
           <ActingOnDesktop />
           <p className="text-sm text-[#8b949e]">
             {dialog.claudeInstalled
-              ? "Run this on that desktop to start Claude Code on this pull request."
+              ? `Run this on that desktop to start Claude Code on ${dialog.about}.`
               : "Run this on that desktop. Claude Code was not found there, so it may need installing first."}
           </p>
           {/* Selectable and wrapped, with no copy button: the phone's
@@ -373,16 +425,16 @@ export function PrClaudifyDialogs({
     );
   }
 
-  const { repo, number, checkout, prompt } = dialog;
+  const { repo, subject, about, checkout, prompt } = dialog;
   return (
     <Dialog open onOpenChange={close}>
       <DialogContent className="max-w-2xl">
         <DialogTitle>
-          Hand {repo}#{number} to Claude Code
+          Hand {subject} to Claude Code
         </DialogTitle>
         <p className="text-sm text-[#8b949e]">
           This opens the terminal you configured in Settings and starts Claude Code in {checkout} on
-          the prompt for this pull request.
+          the prompt for {about}.
         </p>
         <LaunchTermsPicker
           terms={terms}
@@ -408,7 +460,7 @@ export function PrClaudifyDialogs({
                     description: typeof e === "string" ? e : undefined,
                     action: {
                       label: "Copy instead",
-                      onClick: () => copyClaudify(repo, number, checkout, prompt, () => {}),
+                      onClick: () => copyClaudify(repo, subject, about, checkout, prompt, () => {}),
                     },
                   }),
               );
