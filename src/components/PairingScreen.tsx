@@ -114,7 +114,8 @@ export function PairingScreen({ revokedBy }: { revokedBy?: string } = {}) {
   const busy = pair.isPending || scanning;
 
   return (
-    <div className="flex min-h-dvh flex-col bg-[#0d1117] text-[#e6edf3]">
+    // Its own scroller: the document never scrolls (#1583).
+    <div className="flex h-full flex-col overflow-y-auto bg-[#0d1117] text-[#e6edf3]">
       <div className="mx-auto flex w-full max-w-md flex-1 flex-col gap-6 px-6 pt-[max(2rem,env(safe-area-inset-top))] pb-[max(2rem,env(safe-area-inset-bottom))]">
         <header className="space-y-2">
           <h1 className="text-xl font-semibold">

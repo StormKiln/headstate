@@ -141,7 +141,13 @@ export function AuthGate({ children }: { children: ReactNode }) {
   if (isLoading) return null;
   if (data?.ok) {
     return (
-      <>
+      // One screen tall, with the app shell as the flexible row (#1583).
+      // These banners used to be SIBLINGS of the shell, which is itself
+      // one screen tall, so a banner made the document taller than the
+      // window by its own height: the status bar sat that far below the
+      // window's edge until the document was scrolled to reveal it. Here
+      // the banners take their height and the shell gets what is left.
+      <div className="flex h-full flex-col">
         {/* Its own banner, on its own channel. A store failure describes
             a condition a later successful poll did not fix, so it must
             not be cleared by one -- which is what sharing `poll-error`
@@ -149,7 +155,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
         {storeError.message !== null && (
           <div
             role="alert"
-            className="flex items-start gap-2 border-b border-[#d29922]/30 bg-[#d29922]/10 px-4 py-2 text-sm text-[#d29922]"
+            className="flex shrink-0 items-start gap-2 border-b border-[#d29922]/30 bg-[#d29922]/10 px-4 py-2 text-sm text-[#d29922]"
           >
             <span className="flex-1">
               {storeError.message} Your pull requests are still live; only the local
@@ -176,8 +182,8 @@ export function AuthGate({ children }: { children: ReactNode }) {
             role={pollErr.kind === "not-asked" ? "status" : "alert"}
             className={
               pollErr.kind === "not-asked"
-                ? "flex items-start gap-2 border-b border-[#d29922]/30 bg-[#d29922]/10 px-4 py-2 text-sm text-[#d29922]"
-                : "flex items-start gap-2 border-b border-[#f85149]/30 bg-[#f85149]/10 px-4 py-2 text-sm text-[#f85149]"
+                ? "flex shrink-0 items-start gap-2 border-b border-[#d29922]/30 bg-[#d29922]/10 px-4 py-2 text-sm text-[#d29922]"
+                : "flex shrink-0 items-start gap-2 border-b border-[#f85149]/30 bg-[#f85149]/10 px-4 py-2 text-sm text-[#f85149]"
             }
           >
             <span className="flex-1">
@@ -239,8 +245,8 @@ export function AuthGate({ children }: { children: ReactNode }) {
             </button>
           </div>
         )}
-        {children}
-      </>
+        <div className="min-h-0 flex-1">{children}</div>
+      </div>
     );
   }
 
@@ -272,8 +278,8 @@ export function AuthGate({ children }: { children: ReactNode }) {
     // shell's own banners carrying the failure.
     if (data === undefined) return <>{children}</>;
     return (
-      <div className="flex min-h-dvh items-center justify-center bg-[#0d1117] px-6 text-[#e6edf3]">
-        <div className="max-w-md space-y-4">
+      <div className="flex h-full overflow-y-auto bg-[#0d1117] px-6 text-[#e6edf3]">
+        <div className="m-auto max-w-md space-y-4 py-6">
           <h1 className="text-xl font-semibold">Your desktop is not signed in to GitHub</h1>
           <p className="text-sm text-[#8b949e]">
             Headstate on your computer could not reach GitHub, so there is nothing for
@@ -292,8 +298,11 @@ export function AuthGate({ children }: { children: ReactNode }) {
   }
 
   return (
-    <div className="flex h-screen items-center justify-center bg-[#0d1117] text-[#e6edf3]">
-      <div className="max-w-md space-y-4">
+    // Its own scroller, like every full-screen notice: the document never
+    // scrolls (#1583). `m-auto` centres without clipping the top when the
+    // text overflows, which `items-center` would.
+    <div className="flex h-full overflow-y-auto bg-[#0d1117] text-[#e6edf3]">
+      <div className="m-auto max-w-md space-y-4 py-6">
         <h1 className="text-xl font-semibold">Headstate needs the GitHub CLI</h1>
         {/* What the app IS, which this screen never said. It explained
             only how to install `gh`, and the one statement of scope
