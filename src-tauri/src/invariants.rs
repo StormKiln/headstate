@@ -3572,6 +3572,11 @@ static TABLE: &str = HIT_none_3;
     /// `scan_blocking`'s closure, which moves an owned permit onto the
     /// blocking pool with it: the nearest of `scan_blocking(` and
     /// `spawn_blocking(` above the walk has to be the former.
+    ///
+    /// Except classification, which has a permit class of its own
+    /// (#1582): on the scan permits it queued behind the size walks. Its
+    /// walk must sit inside `classify_blocking`, which holds its permit
+    /// the same way.
     #[test]
     fn every_filesystem_scan_takes_a_permit() {
         let src = std::fs::read_to_string(
@@ -3632,8 +3637,25 @@ static TABLE: &str = HIT_none_3;
                     .or_else(|| region.split("pub fn ").nth(1))
                     .and_then(|r| r.split('(').next())
                     .unwrap_or("<unnamed>");
-                let gated = region.rfind("scan_blocking(");
+                // Classification has its OWN permit class (#1582), so it
+                // cannot queue behind the size walks; `classify_blocking`
+                // holds its permit by the walk exactly as `scan_blocking`
+                // does. Every other walk takes the scan permits.
+                let classification = *walk == "worktrees::classify_repo";
+                let gated = if classification {
+                    region.rfind("classify_blocking(")
+                } else {
+                    region.rfind("scan_blocking(")
+                };
                 let bare = region.rfind("spawn_blocking(");
+                assert!(
+                    gated.is_some() || !classification,
+                    "commands.rs: `{name}` classifies a repository's worktrees outside \
+                     `classify_blocking`. On the scan permits it queues behind the size \
+                     walks, which can hold every permit for minutes on a large repository \
+                     -- over five minutes before the countdown began in #1582. Run it as \
+                     `classify_blocking(move || ...).await`."
+                );
                 assert!(
                     gated.is_some_and(|g| bare.is_none_or(|b| g > b)),
                     "commands.rs: `{name}` starts a filesystem walk ({walk}) outside \

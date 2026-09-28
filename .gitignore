@@ -42,6 +42,8 @@ node_modules
 dist
 # The transcript harness build (#1480): `make bench-transcript-browser`.
 dist-harness
+# The Worktrees harness build (#1582): `make bench-worktrees-browser`.
+dist-harness-worktrees
 target
 src-tauri/target
 src-tauri/gen

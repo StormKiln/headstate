@@ -25,6 +25,7 @@ import {
   mainCheckoutFor,
   pathBasename,
   prForWorktree,
+  pullRequestsByBranch,
   safetyReason,
   safetyTone,
   sessionWorktree,
@@ -750,6 +751,35 @@ describe("prForWorktree", () => {
   it("makes no match for a detached worktree", () => {
     const prs = [pr("octocat/api", "feat/x", 1)];
     expect(prForWorktree(prs, "octocat/api", "")).toBeNull();
+  });
+});
+
+/// The indexed join the Worktrees page renders with (#1582) must give
+/// `prForWorktree`'s answer for every row, or the speed-up changed what
+/// a row says.
+describe("pullRequestsByBranch", () => {
+  const pr = (repo: string | null, head: string, number: number) =>
+    ({ repo, head_ref: head, number } as unknown as import("@/types/pr").PullRequest);
+  const prs = [
+    pr("octocat/api", "feat/x", 1),
+    pr("octocat/worker", "feat/shared", 2),
+    pr("octocat/api", "feat/shared", 3),
+    // A second PR on one branch: `find` returns the first, so must this.
+    pr("octocat/api", "feat/x", 4),
+    pr(null, "feat/y", 5),
+  ];
+
+  it("agrees with prForWorktree on every branch and repository", () => {
+    for (const identity of ["octocat/api", "octocat/worker", "octocat/none", null]) {
+      const lookup = pullRequestsByBranch(prs, identity);
+      for (const branch of ["feat/x", "feat/shared", "feat/y", "feat/absent", ""]) {
+        expect(lookup(branch)?.number ?? null).toBe(prForWorktree(prs, identity, branch)?.number ?? null);
+      }
+    }
+  });
+
+  it("keeps the first pull request when two share a branch", () => {
+    expect(pullRequestsByBranch(prs, "octocat/api")("feat/x")?.number).toBe(1);
   });
 });
 
