@@ -2828,8 +2828,35 @@ export type BranchScanFrame =
   | { kind: "listed"; repo: string; total: number; branches: Branch[] }
   | { kind: "classified"; repo: string; verdicts: [string, Deletable][] };
 
-/// One frame of PR Stats backfill progress, mirroring the Rust
-/// `StatsBackfillFrame` in `src-tauri/src/commands.rs` (#1093).
+/// A registered scope's payload (#1570). Mirrors `BackfillRegistered` in
+/// `src-tauri/src/commands.rs`.
+export interface BackfillRegistered {
+  /// The last frame the collector emitted for this scope, or `null` when it
+  /// has emitted none since the app started. `null` is PENDING -- a frame
+  /// will come -- and never a zeroed frame, which would read as measured.
+  lastFrame: StatsBackfillFrame | null;
+}
+
+/// A failed registration's payload (#1570). Mirrors
+/// `BackfillRegistrationFailed` in `src-tauri/src/commands.rs`.
+export interface BackfillRegistrationFailed {
+  /// Why, in the storage layer's own words. Shown as the cause.
+  reason: string;
+}
+
+/// Whether a scope is registered for collection (#1570), mirroring the Rust
+/// `BackfillRegistration` enum (internally tagged on `state`).
+///
+/// Two states the page must never collapse. Registered with no frame is
+/// Pending: "queued" is true, and a frame replaces it. Failed is a failure:
+/// no frame will ever come, so "queued" would be a Pending nothing moves
+/// out of -- #1042's shape.
+export type BackfillRegistration =
+  | ({ state: "registered" } & BackfillRegistered)
+  | ({ state: "failed" } & BackfillRegistrationFailed);
+
+/// One frame of PR Stats backfill progress (#1093). Mirrors
+/// `StatsBackfillFrame` in `src-tauri/src/commands.rs`.
 ///
 /// ONE shape, unlike `BranchScanFrame`'s two, because this stream has one
 /// kind of news: the coverage moved. Every frame carries the whole state
@@ -3609,6 +3636,10 @@ export interface StatsBoard {
   /// Re-deriving it here would be a second spelling of a key the Rust side
   /// already computes, and a disagreement would silently show no progress.
   scopeKey: string;
+  /// Whether this scope is registered for collection, and the collector's
+  /// last frame for it (#1570). Always this load's outcome, never a cached
+  /// one: the Rust side does not read it back from the cache.
+  backfill: BackfillRegistration;
   /// One row per author who appears, in no ranking order -- the UI ranks by
   /// whichever measure its chart is about.
   rows: AuthorRow[];
