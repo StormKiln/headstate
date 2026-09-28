@@ -128,11 +128,7 @@ pub fn map_detail(v: &Value, repo: &str) -> PrDetail {
         .as_array()
         .unwrap_or(&empty)
         .iter()
-        .map(|c| PrComment {
-            author: c["author"]["login"].as_str().unwrap_or("ghost").to_string(),
-            created_at: c["createdAt"].as_str().unwrap_or_default().to_string(),
-            body: c["body"].as_str().unwrap_or_default().to_string(),
-        })
+        .map(map_comment)
         .collect();
 
     // #1457. `ready_at` is the list row's own function, so the header and
@@ -440,15 +436,29 @@ fn map_review_threads(node: &Value) -> Vec<ReviewThread> {
                 .as_array()
                 .unwrap_or(&empty)
                 .iter()
-                .map(|c| PrComment {
-                    author: c["author"]["login"].as_str().unwrap_or("ghost").to_string(),
-                    created_at: c["createdAt"].as_str().unwrap_or_default().to_string(),
-                    body: c["body"].as_str().unwrap_or_default().to_string(),
-                })
+                .map(map_comment)
                 .collect(),
             comment_count: t["comments"]["totalCount"].as_u64().unwrap_or(0),
         })
         .collect()
+}
+
+/// One comment node, from the conversation or a review thread.
+///
+/// ONE function for both, because both selections ask for the same
+/// fields, and two mappings of one node shape drift.
+///
+/// `author_is_bot` is true only when GitHub names the author a `Bot`
+/// (#1581). A deleted account (`author: null`, shown as "ghost") and a
+/// missing `__typename` both read as a person, which is the side the
+/// view folds least on.
+fn map_comment(c: &Value) -> PrComment {
+    PrComment {
+        author: c["author"]["login"].as_str().unwrap_or("ghost").to_string(),
+        created_at: c["createdAt"].as_str().unwrap_or_default().to_string(),
+        body: c["body"].as_str().unwrap_or_default().to_string(),
+        author_is_bot: c["author"]["__typename"].as_str() == Some("Bot"),
+    }
 }
 
 /// GitHub's merge-readiness summary.
@@ -1149,6 +1159,44 @@ mod tests {
             t.comment_count, 2,
             "the total, not the page: the query caps thread comments at 10"
         );
+    }
+
+    /// #1581: `author_is_bot` is GitHub's `__typename`, on the conversation
+    /// and on a thread alike (one `map_comment`). Only `Bot` is a bot: a
+    /// person, a deleted account and a node with no `__typename` all read
+    /// as not-a-bot, which is the side the view folds least on.
+    #[test]
+    fn a_comment_author_is_a_bot_only_when_github_says_bot() {
+        let node = |author: Value| json!({"author": author, "createdAt": "2026-01-01T00:00:00Z", "body": "x"});
+        let v = json!({"repository": {"pullRequest": {
+            "comments": {"totalCount": 4, "nodes": [
+                node(json!({"login": "coverage-bot", "__typename": "Bot"})),
+                node(json!({"login": "alice", "__typename": "User"})),
+                node(json!(null)),
+                node(json!({"login": "bob"})),
+            ]},
+            "reviewThreads": {"nodes": [{
+                "id": "RT_1", "comments": {"totalCount": 1, "nodes": [
+                    node(json!({"login": "review-bot", "__typename": "Bot"})),
+                ]}
+            }]}
+        }}});
+        let d = map_detail(&v, "acme/widget");
+        let bots: Vec<(&str, bool)> = d
+            .comments
+            .iter()
+            .map(|c| (c.author.as_str(), c.author_is_bot))
+            .collect();
+        assert_eq!(
+            bots,
+            vec![
+                ("coverage-bot", true),
+                ("alice", false),
+                ("ghost", false),
+                ("bob", false)
+            ]
+        );
+        assert!(d.review_threads[0].comments[0].author_is_bot);
     }
 
     /// A force-push strands a thread and GitHub sends `line: null`. Zero

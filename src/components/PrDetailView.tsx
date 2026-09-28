@@ -12,7 +12,7 @@ import {
   useViewer,
 } from "../api/hooks";
 import { gateVerdict } from "../lib/reviewGates";
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import type { ReviewVerdictName } from "../api/tauri";
 import type { ClaudePrLink } from "../types/pr";
 import { useFilters } from "../store/filters";
@@ -21,6 +21,8 @@ import { useIsMobile } from "../lib/useIsMobile";
 import { Markdown } from "./Markdown";
 import { PrClaudifyButton } from "./PrClaudify";
 import { CommentRow } from "./CommentRow";
+import { SupersededGroup } from "./SupersededComments";
+import { foldSuperseded } from "../lib/supersededComments";
 import { ReviewThreads } from "./ReviewThreads";
 import { PrDates } from "./PrDates";
 import { Section } from "./Section";
@@ -359,6 +361,13 @@ export function PrDetailView({
       </div>
     );
   }
+
+  /// The comments as shown: repeats folded under their newest (#1581).
+  /// Folds whatever arrived -- partial is not nothing -- and
+  /// `commentsTruncated` is what qualifies the counts when that was not
+  /// every comment.
+  const commentEntries = foldSuperseded(pr.comments);
+  const commentsTruncated = pr.comment_count > pr.comments.length;
 
   /// The pinned actions, built once so the phone and desktop headers
   /// place the same elements rather than two copies that drift.
@@ -728,10 +737,15 @@ export function PrDetailView({
               query fetches the newest comments, so what is cut is the
               oldest, and the reader should know that before scrolling
               rather than after. */}
-          {pr.comment_count > pr.comments.length ? (
+          {/* When repeats were folded, the fetch was probably crowded
+              by them (#1581), so the notice says outright that what is
+              past it can include people's comments -- the ones a
+              reviewer is looking for. */}
+          {commentsTruncated ? (
             <p className="text-xs text-[#8b949e]">
-              Showing the newest {pr.comments.length} of {pr.comment_count} — older ones are on
-              GitHub.
+              Showing the newest {pr.comments.length} of {pr.comment_count} — older ones
+              {commentEntries.length < pr.comments.length ? ", including any from people," : ""}{" "}
+              are on GitHub.
             </p>
           ) : null}
           {/* Each comment collapses on its OWN, rather than the whole
@@ -740,16 +754,27 @@ export function PrDetailView({
               them and scrolling; the collapsed row carries a body
               preview so it can be picked out without opening it.
 
+              Repeats of one bot comment (a coverage report or an AI
+              review per CI round) fold under their newest copy, which
+              stays in its own place in the order (#1581). The section's
+              count above stays the true total.
+
               A lone comment opens by default -- there is nothing to
-              scan past, so collapsing it only adds a click. */}
-          {pr.comments.map((c, i) => (
-            <CommentRow
-              key={`${c.author}-${c.created_at}-${i}`}
-              author={c.author}
-              createdAt={c.created_at}
-              body={c.body}
-              defaultOpen={pr.comments.length === 1}
-            />
+              scan past, so collapsing it only adds a click. That counts
+              what is SHOWN, so thirty folded copies of one report still
+              open its newest. */}
+          {commentEntries.map(({ comment: c, superseded }, i) => (
+            <Fragment key={`${c.author}-${c.created_at}-${i}`}>
+              <CommentRow
+                author={c.author}
+                createdAt={c.created_at}
+                body={c.body}
+                defaultOpen={commentEntries.length === 1}
+              />
+              {superseded.length > 0 ? (
+                <SupersededGroup comments={superseded} truncated={commentsTruncated} />
+              ) : null}
+            </Fragment>
           ))}
           </div>
         </Section>
