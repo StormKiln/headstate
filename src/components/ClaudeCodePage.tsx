@@ -650,8 +650,9 @@ const CLAUDE_CHIPS: ReadonlyArray<{
 /// about. "No session recorded for #1234" is a finding: we asked the
 /// link table and it holds nothing, which is the ordinary answer for a
 /// pull request opened by hand, by CI, or since the transcripts were
-/// last read -- the link table is written by the import, not live
-/// (#1545). "Could not look up #1234" is not a finding at all --
+/// last read -- the link table is written by the import (#1545), and
+/// topped up about once a minute by the live pass since #1557, so a
+/// just-opened PR can be a minute behind. "Could not look up #1234" is not a finding at all --
 /// the database did not answer, and the pull request may well have a
 /// session we simply could not see. Rendering the second as the first
 /// would tell a user their session is gone on the strength of a failed

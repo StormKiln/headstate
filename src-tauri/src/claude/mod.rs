@@ -92,6 +92,9 @@ pub mod hook;
 pub mod install;
 /// Opening the user's configured terminal on a built command (#1126).
 pub mod launch;
+/// Pull request links written since the last import, read incrementally
+/// on the live pass (#1557). Read-only on `~/.claude`.
+pub mod linkscan;
 pub mod live;
 pub mod liveness;
 /// Every MCP server configured on this machine, and which scope defines

@@ -89,6 +89,14 @@ pub mod keys {
     /// zero, which re-reads. That is the safe direction: guessing a
     /// NON-zero offset would skip records permanently.
     pub const CLAUDE_HANDOFF_OFFSET: &str = "claude_handoff_offset";
+    /// How far the incremental pull request link read has got since the
+    /// last transcript import (#1557), as `claude::linkscan::Cursor`.
+    ///
+    /// Absent until the first import sets it, and a pass does nothing
+    /// until then. An unreadable value is treated as absent for the same
+    /// reason: the next import sets it again, and no link is skipped in
+    /// the meantime -- the import still writes them all.
+    pub const CLAUDE_PR_LINK_CURSOR: &str = "claude_pr_link_cursor";
 }
 
 #[cfg(test)]

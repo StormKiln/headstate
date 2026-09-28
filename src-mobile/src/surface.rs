@@ -232,9 +232,9 @@ pub const SURFACE: &[(&str, Class)] = &[
     // link every ten seconds and was carrying every session's detail to
     // render one; it now carries what the list draws, and the phone asks
     // for the rest only when the user opens a session.
-    // Read: one indexed query (#1132).
-    ("claude_sessions_for_pr", Class::Read),
-    // #1545: the search box's lookup by number alone; no transcript text.
+    // #1545: the lookup by number alone, for the search box and (since
+    // #1557 retired `claude_sessions_for_pr`) the PR detail panel; no
+    // transcript text.
     ("claude_sessions_for_pr_number", Class::Read),
     ("claude_session_detail", Class::Read),
     // #1486: what the background window reads to notify about sessions.

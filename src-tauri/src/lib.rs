@@ -354,7 +354,6 @@ pub fn run() {
             commands::claude_search_transcripts,
             commands::claude_index_coverage,
             commands::claude_sessions,
-            commands::claude_sessions_for_pr,
             commands::claude_sessions_for_pr_number,
             commands::claude_session_detail,
             commands::claude_session_digest,

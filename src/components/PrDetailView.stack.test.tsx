@@ -10,7 +10,7 @@ const state = vi.hoisted(() => ({
 }));
 
 vi.mock("../api/hooks", () => ({
-  useClaudeSessionsForPr: () => ({ data: [] }),
+  useClaudeSessionsForPr: () => ({ state: "done", links: [], elsewhere: [] }),
   usePrDetail: () => ({ ...state, error: null, refetch: vi.fn() }),
   useActOnPr: () => vi.fn(() => Promise.resolve()),
   useDeleteHeadBranch: () => vi.fn(() => Promise.resolve()),
