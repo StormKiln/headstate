@@ -27,7 +27,7 @@ import {
   subjectText,
 } from "@/lib/adviceText";
 import { groupMarkdown, reportMarkdown } from "@/lib/adviceMarkdown";
-import { copyText } from "@/lib/clipboard";
+import { type CopiedToast, CopyMarkdownButton } from "./CopyMarkdownButton";
 import type { Filters } from "@/lib/derive";
 import { useActiveFilters, useFilters } from "@/store/filters";
 import { adviceState, needsRefresh, type AdviceState } from "@/lib/adviceState";
@@ -249,8 +249,12 @@ function AdviceBody({
   const copyAll = (result: ClaudeMdAdviceResult, refreshing: boolean) => (
     <CopyMarkdownButton
       label="Copy all as markdown"
-      findings={result.report.findings.length}
-      unknownChecks={result.report.checks.filter((c) => c.run.state === "unknown").length}
+      copied={() =>
+        adviceCopied(
+          result.report.findings.length,
+          result.report.checks.filter((c) => c.run.state === "unknown").length,
+        )
+      }
       markdown={() => reportMarkdown(result, repo, grouping, refreshing)}
     />
   );
@@ -578,56 +582,20 @@ function useAdviceGrouping(): AdviceGrouping {
   return useActiveFilters().adviceGrouping ?? "check";
 }
 
-/// Copy some of the report as markdown (#1399): a whole group, or all of
-/// it. The same look as Copy brief and Re-check.
-///
-/// The markdown is built on click, not on render: a report of a thousand
-/// findings is rendered far more often than it is copied. `copyText`
-/// reports the no-clipboard case, and the toast is what makes the click
-/// visible either way -- never a silent failure.
-function CopyMarkdownButton({
-  label,
-  accessibleName,
-  findings,
-  unknownChecks,
-  markdown,
-  className = "",
-}: {
-  label: string;
-  /// Only where `label` alone would be ambiguous. It must START with the
-  /// visible label, so a voice user can say what they see.
-  accessibleName?: string;
-  findings: number;
-  unknownChecks: number;
-  markdown: () => string;
-  className?: string;
-}) {
-  return (
-    <button
-      type="button"
-      aria-label={accessibleName}
-      onClick={() => {
-        void copyText(markdown()).then((failure) => {
-          if (failure !== null) {
-            toast.error("Could not copy the markdown", { description: failure });
-            return;
-          }
-          // A check that could not run is part of what was copied, and
-          // "0 findings" alone would read as a clean result.
-          const unrun =
-            unknownChecks === 0
-              ? ""
-              : ` ${unknownChecks === 1 ? "One check" : `${unknownChecks} checks`} that could not run ${unknownChecks === 1 ? "is" : "are"} included.`;
-          toast.success(`Copied ${findings} ${findings === 1 ? "finding" : "findings"} as markdown`, {
-            description: `Paste it into a Claude session to review it.${unrun}`,
-          });
-        });
-      }}
-      className={`tap-target text-left text-[11px] text-[#58a6ff] hover:underline ${className}`}
-    >
-      {label}
-    </button>
-  );
+/// What "Copy … as markdown" says once some of the report is copied
+/// (#1399): a whole group, or all of it. The button itself is the shared
+/// `CopyMarkdownButton`.
+function adviceCopied(findings: number, unknownChecks: number): CopiedToast {
+  // A check that could not run is part of what was copied, and
+  // "0 findings" alone would read as a clean result.
+  const unrun =
+    unknownChecks === 0
+      ? ""
+      : ` ${unknownChecks === 1 ? "One check" : `${unknownChecks} checks`} that could not run ${unknownChecks === 1 ? "is" : "are"} included.`;
+  return {
+    title: `Copied ${findings} ${findings === 1 ? "finding" : "findings"} as markdown`,
+    description: `Paste it into a Claude session to review it.${unrun}`,
+  };
 }
 
 /// How many findings a report may hold before its groups open collapsed
@@ -716,8 +684,7 @@ function GroupSection({
         <CopyMarkdownButton
           label="Copy group as markdown"
           accessibleName={`Copy group as markdown: ${heading}`}
-          findings={group.findings.length}
-          unknownChecks={group.unknownChecks.length}
+          copied={() => adviceCopied(group.findings.length, group.unknownChecks.length)}
           markdown={() => groupMarkdown(group, repo)}
           className="absolute top-0 right-0 whitespace-nowrap"
         />
