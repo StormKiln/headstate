@@ -80,6 +80,9 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("get_pr_detail", Class::Read),
     // The review gates (#1451, #1454). A Read; two REST reads, advisory.
     ("get_review_gates", Class::Read),
+    // The Ready for review strip's batched pushers (#1576). A Read; REST reads
+    // capped per call and inside the budget, advisory.
+    ("get_ready_pushers", Class::Read),
     ("get_viewer", Class::Read),
     ("build_target", Class::Read),
     ("latest_release", Class::Read),
@@ -519,6 +522,12 @@ pub const SURFACE: &[(&str, Class)] = &[
     // `reveal_log` cannot close, because there is no Finder here to
     // reveal into. That one stays Local; this shows the text.
     ("read_log_tail", Class::Read),
+    // Read: everything "Report this" can say about the DESKTOP (#1575) --
+    // its poll history, `gh`, install and log tail, redacted. Served to
+    // the phone because the poll its banner reports runs on the desktop,
+    // and every part is already a Read on its own (`build_target`,
+    // `tool_versions`, `read_log_tail`, `get_poll_interval`).
+    ("diagnostic_bundle", Class::Read),
     ("reveal_log", Class::Local),
     // Reveals a session's directory or transcript in the DESKTOP's file
     // manager (#917). Local: this phone cannot see that Finder, which is

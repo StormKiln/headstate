@@ -378,7 +378,7 @@ describe("PrDetailView layout", () => {
           viewer_can_reply: true,
           viewer_can_resolve: true,
           viewer_can_unresolve: true,
-          comments: [{ author: "octocat", body: "Why?", created_at: "2026-01-01T00:00:00Z" }],
+          comments: [{ author: "octocat", author_is_bot: false, body: "Why?", created_at: "2026-01-01T00:00:00Z" }],
           comment_count: 1,
         },
       ],
@@ -483,7 +483,7 @@ describe("PrDetailView", () => {
     view({
       comment_count: 1,
       comments: [
-        { author: "hubot", created_at: "2026-08-20T10:00:00Z", body: "looks good" },
+        { author: "hubot", author_is_bot: false, created_at: "2026-08-20T10:00:00Z", body: "looks good" },
       ],
     });
     expect(screen.getByText(/hubot/)).toBeTruthy();
@@ -500,8 +500,8 @@ describe("PrDetailView", () => {
   /// takes them for the whole discussion.
   it("says which comments are missing, above the ones it shows", () => {
     view({ comment_count: 80, comments: [
-      { author: "hubot", created_at: "2026-08-20T10:00:00Z", body: "one" },
-      { author: "hubot", created_at: "2026-08-21T10:00:00Z", body: "two" },
+      { author: "hubot", author_is_bot: false, created_at: "2026-08-20T10:00:00Z", body: "one" },
+      { author: "hubot", author_is_bot: false, created_at: "2026-08-21T10:00:00Z", body: "two" },
     ] });
     const notice = screen.getByText(/Showing the newest 2 of 80 — older ones are on GitHub/);
     const firstRow = screen.getAllByText("hubot")[0];
@@ -512,9 +512,104 @@ describe("PrDetailView", () => {
 
   it("does not annotate a complete comment list", () => {
     view({ comment_count: 1, comments: [
-      { author: "hubot", created_at: "2026-08-20T10:00:00Z", body: "one" },
+      { author: "hubot", author_is_bot: false, created_at: "2026-08-20T10:00:00Z", body: "one" },
     ] });
     expect(screen.queryByText(/Showing the newest/)).toBeNull();
+  });
+
+  /// #1581: repeated bot comments fold under their newest. The rule is
+  /// pinned in `lib/supersededComments.test.ts`; these pin the view.
+  describe("superseded comments", () => {
+    const report = (day: number, pct: string) => ({
+      author: "coverage-bot",
+      author_is_bot: true,
+      created_at: `2026-08-${String(day).padStart(2, "0")}T10:00:00Z`,
+      body: `## Coverage ${pct}%\n\nDetails at https://ci.example.com/acme/widget/${day}`,
+    });
+    const person = (author: string, day: number, body: string) => ({
+      author,
+      author_is_bot: false,
+      created_at: `2026-08-${String(day).padStart(2, "0")}T10:00:00Z`,
+      body,
+    });
+    /// Each comment's own toggle, in page order, inside the Comments
+    /// section -- not the section's own header or the Superseded control,
+    /// which also carry `aria-expanded`.
+    const rows = () => {
+      const header = screen.getByRole("button", { name: /^Comments/ });
+      const section = header.closest("section") as HTMLElement;
+      return within(section)
+        .getAllByRole("button")
+        .filter((b) => b !== header && b.getAttribute("aria-expanded") !== null)
+        .filter((b) => !/^Superseded/.test(b.textContent ?? ""));
+    };
+
+    it("shows the newest report in place, with the older copies collapsed under it", () => {
+      view({
+        comment_count: 4,
+        comments: [report(1, "80.1"), person("alice", 2, "Why the retry?"), report(3, "80.9"), report(4, "81.4")],
+      });
+      // The section count is the TRUE total, not what is shown.
+      expect(screen.getByText("4")).toBeTruthy();
+      // Two rows: alice, then the newest report where it was posted.
+      expect(rows().map((b) => b.textContent)).toEqual([
+        expect.stringContaining("alice"),
+        expect.stringContaining("81.4"),
+      ]);
+      const toggle = screen.getByRole("button", { name: "Superseded (2 older)" });
+      expect(toggle.getAttribute("aria-expanded")).toBe("false");
+      // A finger-sized target on the phone (the class is breakpoint-scoped).
+      expect(toggle.className).toContain("tap-target");
+      expect(screen.queryByText(/80\.1/)).toBeNull();
+      // Directly after the newest report, not somewhere else.
+      const newest = rows()[1];
+      expect(newest.compareDocumentPosition(toggle) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+      fireEvent.click(toggle);
+      expect(toggle.getAttribute("aria-expanded")).toBe("true");
+      // The older copies, oldest first, each its own row.
+      const all = rows().map((b) => b.textContent ?? "");
+      expect(all).toHaveLength(4);
+      expect(all[2]).toContain("80.1");
+      expect(all[3]).toContain("80.9");
+    });
+
+    /// A person's comments are never folded, even when they repeat.
+    it("never folds a person's comments", () => {
+      view({
+        comment_count: 3,
+        comments: [person("alice", 1, "LGTM"), person("alice", 2, "LGTM"), person("bob", 3, "LGTM")],
+      });
+      expect(rows()).toHaveLength(3);
+      expect(screen.queryByRole("button", { name: /^Superseded/ })).toBeNull();
+    });
+
+    /// Only-low is qualified: the fetch took the newest comments, so more
+    /// copies of the report may sit beyond it -- and so may people's
+    /// comments, which the notice then says.
+    it("qualifies the count and names people's comments when the fetch was truncated", () => {
+      view({
+        comment_count: 250,
+        comments: [report(1, "80.1"), report(2, "80.9"), person("alice", 3, "Ship it")],
+      });
+      expect(screen.getByRole("button", { name: "Superseded (at least 1 older)" })).toBeTruthy();
+      expect(
+        screen.getByText(
+          /Showing the newest 3 of 250 — older ones, including any from people, are on GitHub\./,
+        ),
+      ).toBeTruthy();
+      // Still the true total.
+      expect(screen.getByText("250")).toBeTruthy();
+    });
+
+    /// A fold of every comment into one leaves one row, and one row opens
+    /// by default exactly as a lone comment does.
+    it("opens the newest by default when everything folds into it", () => {
+      view({ comment_count: 3, comments: [report(1, "80"), report(2, "81"), report(3, "82")] });
+      expect(rows()).toHaveLength(1);
+      expect(rows()[0].getAttribute("aria-expanded")).toBe("true");
+      expect(screen.getByRole("button", { name: "Superseded (2 older)" })).toBeTruthy();
+    });
   });
 
   /// #1457: the PR's age and last commit, in the header. Each date is
@@ -598,6 +693,7 @@ describe("PrDetailView", () => {
     const comment = (i: number) => ({
       author: "octocat",
       created_at: "2026-08-20T10:00:00Z",
+      author_is_bot: false,
       body: `comment ${i}`,
     });
     view({
@@ -634,6 +730,7 @@ describe("PrDetailView", () => {
         {
           author: "octocat",
           created_at: "2026-08-20T10:00:00Z",
+          author_is_bot: false,
           body: "the only comment",
         },
       ],
@@ -662,6 +759,7 @@ describe("PrDetailView", () => {
             {
               author: "carol",
               created_at: "2026-08-20T10:00:00Z",
+              author_is_bot: false,
               body: "This leaks the subscription",
             },
           ],
@@ -1245,7 +1343,7 @@ describe("PrDetailView", () => {
       viewer_can_reply: false,
       viewer_can_resolve: false,
       viewer_can_unresolve: false,
-      comments: [{ author: "carol", created_at: "2026-08-20T10:00:00Z", body: "hm" }],
+      comments: [{ author: "carol", author_is_bot: false, created_at: "2026-08-20T10:00:00Z", body: "hm" }],
       comment_count: 1,
     });
 

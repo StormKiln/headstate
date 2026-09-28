@@ -719,7 +719,12 @@ export default function App() {
     );
 
   return (
-    <div className="flex h-dvh flex-col bg-[#0d1117] text-[#e6edf3] px-safe">
+    // `h-full`, not `h-dvh` (#1583): the shell fills what holds it --
+    // `#root`, or the row `AuthGate` leaves under its banners -- so
+    // nothing above it can push the status bar past the window's edge.
+    // `index.css` sizes `html`, `body` and `#root` to the viewport and
+    // stops the document itself from scrolling.
+    <div className="flex h-full flex-col bg-[#0d1117] text-[#e6edf3] px-safe">
       {/* Above everything, including the header: it says which
           desktop the whole screen is describing. Renders nothing on
           the desktop itself. */}

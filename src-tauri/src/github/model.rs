@@ -111,6 +111,15 @@ pub struct PullRequest {
     /// tells "already cleaned up" from "still there".
     #[serde(default)]
     pub head_ref_id: Option<String>,
+    /// The repository the head branch lives in, `owner/name` (#1576).
+    ///
+    /// The same field `PrDetail` carries, for the same reason: the Ready
+    /// for review strip asks THIS repository who pushed the head, and a
+    /// fork's head is not in the base repository. `None` once the fork is
+    /// deleted, and for a snapshot cached before the field existed; the
+    /// pusher is then not asked, never guessed from the base.
+    #[serde(default)]
+    pub head_repo: Option<String>,
     pub base_ref: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -385,6 +394,17 @@ pub struct PrComment {
     pub author: String,
     pub created_at: String,
     pub body: String,
+    /// GitHub says the author is a `Bot` (an app or integration account)
+    /// rather than a person (#1581). Read from the author's `__typename`,
+    /// which both comment selections ask for, so `false` means "GitHub
+    /// named some other kind of author, or none" -- never "not asked".
+    ///
+    /// The view folds repeated comments by kind, and the rule is looser
+    /// for a bot than for a person: a person's comment is never folded
+    /// on a heading that merely looks alike. Defaulted so a payload
+    /// without the field reads as a person, the conservative side.
+    #[serde(default)]
+    pub author_is_bot: bool,
 }
 
 /// One review conversation: an inline comment thread anchored to a line.
@@ -676,6 +696,7 @@ mod attention_tests {
             head_ref: "feature/x".into(),
             head_oid: "deadbeef".into(),
             head_ref_id: None,
+            head_repo: None,
             base_ref: "main".into(),
             created_at: t,
             ready_at: Some(t),

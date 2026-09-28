@@ -5,7 +5,12 @@
     "vite.config.ts",
     "vite.harness.config.ts",
     "src/harness/transcriptBench.tsx",
-    "scripts/transcript-browser-bench.mjs"
+    "src/harness/shellHarness.tsx",
+    "scripts/transcript-browser-bench.mjs",
+    "scripts/check-shell-scroll.mjs",
+    "vite.harness-worktrees.config.ts",
+    "src/harness/worktreesBench.tsx",
+    "scripts/worktrees-browser-bench.mjs"
   ],
   "project": [
     "src/**/*.{ts,tsx}"

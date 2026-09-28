@@ -60,6 +60,17 @@ query($q: String!, $first: Int!, $after: String) {
         }
         headRefName headRefOid baseRefName
         headRef { id }
+        # Where the head branch lives (#1576): the Ready for review strip
+        # asks THAT repository's activity log who pushed the head, and a
+        # fork's head is not in the base. Not a connection, so not priced.
+        # MEASURED free, 2026-09-28, this document with its `#` lines
+        # stripped, `gh api graphql -F first=25` on
+        # `repo:kubernetes/kubernetes is:pr is:open`, three runs each:
+        # cost 2 before and 2 after, wall clock 7.3-8.4s before and
+        # 8.1-9.2s after, inside the run-to-run spread. All 25 heads on
+        # that run were forks, so without this the strip could ask about
+        # none of them. `MEASURED_COST` in `poll.rs` stands.
+        headRepository { nameWithOwner }
         author { login }
         repository { nameWithOwner }
         # `mergeStateStatus` is the single most expensive field here, and
@@ -516,9 +527,35 @@ query($owner: String!, $repo: String!, $number: Int!) {
       # comments: `last: 50` returned the newest 50 oldest-first, at cost
       # 1; and this whole document, before and after this change, cost 1
       # in three runs each.
-      comments(last: 50) {
+      #
+      # 100 since #1581, the connection maximum. On a long-running pull
+      # request the newest 50 could be one bot's comment 50 times, every
+      # CI round's coverage report or AI review, which pushed the human
+      # comments out of the fetch entirely. The view now folds those
+      # repeats under their newest copy, and a bigger page widens the
+      # window a human comment has to survive in. MEASURED 2026-09-28 on
+      # a public pull request with 733 comments, three runs each, with
+      # the review threads selected as here: `last: 50` and `last: 100`
+      # both cost 1 point; the response grew from 57 KB to 115 KB, and
+      # latency stayed within run-to-run noise (1.5-1.7 s against
+      # 1.6-2.4 s). This whole document, as it stands, then cost 1 in
+      # three runs (120 KB). The newest 100 there were all one bot's,
+      # which folded to 6 kinds.
+      #
+      # Not a cursor loop over every comment: that is a round trip and a
+      # point per 100 on every open of the view, for a pull request whose
+      # older comments are mostly superseded copies. And not a second
+      # `first:` page for the oldest comments: that leaves a gap in the
+      # MIDDLE of the conversation, which is harder to state honestly
+      # than "older ones are on GitHub". What is past 100 stays unfetched,
+      # and the view says so (see `PrDetailView`'s truncation notice).
+      #
+      # `__typename` on the author (#1581): GitHub's own answer to "is
+      # this a bot", which the fold rule reads. Fields cost nothing;
+      # measured at cost 1 with it.
+      comments(last: 100) {
         totalCount
-        nodes { author { login } createdAt body }
+        nodes { author { login __typename } createdAt body }
       }
       # The DETAIL query carries the whole thread; the list query above
       # keeps its two-field shape and only counts. MEASURED against the
@@ -593,9 +630,12 @@ query($owner: String!, $repo: String!, $number: Int!) {
           # carries. The cost of keeping the opener is that the newest
           # replies are the ones cut, and `ReviewThreads.tsx` says exactly
           # that rather than the bare "see the rest".
+          # `__typename` as above: the same `PrComment`, so the same
+          # question is asked, and its `author_is_bot` is never a
+          # default standing in for an answer.
           comments(first: 10) {
             totalCount
-            nodes { author { login } createdAt body }
+            nodes { author { login __typename } createdAt body }
           }
         }
       }
@@ -1132,9 +1172,10 @@ mod tests {
             .split_once(')')
             .expect("the connection closes")
             .0;
+        // 100 since #1581: the connection maximum, measured at cost 1.
         assert_eq!(
             conversation.trim(),
-            "last: 50",
+            "last: 100",
             "the conversation must fetch its NEWEST comments; `comments({conversation})` \
              drops the latest ones on a long pull request while the view reads as current"
         );
@@ -1151,6 +1192,39 @@ mod tests {
             "a thread's page must start at its opener; `comments({per_thread})` would \
              show replies to a remark it no longer carries"
         );
+    }
+
+    /// #1581: both comment selections ask what KIND of author wrote each
+    /// comment, which `PrComment::author_is_bot` is read from.
+    ///
+    /// The mapper tests supply `__typename` themselves, so a document that
+    /// stopped asking would leave them green while every bot read as a
+    /// person -- and the view would fold nothing, with no error anywhere.
+    /// Comment lines are stripped for the same reason as above.
+    #[test]
+    fn the_detail_query_asks_whether_each_comment_author_is_a_bot() {
+        let code: String = PR_DETAIL_QUERY
+            .replace("\r\n", "\n")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let selections: Vec<&str> = code
+            .split("comments(")
+            .skip(1)
+            .map(|rest| rest.split_once("createdAt").map_or(rest, |(head, _)| head))
+            .collect();
+        assert_eq!(
+            selections.len(),
+            2,
+            "the conversation and the review threads each select comments"
+        );
+        for s in selections {
+            assert!(
+                s.contains("author { login __typename }"),
+                "a comment selection must ask the author's __typename: {s}"
+            );
+        }
     }
 
     /// #1457: the detail query asks for everything the header's dates are

@@ -3402,6 +3402,33 @@ static TABLE: &str = HIT_none_3;
              {cache_return}: a scope the user has already opened would never be registered, so \
              the backfill would never walk the one scope they are looking at (#1109)"
         );
+
+        // AFTER the identity check (#1570). `stats_cache_read` runs
+        // `note_stats_viewer`, which clears `pr_backfill_scope` when the
+        // account changed -- so a registration made before it is wiped on
+        // the load that made it, and the page is told "registered" about a
+        // row that is gone.
+        let identity = body
+            .find("stats_cache_read(")
+            .expect("stats_board must read the cache through stats_cache_read");
+        assert!(
+            identity < register,
+            "stats_board registers its scope at byte {register}, before the identity check in \
+             stats_cache_read at {identity}: an account change would clear the registration \
+             this load then reports to the page as made (#1570)"
+        );
+
+        // And the cached board carries THIS load's outcome. Without the
+        // assignment a cache hit would report whatever `Default` says
+        // rather than whether registration just succeeded.
+        let assign = body
+            .find("cached.backfill = ")
+            .expect("a cached board must be given this load's backfill registration (#1570)");
+        assert!(
+            assign < cache_return,
+            "stats_board assigns the cached board's backfill at byte {assign}, after it returns \
+             at {cache_return} (#1570)"
+        );
     }
 
     #[test]
@@ -3545,6 +3572,11 @@ static TABLE: &str = HIT_none_3;
     /// `scan_blocking`'s closure, which moves an owned permit onto the
     /// blocking pool with it: the nearest of `scan_blocking(` and
     /// `spawn_blocking(` above the walk has to be the former.
+    ///
+    /// Except classification, which has a permit class of its own
+    /// (#1582): on the scan permits it queued behind the size walks. Its
+    /// walk must sit inside `classify_blocking`, which holds its permit
+    /// the same way.
     #[test]
     fn every_filesystem_scan_takes_a_permit() {
         let src = std::fs::read_to_string(
@@ -3605,8 +3637,25 @@ static TABLE: &str = HIT_none_3;
                     .or_else(|| region.split("pub fn ").nth(1))
                     .and_then(|r| r.split('(').next())
                     .unwrap_or("<unnamed>");
-                let gated = region.rfind("scan_blocking(");
+                // Classification has its OWN permit class (#1582), so it
+                // cannot queue behind the size walks; `classify_blocking`
+                // holds its permit by the walk exactly as `scan_blocking`
+                // does. Every other walk takes the scan permits.
+                let classification = *walk == "worktrees::classify_repo";
+                let gated = if classification {
+                    region.rfind("classify_blocking(")
+                } else {
+                    region.rfind("scan_blocking(")
+                };
                 let bare = region.rfind("spawn_blocking(");
+                assert!(
+                    gated.is_some() || !classification,
+                    "commands.rs: `{name}` classifies a repository's worktrees outside \
+                     `classify_blocking`. On the scan permits it queues behind the size \
+                     walks, which can hold every permit for minutes on a large repository \
+                     -- over five minutes before the countdown began in #1582. Run it as \
+                     `classify_blocking(move || ...).await`."
+                );
                 assert!(
                     gated.is_some_and(|g| bare.is_none_or(|b| g > b)),
                     "commands.rs: `{name}` starts a filesystem walk ({walk}) outside \

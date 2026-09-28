@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { NOT_ASKED } from "@/lib/notAsked";
 import { QueryError } from "./QueryError";
@@ -44,46 +44,53 @@ describe("QueryError", () => {
   });
 });
 
-/// The opt-in report link (#1148).
+/// The opt-in report link (#1148), which now opens a preview (#1575).
 describe("QueryError and Report this", () => {
+  /// The report the dialog would send, as the prefilled form's fields.
+  const reportFields = async () => {
+    fireEvent.click(screen.getByRole("button", { name: /report this/i }));
+    await screen.findByRole("dialog");
+    return new URL(
+      screen.getByRole("link", { name: "Open on GitHub" }).getAttribute("href") ?? "",
+    ).searchParams;
+  };
+
   it("offers no report by default", () => {
     // OPT-IN on purpose: "no network" and "your token expired" are the
     // user's to fix, and a Report link on those invites issues that can
     // only be closed with "this is working as intended".
     render(<QueryError title="Could not load" message="offline" onRetry={() => {}} />);
-    expect(screen.queryByRole("link", { name: /report this/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /report this/i })).toBeNull();
   });
 
   it("offers one when the caller asks", () => {
     render(<QueryError title="Could not load" message="boom" report onRetry={() => {}} />);
-    expect(screen.getByRole("link", { name: /report this/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /report this/i })).toBeTruthy();
   });
 
   it("puts the retry first, because it is the remedy to try first", () => {
     render(<QueryError title="Could not load" message="boom" report onRetry={() => {}} />);
     const retry = screen.getByRole("button", { name: /try again/i });
-    const report = screen.getByRole("link", { name: /report this/i });
+    const report = screen.getByRole("button", { name: /report this/i });
     // `DOCUMENT_POSITION_FOLLOWING` === 4: report comes after retry.
     expect(retry.compareDocumentPosition(report) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
-  it("reports the message, not the title", () => {
+  it("reports the message, not the title", async () => {
     // The title is the app's framing; the message is what actually
     // failed, and it is what a maintainer needs.
     render(<QueryError title="Could not load" message="ECONNREFUSED 127.0.0.1" report />);
-    const href = screen.getByRole("link", { name: /report this/i }).getAttribute("href") ?? "";
-    expect(decodeURIComponent(href)).toContain("ECONNREFUSED");
+    expect((await reportFields()).get("what-happened")).toContain("ECONNREFUSED");
   });
 
-  it("falls back to the title when there is no message", () => {
+  it("falls back to the title when there is no message", async () => {
     // A report saying only "an error occurred" is worse than one naming
     // the panel the user was looking at.
     render(<QueryError title="Could not load the sessions" report />);
-    const href = screen.getByRole("link", { name: /report this/i }).getAttribute("href") ?? "";
-    expect(decodeURIComponent(href)).toContain("Could not load the sessions");
+    expect((await reportFields()).get("what-happened")).toContain("Could not load the sessions");
   });
 
-  it("carries the view and the diagnostics state when given them", () => {
+  it("carries the view and the diagnostics state when given them", async () => {
     render(
       <QueryError
         title="t"
@@ -93,19 +100,22 @@ describe("QueryError and Report this", () => {
         reportDiagnostics={false}
       />,
     );
-    const body = decodeURIComponent(
-      screen.getByRole("link", { name: /report this/i }).getAttribute("href") ?? "",
-    );
-    expect(body).toContain("On the Docker images view");
-    expect(body).toContain("Diagnostic logging was off");
+    const what = (await reportFields()).get("what-happened");
+    expect(what).toContain("View: Docker images");
+    expect(what).toContain("Diagnostic logging: off");
   });
 
-  it("says nothing about diagnostics when the caller does not know", () => {
-    // Three states, not two (#1042): unknown is not off.
+  it("says unknown, not off, when the caller does not know", async () => {
+    // Three states, not two (#1042): unknown is not off. No desktop
+    // answers in this test, so nothing else can supply it.
     render(<QueryError title="t" message="boom" report reportView="Docker images" />);
-    const body = decodeURIComponent(
-      screen.getByRole("link", { name: /report this/i }).getAttribute("href") ?? "",
-    );
-    expect(body).not.toContain("Diagnostic logging");
+    const what = (await reportFields()).get("what-happened");
+    expect(what).toContain("Diagnostic logging: unknown");
+    expect(what).not.toContain("Diagnostic logging: off");
+  });
+
+  it("carries a caught component stack", async () => {
+    render(<QueryError title="t" message="boom" report reportComponentStack="    at DockerPage" />);
+    expect((await reportFields()).get("what-happened")).toContain("at DockerPage");
   });
 });

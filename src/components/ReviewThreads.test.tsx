@@ -27,6 +27,7 @@ const thread = (over: Partial<ReviewThread> = {}): ReviewThread => ({
     {
       author: "carol",
       created_at: "2026-08-20T10:00:00Z",
+      author_is_bot: false,
       body: "This leaks the subscription",
     },
   ],

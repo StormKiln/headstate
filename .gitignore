@@ -40,8 +40,11 @@
 # nine CI jobs.
 node_modules
 dist
-# The transcript harness build (#1480): `make bench-transcript-browser`.
+# The harness build (#1480, #1583): `make bench-transcript-browser`,
+# `make check-shell-scroll`.
 dist-harness
+# The Worktrees harness build (#1582): `make bench-worktrees-browser`.
+dist-harness-worktrees
 target
 src-tauri/target
 src-tauri/gen

@@ -75,6 +75,11 @@ export interface PullRequest extends PrIdentity {
   /// has no such key. Absent reads as "may be short" -- the qualified
   /// answer -- never as exact.
   unresolved_threads_floor?: boolean;
+  /// The repository the head branch lives in, `owner/name` (#1576): the
+  /// fork for a pull request from one, `null` once the fork is deleted.
+  /// OPTIONAL because an older desktop's payload has no such key; absent
+  /// means the pusher is not asked, never asked of the base instead.
+  head_repo?: string | null;
   /// Logins whose review is still outstanding.
   ///
   /// Empty is ORDINARY: repositories that assign reviewers through a
@@ -588,6 +593,19 @@ export interface RepoFile {
 /// Separate from `PullRequest`, which is a list row fetched 100 at a time
 /// on a poll loop -- carrying a body and comments there would make every
 /// tick haul data almost no row needs.
+///
+/// One comment, on the conversation or in a review thread. Mirrors
+/// `github::model::PrComment`.
+export interface PrComment {
+  author: string;
+  created_at: string;
+  body: string;
+  /// GitHub says the author is a `Bot` rather than a person (#1581).
+  /// False for a person, a deleted account, or no answer -- the side the
+  /// repeated-comment fold treats most conservatively.
+  author_is_bot: boolean;
+}
+
 /// One review conversation on a pull request.
 export interface ReviewThread {
   /// The thread's node id, which the resolve and reply commands take --
@@ -610,7 +628,7 @@ export interface ReviewThread {
   viewer_can_reply: boolean;
   viewer_can_resolve: boolean;
   viewer_can_unresolve: boolean;
-  comments: { author: string; created_at: string; body: string }[];
+  comments: PrComment[];
   /// The true total, which can exceed `comments.length` -- the query
   /// pages thread comments at 10.
   comment_count: number;
@@ -670,7 +688,7 @@ export interface PrDetail {
   changed_files: number;
   unresolved_threads: number;
   comment_count: number;
-  comments: { author: string; created_at: string; body: string }[];
+  comments: PrComment[];
   /// The review conversations -- inline threads anchored to a file and
   /// line. A DIFFERENT object from `comments` above, which are flat
   /// top-level comments: only threads can be resolved, so merging the two
@@ -2836,8 +2854,35 @@ export type BranchScanFrame =
   | { kind: "listed"; repo: string; total: number; branches: Branch[] }
   | { kind: "classified"; repo: string; verdicts: [string, Deletable][] };
 
-/// One frame of PR Stats backfill progress, mirroring the Rust
-/// `StatsBackfillFrame` in `src-tauri/src/commands.rs` (#1093).
+/// A registered scope's payload (#1570). Mirrors `BackfillRegistered` in
+/// `src-tauri/src/commands.rs`.
+export interface BackfillRegistered {
+  /// The last frame the collector emitted for this scope, or `null` when it
+  /// has emitted none since the app started. `null` is PENDING -- a frame
+  /// will come -- and never a zeroed frame, which would read as measured.
+  lastFrame: StatsBackfillFrame | null;
+}
+
+/// A failed registration's payload (#1570). Mirrors
+/// `BackfillRegistrationFailed` in `src-tauri/src/commands.rs`.
+export interface BackfillRegistrationFailed {
+  /// Why, in the storage layer's own words. Shown as the cause.
+  reason: string;
+}
+
+/// Whether a scope is registered for collection (#1570), mirroring the Rust
+/// `BackfillRegistration` enum (internally tagged on `state`).
+///
+/// Two states the page must never collapse. Registered with no frame is
+/// Pending: "queued" is true, and a frame replaces it. Failed is a failure:
+/// no frame will ever come, so "queued" would be a Pending nothing moves
+/// out of -- #1042's shape.
+export type BackfillRegistration =
+  | ({ state: "registered" } & BackfillRegistered)
+  | ({ state: "failed" } & BackfillRegistrationFailed);
+
+/// One frame of PR Stats backfill progress (#1093). Mirrors
+/// `StatsBackfillFrame` in `src-tauri/src/commands.rs`.
 ///
 /// ONE shape, unlike `BranchScanFrame`'s two, because this stream has one
 /// kind of news: the coverage moved. Every frame carries the whole state
@@ -3617,6 +3662,10 @@ export interface StatsBoard {
   /// Re-deriving it here would be a second spelling of a key the Rust side
   /// already computes, and a disagreement would silently show no progress.
   scopeKey: string;
+  /// Whether this scope is registered for collection, and the collector's
+  /// last frame for it (#1570). Always this load's outcome, never a cached
+  /// one: the Rust side does not read it back from the cache.
+  backfill: BackfillRegistration;
   /// One row per author who appears, in no ranking order -- the UI ranks by
   /// whichever measure its chart is about.
   rows: AuthorRow[];
@@ -3903,6 +3952,32 @@ type LastPusher =
   | { state: "unknown"; reason: string };
 
 export interface ReviewGates {
+  rules: BaseRules;
+  last_pusher: LastPusher;
+}
+
+/// One Ready for review row's question (#1576). Mirrors
+/// `github::gates::PusherAsk`.
+export interface PusherAsk {
+  repo: string;
+  number: number;
+  base: string;
+  head_repo: string | null;
+  head_ref: string;
+  head_oid: string;
+}
+
+/// One Ready for review row's answer (#1576). Mirrors
+/// `github::gates::RowPusher`.
+///
+/// `last_pusher` is never `not_needed` here. `declined` means NOT CHECKED
+/// -- the budget, the per-refresh cap, or no head repository to ask --
+/// and is never a verdict. `head_oid` is echoed so an answer about a head
+/// the row has since moved off is dropped rather than applied.
+export interface RowPusher {
+  repo: string;
+  number: number;
+  head_oid: string;
   rules: BaseRules;
   last_pusher: LastPusher;
 }

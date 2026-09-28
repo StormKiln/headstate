@@ -246,6 +246,16 @@ const ROWS: Row[] = [
     "get_review_gates",
     { repo, base: "main", headRepo: "fork/r", headRef: "feat/x", headOid: "abc123" },
   ),
+  row(
+    api.getReadyPushers,
+    [[{ repo, number: 7, base: "main", head_repo: "fork/r", head_ref: "feat/x", head_oid: "abc123" }]],
+    "get_ready_pushers",
+    {
+      rows: [
+        { repo, number: 7, base: "main", head_repo: "fork/r", head_ref: "feat/x", head_oid: "abc123" },
+      ],
+    },
+  ),
   row(api.sizeWorktrees, [repoPath], "size_worktrees", { repoPath }),
   row(api.pullCheckout, [path], "pull_checkout", { path }),
   row(api.fetchRefs, [path], "fetch_refs", { path }),
@@ -284,6 +294,7 @@ const ROWS: Row[] = [
   row(api.toolVersions, [], "tool_versions"),
   row(api.readLogTail, [4096], "read_log_tail", { maxBytes: 4096 }),
   row(api.revealLog, [], "reveal_log"),
+  row(api.diagnosticBundle, [], "diagnostic_bundle"),
   row(api.claudeMdEffective, [repoPath], "claude_md_effective", { repoPath }),
   // `mode` is omitted by the caller and sent as explicit `null` (#1293):
   // the Rust side takes `Option<Mode>` and defaults to `Cached`, and a

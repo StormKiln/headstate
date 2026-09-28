@@ -1187,6 +1187,10 @@ pub fn spawn(
                     Ok(res) => res,
                     Err(_) => Err(ClientError::Timeout(FETCH_TIMEOUT.as_secs())),
                 };
+            // For "Report this" (#1575): how long the search took, timeout
+            // included, before the review queue spends the rest.
+            let fetch_ms = tick_started.elapsed().as_millis() as u64;
+            let mut reviewing_outcome = "ok";
 
             // The review queue: for the ready-to-review notification AND
             // for the To Review page's cache.
@@ -1220,6 +1224,7 @@ pub fn spawn(
                     // next tick is about to ask the same question with a
                     // full budget.
                     crate::diag!("[diag] poll reviewing skipped: tick budget spent");
+                    reviewing_outcome = "skipped";
                     Err(source_poll::Failure {
                         message: "Review refresh was not started: the poll budget was spent."
                             .into(),
@@ -1231,9 +1236,11 @@ pub fn spawn(
                         Ok(Ok(list)) => Ok(list),
                         Ok(Err(e)) => {
                             crate::diag!("[diag] poll reviewing failed: {e}");
+                            reviewing_outcome = "failed";
                             Err(source_poll::Failure::from(&e))
                         }
                         Err(_) => {
+                            reviewing_outcome = "timed out";
                             crate::diag!(
                                 "[diag] poll reviewing timed out after {}ms of tick budget",
                                 remaining.as_millis()
@@ -1253,6 +1260,18 @@ pub fn spawn(
                     Err(e) => format!("err: {e}"),
                 }
             );
+            // This report is readable from a paired phone; redact the
+            // failure while retaining its timeout as a separate measure.
+            let tick_failure: Option<(String, Option<u64>)> = match &fetched {
+                Ok(_) => None,
+                Err(e) => Some((
+                    crate::redact::redact(&e.to_string()),
+                    match e {
+                        ClientError::Timeout(s) => Some(*s),
+                        _ => None,
+                    },
+                )),
+            };
             // Each successful queue survives a failure from the other queue.
             let review_publication = if reviewing_now.is_ok() {
                 source_poll::success_publication(&app, &reviewing_attempt).await
@@ -1407,6 +1426,18 @@ pub fn spawn(
                     }
                 }
             }
+            let ok = tick_failure.is_none();
+            let (error, timed_out_after_secs) = tick_failure.unzip();
+            crate::report::record_tick(crate::report::PollTickRecord {
+                at_unix_ms: crate::report::now_unix_ms(),
+                ok,
+                fetch_ms,
+                error,
+                timed_out_after_secs: timed_out_after_secs.flatten(),
+                attempt: consecutive_failures,
+                reviewing: reviewing_outcome.to_string(),
+            });
+
             // Whichever comes first: the cadence elapsing, or someone
             // asking for a refresh. `Notify` stores one permit, so a
             // request that arrives mid-fetch is not lost -- the next
@@ -1417,6 +1448,7 @@ pub fn spawn(
                 interval_secs.load(Ordering::Relaxed),
             );
             crate::diag!("[diag] poll tick sleeping {}s", sleep_for.as_secs());
+            crate::report::note_wait(sleep_for.as_secs());
             tokio::select! {
                 _ = tokio::time::sleep(interval_for_secs(
                     // A view that does not show PR data polls at the
@@ -2302,6 +2334,7 @@ mod tests {
             head_ref: "feature/x".into(),
             head_oid: "deadbeef".into(),
             head_ref_id: None,
+            head_repo: None,
             base_ref: "main".into(),
             author: "octocat".into(),
             is_draft: false,
@@ -3041,6 +3074,7 @@ mod tests {
             head_ref: "feature/x".into(),
             head_oid: "deadbeef".into(),
             head_ref_id: None,
+            head_repo: None,
             base_ref: "main".into(),
             created_at: t,
             ready_at: Some(t),

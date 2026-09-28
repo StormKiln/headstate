@@ -37,6 +37,8 @@ import type {
   NetProcess,
   PrDetail,
   PullRequest,
+  PusherAsk,
+  RowPusher,
   ReviewState,
   Upstream,
   Venv,
@@ -63,6 +65,7 @@ import { createCoalescer } from "@/lib/coalesce";
 import { createLimiter, withDeadline } from "@/lib/limiter";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { matchPrLinks, parsePrQuery, type PrQuery } from "@/lib/claudePrs";
+import { readyPusher, type ReadyPusher, type ViewerLogin } from "@/lib/readyPusher";
 import {
   toolVersions,
   readLogTail,
@@ -105,6 +108,7 @@ import {
   mergeStack,
   getPrDetail,
   getReviewGates,
+  getReadyPushers,
   getWorktreeDirs,
   classifyRepoUpstream,
   classifyWorktrees,
@@ -2688,6 +2692,67 @@ export function useReviewGates(pr: PrDetail | undefined, isPlaceholder: boolean)
   });
 }
 
+/// Re-ask while any row is undecided -- declined past the budget or the
+/// per-refresh cap, or unknown because the activity log lagged a push.
+/// Known answers are cached by head commit on the desktop, so a re-ask
+/// spends only on the rows still open.
+const READY_PUSHERS_RETRY_MS = 120_000;
+
+/// Who pushed each Ready for review row's head, and each base's
+/// last-push rule (#1576).
+///
+/// `of(pr)` is the seam: the strip's tag and filter read it, and so can
+/// anything else on the strip that needs the pusher (a batch action's
+/// prompt list, say). It returns `readyPusher`'s states, so a caller
+/// cannot mistake "not checked" for "someone else pushed".
+///
+/// One query for the whole strip, keyed by every row's head commit in
+/// the strip's order: the desktop answers the top rows first when it
+/// caps a refresh. The previous answer is kept while a new key loads,
+/// and `readyPusher` drops any answer whose head commit no longer
+/// matches, so a moved branch reads as not checked rather than as its
+/// old pusher.
+export function useReadyPushers(prs: PullRequest[]) {
+  const asks: PusherAsk[] = prs.map((pr) => ({
+    repo: pr.repo,
+    number: pr.number,
+    base: pr.base_ref,
+    head_repo: pr.head_repo ?? null,
+    head_ref: pr.head_ref,
+    head_oid: pr.head_oid,
+  }));
+  const key = asks.map((a) => `${a.repo}#${a.number}@${a.head_oid}`).join(",");
+  const viewerQ = useViewer();
+  const q = useQuery({
+    queryKey: ["ready-pushers", key],
+    queryFn: () => getReadyPushers(asks),
+    enabled: asks.length > 0,
+    staleTime: 60_000,
+    placeholderData: (prev) => prev,
+    retry: 0,
+    refetchInterval: (query) =>
+      (query.state.data ?? []).some(
+        (r) => r.last_pusher.state === "declined" || r.last_pusher.state === "unknown",
+      )
+        ? READY_PUSHERS_RETRY_MS
+        : false,
+  });
+  const byRow = useMemo(() => {
+    const m = new Map<string, RowPusher>();
+    for (const r of q.data ?? []) m.set(`${r.repo}#${r.number}`, r);
+    return m;
+  }, [q.data]);
+  // `undefined` while loading, `null` once it has failed: the second is
+  // "could not tell", the first "not checked yet".
+  const viewer: ViewerLogin = viewerQ.isError ? null : viewerQ.data;
+  const of = useCallback(
+    (pr: PullRequest): ReadyPusher =>
+      readyPusher(pr, byRow.get(`${pr.repo}#${pr.number}`), viewer),
+    [byRow, viewer],
+  );
+  return { of, isPending: q.isPending && asks.length > 0 };
+}
+
 /// Repos with worktrees. Listing only -- see `useWorktreeSafety`.
 ///
 /// `staleTime` is short but non-zero: the set changes when the user
@@ -2858,7 +2923,17 @@ export function useWorktreeSafety(repoPath: string | undefined, listed?: Worktre
     queryKey: ["worktree-safety", repoPath],
     queryFn: () => classifyWorktrees(repoPath as string),
     enabled: Boolean(repoPath),
-    staleTime: 30_000,
+    // NOT refetched on focus, and stale only after five minutes (#1582).
+    // A pass on a 141-worktree repository takes minutes, so the old 30s
+    // `staleTime` plus the app-wide focus refetch meant that leaving the
+    // window and coming back started a SECOND whole pass on top of the
+    // first. The verdicts change when the user acts -- a removal, a
+    // fetch, a pull -- and each of those invalidates this key itself.
+    // The desktop also joins a request to a pass already running for the
+    // same repository, so an invalidation mid-pass waits for that pass
+    // rather than starting another.
+    staleTime: 5 * 60_000,
+    refetchOnWindowFocus: false,
     retry: false,
   });
 

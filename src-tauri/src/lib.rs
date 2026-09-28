@@ -25,6 +25,7 @@ pub mod poll;
 pub mod redact;
 pub mod release_notes;
 pub mod remote;
+pub mod report;
 pub mod repos;
 pub mod source_poll;
 pub mod store;
@@ -298,6 +299,7 @@ pub fn run() {
             commands::refresh_source,
             commands::set_source_selection,
             commands::read_log_tail,
+            commands::diagnostic_bundle,
             commands::reveal_log,
             commands::pull_checkout,
             commands::fetch_refs,
@@ -315,6 +317,7 @@ pub fn run() {
             commands::gitlab_action_capabilities,
             commands::gitlab_action,
             commands::get_review_gates,
+            commands::get_ready_pushers,
             commands::act_on_pr,
             commands::merge_stack,
             commands::build_target,

@@ -116,24 +116,26 @@ describe("ErrorBoundary offers a report", () => {
         <Boom />
       </ErrorBoundary>,
     );
-    expect(screen.getByRole("link", { name: /report this/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /report this/i })).toBeTruthy();
     // Beside, not instead of: retrying is still the remedy.
     expect(screen.getByRole("button", { name: /reset/i })).toBeTruthy();
   });
 
-  it("attaches the component stack to the report URL", () => {
-    // THE point of this change. The stack was `console.error`'d and
-    // nothing else -- invisible on a release build, where nobody has a
-    // console open.
+  it("attaches the component stack to the report", async () => {
+    // THE point of #1148. The stack was `console.error`'d and nothing
+    // else -- invisible on a release build, where nobody has a console
+    // open.
     render(
       <ErrorBoundary>
         <Boom />
       </ErrorBoundary>,
     );
-    const href = screen.getByRole("link", { name: /report this/i }).getAttribute("href") ?? "";
-    const body = decodeURIComponent(href);
-    expect(body).toContain("### Where");
+    fireEvent.click(screen.getByRole("button", { name: /report this/i }));
+    await screen.findByRole("dialog");
+    const href = screen.getByRole("link", { name: "Open on GitHub" }).getAttribute("href") ?? "";
+    const what = new URL(href).searchParams.get("what-happened") ?? "";
+    expect(what).toContain("Component stack:");
     // React names the throwing component in the stack it supplies.
-    expect(body).toContain("Boom");
+    expect(what).toContain("Boom");
   });
 });

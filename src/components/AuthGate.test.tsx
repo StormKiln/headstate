@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { emit } from "@tauri-apps/api/event";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import { afterEach, describe, expect, it } from "vitest";
@@ -86,6 +86,40 @@ describe("AuthGate", () => {
     // Content stays mounted -- a poll failure is not a reason to hide the
     // last-known-good cached data.
     expect(screen.getByText("protected content")).toBeTruthy();
+  });
+
+  /// The banner's "Report this" passed neither the view nor the
+  /// diagnostics flag, so the report said nothing about either (#1575).
+  ///
+  /// The desktop's bundle is NOT answered here, so the diagnostics line
+  /// can only have come from the banner's own prop.
+  it("passes the view and diagnostics into the poll banner's report", async () => {
+    mockIPC(
+      (cmd) => {
+        if (cmd === "get_auth_state") return { ok: true, message: "" };
+        if (cmd === "get_ui_prefs") return { diagnostic_logging: true };
+        return undefined;
+      },
+      { shouldMockEvents: true },
+    );
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <AuthGate>
+          <div>protected content</div>
+        </AuthGate>
+      </QueryClientProvider>,
+    );
+    await screen.findByText("protected content");
+    await emit("poll-error", "GitHub request timed out after 30s");
+    const button = await screen.findByRole("button", { name: "Report this" });
+    // Prefs load asynchronously; the report reads them when opened.
+    await waitFor(() => expect(qc.getQueryData(["ui-prefs"])).toBeTruthy());
+    fireEvent.click(button);
+    const where = await screen.findByRole("textbox", { name: "Where" });
+    const text = (where as HTMLTextAreaElement).value;
+    expect(text).toContain("View: My pull requests");
+    expect(text).toContain("Diagnostic logging: on");
   });
 
   /// A poll the app DECLINED to issue is not a failed refresh (#1124),

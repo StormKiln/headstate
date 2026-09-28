@@ -1202,6 +1202,42 @@ pub async fn get_review_gates(
     Ok(out)
 }
 
+/// Each strip lookup's own ceiling (#1576). Shorter than `FETCH_TIMEOUT`:
+/// these are advisory, run a chunk at a time, and a hung one should cost
+/// its row, not half a minute of the whole strip.
+const STRIP_PER_REQUEST: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Who pushed each Ready for review row's head, and what each base's
+/// rules say (#1576).
+///
+/// The strip's batched counterpart of `get_review_gates`, built from the
+/// same parts (`github::gates`): rules cached per (repository, base),
+/// pushers cached per (head repository, head commit), and at most
+/// `STRIP_LOOKUP_CAP` new activity reads per call, inside the REST
+/// budget. A row past the cap or the budget comes back `Declined` -- not
+/// checked -- so the strip never mistakes "we did not ask" for "we could
+/// not tell" (#1050).
+///
+/// Never an `Err` for a GitHub failure; `Err` is only "no client".
+#[tauri::command]
+pub async fn get_ready_pushers(
+    client: State<'_, GhClient>,
+    rows: Vec<crate::github::gates::PusherAsk>,
+) -> Result<Vec<crate::github::gates::RowPusher>, String> {
+    // Names are not logged, for the reason `get_pr_detail` gives.
+    crate::diag!("[diag] cmd get_ready_pushers start rows={}", rows.len());
+    let started = std::time::Instant::now();
+    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+    let budget = crate::github::stats::Budget::new();
+    let out = crate::github::gates::strip_pushers(&client, &budget, &rows, STRIP_PER_REQUEST).await;
+    crate::diag!(
+        "[diag] cmd get_ready_pushers end {}ms rest_requests={}",
+        started.elapsed().as_millis(),
+        budget.rest_requests()
+    );
+    Ok(out)
+}
+
 #[tauri::command]
 /// A previously stored scan, for the cold start (#1152).
 ///
@@ -1348,15 +1384,43 @@ pub async fn classify_worktrees(
     app: AppHandle,
     repo_path: String,
 ) -> Result<Vec<crate::worktrees::Worktree>, String> {
-    // One budget across every filesystem scan (#1149), held by the
-    // walk itself rather than by this future -- see `scan_blocking`.
-    // Two failure modes, both real: the join can fail if the blocking
-    // task panicked, and classification itself can fail if git refuses.
+    // ONE pass per repository at a time (#1582). A second request while a
+    // pass runs JOINS it -- it waits for the same result, and the rows it
+    // is showing fill from the same `worktree-safety` events -- rather
+    // than starting a second pass beside the first. Before this, a focus
+    // refetch, or an invalidation after a removal, started a whole second
+    // pass on a 141-worktree repository while the first was still
+    // running: twice the workers, twice the git, on the same disk.
+    let key = repo_path.clone();
+    classify_passes()
+        .join_or_start(&key, move || classify_pass(app, repo_path))
+        .await?
+}
+
+/// The passes running now, one per repository path.
+fn classify_passes() -> &'static SingleFlight<Result<Vec<crate::worktrees::Worktree>, String>> {
+    static PASSES: std::sync::OnceLock<
+        SingleFlight<Result<Vec<crate::worktrees::Worktree>, String>>,
+    > = std::sync::OnceLock::new();
+    PASSES.get_or_init(SingleFlight::new)
+}
+
+/// One classification pass: the offline verdicts, streamed, then GitHub's
+/// record of merges. See `classify_worktrees`.
+async fn classify_pass(
+    app: AppHandle,
+    repo_path: String,
+) -> Result<Vec<crate::worktrees::Worktree>, String> {
+    // Under CLASSIFICATION's permits, not the scan permits the size walks
+    // hold (#1582) -- see `classify_permits`. Held by the walk itself
+    // rather than by this future, as `scan_blocking` explains. Two
+    // failure modes, both real: the join can fail if the blocking task
+    // panicked, and classification itself can fail if git refuses.
     // Flattened rather than swallowed, so an unreadable repo surfaces as
     // an error instead of as zero worktrees.
     let emitter = app.clone();
     let path = repo_path.clone();
-    let rows = scan_blocking(move || {
+    let rows = classify_blocking(move || {
         let mut out = Vec::new();
         crate::worktrees::classify_repo_streaming(&path, &mut |w| {
             // Emitted per worktree rather than batched, for the reason
@@ -1584,6 +1648,131 @@ fn scan_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
             .unwrap_or(4);
         std::sync::Arc::new(tokio::sync::Semaphore::new(n))
     })
+}
+
+/// Classification's OWN permits, apart from the scan permits (#1582).
+///
+/// Classification used to draw from `scan_permits`, the same budget as
+/// every size walk. The Worktrees page starts both passes at once, and a
+/// size walk is long -- MEASURED, 21.40s for one 200 GB checkout, and
+/// minutes across a repository of 141 -- so the walks could hold every
+/// permit while classification waited behind them. #1582's report fits
+/// that: over five minutes before the "checking what is safe to remove"
+/// countdown began at all.
+///
+/// Its own class rather than a place at the front of the same queue,
+/// because the two do different work for different ends. Sizing is a disk
+/// walk and only informational; classification is git processes, and it
+/// is the answer the user ACTS on -- nothing on the page can be removed
+/// until it arrives. A priority inside one semaphore would still make a
+/// classification wait for a walk that already holds a permit to finish.
+///
+/// Two, because a pass is already `CLASSIFY_WORKERS` threads wide and
+/// `classify_worktrees` runs one pass per repository: two lets a second
+/// repository's pass start while the first finishes, without letting a
+/// burst of repository switches put dozens of git workers on one disk.
+///
+/// `classify_repo_upstream` stays on the scan permits: it is one worktree
+/// per repository for the overview's table, fired for every repository
+/// at once, and giving it this class would queue the Worktrees page's
+/// pass behind ~38 of them.
+fn classify_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static PERMITS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(2)))
+}
+
+/// `scan_blocking`, under classification's own permits (#1582). The
+/// permit is held by the walk, for `scan_blocking`'s reason (#1467).
+async fn classify_blocking<T, F>(walk: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    blocking_under(classify_permits().clone(), walk).await
+}
+
+/// At most one run of a keyed job at a time; a second request while one
+/// runs JOINS it and receives the same result (#1582).
+///
+/// The run is SPAWNED, not driven by whichever caller started it: a
+/// caller that goes away (the phone's call timeout, a page unmount) must
+/// not cancel a pass other callers are waiting on, and could not stop the
+/// blocking work underneath anyway. Its entry is removed when the run
+/// ends, including by a panic, so the next request after it starts
+/// fresh.
+pub(crate) struct SingleFlight<T> {
+    running: std::sync::Mutex<
+        std::collections::HashMap<String, tokio::sync::watch::Receiver<Option<T>>>,
+    >,
+}
+
+impl<T: Clone + Send + Sync + 'static> SingleFlight<T> {
+    pub(crate) fn new() -> Self {
+        Self {
+            running: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Join the run for `key` if there is one, or start one with `start`.
+    ///
+    /// `Err` only when the run ended without a result, which is a panic
+    /// inside it: "stopped" rather than a fabricated answer.
+    pub(crate) async fn join_or_start<F, Fut>(
+        &'static self,
+        key: &str,
+        start: F,
+    ) -> Result<T, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T> + Send + 'static,
+    {
+        let mut rx = {
+            let mut running = self.running.lock().unwrap_or_else(|p| p.into_inner());
+            match running.get(key) {
+                Some(rx) => rx.clone(),
+                None => {
+                    let (tx, rx) = tokio::sync::watch::channel(None);
+                    running.insert(key.to_string(), rx.clone());
+                    let run = start();
+                    let done = Finished {
+                        flight: self,
+                        key: key.to_string(),
+                    };
+                    tauri::async_runtime::spawn(async move {
+                        let out = run.await;
+                        // Removed BEFORE the result is published, so a
+                        // request that arrives after it starts a new run
+                        // instead of joining a finished one.
+                        drop(done);
+                        let _ = tx.send(Some(out));
+                    });
+                    rx
+                }
+            }
+        };
+        let out = match rx.wait_for(Option::is_some).await {
+            Ok(v) => v.clone().ok_or_else(|| "waited for a result".to_string()),
+            Err(_) => Err("the classification stopped before it finished".to_string()),
+        };
+        out
+    }
+}
+
+/// Removes a run's entry when the run ends, however it ends.
+struct Finished<T: 'static> {
+    flight: &'static SingleFlight<T>,
+    key: String,
+}
+
+impl<T> Drop for Finished<T> {
+    fn drop(&mut self) {
+        self.flight
+            .running
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.key);
+    }
 }
 
 /// Take a permit from `permits`. Owned, so it can outlive the future
@@ -2232,6 +2421,32 @@ pub async fn read_log_tail(
     })
     .await
     .map_err(|e| format!("could not read the log: {e}"))?
+}
+
+#[tauri::command]
+/// Everything "Report this" can say about this machine, redacted (#1575).
+///
+/// `Class::Read`, and served to a paired phone. The poll whose failure
+/// the phone's banner shows runs HERE, so the phone's report is about
+/// this machine's poll, `gh` and log -- and every part of the bundle is
+/// already a Read on its own (`build_target`, `tool_versions`,
+/// `read_log_tail`, `get_poll_interval`). Refusing the bundle would
+/// withhold nothing and cost the phone's report its whole substance.
+///
+/// Infallible: every part that cannot be gathered is `None` with a note,
+/// so a report is never lost to one lookup (#1044).
+pub async fn diagnostic_bundle(app: AppHandle) -> crate::report::DiagnosticBundle {
+    use tauri::Manager;
+    let version = app.package_info().version.to_string();
+    let interval = app
+        .try_state::<crate::poll::PollInterval>()
+        .map(|s| s.0.load(std::sync::atomic::Ordering::Relaxed));
+    let log_file = app
+        .path()
+        .app_log_dir()
+        .ok()
+        .map(|d| d.join("headstate.log"));
+    crate::report::bundle(version, interval, log_file).await
 }
 
 #[tauri::command]
@@ -4142,8 +4357,12 @@ pub async fn latest_release(app: AppHandle) -> Option<String> {
     // Through the authenticated client, which already exists -- rather
     // than adding an HTTP dependency for one request. The endpoint is
     // public, so this works whether or not the token has any scopes.
+    //
+    // The canonical owner (#1575): the repository moved, and this named
+    // the old one. `release_notes::REPO` and `src/lib/repo.ts` spell the
+    // same slug, and tests on both sides assert they agree.
     let json: serde_json::Value = octocrab::instance()
-        .get("/repos/pktstorm/headstate/releases/latest", None::<&()>)
+        .get("/repos/StormKiln/headstate/releases/latest", None::<&()>)
         .await
         .ok()?;
     let tag = json.get("tag_name")?.as_str()?.trim_start_matches('v');
@@ -4771,6 +4990,9 @@ fn note_stats_viewer(conn: &rusqlite::Connection, viewer: &str) {
                 Ok(m) => log::info!("dropped {m} backfill scopes for that identity"),
                 Err(e) => log::warn!("could not clear the backfill scopes: {e}"),
             }
+            // And the frames remembered for those scopes (#1570), which
+            // would otherwise seed the next page with the old coverage.
+            forget_backfill_frames();
         }
         Err(e) => log::warn!("could not record the stats viewer: {e}"),
     }
@@ -4912,28 +5134,61 @@ const MAX_PROBE_ROUNDS: u64 = 4;
 ///
 /// A failure costs the backfill, never the board: the user's answer does
 /// not depend on a bookkeeping write, and the next load registers again.
+///
+/// # Why the outcome is RETURNED (#1570)
+///
+/// It used to be logged and dropped. The page then could not tell a scope
+/// queued behind others from one that was never registered, so a failed
+/// registration rendered "queued for collection" forever: a Pending that
+/// nothing would ever move out of, which is #1042's shape. The `Err` is
+/// the reason the page shows instead.
 async fn note_scope_seen(
     db: std::path::PathBuf,
     registration: crate::store::pr_backfill_scope::BackfillScope,
     now: chrono::DateTime<chrono::Utc>,
-) {
-    let _ = tauri::async_runtime::spawn_blocking(move || {
-        let Ok(conn) = open_db(&db) else {
-            log::warn!("could not open the database to register this scope for backfill");
-            return;
-        };
-        if let Err(e) = crate::store::pr_backfill_scope::note_seen(&conn, &registration, now) {
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&db).map_err(|e| {
+            log::warn!("could not open the database to register this scope for backfill: {e}");
+            "the local database could not be opened".to_string()
+        })?;
+        crate::store::pr_backfill_scope::note_seen(&conn, &registration, now).map_err(|e| {
             log::warn!("could not register this scope for backfill: {e}");
-        } else {
-            crate::diag!(
-                "[diag] backfill scope registered key={} kind={} horizon={}",
-                registration.scope_key,
-                registration.scope_kind,
-                registration.horizon_days
-            );
-        }
+            e.to_string()
+        })?;
+        crate::diag!(
+            "[diag] backfill scope registered key={} kind={} horizon={}",
+            registration.scope_key,
+            registration.scope_kind,
+            registration.horizon_days
+        );
+        Ok(())
     })
-    .await;
+    .await
+    .map_err(|e| {
+        log::warn!("the backfill registration task failed: {e}");
+        "the registration did not complete".to_string()
+    })?
+}
+
+/// What the page is told about this scope's backfill (#1570).
+///
+/// A failed registration carries its reason and NO frame: the page renders
+/// it as a failure, never as "queued", because nothing will ever arrive to
+/// replace a queued line for a scope the worker does not know about.
+///
+/// A registered one carries the last frame the worker emitted for this
+/// scope since the app started, if any. That is what a page left open the
+/// whole time would be showing, so a scope switch lands on it at once
+/// rather than on the generic queued line -- the worker may have been
+/// collecting this scope for an hour.
+fn backfill_registration(outcome: Result<(), String>, scope_key: &str) -> BackfillRegistration {
+    match outcome {
+        Ok(()) => BackfillRegistration::Registered(BackfillRegistered {
+            last_frame: last_backfill_frame(scope_key),
+        }),
+        Err(reason) => BackfillRegistration::Failed(BackfillRegistrationFailed { reason }),
+    }
 }
 
 /// Per-author aggregates for one scope: #826's Mine and Others views and
@@ -5078,7 +5333,8 @@ pub async fn stats_board(
     let key = crate::store::stats::key(crate::store::stats::Kind::Board, &q.cache_key(&viewer));
     // Off the runtime since #1090; see `stats_cache_read`.
     let db = db_path(&app);
-    // REGISTERED BEFORE THE CACHE IS READ, not after the fetch (#1109).
+    // REGISTERED BEFORE A CACHED BOARD CAN RETURN, not after the fetch
+    // (#1109).
     //
     // This used to live on the accumulate path, which a cache hit returns
     // before reaching -- so the scope a user had already opened once was
@@ -5101,7 +5357,6 @@ pub async fn stats_board(
         measure: measure_name.to_string(),
         horizon_days: crate::github::stats::backfill::HORIZON_DAYS.max(clamp_days(days) as u32),
     };
-    note_scope_seen(db.clone(), registration.clone(), now).await;
     let hit = stats_cache_read(
         db.clone(),
         viewer.clone(),
@@ -5111,13 +5366,31 @@ pub async fn stats_board(
         now,
     )
     .await?;
+    // AFTER `stats_cache_read`, and that is load-bearing (#1570). The read
+    // runs `note_stats_viewer`, and a changed identity clears
+    // `pr_backfill_scope` -- so a registration made before it was wiped on
+    // the very load that made it, while this command went on to report it
+    // as registered. Registering after the identity check means the row
+    // the outcome describes is the row that is there.
+    //
+    // It is still before the cache-hit return below, which is #1109's
+    // requirement. The invariant that guards #1109 holds both orderings.
+    let backfill = backfill_registration(
+        note_scope_seen(db.clone(), registration, now).await,
+        &q.cache_key(&viewer),
+    );
     if let Some(payload) = hit {
-        if let Ok(cached) = serde_json::from_str::<StatsBoard>(&payload) {
+        if let Ok(mut cached) = serde_json::from_str::<StatsBoard>(&payload) {
             crate::diag!(
                 "[diag] cmd stats_board cache hit authors={} complete={}",
                 cached.board.rows.len(),
                 cached.board.complete
             );
+            // THIS load's outcome, never the stored one: a cached board is
+            // an answer about a window, while registration is about now.
+            // The field is not deserialised at all (`skip_deserializing`),
+            // so a stale row cannot carry an old "registered" through.
+            cached.backfill = backfill;
             return Ok(cached);
         }
         // Same handling as `stats_count`'s: a payload that will not parse
@@ -5183,13 +5456,13 @@ pub async fn stats_board(
                 req.window.to.clone(),
                 loaded,
                 now,
-                registration.clone(),
             )
             .await;
             Ok(StatsBoard {
                 viewer: viewer.clone(),
                 scope_key: scope_key.clone(),
                 board,
+                backfill,
             })
         }
         Err(e) => Err(e),
@@ -5295,19 +5568,10 @@ async fn accumulate_board(
     window_end: String,
     loaded: crate::github::stats::board::LoadedBoard,
     now: chrono::DateTime<chrono::Utc>,
-    registration: crate::store::pr_backfill_scope::BackfillScope,
 ) -> crate::github::stats::Board {
     let fallback = loaded.board.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        accumulate_board_blocking(
-            &db,
-            &scope_key,
-            &window_start,
-            &window_end,
-            loaded,
-            now,
-            &registration,
-        )
+        accumulate_board_blocking(&db, &scope_key, &window_start, &window_end, loaded, now)
     })
     .await
     // A panicked join means the accumulation did not happen. The
@@ -5325,7 +5589,6 @@ fn accumulate_board_blocking(
     window_end: &str,
     loaded: crate::github::stats::board::LoadedBoard,
     now: chrono::DateTime<chrono::Utc>,
-    registration: &crate::store::pr_backfill_scope::BackfillScope,
 ) -> crate::github::stats::Board {
     use crate::store::pr_history;
 
@@ -5363,18 +5626,12 @@ fn accumulate_board_blocking(
         Ok(n) => log::info!("pruned {n} accumulated pull requests past the bound"),
         Err(e) => log::warn!("could not prune accumulated pull requests: {e}"),
     }
-    // Register the scope so the background worker can advance it (#1092).
-    // A scope is walked because a user OPENED it -- background spend
-    // follows demonstrated interest rather than everything a token can
-    // see, which is what keeps `Scope::All` from becoming an unbounded
-    // walk nobody asked for.
-    //
-    // A failure here costs the backfill, never the board: the user's
-    // answer is already assembled and must not depend on a bookkeeping
-    // write.
-    if let Err(e) = crate::store::pr_backfill_scope::note_seen(&conn, registration, now) {
-        log::warn!("could not register this scope for backfill: {e}");
-    }
+    // No registration here since #1570. `stats_board` registers the scope
+    // once, after the identity check and before either return, and reports
+    // the outcome to the page. A second, silent registration here only
+    // existed to repair the first being wiped by an identity change on the
+    // same load -- an ordering `stats_board` no longer has -- and a second
+    // outcome would be one more that could disagree with the reported one.
     let Ok(stored) = pr_history::load(&conn, scope_key, window_start, window_end) else {
         log::warn!("could not read accumulated pull requests back");
         return board;
@@ -5428,6 +5685,64 @@ pub struct StatsBoard {
     pub scope_key: String,
     #[serde(flatten)]
     pub board: crate::github::stats::Board,
+    /// Whether this scope is registered for the background backfill, and
+    /// the worker's last frame for it (#1570).
+    ///
+    /// `skip_deserializing` because a cached board is read back from
+    /// `stats_cache`, and registration is a fact about THIS load, not
+    /// about the window the cached answer describes. `stats_board` sets it
+    /// on every return; the `Default` only exists to let serde build the
+    /// struct before that assignment.
+    #[serde(skip_deserializing)]
+    pub backfill: BackfillRegistration,
+}
+
+/// Whether a scope is registered for the backfill (#1570).
+///
+/// Two states, never collapsed into "no frame yet". Registered-with-no-frame
+/// is PENDING: the worker will reach this scope and a frame will replace
+/// the page's queued line. Failed is a FAILURE: nothing will ever arrive,
+/// so a queued line would be a Pending that nothing moves out of -- #1042's
+/// shape, which is what this type exists to make unrepresentable.
+///
+/// Newtype variants over named structs rather than inline fields, so each
+/// payload has a TypeScript interface the mirrored-type invariant checks.
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum BackfillRegistration {
+    Registered(BackfillRegistered),
+    Failed(BackfillRegistrationFailed),
+}
+
+impl Default for BackfillRegistration {
+    /// Only for `StatsBoard`'s `skip_deserializing`; overwritten before any
+    /// board is returned. A FAILURE rather than a registration if that ever
+    /// stopped being true: an unreported registration must not read as
+    /// queued, which is the exact lie #1570 removed.
+    fn default() -> Self {
+        BackfillRegistration::Failed(BackfillRegistrationFailed {
+            reason: "the registration was not reported".to_string(),
+        })
+    }
+}
+
+/// A registered scope, with the worker's last frame for it if there is one.
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct BackfillRegistered {
+    /// `None` until the worker has emitted a frame for this scope since the
+    /// app started. Never a zeroed frame: "0 of 30 days" is a measurement,
+    /// and nothing has measured this scope yet.
+    pub last_frame: Option<StatsBackfillFrame>,
+}
+
+/// A scope whose registration failed, and why.
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct BackfillRegistrationFailed {
+    /// Shown to the reader as the cause. The storage error's own text, or
+    /// a plain statement when the database could not be opened at all.
+    pub reason: String,
 }
 
 /// The scoped daily activity series: merged and opened counts per day.
@@ -7810,6 +8125,145 @@ mod claudify_tests {
 
 #[cfg(test)]
 mod tests {
+    /// Serialises the tests that CLEAR the remembered frames against the
+    /// ones that read one back. Keys keep the others apart; a clear is the
+    /// one operation a key cannot scope.
+    static FRAMES_CLEAR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A frame for a scope key no other test uses. The remembered frames
+    /// are process-wide, so each test owns its key rather than sharing one.
+    fn frame_for(scope_key: &str, days_covered: usize) -> super::StatsBackfillFrame {
+        super::StatsBackfillFrame {
+            scope_key: scope_key.to_string(),
+            days_covered,
+            days_total: 30,
+            collected: 400,
+            total: Some(500),
+            phase: crate::github::stats::backfill::BackfillPhase::Working,
+            next_tick_at_ms: None,
+        }
+    }
+
+    /// A failed registration reaches the page AS a failure, with its
+    /// reason (#1570).
+    ///
+    /// It used to be logged and dropped, so the page showed "queued for
+    /// collection" for a scope nothing would ever collect. The wire shape
+    /// is asserted, not just the enum, because the page branches on
+    /// `state` and a rename would silently turn every failure back into
+    /// the queued line.
+    #[test]
+    fn a_failed_registration_reports_its_reason_and_no_frame() {
+        let key = "board|merged|*|org:acme-1570-failed";
+        // A frame exists for the key, and a failure must still not carry
+        // it: the page would render the frame's progress and hide the
+        // failure behind it.
+        super::remember_backfill_frame(&frame_for(key, 12));
+        let r = super::backfill_registration(Err("database error: disk I/O error".into()), key);
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "state": "failed", "reason": "database error: disk I/O error" })
+        );
+    }
+
+    /// A registered scope with a frame already emitted carries that frame,
+    /// so a scope switch shows it at once (#1570).
+    #[test]
+    fn a_registered_scope_carries_its_last_frame() {
+        let _clear = FRAMES_CLEAR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let key = "board|merged|*|org:acme-1570-stored";
+        super::remember_backfill_frame(&frame_for(key, 6));
+        // The LAST frame, not the first.
+        super::remember_backfill_frame(&frame_for(key, 18));
+        let r = super::backfill_registration(Ok(()), key);
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["state"], "registered");
+        assert_eq!(json["lastFrame"]["scopeKey"], key);
+        assert_eq!(json["lastFrame"]["daysCovered"], 18);
+        assert_eq!(json["lastFrame"]["total"], 500);
+    }
+
+    /// Registered with nothing emitted yet is Pending: `null`, never a
+    /// zeroed frame, which would read as "0 of 30 days measured".
+    #[test]
+    fn a_registered_scope_with_no_frame_carries_null() {
+        let key = "board|merged|*|org:acme-1570-none";
+        let r = super::backfill_registration(Ok(()), key);
+        assert_eq!(
+            serde_json::to_value(&r).unwrap(),
+            serde_json::json!({ "state": "registered", "lastFrame": null })
+        );
+    }
+
+    /// Another scope's frame is not this scope's.
+    #[test]
+    fn a_registered_scope_does_not_carry_another_scopes_frame() {
+        super::remember_backfill_frame(&frame_for("board|merged|*|org:acme-1570-a", 9));
+        let r = super::backfill_registration(Ok(()), "board|merged|*|org:acme-1570-b");
+        assert_eq!(
+            serde_json::to_value(&r).unwrap()["lastFrame"],
+            serde_json::Value::Null
+        );
+    }
+
+    /// A cached board never carries a stored registration back out.
+    ///
+    /// `StatsBoard` is written to `stats_cache` whole, `backfill` included,
+    /// and read back on a cache hit. The field is `skip_deserializing` so a
+    /// row written while the scope was registered cannot report it as
+    /// registered on a later load whose registration failed; `stats_board`
+    /// assigns this load's outcome. If that assignment were ever lost, the
+    /// default is a FAILURE, never a queued-looking registration.
+    #[test]
+    fn a_cached_board_does_not_read_back_its_registration() {
+        let payload = serde_json::json!({
+            "viewer": "octocat",
+            "scopeKey": "board|merged|*|org:acme",
+            "rows": [],
+            "total": null,
+            "retrieved": 0,
+            "complete": false,
+            "truncatedSlices": [],
+            "refusedFields": 0,
+            "slices": 0,
+            "rounds": 0,
+            "spend": { "points": 0, "requests": 0, "unmetered": 0, "remaining": null, "resetAt": null },
+            "slowest": [],
+            "largest": [],
+            "repoCounts": [],
+            "accumulated": 0,
+            "accumulating": true,
+            "daysCovered": 0,
+            "daysTotal": 30,
+            "backfill": { "state": "registered", "lastFrame": null }
+        });
+        let back: super::StatsBoard = serde_json::from_value(payload).unwrap();
+        assert!(
+            matches!(back.backfill, super::BackfillRegistration::Failed(_)),
+            "a cached row's registration was read back: {:?}",
+            back.backfill
+        );
+    }
+
+    /// The identity change drops the remembered frames with the tables
+    /// they describe.
+    ///
+    /// Asserted on a key this test owns, and without asserting the map is
+    /// empty afterwards: other tests remember frames concurrently, so only
+    /// this key's absence is this test's to check. Holds
+    /// `FRAMES_CLEAR_LOCK` so the clear cannot land inside another test's
+    /// remember-then-read.
+    #[test]
+    fn forgetting_the_frames_drops_a_remembered_one() {
+        let _clear = FRAMES_CLEAR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let key = "board|merged|*|org:acme-1570-forget";
+        super::remember_backfill_frame(&frame_for(key, 3));
+        assert!(super::last_backfill_frame(key).is_some());
+        super::forget_backfill_frames();
+        assert!(super::last_backfill_frame(key).is_none());
+    }
+
     /// `worktree-removal-progress` is forwarded to the phone, so its
     /// frame must never carry a path (#1544). Built from REAL outcomes
     /// of a real batch -- each carrying a path and a refusal that names
@@ -7981,6 +8435,108 @@ mod tests {
             1,
             "and every permit is back once both walks are done"
         );
+    }
+
+    /// Two overlapping classification requests for one repository run ONE
+    /// pass, and both get its result (#1582, candidate 2).
+    ///
+    /// A focus refetch, or an invalidation after a removal, used to start
+    /// a whole second pass on a 141-worktree repository while the first
+    /// was still running. The second caller now joins the first.
+    #[tokio::test]
+    async fn overlapping_requests_for_one_key_share_one_run() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+        static FLIGHT: std::sync::LazyLock<super::SingleFlight<Result<u32, String>>> =
+            std::sync::LazyLock::new(super::SingleFlight::new);
+        let starts = Arc::new(AtomicUsize::new(0));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let s = starts.clone();
+        let first = tokio::spawn(
+            FLIGHT.join_or_start("/code/acme/widget", move || async move {
+                s.fetch_add(1, Ordering::SeqCst);
+                let _ = release_rx.await;
+                Ok(7)
+            }),
+        );
+        while starts.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let s = starts.clone();
+        let second = tokio::spawn(
+            FLIGHT.join_or_start("/code/acme/widget", move || async move {
+                s.fetch_add(1, Ordering::SeqCst);
+                Ok(8)
+            }),
+        );
+        // The first caller goes away, as the phone does at its deadline.
+        // The run is not its to cancel: the second is still waiting on it.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        first.abort();
+        let _ = first.await;
+        release_tx.send(()).expect("the run is still waiting");
+
+        let got = tokio::time::timeout(Duration::from_secs(10), second)
+            .await
+            .expect("the joined request finished")
+            .expect("joined");
+        assert_eq!(
+            got,
+            Ok(Ok(7)),
+            "the second request gets the FIRST run's result"
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 1, "one run, not two");
+
+        // Once it has finished, the next request starts a fresh run.
+        let s = starts.clone();
+        let again = FLIGHT
+            .join_or_start("/code/acme/widget", move || async move {
+                s.fetch_add(1, Ordering::SeqCst);
+                Ok(9)
+            })
+            .await;
+        assert_eq!(again, Ok(Ok(9)));
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+    }
+
+    /// A run that ends without a result (a panic) says it stopped, and
+    /// does not leave its key joined to a run that will never answer.
+    #[tokio::test]
+    async fn a_run_that_panics_is_an_error_and_is_not_joined_again() {
+        static FLIGHT: std::sync::LazyLock<super::SingleFlight<Result<u32, String>>> =
+            std::sync::LazyLock::new(super::SingleFlight::new);
+        let got = FLIGHT
+            .join_or_start("/code/acme/gadget", || async { panic!("the pass failed") })
+            .await;
+        assert!(got.is_err(), "no result is not a result: {got:?}");
+        let again = FLIGHT
+            .join_or_start("/code/acme/gadget", || async { Ok(3) })
+            .await;
+        assert_eq!(again, Ok(Ok(3)), "the next request starts a fresh run");
+    }
+
+    /// Classification holds a permit of its OWN class, not a scan permit
+    /// (#1582, candidate 3), so it cannot queue behind the size walks.
+    /// No other test draws on classification's permits, so the count
+    /// inside the walk is this walk's alone.
+    #[tokio::test]
+    async fn classification_holds_its_own_permit_not_a_scan_permit() {
+        let before = super::classify_permits().available_permits();
+        let inside = super::classify_blocking(|| super::classify_permits().available_permits())
+            .await
+            .expect("ran");
+        assert_eq!(
+            inside,
+            before - 1,
+            "the classification walk must hold one of classification's permits"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(super::classify_permits(), super::scan_permits()),
+            "classification's permits must not be the scan permits the size walks hold"
+        );
+        assert_eq!(super::classify_permits().available_permits(), before);
     }
 
     /// #1124: the three constants must agree, since `AUTH_ERR` is
@@ -9358,18 +9914,57 @@ pub struct StatsBackfillFrame {
 /// down, and a background walk must not fail because nothing was
 /// listening.
 pub fn emit_stats_backfill(app: &AppHandle, report: &crate::github::stats::backfill::Report) {
-    let _ = app.emit(
-        STATS_BACKFILL_PROGRESS,
-        StatsBackfillFrame {
-            scope_key: report.scope_key.clone(),
-            days_covered: report.days_covered,
-            days_total: report.days_total,
-            collected: report.collected,
-            total: report.total,
-            phase: report.phase.clone(),
-            next_tick_at_ms: report.next_tick_at_ms,
-        },
-    );
+    let frame = StatsBackfillFrame {
+        scope_key: report.scope_key.clone(),
+        days_covered: report.days_covered,
+        days_total: report.days_total,
+        collected: report.collected,
+        total: report.total,
+        phase: report.phase.clone(),
+        next_tick_at_ms: report.next_tick_at_ms,
+    };
+    remember_backfill_frame(&frame);
+    let _ = app.emit(STATS_BACKFILL_PROGRESS, frame);
+}
+
+/// The last frame emitted per scope, so a page that was not listening
+/// when it went out can still start from it (#1570).
+///
+/// The events are fire-and-forget: a page that opens a scope, or switches
+/// to one, after the worker's last tick for it holds no frame until the
+/// next one, which the rotation can put many minutes away. Kept in memory
+/// rather than stored, because a frame's phase and next-tick time describe
+/// THIS process's worker; after a restart they would be claims about a
+/// worker that no longer exists.
+///
+/// Bounded by the registered scopes, which are the only keys the worker
+/// emits for, and cleared with them on an identity change.
+fn backfill_frames(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, StatsBackfillFrame>> {
+    static FRAMES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, StatsBackfillFrame>>,
+    > = std::sync::OnceLock::new();
+    FRAMES.get_or_init(Default::default)
+}
+
+fn remember_backfill_frame(frame: &StatsBackfillFrame) {
+    if let Ok(mut frames) = backfill_frames().lock() {
+        frames.insert(frame.scope_key.clone(), frame.clone());
+    }
+}
+
+/// The last frame emitted for `scope_key`, or `None` when none has been.
+fn last_backfill_frame(scope_key: &str) -> Option<StatsBackfillFrame> {
+    backfill_frames().lock().ok()?.get(scope_key).cloned()
+}
+
+/// Drop every remembered frame. The identity change clears the tables
+/// the frames describe, and a frame left behind would seed a page with
+/// coverage that no longer exists.
+fn forget_backfill_frames() {
+    if let Ok(mut frames) = backfill_frames().lock() {
+        frames.clear();
+    }
 }
 
 /// The event name a branch scan reports its progress under.

@@ -1,7 +1,8 @@
 .PHONY: dev build test test-rust test-ui lint lint-rust lint-ui lint-deps fmt icons \
 	mobile-frontend lint-mobile test-mobile check-mobile-ios check-mobile-android \
 	deny-mobile deny-stepup ios-init android-init icons-mobile ios-device android-device \
-	deny test-race check-intel doctor bench-transcript bench-transcript-browser shadcn-add
+	deny test-race check-intel doctor bench-transcript bench-transcript-browser bench-worktrees-browser \
+	check-shell-scroll shadcn-add
 
 # ---- Mobile companion (src-mobile) ---------------------------------------
 #
@@ -170,6 +171,34 @@ bench-transcript-browser:
 	&& yarn vite build -c vite.harness.config.ts \
 	&& node scripts/transcript-browser-bench.mjs "$$out"; status=$$?; \
 	[ -n "$(BENCH_TRANSCRIPT_OUT)" ] || rm -rf "$$out"; exit $$status
+# The document never scrolls (#1583): builds the shell harness page
+# (vite.harness.config.ts, into dist-harness) and opens the real app tree
+# in Playwright's Chromium with long generated lists, at a desktop size,
+# the minimum window and a phone width. Asserts the document stays at
+# scrollTop 0 and no taller or wider than the window, with the Settings
+# button inside it, after every inner list is scrolled to its end, its
+# last row focused and wheeled at -- and that the index.css lock holds
+# when the document is forced taller. jsdom does no layout, so no vitest
+# can; `src/shellLock.test.ts` is the cheap half that runs in `test-ui`.
+# Not in `test` or CI: it needs a browser, installed once with
+# `yarn playwright install chromium`. HARNESS_ENGINE=webkit runs
+# Playwright's WebKit instead (`yarn playwright install webkit`), which
+# is closer to the WKWebView the app ships in. About a minute.
+check-shell-scroll:
+	yarn vite build -c vite.harness.config.ts
+	node scripts/check-shell-scroll.mjs
+
+# The Worktrees page in a browser (#1582): builds the harness page
+# (vite.harness-worktrees.config.ts, into dist-harness-worktrees), mounts
+# the real WorktreesPage over a generated repository of N worktrees and
+# streams a classification pass into it, timing every commit, the lag of
+# each verdict's delivery, and where the CPU went. Generated fixtures
+# only; it reads nothing from the machine. N, PRS, RATES, SIZES and
+# THROTTLE are passed through (see the script's header). Not in `test` or
+# CI, for bench-transcript's reason: its figures describe the machine.
+bench-worktrees-browser:
+	yarn vite build -c vite.harness-worktrees.config.ts \
+	&& node scripts/worktrees-browser-bench.mjs
 
 # ---- Parity with CI (#853) -----------------------------------------------
 #
@@ -462,6 +491,11 @@ lint-ui:
 	# @tailwindcss/vite claims it, and tests avoid node:fs. Deleting the
 	# rule un-fixes every button in the app with a green suite (#694).
 	./scripts/check-focus-css.sh
+	# The document scroll lock is CSS the suite cannot see either, for the
+	# same reasons. Without it the status bar could sit below the window's
+	# edge (#1583); `make check-shell-scroll` is the in-browser half.
+	python3 scripts/check-shell-lock.test.py
+	python3 scripts/check-shell-lock.py
 
 fmt:
 	cd crates/headstate-stepup && cargo fmt

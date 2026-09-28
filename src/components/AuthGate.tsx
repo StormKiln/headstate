@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
+import { useFilters, viewLabel } from "../store/filters";
 import { useEffect, type ReactNode } from "react";
-import { clearPollError, usePollError, useStoreError } from "../api/hooks";
+import { clearPollError, usePollError, useStoreError, useUiPrefs } from "../api/hooks";
 import { ReportLink } from "./ReportLink";
 import { getAuthState, getGitLabAuthState } from "../api/tauri";
 import { useConnectionState } from "@/api/connection";
@@ -67,6 +68,12 @@ export function AuthGate({ children }: { children: ReactNode }) {
   // value this component already holds.
   const pollErr = commandError(pollError ?? "");
   const storeError = useStoreError();
+  // For "Report this" on the poll banner (#1575), which passed neither
+  // and so filed a report with no view and no diagnostics line. This
+  // component is under the query provider, unlike the crash panel, so
+  // it can read both. `undefined` while prefs load is "unknown", not off.
+  const currentView = useFilters((s) => s.view);
+  const { prefs } = useUiPrefs();
   // `local` on the desktop build by construction, so `offline` below is
   // always false there and every branch after it renders exactly what it
   // rendered before.
@@ -133,6 +140,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
   if (data !== undefined) {
     return (
       <GitHubAuthProvider available={data.ok}>
+      <div className="flex h-full flex-col">
         {!data.ok && selection !== "gitlab" && (
           <div role="status" className="border-b border-[#d29922]/30 bg-[#d29922]/10 px-4 py-2 text-sm text-[#d29922]">
             <span>GitHub is unavailable: {data.message}</span>
@@ -153,7 +161,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
         {storeError.message !== null && (
           <div
             role="alert"
-            className="flex items-start gap-2 border-b border-[#d29922]/30 bg-[#d29922]/10 px-4 py-2 text-sm text-[#d29922]"
+            className="flex shrink-0 items-start gap-2 border-b border-[#d29922]/30 bg-[#d29922]/10 px-4 py-2 text-sm text-[#d29922]"
           >
             <span className="flex-1">
               {storeError.message} Your pull requests are still live; only the local
@@ -180,8 +188,8 @@ export function AuthGate({ children }: { children: ReactNode }) {
             role={pollErr.kind === "not-asked" ? "status" : "alert"}
             className={
               pollErr.kind === "not-asked"
-                ? "flex items-start gap-2 border-b border-[#d29922]/30 bg-[#d29922]/10 px-4 py-2 text-sm text-[#d29922]"
-                : "flex items-start gap-2 border-b border-[#f85149]/30 bg-[#f85149]/10 px-4 py-2 text-sm text-[#f85149]"
+                ? "flex shrink-0 items-start gap-2 border-b border-[#d29922]/30 bg-[#d29922]/10 px-4 py-2 text-sm text-[#d29922]"
+                : "flex shrink-0 items-start gap-2 border-b border-[#f85149]/30 bg-[#f85149]/10 px-4 py-2 text-sm text-[#f85149]"
             }
           >
             <span className="flex-1">
@@ -193,7 +201,11 @@ export function AuthGate({ children }: { children: ReactNode }) {
                 Opens a PREFILLED form rather than posting: the user is
                 the only one who can confirm nothing sensitive survived
                 scrubbing. */}
-            <ReportLink error={pollError} />
+            <ReportLink
+              error={pollError}
+              view={viewLabel(currentView)}
+              diagnostics={prefs?.diagnostic_logging}
+            />
             {/* The token is read once at startup and held for the process
                 lifetime, so a revoked or expired one 401s forever with the
                 list silently going stale. A relaunch is the actual fix;
@@ -239,12 +251,13 @@ export function AuthGate({ children }: { children: ReactNode }) {
             </button>
           </div>
         )}
-        {children}
+        <div className="min-h-0 flex-1">{children}</div>
+      </div>
       </GitHubAuthProvider>
     );
   }
 
   // A failed IPC check says nothing about either provider's credential.
-  // Keep local views available while the connection layer reports the error.
+  // Keep local and GitLab views available while the connection layer reports it.
   return <GitHubAuthProvider available={null}>{children}</GitHubAuthProvider>;
 }

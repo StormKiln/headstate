@@ -116,6 +116,11 @@ vi.mock("./api/hooks", () => ({
   useRerunChecks: () => () => Promise.resolve(),
   useViewer: () => ({ data: undefined }),
   useReviewGates: () => ({ data: undefined }),
+  // #1576: nothing checked yet, which hides nothing.
+  useReadyPushers: () => ({
+    of: () => ({ pusher: { state: "pending" }, rule: "unread" }),
+    isPending: false,
+  }),
   // StatsPage owns these; this suite only asserts the shell's layout, so
   // they return a pending result rather than real figures. #826 replaced the
   // four `author:@me` hooks this block used to stub (`usePeriods`,

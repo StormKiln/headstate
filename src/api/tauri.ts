@@ -66,6 +66,8 @@ import type {
   PrDetail,
   PullRequest,
   ReviewGates,
+  PusherAsk,
+  RowPusher,
   Stats,
   StatsBoard,
   StatsOutcome,
@@ -85,6 +87,7 @@ import type {
   TranscriptPageDirection,
 } from "../types/transcript";
 import type { OpeningPrompt, SessionDigest } from "../types/sessionDigest";
+import type { DiagnosticBundle } from "../types/report";
 
 export interface AuthState {
   ok: boolean;
@@ -924,6 +927,13 @@ export const getReviewGates = (
 ) =>
   call<ReviewGates>("get_review_gates", { repo, base, headRepo, headRef, headOid });
 
+/// Rules and last pusher for every Ready for review row (#1576). Pushers
+/// cached by head commit, rules per (repo, base), new reads capped per
+/// call and inside the REST budget; a row past either is `declined` (not
+/// checked). Never rejects for a GitHub failure.
+export const getReadyPushers = (rows: PusherAsk[]) =>
+  call<RowPusher[]>("get_ready_pushers", { rows });
+
 /// Disk sizes for one repo's worktrees, as `[path, bytes]` pairs.
 ///
 /// A full tree walk -- ~13s for 147 worktrees -- so it is a separate
@@ -1225,6 +1235,12 @@ export const readLogTail = (maxBytes?: number) =>
   call<LogTail>("read_log_tail", { maxBytes: maxBytes ?? null });
 
 export const revealLog = () => call<string>("reveal_log");
+
+/// Everything "Report this" can say about the desktop, redacted (#1575).
+///
+/// `Class::Read`: on the phone this describes the paired desktop, whose
+/// poll the phone's banner reports.
+export const diagnosticBundle = () => call<DiagnosticBundle>("diagnostic_bundle");
 
 /// Every scope a session actually loads: the repository, plus
 /// `~/.claude/CLAUDE.md` and any `CLAUDE.local.md` (#1131).

@@ -2,7 +2,9 @@ import { ActingOnDesktop } from "./ActingOnDesktop";
 import { summarisePull } from "@/lib/pullSummary";
 import { ExternalLink } from "./ExternalLink";
 import { Sparkles } from "lucide-react";
-import { useMemo, useState } from "react";
+import { memo, useMemo, useState } from "react";
+import { sameRowProps } from "@/lib/rowProps";
+import { useStableHandlers } from "@/lib/useStableHandlers";
 import {
   useClaudeSessions,
   useUiPrefs,
@@ -41,7 +43,7 @@ import {
   isPending,
   isSafe,
   pathBasename,
-  prForWorktree,
+  pullRequestsByBranch,
   worktreeSignal,
   isOrphaned,
   ORPHAN_FILTER,
@@ -844,6 +846,103 @@ function Row({
   );
 }
 
+/// `Row`, skipped when nothing it renders has changed (#1582).
+const MemoRow = memo(Row, sameRowProps);
+
+/// The handlers every row shares. Each is a page closure over the page's
+/// own state, so it is a new function on every render.
+type RowHandlers = {
+  onToggle: (path: string, shiftKey: boolean) => void;
+  onForce: (wt: Worktree) => void;
+  onUnlock: (wt: Worktree) => void;
+  onRemoveOrphan: (wt: Worktree) => void;
+  onPull: (wt: Worktree) => void;
+  onFetch: (wt: Worktree) => void;
+  onRemove: (wt: Worktree) => void;
+  onClaudify: (wt: Worktree) => void;
+  onCopyClaudify: (wt: Worktree) => void;
+  onForget: (wt: Worktree) => void;
+};
+
+/// One repository's rows, re-rendering only the rows that changed
+/// (#1582).
+///
+/// While a classification pass streams, the page re-renders once per
+/// frame, and every render used to rebuild every row: 141 rows for one
+/// verdict. MEASURED in the Worktrees browser harness
+/// (`make bench-worktrees-browser`, 141 worktrees, 1,000 open PRs, 4x CPU
+/// throttling): a ~21 ms commit per frame that held the main thread at
+/// 89% and delivered verdicts up to 7.5 s late. Here each row is
+/// memoised, its per-row props are values that change only when that
+/// row's own state does, and the handlers are stable wrappers over the
+/// page's latest ones, so a verdict landing renders its own row.
+///
+/// Its own component so its hooks sit below the page's early returns
+/// without changing the page's hook order.
+function WorktreeRowList({
+  rows,
+  isChecked,
+  agentIn,
+  prFor,
+  isAssessed,
+  pullingPath,
+  fetchingPath,
+  removing,
+  repoPath,
+  fetchedAt,
+  scannedAt,
+  terminalConfigured,
+  sizePending,
+  handlers,
+}: {
+  rows: (Worktree & { sizeUnmeasurable?: boolean; sizeUnmeasuredWhy?: string })[];
+  isChecked: (path: string) => boolean;
+  agentIn: (path: string) => ClaudeSession | null;
+  prFor: (branch: string) => PullRequest | null;
+  isAssessed: (path: string) => boolean;
+  pullingPath: string | null;
+  fetchingPath: string | null;
+  removing: string | null;
+  repoPath: string;
+  fetchedAt: string | null;
+  scannedAt: Date;
+  terminalConfigured: boolean;
+  sizePending: boolean;
+  handlers: RowHandlers;
+}) {
+  const h = useStableHandlers(handlers);
+  return rows.map((wt) => (
+    <MemoRow
+      key={wt.path}
+      wt={wt}
+      checked={isChecked(wt.path)}
+      onToggle={h.onToggle}
+      agent={agentIn(wt.path)}
+      repoPath={repoPath}
+      pr={prFor(wt.branch)}
+      assessed={isAssessed(wt.path)}
+      onForce={h.onForce}
+      onUnlock={h.onUnlock}
+      onRemoveOrphan={h.onRemoveOrphan}
+      onPull={h.onPull}
+      pulling={pullingPath === wt.path}
+      onFetch={h.onFetch}
+      fetching={fetchingPath === wt.path}
+      fetchedAt={fetchedAt}
+      scannedAt={scannedAt}
+      onRemove={h.onRemove}
+      onClaudify={h.onClaudify}
+      onCopyClaudify={h.onCopyClaudify}
+      terminalConfigured={terminalConfigured}
+      onForget={h.onForget}
+      sizePending={sizePending}
+      sizeUnmeasurable={wt.sizeUnmeasurable}
+      sizeUnmeasuredWhy={wt.sizeUnmeasuredWhy}
+      removing={removing === wt.path}
+    />
+  ));
+}
+
 /// Confirmation, naming the path and the branch.
 ///
 /// A MODAL, not an inline banner: with 149 worktrees on one repository
@@ -1400,7 +1499,11 @@ export function WorktreesPage() {
   const removeMany = useRemoveWorktrees();
   const forceRemove = useRemoveWorktreeForced();
   const { data: assessedPaths } = useAssessed();
-  const { data: prs = [] } = usePullRequests();
+  const { data: prs } = usePullRequests();
+  // Indexed once per PR list rather than scanned per row per render
+  // (#1582): see `pullRequestsByBranch`.
+  const identity = selected?.identity ?? null;
+  const prFor = useMemo(() => pullRequestsByBranch(prs ?? [], identity), [prs, identity]);
   // Only while the confirmation is open. Docker is a subprocess call,
   // and the Worktrees page has no business paying for it just to sit
   // there -- the manifest is needed at the moment of confirming, not
@@ -3494,41 +3597,40 @@ export function WorktreesPage() {
             )}
           </div>
         ) : (
-          visible.map((wt) => (
-            <Row
-              key={wt.path}
-              wt={wt}
-              checked={checked.includes(wt.path)}
-              onToggle={toggleRow}
-              agent={agentIn(wt.path)}
-              repoPath={selected?.path ?? ""}
-              pr={prForWorktree(prs, selected?.identity ?? null, wt.branch)}
-              assessed={assessed.has(wt.path)}
-              onForce={setForcing}
-              onUnlock={setUnlocking}
-              onRemoveOrphan={setPendingOrphan}
-              onPull={runPull}
-              pulling={pullingPath === wt.path}
-              onFetch={runFetch}
-              fetching={fetchingPath === wt.path}
-              // `?? null`, not `??  ""` or a fallback date. The Rust side
-              // always sends the key, but a repository that has never
-              // fetched sends null -- and null must stay null all the way
-              // to `refStaleness`, which reports it as `unknown` rather
-              // than as an age of zero.
-              fetchedAt={selected?.fetched_at ?? null}
-              scannedAt={scannedAt}
-              onRemove={setPending}
-              onClaudify={claudify}
-            onCopyClaudify={copyClaudify}
+          // Memoised rows (#1582): a verdict landing re-renders ITS row,
+          // not all of them. See `WorktreeRowList`.
+          <WorktreeRowList
+            rows={visible}
+            isChecked={(path) => checked.includes(path)}
+            agentIn={agentIn}
+            prFor={prFor}
+            isAssessed={(path) => assessed.has(path)}
+            pullingPath={pullingPath}
+            fetchingPath={fetchingPath}
+            removing={removing}
+            repoPath={selected?.path ?? ""}
+            // `?? null`, not `??  ""` or a fallback date. The Rust side
+            // always sends the key, but a repository that has never
+            // fetched sends null -- and null must stay null all the way
+            // to `refStaleness`, which reports it as `unknown` rather
+            // than as an age of zero.
+            fetchedAt={selected?.fetched_at ?? null}
+            scannedAt={scannedAt}
             terminalConfigured={terminalConfigured}
-              onForget={forget}
-              sizePending={sizing}
-              sizeUnmeasurable={wt.sizeUnmeasurable}
-              sizeUnmeasuredWhy={wt.sizeUnmeasuredWhy}
-              removing={removing === wt.path}
-            />
-          ))
+            sizePending={sizing}
+            handlers={{
+              onToggle: toggleRow,
+              onForce: setForcing,
+              onUnlock: setUnlocking,
+              onRemoveOrphan: setPendingOrphan,
+              onPull: runPull,
+              onFetch: runFetch,
+              onRemove: setPending,
+              onClaudify: claudify,
+              onCopyClaudify: copyClaudify,
+              onForget: forget,
+            }}
+          />
         )}
       </div>
     </div>

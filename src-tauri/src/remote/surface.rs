@@ -151,6 +151,9 @@ pub const SURFACE: &[(&str, Class)] = &[
     // because the phone renders the same detail view and the same Approve
     // and Merge buttons these gates qualify.
     ("get_review_gates", Class::Read),
+    // The Ready for review strip's batched pushers (#1576). A Read; REST reads
+    // capped per call and inside the budget, advisory.
+    ("get_ready_pushers", Class::Read),
     ("get_viewer", Class::Read),
     ("build_target", Class::Read),
     ("latest_release", Class::Read),
@@ -852,6 +855,12 @@ pub const SURFACE: &[(&str, Class)] = &[
     // `reveal_log` cannot close, because there is no Finder here to
     // reveal into. That one stays Local; this shows the text.
     ("read_log_tail", Class::Read),
+    // Read: everything "Report this" can say about the DESKTOP (#1575) --
+    // its poll history, `gh`, install and log tail, redacted. Served to
+    // the phone because the poll its banner reports runs on the desktop,
+    // and every part is already a Read on its own (`build_target`,
+    // `tool_versions`, `read_log_tail`, `get_poll_interval`).
+    ("diagnostic_bundle", Class::Read),
     ("reveal_log", Class::Local),
     // Reveals a session's directory or transcript in the file manager
     // (#917). `Local` for exactly the reason this class's own doc comment
@@ -1065,6 +1074,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         // the command applies its own default and its own ceiling, so a
         // phone cannot ask for a larger payload than the desktop would.
         "read_log_tail" => res(commands::read_log_tail(app.clone(), a.get("maxBytes")?).await),
+        "diagnostic_bundle" => ok(commands::diagnostic_bundle(app.clone()).await),
         "get_auth_state" => ok(commands::get_auth_state(app.state())),
         "get_gitlab_auth_state" => ok(commands::get_gitlab_auth_state(app.clone()).await),
         "get_gitlab_host" => res(commands::get_gitlab_host(app.clone())),
@@ -1168,6 +1178,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             a.get("headOid")?,
         )
         .await),
+        "get_ready_pushers" => res(commands::get_ready_pushers(app.state(), a.get("rows")?).await),
         "get_viewer" => res(commands::get_viewer(app.state()).await),
         "build_target" => ok(commands::build_target()),
         "latest_release" => ok(commands::latest_release(app.clone()).await),

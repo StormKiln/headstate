@@ -1,12 +1,57 @@
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render as rtlRender,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { ReactElement, ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: () => Promise.resolve() }));
+const copyFn = vi.hoisted(() => vi.fn<(text: string) => Promise<string | null>>());
+const toastFns = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn() }));
+vi.mock("@/lib/clipboard", () => ({ copyText: copyFn }));
+vi.mock("sonner", () => ({ toast: toastFns }));
+
+/// The Tauri bridge is the only thing mocked: the strip's pusher hook,
+/// the transport and the wrappers are real, so what these tests control
+/// is exactly what the desktop command would answer (#1576).
+const invoke = vi.hoisted(() =>
+  vi.fn<(cmd: string, args?: Record<string, unknown>) => Promise<unknown>>(),
+);
+vi.mock("@tauri-apps/api/core", () => ({ invoke }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(() => Promise.resolve(() => {})) }));
 
 import { ReadyStrip } from "./ReadyStrip";
 import { PR_FIXTURES } from "../fixtures/prs";
 import { useFilters } from "@/store/filters";
-import type { PullRequest } from "@/types/pr";
+import type { PullRequest, RowPusher } from "@/types/pr";
+
+/// What `get_ready_pushers` answers; `[]` (nothing checked) by default.
+let pusherAnswers: RowPusher[] = [];
+let viewerLogin: Promise<unknown> = Promise.resolve("me");
+
+beforeEach(() => {
+  pusherAnswers = [];
+  viewerLogin = Promise.resolve("me");
+  invoke.mockReset();
+  invoke.mockImplementation((cmd: string) => {
+    if (cmd === "get_viewer") return viewerLogin;
+    if (cmd === "get_ready_pushers") return Promise.resolve(pusherAnswers);
+    return Promise.resolve(undefined);
+  });
+});
+
+function render(ui: ReactElement) {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={qc}>{children}</QueryClientProvider>
+  );
+  return rtlRender(ui, { wrapper });
+}
 
 afterEach(cleanup);
 
@@ -311,5 +356,310 @@ describe("ReadyStrip unresolved conversations", () => {
     const { container } = render(<ReadyStrip prs={[withThreads(4, false)]} />);
     expect(container.querySelector("[data-unresolved]")?.textContent).toBe("4");
     expect(screen.getByText(", 4 unresolved conversations")).toBeTruthy();
+  });
+});
+
+/// #1576: rows the viewer pushed last -- tagged, and filtered.
+describe("ReadyStrip last pusher", () => {
+  const HEAD = "1111111111111111111111111111111111111111";
+  const pr = (number: number, title: string): PullRequest => ({
+    ...ready,
+    number,
+    title,
+    head_oid: HEAD,
+    head_repo: "acme/widget",
+  });
+  type Rules = RowPusher["rules"];
+  const RULE_ON: Rules = {
+    state: "read",
+    require_last_push_approval: true,
+    required_review_thread_resolution: false,
+  };
+  const RULE_OFF: Rules = { ...RULE_ON, require_last_push_approval: false };
+  const UNREAD: Rules = { state: "unreadable", reason: "404" };
+  const answer = (
+    p: PullRequest,
+    rules: Rules,
+    last_pusher: RowPusher["last_pusher"],
+    head_oid = HEAD,
+  ): RowPusher => ({ repo: p.repo, number: p.number, head_oid, rules, last_pusher });
+  const setMode = (readyMyPushes: "auto" | "hide" | "show") =>
+    useFilters.setState({
+      filtersByView: { ...EMPTY, "to-review": { readyMyPushes } },
+      view: "to-review",
+    });
+  const status = () => document.querySelector("[data-my-pushes-status]")?.textContent ?? "";
+
+  const mine = pr(1, "Mine");
+  const theirs = pr(2, "Theirs");
+
+  // #1578: the copy is of what is SHOWN -- after this filter -- and
+  // carries a known pusher, but never an undecided one.
+  it("copies the rows the last-push filter leaves, with known pushers only", async () => {
+    copyFn.mockReset();
+    copyFn.mockResolvedValue(null);
+    const unknown = pr(3, "Unknown");
+    pusherAnswers = [
+      answer(mine, RULE_ON, { state: "known", login: "me" }),
+      answer(theirs, RULE_ON, { state: "known", login: "someone" }),
+      answer(unknown, RULE_ON, { state: "unknown", reason: "log lags" }),
+    ];
+    render(<ReadyStrip prs={[mine, theirs, unknown]} onOpen={vi.fn()} />);
+    await waitFor(() => expect(screen.queryByText("Mine")).toBeNull());
+    fireEvent.click(screen.getByRole("button", { name: "Copy as markdown" }));
+    await waitFor(() => expect(copyFn).toHaveBeenCalledTimes(1));
+    const md = copyFn.mock.calls[0][0];
+    expect(md).toContain("2 pull requests");
+    expect(md).not.toContain("[Mine]");
+    expect(md).toMatch(/\[Theirs\].*last push by @someone/);
+    const unknownLine = md.split("\n").find((l) => l.startsWith("- [Unknown]")) ?? "";
+    expect(unknownLine).not.toMatch(/push/);
+  });
+
+  // #1579: the batch Claudify is handed the rows SHOWN. Every row hidden
+  // leaves it nothing, so it is disabled with the reason, not hidden.
+  it("disables the batch Claudify, with its reason, when the filter hides every row", async () => {
+    pusherAnswers = [answer(mine, RULE_ON, { state: "known", login: "me" })];
+    render(<ReadyStrip prs={[mine]} onOpen={vi.fn()} />);
+    await waitFor(() => expect(screen.queryByText("Mine")).toBeNull());
+    const claudify = screen.getByRole("button", { name: /Claudify|Copy prompt/ }) as HTMLButtonElement;
+    expect(claudify.disabled).toBe(true);
+    expect(document.querySelector("[data-ready-claudify-reason]")?.textContent).toMatch(
+      /No pull requests are showing/,
+    );
+  });
+
+  it("asks for every row's pusher with its head and base", async () => {
+    render(<ReadyStrip prs={[mine]} onOpen={vi.fn()} />);
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("get_ready_pushers", {
+        rows: [
+          {
+            repo: mine.repo,
+            number: 1,
+            base: mine.base_ref,
+            head_repo: "acme/widget",
+            head_ref: mine.head_ref,
+            head_oid: HEAD,
+          },
+        ],
+      }),
+    );
+  });
+
+  it("hides automatically only a known viewer push under a rule read as true", async () => {
+    pusherAnswers = [
+      answer(mine, RULE_ON, { state: "known", login: "me" }),
+      answer(theirs, RULE_ON, { state: "known", login: "someone" }),
+    ];
+    render(<ReadyStrip prs={[mine, theirs]} onOpen={vi.fn()} />);
+    await waitFor(() => expect(screen.queryByText("Mine")).toBeNull());
+    expect(screen.getByText("Theirs")).toBeTruthy();
+    expect(screen.getByText(/ready for review \(1\)/i)).toBeTruthy();
+    expect(status()).toBe("1 hidden: you pushed last and your approval can't count");
+  });
+
+  it("never hides automatically when the rule is off or could not be read", async () => {
+    const other = pr(3, "Unread rules");
+    pusherAnswers = [
+      answer(mine, RULE_OFF, { state: "known", login: "me" }),
+      answer(other, UNREAD, { state: "known", login: "me" }),
+    ];
+    render(<ReadyStrip prs={[mine, other]} onOpen={vi.fn()} />);
+    await waitFor(() => expect(document.querySelectorAll("[data-pushed-by-you]")).toHaveLength(2));
+    expect(screen.getByText("Mine")).toBeTruthy();
+    expect(screen.getByText("Unread rules")).toBeTruthy();
+    // The unread rule is what the filter could not decide.
+    expect(status()).toBe("1 could not be decided");
+  });
+
+  it("never auto-hides an unknown or not-checked pusher, and counts both", async () => {
+    const unknown = pr(3, "Unknown");
+    pusherAnswers = [
+      answer(mine, RULE_ON, { state: "declined", reason: "budget" }),
+      answer(unknown, RULE_ON, { state: "unknown", reason: "log lags" }),
+    ];
+    render(<ReadyStrip prs={[mine, unknown]} onOpen={vi.fn()} />);
+    await waitFor(() => expect(status()).toBe("1 not checked yet · 1 could not be decided"));
+    expect(screen.getByText("Mine")).toBeTruthy();
+    expect(screen.getByText("Unknown")).toBeTruthy();
+    // An undecided row is not tagged either: no false "your push".
+    expect(document.querySelector("[data-pushed-by-you]")).toBeNull();
+  });
+
+  it("tags a known viewer push, with the fact in the accessible name", async () => {
+    setMode("show");
+    pusherAnswers = [
+      answer(mine, RULE_ON, { state: "known", login: "me" }),
+      answer(theirs, RULE_ON, { state: "known", login: "someone" }),
+    ];
+    render(<ReadyStrip prs={[mine, theirs]} onOpen={vi.fn()} />);
+    await waitFor(() => expect(document.querySelector("[data-pushed-by-you]")).not.toBeNull());
+    expect(document.querySelectorAll("[data-pushed-by-you]")).toHaveLength(1);
+    expect(
+      screen.getByRole("button", {
+        name: /^Mine.*you pushed the latest commit, so your approval won't count here/,
+      }),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^Theirs/ }).textContent).not.toMatch(/you pushed/);
+    // Show hides nothing and says nothing.
+    expect(status()).toBe("");
+  });
+
+  it("the manual filter hides every known viewer push and says how many", async () => {
+    setMode("hide");
+    const unknown = pr(3, "Unknown");
+    pusherAnswers = [
+      answer(mine, RULE_OFF, { state: "known", login: "me" }),
+      answer(theirs, RULE_OFF, { state: "known", login: "someone" }),
+      answer(unknown, RULE_OFF, { state: "unknown", reason: "log lags" }),
+    ];
+    render(<ReadyStrip prs={[mine, theirs, unknown]} onOpen={vi.fn()} />);
+    await waitFor(() => expect(screen.queryByText("Mine")).toBeNull());
+    expect(screen.getByText("Theirs")).toBeTruthy();
+    expect(screen.getByText("Unknown")).toBeTruthy();
+    expect(status()).toBe("1 hidden: you pushed last · 1 could not be decided");
+  });
+
+  // The pusher of an old head says nothing about the new one.
+  it("ignores an answer about a head the row has moved off", async () => {
+    setMode("hide");
+    pusherAnswers = [
+      answer(mine, RULE_ON, { state: "known", login: "me" }, "2222222222222222222222222222222222222222"),
+    ];
+    render(<ReadyStrip prs={[mine]} onOpen={vi.fn()} />);
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("get_ready_pushers", expect.anything()));
+    await waitFor(() => expect(status()).toBe("1 not checked yet"));
+    expect(screen.getByText("Mine")).toBeTruthy();
+    expect(document.querySelector("[data-pushed-by-you]")).toBeNull();
+  });
+
+  // A viewer login that could not be read is "could not tell", and hides
+  // nothing: the pusher is never compared against a guess.
+  it("hides nothing when the viewer's login could not be read", async () => {
+    setMode("hide");
+    viewerLogin = Promise.reject(new Error("no client"));
+    viewerLogin.catch(() => {});
+    pusherAnswers = [answer(mine, RULE_ON, { state: "known", login: "me" })];
+    render(<ReadyStrip prs={[mine]} onOpen={vi.fn()} />);
+    await waitFor(() => expect(status()).toBe("1 could not be decided"));
+    expect(screen.getByText("Mine")).toBeTruthy();
+  });
+
+  // Everything hidden is not "nothing ready": the strip stays, and says why.
+  it("keeps the strip when every row is hidden", async () => {
+    pusherAnswers = [answer(mine, RULE_ON, { state: "known", login: "me" })];
+    render(<ReadyStrip prs={[mine]} onOpen={vi.fn()} />);
+    await waitFor(() => expect(screen.queryByText("Mine")).toBeNull());
+    expect(screen.queryByText(/nothing ready to review/i)).toBeNull();
+    expect(status()).toBe("1 hidden: you pushed last and your approval can't count");
+  });
+
+  it("says it is checking while the first answer is on its way", () => {
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "get_ready_pushers" ? new Promise(() => {}) : viewerLogin,
+    );
+    render(<ReadyStrip prs={[mine]} onOpen={vi.fn()} />);
+    expect(status()).toBe("Checking who pushed last…");
+  });
+
+  it("persists the choice like the sort", () => {
+    render(<ReadyStrip prs={[mine]} onOpen={vi.fn()} />);
+    const trigger = screen.getByRole("button", { name: /pull requests you pushed last/i });
+    expect(trigger.textContent).toContain("auto");
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Hide all I pushed last" }));
+    expect(useFilters.getState().filtersByView["to-review"].readyMyPushes).toBe("hide");
+  });
+});
+
+describe("ReadyStrip copy as markdown (#1578)", () => {
+  beforeEach(() => {
+    copyFn.mockReset();
+    copyFn.mockResolvedValue(null);
+    toastFns.success.mockReset();
+    toastFns.error.mockReset();
+  });
+
+  const row = (number: number, ready_at: string, over: Partial<PullRequest> = {}): PullRequest => ({
+    ...ready,
+    number,
+    title: `PR ${number}`,
+    ready_at,
+    ...over,
+  });
+
+  it("copies what is shown: the filtered rows, in the strip's order", async () => {
+    render(
+      <ReadyStrip
+        prs={[
+          row(3, "2026-09-03T00:00:00Z"),
+          // Filtered out of the strip, so it must not be copied.
+          row(9, "2026-08-01T00:00:00Z", { ci: "failure" }),
+          row(1, "2026-09-01T00:00:00Z"),
+        ]}
+        onOpen={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Copy as markdown" }));
+    await waitFor(() => expect(copyFn).toHaveBeenCalledTimes(1));
+    const md = copyFn.mock.calls[0][0];
+    expect(md).toContain("2 pull requests");
+    expect(md).not.toContain("PR 9");
+    expect(md.indexOf("[PR 1]")).toBeGreaterThan(-1);
+    expect(md.indexOf("[PR 1]")).toBeLessThan(md.indexOf("[PR 3]"));
+    await waitFor(() =>
+      expect(toastFns.success).toHaveBeenCalledWith(
+        "Copied 2 pull requests as markdown",
+        expect.anything(),
+      ),
+    );
+  });
+
+  // #1577's floor flag reaches the copy: a count that may be short is
+  // qualified, an exact one is not.
+  it("qualifies an unresolved count the row marks as a floor", async () => {
+    render(
+      <ReadyStrip
+        prs={[
+          row(1, "2026-09-01T00:00:00Z", { unresolved_threads: 3, unresolved_threads_floor: true }),
+          row(2, "2026-09-02T00:00:00Z", { unresolved_threads: 2, unresolved_threads_floor: false }),
+        ]}
+        onOpen={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Copy as markdown" }));
+    await waitFor(() => expect(copyFn).toHaveBeenCalledTimes(1));
+    const md = copyFn.mock.calls[0][0];
+    expect(md).toMatch(/\[PR 1\].*at least 3 unresolved conversations/);
+    expect(md).toMatch(/\[PR 2\].* 2 unresolved conversations/);
+    expect(md).not.toMatch(/\[PR 2\].*at least/);
+  });
+
+  it("follows the sort the reader chose", async () => {
+    render(
+      <ReadyStrip
+        prs={[row(1, "2026-09-01T00:00:00Z"), row(3, "2026-09-03T00:00:00Z")]}
+        onOpen={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /sort/i }));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Newest ready first" }));
+    fireEvent.click(screen.getByRole("button", { name: "Copy as markdown" }));
+    await waitFor(() => expect(copyFn).toHaveBeenCalledTimes(1));
+    const md = copyFn.mock.calls[0][0];
+    expect(md.indexOf("[PR 3]")).toBeLessThan(md.indexOf("[PR 1]"));
+  });
+
+  it("says so when the clipboard refuses", async () => {
+    copyFn.mockResolvedValue("This window has no clipboard access.");
+    render(<ReadyStrip prs={[row(1, "2026-09-01T00:00:00Z")]} onOpen={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Copy as markdown" }));
+    await waitFor(() =>
+      expect(toastFns.error).toHaveBeenCalledWith("Could not copy the markdown", {
+        description: "This window has no clipboard access.",
+      }),
+    );
+    expect(toastFns.success).not.toHaveBeenCalled();
   });
 });

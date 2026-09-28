@@ -1,0 +1,17 @@
+<!doctype html>
+<!-- The app shell's browser harness (#1583). NOT part of the app: built
+     only by `vite.harness.config.ts`, for `make check-shell-scroll`. It
+     mounts the real `App` with Tauri's IPC mocked, so a real browser can
+     measure whether the DOCUMENT ever scrolls. Same `<html>`/viewport as
+     `index.html`, without the splash. -->
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>Shell harness</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/harness/shellHarness.tsx"></script>
+  </body>
+</html>
