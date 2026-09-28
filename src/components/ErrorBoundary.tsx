@@ -81,8 +81,10 @@ export class ErrorBoundary extends Component<Props, State> {
     if (!error) return this.props.children;
 
     return (
-      <div className="flex h-screen items-center justify-center bg-[#0d1117] p-8 text-[#e6edf3]">
-        <div className="w-full max-w-lg">
+      // Its own scroller: the document never scrolls (#1583). `m-auto`
+      // centres without clipping the top when a long message overflows.
+      <div className="flex h-full overflow-y-auto bg-[#0d1117] p-8 text-[#e6edf3]">
+        <div className="m-auto w-full max-w-lg">
           <QueryError title="Something went wrong" message={error.message}>
             <div className="mt-4 flex items-center justify-center gap-3">
               <button

@@ -184,6 +184,33 @@
     color-scheme: dark;
     }
 }
+/* The document never scrolls (#1583).
+ *
+ * The app shell is one screen tall and `main` is its scroller. Nothing
+ * stopped the DOCUMENT from scrolling as well, so anything that made it
+ * even slightly taller than the window made it scrollable, and the
+ * status bar -- the last row of the shell -- was the first thing to leave
+ * the screen. It shipped: `AuthGate`'s poll-error banner sat ABOVE the
+ * one-screen shell, the document grew by the banner's height, and the
+ * Settings button was below the window's edge until a scroll that
+ * chained out of a list brought it back. A fractional page zoom (1.1 in
+ * WKWebView) also leaves the document 1px larger than the window.
+ *
+ * `height: 100%` down to `#root` is what the shell's `h-full` fills;
+ * `overflow: hidden` and `overscroll-behavior: none` stop the document
+ * scrolling, rubber-banding, or taking a chained scroll from an inner
+ * list, on the desktop and in the phone's webview alike. A full-screen
+ * page that can be taller than the window must scroll itself.
+ * `scripts/check-shell-lock.py` keeps this rule; `make check-shell-scroll`
+ * measures the result in a real browser. */
+html,
+body,
+#root {
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
 /* Always-visible scrollbars.
  *
  * macOS hides overlay scrollbars until you are already scrolling, which
