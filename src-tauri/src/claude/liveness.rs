@@ -104,9 +104,8 @@
 //! is not running.** `~/.claude/sessions/<pid>.json` exists for every
 //! running session and survives a SIGKILL (measured, epic #910), and
 //! `read_registry` already treats an absent directory as a settled empty
-//! answer rather than a failure -- `live.rs`'s
-//! `a_missing_registry_is_a_settled_empty_answer` is the same rule stated
-//! as a test, with the comment "absent is the answer, not an error".
+//! answer rather than a failure -- `an_absent_registry_directory_is_not_a_failure`
+//! states the same rule as a test.
 //!
 //! This does NOT weaken `Unknown`, and the ordering is what guarantees
 //! that: `registry.failure` and a non-empty `registry.unreadable` are
@@ -163,10 +162,18 @@
 //! process cwd we could not read, or a row with no recorded cwd,
 //! matches everything.
 //!
-//! This is a fix to `liveness.rs`, not the `live.rs` migration: the
-//! overview still counts from `live.rs` (which already reports these as
-//! "running is at least N", #1312), and the two now agree that such a
-//! session exists without either pretending to name it.
+//! **Named, when a hook-recorded run says which session it is (#1534).**
+//! The `.key` has no session id, but the `SessionStart` hook records
+//! `(session_id, pid)`, and the live pass stores the `.key`'s confirmed
+//! start time on that run. A live `.key`-only process whose start time
+//! EXACTLY matches one session's un-ended run is that session: its row is
+//! `Running`, and it stops hedging its neighbours. [`Unnamed`] carries the
+//! rule and what does not count; anything short of an exact, unambiguous
+//! match leaves the process unnamed.
+//!
+//! The overview page counts from the session list since #1534, so it
+//! shows exactly these verdicts; the old `live.rs` seam, which offered
+//! Resume on rows this module hedged, is gone.
 //!
 //! # `(pid, pid_start_time)`, never a pid alone
 //!
@@ -413,6 +420,12 @@ pub struct UnnamedSession {
     /// One line for the list and the export: which pid, where, and how
     /// sure. Never a session id -- there is none.
     pub line: String,
+    /// The `.key`'s `procStart`, in epoch seconds, ONLY when the process
+    /// table confirmed it (the same pairing and tolerance as every other
+    /// arm). `None` for a record we could not check or whose file carried
+    /// no usable start time -- and such a record can never be named
+    /// (#1534), because naming it would rest on the pid alone.
+    pub confirmed_start: Option<i64>,
 }
 
 impl UnnamedSession {
@@ -495,15 +508,17 @@ pub fn unnamed_sessions<P: ProcessProbe>(probe: &P, registry: &Registry) -> Vec<
                     pid: rec.pid,
                     cwd: None,
                     line: format!("pid {} could not be checked: {why}", rec.pid),
+                    confirmed_start: None,
                 });
                 continue;
             }
         };
-        let confirmed = match rec.proc_start.as_deref().and_then(parse_proc_start) {
-            Some(recorded) if (actual - recorded).abs() <= START_TOLERANCE_SECS => true,
+        let confirmed_start = match rec.proc_start.as_deref().and_then(parse_proc_start) {
+            Some(recorded) if (actual - recorded).abs() <= START_TOLERANCE_SECS => Some(recorded),
             Some(_) => continue,
-            None => false,
+            None => None,
         };
+        let confirmed = confirmed_start.is_some();
         let cwd = probe.cwd(rec.pid).ok().flatten();
         let place = match &cwd {
             Some(c) => format!("in {}", c.display()),
@@ -522,9 +537,113 @@ pub fn unnamed_sessions<P: ProcessProbe>(probe: &P, registry: &Registry) -> Vec<
             pid: rec.pid,
             cwd,
             line,
+            confirmed_start,
         });
     }
     out
+}
+
+/// The confirmed start time of every live `.key`-only process, by pid
+/// (#1534).
+///
+/// What the handoff consumer stores as a hook-recorded run's
+/// `pid_start_time`, beside `crash::start_times` for the `.json` records.
+/// Without it a terminal-launched session's run is ALWAYS recorded with a
+/// NULL start time -- the sweep that supplies start times reads only
+/// `.json` files -- and [`Unnamed::resolve`] could never name it.
+///
+/// The same trust as the `.json` path: only a `procStart` the process
+/// table agreed with, so a stale `.key` whose pid now belongs to another
+/// program contributes nothing.
+pub fn unnamed_start_times<P: ProcessProbe>(probe: &P, registry: &Registry) -> HashMap<u32, i64> {
+    unnamed_sessions(probe, registry)
+        .into_iter()
+        .filter_map(|u| u.confirmed_start.map(|t| (u.pid, t)))
+        .collect()
+}
+
+/// The live `.key`-only processes, split into the ones a hook-recorded run
+/// NAMES and the ones nothing does (#1534).
+///
+/// # The narrowing, and why it is not a guess
+///
+/// A `.key` carries no session id, but the `SessionStart` hook does: it
+/// records `(session_id, pid)` as a run, and the consumer stores the pid's
+/// confirmed start time beside it. So a live `.key`-only process whose
+/// start time EXACTLY equals an un-ended run's recorded start time, on the
+/// same pid, is that run's session. That is the `(pid, start time)`
+/// identity every other verdict here rests on, reached from the other
+/// side.
+///
+/// Exact, not [`START_TOLERANCE_SECS`]: the tolerance absorbs two clocks
+/// reading one process, and here both values are the same kernel start
+/// time recorded twice. A near miss is not evidence of anything, so it
+/// leaves the process unnamed -- the safe direction, since an unnamed
+/// process only ever makes rows LESS certain.
+///
+/// # What does not name a process
+///
+/// - A `.key` with no usable `procStart`, or one the process table did not
+///   confirm: [`UnnamedSession::confirmed_start`] is `None`.
+/// - A run that ENDED: `/clear` ends one session and starts another in the
+///   same process, so an ended run on this pid describes a session the
+///   process is no longer running.
+/// - Two or more sessions with a matching un-ended run: ambiguous, so
+///   neither is chosen.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Unnamed {
+    /// Live `.key`-only processes nothing names. Each still hedges the
+    /// rows it could be, and is what "running is at least N" counts.
+    pub sessions: Vec<UnnamedSession>,
+    /// Session id -> the pid a hook-recorded run names as running it.
+    pub named: HashMap<String, u32>,
+}
+
+impl Unnamed {
+    /// Check every `.key`-only record against the process table, and name
+    /// the ones a hook-recorded run identifies.
+    ///
+    /// `runs` is every session's runs, keyed by session id: naming is a
+    /// question about which session a process belongs to, so it needs
+    /// every row's runs rather than one row's.
+    pub fn resolve<P: ProcessProbe>(
+        probe: &P,
+        registry: &Registry,
+        runs: &HashMap<String, Vec<Run>>,
+    ) -> Unnamed {
+        let mut out = Unnamed::default();
+        for u in unnamed_sessions(probe, registry) {
+            match u.confirmed_start.and_then(|t| named_by(runs, u.pid, t)) {
+                Some(session_id) => {
+                    out.named.insert(session_id, u.pid);
+                }
+                None => out.sessions.push(u),
+            }
+        }
+        out
+    }
+}
+
+/// The ONE session with an un-ended run on `pid` whose recorded start time
+/// is exactly `start`, or `None` when there is no such session or more
+/// than one.
+fn named_by(runs: &HashMap<String, Vec<Run>>, pid: u32, start: i64) -> Option<String> {
+    let mut found: Option<&String> = None;
+    for (session_id, session_runs) in runs {
+        let matches = session_runs.iter().any(|r| {
+            r.ended_at.is_none()
+                && r.pid == pid
+                && r.pid_start_time.as_deref().and_then(parse_run_start) == Some(start)
+        });
+        if !matches {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(session_id);
+    }
+    found.cloned()
 }
 
 /// `~/.claude/sessions`, or `None` when there is no home directory.
@@ -613,6 +732,24 @@ pub fn parse_proc_start(text: &str) -> Option<i64> {
     chrono::NaiveDateTime::parse_from_str(text.trim(), "%a %b %e %H:%M:%S %Y")
         .ok()
         .map(|dt| dt.and_utc().timestamp())
+}
+
+/// Parse a hook-recorded run's `pid_start_time` into epoch seconds.
+///
+/// The column is written as **RFC 3339** (`2026-09-11T09:43:48+00:00`) by
+/// both of its writers, `handoff.rs` and `crash.rs`, "to match every
+/// other timestamp in the schema". Reading it with [`parse_proc_start`]
+/// alone -- as this module did until #1534 -- parsed nothing that was
+/// actually stored, so every un-ended run whose registry entry had gone
+/// read `Unknown` ("without a start time we can compare") however alive or
+/// dead its pid was. The registry's own spelling is still accepted,
+/// because a run built from it (the tests, and any older writer) carries
+/// the same instant.
+pub fn parse_run_start(text: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(text.trim())
+        .ok()
+        .map(|t| t.timestamp())
+        .or_else(|| parse_proc_start(text))
 }
 
 /// What the machine says about one pid, independent of any session.
@@ -787,43 +924,62 @@ pub struct Run {
 /// registry we could not read still puts every row in `Unknown`.
 ///
 /// With no cwd for the row, so any live `.key`-only session turns a
-/// `Dead` into `Unknown` (#1315). Callers that know the row's cwd use
-/// [`derive_at`], which narrows that to the sessions that could be it.
+/// `Dead` into `Unknown` (#1315), and with no other rows' runs, so no
+/// `.key`-only process is named (#1534). Callers deriving a whole list use
+/// [`derive_at`] with one [`Unnamed::resolve`] over every row's runs.
 pub fn derive<P: ProcessProbe>(
     probe: &P,
     registry: &Registry,
     session_id: &str,
     runs: &[Run],
 ) -> Liveness {
-    derive_at(probe, registry, session_id, None, runs)
+    let unnamed = Unnamed::resolve(probe, registry, &HashMap::new());
+    derive_at(probe, registry, &unnamed, session_id, None, runs)
 }
 
-/// [`derive`], for a row whose recorded working directory is `cwd`.
+/// [`derive`], for a row whose recorded working directory is `cwd`,
+/// against the `.key`-only processes [`Unnamed::resolve`] classified.
 ///
 /// Every `Dead` below rests, somewhere, on "the registry would have
 /// shown it": the #984 absence inference, a run's pid being gone, even
 /// an orphaned entry (a crashed session resumed from a terminal leaves
 /// its old `.json` and publishes only a `.key` for the new process). A
 /// live `.key`-only session breaks that premise for every row it could
-/// be, so those rows become `Unknown`, naming the pid. `Running` and
-/// `Unknown` verdicts are never touched -- the unnamed session cannot
-/// make a row MORE certain, and it is never promoted to `Running`,
-/// because nothing says which session it is.
+/// be, so those rows become `Unknown`, naming the pid.
+///
+/// Except when a hook-recorded run NAMES the process (#1534): then this
+/// row is `Running` on the `(pid, start time)` identity, and the process
+/// no longer hedges anyone else's row -- it is not "some session", it is
+/// this one. That is the only way a `.key` reaches `Running`, and
+/// [`Unnamed`] states why it is not a guess.
+///
+/// A row `Running` on its own records is never touched: the unnamed
+/// session cannot make a row MORE certain.
 pub fn derive_at<P: ProcessProbe>(
     probe: &P,
     registry: &Registry,
+    unnamed: &Unnamed,
     session_id: &str,
     cwd: Option<&str>,
     runs: &[Run],
 ) -> Liveness {
     let verdict = from_records(probe, registry, session_id, runs);
+    if verdict.is_running() {
+        return verdict;
+    }
+    if let Some(&pid) = unnamed.named.get(session_id) {
+        // No `status`: a `.key` publishes none, and an orphaned `.json`
+        // for this session describes the process that died, not this one.
+        return Liveness::Running { pid, status: None };
+    }
     if !matches!(verdict, Liveness::Dead { .. }) {
         return verdict;
     }
-    let could_be: Vec<String> = unnamed_sessions(probe, registry)
-        .into_iter()
+    let could_be: Vec<&str> = unnamed
+        .sessions
+        .iter()
         .filter(|u| u.could_be(cwd))
-        .map(|u| u.line)
+        .map(|u| u.line.as_str())
         .collect();
     if could_be.is_empty() {
         return verdict;
@@ -994,7 +1150,7 @@ fn from_records<P: ProcessProbe>(
         };
     };
 
-    let Some(recorded) = run.pid_start_time.as_deref().and_then(parse_proc_start) else {
+    let Some(recorded) = run.pid_start_time.as_deref().and_then(parse_run_start) else {
         return Liveness::Unknown {
             why: format!(
                 "pid {} was recorded for this session without a start time we can compare, so a \
@@ -1722,6 +1878,19 @@ mod tests {
         )
     }
 
+    /// [`derive_at`] for one row with no other rows' runs, so nothing is
+    /// named: the #1315 tests below are about hedging, not naming.
+    fn at<P: ProcessProbe>(
+        probe: &P,
+        reg: &Registry,
+        session_id: &str,
+        cwd: Option<&str>,
+        runs: &[Run],
+    ) -> Liveness {
+        let unnamed = Unnamed::resolve(probe, reg, &HashMap::new());
+        derive_at(probe, reg, &unnamed, session_id, cwd, runs)
+    }
+
     /// The registry a terminal launch leaves: a `.key`, no `.json`.
     fn key_only_registry(proc_start: Option<&str>) -> Registry {
         Registry {
@@ -1814,7 +1983,7 @@ mod tests {
             ("every run ended", &reg, &ended[..]),
             ("orphaned entry", &orphaned, &[][..]),
         ] {
-            match derive_at(&probe, reg, "s1", Some(WIDGET), runs) {
+            match at(&probe, reg, "s1", Some(WIDGET), runs) {
                 Liveness::Unknown { why } => {
                     assert!(why.contains("pid 4242"), "{what}: must name the pid: {why}");
                     assert!(why.contains(WIDGET), "{what}: and where it runs: {why}");
@@ -1836,7 +2005,7 @@ mod tests {
     fn a_key_only_session_only_hedges_rows_it_could_be() {
         let probe = table(&[(4242, PROC_START_EPOCH, WIDGET)]);
         let reg = key_only_registry(Some(PROC_START));
-        let row = |cwd: Option<&str>| derive_at(&probe, &reg, "s1", cwd, &[]);
+        let row = |cwd: Option<&str>| at(&probe, &reg, "s1", cwd, &[]);
 
         assert!(
             matches!(row(Some("/Users/acme/code/gadget")), Liveness::Dead { .. }),
@@ -1857,7 +2026,7 @@ mod tests {
         let above = table(&[(4242, PROC_START_EPOCH, "/Users/acme")]);
         assert!(
             matches!(
-                derive_at(&above, &reg, "s1", Some(WIDGET), &[]),
+                at(&above, &reg, "s1", Some(WIDGET), &[]),
                 Liveness::Unknown { .. }
             ),
             "a row recorded in a descendant folder of the live process could be it"
@@ -1888,7 +2057,7 @@ mod tests {
             assert!(unnamed_sessions(probe, &reg).is_empty(), "{what}");
             assert!(
                 matches!(
-                    derive_at(probe, &reg, "s1", Some(WIDGET), &[]),
+                    at(probe, &reg, "s1", Some(WIDGET), &[]),
                     Liveness::Dead { .. }
                 ),
                 "{what}: the row keeps its settled answer"
@@ -1913,7 +2082,7 @@ mod tests {
             );
             assert!(
                 matches!(
-                    derive_at(&probe, &reg, "s1", Some(WIDGET), &[]),
+                    at(&probe, &reg, "s1", Some(WIDGET), &[]),
                     Liveness::Unknown { .. }
                 ),
                 "{proc_start:?}"
@@ -1940,7 +2109,7 @@ mod tests {
         for (what, probe) in [("probe failed", &failed), ("cwd unreadable", &no_cwd)] {
             assert!(
                 matches!(
-                    derive_at(probe, &reg, "s1", Some("/Users/acme/code/gadget"), &[]),
+                    at(probe, &reg, "s1", Some("/Users/acme/code/gadget"), &[]),
                     Liveness::Unknown { .. }
                 ),
                 "{what}"
@@ -1959,12 +2128,205 @@ mod tests {
             (4242, PROC_START_EPOCH, WIDGET),
         ]);
         assert_eq!(
-            derive_at(&probe, &reg, "s1", Some(WIDGET), &[]),
+            at(&probe, &reg, "s1", Some(WIDGET), &[]),
             Liveness::Running {
                 pid: 14779,
                 status: Some("busy".into())
             }
         );
+    }
+
+    /// `2026-09-11T09:43:48+00:00`: [`PROC_START`] as `claude_run` stores
+    /// it. Both writers of `pid_start_time` spell it this way.
+    const PROC_START_RFC3339: &str = "2026-09-11T09:43:48+00:00";
+
+    /// An un-ended hook-recorded run of `pid`, started at `start`.
+    fn open_run(pid: u32, start: Option<&str>) -> Run {
+        Run {
+            pid,
+            pid_start_time: start.map(str::to_string),
+            ended_at: None,
+            ..Default::default()
+        }
+    }
+
+    /// A stored run start time is RFC 3339, and it is compared (#1534).
+    ///
+    /// Both writers of `claude_run.pid_start_time` store RFC 3339, and
+    /// until #1534 this module parsed it only as a registry `procStart` --
+    /// so every such run read `Unknown`, alive or dead. Sabotage: reading
+    /// runs with `parse_proc_start` alone makes both arms `Unknown`.
+    #[test]
+    fn a_run_start_time_stored_as_rfc3339_is_compared() {
+        assert_eq!(parse_run_start(PROC_START_RFC3339), Some(PROC_START_EPOCH));
+        assert_eq!(parse_run_start(PROC_START), Some(PROC_START_EPOCH));
+        let runs = [open_run(4242, Some(PROC_START_RFC3339))];
+        assert!(derive(&alive(PROC_START_EPOCH), &Registry::default(), "s1", &runs).is_running());
+        match derive(&gone(), &Registry::default(), "s1", &runs) {
+            Liveness::Dead { why } => assert!(why.contains("4242"), "{why}"),
+            other => panic!("a run whose pid is gone is stopped, not {other:?}"),
+        }
+    }
+
+    /// **#1534, the match.** A live `.key`-only process whose start time
+    /// is exactly an un-ended run's is that run's session: its row is
+    /// `Running`, and the process stops hedging the other rows in its
+    /// folder, because it is not "some session" any more.
+    ///
+    /// Both shapes the narrowing exists for: a row the registry has never
+    /// named, and a crashed session resumed from a terminal, whose old
+    /// `.json` is still there naming a pid that is gone.
+    ///
+    /// Sabotage: dropping the `named` arm from `derive_at` leaves `s1`
+    /// hedged `Unknown`; resolving without removing the named process from
+    /// `sessions` leaves `s2` hedged.
+    #[test]
+    fn a_key_only_process_whose_start_matches_a_run_is_that_session() {
+        let probe = table(&[(4242, PROC_START_EPOCH, WIDGET)]);
+        let runs = HashMap::from([
+            (
+                "s1".to_string(),
+                vec![open_run(4242, Some(PROC_START_RFC3339))],
+            ),
+            ("s2".to_string(), vec![]),
+        ]);
+        let plain = key_only_registry(Some(PROC_START));
+        let mut crashed = plain.clone();
+        crashed.entries = registry_with(Some("busy")).entries; // s1 at pid 14779, gone
+
+        for (what, reg) in [
+            ("never in the registry", &plain),
+            ("orphaned .json", &crashed),
+        ] {
+            let unnamed = Unnamed::resolve(&probe, reg, &runs);
+            assert_eq!(unnamed.named.get("s1"), Some(&4242), "{what}");
+            assert!(
+                unnamed.sessions.is_empty(),
+                "{what}: {:?}",
+                unnamed.sessions
+            );
+            assert_eq!(
+                derive_at(&probe, reg, &unnamed, "s1", Some(WIDGET), &runs["s1"]),
+                // No status: the orphan's frozen "busy" is the dead process's.
+                Liveness::Running {
+                    pid: 4242,
+                    status: None
+                },
+                "{what}"
+            );
+            assert!(
+                matches!(
+                    derive_at(&probe, reg, &unnamed, "s2", Some(WIDGET), &[]),
+                    Liveness::Dead { .. }
+                ),
+                "{what}: the process is s1, so it cannot be s2"
+            );
+        }
+    }
+
+    /// **#1534, the mismatch.** Anything short of an exact start-time
+    /// match on an un-ended run of the same pid names nothing, and the
+    /// rows stay hedged exactly as #1315 left them.
+    ///
+    /// One second out is inside [`START_TOLERANCE_SECS`], and deliberately
+    /// not enough: the two values are one kernel start time recorded
+    /// twice, so a near miss is not a match. Sabotage: comparing with the
+    /// tolerance instead of `==` names `s1` on the first case.
+    #[test]
+    fn a_key_only_process_is_not_named_by_a_run_that_does_not_match_exactly() {
+        let probe = table(&[(4242, PROC_START_EPOCH, WIDGET)]);
+        let reg = key_only_registry(Some(PROC_START));
+        let one_second_out = chrono::DateTime::from_timestamp(PROC_START_EPOCH + 1, 0)
+            .unwrap()
+            .to_rfc3339();
+        let ended = Run {
+            ended_at: Some("2026-09-11T10:00:00Z".into()),
+            ..open_run(4242, Some(PROC_START_RFC3339))
+        };
+        let cases: [(&str, HashMap<String, Vec<Run>>); 5] = [
+            (
+                "start one second out",
+                HashMap::from([("s1".into(), vec![open_run(4242, Some(&one_second_out))])]),
+            ),
+            (
+                "a different pid",
+                HashMap::from([("s1".into(), vec![open_run(5000, Some(PROC_START_RFC3339))])]),
+            ),
+            (
+                "no recorded start",
+                HashMap::from([("s1".into(), vec![open_run(4242, None)])]),
+            ),
+            (
+                "the run ended (a /clear)",
+                HashMap::from([("s1".into(), vec![ended])]),
+            ),
+            (
+                "two sessions match",
+                HashMap::from([
+                    ("s1".into(), vec![open_run(4242, Some(PROC_START_RFC3339))]),
+                    ("s2".into(), vec![open_run(4242, Some(PROC_START))]),
+                ]),
+            ),
+        ];
+        for (what, runs) in cases {
+            let unnamed = Unnamed::resolve(&probe, &reg, &runs);
+            assert!(unnamed.named.is_empty(), "{what}: {:?}", unnamed.named);
+            assert_eq!(unnamed.sessions.len(), 1, "{what}");
+            assert!(
+                matches!(
+                    derive_at(&probe, &reg, &unnamed, "s3", Some(WIDGET), &[]),
+                    Liveness::Unknown { .. }
+                ),
+                "{what}: the process is still unnamed, so it still hedges"
+            );
+        }
+    }
+
+    /// **#1534, no `procStart`.** A `.key` whose start time is missing or
+    /// unreadable cannot be named, even by a run whose start matches the
+    /// process exactly: that match would rest on the pid alone.
+    ///
+    /// Sabotage: naming from the probe's start time when the `.key` has
+    /// none names `s1` and fails this.
+    #[test]
+    fn a_key_only_process_with_no_proc_start_is_never_named() {
+        let probe = table(&[(4242, PROC_START_EPOCH, WIDGET)]);
+        let runs = HashMap::from([(
+            "s1".to_string(),
+            vec![open_run(4242, Some(PROC_START_RFC3339))],
+        )]);
+        for proc_start in [None, Some("not a start time")] {
+            let reg = key_only_registry(proc_start);
+            let unnamed = Unnamed::resolve(&probe, &reg, &runs);
+            assert!(unnamed.named.is_empty(), "{proc_start:?}");
+            assert_eq!(unnamed.sessions.len(), 1, "{proc_start:?}");
+            assert_eq!(unnamed.sessions[0].confirmed_start, None);
+            assert!(
+                matches!(
+                    derive_at(&probe, &reg, &unnamed, "s2", Some(WIDGET), &[]),
+                    Liveness::Unknown { .. }
+                ),
+                "{proc_start:?}: still hedging"
+            );
+        }
+        assert!(unnamed_start_times(&probe, &key_only_registry(None)).is_empty());
+    }
+
+    /// The handoff is handed only CONFIRMED `.key` start times (#1534).
+    ///
+    /// Without them a terminal launch's run is stored with a NULL start
+    /// time and can never name its process. With an unconfirmed one, a
+    /// reused pid would hand a stranger's start time to a new run.
+    #[test]
+    fn only_confirmed_key_start_times_reach_the_handoff() {
+        let reg = key_only_registry(Some(PROC_START));
+        assert_eq!(
+            unnamed_start_times(&table(&[(4242, PROC_START_EPOCH, WIDGET)]), &reg),
+            HashMap::from([(4242, PROC_START_EPOCH)])
+        );
+        let reused = table(&[(4242, PROC_START_EPOCH + 86_400, WIDGET)]);
+        assert!(unnamed_start_times(&reused, &reg).is_empty());
+        assert!(unnamed_start_times(&table(&[]), &reg).is_empty());
     }
 
     /// `sysinfo`'s `start_time()` is EPOCH SECONDS, and this pins it.

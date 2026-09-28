@@ -417,7 +417,12 @@ export function matchesClaudeFilter(s: ClaudeSession, filter: ClaudeSessionFilte
       // It is also the right predicate on its own terms: resuming a
       // session that is already alive starts a SECOND copy of it, which is
       // the failure both banners on the overview are worded to prevent.
-      return s.liveness.state !== "running" && s.cwd_state.state === "exists";
+      //
+      // `dead`, not `!== "running"` (#1534). A row this list says it could
+      // not tell about -- a terminal-launched session may be running in
+      // its folder -- is not resumable, and the overview's "Ready to
+      // resume" stopped offering it for the same reason.
+      return s.liveness.state === "dead" && s.cwd_state.state === "exists";
     case "gone":
       // Same subtraction, same reason -- `overview.rs` counts `archived`
       // as "not running + cwd gone", and the three cwd buckets plus

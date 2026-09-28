@@ -6,7 +6,7 @@
 /// # Liveness: three answers, plus one the transcript adds
 ///
 /// `Liveness` comes from `claude/liveness.rs` (via the session detail),
-/// not from `live.rs`, which feeds the overview. Since #1315 a session
+/// the same derivation the overview counts from since #1534. Since #1315 a session
 /// that published only a `.key` makes the rows in its folder read
 /// `unknown`, naming the pid and the folder in `why`. The header takes
 /// that verdict as it is: `unknown` renders as "could not tell", with

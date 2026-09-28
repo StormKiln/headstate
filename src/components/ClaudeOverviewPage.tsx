@@ -248,12 +248,19 @@ function Tile({
 /// "derives no liveness of its own -- #917's `liveness` module owns that,
 /// and two answers to one question disagree the first time either
 /// changes." The fix was in `liveness::derive` rather than here, because
-/// this page's reading was the one consistent with `live.rs`'s own
-/// `a_missing_registry_is_a_settled_empty_answer`: a registry listing we
-/// read WHOLE that does not name a session is positive evidence. Nothing
-/// on this page changed; the list stopped hedging. Measured after:
+/// this page's reading was the consistent one: a registry listing we read
+/// WHOLE that does not name a session is positive evidence. Nothing on
+/// this page changed; the list stopped hedging. Measured after:
 /// `running 1  dead 1490  unknown 0`, and 183 of the 1,490 have a live
 /// directory -- which is `resumable` exactly.
+///
+/// #1534 was the same disagreement the other way round: the list rightly
+/// said "could not tell" for rows a terminal-launched session might be,
+/// and this page, counting from a separate running-ids set, still offered
+/// them for resumption. Since then every row's verdict comes off the
+/// session list itself (`overview.rs`'s `report`), so the two cannot
+/// disagree, and a row the list cannot decide is counted in
+/// `liveness_unknown` and offered nowhere.
 ///
 /// # Absent is not zero, and a chart is the worst place to break it
 ///
@@ -262,8 +269,8 @@ function Tile({
 /// | condition | rendering |
 /// |---|---|
 /// | the aggregate query failed | `QueryError` with the reason. **Not** a page of zeros. |
-/// | the live registry could not be read | the page, with a banner; `running` renders "could not tell" |
-/// | registry records could not be used | the page, with a banner saying `running` is a floor |
+/// | the live registry could not be read | the page, with a banner; `running` and `resumable` render "could not tell" |
+/// | registry records could not be used, or a session runs with none | the page, with a banner saying `running` is a floor |
 /// | the cache is genuinely empty | "no sessions", and an offer to rescan -- only when the read SUCCEEDED |
 ///
 /// The error arm is ordered FIRST, before the empty one. That ordering is
@@ -393,12 +400,19 @@ export function ClaudeOverviewPage() {
     );
   }
 
-  const { counts, activity, resumable, live_failure, live_unreadable } = data;
-  // The ONE place `running` becomes null. A registry we could not list
-  // gives no answer about what is running, and rendering 0 there is
-  // #841's fail-open in the place a user acts on it: "nothing is running"
-  // is what makes a Resume button look safe.
+  const { counts, activity, resumable, live_failure, live_unreadable, live_unnamed } = data;
+  // The places a figure becomes null. A registry we could not list gives
+  // no answer about what is running, and rendering 0 there is #841's
+  // fail-open in the place a user acts on it: "nothing is running" is
+  // what makes a Resume button look safe. Since #1534 the same failure
+  // leaves every row "could not tell", so `resumable` is 0 by absence
+  // rather than by measurement -- and a 0 there would read as "nothing
+  // to resume".
   const running = live_failure === null ? counts.running : null;
+  const resumableCount = live_failure === null ? counts.resumable : null;
+  // Records we could not use, plus sessions running under no record:
+  // either way `running` is a floor.
+  const hidden = live_unreadable.length + live_unnamed.length;
 
   return (
     <div className="flex flex-col gap-4">
@@ -412,42 +426,49 @@ export function ClaudeOverviewPage() {
           className="flex items-start gap-2 rounded-md border border-[#30363d] bg-[#161b22] px-3 py-2 text-xs text-[#8b949e]"
         >
           <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-          {/* NOT "the figures below are unaffected", which is what this
-              said first and is too strong. `aggregate` classifies a
-              session as resumable precisely when it is NOT in the running
-              set, so a registry we could not read leaves every live
-              session counted as resumable -- and resuming one that is
-              already alive starts a second copy of it. The over-count is
-              small (never more than the handful that can be live at once)
-              and the direction is the one that misleads an action, so it
-              is named rather than glossed. */}
+          {/* Since #1534 every row takes the session list's own verdict,
+              and a registry we could not read leaves every row "could not
+              tell" there -- so no session is offered to resume, rather
+              than every live one being offered as it was before. What the
+              reader can do is the same either way: nothing here is safe to
+              resume until the registry can be read. */}
           <span>
             Could not tell which sessions are running: {live_failure}. The
-            history below is unaffected, but nothing could be subtracted from
-            &ldquo;resumable&rdquo; — so any session that IS running is counted
-            there, and resuming one that is already alive starts a second copy.
+            history below is unaffected. No session is offered to resume,
+            because any of them may be running.
           </span>
         </div>
-      ) : live_unreadable.length > 0 ? (
+      ) : hidden > 0 ? (
         <div
           role="alert"
           className="flex items-start gap-2 rounded-md border border-[#30363d] bg-[#161b22] px-3 py-2 text-xs text-[#8b949e]"
         >
           <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-          {/* Both halves, because the unreadable record cuts two ways. A
-              session it hides is missing from the running set, so
-              "running" under-counts -- and `aggregate` then classifies
-              that same session by its directory, which can put a LIVE
-              session in the resumable list. Resuming one that is already
-              alive starts a second copy of it, so the over-count is the
-              half that can mislead an action and it has to be said. */}
+          {/* "Running" is a floor, and that is the whole claim. The
+              sessions these could be read "could not tell" on the list,
+              and since #1534 this page takes that verdict too, so none of
+              them is offered to resume -- the over-count this banner used
+              to warn about is gone. Unusable records and unnamed
+              processes are stated apart: they are different facts with
+              different remedies. */}
           <span>
-            {live_unreadable.length} live session{" "}
-            {live_unreadable.length === 1 ? "record" : "records"} could not be
-            used, so &ldquo;running&rdquo; is at least {counts.running} rather
-            than exactly {counts.running} — and a session it hides may be
-            counted as resumable while in fact still running.{" "}
-            {live_unreadable[0]}
+            {live_unreadable.length > 0 ? (
+              <>
+                {live_unreadable.length} live session{" "}
+                {live_unreadable.length === 1 ? "record" : "records"} could not be
+                used.{" "}
+              </>
+            ) : null}
+            {live_unnamed.length > 0 ? (
+              <>
+                {live_unnamed.length} Claude Code{" "}
+                {live_unnamed.length === 1 ? "session is" : "sessions are"} running
+                without a session record.{" "}
+              </>
+            ) : null}
+            &ldquo;Running&rdquo; is at least {counts.running} rather than exactly{" "}
+            {counts.running}, and a session any of them could be is not offered
+            to resume. {live_unreadable[0] ?? live_unnamed[0]}
           </span>
         </div>
       ) : null}
@@ -471,10 +492,19 @@ export function ClaudeOverviewPage() {
         />
         <Tile
           label="Resumable"
-          value={counts.resumable}
+          value={resumableCount}
           Icon={RotateCw}
           tone="action"
-          hint="not running, and the directory they ran in still exists"
+          hint={
+            live_failure !== null
+              ? "whether any of them is running could not be told"
+              : counts.liveness_unknown > 0
+                ? // Qualified, not suppressed: the count is right about
+                  // what it contains, and low by rows the list could not
+                  // decide (#1534).
+                  `at least this many: not running, and the directory still exists. ${counts.liveness_unknown.toLocaleString()} more could not be told apart from running`
+                : "not running, and the directory they ran in still exists"
+          }
           onClick={() => showSessions("resumable")}
         />
         <Tile
@@ -496,6 +526,15 @@ export function ClaudeOverviewPage() {
 
       <div className="text-xs text-[#8b949e]">
         {counts.sessions.toLocaleString()} sessions in the cache
+        {/* Only while the registry was read: under `live_failure` this is
+            every session, and the banner above already says so. */}
+        {live_failure === null && counts.liveness_unknown > 0 ? (
+          <>
+            {" · "}
+            {counts.liveness_unknown.toLocaleString()} that may be running,
+            not offered to resume
+          </>
+        ) : null}
         {counts.cwd_unknown > 0 ? (
           <>
             {" · "}
@@ -541,7 +580,15 @@ export function ClaudeOverviewPage() {
             ? "sessions whose directory still exists"
             : `the ${resumable.length} most recent of ${counts.resumable.toLocaleString()} — newest activity first`}
         </div>
-        {resumable.length === 0 ? (
+        {resumable.length === 0 && live_failure !== null ? (
+          <div className="py-8 text-center text-sm text-[#8b949e]">
+            {/* Empty by absence, not by measurement (#1534): with no
+                registry read every row is "could not tell", and "no
+                session can be resumed" would be a confident wrong answer. */}
+            Whether any session is running could not be told, so none is
+            offered here.
+          </div>
+        ) : resumable.length === 0 ? (
           <div className="py-8 text-center text-sm text-[#8b949e]">
             {/* Only reachable when the read SUCCEEDED, because the error
                 arm returned above. So this is a real answer and is worded

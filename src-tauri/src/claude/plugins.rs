@@ -405,7 +405,7 @@ pub struct PluginsReport {
     /// answer, an unreadable file is no answer at all.
     pub inventory_failure: Option<String>,
     /// The inventory file is simply not there -- nothing is installed.
-    /// A settled empty answer, not a failure. `live.rs`'s `read_registry`
+    /// A settled empty answer, not a failure. `liveness.rs`'s `read_registry`
     /// draws this same line and #970 is why it exists.
     pub inventory_absent: bool,
     /// How many transcripts the scan read this time (the rest were
