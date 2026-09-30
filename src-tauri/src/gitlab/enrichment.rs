@@ -473,10 +473,12 @@ mod tests {
         }])).unwrap();
         let raw = json!({"id":77,"iid":7,"title":"fixture","web_url":rows[0].url,"state":"opened","draft":false,
             "source_branch":"topic","target_branch":"main","sha":"a","head_pipeline":{"id":1,"sha":"a","status":"failed"}});
+        // Consume POST stdin before replying, just as glab does. Exiting
+        // early races write_all with a closed pipe on faster Linux runners.
         std::fs::write(
             &program,
             format!(
-                "#!/bin/sh\necho read >> \"$0.calls\"\nprintf 'HTTP/2 200\\n\\n%s' '{}'\n",
+                "#!/bin/sh\ncat > /dev/null\necho read >> \"$0.calls\"\nprintf 'HTTP/2 200\\n\\n%s' '{}'\n",
                 raw
             ),
         )
