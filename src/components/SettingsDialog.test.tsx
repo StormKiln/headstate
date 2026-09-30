@@ -38,6 +38,7 @@ const cleanupPrefs = vi.hoisted(() => ({
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 vi.mock("../api/tauri", () => ({ revealLog: revealFn }));
+vi.mock("./GitLabHostPanel", () => ({ GitLabHostPanel: () => <button>Save GitLab host</button> }));
 vi.mock("../api/hooks", () => ({
   // #1154. Undefined renders nothing, which is what these tests assume:
   // a failed probe must not draw "not found" for every tool.
@@ -98,6 +99,13 @@ import { ALL_VIEWS } from "@/store/filters";
 function open() {
   return render(<SettingsDialog open onOpenChange={() => {}} />);
 }
+
+it("uses the GitLab host save control instead of the scan-directory footer save", () => {
+  open();
+  fireEvent.click(screen.getByRole("button", { name: "GitLab" }));
+  expect(screen.getByRole("button", { name: "Save GitLab host" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: /^Save$/ })).toBeNull();
+});
 
 describe("SettingsDialog", () => {
   it("shows the configured directories, one per line", () => {

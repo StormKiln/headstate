@@ -1,3 +1,4 @@
+import { prKey } from "@/lib/prIdentity";
 import { ExternalLink } from "./ExternalLink";
 import { AlertTriangle } from "lucide-react";
 import { HelpButton } from "./HelpButton";
@@ -59,7 +60,7 @@ export function PrioritiesStrip({
       </h2>
       <ul>
         {blocked.map((pr) => (
-          <li key={`${pr.repo}#${pr.number}`} className="text-sm">
+          <li key={prKey(pr)} className="text-sm">
             {/* The panel exists to say "these need you right now", and
                 it was the one surface you could not act from: its only
                 interactive element was an external link to github.com.

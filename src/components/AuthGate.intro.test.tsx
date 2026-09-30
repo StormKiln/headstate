@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../api/hooks", () => ({
   usePollError: () => null,
-  useStoreError: () => null,
+  useStoreError: () => ({ message: null, dismiss: () => {} }),
   clearPollError: vi.fn(),
   useUiPrefs: () => ({ prefs: undefined, set: vi.fn() }),
 }));
@@ -11,6 +11,12 @@ vi.mock("../splash", () => ({ dismissSplash: vi.fn() }));
 vi.mock("../api/tauri", () => ({
   getAuthState: () =>
     Promise.resolve({ ok: false, message: "gh was not found in /usr/local/bin" }),
+  getGitLabAuthState: () => Promise.resolve({
+    host: "gitlab.com",
+    ok: false,
+    issue: "missingCli",
+    message: "GitLab CLI (glab) was not found on the desktop running Headstate.",
+  }),
 }));
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -29,11 +35,9 @@ function show() {
   );
 }
 
-/// The unauthenticated screen was well built for the FAILURE case -- a
-/// real headline, the actual error from Rust naming the searched
-/// directories, copy-pasteable commands, a privacy note. But it
-/// explained only how to install `gh`. Nothing on it, or anywhere after
-/// it, said what Headstate IS.
+/// The former unauthenticated screen explained how to install `gh` and
+/// what Headstate watches. The shell now stays open when GitHub auth is
+/// missing, so that context and the repair command live in its banner.
 ///
 /// The one statement of scope lived in an empty-list branch most users
 /// never see, so a user WITH pull requests skipped straight past it --
@@ -46,8 +50,7 @@ describe("first run", () => {
     expect(screen.getByText(/waiting on your review/i)).toBeTruthy();
   });
 
-  // The diagnosable error from Rust is the most useful thing on screen
-  // when something is actually wrong; an intro must not displace it.
+  // The diagnosable Rust error and repair command remain visible.
   it("still shows the real error and the install commands", async () => {
     show();
     expect(await screen.findByText(/gh was not found/)).toBeTruthy();

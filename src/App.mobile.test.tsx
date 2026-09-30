@@ -1,11 +1,17 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConnectionState } from "./api/connection";
 import { PR_FIXTURES } from "./fixtures/prs";
 import { REQUIRED_PROTOCOL_VERSION } from "./lib/protocol";
 import { useFilters } from "./store/filters";
+import { useSourceSelection } from "./store/sourceSelection";
+import { sourceRepoKey } from "./components/SourceQueue";
 import { stubViewport } from "./test-utils";
+import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
+import { AuthGate } from "./components/AuthGate";
+
+const cacheReadAt = vi.hoisted(() => ({ value: 0 }));
 
 // The shell talks to Tauri on mount. Stub the command surface so these
 // tests exercise the layout, not the backend -- the same set App.test
@@ -25,8 +31,10 @@ vi.mock("./api/hooks", () => ({
   useUpdatePrBranch: () => () => Promise.resolve(),
   useActOnPrs: () => () => Promise.resolve([]),
   useSetAutoMerge: () => () => Promise.resolve(),
-  usePullRequests: () => ({ data: PR_FIXTURES, isSuccess: true, isLoading: false }),
+  usePullRequests: () => ({ data: PR_FIXTURES, isSuccess: true, isLoading: false, dataUpdatedAt: cacheReadAt.value }),
   usePollError: () => null,
+  useStoreError: () => ({ message: null, dismiss: () => {} }),
+  clearPollError: () => {},
   useRefreshRequested: () => undefined,
   useRefreshFromGesture: () => () => Promise.resolve(),
   useTruncation: () => null,
@@ -92,10 +100,6 @@ vi.mock("./api/hooks", () => ({
   useMergedDetail: () => ({ data: undefined, isLoading: false }),
 }));
 
-vi.mock("./components/AuthGate", () => ({
-  AuthGate: ({ children }: { children: React.ReactNode }) => <>{children}</>,
-}));
-
 const connection = vi.hoisted(() => ({ current: { kind: "local" } as ConnectionState }));
 // Spread the real module rather than replacing it: only the hook needs
 // to be driven from the test, and `isStale` -- which `StaleRibbon` and
@@ -117,6 +121,15 @@ function renderApp() {
   );
 }
 
+function renderGatedApp() {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={qc}>
+      <AuthGate><App /></AuthGate>
+    </QueryClientProvider>,
+  );
+}
+
 const EMPTY = {
   "my-prs": {},
   "to-review": {},
@@ -129,11 +142,15 @@ const EMPTY = {
 };
 
 beforeEach(() => {
+  useSourceSelection.setState({ selection: "github", repoKey: null, query: "" });
   useFilters.setState({ filtersByView: EMPTY, view: "my-prs" } as never);
 });
 
 afterEach(() => {
   cleanup();
+  useSourceSelection.setState({ selection: "github", repoKey: null, query: "" });
+  clearMocks();
+  cacheReadAt.value = 0;
   stubViewport(null);
   connection.current = { kind: "local" };
 });
@@ -174,6 +191,47 @@ describe("App shell on a phone", () => {
     };
   });
 
+  it("shows a settled GitLab host error when the desktop cannot answer", async () => {
+    useSourceSelection.setState({ selection: "gitlab", repoKey: null, query: "" });
+    mockIPC((command) => {
+      if (command === "get_gitlab_host") throw new Error("desktop offline");
+      return undefined;
+    }, { shouldMockEvents: true });
+    renderApp();
+    expect(await screen.findByText(/Could not read the configured GitLab host/)).toBeTruthy();
+    expect(screen.queryByText(/Loading GitLab/)).toBeNull();
+  });
+
+  it("does not show a green or fresh GitHub claim with missing auth and a warm cache", async () => {
+    cacheReadAt.value = Date.now();
+    mockIPC((cmd) => {
+      if (cmd === "get_auth_state") return { ok: false, message: "gh was not found" };
+      if (cmd === "get_gitlab_auth_state") return { host: "gitlab.com", ok: true, issue: null, message: "" };
+      return undefined;
+    }, { shouldMockEvents: true });
+    renderGatedApp();
+    const banner = await screen.findByRole("button", { name: /GitHub is not refreshing/ });
+    expect(banner.textContent).toContain("reachable");
+    expect(banner.textContent).not.toContain("updated");
+    expect(banner.querySelector(".bg-\\[\\#3fb950\\]")).toBeNull();
+    expect(screen.getByText(PR_FIXTURES[0].title)).toBeTruthy();
+  });
+
+  it("labels auth IPC failure unknown on a connected phone with a warm cache", async () => {
+    cacheReadAt.value = Date.now();
+    mockIPC((cmd) => {
+      if (cmd === "get_auth_state") throw new Error("desktop IPC failed");
+      if (cmd === "get_gitlab_auth_state") return { host: "gitlab.com", ok: true, issue: null, message: "" };
+      return undefined;
+    }, { shouldMockEvents: true });
+    renderGatedApp();
+    const banner = await screen.findByRole("button", { name: /GitHub status unavailable/ });
+    expect(banner.textContent).toContain("reachable");
+    expect(banner.textContent).not.toContain("updated");
+    expect(banner.textContent).not.toContain("sign in");
+    expect(screen.getByText(PR_FIXTURES[0].title)).toBeTruthy();
+  });
+
   it("puts the repo sidebar behind a menu button", async () => {
     renderApp();
     // Not inline: the list gets the whole width.
@@ -181,6 +239,17 @@ describe("App shell on a phone", () => {
     fireEvent.click(screen.getByRole("button", { name: /open navigation/i }));
     await waitFor(() => expect(screen.getByRole("navigation")).toBeTruthy());
     expect(within(screen.getByRole("navigation")).getByText("All repositories")).toBeTruthy();
+  });
+
+  it("closes the sheet when a source repository is picked in Both mode", async () => {
+    useSourceSelection.setState({ selection: "both" });
+    renderApp();
+    fireEvent.click(screen.getByRole("button", { name: /open navigation/i }));
+    const nav = await screen.findByRole("navigation");
+    fireEvent.click(within(nav).getByRole("button", { name: /GitHub · github.com · octocat\/hello-world/ }));
+    await waitFor(() => expect(screen.queryByRole("navigation")).toBeNull());
+    expect(useSourceSelection.getState().repoKey).toBe(sourceRepoKey(PR_FIXTURES[0]));
+    expect(useFilters.getState().filtersByView["my-prs"].repo).toBeUndefined();
   });
 
   it("closes the sheet once a repo is picked", async () => {
@@ -251,6 +320,42 @@ describe("Stats on the companion build", () => {
 
   afterEach(() => {
     vi.unstubAllEnvs();
+  });
+
+  it("changes the phone source without changing desktop polling preferences", async () => {
+    const commands: string[] = [];
+    mockIPC((command, args) => {
+      commands.push(command === "remote_call" && args && "command" in args ? String(args.command) : command);
+      return undefined;
+    }, { shouldMockEvents: true });
+    stubViewport(390);
+    await renderMobileApp();
+    fireEvent.change(screen.getByLabelText("Source"), { target: { value: "gitlab" } });
+    expect((screen.getByLabelText("Source") as HTMLSelectElement).value).toBe("gitlab");
+    expect(commands).not.toContain("set_source_selection");
+  });
+
+  it("rechecks the desktop GitLab host on the phone's queue cadence", async () => {
+    const hostReads: string[] = [];
+    mockIPC((command, args) => {
+      if (command === "remote_call" && args && "command" in args && args.command === "get_gitlab_host") {
+        hostReads.push("read");
+        return hostReads.length === 1 ? "gitlab.com" : "self.example";
+      }
+      return undefined;
+    }, { shouldMockEvents: true });
+    useSourceSelection.setState({ selection: "gitlab", repoKey: null, query: "" });
+    vi.useFakeTimers();
+    const app = await renderMobileApp();
+    try {
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+      expect(hostReads).toHaveLength(1);
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+      expect(hostReads.length).toBeGreaterThan(1);
+    } finally {
+      app.unmount();
+      vi.useRealTimers();
+    }
   });
 
   /// #863 ships PR Stats to the companion, reversing #794's

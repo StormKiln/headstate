@@ -1,7 +1,8 @@
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { BatchOutcome } from "@/api/tauri";
-import { BulkBar, prKey } from "@/components/BulkBar";
+import { BulkBar } from "@/components/BulkBar";
+import { prKey } from "@/lib/prIdentity";
 import { PR_FIXTURES } from "@/fixtures/prs";
 import { useFilters } from "@/store/filters";
 import { renderWithQuery as render } from "@/test-utils";
@@ -154,8 +155,8 @@ describe("BulkBar", () => {
       { repo: PR_FIXTURES[1].repo, number: PR_FIXTURES[1].number, error: "boom" },
     ]);
     render(<BulkBar prs={PR_FIXTURES} />);
-    fireEvent.click(screen.getByRole("button", { name: "Convert to draft" }));
-    confirm("Convert to draft");
+    fireEvent.click(screen.getByRole("button", { name: "Close PRs" }));
+    confirm("Close PRs");
     await waitFor(() => expect(toastError).toHaveBeenCalled());
     expect(useFilters.getState().checked).toEqual([prKey(PR_FIXTURES[1])]);
   });
@@ -282,6 +283,28 @@ describe("BulkBar", () => {
     expect(useFilters.getState().checked).toEqual([]);
   });
 });
+
+for (const source of [
+  { provider: "gitlab" as const, host: "gitlab.com" },
+  { provider: "github" as const, host: "github.example" },
+]) {
+  it(`keeps ${source.provider}/${source.host} selection separate and refuses unsupported writes`, () => {
+    const github = PR_FIXTURES[0];
+    const other = { ...github, source, title: "Other source row" };
+    select(other);
+    render(<BulkBar prs={[github, other]} />);
+    expect(screen.getByText("1 selected")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Close PRs" }));
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByText(/Other source row/)).toBeTruthy();
+    expect(within(dialog).queryByText(new RegExp(github.title))).toBeNull();
+    confirm("Close PRs");
+    expect(batch).not.toHaveBeenCalled();
+    expect(toastSuccess).not.toHaveBeenCalled();
+    expect(toastError).toHaveBeenCalledWith("Bulk actions are currently available only for GitHub.com pull requests");
+    expect(useFilters.getState().checked).toEqual([prKey(other)]);
+  });
+}
 
 /// #1286, the same defect #1278 fixed for the PR detail bar.
 ///

@@ -23,9 +23,8 @@
 //! payloads are untouched: the hub reads them and never re-emits.
 //!
 //! Tauri runs Rust listeners on the emitting thread, under its listener
-//! lock, so the callback does one thing: push onto a
-//! `tokio::sync::broadcast` channel, which never blocks and never
-//! re-enters Tauri.
+//! lock. The callback retains the latest source frame and pushes onto a
+//! `tokio::sync::broadcast` channel; it never awaits or re-enters Tauri.
 //!
 //! # The stream a phone sees
 //!
@@ -40,7 +39,8 @@
 //! The first frame is always a `prs-updated` carrying the cached
 //! snapshot -- the same list `get_cached` returns -- so a phone renders
 //! immediately after (re)connecting instead of waiting up to a poll
-//! interval. A bare comment line `:` goes out after every [`KEEP_ALIVE`]
+//! interval. The latest versioned source frames follow it, so modern clients
+//! recover missed rows and status for both lists. A bare comment line `:` goes out after every [`KEEP_ALIVE`]
 //! of silence so NAT tables stay warm and the phone can tell idle from
 //! dead.
 //!
@@ -88,12 +88,15 @@ pub const PATH: &str = "/v1/events";
 pub const EVENT_NAMES: &[&str] = &[
     "prs-updated",
     "poll-state",
+    "source-poll-status",
+    "gitlab-data-changed",
     "poll-error",
     "prs-truncated",
     "prs-incomplete",
     "store-error",
     "worktree-removal-progress",
     "reviewing-short",
+    "reviewing-updated",
     "update-run-progress",
     "update-run-done",
     // Widening this list widens a security boundary -- see the module
@@ -221,18 +224,48 @@ pub struct Emitted {
 pub type SnapshotSource =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync>;
 
+type SourceFrames = Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<(crate::identity::Source, crate::store::CachedList), Emitted>,
+    >,
+>;
+
 /// The broadcast every subscriber hangs off. One per process, held in
 /// `gate::Remote`, attached to the app once at startup; the listener
 /// clones the `Arc` each time it starts.
 pub struct Hub {
     tx: broadcast::Sender<Emitted>,
     snapshot: SnapshotSource,
+    sources: SourceFrames,
+}
+
+/// Retain only the newest publication for each source/list, including while no
+/// phone is connected. Parsing just the routing fields skips the row payload.
+fn remember_source(sources: &SourceFrames, event: &Emitted) {
+    if event.name != "source-poll-status" {
+        return;
+    }
+    #[derive(serde::Deserialize)]
+    struct Key {
+        source: crate::identity::Source,
+        list: crate::store::CachedList,
+    }
+    if let Ok(key) = serde_json::from_str::<Key>(&event.json) {
+        sources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((key.source, key.list), event.clone());
+    }
 }
 
 impl Hub {
     pub fn new(snapshot: SnapshotSource) -> Self {
         let (tx, _) = broadcast::channel(CAPACITY);
-        Self { tx, snapshot }
+        Self {
+            tx,
+            snapshot,
+            sources: Arc::default(),
+        }
     }
 
     /// Tap every emit of every name in [`EVENT_NAMES`]. Call once; the
@@ -240,13 +273,16 @@ impl Hub {
     pub fn attach(&self, app: &AppHandle) {
         for name in EVENT_NAMES {
             let tx = self.tx.clone();
+            let sources = self.sources.clone();
             app.listen_any(*name, move |event| {
                 // No receivers is the usual state (no phone connected)
                 // and not an error.
-                let _ = tx.send(Emitted {
+                let event = Emitted {
                     name: (*name).to_string(),
                     json: event.payload().to_string(),
-                });
+                };
+                remember_source(&sources, &event);
+                let _ = tx.send(event);
             });
         }
     }
@@ -256,10 +292,12 @@ impl Hub {
     /// to the wire verbatim. Production goes through [`Hub::attach`];
     /// this is for tests and for code with no `AppHandle` in reach.
     pub fn publish(&self, name: &str, json: String) {
-        let _ = self.tx.send(Emitted {
+        let event = Emitted {
             name: name.to_string(),
             json,
-        });
+        };
+        remember_source(&self.sources, &event);
+        let _ = self.tx.send(event);
     }
 
     fn subscribe(&self) -> broadcast::Receiver<Emitted> {
@@ -302,7 +340,18 @@ pub async fn subscribe(
         name: SNAPSHOT_EVENT.to_string(),
         json,
     });
-    let frames = stream::iter(first)
+    // The legacy SQLite frame keeps older clients compatible. Modern clients
+    // need versioned receipts/status too: they deliberately ignore unversioned
+    // rows after seeing source status. Replay both lists without waiting for a
+    // new poll; queued older events are rejected by their revisions.
+    let sources: Vec<_> = hub
+        .sources
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .cloned()
+        .collect();
+    let frames = stream::iter(first.into_iter().chain(sources))
         .chain(live(events, sub))
         .map(|e| Ok(sse::Event::default().event(e.name).data(e.json)));
     Some(Sse::new(frames).keep_alive(KeepAlive::new().interval(KEEP_ALIVE)))
@@ -658,6 +707,46 @@ pub(crate) mod tests {
             webview_json(&update)
         );
         assert_eq!(String::from_utf8(body).unwrap(), expected);
+        server.handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn reconnect_replays_a_missed_source_publication_without_another_poll() {
+        let hub = Arc::new(Hub::new(fixed_snapshot(Some("[]".into()))));
+        let certs = Arc::new(MemoryCerts::default());
+        let server = serve_with(certs, hub.clone()).await;
+        let phone = Identity::generate().unwrap();
+        server.certs.pair(&phone.fingerprint());
+        let frame = |revision| {
+            webview_json(&json!({
+                "source": { "provider": "github", "host": "github.com" },
+                "list": "reviewing", "session": "desktop", "revision": revision,
+                "receipt_revision": revision, "phase": "ready", "error": null,
+                "prs": [{ "number": revision }]
+            }))
+        };
+        hub.publish("source-poll-status", frame(1));
+        let mut client = SseClient::connect(server.handle.local_addr(), &phone, &server.fp).await;
+        assert_eq!(
+            client.next_frame().await,
+            Some(("prs-updated".into(), "[]".into()))
+        );
+        assert_eq!(
+            client.next_frame().await,
+            Some(("source-poll-status".into(), frame(1)))
+        );
+        drop(client);
+        // This publication happens while the phone has no event connection.
+        hub.publish("source-poll-status", frame(2));
+        let mut resumed = SseClient::connect(server.handle.local_addr(), &phone, &server.fp).await;
+        assert_eq!(
+            resumed.next_frame().await,
+            Some(("prs-updated".into(), "[]".into()))
+        );
+        assert_eq!(
+            resumed.next_frame().await,
+            Some(("source-poll-status".into(), frame(2)))
+        );
         server.handle.stop().await;
     }
 

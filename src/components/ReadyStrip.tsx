@@ -1,3 +1,4 @@
+import { prKey } from "@/lib/prIdentity";
 import { CircleCheck, GitCommitHorizontal, MessageCircleWarning } from "lucide-react";
 import type { PullRequest } from "@/types/pr";
 import { type Filters, readyForReview, sortReadyForReview } from "@/lib/derive";
@@ -342,7 +343,7 @@ export function ReadyStrip({
       />
       <ul>
         {shown.map(({ pr }) => (
-          <li key={`${pr.repo}#${pr.number}`} className="text-sm">
+          <li key={prKey(pr)} className="text-sm">
             {onOpen ? (
               <div
                 role="button"

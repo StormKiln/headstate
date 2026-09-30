@@ -547,6 +547,7 @@ fn map_node(node: &Value) -> Option<PullRequest> {
     let is_draft = node["isDraft"].as_bool().unwrap_or(false);
 
     Some(PullRequest {
+        source: Default::default(),
         id: node["id"].as_str().unwrap_or_default().to_string(),
         number: node["number"].as_u64()?,
         title: node["title"].as_str()?.to_string(),

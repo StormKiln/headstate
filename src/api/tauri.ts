@@ -12,6 +12,9 @@
 /// `invoke`; see `transport.ts`.
 
 import { call } from "./transport";
+import type { GitLabScope, GitLabStatsTree, GitLabStatsReport, GitLabBackfill } from "./gitlabStats";
+import type { Source } from "../types/identity";
+import type { MergeRequest } from "../types/gitlab";
 import type {
   ClaudeMdAdviceMode,
   ClaudeMdAdviceResult,
@@ -91,14 +94,66 @@ export interface AuthState {
   message: string;
 }
 
+export interface GitLabAuthState {
+  viewer?: string | null;
+  host: string;
+  ok: boolean;
+  issue: "missingCli" | "unverified" | "timedOut" | null;
+  message: string;
+}
+
 /// The cached snapshot. Never talks to GitHub. Returns `[]` both when
 /// nothing has ever been polled and when auth failed at startup -- callers
 /// must consult `getAuthState` to tell those apart.
 export const getCached = () => call<PullRequest[]>("get_cached");
 
+export type SourceList = "authored" | "reviewing";
+export type SourceCoverage = "complete" | "unknown" | { partial: { total: number | null } };
+export type SourceSnapshot = {
+  source: Source;
+  list: SourceList;
+  data:
+    | { state: "missing" | "unreadable" }
+    | { state: "available"; prs: PullRequest[]; fetched_at: string; stale_secs: number | null; coverage: SourceCoverage }
+    | { state: "git_lab_available"; mrs: MergeRequest[]; fetched_at: string; stale_secs: number | null; coverage: SourceCoverage };
+};
+export type SourceRefreshResult = {
+  source: Source;
+  list: SourceList;
+  prs: PullRequest[] | null;
+  mrs: MergeRequest[] | null;
+  coverage: SourceCoverage;
+};
+export type SourcePollUpdate = {
+  source: Source;
+  list: SourceList;
+  phase: "not_requested" | "fetching" | "ready" | "partial" | "unknown" | "retrying" | "failed" | "not_asked";
+  error: string | null;
+  session: string;
+  revision: number;
+  receipt_revision: number | null;
+  completed_request: string | null;
+  last_received_at: string | null;
+  mrs: MergeRequest[] | null;
+  coverage: SourceCoverage | null;
+};
+export type SourceRefreshReply = SourceRefreshResult | {
+  request_id: string;
+  update: SourcePollUpdate;
+};
+export const getSourceSnapshot = (source: Source, list: SourceList) =>
+  call<SourceSnapshot>("get_source_snapshot", { source, list });
+export const refreshSelectedSource = (source: Source, list: SourceList, requestId?: string) =>
+  call<SourceRefreshReply>("refresh_source", { source, list, requestId });
+export const setSourceSelection = (selection: "github" | "gitlab" | "both") =>
+  call<void>("set_source_selection", { selection });
+
 /// A user-initiated, out-of-band fetch. Does not persist to SQLite and does
 /// not affect the poll loop's cadence.
 export const refreshNow = () => call<PullRequest[]>("refresh_now");
+/// Opt into correlated replies; older paired desktops still return arrays.
+export const refreshSource = (list: "authored" | "reviewing", requestId: string) =>
+  call<import("./sourceRefresh").RefreshReply>(list === "authored" ? "refresh_now" : "get_reviewing", { requestId });
 
 /// Interface preferences. Mirrors the Rust `UiPrefs`.
 export interface UiPrefs {
@@ -281,6 +336,10 @@ export const getStats = () => call<Stats>("get_stats");
 /// Sourced from GitHub, never from a local checkout. Carries NO statistics --
 /// two requests, 2 rate-limit points total, measured -- because discovery is
 /// cheap and measurement waits for a click (`hooks.ts:712-717`).
+export const gitlabStatsTree = (host: string) => call<GitLabStatsTree>("gitlab_stats_tree", { host });
+export const gitlabStatsLoad = (host: string, scope: GitLabScope, days: number, refresh: boolean) => call<GitLabStatsReport>("gitlab_stats_load", { host, scope, days, refresh });
+export const gitlabStatsBackfill = (host: string, scope: GitLabScope, days: number) => call<GitLabBackfill>("gitlab_stats_backfill", { host, scope, days });
+
 export const statsTree = () => call<StatsTree>("stats_tree");
 
 /// A COMPLETE count of pull requests for one subject and scope (#824).
@@ -965,6 +1024,10 @@ export const getMergedDetail = () => call<MergedDetail>("get_merged_detail");
 /// Computed once at startup from the `gh` CLI token. `ok: false` means the
 /// user needs to run `gh auth login`; `message` is ready-to-display prose.
 export const getAuthState = () => call<AuthState>("get_auth_state");
+/// The desktop checks glab's configured GitLab host. No token crosses IPC.
+export const getGitLabAuthState = () => call<GitLabAuthState>("get_gitlab_auth_state");
+export const getGitLabHost = () => call<string>("get_gitlab_host");
+export const setGitLabHost = (host: string) => call<string>("set_gitlab_host", { host });
 
 /// Regenerable build output under the configured scan roots.
 ///
@@ -2190,3 +2253,10 @@ export const systemFootprint = () => call<Footprint>("system_footprint");
 /// empty table.
 export const systemNetworkProcesses = () =>
   call<NetProcess[]>("system_network_processes");
+
+export const getGitLabDetail = (identity: import("../types/identity").PrIdentity) =>
+  call<import("../types/gitlabActions").GitLabDetail>("get_gitlab_detail", { identity });
+export const getGitLabActionCapabilities = (identity: import("../types/identity").PrIdentity) =>
+  call<import("../types/gitlabActions").GitLabCapabilities>("gitlab_action_capabilities", { identity });
+export const gitLabAction = (request: import("../types/gitlabActions").GitLabActionRequest) =>
+  call<import("../types/gitlabActions").GitLabReceipt>("gitlab_action", { request });

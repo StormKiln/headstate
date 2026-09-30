@@ -1,3 +1,5 @@
+import type { PrIdentity } from "./identity";
+
 /// TypeScript mirrors of the Rust model in `src-tauri/src/github/model.rs`.
 /// Field names and enum values are wire-format, not TS convention: serde
 /// renames `CiState`/`MergeState` to lowercase and `ReviewState` to
@@ -14,13 +16,11 @@ export interface Label {
   color: string;
 }
 
-export interface PullRequest {
+export interface PullRequest extends PrIdentity {
   /// GraphQL node ID, so a row can act without opening the detail view.
   id: string;
-  number: number;
   title: string;
   url: string;
-  repo: string;
   author: string;
   is_draft: boolean;
   /// The branch being merged, and the branch it merges into.
@@ -433,7 +433,8 @@ export interface Worktree {
 }
 
 export interface WorktreeRepo {
-  /// `owner/repo` from the git REMOTE, not the directory name -- this
+  /// GitHub owner/repo, or host/full/project/path for other git hosts.
+  /// From the git REMOTE, not the directory name -- this
   /// app's own directory is `ghstat` while its repository is
   /// `pktstorm/headstate`. `null` when there is no remote to ask.
   identity: string | null;

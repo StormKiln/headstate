@@ -1,8 +1,8 @@
 # Headstate
 
 Headstate is a desktop app — macOS, Windows and Linux — that shows you the
-real state of the work on your machine and in your GitHub account: every
-open pull request, the worktrees and branches scattered across your
+real state of the work on your machine, GitHub, and GitLab: open pull and
+merge requests, the worktrees and branches scattered across your
 checkouts, what Docker and stale build artifacts are costing you in disk,
 and whether the machine itself is healthy. One window, refreshed in the
 background, instead of a browser tab per repo and a terminal per question.
@@ -15,23 +15,32 @@ a few clicks. The rest grew from the same principle — the answer should
 already be on screen when you think to ask.
 
 There is also an **iOS companion** that pairs with your desktop over the
-local network and shows the same views on a phone. It holds no GitHub
-token of its own: every question it asks is forwarded to the paired
-desktop, which is the only thing that talks to GitHub.
+local network and shows the same views on a phone. It holds no GitHub or
+GitLab token: provider requests are forwarded to the paired desktop,
+which talks to GitHub and runs `glab` for GitLab.
 
 ![Headstate splash](public/splash.png)
 
 ## Status
 
-Headstate reads from `api.github.com` and shows you what it finds. It
-also **writes, but only when you ask it to** — merge, close, reopen,
-draft/ready, the merge queue, auto-merge, branch deletion, and reviews
-(approve, request changes, comment).
+Choose **GitHub**, **GitLab**, or **Both** in the source selector. GitHub
+uses `api.github.com`; GitLab uses GitLab.com by default or one explicitly
+configured self-managed host over HTTPS. Authored and review queues refresh
+in the background. The providers have independent authentication, and
+GitLab works without a GitHub login.
 
-Every write is an explicit action on a pull request you are looking at.
-Nothing is automated, nothing runs in the background, and every write is
-logged with its repo, number, and action. Reads and writes live in
-separate modules so the read path stays independently auditable.
+Headstate also **writes when you ask it to**. GitHub actions include merge,
+close, reopen, draft/ready, the merge queue, auto-merge, branch deletion,
+and reviews (approve, request changes, comment). GitLab actions include
+approve, comment/reply, resolve/reopen discussions, merge, close/reopen,
+draft/ready, rebase, retry failed CI, and auto-merge where the server permits
+them. GitLab merge trains and submitting request-changes reviews are not
+supported. GitLab actions check current permissions and report whether the
+result could be verified.
+
+Provider writes follow an explicit action on a selected request or selection
+of requests. Background polling reads state and can notify you; it does not
+approve, merge, or post comments on your behalf.
 
 Local actions — removing a worktree, deleting a branch, reclaiming build
 output — are separated the same way, and the destructive ones confirm
@@ -40,33 +49,39 @@ attempted: a directory that may still be written to, a worktree with
 uncommitted work, a scan that could not complete. "We could not tell" is
 never reported as "nothing found".
 
-The iOS companion holds no token and reaches GitHub only through the
-paired desktop, which classifies every forwarded command as a read, a
+The iOS companion holds no provider token and reaches GitHub and GitLab
+through the paired desktop, which classifies every forwarded command as a read, a
 write, or a destructive action; destructive ones require a biometric
 step-up on the phone before the desktop will run them.
 
 ## Prerequisites
 
-- macOS, Windows, or Linux.
-- The [GitHub CLI](https://cli.github.com/), authenticated:
+Use macOS, Windows, or Linux for the desktop. Install and authenticate the
+CLI for each provider you want to use, on that desktop. Missing provider
+authentication does not prevent access to the other provider or local views.
 
-  ```
-  brew install gh
-  gh auth login
-  ```
+### GitHub
 
-  Headstate reads your GitHub token from `GH_TOKEN` or `GITHUB_TOKEN` if
-  either is set, and otherwise from `gh auth token`. If no token is found,
-  Headstate shows you the same two commands on launch and won't proceed
-  until they work — there is no separate login flow inside the app itself.
+Install the [GitHub CLI](https://cli.github.com/) and authenticate. On macOS
+with Homebrew:
+
+```sh
+brew install gh
+gh auth login
+```
+
+Headstate reads your GitHub token from `GH_TOKEN` or `GITHUB_TOKEN` if
+either is set, and otherwise from `gh auth token`. It keeps that token in
+memory. If authentication is unavailable, GitHub views explain what is
+missing; there is no separate token-entry flow in Headstate.
 
 #### Token scopes
 
-Headstate needs three scopes:
+For GitHub, Headstate uses these scopes:
 
 | Scope | What stops working without it |
 | --- | --- |
-| `repo` | Everything. Pull requests are not readable at all. |
+| `repo` | GitHub pull request access, including private repositories. |
 | `read:org` | **PR Stats only.** The sidebar lists no organizations, so an org or a team cannot be selected — which looks like having no organizations rather than like a missing permission. |
 | `gist` | Nothing in Headstate. It is in `gh auth login`'s own minimum set, so a `gh`-authenticated token has it regardless. |
 
@@ -93,6 +108,37 @@ Fine-grained personal access tokens report no scopes at all through that
 header; they carry permissions instead, and the one to grant is
 **Organization permissions → Members: read**.
 
+### GitLab
+
+Install the [GitLab CLI (`glab`)](https://docs.gitlab.com/cli/) on the
+desktop. On macOS with Homebrew, for GitLab.com:
+
+```sh
+brew install glab
+glab auth login --hostname gitlab.com
+```
+
+For a self-managed instance, open **Settings → GitLab**, enter its DNS
+hostname (for example, `gitlab.example.com`), and choose **Save GitLab host**.
+Then authenticate to that same host on the desktop:
+
+```sh
+glab auth login --hostname gitlab.example.com
+glab auth status --hostname gitlab.example.com
+```
+
+Enter a hostname without a scheme, port, or path. Headstate uses HTTPS with
+certificate verification and sends API requests to that configured host.
+It checks `glab` authentication and API access; available MR actions depend
+on your permissions and the server's capabilities.
+
+`glab` manages GitLab credentials. Headstate has no GitLab token-entry field,
+does not store a GitLab token, and does not send one to the phone. Configure
+the host and CLI login on the paired desktop when using the iOS companion.
+
+If the desktop cannot find `glab`, set `HEADSTATE_GLAB` to its full executable
+path and relaunch Headstate, as with `HEADSTATE_GH` below.
+
 ### Building from source on Linux
 
 Releases ship a `.deb` and an `.AppImage`, so building from source is only
@@ -100,8 +146,8 @@ necessary to develop against the app or to run an unreleased commit. The
 steps below were verified on Ubuntu 26.04; package names differ on other
 distributions, but the four things you need are the same.
 
-Install `gh` from the [GitHub CLI site](https://cli.github.com/), which
-carries current apt, dnf, and Homebrew instructions. The version in Ubuntu's
+For GitHub access, install `gh` from the [GitHub CLI site](https://cli.github.com/),
+which carries current apt, dnf, and Homebrew instructions. The version in Ubuntu's
 own archive lags well behind and may sit behind an ESM subscription, so
 prefer GitHub's apt repository over `apt install gh`.
 
@@ -200,8 +246,18 @@ tools, because a GUI-launched app does not inherit your shell's `PATH`.
 
 ## What it shows
 
-**Pull request list.** Every open PR you authored, across every repo you
-have access to, in one list — the chrome mirrors GitHub's own
+**GitLab merge requests.** Authored and review queues, MR details,
+discussions, approvals, CI, and permission-checked actions use the configured
+host. GitLab MR Stats offers author, project, and group scopes; incomplete
+reads remain visibly partial. GitHub and GitLab statistics stay separate.
+Both mode retains GitHub filters, selection, bulk actions and overview controls.
+GitLab reads are cached and coordinated across desktop and paired clients;
+write outcomes trigger targeted invalidation and both queue refreshes. See the
+[GitLab readiness and compatibility record](docs/reviews/pr1596-readiness.md)
+for cache bounds, feature differences and the live compatibility gate.
+
+**Pull request list.** On GitHub, every open PR you authored, across every repo
+you have access to, in one list — the chrome mirrors GitHub's own
 `<owner>/<repo>/pulls` view: filter by label (include *and* exclude —
 GitHub's own UI only lets you include), review state, drafts, and sort
 order.
@@ -230,8 +286,8 @@ with admin access on that repository.
 nobody else — real merge conflicts or failing CI — so the thing you need to
 fix first doesn't get lost in a longer list. Quiet when nothing is blocked.
 
-**PR Stats.** The first entry in the view menu, answering what the open-PR
-list cannot: how much is actually getting done, whether that is improving,
+**PR Stats.** GitHub's first entry in the view menu, answering what the
+open-PR list cannot: how much is actually getting done, whether that is improving,
 and — for a team or org lead — how the team is doing.
 
 The sidebar is a GitHub hierarchy rather than a list of local checkouts,
@@ -362,7 +418,7 @@ loop is neither.
 **Filters and repo sidebar.** A sidebar of repos with open PR counts, plus a
 filter bar for labels, review state, and drafts.
 
-**Nudge wizard.** A three-step flow — pick repos, pick which PRs qualify
+**GitHub nudge wizard.** A three-step flow — pick repos, pick which PRs qualify
 (ready for review only, green CI only, needs-attention only, stale only),
 then pick a text format — that produces a paste-ready block and copies it
 to your clipboard. Nothing here calls GitHub; it only reads PRs already in

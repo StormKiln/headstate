@@ -1,7 +1,8 @@
 import { fireEvent, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { BatchOutcome } from "@/api/tauri";
-import { BulkBar, prKey } from "@/components/BulkBar";
+import { BulkBar } from "@/components/BulkBar";
+import { prKey } from "@/lib/prIdentity";
 import { PR_FIXTURES } from "@/fixtures/prs";
 import { useFilters } from "@/store/filters";
 import { renderWithQuery as render } from "@/test-utils";

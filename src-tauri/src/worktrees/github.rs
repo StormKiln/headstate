@@ -229,10 +229,8 @@ pub fn map_merged_heads(
 /// budget on a question with no meaningful answer.
 pub fn github_identity(repo_path: &str) -> Option<String> {
     let url = super::scan::git(Path::new(repo_path), &["remote", "get-url", "origin"]).ok()?;
-    if !url.contains("github.com") {
-        return None;
-    }
-    super::scan::parse_owner_repo(&url)
+    let identity = super::scan::parse_owner_repo(&url)?;
+    (identity.split('/').count() == 2).then_some(identity)
 }
 
 /// Ask GitHub about `branches` in `identity`, in chunks, under

@@ -39,6 +39,9 @@ pub fn set<T: Serialize>(conn: &Connection, key: &str, value: &T) -> Result<(), 
 pub mod keys {
     /// Focused poll interval, in seconds.
     pub const POLL_INTERVAL_SECS: &str = "poll_interval_secs";
+    pub const SOURCE_SELECTION: &str = "source_selection";
+    /// Explicit GitLab API hostname. Never a URL or credential.
+    pub const GITLAB_HOST: &str = "gitlab_host";
     /// Directories scanned for git checkouts, as a JSON array of paths.
     pub const WORKTREE_DIRS: &str = "worktree_dirs";
     /// Worktrees handed to Claude Code, as a JSON map of path -> head

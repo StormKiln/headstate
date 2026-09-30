@@ -3,31 +3,21 @@ import { useFilters, viewLabel } from "../store/filters";
 import { useEffect, type ReactNode } from "react";
 import { clearPollError, usePollError, useStoreError, useUiPrefs } from "../api/hooks";
 import { ReportLink } from "./ReportLink";
-import { getAuthState } from "../api/tauri";
+import { getAuthState, getGitLabAuthState } from "../api/tauri";
 import { useConnectionState } from "@/api/connection";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { dismissSplash } from "../splash";
 import { commandError } from "@/lib/errorKind";
+import { GitHubAuthProvider, GitLabViewerProvider } from "@/api/authAvailability";
+import { useSourceSelection } from "@/store/sourceSelection";
+import { getGitLabHost } from "@/api/gitlabHost";
 
-/// Gates the whole app on `get_auth_state`. Rust computes auth once at
-/// startup from the `gh` CLI token, so this is a one-shot check, not a
-/// poll -- `staleTime: Infinity` avoids a pointless refetch on window
-/// focus for a value that cannot change without an app restart.
-///
-/// `isLoading` and "authenticated but not yet ok" are deliberately
-/// distinct from the failure screen below: returning `null` while loading
-/// avoids flashing the "install gh" message for authenticated users before
-/// the first render settles.
-///
-/// On the PHONE there is a third case, and it is the ordinary one: the
-/// desktop is not reachable. `get_auth_state` is a `Class::Read` command
-/// forwarded over `remote_call`, and the companion serves only
-/// `get_cached` from its stored snapshot -- every other read rejects with
-/// "<desktop> is unreachable". So a phone away from its desktop, which is
-/// a phone on cellular, which is most of the time, failed this check on
-/// launch. See `offline` below for what that produced and why the answer
-/// is to let the app through rather than to gate on it.
+/// Reports provider authentication without hiding local views. GitHub's
+/// startup state and the configured GitLab host's bounded CLI check have separate queries.
+/// On an offline phone, the desktop's auth is unknown and cached views
+/// remain available.
 export function AuthGate({ children }: { children: ReactNode }) {
+  const selection = useSourceSelection((s) => s.selection);
   const { data, isLoading } = useQuery({
     queryKey: ["auth"],
     queryFn: getAuthState,
@@ -58,6 +48,15 @@ export function AuthGate({ children }: { children: ReactNode }) {
     // them off, which is a thing this file's own test caught only
     // because it asserts on the desktop path too.
     ...(IS_MOBILE_BUILD ? { retry: false } : {}),
+  });
+  const gitlabHost = useQuery({ queryKey: ["gitlab-host"], queryFn: getGitLabHost, retry: false });
+  const gitlab = useQuery({
+    queryKey: ["gitlab-auth", gitlabHost.data ?? "invalid"],
+    queryFn: getGitLabAuthState,
+    staleTime: 60_000,
+    refetchInterval: selection === "github" ? false : 60_000,
+    retry: false,
+    enabled: gitlabHost.isSuccess || gitlabHost.isError,
   });
   const pollError = usePollError();
   // Classified ONCE (#1230). Three call sites used to ask `isNotAsked`
@@ -136,18 +135,31 @@ export function AuthGate({ children }: { children: ReactNode }) {
   // `get_cached` is the one read the companion serves from its stored
   // snapshot, so there is genuinely something to show. Where there is
   // not, `PrList` renders its own empty state, which is honest too.
-  if (offline) return <>{children}</>;
+  if (offline) return <GitHubAuthProvider available={null}>{<GitLabViewerProvider viewer={gitlab.data?.ok ? gitlab.data.viewer ?? null : null}>{children}</GitLabViewerProvider>}</GitHubAuthProvider>;
 
   if (isLoading) return null;
-  if (data?.ok) {
+  if (data !== undefined) {
     return (
-      // One screen tall, with the app shell as the flexible row (#1583).
-      // These banners used to be SIBLINGS of the shell, which is itself
-      // one screen tall, so a banner made the document taller than the
-      // window by its own height: the status bar sat that far below the
-      // window's edge until the document was scrolled to reveal it. Here
-      // the banners take their height and the shell gets what is left.
+      <GitHubAuthProvider available={data.ok}>
+      <GitLabViewerProvider viewer={gitlab.data?.ok ? gitlab.data.viewer ?? null : null}>
       <div className="flex h-full flex-col">
+        {selection !== "github" && (gitlab.error || gitlab.data && !gitlab.data.ok) ? <div role="alert" className="border-b border-[#d29922]/30 bg-[#d29922]/10 px-4 py-2 text-sm text-[#d29922]">
+          {gitlab.data?.message || "GitLab account could not be verified. Check desktop authentication and connectivity."}
+          <button type="button" className="ml-2 underline" onClick={() => void gitlab.refetch()}>Retry GitLab authentication</button>
+        </div> : null}
+        {!data.ok && selection !== "gitlab" && (
+          <div role="status" className="border-b border-[#d29922]/30 bg-[#d29922]/10 px-4 py-2 text-sm text-[#d29922]">
+            <span>GitHub is unavailable: {data.message}</span>
+            <span className="ml-1">On the desktop, install gh and run <code>gh auth login</code> to enable GitHub.</span>
+            <span className="ml-1">Headstate watches GitHub pull requests you opened and the ones waiting on your review.</span>
+            <span className="ml-1">Your GitHub token is kept in memory only.</span>
+            {gitlab.data?.ok ? (
+              <span className="ml-1">GitLab sign-in for {gitlab.data.host} is verified.</span>
+            ) : gitlab.data ? (
+              <span className="ml-1">{gitlab.data.message}</span>
+            ) : null}
+          </div>
+        )}
         {/* Its own banner, on its own channel. A store failure describes
             a condition a later successful poll did not fix, so it must
             not be cleared by one -- which is what sharing `poll-error`
@@ -171,7 +183,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
             </button>
           </div>
         )}
-        {pollError !== null && (
+        {pollError !== null && selection !== "gitlab" && (
           <div
             // #1124: a poll the app DECLINED to issue is not a failed
             // refresh. The banner said "Background refresh failed" and
@@ -247,81 +259,12 @@ export function AuthGate({ children }: { children: ReactNode }) {
         )}
         <div className="min-h-0 flex-1">{children}</div>
       </div>
+      </GitLabViewerProvider>
+      </GitHubAuthProvider>
     );
   }
 
-  // On the phone the remediation below is impossible advice: there is
-  // no Homebrew, no shell, and by design no GitHub token -- the DESKTOP
-  // holds it. A failed auth check here means the paired desktop is not
-  // signed in, which is a thing to fix at the desktop.
-  //
-  // `PairingGate` above already sends an unpaired phone to the pairing
-  // screen, so reaching this branch on mobile means paired-but-the-
-  // desktop-cannot-authenticate. Guarded on the build target rather than
-  // `useIsMobile()`: a narrow desktop window still has `gh`, and telling
-  // its user to fix it elsewhere would be the same bug mirrored.
-  if (IS_MOBILE_BUILD) {
-    // The desktop must have ANSWERED for the screen below to be true.
-    //
-    // This guard is the accusation half of #684. Without it a rejected
-    // query landed here as well -- `data` at its undefined default,
-    // `data?.ok` falsy -- and the phone covered the whole app with
-    // "your desktop is not signed in to GitHub" on the strength of
-    // never having managed to ask it. Off-network that was the reported
-    // full-screen error; the `offline` branch above now takes that case
-    // first, and this catches the remainder.
-    //
-    // What remains is a desktop the connection says is THERE whose auth
-    // call did not come back: a transient forwarding failure, not a
-    // verdict on anybody's GitHub login. So the phone degrades the same
-    // way it does offline -- the app over its cached snapshot, with the
-    // shell's own banners carrying the failure.
-    if (data === undefined) return <>{children}</>;
-    return (
-      <div className="flex h-full overflow-y-auto bg-[#0d1117] px-6 text-[#e6edf3]">
-        <div className="m-auto max-w-md space-y-4 py-6">
-          <h1 className="text-xl font-semibold">Your desktop is not signed in to GitHub</h1>
-          <p className="text-sm text-[#8b949e]">
-            Headstate on your computer could not reach GitHub, so there is nothing for
-            this phone to show yet.
-          </p>
-          {data?.message !== undefined ? (
-            <p className="text-sm text-[#8b949e]">{data.message}</p>
-          ) : null}
-          <p className="text-sm text-[#8b949e]">
-            Open Headstate on that computer and follow the instructions it shows, then
-            come back — this screen clears on its own once it can sign in.
-          </p>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    // Its own scroller, like every full-screen notice: the document never
-    // scrolls (#1583). `m-auto` centres without clipping the top when the
-    // text overflows, which `items-center` would.
-    <div className="flex h-full overflow-y-auto bg-[#0d1117] text-[#e6edf3]">
-      <div className="m-auto max-w-md space-y-4 py-6">
-        <h1 className="text-xl font-semibold">Headstate needs the GitHub CLI</h1>
-        {/* What the app IS, which this screen never said. It explained
-            only how to install `gh`, and the one statement of scope
-            lived in an empty-list branch most users never see -- so
-            anyone WITH pull requests skipped straight past the single
-            most important fact about the data they were about to be
-            shown. Above the error because it is the reason to fix it. */}
-        <p className="text-sm text-[#e6edf3]">
-          Headstate watches the pull requests you opened and the ones waiting on
-          your review, and tells you when one breaks.
-        </p>
-        <p className="text-sm text-[#8b949e]">{data?.message}</p>
-        <pre className="rounded bg-[#161b22] p-3 text-sm">
-          brew install gh{"\n"}gh auth login
-        </pre>
-        <p className="text-sm text-[#8b949e]">
-          Headstate reads your token from <code>gh</code> and keeps it in memory only.
-        </p>
-      </div>
-    </div>
-  );
+  // A failed IPC check says nothing about either provider's credential.
+  // Keep local and GitLab views available while the connection layer reports it.
+  return <GitHubAuthProvider available={null}>{<GitLabViewerProvider viewer={gitlab.data?.ok ? gitlab.data.viewer ?? null : null}>{children}</GitLabViewerProvider>}</GitHubAuthProvider>;
 }

@@ -70,7 +70,7 @@ function renderEntry(entry: ClaudeRestartEntry): string[] {
 /// is short is worth far more before a reboot than no list at all.
 function summary(list: ClaudeRestartList): string[] {
   const total = list.running.length + list.uncertain.length;
-  const short = 
+  const short =
     list.registry_failure !== null ||
     list.registry_unreadable.length > 0 ||
     list.registry_unnamed.length > 0;
@@ -152,7 +152,7 @@ export function restartExportText(list: ClaudeRestartList): string {
   }
 
   if (list.running.length === 0 && list.uncertain.length === 0) {
-    const short = 
+    const short =
     list.registry_failure !== null ||
     list.registry_unreadable.length > 0 ||
     list.registry_unnamed.length > 0;

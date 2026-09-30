@@ -1,16 +1,23 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { PullRequest } from "./types/pr";
+import type { PullRequest, StatsTree } from "./types/pr";
 import { PR_FIXTURES, prWithState } from "./fixtures/prs";
 import { useFilters } from "./store/filters";
+import { useSourceSelection } from "./store/sourceSelection";
+import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
+import { AuthGate } from "./components/AuthGate";
 
 // The shell talks to Tauri on mount. Stub the command surface so these tests
 // exercise the wiring, not the backend.
+const mockStatsTree = vi.fn<() => StatsTree | undefined>(() => undefined);
 const mockPrs = vi.fn<() => PullRequest[]>(() => []);
 const mockReviewing = vi.fn<() => PullRequest[]>(() => []);
+const mockReviewError = vi.fn<() => Error | null>(() => null);
 const mockRefused = vi.fn<() => number>(() => 0);
-const mockShortfall = vi.fn<() => number>(() => 0);
+const mockShortfall = vi.fn<() => number | null>(() => 0);
+const mockTruncation = vi.fn<() => number | null | undefined>(() => undefined);
+const mockDataUpdatedAt = vi.fn<() => number>(() => 0);
 
 /// Overridable UI preferences, so the capability-gate tests at the bottom
 /// of this file can turn `claude_integrations_enabled` on and off without
@@ -68,11 +75,13 @@ vi.mock("./api/hooks", () => ({
   useUpdatePrBranch: () => () => Promise.resolve(),
   useActOnPrs: () => () => Promise.resolve([]),
   useSetAutoMerge: () => () => Promise.resolve(),
-  usePullRequests: () => ({ data: mockPrs(), isSuccess: true, isLoading: false }),
+  usePullRequests: () => ({ data: mockPrs(), isSuccess: true, isLoading: false, dataUpdatedAt: mockDataUpdatedAt() }),
   usePollError: () => null,
+  useStoreError: () => ({ message: null, dismiss: () => {} }),
+  clearPollError: () => {},
   useRefreshRequested: () => undefined,
   useRefreshFromGesture: () => () => Promise.resolve(),
-  useTruncation: () => null,
+  useTruncation: () => mockTruncation(),
   // No refused fields: the advisory banner stays hidden.
   useIncomplete: () => mockRefused(),
   useReviewShortfall: () => mockShortfall(),
@@ -94,8 +103,8 @@ vi.mock("./api/hooks", () => ({
   // pending: these tests are about what the PR Stats page body renders, and
   // a pending sidebar would leave a "Finding your organizations" line in
   // the document that a `queryByText` elsewhere could trip over.
-  useStatsTree: () => ({ data: undefined, isPending: false, error: null }),
-  useReviewing: () => ({ data: mockReviewing(), isLoading: false }),
+  useStatsTree: () => ({ data: mockStatsTree(), isPending: false, error: null }),
+  useReviewing: () => ({ data: mockReviewing(), isLoading: false, isError: mockReviewError() !== null, error: mockReviewError(), refetch: () => Promise.resolve() }),
   // The badge's own cheap query, separate from the list.
   useReviewingCount: () => ({ data: mockReviewing().length }),
   // PrDetailView's hooks: App's mock replaces the whole module, so
@@ -147,10 +156,6 @@ vi.mock("./api/hooks", () => ({
   useCycleTrend: () => ({ data: undefined, isError: false, refetch: () => {} }),
 }));
 
-vi.mock("./components/AuthGate", () => ({
-  AuthGate: ({ children }: { children: React.ReactNode }) => <>{children}</>,
-}));
-
 const { default: App } = await import("./App");
 
 /// Settle the lazy routes' dynamic imports BEFORE any test runs (#898).
@@ -191,18 +196,56 @@ const { default: App } = await import("./App");
 /// SHELL (the switcher entry, and the `<h1>` at `App.tsx:529`, which is
 /// driven by `view` alone), not on the lazy page's body.
 await Promise.all([
+  import("./components/ProviderStatsPage"),
   import("./components/StatsPage"),
   import("./components/SystemHealthPage"),
 ]);
 
 function renderApp() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  qc.setQueryData(["gitlab-host"], "gitlab.com");
   return render(
     <QueryClientProvider client={qc}>
       <App />
     </QueryClientProvider>,
   );
 }
+
+describe("assembled auth and PR status", () => {
+  afterEach(() => {
+    clearMocks();
+    mockPrs.mockReturnValue([]);
+    mockDataUpdatedAt.mockReturnValue(0);
+  });
+
+  it("shows saved PRs without claiming a fresh poll when GitHub auth is missing", async () => {
+    mockPrs.mockReturnValue([PR_FIXTURES[0]]);
+    // Reading a warm SQLite snapshot advances React Query's timestamp,
+    // even though Rust never starts the GitHub poll without a client.
+    mockDataUpdatedAt.mockReturnValue(Date.now());
+    mockIPC((cmd) => {
+      if (cmd === "get_auth_state") return { ok: false, message: "gh was not found" };
+      if (cmd === "get_gitlab_host") return "gitlab.com";
+      if (cmd === "get_gitlab_auth_state") return {
+        host: "gitlab.com", ok: true, issue: null, message: "",
+      };
+      return undefined;
+    }, { shouldMockEvents: true });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <AuthGate><App /></AuthGate>
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByText(/GitHub is not refreshing/)).toBeTruthy();
+    expect(screen.getByText(PR_FIXTURES[0].title)).toBeTruthy();
+    expect(screen.queryByText("PRs up to date")).toBeNull();
+    expect(screen.queryByText(/Updated just now/)).toBeNull();
+    const dot = screen.getByText(/GitHub is not refreshing/).previousElementSibling;
+    expect(dot?.className).toContain("bg-[#d29922]");
+  });
+});
 
 describe("App — priorities strip scoping", () => {
   afterEach(() => {
@@ -389,13 +432,13 @@ describe("keyboard triage", () => {
     fireEvent.keyDown(window, { key, bubbles: true });
 
   it("puts the cursor on the first row on the first press", () => {
-    render(<App />);
+    renderApp();
     press("j");
     expect(useFilters.getState().cursor).toBe(0);
   });
 
   it("walks down and back up", () => {
-    render(<App />);
+    renderApp();
     press("j");
     press("j");
     expect(useFilters.getState().cursor).toBe(1);
@@ -406,7 +449,7 @@ describe("keyboard triage", () => {
   // Clamped, not wrapped: wrapping from the bottom back to the top
   // silently moves the eye across the whole screen.
   it("stops at the top rather than wrapping", () => {
-    render(<App />);
+    renderApp();
     press("j");
     press("k");
     press("k");
@@ -414,7 +457,7 @@ describe("keyboard triage", () => {
   });
 
   it("selects the cursor row with x", () => {
-    render(<App />);
+    renderApp();
     press("j");
     press("x");
     expect(useFilters.getState().checked).toHaveLength(1);
@@ -423,7 +466,7 @@ describe("keyboard triage", () => {
   // `x` with no cursor must do nothing rather than select row 0 -- the
   // user has not pointed at anything yet.
   it("does nothing on x before the cursor exists", () => {
-    render(<App />);
+    renderApp();
     press("x");
     expect(useFilters.getState().checked).toEqual([]);
   });
@@ -444,6 +487,7 @@ describe("opening a pull request from To review", () => {
   };
 
   beforeEach(() => {
+    mockReviewError.mockReturnValue(null);
     mockPrs.mockReturnValue([]);
     mockReviewing.mockReturnValue([theirs]);
     useFilters.setState({
@@ -455,12 +499,21 @@ describe("opening a pull request from To review", () => {
   });
 
   it("lists the review queue", () => {
-    render(<App />);
+    renderApp();
     expect(screen.getByText(theirs.title)).toBeTruthy();
   });
 
+  it("keeps usable review rows visible beside a newer refresh failure", () => {
+    mockReviewError.mockReturnValue(new Error("newer review refresh failed"));
+    renderApp();
+    expect(screen.getByText(theirs.title)).toBeTruthy();
+    expect(screen.getByText("Could not refresh the pull requests awaiting your review")).toBeTruthy();
+    expect(screen.getByText("newer review refresh failed")).toBeTruthy();
+    mockReviewError.mockReturnValue(null);
+  });
+
   it("selects the pull request when its row is clicked", () => {
-    render(<App />);
+    renderApp();
     fireEvent.click(screen.getByText(theirs.title));
     expect(useFilters.getState().selectedPr).toEqual({
       repo: "someone/else",
@@ -473,7 +526,7 @@ describe("opening a pull request from To review", () => {
   // failure here is about rendering rather than routing.
   it("shows the detail view rather than staying on the list", () => {
     useFilters.setState({ selectedPr: { repo: "someone/else", number: 71 } });
-    render(<App />);
+    renderApp();
     expect(screen.getByRole("button", { name: /back to list/i })).toBeTruthy();
   });
 });
@@ -486,6 +539,7 @@ describe("an incomplete refresh", () => {
   beforeEach(() => {
     mockRefused.mockReturnValue(0);
     mockShortfall.mockReturnValue(0);
+    mockTruncation.mockReturnValue(undefined);
     mockPrs.mockReturnValue([]);
     useFilters.setState({
       view: "my-prs",
@@ -493,6 +547,15 @@ describe("an incomplete refresh", () => {
       filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
   branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, repositories: {}, "system-health": {} },
     });
+  });
+
+  it.each(["my-prs", "to-review"] as const)("qualifies an unknown total for %s without an old numeric count", (view) => {
+    if (view === "my-prs") mockTruncation.mockReturnValue(null);
+    else mockShortfall.mockReturnValue(null);
+    useFilters.setState({ view });
+    renderApp();
+    expect(screen.getByText("GitHub could not confirm whether this list is complete.")).toBeTruthy();
+    expect(screen.queryByText(/12 pull requests are missing/i)).toBeNull();
   });
 
   /// The silent truncation the v3.5.3 log caught on a real machine: the
@@ -503,27 +566,27 @@ describe("an incomplete refresh", () => {
   it("says how many pull requests are missing from a short review list", () => {
     mockShortfall.mockReturnValue(12);
     useFilters.setState({ view: "to-review" });
-    render(<App />);
+    renderApp();
     expect(screen.getByText(/12 pull requests are missing/i)).toBeTruthy();
   });
 
   it("stays quiet when the review list is complete", () => {
     mockShortfall.mockReturnValue(0);
     useFilters.setState({ view: "to-review" });
-    render(<App />);
+    renderApp();
     expect(screen.queryByText(/missing from this list/i)).toBeNull();
   });
 
   it("says so when GitHub refused some fields", () => {
     mockRefused.mockReturnValue(86);
-    render(<App />);
+    renderApp();
     expect(screen.getByText(/could not compute 86 fields/i)).toBeTruthy();
   });
 
   // Silence is the normal case; a banner that is always there stops
   // being read.
   it("stays quiet when nothing was refused", () => {
-    render(<App />);
+    renderApp();
     expect(screen.queryByText(/could not compute/i)).toBeNull();
   });
 
@@ -531,7 +594,7 @@ describe("an incomplete refresh", () => {
   it("still renders the pull requests it did receive", () => {
     mockRefused.mockReturnValue(86);
     mockPrs.mockReturnValue([{ ...PR_FIXTURES[0], title: "Survived" }]);
-    render(<App />);
+    renderApp();
     expect(screen.getByText("Survived")).toBeTruthy();
   });
 });
@@ -603,5 +666,55 @@ describe("the Claude Code route is gated on the capability", () => {
     uiPrefs.value = { hidden_views: [], close_hides_to_tray: true, claude_integrations_enabled: false };
     at("claude-md");
     expect(screen.getByRole("heading", { name: "CLAUDE.md" })).toBeTruthy();
+  });
+});
+
+
+describe("source statistics navigation", () => {
+  afterEach(() => {
+    mockStatsTree.mockReturnValue(undefined);
+    useSourceSelection.setState({ selection: "github", repoKey: null, query: "" });
+  });
+
+  it("shows GitHub scopes only while the GitHub statistics tab is active", async () => {
+    mockStatsTree.mockReturnValue({
+      viewer: "octocat", orgs: [], orgsTotal: 0, personal: [], personalTotal: 0,
+      refusedFields: 0, spend: { points: 0, requests: 0, unmetered: 0, remaining: null, resetAt: null },
+    });
+    useFilters.setState({ view: "pr-stats", selectedPr: null });
+    useSourceSelection.setState({ selection: "both", repoKey: null, query: "" });
+    renderApp();
+    await act(async () => {});
+    expect(screen.getByRole("button", { name: /Everything/ })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "GitLab MR Stats" }));
+    expect(screen.getByRole("heading", { name: /GitLab MR Stats/ })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Everything/ })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "GitHub PR Stats" }));
+    expect(screen.getByRole("button", { name: /Everything/ })).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: /GitLab MR Stats/ })).toBeNull();
+  });
+});
+
+describe("review request source scope", () => {
+  afterEach(() => {
+    mockPrs.mockReturnValue([]);
+    useSourceSelection.setState({ selection: "github", repoKey: null, query: "" });
+    useFilters.setState({ view: "my-prs", selectedPr: null });
+  });
+
+  it("preserves GitHub review requests in Both and excludes them in GitLab-only mode", async () => {
+    mockPrs.mockReturnValue([PR_FIXTURES[0]]);
+    useFilters.setState({ view: "my-prs", selectedPr: null });
+    useSourceSelection.setState({ selection: "github", repoKey: null, query: "" });
+    renderApp();
+    expect(screen.getByRole("button", { name: "Request reviews" })).toBeTruthy();
+
+    await act(async () => useSourceSelection.setState({ selection: "gitlab", repoKey: null, query: "" }));
+    expect(screen.queryByRole("button", { name: "Request reviews" })).toBeNull();
+
+    await act(async () => useSourceSelection.setState({ selection: "both", repoKey: null, query: "" }));
+    expect(screen.getByRole("button", { name: "Request reviews" })).toBeTruthy();
   });
 });

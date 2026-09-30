@@ -18,6 +18,7 @@ const authState = vi.hoisted(() => ({ current: null as unknown }));
 vi.mock("../api/tauri", async (orig) => ({
   ...(await orig<Record<string, unknown>>()),
   getAuthState: () => authState.current as never,
+  getGitLabAuthState: () => Promise.resolve({ host: "gitlab.com", ok: false, issue: "unverified", message: "" }),
   getCached: () => Promise.resolve([]),
   refreshNow: () => Promise.reject(new Error("no auth")),
   getStats: () => Promise.reject(new Error("no auth")),
@@ -67,7 +68,7 @@ describe("splash dismissal", () => {
     renderGate();
 
     await waitFor(() =>
-      expect(document.body.textContent).toContain("Headstate needs the GitHub CLI"),
+      expect(document.body.textContent).toContain("GitHub is unavailable"),
     );
     // Past the 3s floor plus the fade.
     await vi.advanceTimersByTimeAsync(3600);
@@ -92,4 +93,3 @@ describe("splash dismissal", () => {
     expect(document.getElementById("splash")).toBeNull();
   });
 });
-

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 /// A checkout with worktrees hanging off it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Repo {
-    /// `owner/repo` from the git remote, when it can be established.
+    /// GitHub owner/repo, or host/full/project/path for other git hosts.
     ///
     /// From the REMOTE, never the directory name -- this app's own
     /// directory is `ghstat` while its repository is

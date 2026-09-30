@@ -20,6 +20,7 @@
 
 mod cache;
 pub mod devices;
+pub mod gitlab_stats;
 pub mod health;
 /// Which scopes the background backfill is allowed to walk, and how far
 /// (#1092). Written when a user opens a scope, so background spend
@@ -33,6 +34,7 @@ pub mod pr_slice;
 pub mod scans;
 mod schema;
 pub mod settings;
+pub mod source_cache;
 pub mod stats;
 
 pub use cache::{load_snapshot, load_snapshot_marked, save_snapshot, CachedList, CachedSnapshot};
@@ -58,6 +60,7 @@ mod tests {
 
     fn sample() -> PullRequest {
         PullRequest {
+            source: Default::default(),
             id: "PR_test".into(),
             number: 42,
             title: "Add retry to the fetch client".into(),
@@ -94,6 +97,31 @@ mod tests {
             latest_reviews_total: 0,
             labels_total: 0,
         }
+    }
+
+    #[test]
+    fn legacy_snapshot_loads_as_github_and_emits_explicit_source() {
+        let conn = db();
+        let original = sample();
+        let mut value = serde_json::to_value(&original).unwrap();
+        value.as_object_mut().unwrap().remove("source");
+        let legacy = serde_json::to_string(&vec![value]).unwrap();
+        conn.execute(
+            "INSERT INTO snapshot (id, payload, fetched_at) VALUES (1, ?1, datetime('now'))",
+            rusqlite::params![legacy],
+        )
+        .unwrap();
+        let loaded = load_snapshot(&conn, CachedList::Authored).unwrap();
+        assert_eq!(loaded, vec![original.clone()]);
+        assert_eq!(
+            loaded[0].identity().source,
+            crate::identity::Source::default()
+        );
+        let emitted = serde_json::to_value(&loaded[0]).unwrap();
+        assert_eq!(
+            emitted["source"],
+            serde_json::json!({"provider": "github", "host": "github.com"})
+        );
     }
 
     #[test]

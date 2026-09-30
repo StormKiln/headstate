@@ -79,3 +79,12 @@ describe("splitByCourt", () => {
     expect(mine).toHaveLength(1);
   });
 });
+
+it("deduplicates the same identity without losing overlapping provider and host rows", () => {
+  const github = pr({ ci: "failure" });
+  const gitlab = pr({ ci: "failure", source: { provider: "gitlab", host: "gitlab.com" } });
+  const otherHost = pr({ ci: "failure", source: { provider: "gitlab", host: "gitlab.example" } });
+  const nested = pr({ ci: "failure", repo: "group/subgroup/project", source: { provider: "gitlab", host: "gitlab.com" } });
+  const { mine } = splitByCourt([github, gitlab, otherHost, nested], [gitlab]);
+  expect(mine).toEqual([github, gitlab, otherHost, nested]);
+});

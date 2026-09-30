@@ -92,6 +92,33 @@ describe("ConnectionBanner", () => {
     expect(banner.textContent).not.toContain("updated");
   });
 
+  it("qualifies a connected desktop whose GitHub auth is unavailable", () => {
+    stubViewport(390);
+    connection.current = {
+      kind: "connected", desktop: "octocat's laptop", lastPoll: null,
+      protocolVersion: REQUIRED_PROTOCOL_VERSION, stale: false,
+    };
+    render(<ConnectionBanner updatedAt={Date.now()} githubAuthAvailable={false} />);
+    const banner = screen.getByRole("button", { name: /octocat's laptop/ });
+    expect(banner.textContent).toContain("reachable · GitHub is not refreshing");
+    expect(banner.textContent).not.toContain("updated");
+    expect(banner.querySelector(".bg-\\[\\#3fb950\\]")).toBeNull();
+    expect(banner.querySelector(".bg-\\[\\#d29922\\]")).not.toBeNull();
+  });
+
+  it("treats an unanswered auth check as unknown, not signed out", () => {
+    stubViewport(390);
+    connection.current = {
+      kind: "connected", desktop: "octocat's laptop", lastPoll: null,
+      protocolVersion: REQUIRED_PROTOCOL_VERSION, stale: false,
+    };
+    render(<ConnectionBanner updatedAt={Date.now()} githubAuthAvailable={null} />);
+    const banner = screen.getByRole("button", { name: /octocat's laptop/ });
+    expect(banner.textContent).toContain("GitHub status unavailable");
+    expect(banner.textContent).not.toContain("updated");
+    expect(banner.textContent).not.toContain("sign in");
+  });
+
   it("tells the user to update the desktop when its protocol is too old", () => {
     stubViewport(390);
     connection.current = {
@@ -173,5 +200,45 @@ describe("ConnectionBanner", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
     fireEvent.click(screen.getByRole("button"));
     await waitFor(() => expect(screen.getByRole("dialog").textContent).toContain("phone"));
+  });
+});
+
+
+describe("selected provider connection status", () => {
+  const gitlab = { rows: [], coverage: "complete" as const, staleSecs: null, loading: false, refreshing: false, error: null };
+  function connected() {
+    stubViewport(390);
+    connection.current = { kind: "connected", desktop: "octocat's laptop", lastPoll: null, protocolVersion: REQUIRED_PROTOCOL_VERSION, stale: false };
+  }
+  it("reports GitLab freshness without a GitHub auth error in GitLab-only mode", () => {
+    connected();
+    render(<ConnectionBanner updatedAt={Date.now()} githubAuthAvailable={false} selection="gitlab" gitlab={gitlab} />);
+    const banner = screen.getByRole("button");
+    expect(banner.textContent).toContain("GitLab MRs updated within the last hour");
+    expect(banner.firstElementChild?.className).toContain("3fb950");
+    expect(banner.textContent).not.toContain("GitHub");
+    expect(banner.textContent).not.toContain("just now");
+  });
+  it("shows both providers and never colors a GitLab failure green because GitHub is fresh", () => {
+    connected();
+    render(<ConnectionBanner updatedAt={Date.now()} selection="both" gitlab={{ ...gitlab, rows: undefined, error: "Authentication unavailable" }} />);
+    const banner = screen.getByRole("button");
+    expect(banner.textContent).toContain("GitHub updated just now");
+    expect(banner.textContent).toContain("GitLab MRs: could not refresh");
+    expect(banner.firstElementChild?.className).toContain("d29922");
+  });
+  it("marks a stale GitLab receipt amber on the phone", () => {
+    connected();
+    render(<ConnectionBanner selection="gitlab" gitlab={{ ...gitlab, staleSecs: 7200 }} />);
+    const banner = screen.getByRole("button");
+    expect(banner.textContent).toContain("GitLab MRs last updated 2 hours ago · stale");
+    expect(banner.firstElementChild?.className).toContain("d29922");
+  });
+  it("withholds provider freshness while the desktop is unreachable", () => {
+    stubViewport(390);
+    connection.current = { kind: "unreachable", desktop: "octocat's laptop", lastPoll: null, stale: true };
+    render(<ConnectionBanner selection="gitlab" gitlab={gitlab} />);
+    expect(screen.getByRole("button").textContent).toContain("unreachable");
+    expect(screen.queryByText(/GitLab MRs/)).toBeNull();
   });
 });

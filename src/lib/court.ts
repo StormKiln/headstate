@@ -1,3 +1,4 @@
+import { prKey } from "@/lib/prIdentity";
 import type { PullRequest } from "@/types/pr";
 import { awaitingReview, needsAttention, needsMyReview } from "./derive";
 
@@ -26,7 +27,7 @@ export function splitByCourt(
     // The two lists are fetched separately. GitHub cannot request a
     // review from an author, but nothing here should double-count if
     // that ever changes.
-    const key = `${pr.repo}#${pr.number}`;
+    const key = prKey(pr);
     if (seen.has(key)) return;
     seen.add(key);
     into.push(pr);

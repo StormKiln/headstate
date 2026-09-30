@@ -1,3 +1,4 @@
+import { prKey } from "@/lib/prIdentity";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
@@ -13,7 +14,7 @@ afterEach(() => {
   useFilters.setState({ checked: [], anchor: null });
 });
 
-const key = (i: number) => `${PR_FIXTURES[i].repo}#${PR_FIXTURES[i].number}`;
+const key = (i: number) => prKey(PR_FIXTURES[i]);
 
 function wrap(ui: ReactNode) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });

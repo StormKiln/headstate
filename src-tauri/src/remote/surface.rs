@@ -78,6 +78,12 @@ pub const SURFACE: &[(&str, Class)] = &[
     // diagnosing "why are there no worktrees" reasonably asks (#1154).
     ("tool_versions", Class::Read),
     ("get_auth_state", Class::Read),
+    ("get_gitlab_auth_state", Class::Read),
+    ("get_gitlab_host", Class::Read),
+    ("set_gitlab_host", Class::Local),
+    ("get_source_snapshot", Class::Read),
+    ("refresh_source", Class::Read),
+    ("set_source_selection", Class::Local),
     ("get_cached", Class::Read),
     ("get_cached_reviewing", Class::Read),
     ("refresh_now", Class::Read),
@@ -108,6 +114,9 @@ pub const SURFACE: &[(&str, Class)] = &[
     // desktop-specific -- unlike `reveal_in_finder`, a phone could act on
     // this answer perfectly well.
     ("stats_tree", Class::Read),
+    ("gitlab_stats_tree", Class::Read),
+    ("gitlab_stats_load", Class::Read),
+    ("gitlab_stats_backfill", Class::Read),
     // The per-author board behind the Mine and Others views (#826). A
     // Read, and the most expensive one in this table: it probes, slices,
     // and fetches per-PR nodes across a whole scope.
@@ -629,6 +638,9 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("update_all_state", Class::Read),
     // write: changes GitHub state through the existing write module, or
     // a desktop setting.
+    ("get_gitlab_detail", Class::Read),
+    ("gitlab_action_capabilities", Class::Read),
+    ("gitlab_action", Class::Write),
     ("act_on_pr", Class::Write),
     ("act_on_prs", Class::Write),
     ("review_pr", Class::Write),
@@ -1064,9 +1076,26 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "read_log_tail" => res(commands::read_log_tail(app.clone(), a.get("maxBytes")?).await),
         "diagnostic_bundle" => ok(commands::diagnostic_bundle(app.clone()).await),
         "get_auth_state" => ok(commands::get_auth_state(app.state())),
+        "get_gitlab_auth_state" => ok(commands::get_gitlab_auth_state(app.clone()).await),
+        "get_gitlab_host" => res(commands::get_gitlab_host(app.clone())),
+        "get_source_snapshot" => res(commands::get_source_snapshot(
+            app.clone(),
+            a.get("source")?,
+            a.get("list")?,
+        )),
+        "refresh_source" => res(commands::refresh_source(
+            app.clone(),
+            app.state(),
+            a.get("source")?,
+            a.get("list")?,
+            a.get("requestId")?,
+        )
+        .await),
         "get_cached" => res(commands::get_cached(app.clone())),
         "get_cached_reviewing" => res(commands::get_cached_reviewing(app.clone())),
-        "refresh_now" => res(commands::refresh_now(app.state()).await),
+        "refresh_now" => {
+            res(commands::refresh_now(app.clone(), app.state(), a.get("requestId")?).await)
+        }
         "get_stats" => res(commands::get_stats(app.state()).await),
         "get_history" => res(commands::get_history(app.state(), a.get("days")?).await),
         "get_periods" => res(commands::get_periods(app.state()).await),
@@ -1083,6 +1112,22 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         )
         .await),
         "stats_tree" => res(commands::stats_tree(app.state()).await),
+        "gitlab_stats_tree" => res(commands::gitlab_stats_tree(app.clone(), a.get("host")?).await),
+        "gitlab_stats_backfill" => res(commands::gitlab_stats_backfill(
+            app.clone(),
+            a.get("host")?,
+            a.get("scope")?,
+            a.get("days")?,
+        )
+        .await),
+        "gitlab_stats_load" => res(commands::gitlab_stats_load(
+            app.clone(),
+            a.get("host")?,
+            a.get("scope")?,
+            a.get("days")?,
+            a.get("refresh")?,
+        )
+        .await),
         // No `subject`, deliberately, and not an omission: a board asks
         // about everyone in the scope, and a subject qualifier would render
         // a leaderboard with one name on it. The viewer's login comes back
@@ -1117,7 +1162,9 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             a.get("days")?,
         )
         .await),
-        "get_reviewing" => res(commands::get_reviewing(app.clone(), app.state()).await),
+        "get_reviewing" => {
+            res(commands::get_reviewing(app.clone(), app.state(), a.get("requestId")?).await)
+        }
         "count_reviewing" => res(commands::count_reviewing(app.state()).await),
         "get_pr_detail" => {
             res(commands::get_pr_detail(app.state(), a.get("repo")?, a.get("number")?).await)
@@ -1337,6 +1384,13 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             a.get("body")?,
         )
         .await),
+        "get_gitlab_detail" => {
+            res(commands::get_gitlab_detail(app.clone(), a.get("identity")?).await)
+        }
+        "gitlab_action_capabilities" => {
+            res(commands::gitlab_action_capabilities(app.clone(), a.get("identity")?).await)
+        }
+        "gitlab_action" => res(commands::gitlab_action(app.clone(), a.get("request")?).await),
         "resolve_thread" => res(commands::resolve_thread(
             app.state(),
             a.get("threadId")?,
@@ -1430,6 +1484,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "set_poll_interval" => ok(commands::set_poll_interval(
             app.clone(),
             a.get("secs")?,
+            app.state(),
             app.state(),
             app.state(),
         )),

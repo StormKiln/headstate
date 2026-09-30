@@ -45,6 +45,12 @@ pub const SURFACE: &[(&str, Class)] = &[
     // diagnosing "why are there no worktrees" reasonably asks (#1154).
     ("tool_versions", Class::Read),
     ("get_auth_state", Class::Read),
+    ("get_gitlab_auth_state", Class::Read),
+    ("get_gitlab_host", Class::Read),
+    ("set_gitlab_host", Class::Local),
+    ("get_source_snapshot", Class::Read),
+    ("refresh_source", Class::Read),
+    ("set_source_selection", Class::Local),
     ("get_cached", Class::Read),
     ("get_cached_reviewing", Class::Read),
     ("refresh_now", Class::Read),
@@ -58,6 +64,9 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("stats_count", Class::Read),
     // The stats scope hierarchy (#825). A Read; names only, no statistics.
     ("stats_tree", Class::Read),
+    ("gitlab_stats_tree", Class::Read),
+    ("gitlab_stats_load", Class::Read),
+    ("gitlab_stats_backfill", Class::Read),
     // The Mine/Others per-author board (#826). A Read; the desktop's
     // ceiling, concurrency cap and budget refusal are inside the command.
     ("stats_board", Class::Read),
@@ -379,6 +388,9 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("update_all_state", Class::Read),
     // write: changes GitHub state through the existing write module, or
     // a desktop setting.
+    ("get_gitlab_detail", Class::Read),
+    ("gitlab_action_capabilities", Class::Read),
+    ("gitlab_action", Class::Write),
     ("act_on_pr", Class::Write),
     ("act_on_prs", Class::Write),
     ("review_pr", Class::Write),

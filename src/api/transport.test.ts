@@ -1,3 +1,4 @@
+import { useGitLabInvalidation } from "./gitlabInvalidation";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderHook } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
@@ -72,6 +73,8 @@ const dirs = ["/home/octocat/code"];
 const name = "hello-world_data";
 const until = "24h";
 const body = "Looks good.";
+const gitlabIdentity = { source: { provider: "gitlab" as const, host: "gitlab.com" }, repo: "group/subgroup/project", number: 7 };
+const gitlabRequest = { identity: gitlabIdentity, action: "approve" as const, expected_head: "head" };
 const verdict = "approve" as const;
 const action = "merge" as const;
 const prs: [string, string, number][] = [[id, repo, number]];
@@ -102,9 +105,15 @@ const row = (
 
 /// One row per exported wrapper: the command name and argument object
 /// each one sent to `invoke` before the seam existed.
+const source = { provider: "gitlab", host: "gitlab.example" } as const;
+const gitlabStatsScope = { kind: "project", path: "octocat/hello-world" } as const;
 const ROWS: Row[] = [
+  row(api.getSourceSnapshot, [source, "reviewing"], "get_source_snapshot", { source, list: "reviewing" }),
+  row(api.refreshSelectedSource, [source, "authored", "request-1"], "refresh_source", { source, list: "authored", requestId: "request-1" }),
+  row(api.setSourceSelection, ["both"], "set_source_selection", { selection: "both" }),
   row(api.getCached, [], "get_cached"),
   row(api.refreshNow, [], "refresh_now"),
+  row(api.refreshSource, ["authored", "request-1"], "refresh_now", { requestId: "request-1" }),
   row(api.getUiPrefs, [], "get_ui_prefs"),
   row(api.setUiPrefs, [uiPrefs], "set_ui_prefs", { prefs: uiPrefs }),
   row(api.getAutostart, [], "get_autostart"),
@@ -229,6 +238,9 @@ const ROWS: Row[] = [
   row(api.updatePrBranch, [id, repo, number, expectedHead], "update_pr_branch", { id, repo, number, expectedHead }),
   row(api.actOnPrs, [prs, action], "act_on_prs", { prs, action }),
   row(api.getPrDetail, [repo, number], "get_pr_detail", { repo, number }),
+  row(api.getGitLabDetail, [gitlabIdentity], "get_gitlab_detail", { identity: gitlabIdentity }),
+  row(api.getGitLabActionCapabilities, [gitlabIdentity], "gitlab_action_capabilities", { identity: gitlabIdentity }),
+  row(api.gitLabAction, [gitlabRequest], "gitlab_action", { request: gitlabRequest }),
   row(
     api.getReviewGates,
     [repo, "main", "fork/r", "feat/x", "abc123"],
@@ -262,6 +274,7 @@ const ROWS: Row[] = [
   row(api.getHistory, [days], "get_history", { days }),
   row(api.getMergedDetail, [], "get_merged_detail"),
   row(api.getAuthState, [], "get_auth_state"),
+  row(api.getGitLabAuthState, [], "get_gitlab_auth_state"),
   row(api.scanArtifacts, [], "scan_artifacts"),
   row(api.readCachedScan, ["artifacts"], "read_cached_scan", { kind: "artifacts" }),
   row(api.sizeArtifacts, [paths], "size_artifacts", { paths }),
@@ -426,6 +439,11 @@ const ROWS: Row[] = [
   // Argument-free: the scope hierarchy is everything the TOKEN can see, so
   // there is nothing for a caller to narrow. #825.
   row(api.statsTree, [], "stats_tree"),
+  row(api.getGitLabHost, [], "get_gitlab_host"),
+  row(api.setGitLabHost, ["gitlab.example"], "set_gitlab_host", { host: "gitlab.example" }),
+  row(api.gitlabStatsTree, ["gitlab.com"], "gitlab_stats_tree", { host: "gitlab.com" }),
+  row(api.gitlabStatsLoad, ["gitlab.com", gitlabStatsScope, days, true], "gitlab_stats_load", { host: "gitlab.com", scope: gitlabStatsScope, days, refresh: true }),
+  row(api.gitlabStatsBackfill, ["gitlab.com", gitlabStatsScope, days], "gitlab_stats_backfill", { host: "gitlab.com", scope: gitlabStatsScope, days }),
   // The scoped stats trio (#826). Argument order matters more here than on
   // most rows: all three take a scope kind and an optional value, and two of
   // them take a subject as well -- so a transposed pair would send a login
@@ -486,6 +504,11 @@ describe("tauri.ts wrappers through the transport", () => {
     await (r.fn as (...a: unknown[]) => Promise<unknown>)(...r.args);
     expect(local.call).toHaveBeenCalledTimes(1);
     expect(local.call).toHaveBeenCalledWith(r.command, r.expected);
+  });
+
+  it("routes correlated reviewing refreshes through get_reviewing", async () => {
+    await api.refreshSource("reviewing", "request-2");
+    expect(local.call).toHaveBeenCalledWith("get_reviewing", { requestId: "request-2" });
   });
 
   it("covers every wrapper tauri.ts exports", () => {
@@ -570,6 +593,9 @@ const POLL_EVENTS: [string, () => unknown][] = [
   ["prs-updated", hooks.usePullRequests],
   ["poll-state", hooks.usePollState],
   ["poll-error", hooks.usePollError],
+  ["source-poll-status", hooks.usePollError],
+  ["gitlab-data-changed", useGitLabInvalidation],
+  ["reviewing-updated", hooks.useReviewing],
   ["prs-truncated", hooks.useTruncation],
   ["prs-incomplete", hooks.useIncomplete],
   ["store-error", hooks.useStoreError],

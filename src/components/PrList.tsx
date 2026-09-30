@@ -2,7 +2,7 @@ import type { PullRequest } from "@/types/pr";
 import { PrRow } from "@/components/PrRow";
 import { HelpButton } from "@/components/HelpButton";
 import { useFilters } from "@/store/filters";
-import { prKey } from "@/components/BulkBar";
+import { prKey } from "@/lib/prIdentity";
 import { deriveStacked } from "@/lib/derive";
 
 /// Renders PRs in whatever order it is given -- sorting is the caller's
@@ -173,7 +173,7 @@ export function PrList({
       ) : (
         prs.map((pr, i) => (
           <PrRow
-            key={`${pr.repo}#${pr.number}`}
+            key={prKey(pr)}
             pr={pr}
             onOpen={onOpen ? () => onOpen(pr) : undefined}
             canWrite={canWrite}
@@ -185,7 +185,7 @@ export function PrList({
             // the store's selection is a property of the LIST's state,
             // not of any one pull request.
             opened={
-              selectedPr?.repo === pr.repo && selectedPr.number === pr.number
+              selectedPr !== null && prKey(selectedPr) === prKey(pr)
             }
             stackedOn={stacked.get(pr.id)}
           />

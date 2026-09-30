@@ -49,7 +49,7 @@ const SORT_OPTIONS: { value: NonNullable<Filters["sort"]>; label: string }[] = [
 /// Every control here writes through the Task 13 filter store via
 /// `setFilter`; this component holds no filter state of its own, so it
 /// never drifts from what the PR list is actually showing.
-export function FilterBar({ prs }: { prs: PullRequest[] }) {
+export function FilterBar({ prs }: { prs: Pick<PullRequest, "labels">[] }) {
   const filters = useActiveFilters();
   const { setFilter, reset, density, setDensity } = useFilters();
   const labels = [...new Set(prs.flatMap((pr) => pr.labels.map((l) => l.name)))].sort();

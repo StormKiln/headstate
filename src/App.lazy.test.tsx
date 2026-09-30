@@ -39,7 +39,8 @@ import { describe, expect, it } from "vitest";
 /// count keeps passing when a route is added without a boundary, which is
 /// a crash on first navigation to that view.
 const LAZY_ROUTES: [name: string, specifier: string][] = [
-  ["StatsPage", "./components/StatsPage"],
+  // This route owns both providers and imports the charted GitHub page.
+  ["ProviderStatsPage", "./components/ProviderStatsPage"],
   ["SystemHealthPage", "./components/SystemHealthPage"],
   // #921. The entry that this guard's own design makes easy to forget: it
   // reads `App.tsx?raw` and checks SOURCE SHAPE, so a new charting route
@@ -114,6 +115,7 @@ describe("the launch chunk", () => {
   /// only a wrapper over it -- anywhere in this file defeats the split
   /// regardless of how the two routes are loaded.
   it("never reaches a charting library from the shell", () => {
+    expect(app).not.toMatch(/^import\s*\{[^}]*\b(?:StatsPage|GitLabStatsPage)\b[^}]*\}\s*from/m);
     expect(app).not.toMatch(/from\s*"recharts"/);
     expect(app).not.toMatch(/from\s*"[^"]*ui\/chart"/);
   });

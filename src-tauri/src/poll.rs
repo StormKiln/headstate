@@ -5,9 +5,12 @@
 //! React never talks to GitHub directly: it renders whatever snapshot is on
 //! disk and listens for the `prs-updated` event.
 
-use crate::github::client::{ClientError, GitHubClient};
+use crate::github::client::{ClientError, FetchedList, GitHubClient};
 use crate::github::model::{needs_attention_count, CiState, MergeState, PullRequest, ReviewState};
-use crate::store::{open_db, save_snapshot, CachedList};
+use crate::identity::Source;
+use crate::source_poll;
+use crate::store::source_cache::{save_source_snapshot, Coverage};
+use crate::store::{open_db, CachedList};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -149,7 +152,13 @@ fn notify_breakage(app: &AppHandle, b: &Breakage) {
         return;
     }
 
-    let body = format!("{}#{} {}", b.repo, b.number, b.kind.reason());
+    let body = format!(
+        "{}: {}#{} {}",
+        b.source.host,
+        b.repo,
+        b.number,
+        b.kind.reason()
+    );
     if let Err(e) = app
         .notification()
         .builder()
@@ -200,6 +209,7 @@ pub(crate) fn notification_allowed(app: &AppHandle) -> bool {
 /// A newly-broken PR worth interrupting the user for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Breakage {
+    pub source: Source,
     pub title: String,
     pub repo: String,
     pub number: u64,
@@ -608,10 +618,11 @@ pub fn newly_ready(previous: &[PullRequest], current: &[PullRequest]) -> Vec<Bre
             // Absent from `previous` means "was not ready", not "skip".
             previous
                 .iter()
-                .find(|p| p.repo == pr.repo && p.number == pr.number)
+                .find(|p| p.identity() == pr.identity())
                 .is_none_or(|was| !ready_for_review(was))
         })
         .map(|pr| Breakage {
+            source: pr.source.clone(),
             title: pr.title.clone(),
             repo: pr.repo.clone(),
             number: pr.number,
@@ -653,12 +664,9 @@ pub fn newly_appeared(previous: &[PullRequest], current: &[PullRequest]) -> Vec<
     current
         .iter()
         .filter(|pr| !pr.is_draft)
-        .filter(|pr| {
-            !previous
-                .iter()
-                .any(|p| p.repo == pr.repo && p.number == pr.number)
-        })
+        .filter(|pr| !previous.iter().any(|p| p.identity() == pr.identity()))
         .map(|pr| Breakage {
+            source: pr.source.clone(),
             title: pr.title.clone(),
             repo: pr.repo.clone(),
             number: pr.number,
@@ -672,9 +680,7 @@ pub fn newly_broken(previous: &[PullRequest], current: &[PullRequest]) -> Vec<Br
     current
         .iter()
         .filter_map(|pr| {
-            let was = previous
-                .iter()
-                .find(|p| p.repo == pr.repo && p.number == pr.number)?;
+            let was = previous.iter().find(|p| p.identity() == pr.identity())?;
             let kind = if pr.ci == CiState::Failure && was.ci != CiState::Failure {
                 BreakageKind::CiFailed
             } else if pr.merge == MergeState::Conflicted && was.merge != MergeState::Conflicted {
@@ -683,6 +689,7 @@ pub fn newly_broken(previous: &[PullRequest], current: &[PullRequest]) -> Vec<Br
                 return None;
             };
             Some(Breakage {
+                source: pr.source.clone(),
                 title: pr.title.clone(),
                 repo: pr.repo.clone(),
                 number: pr.number,
@@ -698,7 +705,7 @@ fn merge_by_identity(base: &[PullRequest], updates: &[PullRequest]) -> Vec<PullR
         .map(|pr| {
             updates
                 .iter()
-                .find(|u| u.repo == pr.repo && u.number == pr.number)
+                .find(|u| u.identity() == pr.identity())
                 .cloned()
                 .unwrap_or_else(|| pr.clone())
         })
@@ -787,14 +794,31 @@ async fn read_notify_prefs(app: &AppHandle) -> NotifyPrefs {
 /// A failed write is logged and swallowed, matching the foreground
 /// command's own reasoning: this is a cache, and the tick has real work
 /// behind it that must not fail because a cache write did.
-async fn persist_reviewing(app: &AppHandle, prs: &[PullRequest]) {
+pub(crate) fn emit_reviewing(app: &AppHandle, result: &FetchedList) {
+    let short = result
+        .total
+        .map(|total| total.saturating_sub(result.prs.len() as u64));
+    let _ = app.emit("reviewing-short", short);
+    let _ = app.emit("reviewing-updated", &result.prs);
+}
+
+async fn persist_reviewing(app: &AppHandle, result: &FetchedList) {
+    let prs = &result.prs;
+    let coverage = result.coverage.clone();
     let Ok(dir) = app.path().app_data_dir() else {
         return;
     };
     let owned: Vec<PullRequest> = prs.to_vec();
     let written = tauri::async_runtime::spawn_blocking(move || {
         let conn = open_db(&dir.join("headstate.db")).map_err(|e| format!("{e}"))?;
-        save_snapshot(&conn, CachedList::Reviewing, &owned).map_err(|e| format!("{e}"))
+        save_source_snapshot(
+            &conn,
+            &Source::default(),
+            CachedList::Reviewing,
+            &owned,
+            &coverage,
+        )
+        .map_err(|e| format!("{e}"))
     })
     .await;
     match written {
@@ -804,15 +828,21 @@ async fn persist_reviewing(app: &AppHandle, prs: &[PullRequest]) {
     }
 }
 
-async fn persist_and_emit(app: &AppHandle, prs: &[PullRequest]) {
+async fn persist_and_emit(app: &AppHandle, prs: &[PullRequest], coverage: Coverage) {
     match app.path().app_data_dir() {
         Ok(dir) => {
             let owned: Vec<PullRequest> = prs.to_vec();
             let written = tauri::async_runtime::spawn_blocking(move || {
                 let conn =
                     open_db(&dir.join("headstate.db")).map_err(|e| (true, format!("{e}")))?;
-                save_snapshot(&conn, CachedList::Authored, &owned)
-                    .map_err(|e| (false, format!("{e}")))
+                save_source_snapshot(
+                    &conn,
+                    &Source::default(),
+                    CachedList::Authored,
+                    &owned,
+                    &coverage,
+                )
+                .map_err(|e| (false, format!("{e}")))
             })
             .await;
             match written {
@@ -866,14 +896,30 @@ async fn persist_and_emit(app: &AppHandle, prs: &[PullRequest]) {
 /// recheck logs and returns without touching the snapshot, so the last good
 /// snapshot on disk is left exactly as the regular tick left it -- the UI
 /// is never blanked.
-fn spawn_recheck(app: AppHandle, client: Arc<GitHubClient>, last_known: Vec<PullRequest>) {
+fn spawn_recheck(
+    app: AppHandle,
+    client: Arc<GitHubClient>,
+    last_known: Vec<PullRequest>,
+    attempt: source_poll::Attempt,
+) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(RECHECK_DELAY).await;
 
         match client.fetch_prs().await {
             Ok(fresh) => {
-                let merged = merge_by_identity(&last_known, &fresh);
-                persist_and_emit(&app, &merged).await;
+                if let Some(publication) = source_poll::publication(&app, &attempt).await {
+                    let merged = merge_by_identity(&last_known, &fresh);
+                    persist_and_emit(&app, &merged, Coverage::Unknown).await;
+                    source_poll::complete(
+                        &app,
+                        publication,
+                        Ok(FetchedList {
+                            prs: merged,
+                            total: None,
+                            coverage: Coverage::Unknown,
+                        }),
+                    );
+                }
             }
             Err(e) => {
                 // No retry: the regular 60s/300s cadence picks this back up
@@ -1028,6 +1074,7 @@ pub struct PollInterval(pub Arc<AtomicU64>);
 /// on another view, and the badge staying honest is the stated reason
 /// polling lives in Rust at all.
 pub struct ViewNeedsGithub(pub Arc<AtomicBool>);
+pub struct GithubSourceEnabled(pub Arc<AtomicBool>);
 
 /// How many consecutive transient failures before the banner appears.
 ///
@@ -1077,6 +1124,7 @@ pub fn spawn(
     waker: Arc<Notify>,
     interval_secs: Arc<AtomicU64>,
     view_needs_github: Arc<AtomicBool>,
+    github_source_enabled: Arc<AtomicBool>,
 ) {
     tauri::async_runtime::spawn(async move {
         let mut previous: Vec<PullRequest> = Vec::new();
@@ -1102,6 +1150,12 @@ pub fn spawn(
         // `should_surface`.
         let mut consecutive_failures: u32 = 0;
         loop {
+            if !github_source_enabled.load(Ordering::Relaxed) {
+                // Source selection pauses GitHub network work, including the
+                // initial tick after a relaunch. Switching back wakes us.
+                waker.notified().await;
+                continue;
+            }
             // `timeout` collapses a hang into the Err arm the loop already
             // handles, so a wedged request costs one tick instead of the
             // rest of the session.
@@ -1109,7 +1163,7 @@ pub fn spawn(
             // What this tick leaves behind, emitted once at the end. A
             // suppressed failure sets "retrying"; everything else is
             // genuinely idle. Reset per tick so a recovery clears it.
-            let mut ending_state = tick_state(None);
+
             // DIAGNOSTIC LOGGING (Settings > diagnostic log). The background loop
             // shares one client -- and one connection pool -- with
             // whatever the user just clicked, so a tick that overlaps a
@@ -1126,8 +1180,10 @@ pub fn spawn(
             // to prevent. See `TICK_TIMEOUT` for why the fix is a shared
             // deadline rather than a smaller `FETCH_TIMEOUT` or a
             // `tokio::join!`.
+            let authored_attempt =
+                source_poll::begin(&app, Source::default(), CachedList::Authored).await;
             let fetched =
-                match tokio::time::timeout(FETCH_TIMEOUT, client.fetch_prs_with_total()).await {
+                match tokio::time::timeout(FETCH_TIMEOUT, client.fetch_prs_snapshot()).await {
                     Ok(res) => res,
                     Err(_) => Err(ClientError::Timeout(FETCH_TIMEOUT.as_secs())),
                 };
@@ -1158,6 +1214,8 @@ pub fn spawn(
             //
             // The preference still decides whether anything is ANNOUNCED;
             // it no longer decides whether anything is known.
+            let reviewing_attempt =
+                source_poll::begin(&app, Source::default(), CachedList::Reviewing).await;
             let reviewing_now = {
                 if remaining.is_zero() {
                     // The authored fetch used the whole tick. Skipped rather
@@ -1167,14 +1225,19 @@ pub fn spawn(
                     // full budget.
                     crate::diag!("[diag] poll reviewing skipped: tick budget spent");
                     reviewing_outcome = "skipped";
-                    None
+                    Err(source_poll::Failure {
+                        message: "Review refresh was not started: the poll budget was spent."
+                            .into(),
+                        transient: false,
+                        not_asked: true,
+                    })
                 } else {
-                    match tokio::time::timeout(remaining, client.fetch_reviewing()).await {
-                        Ok(Ok(list)) => Some(list),
+                    match tokio::time::timeout(remaining, client.fetch_reviewing_snapshot()).await {
+                        Ok(Ok(list)) => Ok(list),
                         Ok(Err(e)) => {
                             crate::diag!("[diag] poll reviewing failed: {e}");
                             reviewing_outcome = "failed";
-                            None
+                            Err(source_poll::Failure::from(&e))
                         }
                         Err(_) => {
                             reviewing_outcome = "timed out";
@@ -1182,7 +1245,9 @@ pub fn spawn(
                                 "[diag] poll reviewing timed out after {}ms of tick budget",
                                 remaining.as_millis()
                             );
-                            None
+                            Err(source_poll::Failure::from(&ClientError::Timeout(
+                                remaining.as_secs(),
+                            )))
                         }
                     }
                 }
@@ -1191,13 +1256,12 @@ pub fn spawn(
                 "[diag] poll tick fetch done {}ms {}",
                 tick_started.elapsed().as_millis(),
                 match &fetched {
-                    Ok((prs, total)) => format!("ok n={} total={total}", prs.len()),
+                    Ok(result) => format!("ok n={} total={:?}", result.prs.len(), result.total),
                     Err(e) => format!("err: {e}"),
                 }
             );
-            // What the report says about this tick, taken before `fetched`
-            // is consumed. Redacted here: the history is read by a command
-            // a paired phone may call.
+            // This report is readable from a paired phone; redact the
+            // failure while retaining its timeout as a separate measure.
             let tick_failure: Option<(String, Option<u64>)> = match &fetched {
                 Ok(_) => None,
                 Err(e) => Some((
@@ -1208,150 +1272,160 @@ pub fn spawn(
                     },
                 )),
             };
-            match fetched {
-                Ok((prs, total)) => {
-                    // Compare against the tick before this one. `previous`
-                    // starts empty, so the first tick never notifies --
-                    // otherwise launching with 13 broken PRs would fire 13
-                    // notifications at once.
-                    // Read per tick rather than cached at startup, so a
-                    // setting change takes effect on the next poll
-                    // instead of at the next relaunch. A failed read
-                    // falls back to the default (everything on), which
-                    // is what the app did before the setting existed.
-                    let prefs = read_notify_prefs(&app).await;
-                    for b in newly_broken(&previous, &prs) {
-                        if prefs.wants(b.kind) {
-                            notify_breakage(&app, &b);
-                        }
-                    }
-                    // Newly APPEARED pull requests (#789).
-                    //
-                    // Gated on `had_a_tick` rather than on `previous`
-                    // being non-empty, and that distinction is the whole
-                    // of the first-tick suppression. `previous` starts
-                    // EMPTY, so `!previous.is_empty()` would be false on
-                    // the first tick and also false on the first tick of
-                    // a user whose last pull request merged -- and the
-                    // second of those is a real empty list whose next
-                    // arrival IS news. A separate flag says "we have
-                    // compared at least once", which is the actual
-                    // question.
-                    //
-                    // `newly_broken` above needs no such guard: it never
-                    // fires for a pull request absent from `previous`, so
-                    // an empty previous list announces nothing by
-                    // construction. This rule is the opposite shape --
-                    // absent means new -- so it needs the flag.
-                    if had_a_tick {
-                        for b in newly_appeared(&previous, &prs) {
-                            if prefs.wants(b.kind) {
-                                notify_breakage(&app, &b);
-                            }
-                        }
-                    }
-                    had_a_tick = true;
-                    // Ready-to-review, from the queue fetched above.
-                    //
-                    // Skipped entirely until there is one tick of
-                    // history: without this, opening the app announces
-                    // every pull request already waiting.
-                    if let Some(now) = reviewing_now {
+            // Each successful queue survives a failure from the other queue.
+            let review_publication = if reviewing_now.is_ok() {
+                source_poll::success_publication(&app, &reviewing_attempt).await
+            } else {
+                source_poll::publication(&app, &reviewing_attempt).await
+            };
+            if let Some(publication) = review_publication {
+                match reviewing_now {
+                    Ok(now) => {
+                        let prefs = read_notify_prefs(&app).await;
                         if let Some(before) = &previous_reviewing {
-                            for b in newly_ready(before, &now) {
+                            for b in newly_ready(before, &now.prs) {
                                 if prefs.wants(b.kind) {
                                     notify_breakage(&app, &b);
                                 }
                             }
                         }
-                        // WRITTEN DOWN, not just compared (#1118).
-                        //
-                        // This list was fetched every tick and used only
-                        // to decide what to announce, then dropped on the
-                        // floor -- while the authored list on the same
-                        // tick went through `persist_and_emit` and reached
-                        // both the cache and the UI. So the To Review page
-                        // paid ~20s for a query the background had already
-                        // made a minute earlier.
                         persist_reviewing(&app, &now).await;
-                        previous_reviewing = Some(now);
+                        emit_reviewing(&app, &now);
+                        let complete = matches!(now.coverage, Coverage::Complete);
+                        previous_reviewing = complete.then(|| now.prs.clone());
+                        source_poll::complete(&app, publication, Ok(now));
                     }
-
-                    previous = prs.clone();
-                    // Emitted on EVERY tick, including the complete one
-                    // -- see `truncation_payload` for why the zero
-                    // matters as much as the count.
-                    let truncated = truncation_payload(prs.len() as u64, total);
-                    if truncated > 0 {
-                        log::warn!("truncated: showing {} of {total} open PRs", prs.len());
-                    }
-                    if let Err(e) = app.emit("prs-truncated", truncated) {
-                        log::warn!("failed to emit prs-truncated: {e}");
-                    }
-                    // The heartbeat that makes "it stopped updating"
-                    // answerable: if the log ends here, the loop died or
-                    // the machine slept; if it keeps ticking, the problem
-                    // is downstream. Counts only -- never titles, never
-                    // repository names.
-                    log::info!(
-                        "poll ok: {} open, {} need attention (of {total} matching)",
-                        prs.len(),
-                        needs_attention_count(&prs)
-                    );
-                    // Fields GitHub refused on this fetch, then cleared:
-                    // a later complete response must stop reporting a
-                    // shortfall that no longer exists. Emitted even when
-                    // zero, so the banner disappears on recovery rather
-                    // than sticking until relaunch.
-                    let refused = crate::github::client::REFUSED_FIELDS.swap(0, Ordering::Relaxed);
-                    if let Err(e) = app.emit("prs-incomplete", refused) {
-                        log::warn!("failed to emit prs-incomplete: {e}");
-                    }
-
-                    consecutive_failures = 0;
-                    persist_and_emit(&app, &prs).await;
-                    if has_checking(&prs) {
-                        spawn_recheck(app.clone(), client.clone(), prs);
-                    }
+                    Err(error) => source_poll::complete(&app, publication, Err(error)),
                 }
-                // A failed poll leaves the last snapshot in place rather
-                // than blanking the UI; the next tick retries.
-                Err(e) => {
-                    log::warn!("poll failed: {e}");
-                    consecutive_failures += 1;
-                    if should_surface(&e, consecutive_failures) {
-                        if let Err(emit_err) = app.emit("poll-error", e.to_string()) {
-                            log::warn!("failed to emit poll-error: {emit_err}");
+            }
+            let authored_publication = if fetched.is_ok() {
+                source_poll::success_publication(&app, &authored_attempt).await
+            } else {
+                source_poll::publication(&app, &authored_attempt).await
+            };
+            if let Some(publication) = authored_publication {
+                match fetched {
+                    Ok(result) => {
+                        let receipt = result.clone();
+                        let FetchedList {
+                            prs,
+                            total,
+                            coverage,
+                        } = result;
+                        // Compare against the tick before this one. `previous`
+                        // starts empty, so the first tick never notifies --
+                        // otherwise launching with 13 broken PRs would fire 13
+                        // notifications at once.
+                        // Read per tick rather than cached at startup, so a
+                        // setting change takes effect on the next poll
+                        // instead of at the next relaunch. A failed read
+                        // falls back to the default (everything on), which
+                        // is what the app did before the setting existed.
+                        let prefs = read_notify_prefs(&app).await;
+                        for b in newly_broken(&previous, &prs) {
+                            if prefs.wants(b.kind) {
+                                notify_breakage(&app, &b);
+                            }
                         }
-                    } else {
+                        // Newly APPEARED pull requests (#789).
+                        //
+                        // Gated on `had_a_tick` rather than on `previous`
+                        // being non-empty, and that distinction is the whole
+                        // of the first-tick suppression. `previous` starts
+                        // EMPTY, so `!previous.is_empty()` would be false on
+                        // the first tick and also false on the first tick of
+                        // a user whose last pull request merged -- and the
+                        // second of those is a real empty list whose next
+                        // arrival IS news. A separate flag says "we have
+                        // compared at least once", which is the actual
+                        // question.
+                        //
+                        // `newly_broken` above needs no such guard: it never
+                        // fires for a pull request absent from `previous`, so
+                        // an empty previous list announces nothing by
+                        // construction. This rule is the opposite shape --
+                        // absent means new -- so it needs the flag.
+                        if had_a_tick {
+                            for b in newly_appeared(&previous, &prs) {
+                                if prefs.wants(b.kind) {
+                                    notify_breakage(&app, &b);
+                                }
+                            }
+                        }
+                        had_a_tick = matches!(coverage, Coverage::Complete);
+
+                        previous = prs.clone();
+                        // Null replaces stale numeric advice with unknown completeness.
+                        let truncated =
+                            total.map(|total| truncation_payload(prs.len() as u64, total));
+                        if let Err(e) = app.emit("prs-truncated", truncated) {
+                            log::warn!("failed to emit prs-truncated: {e}");
+                        }
+                        // The heartbeat that makes "it stopped updating"
+                        // answerable: if the log ends here, the loop died or
+                        // the machine slept; if it keeps ticking, the problem
+                        // is downstream. Counts only -- never titles, never
+                        // repository names.
                         log::info!(
+                            "poll ok: {} open, {} need attention (matching total: {total:?})",
+                            prs.len(),
+                            needs_attention_count(&prs)
+                        );
+                        // Fields GitHub refused on this fetch, then cleared:
+                        // a later complete response must stop reporting a
+                        // shortfall that no longer exists. Emitted even when
+                        // zero, so the banner disappears on recovery rather
+                        // than sticking until relaunch.
+                        let refused =
+                            crate::github::client::REFUSED_FIELDS.swap(0, Ordering::Relaxed);
+                        if let Err(e) = app.emit("prs-incomplete", refused) {
+                            log::warn!("failed to emit prs-incomplete: {e}");
+                        }
+
+                        consecutive_failures = 0;
+                        persist_and_emit(&app, &prs, coverage.clone()).await;
+                        let _ = app.emit("poll-state", tick_state(None));
+                        source_poll::complete(&app, publication, Ok(receipt));
+                        if has_checking(&prs) {
+                            spawn_recheck(app.clone(), client.clone(), prs, authored_attempt);
+                        }
+                    }
+                    // A failed poll leaves the last snapshot in place rather
+                    // than blanking the UI; the next tick retries.
+                    Err(e) => {
+                        log::warn!("poll failed: {e}");
+                        consecutive_failures += 1;
+                        let surfaced = should_surface(&e, consecutive_failures);
+                        if surfaced {
+                            if let Err(emit_err) = app.emit("poll-error", e.to_string()) {
+                                log::warn!("failed to emit poll-error: {emit_err}");
+                            }
+                        } else {
+                            log::info!(
                             "not surfacing a transient failure ({consecutive_failures} in a row); \
                              the next tick should recover"
                         );
-                        // The bar has nothing else to go on: no
-                        // poll-error and no prs-updated on a suppressed
-                        // failure, so it would otherwise show a green
-                        // "Up to date" while the data is stale.
-                        //
-                        // Recorded rather than emitted here: the terminal
-                        // emit below runs on EVERY tick, so emitting
-                        // "retrying" at this point would be overwritten by
-                        // it microseconds later and the bar would settle on
-                        // green anyway -- the exact bug this branch exists
-                        // to prevent (#1104).
-                        ending_state = tick_state(Some(false));
+                            // The bar has nothing else to go on: no
+                            // poll-error and no prs-updated on a suppressed
+                            // failure, so it would otherwise show a green
+                            // "Up to date" while the data is stale.
+                            //
+                            // Recorded rather than emitted here: the terminal
+                            // emit below runs on EVERY tick, so emitting
+                            // "retrying" at this point would be overwritten by
+                            // it microseconds later and the bar would settle on
+                            // green anyway -- the exact bug this branch exists
+                            // to prevent (#1104).
+                        }
+                        let _ = app.emit("poll-state", tick_state(Some(surfaced)));
+                        source_poll::complete(
+                            &app,
+                            publication,
+                            Err(source_poll::Failure::from(&e)),
+                        );
                     }
                 }
             }
-            // The bar shows FETCHING only while a request is genuinely in
-            // flight. Inferring it from `isFetching` would miss the tray
-            // path, which bypasses the queryFn -- so the loop that knows
-            // says so directly.
-            //
-            // Carries the tick's OUTCOME, not a fixed "idle": a suppressed
-            // failure leaves the data stale, and the bar has no other way to
-            // learn that. See `tick_state`.
-            let _ = app.emit("poll-state", ending_state);
             let ok = tick_failure.is_none();
             let (error, timed_out_after_secs) = tick_failure.unzip();
             crate::report::record_tick(crate::report::PollTickRecord {
@@ -2251,6 +2325,7 @@ mod tests {
 
     fn pr(repo: &str, number: u64, merge: MergeState) -> PullRequest {
         PullRequest {
+            source: Default::default(),
             id: "PR_test".into(),
             number,
             title: "Add retry to the fetch client".into(),
@@ -2988,6 +3063,7 @@ mod tests {
             .unwrap()
             .with_timezone(&chrono::Utc);
         PullRequest {
+            source: Default::default(),
             id: "PR_test".into(),
             number,
             title: format!("PR {number}"),
@@ -3160,6 +3236,33 @@ mod tests {
     /// everything else in the last known snapshot survives untouched. This
     /// is what keeps a partial recheck from silently dropping PRs that
     /// weren't part of it.
+    #[test]
+    fn notifications_and_rechecks_do_not_alias_provider_or_host() {
+        let gh = pr_full("o/r", 7, CiState::Success, MergeState::Mergeable);
+        for (provider, host) in [
+            (crate::identity::Provider::Gitlab, "gitlab.com"),
+            (crate::identity::Provider::Github, "other.example"),
+        ] {
+            let mut other = gh.clone();
+            other.source = Source {
+                provider,
+                host: host.into(),
+            };
+            other.ci = CiState::Failure;
+            assert!(
+                newly_broken(std::slice::from_ref(&gh), std::slice::from_ref(&other)).is_empty()
+            );
+            assert_eq!(
+                newly_appeared(std::slice::from_ref(&gh), std::slice::from_ref(&other))[0].source,
+                other.source
+            );
+            assert_eq!(
+                merge_by_identity(std::slice::from_ref(&gh), &[other]),
+                vec![gh.clone()]
+            );
+        }
+    }
+
     #[test]
     fn merge_by_identity_replaces_only_matching_prs() {
         let base = vec![

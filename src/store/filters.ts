@@ -1,3 +1,4 @@
+import type { PrIdentity } from "../types/identity";
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import type { Filters } from "../lib/derive";
@@ -600,9 +601,9 @@ interface FilterStore {
   ///
   /// Deliberately NOT persisted: reopening the app on a detail page for a
   /// PR that has since merged is worse than landing on the list.
-  selectedPr: { repo: string; number: number } | null;
-  selectPr: (pr: { repo: string; number: number } | null) => void;
-  /// Rows checked for a bulk action, keyed `repo#number`.
+  selectedPr: PrIdentity | null;
+  selectPr: (pr: PrIdentity | null) => void;
+  /// Rows checked for a bulk action, keyed by provider, host, project and number.
   ///
   /// Keyed rather than held as a list of PRs so selection is independent
   /// of the filtered list: narrowing a filter after selecting must not

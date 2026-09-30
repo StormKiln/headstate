@@ -3,6 +3,8 @@ import { toast } from "sonner";
 import { type View, useFilters } from "../store/filters";
 import { listen, type UnlistenFn } from "./transport";
 import { safeUnlisten } from "./unlisten";
+import { receiptAdvisory } from "./sourceRefresh";
+import { clearAuthoredError, patchSourceRows, readAuthored, refreshWithState, useSourceRefresh } from "./sourceRefreshHooks";
 import { timeCall, timed } from "./diag";
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import type {
@@ -78,7 +80,6 @@ import {
   claudeConfigHealth,
   claudeMcpServers,
   claudeUsageProfile,
-  getCached,
   actOnPrs,
   updatePrBranch,
   statsTree,
@@ -176,12 +177,10 @@ import {
   sizeWorktrees,
   repoTree,
   repoFile,
-  getReviewing,
   getCachedReviewing,
   countReviewing,
   getStats,
   cancelUpdateRun,
-  refreshNow,
   updateRunState,
   setPollInterval,
   setViewNeedsGithub,
@@ -215,40 +214,18 @@ import {
 /// is never a bare empty screen while a poll is in flight. Callers that
 /// need "never authenticated" vs. "authenticated, still loading" should
 /// consult `get_auth_state` (see `AuthGate`).
-export function usePullRequests() {
+export function usePullRequests(enabled = true) {
   const qc = useQueryClient();
 
-  useEffect(() => {
-    // Cleanup must not race `listen()`'s own promise: if the effect tears
-    // down before `listen` resolves, a naive `un.then(f => f())` calls
-    // unlisten on a promise that hasn't produced `f` yet, so the listener
-    // registers *after* teardown and leaks. React 19 StrictMode mounts,
-    // unmounts, and remounts effects on purpose, so this is not
-    // theoretical -- it's the normal dev-mode path.
-    let unlisten: UnlistenFn | undefined;
-    let cancelled = false;
-
-    listen<PullRequest[]>("prs-updated", (e) => {
-      qc.setQueryData(["prs"], e.payload);
-    }).then(
-      (fn) => {
-        if (cancelled) safeUnlisten(fn);
-        else unlisten = fn;
-      },
-      () => {},
-    );
-
-    return () => {
-      cancelled = true;
-      safeUnlisten(unlisten);
-    };
-  }, [qc]);
-
-  return useQuery({
+  const source = useSourceRefresh("authored");
+  const read = useCallback(() => readAuthored(qc), [qc]);
+  const query = useQuery({
     queryKey: ["prs"],
-    queryFn: PRS_FN,
+    queryFn: read,
+    enabled,
     staleTime: Infinity,
   });
+  return { ...query, data: source.prs ?? query.data };
 }
 
 /// `Stats`'s five derived fields always come back zero from the Rust layer
@@ -259,40 +236,10 @@ export function useStats() {
   return useQuery({ queryKey: ["stats"], queryFn: getStats, staleTime: 60_000 });
 }
 
-/// The Rust poll loop emits `poll-error` (payload: a display-ready message
-/// string) on every failed background poll, and nothing else listens for
-/// it. Without this, M2's error handling is invisible: the UI would show
-/// stale cached data forever with no indication a poll is failing.
-///
-/// Deliberately not a TanStack Query cache entry -- there's no `queryFn` to
-/// attach it to, it's a push notification from a background loop, not the
-/// result of a fetch this component initiated. A minimal module-level store
-/// subscribed via `useSyncExternalStore` is the smallest thing that works.
-let lastPollError: string | null = null;
-const listeners = new Set<() => void>();
-
-function setLastPollError(message: string | null): void {
-  lastPollError = message;
-  for (const listener of listeners) listener();
-}
-
-function subscribe(listener: () => void): () => void {
-  listeners.add(listener);
-  return () => listeners.delete(listener);
-}
-
-function getSnapshot(): string | null {
-  return lastPollError;
-}
-
-/// Clear the poll-error banner.
-///
-/// The banner used to clear ONLY on a `prs-updated` event, and
-/// `refresh_now` never emits one -- so a successful tray refresh left a red
-/// "Background refresh failed" banner over freshly-loaded PRs until the
-/// next background tick, up to 300s later.
+/// Poll errors are reconciled with command outcomes in the shared source store.
+/// Explicit user dismissal; later provider outcomes can show a new error.
 export function clearPollError(): void {
-  setLastPollError(null);
+  clearAuthoredError();
 }
 
 /// `src-tauri/src/tray.rs` emits `refresh-requested` when the user clicks
@@ -323,14 +270,10 @@ export function clearPollError(): void {
 /// that failed silently is how the tray menu item used to behave.
 async function refreshFromGitHub(qc: QueryClient): Promise<void> {
   try {
-    const prs = await refreshNow();
-    qc.setQueryData(["prs"], prs);
-    // A successful manual refresh is proof the failure is over.
-    clearPollError();
-  } catch (err: unknown) {
-    setLastPollError(
-      typeof err === "string" ? err : err instanceof Error ? err.message : "Refresh failed",
-    );
+    await refreshWithState(qc, "authored");
+  } catch {
+    // The shared source state distinguishes provider outcomes from transport
+    // failures and keeps the latter visible until this request is recovered.
   }
 }
 
@@ -341,11 +284,13 @@ async function refreshFromGitHub(qc: QueryClient): Promise<void> {
 /// touch listeners on every render of the whole app shell.
 export function useRefreshFromGesture(): () => Promise<void> {
   const qc = useQueryClient();
+  useSourceRefresh("authored");
   return useCallback(() => refreshFromGitHub(qc), [qc]);
 }
 
-export function useRefreshRequested(): void {
+export function useRefreshRequested(enabled = true): void {
   const qc = useQueryClient();
+  useSourceRefresh("authored");
 
   useEffect(() => {
     // Same guarded pattern as the two listeners above -- see their comments
@@ -359,7 +304,7 @@ export function useRefreshRequested(): void {
       // goes to the poll-error store. Extracted when the phone's
       // pull-to-refresh gained the same meaning (#639); a second copy
       // would have drifted.
-      void refreshFromGitHub(qc);
+      if (enabled) void refreshFromGitHub(qc);
     }).then(
       (fn) => {
         if (cancelled) safeUnlisten(fn);
@@ -372,51 +317,13 @@ export function useRefreshRequested(): void {
       cancelled = true;
       safeUnlisten(unlisten);
     };
-  }, [qc]);
+  }, [qc, enabled]);
 }
 
-/// The most recent `poll-error` message, or `null` if no poll has failed
-/// since this window opened (or a later poll has since succeeded and
-/// re-emitted `prs-updated`, which clears it).
+/// The latest provider or foreground transport failure for the authored list.
+/// Versioned source outcomes cannot clear an unrelated phone transport error.
 export function usePollError(): string | null {
-  useEffect(() => {
-    let unlistenError: UnlistenFn | undefined;
-    let unlistenUpdated: UnlistenFn | undefined;
-    let cancelled = false;
-
-    listen<string>("poll-error", (e) => {
-      setLastPollError(e.payload);
-    }).then(
-      (fn) => {
-        if (cancelled) safeUnlisten(fn);
-        else unlistenError = fn;
-      },
-      () => {},
-    );
-
-    // A later successful poll clears the error banner. `prs-updated` is
-    // already listened to by `usePullRequests` (which updates the query
-    // cache); this listens independently only to clear the error flag, so
-    // the two hooks stay decoupled -- a banner can mount without the list
-    // being mounted too.
-    listen<PullRequest[]>("prs-updated", () => {
-      setLastPollError(null);
-    }).then(
-      (fn) => {
-        if (cancelled) safeUnlisten(fn);
-        else unlistenUpdated = fn;
-      },
-      () => {},
-    );
-
-    return () => {
-      cancelled = true;
-      safeUnlisten(unlistenError);
-      safeUnlisten(unlistenUpdated);
-    };
-  }, []);
-
-  return useSyncExternalStore(subscribe, getSnapshot);
+  return useSourceRefresh("authored").error;
 }
 
 /// Whether the poll loop is currently fetching.
@@ -500,15 +407,9 @@ export function useViewCadence(view: string): void {
 const SCAN_ARTIFACTS_FN = timed("scan_artifacts", scanArtifacts);
 const SCAN_VENVS_FN = timed("scan_venvs", scanVenvs);
 
-const REVIEWING_FN = timed("reviewing", getReviewing);
 const CACHED_REVIEWING_FN = timed("reviewing-cached", getCachedReviewing);
 const REVIEWING_COUNT_FN = timed("reviewing-count", countReviewing);
-const PRS_FN = timed("prs", async () => {
-  const cached = await getCached();
-  // Show the cache immediately; the poll loop supplies fresh data.
-  if (cached.length > 0) return cached;
-  return refreshNow();
-});
+
 
 /// The `refreshPrs` currently in flight, so a second caller joins it
 /// instead of starting a rival (#742).
@@ -537,7 +438,7 @@ async function refreshPrs(qc: QueryClient): Promise<void> {
 
   refreshInFlight = (async () => {
     try {
-      qc.setQueryData(["prs"], await refreshNow());
+      await refreshWithState(qc, "authored");
     } catch {
       // The write already succeeded; only the read-back failed. Fall back
       // to the poll loop, which the Rust side has already woken. Throwing
@@ -596,16 +497,16 @@ function patchListRows(
   patch: Partial<PullRequest>,
 ): void {
   for (const key of LIST_KEYS) {
-    const rows = qc.getQueryData<PullRequest[]>(key);
-    if (rows === undefined) continue;
-    if (!rows.some((p) => p.repo === repo && p.number === number)) continue;
-    // New array and new row objects: React Query compares by reference,
-    // and mutating in place would leave the list rendering the old value
-    // -- the same trap `withOwnReview` documents.
-    qc.setQueryData<PullRequest[]>(
-      key,
-      rows.map((p) => (p.repo === repo && p.number === number ? { ...p, ...patch } : p)),
-    );
+    // Update the same rows the hooks render, even if query-cache GC removed
+    // their mirrored entry. Cached-only rows stay cached; do not invent a live
+    // receipt for a confirmed local mutation.
+    const apply = (items: PullRequest[]) => items.some((p) => p.repo === repo && p.number === number)
+      ? items.map((p) => p.repo === repo && p.number === number ? { ...p, ...patch } : p)
+      : items;
+    const patched = patchSourceRows(qc, key[0] === "prs" ? "authored" : "reviewing", apply);
+    const rows = patched ?? qc.getQueryData<PullRequest[]>(key);
+    if (rows === undefined || !rows.some((p) => p.repo === repo && p.number === number)) continue;
+    qc.setQueryData<PullRequest[]>(key, patched ?? apply(rows));
   }
 }
 
@@ -5090,6 +4991,10 @@ export function useNotifyPrefs() {
 /// about the queue the user is the bottleneck for -- the largest gap for a
 /// daily driver. Same 60s staleness as the authored list.
 export function useReviewing(enabled = true) {
+  const qc = useQueryClient();
+  const source = useSourceRefresh("reviewing");
+  const fetchReviewing = useCallback(() => refreshWithState(qc, "reviewing"), [qc]);
+
   // The cached list, read from SQLite and never from GitHub. Its own
   // query so it resolves in milliseconds while the live one runs --
   // folding the cache into the live queryFn instead would let a cached
@@ -5117,7 +5022,7 @@ export function useReviewing(enabled = true) {
 
   const live = useQuery({
     queryKey: ["reviewing"],
-    queryFn: REVIEWING_FN,
+    queryFn: fetchReviewing,
     // Only the view that RENDERS these pull requests fetches them. It
     // used to run on every view -- including Docker and Worktrees, which
     // show none -- purely so a sidebar badge could display its length.
@@ -5125,6 +5030,10 @@ export function useReviewing(enabled = true) {
     // failed there too.
     enabled,
     staleTime: 60_000,
+    // The phone may select GitHub while the desktop poller selects GitLab.
+    // Keep the visible review queue live without polling hidden views.
+    refetchInterval: IS_MOBILE_BUILD ? 60_000 : false,
+    refetchOnWindowFocus: IS_MOBILE_BUILD ? "always" : true,
   });
 
   // Live data the moment it exists; the cache only until then. Note
@@ -5138,19 +5047,30 @@ export function useReviewing(enabled = true) {
   // beat the loading state and the view rendered a confident "nothing
   // awaits your review" until the live fetch landed. On the account
   // that reported this, that was seventeen seconds.
-  const data = live.data ?? cached.data?.prs;
+  const data = source.prs ?? live.data ?? cached.data?.prs;
 
   // Only meaningful while the CACHE is what is on screen: once live data
   // arrives it is current by definition, whatever the disk said.
   const staleSecs = live.data === undefined ? (cached.data?.stale_secs ?? null) : null;
 
+  // Provider status and command transport outcomes are reconciled separately;
+  // TanStack's last promise completion cannot replace a newer publication.
+  const error = source.error === null ? null : new Error(source.error);
+  const isError = error !== null;
+  const status = isError ? "error" as const
+    : data === undefined ? "pending" as const : "success" as const;
   return {
     ...live,
     data,
+    error,
+    isError,
+    isSuccess: status === "success",
+    isPending: status === "pending",
+    status,
     // Loading only when there is genuinely nothing to show. With a warm
     // cache the panel paints immediately, which is the whole point --
     // the reported complaint was an empty view for over a minute.
-    isLoading: data === undefined && (live.isLoading || cached.isLoading),
+    isLoading: !isError && data === undefined && (live.isLoading || cached.isLoading),
     // True while the live query runs, INCLUDING when the cache is
     // already painted. This drives the "refreshing" indicator, which is
     // the other half of the complaint: "no indication that it is
@@ -5170,10 +5090,11 @@ export function useReviewing(enabled = true) {
 /// The badge's own query, so it does not depend on the list being
 /// fetched. MEASURED: 1 rate-limit point and ~0.9s, against 6 and ~4s
 /// for the list it replaces here.
-export function useReviewingCount() {
+export function useReviewingCount(enabled = true) {
   return useQuery({
     queryKey: ["reviewing-count"],
     queryFn: REVIEWING_COUNT_FN,
+    enabled,
     staleTime: 60_000,
   });
 }
@@ -5221,13 +5142,14 @@ export function useIncomplete(): number {
 /// Advisory, like `useTruncation` and `useIncomplete`: the pull
 /// requests that arrived are real, so the list is shown and annotated
 /// rather than replaced with an error.
-export function useReviewShortfall(): number {
-  const [short, setShort] = useState(0);
+export function useReviewShortfall(): number | null {
+  const receipt = useSourceRefresh("reviewing");
+  const [short, setShort] = useState<number | null>(0);
 
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;
     let cancelled = false;
-    listen<number>("reviewing-short", (e) => setShort(e.payload)).then(
+    listen<number | null>("reviewing-short", (e) => setShort(e.payload)).then(
       (fn) => {
         if (cancelled) safeUnlisten(fn);
         else unlisten = fn;
@@ -5242,18 +5164,20 @@ export function useReviewShortfall(): number {
     };
   }, []);
 
-  return short;
+  const fromReceipt = receiptAdvisory(receipt, "missing");
+  return fromReceipt === undefined ? short : fromReceipt;
 }
 
 /// GitHub's true open-PR count, when it exceeds what the poll fetched.
 ///
-/// `null` until the first poll reports, then GitHub's count while the
-/// list is short and `0` once it is complete. The zero matters: the loop
-/// emits on every tick precisely so a recovered poll can take the notice
+/// `undefined` until the first poll reports; `null` when completeness cannot
+/// be established, GitHub's count while short, and `0` once complete. The zero
+/// matters: the loop emits on every tick so a recovered poll can take the notice
 /// back, and holding the last non-zero value left "showing 8 of 29" over
 /// a complete list until relaunch (#745).
-export function useTruncation(): number | null {
-  const [total, setTotal] = useState<number | null>(null);
+export function useTruncation(): number | null | undefined {
+  const receipt = useSourceRefresh("authored");
+  const [total, setTotal] = useState<number | null>();
 
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;
@@ -5261,7 +5185,7 @@ export function useTruncation(): number | null {
     // Tolerate a host without Tauri's event bridge (tests that do not opt
     // into mocked events, and any non-Tauri render). Truncation is an
     // advisory notice; failing to subscribe must not break the page.
-    listen<number>("prs-truncated", (e) => setTotal(e.payload)).then(
+    listen<number | null>("prs-truncated", (e) => setTotal(e.payload)).then(
       (fn) => {
         if (cancelled) safeUnlisten(fn);
         else unlisten = fn;
@@ -5274,7 +5198,8 @@ export function useTruncation(): number | null {
     };
   }, []);
 
-  return total;
+  const fromReceipt = receiptAdvisory(receipt, "total");
+  return fromReceipt === undefined ? total : fromReceipt;
 }
 
 /// `usePeriods`, `useHistory`, `useMergedDetail` and `useCycleTrend` WERE

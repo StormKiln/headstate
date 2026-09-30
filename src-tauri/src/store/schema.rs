@@ -9,6 +9,8 @@ use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
+    #[error("snapshot rows do not belong to the requested source")]
+    SnapshotSourceMismatch,
     #[error("database error: {0}")]
     Db(#[from] rusqlite::Error),
     #[error("serialisation error: {0}")]
@@ -1239,6 +1241,36 @@ const MIGRATIONS: &[&str] = &[
      CREATE VIRTUAL TABLE claude_transcript_fts
         USING fts5(session_id UNINDEXED, body, body_masked);
      DELETE FROM claude_index_ledger;",
+    // 32: partition PR snapshots by provider/host/list. Legacy rows retain
+    // their original payload and timestamp and explicitly belong to GitHub.
+    "BEGIN;
+     CREATE TABLE snapshot_sources (
+        provider TEXT NOT NULL DEFAULT 'github',
+        host TEXT NOT NULL DEFAULT 'github.com',
+        id INTEGER NOT NULL,
+        payload TEXT NOT NULL,
+        fetched_at TEXT NOT NULL,
+        coverage TEXT NOT NULL DEFAULT '\"unknown\"',
+        PRIMARY KEY (provider, host, id)
+     );
+     INSERT INTO snapshot_sources (id, payload, fetched_at)
+        SELECT id, payload, fetched_at FROM snapshot;
+     DROP TABLE snapshot;
+     ALTER TABLE snapshot_sources RENAME TO snapshot;
+     COMMIT;",
+    // GitLab receipts retain coverage and history without relabelling GitHub tables.
+    "CREATE TABLE gitlab_stats_cache (
+        key TEXT PRIMARY KEY,
+        payload TEXT NOT NULL,
+        fetched_at TEXT NOT NULL
+    );",
+    // Durable GitLab day receipts; account and scope are part of the partition.
+    "CREATE TABLE gitlab_stats_history (
+        partition TEXT NOT NULL,
+        day TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        PRIMARY KEY (partition, day)
+    );",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
@@ -1928,7 +1960,8 @@ mod tests {
     fn migration_16_adds_the_plugin_scan_cache() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE claude_session (
+            "CREATE TABLE snapshot (id INTEGER PRIMARY KEY, payload TEXT NOT NULL, fetched_at TEXT NOT NULL);
+             CREATE TABLE claude_session (
                 session_id TEXT PRIMARY KEY, name TEXT, cwd TEXT, git_branch TEXT,
                 claude_version TEXT, transcript_path TEXT,
                 first_seen_at TEXT NOT NULL, last_activity_at TEXT);",
@@ -2000,7 +2033,8 @@ mod tests {
     fn migration_17_clears_the_stale_plugin_cache() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE claude_session (
+            "CREATE TABLE snapshot (id INTEGER PRIMARY KEY, payload TEXT NOT NULL, fetched_at TEXT NOT NULL);
+             CREATE TABLE claude_session (
                 session_id TEXT PRIMARY KEY, name TEXT, cwd TEXT, git_branch TEXT,
                 claude_version TEXT, transcript_path TEXT,
                 first_seen_at TEXT NOT NULL, last_activity_at TEXT);
@@ -2596,7 +2630,8 @@ mod tests {
     fn migration_nine_adds_capacity_without_touching_old_samples() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            "CREATE TABLE snapshot (id INTEGER PRIMARY KEY, payload TEXT NOT NULL, fetched_at TEXT NOT NULL);
+             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              CREATE TABLE health_samples (
                 sampled_at TEXT PRIMARY KEY, load_1 REAL, load_5 REAL, load_15 REAL,
                 cpu_percent REAL, mem_total INTEGER, mem_used INTEGER,
@@ -2650,6 +2685,47 @@ mod tests {
 
     /// Migrations are applied once and are idempotent on re-open, which
     /// every call to `open_db` relies on.
+    #[test]
+    fn migration_32_preserves_both_legacy_github_snapshots_and_timestamps() {
+        let conn = Connection::open_in_memory().unwrap();
+        for (i, sql) in MIGRATIONS.iter().take(31).enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.pragma_update(None, "user_version", (i + 1) as i64)
+                .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO snapshot VALUES (1, '[{\"number\":42}]', '2026-09-22 10:11:12');
+            INSERT INTO snapshot VALUES (2, '[]', '2026-09-22 11:12:13');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let rows: Vec<(String, String, i64, String, String, String)> = conn.prepare(
+            "SELECT provider, host, id, payload, fetched_at, coverage FROM snapshot ORDER BY id")
+            .unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+            .unwrap().map(Result::unwrap).collect();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "github".into(),
+                    "github.com".into(),
+                    1,
+                    "[{\"number\":42}]".into(),
+                    "2026-09-22 10:11:12".into(),
+                    "\"unknown\"".into()
+                ),
+                (
+                    "github".into(),
+                    "github.com".into(),
+                    2,
+                    "[]".into(),
+                    "2026-09-22 11:12:13".into(),
+                    "\"unknown\"".into()
+                ),
+            ]
+        );
+    }
+
     #[test]
     fn migrate_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();

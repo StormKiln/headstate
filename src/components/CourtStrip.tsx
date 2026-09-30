@@ -1,3 +1,4 @@
+import { prKey } from "@/lib/prIdentity";
 import { CheckCircle2 } from "lucide-react";
 import type { PullRequest } from "@/types/pr";
 import { splitByCourt } from "@/lib/court";
@@ -37,7 +38,7 @@ export function CourtStrip({
   // double-count if that ever changes, or it would exceed a sum of
   // parts that does not.
   const total = new Set(
-    [...authored, ...reviewing].map((pr) => `${pr.repo}#${pr.number}`),
+    [...authored, ...reviewing].map((pr) => prKey(pr)),
   ).size;
 
   if (mine.length === 0) {

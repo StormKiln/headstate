@@ -13,6 +13,7 @@ import { IS_MOBILE_BUILD } from "@/lib/target";
 import { PairedDevicesList } from "./PairedDevicesList";
 import { PhoneNotifyPanel } from "./PhoneNotifyPanel";
 import { ClaudeIntegrationsPanel } from "./ClaudeIntegrationsPanel";
+import { GitLabHostPanel } from "./GitLabHostPanel";
 import {
   useAutostart,
   useNotifyPrefs,
@@ -57,6 +58,7 @@ function intervalLabel(secs: number): string {
 const SECTIONS = [
   { id: "general", label: "General" },
   { id: "repositories", label: "Repositories" },
+  { id: "gitlab", label: "GitLab" },
   { id: "notifications", label: "Notifications" },
   { id: "cleanup", label: "Cleanup" },
   { id: "phone", label: "Phone" },
@@ -215,7 +217,7 @@ export function SettingsDialog({
                 : "flex w-36 shrink-0 flex-col gap-0.5 border-r border-[#30363d] pr-2"
             }
           >
-            {SECTIONS.map((s) => (
+            {SECTIONS.filter((s) => s.id !== "gitlab" || !IS_MOBILE_BUILD).map((s) => (
               <button
                 key={s.id}
                 type="button"
@@ -496,6 +498,7 @@ export function SettingsDialog({
                 reach a setting until the right topic is clicked -- the
                 existing tests caught exactly that, by failing to find
                 controls by role. */}
+            {!IS_MOBILE_BUILD && section === "gitlab" ? <GitLabHostPanel /> : null}
             <div className={section === "notifications" ? "" : "hidden"}>
         <div className="mt-5 flex flex-col gap-2">
           <span className="text-sm font-medium">Notifications</span>
@@ -987,13 +990,15 @@ export function SettingsDialog({
           >
             Cancel
           </button>
-          <button
-            type="button"
-            onClick={save}
-            className="rounded bg-[#238636] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#1a7f37]"
-          >
-            Save
-          </button>
+          {section !== "gitlab" ? (
+            <button
+              type="button"
+              onClick={save}
+              className="rounded bg-[#238636] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#1a7f37]"
+            >
+              Save
+            </button>
+          ) : null}
         </div>
       </DialogContent>
     </Dialog>

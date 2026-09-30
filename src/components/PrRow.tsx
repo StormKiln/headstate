@@ -12,7 +12,7 @@ import type { PullRequest } from "@/types/pr";
 import { current } from "@/lib/ariaCurrent";
 import { labelForeground } from "@/lib/labels";
 import { PrKebab } from "@/components/PrKebab";
-import { prKey } from "@/components/BulkBar";
+import { prKey } from "@/lib/prIdentity";
 import { useFilters } from "@/store/filters";
 import { needsAttention, pendingReview } from "@/lib/derive";
 import { relativeTime } from "@/lib/time";
@@ -209,6 +209,7 @@ export function PrRow({
   cursored = false,
   opened = false,
   selectable = false,
+  showSource = false,
   stackedOn,
 }: {
   pr: PullRequest;
@@ -252,6 +253,7 @@ export function PrRow({
   /// Show the bulk-selection checkbox. Off on the review view for the
   /// same reason `canWrite` is: every bulk action is a write.
   selectable?: boolean;
+  showSource?: boolean;
   /// The number of the open PR this one is stacked on, when there is
   /// one. Supplied by the list for the same reason `onRange` is: only
   /// the list can see the other PRs, and a stack is a relationship
@@ -347,6 +349,7 @@ export function PrRow({
         aria-label={state.label}
       />
       <div className="min-w-0 flex-1">
+        {showSource ? <div className="text-xs text-[#8b949e]">GitHub · {pr.source?.host ?? "github.com"} · {pr.repo}</div> : null}
         {isMobile ? <div className="truncate text-xs text-[#8b949e]">{pr.repo}</div> : null}
         <div className="flex flex-wrap items-center gap-2">
           {/* The title opens the DETAIL VIEW, not github.com.

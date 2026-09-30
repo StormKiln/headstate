@@ -3,6 +3,7 @@
 //! mirrored into TypeScript in a later milestone, so they are chosen to be
 //! stable and are not to be changed casually.
 
+use crate::identity::{PrIdentity, PrNumber, ProjectPath, Source};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -74,6 +75,9 @@ pub struct Label {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequest {
+    /// Absent only in snapshots written before provider identity was added.
+    #[serde(default)]
+    pub source: Source,
     /// GraphQL node ID, so a row can act without first opening the
     /// detail view. Rides along in the list query at no extra cost.
     ///
@@ -85,10 +89,10 @@ pub struct PullRequest {
     /// "cannot act on this row", and the next poll replaces it wholesale.
     #[serde(default)]
     pub id: String,
-    pub number: u64,
+    pub number: PrNumber,
     pub title: String,
     pub url: String,
-    pub repo: String,
+    pub repo: ProjectPath,
     pub author: String,
     pub is_draft: bool,
     /// The branch being merged, and the branch it merges into.
@@ -340,6 +344,14 @@ fn may_be_a_floor() -> bool {
 }
 
 impl PullRequest {
+    pub fn identity(&self) -> PrIdentity {
+        PrIdentity {
+            source: self.source.clone(),
+            repo: self.repo.clone(),
+            number: self.number,
+        }
+    }
+
     /// Blocked on the author and nobody else: a real conflict, or failing
     /// CI. `Checking` is deliberately excluded -- GitHub reports UNKNOWN
     /// mergeability while it computes, and treating that as a conflict
@@ -673,6 +685,7 @@ mod attention_tests {
             .unwrap()
             .with_timezone(&Utc);
         PullRequest {
+            source: Default::default(),
             id: "PR_test".into(),
             number: 1,
             title: "t".into(),

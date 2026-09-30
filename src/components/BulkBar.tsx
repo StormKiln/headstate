@@ -1,3 +1,4 @@
+import { prKey } from "../lib/prIdentity";
 import { useState } from "react";
 import { toast } from "sonner";
 import { useActOnPrs } from "../api/hooks";
@@ -21,10 +22,6 @@ const BULK: { action: PrActionName; label: string }[] = [
   { action: "draft", label: "Convert to draft" },
   { action: "close", label: "Close PRs" },
 ];
-
-export function prKey(pr: { repo: string; number: number }): string {
-  return `${pr.repo}#${pr.number}`;
-}
 
 /// Why an action would do nothing to this pull request, or null.
 ///
@@ -113,6 +110,13 @@ export function BulkBar({ prs }: { prs: PullRequest[] }) {
   const skipped = pending ? selected.filter((pr) => skip(pr, pending) !== null) : [];
 
   const run = (action: PrActionName) => {
+    // The current command is GitHub.com-only. Fail the whole selection before
+    // sending anything; provider routing arrives with the actions slice.
+    if (selected.some((pr) => pr.source !== undefined &&
+        (pr.source.provider !== "github" || pr.source.host !== "github.com"))) {
+      toast.error("Bulk actions are currently available only for GitHub.com pull requests");
+      return;
+    }
     // Send only the rows the action can change. The user has just been
     // shown exactly which ones those are and confirmed against that
     // count, so this acts on what was agreed rather than on a batch
@@ -155,7 +159,9 @@ export function BulkBar({ prs }: { prs: PullRequest[] }) {
           });
           // Keep the failures selected so they can be retried; drop the
           // ones that worked, or a retry would repeat them.
-          const stillFailing = failed.map((f) => prKey(f));
+          const stillFailing = targets
+            .filter((pr) => failed.some((f) => f.repo === pr.repo && f.number === pr.number))
+            .map(prKey);
           useFilters.getState().setChecked(stillFailing);
         }
       },

@@ -1,8 +1,10 @@
 import { renderWithQuery as render } from "@/test-utils";
-import { screen } from "@testing-library/react";
+import { fireEvent, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { PR_FIXTURES } from "@/fixtures/prs";
 import { PrList } from "@/components/PrList";
+import { prKey } from "@/lib/prIdentity";
+import type { PullRequest } from "@/types/pr";
 import { useFilters } from "@/store/filters";
 
 describe("PrList", () => {
@@ -66,4 +68,24 @@ describe("PrList", () => {
     const rendered = screen.getAllByRole("link").map((el) => el.textContent);
     expect(rendered).toEqual(reversed.map((pr) => pr.title));
   });
+});
+
+// Deliberately reuse both provider-local node id and IID. Neither is a row key.
+it("selects and checks only the matching source/project among overlapping IIDs", () => {
+  const base = PR_FIXTURES[0];
+  const prs: PullRequest[] = [
+    { ...base, title: "GitHub row" },
+    { ...base, title: "GitLab row", source: { provider: "gitlab", host: "gitlab.com" } },
+    { ...base, title: "Other host", source: { provider: "gitlab", host: "gitlab.example" } },
+    { ...base, title: "Nested project", repo: "group/subgroup/project", source: { provider: "gitlab", host: "gitlab.com" } },
+  ];
+  useFilters.setState({ selectedPr: prs[1], checked: [] });
+  const { container } = render(<PrList prs={prs} selectable onOpen={() => {}} />);
+  const current = container.querySelectorAll('[role="button"][aria-current]');
+  expect(current).toHaveLength(1);
+  expect(current[0].textContent).toContain("GitLab row");
+  fireEvent.click(screen.getByRole("checkbox", { name: "Select all" }));
+  expect(useFilters.getState().checked).toEqual(prs.map(prKey));
+  expect(new Set(useFilters.getState().checked).size).toBe(4);
+  useFilters.setState({ selectedPr: null, checked: [] });
 });

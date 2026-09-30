@@ -193,3 +193,12 @@ flate2 = "1"
 # Test fixtures in a directory no concurrent run can name, removed on
 # drop (#1554). Already in this graph at this version.
 tempfile = "3"
+
+# Exercise real Stronghold encryption parameters without spending minutes in
+# the debug build's scrypt/Salsa20 loops. Application and release settings are
+# unchanged; this only optimizes cryptographic dependencies in cargo test.
+[profile.test.package.scrypt]
+opt-level = 3
+
+[profile.test.package.salsa20]
+opt-level = 3

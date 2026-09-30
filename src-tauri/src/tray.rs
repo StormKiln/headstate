@@ -118,6 +118,11 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 if let Some(waker) = app.try_state::<crate::poll::Waker>() {
                     waker.0.notify_one();
                 }
+                if let Some(control) =
+                    app.try_state::<std::sync::Arc<crate::gitlab::poll::Control>>()
+                {
+                    control.wake();
+                }
                 let _ = app.emit_to("main", "refresh-requested", ());
             }
             "release-notes" => {

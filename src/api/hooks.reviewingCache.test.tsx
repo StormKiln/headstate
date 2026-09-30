@@ -151,6 +151,29 @@ describe("useReviewing paints from cache while the live query runs", () => {
     live.resolve([pr(1)]);
   });
 
+  it("retains the SQLite rows and stale marker when a correlated failure has no receipt", async () => {
+    const live = deferred<unknown>();
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_cached_reviewing") return Promise.resolve({ prs: [pr(1)], stale_secs: 7200 });
+      if (cmd === "get_reviewing") return live.promise;
+      return Promise.resolve(undefined);
+    });
+    const qc = client();
+    const { result } = renderHook(() => useReviewing(), { wrapper: wrapper(qc) });
+    await waitFor(() => expect(result.current.data?.[0].number).toBe(1));
+    live.resolve({ request_id: "request", update: {
+      source: { provider: "github", host: "github.com" }, list: "reviewing", session: "desktop", revision: 2,
+      receipt_revision: null, prs: null, phase: "failed", error: "GitHub unavailable",
+    } });
+    await waitFor(() => expect(result.current.isRefreshing).toBe(false));
+    expect(result.current.isError).toBe(true);
+    expect(String(result.current.error)).toContain("GitHub unavailable");
+    expect(result.current.data?.[0].number).toBe(1);
+    expect(result.current.isFromCache).toBe(true);
+    expect(result.current.staleSecs).toBe(7200);
+    expect(qc.getQueryData(["reviewing"])).toBeUndefined();
+  });
+
   it("reads nothing at all while the view is disabled", async () => {
     invoke.mockImplementation(() => Promise.resolve({ prs: [], stale_secs: null }));
     renderHook(() => useReviewing(false), { wrapper: wrapper(client()) });

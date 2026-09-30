@@ -1,7 +1,11 @@
+import type { PullRequest } from "./types/pr";
+import { useGitLabInvalidation } from "./api/gitlabInvalidation";
+import { prIdentity, prKey } from "./lib/prIdentity";
 import { emit } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Menu } from "lucide-react";
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import {
   usePullRequests,
   useRefreshFromGesture,
@@ -45,6 +49,7 @@ import { WorktreesPage } from "./components/WorktreesPage";
 import { QueryError, errorMessage } from "./components/QueryError";
 import { ViewErrorBoundary } from "./components/ViewErrorBoundary";
 import { RepoSidebar } from "./components/RepoSidebar";
+import { ViewSwitcher } from "./components/ViewSwitcher";
 import { StatsSidebar } from "./components/StatsSidebar";
 import { StatusBar } from "./components/StatusBar";
 import { SystemHealthSidebar } from "./components/SystemHealthSidebar";
@@ -61,6 +66,13 @@ import { shortcutFor } from "./lib/shortcuts";
 import { activeRowCursor, nextCursor, type RowCursorTarget } from "./lib/rowCursor";
 import { useIsMobile } from "./lib/useIsMobile";
 import { relativeSeconds } from "./lib/time";
+import { useGitHubAuthAvailable, useGitLabViewer } from "./api/authAvailability";
+import { setSourceSelection } from "./api/tauri";
+import { useGitLabQueue } from "./api/gitlabQueues";
+import { getGitLabHost } from "./api/gitlabHost";
+import { usePhoneGitHubRefresh, useSourceRefresh } from "./api/sourceRefreshHooks";
+import { useSourceSelection } from "./store/sourceSelection";
+import { GitLabSummary, SourceQueue, SourceRepoSidebar } from "./components/SourceQueue";
 import { MOBILE_HIDDEN_VIEWS, useActiveFilters, useFilters, viewLabel } from "./store/filters";
 
 /// The chart-carrying views, split off the launch chunk (#838, #921).
@@ -189,8 +201,8 @@ import { MOBILE_HIDDEN_VIEWS, useActiveFilters, useFilters, viewLabel } from "./
 /// handful from the app's hand-drawn SVG. If the set had shipped the count
 /// would be in the thousands. Nothing to do here, and worth recording so
 /// the 44 MB does not get re-investigated.
-const StatsPage = lazy(() =>
-  import("./components/StatsPage").then((m) => ({ default: m.StatsPage })),
+const ProviderStatsPage = lazy(() =>
+  import("./components/ProviderStatsPage").then((m) => ({ default: m.ProviderStatsPage })),
 );
 const SystemHealthPage = lazy(() =>
   import("./components/SystemHealthPage").then((m) => ({
@@ -257,6 +269,41 @@ function ViewLoading() {
 /// `get_auth_state` query and one `usePollError` subscription (and
 /// therefore one error banner) per window.
 export default function App() {
+  useGitLabInvalidation();
+  const selection = useSourceSelection((s) => s.selection);
+  const setSelection = useSourceSelection((s) => s.setSelection);
+  const sourceRepoKey = useSourceSelection((s) => s.repoKey);
+  const [statsTab, setStatsTab] = useState<"github" | "gitlab">("github");
+  const statsProvider = selection === "both" ? statsTab : selection;
+  const githubEnabled = selection !== "gitlab";
+  const gitlabEnabled = selection !== "github";
+  const gitlabHost = useQuery({
+    queryKey: ["gitlab-host"], queryFn: getGitLabHost, retry: false,
+    // A paired phone stays open while the desktop host setting changes.
+    // Recheck it on the phone's queue cadence so its next requests use the
+    // new host and the old host's rows disappear together.
+    refetchInterval: IS_MOBILE_BUILD ? 60_000 : false,
+    refetchOnWindowFocus: IS_MOBILE_BUILD ? "always" : true,
+  });
+  const [sourceSelectionError, setSourceSelectionError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!IS_DESKTOP_BUILD) return;
+    void setSourceSelection(selection).then(
+      () => setSourceSelectionError(null),
+      (error: unknown) => setSourceSelectionError(error instanceof Error ? error.message : String(error)),
+    );
+  }, [selection]);
+  usePhoneGitHubRefresh(githubEnabled);
+  const githubAuthAvailable = useGitHubAuthAvailable();
+  const gitlabViewer = useGitLabViewer();
+  const previousGitLabViewer = useRef(gitlabViewer);
+  useEffect(() => {
+    if (previousGitLabViewer.current !== gitlabViewer) {
+      previousGitLabViewer.current = gitlabViewer;
+      if (useFilters.getState().selectedPr?.source?.provider === "gitlab") useFilters.getState().selectPr(null);
+      useSourceSelection.getState().setRepoKey(null);
+    }
+  }, [gitlabViewer]);
   const {
     data: prs = [],
     isLoading,
@@ -264,12 +311,13 @@ export default function App() {
     error,
     refetch,
     dataUpdatedAt,
-  } = usePullRequests();
+  } = usePullRequests(githubEnabled);
   const filters = useActiveFilters();
   const {
     view: storedView,
     selectedPr,
     selectPr,
+    clearChecked,
     applyPreset,
     // Which of the Claude Code view's two pages is showing. Read here
     // rather than inside a page because the SPLIT is the route: sessions
@@ -336,7 +384,7 @@ export default function App() {
   // the same literal, and dropping it changes no behaviour. Kept in mind
   // rather than silently: this key's job is to name every axis that
   // changes WHERE you are, so a reader should know why one of them left.
-  const navKey = `${view}|${filters.repo ?? ""}`;
+  const navKey = JSON.stringify([view, filters.repo, selection, sourceRepoKey]);
   const [navOpenedAt, setNavOpenedAt] = useState<string | null>(null);
   const navOpen = navOpenedAt === navKey;
   const setNavOpen = (open: boolean) => setNavOpenedAt(open ? navKey : null);
@@ -358,7 +406,15 @@ export default function App() {
   // does it: invalidating `["prs"]` re-reads the SQLite snapshot the
   // poll loop just wrote, so the user would see the rows they were
   // already looking at. Pull to refresh has to mean "ask GitHub now".
-  const refreshFromGesture = useRefreshFromGesture();
+  const refreshGitHubFromGesture = useRefreshFromGesture();
+  const gitlabAuthored = useGitLabQueue("authored", gitlabEnabled && !!gitlabHost.data, gitlabHost.data ?? "");
+  const gitlabReviewing = useGitLabQueue("reviewing", gitlabEnabled && !!gitlabHost.data, gitlabHost.data ?? "");
+  const refreshFromGesture = async () => {
+    await Promise.all([
+      ...(githubEnabled ? [refreshGitHubFromGesture()] : []),
+      ...(gitlabEnabled ? [gitlabAuthored.refresh(), gitlabReviewing.refresh()] : []),
+    ]);
+  };
   const pull = usePullToRefresh(mainRef, refreshFromGesture, IS_MOBILE_BUILD);
   // Publishes the app header's measured height onto `<main>` as
   // `--app-header-h`, which is what the stickies below it use as `top`.
@@ -371,12 +427,12 @@ export default function App() {
   // never have been one of the axes this key exists to watch.
   useScrollReset(
     mainRef,
-    `${view}|${filters.repo ?? ""}|${selectedPr ? `${selectedPr.repo}#${selectedPr.number}` : ""}`,
+    `${view}|${filters.repo ?? ""}|${selectedPr ? prKey(selectedPr) : ""}`,
   );
 
   // The tray's "Refresh now" menu item only emits `refresh-requested`; this
   // is what actually makes it do anything (see the hook's own comment).
-  useRefreshRequested();
+  useRefreshRequested(githubEnabled);
   useViewCadence(view);
   const truncatedTotal = useTruncation();
   const refusedFields = useIncomplete();
@@ -398,7 +454,7 @@ export default function App() {
   // the time anyone reaches To review -- so switching there showed an
   // empty list with no indication anything was happening, for as long
   // as the request took.
-  const reviewingQuery = useReviewing(view === "to-review");
+  const reviewingQuery = useReviewing(view === "to-review" && githubEnabled);
   const {
     data: reviewing = [],
     isLoading: reviewingLoading,
@@ -416,7 +472,7 @@ export default function App() {
     fetchStatus: reviewingQuery.fetchStatus,
     count: reviewingQuery.data?.length,
   });
-  const { data: reviewingCount = 0 } = useReviewingCount();
+  const { data: reviewingCount = 0 } = useReviewingCount(githubEnabled);
 
   // The app had no keyboard affordances at all. These three need no
   // backend change: `refresh-requested` already exists and the window
@@ -434,6 +490,9 @@ export default function App() {
   // sidebar counts, filters, the strip -- reads this rather than `prs`,
   // so the two views share every component instead of duplicating them.
   const source = view === "to-review" ? reviewing : prs;
+  const gitlabQueue = view === "to-review" ? gitlabReviewing : gitlabAuthored;
+  const githubReceipt = useSourceRefresh(view === "to-review" ? "reviewing" : "authored");
+  const githubCoverage = githubReceipt.coverage ?? "unknown";
   const visible = sortPrs(applyFilters(source, filters), filters.sort);
 
   // A cursor past the end of a newly-filtered list points at nothing.
@@ -447,11 +506,11 @@ export default function App() {
     // sessions cursor down to the number of pull requests, or to `null`
     // when there are none. The owning view does its own clamping;
     // `nextCursor` is the shared rule.
-    if (activeRowCursor() !== null) return;
+    if (selection !== "github" || activeRowCursor() !== null) return;
     if (cursor !== null && cursor >= visible.length) {
       setCursor(visible.length > 0 ? visible.length - 1 : null);
     }
-  }, [cursor, visible.length, setCursor]);
+  }, [cursor, visible.length, setCursor, selection]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -511,17 +570,17 @@ export default function App() {
         // captured at mount -- the constraint #953 states explicitly,
         // and the same one the `visible` dependency below encodes.
         const registered = activeRowCursor();
-        const target: RowCursorTarget = registered ?? {
+        const target: RowCursorTarget = registered ?? (selection === "github" ? {
           rows: () => visible.length,
           open: (i) => {
             const pr = visible[i];
-            if (pr) selectPr({ repo: pr.repo, number: pr.number });
+            if (pr) selectPr(prIdentity(pr));
           },
           toggle: (i) => {
             const pr = visible[i];
-            if (pr) useFilters.getState().toggleChecked(`${pr.repo}#${pr.number}`);
+            if (pr) useFilters.getState().toggleChecked(prKey(pr));
           },
-        };
+        } : { rows: () => 0, open: () => {} });
         const rows = target.rows();
         if (rows === 0) return;
         const { cursor, setCursor } = useFilters.getState();
@@ -549,7 +608,7 @@ export default function App() {
     // into it, so a listener bound to a stale list would move the
     // cursor through rows that are no longer on screen. Re-binding one
     // window listener per filter change is cheap; a wrong cursor is not.
-  }, [selectPr, visible]);
+  }, [selectPr, visible, selection]);
 
   // The priorities strip is scoped to the selected repo, matching the page
   // it sits on: on `octocat/hello-world` you want that repo's blocked PRs,
@@ -560,9 +619,9 @@ export default function App() {
   // blocked on you stays blocked whether or not you happen to be filtering
   // by label, so a label filter must not hide it -- but a repo selection is
   // a change of page, and the strip should follow.
-  const scopedForStrip = filters.repo
-    ? source.filter((pr) => pr.repo === filters.repo)
-    : source;
+  const matchesRepository = (pr: PullRequest) => (!filters.repo || pr.repo === filters.repo) &&
+    (!sourceRepoKey || JSON.stringify([pr.source?.provider ?? "github", pr.source?.host ?? "github.com", pr.repo]) === sourceRepoKey);
+  const scopedForStrip = source.filter(matchesRepository);
 
   // Scoped the SAME WAY as `scopedForStrip`. The court strip counts
   // both lists together, so passing a repo-scoped authored list beside
@@ -570,9 +629,7 @@ export default function App() {
   // scopes in it: "36 needs you · 18 waiting on others · of 13 open",
   // where 36 and 18 spanned every repo and 13 was one repo. That reads
   // as an arithmetic bug because it is one.
-  const scopedReviewing = filters.repo
-    ? reviewing.filter((pr) => pr.repo === filters.repo)
-    : reviewing;
+  const scopedReviewing = reviewing.filter(matchesRepository);
 
   // `repo` is navigation, not a filter (see the store's `reset`), so it
   // does not count -- an empty repo page should still explain itself.
@@ -660,13 +717,124 @@ export default function App() {
       // organisation or a person -- so #823's second audience ("how is
       // my team doing?") had nowhere to be asked from. This one is
       // sourced from GitHub and consults nothing on disk.
-      <StatsSidebar viewCounts={{ "to-review": reviewingCount }} />
+      statsProvider === "gitlab" ? (
+        <nav className="flex w-64 shrink-0 flex-col border-r border-[#30363d] p-3"><ViewSwitcher /></nav>
+      ) : <StatsSidebar viewCounts={{ "to-review": reviewingCount }} />
     ) : (
       // My PRs, and any future view that falls through. The repo rows
       // are a live filter here -- this is the view they were always
       // about.
-      <RepoSidebar prs={source} viewCounts={{ "to-review": reviewingCount }} />
+      selection === "github" ? <RepoSidebar prs={source} viewCounts={{ "to-review": reviewingCount }} />
+        : <SourceRepoSidebar github={source} gitlab={gitlabQueue.rows ?? []} selection={selection} viewCounts={{ "to-review": reviewingCount }} />
     );
+
+  const githubOverview = <>
+            {/* Only for My PRs: the strip means "blocked on YOU as
+                author", and someone else's red CI is not yours to fix. The
+                review view gets its own attention rule below. */}
+            {/* Answers "is anything on fire?" before the filter
+                toolbar does anything. `PrioritiesStrip` still follows
+                with the WHY for each blocked pull request -- this says
+                whether to look at all, that says what to look at. */}
+            {view === "my-prs" ? (
+              <CourtStrip
+                authored={scopedForStrip}
+                reviewing={scopedReviewing}
+                onSelect={(court) =>
+                  applyPreset(
+                    court === "mine"
+                      ? { needsAttentionOnly: true }
+                      : { awaitingReviewOnly: true },
+                  )
+                }
+              />
+            ) : null}
+            {view === "my-prs" ? (
+              <PrioritiesStrip
+                prs={scopedForStrip}
+                onOpen={(pr) => selectPr(prIdentity(pr))}
+              />
+            ) : null}
+            {/* The review queue's counterpart to the attention strip:
+                what a reviewer can pick up right now. Scoped to the
+                sidebar selection for the same reason -- on one
+                repository you want that repository's work, not a list
+                dominated by nine others. */}
+            {view === "to-review" ? (
+              <ReadyStrip
+                prs={scopedForStrip}
+                onOpen={(pr) => selectPr(prIdentity(pr))}
+              />
+            ) : null}
+            {/* Counts come from the same predicates the chips apply, so a
+                chip can never open a list that disagrees with its number.
+                Scoped to the sidebar selection like the strip above. */}
+            {view === "my-prs" ? <TriageChips prs={scopedForStrip} /> : null}
+            {view === "to-review" ? <ReviewChips prs={scopedForStrip} /> : null}
+            {/* GitHub answered with usable data and a complaint that it
+                could not compute all of it. The list is real but short,
+                and saying so beats hiding it -- or, as v3.2.5 did,
+                discarding the data and showing nothing at all. */}
+            {refusedFields > 0 ? (
+              <p className="mb-3 rounded-md border border-[#d29922]/40 bg-[#d29922]/5 px-4 py-2 text-xs text-[#d29922]">
+                GitHub could not compute {refusedFields} field
+                {refusedFields === 1 ? "" : "s"} on the last refresh, so some pull
+                requests may be missing details or absent. It usually recovers on
+                the next one.
+              </p>
+            ) : null}
+            {/* The 100 -> 50 fallback returns a SHORT list, and this is
+                the only thing that says so. Without it the panel shows
+                50 pull requests under a sidebar badge reading 62, with
+                nothing to explain the gap -- which is what "the numbers
+                are off" was describing. */}
+            {(view === "to-review" && reviewShortfall === null) ||
+            (view === "my-prs" && truncatedTotal === null) ? (
+              <p className="mb-3 rounded-md border border-[#d29922]/40 bg-[#d29922]/5 px-4 py-2 text-xs text-[#d29922]">
+                GitHub could not confirm whether this list is complete.
+              </p>
+            ) : null}
+            {view === "to-review" && (reviewShortfall ?? 0) > 0 ? (
+              <p className="mb-3 rounded-md border border-[#d29922]/40 bg-[#d29922]/5 px-4 py-2 text-xs text-[#d29922]">
+                {reviewShortfall} pull request{reviewShortfall === 1 ? " is" : "s are"}{" "}
+                missing from this list — GitHub could not answer the full query, so
+                it was retried for fewer. Refreshing usually returns the rest.
+              </p>
+            ) : null}
+            {/* The other half of the reported complaint: "no indication
+                that it is blocked". The list now paints from the cache
+                immediately, so without this the user would be looking
+                at stale data with nothing to say it was being
+                refreshed. */}
+            {view === "to-review" && reviewingRefreshing && reviewingFromCache ? (
+              // Amber, and it names the age, when the snapshot is past
+              // the freshness window (#742). Such a snapshot used to be
+              // thrown away, which reached the view as an empty list --
+              // "nothing awaits your review", stated confidently, for
+              // as long as the live fetch took. Showing the old rows
+              // and saying how old they are beats asserting there are
+              // none. Inside the window it stays the quiet grey note:
+              // a snapshot seconds old needs no warning.
+              <p
+                className={
+                  reviewingStaleSecs === null
+                    ? "mb-3 rounded-md border border-[#30363d] bg-[#161b22] px-4 py-2 text-xs text-[#8b949e]"
+                    : "mb-3 rounded-md border border-[#d29922]/30 bg-[#d29922]/10 px-4 py-2 text-xs text-[#d29922]"
+                }
+              >
+                {reviewingStaleSecs === null
+                  ? "Showing the last saved list — checking GitHub for changes…"
+                  : `Showing a saved list from ${relativeSeconds(reviewingStaleSecs)} — checking GitHub for changes…`}
+              </p>
+            ) : null}
+            {view === "to-review" && reviewingError && reviewing.length > 0 ? (
+              <QueryError
+                title="Could not refresh the pull requests awaiting your review"
+                message={errorMessage(reviewingErr)}
+                onRetry={() => void refetchReviewing()}
+              />
+            ) : null}
+  </>;
 
   return (
     // `h-full`, not `h-dvh` (#1583): the shell fills what holds it --
@@ -678,7 +846,8 @@ export default function App() {
       {/* Above everything, including the header: it says which
           desktop the whole screen is describing. Renders nothing on
           the desktop itself. */}
-      <ConnectionBanner updatedAt={dataUpdatedAt} />
+      <ConnectionBanner updatedAt={dataUpdatedAt} githubAuthAvailable={githubAuthAvailable} selection={selection} gitlab={gitlabQueue} />
+      {sourceSelectionError ? <p role="alert" className="border-b border-[#d29922]/40 bg-[#d29922]/10 px-4 py-2 text-sm text-[#d29922]">The source choice could not be saved: {sourceSelectionError}</p> : null}
       {/* Below the banner and above everything else: the banner says
           which desktop, this says the rows underneath may be old. The
           banner alone was not enough -- it is one line that scrolls out
@@ -756,13 +925,31 @@ export default function App() {
               "Pull requests" -- which is what the chain's default arm
               did. */}
           <h1 className="text-sm font-semibold">{viewLabel(view)}</h1>
+          {(view === "my-prs" || view === "to-review" || view === "pr-stats") ? (
+            <label className="ml-3 flex items-center gap-2 text-xs text-[#8b949e]">
+              Source
+              <select
+                aria-label="Source"
+                value={selection}
+                onChange={(event) => {
+                  setSelection(event.target.value as "github" | "gitlab" | "both");
+                  selectPr(null);
+                  clearChecked();
+                }}
+                className="rounded border border-[#30363d] bg-[#161b22] px-2 py-1 text-sm text-[#e6edf3]"
+              >
+                <option value="github">GitHub</option>
+                <option value="gitlab">GitLab</option>
+                <option value="both">Both</option>
+              </select>
+            </label>
+          ) : null}
           <div className="ml-auto">
-            {/* My pull requests ONLY. The wizard composes a nudge for
-                pull requests YOU authored, so it means nothing on
-                Docker or Worktrees (local state) and nothing on To
-                review (other people's work). The previous condition
-                excluded only Worktrees, so it appeared on all three. */}
-            {view === "my-prs" ? (
+            {/* The wizard only understands GitHub pull requests and the
+                GitHub repository filter. A GitLab or Both list can retain
+                cached GitHub rows, but must not offer those hidden rows
+                as a review request for the selected source. */}
+            {view === "my-prs" && selection !== "gitlab" ? (
               // scopedRepo skips the wizard's "which repositories?" step:
               // selecting a repo in the sidebar already answers it.
               <NudgeWizard prs={source} scopedRepo={filters.repo} />
@@ -821,11 +1008,15 @@ export default function App() {
         view !== "claude-code" &&
         view !== "system-health" ? (
           <div className="p-4">
-            <PrDetailView
+            {selectedPr.source?.provider === "gitlab" ? <GitLabSummary
+              identity={selectedPr}
+              mr={[...(gitlabAuthored.rows ?? []), ...(gitlabReviewing.rows ?? [])].find((mr) => prKey(mr) === prKey(selectedPr))}
+              onBack={() => selectPr(null)}
+            /> : <PrDetailView
               repo={selectedPr.repo}
               number={selectedPr.number}
               onBack={() => selectPr(null)}
-            />
+            />}
           </div>
         ) : view === "claude-md" ? (
           <ClaudeMdPage />
@@ -957,103 +1148,33 @@ export default function App() {
                 the `SystemHealthPage` branch above for why the boundary
                 sits inside the padded wrapper. */}
             <Suspense fallback={<ViewLoading />}>
-              <StatsPage />
+              <ProviderStatsPage selection={selection} provider={statsProvider} onProviderChange={setStatsTab} gitlabHost={gitlabHost.data} />
             </Suspense>
+          </div>
+        ) : selection !== "github" ? (
+          <div className="p-4">
+            {selection === "both" ? githubOverview : null}
+            <SourceQueue
+              selection={selection}
+              github={source}
+              gitlab={gitlabQueue.rows}
+              githubLoading={view === "to-review" ? reviewingLoading : isLoading}
+              gitlabLoading={gitlabHost.isPending || (gitlabHost.isSuccess && gitlabQueue.loading)}
+              githubError={view === "to-review" ? (reviewingError ? errorMessage(reviewingErr) ?? "Could not refresh GitHub" : null) : (isError ? errorMessage(error) ?? "Could not refresh GitHub" : pollError ?? null)}
+              gitlabError={gitlabHost.isError ? "Could not read the configured GitLab host. Check the desktop connection or Settings." : gitlabQueue.error}
+              githubCoverage={githubCoverage}
+              gitlabCoverage={gitlabQueue.coverage}
+              githubStaleSecs={view === "to-review" ? reviewingStaleSecs : null}
+              gitlabStaleSecs={gitlabQueue.staleSecs}
+              canWriteGitHub={view === "my-prs"}
+              onOpen={selectPr}
+              onRefreshGitHub={() => void (view === "to-review" ? refetchReviewing() : refreshGitHubFromGesture())}
+              onRefreshGitLab={() => { if (gitlabHost.isError) void gitlabHost.refetch(); else void gitlabQueue.refresh(); }}
+            />
           </div>
         ) : (
           <div className="p-4">
-            {/* Only for My PRs: the strip means "blocked on YOU as
-                author", and someone else's red CI is not yours to fix. The
-                review view gets its own attention rule below. */}
-            {/* Answers "is anything on fire?" before the filter
-                toolbar does anything. `PrioritiesStrip` still follows
-                with the WHY for each blocked pull request -- this says
-                whether to look at all, that says what to look at. */}
-            {view === "my-prs" ? (
-              <CourtStrip
-                authored={scopedForStrip}
-                reviewing={scopedReviewing}
-                onSelect={(court) =>
-                  applyPreset(
-                    court === "mine"
-                      ? { needsAttentionOnly: true }
-                      : { awaitingReviewOnly: true },
-                  )
-                }
-              />
-            ) : null}
-            {view === "my-prs" ? (
-              <PrioritiesStrip
-                prs={scopedForStrip}
-                onOpen={(pr) => selectPr({ repo: pr.repo, number: pr.number })}
-              />
-            ) : null}
-            {/* The review queue's counterpart to the attention strip:
-                what a reviewer can pick up right now. Scoped to the
-                sidebar selection for the same reason -- on one
-                repository you want that repository's work, not a list
-                dominated by nine others. */}
-            {view === "to-review" ? (
-              <ReadyStrip
-                prs={scopedForStrip}
-                onOpen={(pr) => selectPr({ repo: pr.repo, number: pr.number })}
-              />
-            ) : null}
-            {/* Counts come from the same predicates the chips apply, so a
-                chip can never open a list that disagrees with its number.
-                Scoped to the sidebar selection like the strip above. */}
-            {view === "my-prs" ? <TriageChips prs={scopedForStrip} /> : null}
-            {view === "to-review" ? <ReviewChips prs={scopedForStrip} /> : null}
-            {/* GitHub answered with usable data and a complaint that it
-                could not compute all of it. The list is real but short,
-                and saying so beats hiding it -- or, as v3.2.5 did,
-                discarding the data and showing nothing at all. */}
-            {refusedFields > 0 ? (
-              <p className="mb-3 rounded-md border border-[#d29922]/40 bg-[#d29922]/5 px-4 py-2 text-xs text-[#d29922]">
-                GitHub could not compute {refusedFields} field
-                {refusedFields === 1 ? "" : "s"} on the last refresh, so some pull
-                requests may be missing details or absent. It usually recovers on
-                the next one.
-              </p>
-            ) : null}
-            {/* The 100 -> 50 fallback returns a SHORT list, and this is
-                the only thing that says so. Without it the panel shows
-                50 pull requests under a sidebar badge reading 62, with
-                nothing to explain the gap -- which is what "the numbers
-                are off" was describing. */}
-            {view === "to-review" && reviewShortfall > 0 ? (
-              <p className="mb-3 rounded-md border border-[#d29922]/40 bg-[#d29922]/5 px-4 py-2 text-xs text-[#d29922]">
-                {reviewShortfall} pull request{reviewShortfall === 1 ? " is" : "s are"}{" "}
-                missing from this list — GitHub could not answer the full query, so
-                it was retried for fewer. Refreshing usually returns the rest.
-              </p>
-            ) : null}
-            {/* The other half of the reported complaint: "no indication
-                that it is blocked". The list now paints from the cache
-                immediately, so without this the user would be looking
-                at stale data with nothing to say it was being
-                refreshed. */}
-            {view === "to-review" && reviewingRefreshing && reviewingFromCache ? (
-              // Amber, and it names the age, when the snapshot is past
-              // the freshness window (#742). Such a snapshot used to be
-              // thrown away, which reached the view as an empty list --
-              // "nothing awaits your review", stated confidently, for
-              // as long as the live fetch took. Showing the old rows
-              // and saying how old they are beats asserting there are
-              // none. Inside the window it stays the quiet grey note:
-              // a snapshot seconds old needs no warning.
-              <p
-                className={
-                  reviewingStaleSecs === null
-                    ? "mb-3 rounded-md border border-[#30363d] bg-[#161b22] px-4 py-2 text-xs text-[#8b949e]"
-                    : "mb-3 rounded-md border border-[#d29922]/30 bg-[#d29922]/10 px-4 py-2 text-xs text-[#d29922]"
-                }
-              >
-                {reviewingStaleSecs === null
-                  ? "Showing the last saved list — checking GitHub for changes…"
-                  : `Showing a saved list from ${relativeSeconds(reviewingStaleSecs)} — checking GitHub for changes…`}
-              </p>
-            ) : null}
+            {githubOverview}
             <FilterBar prs={source} />
             {/* Fed the UNFILTERED list on purpose: selection is keyed by
                 repo#number, so narrowing a filter after selecting must
@@ -1069,7 +1190,7 @@ export default function App() {
               <div className="rounded-md border border-[#30363d] px-4 py-12 text-center text-sm text-[#8b949e]">
                 Loading pull requests…
               </div>
-            ) : (view === "to-review" ? reviewingError : isError) ? (
+            ) : (view === "to-review" ? reviewingError && reviewing.length === 0 : isError) ? (
               // The same reasoning one step further. A REJECTED query also
               // leaves `prs` at its `[]` default, so without this branch the
               // list renders "0 Open -- no pull requests match these
@@ -1100,7 +1221,7 @@ export default function App() {
                 // against GitHub's unfiltered count, so the number beside
                 // it has to be unfiltered too (#745).
                 fetched={source.length}
-                onOpen={(pr) => selectPr({ repo: pr.repo, number: pr.number })}
+                onOpen={(pr) => selectPr(prIdentity(pr))}
                 canWrite={view === "my-prs"}
                 selectable={view === "my-prs"}
                 // A poll failure with a SUCCESSFUL but empty cache read
@@ -1117,7 +1238,7 @@ export default function App() {
       </div>
       {/* Pinned below both the sidebar and the list, so it reads as the
           window's status rather than the list's. */}
-      <StatusBar updatedAt={dataUpdatedAt} />
+      <StatusBar updatedAt={dataUpdatedAt} githubAuthAvailable={githubAuthAvailable} selection={selection} gitlab={gitlabQueue} />
     </div>
   );
 }

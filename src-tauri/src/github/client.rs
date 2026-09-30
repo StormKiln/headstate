@@ -6,7 +6,7 @@
 
 use super::map::{
     map_cycle_trend, map_detail, map_history, map_list, map_merged_detail, map_rate_limit,
-    map_search, map_total, map_viewer,
+    map_search, map_viewer,
 };
 use super::model::{CycleTrend, History, MergedDetail, Periods, PrDetail, PullRequest, Stats};
 use super::query::{
@@ -290,6 +290,39 @@ fn refused_fields(v: &serde_json::Value) -> usize {
     v["__refused"].as_u64().unwrap_or(0) as usize
 }
 
+/// List evidence retained before legacy numeric wrappers apply defaults.
+#[derive(Clone)]
+pub struct FetchedList {
+    pub prs: Vec<PullRequest>,
+    pub total: Option<u64>,
+    pub coverage: crate::store::source_cache::Coverage,
+}
+
+fn list_evidence(v: &serde_json::Value, prs: Vec<PullRequest>) -> FetchedList {
+    use crate::store::source_cache::Coverage;
+    let total = v["headstate_paging"]["truest_total"]
+        .as_u64()
+        .or_else(|| v["authored"]["issueCount"].as_u64());
+    let refused = refused_fields(v) > 0;
+    let failed = v["headstate_paging"]["failed_pages"].as_u64().unwrap_or(0) > 0;
+    let malformed = v["authored"]["nodes"]
+        .as_array()
+        .is_none_or(|nodes| nodes.len() != prs.len());
+    let coverage = if refused || failed || malformed || total.is_some_and(|n| n > prs.len() as u64)
+    {
+        Coverage::Partial { total }
+    } else if total.is_none() || v["headstate_paging"]["count_unknown"] == true {
+        Coverage::Unknown
+    } else {
+        Coverage::Complete
+    };
+    FetchedList {
+        prs,
+        total,
+        coverage,
+    }
+}
+
 impl GitHubClient {
     pub fn new(octocrab: Octocrab) -> Self {
         Self { octocrab }
@@ -393,11 +426,16 @@ impl GitHubClient {
         // the common case -- the user is working through the queue, and
         // every approval removes one.
         let mut truest_total = total;
+        let mut count_unknown = false;
+        let mut all_refused = refused_fields(&merged);
         for page in rest {
             match page {
                 Ok(v) => {
+                    all_refused += refused_fields(&v);
                     if let Some(t) = v["authored"]["issueCount"].as_u64() {
                         truest_total = truest_total.min(t as u32);
+                    } else {
+                        count_unknown = true;
                     }
                     if let Some(nodes) = v["authored"]["nodes"].as_array() {
                         if let Some(into) = merged["authored"]["nodes"].as_array_mut() {
@@ -435,7 +473,9 @@ impl GitHubClient {
         // crossed, and how many pages were lost. A shortfall no larger
         // than the number of boundaries is ordinary drift and not worth
         // a warning; anything beyond that is worth seeing.
+        merged["__refused"] = json!(all_refused);
         merged["headstate_paging"] = json!({
+            "count_unknown": count_unknown,
             "boundaries": pages.saturating_sub(1),
             "failed_pages": failed_pages,
             "truest_total": truest_total,
@@ -557,6 +597,16 @@ impl GitHubClient {
     pub async fn fetch_reviewing_with_shortfall(
         &self,
     ) -> Result<(Vec<PullRequest>, u64), ClientError> {
+        self.fetch_reviewing_snapshot().await.map(|result| {
+            let short = result
+                .total
+                .unwrap_or(0)
+                .saturating_sub(result.prs.len() as u64);
+            (result.prs, short)
+        })
+    }
+
+    pub async fn fetch_reviewing_snapshot(&self) -> Result<FetchedList, ClientError> {
         // Its OWN request, not both lists. It used to call
         // `fetch_prs_and_reviewing`, so opening To review paid for the
         // authored list as well -- and on a reported account with 40
@@ -622,10 +672,7 @@ impl GitHubClient {
             );
         }
         let refused = refused_fields(&v);
-        Self::reject_empty_after_refusals(mapped, refused).map(|prs| {
-            let short = total.saturating_sub(prs.len() as u64);
-            (prs, short)
-        })
+        Self::reject_empty_after_refusals(mapped, refused).map(|prs| list_evidence(&v, prs))
     }
 
     /// How many pull requests await the user's review.
@@ -1185,6 +1232,12 @@ impl GitHubClient {
     }
 
     pub async fn fetch_prs_with_total(&self) -> Result<(Vec<PullRequest>, u64), ClientError> {
+        self.fetch_prs_snapshot()
+            .await
+            .map(|result| (result.prs, result.total.unwrap_or(0)))
+    }
+
+    pub async fn fetch_prs_snapshot(&self) -> Result<FetchedList, ClientError> {
         let started = std::time::Instant::now();
         let v = self.search_page_with_fallback(AUTHORED_OPEN).await?;
         // How long GitHub took, and what it was asked for. A slow
@@ -1216,7 +1269,7 @@ impl GitHubClient {
             // from the other at different moments.
             crate::github::stats::budget::note_remaining(remaining);
         }
-        Ok((map_search(&v), map_total(&v)))
+        Ok(list_evidence(&v, map_search(&v)))
     }
 
     /// The two historical counters. The other five dashboard numbers are
@@ -1642,6 +1695,47 @@ mod tests {
     /// Offset cursors index a live list, so an item entering mid-fetch
     /// shifts the boundary and hands the same node to two pages. The
     /// merge used to keep both.
+    #[test]
+    fn source_coverage_distinguishes_missing_totals_from_measured_zero() {
+        use crate::store::source_cache::Coverage;
+        let missing = json!({"authored": {"nodes": []}});
+        let result = list_evidence(&missing, vec![]);
+        assert_eq!(result.total, None);
+        assert_eq!(result.coverage, Coverage::Unknown);
+        let empty = json!({"authored": {"nodes": [], "issueCount": 0}});
+        let result = list_evidence(&empty, vec![]);
+        assert_eq!(result.total, Some(0));
+        assert_eq!(result.coverage, Coverage::Complete);
+    }
+
+    #[test]
+    fn source_coverage_retains_refusals_failed_pages_and_unknown_page_counts() {
+        use crate::store::source_cache::Coverage;
+        for response in [
+            json!({"authored": {"nodes": [], "issueCount": 0}, "__refused": 1}),
+            json!({"authored": {"nodes": [], "issueCount": 0}, "headstate_paging": {"failed_pages": 1}}),
+            json!({"authored": {"nodes": [null], "issueCount": 0}}),
+        ] {
+            assert_eq!(
+                list_evidence(&response, vec![]).coverage,
+                Coverage::Partial { total: Some(0) }
+            );
+        }
+        assert_eq!(
+            list_evidence(&json!({"authored": {"nodes": []}, "__refused": 1}), vec![]).coverage,
+            Coverage::Partial { total: None }
+        );
+        assert_eq!(
+            list_evidence(
+                &json!({"authored": {"nodes": [], "issueCount": 0},
+            "headstate_paging": {"count_unknown": true}}),
+                vec![]
+            )
+            .coverage,
+            Coverage::Unknown
+        );
+    }
+
     #[test]
     fn a_node_returned_by_two_pages_appears_once() {
         let mut merged = serde_json::json!({

@@ -8,8 +8,7 @@ use crate::github::model::{
 };
 use crate::github::mutate::{PrAction, ReviewVerdict};
 use crate::store::{
-    load_snapshot, load_snapshot_marked, open_db, save_snapshot, settings, CachedList,
-    CachedSnapshot,
+    load_snapshot, load_snapshot_marked, open_db, settings, CachedList, CachedSnapshot,
 };
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -151,6 +150,20 @@ pub fn db_path(app: &AppHandle) -> std::path::PathBuf {
         .join("headstate.db")
 }
 
+fn configured_gitlab_host(app: &AppHandle) -> Result<String, String> {
+    let conn = open_db(&db_path(app)).map_err(|_| "Could not read the GitLab host setting.")?;
+    crate::gitlab::host::read_host(&conn).map_err(|error| error.to_string())
+}
+
+fn require_gitlab_host(app: &AppHandle, candidate: &str) -> Result<(), String> {
+    let configured = configured_gitlab_host(app)?;
+    if candidate == configured {
+        Ok(())
+    } else {
+        Err("This GitLab host is not the one configured in Settings.".into())
+    }
+}
+
 /// DIAGNOSTIC COMMAND (Settings > diagnostic log).
 ///
 /// Lets the frontend write into the same log file as the Rust side, so
@@ -193,36 +206,363 @@ pub fn get_cached(app: AppHandle) -> Result<Vec<PullRequest>, String> {
 }
 
 /// A user-initiated, out-of-band fetch (e.g. a manual refresh button).
-/// Does not touch the poll loop's cadence or its cached snapshot on disk.
+/// Keeps its own source/list cache and status current without changing cadence.
 #[tauri::command]
-pub async fn refresh_now(client: State<'_, GhClient>) -> Result<Vec<PullRequest>, String> {
-    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
-    // Bounded like the poll loop's fetch. This is the COLD-START path --
-    // `usePullRequests` calls it whenever the cache is empty, which is
-    // exactly a fresh install -- and it had no overall timeout at all.
-    //
-    // The transport timeouts on the client are not enough on their own,
-    // for the reason its own comment gives: a server that trickles bytes
-    // keeps a read alive indefinitely without ever tripping one. With
-    // `retry` enabled each attempt restarts them, so a machine that
-    // cannot complete a handshake sat on "Loading pull requests" for
-    // minutes rather than failing with something to act on.
-    // DIAGNOSTIC LOGGING (Settings > diagnostic log).
-    crate::diag!("[diag] cmd refresh_now start");
-    let started = std::time::Instant::now();
-    let out = match tokio::time::timeout(crate::poll::FETCH_TIMEOUT, client.fetch_prs()).await {
-        Ok(res) => res.map_err(|e| e.to_string()),
-        Err(_) => Err(ClientError::Timeout(crate::poll::FETCH_TIMEOUT.as_secs()).to_string()),
+pub async fn refresh_now(
+    app: AppHandle,
+    client: State<'_, GhClient>,
+    request_id: Option<String>,
+) -> Result<RefreshReply, String> {
+    refresh_reply(app, client, CachedList::Authored, request_id).await
+}
+
+/// Legacy callers receive the original array/error contract. Correlated
+/// callers receive backend outcomes in-band; an IPC rejection then denotes a
+/// transport failure, distinct from a provider failure already in source status.
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+pub enum RefreshReply {
+    Legacy(Vec<PullRequest>),
+    Correlated {
+        request_id: String,
+        update: Box<crate::source_poll::Update>,
+    },
+}
+
+async fn refresh_reply(
+    app: AppHandle,
+    client: State<'_, GhClient>,
+    list: CachedList,
+    request_id: Option<String>,
+) -> Result<RefreshReply, String> {
+    let source = crate::identity::Source::default();
+    let result = refresh_source_request(
+        app.clone(),
+        client,
+        source.clone(),
+        list,
+        request_id.clone(),
+    )
+    .await;
+    if let Some(request_id) = request_id {
+        let update = app
+            .state::<crate::source_poll::SourcePolls>()
+            .snapshot(&source, list)
+            .await;
+        Ok(RefreshReply::Correlated {
+            request_id,
+            update: Box::new(update),
+        })
+    } else {
+        result.map(|result| RefreshReply::Legacy(result.prs.expect("GitHub refresh returns PRs")))
+    }
+}
+
+/// Source-scoped cache/readback for slice 6. Legacy commands stay GitHub-only.
+#[tauri::command]
+pub fn get_source_snapshot(
+    app: AppHandle,
+    source: crate::identity::Source,
+    list: CachedList,
+) -> Result<crate::store::source_cache::SourceSnapshot, String> {
+    if source.provider == crate::identity::Provider::Gitlab {
+        require_gitlab_host(&app, &source.host)?;
+    }
+    let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
+    crate::store::source_cache::load_source_snapshot(&conn, &source, list)
+        .map_err(|e| e.to_string())
+}
+
+/// Persist the desktop's selected network sources independently of auth.
+#[tauri::command]
+pub fn set_source_selection(
+    app: AppHandle,
+    selection: String,
+    enabled: State<'_, crate::poll::GithubSourceEnabled>,
+    waker: State<'_, crate::poll::Waker>,
+    gitlab: State<'_, Arc<crate::gitlab::poll::Control>>,
+) -> Result<(), String> {
+    if !matches!(selection.as_str(), "github" | "gitlab" | "both") {
+        return Err("Unknown source selection".into());
+    }
+    let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
+    crate::store::settings::set(
+        &conn,
+        crate::store::settings::keys::SOURCE_SELECTION,
+        &selection,
+    )
+    .map_err(|e| e.to_string())?;
+    let github = selection != "gitlab";
+    enabled
+        .0
+        .store(github, std::sync::atomic::Ordering::Relaxed);
+    waker.0.notify_one();
+    if selection == "github" {
+        gitlab.select(None);
+    } else {
+        let host = configured_gitlab_host(&app).inspect_err(|_| {
+            gitlab.select(None);
+        })?;
+        gitlab.select(Some(crate::identity::Source {
+            provider: crate::identity::Provider::Gitlab,
+            host,
+        }));
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+pub struct SourceRefresh {
+    pub source: crate::identity::Source,
+    pub list: CachedList,
+    pub prs: Option<Vec<PullRequest>>,
+    pub mrs: Option<Vec<crate::gitlab::queues::MergeRequest>>,
+    pub coverage: crate::store::source_cache::Coverage,
+}
+
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+pub enum SourceRefreshReply {
+    Legacy(SourceRefresh),
+    Correlated {
+        request_id: String,
+        update: Box<crate::source_poll::Update>,
+    },
+}
+
+/// Manual refresh targets exactly one source/list.
+#[tauri::command]
+pub async fn refresh_source(
+    app: AppHandle,
+    client: State<'_, GhClient>,
+    source: crate::identity::Source,
+    list: CachedList,
+    request_id: Option<String>,
+) -> Result<SourceRefreshReply, String> {
+    if source.provider == crate::identity::Provider::Gitlab {
+        require_gitlab_host(&app, &source.host)?;
+    }
+    let result = refresh_source_request(
+        app.clone(),
+        client,
+        source.clone(),
+        list,
+        request_id.clone(),
+    )
+    .await;
+    if let Some(request_id) = request_id {
+        let update = app
+            .state::<crate::source_poll::SourcePolls>()
+            .snapshot(&source, list)
+            .await;
+        Ok(SourceRefreshReply::Correlated {
+            request_id,
+            update: Box::new(update),
+        })
+    } else {
+        result.map(SourceRefreshReply::Legacy)
+    }
+}
+
+async fn refresh_source_request(
+    app: AppHandle,
+    client: State<'_, GhClient>,
+    source: crate::identity::Source,
+    list: CachedList,
+    request_id: Option<String>,
+) -> Result<SourceRefresh, String> {
+    use crate::source_poll::{self, Failure};
+    let attempt = source_poll::begin_request(&app, source.clone(), list, request_id).await;
+    let gitlab_source = source.provider == crate::identity::Provider::Gitlab
+        && crate::gitlab::host::validate(&source.host).is_ok();
+    let refusal = if !gitlab_source && source != crate::identity::Source::default() {
+        Some("headstate:not-asked: fetching is not enabled for this source".to_string())
+    } else if !gitlab_source && client.0.is_none() {
+        Some(AUTH_ERR.to_string())
+    } else {
+        None
     };
-    crate::diag!(
-        "[diag] cmd refresh_now end {}ms {}",
-        started.elapsed().as_millis(),
-        match &out {
-            Ok(v) => format!("ok n={}", v.len()),
-            Err(e) => format!("err: {e}"),
+    if let Some(message) = refusal {
+        source_poll::fail(
+            &app,
+            attempt,
+            Failure {
+                message: message.clone(),
+                transient: false,
+                not_asked: true,
+            },
+        )
+        .await;
+        return Err(message);
+    }
+    if gitlab_source {
+        return refresh_gitlab_request(app, source, list, attempt).await;
+    }
+    // Preserve reviewing's existing paged loader: an outer timeout drops
+    // pages it already owns. The individual HTTP requests remain bounded.
+    let client = client.0.as_ref().expect("checked above");
+    let result = match list {
+        CachedList::Authored => {
+            tokio::time::timeout(crate::poll::FETCH_TIMEOUT, client.fetch_prs_snapshot())
+                .await
+                .unwrap_or_else(|_| Err(ClientError::Timeout(crate::poll::FETCH_TIMEOUT.as_secs())))
         }
-    );
-    out
+        CachedList::Reviewing => client.fetch_reviewing_snapshot().await,
+    };
+    let fetched = result.map_err(|error| Failure::from(&error));
+    match fetched {
+        Ok(result) => {
+            let Some(publication) = source_poll::success_publication(&app, &attempt).await else {
+                let winner = source_poll::winner(&app, &attempt, Ok(result))?;
+                return Ok(SourceRefresh {
+                    source,
+                    list,
+                    prs: Some(winner.prs),
+                    mrs: None,
+                    coverage: winner.coverage,
+                });
+            };
+            let receipt = result.clone();
+            let crate::github::client::FetchedList {
+                prs,
+                total,
+                coverage,
+            } = result;
+            let path = db_path(&app);
+            let owned = prs.clone();
+            let owned_source = source.clone();
+            let owned_coverage = coverage.clone();
+            let saved = tauri::async_runtime::spawn_blocking(move || {
+                let conn = open_db(&path).map_err(|e| e.to_string())?;
+                crate::store::source_cache::save_source_snapshot(
+                    &conn,
+                    &owned_source,
+                    list,
+                    &owned,
+                    &owned_coverage,
+                )
+                .map_err(|e| e.to_string())
+            })
+            .await;
+            if !matches!(saved, Ok(Ok(()))) {
+                let _ = app.emit(
+                    "store-error",
+                    "The refreshed list could not be saved for offline use.",
+                );
+            }
+            if list == CachedList::Reviewing {
+                crate::poll::emit_reviewing(&app, &receipt);
+            } else {
+                let truncated = total.map(|total| if total > prs.len() as u64 { total } else { 0 });
+                let _ = app.emit("prs-truncated", truncated);
+            }
+            source_poll::complete(&app, publication, Ok(receipt));
+            Ok(SourceRefresh {
+                source,
+                list,
+                prs: Some(prs),
+                mrs: None,
+                coverage,
+            })
+        }
+        Err(error) => {
+            if let Some(publication) = source_poll::publication(&app, &attempt).await {
+                let message = error.message.clone();
+                source_poll::complete(&app, publication, Err(error));
+                Err(message)
+            } else {
+                let winner = source_poll::winner(&app, &attempt, Err(error.message))?;
+                Ok(SourceRefresh {
+                    source,
+                    list,
+                    prs: Some(winner.prs),
+                    mrs: None,
+                    coverage: winner.coverage,
+                })
+            }
+        }
+    }
+}
+
+async fn refresh_gitlab_request(
+    app: AppHandle,
+    source: crate::identity::Source,
+    list: CachedList,
+    attempt: crate::source_poll::Attempt,
+) -> Result<SourceRefresh, String> {
+    use crate::source_poll::{self, Failure};
+    match crate::gitlab::queues::fetch(&source, list, |receipt| async {
+        if let Some(publication) = source_poll::success_publication(&app, &attempt).await {
+            source_poll::complete_gitlab(&app, publication, Ok(receipt));
+        }
+    })
+    .await
+    {
+        Ok(result) => {
+            let Some(publication) = source_poll::success_publication(&app, &attempt).await else {
+                let winner = source_poll::winner_gitlab(&app, &attempt, Ok(result))?;
+                return Ok(SourceRefresh {
+                    source,
+                    list,
+                    prs: None,
+                    mrs: Some(winner.mrs),
+                    coverage: winner.coverage,
+                });
+            };
+            let receipt = result.clone();
+            let path = db_path(&app);
+            let owned_source = source.clone();
+            let owned = result.mrs.clone();
+            let owned_coverage = result.coverage.clone();
+            let saved = tauri::async_runtime::spawn_blocking(move || {
+                let conn = open_db(&path).map_err(|e| e.to_string())?;
+                crate::store::source_cache::save_gitlab_snapshot(
+                    &conn,
+                    &owned_source,
+                    list,
+                    &owned,
+                    &owned_coverage,
+                )
+                .map_err(|e| e.to_string())
+            })
+            .await;
+            if !matches!(saved, Ok(Ok(()))) {
+                let _ = app.emit(
+                    "store-error",
+                    "The refreshed list could not be saved for offline use.",
+                );
+            }
+            source_poll::complete_gitlab(&app, publication, Ok(receipt));
+            Ok(SourceRefresh {
+                source,
+                list,
+                prs: None,
+                mrs: Some(result.mrs),
+                coverage: result.coverage,
+            })
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let failure = Failure {
+                message: message.clone(),
+                transient: error.transient(),
+                not_asked: matches!(error, crate::gitlab::queues::QueueError::MissingCli),
+            };
+            if let Some(publication) = source_poll::publication(&app, &attempt).await {
+                source_poll::complete_gitlab(&app, publication, Err(failure));
+                Err(message)
+            } else {
+                let winner = source_poll::winner_gitlab(&app, &attempt, Err(message))?;
+                Ok(SourceRefresh {
+                    source,
+                    list,
+                    prs: None,
+                    mrs: Some(winner.mrs),
+                    coverage: winner.coverage,
+                })
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -3354,6 +3694,17 @@ async fn pr_claudify_line(
 ) -> Result<(String, String), String> {
     let scan = list_worktrees(app).await?;
     let checkout = pr_checkout(&scan.repos, repo_path, pr_repo)?;
+    let path = checkout.clone();
+    let actual =
+        tauri::async_runtime::spawn_blocking(move || crate::worktrees::scan::repo_identity(&path))
+            .await
+            .map_err(|_| "Could not verify the checkout origin")?;
+    if !actual
+        .as_deref()
+        .is_some_and(|actual| actual.eq_ignore_ascii_case(pr_repo))
+    {
+        return Err("The checkout origin changed. Rescan repositories before launching.".into());
+    }
     let line = pr_claude_command(prompt, &checkout)?;
     Ok((checkout, line))
 }
@@ -4153,6 +4504,7 @@ pub fn set_poll_interval(
     secs: u64,
     state: State<'_, crate::poll::PollInterval>,
     waker: State<'_, crate::poll::Waker>,
+    gitlab: State<'_, Arc<crate::gitlab::poll::Control>>,
 ) -> u64 {
     let applied = crate::poll::clamp_interval(secs);
     state.0.store(applied, std::sync::atomic::Ordering::Relaxed);
@@ -4169,6 +4521,7 @@ pub fn set_poll_interval(
     }
 
     waker.0.notify_one();
+    gitlab.wake();
     applied
 }
 
@@ -4219,59 +4572,9 @@ pub fn get_cached_reviewing(app: AppHandle) -> Result<CachedSnapshot, String> {
 pub async fn get_reviewing(
     app: AppHandle,
     client: State<'_, GhClient>,
-) -> Result<Vec<PullRequest>, String> {
-    // DIAGNOSTIC LOGGING (Settings > diagnostic log). Brackets the whole
-    // command, so the log distinguishes the three ways To review can
-    // appear stuck: the command was never invoked (no start line), it
-    // is still running (a start with no end), or it returned promptly
-    // and the delay is in the frontend (a fast start/end pair).
-    crate::diag!("[diag] cmd get_reviewing start");
-    let started = std::time::Instant::now();
-    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
-    let out = client
-        .fetch_reviewing_with_shortfall()
-        .await
-        .map(|(prs, short)| {
-            // Tell the UI when the list is SHORT. The 100 -> 50 fallback
-            // returns fewer pull requests than exist and everything
-            // downstream presented that as complete -- the v3.5.3 log
-            // caught 50 shown against a count of 62, with twelve gone
-            // silently. Emitted even when zero, so a recovered fetch
-            // clears a banner an earlier one raised.
-            if let Err(e) = app.emit("reviewing-short", short) {
-                log::warn!("failed to emit reviewing-short: {e}");
-            }
-            // Cache it, so the next visit to To review paints from disk
-            // instead of waiting out the query again. The measurements
-            // on #328 are what make this the fix: the query itself
-            // cannot be made fast (a bare 25-item search already costs
-            // 6.2s, and trimming fields measured as noise), so the win
-            // has to come from not blocking on it.
-            //
-            // A failed write is logged and swallowed: the caller has
-            // real pull requests in hand, and refusing to return them
-            // because a cache write failed would turn a slow path into
-            // a broken one.
-            match open_db(&db_path(&app)) {
-                Ok(conn) => {
-                    if let Err(e) = save_snapshot(&conn, CachedList::Reviewing, &prs) {
-                        log::warn!("could not cache the review list: {e}");
-                    }
-                }
-                Err(e) => log::warn!("could not open the store to cache the review list: {e}"),
-            }
-            prs
-        })
-        .map_err(|e| e.to_string());
-    crate::diag!(
-        "[diag] cmd get_reviewing end {}ms {}",
-        started.elapsed().as_millis(),
-        match &out {
-            Ok(v) => format!("ok n={}", v.len()),
-            Err(e) => format!("err: {e}"),
-        }
-    );
-    out
+    request_id: Option<String>,
+) -> Result<RefreshReply, String> {
+    refresh_reply(app, client, CachedList::Reviewing, request_id).await
 }
 
 #[tauri::command]
@@ -5814,6 +6117,49 @@ pub async fn stats_reviewers(
 #[tauri::command]
 pub fn get_auth_state(state: State<'_, AuthState>) -> AuthState {
     state.inner().clone()
+}
+
+#[tauri::command]
+pub fn get_gitlab_host(app: AppHandle) -> Result<String, String> {
+    configured_gitlab_host(&app)
+}
+
+#[tauri::command]
+pub fn set_gitlab_host(
+    app: AppHandle,
+    host: String,
+    control: State<'_, Arc<crate::gitlab::poll::Control>>,
+) -> Result<String, String> {
+    let conn = open_db(&db_path(&app)).map_err(|_| "Could not save the GitLab host setting.")?;
+    let host = crate::gitlab::host::write_host(&conn, &host).map_err(|e| e.to_string())?;
+    let selected = crate::store::settings::get::<String>(
+        &conn,
+        crate::store::settings::keys::SOURCE_SELECTION,
+    )
+    .ok()
+    .flatten()
+    .is_some_and(|selection| selection == "gitlab" || selection == "both");
+    control.select(selected.then(|| crate::identity::Source {
+        provider: crate::identity::Provider::Gitlab,
+        host: host.clone(),
+    }));
+    Ok(host)
+}
+
+/// GitLab authentication is checked independently of GitHub startup auth.
+/// The CLI retains the credential; only a fixed status and host cross IPC.
+#[tauri::command]
+pub async fn get_gitlab_auth_state(app: AppHandle) -> crate::gitlab::auth::AuthState {
+    match configured_gitlab_host(&app) {
+        Ok(host) => crate::gitlab::auth::check_host(&host).await,
+        Err(_) => crate::gitlab::auth::AuthState {
+            host: String::new(),
+            viewer: None,
+            ok: false,
+            issue: Some(crate::gitlab::auth::AuthIssue::InvalidHost),
+            message: "The configured GitLab host is invalid. Enter a DNS hostname in Settings before using GitLab.".into(),
+        },
+    }
 }
 
 /// Import the Claude Code transcripts already on disk (#914, epic #910).
@@ -10145,4 +10491,85 @@ fn finish(app: &AppHandle, done: UpdateRunDone) {
         log::warn!("failed to show notification: {e}");
     }
     log::info!("update run opened {url}");
+}
+
+/// GitLab commands have no GitHub client dependency and no shared stats totals.
+#[tauri::command]
+pub async fn gitlab_stats_tree(
+    app: AppHandle,
+    host: String,
+) -> Result<crate::gitlab::stats::Tree, String> {
+    require_gitlab_host(&app, &host)?;
+    crate::gitlab::stats::tree(&host).await
+}
+#[tauri::command]
+pub async fn gitlab_stats_load(
+    app: AppHandle,
+    host: String,
+    scope: crate::gitlab::stats::Scope,
+    days: u32,
+    refresh: bool,
+) -> Result<crate::gitlab::stats::Report, String> {
+    require_gitlab_host(&app, &host)?;
+    crate::gitlab::stats::load(&host, scope, days, db_path(&app), refresh).await
+}
+
+#[tauri::command]
+pub async fn gitlab_stats_backfill(
+    app: AppHandle,
+    host: String,
+    scope: crate::gitlab::stats::Scope,
+    days: u32,
+) -> Result<crate::gitlab::stats::Backfill, String> {
+    require_gitlab_host(&app, &host)?;
+    crate::gitlab::stats::backfill(&host, scope, days, db_path(&app)).await
+}
+
+/// Full identity is mandatory: these writes never fall through to GitHub.
+#[tauri::command]
+pub async fn gitlab_action_capabilities(
+    app: AppHandle,
+    identity: crate::identity::PrIdentity,
+) -> Result<crate::gitlab::actions::Capabilities, String> {
+    require_gitlab_host(&app, &identity.source.host)?;
+    crate::gitlab::actions::capabilities(&identity).await
+}
+
+#[tauri::command]
+pub async fn gitlab_action(
+    app: AppHandle,
+    request: crate::gitlab::actions::ActionRequest,
+) -> Result<crate::gitlab::actions::Receipt, String> {
+    require_gitlab_host(&app, &request.identity.source.host)?;
+    crate::gitlab::poll::after_mutation(
+        async {
+            let result = crate::gitlab::actions::execute(&request).await;
+            crate::source_poll::invalidate_gitlab(&app, &request.identity.source).await;
+            crate::gitlab::queues::invalidate_identity(&request.identity);
+            crate::gitlab::stats::invalidate(request.identity.source.host.clone(), db_path(&app))
+                .await;
+            let _ = app.emit("gitlab-data-changed", &request.identity);
+            result
+        },
+        |list| {
+            let app = app.clone();
+            let source = request.identity.source.clone();
+            tauri::async_runtime::spawn(async move {
+                let attempt = crate::source_poll::begin(&app, source.clone(), list).await;
+                let _ = refresh_gitlab_request(app, source, list, attempt).await;
+            });
+        },
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn get_gitlab_detail(
+    app: AppHandle,
+    identity: crate::identity::PrIdentity,
+) -> Result<crate::gitlab::detail::MergeRequestDetail, String> {
+    require_gitlab_host(&app, &identity.source.host)?;
+    crate::gitlab::detail::fetch(&identity)
+        .await
+        .map_err(|issue| format!("GitLab detail unavailable ({issue:?})."))
 }

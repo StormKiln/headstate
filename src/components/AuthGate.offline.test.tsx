@@ -51,6 +51,10 @@ const authAnswer = vi.hoisted(() => ({
   current: (): Promise<{ ok: boolean; message: string }> =>
     Promise.reject(new Error("octocat's laptop is unreachable: timed out")),
 }));
+const gitlabAnswer = vi.hoisted(() => ({
+  current: (): Promise<{ host: string; ok: boolean; issue: string; message: string }> =>
+    Promise.reject(new Error("octocat's laptop is unreachable: timed out")),
+}));
 
 // The transport is the seam the phone actually fails at, so these tests
 // drive it rather than mocking the hooks above it: the point is that
@@ -63,6 +67,7 @@ vi.mock("../api/transport", () => ({
       authCalls.count += 1;
       return authAnswer.current();
     }
+    if (name === "get_gitlab_auth_state") return gitlabAnswer.current();
     return Promise.reject(new Error("octocat's laptop is unreachable: timed out"));
   },
   listen: () => Promise.resolve(() => {}),
@@ -97,10 +102,16 @@ async function renderGate(target: string, client: QueryClient = productionClient
   vi.stubEnv("VITE_TARGET", target);
   vi.resetModules();
   const { AuthGate } = await import("./AuthGate");
+  const { useGitHubAuthAvailable } = await import("../api/authAvailability");
+  function AuthAvailability() {
+    const available = useGitHubAuthAvailable();
+    return <span>GitHub auth: {available === null ? "unknown" : available ? "ready" : "unavailable"}</span>;
+  }
   return render(
     <QueryClientProvider client={client}>
       <AuthGate>
         <div>the app</div>
+        <AuthAvailability />
       </AuthGate>
     </QueryClientProvider>,
   );
@@ -117,6 +128,8 @@ beforeEach(() => {
   };
   authAnswer.current = () =>
     Promise.reject(new Error("octocat's laptop is unreachable: timed out"));
+  gitlabAnswer.current = () =>
+    Promise.reject(new Error("octocat's laptop is unreachable: timed out"));
 });
 
 afterEach(() => {
@@ -132,6 +145,7 @@ describe("the companion off the desktop's network", () => {
     // and there is nothing to wait for.
     expect(await screen.findByText("the app")).toBeTruthy();
     expect(container.innerHTML).not.toBe("");
+    expect(screen.getByText("GitHub auth: unknown")).toBeTruthy();
   });
 
   it("does not accuse the desktop of being signed out", async () => {
@@ -201,18 +215,39 @@ describe("the companion WITH its desktop reachable", () => {
     };
   });
 
-  it("still reports a desktop that really is signed out", async () => {
-    // The screen this fix must NOT delete. A reachable desktop that
-    // answers `{ok: false}` has said something the phone can repeat, and
-    // repeating it is the whole point of that screen.
+  it("reports a signed-out desktop while keeping local views open", async () => {
     authAnswer.current = () =>
       Promise.resolve({ ok: false, message: "gh auth status: not logged in to github.com" });
     await renderGate("mobile");
-    expect(await screen.findByText(/not signed in to GitHub/i)).toBeTruthy();
+    expect(await screen.findByText("the app")).toBeTruthy();
     expect(screen.getByText(/not logged in to github\.com/i)).toBeTruthy();
-    expect(screen.queryByText("the app")).toBeNull();
+    expect(screen.getByText("GitHub auth: unavailable")).toBeTruthy();
     // Still no impossible advice, reachable or not.
     expect(screen.queryByText(/brew install/i)).toBeNull();
+  });
+
+  it("directs a missing glab installation to the paired desktop", async () => {
+    authAnswer.current = () => Promise.resolve({ ok: false, message: "gh was not found" });
+    gitlabAnswer.current = () => Promise.resolve({
+      host: "gitlab.com", ok: false, issue: "missingCli",
+      message: "GitLab CLI (glab) was not found on the desktop running Headstate. Install glab there and run `glab auth login --hostname gitlab.com`.",
+    });
+    await renderGate("mobile");
+    expect(await screen.findByText(/Install glab there and run/)).toBeTruthy();
+    expect(screen.queryByText(/on this computer/)).toBeNull();
+    expect(screen.getByText("the app")).toBeTruthy();
+  });
+
+  it("directs an unverified credential check to the paired desktop", async () => {
+    authAnswer.current = () => Promise.resolve({ ok: false, message: "gh was not found" });
+    gitlabAnswer.current = () => Promise.resolve({
+      host: "gitlab.com", ok: false, issue: "unverified",
+      message: "GitLab.com authentication could not be verified. Run `glab auth status --hostname gitlab.com` on the desktop running Headstate; sign in again there if the credential expired.",
+    });
+    await renderGate("mobile");
+    expect(await screen.findByText(/Run `glab auth status --hostname gitlab.com` on the desktop/)).toBeTruthy();
+    expect(screen.queryByText(/on this computer/)).toBeNull();
+    expect(screen.getByText("the app")).toBeTruthy();
   });
 
   it("lets an authenticated phone through", async () => {
@@ -233,17 +268,12 @@ describe("the companion WITH its desktop reachable", () => {
 });
 
 describe("the desktop build", () => {
-  // The constraint on this whole change: `useConnectionState` is `local`
-  // by construction on the desktop, so nothing above may have moved.
-  // Asserted rather than assumed -- "it should be mobile-only" is how
-  // #598 got in.
-  it("still gates on gh and shows the install screen", async () => {
+  it("keeps the desktop's local views open without gh", async () => {
     authAnswer.current = () =>
       Promise.resolve({ ok: false, message: "gh was not found in /usr/local/bin" });
     await renderGate("desktop");
-    expect(await screen.findByText("Headstate needs the GitHub CLI")).toBeTruthy();
+    expect(await screen.findByText("the app")).toBeTruthy();
     expect(screen.getByText(/gh was not found/)).toBeTruthy();
-    expect(screen.queryByText("the app")).toBeNull();
   });
 
   it("still keeps its retries, where a rejection is a transient IPC failure", async () => {
@@ -283,11 +313,9 @@ describe("the desktop build", () => {
     }
   });
 
-  it("does not show the app to an unauthenticated desktop just because a query rejected", async () => {
-    // The desktop's own guard, unchanged: a rejection here still lands
-    // on the `gh` screen rather than on the app.
+  it("keeps local views open when the desktop auth IPC check rejects", async () => {
     await renderGate("desktop", new QueryClient({ defaultOptions: { queries: { retry: false } } }));
-    expect(await screen.findByText("Headstate needs the GitHub CLI")).toBeTruthy();
-    expect(screen.queryByText("the app")).toBeNull();
+    expect(await screen.findByText("the app")).toBeTruthy();
+    expect(screen.queryByText("Headstate needs the GitHub CLI")).toBeNull();
   });
 });

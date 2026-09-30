@@ -20,6 +20,11 @@ import { relativeTime } from "../lib/time";
 import { useIsMobile } from "../lib/useIsMobile";
 import { IS_MOBILE_BUILD } from "../lib/target";
 import { SettingsDialog } from "./SettingsDialog";
+import type { GitHubAuthAvailability } from "@/api/authAvailability";
+
+import type { SourceSelection } from "../store/sourceSelection";
+import type { GitLabQueueSnapshot } from "../api/gitlabQueueState";
+import { gitlabQueueSummary } from "../lib/gitlabQueueSummary";
 
 const CHOICES = [60, 120, 300, 900];
 
@@ -48,7 +53,11 @@ function label(secs: number): string {
 /// still being fast enough that nobody sits three versions behind.
 const UPDATE_CHECK_MS = 24 * 60 * 60 * 1000;
 
-export function StatusBar({ updatedAt }: { updatedAt: number }) {
+export function StatusBar({ updatedAt, githubAuthAvailable = true, selection = "github", gitlab }: {
+  updatedAt: number; githubAuthAvailable?: GitHubAuthAvailability;
+  selection?: SourceSelection; gitlab?: GitLabQueueSnapshot;
+}) {
+  const gitlabSummary = gitlabQueueSummary(gitlab);
   const state = usePollState();
   const pollError = usePollError();
 
@@ -65,8 +74,15 @@ export function StatusBar({ updatedAt }: { updatedAt: number }) {
   // task that would have emitted it is the one that died.
   const panicked = useBackgroundPanicked();
 
+  // A cache read can set `updatedAt` to now even when startup had no gh
+  // client and Rust did not start a poll. Auth availability outranks the
+  // idle state; the timestamp is withheld below for the same reason.
   const status = panicked
     ? ("panicked" as const)
+    : githubAuthAvailable === false
+      ? ("authUnavailable" as const)
+      : githubAuthAvailable === null
+        ? ("authUnknown" as const)
     : pollError
     ? updatedAt > 0
       ? ("stale" as const)
@@ -83,6 +99,8 @@ export function StatusBar({ updatedAt }: { updatedAt: number }) {
 
   const DOT = {
     panicked: "bg-[#f85149]",
+    authUnavailable: "bg-[#d29922]",
+    authUnknown: "bg-[#d29922]",
     fetching: "bg-[#58a6ff]",
     ok: "bg-[#3fb950]",
     retrying: "bg-[#d29922]",
@@ -118,6 +136,8 @@ export function StatusBar({ updatedAt }: { updatedAt: number }) {
     // the panic flag is set by ANY background task, the stats backfill
     // included.
     panicked: "Background updates stopped — see the log",
+    authUnavailable: "GitHub is not refreshing — sign in on the desktop",
+    authUnknown: "GitHub status unavailable",
     fetching: "Checking PRs…",
     ok: "PRs up to date",
     retrying: "Retrying PRs…",
@@ -242,22 +262,29 @@ export function StatusBar({ updatedAt }: { updatedAt: number }) {
           Only this pair moves. The progress counter, its cancel button,
           the version and the settings entry point below have no second
           home and stay on both. */}
-      {isMobile ? null : (
+      {isMobile || selection === "gitlab" ? null : (
         <>
           <span className="flex items-center gap-1.5">
             <span className={`h-1.5 w-1.5 rounded-full ${DOT[status]}`} aria-hidden="true" />
             <span className={status === "failed" ? "text-[#f85149]" : undefined}>
-              {TEXT[status]}
+              {selection === "both" && !TEXT[status].includes("GitHub") ? "GitHub · " : ""}{TEXT[status]}
             </span>
           </span>
 
           {/* `dataUpdatedAt`, not `isFetching`: the tray path advances the
               former on both routes but never flips the latter. */}
-          {updatedAt > 0 ? (
-            <span>Updated {relativeTime(new Date(updatedAt).toISOString())}</span>
+          {githubAuthAvailable === true && updatedAt > 0 ? (
+            <span>{selection === "both" ? "GitHub updated" : "Updated"} {relativeTime(new Date(updatedAt).toISOString())}</span>
           ) : null}
         </>
       )}
+
+      {!isMobile && selection !== "github" ? (
+        <span className="flex items-center gap-1.5">
+          <span className={`h-1.5 w-1.5 rounded-full ${panicked ? DOT.panicked : gitlabSummary.warning ? DOT.stale : DOT.ok}`} aria-hidden="true" />
+          <span>{panicked ? TEXT.panicked : gitlabSummary.text}</span>
+        </span>
+      ) : null}
 
       {/* Bulk worktree removal reported progress only on the Worktrees
           page's own button -- but the work runs on the backend and

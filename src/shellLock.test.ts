@@ -31,7 +31,9 @@ function shellClasses(source: string): string[] | null {
 /// `AuthGate`'s signed-in branch, from its `if` to the brace closing it.
 function signedInBranch(source: string): string {
   const text = source.replace(/\r\n/g, "\n");
-  const from = text.slice(text.indexOf("if (data?.ok) {"));
+  const start = text.search(/\bif \((?:data\?\.ok|data !== undefined)\) \{/);
+  if (start < 0) return "";
+  const from = text.slice(start);
   return from.slice(0, from.indexOf("\n  }\n"));
 }
 

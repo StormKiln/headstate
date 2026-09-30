@@ -1,4 +1,4 @@
-//! Which version of `gh`, `git`, `docker` and `claude` is installed.
+//! Which version of `gh`, `glab`, `git`, `docker` and `claude` is installed.
 //!
 //! Headstate detected whether these EXIST and never which version, so a
 //! too-old tool failed at the point of use with that tool's own error
@@ -228,6 +228,8 @@ pub fn report_all() -> Vec<ToolReport> {
     };
 
     let (gh_path, gh_line) = run(crate::auth::find_gh(), &["--version"]);
+    let (glab_path, glab_line) = run(crate::gitlab::auth::find_glab(), &["--version"]);
+    let glab_found = glab_path.is_some();
     let (git_path, git_line) = run(
         Some(crate::auth::git_program().to_path_buf()),
         &["--version"],
@@ -247,7 +249,27 @@ pub fn report_all() -> Vec<ToolReport> {
             name: "gh",
             path: gh_path,
             version: judge(gh_line.as_deref(), min("gh")),
-            matters: "Your GitHub token. Without it there are no pull requests at all.",
+            matters: "GitHub pull requests only. GitLab and local views remain available.",
+        },
+        ToolReport {
+            name: "glab",
+            path: glab_path,
+            // 1.119.0 is the version exercised by the probe, not a proven
+            // minimum. An older release must not be called unusable solely
+            // because it is older than our fixture.
+            version: match glab_line.as_deref() {
+                Some(line) => match parse_version(line) {
+                    Some(found) => ToolVersion::Ok { found },
+                    None => ToolVersion::CannotTell {
+                        detail: "could not read glab's version".to_string(),
+                    },
+                },
+                None if glab_found => ToolVersion::CannotTell {
+                    detail: "glab did not report a version".to_string(),
+                },
+                None => ToolVersion::NotFound,
+            },
+            matters: "GitLab.com authentication only. GitHub and local views remain available.",
         },
         ToolReport {
             name: "claude",
