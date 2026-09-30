@@ -1070,6 +1070,7 @@ esac
             );
             std::fs::write(&program, script).unwrap();
             std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let _fixture = crate::gitlab::test_support::register(&program, "/bin/sh");
             let report = load_window(
                 &program,
                 source("gitlab.com").unwrap(),
@@ -1130,6 +1131,7 @@ esac
         )
         .unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _fixture = crate::gitlab::test_support::register(&program, "/bin/sh");
         let report = load_window(
             &program,
             source("gitlab.com").unwrap(),
@@ -1232,6 +1234,7 @@ esac
         let program = dir.path().join("glab");
         std::fs::write(&program, "#!/bin/sh\nsleep 1\n").unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _fixture = crate::gitlab::test_support::register(&program, "/bin/sh");
         let tree = discover_tree(
             &program,
             source("gitlab.com").unwrap(),

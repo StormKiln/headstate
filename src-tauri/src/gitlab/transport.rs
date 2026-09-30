@@ -38,7 +38,11 @@ pub enum Error {
 }
 
 pub async fn output(command: &mut Command) -> Result<(Vec<u8>, ExitStatus), Error> {
-    let _permit = acquire_for(command.as_std().get_program()).await;
+    #[cfg(all(test, unix))]
+    let program = super::test_support::budget_program(command.as_std());
+    #[cfg(not(all(test, unix)))]
+    let program = command.as_std().get_program();
+    let _permit = acquire_for(program).await;
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

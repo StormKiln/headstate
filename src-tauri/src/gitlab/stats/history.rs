@@ -262,6 +262,7 @@ mod tests {
             dir.path(),
             "printf 'HTTP/2 200\\nx-next-page: \\nx-total: 0\\n\\n[]'",
         );
+        let _fixture = crate::gitlab::test_support::register(&program, "/bin/sh");
         let source = source("gitlab.com").unwrap();
         let today = "2026-09-04".parse().unwrap();
         let first = backfill_with(
@@ -322,6 +323,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("history.sqlite");
         let program = program(dir.path(), "exit 1");
+        let _fixture = crate::gitlab::test_support::register(&program, "/bin/sh");
         let source = source("gitlab.com").unwrap();
         let today = "2026-09-04".parse().unwrap();
         let first = backfill_with(
@@ -357,6 +359,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("history.sqlite");
         let program = program(dir.path(), "printf 'HTTP/2 200\\n\\n[]'");
+        let _fixture = crate::gitlab::test_support::register(&program, "/bin/sh");
         let source = source("gitlab.com").unwrap();
         let today = "2026-09-04".parse().unwrap();
         let first = backfill_with(
@@ -384,6 +387,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("history.sqlite");
         let cli = program(dir.path(), "printf 'HTTP/2 200\\nx-next-page: \\n\\n[]'");
+        let _fixture = crate::gitlab::test_support::register(&cli, "/bin/sh");
         let script = std::fs::read_to_string(&cli)
             .unwrap()
             .replace("\"id\":1", "\"id\":2");

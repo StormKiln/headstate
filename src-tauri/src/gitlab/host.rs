@@ -83,6 +83,10 @@ pub fn constrained_command(
     program: &Path,
     expected_host: &str,
 ) -> Result<tokio::process::Command, HostError> {
+    #[cfg(all(test, unix))]
+    let mut command = super::test_support::command(program)
+        .unwrap_or_else(|| tokio::process::Command::new(program));
+    #[cfg(not(all(test, unix)))]
     let mut command = tokio::process::Command::new(program);
     constrain_command(&mut command, expected_host)?;
     Ok(command)
@@ -175,6 +179,7 @@ mod tests {
         let script = dir.path().join("glab");
         std::fs::write(&script, "#!/bin/sh\nprintf '%s|%s|%s|%s' \"$GITLAB_HOST\" \"$GITLAB_API_HOST\" \"$GLAB_API_PROTOCOL\" \"$GLAB_SKIP_TLS_VERIFY\"\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _fixture = super::super::test_support::register(&script, "/bin/sh");
         let mut command = constrained_command(&script, "GitLab.Example").unwrap();
         let output = command.output().await.unwrap();
         assert!(output.status.success());
