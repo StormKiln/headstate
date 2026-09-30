@@ -90,7 +90,7 @@ export function ReadyClaudify({ rows }: { rows: readonly ReadyRow[] }) {
   };
 
   return (
-    <span className="inline-flex items-center gap-2 font-normal">
+    <span className="inline-flex min-w-0 max-w-full flex-wrap items-center gap-2 font-normal">
       <button
         type="button"
         disabled={blocked !== null}

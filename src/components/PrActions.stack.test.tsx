@@ -116,3 +116,10 @@ describe("PrActions on a stacked pull request (#1452)", () => {
     expect(screen.queryByText(/Cannot queue/)).toBeNull();
   });
 });
+
+it("does not queue a standalone PR while mergeability is being checked", () => {
+  render(<PrActions pr={pr({ stack: { kind: "none" }, merge_status: "unknown" })} />);
+  const button = screen.getByRole("button", { name: "Add to merge queue" }) as HTMLButtonElement;
+  expect(button.disabled).toBe(true);
+  expect(button.title).toMatch(/checking/i);
+});

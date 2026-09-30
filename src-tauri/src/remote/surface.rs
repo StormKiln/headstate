@@ -154,6 +154,7 @@ pub const SURFACE: &[(&str, Class)] = &[
     // The Ready for review strip's batched pushers (#1576). A Read; REST reads
     // capped per call and inside the budget, advisory.
     ("get_ready_pushers", Class::Read),
+    ("get_ready_stacks", Class::Read),
     ("get_viewer", Class::Read),
     ("build_target", Class::Read),
     ("latest_release", Class::Read),
@@ -1179,6 +1180,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         )
         .await),
         "get_ready_pushers" => res(commands::get_ready_pushers(app.state(), a.get("rows")?).await),
+        "get_ready_stacks" => res(commands::get_ready_stacks(app.state(), a.get("rows")?).await),
         "get_viewer" => res(commands::get_viewer(app.state()).await),
         "build_target" => ok(commands::build_target()),
         "latest_release" => ok(commands::latest_release(app.clone()).await),
@@ -1478,7 +1480,13 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "docker_start" => res(blocking(commands::docker_start).await?),
         "docker_restart" => res(blocking(commands::docker_restart).await?),
         "set_view_needs_github" => {
-            commands::set_view_needs_github(a.get("needs")?, app.state(), app.state());
+            commands::set_view_needs_github(
+                a.get("needs")?,
+                app.state(),
+                app.state(),
+                app.state(),
+                a.get("reviewing")?,
+            );
             ok(())
         }
         "set_poll_interval" => ok(commands::set_poll_interval(

@@ -13,7 +13,7 @@
 
 import { call } from "./transport";
 import type { GitLabScope, GitLabStatsTree, GitLabStatsReport, GitLabBackfill } from "./gitlabStats";
-import type { Source } from "../types/identity";
+import type { PrIdentity, Source } from "../types/identity";
 import type { MergeRequest } from "../types/gitlab";
 import type {
   ClaudeMdAdviceMode,
@@ -64,6 +64,7 @@ import type {
   NetProcess,
   Periods,
   PrDetail,
+  PrStack,
   PullRequest,
   ReviewGates,
   PusherAsk,
@@ -979,8 +980,8 @@ export const removeWorktree = (repoPath: string, worktreePath: string) =>
   call<void>("remove_worktree", { repoPath, worktreePath });
 
 /// Tell the poll loop whether the active view needs live PR data.
-export const setViewNeedsGithub = (needs: boolean) =>
-  call<void>("set_view_needs_github", { needs });
+export const setViewNeedsGithub = (needs: boolean, reviewing = false) =>
+  call<void>("set_view_needs_github", { needs, reviewing });
 
 /// Directories scanned for git checkouts. Defaults to `~/code`.
 export const getWorktreeDirs = () => call<string[]>("get_worktree_dirs");
@@ -2260,3 +2261,7 @@ export const getGitLabActionCapabilities = (identity: import("../types/identity"
   call<import("../types/gitlabActions").GitLabCapabilities>("gitlab_action_capabilities", { identity });
 export const gitLabAction = (request: import("../types/gitlabActions").GitLabActionRequest) =>
   call<import("../types/gitlabActions").GitLabReceipt>("gitlab_action", { request });
+
+/// Bounded metadata-only stack lookups for Ready rows (#1602).
+export const getReadyStacks = (rows: PrIdentity[]) =>
+  call<(PrIdentity & { stack: PrStack })[]>("get_ready_stacks", { rows });

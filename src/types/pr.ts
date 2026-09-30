@@ -784,6 +784,10 @@ export interface StackMember {
   title: string;
   /// `open`, `merged` or `closed`.
   state: string;
+  /// Advisory readings; absent/null is unknown, never proof of readiness.
+  is_draft?: boolean | null;
+  review?: string | null;
+  checks?: string | null;
 }
 
 /// How an image's provenance was established. A recorded fact and a
