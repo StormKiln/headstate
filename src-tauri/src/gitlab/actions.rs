@@ -1097,7 +1097,13 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn scripted(steps: &[Value]) -> (tempfile::TempDir, std::path::PathBuf) {
+    fn scripted(
+        steps: &[Value],
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        crate::gitlab::test_support::Registered,
+    ) {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1131,7 +1137,8 @@ print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
         )
         .unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-        (dir, program)
+        let fixture = crate::gitlab::test_support::register(&program, "/usr/bin/python3");
+        (dir, program, fixture)
     }
 
     #[cfg(unix)]
@@ -1178,7 +1185,7 @@ print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
 
     #[cfg(unix)]
     async fn check_retry(steps: &[Value], outcome: Outcome) -> Receipt {
-        let (dir, program) = scripted(steps);
+        let (dir, program, _fixture) = scripted(steps);
         let receipt = execute_with_program(&program, &request(Action::RetryCi))
             .await
             .unwrap();
@@ -1310,7 +1317,7 @@ print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
             let mut steps = retry_steps(json!([job(100, "unit", "failed")]), &[]);
             steps[4]["response"]["head_pipeline"][field] = Value::Null;
             steps.truncate(5);
-            let (dir, program) = scripted(&steps);
+            let (dir, program, _fixture) = scripted(&steps);
             assert!(execute_with_program(&program, &request(Action::RetryCi))
                 .await
                 .unwrap_err()
@@ -1323,7 +1330,7 @@ print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
         let mut steps = retry_steps(json!([job(100, "unit", "failed")]), &[]);
         steps[4]["response"]["sha"] = json!("new-head");
         steps.truncate(5);
-        let (_dir, program) = scripted(&steps);
+        let (_dir, program, _fixture) = scripted(&steps);
         assert!(execute_with_program(&program, &request(Action::RetryCi))
             .await
             .is_err());
@@ -1411,7 +1418,7 @@ print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
                 .iter()
                 .any(|c| c.action == Action::Reply && c.allowed));
             let steps = context_steps(&raw(), &p);
-            let (dir, program) = scripted(&steps);
+            let (dir, program, _fixture) = scripted(&steps);
             let error = execute_with_program(&program, &request(Action::Reply))
                 .await
                 .unwrap_err();
@@ -1490,7 +1497,7 @@ print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
                     steps.push(read(format!("{BASE}?include_rebase_in_progress=true"), r.clone()));
                 }
             }
-            let (dir, program) = scripted(&steps);
+            let (dir, program, _fixture) = scripted(&steps);
             let receipt = execute_with_program(&program, &req).await.unwrap();
             assert_eq!(receipt.outcome, Outcome::Verified, "{action:?}");
             assert_eq!(
@@ -1499,7 +1506,7 @@ print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
             );
             // The exact same 2xx write with failed readback must never report success.
             steps[4]["status"] = json!(403);
-            let (_dir, program) = scripted(&steps);
+            let (_dir, program, _fixture) = scripted(&steps);
             assert_eq!(
                 execute_with_program(&program, &req).await.unwrap().outcome,
                 Outcome::Unverified,
@@ -1534,7 +1541,7 @@ print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
         ] {
             let mut steps = context_steps(&raw(), &permissions());
             steps[1]["response"] = response;
-            let (dir, program) = scripted(&steps);
+            let (dir, program, _fixture) = scripted(&steps);
             let error = execute_with_program(&program, &request(Action::Close))
                 .await
                 .unwrap_err();
@@ -1553,7 +1560,7 @@ print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
         steps[1]["response"] = json!({"errors":[{"extensions":{"code":"undefinedField"}}]});
         let basic = json!({"iid":"7","webUrl":r["web_url"],"diffHeadSha":r["sha"],"userPermissions":{"canMerge":true,"createNote":true,"updateMergeRequest":true}});
         steps.insert(2, json!({"method":"POST","path":"graphql","body":{"query":LEGACY_QUERY,"variables":{"path":identity().repo,"iid":"7"}},"response":{"data":{"project":{"mergeRequest":basic}}}}));
-        let (_dir, program) = scripted(&steps);
+        let (_dir, program, _fixture) = scripted(&steps);
         let identity = identity();
         let session = Session {
             program: &program,
@@ -1631,7 +1638,7 @@ print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
                     }
                 }
                 steps.extend(context_steps(&r, &p));
-                let (dir, program) = scripted(&steps);
+                let (dir, program, _fixture) = scripted(&steps);
                 let receipt = execute_with_program(&program, &req).await.unwrap();
                 assert_eq!(
                     receipt.outcome,
