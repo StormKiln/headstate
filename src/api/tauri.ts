@@ -979,8 +979,8 @@ export const removeWorktree = (repoPath: string, worktreePath: string) =>
   call<void>("remove_worktree", { repoPath, worktreePath });
 
 /// Tell the poll loop whether the active view needs live PR data.
-export const setViewNeedsGithub = (needs: boolean) =>
-  call<void>("set_view_needs_github", { needs });
+export const setViewNeedsGithub = (needs: boolean, reviewing = false) =>
+  call<void>("set_view_needs_github", { needs, reviewing });
 
 /// Directories scanned for git checkouts. Defaults to `~/code`.
 export const getWorktreeDirs = () => call<string[]>("get_worktree_dirs");

@@ -1,3 +1,4 @@
+import { DetailPollBackoff } from "./detailPolling";
 import { type QueryClient, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { type View, useFilters } from "../store/filters";
@@ -372,7 +373,7 @@ export function useViewCadence(view: string): void {
     // Tolerate a host without the command, as the other listeners do:
     // cadence is an optimisation, and failing to set it must not break
     // the page.
-    void setViewNeedsGithub(view !== "worktrees").catch(() => {});
+    void setViewNeedsGithub(view !== "worktrees", view === "to-review").catch(() => {});
   }, [view]);
 }
 
@@ -682,15 +683,34 @@ export function withOwnReview(detail: PrDetail, viewer: string, state: string): 
 /// Failure is swallowed on purpose. The review itself already
 /// succeeded; a failed follow-up read must not report it as failed. The
 /// poll loop and `usePrDetail`'s own refetching still catch up.
+// A verified write completes independently of its read-back. Track the latest
+// reconciliation per cache/key so a late response cannot undo a newer review.
+const reviewReconciliations = new WeakMap<QueryClient, Map<string, symbol>>();
+const reviewKey = (repo: string, number: number) => JSON.stringify([repo, number]);
+
 async function mergeFieldsAfterReview(
   qc: QueryClient,
   repo: string,
   number: number,
 ): Promise<void> {
+  const key = reviewKey(repo, number);
+  let pending = reviewReconciliations.get(qc);
+  if (!pending) {
+    pending = new Map();
+    reviewReconciliations.set(qc, pending);
+  }
+  const generation = Symbol();
+  pending.set(key, generation);
+  const before = qc.getQueryData<PrDetail>(["pr-detail", repo, number]);
+  qc.setQueryData<PrDetail>(["pr-detail", repo, number], (prev) =>
+    prev ? { ...prev, merge_status: "unknown" } : prev,
+  );
   try {
     const fresh = await getPrDetail(repo, number);
+    if (pending.get(key) !== generation) return;
     qc.setQueryData<PrDetail>(["pr-detail", repo, number], (prev) =>
-      prev === undefined
+      prev === undefined || prev.latest_reviews !== before?.latest_reviews
+        || prev.head_oid !== before?.head_oid || fresh.head_oid !== before?.head_oid
         ? prev
         : {
             ...prev,
@@ -700,7 +720,15 @@ async function mergeFieldsAfterReview(
           },
     );
   } catch {
-    // Deliberately silent; see above.
+    // The verified review succeeded. Keep mergeability unknown and let the
+    // bounded detail poll recover, without reporting the write as failed.
+  } finally {
+    if (pending.get(key) === generation) {
+      pending.delete(key);
+      // Re-evaluate the detail poll even if the read failed: no new response
+      // would otherwise notify its observer that reconciliation ended.
+      qc.setQueryData<PrDetail>(["pr-detail", repo, number], prev => prev ? { ...prev } : prev);
+    }
   }
 }
 
@@ -719,6 +747,8 @@ export function useReviewPr() {
     body: string,
   ) =>
     reviewPr(id, repo, number, verdict, body).then(async () => {
+      // A pre-write read must not publish over the verified verdict.
+      await qc.cancelQueries({ queryKey: ["pr-detail", repo, number], exact: true });
       void qc.invalidateQueries({ queryKey: ["reviewing"] });
       // Write the verdict we KNOW landed straight into the cache, before
       // asking GitHub anything.
@@ -794,8 +824,8 @@ export function useReviewPr() {
       //
       // `mergeFieldsAfterReview` re-reads the one pull request and
       // copies ONLY those fields over, so the seeded verdict survives.
-      // Awaited: the detail view the user is looking at, one request.
-      await mergeFieldsAfterReview(qc, repo, number);
+      // Reconciliation must not hold the verified review pending (#1599).
+      void mergeFieldsAfterReview(qc, repo, number);
       // NOT awaited: the whole-world list refresh.
       //
       // `refreshPrs` calls `refresh_now`, which searches EVERY watched
@@ -2597,6 +2627,7 @@ function seedFromRow(row: PullRequest): PrDetail {
 /// spinner branch stays.
 export function usePrDetail(repo: string | undefined, number: number | undefined) {
   const qc = useQueryClient();
+  const polling = useMemo(() => new DetailPollBackoff(), [repo, number]);
   return useQuery({
     queryKey: ["pr-detail", repo, number],
     // DIAGNOSTIC LOGGING (Settings > diagnostic log). `timeCall` rather
@@ -2617,17 +2648,9 @@ export function usePrDetail(repo: string | undefined, number: number | undefined
       const row = cachedRow(qc, repo, number);
       return row ? seedFromRow(row) : undefined;
     },
-    // EXPLICIT, because the inherited default is 3 and this fetch sits
-    // behind octocrab's own `max_retries: 3` with a 60-second minimum
-    // wait on a rate-limit response (`auth.rs`). Stacked, that is up to
-    // 16 attempts for one click, each one of them able to wait out the
-    // 30-second command ceiling before the next begins -- minutes of
-    // spinner from a single click, which is what #790 reported.
-    //
-    // 1, not 0: a detail fetch really does fail transiently (a laptop
-    // waking, a 502 from GitHub), and one quiet retry saves the user a
-    // click. Two would be the first step back towards the multiplier.
-    retry: 1,
+    // The provider read now retries once inside the command's total budget.
+    // A second frontend retry would multiply that budget for a cold view.
+    retry: false,
     // A whole session, against the default five minutes (#790). `gcTime`
     // is how long an UNUSED entry survives, not how long it is trusted
     // -- `staleTime: 30_000` above is still what decides that -- so this
@@ -2643,18 +2666,16 @@ export function usePrDetail(repo: string | undefined, number: number | undefined
     // query in the app. They are dropped on relaunch like everything
     // else in this cache.
     gcTime: Infinity,
-    // `unknown` mergeability is TRANSIENT: GitHub sets it while it
-    // recomputes, which approving a pull request is precisely what
-    // triggers. One invalidation after the mutation is not enough --
-    // the refetch lands while GitHub is still computing and gets
-    // `unknown` back, then nothing asks again.
-    //
-    // Polling only in that state, and only while the detail view is
-    // open. It stops the moment a real answer arrives, so this is a few
-    // seconds of extra requests on one pull request rather than a
-    // background cost.
+    // Keep recomputing mergeability live, with bounded backoff. The verified
+    // review's read-back owns its request until it finishes; do not duplicate it.
     refetchInterval: (query) =>
-      query.state.data?.merge_status === "unknown" ? 3_000 : false,
+      reviewReconciliations.get(qc)?.has(reviewKey(repo as string, number as number))
+        ? false
+        : polling.delay(
+            query.state.data?.head_oid ?? "",
+            query.state.data?.merge_status === "unknown",
+            Math.max(query.state.dataUpdatedAt, query.state.errorUpdatedAt),
+          ),
   });
 }
 

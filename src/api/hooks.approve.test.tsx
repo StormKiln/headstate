@@ -177,6 +177,54 @@ describe("useReviewPr and the merge buttons", () => {
     ).toContainEqual({ author: "me", state: "APPROVED" });
   });
 
+  it("does not let an older detail query erase a verified approval", async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    qc.setQueryData(["viewer"], "me");
+    qc.setQueryData<PrDetail>(["pr-detail", "o/r", 7], BEFORE);
+    let finishOld!: (value: PrDetail) => void;
+    let finishNew!: (value: PrDetail) => void;
+    const oldRead = new Promise<PrDetail>(resolve => { finishOld = resolve; });
+    const newRead = new Promise<PrDetail>(resolve => { finishNew = resolve; });
+    let reads = 0;
+    invoke.mockImplementation((cmd: string) => cmd === "get_pr_detail"
+      ? (++reads === 1 ? oldRead : newRead) : Promise.resolve());
+    const { result, unmount } = renderHook(() => ({ detail: usePrDetail("o/r", 7), review: useReviewPr() }), { wrapper: wrap(qc) });
+    const older = result.current.detail.refetch();
+    await waitFor(() => expect(reads).toBe(1));
+    await result.current.review("id", "o/r", 7, "approve", "");
+    finishOld(BEFORE);
+    await older;
+    try {
+      expect(qc.getQueryData<PrDetail>(["pr-detail", "o/r", 7])).toMatchObject({
+        latest_reviews: [{ author: "me", state: "APPROVED" }], merge_status: "unknown",
+      });
+    } finally { finishNew(FRESH); unmount(); qc.clear(); }
+  });
+
+  it("finishes a verified approval before the merge-field read returns", async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    qc.setQueryData(["viewer"], "me");
+    qc.setQueryData<PrDetail>(["pr-detail", "o/r", 7], BEFORE);
+    let finish!: (value: PrDetail) => void;
+    const pending = new Promise<PrDetail>((resolve) => { finish = resolve; });
+    invoke.mockImplementation((cmd: string) => cmd === "get_pr_detail" ? pending : Promise.resolve());
+    const { result, unmount } = renderHook(() => useReviewPr(), { wrapper: wrap(qc) });
+    let completed = false;
+    const submitted = result.current("id", "o/r", 7, "approve", "").then(() => { completed = true; });
+    try {
+      await waitFor(() => expect(completed).toBe(true));
+      expect(qc.getQueryData<PrDetail>(["pr-detail", "o/r", 7])).toMatchObject({
+        latest_reviews: [{ author: "me", state: "APPROVED" }], merge_status: "unknown",
+      });
+    } finally {
+      finish(FRESH);
+      await submitted;
+      unmount();
+    }
+    await waitFor(() => expect(qc.getQueryData<PrDetail>(["pr-detail", "o/r", 7])?.merge_status).toBe("clean"));
+    qc.clear();
+  });
+
   /// The review already succeeded. A failed follow-up read must not
   /// report it as failed -- the poll loop catches up regardless.
   it("does not fail the review when the follow-up read fails", async () => {

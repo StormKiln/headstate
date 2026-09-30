@@ -398,15 +398,10 @@ async fn refresh_source_request(
     if gitlab_source {
         return refresh_gitlab_request(app, source, list, attempt).await;
     }
-    // Preserve reviewing's existing paged loader: an outer timeout drops
-    // pages it already owns. The individual HTTP requests remain bounded.
+    // The loader owns its deadline so completed pages survive a timeout.
     let client = client.0.as_ref().expect("checked above");
     let result = match list {
-        CachedList::Authored => {
-            tokio::time::timeout(crate::poll::FETCH_TIMEOUT, client.fetch_prs_snapshot())
-                .await
-                .unwrap_or_else(|_| Err(ClientError::Timeout(crate::poll::FETCH_TIMEOUT.as_secs())))
-        }
+        CachedList::Authored => client.fetch_prs_snapshot().await,
         CachedList::Reviewing => client.fetch_reviewing_snapshot().await,
     };
     let fetched = result.map_err(|error| Failure::from(&error));
@@ -4346,9 +4341,16 @@ pub fn set_view_needs_github(
     needs: bool,
     state: State<'_, crate::poll::ViewNeedsGithub>,
     waker: State<'_, crate::poll::Waker>,
+    client: State<'_, GhClient>,
+    reviewing: Option<bool>,
 ) {
+    let first = reviewing.unwrap_or(false);
+    let changed = client
+        .0
+        .as_ref()
+        .is_some_and(|client| client.set_reviewing_first(first) != first);
     let was = state.0.swap(needs, std::sync::atomic::Ordering::Relaxed);
-    if needs && !was {
+    if needs && (!was || changed) {
         waker.0.notify_one();
     }
 }

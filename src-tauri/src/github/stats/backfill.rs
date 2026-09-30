@@ -224,7 +224,7 @@ impl TickOutcome {
         match self {
             // Nothing has been opened, so nothing is owed an explanation
             // yet -- but the page is still waiting rather than stopped.
-            TickOutcome::NoScope => BackfillPhase::Waiting,
+            TickOutcome::NoScope | TickOutcome::ForegroundBusy => BackfillPhase::Waiting,
             TickOutcome::Skipped { remaining } => BackfillPhase::Paused {
                 remaining: *remaining,
             },
@@ -238,6 +238,8 @@ impl TickOutcome {
 /// What a tick did, for the log and the progress stream.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TickOutcome {
+    /// Optional work yields while the user-facing queues/detail are loading.
+    ForegroundBusy,
     /// No scope has been opened, so there is nothing to walk.
     NoScope,
     /// The budget is too low, or nothing has reported one yet.
