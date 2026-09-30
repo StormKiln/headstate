@@ -546,22 +546,9 @@ pub fn build_client(token: &str) -> Result<octocrab::Octocrab, AuthError> {
         .set_connect_timeout(Some(std::time::Duration::from_secs(10)))
         .set_read_timeout(Some(std::time::Duration::from_secs(30)))
         .set_write_timeout(Some(std::time::Duration::from_secs(30)))
-        // Octocrab's default is RetryConfig::Simple(3), which retries with
-        // `future::ready(())` -- no delay at all. On a 429 that means three
-        // more requests fired instantly at a server that just said "slow
-        // down", which is the opposite of what a rate limit asks for.
-        // HandleRateLimits reads GitHub's own retry headers and waits for the
-        // refresh window instead, falling back to min_wait_seconds when the
-        // headers are absent.
-        .add_retry_config(
-            octocrab::service::middleware::retry::RetryConfig::HandleRateLimits {
-                metrics: std::sync::Arc::new(
-                    octocrab::service::middleware::retry::NoOpRateLimitMetrics,
-                ),
-                max_retries: 3,
-                min_wait_seconds: 60,
-            },
-        )
+        // Reads own a bounded, observable retry policy. The shared client
+        // must never automatically replay a GraphQL/REST write after a 5xx.
+        .add_retry_config(octocrab::service::middleware::retry::RetryConfig::None)
         .build()
         .map_err(AuthError::ClientBuild)
 }

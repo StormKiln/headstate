@@ -1478,7 +1478,13 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "docker_start" => res(blocking(commands::docker_start).await?),
         "docker_restart" => res(blocking(commands::docker_restart).await?),
         "set_view_needs_github" => {
-            commands::set_view_needs_github(a.get("needs")?, app.state(), app.state());
+            commands::set_view_needs_github(
+                a.get("needs")?,
+                app.state(),
+                app.state(),
+                app.state(),
+                a.get("reviewing")?,
+            );
             ok(())
         }
         "set_poll_interval" => ok(commands::set_poll_interval(

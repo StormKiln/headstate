@@ -1010,9 +1010,9 @@ pub const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// It must be under `MIN_FOCUSED_SECS` (60) with enough margin that a tick
 /// finishing at the ceiling still lands before its successor starts, and
-/// it must leave the FIRST fetch its full `FETCH_TIMEOUT` -- the authored
-/// list is what the UI renders, and the review queue is a notification
-/// whose loss costs nothing (`:880`). 45s gives the first fetch all 30s
+/// it must leave the FIRST fetch its full `FETCH_TIMEOUT` -- the active
+/// list is what the UI renders. The other list receives the residual budget
+/// and keeps its previous receipt if it cannot refresh. 45s gives the first fetch all 30s
 /// and the second up to 15s, and 45 < 60 holds with 15s of slack.
 ///
 /// The budget is generous on purpose for `fetch::LOAD_TIMEOUT`'s reason:
@@ -1042,6 +1042,25 @@ pub const TICK_TIMEOUT: Duration = Duration::from_secs(45);
 /// spends a rate-limit point.
 pub fn remaining_tick_budget(spent: Duration) -> Duration {
     TICK_TIMEOUT.saturating_sub(spent).min(FETCH_TIMEOUT)
+}
+
+// Sequential avoids multiplying provider contention. The selected list owns
+// the first full budget and publishes inside its callback before the next starts.
+async fn prioritized_pair<A, R, T, U>(reviewing_first: bool, authored: A, reviewing: R) -> (T, U)
+where
+    A: std::ops::AsyncFnOnce(Duration) -> T,
+    R: std::ops::AsyncFnOnce(Duration) -> U,
+{
+    let started = tokio::time::Instant::now();
+    if reviewing_first {
+        let review = reviewing(FETCH_TIMEOUT).await;
+        let own = authored(remaining_tick_budget(started.elapsed())).await;
+        (own, review)
+    } else {
+        let own = authored(FETCH_TIMEOUT).await;
+        let review = reviewing(remaining_tick_budget(started.elapsed())).await;
+        (own, review)
+    }
 }
 
 /// Wakes the poll loop out of its sleep.
@@ -1172,260 +1191,204 @@ pub fn spawn(
             // visible against the `cmd get_reviewing` bracket.
             crate::diag!("[diag] poll tick start");
             let tick_started = std::time::Instant::now();
-            // ONE deadline across BOTH fetches, not one per fetch (#844).
-            // Two independent 30s ceilings make the worst-case tick 60s,
-            // exactly `MIN_FOCUSED_SECS` -- so a hung tick overlaps its own
-            // successor, which is the regression
-            // `the_fetch_ceiling_is_under_the_shortest_poll_interval` exists
-            // to prevent. See `TICK_TIMEOUT` for why the fix is a shared
-            // deadline rather than a smaller `FETCH_TIMEOUT` or a
-            // `tokio::join!`.
-            let authored_attempt =
-                source_poll::begin(&app, Source::default(), CachedList::Authored).await;
-            let fetched =
-                match tokio::time::timeout(FETCH_TIMEOUT, client.fetch_prs_snapshot()).await {
-                    Ok(res) => res,
-                    Err(_) => Err(ClientError::Timeout(FETCH_TIMEOUT.as_secs())),
+            // Publish the active list before asking for the other list. Each
+            // collector retains completed pages inside its assigned budget.
+            let authored_work = async |budget| {
+                let authored_attempt =
+                    source_poll::begin(&app, Source::default(), CachedList::Authored).await;
+                let started = std::time::Instant::now();
+                let fetched = client.fetch_prs_snapshot_with_budget(budget).await;
+                let fetch_ms = started.elapsed().as_millis() as u64;
+                // This report is readable from a paired phone; redact the
+                // failure while retaining its timeout as a separate measure.
+                let tick_failure: Option<(String, Option<u64>)> = match &fetched {
+                    Ok(_) => None,
+                    Err(e) => Some((
+                        crate::redact::redact(&e.to_string()),
+                        match e {
+                            ClientError::Timeout(s) => Some(*s),
+                            _ => None,
+                        },
+                    )),
                 };
-            // For "Report this" (#1575): how long the search took, timeout
-            // included, before the review queue spends the rest.
-            let fetch_ms = tick_started.elapsed().as_millis() as u64;
-            let mut reviewing_outcome = "ok";
-
-            // The review queue: for the ready-to-review notification AND
-            // for the To Review page's cache.
-            //
-            // A SEPARATE request rather than `fetch_prs_and_reviewing`,
-            // which returns both but drops the total this loop needs.
-            //
-            // A failure here is NOT a tick failure: the authored list
-            // above is what the UI renders, and losing one notification
-            // must not cost the poll. That is also what makes it the right
-            // half to squeeze when the shared deadline is nearly spent.
-            let remaining = remaining_tick_budget(tick_started.elapsed());
-            // Fetched for the DATA, not only for the alert.
-            //
-            // This used to be gated on the `ready_to_review` notification
-            // preference, so a user who turned those alerts off silently
-            // turned off background refresh of the To Review list too --
-            // and the list was then only ever fetched by opening the page
-            // and waiting out a ~20s query (#1118). "Interrupt me" and
-            // "keep this current" are different questions.
-            //
-            // The preference still decides whether anything is ANNOUNCED;
-            // it no longer decides whether anything is known.
-            let reviewing_attempt =
-                source_poll::begin(&app, Source::default(), CachedList::Reviewing).await;
-            let reviewing_now = {
-                if remaining.is_zero() {
-                    // The authored fetch used the whole tick. Skipped rather
-                    // than issued with no time to answer: a request that
-                    // cannot finish still SPENDS a rate-limit point, and the
-                    // next tick is about to ask the same question with a
-                    // full budget.
-                    crate::diag!("[diag] poll reviewing skipped: tick budget spent");
-                    reviewing_outcome = "skipped";
-                    Err(source_poll::Failure {
-                        message: "Review refresh was not started: the poll budget was spent."
-                            .into(),
-                        transient: false,
-                        not_asked: true,
-                    })
+                let authored_publication = if fetched.is_ok() {
+                    source_poll::success_publication(&app, &authored_attempt).await
                 } else {
-                    match tokio::time::timeout(remaining, client.fetch_reviewing_snapshot()).await {
-                        Ok(Ok(list)) => Ok(list),
-                        Ok(Err(e)) => {
-                            crate::diag!("[diag] poll reviewing failed: {e}");
-                            reviewing_outcome = "failed";
-                            Err(source_poll::Failure::from(&e))
-                        }
-                        Err(_) => {
-                            reviewing_outcome = "timed out";
-                            crate::diag!(
-                                "[diag] poll reviewing timed out after {}ms of tick budget",
-                                remaining.as_millis()
-                            );
-                            Err(source_poll::Failure::from(&ClientError::Timeout(
-                                remaining.as_secs(),
-                            )))
-                        }
-                    }
-                }
-            };
-            crate::diag!(
-                "[diag] poll tick fetch done {}ms {}",
-                tick_started.elapsed().as_millis(),
-                match &fetched {
-                    Ok(result) => format!("ok n={} total={:?}", result.prs.len(), result.total),
-                    Err(e) => format!("err: {e}"),
-                }
-            );
-            // This report is readable from a paired phone; redact the
-            // failure while retaining its timeout as a separate measure.
-            let tick_failure: Option<(String, Option<u64>)> = match &fetched {
-                Ok(_) => None,
-                Err(e) => Some((
-                    crate::redact::redact(&e.to_string()),
-                    match e {
-                        ClientError::Timeout(s) => Some(*s),
-                        _ => None,
-                    },
-                )),
-            };
-            // Each successful queue survives a failure from the other queue.
-            let review_publication = if reviewing_now.is_ok() {
-                source_poll::success_publication(&app, &reviewing_attempt).await
-            } else {
-                source_poll::publication(&app, &reviewing_attempt).await
-            };
-            if let Some(publication) = review_publication {
-                match reviewing_now {
-                    Ok(now) => {
-                        let prefs = read_notify_prefs(&app).await;
-                        if let Some(before) = &previous_reviewing {
-                            for b in newly_ready(before, &now.prs) {
+                    source_poll::publication(&app, &authored_attempt).await
+                };
+                if let Some(publication) = authored_publication {
+                    match fetched {
+                        Ok(result) => {
+                            let receipt = result.clone();
+                            let FetchedList {
+                                prs,
+                                total,
+                                coverage,
+                            } = result;
+                            // Compare against the tick before this one. `previous`
+                            // starts empty, so the first tick never notifies --
+                            // otherwise launching with 13 broken PRs would fire 13
+                            // notifications at once.
+                            // Read per tick rather than cached at startup, so a
+                            // setting change takes effect on the next poll
+                            // instead of at the next relaunch. A failed read
+                            // falls back to the default (everything on), which
+                            // is what the app did before the setting existed.
+                            let prefs = read_notify_prefs(&app).await;
+                            for b in newly_broken(&previous, &prs) {
                                 if prefs.wants(b.kind) {
                                     notify_breakage(&app, &b);
                                 }
                             }
-                        }
-                        persist_reviewing(&app, &now).await;
-                        emit_reviewing(&app, &now);
-                        let complete = matches!(now.coverage, Coverage::Complete);
-                        previous_reviewing = complete.then(|| now.prs.clone());
-                        source_poll::complete(&app, publication, Ok(now));
-                    }
-                    Err(error) => source_poll::complete(&app, publication, Err(error)),
-                }
-            }
-            let authored_publication = if fetched.is_ok() {
-                source_poll::success_publication(&app, &authored_attempt).await
-            } else {
-                source_poll::publication(&app, &authored_attempt).await
-            };
-            if let Some(publication) = authored_publication {
-                match fetched {
-                    Ok(result) => {
-                        let receipt = result.clone();
-                        let FetchedList {
-                            prs,
-                            total,
-                            coverage,
-                        } = result;
-                        // Compare against the tick before this one. `previous`
-                        // starts empty, so the first tick never notifies --
-                        // otherwise launching with 13 broken PRs would fire 13
-                        // notifications at once.
-                        // Read per tick rather than cached at startup, so a
-                        // setting change takes effect on the next poll
-                        // instead of at the next relaunch. A failed read
-                        // falls back to the default (everything on), which
-                        // is what the app did before the setting existed.
-                        let prefs = read_notify_prefs(&app).await;
-                        for b in newly_broken(&previous, &prs) {
-                            if prefs.wants(b.kind) {
-                                notify_breakage(&app, &b);
-                            }
-                        }
-                        // Newly APPEARED pull requests (#789).
-                        //
-                        // Gated on `had_a_tick` rather than on `previous`
-                        // being non-empty, and that distinction is the whole
-                        // of the first-tick suppression. `previous` starts
-                        // EMPTY, so `!previous.is_empty()` would be false on
-                        // the first tick and also false on the first tick of
-                        // a user whose last pull request merged -- and the
-                        // second of those is a real empty list whose next
-                        // arrival IS news. A separate flag says "we have
-                        // compared at least once", which is the actual
-                        // question.
-                        //
-                        // `newly_broken` above needs no such guard: it never
-                        // fires for a pull request absent from `previous`, so
-                        // an empty previous list announces nothing by
-                        // construction. This rule is the opposite shape --
-                        // absent means new -- so it needs the flag.
-                        if had_a_tick {
-                            for b in newly_appeared(&previous, &prs) {
-                                if prefs.wants(b.kind) {
-                                    notify_breakage(&app, &b);
+                            // Newly APPEARED pull requests (#789).
+                            //
+                            // Gated on `had_a_tick` rather than on `previous`
+                            // being non-empty, and that distinction is the whole
+                            // of the first-tick suppression. `previous` starts
+                            // EMPTY, so `!previous.is_empty()` would be false on
+                            // the first tick and also false on the first tick of
+                            // a user whose last pull request merged -- and the
+                            // second of those is a real empty list whose next
+                            // arrival IS news. A separate flag says "we have
+                            // compared at least once", which is the actual
+                            // question.
+                            //
+                            // `newly_broken` above needs no such guard: it never
+                            // fires for a pull request absent from `previous`, so
+                            // an empty previous list announces nothing by
+                            // construction. This rule is the opposite shape --
+                            // absent means new -- so it needs the flag.
+                            if had_a_tick {
+                                for b in newly_appeared(&previous, &prs) {
+                                    if prefs.wants(b.kind) {
+                                        notify_breakage(&app, &b);
+                                    }
                                 }
                             }
-                        }
-                        had_a_tick = matches!(coverage, Coverage::Complete);
+                            had_a_tick = matches!(coverage, Coverage::Complete);
 
-                        previous = prs.clone();
-                        // Null replaces stale numeric advice with unknown completeness.
-                        let truncated =
-                            total.map(|total| truncation_payload(prs.len() as u64, total));
-                        if let Err(e) = app.emit("prs-truncated", truncated) {
-                            log::warn!("failed to emit prs-truncated: {e}");
-                        }
-                        // The heartbeat that makes "it stopped updating"
-                        // answerable: if the log ends here, the loop died or
-                        // the machine slept; if it keeps ticking, the problem
-                        // is downstream. Counts only -- never titles, never
-                        // repository names.
-                        log::info!(
-                            "poll ok: {} open, {} need attention (matching total: {total:?})",
-                            prs.len(),
-                            needs_attention_count(&prs)
-                        );
-                        // Fields GitHub refused on this fetch, then cleared:
-                        // a later complete response must stop reporting a
-                        // shortfall that no longer exists. Emitted even when
-                        // zero, so the banner disappears on recovery rather
-                        // than sticking until relaunch.
-                        let refused =
-                            crate::github::client::REFUSED_FIELDS.swap(0, Ordering::Relaxed);
-                        if let Err(e) = app.emit("prs-incomplete", refused) {
-                            log::warn!("failed to emit prs-incomplete: {e}");
-                        }
-
-                        consecutive_failures = 0;
-                        persist_and_emit(&app, &prs, coverage.clone()).await;
-                        let _ = app.emit("poll-state", tick_state(None));
-                        source_poll::complete(&app, publication, Ok(receipt));
-                        if has_checking(&prs) {
-                            spawn_recheck(app.clone(), client.clone(), prs, authored_attempt);
-                        }
-                    }
-                    // A failed poll leaves the last snapshot in place rather
-                    // than blanking the UI; the next tick retries.
-                    Err(e) => {
-                        log::warn!("poll failed: {e}");
-                        consecutive_failures += 1;
-                        let surfaced = should_surface(&e, consecutive_failures);
-                        if surfaced {
-                            if let Err(emit_err) = app.emit("poll-error", e.to_string()) {
-                                log::warn!("failed to emit poll-error: {emit_err}");
+                            previous = prs.clone();
+                            // Null replaces stale numeric advice with unknown completeness.
+                            let truncated =
+                                total.map(|total| truncation_payload(prs.len() as u64, total));
+                            if let Err(e) = app.emit("prs-truncated", truncated) {
+                                log::warn!("failed to emit prs-truncated: {e}");
                             }
-                        } else {
+                            // The heartbeat that makes "it stopped updating"
+                            // answerable: if the log ends here, the loop died or
+                            // the machine slept; if it keeps ticking, the problem
+                            // is downstream. Counts only -- never titles, never
+                            // repository names.
                             log::info!(
+                                "poll ok: {} open, {} need attention (matching total: {total:?})",
+                                prs.len(),
+                                needs_attention_count(&prs)
+                            );
+                            // Fields GitHub refused on this fetch, then cleared:
+                            // a later complete response must stop reporting a
+                            // shortfall that no longer exists. Emitted even when
+                            // zero, so the banner disappears on recovery rather
+                            // than sticking until relaunch.
+                            let refused =
+                                crate::github::client::REFUSED_FIELDS.swap(0, Ordering::Relaxed);
+                            if let Err(e) = app.emit("prs-incomplete", refused) {
+                                log::warn!("failed to emit prs-incomplete: {e}");
+                            }
+
+                            consecutive_failures = 0;
+                            persist_and_emit(&app, &prs, coverage.clone()).await;
+                            let _ = app.emit("poll-state", tick_state(None));
+                            source_poll::complete(&app, publication, Ok(receipt));
+                            if has_checking(&prs) {
+                                spawn_recheck(app.clone(), client.clone(), prs, authored_attempt);
+                            }
+                        }
+                        // A failed poll leaves the last snapshot in place rather
+                        // than blanking the UI; the next tick retries.
+                        Err(e) => {
+                            log::warn!("poll failed: {e}");
+                            consecutive_failures += 1;
+                            let surfaced = should_surface(&e, consecutive_failures);
+                            if surfaced {
+                                if let Err(emit_err) = app.emit("poll-error", e.to_string()) {
+                                    log::warn!("failed to emit poll-error: {emit_err}");
+                                }
+                            } else {
+                                log::info!(
                             "not surfacing a transient failure ({consecutive_failures} in a row); \
                              the next tick should recover"
                         );
-                            // The bar has nothing else to go on: no
-                            // poll-error and no prs-updated on a suppressed
-                            // failure, so it would otherwise show a green
-                            // "Up to date" while the data is stale.
-                            //
-                            // Recorded rather than emitted here: the terminal
-                            // emit below runs on EVERY tick, so emitting
-                            // "retrying" at this point would be overwritten by
-                            // it microseconds later and the bar would settle on
-                            // green anyway -- the exact bug this branch exists
-                            // to prevent (#1104).
+                                // The bar has nothing else to go on: no
+                                // poll-error and no prs-updated on a suppressed
+                                // failure, so it would otherwise show a green
+                                // "Up to date" while the data is stale.
+                                //
+                                // Recorded rather than emitted here: the terminal
+                                // emit below runs on EVERY tick, so emitting
+                                // "retrying" at this point would be overwritten by
+                                // it microseconds later and the bar would settle on
+                                // green anyway -- the exact bug this branch exists
+                                // to prevent (#1104).
+                            }
+                            let _ = app.emit("poll-state", tick_state(Some(surfaced)));
+                            source_poll::complete(
+                                &app,
+                                publication,
+                                Err(source_poll::Failure::from(&e)),
+                            );
                         }
-                        let _ = app.emit("poll-state", tick_state(Some(surfaced)));
-                        source_poll::complete(
-                            &app,
-                            publication,
-                            Err(source_poll::Failure::from(&e)),
-                        );
                     }
                 }
-            }
+                (fetch_ms, tick_failure)
+            };
+            let reviewing_work = async |budget| {
+                let reviewing_attempt =
+                    source_poll::begin(&app, Source::default(), CachedList::Reviewing).await;
+                let reviewing_now = client
+                    .fetch_reviewing_snapshot_with_budget(budget)
+                    .await
+                    .map_err(|e| source_poll::Failure::from(&e));
+                let reviewing_outcome = if reviewing_now.is_ok() {
+                    "ok"
+                } else {
+                    "failed"
+                };
+                // Each successful queue survives a failure from the other queue.
+                let review_publication = if reviewing_now.is_ok() {
+                    source_poll::success_publication(&app, &reviewing_attempt).await
+                } else {
+                    source_poll::publication(&app, &reviewing_attempt).await
+                };
+                if let Some(publication) = review_publication {
+                    match reviewing_now {
+                        Ok(now) => {
+                            let prefs = read_notify_prefs(&app).await;
+                            if let Some(before) = &previous_reviewing {
+                                for b in newly_ready(before, &now.prs) {
+                                    if prefs.wants(b.kind) {
+                                        notify_breakage(&app, &b);
+                                    }
+                                }
+                            }
+                            persist_reviewing(&app, &now).await;
+                            emit_reviewing(&app, &now);
+                            let complete = matches!(now.coverage, Coverage::Complete);
+                            previous_reviewing = complete.then(|| now.prs.clone());
+                            source_poll::complete(&app, publication, Ok(now));
+                        }
+                        Err(error) => source_poll::complete(&app, publication, Err(error)),
+                    }
+                }
+                reviewing_outcome
+            };
+            let ((fetch_ms, tick_failure), reviewing_outcome) =
+                prioritized_pair(client.reviewing_first(), authored_work, reviewing_work).await;
+            crate::diag!(
+                "[diag] poll tick fetch done {}ms authored_ok={} reviewing={}",
+                tick_started.elapsed().as_millis(),
+                tick_failure.is_none(),
+                reviewing_outcome
+            );
             let ok = tick_failure.is_none();
             let (error, timed_out_after_secs) = tick_failure.unzip();
             crate::report::record_tick(crate::report::PollTickRecord {
@@ -1629,6 +1592,10 @@ async fn backfill_tick(app: &AppHandle, client: &Arc<GitHubClient>) -> Tick {
     // opposite of `Budget::permits`' arm, because nobody is waiting for
     // this and an unknown budget costs one minute rather than a user's
     // first click.
+    if client.has_interactive_reads() {
+        crate::diag!("[diag] stats backfill deferred: user-facing read active");
+        return TickOutcome::ForegroundBusy.into();
+    }
     let observed = crate::github::stats::budget::observed_remaining();
     if !bf::affordable(observed, bf::TICK_PROJECTION) {
         // Logged, not just returned: this gate fires BEFORE any request,
@@ -2278,6 +2245,51 @@ mod tests {
             _ = n.notified() => {}
         }
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn selected_review_queue_publishes_before_slow_authored_work() {
+        let published = std::sync::Mutex::new(Vec::new());
+        let started = tokio::time::Instant::now();
+        let (authored_ok, reviewing_ok) = prioritized_pair(
+            true,
+            async |budget| {
+                assert_eq!(published.lock().unwrap().as_slice(), &["reviewing"]);
+                assert_eq!(budget, Duration::from_secs(25));
+                tokio::time::sleep(budget).await;
+                false
+            },
+            async |budget| {
+                assert_eq!(budget, FETCH_TIMEOUT);
+                tokio::time::sleep(Duration::from_secs(20)).await;
+                published.lock().unwrap().push("reviewing");
+                true
+            },
+        )
+        .await;
+        assert!(!authored_ok && reviewing_ok);
+        assert_eq!(started.elapsed(), TICK_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn selected_authored_queue_keeps_its_full_budget() {
+        let published = std::sync::Mutex::new(Vec::new());
+        let (authored_ok, reviewing_ok) = prioritized_pair(
+            false,
+            async |budget| {
+                assert_eq!(budget, FETCH_TIMEOUT);
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                published.lock().unwrap().push("authored");
+                true
+            },
+            async |budget| {
+                assert_eq!(published.lock().unwrap().as_slice(), &["authored"]);
+                assert_eq!(budget, Duration::from_secs(15));
+                false
+            },
+        )
+        .await;
+        assert!(authored_ok && !reviewing_ok);
     }
 
     /// A hung request must collapse into the error arm rather than

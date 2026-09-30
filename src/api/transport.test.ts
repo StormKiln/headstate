@@ -262,7 +262,7 @@ const ROWS: Row[] = [
   row(api.fetchRefs, [path], "fetch_refs", { path }),
   row(api.removeOrphan, [path], "remove_orphan", { path }),
   row(api.removeWorktree, [repoPath, worktreePath], "remove_worktree", { repoPath, worktreePath }),
-  row(api.setViewNeedsGithub, [needs], "set_view_needs_github", { needs }),
+  row(api.setViewNeedsGithub, [needs], "set_view_needs_github", { needs, reviewing: false }),
   row(api.getWorktreeDirs, [], "get_worktree_dirs"),
   row(api.setWorktreeDirs, [dirs], "set_worktree_dirs", { dirs }),
   row(api.getPollInterval, [], "get_poll_interval"),

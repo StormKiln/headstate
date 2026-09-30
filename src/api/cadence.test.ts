@@ -13,19 +13,19 @@ describe("useViewCadence", () => {
   it("tells the loop a PR view needs live data", () => {
     setNeeds.mockClear();
     renderHook(() => useViewCadence("my-prs"));
-    expect(setNeeds).toHaveBeenCalledWith(true);
+    expect(setNeeds).toHaveBeenCalledWith(true, false);
   });
 
   it("tells the loop the worktrees view does not", () => {
     setNeeds.mockClear();
     renderHook(() => useViewCadence("worktrees"));
-    expect(setNeeds).toHaveBeenCalledWith(false);
+    expect(setNeeds).toHaveBeenCalledWith(false, false);
   });
 
   it("treats the review view as needing live data", () => {
     setNeeds.mockClear();
     renderHook(() => useViewCadence("to-review"));
-    expect(setNeeds).toHaveBeenCalledWith(true);
+    expect(setNeeds).toHaveBeenCalledWith(true, true);
   });
 
   // Cadence is an optimisation; failing to set it must never break the

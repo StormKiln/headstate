@@ -15,11 +15,21 @@ use super::query::{
     PR_DETAIL_QUERY, STATS_QUERY,
 };
 use chrono::{DateTime, Duration, Utc};
+use futures_util::{stream, StreamExt};
 use octocrab::Octocrab;
 use serde_json::json;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
+};
+use tokio::{sync::Mutex, time::Instant};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
+    #[error("GitHub did not confirm the change. It may have succeeded; refresh and check its state before trying again.")]
+    UnconfirmedWrite,
+    #[error("{0}")]
+    Shared(Arc<ClientError>),
     #[error("GitHub request failed: {0}")]
     Api(#[from] octocrab::Error),
     /// GitHub answered with something that is not JSON.
@@ -91,6 +101,22 @@ pub enum ClientError {
 }
 
 impl ClientError {
+    // Preserve typed refusals/timeouts for callers; only octocrab's non-Clone
+    // transport error needs an Arc wrapper when an in-flight result is shared.
+    fn shared(error: Arc<Self>) -> Self {
+        match error.as_ref() {
+            Self::Shared(inner) => Self::shared(inner.clone()),
+            Self::Api(_) => Self::Shared(error),
+            Self::NotJson(message) => Self::NotJson(message.clone()),
+            Self::Join(message) => Self::Join(message.clone()),
+            Self::Timeout(seconds) => Self::Timeout(*seconds),
+            Self::Graphql(message) => Self::Graphql(message.clone()),
+            Self::RateLimited(message) => Self::RateLimited(message.clone()),
+            Self::TokenRejected { said } => Self::TokenRejected { said: said.clone() },
+            Self::UnconfirmedWrite => Self::UnconfirmedWrite,
+        }
+    }
+
     /// Whether waiting is likely to fix this on its own.
     ///
     /// Transport failures are the common case and almost always recover:
@@ -105,6 +131,8 @@ impl ClientError {
     /// rather than chase a network fault.
     pub fn is_transient(&self) -> bool {
         match self {
+            Self::Shared(error) => error.is_transient(),
+            Self::UnconfirmedWrite => false,
             // The request never reached GitHub, or the response never
             // came back. Retrying is exactly the right response.
             ClientError::Timeout(_) => true,
@@ -134,6 +162,33 @@ impl ClientError {
 /// dropped connection surfaces as -- the "client error (SendRequest)"
 /// the banner was showing. An HTTP status means GitHub answered, which is
 /// a different situation even when the status is a server error.
+// Invalidate read receipts on entry and on every exit, including cancellation.
+struct MutationEpoch<'a>(&'a AtomicU64);
+impl<'a> MutationEpoch<'a> {
+    fn new(generation: &'a AtomicU64) -> Self {
+        generation.fetch_add(1, Ordering::AcqRel);
+        Self(generation)
+    }
+}
+impl Drop for MutationEpoch<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+fn write_error(error: octocrab::Error) -> ClientError {
+    if is_transport_error(&error) {
+        ClientError::UnconfirmedWrite
+    } else if matches!(&error, octocrab::Error::GitHub { source, .. } if source.status_code.as_u16() == 401)
+    {
+        ClientError::TokenRejected {
+            said: "HTTP 401".into(),
+        }
+    } else {
+        ClientError::Api(error)
+    }
+}
+
 fn is_transport_error(e: &octocrab::Error) -> bool {
     match e {
         octocrab::Error::Service { .. } | octocrab::Error::Hyper { .. } => true,
@@ -253,6 +308,7 @@ const REVIEW_REQUESTED: &str = "is:pr is:open review-requested:@me";
 /// malformed query means "asking again changes nothing".
 fn server_gave_up(e: &ClientError) -> bool {
     match e {
+        ClientError::Shared(error) => server_gave_up(error),
         ClientError::NotJson(_) => true,
         ClientError::Api(octocrab::Error::GitHub { source, .. }) => {
             source.status_code.is_server_error()
@@ -268,7 +324,40 @@ fn server_gave_up(e: &ClientError) -> bool {
 #[derive(Clone)]
 pub struct GitHubClient {
     octocrab: Octocrab,
+    searches: Arc<Searches>,
+    read_transport: Arc<super::read_transport::ReadTransport>,
 }
+
+// Client-local: separate accounts never share a result. Only callers which
+// overlapped an operation share its answer; a later refresh always asks again.
+type SearchAnswer = Result<serde_json::Value, Arc<ClientError>>;
+type SearchReceipt = Option<(Instant, u64, SearchAnswer)>;
+type DetailReceipt = Option<(Instant, u64, Result<PrDetail, Arc<ClientError>>)>;
+type ReadSlots<K, V> = std::sync::Mutex<std::collections::HashMap<K, std::sync::Weak<Mutex<V>>>>;
+#[derive(Default)]
+struct Searches {
+    lists: ReadSlots<(bool, u64), SearchReceipt>,
+    generation: AtomicU64,
+    reviewing_first: AtomicBool,
+    detail_reads: AtomicU64,
+    queue_reads: AtomicU64,
+    details: ReadSlots<(String, u64, u64), DetailReceipt>,
+}
+
+struct ActiveRead<'a>(&'a AtomicU64);
+impl<'a> ActiveRead<'a> {
+    fn new(count: &'a AtomicU64) -> Self {
+        count.fetch_add(1, Ordering::Relaxed);
+        Self(count)
+    }
+}
+impl Drop for ActiveRead<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+const SEARCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+const SEARCH_CONCURRENCY: usize = 3;
 
 /// How many fields GitHub refused on the last request, or 0.
 ///
@@ -325,7 +414,11 @@ fn list_evidence(v: &serde_json::Value, prs: Vec<PullRequest>) -> FetchedList {
 
 impl GitHubClient {
     pub fn new(octocrab: Octocrab) -> Self {
-        Self { octocrab }
+        Self {
+            octocrab,
+            searches: Arc::new(Searches::default()),
+            read_transport: Arc::default(),
+        }
     }
 
     /// Run a GraphQL document, keeping `data` on a PARTIAL success.
@@ -347,71 +440,113 @@ impl GitHubClient {
         &self,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, ClientError> {
-        graphql_partial_ok(&self.octocrab, body).await
+        graphql_with_transport(&self.octocrab, body, &self.read_transport).await
     }
 
-    /// One attempt at the PR query, then a smaller one if GitHub gave up.
-    ///
-    /// MEASURED against the live API: `first: 100` costs 6 rate-limit
-    /// points and ~6s; `first: 50` costs 3 and ~4s. On an account whose
-    /// pull requests carry many labels and review threads, the full page
-    /// makes GitHub time out resolving nested fields -- it answers 502,
-    /// or 200 with `RESOURCE_LIMITS_EXCEEDED` errors alongside partial
-    /// data.
-    ///
-    /// A reported log showed EVERY poll failing that way for over an
-    /// hour, so the list never populated at all. Half a list beats none:
-    /// the truncation is already surfaced by `prs-truncated`, so the UI
-    /// says "showing 50 of N" rather than quietly claiming that is
-    /// everything.
-    ///
-    /// Only ONE retry, and only when the failure says the server gave
-    /// up. Retrying a 401 or a malformed query would just spend the
-    /// budget twice for the same answer.
-    /// One search, with a smaller page if GitHub gives up on the first.
-    ///
-    /// The retry is only for a failure that means the SERVER gave up --
-    /// a 5xx or an unparseable body. A 401 or a malformed query means
-    /// asking again changes nothing and would spend the budget twice.
+    /// Share overlapping equivalent searches, with a deadline that includes
+    /// waiting for an existing load. No spawned tasks survive cancellation.
     async fn search_page_with_fallback(
         &self,
         query: &str,
     ) -> Result<serde_json::Value, ClientError> {
+        self.search_with_budget(query, SEARCH_BUDGET).await
+    }
+
+    async fn search_with_budget(
+        &self,
+        query: &str,
+        budget: std::time::Duration,
+    ) -> Result<serde_json::Value, ClientError> {
+        let started = Instant::now();
+        let deadline = started + budget;
+        let generation = self.searches.generation.load(Ordering::Acquire);
+        let _active = ActiveRead::new(&self.searches.queue_reads);
+        let slot = {
+            let mut active = self
+                .searches
+                .lists
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            active.retain(|_, weak| weak.strong_count() > 0);
+            let key = (query == REVIEW_REQUESTED, generation);
+            if let Some(slot) = active.get(&key).and_then(std::sync::Weak::upgrade) {
+                slot
+            } else {
+                let slot = Arc::new(Mutex::new(None));
+                active.insert(key, Arc::downgrade(&slot));
+                slot
+            }
+        };
+        let mut receipt = tokio::time::timeout_at(deadline, slot.lock())
+            .await
+            .map_err(|_| ClientError::Timeout(budget.as_secs()))?;
+        if let Some((completed, previous_generation, result)) = receipt.as_ref() {
+            if *completed >= started && *previous_generation == generation {
+                crate::diag!(
+                    "[diag] queue search shared elapsed_ms={}",
+                    started.elapsed().as_millis()
+                );
+                return result.clone().map_err(ClientError::shared);
+            }
+        }
+        let result = self
+            .collect_search_pages(query, deadline, budget)
+            .await
+            .map_err(Arc::new);
+        *receipt = Some((Instant::now(), generation, result.clone()));
+        result.map_err(ClientError::shared)
+    }
+
+    pub fn set_reviewing_first(&self, reviewing: bool) -> bool {
+        self.searches
+            .reviewing_first
+            .swap(reviewing, Ordering::Relaxed)
+    }
+
+    pub fn has_interactive_reads(&self) -> bool {
+        self.searches.detail_reads.load(Ordering::Relaxed) > 0
+            || self.searches.queue_reads.load(Ordering::Relaxed) > 0
+    }
+
+    pub fn reviewing_first(&self) -> bool {
+        self.searches.reviewing_first.load(Ordering::Relaxed)
+    }
+
+    async fn collect_search_pages(
+        &self,
+        query: &str,
+        deadline: Instant,
+        budget: std::time::Duration,
+    ) -> Result<serde_json::Value, ClientError> {
         // First page at PAGE_SIZE, which also tells us the true total.
-        let first = self.search_page(query, PAGE_SIZE, None).await?;
+        let first = tokio::time::timeout_at(deadline, self.search_page(query, PAGE_SIZE, None))
+            .await
+            .map_err(|_| ClientError::Timeout(budget.as_secs()))??;
         let total = first["authored"]["issueCount"].as_u64().unwrap_or(0) as u32;
         if total <= PAGE_SIZE {
             return Ok(first);
         }
 
-        // The REST of the pages, all at once.
-        //
-        // Search cursors are base64 of `cursor:<offset>` -- verified
-        // against the live API: a constructed `cursor:25` returns
-        // exactly the items a `first: 27` query has at positions 26-27.
-        // That means pages do not have to be chained; they can be
-        // requested simultaneously, and GitHub shows no contention
-        // between concurrent queries.
         let pages = total.div_ceil(PAGE_SIZE).min(MAX_PAGES);
-        // Issued together, awaited together. `join_all` would need
-        // another crate; a Vec of futures polled by `select`-free
-        // sequential await would serialise them, which is the thing this
-        // exists to avoid. Spawning is what actually overlaps them.
-        let mut handles = Vec::new();
-        for i in 1..pages {
-            let cursor = offset_cursor(i * PAGE_SIZE);
-            let q = query.to_string();
-            let client = self.clone();
-            handles.push(tokio::spawn(async move {
-                client.search_page(&q, PAGE_SIZE, Some(cursor)).await
-            }));
-        }
+        // Futures owned by the collector are canceled on drop. A bounded
+        // stream also prevents a large queue from flooding the provider.
+        let mut pending = stream::iter(1..pages)
+            .map(|i| self.search_page(query, PAGE_SIZE, Some(offset_cursor(i * PAGE_SIZE))))
+            .buffer_unordered(SEARCH_CONCURRENCY);
         let mut rest = Vec::new();
-        for h in handles {
-            rest.push(h.await.unwrap_or(Err(ClientError::Graphql(
-                "a search page did not complete".into(),
-            ))));
+        while let Ok(Some(page)) = tokio::time::timeout_at(deadline, pending.next()).await {
+            rest.push(page);
         }
+        let missing = pages.saturating_sub(1 + rest.len() as u32);
+        for _ in 0..missing {
+            rest.push(Err(ClientError::Timeout(budget.as_secs())));
+        }
+        crate::diag!(
+            "[diag] queue pages planned={} completed={} deadline_missing={}",
+            pages,
+            pages - missing,
+            missing
+        );
 
         let mut merged = first;
         // How many pages failed outright, and the truest total any page
@@ -607,6 +742,14 @@ impl GitHubClient {
     }
 
     pub async fn fetch_reviewing_snapshot(&self) -> Result<FetchedList, ClientError> {
+        self.fetch_reviewing_snapshot_with_budget(SEARCH_BUDGET)
+            .await
+    }
+
+    pub async fn fetch_reviewing_snapshot_with_budget(
+        &self,
+        budget: std::time::Duration,
+    ) -> Result<FetchedList, ClientError> {
         // Its OWN request, not both lists. It used to call
         // `fetch_prs_and_reviewing`, so opening To review paid for the
         // authored list as well -- and on a reported account with 40
@@ -621,7 +764,7 @@ impl GitHubClient {
         // the test suite it raced other tests.
         // DIAGNOSTIC LOGGING (Settings > diagnostic log).
         let started = std::time::Instant::now();
-        let v = self.search_page_with_fallback(REVIEW_REQUESTED).await?;
+        let v = self.search_with_budget(REVIEW_REQUESTED, budget).await?;
         // Counted from THIS response, not from shared state. A global
         // counter raced the next poll -- and, in the test suite, other
         // tests running in parallel.
@@ -773,8 +916,20 @@ impl GitHubClient {
     /// bytes and discards them rather than trying to deserialise
     /// nothing, which is what a plain `post::<_, T>` would do and fail.
     pub(super) async fn rest_post(&self, path: &str) -> Result<(), ClientError> {
-        self.octocrab._post(path, None::<&()>).await?;
-        Ok(())
+        let _epoch = MutationEpoch::new(&self.searches.generation);
+        tokio::time::timeout(SEARCH_BUDGET, async {
+            let response = self
+                .octocrab
+                ._post(path, None::<&()>)
+                .await
+                .map_err(write_error)?;
+            octocrab::map_github_error(response)
+                .await
+                .map_err(write_error)?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| ClientError::UnconfirmedWrite)?
     }
 
     /// A REST POST that CARRIES a body and returns the response.
@@ -787,16 +942,25 @@ impl GitHubClient {
         path: &str,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, ClientError> {
-        let response = self.octocrab._post(path, Some(body)).await?;
-        // `_post` returns the raw response; the JSON has to be read from
-        // it. A body that will not parse is an error rather than an
-        // empty object: silently returning nothing would lose the URL
-        // and look like success.
-        let parsed: serde_json::Value = self.octocrab.body_to_string(response).await.map_or_else(
-            |_| serde_json::Value::Null,
-            |text| serde_json::from_str(&text).unwrap_or(serde_json::Value::Null),
-        );
-        Ok(parsed)
+        let _epoch = MutationEpoch::new(&self.searches.generation);
+        tokio::time::timeout(SEARCH_BUDGET, async {
+            let response = self
+                .octocrab
+                ._post(path, Some(body))
+                .await
+                .map_err(write_error)?;
+            let response = octocrab::map_github_error(response)
+                .await
+                .map_err(write_error)?;
+            let text = self
+                .octocrab
+                .body_to_string(response)
+                .await
+                .map_err(write_error)?;
+            serde_json::from_str(&text).map_err(|_| ClientError::UnconfirmedWrite)
+        })
+        .await
+        .map_err(|_| ClientError::UnconfirmedWrite)?
     }
 
     /// A REST GET, metered into `budget`, returning the parsed body (#1451).
@@ -826,16 +990,7 @@ impl GitHubClient {
         path: &str,
         budget: &crate::github::stats::Budget,
     ) -> Result<serde_json::Value, ClientError> {
-        let response = self.octocrab._get(path).await?;
-        let remaining = response
-            .headers()
-            .get("x-ratelimit-remaining")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse::<u64>().ok());
-        budget.record_rest(remaining);
-        let response = octocrab::map_github_error(response).await?;
-        let text = self.octocrab.body_to_string(response).await?;
-        serde_json::from_str(&text).map_err(|_| ClientError::NotJson("non-JSON body".into()))
+        self.read_transport.get(&self.octocrab, path, budget).await
     }
 
     /// A REST PUT with a JSON body, metered into `budget`, returning the
@@ -857,19 +1012,35 @@ impl GitHubClient {
         body: &serde_json::Value,
         budget: &crate::github::stats::Budget,
     ) -> Result<(u16, serde_json::Value), ClientError> {
-        let response = self.octocrab._put(path, Some(body)).await?;
-        let remaining = response
-            .headers()
-            .get("x-ratelimit-remaining")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse::<u64>().ok());
-        budget.record_rest(remaining);
-        let status = response.status().as_u16();
-        let text = self.octocrab.body_to_string(response).await?;
-        Ok((
-            status,
-            serde_json::from_str(&text).unwrap_or(serde_json::Value::Null),
-        ))
+        let _epoch = MutationEpoch::new(&self.searches.generation);
+        tokio::time::timeout(SEARCH_BUDGET, async {
+            let response = self
+                .octocrab
+                ._put(path, Some(body))
+                .await
+                .map_err(write_error)?;
+            let remaining = response
+                .headers()
+                .get("x-ratelimit-remaining")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok());
+            budget.record_rest(remaining);
+            let status = response.status().as_u16();
+            if status >= 500 {
+                return Err(ClientError::UnconfirmedWrite);
+            }
+            let text = self
+                .octocrab
+                .body_to_string(response)
+                .await
+                .map_err(write_error)?;
+            Ok((
+                status,
+                serde_json::from_str(&text).unwrap_or(serde_json::Value::Null),
+            ))
+        })
+        .await
+        .map_err(|_| ClientError::UnconfirmedWrite)?
     }
 
     /// Like `graphql_mutation`, but hands back the `data` object.
@@ -896,7 +1067,25 @@ impl GitHubClient {
         &self,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, ClientError> {
-        let raw: serde_json::Value = self.octocrab.post("/graphql", Some(body)).await?;
+        let _epoch = MutationEpoch::new(&self.searches.generation);
+        let started = std::time::Instant::now();
+        let posted =
+            tokio::time::timeout(SEARCH_BUDGET, self.octocrab.post("/graphql", Some(body))).await;
+        crate::diag!(
+            "[diag] provider mutation elapsed_ms={} acknowledged={}",
+            started.elapsed().as_millis(),
+            matches!(&posted, Ok(Ok(_)))
+        );
+        let raw: serde_json::Value = match posted {
+            Ok(Ok(value)) => value,
+            Ok(Err(error)) => {
+                if is_transport_error(&error) {
+                    return Err(ClientError::UnconfirmedWrite);
+                }
+                return Err(ClientError::Api(error));
+            }
+            Err(_) => return Err(ClientError::UnconfirmedWrite),
+        };
 
         if let Some(errs) = raw.get("errors").and_then(|e| e.as_array()) {
             if !errs.is_empty() {
@@ -936,6 +1125,47 @@ impl GitHubClient {
     /// `repo` is `owner/name`; it is split here rather than by the caller
     /// so a malformed value fails in one place with a clear message.
     pub async fn fetch_pr_detail(&self, repo: &str, number: u64) -> Result<PrDetail, ClientError> {
+        let _active = ActiveRead::new(&self.searches.detail_reads);
+        let started = Instant::now();
+        let generation = self.searches.generation.load(Ordering::Acquire);
+        let slot = {
+            let mut active = self
+                .searches
+                .details
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            active.retain(|_, weak| weak.strong_count() > 0);
+            let key = (repo.to_string(), number, generation);
+            if let Some(slot) = active.get(&key).and_then(std::sync::Weak::upgrade) {
+                slot
+            } else {
+                let slot = Arc::new(Mutex::new(None));
+                active.insert(key, Arc::downgrade(&slot));
+                slot
+            }
+        };
+        let deadline = started + SEARCH_BUDGET;
+        let mut receipt = tokio::time::timeout_at(deadline, slot.lock())
+            .await
+            .map_err(|_| ClientError::Timeout(SEARCH_BUDGET.as_secs()))?;
+        if let Some((completed, previous_generation, result)) = receipt.as_ref() {
+            if *completed >= started && *previous_generation == generation {
+                return result.clone().map_err(ClientError::shared);
+            }
+        }
+        let result = tokio::time::timeout_at(deadline, self.fetch_pr_detail_uncached(repo, number))
+            .await
+            .unwrap_or(Err(ClientError::Timeout(SEARCH_BUDGET.as_secs())))
+            .map_err(Arc::new);
+        *receipt = Some((Instant::now(), generation, result.clone()));
+        result.map_err(ClientError::shared)
+    }
+
+    async fn fetch_pr_detail_uncached(
+        &self,
+        repo: &str,
+        number: u64,
+    ) -> Result<PrDetail, ClientError> {
         let (owner, name) = repo
             .split_once('/')
             .ok_or_else(|| ClientError::Graphql(format!("malformed repository: {repo}")))?;
@@ -1238,8 +1468,15 @@ impl GitHubClient {
     }
 
     pub async fn fetch_prs_snapshot(&self) -> Result<FetchedList, ClientError> {
+        self.fetch_prs_snapshot_with_budget(SEARCH_BUDGET).await
+    }
+
+    pub async fn fetch_prs_snapshot_with_budget(
+        &self,
+        budget: std::time::Duration,
+    ) -> Result<FetchedList, ClientError> {
         let started = std::time::Instant::now();
-        let v = self.search_page_with_fallback(AUTHORED_OPEN).await?;
+        let v = self.search_with_budget(AUTHORED_OPEN, budget).await?;
         // How long GitHub took, and what it was asked for. A slow
         // response is the leading indicator of the timeout that follows,
         // and neither was recorded anywhere. Counts and timings only --
@@ -1328,8 +1565,8 @@ impl GitHubClient {
             } else {
                 history_query_range(now, start, len)
             };
-            let oc = self.octocrab.clone();
-            set.spawn(async move { graphql_partial_ok(&oc, &json!({ "query": q })).await });
+            let client = self.clone();
+            set.spawn(async move { client.graphql_partial_ok(&json!({ "query": q })).await });
             start += len;
         }
 
@@ -1502,65 +1739,25 @@ pub fn server_gave_up_on(e: &ClientError) -> bool {
 /// See `GitHubClient::graphql_partial_ok`. A free function so the
 /// concurrent history chunks, which own a cloned `Octocrab` inside a
 /// spawned task, get the same partial-success handling.
+#[cfg(test)]
 async fn graphql_partial_ok(
     octocrab: &Octocrab,
     body: &serde_json::Value,
 ) -> Result<serde_json::Value, ClientError> {
-    // Mapped rather than propagated raw: octocrab reports a non-JSON
-    // body as a serde failure ("expected value at line 1 column 1"),
-    // which describes a parser's internal state and hides the fact that
-    // GitHub answered 502. The status is the actionable part.
-    // DIAGNOSTIC LOGGING (Settings > diagnostic log). The POST is where
-    // octocrab's retry middleware lives: `max_retries: 3` with a
-    // 60-second minimum wait on a rate-limit response, so ONE call here
-    // can legitimately take minutes while every layer above it simply
-    // waits. That is the leading candidate for 5s by hand against a
-    // minute in the app, and nothing recorded it. Timed on BOTH paths,
-    // since a slow failure is as interesting as a slow success.
-    let http_started = std::time::Instant::now();
-    let posted: Result<serde_json::Value, _> = octocrab.post("/graphql", Some(body)).await;
-    crate::diag!(
-        "[diag] graphql POST {} after {}ms",
-        if posted.is_ok() { "ok" } else { "failed" },
-        http_started.elapsed().as_millis()
-    );
-    let raw: serde_json::Value = posted.map_err(|e| match &e {
-        octocrab::Error::Serde { .. } | octocrab::Error::Json { .. } => {
-            ClientError::NotJson("non-JSON response".into())
-        }
-        // THE point the 401 is first known (#1230). `status_code` is an
-        // `http::StatusCode` on octocrab's own error, so the condition
-        // is read off a typed value rather than out of GitHub's words --
-        // which is the whole difference between this and the regex it
-        // replaces.
-        //
-        // `.as_u16() == 401` rather than `== StatusCode::UNAUTHORIZED`:
-        // octocrab does not re-export `http`, and taking a direct
-        // dependency on it to name one constant would add a version we
-        // then have to keep in step with octocrab's for no gain. The
-        // sibling arm below already reads this same field through
-        // `is_server_error()`.
-        //
-        // It has to be caught here rather than left to `ClientError::
-        // Api`, because `Api`'s `Display` renders this variant as the
-        // bare word "GitHub": the status is thrown away the moment it is
-        // formatted, and every layer above sees "GitHub request failed:
-        // GitHub". That is why the banner's `/401|unauthorized|bad
-        // credentials/i` never fired on a real 401.
-        //
-        // 401 ONLY, deliberately. A 403 is GitHub refusing this
-        // particular request -- a scope the token lacks, an org behind
-        // SAML, secondary rate limiting -- and `gh auth login` plus a
-        // relaunch is not the remedy for any of those. Telling a user
-        // their token expired when it did not is the same class of
-        // mistake as not telling them when it did.
-        octocrab::Error::GitHub { source, .. } if source.status_code.as_u16() == 401 => {
-            ClientError::TokenRejected {
-                said: source.message.clone(),
-            }
-        }
-        _ => ClientError::Api(e),
-    })?;
+    graphql_with_transport(
+        octocrab,
+        body,
+        &super::read_transport::ReadTransport::default(),
+    )
+    .await
+}
+
+async fn graphql_with_transport(
+    octocrab: &Octocrab,
+    body: &serde_json::Value,
+    transport: &super::read_transport::ReadTransport,
+) -> Result<serde_json::Value, ClientError> {
+    let raw = transport.post(octocrab, body).await?;
 
     let errors = raw.get("errors").and_then(|e| e.as_array());
     let data = raw.get("data").filter(|d| !d.is_null());
