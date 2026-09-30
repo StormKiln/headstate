@@ -1,3 +1,4 @@
+import { useGitLabInvalidation } from "./gitlabInvalidation";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderHook } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
@@ -593,6 +594,7 @@ const POLL_EVENTS: [string, () => unknown][] = [
   ["poll-state", hooks.usePollState],
   ["poll-error", hooks.usePollError],
   ["source-poll-status", hooks.usePollError],
+  ["gitlab-data-changed", useGitLabInvalidation],
   ["reviewing-updated", hooks.useReviewing],
   ["prs-truncated", hooks.useTruncation],
   ["prs-incomplete", hooks.useIncomplete],

@@ -82,6 +82,7 @@ pub struct SourcePolls(
     Mutex<Receipts>,
     String,
     Mutex<GitLabReceipts>,
+    Mutex<HashMap<PollKey, u64>>,
 );
 impl Default for SourcePolls {
     fn default() -> Self {
@@ -90,6 +91,7 @@ impl Default for SourcePolls {
             Mutex::default(),
             Mutex::default(),
             format!("{}:{}", std::process::id(), chrono::Utc::now().to_rfc3339()),
+            Mutex::default(),
             Mutex::default(),
         )
     }
@@ -101,6 +103,29 @@ pub struct Publication {
 }
 
 impl SourcePolls {
+    fn before_mutation(&self, attempt: &Attempt) -> bool {
+        self.5
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(attempt.source.clone(), attempt.list))
+            .is_some_and(|minimum| attempt.generation < *minimum)
+    }
+    async fn invalidate_gitlab(&self, source: &Source) {
+        for list in [CachedList::Authored, CachedList::Reviewing] {
+            let _guard = self.gate(source, list).lock_owned().await;
+            let minimum = self
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&(source.clone(), list))
+                .map(|(generation, _)| generation + 1)
+                .unwrap_or(1);
+            self.5
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert((source.clone(), list), minimum);
+        }
+    }
     fn gate(&self, source: &Source, list: CachedList) -> Arc<tokio::sync::Mutex<()>> {
         self.1
             .lock()
@@ -150,6 +175,9 @@ impl SourcePolls {
     }
     async fn success_publication(&self, attempt: &Attempt) -> Option<Publication> {
         let guard = self.gate(&attempt.source, attempt.list).lock_owned().await;
+        if self.before_mutation(attempt) {
+            return None;
+        }
         let newer_success = if attempt.source.provider == crate::identity::Provider::Gitlab {
             self.4
                 .lock()
@@ -232,6 +260,11 @@ impl SourcePolls {
         attempt: &Attempt,
         fallback: Result<crate::gitlab::queues::FetchedList, String>,
     ) -> Result<crate::gitlab::queues::FetchedList, String> {
+        if self.before_mutation(attempt) {
+            return Err(
+                "GitLab changed while this list was loading. A new refresh is required.".into(),
+            );
+        }
         self.4
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -418,6 +451,12 @@ pub fn complete(app: &AppHandle, publication: Publication, result: Result<Fetche
         });
 }
 
+/// An accepted or uncertain write retires all reads that began before it.
+/// Ordinary competing refreshes still retain their older usable receipts.
+pub async fn invalidate_gitlab(app: &AppHandle, source: &Source) {
+    app.state::<SourcePolls>().invalidate_gitlab(source).await;
+}
+
 pub fn complete_gitlab(
     app: &AppHandle,
     publication: Publication,
@@ -530,6 +569,7 @@ mod tests {
         polls.complete_gitlab(
             published,
             Ok(crate::gitlab::queues::FetchedList {
+                viewer: None,
                 mrs: vec![gitlab_mr(&source)],
                 total: None,
                 coverage: Coverage::Partial { total: None },
@@ -556,6 +596,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mutation_retires_both_old_lists_even_if_the_reconciliation_fails() {
+        let polls = SourcePolls::default();
+        let source = Source {
+            provider: Provider::Gitlab,
+            host: "gitlab.com".into(),
+        };
+        let (authored, _) = polls
+            .begin_attempt(source.clone(), CachedList::Authored)
+            .await;
+        let (reviewing, _) = polls
+            .begin_attempt(source.clone(), CachedList::Reviewing)
+            .await;
+        polls.invalidate_gitlab(&source).await;
+        let (fresh, _) = polls.begin_attempt(source, CachedList::Authored).await;
+        let permit = polls.publication(&fresh).await.unwrap();
+        polls.complete_gitlab(permit, Err(failure()), |_| {});
+        assert!(polls.success_publication(&authored).await.is_none());
+        assert!(polls.success_publication(&reviewing).await.is_none());
+        assert!(polls
+            .winner_gitlab(
+                &authored,
+                Ok(crate::gitlab::queues::FetchedList {
+                    viewer: None,
+                    mrs: vec![],
+                    total: Some(0),
+                    coverage: Coverage::Complete
+                })
+            )
+            .is_err());
+        assert!(polls.success_publication(&fresh).await.is_some());
+    }
+
+    #[tokio::test]
     async fn newer_gitlab_foreground_success_rejects_old_background_publication_only_for_its_key() {
         let polls = SourcePolls::default();
         let source = Source {
@@ -579,6 +652,7 @@ mod tests {
             .await;
         let (foreground, _) = polls.begin_attempt(source, CachedList::Authored).await;
         let receipt = crate::gitlab::queues::FetchedList {
+            viewer: None,
             mrs: vec![],
             total: Some(0),
             coverage: Coverage::Complete,
@@ -607,6 +681,7 @@ mod tests {
             .begin_attempt(source.clone(), CachedList::Authored)
             .await;
         let receipt = crate::gitlab::queues::FetchedList {
+            viewer: None,
             mrs: vec![gitlab_mr(&source)],
             total: Some(2),
             coverage: Coverage::Partial { total: Some(2) },

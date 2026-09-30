@@ -192,13 +192,18 @@ async fn backfill_with(
             report: prior.as_ref().and_then(|r| r.report.clone()),
             error: None,
         };
-        match load_window(program, source, viewer, scope, start, end).await {
+        match load_window(program, source.clone(), viewer.clone(), scope, start, end).await {
             Ok(report) => {
                 receipt.report = Some(report);
             }
             Err(error) => {
                 receipt.error = Some(error);
             }
+        }
+        if super::viewer(program, &source.host).await? != viewer {
+            return Err(
+                "GitLab account changed while loading history. Refresh to try again.".into(),
+            );
         }
         if let Some(old) = prior {
             receipt.retain_prior(old);
@@ -374,6 +379,35 @@ mod tests {
         assert_eq!(second.attempted_days, 2);
         assert!(second.slices.iter().all(|r| !r.coverage.complete));
     }
+    #[tokio::test]
+    async fn account_change_discards_history_before_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("history.sqlite");
+        let cli = program(dir.path(), "printf 'HTTP/2 200\\nx-next-page: \\n\\n[]'");
+        let script = std::fs::read_to_string(&cli)
+            .unwrap()
+            .replace("\"id\":1", "\"id\":2");
+        std::fs::write(&cli, script).unwrap();
+        let result = backfill_with(
+            &cli,
+            source("gitlab.com").unwrap(),
+            "1".into(),
+            Scope::Mine,
+            1,
+            db.clone(),
+            "2026-09-04".parse().unwrap(),
+        )
+        .await;
+        assert!(result.unwrap_err().contains("account changed"));
+        assert!(crate::store::gitlab_stats::history_get(
+            &db,
+            r#"["gitlab","gitlab.com","1",{"kind":"mine"}]"#,
+            "2026-09-03"
+        )
+        .unwrap()
+        .is_none());
+    }
+
     #[test]
     fn slower_concurrent_failure_cannot_erase_completed_receipt() {
         let dir = tempfile::tempdir().unwrap();

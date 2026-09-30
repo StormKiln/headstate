@@ -86,6 +86,8 @@ pub struct Project {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tree {
+    #[serde(default)]
+    pub account: Option<String>,
     pub source: Source,
     pub viewer: String,
     pub projects: Vec<Project>,
@@ -217,6 +219,7 @@ fn endpoint(scope: &Scope) -> Result<String, String> {
     }
 }
 struct Response {
+    bytes: usize,
     body: Value,
     next: Option<usize>,
     terminal: bool,
@@ -278,6 +281,7 @@ fn parse(raw: &[u8], success: bool) -> Result<Response, RequestFailure> {
         });
     }
     let mut out = Response {
+        bytes: raw.len(),
         body: serde_json::from_str(body).map_err(|_| Stop::InvalidData)?,
         next: None,
         terminal: false,
@@ -312,19 +316,20 @@ async fn request(
 ) -> Result<Response, RequestFailure> {
     let mut command =
         super::host::constrained_command(program, host).map_err(|_| Stop::InvalidData)?;
-    let output = tokio::time::timeout(
+    command
+        .args(["api", "--hostname", host, "-i", endpoint])
+        .stdin(Stdio::null());
+    let (raw, status) = tokio::time::timeout(
         budget.min(REQUEST_TIMEOUT),
-        command
-            .args(["api", "--hostname", host, "-i", endpoint])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .output(),
+        super::transport::output(&mut command),
     )
     .await
     .map_err(|_| Stop::Timeout)?
-    .map_err(|_| Stop::RequestFailed)?;
-    parse(&output.stdout, output.status.success())
+    .map_err(|error| match error {
+        super::transport::Error::TooLarge => Stop::InvalidData,
+        super::transport::Error::Io => Stop::RequestFailed,
+    })?;
+    parse(&raw, status.success())
 }
 fn error(stop: &Stop) -> String {
     match stop {
@@ -365,6 +370,7 @@ async fn pages_limited(
 ) -> Result<(Vec<Value>, Coverage), RequestFailure> {
     let started = tokio::time::Instant::now();
     let mut rows = Vec::new();
+    let mut retained_bytes = 0;
     let mut page_number = 1;
     let mut total_conflict = false;
     let separator = if base.contains('?') { '&' } else { '?' };
@@ -396,13 +402,21 @@ async fn pages_limited(
                 break;
             }
         };
-        let Some(page_rows) = out.body.as_array() else {
+        let Value::Array(page_rows) = out.body else {
             if coverage.pages == 0 {
                 return Err(Stop::InvalidData.into());
             }
             coverage.stop = Stop::InvalidData;
             break;
         };
+        retained_bytes += out.bytes;
+        if retained_bytes > 16 * 1024 * 1024 || page_rows.len() > PAGE_SIZE {
+            if coverage.pages == 0 {
+                return Err(Stop::InvalidData.into());
+            }
+            coverage.stop = Stop::InvalidData;
+            break;
+        }
         coverage.pages += 1;
         coverage.rate_remaining = out.remaining;
         coverage.rate_reset = out.reset;
@@ -412,7 +426,8 @@ async fn pages_limited(
             }
             coverage.total = if total_conflict { None } else { Some(total) };
         }
-        rows.extend(page_rows.iter().cloned());
+        let page_len = page_rows.len();
+        rows.extend(page_rows);
         if out.terminal && out.next.is_none() {
             coverage.complete = true;
             coverage.stop = Stop::Complete;
@@ -428,7 +443,7 @@ async fn pages_limited(
                 coverage.stop = Stop::InvalidData;
                 break;
             }
-            None if page_rows.len() < PAGE_SIZE => {
+            None if page_len < PAGE_SIZE => {
                 coverage.stop = Stop::UnknownPagination;
                 break;
             }
@@ -452,7 +467,26 @@ pub async fn tree(host: &str) -> Result<Tree, String> {
     let program =
         super::auth::find_glab().ok_or("GitLab CLI (glab) was not found on the desktop")?;
     let viewer = viewer(&program, host).await?;
-    discover_tree(&program, source, viewer, BUDGET).await
+    let account = super::auth::viewer(&program, host)
+        .await
+        .map_err(|_| "GitLab account unavailable")?;
+    static READS: std::sync::LazyLock<super::coalesce::Reads<Result<Tree, String>>> =
+        std::sync::LazyLock::new(super::coalesce::Reads::default);
+    let mut tree = READS
+        .run(
+            format!("{host}:{viewer}"),
+            discover_tree(&program, source, viewer, BUDGET),
+        )
+        .await?;
+    if super::auth::viewer(&program, host)
+        .await
+        .map_err(|_| "GitLab account unavailable")?
+        != account
+    {
+        return Err("GitLab account changed while loading scopes. Refresh to try again.".into());
+    }
+    tree.account = Some(account);
+    Ok(tree)
 }
 
 async fn discover_tree(
@@ -551,6 +585,7 @@ async fn discover_tree(
         }
     }
     Ok(Tree {
+        account: None,
         source,
         viewer,
         projects: projects.into_values().collect(),
@@ -714,6 +749,17 @@ fn summarize(
     }
 }
 
+static CACHE_WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static CACHE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub async fn invalidate(host: String, db: std::path::PathBuf) {
+    CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    let _ = tokio::task::spawn_blocking(move || {
+        let _guard = CACHE_WRITES.lock().unwrap_or_else(|e| e.into_inner());
+        crate::store::gitlab_stats::invalidate_host(&db, &host)
+    })
+    .await;
+}
+
 pub async fn load(
     host: &str,
     scope: Scope,
@@ -721,6 +767,7 @@ pub async fn load(
     db: std::path::PathBuf,
     refresh: bool,
 ) -> Result<Report, String> {
+    let generation = CACHE_GENERATION.load(std::sync::atomic::Ordering::Acquire);
     let source = source(host)?;
     endpoint(&scope)?;
     if !(1..=90).contains(&days) {
@@ -757,11 +804,32 @@ pub async fn load(
             return Ok(report);
         }
     }
-    let report = load_window(&program, source, viewer, scope, start, end).await?;
+    static READS: std::sync::LazyLock<super::coalesce::Reads<Result<Report, String>>> =
+        std::sync::LazyLock::new(super::coalesce::Reads::default);
+    let report = READS
+        .run(
+            format!("{key}:{generation}"),
+            load_window(&program, source, viewer.clone(), scope, start, end),
+        )
+        .await?;
+    if self::viewer(&program, host).await? != viewer {
+        return Err(
+            "GitLab account changed while loading statistics. Refresh to try again.".into(),
+        );
+    }
+    if generation != CACHE_GENERATION.load(std::sync::atomic::Ordering::Acquire) {
+        return Ok(report);
+    }
     let saved = report.clone();
     // Cache trouble never discards a measured result.
-    let _ = tokio::task::spawn_blocking(move || crate::store::gitlab_stats::put(&db, &key, &saved))
-        .await;
+    let _ = tokio::task::spawn_blocking(move || {
+        let _guard = CACHE_WRITES.lock().unwrap_or_else(|e| e.into_inner());
+        if generation != CACHE_GENERATION.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        crate::store::gitlab_stats::put(&db, &key, &saved)
+    })
+    .await;
     Ok(report)
 }
 
@@ -1145,11 +1213,14 @@ esac
         let program = dir.path().join("glab");
         std::fs::write(&program, format!("#!/bin/sh\n{script}\n")).unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-        pages(
+        crate::gitlab::test_support::scripted(
             &program,
-            "gitlab.com",
-            "merge_requests?scope=created_by_me",
-            budget,
+            pages(
+                &program,
+                "gitlab.com",
+                "merge_requests?scope=created_by_me",
+                budget,
+            ),
         )
         .await
     }
@@ -1180,7 +1251,7 @@ esac
     #[cfg(unix)]
     #[tokio::test]
     async fn late_timeout_retains_rows_and_first_failure_is_not_empty_success() {
-        let (rows, coverage) = scripted("case \"$5\" in *page=1) printf 'HTTP/2 200\\nx-next-page: 2\\nx-total: 2\\n\\n[{}]';; *) sleep 2;; esac", Duration::from_millis(300)).await.unwrap();
+        let (rows, coverage) = scripted("case \"$5\" in *page=1) printf 'HTTP/2 200\\nx-next-page: 2\\nx-total: 2\\n\\n[{}]';; *) touch \"$0.timeout\"; exec sleep 60;; esac", Duration::from_millis(300)).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert!(!coverage.complete);
         assert_eq!(coverage.stop, Stop::Timeout);
@@ -1256,5 +1327,15 @@ esac
         let cached = crate::store::gitlab_stats::get(&db, key).unwrap().unwrap();
         assert!(!cached.coverage.complete);
         assert_eq!(cached.history.len(), 1);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oversized_later_page_keeps_earlier_statistics_as_partial() {
+        let large = json!([{ "description": "x".repeat(4 * 1024 * 1024) }]);
+        let script = format!("case \"$5\" in *page=1) printf 'HTTP/2 200\\nx-next-page: 2\\n\\n[{{}}]';; *) printf 'HTTP/2 200\\nx-next-page:\\n\\n%s' '{large}';; esac");
+        let (rows, coverage) = scripted(&script, Duration::from_secs(30)).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(coverage.stop, Stop::InvalidData);
+        assert!(!coverage.complete);
     }
 }

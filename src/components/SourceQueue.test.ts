@@ -1,8 +1,8 @@
 import { createElement } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render } from "@testing-library/react";
+import { render, fireEvent, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { SourceQueue, combinedRows, sourceRepoKey } from "./SourceQueue";
+import { SourceQueue, SourceRepoSidebar, combinedRows, sourceRepoKey } from "./SourceQueue";
 import type { PullRequest } from "../types/pr";
 import type { MergeRequest } from "../types/gitlab";
 import { activeRowCursor, resetRowCursorForTest } from "../lib/rowCursor";
@@ -51,8 +51,27 @@ describe("source queue identity", () => {
     expect(activeRowCursor()?.rows()).toBe(2);
     activeRowCursor()?.open(0);
     expect(open).toHaveBeenCalledWith(expect.objectContaining({ source: { provider: "gitlab", host: "gitlab.com" }, number: 7 }));
-    expect(activeRowCursor()?.toggle).toBeUndefined();
+    expect(activeRowCursor()?.toggle).toBeTypeOf("function");
     view.unmount();
     expect(activeRowCursor()).toBeNull();
   });
+});
+
+it("keeps existing Github filters and sort in the combined queue", () => {
+  const a = { ...PR_FIXTURES[0], ...gh, ci: "failure" as const };
+  const b = { ...a, number: 8, ci: "success" as const };
+  expect(combinedRows([a, b], [], "both", null, "", { ci: "failure" }).map(row => row.value.number)).toEqual([7]);
+  const older = { ...a, number: 9, created_at: "2020-01-01T00:00:00Z" };
+  expect(combinedRows([a, older], [], "both", null, "", { sort: "oldest" }).map(row => row.value.number)).toEqual([9, 7]);
+});
+
+it("repository navigation clears the prior GitHub-only repository filter", () => {
+  useFilters.getState().setFilter("repo", "previous/repository");
+  useSourceSelection.setState({ selection: "both", repoKey: null, query: "" });
+  const view = render(createElement(QueryClientProvider, { client: new QueryClient() }, createElement(SourceRepoSidebar, { github: [gh], gitlab: [gl], selection: "both" })));
+  fireEvent.click(screen.getByRole("button", { name: /GitLab · gitlab.com · group\/project/ }));
+  expect(useFilters.getState().filtersByView[useFilters.getState().view].repo).toBeUndefined();
+  expect(useSourceSelection.getState().repoKey).toBe(sourceRepoKey(gl));
+  view.unmount();
+  useSourceSelection.setState({ selection: "github", repoKey: null, query: "" });
 });

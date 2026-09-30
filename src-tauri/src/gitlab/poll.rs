@@ -115,6 +115,7 @@ struct Baseline {
     source: Option<Source>,
     list: Option<CachedList>,
     rows: Option<HashMap<PrIdentity, MergeRequest>>,
+    viewer: Option<String>,
     complete: bool,
 }
 
@@ -126,6 +127,11 @@ impl Baseline {
             *self = Self::default();
             self.source = Some(source.clone());
             self.list = Some(list);
+        }
+        if self.viewer != result.viewer {
+            self.rows = None;
+            self.complete = false;
+            self.viewer = result.viewer.clone();
         }
         let mut notices = Vec::new();
         if let Some(before) = &self.rows {
@@ -144,7 +150,9 @@ impl Baseline {
                     CachedList::Authored => match was {
                         None if self.complete && !mr.is_draft => Some(NoticeKind::AuthoredArrival),
                         Some(was)
-                            if mr.ci == Some(CiState::Failure)
+                            if mr.head_oid.is_some()
+                                && mr.head_oid == was.head_oid
+                                && mr.ci == Some(CiState::Failure)
                                 && was.ci.is_some_and(|ci| ci != CiState::Failure) =>
                         {
                             Some(NoticeKind::CiFailed)
@@ -264,7 +272,13 @@ async fn fetch_and_persist(
     let attempt = source_poll::begin(app, source.clone(), list).await;
     // The accumulating loader enforces FETCH_TIMEOUT itself. Wrapping it in
     // timeout/select would throw away pages that already arrived.
-    match queues::fetch(source, list).await {
+    match queues::fetch(source, list, |receipt| async {
+        if let Some(publication) = source_poll::success_publication(app, &attempt).await {
+            source_poll::complete_gitlab(app, publication, Ok(receipt));
+        }
+    })
+    .await
+    {
         Ok(receipt) => {
             let publication = source_poll::success_publication(app, &attempt).await?;
             persist(app, source, list, &receipt).await;
@@ -405,6 +419,7 @@ mod tests {
 
     fn receipt(mrs: Vec<MergeRequest>, coverage: Coverage) -> FetchedList {
         FetchedList {
+            viewer: Some("fixture-account".into()),
             total: matches!(coverage, Coverage::Complete).then_some(mrs.len() as u64),
             mrs,
             coverage,
@@ -432,6 +447,22 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn changing_account_after_an_empty_list_establishes_a_silent_baseline() {
+        let source = source("gitlab.com");
+        let mut baseline = Baseline::default();
+        baseline.observe(
+            &source,
+            CachedList::Authored,
+            &receipt(vec![], Coverage::Complete),
+        );
+        let mut next = receipt(vec![mr(&source, 7)], Coverage::Complete);
+        next.viewer = Some("different-account".into());
+        assert!(baseline
+            .observe(&source, CachedList::Authored, &next)
+            .is_empty());
     }
 
     #[test]
@@ -664,6 +695,45 @@ mod tests {
         assert!(
             !control.is_current(&selected),
             "a resumed source starts a silent baseline"
+        );
+    }
+}
+
+/// Reconcile both memberships after any attempted write, including a lost
+/// response. The caller schedules reads without delaying the action receipt.
+/// Never retries the write; the original success/error is preserved.
+pub async fn after_mutation<T>(
+    mutation: impl Future<Output = T>,
+    mut schedule: impl FnMut(CachedList),
+) -> T {
+    let result = mutation.await;
+    queues::invalidate();
+    schedule(CachedList::Authored);
+    schedule(CachedList::Reviewing);
+    result
+}
+
+#[cfg(test)]
+mod mutation_tests {
+    use super::*;
+    #[tokio::test]
+    async fn action_receipt_waits_for_write_but_schedules_both_lists_even_on_error() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (send, recv) = tokio::sync::oneshot::channel::<Result<(), &str>>();
+        let recorded = calls.clone();
+        let task = tokio::spawn(async move {
+            after_mutation(async { recv.await.unwrap() }, move |list| {
+                recorded.lock().unwrap().push(list)
+            })
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(calls.lock().unwrap().is_empty());
+        send.send(Err("write outcome unknown")).unwrap();
+        assert_eq!(task.await.unwrap(), Err("write outcome unknown"));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![CachedList::Authored, CachedList::Reviewing]
         );
     }
 }

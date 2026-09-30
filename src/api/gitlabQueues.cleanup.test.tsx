@@ -74,3 +74,12 @@ describe("GitLab queue listeners", () => {
     unmount();
   });
 });
+
+it("uses a fresh desktop snapshot on mount without requesting the provider again", async () => {
+  ipc.snapshot.mockResolvedValue({ data: { state: "git_lab_available", mrs: [], coverage: "complete", fetched_at: new Date().toISOString(), stale_secs: null } });
+  const { result, unmount } = renderHook(() => useGitLabQueue("authored", true));
+  await waitFor(() => expect(result.current.rows).toEqual([]));
+  expect(result.current.loading).toBe(false);
+  expect(ipc.refresh).not.toHaveBeenCalled();
+  unmount();
+});

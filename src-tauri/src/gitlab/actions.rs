@@ -9,12 +9,19 @@ use std::{path::Path, time::Duration};
 const BUDGET: Duration = Duration::from_secs(60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const RETRY_JOBS: &str = "/jobs?include_retried=false&per_page=100&page=1";
-const QUERY: &str = "query($path: ID!, $iid: String!) { project(fullPath: $path) { mergeRequest(iid: $iid) { iid webUrl diffHeadSha rebaseCommitSha autoMergeEnabled availableAutoMergeStrategies userPermissions { canApprove canMerge createNote updateMergeRequest pushToSourceBranch } headPipeline { id sha retryable userPermissions { updatePipeline } } discussions(first: 100) { nodes { replyId resolvable resolved userPermissions { resolveNote } notes(first: 1) { nodes { system userPermissions { createNote } } } } pageInfo { hasNextPage } } } } }";
+const LEGACY_QUERY: &str = "query($path: ID!, $iid: String!) { currentUser { username } project(fullPath: $path) { mergeRequest(iid: $iid) { iid webUrl diffHeadSha rebaseCommitSha autoMergeEnabled availableAutoMergeStrategies userPermissions { canApprove canMerge createNote updateMergeRequest pushToSourceBranch } headPipeline { id sha retryable userPermissions { updatePipeline } } discussions(first: 100) { nodes { replyId resolvable resolved userPermissions { resolveNote } notes(first: 1) { nodes { system userPermissions { createNote } } } } pageInfo { hasNextPage } } } } }";
+const QUERY: &str = "query($path: ID!, $iid: String!) { currentUser { username } project(fullPath: $path) { mergeRequest(iid: $iid) { iid webUrl diffHeadSha changeRequestedBy(first: 100) { nodes { username } pageInfo { hasNextPage } } mergeTrainCar { index } autoMergeStrategy rebaseCommitSha autoMergeEnabled availableAutoMergeStrategies userPermissions { canApprove canMerge createNote updateMergeRequest pushToSourceBranch } headPipeline { id sha retryable userPermissions { updatePipeline } } discussions(first: 100) { nodes { replyId resolvable resolved userPermissions { resolveNote } notes(first: 1) { nodes { system userPermissions { createNote } } } } pageInfo { hasNextPage } } } } }";
+
+// Older self-managed schemas may lack optional CI/auto-merge/discussion
+// fields. A schema error there must not remove basic read/write permission.
+const CORE_QUERY: &str = "query($path: ID!, $iid: String!) { currentUser { username } project(fullPath: $path) { mergeRequest(iid: $iid) { iid webUrl diffHeadSha userPermissions { canMerge createNote updateMergeRequest } } } }";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
     Approve,
+    RequestChanges,
+    EnqueueTrain,
     Comment,
     Reply,
     Resolve,
@@ -47,6 +54,7 @@ pub struct DiscussionCapability {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Capabilities {
+    pub viewer: Option<String>,
     pub identity: PrIdentity,
     pub head_oid: Option<String>,
     pub actions: Vec<Capability>,
@@ -56,6 +64,7 @@ pub struct Capabilities {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ActionRequest {
+    pub expected_viewer: Option<String>,
     pub identity: PrIdentity,
     pub action: Action,
     pub expected_head: Option<String>,
@@ -139,16 +148,32 @@ impl Session<'_> {
     async fn context(&self) -> Result<Context, DetailIssue> {
         let raw = self.core().await?;
         let core = detail::map_core(&raw, self.identity).ok_or(DetailIssue::InvalidResponse)?;
-        let response = self.request("POST", "graphql", Some(json!({
-            "query": QUERY, "variables": {"path": self.identity.repo, "iid": self.identity.number.to_string()}
-        }))).await?;
+        let mut response = Value::Null;
+        for query in [QUERY, LEGACY_QUERY, CORE_QUERY] {
+            response = self.request("POST", "graphql", Some(json!({
+                "query": query, "variables": {"path": self.identity.repo, "iid": self.identity.number.to_string()}
+            }))).await?;
+            let missing_field = response
+                .get("errors")
+                .and_then(Value::as_array)
+                .is_some_and(|errors| {
+                    !errors.is_empty()
+                        && errors.iter().all(|error| {
+                            error.pointer("/extensions/code").and_then(Value::as_str)
+                                == Some("undefinedField")
+                        })
+                });
+            if !missing_field {
+                break;
+            }
+        }
         if response
             .get("errors")
             .is_some_and(|e| !e.as_array().is_some_and(Vec::is_empty))
         {
             return Err(DetailIssue::InvalidResponse);
         }
-        let permissions = response
+        let mut permissions = response
             .pointer("/data/project/mergeRequest")
             .cloned()
             .ok_or(DetailIssue::InvalidResponse)?;
@@ -158,6 +183,10 @@ impl Session<'_> {
         {
             return Err(DetailIssue::InvalidResponse);
         }
+        permissions["viewer"] = response
+            .pointer("/data/currentUser/username")
+            .cloned()
+            .unwrap_or(Value::Null);
         let mut raw = raw;
         raw["action_approvals"] = self
             .request("GET", &format!("{}/approvals", self.base()), None)
@@ -237,6 +266,36 @@ fn capabilities_from(core: &MrCore, raw: &Value, data: &Value) -> Capabilities {
                     "require_reauthentication_to_approve",
                 ),
             "GitLab has not granted approval permission for this MR.",
+        ),
+        (
+            Action::RequestChanges,
+            opened
+                && head_known
+                && mutable
+                && data["viewer"].as_str().is_some()
+                && core.author.is_some()
+                && data["viewer"].as_str() != core.author.as_deref()
+                && data["changeRequestedBy"].is_object(),
+            "Requesting changes requires an open MR, a current account, and update permission.",
+        ),
+        (
+            Action::EnqueueTrain,
+            opened
+                && head_known
+                && !core.is_draft
+                && yes(p, "canMerge")
+                && data.get("mergeTrainCar").is_some_and(Value::is_null)
+                && data["availableAutoMergeStrategies"]
+                    .as_array()
+                    .is_some_and(|strategies| {
+                        strategies.iter().any(|s| {
+                            matches!(
+                                s.as_str(),
+                                Some("merge_train" | "add_to_merge_train_when_checks_pass")
+                            )
+                        })
+                    }),
+            "GitLab has not confirmed merge-train availability and merge permission for this MR.",
         ),
         (
             Action::Comment,
@@ -356,6 +415,7 @@ fn capabilities_from(core: &MrCore, raw: &Value, data: &Value) -> Capabilities {
         }
     }
     Capabilities {
+        viewer: data["viewer"].as_str().map(str::to_owned),
         identity: core.identity.clone(),
         head_oid: core.head_oid.clone(),
         actions,
@@ -375,11 +435,22 @@ pub async fn capabilities(identity: &PrIdentity) -> Result<Capabilities, String>
         identity,
         start: tokio::time::Instant::now(),
     };
-    session
-        .context()
+    let viewer = super::auth::viewer(&program, &identity.source.host)
         .await
-        .map(|c| c.capabilities)
-        .map_err(read_error)
+        .map_err(read_error)?;
+    static READS: std::sync::LazyLock<super::coalesce::Reads<Result<Capabilities, String>>> =
+        std::sync::LazyLock::new(super::coalesce::Reads::default);
+    let key = serde_json::to_string(&(identity, &viewer, super::queues::generation()))
+        .expect("serializable identity");
+    READS
+        .run(key, async {
+            let capabilities = session.context().await.map_err(read_error)?.capabilities;
+            if capabilities.viewer.as_ref() != Some(&viewer) {
+                return Err("GitLab account changed while checking actions.".into());
+            }
+            Ok(capabilities)
+        })
+        .await
 }
 
 fn read_error(issue: DetailIssue) -> String {
@@ -400,6 +471,13 @@ async fn execute_with_program(program: &Path, request: &ActionRequest) -> Result
         start: tokio::time::Instant::now(),
     };
     let context = session.context().await.map_err(read_error)?;
+    if request
+        .expected_viewer
+        .as_ref()
+        .is_some_and(|viewer| context.capabilities.viewer.as_ref() != Some(viewer))
+    {
+        return Err("The GitLab account changed. Refresh before acting.".into());
+    }
     let write = prepare(&session.base(), request, &context)?;
     let retry_before = if request.action == Action::RetryCi {
         let path = pipeline_path(&context, RETRY_JOBS)?;
@@ -419,6 +497,12 @@ async fn execute_with_program(program: &Path, request: &ActionRequest) -> Result
     } else {
         None
     };
+    if request.action == Action::RequestChanges {
+        let fresh = session.core().await.map_err(read_error)?;
+        if fresh["sha"].as_str() != request.expected_head.as_deref() {
+            return Err("The MR head changed. Refresh before requesting changes.".into());
+        }
+    }
     let response = session
         .request(write.method, &write.path, Some(write.body))
         .await;
@@ -463,6 +547,8 @@ fn prepare(base: &str, request: &ActionRequest, context: &Context) -> Result<Wri
     if matches!(
         request.action,
         Action::Approve
+            | Action::RequestChanges
+            | Action::EnqueueTrain
             | Action::Merge
             | Action::Rebase
             | Action::RetryCi
@@ -521,6 +607,20 @@ fn prepare(base: &str, request: &ActionRequest, context: &Context) -> Result<Wri
             "POST",
             format!("{base}/approve"),
             json!({"sha": request.expected_head}),
+        ),
+        Action::RequestChanges => (
+            "POST",
+            "graphql".into(),
+            json!({"query":"mutation($input: MergeRequestRequestChangesInput!) { mergeRequestRequestChanges(input: $input) { errors mergeRequest { iid } } }", "variables":{"input":{"projectPath":request.identity.repo,"iid":request.identity.number.to_string()}}}),
+        ),
+        Action::EnqueueTrain => (
+            "POST",
+            format!(
+                "projects/{}/merge_trains/merge_requests/{}",
+                detail::encode_project(&request.identity.repo),
+                request.identity.number
+            ),
+            json!({"sha":request.expected_head,"auto_merge":true}),
         ),
         Action::Comment => ("POST", format!("{base}/notes"), json!({"body": body})),
         Action::Reply => (
@@ -641,6 +741,39 @@ async fn verify(
             Ok(yes(&v, "user_has_approved")
                 && core["sha"].as_str() == request.expected_head.as_deref())
         }
+        Action::RequestChanges => {
+            if !response
+                .pointer("/data/mergeRequestRequestChanges/errors")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+            {
+                return Ok(false);
+            }
+            let fresh = session.context().await?;
+            let viewer = context.permissions["viewer"].as_str();
+            Ok(viewer.is_some()
+                && fresh.permissions["viewer"].as_str() == viewer
+                && fresh.core.head_oid == request.expected_head
+                && fresh
+                    .permissions
+                    .pointer("/changeRequestedBy/nodes")
+                    .and_then(Value::as_array)
+                    .is_some_and(|nodes| {
+                        nodes.iter().any(|node| node["username"].as_str() == viewer)
+                    }))
+        }
+        Action::EnqueueTrain => {
+            let fresh = session.context().await?;
+            Ok(fresh.core.head_oid == request.expected_head
+                && (fresh
+                    .permissions
+                    .pointer("/mergeTrainCar/index")
+                    .and_then(Value::as_u64)
+                    .is_some()
+                    || (yes(&fresh.permissions, "autoMergeEnabled")
+                        && fresh.permissions["autoMergeStrategy"].as_str()
+                            == Some("add_to_merge_train_when_checks_pass"))))
+        }
         Action::Comment | Action::Reply => {
             let Some(id) = response["id"].as_u64() else {
                 return Ok(false);
@@ -759,7 +892,7 @@ mod tests {
     }
 
     fn raw() -> Value {
-        json!({"id": 70, "iid":7, "web_url":"https://gitlab.com/group/subgroup/project/-/merge_requests/7", "title":"Review", "state":"opened", "draft":false, "sha":"old-head", "source_branch":"topic", "target_branch":"main", "detailed_merge_status":"mergeable", "rebase_in_progress":false, "merge_error":null, "head_pipeline":{"id":91,"project_id":42,"sha":"old-head","status":"failed"}, "action_approvals":{"user_can_approve":true,"user_has_approved":false}})
+        json!({"id": 70, "iid":7, "web_url":"https://gitlab.com/group/subgroup/project/-/merge_requests/7", "title":"Review", "author":{"username":"author"}, "state":"opened", "draft":false, "sha":"old-head", "source_branch":"topic", "target_branch":"main", "detailed_merge_status":"mergeable", "rebase_in_progress":false, "merge_error":null, "head_pipeline":{"id":91,"project_id":42,"sha":"old-head","status":"failed"}, "action_approvals":{"user_can_approve":true,"user_has_approved":false}})
     }
 
     fn permissions() -> Value {
@@ -779,6 +912,7 @@ mod tests {
 
     fn request(action: Action) -> ActionRequest {
         ActionRequest {
+            expected_viewer: None,
             identity: identity(),
             action,
             expected_head: Some("old-head".into()),
@@ -1009,7 +1143,7 @@ print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
     fn context_steps(r: &Value, p: &Value) -> Vec<Value> {
         vec![
             read(format!("{BASE}?include_rebase_in_progress=true"), r.clone()),
-            json!({"method":"POST","path":"graphql","body":{"query":QUERY,"variables":{"path":identity().repo,"iid":"7"}},"response":{"data":{"project":{"mergeRequest":p}}}}),
+            json!({"method":"POST","path":"graphql","body":{"query":QUERY,"variables":{"path":identity().repo,"iid":"7"}},"response":{"data":{"currentUser":{"username":p["viewer"]},"project":{"mergeRequest":p}}}}),
             read(format!("{BASE}/approvals"), r["action_approvals"].clone()),
         ]
     }
@@ -1409,6 +1543,109 @@ print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
                 std::fs::read_to_string(dir.path().join("count")).unwrap(),
                 "2"
             );
+        }
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn optional_schema_failure_preserves_basic_permissions_without_guessing_optional_ones() {
+        let r = raw();
+        let mut steps = context_steps(&r, &permissions());
+        steps[1]["response"] = json!({"errors":[{"extensions":{"code":"undefinedField"}}]});
+        let basic = json!({"iid":"7","webUrl":r["web_url"],"diffHeadSha":r["sha"],"userPermissions":{"canMerge":true,"createNote":true,"updateMergeRequest":true}});
+        steps.insert(2, json!({"method":"POST","path":"graphql","body":{"query":LEGACY_QUERY,"variables":{"path":identity().repo,"iid":"7"}},"response":{"data":{"project":{"mergeRequest":basic}}}}));
+        let (_dir, program) = scripted(&steps);
+        let identity = identity();
+        let session = Session {
+            program: &program,
+            identity: &identity,
+            start: tokio::time::Instant::now(),
+        };
+        let context = session.context().await.unwrap();
+        assert!(context
+            .capabilities
+            .actions
+            .iter()
+            .any(|c| c.action == Action::Close && c.allowed));
+        assert!(context
+            .capabilities
+            .actions
+            .iter()
+            .any(|c| c.action == Action::Comment && c.allowed));
+        assert!(!context
+            .capabilities
+            .actions
+            .iter()
+            .any(|c| c.action == Action::RetryCi && c.allowed));
+    }
+    #[test]
+    fn request_changes_and_train_actions_require_measured_capabilities_and_current_head() {
+        let mut p = permissions();
+        p["viewer"] = json!("reviewer");
+        p["changeRequestedBy"] = json!({"nodes":[],"pageInfo":{"hasNextPage":false}});
+        p["mergeTrainCar"] = Value::Null;
+        p["availableAutoMergeStrategies"] = json!(["merge_train"]);
+        let c = context(raw(), p.clone());
+        for name in ["request_changes", "enqueue_train"] {
+            let action: Action =
+                serde_json::from_value(json!(name)).expect("supported GitLab action");
+            let write = prepare(BASE, &request(action), &c).unwrap();
+            assert_eq!(write.method, "POST");
+            let mut stale = request(action);
+            stale.expected_head = Some("stale-head".into());
+            assert!(prepare(BASE, &stale, &c).is_err());
+        }
+        p["userPermissions"]["updateMergeRequest"] = json!(false);
+        p["userPermissions"]["canMerge"] = json!(false);
+        let denied = context(raw(), p);
+        for name in ["request_changes", "enqueue_train"] {
+            let action: Action = serde_json::from_value(json!(name)).unwrap();
+            assert!(prepare(BASE, &request(action), &denied).is_err());
+        }
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn review_and_train_writes_need_independent_readback_and_never_repeat() {
+        for action in [Action::RequestChanges, Action::EnqueueTrain] {
+            for verified in [true, false] {
+                let r = raw();
+                let mut p = permissions();
+                p["viewer"] = json!("reviewer");
+                p["changeRequestedBy"] = json!({"nodes":[],"pageInfo":{"hasNextPage":false}});
+                p["mergeTrainCar"] = Value::Null;
+                p["availableAutoMergeStrategies"] = json!(["merge_train"]);
+                let req = request(action);
+                let write = prepare(BASE, &req, &context(r.clone(), p.clone())).unwrap();
+                let mut steps = context_steps(&r, &p);
+                if action == Action::RequestChanges {
+                    steps.push(read(
+                        format!("{BASE}?include_rebase_in_progress=true"),
+                        r.clone(),
+                    ));
+                }
+                steps.push(json!({"method":write.method,"path":write.path,"body":write.body,"response":{"data":{"mergeRequestRequestChanges":{"errors":[],"mergeRequest":{"iid":"7"}}}}}));
+                if verified {
+                    if action == Action::RequestChanges {
+                        p["changeRequestedBy"]["nodes"] = json!([{"username":"reviewer"}]);
+                    } else {
+                        p["mergeTrainCar"] = json!({"index":0});
+                    }
+                }
+                steps.extend(context_steps(&r, &p));
+                let (dir, program) = scripted(&steps);
+                let receipt = execute_with_program(&program, &req).await.unwrap();
+                assert_eq!(
+                    receipt.outcome,
+                    if verified {
+                        Outcome::Verified
+                    } else {
+                        Outcome::Unverified
+                    }
+                );
+                assert_eq!(
+                    std::fs::read_to_string(dir.path().join("count")).unwrap(),
+                    steps.len().to_string()
+                );
+            }
         }
     }
 }

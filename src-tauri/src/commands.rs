@@ -491,7 +491,13 @@ async fn refresh_gitlab_request(
     attempt: crate::source_poll::Attempt,
 ) -> Result<SourceRefresh, String> {
     use crate::source_poll::{self, Failure};
-    match crate::gitlab::queues::fetch(&source, list).await {
+    match crate::gitlab::queues::fetch(&source, list, |receipt| async {
+        if let Some(publication) = source_poll::success_publication(&app, &attempt).await {
+            source_poll::complete_gitlab(&app, publication, Ok(receipt));
+        }
+    })
+    .await
+    {
         Ok(result) => {
             let Some(publication) = source_poll::success_publication(&app, &attempt).await else {
                 let winner = source_poll::winner_gitlab(&app, &attempt, Ok(result))?;
@@ -3688,6 +3694,17 @@ async fn pr_claudify_line(
 ) -> Result<(String, String), String> {
     let scan = list_worktrees(app).await?;
     let checkout = pr_checkout(&scan.repos, repo_path, pr_repo)?;
+    let path = checkout.clone();
+    let actual =
+        tauri::async_runtime::spawn_blocking(move || crate::worktrees::scan::repo_identity(&path))
+            .await
+            .map_err(|_| "Could not verify the checkout origin")?;
+    if !actual
+        .as_deref()
+        .is_some_and(|actual| actual.eq_ignore_ascii_case(pr_repo))
+    {
+        return Err("The checkout origin changed. Rescan repositories before launching.".into());
+    }
     let line = pr_claude_command(prompt, &checkout)?;
     Ok((checkout, line))
 }
@@ -6137,6 +6154,7 @@ pub async fn get_gitlab_auth_state(app: AppHandle) -> crate::gitlab::auth::AuthS
         Ok(host) => crate::gitlab::auth::check_host(&host).await,
         Err(_) => crate::gitlab::auth::AuthState {
             host: String::new(),
+            viewer: None,
             ok: false,
             issue: Some(crate::gitlab::auth::AuthIssue::InvalidHost),
             message: "The configured GitLab host is invalid. Enter a DNS hostname in Settings before using GitLab.".into(),
@@ -10523,7 +10541,26 @@ pub async fn gitlab_action(
     request: crate::gitlab::actions::ActionRequest,
 ) -> Result<crate::gitlab::actions::Receipt, String> {
     require_gitlab_host(&app, &request.identity.source.host)?;
-    crate::gitlab::actions::execute(&request).await
+    crate::gitlab::poll::after_mutation(
+        async {
+            let result = crate::gitlab::actions::execute(&request).await;
+            crate::source_poll::invalidate_gitlab(&app, &request.identity.source).await;
+            crate::gitlab::queues::invalidate_identity(&request.identity);
+            crate::gitlab::stats::invalidate(request.identity.source.host.clone(), db_path(&app))
+                .await;
+            let _ = app.emit("gitlab-data-changed", &request.identity);
+            result
+        },
+        |list| {
+            let app = app.clone();
+            let source = request.identity.source.clone();
+            tauri::async_runtime::spawn(async move {
+                let attempt = crate::source_poll::begin(&app, source.clone(), list).await;
+                let _ = refresh_gitlab_request(app, source, list, attempt).await;
+            });
+        },
+    )
+    .await
 }
 
 #[tauri::command]

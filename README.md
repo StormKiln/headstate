@@ -250,6 +250,11 @@ tools, because a GUI-launched app does not inherit your shell's `PATH`.
 discussions, approvals, CI, and permission-checked actions use the configured
 host. GitLab MR Stats offers author, project, and group scopes; incomplete
 reads remain visibly partial. GitHub and GitLab statistics stay separate.
+Both mode retains GitHub filters, selection, bulk actions and overview controls.
+GitLab reads are cached and coordinated across desktop and paired clients;
+write outcomes trigger targeted invalidation and both queue refreshes. See the
+[GitLab readiness and compatibility record](docs/reviews/pr1596-readiness.md)
+for cache bounds, feature differences and the live compatibility gate.
 
 **Pull request list.** On GitHub, every open PR you authored, across every repo
 you have access to, in one list — the chrome mirrors GitHub's own

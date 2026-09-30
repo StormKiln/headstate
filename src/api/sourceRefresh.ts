@@ -69,7 +69,7 @@ export class SourceRefreshState {
     if (!modern) {
       if (this.session !== undefined) return;
       if (update.phase !== "fetching") this.statusEpoch++;
-      this.backendError = update.error;
+      this.backendError = update.phase === "retrying" ? null : update.error;
       this.legacyStatusError = update.error !== null;
       this.publish();
       return;
@@ -88,7 +88,7 @@ export class SourceRefreshState {
     }
     if (update.revision! > this.revision) {
       this.revision = update.revision!;
-      this.backendError = update.error;
+      this.backendError = update.phase === "retrying" ? null : update.error;
       this.statusEpoch++;
     }
     let rows = this.value.prs;

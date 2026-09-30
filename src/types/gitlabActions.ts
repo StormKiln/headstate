@@ -1,9 +1,10 @@
 import type { PrIdentity } from "./identity";
 import type { SourceCoverage } from "../api/tauri";
 
-export type GitLabAction = "approve" | "comment" | "reply" | "resolve" | "unresolve" | "merge" | "close" | "reopen" | "draft" | "ready" | "rebase" | "retry_ci" | "enable_auto_merge" | "disable_auto_merge";
+export type GitLabAction = "approve" | "request_changes" | "enqueue_train" | "comment" | "reply" | "resolve" | "unresolve" | "merge" | "close" | "reopen" | "draft" | "ready" | "rebase" | "retry_ci" | "enable_auto_merge" | "disable_auto_merge";
 
 export interface GitLabCapabilities {
+  viewer?: string | null;
   identity: PrIdentity;
   head_oid: string | null;
   actions: { action: GitLabAction; allowed: boolean; reason: string | null }[];
@@ -12,6 +13,7 @@ export interface GitLabCapabilities {
 }
 
 export interface GitLabActionRequest {
+  expected_viewer?: string | null;
   identity: PrIdentity;
   action: GitLabAction;
   expected_head: string | null;
@@ -32,6 +34,7 @@ interface Comment { id: number; author: string | null; body: string | null; crea
 export interface GitLabDiscussion { id: string; individual_note: boolean | null; notes: { comment: Comment; kind: string | null; resolvable: boolean | null; resolved: boolean | null }[] }
 
 export interface GitLabDetail {
+  viewer?: string | null;
   core: {
     identity: PrIdentity; id: number; title: string; url: string; state: string; is_draft: boolean;
     body: string | null; author: string | null; head_ref: string; head_oid: string | null; base_ref: string;

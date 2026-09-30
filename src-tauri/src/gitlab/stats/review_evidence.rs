@@ -303,7 +303,11 @@ esac
         )
         .unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let result = load(&program, &report, Duration::from_secs(2)).await;
+        let result = crate::gitlab::test_support::scripted(
+            &program,
+            load(&program, &report, Duration::from_secs(2)),
+        )
+        .await;
         assert_eq!(result.approvals_checked, 1);
         assert_eq!(result.current_approvals, Some(1));
         assert_eq!(result.current_change_requests, None);
@@ -326,7 +330,11 @@ esac
         )
         .unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let result = load(&program, &report, Duration::from_secs(2)).await;
+        let result = crate::gitlab::test_support::scripted(
+            &program,
+            load(&program, &report, Duration::from_secs(2)),
+        )
+        .await;
         let calls = std::fs::read_to_string(program.with_extension("calls")).unwrap();
         (result, calls)
     }

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, it, expect, vi } from "vitest";
 import { GitLabStatsPage, GitLabStatsResults } from "./GitLabStatsPage";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -26,7 +26,7 @@ describe("GitLab statistics evidence", () => {
   });
   it("renders a measured zero and a fully measured mean only for complete coverage", () => {
     render(<GitLabStatsResults report={report(true)} />);
-    expect(screen.getAllByText("0")).toHaveLength(2);
+    expect(within(screen.getByLabelText("MR counts")).getAllByText("0")).toHaveLength(2);
     expect(screen.getByText("24.0 hours (1 MRs)")).toBeTruthy();
     expect(screen.queryByText("At least 0")).toBeNull();
   });
@@ -198,4 +198,22 @@ describe("GitLab explicit history", () => {
     fireEvent.click(screen.getByRole("button", { name: "Load next history day" }));
     expect((await screen.findByRole("alert")).textContent).toContain("account changed");
   });
+});
+
+it("reuses fresh statistics across remounts and forces only explicit Refresh", async () => {
+  vi.mocked(call).mockReset();
+  vi.mocked(call).mockImplementation(async (name) => name === "gitlab_stats_tree" ? tree("1", []) : accountReport("1"));
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const page = <QueryClientProvider client={client}><GitLabStatsPage /></QueryClientProvider>;
+  const first = render(page);
+  await screen.findByText("author-1");
+  expect(vi.mocked(call).mock.calls.find(([name]) => name === "gitlab_stats_load")?.[1]?.refresh).toBe(false);
+  first.unmount();
+  render(page);
+  await screen.findByText("author-1");
+  expect(vi.mocked(call).mock.calls.filter(([name]) => name === "gitlab_stats_load")).toHaveLength(1);
+  expect(vi.mocked(call).mock.calls.filter(([name]) => name === "gitlab_stats_tree")).toHaveLength(1);
+  fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+  await waitFor(() => expect(vi.mocked(call).mock.calls.filter(([name]) => name === "gitlab_stats_load")).toHaveLength(2));
+  expect(vi.mocked(call).mock.calls.filter(([name]) => name === "gitlab_stats_load").at(-1)?.[1]?.refresh).toBe(true);
 });

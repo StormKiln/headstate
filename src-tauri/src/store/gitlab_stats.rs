@@ -25,6 +25,17 @@ pub fn put(path: &Path, key: &str, report: &Report) -> Result<(), String> {
     Ok(())
 }
 
+/// Invalidate live summaries only; retained historical evidence is immutable.
+pub fn invalidate_host(path: &Path, host: &str) -> Result<(), String> {
+    let conn = super::open_db(path).map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM gitlab_stats_cache WHERE json_extract(payload, '$.source.host') = ?1",
+        [host],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 pub fn history_get(
     path: &Path,
     partition: &str,

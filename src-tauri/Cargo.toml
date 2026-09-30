@@ -349,6 +349,7 @@ sysinfo = { version = "0.39", default-features = false, features = ["system", "d
 libc = "0.2"
 
 [dev-dependencies]
+tokio = { version = "1.53", features = ["test-util"] }
 # Decodes the listener's gzip bodies in the loopback tests (#1478), which
 # read raw HTTP rather than go through a client that would decode them
 # and hide the byte count being measured. Already in the tree (tauri's

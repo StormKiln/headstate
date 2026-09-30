@@ -1,3 +1,5 @@
+import { useGitLabViewer } from "./authAvailability";
+import { useRef } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { gitlabStatsTree, gitlabStatsLoad, gitlabStatsBackfill } from "./tauri";
 import type { Source } from "../types/identity";
@@ -13,6 +15,7 @@ interface Coverage {
   rate_reset: number | null;
 }
 export interface GitLabStatsTree {
+  account?: string | null;
   source: Source;
   viewer: string;
   projects: { path: string; namespace: string }[];
@@ -58,13 +61,17 @@ export interface GitLabStatsReport {
   history: { source: Source; project: string; iid: number; title: string; url: string; author: string; state: string; created_at: string; merged_at: string | null }[];
 }
 export function useGitLabStatsTree(host: string, revision: number) {
-  return useQuery({ queryKey: ["stats", "gitlab", host, "tree", revision], queryFn: () => gitlabStatsTree(host), staleTime: 0, gcTime: 0, retry: false });
+  const account = useGitLabViewer();
+  return useQuery({ queryKey: ["stats", "gitlab", host, "tree", revision, account], queryFn: async () => { const tree = await gitlabStatsTree(host); if (account !== undefined && tree.account !== account) throw new Error("GitLab account changed. Refresh account status."); return tree; }, enabled: account !== null, staleTime: 5 * 60_000, gcTime: 30 * 60_000, retry: false });
 }
-export function useGitLabStats(host: string, viewer: string | undefined, scope: GitLabScope, days: number) {
+export function useGitLabStats(host: string, viewer: string | undefined, scope: GitLabScope, days: number, forceRefresh = false) {
+  const force = useRef(forceRefresh);
   return useQuery({
     queryKey: ["stats", "gitlab", host, viewer, scope, days],
     queryFn: async () => {
-      const report = await gitlabStatsLoad(host, scope, days, true);
+      const refresh = force.current;
+      force.current = false;
+      const report = await gitlabStatsLoad(host, scope, days, refresh);
       // glab credentials can change between discovery and this request. Never
       // put the new account's result into the previous account's query key.
       if (report.viewer !== viewer || report.source.provider !== "gitlab" || report.source.host !== host) {
@@ -72,7 +79,7 @@ export function useGitLabStats(host: string, viewer: string | undefined, scope: 
       }
       return report;
     },
-    enabled: viewer !== undefined, staleTime: 0, gcTime: 0, retry: false,
+    enabled: viewer !== undefined, staleTime: 5 * 60_000, gcTime: 30 * 60_000, retry: false,
   });
 }
 

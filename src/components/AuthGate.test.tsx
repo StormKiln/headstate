@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { emit } from "@tauri-apps/api/event";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import { afterEach, describe, expect, it } from "vitest";
+import { useSourceSelection } from "../store/sourceSelection";
 import { AuthGate } from "./AuthGate";
 import { AUTH_EXPIRED, NOT_ASKED } from "@/lib/notAsked";
 
@@ -254,4 +255,13 @@ describe("AuthGate", () => {
     expect(screen.queryByText(/Not refreshing in the background/)).toBeNull();
     expect(screen.getByRole("alert")).toBeTruthy();
   });
+});
+
+it("reports GitLab authentication failure in GitLab-only mode without hiding content", async () => {
+  useSourceSelection.setState({ selection: "gitlab" });
+  try {
+    renderGated({ ok: true, message: "" });
+    expect(await screen.findByRole("button", { name: "Retry GitLab authentication" })).toBeTruthy();
+    expect(screen.getByText("protected content")).toBeTruthy();
+  } finally { useSourceSelection.setState({ selection: "github" }); }
 });

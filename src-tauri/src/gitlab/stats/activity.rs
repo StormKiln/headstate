@@ -203,7 +203,11 @@ mod tests {
         let program = dir.path().join("glab");
         std::fs::write(&program, "#!/bin/sh\nprintf 'HTTP/2 429\\nratelimit-remaining: 0\\nratelimit-reset: 123\\n\\nlimited'\nexit 1\n").unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let limited = load(&program, &report, Duration::from_secs(1)).await;
+        let limited = crate::gitlab::test_support::scripted(
+            &program,
+            load(&program, &report, Duration::from_secs(1)),
+        )
+        .await;
         assert_eq!(limited.comments, None);
         assert_eq!(limited.failures.len(), 1);
         assert_eq!(limited.rate_remaining, Some(0));

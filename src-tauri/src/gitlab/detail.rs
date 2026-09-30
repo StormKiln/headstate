@@ -156,6 +156,8 @@ pub struct DiscussionRead {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeRequestDetail {
+    #[serde(default)]
+    pub viewer: Option<String>,
     pub core: MrCore,
     pub pipelines: PipelineRead,
     pub approvals: ReadState<Approvals>,
@@ -167,7 +169,20 @@ pub struct MergeRequestDetail {
 pub async fn fetch(identity: &PrIdentity) -> Result<MergeRequestDetail, DetailIssue> {
     validate_identity(identity)?;
     let program = super::auth::find_glab().ok_or(DetailIssue::MissingCli)?;
-    fetch_with_program(&program, identity, DETAIL_TIMEOUT).await
+    let viewer = super::auth::viewer(&program, &identity.source.host).await?;
+    static READS: std::sync::LazyLock<
+        super::coalesce::Reads<Result<MergeRequestDetail, DetailIssue>>,
+    > = std::sync::LazyLock::new(super::coalesce::Reads::default);
+    let key = serde_json::to_string(&(identity, &viewer, super::queues::generation()))
+        .expect("serializable identity");
+    let mut detail = READS
+        .run(key, fetch_with_program(&program, identity, DETAIL_TIMEOUT))
+        .await?;
+    if super::auth::viewer(&program, &identity.source.host).await? != viewer {
+        return Err(DetailIssue::Unauthorized);
+    }
+    detail.viewer = Some(viewer);
+    Ok(detail)
 }
 
 pub(super) fn validate_identity(identity: &PrIdentity) -> Result<(), DetailIssue> {
@@ -296,6 +311,7 @@ async fn fetch_with_program(
         ReadState::Unavailable { issue } => ReadState::Unavailable { issue },
     };
     Ok(MergeRequestDetail {
+        viewer: None,
         core,
         pipelines: PipelineRead {
             pipelines,
@@ -476,9 +492,10 @@ pub(super) async fn request_json(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    let mut child = command.spawn().map_err(|_| DetailIssue::Request)?;
-    let stdout = child.stdout.take().ok_or(DetailIssue::Request)?;
     let operation = async {
+        let _permit = super::transport::acquire(program).await;
+        let mut child = command.spawn().map_err(|_| DetailIssue::Request)?;
+        let stdout = child.stdout.take().ok_or(DetailIssue::Request)?;
         if let Some(body) = body {
             let bytes = serde_json::to_vec(&body).map_err(|_| DetailIssue::InvalidResponse)?;
             let mut stdin = child.stdin.take().ok_or(DetailIssue::Request)?;
@@ -859,7 +876,11 @@ mod tests {
         let program = dir.path().join("glab");
         std::fs::write(&program, format!("#!/bin/sh\n{script}\n")).unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-        fetch_with_program(&program, &identity("gitlab.com"), budget).await
+        crate::gitlab::test_support::scripted(
+            &program,
+            fetch_with_program(&program, &identity("gitlab.com"), budget),
+        )
+        .await
     }
 
     #[cfg(unix)]
@@ -932,7 +953,7 @@ esac
 case "$5" in
   */merge_requests/7) printf 'HTTP/2 200\n\n%s' '{detail}' ;;
   */notes*page=1) printf 'HTTP/2 200\nx-total: 2\nx-next-page: 2\n\n%s' '{comments}' ;;
-  */notes*page=2) sleep 2 ;;
+  */notes*page=2) touch "$0.timeout"; exec sleep 60 ;;
   *) printf 'HTTP/2 200\nx-total: 0\nx-next-page:\n\n[]' ;;
 esac
 "#

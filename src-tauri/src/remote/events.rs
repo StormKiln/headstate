@@ -89,6 +89,7 @@ pub const EVENT_NAMES: &[&str] = &[
     "prs-updated",
     "poll-state",
     "source-poll-status",
+    "gitlab-data-changed",
     "poll-error",
     "prs-truncated",
     "prs-incomplete",

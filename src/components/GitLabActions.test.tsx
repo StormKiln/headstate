@@ -54,6 +54,9 @@ describe("GitLab actions", () => {
     fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
     expect((await screen.findByRole("alert")).textContent).toContain("may have applied");
     expect(gitLabAction).toHaveBeenCalledTimes(1);
+    expect((screen.getByRole("button", { name: "Close MR" }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Close MR" }));
+    expect(gitLabAction).toHaveBeenCalledTimes(1);
     expect(screen.queryByText("Close MR: GitLab action verified.")).toBeNull();
   });
 

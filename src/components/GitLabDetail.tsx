@@ -1,19 +1,24 @@
+import { useWritesPaused } from "../lib/useWritesPaused";
+import { useGitLabViewer } from "../api/authAvailability";
 import { useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { getGitLabActionCapabilities, getGitLabDetail, gitLabAction } from "../api/tauri";
 import type { PrIdentity } from "../types/identity";
 import type { GitLabAction, GitLabActionRequest, GitLabCapabilities, GitLabDiscussion, GitLabReceipt } from "../types/gitlabActions";
 import { prKey } from "../lib/prIdentity";
+import { GitLabClaudify } from "./GitLabClaudify";
+import { Markdown } from "./Markdown";
 import { ExternalLink } from "./ExternalLink";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 
 const LABEL: Record<GitLabAction, string> = {
+  request_changes: "Request changes", enqueue_train: "Add to merge train",
   approve: "Approve", comment: "Post comment", reply: "Reply", resolve: "Resolve discussion", unresolve: "Reopen discussion",
   merge: "Merge MR", close: "Close MR", reopen: "Reopen MR", draft: "Mark draft", ready: "Mark ready",
   rebase: "Rebase source branch", retry_ci: "Retry failed CI", enable_auto_merge: "Enable auto-merge", disable_auto_merge: "Cancel auto-merge",
 };
 const BUTTON = "rounded border border-[#30363d] px-3 py-1.5 text-sm hover:bg-[#21262d] disabled:opacity-40";
-const PRIMARY: GitLabAction[] = ["approve", "merge", "close", "reopen", "draft", "ready", "rebase", "retry_ci", "enable_auto_merge", "disable_auto_merge"];
+const PRIMARY: GitLabAction[] = ["approve", "request_changes", "enqueue_train", "merge", "close", "reopen", "draft", "ready", "rebase", "retry_ci", "enable_auto_merge", "disable_auto_merge"];
 
 function permitted(capabilities: GitLabCapabilities | undefined, action: GitLabAction): boolean {
   return capabilities?.actions.some((c) => c.action === action && c.allowed) === true;
@@ -28,7 +33,7 @@ function Discussion({ discussion, capabilities, busy, act }: {
   return <section className="space-y-2 rounded border border-[#30363d] p-3">
     {discussion.notes.map(({ comment, resolvable, resolved }) => <div key={comment.id}>
       <p className="text-xs text-[#8b949e]">{comment.author ?? "Unknown author"}{resolvable ? resolved === null ? " · Resolution unknown" : resolved ? " · Resolved" : " · Unresolved" : ""}</p>
-      <p className="whitespace-pre-wrap break-words text-sm">{comment.body ?? "Comment text unavailable"}</p>
+      <Markdown>{comment.body ?? "Comment text unavailable"}</Markdown>
     </div>)}
     {permission?.can_resolve ? <button className={BUTTON} type="button" disabled={busy} onClick={() => act(permission.resolved ? "unresolve" : "resolve", undefined, discussion.id)}>{permission.resolved ? "Reopen discussion" : "Resolve discussion"}</button> : null}
     {permission?.can_reply && permitted(capabilities, "reply") ? <div>
@@ -39,12 +44,14 @@ function Discussion({ discussion, capabilities, busy, act }: {
 }
 
 export function GitLabDetail({ identity }: { identity: PrIdentity }) {
+  const viewer = useGitLabViewer();
+  const paused = useWritesPaused();
   const key = prKey(identity);
-  const client = useQueryClient();
-  const detail = useQuery({ queryKey: ["gitlab-detail", key], queryFn: () => getGitLabDetail(identity), retry: false });
-  const caps = useQuery({ queryKey: ["gitlab-actions", key], queryFn: () => getGitLabActionCapabilities(identity), retry: false });
+  const detail = useQuery({ queryKey: ["gitlab-detail", key, viewer], queryFn: async () => { const result = await getGitLabDetail(identity); if (viewer !== undefined && result.viewer !== viewer) throw new Error("GitLab account changed. Refresh account status."); return result; }, enabled: viewer !== null, staleTime: 60_000, retry: false });
+  const caps = useQuery({ queryKey: ["gitlab-actions", key, viewer], queryFn: async () => { const result = await getGitLabActionCapabilities(identity); if (viewer !== undefined && result.viewer !== viewer) throw new Error("GitLab account changed. Refresh account status."); return result; }, enabled: viewer !== null, staleTime: 30_000, retry: false });
   const [pending, setPending] = useState<GitLabActionRequest | null>(null);
   const [busy, setBusy] = useState(false);
+  const [uncertain, setUncertain] = useState(false);
   const [receipt, setReceipt] = useState<GitLabReceipt | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [comment, setComment] = useState("");
@@ -52,23 +59,23 @@ export function GitLabDetail({ identity }: { identity: PrIdentity }) {
   // Permission and detail reads must describe the same commit the user sees.
   const capabilities = !caps.error && !detail.error && caps.data && detail.data && prKey(caps.data.identity) === key && caps.data.head_oid === detail.data.core.head_oid ? caps.data : undefined;
   const act = (action: GitLabAction, body?: string, discussion_id?: string) => {
-    if (!capabilities || busy) return;
-    setPending({ identity, action, expected_head: detail.data?.core.head_oid ?? null, body, discussion_id });
+    if (!capabilities || busy || uncertain || paused) return;
+    setPending({ identity, action, expected_viewer: capabilities.viewer, expected_head: detail.data?.core.head_oid ?? null, body, discussion_id });
   };
   const run = async () => {
-    if (!pending || busy) return;
+    if (!pending || busy || uncertain || paused) return;
     const request = pending;
     setBusy(true); setPending(null); setError(null); setReceipt(null);
     try {
       const result = await gitLabAction(request);
       setReceipt(result);
+      setUncertain(result.outcome === "unverified");
       if (result.outcome === "verified" && request.action === "comment") setComment("");
     } catch (e) {
       setError(`${String(e)} Refresh the MR before trying again.`);
+      setUncertain(true);
     } finally {
       setBusy(false);
-      void client.invalidateQueries({ queryKey: ["gitlab-detail", key] });
-      void client.invalidateQueries({ queryKey: ["gitlab-actions", key] });
     }
   };
   if (!detail.data) return <div className="mt-3 text-sm" role={detail.error ? "alert" : "status"}>
@@ -82,14 +89,19 @@ export function GitLabDetail({ identity }: { identity: PrIdentity }) {
     <div className="text-sm text-[#8b949e]">{d.core.state}{d.core.is_draft ? " · Draft" : ""} · Head {d.core.head_oid?.slice(0, 12) ?? "unknown"} · Merge status: {d.core.detailed_merge_status ?? "unknown"}
       <button type="button" className={`${BUTTON} ml-2`} disabled={busy || detail.isFetching || caps.isFetching} onClick={refresh}>Refresh details</button>
     </div>
-    {d.core.body ? <p className="whitespace-pre-wrap break-words text-sm">{d.core.body}</p> : null}
+    <GitLabClaudify detail={d} />
+    {d.core.body ? <Markdown>{d.core.body}</Markdown> : null}
     {detail.error ? <p role="alert">Detail refresh failed; showing the previous detail. {String(detail.error)}</p> : null}
     {caps.error ? <p role="alert">Action permissions could not be checked. {String(caps.error)}</p> : !capabilities ? <p role="status">Action permissions and MR head have not yet been confirmed together.</p> : null}
     {receipt ? <p role={receipt.outcome === "verified" ? "status" : "alert"}>{LABEL[receipt.action]}: {receipt.message}</p> : null}
     {error ? <p role="alert">{error}</p> : null}
-    <div className="flex flex-wrap gap-2">{PRIMARY.filter((a) => permitted(capabilities, a)).map((a) => <button key={a} type="button" className={BUTTON} disabled={busy || caps.isFetching || detail.isFetching} onClick={() => act(a)}>{LABEL[a]}</button>)}</div>
+    {paused ? <p role="status">Writes paused: {paused}.</p> : null}
+    {uncertain ? <div role="status">This write may already have completed. Inspect the MR on GitLab before allowing another write.
+      <button type="button" className={`${BUTTON} ml-2`} onClick={() => { setUncertain(false); refresh(); }}>I checked GitLab; allow another action</button>
+    </div> : null}
+    <div className="flex flex-wrap gap-2">{PRIMARY.filter((a) => permitted(capabilities, a)).map((a) => <button key={a} type="button" className={BUTTON} disabled={busy || uncertain || !!paused || caps.isFetching || detail.isFetching} onClick={() => act(a)}>{LABEL[a]}</button>)}</div>
     <details className="text-xs text-[#8b949e]"><summary>Action availability</summary>
-      <p>GitLab merge trains and request-changes reviews are not supported here. Rebase updates the source branch; GitLab does not provide an atomic head guard for this action.</p>
+      <p>Rebase and request-changes reviews require a fresh head check, but GitLab does not provide an atomic head guard for these actions.</p>
       {caps.data?.actions.filter((c) => !c.allowed).map((c) => <p key={c.action}>{LABEL[c.action]}: {c.reason}</p>)}
       {caps.data && !caps.data.discussions_complete ? <p>Permissions were checked for the first 100 discussions. Later discussions can be acted on in GitLab.</p> : null}
     </details>
@@ -118,7 +130,7 @@ export function GitLabDetail({ identity }: { identity: PrIdentity }) {
     <section className="space-y-3"><h3 className="font-semibold">Discussions</h3>
       {d.discussions.state === "unavailable" ? <p>Discussions unavailable ({d.discussions.issue}).</p> : <>
         <p className="text-sm">Unresolved threads: {d.discussions.value.unresolved_resolvable ?? "unknown"}{d.discussions.value.discussions.coverage !== "complete" ? " · Discussion list is incomplete" : ""}</p>
-        {discussions.map((discussion) => <Discussion key={discussion.id} discussion={discussion} capabilities={capabilities} busy={busy} act={act} />)}
+        {discussions.map((discussion) => <Discussion key={discussion.id} discussion={discussion} capabilities={capabilities} busy={busy || uncertain || !!paused} act={act} />)}
       </>}
       {d.comments.state === "unavailable" ? <p>Comments unavailable ({d.comments.issue}).</p> : <>
         {d.comments.value.coverage !== "complete" ? <p>Comment list is incomplete.</p> : null}
@@ -131,7 +143,7 @@ export function GitLabDetail({ identity }: { identity: PrIdentity }) {
       {pending?.action === "merge" || pending?.action === "enable_auto_merge" ? <p className="text-sm">This changes the target branch{pending.action === "enable_auto_merge" ? " when GitLab's checks pass" : " now"}. Head: {pending.expected_head?.slice(0, 12)}.</p> : null}
       {pending?.action === "rebase" ? <p className="text-sm">This rewrites the source branch by rebasing it onto the target. A concurrent push cannot be guarded atomically by GitLab.</p> : null}
       {pending?.body ? <p className="max-h-52 overflow-auto whitespace-pre-wrap break-words text-sm">{pending.body}</p> : null}
-      <div className="flex gap-2"><button type="button" className={BUTTON} onClick={() => void run()} disabled={busy}>Confirm</button><button type="button" className={BUTTON} onClick={() => setPending(null)}>Cancel</button></div>
+      <div className="flex gap-2"><button type="button" className={BUTTON} onClick={() => void run()} disabled={busy || !!paused}>Confirm</button><button type="button" className={BUTTON} onClick={() => setPending(null)}>Cancel</button></div>
     </DialogContent></Dialog>
   </div>;
 }

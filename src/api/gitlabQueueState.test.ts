@@ -112,3 +112,14 @@ it("changes the displayed freshness when a real accepted receipt crosses the sta
     vi.useRealTimers();
   }
 });
+
+it("rejects saved and late live rows from a different GitLab account", () => {
+  const state = new GitLabQueueState("gitlab.com", "authored", "new-account");
+  const old = { ...mr("private old row"), viewer: "old-account" };
+  state.seed({ state: "git_lab_available", mrs: [old], coverage: "complete", fetched_at: new Date().toISOString(), stale_secs: null });
+  expect(state.snapshot().rows).toBeUndefined();
+  state.accept(update({ mrs: [old] }));
+  expect(state.snapshot().rows).toBeUndefined();
+  state.accept(update({ revision: 2, receipt_revision: 2, mrs: [{ ...mr("new row"), viewer: "new-account" }] }));
+  expect(state.snapshot().rows?.[0].title).toBe("new row");
+});

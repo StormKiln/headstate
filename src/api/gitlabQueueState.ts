@@ -17,7 +17,7 @@ type Request = { id: string; order: number; session: string | undefined; complet
 /// revisions can change the provider error. A late reply therefore cannot
 /// erase a failure (or a later receipt) already observed through events.
 export class GitLabQueueState {
-  constructor(private readonly expectedHost?: string, private readonly expectedList?: SourceList) {}
+  constructor(private readonly expectedHost?: string, private readonly expectedList?: SourceList, private readonly viewer?: string | null) {}
   private value: GitLabQueueSnapshot = {
     rows: undefined, coverage: null, staleSecs: null,
     loading: true, refreshing: false, error: null,
@@ -55,6 +55,7 @@ export class GitLabQueueState {
     // during the disk read, including a measured empty live list.
     if (this.value.rows !== undefined) return;
     if (data.state === "git_lab_available") {
+      if (this.viewer !== undefined && (this.viewer === null || data.mrs.some(row => row.viewer !== this.viewer))) return;
       this.receivedAt = data.fetched_at;
       this.publish({ rows: data.mrs, coverage: data.coverage, staleSecs: data.stale_secs, loading: false });
     } else if (data.state === "unreadable") {
@@ -71,6 +72,7 @@ export class GitLabQueueState {
   }
 
   accept(update: SourcePollUpdate) {
+    if (this.viewer !== undefined && (this.viewer === null || update.mrs?.some(row => row.viewer !== this.viewer))) return;
     if (this.expectedHost !== undefined && (update.source.provider !== "gitlab" || update.source.host !== this.expectedHost || update.list !== this.expectedList)) return;
     if (this.retired.has(update.session)) return;
     if (this.session !== update.session) {
@@ -108,7 +110,7 @@ export class GitLabQueueState {
     }
     // Legacy desktops return rows without a revision. They cannot safely
     // supersede any versioned receipt or terminal status already observed.
-    if ("mrs" in reply && this.session === undefined && this.value.rows === undefined && reply.mrs !== null) {
+    if (this.viewer === undefined && "mrs" in reply && this.session === undefined && this.value.rows === undefined && reply.mrs !== null) {
       this.publish({ rows: reply.mrs, coverage: reply.coverage, staleSecs: null, loading: false });
     }
     this.requests.delete(request.id);

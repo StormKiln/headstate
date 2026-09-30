@@ -8,7 +8,7 @@ import { useConnectionState } from "@/api/connection";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { dismissSplash } from "../splash";
 import { commandError } from "@/lib/errorKind";
-import { GitHubAuthProvider } from "@/api/authAvailability";
+import { GitHubAuthProvider, GitLabViewerProvider } from "@/api/authAvailability";
 import { useSourceSelection } from "@/store/sourceSelection";
 import { getGitLabHost } from "@/api/gitlabHost";
 
@@ -54,6 +54,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
     queryKey: ["gitlab-auth", gitlabHost.data ?? "invalid"],
     queryFn: getGitLabAuthState,
     staleTime: 60_000,
+    refetchInterval: selection === "github" ? false : 60_000,
     retry: false,
     enabled: gitlabHost.isSuccess || gitlabHost.isError,
   });
@@ -134,13 +135,18 @@ export function AuthGate({ children }: { children: ReactNode }) {
   // `get_cached` is the one read the companion serves from its stored
   // snapshot, so there is genuinely something to show. Where there is
   // not, `PrList` renders its own empty state, which is honest too.
-  if (offline) return <GitHubAuthProvider available={null}>{children}</GitHubAuthProvider>;
+  if (offline) return <GitHubAuthProvider available={null}>{<GitLabViewerProvider viewer={gitlab.data?.ok ? gitlab.data.viewer ?? null : null}>{children}</GitLabViewerProvider>}</GitHubAuthProvider>;
 
   if (isLoading) return null;
   if (data !== undefined) {
     return (
       <GitHubAuthProvider available={data.ok}>
+      <GitLabViewerProvider viewer={gitlab.data?.ok ? gitlab.data.viewer ?? null : null}>
       <div className="flex h-full flex-col">
+        {selection !== "github" && (gitlab.error || gitlab.data && !gitlab.data.ok) ? <div role="alert" className="border-b border-[#d29922]/30 bg-[#d29922]/10 px-4 py-2 text-sm text-[#d29922]">
+          {gitlab.data?.message || "GitLab account could not be verified. Check desktop authentication and connectivity."}
+          <button type="button" className="ml-2 underline" onClick={() => void gitlab.refetch()}>Retry GitLab authentication</button>
+        </div> : null}
         {!data.ok && selection !== "gitlab" && (
           <div role="status" className="border-b border-[#d29922]/30 bg-[#d29922]/10 px-4 py-2 text-sm text-[#d29922]">
             <span>GitHub is unavailable: {data.message}</span>
@@ -253,11 +259,12 @@ export function AuthGate({ children }: { children: ReactNode }) {
         )}
         <div className="min-h-0 flex-1">{children}</div>
       </div>
+      </GitLabViewerProvider>
       </GitHubAuthProvider>
     );
   }
 
   // A failed IPC check says nothing about either provider's credential.
   // Keep local and GitLab views available while the connection layer reports it.
-  return <GitHubAuthProvider available={null}>{children}</GitHubAuthProvider>;
+  return <GitHubAuthProvider available={null}>{<GitLabViewerProvider viewer={gitlab.data?.ok ? gitlab.data.viewer ?? null : null}>{children}</GitLabViewerProvider>}</GitHubAuthProvider>;
 }

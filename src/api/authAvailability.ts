@@ -19,3 +19,11 @@ export function GitHubAuthProvider({
 export function useGitHubAuthAvailable(): GitHubAuthAvailability {
   return useContext(GitHubAuthAvailabilityContext);
 }
+
+// null means the account has not been verified. undefined is only the
+// standalone component default; AuthGate always supplies an explicit value.
+const GitLabViewerContext = createContext<string | null | undefined>(undefined);
+export function GitLabViewerProvider({ viewer, children }: { viewer: string | null; children: ReactNode }) {
+  return createElement(GitLabViewerContext.Provider, { value: viewer }, children);
+}
+export const useGitLabViewer = () => useContext(GitLabViewerContext);

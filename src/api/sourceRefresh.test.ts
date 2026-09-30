@@ -121,3 +121,14 @@ describe("correlated source refreshes", () => {
     expect(state.snapshot().prs).toEqual(rows(2));
   });
 });
+
+ it("retains rows and suppresses retrying errors until failure, then clears on recovery", () => {
+    const state = new SourceRefreshState();
+    state.accept(update(1));
+    state.accept(update(2, "temporary failure", { phase: "retrying", prs: null }));
+    expect(state.snapshot()).toMatchObject({ prs: rows(1), error: null });
+    state.accept(update(3, "persistent failure", { phase: "failed", prs: null }));
+    expect(state.snapshot().error).toBe("persistent failure");
+    state.accept(update(4));
+    expect(state.snapshot()).toMatchObject({ prs: rows(4), error: null });
+  });

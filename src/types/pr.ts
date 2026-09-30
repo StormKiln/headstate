@@ -433,7 +433,8 @@ export interface Worktree {
 }
 
 export interface WorktreeRepo {
-  /// `owner/repo` from the git REMOTE, not the directory name -- this
+  /// GitHub owner/repo, or host/full/project/path for other git hosts.
+  /// From the git REMOTE, not the directory name -- this
   /// app's own directory is `ghstat` while its repository is
   /// `pktstorm/headstate`. `null` when there is no remote to ask.
   identity: string | null;

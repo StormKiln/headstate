@@ -704,7 +704,7 @@ describe("review request source scope", () => {
     useFilters.setState({ view: "my-prs", selectedPr: null });
   });
 
-  it("does not offer cached GitHub pull requests after selecting GitLab or Both", async () => {
+  it("preserves GitHub review requests in Both and excludes them in GitLab-only mode", async () => {
     mockPrs.mockReturnValue([PR_FIXTURES[0]]);
     useFilters.setState({ view: "my-prs", selectedPr: null });
     useSourceSelection.setState({ selection: "github", repoKey: null, query: "" });
@@ -715,6 +715,6 @@ describe("review request source scope", () => {
     expect(screen.queryByRole("button", { name: "Request reviews" })).toBeNull();
 
     await act(async () => useSourceSelection.setState({ selection: "both", repoKey: null, query: "" }));
-    expect(screen.queryByRole("button", { name: "Request reviews" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Request reviews" })).toBeTruthy();
   });
 });

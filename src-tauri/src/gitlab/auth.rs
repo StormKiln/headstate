@@ -23,6 +23,7 @@ pub enum AuthIssue {
 #[serde(rename_all = "camelCase")]
 pub struct AuthState {
     pub host: String,
+    pub viewer: Option<String>,
     pub ok: bool,
     pub issue: Option<AuthIssue>,
     pub message: String,
@@ -32,6 +33,7 @@ impl AuthState {
     fn ready(host: &str) -> Self {
         Self {
             host: host.into(),
+            viewer: None,
             ok: true,
             issue: None,
             message: String::new(),
@@ -48,6 +50,7 @@ impl AuthState {
         };
         Self {
             host: host.into(),
+            viewer: None,
             ok: false,
             issue: Some(issue),
             message,
@@ -101,7 +104,14 @@ pub async fn check_host(host: &str) -> AuthState {
     let Some(glab) = find_glab() else {
         return AuthState::failed(&host, AuthIssue::MissingCli);
     };
-    check_with_program(&glab, &host, PROBE_TIMEOUT).await
+    let mut state = check_with_program(&glab, &host, PROBE_TIMEOUT).await;
+    if state.ok {
+        match viewer(&glab, &host).await {
+            Ok(viewer) => state.viewer = Some(viewer),
+            Err(_) => return AuthState::failed(&host, AuthIssue::Unverified),
+        }
+    }
+    state
 }
 
 async fn check_with_program(glab: &std::path::Path, host: &str, timeout: Duration) -> AuthState {
@@ -129,6 +139,29 @@ async fn check_with_program(glab: &std::path::Path, host: &str, timeout: Duratio
         Ok(_) => AuthState::failed(host, AuthIssue::ApiUnavailable),
         Err(_) => AuthState::failed(host, AuthIssue::TimedOut),
     }
+}
+
+/// Identity reads are shared across simultaneous desktop/phone requests. No
+/// credential or raw diagnostic is read; glab retains ownership of authentication.
+pub async fn viewer(
+    program: &std::path::Path,
+    host: &str,
+) -> Result<String, super::detail::DetailIssue> {
+    use std::sync::LazyLock;
+    static READS: LazyLock<super::coalesce::Reads<Result<String, super::detail::DetailIssue>>> =
+        LazyLock::new(super::coalesce::Reads::default);
+    READS
+        .run(format!("{program:?}:{host}"), async {
+            let response =
+                super::detail::request_json(program, host, "user", "GET", None, PROBE_TIMEOUT)
+                    .await?;
+            response.body["username"]
+                .as_str()
+                .filter(|name| !name.is_empty() && name.len() <= 255)
+                .map(str::to_owned)
+                .ok_or(super::detail::DetailIssue::InvalidResponse)
+        })
+        .await
 }
 
 #[cfg(test)]
@@ -161,7 +194,8 @@ mod tests {
         let program = dir.path().join("glab");
         std::fs::write(&program, format!("#!/bin/sh\n{script}\n")).unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-        check_with_program(&program, host, timeout).await
+        crate::gitlab::test_support::scripted(&program, check_with_program(&program, host, timeout))
+            .await
     }
 
     #[cfg(unix)]
@@ -192,7 +226,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn hung_probe_is_bounded() {
-        let state = fake_glab("sleep 2", Duration::from_millis(20)).await;
+        let state = fake_glab(
+            "touch \"$0.timeout\"; exec sleep 60",
+            Duration::from_millis(20),
+        )
+        .await;
         assert_eq!(state.issue, Some(AuthIssue::TimedOut));
     }
 

@@ -95,6 +95,7 @@ export interface AuthState {
 }
 
 export interface GitLabAuthState {
+  viewer?: string | null;
   host: string;
   ok: boolean;
   issue: "missingCli" | "unverified" | "timedOut" | null;

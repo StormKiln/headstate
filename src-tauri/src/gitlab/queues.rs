@@ -15,10 +15,24 @@ const MAX_PAGES: usize = 5;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
+// A read started after a mutation must never join the pre-mutation read.
+static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn invalidate_identity(identity: &PrIdentity) {
+    super::enrichment::invalidate(identity);
+}
+pub fn generation() -> u64 {
+    GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+pub fn invalidate() {
+    GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
 /// A list receipt, with absent detail measures left absent. It is never
 /// deserialized as a GitHub PullRequest or sent through GitHub row events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeRequest {
+    #[serde(default)]
+    pub viewer: Option<String>,
     pub source: Source,
     pub id: u64,
     pub number: u64,
@@ -40,6 +54,14 @@ pub struct MergeRequest {
     pub ci: Option<CiState>,
     pub review: Option<ReviewState>,
     pub unresolved_threads: Option<u64>,
+    #[serde(default)]
+    pub unresolved_threads_floor: bool,
+    #[serde(default)]
+    pub needs_my_review: Option<bool>,
+    #[serde(default)]
+    pub in_merge_queue: Option<bool>,
+    #[serde(default)]
+    pub can_enqueue_train: Option<bool>,
 }
 
 impl MergeRequest {
@@ -54,12 +76,13 @@ impl MergeRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchedList {
+    pub viewer: Option<String>,
     pub mrs: Vec<MergeRequest>,
     pub total: Option<u64>,
     pub coverage: Coverage,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum QueueError {
     #[error("GitLab CLI (glab) was not found on the desktop")]
     MissingCli,
@@ -95,12 +118,66 @@ struct Page {
     terminal_known: bool,
 }
 
-pub async fn fetch(source: &Source, list: CachedList) -> Result<FetchedList, QueueError> {
+pub async fn fetch<F: std::future::Future<Output = ()>>(
+    source: &Source,
+    list: CachedList,
+    progress: impl FnOnce(FetchedList) -> F,
+) -> Result<FetchedList, QueueError> {
     if source.provider != Provider::Gitlab || super::host::validate(&source.host).is_err() {
         return Err(QueueError::UnsupportedHost);
     }
     let program = super::auth::find_glab().ok_or(QueueError::MissingCli)?;
-    fetch_with_program(&program, source, list, FETCH_TIMEOUT).await
+    static READS: std::sync::LazyLock<super::coalesce::Reads<Result<FetchedList, QueueError>>> =
+        std::sync::LazyLock::new(super::coalesce::Reads::default);
+    let viewer = super::auth::viewer(&program, &source.host)
+        .await
+        .map_err(|_| QueueError::Unauthorized)?;
+    let key = format!(
+        "{}:{viewer}:{list:?}:{}",
+        source.host,
+        GENERATION.load(std::sync::atomic::Ordering::Acquire)
+    );
+    READS
+        .run(key, async {
+            let started = tokio::time::Instant::now();
+            let generation = GENERATION.load(std::sync::atomic::Ordering::Acquire);
+            let mut result = fetch_with_program(&program, source, list, FETCH_TIMEOUT).await?;
+            result.viewer = Some(viewer.clone());
+            for row in &mut result.mrs {
+                row.viewer = Some(viewer.clone());
+            }
+            if super::auth::viewer(&program, &source.host)
+                .await
+                .map_err(|_| QueueError::Unauthorized)?
+                != viewer
+            {
+                return Err(QueueError::Unauthorized);
+            }
+            if generation != GENERATION.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(QueueError::Request);
+            }
+            super::enrichment::fill_cached(&mut result.mrs, generation);
+            progress(result.clone()).await;
+            super::enrichment::enrich(
+                &program,
+                &mut result.mrs,
+                FETCH_TIMEOUT.saturating_sub(started.elapsed()),
+                generation,
+            )
+            .await;
+            if super::auth::viewer(&program, &source.host)
+                .await
+                .map_err(|_| QueueError::Unauthorized)?
+                != viewer
+            {
+                return Err(QueueError::Unauthorized);
+            }
+            if generation != GENERATION.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(QueueError::Request);
+            }
+            Ok(result)
+        })
+        .await
 }
 
 async fn fetch_with_program(
@@ -201,6 +278,7 @@ async fn fetch_with_program(
         Coverage::Unknown
     };
     Ok(FetchedList {
+        viewer: None,
         mrs,
         total,
         coverage,
@@ -220,11 +298,14 @@ async fn request(
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    let output = tokio::time::timeout(timeout, command.output())
+    let (raw, status) = tokio::time::timeout(timeout, super::transport::output(&mut command))
         .await
         .map_err(|_| QueueError::Timeout)?
-        .map_err(|_| QueueError::Request)?;
-    parse_page(&output.stdout, output.status.success())
+        .map_err(|error| match error {
+            super::transport::Error::TooLarge => QueueError::InvalidPage,
+            super::transport::Error::Io => QueueError::Request,
+        })?;
+    parse_page(&raw, status.success())
 }
 
 fn parse_page(raw: &[u8], successful: bool) -> Result<Page, QueueError> {
@@ -327,6 +408,7 @@ fn map_row(v: &Value, source: &Source) -> Option<MergeRequest> {
     let comment_count = v.get("user_notes_count")?.as_u64()?;
     let id = v.get("id")?.as_u64()?;
     Some(MergeRequest {
+        viewer: None,
         source: source.clone(),
         id,
         number,
@@ -350,6 +432,10 @@ fn map_row(v: &Value, source: &Source) -> Option<MergeRequest> {
             .map(str::to_owned),
         ci: None,
         unresolved_threads: None,
+        unresolved_threads_floor: true,
+        needs_my_review: None,
+        in_merge_queue: None,
+        can_enqueue_train: None,
         review: None,
     })
 }
@@ -482,7 +568,11 @@ mod tests {
         let program = dir.path().join("glab");
         std::fs::write(&program, format!("#!/bin/sh\n{script}\n")).unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-        fetch_with_program(&program, &source("gitlab.com"), list, budget).await
+        crate::gitlab::test_support::scripted(
+            &program,
+            fetch_with_program(&program, &source("gitlab.com"), list, budget),
+        )
+        .await
     }
 
     #[cfg(unix)]
@@ -494,7 +584,7 @@ mod tests {
 test "$1" = api && test "$2" = --hostname && test "$3" = gitlab.com && test "$4" = -i || exit 90
 case "$5" in
   *scope=created_by_me*page=1) printf 'HTTP/2 200\nx-total: 2\nx-next-page: 2\n\n%s' '{first}' ;;
-  *scope=created_by_me*page=2) sleep 2 ;;
+  *scope=created_by_me*page=2) touch "$0.timeout"; exec sleep 60 ;;
   *scope=reviews_for_me*) printf 'HTTP/2 200\nx-total: 0\nx-next-page:\n\n[]' ;;
   *) exit 91 ;;
 esac
@@ -543,7 +633,7 @@ esac
         let script = r#"
 case "$5" in
   *page=1) printf 'HTTP/2 200\nx-total: 2\nx-next-page: 2\n\n[]' ;;
-  *page=2) sleep 2 ;;
+  *page=2) touch "$0.timeout"; exec sleep 60 ;;
   *) exit 91 ;;
 esac
 "#;
@@ -553,5 +643,19 @@ esac
         assert!(result.mrs.is_empty());
         assert_eq!(result.total, Some(2));
         assert_eq!(result.coverage, Coverage::Partial { total: Some(2) });
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oversized_valid_page_is_rejected_before_retention() {
+        let mut large = row("gitlab.com", "group/subgroup/project", 7);
+        large["description"] = json!("x".repeat(4 * 1024 * 1024));
+        let script = format!(
+            "printf 'HTTP/2 200\\nx-next-page:\\n\\n%s' '{}'",
+            json!([large])
+        );
+        assert!(matches!(
+            scripted(&script, CachedList::Authored, Duration::from_secs(30)).await,
+            Err(QueueError::InvalidPage)
+        ));
     }
 }

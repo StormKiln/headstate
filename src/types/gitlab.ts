@@ -3,6 +3,7 @@ import type { CiState, Label, ReviewState } from "./pr";
 
 /// Rust gitlab::queues::MergeRequest. Null means the list did not measure it.
 export interface MergeRequest {
+  viewer?: string | null;
   source: Source;
   id: number;
   number: number;
@@ -24,4 +25,8 @@ export interface MergeRequest {
   ci: CiState | null;
   review: ReviewState | null;
   unresolved_threads: number | null;
+  unresolved_threads_floor?: boolean;
+  needs_my_review?: boolean | null;
+  in_merge_queue?: boolean | null;
+  can_enqueue_train?: boolean | null;
 }

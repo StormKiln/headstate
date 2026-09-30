@@ -494,17 +494,50 @@ pub(super) fn fetched_at(dir: &Path) -> Option<String> {
     Some(t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
-pub fn parse_owner_repo(url: &str) -> Option<String> {
-    let url = url.trim().trim_end_matches('/');
-    let url = url.strip_suffix(".git").unwrap_or(url);
-    // Everything after the host, whichever form the URL takes:
-    //   git@host:owner/repo   https://host/owner/repo   ssh://git@host/owner/repo
-    let tail = url.rsplit_once(':').map_or(url, |(_, t)| t);
-    let mut parts = tail.rsplit('/');
-    let repo = parts.next()?;
-    let owner = parts.next()?;
-    (!owner.is_empty() && !repo.is_empty() && !owner.contains(' ') && !repo.contains(' '))
-        .then(|| format!("{owner}/{repo}"))
+/// GitHub keeps its established owner/repo key. Other hosts retain their
+/// hostname and full namespace, so they cannot join unrelated GitHub PRs.
+pub fn parse_owner_repo(remote: &str) -> Option<String> {
+    let remote = remote.trim();
+    let normalized = if remote.contains("://") {
+        remote.to_owned()
+    } else {
+        let (authority, path) = remote.split_once(':')?;
+        if !authority.contains('@') || path.starts_with('/') {
+            return None;
+        }
+        format!("ssh://{authority}/{path}")
+    };
+    let url = reqwest::Url::parse(&normalized).ok()?;
+    if !matches!(url.scheme(), "https" | "http" | "ssh" | "git")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let host = url.host_str()?.to_ascii_lowercase();
+    let path = url.path().trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let parts: Vec<_> = path.split('/').collect();
+    if parts.len() < 2
+        || parts.iter().any(|part| {
+            part.is_empty()
+                || *part == "."
+                || *part == ".."
+                || !part
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || "._-".contains(c))
+        })
+    {
+        return None;
+    }
+    if (host == "github.com"
+        && (url.port().is_none() || url.scheme() == "ssh" && url.port() == Some(22)))
+        || (host == "ssh.github.com" && url.scheme() == "ssh" && url.port() == Some(443))
+    {
+        (parts.len() == 2).then(|| path.to_owned())
+    } else {
+        Some(format!("{host}/{path}"))
+    }
 }
 
 /// The `owner/repo` a checkout belongs to, or None.
@@ -6885,6 +6918,25 @@ prunable gitdir file points to non-existent location
             ),
         ] {
             assert_eq!(parse_owner_repo(url).as_deref(), Some(want), "{url}");
+        }
+        assert_eq!(
+            parse_owner_repo("git@gitlab.com:acme/team/project.git").as_deref(),
+            Some("gitlab.com/acme/team/project")
+        );
+        assert_eq!(
+            parse_owner_repo("https://gitlab.example/group/project.git").as_deref(),
+            Some("gitlab.example/group/project")
+        );
+        assert_ne!(
+            parse_owner_repo("https://github.com.evil/octocat/hello-world"),
+            parse_owner_repo("https://github.com/octocat/hello-world")
+        );
+        for (host, port) in [("github.com", 22), ("ssh.github.com", 443)] {
+            let remote = format!("ssh://git@{host}:{port}/octocat/hello-world.git");
+            assert_eq!(
+                parse_owner_repo(&remote).as_deref(),
+                Some("octocat/hello-world")
+            );
         }
         // Anything unrecognisable yields None rather than a guess: a
         // fuzzy match here pairs a PR with the wrong directory.
