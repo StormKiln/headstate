@@ -69,7 +69,7 @@ Internal testing reaches only App Store Connect users you add by hand. A
 desktop's *Get the mobile companion* button and its QR code point at
 (`TESTFLIGHT_JOIN_URL` in `src/components/GetCompanionPanel.tsx`).
 
-The group is **live**: "HeadState beta", public link
+The public beta link is **live**:
 `https://testflight.apple.com/join/HwV4gMHr`.
 
 Setting it up is a console task, done once — recorded here because it has
