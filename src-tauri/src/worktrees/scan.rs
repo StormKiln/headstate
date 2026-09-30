@@ -85,9 +85,7 @@ pub(crate) mod fake_git {
     static FAKES: Mutex<Vec<(PathBuf, PathBuf)>> = Mutex::new(Vec::new());
 
     /// Run `program` for every git call in a directory under `prefix`,
-    /// until the returned guard drops. Unix only, like the one test that
-    /// uses it: its fake git is a shell script.
-    #[cfg(unix)]
+    /// until the returned guard drops.
     pub(crate) fn install(prefix: &Path, program: &Path) -> Installed {
         FAKES
             .lock()
@@ -96,10 +94,8 @@ pub(crate) mod fake_git {
         Installed(prefix.to_path_buf())
     }
 
-    #[cfg(unix)]
     pub(crate) struct Installed(PathBuf);
 
-    #[cfg(unix)]
     impl Drop for Installed {
         fn drop(&mut self) {
             FAKES
@@ -161,6 +157,11 @@ pub(crate) fn git_output_with(
     let mut spawned = None;
     for _ in 0..3 {
         let mut cmd = Command::new(program);
+        // Piped output does not prevent Windows from allocating a console
+        // for a GUI parent's child (#1603). Keep background Git windowless;
+        // this does not suppress GUI credential helpers or terminal actions.
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x08000000);
         cmd.arg("-C")
             .arg(dir)
             .args(args)
@@ -203,6 +204,10 @@ fn git_piped(dir: &Path, args: &[&str], input: Vec<u8>) -> Result<std::process::
     #[cfg(not(test))]
     let program = crate::auth::git_program();
     let mut cmd = Command::new(program);
+    // CREATE_NO_WINDOW, as in git_output_with: piping stdin must not make
+    // this second background launch path allocate a Windows console.
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x08000000);
     cmd.arg("-C")
         .arg(dir)
         .args(args)
@@ -12173,5 +12178,100 @@ mod in_progress_tests {
             other => panic!("expected InProgress, got {other:?} -- Dirty would hide it"),
         }
         assert!(!w.safety.is_safe(), "and it is never one-click removable");
+    }
+}
+
+/// A real Windows console-subsystem child: successful Git output alone cannot
+/// reveal a window accidentally allocated by CreateProcess (#1603).
+#[cfg(all(test, windows))]
+mod windows_console_tests {
+    use super::*;
+
+    fn console_probe(dir: &Path) -> std::path::PathBuf {
+        let source = dir.join("console_probe.rs");
+        let binary = dir.join("console_probe.exe");
+        std::fs::write(
+            &source,
+            r#"
+use std::io::{Read, Write};
+#[link(name = "kernel32")]
+extern "system" { fn GetConsoleWindow() -> *mut std::ffi::c_void; }
+fn main() {
+    println!("{}", unsafe { GetConsoleWindow() } as usize);
+    eprintln!("probe stderr");
+    match std::env::args().nth(3).as_deref() {
+        Some("piped") => {
+            let mut input = Vec::new();
+            std::io::stdin().read_to_end(&mut input).unwrap();
+            std::io::stdout().write_all(&input).unwrap();
+        }
+        Some("fail") => std::process::exit(7),
+        _ => {}
+    }
+}
+"#,
+        )
+        .unwrap();
+        let compiled = Command::new("rustc")
+            .arg("--edition=2021")
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary)
+            .output()
+            .expect("Windows CI has rustc on PATH");
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        binary
+    }
+
+    #[test]
+    fn background_git_children_have_no_console_and_keep_their_pipes_and_exit_status() {
+        use std::os::windows::process::CommandExt;
+        let temp = tempfile::TempDir::new().unwrap();
+        let probe = console_probe(temp.path());
+
+        // Positive control: the probe must detect a console when Windows is
+        // explicitly asked to allocate one. Do not rely on CI's own console.
+        let visible = Command::new(&probe)
+            .creation_flags(0x00000010) // CREATE_NEW_CONSOLE
+            .output()
+            .unwrap();
+        assert!(visible.status.success());
+        let console: usize = String::from_utf8(visible.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_ne!(console, 0, "the control child must observe its console");
+
+        for (mode, code) in [("ok", 0), ("fail", 7)] {
+            let out = git_output_with(&probe, temp.path(), &[mode]).unwrap();
+            assert_eq!(out.status.code(), Some(code));
+            assert_eq!(
+                String::from_utf8(out.stdout).unwrap().trim(),
+                "0",
+                "background git must not receive a console"
+            );
+            assert_eq!(
+                String::from_utf8(out.stderr).unwrap().trim(),
+                "probe stderr"
+            );
+        }
+
+        let _fake = fake_git::install(temp.path(), &probe);
+        let out = git_piped(temp.path(), &["piped"], b"synthetic input".to_vec()).unwrap();
+        assert!(out.status.success());
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap().replace("\r\n", "\n"),
+            "0\nsynthetic input",
+            "piped git must have no console and receive stdin"
+        );
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap().trim(),
+            "probe stderr"
+        );
     }
 }

@@ -5140,4 +5140,39 @@ mod tests {
             assert_eq!(at, ["9", "14"], "{found:#?}");
         }
     }
+
+    /// These are the two spawn boundaries shared by worktree discovery and
+    /// classification. Piped output alone does not suppress a Windows console
+    /// (#1603). The Windows runtime test also checks the child's console handle;
+    /// this guard lets Unix CI catch removal of either launch policy.
+    #[test]
+    fn worktree_git_spawns_suppress_windows_consoles() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/worktrees");
+        let mut checked = 0;
+        for file in rust_files(&root) {
+            let source = std::fs::read_to_string(&file).unwrap();
+            // These functions contain statement-level cfg(test) overrides;
+            // production() masks whole items and would cut off their bodies.
+            for (name, body) in fn_bodies(&source) {
+                if !["git_output_with", "git_piped"].contains(&name.as_str()) {
+                    continue;
+                }
+                let code: String = body
+                    .lines()
+                    .filter(|line| !is_comment(line))
+                    .flat_map(|line| line.chars().filter(|c| !c.is_whitespace()))
+                    .collect();
+                assert!(
+                    code.contains("#[cfg(windows)]std::os::windows::process::CommandExt::creation_flags(&mutcmd,0x08000000);"),
+                    "{}: {name} must use Windows CREATE_NO_WINDOW before spawning background git",
+                    file.display()
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(
+            checked, 2,
+            "both worktree git spawn boundaries must be checked"
+        );
+    }
 }
