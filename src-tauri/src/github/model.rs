@@ -674,6 +674,13 @@ pub struct StackMember {
     pub title: String,
     /// GitHub's `PullRequestState`, lowercased: `open`, `merged`, `closed`.
     pub state: String,
+    /// Advisory, nullable for older cached or partial responses.
+    #[serde(default)]
+    pub is_draft: Option<bool>,
+    #[serde(default)]
+    pub review: Option<String>,
+    #[serde(default)]
+    pub checks: Option<String>,
 }
 
 #[cfg(test)]

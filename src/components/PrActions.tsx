@@ -65,7 +65,8 @@ function unavailable(
     // that has to come first either way. Open conversations (#1454) are the
     // next blocker once the stack is out of the way.
     case "enqueue":
-      return stackBlocksQueue(stackGate(pr.stack, pr.number)) ?? byConversations;
+      return stackBlocksQueue(stackGate(pr.stack, pr.number)) ?? byConversations ??
+        (pr.merge_status === "unknown" ? "GitHub is still checking — this usually clears in a moment" : null);
     case "ready":
       return pr.is_draft ? null : "already ready for review";
     case "draft":
@@ -212,10 +213,9 @@ export function PrActions({
         // here (`inverseOf` deliberately gives close no undo), so it is
         // the one action that must not look like its neutral neighbours.
         const destructive = action === "close";
-        // A native stack GitHub can merge is merged AS a stack (#1468): the
-        // primary action becomes the stack merge, which confirms with every
-        // pull request it lands. Same availability reason as the plain
-        // button would have had.
+        // Native stacks use the async endpoint even for a singleton. The
+        // component keeps individual intent visible and separately offers
+        // a larger scope when unmerged predecessors make it unavoidable.
         const lands = stackMergePlan(pr.stack, pr.number);
         if (lands !== null && (action === "merge" || action === "enqueue")) {
           return (
@@ -225,6 +225,7 @@ export function PrActions({
               lands={lands}
               queue={action === "enqueue"}
               why={why}
+              compact={compact}
             />
           );
         }

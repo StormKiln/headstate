@@ -7963,6 +7963,16 @@ pub async fn claude_permission_ownership(
     .map_err(|e| e.to_string())?
 }
 
+/// Bounded stack metadata for the shared Ready strip; no full-detail reads.
+#[tauri::command]
+pub async fn get_ready_stacks(
+    client: State<'_, GhClient>,
+    rows: Vec<crate::identity::PrIdentity>,
+) -> Result<Vec<crate::github::ready_stacks::RowStack>, String> {
+    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+    crate::github::ready_stacks::ready_stacks(&client, rows).await
+}
+
 #[cfg(test)]
 mod pr_claudify_tests {
     use super::{pr_checkout, pr_claude_command};

@@ -799,9 +799,13 @@ query PrStack($owner: String!, $repo: String!, $number: Int!) {
       # (#1468): the stack-merge confirmation names every open pull
       # request a merge would land. 50 is past any stack `gh stack` makes;
       # `totalCount` says when it is not, and the merge is then not
-      # offered. MEASURED live 2026-09-25 with this field: still cost 1.
+      # offered. Readiness fields are advisory; membership alone cannot
+      # establish that every included PR is approved and passing.
       stackEntry { position stack { number size
-        entries(first: 50) { totalCount nodes { position pullRequest { number title state } } }
+        entries(first: 50) { totalCount nodes { position pullRequest {
+          number title state isDraft reviewDecision
+          commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+        } } }
       } }
       baseRef { associatedPullRequests(states: OPEN, first: 2) { nodes {
         number baseRefName
@@ -2024,7 +2028,9 @@ mod tests {
             "defaultBranchRef { name }",
             "number headRefName baseRefName isCrossRepository",
             "stackEntry { position stack { number size",
-            "entries(first: 50) { totalCount nodes { position pullRequest { number title state } } }",
+            "entries(first: 50) { totalCount nodes { position pullRequest {",
+            "number title state isDraft reviewDecision",
+            "commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }",
         ] {
             assert!(q.contains(f), "PR_STACK_QUERY must select `{f}`");
         }

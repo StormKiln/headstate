@@ -23,6 +23,8 @@ import {
 } from "@/lib/readyPusher";
 import { type ReadyRow, lastPusherOf, readyListMarkdown } from "@/lib/readyMarkdown";
 import { CopyMarkdownButton } from "./CopyMarkdownButton";
+import { useReadyStacks } from "@/api/useReadyStacks";
+import { ReadyStackChip } from "./ReadyStackChip";
 import { ReadyClaudify } from "./ReadyClaudify";
 
 /// Both labels name the FIELD, not just the direction (#1277).
@@ -269,6 +271,7 @@ export function ReadyStrip({
   const mode: MyPushesMode = readyMyPushes ?? "auto";
   const part = partitionReady(all, pushers.of, mode);
   const ready = part.shown;
+  const stacks = useReadyStacks(ready);
 
   // The rows as SHOWN -- after the last-push filter, in the sort. The
   // list below and "Copy as markdown" both read this, so the copy cannot
@@ -286,9 +289,11 @@ export function ReadyStrip({
 
   return (
     <section className="mb-4 rounded-md border border-[#3fb950]/40 bg-[#3fb950]/5">
-      <h2 className="flex items-center gap-2 border-b border-[#3fb950]/30 px-4 py-2 text-sm font-semibold text-[#3fb950]">
-        <CircleCheck className="h-4 w-4" aria-hidden="true" />
-        Ready for review ({ready.length})
+      <h2 className="flex flex-wrap items-center gap-2 border-b border-[#3fb950]/30 px-4 py-2 text-sm font-semibold text-[#3fb950]">
+        <span className="inline-flex shrink-0 items-center gap-2 whitespace-nowrap">
+          <CircleCheck className="h-4 w-4" aria-hidden="true" />
+          Ready for review ({ready.length})
+        </span>
         {/* Beside the sort, and built on click from `shown` -- the rows
             on screen, in their order (#1578). */}
         <CopyMarkdownButton
@@ -355,7 +360,7 @@ export function ReadyStrip({
                     onOpen(pr);
                   }
                 }}
-                className="flex cursor-pointer items-baseline gap-3 px-4 py-2 hover:bg-[#3fb950]/10"
+                className="flex flex-wrap cursor-pointer items-baseline gap-3 px-4 py-2 hover:bg-[#3fb950]/10"
               >
                 <span className="min-w-0 flex-1">
                   <span className="text-[#e6edf3]">{pr.title}</span>
@@ -363,12 +368,13 @@ export function ReadyStrip({
                     {pr.repo}#{pr.number} · {pr.author}
                   </span>
                 </span>
+                <ReadyStackChip stack={stacks.of(pr)} />
                 <PushedByYouChip pusher={pushers.of(pr)} />
                 <UnresolvedChip count={pr.unresolved_threads} floor={pr.unresolved_threads_floor} />
                 <ReadyAgeChip readyAt={pr.ready_at} now={now} />
               </div>
             ) : (
-              <div className="flex items-baseline gap-3 px-4 py-2">
+              <div className="flex flex-wrap items-baseline gap-3 px-4 py-2">
                 <span className="min-w-0 flex-1">
                   <ExternalLink href={pr.url} className="text-[#e6edf3] hover:text-[#4493f8]">
                     {pr.title}
@@ -377,6 +383,7 @@ export function ReadyStrip({
                     {pr.repo}#{pr.number} · {pr.author}
                   </span>
                 </span>
+                <ReadyStackChip stack={stacks.of(pr)} />
                 <PushedByYouChip pusher={pushers.of(pr)} />
                 <UnresolvedChip count={pr.unresolved_threads} floor={pr.unresolved_threads_floor} />
                 <ReadyAgeChip readyAt={pr.ready_at} now={now} />
