@@ -257,6 +257,7 @@ const ROWS: Row[] = [
       ],
     },
   ),
+  row(api.getReadyStacks, [[{ repo, number }]], "get_ready_stacks", { rows: [{ repo, number }] }),
   row(api.sizeWorktrees, [repoPath], "size_worktrees", { repoPath }),
   row(api.pullCheckout, [path], "pull_checkout", { path }),
   row(api.fetchRefs, [path], "fetch_refs", { path }),

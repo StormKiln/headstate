@@ -318,6 +318,7 @@ pub fn run() {
             commands::gitlab_action,
             commands::get_review_gates,
             commands::get_ready_pushers,
+            commands::get_ready_stacks,
             commands::act_on_pr,
             commands::merge_stack,
             commands::build_target,

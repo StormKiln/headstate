@@ -80,7 +80,7 @@ beforeEach(() => {
   toast.info.mockClear();
 });
 
-const openConfirm = (label = "Add stack to merge queue") =>
+const openConfirm = (label = "Queue 2 pull requests…") =>
   fireEvent.click(screen.getByRole("button", { name: label }));
 
 describe("Stack merge (#1468)", () => {
@@ -110,7 +110,7 @@ describe("Stack merge (#1468)", () => {
   it("merges directly when the base branch does not queue", async () => {
     mergeStack.mockResolvedValue({ kind: "merged", sha: "abc" });
     render(<PrActions pr={pr({ merge_queue_enabled: false })} />);
-    openConfirm("Merge stack");
+    openConfirm("Merge 2 pull requests…");
     fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Merge 2 pull requests" }));
     await waitFor(() => expect(toast.success).toHaveBeenCalled());
     expect(mergeStack.mock.calls[0][2]).toBe("direct_merge");
@@ -153,8 +153,85 @@ describe("Stack merge (#1468)", () => {
 
   it("carries the plain button's availability reason", () => {
     render(<PrActions pr={pr({ merge_queue_enabled: false, merge_status: "dirty" })} />);
-    const button = screen.getByRole("button", { name: "Merge stack" }) as HTMLButtonElement;
+    const button = screen.getByRole("button", { name: "Merge 2 pull requests…" }) as HTMLButtonElement;
     expect(button.disabled).toBe(true);
     expect(button.title).toBe("merge conflicts");
   });
+});
+
+
+describe("selected PR scope (#1601)", () => {
+  it("keeps selected-only intent visible and requires an explicit broader action", () => {
+    render(<PrActions pr={pr()} />);
+    const individual = screen.getByRole("button", { name: "Add to merge queue" }) as HTMLButtonElement;
+    expect(individual.disabled).toBe(true);
+    expect(individual.title).toMatch(/#20.*first/);
+    expect(screen.getByText(/cannot queue #30 alone/i)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Queue 2 pull requests…" })).toBeTruthy();
+    openConfirm();
+    expect(screen.getByRole("dialog").textContent).toMatch(/readiness.*unknown/i);
+    expect(mergeStack).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("labels a one-member plan individually (queue=%s)", async (queue) => {
+    const one = { ...stack, members: stack.members!.map((m) => m.number === 20 ? { ...m, state: "merged" } : m) };
+    mergeStack.mockResolvedValue(queue ? { kind: "enqueued" } : { kind: "merged", sha: null });
+    render(<PrActions pr={pr({ stack: one, merge_queue_enabled: queue })} />);
+    fireEvent.click(screen.getByRole("button", { name: queue ? "Add to merge queue" : "Merge" }));
+    expect(screen.getByRole("dialog").textContent).not.toMatch(/#20/);
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: queue ? "Queue 1 pull request" : "Merge 1 pull request" }));
+    await waitFor(() => expect(mergeStack).toHaveBeenCalledWith("acme/widgets", 30, queue ? "merge_queue" : "direct_merge", "head-30"));
+  });
+
+  it.each([
+    [{ is_draft: true }, /draft/i],
+    [{ review: "review_required" }, /approval required/i],
+    [{ review: "changes_requested" }, /changes requested/i],
+    [{ checks: "failure" }, /checks failing/i],
+    [{ checks: "pending" }, /checks pending/i],
+  ])("names a predecessor's known blocker %j", (facts, expected) => {
+    const blocked = { ...stack, members: stack.members!.map((m) => m.number === 20 ? { ...m, ...facts } : m) };
+    render(<PrActions pr={pr({ stack: blocked })} />);
+    const group = screen.getByRole("button", { name: "Queue 2 pull requests…" }) as HTMLButtonElement;
+    expect(group.disabled).toBe(true);
+    expect(group.title).toMatch(expected);
+    expect(group.title).toContain("#20");
+  });
+});
+
+it("keeps native enqueue disabled while selected mergeability is being refreshed", () => {
+  render(<PrActions pr={pr({ merge_status: "unknown" })} />);
+  const action = screen.getByRole("button", { name: "Queue 2 pull requests…" }) as HTMLButtonElement;
+  expect(action.disabled).toBe(true);
+  expect(action.title).toMatch(/checking/i);
+});
+
+it("requires a fresh confirmation when the viewed head changes", () => {
+  const view = render(<PrActions pr={pr()} />);
+  openConfirm();
+  view.rerender(<PrActions pr={pr({ head_oid: "new-head" })} />);
+  const confirm = within(screen.getByRole("dialog")).getByRole("button", { name: "Queue 2 pull requests" }) as HTMLButtonElement;
+  expect(confirm.disabled).toBe(true);
+  expect(screen.getByRole("dialog").textContent).toMatch(/changed/i);
+  fireEvent.click(confirm);
+  expect(mergeStack).not.toHaveBeenCalled();
+});
+
+it("cannot submit an open confirmation after a readiness blocker arrives", () => {
+  const view = render(<PrActions pr={pr()} />);
+  openConfirm();
+  view.rerender(<PrActions pr={pr({ merge_status: "unknown" })} />);
+  const confirm = within(screen.getByRole("dialog")).getByRole("button", { name: "Queue 2 pull requests" }) as HTMLButtonElement;
+  expect(confirm.disabled).toBe(true);
+  fireEvent.click(confirm);
+  expect(mergeStack).not.toHaveBeenCalled();
+});
+
+it("keeps the compact header's single-PR intent and leaves the broader action in the body", () => {
+  render(<PrActions pr={pr()} compact />);
+  const buttons = screen.getAllByRole("button");
+  expect(buttons).toHaveLength(1);
+  expect(buttons[0].textContent).toBe("Add to merge queue");
+  expect((buttons[0] as HTMLButtonElement).disabled).toBe(true);
+  expect(buttons[0].title).toMatch(/#20.*first/);
 });

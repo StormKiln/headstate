@@ -152,6 +152,11 @@ fn parse_members(entries: &Value) -> (Vec<StackMember>, bool) {
                 number: pr["number"].as_u64()?,
                 title: pr["title"].as_str().unwrap_or_default().to_string(),
                 state: pr["state"].as_str()?.to_lowercase(),
+                is_draft: pr["isDraft"].as_bool(),
+                review: pr["reviewDecision"].as_str().map(str::to_lowercase),
+                checks: pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["state"]
+                    .as_str()
+                    .map(str::to_lowercase),
             })
         })
         .collect();
@@ -351,6 +356,23 @@ mod tests {
     /// The reported case: the parent is NOT in any list the app holds, and
     /// the pull request is still found to be stacked -- because the answer
     /// comes from GitHub's graph, not from the rows on screen.
+    #[test]
+    fn native_members_keep_readiness_facts_and_do_not_default_absent_to_ready() {
+        let (members, complete) = parse_members(&json!({ "totalCount": 2, "nodes": [
+            {"position": 1, "pullRequest": {"number": 10, "title": "Base", "state": "OPEN", "isDraft": true,
+              "reviewDecision": "REVIEW_REQUIRED", "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "FAILURE"}}}]}}},
+            {"position": 2, "pullRequest": {"number": 20, "title": "Next", "state": "OPEN"}}
+        ]}));
+        assert!(complete);
+        let facts = serde_json::to_value(&members).unwrap();
+        assert_eq!(facts[0]["is_draft"], true);
+        assert_eq!(facts[0]["review"], "review_required");
+        assert_eq!(facts[0]["checks"], "failure");
+        assert!(facts[1]["is_draft"].is_null());
+        assert!(facts[1]["review"].is_null());
+        assert!(facts[1]["checks"].is_null());
+    }
+
     #[test]
     fn a_stacked_pull_request_is_found_without_its_parent_in_the_list() {
         // #30 on feat-b (#20), on feat-a (#10), on main.

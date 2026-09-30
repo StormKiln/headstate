@@ -32,16 +32,19 @@ import type { PullRequest, RowPusher } from "@/types/pr";
 
 /// What `get_ready_pushers` answers; `[]` (nothing checked) by default.
 let pusherAnswers: RowPusher[] = [];
+let stackAnswers: { repo: string; number: number; stack: unknown }[] = [];
 let viewerLogin: Promise<unknown> = Promise.resolve("me");
 
 beforeEach(() => {
   pusherAnswers = [];
+  stackAnswers = [];
   viewerLogin = Promise.resolve("me");
   invoke.mockReset();
   invoke.mockImplementation((cmd: string) => {
     if (cmd === "get_viewer") return viewerLogin;
+    if (cmd === "get_ready_stacks") return Promise.resolve(stackAnswers);
     if (cmd === "get_ready_pushers") return Promise.resolve(pusherAnswers);
-    return Promise.resolve(undefined);
+    return Promise.resolve(null);
   });
 });
 
@@ -661,5 +664,69 @@ describe("ReadyStrip copy as markdown (#1578)", () => {
       }),
     );
     expect(toastFns.success).not.toHaveBeenCalled();
+  });
+});
+
+
+const exactStack = {
+  kind: "stacked", native: true, stack_number: 8, position: 5, size: 8,
+  position_exact: true, size_exact: true, below: 4,
+};
+
+describe("Ready stack context (#1602)", () => {
+  it.each([false, true])("shows off-list position, icon and accessible context (interactive=%s)", async (interactive) => {
+    stackAnswers = [{ repo: ready.repo, number: ready.number, stack: exactStack }];
+    render(<ReadyStrip prs={[ready]} onOpen={interactive ? vi.fn() : undefined} />);
+    const chip = await screen.findByLabelText("Stack position 5 of 8");
+    expect(chip.textContent).toBe("5/8");
+    expect(chip.querySelector("svg")).toBeTruthy();
+    expect(chip.title).toMatch(/1 is closest to the base branch/);
+    expect(invoke.mock.calls.filter(([cmd]) => cmd === "get_pr_detail")).toHaveLength(0);
+  });
+
+  it("qualifies a base-chain floor rather than printing a guessed fraction", async () => {
+    stackAnswers = [{ repo: ready.repo, number: ready.number, stack: { ...exactStack, native: false, position_exact: false, size_exact: false } }];
+    render(<ReadyStrip prs={[ready]} />);
+    expect(await screen.findByLabelText("Stack position at least 5 of at least 8")).toBeTruthy();
+    expect(screen.queryByText("5/8")).toBeNull();
+  });
+
+  it.each([{ kind: "unknown" }, { kind: "none" }])("does not invent a badge for %j", async (stack) => {
+    stackAnswers = [{ repo: ready.repo, number: ready.number, stack }];
+    render(<ReadyStrip prs={[ready]} />);
+    await waitFor(() => expect(invoke.mock.calls.some(([cmd]) => cmd === "get_ready_stacks")).toBe(true));
+    expect(screen.queryByLabelText(/Stack position/)).toBeNull();
+  });
+
+  it("batches visible rows and reuses cached facts across filtering and reorder", async () => {
+    const other = { ...ready, id: "other", number: ready.number + 1, title: "Other" };
+    stackAnswers = [ready, other].map((pr) => ({ repo: pr.repo, number: pr.number, stack: exactStack }));
+    const view = render(<ReadyStrip prs={[ready, other]} />);
+    await waitFor(() => expect(screen.getAllByLabelText("Stack position 5 of 8")).toHaveLength(2));
+    expect(invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks")).toHaveLength(1);
+    view.rerender(<ReadyStrip prs={[other]} />);
+    view.rerender(<ReadyStrip prs={[other, ready]} />);
+    await waitFor(() => expect(screen.getAllByLabelText("Stack position 5 of 8")).toHaveLength(2));
+    expect(invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks")).toHaveLength(1);
+  });
+
+  it("renders rows immediately and limits each metadata batch", async () => {
+    const rows = Array.from({ length: 18 }, (_, i) => ({ ...ready, id: `row-${i}`, number: 100 + i, title: `Row ${i}` }));
+    let resolveFirst: ((x: unknown) => void) | undefined;
+    invoke.mockImplementation((cmd) => cmd === "get_ready_stacks" ? new Promise((resolve) => { resolveFirst = resolve; }) : Promise.resolve(cmd === "get_viewer" ? "me" : []));
+    const view = render(<ReadyStrip prs={rows} />);
+    expect(screen.getByText("Row 17")).toBeTruthy();
+    await waitFor(() => expect(resolveFirst).toBeDefined());
+    let calls = invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks");
+    expect(calls).toHaveLength(1);
+    expect((calls[0][1]?.rows as unknown[]).length).toBeLessThanOrEqual(8);
+    // The next batches start only when the previous call has finished.
+    for (let i = 0; i < 3; i++) {
+      const resolve = resolveFirst!;
+      await act(async () => { resolve([]); });
+    }
+    calls = invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks");
+    expect(calls).toHaveLength(3);
+    view.unmount();
   });
 });

@@ -83,6 +83,7 @@ pub const SURFACE: &[(&str, Class)] = &[
     // The Ready for review strip's batched pushers (#1576). A Read; REST reads
     // capped per call and inside the budget, advisory.
     ("get_ready_pushers", Class::Read),
+    ("get_ready_stacks", Class::Read),
     ("get_viewer", Class::Read),
     ("build_target", Class::Read),
     ("latest_release", Class::Read),

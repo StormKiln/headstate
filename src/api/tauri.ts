@@ -13,7 +13,7 @@
 
 import { call } from "./transport";
 import type { GitLabScope, GitLabStatsTree, GitLabStatsReport, GitLabBackfill } from "./gitlabStats";
-import type { Source } from "../types/identity";
+import type { PrIdentity, Source } from "../types/identity";
 import type { MergeRequest } from "../types/gitlab";
 import type {
   ClaudeMdAdviceMode,
@@ -64,6 +64,7 @@ import type {
   NetProcess,
   Periods,
   PrDetail,
+  PrStack,
   PullRequest,
   ReviewGates,
   PusherAsk,
@@ -2260,3 +2261,7 @@ export const getGitLabActionCapabilities = (identity: import("../types/identity"
   call<import("../types/gitlabActions").GitLabCapabilities>("gitlab_action_capabilities", { identity });
 export const gitLabAction = (request: import("../types/gitlabActions").GitLabActionRequest) =>
   call<import("../types/gitlabActions").GitLabReceipt>("gitlab_action", { request });
+
+/// Bounded metadata-only stack lookups for Ready rows (#1602).
+export const getReadyStacks = (rows: PrIdentity[]) =>
+  call<(PrIdentity & { stack: PrStack })[]>("get_ready_stacks", { rows });
