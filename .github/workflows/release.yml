@@ -117,10 +117,10 @@ jobs:
   # that never reports is the permanently-unmergeable class ci.yml:388-412
   # warns about.
   gate:
-    # 1-8m measured. A gate waiting on a status that never arrives is the
-    # exact hang this ceiling exists for -- without it, six hours of a
-    # runner (#885).
-    timeout-minutes: 30
+    # A healthy Windows CI run took 30m22s (run 36735484073). Wait beyond
+    # the platform job's 45m ceiling, with 15m for runner startup, so a
+    # cold build cannot exhaust the release gate before CI finishes.
+    timeout-minutes: 60
     # Reads check runs on the tag's commit. `checks: read` is explicit
     # rather than inherited, so tightening the workflow default above
     # cannot silently blind the gate.
