@@ -1,7 +1,7 @@
 # GitLab integration: merge-readiness record
 
 This records the follow-up to PR #1596, starting at `7a7a9d5`.
-The automated checks below do **not** establish live GitLab compatibility.
+Automated checks and the scoped GitLab.com follow-up below are separate evidence; neither establishes a self-managed version range.
 
 ## Behavior contract
 
@@ -95,7 +95,7 @@ unchanged.
 ## Verification and remaining gate
 
 Local checks passed during final integration: 4,581 UI tests (309 files),
-2,973 desktop Rust tests (50 pre-existing ignored), 20 step-up tests and
+2,974 desktop Rust tests (50 pre-existing ignored), 20 step-up tests and
 224 mobile tests. Complete lint, mobile lint, desktop and mobile frontend
 builds passed. An independent review found no remaining actionable issue
 after its regression fixes. The oversized-response tests passed together in
@@ -106,19 +106,48 @@ Required checks: `make test-ui`, normally parallel `make test-rust` (repeated),
 `make lint`, `make test-mobile`, `make lint-mobile`, desktop and mobile frontend
 builds, and final-head CI across supported platforms.
 
-**Live compatibility remains unverified in this follow-up.** No authorized
-GitLab.com and self-managed disposable projects or supported version floor
-were supplied, and `glab` is not available on this review machine's PATH.
-Do not interpret fixture coverage as a tested self-managed version range.
-Before merging, record the GitLab/glab versions and run the following on both
-an authorized GitLab.com project and a representative self-managed server:
+### Live GitLab.com follow-up
 
-1. Verify the displayed host/account, nested project discovery and both queues.
-2. Exercise list/detail/CI/discussion/statistics reads, partial permissions,
-   repeat navigation and request counts, and account changes during reads.
-3. In disposable MRs, exercise each available action and independent readback,
-   including request changes and merge trains when licensed/enabled.
-4. Confirm Both keeps GitHub usable during a GitLab timeout/429 and after a
-   GitLab write; confirm paired-phone authorization, disconnect and resume.
-5. Record any unavailable feature/version accurately, and resolve failures
-   before marking the PR ready to merge.
+Tested with GitLab.com reporting `19.5.0-pre` (revision `856fb0ad1c5`) and
+`glab 1.120.0` on macOS. Two private fictional projects, six MRs, labels,
+discussions and CI pipelines are retained for future desktop/phone screenshots.
+The authenticated owner explicitly requested that this data not be deleted.
+
+The probe invoked HeadState's actual Rust queue, detail, capability, statistics
+and action functions. It found and fixed two issues fixtures had missed:
+
+- The change-request connection is `changeRequesters`, not `changeRequestedBy`.
+- `glab` exits nonzero for GraphQL error documents returned with HTTP status
+  200. Preserve these typed errors for schema fallback on GraphQL calls only;
+  HTTP and REST failures remain failures. A subprocess regression failed before
+  the parser fix and passed afterward.
+
+Both queue types loaded measured CI, reviewer and discussion evidence. Detail
+reads and permission checks succeeded. Comment, reply, resolve/unresolve,
+draft/ready, close/reopen, merge and CI retry all returned independently verified
+receipts. A real rebase completed after the bounded immediate readback, so the
+application correctly returned an unverified receipt; a later read confirmed
+that the new head matched `rebaseCommitSha`, with no rebase running or error.
+No uncertain write was automatically retried.
+
+Measured calls in one live probe: authored queue 9, reviewing queue 4 (the
+second list reused all five open MRs' fresh enrichment); explicit statistics
+refresh 16, subsequent cached load 1 (identity check only, no report refetch).
+These are observations for this small dataset, not large-project benchmarks.
+
+### Remaining live gates
+
+- Approval and request-changes writes need a second test identity to create or
+  review another author's MR. The owner cannot exercise those on its own MRs.
+- Merge trains and other unavailable tier/configuration features need an
+  appropriately configured test project. Unavailable actions remain disabled.
+- Self-managed compatibility needs an authorized instance and tested version
+  floor. GitLab.com's development version is not a self-managed support claim.
+- Paired-device authorization, disconnect/resume and native desktop/phone UI
+  smoke tests remain open. Browser layout tests do not establish device parity.
+- Live account switching, cross-provider failure isolation, nested namespaces
+  and larger-data performance remain outside this single-account smoke run.
+
+Retain all synthetic repositories, branches, MRs, comments and pipeline history.
+Record additional live results and resolve failures before treating these gates
+as complete.

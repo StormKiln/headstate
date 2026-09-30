@@ -10,7 +10,7 @@ const BUDGET: Duration = Duration::from_secs(60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const RETRY_JOBS: &str = "/jobs?include_retried=false&per_page=100&page=1";
 const LEGACY_QUERY: &str = "query($path: ID!, $iid: String!) { currentUser { username } project(fullPath: $path) { mergeRequest(iid: $iid) { iid webUrl diffHeadSha rebaseCommitSha autoMergeEnabled availableAutoMergeStrategies userPermissions { canApprove canMerge createNote updateMergeRequest pushToSourceBranch } headPipeline { id sha retryable userPermissions { updatePipeline } } discussions(first: 100) { nodes { replyId resolvable resolved userPermissions { resolveNote } notes(first: 1) { nodes { system userPermissions { createNote } } } } pageInfo { hasNextPage } } } } }";
-const QUERY: &str = "query($path: ID!, $iid: String!) { currentUser { username } project(fullPath: $path) { mergeRequest(iid: $iid) { iid webUrl diffHeadSha changeRequestedBy(first: 100) { nodes { username } pageInfo { hasNextPage } } mergeTrainCar { index } autoMergeStrategy rebaseCommitSha autoMergeEnabled availableAutoMergeStrategies userPermissions { canApprove canMerge createNote updateMergeRequest pushToSourceBranch } headPipeline { id sha retryable userPermissions { updatePipeline } } discussions(first: 100) { nodes { replyId resolvable resolved userPermissions { resolveNote } notes(first: 1) { nodes { system userPermissions { createNote } } } } pageInfo { hasNextPage } } } } }";
+const QUERY: &str = "query($path: ID!, $iid: String!) { currentUser { username } project(fullPath: $path) { mergeRequest(iid: $iid) { iid webUrl diffHeadSha changeRequesters(first: 100) { nodes { username } pageInfo { hasNextPage } } mergeTrainCar { index } autoMergeStrategy rebaseCommitSha autoMergeEnabled availableAutoMergeStrategies userPermissions { canApprove canMerge createNote updateMergeRequest pushToSourceBranch } headPipeline { id sha retryable userPermissions { updatePipeline } } discussions(first: 100) { nodes { replyId resolvable resolved userPermissions { resolveNote } notes(first: 1) { nodes { system userPermissions { createNote } } } } pageInfo { hasNextPage } } } } }";
 
 // Older self-managed schemas may lack optional CI/auto-merge/discussion
 // fields. A schema error there must not remove basic read/write permission.
@@ -275,7 +275,7 @@ fn capabilities_from(core: &MrCore, raw: &Value, data: &Value) -> Capabilities {
                 && data["viewer"].as_str().is_some()
                 && core.author.is_some()
                 && data["viewer"].as_str() != core.author.as_deref()
-                && data["changeRequestedBy"].is_object(),
+                && data["changeRequesters"].is_object(),
             "Requesting changes requires an open MR, a current account, and update permission.",
         ),
         (
@@ -756,7 +756,7 @@ async fn verify(
                 && fresh.core.head_oid == request.expected_head
                 && fresh
                     .permissions
-                    .pointer("/changeRequestedBy/nodes")
+                    .pointer("/changeRequesters/nodes")
                     .and_then(Value::as_array)
                     .is_some_and(|nodes| {
                         nodes.iter().any(|node| node["username"].as_str() == viewer)
@@ -1581,7 +1581,7 @@ print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
     fn request_changes_and_train_actions_require_measured_capabilities_and_current_head() {
         let mut p = permissions();
         p["viewer"] = json!("reviewer");
-        p["changeRequestedBy"] = json!({"nodes":[],"pageInfo":{"hasNextPage":false}});
+        p["changeRequesters"] = json!({"nodes":[],"pageInfo":{"hasNextPage":false}});
         p["mergeTrainCar"] = Value::Null;
         p["availableAutoMergeStrategies"] = json!(["merge_train"]);
         let c = context(raw(), p.clone());
@@ -1610,7 +1610,7 @@ print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
                 let r = raw();
                 let mut p = permissions();
                 p["viewer"] = json!("reviewer");
-                p["changeRequestedBy"] = json!({"nodes":[],"pageInfo":{"hasNextPage":false}});
+                p["changeRequesters"] = json!({"nodes":[],"pageInfo":{"hasNextPage":false}});
                 p["mergeTrainCar"] = Value::Null;
                 p["availableAutoMergeStrategies"] = json!(["merge_train"]);
                 let req = request(action);
@@ -1625,7 +1625,7 @@ print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
                 steps.push(json!({"method":write.method,"path":write.path,"body":write.body,"response":{"data":{"mergeRequestRequestChanges":{"errors":[],"mergeRequest":{"iid":"7"}}}}}));
                 if verified {
                     if action == Action::RequestChanges {
-                        p["changeRequestedBy"]["nodes"] = json!([{"username":"reviewer"}]);
+                        p["changeRequesters"]["nodes"] = json!([{"username":"reviewer"}]);
                     } else {
                         p["mergeTrainCar"] = json!({"index":0});
                     }

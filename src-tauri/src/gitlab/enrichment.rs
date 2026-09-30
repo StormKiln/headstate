@@ -70,7 +70,7 @@ fn evidence(raw: &serde_json::Value, head: Option<&str>) -> Evidence {
     }
 }
 
-const QUERY: &str = "query($path: ID!, $iid: String!) { currentUser { username } project(fullPath: $path) { mergeRequest(iid: $iid) { iid webUrl diffHeadSha approved approvedBy(first: 1) { nodes { username } } changeRequestedBy(first: 1) { nodes { username } } headPipeline { sha status } discussions(first: 100) { nodes { resolvable resolved } pageInfo { hasNextPage } } reviewers(first: 100) { nodes { username mergeRequestInteraction { reviewState } } pageInfo { hasNextPage } } mergeTrainCar { index } availableAutoMergeStrategies userPermissions { canMerge } } } }";
+const QUERY: &str = "query($path: ID!, $iid: String!) { currentUser { username } project(fullPath: $path) { mergeRequest(iid: $iid) { iid webUrl diffHeadSha approved approvedBy(first: 1) { nodes { username } } changeRequesters(first: 1) { nodes { username } } headPipeline { sha status } discussions(first: 100) { nodes { resolvable resolved } pageInfo { hasNextPage } } reviewers(first: 100) { nodes { username mergeRequestInteraction { reviewState } } pageInfo { hasNextPage } } mergeTrainCar { index } availableAutoMergeStrategies userPermissions { canMerge } } } }";
 
 // Schema capability failures are host-local. Removing only named optional
 // fields preserves CI and discussion evidence on older self-managed versions.
@@ -86,7 +86,7 @@ fn reduced_query(query: &str, response: &serde_json::Value) -> Option<String> {
         }
         let field = error["extensions"]["fieldName"].as_str()?;
         let fragment = match field {
-            "changeRequestedBy" => "changeRequestedBy(first: 1) { nodes { username } }",
+            "changeRequesters" => "changeRequesters(first: 1) { nodes { username } }",
             "mergeTrainCar" => "mergeTrainCar { index }",
             "availableAutoMergeStrategies" => "availableAutoMergeStrategies",
             "mergeRequestInteraction" => "mergeRequestInteraction { reviewState }",
@@ -231,7 +231,7 @@ fn graph_evidence(
         head,
     );
     let changes = mr
-        .pointer("/changeRequestedBy/nodes")
+        .pointer("/changeRequesters/nodes")
         .and_then(Value::as_array);
     let approvals = mr.pointer("/approvedBy/nodes").and_then(Value::as_array);
     result.review = if changes.is_some_and(|nodes| !nodes.is_empty()) {
@@ -522,7 +522,7 @@ mod tests {
         };
         let value = json!({"data":{"currentUser":{"username":"me"},"project":{"mergeRequest":{
             "iid":"7","webUrl":"https://gitlab.com/team/app/-/merge_requests/7","diffHeadSha":"head","approved":true,
-            "approvedBy":{"nodes":[{"username":"other"}]},"changeRequestedBy":{"nodes":[]},
+            "approvedBy":{"nodes":[{"username":"other"}]},"changeRequesters":{"nodes":[]},
             "headPipeline":{"sha":"head","status":"SUCCESS"},
             "discussions":{"nodes":[{"resolvable":true,"resolved":false}],"pageInfo":{"hasNextPage":true}},
             "reviewers":{"nodes":[{"username":"me","mergeRequestInteraction":{"reviewState":"UNREVIEWED"}}],"pageInfo":{"hasNextPage":false}},

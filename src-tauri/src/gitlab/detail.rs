@@ -516,14 +516,14 @@ pub(super) async fn request_json(
             return Err(DetailIssue::InvalidResponse);
         }
         let status = child.wait().await.map_err(|_| DetailIssue::Request)?;
-        parse_response(&raw, status.success())
+        parse_response(&raw, status.success(), endpoint == "graphql")
     };
     tokio::time::timeout(timeout, operation)
         .await
         .map_err(|_| DetailIssue::Timeout)?
 }
 
-fn parse_response(raw: &[u8], successful: bool) -> Result<Response, DetailIssue> {
+fn parse_response(raw: &[u8], successful: bool, graphql: bool) -> Result<Response, DetailIssue> {
     let text = std::str::from_utf8(raw).map_err(|_| DetailIssue::InvalidResponse)?;
     let normalized = text.replace("\r\n", "\n");
     let status = normalized
@@ -537,9 +537,7 @@ fn parse_response(raw: &[u8], successful: bool) -> Result<Response, DetailIssue>
         Some(404) => return Err(DetailIssue::NotFound),
         Some(429) => return Err(DetailIssue::RateLimited),
         None if !successful => return Err(DetailIssue::Request),
-        Some(code) if !(200..300).contains(&code) || !successful => {
-            return Err(DetailIssue::Request)
-        }
+        Some(code) if !(200..300).contains(&code) => return Err(DetailIssue::Request),
         None => return Err(DetailIssue::InvalidResponse),
         _ => {}
     }
@@ -566,12 +564,25 @@ fn parse_response(raw: &[u8], successful: bool) -> Result<Response, DetailIssue>
             }
         }
     }
+    let body: Value = if body.trim().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str(body.trim()).map_err(|_| DetailIssue::InvalidResponse)?
+    };
+    // glab returns exit 1 for HTTP status 200 GraphQL errors. Preserve the typed
+    // error document so callers can distinguish unsupported schema from
+    // authorization failures; a nonzero REST response is still a failure.
+    if !successful
+        && !(graphql
+            && body
+                .get("errors")
+                .and_then(Value::as_array)
+                .is_some_and(|errors| !errors.is_empty()))
+    {
+        return Err(DetailIssue::Request);
+    }
     Ok(Response {
-        body: if body.trim().is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_str(body.trim()).map_err(|_| DetailIssue::InvalidResponse)?
-        },
+        body,
         total,
         next,
         terminal_known,
@@ -840,27 +851,75 @@ mod tests {
         assert_eq!(count_unresolved(&unknown), None);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graphql_schema_errors_survive_glab_nonzero_exit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("glab");
+        let body = json!({"errors":[{"extensions":{"code":"undefinedField","fieldName":"mergeTrainCar"}}]});
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\nprintf 'HTTP/2 200\\n\\n%s' '{}'\nexit 1\n",
+                body
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::gitlab::test_support::scripted(&program, async {
+            let response = request_json(
+                &program,
+                "gitlab.com",
+                "graphql",
+                "POST",
+                Some(json!({"query":"query { currentUser { username } }"})),
+                Duration::from_secs(15),
+            )
+            .await
+            .expect("GraphQL schema errors must reach capability fallback");
+            assert_eq!(response.body, body);
+            assert!(matches!(
+                request_json(
+                    &program,
+                    "gitlab.com",
+                    "projects/1",
+                    "GET",
+                    None,
+                    Duration::from_secs(15)
+                )
+                .await,
+                Err(DetailIssue::Request)
+            ));
+        })
+        .await;
+    }
+
     #[test]
     fn response_status_and_headers_are_typed_without_exposing_body() {
-        let response =
-            parse_response(b"HTTP/2 200\r\nx-total: 0\r\nx-next-page:\r\n\r\n[]", true).unwrap();
+        let response = parse_response(
+            b"HTTP/2 200\r\nx-total: 0\r\nx-next-page:\r\n\r\n[]",
+            true,
+            false,
+        )
+        .unwrap();
         assert_eq!(response.total, Some(0));
         assert!(response.terminal_known);
         assert_eq!(response.body, json!([]));
         assert!(matches!(
-            parse_response(b"HTTP/2 401\n\n{\"token\":\"secret\"}", false),
+            parse_response(b"HTTP/2 401\n\n{\"token\":\"secret\"}", false, false),
             Err(DetailIssue::Unauthorized)
         ));
         assert!(matches!(
-            parse_response(b"HTTP/2 429\n\n{}", false),
+            parse_response(b"HTTP/2 429\n\n{}", false, false),
             Err(DetailIssue::RateLimited)
         ));
         assert!(matches!(
-            parse_response(b"HTTP/2 404\n\n{}", false),
+            parse_response(b"HTTP/2 404\n\n{}", false, false),
             Err(DetailIssue::NotFound)
         ));
         assert!(matches!(
-            parse_response(b"secret", false),
+            parse_response(b"secret", false, false),
             Err(DetailIssue::Request)
         ));
         assert_eq!(
