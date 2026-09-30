@@ -289,9 +289,11 @@ export function ReadyStrip({
 
   return (
     <section className="mb-4 rounded-md border border-[#3fb950]/40 bg-[#3fb950]/5">
-      <h2 className="flex items-center gap-2 border-b border-[#3fb950]/30 px-4 py-2 text-sm font-semibold text-[#3fb950]">
-        <CircleCheck className="h-4 w-4" aria-hidden="true" />
-        Ready for review ({ready.length})
+      <h2 className="flex flex-wrap items-center gap-2 border-b border-[#3fb950]/30 px-4 py-2 text-sm font-semibold text-[#3fb950]">
+        <span className="inline-flex shrink-0 items-center gap-2 whitespace-nowrap">
+          <CircleCheck className="h-4 w-4" aria-hidden="true" />
+          Ready for review ({ready.length})
+        </span>
         {/* Beside the sort, and built on click from `shown` -- the rows
             on screen, in their order (#1578). */}
         <CopyMarkdownButton

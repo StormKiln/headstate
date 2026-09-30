@@ -1,5 +1,5 @@
 //! Advisory stack metadata for Ready rows; never fetch full PR details.
-use super::{client::GitHubClient, model::PrStack};
+use super::{client::GitHubClient, model::PrStack, stats::Budget};
 use crate::identity::{PrIdentity, Provider};
 use futures_util::{stream, StreamExt};
 use serde::Serialize;
@@ -24,18 +24,22 @@ pub async fn ready_stacks(
     if rows.len() > 8 {
         return Err("Stack metadata accepts at most 8 pull requests per batch".into());
     }
+    let budget = Budget::new();
     let mut seen = HashSet::new();
     let rows = rows.into_iter().filter(|row| seen.insert(row.clone()));
-    Ok(stream::iter(rows.map(|identity| async move {
-        let stack = lookup(client, &identity).await;
-        RowStack { identity, stack }
+    Ok(stream::iter(rows.map(|identity| {
+        let budget = &budget;
+        async move {
+            let stack = lookup(client, &identity, budget).await;
+            RowStack { identity, stack }
+        }
     }))
     .buffer_unordered(4)
     .collect()
     .await)
 }
 
-async fn lookup(client: &GitHubClient, row: &PrIdentity) -> PrStack {
+async fn lookup(client: &GitHubClient, row: &PrIdentity, budget: &Budget) -> PrStack {
     if row.source.provider != Provider::Github || row.source.host != "github.com" {
         return PrStack::Unknown;
     }
@@ -51,10 +55,9 @@ async fn lookup(client: &GitHubClient, row: &PrIdentity) -> PrStack {
     else {
         return PrStack::Unknown;
     };
-    if !super::stats::Budget::new().permits(8) {
-        return PrStack::Unknown;
-    }
-    client.fetch_pr_stack(owner, repo, row.number).await
+    client
+        .fetch_pr_stack_advisory(owner, repo, row.number, budget)
+        .await
 }
 
 #[cfg(test)]
@@ -146,5 +149,119 @@ mod tests {
         assert_eq!(got.len(), 3);
         assert!(got.iter().all(|r| r.stack == PrStack::Unknown));
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    // Explicit current-thread runtimes keep every response inside the quota
+    // scope. Real async HTTP reads are exercised without process-wide writes
+    // or a mutex held across an await.
+    #[test]
+    fn a_stack_response_updates_quota_before_the_next_advisory_batch() {
+        super::super::stats::budget::scoped::with(520, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let server = MockServer::start().await;
+                    Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {
+                "rateLimit": {"cost": 21, "remaining": 499},
+                "repository": {"defaultBranchRef": {"name": "main"}, "pullRequest": {
+                    "number": 5, "headRefName": "feature", "baseRefName": "main", "stackEntry": {
+                        "position": 5, "stack": {"number": 9, "size": 8}
+                    }
+                }}
+            }})))
+            .expect(1)
+            .mount(&server)
+            .await;
+                    let client = client(&server).await;
+                    let first = ready_stacks(&client, vec![row(5)]).await.unwrap();
+                    assert!(matches!(first[0].stack, PrStack::Stacked { .. }));
+                    let second = ready_stacks(&client, vec![row(6)]).await.unwrap();
+                    assert_eq!(second[0].stack, PrStack::Unknown);
+                    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+                    assert_eq!(super::super::stats::budget::observed_remaining(), Some(499));
+                });
+        });
+    }
+
+    #[test]
+    fn advisory_walk_stops_at_the_reserve_and_keeps_partial_membership() {
+        super::super::stats::budget::scoped::with(520, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+        use wiremock::matchers::body_string_contains;
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(body_string_contains("query PrStack("))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {
+                "rateLimit": {"cost": 5, "remaining": 515},
+                "repository": {"defaultBranchRef": {"name": "main"}, "pullRequest": {
+                    "number": 5, "headRefName": "feature", "baseRefName": "base", "stackEntry": null,
+                    "baseRef": {"associatedPullRequests": {"nodes": [{"number": 4, "baseRefName": "main"}]}}
+                }}
+            }}))).expect(1).mount(&server).await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("query PrStackUp("))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {
+                "rateLimit": {"cost": 16, "remaining": 499},
+                "repository": {"pullRequests": {"nodes": [{"number": 6, "headRefName": "next"}]}}
+            }})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let got = ready_stacks(&client(&server).await, vec![row(5)])
+            .await
+            .unwrap();
+        assert!(matches!(
+            got[0].stack,
+            PrStack::Stacked {
+                position: 2,
+                size: 3,
+                position_exact: true,
+                size_exact: false,
+                ..
+            }
+        ));
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        assert_eq!(super::super::stats::budget::observed_remaining(), Some(499));
+                });
+        });
+    }
+
+    #[test]
+    fn explicit_detail_stack_reads_are_metered_without_the_advisory_reserve_gate() {
+        super::super::stats::budget::scoped::with(499, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let server = MockServer::start().await;
+                    Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {
+                "rateLimit": {"cost": 1, "remaining": 498},
+                "repository": {"defaultBranchRef": {"name": "main"}, "pullRequest": {
+                    "number": 5, "headRefName": "feature", "baseRefName": "main", "stackEntry": {
+                        "position": 5, "stack": {"number": 9, "size": 8}
+                    }
+                }}
+            }})))
+            .expect(1)
+            .mount(&server)
+            .await;
+                    let stack = client(&server)
+                        .await
+                        .fetch_pr_stack("demo", "widgets", 5)
+                        .await;
+                    assert!(matches!(stack, PrStack::Stacked { .. }));
+                    assert_eq!(super::super::stats::budget::observed_remaining(), Some(498));
+                });
+        });
     }
 }

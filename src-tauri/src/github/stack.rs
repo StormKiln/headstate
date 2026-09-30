@@ -20,6 +20,7 @@
 use super::client::GitHubClient;
 use super::model::{PrStack, StackMember};
 use super::query::{PR_STACK_QUERY, PR_STACK_UP_QUERY};
+use super::stats::Budget;
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -247,6 +248,35 @@ impl GitHubClient {
     /// Where `number` sits in a stack. Never an error: every failure is
     /// `PrStack::Unknown`, or a partial answer qualified as one.
     pub async fn fetch_pr_stack(&self, owner: &str, name: &str, number: u64) -> PrStack {
+        self.fetch_stack_with_budget(owner, name, number, &Budget::new(), false)
+            .await
+    }
+
+    /// Advisory list enrichment leaves the reserve for explicit detail reads.
+    /// A batch shares its local minimum so concurrent responses cannot raise
+    /// the quota another member already found to be low.
+    pub(super) async fn fetch_pr_stack_advisory(
+        &self,
+        owner: &str,
+        name: &str,
+        number: u64,
+        budget: &Budget,
+    ) -> PrStack {
+        self.fetch_stack_with_budget(owner, name, number, budget, true)
+            .await
+    }
+
+    async fn fetch_stack_with_budget(
+        &self,
+        owner: &str,
+        name: &str,
+        number: u64,
+        budget: &Budget,
+        advisory: bool,
+    ) -> PrStack {
+        if advisory && !budget.permits(8) {
+            return PrStack::Unknown;
+        }
         let started = tokio::time::Instant::now();
         let remaining = || STACK_BUDGET.saturating_sub(started.elapsed());
 
@@ -263,6 +293,9 @@ impl GitHubClient {
             // Failed or timed out: nothing is known, which is Unknown.
             _ => return PrStack::Unknown,
         };
+        // Record before interpreting partial/refused membership: its quota
+        // is still the latest reading and must gate subsequent advisory work.
+        budget.record(&v);
         // A refused field is a field we did not get, so an absent
         // `stackEntry` could be a native stack GitHub declined to describe.
         if super::client::refused_fields_of(&v) > 0 {
@@ -282,7 +315,7 @@ impl GitHubClient {
         let mut up_complete = down.cross_repository || down.head.is_empty();
         let mut head = down.head.clone();
         for _ in 0..UP_HOPS {
-            if up_complete {
+            if up_complete || (advisory && !budget.permits(8)) {
                 break;
             }
             let step = tokio::time::timeout(
@@ -296,6 +329,7 @@ impl GitHubClient {
             // Out of time or failed: keep what the earlier hops found, and
             // leave the total qualified.
             let Ok(Ok(page)) = step else { break };
+            budget.record(&page);
             match parse_up(&page) {
                 UpStep::Top => up_complete = true,
                 UpStep::Child {
