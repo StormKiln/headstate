@@ -97,7 +97,10 @@ gh run download RUN_ID -R StormKiln/headstate \
 Read `exit-code.txt` with `vitest.log`. A completed run also writes
 `vitest.json`; a missing JSON file means the result is incomplete, not that
 zero tests failed. Compare the JSON test totals and `success` field with the
-exit status. The log includes per-file heap measurements, and Node may write
+exit status. The wrapper invokes Node directly to preserve native signal
+statuses (for example, 139 for SIGSEGV); Yarn can collapse those into exit 1.
+Explicit `process.exit()` calls include a trace. The log includes per-file
+heap measurements, and Node may write
 a diagnostic report on a fatal error or uncaught exception. The wrapper
 preserves a nonzero exit status; collecting an artifact does not turn the run
 green. Node reports exclude environment variables and network details, but
