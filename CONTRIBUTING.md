@@ -85,6 +85,31 @@ why CI repeats the suite. The other two are cheap insurance before a
 release, since an arch-gated link failure or a new advisory would otherwise
 first appear at tag time.
 
+When the frontend test process exits without a Vitest summary (#1611),
+download the `frontend-diagnostics` artifact from that run before its seven-day
+retention expires:
+
+```bash
+gh run download RUN_ID -R StormKiln/headstate \
+  --name frontend-diagnostics --dir /tmp/headstate-frontend-RUN_ID
+```
+
+Read `exit-code.txt` with `vitest.log`. A completed run also writes
+`vitest.json`; a missing JSON file means the result is incomplete, not that
+zero tests failed. Compare the JSON test totals and `success` field with the
+exit status. The log includes per-file heap measurements, and Node may write
+a diagnostic report on a fatal error or uncaught exception. The wrapper
+preserves a nonzero exit status; collecting an artifact does not turn the run
+green. Node reports exclude environment variables and network details, but
+inspect all diagnostic content before sharing it outside the repository.
+
+Record the exact run, commit, last completed test and available process
+reports before changing worker counts, timeouts or heap limits. An exit code
+alone does not establish an out-of-memory cause. A later passing run is useful
+reproduction evidence, but does not explain the original failure. For a
+release, also follow the [release check-run policy](.claude/skills/release/SKILL.md):
+a passing rerun does not erase earlier failed or cancelled attempts.
+
 Two guards that used to be CI-only now run in `make lint` (via
 `lint-deps`): `scripts/check-privacy.sh` and
 `scripts/check-workflow-shells.py`. The privacy one matters most, because
