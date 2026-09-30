@@ -9,8 +9,14 @@ function memberBlocker(member: StackMember): string | null {
   if (member.is_draft) return "draft";
   if (member.review === "changes_requested") return "changes requested";
   if (member.review === "review_required") return "approval required";
-  if (member.checks === "failure" || member.checks === "error") return "checks failing";
-  if (member.checks === "pending" || member.checks === "expected") return "checks pending";
+  return null;
+}
+
+// The rollup includes optional checks. Without the base's required-check
+// policy it is advisory, not evidence that GitHub must reject the operation.
+function checkNote(member: StackMember): string | null {
+  if (member.checks === "failure" || member.checks === "error") return "checks failing (required-check policy unknown)";
+  if (member.checks === "pending" || member.checks === "expected") return "checks pending (required-check policy unknown)";
   return null;
 }
 
@@ -142,6 +148,7 @@ export function StackMerge({
               {lands.map((m) => (
                 <li key={m.number} className="py-0.5">
                   #{m.number} — {m.title}
+                  {checkNote(m) ? <span className="text-[#d29922]"> — {checkNote(m)}</span> : null}
                 </li>
               ))}
             </ol>

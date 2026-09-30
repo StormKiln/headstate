@@ -1,4 +1,5 @@
-import { useQueries } from "@tanstack/react-query";
+import { useEffect } from "react";
+import { useQueries, useQueryClient } from "@tanstack/react-query";
 import { getReadyStacks } from "./tauri";
 import { prIdentity, prKey } from "@/lib/prIdentity";
 import type { PrIdentity } from "@/types/identity";
@@ -48,6 +49,20 @@ function load(pr: PrIdentity, signal: AbortSignal): Promise<PrStack> {
 }
 
 export function useReadyStacks(prs: PullRequest[]) {
+  const qc = useQueryClient();
+  useEffect(() => {
+    // A predecessor can merge while this row's head/base stay unchanged.
+    // Refresh active stale rows together so the loader still batches them;
+    // other mounted strips reuse fresh answers and pending reads are kept.
+    const timer = setInterval(() => {
+      void qc.invalidateQueries({
+        queryKey: ["ready-stack"],
+        type: "active",
+        predicate: (query) => query.isStaleByTime(60_000),
+      }, { cancelRefetch: false });
+    }, 60_000);
+    return () => clearInterval(timer);
+  }, [qc]);
   const rows = prs.filter((pr) => !pr.source || (pr.source.provider === "github" && pr.source.host === "github.com"));
   const queries = useQueries({ queries: rows.map((pr) => ({
     queryKey: ["ready-stack", prKey(pr), pr.head_oid, pr.base_ref],

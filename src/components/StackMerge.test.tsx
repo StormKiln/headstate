@@ -187,8 +187,6 @@ describe("selected PR scope (#1601)", () => {
     [{ is_draft: true }, /draft/i],
     [{ review: "review_required" }, /approval required/i],
     [{ review: "changes_requested" }, /changes requested/i],
-    [{ checks: "failure" }, /checks failing/i],
-    [{ checks: "pending" }, /checks pending/i],
   ])("names a predecessor's known blocker %j", (facts, expected) => {
     const blocked = { ...stack, members: stack.members!.map((m) => m.number === 20 ? { ...m, ...facts } : m) };
     render(<PrActions pr={pr({ stack: blocked })} />);
@@ -234,4 +232,23 @@ it("keeps the compact header's single-PR intent and leaves the broader action in
   expect(buttons[0].textContent).toBe("Add to merge queue");
   expect((buttons[0] as HTMLButtonElement).disabled).toBe(true);
   expect(buttons[0].title).toMatch(/#20.*first/);
+});
+
+
+it.each([
+  ["failure", /checks failing/i],
+  ["error", /checks failing/i],
+  ["pending", /checks pending/i],
+  ["expected", /checks pending/i],
+])("reports aggregate %s checks as advisory when required-check policy is unknown", (checks, expected) => {
+  const advisory = { ...stack, members: stack.members!.map((member) => member.number === 20 ? { ...member, checks } : member) };
+  render(<PrActions pr={pr({ stack: advisory })} />);
+  const action = screen.getByRole("button", { name: "Queue 2 pull requests…" }) as HTMLButtonElement;
+  expect(action.disabled).toBe(false);
+  fireEvent.click(action);
+  const dialog = screen.getByRole("dialog");
+  expect(dialog.textContent).toMatch(expected);
+  expect(dialog.textContent).toMatch(/required.check policy.*unknown/i);
+  const confirm = within(dialog).getByRole("button", { name: "Queue 2 pull requests" }) as HTMLButtonElement;
+  expect(confirm.disabled).toBe(false);
 });
