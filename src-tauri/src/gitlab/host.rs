@@ -193,13 +193,55 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    fn fixture_headers(stream: &mut std::net::TcpStream) -> Vec<u8> {
+        use std::io::Read;
+        // macOS inherits the listener's nonblocking flag on accept; a read
+        // timeout alone does not make the stream wait for incoming headers.
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        let mut part = [0u8; 1024];
+        while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+            let n = stream.read(&mut part).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&part[..n]);
+        }
+        bytes
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loopback_fixture_clears_the_accepted_socket_nonblocking_flag() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut sender = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut receiver, _) = listener.accept().unwrap();
+        // Make macOS's inherited flag explicit on every platform, so Linux
+        // also checks the accepted socket mode without depending on scheduling.
+        receiver.set_nonblocking(true).unwrap();
+        let expected = b"GET /api/v4/version HTTP/1.1\r\nHost: gitlab.example\r\n\r\n";
+        assert!(socket2::SockRef::from(&receiver).nonblocking().unwrap());
+        sender.write_all(expected).unwrap();
+        let received = fixture_headers(&mut receiver);
+        assert!(
+            !socket2::SockRef::from(&receiver).nonblocking().unwrap(),
+            "accepted sockets must block while waiting for request headers"
+        );
+        assert_eq!(received, expected);
+    }
+
     /// The real CLI sends a synthetic credential to a configured HTTP
     /// loopback endpoint without the guard. With the guard, the same config
     /// resolves to the expected HTTPS host. No real credential is involved.
     #[cfg(unix)]
     #[tokio::test]
     async fn glab_config_cannot_redirect_the_synthetic_host_credential() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
         let search_path = std::env::var("PATH").ok();
         let Some(glab) = crate::auth::find_exe_with(
@@ -232,18 +274,7 @@ mod tests {
             while std::time::Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        stream
-                            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
-                            .unwrap();
-                        let mut bytes = Vec::new();
-                        let mut part = [0u8; 1024];
-                        while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-                            let n = stream.read(&mut part).unwrap_or(0);
-                            if n == 0 {
-                                break;
-                            }
-                            bytes.extend_from_slice(&part[..n]);
-                        }
+                        let bytes = fixture_headers(&mut stream);
                         let body = b"{\"version\":\"19.4.0\"}";
                         let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
                         stream.write_all(reply.as_bytes()).unwrap();
