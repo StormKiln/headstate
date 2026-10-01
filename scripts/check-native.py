@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import tomllib
@@ -39,7 +40,10 @@ def inventory(root, platform):
 
 def run(args, cwd):
     print('+', ' '.join(map(str,args)), flush=True)
-    result = subprocess.run(args, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    result = subprocess.run(args, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    # Machine-readable stdout must never contain Cargo download/status output.
+    # Keep diagnostics visible even when metadata stdout is deliberately quiet.
+    if result.stderr: print(result.stderr, end='', file=sys.stderr, flush=True)
     if 'metadata' not in args: print(result.stdout, end='', flush=True)
     result.check_returncode()
     return result.stdout

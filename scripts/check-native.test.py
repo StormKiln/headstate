@@ -1,3 +1,6 @@
+import contextlib
+import io
+import sys
 import importlib.util
 import json
 from pathlib import Path
@@ -27,6 +30,26 @@ class NativeTests(unittest.TestCase):
     def test_compiler_failure_propagates(self):
         with tempfile.TemporaryDirectory() as d:
             with self.assertRaises(subprocess.CalledProcessError): native.run(['python3','-c','raise SystemExit(17)'],Path(d))
+    def test_metadata_stdout_is_json_even_with_colored_stderr_progress(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            tauri=root/'tauri';(tauri/'mobile/android').mkdir(parents=True);(tauri/'mobile/ios-api').mkdir(parents=True)
+            document=json.dumps({'packages':[{'name':'tauri','version':'2.11.5','manifest_path':str(tauri/'Cargo.toml')}]})
+            progress="\x1b[1;32m Downloaded\x1b[0m synthetic dependency\n"
+            program=f"import sys; sys.stderr.write({progress!r}); print({document!r})"
+            diagnostics=io.StringIO()
+            with contextlib.redirect_stderr(diagnostics):
+                result=native.tauri_source(root,lambda args,cwd:native.run([sys.executable,'-c',program,'metadata'],cwd))
+            self.assertEqual(result,tauri)
+            self.assertIn(progress,diagnostics.getvalue())
+    def test_metadata_failure_preserves_diagnostics_and_nonzero_status(self):
+        diagnostics=io.StringIO()
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stderr(diagnostics):
+            with self.assertRaises(subprocess.CalledProcessError) as error:
+                native.run([sys.executable,'-c',"import sys; print('{}'); sys.stderr.write('synthetic download refused\\n'); sys.exit(17)",'metadata'],Path(d))
+        self.assertEqual(error.exception.returncode,17)
+        self.assertIn('synthetic download refused',diagnostics.getvalue())
+
     def test_metadata_must_resolve_one_real_native_api(self):
         for packages in [[], [{'name':'tauri','manifest_path':'/missing/Cargo.toml','version':'2'}], [{'name':'tauri'}]*2]:
             with self.assertRaises(ValueError): native.tauri_source(Path('/unused'),lambda *a:json.dumps({'packages':packages}))
