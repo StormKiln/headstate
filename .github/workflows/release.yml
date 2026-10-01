@@ -552,6 +552,8 @@ jobs:
           # checks the repo out. `dist/*` then globbed Vite's `assets/`
           # directory and gh refused it with "is a directory".
           path: release-assets
+          # Setup diagnostics remain Actions artifacts, never release assets.
+          pattern: bundle-*
           merge-multiple: true
 
       - name: Publish release
