@@ -1280,6 +1280,8 @@ const MIGRATIONS: &[&str] = &[
         attempted INTEGER NOT NULL,
         PRIMARY KEY (viewer, scope_key, day)
     );",
+    // 36: same-Notification permission context; old rows remain unknown.
+    "ALTER TABLE claude_hook_event ADD COLUMN permission_summary TEXT;",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
@@ -1976,6 +1978,10 @@ mod tests {
                 first_seen_at TEXT NOT NULL, last_activity_at TEXT);",
         )
         .unwrap();
+        // This partial legacy fixture must include the hook table that a
+        // real schema at this version already has (migration 36 alters it).
+        conn.execute_batch(MIGRATIONS[13]).unwrap();
+        conn.execute_batch(MIGRATIONS[14]).unwrap();
         conn.pragma_update(None, "user_version", 15i64).unwrap();
         conn.execute(
             "INSERT INTO claude_session (session_id, first_seen_at)
@@ -2065,6 +2071,10 @@ mod tests {
             [],
         )
         .unwrap();
+        // This partial legacy fixture must include the hook table that a
+        // real schema at this version already has (migration 36 alters it).
+        conn.execute_batch(MIGRATIONS[13]).unwrap();
+        conn.execute_batch(MIGRATIONS[14]).unwrap();
         conn.pragma_update(None, "user_version", 16i64).unwrap();
 
         migrate(&conn).unwrap();
@@ -2302,6 +2312,10 @@ mod tests {
                 '2026-02-01T00:00:00Z');",
         )
         .unwrap();
+        // This partial legacy fixture must include the hook table that a
+        // real schema at this version already has (migration 36 alters it).
+        conn.execute_batch(MIGRATIONS[13]).unwrap();
+        conn.execute_batch(MIGRATIONS[14]).unwrap();
         conn.pragma_update(None, "user_version", 17i64).unwrap();
 
         migrate(&conn).unwrap();
@@ -2915,5 +2929,32 @@ mod tests {
             !ordinary.forbids_writing(),
             "an ordinary database error means there is no data, not that we must not write"
         );
+    }
+    #[test]
+    fn migration_36_leaves_legacy_permission_context_unknown() {
+        let conn = Connection::open_in_memory().unwrap();
+        for migration in &MIGRATIONS[..35] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 35).unwrap();
+        conn.execute("INSERT INTO claude_hook_event(session_id,event,at,notification_type) VALUES ('legacy','Notification','fixture-time','permission_prompt')", []).unwrap();
+        migrate(&conn).unwrap();
+        let summary: Option<String> = conn
+            .query_row(
+                "SELECT permission_summary FROM claude_hook_event WHERE session_id='legacy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(summary.is_none());
+        migrate(&conn).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM claude_hook_event WHERE session_id='legacy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

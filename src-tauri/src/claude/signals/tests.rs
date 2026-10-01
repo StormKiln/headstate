@@ -382,6 +382,8 @@ fn a_live_session_at_an_idle_prompt_is_waiting_now() {
     assert_eq!(
         w,
         Waiting::Now {
+            tool: None,
+            summary: None,
             kind: "idle_prompt".into(),
             at: "2026-09-13T10:00:00+00:00".into(),
         }
@@ -428,6 +430,8 @@ fn a_session_whose_process_is_gone_never_shows_present_tense_waiting() {
     assert_eq!(
         w,
         Waiting::LastSeen {
+            tool: None,
+            summary: None,
             kind: "idle_prompt".into(),
             at: "2026-09-13T10:00:00+00:00".into(),
             why: "its process is no longer running".into(),
@@ -828,4 +832,122 @@ fn equal_counts_order_by_name_so_the_list_does_not_reshuffle() {
             ("zebra".to_owned(), 1)
         ]
     );
+}
+
+#[test]
+fn permission_context_survives_the_real_hook_handoff_and_waiting_path() {
+    let mut conn = db();
+    let payload = serde_json::json!({"hook_event_name":"Notification", "session_id":"permission-fixture", "notification_type":"permission_prompt", "tool_name":"Bash", "tool_input":{"command":"API_KEY=sk_test_abcdefghijklmnopqrstuvwxyz123456 echo fixture"}});
+    let record = crate::claude::hook::record_from(&payload, 4242, "2026-10-01T10:00:00+00:00");
+    feed(&mut conn, &[serde_json::to_string(&record).unwrap()]);
+    let waiting = serde_json::to_value(
+        events_for(&conn, "permission-fixture")
+            .unwrap()
+            .waiting(&running()),
+    )
+    .unwrap();
+    assert_eq!(waiting["tool"], "Bash");
+    assert!(waiting["summary"].as_str().unwrap().contains("hidden:"));
+    assert!(!waiting
+        .to_string()
+        .contains("abcdefghijklmnopqrstuvwxyz123456"));
+}
+
+#[test]
+fn permission_context_follows_its_notification_and_never_a_neighbouring_tool() {
+    let first = "2026-10-01T10:00:00+00:00";
+    let later = "2026-10-01T10:00:01+00:00";
+    for event in [
+        "generic",
+        "idle",
+        "other",
+        "SessionEnd",
+        "PermissionDenied",
+        "FutureHook",
+    ] {
+        let mut conn = db();
+        let payload = serde_json::json!({"hook_event_name":"Notification","session_id":"s1","notification_type":"permission_prompt","tool_name":"Bash","tool_input":{"command":"echo safe"}});
+        feed(
+            &mut conn,
+            &[
+                serde_json::to_string(&crate::claude::hook::record_from(&payload, 1, first))
+                    .unwrap(),
+            ],
+        );
+        for live in [dead(), unknown()] {
+            let w = serde_json::to_value(events_for(&conn, "s1").unwrap().waiting(&live)).unwrap();
+            assert_eq!(w["state"], "last-seen");
+            assert_eq!(w["tool"], "Bash");
+            assert_eq!(w["summary"], "echo safe");
+        }
+        // Another session cannot supply or clear this context.
+        feed(
+            &mut conn,
+            &[line(
+                "Notification",
+                "s2",
+                later,
+                r#""notification_type":"permission_prompt","tool_name":"Other""#,
+            )],
+        );
+        assert_eq!(
+            serde_json::to_value(events_for(&conn, "s1").unwrap().waiting(&running())).unwrap()
+                ["tool"],
+            "Bash"
+        );
+        let (name, extra) = match event {
+            "generic" => ("Notification", r#""notification_type":"permission_prompt""#),
+            "idle" => (
+                "Notification",
+                r#""notification_type":"idle_prompt","tool_name":"Other","permission_summary":"wrong""#,
+            ),
+            "other" => ("Notification", r#""notification_type":"other""#),
+            "PermissionDenied" => (
+                "PermissionDenied",
+                r#""tool_name":"Other","denial_reason":"refused""#,
+            ),
+            e => (e, ""),
+        };
+        feed(&mut conn, &[line(name, "s1", later, extra)]);
+        let w = serde_json::to_value(events_for(&conn, "s1").unwrap().waiting(&running())).unwrap();
+        assert!(
+            w.get("tool").is_none() && w.get("summary").is_none(),
+            "{event}"
+        );
+        assert_eq!(
+            w["state"],
+            if event == "generic" || event == "idle" {
+                "now"
+            } else {
+                "no"
+            }
+        );
+    }
+    // Same-event/same-time replay is the existing primary-key no-op: fields
+    // never migrate independently from the retained authoritative record.
+    let mut conn = db();
+    feed(
+        &mut conn,
+        &[line(
+            "Notification",
+            "s1",
+            first,
+            r#""notification_type":"permission_prompt","tool_name":"Bash","permission_summary":"echo first""#,
+        )],
+    );
+    feed(
+        &mut conn,
+        &[
+            line(
+                "Notification",
+                "s1",
+                first,
+                r#""notification_type":"permission_prompt","tool_name":"Other","permission_summary":"echo second""#,
+            ),
+            line("PermissionDenied", "s1", first, r#""tool_name":"Other""#),
+        ],
+    );
+    let w = serde_json::to_value(events_for(&conn, "s1").unwrap().waiting(&running())).unwrap();
+    assert_eq!(w["tool"], "Bash");
+    assert_eq!(w["summary"], "echo first");
 }

@@ -66,6 +66,7 @@ export type WaitingTone = "now" | "past" | "not-waiting" | "not-recorded";
 export interface WaitingView {
   tone: WaitingTone;
   label: string;
+  summary?: string | null;
   /// For the `title`: the kind as sent and, for `past`, why the present
   /// tense could not be claimed.
   title: string | null;
@@ -79,13 +80,15 @@ export function waitingView(waiting: ClaudeWaiting, clock: (iso: string) => stri
     case "now":
       return {
         tone: "now",
-        label: waitingFor(waiting.kind),
+        summary: waiting.kind === "permission_prompt" && waiting.tool?.trim() ? waiting.summary : null,
+        label: waitingFor(waiting.kind, waiting.tool),
         title: `${waiting.kind} at ${clock(waiting.at)}`,
       };
     case "last-seen":
       return {
         tone: "past",
-        label: `Last seen ${lowerFirst(waitingFor(waiting.kind))} at ${clock(waiting.at)}`,
+        summary: waiting.kind === "permission_prompt" && waiting.tool?.trim() ? waiting.summary : null,
+        label: `Last seen ${lowerFirst(waitingFor(waiting.kind, waiting.tool))} at ${clock(waiting.at)}`,
         title: `${waiting.kind}: ${waiting.why}`,
       };
     case "no":
@@ -97,9 +100,9 @@ export function waitingView(waiting: ClaudeWaiting, clock: (iso: string) => stri
 
 /// The two #1067 kinds get their own sentence; anything else is shown as
 /// sent, never relabelled.
-function waitingFor(kind: string): string {
+function waitingFor(kind: string, tool?: string | null): string {
   if (kind === "idle_prompt") return "Waiting for your input";
-  if (kind === "permission_prompt") return "Waiting for your permission";
+  if (kind === "permission_prompt") return `Waiting for your permission${tool?.trim() ? ` to run ${tool.trim()}` : ""}`;
   return `Waiting: ${kind}`;
 }
 

@@ -157,6 +157,8 @@ pub struct Record {
     /// `PostToolUseFailure`'s `tool_name` (#1060 sub-issue 2).
     #[serde(default)]
     pub tool_name: Option<String>,
+    #[serde(default)]
+    pub permission_summary: Option<String>,
     /// `PostToolUseFailure`'s `error_message`, capped by the writer at
     /// [`super::hook::TEXT_FIELD_CAP`] bytes.
     #[serde(default)]
@@ -613,6 +615,21 @@ fn write_record(conn: &Connection, rec: &Record, start_time: Option<i64>) -> Res
     // rate limit and kept going would be reported as ended.
     if let Some(event) = rec.point_event() {
         let f = rec.failure_fields();
+        let permission = event == "Notification"
+            && rec.notification_type.as_deref() == Some("permission_prompt");
+        // Old handoff producers may supply an unmasked name; normalize at
+        // ingestion as well. Only this same authoritative record contributes.
+        let tool = permission
+            .then(|| {
+                rec.tool_name
+                    .as_deref()
+                    .and_then(|s| super::hook::permission_text(s, 80))
+            })
+            .flatten();
+        let summary = tool
+            .as_ref()
+            .and(rec.permission_summary.as_deref())
+            .and_then(|s| super::hook::permission_text(s, super::hook::TEXT_FIELD_CAP));
         conn.execute(
             // OR IGNORE against (session_id, event, at) for the reason
             // the start-record insert below uses it: `consume` can
@@ -628,8 +645,8 @@ fn write_record(conn: &Connection, rec: &Record, start_time: Option<i64>) -> Res
             "INSERT OR IGNORE INTO claude_hook_event
                 (session_id, event, at, trigger_kind, agent_id, agent_type,
                  notification_type, error_type, tool_name, failure_detail,
-                 tool_use_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 tool_use_id, permission_summary)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
                 session_id,
                 event,
@@ -646,7 +663,11 @@ fn write_record(conn: &Connection, rec: &Record, start_time: Option<i64>) -> Res
                 rec.agent_type.as_deref().filter(|t| !t.is_empty()),
                 rec.notification_type,
                 f.error_type,
-                f.tool_name,
+                if permission {
+                    tool.as_deref()
+                } else {
+                    f.tool_name
+                },
                 // Same empty-is-absent rule as `agent_type` above, and
                 // #1064 needs it by name: a denial whose `denial_reason`
                 // arrived as "" must reach the "not recorded" arm rather
@@ -657,6 +678,7 @@ fn write_record(conn: &Connection, rec: &Record, start_time: Option<i64>) -> Res
                 // `tool_use_id IS NOT NULL`: two distinct `StopFailure`
                 // records must not collide on a shared sentinel.
                 rec.tool_use_id.as_deref().filter(|t| !t.is_empty()),
+                summary,
             ],
         )
         .map_err(|e| format!("{session_id}: could not store the {event}: {e}"))?;

@@ -141,7 +141,13 @@ pub enum Carries {
     /// the command, because the command answers more than the excerpt --
     /// the session list must not vanish because one column of it is a
     /// transcript excerpt.
-    Fields(&'static [&'static str]),
+    Fields {
+        names: &'static [&'static str],
+        /// Exact leaf paths; `*` traverses array members only. These leaves
+        /// remain masked even on Reveal: captured permission context has no
+        /// raw backing field and is not a transcript-reveal surface.
+        paths: &'static [&'static [&'static str]],
+    },
 }
 
 /// Every remote command whose answer carries transcript text.
@@ -168,7 +174,23 @@ pub const TRANSCRIPT_TEXT: &[(&str, Carries)] = &[
     ("claude_transcript_find", Carries::Whole),
     // The first thing the user typed (#1133), clamped to 300 characters
     // -- still a place a pasted token lands.
-    ("claude_sessions", Carries::Fields(&["opening_prompt"])),
+    (
+        "claude_sessions",
+        Carries::Fields {
+            names: &["opening_prompt"],
+            paths: &[
+                &["sessions", "*", "waiting", "tool"],
+                &["sessions", "*", "waiting", "summary"],
+            ],
+        },
+    ),
+    (
+        "claude_session_detail",
+        Carries::Fields {
+            names: &[],
+            paths: &[&["waiting", "tool"], &["waiting", "summary"]],
+        },
+    ),
     // The same opening prompt for ONE session, as the phone's opt-in
     // lock-screen snippet (#1486). Whole: `prompt` is its only string.
     // Its sibling `claude_session_digest` has NO row because it carries
@@ -442,11 +464,16 @@ impl Plan {
         let withhold = !self.access.transcripts;
         let mut hidden = 0usize;
         if withhold {
-            if let Carries::Fields(fields) = carries {
-                null_fields(&mut value, fields);
+            if let Carries::Fields { names, .. } = carries {
+                null_fields(&mut value, names);
             }
         } else if !self.reveal {
             hidden = walk(&mut value, carries == Carries::Whole, carries);
+        }
+        if let Carries::Fields { paths, .. } = carries {
+            for path in paths {
+                hidden += waiting_leaf(&mut value, path, withhold);
+            }
         }
         crate::diag!("[diag] remote: {command} hid {hidden} span(s)");
         if let Value::Object(map) = &mut value {
@@ -481,12 +508,35 @@ fn walk(value: &mut Value, in_scope: bool, carries: Carries) -> usize {
             .filter(|(k, _)| !OPAQUE_KEYS.contains(&k.as_str()))
             .map(|(k, v)| {
                 let scoped =
-                    in_scope || matches!(carries, Carries::Fields(fs) if fs.contains(&k.as_str()));
+                    in_scope || matches!(carries, Carries::Fields { names, .. } if names.contains(&k.as_str()));
                 walk(v, scoped, carries)
             })
             .sum(),
         _ => 0,
     }
+}
+
+/// Apply only a declared leaf; never match unrelated `tool`/`summary` keys.
+fn waiting_leaf(value: &mut Value, path: &[&str], withhold: bool) -> usize {
+    let Some((key, rest)) = path.split_first() else {
+        if withhold {
+            *value = Value::Null;
+            return 0;
+        }
+        return walk(value, true, Carries::Whole);
+    };
+    if *key == "*" {
+        return match value {
+            Value::Array(items) => items
+                .iter_mut()
+                .map(|v| waiting_leaf(v, rest, withhold))
+                .sum(),
+            _ => 0,
+        };
+    }
+    value
+        .get_mut(*key)
+        .map_or(0, |v| waiting_leaf(v, rest, withhold))
 }
 
 /// Set every `fields` key under `value`, at any depth, to `null`.
@@ -1393,6 +1443,14 @@ mod tests {
                 "claude_transcript_block_text",
                 serde_json::to_value(&block).unwrap(),
             ),
+            (
+                "claude_sessions",
+                json!({"sessions":[{"waiting":{"state":"now","kind":"permission_prompt","at":"fixture","tool":"Bash","summary":format!("{CANARY} {SECRET}")}}]}),
+            ),
+            (
+                "claude_session_detail",
+                json!({"waiting":{"state":"now","kind":"permission_prompt","at":"fixture","tool":"Bash","summary":format!("{CANARY} {SECRET}")}}),
+            ),
         ] {
             let (_, plan) = admit(command, json!({"path": "p"}), ON).unwrap();
             finished.push(plan.finish(command, value));
@@ -1404,6 +1462,10 @@ mod tests {
         // vacuously empty of text for want of any.
         assert!(finished[0].to_string().contains(CANARY));
         assert!(!finished[0].to_string().contains(SECRET));
+        for answer in &finished[2..] {
+            assert!(answer.to_string().contains(CANARY));
+            assert!(!answer.to_string().contains(SECRET));
+        }
         let ours: Vec<&String> = lines
             .iter()
             .filter(|l| l.contains("claude_transcript_"))
@@ -1417,6 +1479,51 @@ mod tests {
                 !line.contains(CANARY) && !line.contains("canaryCANARY"),
                 "a diag line carried transcript text: {line}"
             );
+        }
+    }
+    #[test]
+    fn waiting_context_is_masked_and_withheld_at_exact_list_and_detail_leaves() {
+        for (command, list) in [("claude_sessions", true), ("claude_session_detail", false)] {
+            let row = json!({"waiting":{"state":"now","kind":"permission_prompt","at":"fixture-time","tool":"PASSWORD=unmistakablySecret123","summary":"API_KEY=unmistakablySecret456"},"summary":"API_KEY=unrelatedSecret789","tool":"unrelated"});
+            let body = if list { json!({"sessions":[row]}) } else { row };
+            let (_, plan) = admit(command, json!({}), ON).unwrap();
+            let masked = plan.finish(command, body.clone());
+            assert!(!masked.to_string().contains("unmistakablySecret"));
+            assert!(masked.to_string().contains("API_KEY=unrelatedSecret789"));
+            // Even Reveal cannot make a captured masked summary raw again.
+            let (_, reveal) = admit(
+                command,
+                json!({"reveal":true}),
+                Access {
+                    transcripts: true,
+                    reveal: true,
+                },
+            )
+            .unwrap();
+            assert!(!reveal
+                .finish(command, body.clone())
+                .to_string()
+                .contains("unmistakablySecret"));
+            let (_, plan) = admit(
+                command,
+                json!({}),
+                Access {
+                    transcripts: false,
+                    reveal: false,
+                },
+            )
+            .unwrap();
+            let hidden = plan.finish(command, body);
+            let row = if list {
+                &hidden["sessions"][0]
+            } else {
+                &hidden
+            };
+            assert_eq!(row["waiting"]["state"], "now");
+            assert!(row["waiting"]["tool"].is_null());
+            assert!(row["waiting"]["summary"].is_null());
+            assert_eq!(row["summary"], "API_KEY=unrelatedSecret789");
+            assert_eq!(row["tool"], "unrelated");
         }
     }
 }

@@ -76,3 +76,23 @@ it("measures large synthetic replies and leaves operation-budget headroom", () =
     console.info(`wire-benchmark ${name}: ${bytes} bytes, ${operations} operations, median ${times.sort((a, b) => a - b)[1].toFixed(2)} ms (synthetic host, 10000 rows/messages)`);
   }
 });
+
+
+it("preserves legacy waiting payloads and validates optional permission context", () => {
+  const base = {
+    session_id: "fixture", claude_version: null, transcript_path: null, first_seen_at: "fixture-time",
+    liveness: { state: "unknown", why: "fixture" }, transcript_state: { state: "exists" },
+    resume: { command: "fixture", caveat: null, anchored: true }, runs: 0,
+    registry_failure: null, kind: { kind: "own" }, subagents: [], parent: null, unattributed: null,
+    compactions: null, agent_types: null,
+  };
+  for (const state of ["now", "last-seen"]) {
+    const waiting = { state, kind: "permission_prompt", at: "fixture-time", ...(state === "last-seen" ? { why: "fixture" } : {}) };
+    for (const context of [{}, { tool: null, summary: null }, { tool: "Bash", summary: "echo safe" }]) {
+      expect(() => assertRemoteReply("claude_session_detail", { ...base, waiting: { ...waiting, ...context } })).not.toThrow();
+    }
+    for (const context of [{ tool: 123 }, { summary: [] }]) {
+      expect(() => assertRemoteReply("claude_session_detail", { ...base, waiting: { ...waiting, ...context } })).toThrow();
+    }
+  }
+});

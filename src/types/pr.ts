@@ -1632,6 +1632,9 @@ export type ClaudeWaiting =
       kind: string;
       /// When the notification was recorded, as an ISO timestamp.
       at: string;
+      /// Optional same-notification masked permission context; older peers omit it.
+      tool?: string | null;
+      summary?: string | null;
     }
   /// It asked for input at `at`, and we cannot say whether it still
   /// needs it. Never rendered in the present tense.
@@ -1639,6 +1642,9 @@ export type ClaudeWaiting =
       state: "last-seen";
       kind: string;
       at: string;
+      /// Optional same-notification masked permission context; older peers omit it.
+      tool?: string | null;
+      summary?: string | null;
       /// Why the present tense could not be claimed -- the liveness
       /// reason, carried through so the indicator's `title` says which of
       /// "the process is gone" and "we could not tell" applies. Without

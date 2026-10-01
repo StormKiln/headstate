@@ -356,3 +356,28 @@ describe("TranscriptHeader actions", () => {
     expect(screen.getByTestId("transcript-header").textContent).not.toMatch(/reply|send/i);
   });
 });
+
+
+it.each([false, true])("renders the same masked permission context on mobile=%s", (mobile) => {
+  state.mobile = mobile;
+  renderHeader({ liveness: RUNNING, waiting: { state: "now", kind: "permission_prompt", at: "2026-09-26T10:00:00Z", tool: "Bash", summary: "API_KEY=⟦hidden:api-key⟧ echo fixture" } }, {}, { variant: mobile ? "phone" : "desktop" });
+  expect(screen.getByRole("status").textContent).toBe("Waiting for your permission to run Bash");
+  const summary = screen.getByTestId("permission-summary");
+  expect(summary.textContent).toContain("echo fixture");
+  expect(within(summary).getByTitle(/Hidden on this phone/)).toBeTruthy();
+  expect(summary.className).toContain("break-all");
+});
+
+
+it("keeps permission context in the past tense and clears it on a generic or superseded update", () => {
+  const view = render(headerElement({ waiting: { state: "last-seen", kind: "permission_prompt", at: "2026-09-26T10:00:00Z", why: "gone", tool: "Bash", summary: "echo earlier" } }));
+  expect(screen.getByText(/Last seen waiting for your permission to run Bash/)).toBeTruthy();
+  expect(screen.getByTestId("permission-summary").textContent).toBe("echo earlier");
+  expect(screen.getByRole("status").textContent).toBe("");
+  view.rerender(headerElement({ waiting: { state: "now", kind: "permission_prompt", at: "2026-09-26T10:01:00Z", tool: "  ", summary: "must not show" } }));
+  expect(screen.queryByTestId("permission-summary")).toBeNull();
+  expect(screen.getByRole("status").textContent).toBe("Waiting for your permission");
+  view.rerender(headerElement({ waiting: { state: "no", reason: "superseded" } }));
+  expect(screen.queryByText(/Bash|echo earlier|must not show/)).toBeNull();
+  expect(screen.getByRole("status").textContent).toBe("");
+});
