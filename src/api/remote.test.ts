@@ -13,6 +13,8 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: tauri.listen }));
 
 import { remote } from "./remote";
 import { PR_FIXTURES } from "../fixtures/prs";
+import { GitLabQueueState } from "./gitlabQueueState";
+import type { SourcePollUpdate } from "./tauri";
 
 function setVisibility(state: DocumentVisibilityState) {
   Object.defineProperty(document, "visibilityState", { value: state, configurable: true });
@@ -200,5 +202,49 @@ describe("remote event validation", () => {
     const frame = { payload: { arbitrary_local_shape: true } };
     callback(frame);
     expect(consumer).toHaveBeenCalledExactlyOnceWith(frame);
+  });
+});
+
+
+// Exercise the real phone event delivery seam and the GitLab consumer model.
+// Old GitHub compatibility must never admit a partial GitLab receipt.
+describe("remote GitLab queue event contract", () => {
+  it.each([
+    "session", "revision", "receipt_revision", "completed_request",
+    "last_received_at", "mrs", "coverage",
+  ])("drops a GitLab frame missing %s without poisoning the next valid receipt", async (missing) => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const model = new GitLabQueueState("gitlab.com", "authored");
+    const accept = vi.fn((frame: SourcePollUpdate) => model.accept(frame));
+    await remote.listen<SourcePollUpdate>("source-poll-status", ({ payload }) => {
+      if (payload.source.provider === "gitlab") accept(payload);
+    });
+    const deliver = tauri.listen.mock.calls.at(-1)![1] as (event: { payload: unknown }) => void;
+    const first: SourcePollUpdate = {
+      source: { provider: "gitlab", host: "gitlab.com" }, list: "authored",
+      phase: "ready", error: null, session: "desktop-current", revision: 1,
+      receipt_revision: 1, completed_request: null,
+      last_received_at: "2026-10-01T00:00:00Z", mrs: [], coverage: "complete",
+    };
+    deliver({ payload: first });
+    expect(accept).toHaveBeenCalledTimes(1);
+    const established = model.snapshot();
+    const malformed: Record<string, unknown> = {
+      ...first, revision: 2, receipt_revision: 2,
+      phase: "failed", error: "malformed frame must not reach the queue",
+    };
+    delete malformed[missing];
+    deliver({ payload: malformed });
+    expect(accept).toHaveBeenCalledTimes(1);
+    expect(model.snapshot()).toBe(established);
+    const latest: SourcePollUpdate = {
+      ...first, revision: 3, receipt_revision: 3,
+      phase: "failed", error: "Latest valid provider status", mrs: [], coverage: "unknown",
+    };
+    deliver({ payload: latest });
+    expect(accept).toHaveBeenCalledTimes(2);
+    expect(model.snapshot().rows).toBe(latest.mrs);
+    expect(model.snapshot().coverage).toBe("unknown");
+    expect(model.snapshot().error).toBe("Latest valid provider status");
   });
 });

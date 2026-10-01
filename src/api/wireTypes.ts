@@ -3,7 +3,7 @@ import type { MergeRequest } from "../types/gitlab";
 import type { PrIdentity } from "../types/identity";
 import type { SessionActivity } from "../types/transcript";
 import type { SourceStatus } from "./sourceRefresh";
-import type { UpdateRunDone } from "./tauri";
+import type { SourcePollUpdate, UpdateRunDone } from "./tauri";
 
 /// The event contract is explicit because subscribers intentionally consume
 /// different projections. Optional fields preserve independently shipped older
@@ -14,10 +14,16 @@ export interface RemoteEvents {
   "poll-state": string;
   "poll-error": string;
   "store-error": string;
-  "source-poll-status": SourceStatus & {
-    mrs?: MergeRequest[] | null;
-    last_received_at?: string | null;
-  };
+  "source-poll-status":
+    // Only GitHub had the legacy uncorrelated shape. A broad SourceStatus
+    // arm would also accept incomplete GitLab frames and could retire the
+    // queue's live session or publish undefined rows (#711 review).
+    | (SourceStatus & {
+        source: { provider: "github"; host: string };
+        mrs?: MergeRequest[] | null;
+        last_received_at?: string | null;
+      })
+    | (SourcePollUpdate & { source: { provider: "gitlab"; host: string } });
   "gitlab-data-changed": PrIdentity;
   "prs-truncated": number | null;
   "reviewing-short": number | null;
