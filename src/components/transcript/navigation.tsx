@@ -14,7 +14,7 @@
 /// answers with sessions, not messages.
 
 import { memo, useEffect, useMemo, useRef, useState } from "react";
-import { saveMarkdown } from "../../api/markdownExport";
+import { saveMarkdown } from "../../api/tauri";
 import { IS_MOBILE_BUILD } from "../../lib/target";
 import { toast } from "sonner";
 import { useClaudeTranscriptFind } from "../../api/hooks";

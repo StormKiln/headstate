@@ -1,6 +1,8 @@
+import { useTranscriptWatch } from "./useTranscriptWatch";
+import { TranscriptFollower } from "../lib/transcriptFollow";
 import { useGitLabInvalidation } from "./gitlabInvalidation";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { renderHook } from "@testing-library/react";
+import { act, renderHook } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
@@ -108,6 +110,8 @@ const row = (
 const source = { provider: "gitlab", host: "gitlab.example" } as const;
 const gitlabStatsScope = { kind: "project", path: "octocat/hello-world" } as const;
 const ROWS: Row[] = [
+  row(api.saveMarkdown, ["# masked café"], "save_markdown", {markdown: "# masked café"}),
+  row(api.claudeTranscriptWatch, [path], "claude_transcript_watch", {path}),
   row(api.getSourceSnapshot, [source, "reviewing"], "get_source_snapshot", { source, list: "reviewing" }),
   row(api.refreshSelectedSource, [source, "authored", "request-1"], "refresh_source", { source, list: "authored", requestId: "request-1" }),
   row(api.setSourceSelection, ["both"], "set_source_selection", { selection: "both" }),
@@ -592,6 +596,7 @@ describe("tauri.ts wrappers through the transport", () => {
 /// to each. The remote transport will re-emit them under these names,
 /// so the hooks must reach them through the seam and nowhere else.
 const POLL_EVENTS: [string, () => unknown][] = [
+  ["claude-transcript-activity", () => useTranscriptWatch(new TranscriptFollower(vi.fn()), path, true)],
   ["prs-updated", hooks.usePullRequests],
   ["poll-state", hooks.usePollState],
   ["poll-error", hooks.usePollError],
@@ -669,6 +674,26 @@ describe("poll-loop events through the transport", () => {
     const events = local.listen.mock.calls.map((c) => c[0]);
     expect(events).toContain(event);
     unmount();
+  });
+
+  it("routes leased child activity payloads through the real hook and transport", async () => {
+    const follower = new TranscriptFollower(vi.fn());
+    const nudge = vi.spyOn(follower, "nudge");
+    const stop = vi.fn();
+    local.listen.mockResolvedValueOnce(stop);
+    local.call.mockResolvedValueOnce({watch_id:"opaque-child", expires_in_ms:30_000});
+    const { unmount } = renderHook(() => useTranscriptWatch(follower, path, true));
+    await act(async () => {});
+    expect(local.call).toHaveBeenCalledWith("claude_transcript_watch", {path});
+    const callback = local.listen.mock.calls.find(([event]) => event === "claude-transcript-activity")![1] as (event: {payload:{watch_id:string;size:number}}) => void;
+    callback({payload:{watch_id:"another-child",size:100}});
+    expect(nudge).not.toHaveBeenCalled();
+    callback({payload:{watch_id:"opaque-child",size:123}});
+    expect(nudge).toHaveBeenCalledExactlyOnceWith(123);
+    unmount();
+    expect(stop).toHaveBeenCalledTimes(1);
+    callback({payload:{watch_id:"opaque-child",size:456}});
+    expect(nudge).toHaveBeenCalledTimes(1);
   });
 
   it("passes the event name and callback through unchanged", async () => {

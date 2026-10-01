@@ -61,6 +61,7 @@ vi.mock("@/api/tauri", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   claudeTranscriptBlockText: vi.fn(),
   claudeTranscriptPage: pageRead,
+  saveMarkdown: saveExport,
 }));
 
 /// What the host hands pending reconciliation (#1491), per render.
@@ -97,7 +98,6 @@ function windowOf(p: RemoteTranscriptPage): RemoteTranscriptWindow {
 }
 
 const saveExport = vi.hoisted(() => vi.fn().mockResolvedValue("presented"));
-vi.mock("../../../api/markdownExport", () => ({saveMarkdown: saveExport}));
 const { PhoneTranscript } = await import("./PhoneTranscript");
 
 function msg(id: string, over: Partial<TranscriptMessage> = {}): TranscriptMessage {
