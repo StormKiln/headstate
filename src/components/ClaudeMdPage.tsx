@@ -549,7 +549,7 @@ function ImportRow({ node }: { node: ImportNode }) {
             tree look complete when it is not, and a cycle is a bug in
             the user's own config that nothing else will surface. */}
         {node.problem ? (
-          <span className="rounded-full bg-[#f85149]/15 px-2 py-0.5 text-[#f85149]">
+          <span className="rounded-full bg-[#f85149]/15 px-2 py-0.5 text-[#ff7b72]">
             {node.problem}
           </span>
         ) : (

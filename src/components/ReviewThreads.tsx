@@ -227,7 +227,7 @@ function ThreadCard({ thread, repo, number, forceOpen = false }: {
                 onChange={(e) => setReply(e.target.value)}
                 rows={2}
                 placeholder="Reply…"
-                className="w-full rounded border border-[#30363d] bg-[#0d1117] p-2 text-sm text-[#e6edf3] placeholder:text-[#6e7681]"
+                className="w-full rounded border border-[#30363d] bg-[#0d1117] p-2 text-sm text-[#e6edf3] placeholder:text-[#8b949e]"
               />
             </div>
           ) : null}

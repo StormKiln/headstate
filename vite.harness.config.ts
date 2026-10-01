@@ -13,6 +13,7 @@ export default defineConfig((env) =>
       emptyOutDir: true,
       rollupOptions: {
         input: {
+          contrast: new URL("./harness/contrast.html", import.meta.url).pathname,
           transcript: new URL("./harness/transcript.html", import.meta.url).pathname,
           shell: new URL("./harness/shell.html", import.meta.url).pathname,
         },

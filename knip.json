@@ -2,6 +2,9 @@
   "$schema": "https://unpkg.com/knip@6/schema.json",
   "entry": [
     "src/main.tsx",
+    "src/harness/contrastHarness.tsx",
+    "scripts/check-contrast-source.mjs",
+    "scripts/check-contrast-rendered.mjs",
     "vite.config.ts",
     "vite.harness.config.ts",
     "src/harness/transcriptBench.tsx",

@@ -381,3 +381,15 @@ it("keeps permission context in the past tense and clears it on a generic or sup
   expect(screen.queryByText(/Bash|echo earlier|must not show/)).toBeNull();
   expect(screen.getByRole("status").textContent).toBe("");
 });
+
+it("makes the full masked Asked prompt visible without a secret title, including a stale withheld prop", () => {
+  const prompt = `First line\n${"long-unbroken-".repeat(40)} ⟦hidden:token⟧ last line`;
+  const view = render(headerElement({}, { opening_prompt: prompt }));
+  const asked = screen.getByText(/Asked:/);
+  expect(asked.textContent).toContain("last line");
+  expect(asked.className).not.toMatch(/truncate|line-clamp/);
+  expect(asked.className).toContain("overflow-wrap:anywhere");
+  expect(asked.getAttribute("title")).toBeNull();
+  view.rerender(headerElement({}, { opening_prompt: "STALE_SECRET_SENTINEL" }, { withheld: true }));
+  expect(screen.queryByText(/STALE_SECRET_SENTINEL/)).toBeNull();
+});

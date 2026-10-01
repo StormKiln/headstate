@@ -100,7 +100,7 @@ export function WorktreeKebab({
   // that deletes a directory must not look like one that copies a
   // string.
   const destructive =
-    "flex w-full items-start gap-2 rounded px-2 py-1.5 text-left text-xs text-[#f85149] hover:bg-[#f85149]/10";
+    "flex w-full items-start gap-2 rounded px-2 py-1.5 text-left text-xs text-[#ff7b72] hover:bg-[#f85149]/10";
 
   // The gate, read here exactly as the primary button reads it (#770).
   //

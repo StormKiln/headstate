@@ -364,7 +364,7 @@ export function ReadyStrip({
               >
                 <span className="min-w-0 flex-1">
                   <span className="text-[#e6edf3]">{pr.title}</span>
-                  <span className="ml-2 text-xs text-[#8b949e]">
+                  <span className="ml-2 text-xs text-[#b1bac4]">
                     {pr.repo}#{pr.number} · {pr.author}
                   </span>
                 </span>

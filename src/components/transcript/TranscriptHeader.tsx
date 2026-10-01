@@ -143,7 +143,7 @@ export function TranscriptHeader({
           shown.
         </p>
       ) : s.opening_prompt ? (
-        <p className="truncate text-[11px] text-[#8b949e]" title={s.opening_prompt}>
+        <p className="min-w-0 whitespace-pre-wrap [overflow-wrap:anywhere] text-[11px] text-[#8b949e]" data-testid="transcript-header-asked">
           Asked: <MaskedText text={s.opening_prompt} />
         </p>
       ) : null}

@@ -537,7 +537,7 @@ function Row({
             `sizePending` would leave the skeleton up for the rest of the
             pass. */}
         {sizeUnmeasurable ? (
-          <span className="cursor-help text-[#6e7681]" title={sizeUnmeasuredWhy}>
+          <span className="cursor-help text-[#8b949e]" title={sizeUnmeasuredWhy}>
             not measured
           </span>
         ) : sizePending && wt.size_bytes === null ? (
@@ -582,7 +582,7 @@ function Row({
           type="button"
           onClick={() => onForce(wt)}
           title="You assessed this worktree — remove it despite the safety gate"
-          className="shrink-0 rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#f85149] hover:bg-[#f85149]/10"
+          className="shrink-0 rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#ff7b72] hover:bg-[#f85149]/10"
         >
           Remove anyway…
         </button>
@@ -593,7 +593,7 @@ function Row({
           title={`Copy a prompt asking Claude Code to assess this worktree (${safetyReason(
             wt.safety,
           )})`}
-          className="flex shrink-0 items-center gap-1 rounded border border-[#8957e5]/40 px-2 py-0.5 text-xs text-[#a371f7] hover:bg-[#8957e5]/10"
+          className="flex shrink-0 items-center gap-1 rounded border border-[#8957e5]/40 px-2 py-0.5 text-xs text-[#bc8cff] hover:bg-[#8957e5]/10"
         >
           <Sparkles className="h-3 w-3" aria-hidden="true" />
           Claudify
@@ -720,7 +720,7 @@ function Row({
           }
           className={`shrink-0 rounded border px-2 py-0.5 text-xs ${
             dirtyCount !== null || pulling
-              ? "border-[#30363d] text-[#8b949e] opacity-50"
+              ? "border-[#30363d] text-[#8b949e] disabled:opacity-50"
               : "border-[#30363d] text-[#e6edf3] hover:bg-[#161b22]"
           }`}
         >
@@ -759,7 +759,7 @@ function Row({
           title="Refresh this repository's view of its remote. Moves no branch and touches no file — it only makes the comparisons on this page current."
           className={`shrink-0 rounded border px-2 py-0.5 text-xs ${
             fetching
-              ? "border-[#30363d] text-[#8b949e] opacity-50"
+              ? "border-[#30363d] text-[#8b949e] disabled:opacity-50"
               : "border-[#30363d] text-[#e6edf3] hover:bg-[#161b22]"
           }`}
         >
@@ -2269,7 +2269,7 @@ export function WorktreesPage() {
                   nothing". The banner above covers the pending case, so
                   this only has to separate the other two. */}
               {wt.size_bytes === null && sizesPending === 0 ? (
-                <span className="cursor-help text-[#6e7681]" title={UNMEASURED_HINT}>
+                <span className="cursor-help text-[#8b949e]" title={UNMEASURED_HINT}>
                   not measured
                 </span>
               ) : wt.size_bytes === null ? (
@@ -2756,7 +2756,7 @@ export function WorktreesPage() {
             type="button"
             disabled={bulkBusy}
             onClick={() => setSelectionOpen(true)}
-            className="rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#f85149] hover:bg-[#f85149]/10 disabled:opacity-50"
+            className="rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#ff7b72] hover:bg-[#f85149]/10 disabled:opacity-50"
           >
             Remove {selectedVisible.length} selected
           </button>
@@ -2775,7 +2775,7 @@ export function WorktreesPage() {
             type="button"
             disabled={bulkBusy}
             onClick={() => setBulkOpen(true)}
-            className="rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#f85149] hover:bg-[#f85149]/10 disabled:opacity-50"
+            className="rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#ff7b72] hover:bg-[#f85149]/10 disabled:opacity-50"
           >
             {/* A count, not a spinner: ~100 worktrees is around 30
                 seconds of sequential deletion, and a bare "Removing…"
@@ -3424,7 +3424,7 @@ export function WorktreesPage() {
                     },
                   );
                 }}
-                className="rounded border border-[#f85149]/40 px-3 py-1.5 text-sm text-[#f85149] hover:bg-[#f85149]/10"
+                className="rounded border border-[#f85149]/40 px-3 py-1.5 text-sm text-[#ff7b72] hover:bg-[#f85149]/10"
               >
                 Remove {selectedVisible.length} worktree{selectedVisible.length === 1 ? "" : "s"}
               </button>

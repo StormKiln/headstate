@@ -4159,6 +4159,7 @@ __metadata:
     "@eslint/js": "npm:^10"
     "@fontsource-variable/geist": "npm:^5.3.0"
     "@shadcn/react": "npm:^0.3.1"
+    "@tailwindcss/node": "npm:4.3.3"
     "@tailwindcss/vite": "npm:^4"
     "@tanstack/react-query": "npm:5.102.8"
     "@tauri-apps/api": "npm:^2"

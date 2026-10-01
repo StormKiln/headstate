@@ -50,7 +50,7 @@ export function PrioritiesStrip({
 
   return (
     <section className="mb-4 rounded-md border border-[#f85149]/40 bg-[#f85149]/5">
-      <h2 className="flex items-center gap-2 border-b border-[#f85149]/30 px-4 py-2 text-sm font-semibold text-[#f85149]">
+      <h2 className="flex items-center gap-2 border-b border-[#f85149]/30 px-4 py-2 text-sm font-semibold text-[#ff7b72]">
         <AlertTriangle className="h-4 w-4" aria-hidden="true" />
         Needs your attention ({blocked.length})
         {/* The count is correct and the RULE behind it is invisible --
@@ -80,7 +80,7 @@ export function PrioritiesStrip({
                 className="cursor-pointer px-4 py-2 hover:bg-[#f85149]/10"
               >
                 <span className="text-[#e6edf3]">{pr.title}</span>
-                <span className="ml-2 text-xs text-[#8b949e]">
+                <span className="ml-2 text-xs text-[#b1bac4]">
                   {pr.repo}#{pr.number} — {blockedReasons(pr).join(" and ")}
                 </span>
               </div>

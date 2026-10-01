@@ -307,7 +307,7 @@ function Row({
       </span>
       {detail && (
         <span
-          className={`shrink-0 text-[11px] ${active ? "text-white/80" : "text-[#8b949e]"}`}
+          className={`shrink-0 text-[11px] ${active ? "text-white" : "text-[#8b949e]"}`}
         >
           {detail}
         </span>

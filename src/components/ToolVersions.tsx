@@ -64,7 +64,7 @@ export function ToolVersions() {
               {/* The resolved PATH, and only when it is surprising: a
                   working tool at an expected location is noise. */}
               {t.path && t.version.state !== "ok" ? (
-                <span className="ml-1 text-[10px] text-[#6e7681]">{t.path}</span>
+                <span className="ml-1 text-[10px] text-[#8b949e]">{t.path}</span>
               ) : null}
             </li>
           );

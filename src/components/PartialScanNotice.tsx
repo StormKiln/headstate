@@ -74,7 +74,7 @@ export function PartialScanNotice({
           count. */}
       <ul className="mt-1 space-y-0.5">
         {unreadable.map((u) => (
-          <li key={u} className="break-all font-mono text-[#6e7681]">
+          <li key={u} className="break-all font-mono text-[#8b949e]">
             {u}
           </li>
         ))}

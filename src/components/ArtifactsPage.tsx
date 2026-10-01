@@ -549,7 +549,7 @@ export function ArtifactsPage() {
                 type="button"
                 disabled={busy}
                 onClick={() => setConfirming(true)}
-                className="rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#f85149] hover:bg-[#f85149]/10 disabled:opacity-50"
+                className="rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#ff7b72] hover:bg-[#f85149]/10 disabled:opacity-50"
               >
                 {/* The COUNT and the size in the label, so the scope is
                     legible before the dialog rather than only inside it. */}
@@ -571,7 +571,7 @@ export function ArtifactsPage() {
                   setChecked(new Set(removable.map((r) => r.path)));
                   setConfirming(true);
                 }}
-                className="rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#f85149] hover:bg-[#f85149]/10 disabled:opacity-50"
+                className="rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#ff7b72] hover:bg-[#f85149]/10 disabled:opacity-50"
               >
                 Remove all {removable.length}
                 {/* The size appears only when it IS the size (#956). The

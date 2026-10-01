@@ -563,3 +563,13 @@ wire-contract:
 check-wire-contract:
 	node --test scripts/wire-contract.test.mjs
 	node scripts/wire-contract.mjs --check
+
+# Source-discovered contrast contracts plus real compiled component states.
+# Needs `yarn playwright install chromium` once; CI installs the pinned browser.
+.PHONY: check-contrast
+check-contrast:
+	node --test scripts/contrast-source.test.mjs
+	node scripts/check-contrast-source.mjs
+	yarn vitest run src/components/transcript/palette.test.ts src/lib/labels.test.ts
+	yarn vite build -c vite.harness.config.ts
+	node scripts/check-contrast-rendered.mjs

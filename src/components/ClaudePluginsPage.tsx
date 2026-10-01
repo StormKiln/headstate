@@ -229,7 +229,7 @@ function Loaded({
             The installed-plugin list could not be read, so this page can show what was called but
             not what you have installed. A plugin you own may be missing from the table below.
           </p>
-          <p className="mt-1 break-all font-mono text-[#6e7681]">{inventory_failure}</p>
+          <p className="mt-1 break-all font-mono text-[#8b949e]">{inventory_failure}</p>
         </div>
       )}
 
@@ -269,7 +269,7 @@ function Loaded({
       >
         Rescan transcripts
       </button>
-      <p className="mt-1 text-xs text-[#6e7681]">
+      <p className="mt-1 text-xs text-[#8b949e]">
         {report.scanned === 0
           ? "Nothing changed since the last scan, so nothing was re-read."
           : `Read ${report.scanned.toLocaleString()} ${
@@ -299,7 +299,7 @@ function Summary({
         <div className="mt-1 text-2xl font-semibold text-[#e6edf3]">
           {report.inventory_failure !== null ? "—" : installed.toLocaleString()}
         </div>
-        <div className="mt-1 text-xs text-[#6e7681]">
+        <div className="mt-1 text-xs text-[#8b949e]">
           {report.inventory_failure !== null
             ? "the inventory could not be read"
             : `from ${new Set(report.installed.map((p) => p.marketplace)).size} marketplace${
@@ -315,7 +315,7 @@ function Summary({
         <div data-testid="activity-tally" className="mt-1 text-2xl font-semibold text-[#e6edf3]">
           {used.toLocaleString()}
         </div>
-        <div className="mt-1 text-xs text-[#6e7681]">
+        <div className="mt-1 text-xs text-[#8b949e]">
           {/* The denominator is the finding. "7" alone is not an
               argument; "7 of 22" is. */}
           {report.inventory_failure !== null
@@ -328,7 +328,7 @@ function Summary({
         <div className="mt-1 text-2xl font-semibold text-[#e6edf3]">
           {partial ? `at least ${total.toLocaleString()}` : total.toLocaleString()}
         </div>
-        <div className="mt-1 text-xs text-[#6e7681]">across every transcript on this machine</div>
+        <div className="mt-1 text-xs text-[#8b949e]">across every transcript on this machine</div>
       </Card>
     </div>
   );
@@ -386,7 +386,7 @@ function Ranked({
                     // inventory was used and then removed. Worth saying:
                     // it explains a name the user cannot find in their
                     // plugin list, and it is evidence of past value.
-                    <span className="ml-2 font-sans text-[#6e7681]">no longer installed</span>
+                    <span className="ml-2 font-sans text-[#8b949e]">no longer installed</span>
                   )}
                 </span>
                 <span className="shrink-0 tabular-nums text-[#8b949e]">
@@ -487,16 +487,16 @@ function Row({
       <th scope="row" className="px-4 py-2 text-left font-normal">
         <div className="font-mono text-[#e6edf3]">{usage.name}</div>
         {plugin?.version !== undefined && plugin.version !== null && (
-          <div className="text-[#6e7681]">v{plugin.version}</div>
+          <div className="text-[#8b949e]">v{plugin.version}</div>
         )}
       </th>
       <td className="px-4 py-2 align-top text-[#8b949e]">
         {plugin === undefined ? (
-          <span className="text-[#6e7681]">not installed</span>
+          <span className="text-[#8b949e]">not installed</span>
         ) : (
           <>
             <div>{plugin.marketplace === "" ? "unknown marketplace" : plugin.marketplace}</div>
-            {plugin.scope !== null && <div className="text-[#6e7681]">{plugin.scope}</div>}
+            {plugin.scope !== null && <div className="text-[#8b949e]">{plugin.scope}</div>}
           </>
         )}
       </td>
@@ -514,11 +514,11 @@ function Row({
             happened. With no calls there is nothing to have failed, and
             a "0" in this column would read as a clean record rather than
             as an empty one. */}
-        {n === 0 ? <span className="text-[#6e7681]">—</span> : usage.failures.toLocaleString()}
+        {n === 0 ? <span className="text-[#8b949e]">—</span> : usage.failures.toLocaleString()}
       </td>
       <td className="px-4 py-2 align-top text-[#8b949e]">
         {usage.last_called_at === null ? (
-          <span className="text-[#6e7681]">—</span>
+          <span className="text-[#8b949e]">—</span>
         ) : (
           relativeTime(usage.last_called_at, new Date())
         )}
@@ -539,7 +539,7 @@ function Row({
 /// the same absent-is-not-zero rule, applied to a feature list.
 function Contributes({ contribution }: { contribution: PluginContribution | undefined }) {
   if (contribution === undefined || !contribution.read) {
-    return <span className="text-[#6e7681]">not known</span>;
+    return <span className="text-[#8b949e]">not known</span>;
   }
   const parts = [
     contribution.mcp && "an MCP server",
@@ -552,7 +552,7 @@ function Contributes({ contribution }: { contribution: PluginContribution | unde
     // Real, and the reason `rust-analyzer-lsp` must never read as
     // "unused": it ships a README and contributes background behaviour
     // that leaves no tool call by construction.
-    return <span className="text-[#6e7681]">background behaviour only</span>;
+    return <span className="text-[#8b949e]">background behaviour only</span>;
   }
   return <span>{parts.join(", ")}</span>;
 }
@@ -572,7 +572,7 @@ function Contributes({ contribution }: { contribution: PluginContribution | unde
 function Engagement({ footprint, partial }: { footprint: PluginFootprint; partial: boolean }) {
   if (!footprint.owned_known) {
     // Absent is not zero. We cannot trace this one, and must say so.
-    return <span className="text-[#6e7681]">not traced</span>;
+    return <span className="text-[#8b949e]">not traced</span>;
   }
   if (footprint.calls === 0 && footprint.install_reads === 0) {
     return <span className="text-[#8b949e]">none recorded</span>;
@@ -587,12 +587,12 @@ function Engagement({ footprint, partial }: { footprint: PluginFootprint; partia
         {partial ? `at least ${footprint.calls.toLocaleString()}` : footprint.calls.toLocaleString()}
       </div>
       {top !== undefined && (
-        <div className="text-[#6e7681]">
+        <div className="text-[#8b949e]">
           mostly {top[0]} ({top[1].toLocaleString()})
         </div>
       )}
       {footprint.install_reads > 0 && (
-        <div className="text-[#6e7681]">
+        <div className="text-[#8b949e]">
           {footprint.install_reads.toLocaleString()} of its own files read
         </div>
       )}
@@ -616,7 +616,7 @@ function CallCount({
   // scan, and a zero here argues for uninstalling it on the strength of
   // nothing.
   if (!usage.measured) {
-    return <span className="text-[#6e7681]">no calls recorded</span>;
+    return <span className="text-[#8b949e]">no calls recorded</span>;
   }
   if (n > 0) {
     return (
@@ -630,7 +630,7 @@ function CallCount({
   // works by being loaded, not by being called.
   if (notCountable) {
     return (
-      <span className="text-[#6e7681]">
+      <span className="text-[#8b949e]">
         nothing here is counted — this plugin makes no tool calls
       </span>
     );
@@ -811,7 +811,7 @@ export function DefinitionsSection() {
                       {/* A name taken from the filename is marked, so a
                           reader can tell it from one the author wrote. */}
                       {!d.namedInFrontmatter && (
-                        <span className="ml-1 text-[10px] text-[#6e7681]">(from filename)</span>
+                        <span className="ml-1 text-[10px] text-[#8b949e]">(from filename)</span>
                       )}
                       {d.description && (
                         <span className="ml-2 text-[#8b949e]">{d.description}</span>
@@ -964,18 +964,18 @@ export function McpSection() {
                   it is the column the page exists for. */}
               <span className="ml-2 text-[#8b949e]">{MCP_ORIGIN_LABEL[s.origin]}</span>
               {s.scopeDetail !== null && s.origin !== "user" && (
-                <span className="ml-1 text-[10px] text-[#6e7681]">{s.scopeDetail}</span>
+                <span className="ml-1 text-[10px] text-[#8b949e]">{s.scopeDetail}</span>
               )}
               {/* Whether it applies HERE, in text rather than by colour.
                   Shown only when a repository is selected: without one
                   the question has no subject, and marking every row
                   would answer it for a repository nobody named. */}
               {mcpInForce(s, repo) === false && (
-                <span className="ml-1 text-[10px] text-[#6e7681]">
+                <span className="ml-1 text-[10px] text-[#8b949e]">
                   [not in this repository]
                 </span>
               )}
-              <code className="ml-2 break-all text-[#6e7681]">{transportText(s.transport)}</code>
+              <code className="ml-2 break-all text-[#8b949e]">{transportText(s.transport)}</code>
             </li>
           ))}
         </ul>

@@ -65,7 +65,7 @@ export function QueryError({
       role="alert"
       className="rounded-md border border-[#f85149]/40 bg-[#f85149]/5 px-4 py-8 text-center"
     >
-      <p className="text-sm font-semibold text-[#f85149]">{title}</p>
+      <p className="text-sm font-semibold text-[#ff7b72]">{title}</p>
       {/* `err.message`, not `message`: the marker is stripped on BOTH
           arms, so no path through this component can put a wire detail
           on screen. Identical prose for every rejection that carries no

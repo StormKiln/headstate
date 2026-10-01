@@ -195,7 +195,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
             className={
               pollErr.kind === "not-asked"
                 ? "flex shrink-0 items-start gap-2 border-b border-[#d29922]/30 bg-[#d29922]/10 px-4 py-2 text-sm text-[#d29922]"
-                : "flex shrink-0 items-start gap-2 border-b border-[#f85149]/30 bg-[#f85149]/10 px-4 py-2 text-sm text-[#f85149]"
+                : "flex shrink-0 items-start gap-2 border-b border-[#f85149]/30 bg-[#f85149]/10 px-4 py-2 text-sm text-[#ff7b72]"
             }
           >
             <span className="flex-1">

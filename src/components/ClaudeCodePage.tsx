@@ -1655,7 +1655,7 @@ function Highlight({ value }: { value: string }) {
           // `key` is the index because the segments ARE positional: two
           // runs of the same text at different offsets are different
           // segments, so text would be an unstable key.
-          <mark key={i} className="rounded-sm bg-[#9e6a03] px-0.5 text-[#e6edf3]">
+          <mark key={i} className="rounded-sm bg-[#9e6a03] px-0.5 text-[#ffffff]">
             {part.text}
           </mark>
         ) : (
@@ -1735,7 +1735,7 @@ function SessionEntry({
           about the two titleless sessions above. */}
       {s.opening_prompt ? (
         <span
-          className={`w-full truncate text-[11px] ${active ? "text-white/80" : "text-[#6e7681]"}`}
+          className={`w-full truncate text-[11px] ${active ? "text-white" : "text-[#8b949e]"}`}
         >
           <Highlight value={s.opening_prompt} />
         </span>
@@ -3565,7 +3565,7 @@ function StopSession({
               type="button"
               disabled={busy}
               onClick={() => setProposal(null)}
-              className="tap-target rounded-md border border-[#30363d] bg-[#21262d] px-2 py-1 text-xs text-[#8b949e] hover:bg-[#30363d] disabled:opacity-60"
+              className="tap-target rounded-md border border-[#30363d] bg-[#21262d] px-2 py-1 text-xs text-[#b1bac4] hover:bg-[#30363d] disabled:opacity-60"
             >
               Leave it running
             </button>
@@ -3799,7 +3799,7 @@ function RevealButton({
         className={
           revealable !== null
             ? "tap-target flex items-center gap-1.5 rounded-md border border-[#30363d] bg-[#21262d] px-2 py-1 text-xs text-[#e6edf3] hover:bg-[#30363d]"
-            : "tap-target flex cursor-not-allowed items-center gap-1.5 rounded-md border border-[#30363d] bg-[#161b22] px-2 py-1 text-xs text-[#6e7681]"
+            : "tap-target flex cursor-not-allowed items-center gap-1.5 rounded-md border border-[#30363d] bg-[#161b22] px-2 py-1 text-xs disabled:text-[#6e7681]"
         }
       >
         <FolderOpen className="h-3 w-3" aria-hidden="true" />
@@ -3992,7 +3992,7 @@ function Resume({
           }
           className={`tap-target rounded-md px-2 py-1 text-xs ${
             anchored
-              ? "bg-[#1f6feb] text-white hover:bg-[#388bfd]"
+              ? "bg-[#1f6feb] text-white hover:bg-[#316dca]"
               : "border border-[#30363d] bg-[#21262d] text-[#e6edf3] hover:bg-[#30363d]"
           }`}
         >

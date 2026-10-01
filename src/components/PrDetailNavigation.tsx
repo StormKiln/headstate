@@ -22,7 +22,7 @@ export function PrDetailNavigation({ provider, repo, number, href, onBack }: {
       <span className="min-w-0 flex-1 break-words text-sm text-[#e6edf3]">
         {repo} {provider === "GitHub" ? "#" : "!"}{number}
       </span>
-      <ExternalLink href={href} className="tap-target inline-flex shrink-0 items-center justify-center gap-2 rounded-md border border-[#58a6ff]/50 bg-[#58a6ff]/10 px-3 py-2 text-sm font-medium text-[#58a6ff] hover:bg-[#58a6ff]/20">
+      <ExternalLink href={href} className="tap-target inline-flex shrink-0 items-center justify-center gap-2 rounded-md border border-[#58a6ff]/50 bg-[#58a6ff]/10 px-3 py-2 text-sm font-medium text-[#79c0ff] hover:bg-[#58a6ff]/20">
         <ExternalLinkIcon className="h-4 w-4" aria-hidden="true" />
         Open on {provider}
       </ExternalLink>

@@ -108,7 +108,7 @@ function Resolved({
                 return (
                   <li
                     key={c.origin}
-                    className={`text-[11px] ${wins ? "text-[#e6edf3]" : "text-[#6e7681]"}`}
+                    className={`text-[11px] ${wins ? "text-[#e6edf3]" : "text-[#8b949e]"}`}
                   >
                     {/* The winner is marked in TEXT as well as by
                         colour: colour alone is not an answer for a

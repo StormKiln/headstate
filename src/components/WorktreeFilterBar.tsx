@@ -130,7 +130,7 @@ export function WorktreeFilterBar({
           onClick={() => setFilter("occupiedOnly", filters.occupiedOnly ? undefined : true)}
           className={`rounded border px-2 py-0.5 text-xs ${
             filters.occupiedOnly
-              ? "border-[#8957e5] bg-[#8957e5]/10 text-[#a371f7]"
+              ? "border-[#8957e5] bg-[#8957e5]/10 text-[#bc8cff]"
               : "border-[#30363d] text-[#8b949e] hover:bg-[#21262d]"
           }`}
         >

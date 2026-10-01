@@ -418,7 +418,7 @@ export function BranchesPage() {
                     can
                       ? "text-[#3fb950]"
                       : b.deletable.kind === "pending"
-                        ? "italic text-[#6e7681]"
+                        ? "italic text-[#8b949e]"
                         : "text-[#8b949e]"
                   }`}
                 >
@@ -563,7 +563,7 @@ function DeleteScopeDialog({
             onClick={() => onConfirm(scope)}
             className={`rounded px-3 py-1 text-xs disabled:opacity-40 ${
               touchesRemote
-                ? "border border-[#f85149]/40 text-[#f85149] hover:bg-[#f85149]/10"
+                ? "border border-[#f85149]/40 text-[#ff7b72] hover:bg-[#f85149]/10"
                 : "border border-[#30363d] text-[#e6edf3] hover:bg-[#21262d]"
             }`}
           >
