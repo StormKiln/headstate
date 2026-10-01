@@ -32,7 +32,9 @@ API_AVAILABLE(macos(10.14))
 @end
 
 bool headstate_notifications_supported(void) {
-    if (@available(macOS 10.14, *)) return true;
+    // The plugin can deliver dev notifications using Terminal's identity;
+    // UN requires our own application bundle. Keep that fallback reachable.
+    if (@available(macOS 10.14, *)) return NSBundle.mainBundle.bundleIdentifier.length > 0;
     return false;
 }
 

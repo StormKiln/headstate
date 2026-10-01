@@ -72,6 +72,14 @@ pub use macos::{headstate_about, notify, setup, supported};
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Cargo's native test executable is not an application bundle. The
+    // supported gate must leave dev notifications on the plugin path,
+    // which supplies com.apple.Terminal as their bundle identity.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unbundled_process_keeps_legacy_notification_delivery() {
+        assert!(!supported());
+    }
     #[test]
     fn click_handoff_keeps_provider_identity_and_consumes_only_once() {
         let target = PrIdentity {
