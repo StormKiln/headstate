@@ -13,7 +13,7 @@
 /// was not reused: it indexes each session's first 8 MB as one row and
 /// answers with sessions, not messages.
 
-import { useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import { useClaudeTranscriptFind } from "../../api/hooks";
 import { copyText } from "../../lib/clipboard";
@@ -32,7 +32,7 @@ import { findShortfall, type SinceYouLeft } from "./useNavigation";
 // What is shown
 // ---------------------------------------------------------------------
 
-export function ShowControls({ show, hidden }: { show: TranscriptShow; hidden: number }) {
+export const ShowControls = memo(function ShowControls({ show, hidden }: { show: TranscriptShow; hidden: number }) {
   const set = useFilters((f) => f.setTranscriptShow);
   const hiddenText =
     hidden > 0
@@ -66,7 +66,7 @@ export function ShowControls({ show, hidden }: { show: TranscriptShow; hidden: n
       </span>
     </fieldset>
   );
-}
+});
 
 // ---------------------------------------------------------------------
 // Since you left

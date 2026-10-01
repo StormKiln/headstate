@@ -31,6 +31,7 @@ import type { TranscriptMessage, TranscriptSubagent } from "../../types/transcri
 import { errorMessage } from "../QueryError";
 import { Composer } from "./Composer";
 import { FollowStatus } from "./FollowStatus";
+import { earlierCallLoader } from "./loadEarlier";
 import { subagentLiveness } from "./header";
 import { palette } from "./palette";
 import type { PendingMessage } from "./pending";
@@ -180,17 +181,12 @@ function Loaded({
   // "Load earlier" beside a result pages back until its call is held,
   // not one page per click (#1476's follow-up, #1484).
   const onLoadEarlier = useMemo(
-    () =>
-      live.hasOlder
-        ? (toolUseId: string | null) =>
-            void loadOlderUntil((m) =>
-              toolUseId === null
-                ? true
-                : m.blocks.some((b) => b.kind === "tool_call" && b.id === toolUseId),
-            )
-        : undefined,
+    () => earlierCallLoader(live.hasOlder, loadOlderUntil),
     [live.hasOlder, loadOlderUntil],
   );
+  // Created on the initial render, separate from later env changes, so
+  // the getter never captures a render holding pages since evicted.
+  const heldMessages = useCallback(() => holder.current, []);
   const streaming = transcriptStreaming(liveness);
   const env = useMemo<TerminalEnv>(
     () => ({
@@ -199,9 +195,9 @@ function Loaded({
       onLoadFullText,
       onOpenSubagent,
       onLoadEarlier,
-      messages: () => holder.current,
+      messages: heldMessages,
     }),
-    [liveness, density, onLoadFullText, onOpenSubagent, onLoadEarlier],
+    [liveness, density, onLoadFullText, onOpenSubagent, onLoadEarlier, heldMessages],
   );
   const footers = useMemo(
     () => turnFooters(messages ?? [], streaming === true),

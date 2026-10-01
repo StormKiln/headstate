@@ -43,8 +43,9 @@
 
 import type { TranscriptMessage } from "../../types/transcript";
 
-/// The window's target length. #1479 asked for 300-500.
-export const WINDOW_SIZE = 400;
+/// Target mount length, reduced from 400 for large-page opens and
+/// catch-ups (#1538); the separate resident-data bound is unchanged.
+export const WINDOW_SIZE = 200;
 /// How far past `WINDOW_SIZE` the window may grow before it is trimmed.
 export const WINDOW_SLACK = 100;
 /// How many messages one reach toward an edge brings in.

@@ -33,6 +33,20 @@ const m = (id: string, opener = false): TranscriptMessage => ({
 const many = (n: number, prefix = "m") => Array.from({ length: n }, (_, i) => m(`${prefix}${i}`));
 
 describe("resolveWindow", () => {
+  it("limits a large page's first mount to 200 rows while keeping earlier rows reachable", () => {
+    const list = many(400);
+    const initial = resolveWindow(list, OPEN_PINS, true, true);
+    expect(initial.to - initial.from).toBeLessThanOrEqual(200);
+    expect(initial.to).toBe(list.length);
+    let window = initial;
+    while (window.from > 0) {
+      const older = extendStart(list, window)!;
+      window = resolveWindow(list, older.pins, false, false);
+    }
+    expect(window.from).toBe(0);
+    expect(window.to).toBeGreaterThan(0);
+  });
+
   it("opens on the newest WINDOW_SIZE and pins the start to an id", () => {
     const list = many(1000);
     const w = resolveWindow(list, OPEN_PINS, true, true);

@@ -77,8 +77,9 @@
 /// longer reaches it would leave a hole. Scrolling back down pages
 /// forward again; reaching the end re-attaches.
 ///
-/// Live growth is no exception. The page a tick appends is not one the
-/// reader asked for, so it is not protected: a reader whose window holds
+/// Live growth prefers an oldest page outside the window, even when the
+/// tail is farther away. The appended page is not protected: the reader
+/// did not ask for it. A reader whose window holds
 /// the oldest page -- parked on a new turn's prompt while output arrives
 /// below it -- detaches the follow once the bound binds, exactly as
 /// reading far back does (#1524). Protecting it left neither end
@@ -560,11 +561,10 @@ export class TranscriptFollower {
       if (w.end.offset === w.start.offset) break; // nothing new
       grew = true;
       this.append(w);
-      // Nothing protects the page just appended: the reader did not ask
-      // for it. Where their window holds the oldest page, the newest is
-      // the one that goes, and the follow detaches (#1524) -- protecting
-      // it too left neither end droppable, and growth held without bound.
-      this.evict(this.max, null);
+      // Keep the live edge whenever an unseen oldest page can go.
+      // If the reader actually holds that oldest page, the newest must
+      // still go: detaching preserves their place and the memory bound.
+      this.evict(this.max, null, true);
       if (!this.attached) break;
       if (w.at_end) break;
       if (i === CATCH_UP_PAGES - 1) this.catchingUp = true;
@@ -668,13 +668,14 @@ export class TranscriptFollower {
     }
   }
 
-  /// Drop whole pages until at most `max` messages are held, from the
-  /// end farther from the viewer's window. Never a page the window
+  /// Drop whole pages until at most `max` messages are held, normally from
+  /// the farther end; live growth prefers a removable oldest page. Never
+  /// a page the window
   /// shows, and never the page just `loaded` -- the reader asked for it.
   /// When both of those forbid every drop the bound is exceeded by that
   /// page until the reader moves on, rather than losing what they are
   /// reading.
-  private evict(max: number, loaded: "head" | "tail" | null): void {
+  private evict(max: number, loaded: "head" | "tail" | null, liveGrowth = false): void {
     while (count(this.pages) > max && this.pages.length > 1) {
       const n = this.pages.length;
       const v = this.viewport;
@@ -684,10 +685,10 @@ export class TranscriptFollower {
       const canHead = loaded !== "head" && (shown === null || shown.lo > 0);
       const canTail = loaded !== "tail" && (shown === null || shown.hi < n - 1);
       if (!canHead && !canTail) break;
-      // Both possible: the farther end goes; a tie, or nothing shown,
-      // keeps the live edge.
+      // Live growth prefers the oldest removable page. Reader-driven
+      // paging and memory pressure still drop the farther end.
       const dropTail =
-        canHead && canTail ? shown !== null && n - 1 - shown.hi > shown.lo : canTail;
+        canHead && canTail ? !liveGrowth && shown !== null && n - 1 - shown.hi > shown.lo : canTail;
       if (dropTail) {
         this.pages = this.pages.slice(0, -1);
         this.attached = false;

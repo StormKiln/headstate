@@ -9,10 +9,8 @@
 //
 // - B1, open to first paint of the newest message: from a
 //   `performance.mark` taken in the same task as the "Open" click, to the
-//   Element Timing `renderTime` of `[elementtiming="newest"]`. Where the
-//   engine reports no element entry, the fallback is the second
-//   animation frame after that row is in the DOM, and the table says
-//   which was used.
+//   Element Timing `renderTime` of directly contained newest-row text.
+//   Missing Element Timing fails B1; two-frame timing is diagnostic only.
 // - B2, scrolling: long tasks (> 50 ms) and frame intervals during a
 //   scripted wheel scroll from the newest message to the oldest and back.
 // - B3, heap: `Runtime.getHeapUsage` after a forced GC
@@ -71,10 +69,11 @@ const NUDGE_MS = 1_000;
 const GROW_CHUNKS = 30;
 const MAX_RESIDENT = 2_000;
 const B4_DEFAULT = ["messages-1k.messages-tail", "tool-heavy-70mb.messages-whole"];
-/// Only this page is grown past the bound: it is page-sized (122
-/// messages, as a real page is). A 400-message chunk would measure a
-/// page the paged read never returns.
-const GROW_FIXTURE = "messages-1k.messages-tail";
+/// Exercise ordinary pages and a deliberate 400-message catch-up stress
+/// case. GROW_FIXTURE selects a single fixture for focused comparisons.
+const GROW_FIXTURES = process.env.GROW_FIXTURE
+  ? [process.env.GROW_FIXTURE]
+  : ["messages-1k.messages-tail", "tool-heavy-70mb.messages-whole"];
 
 // B5. #1478 (PR #1497): 20 real local transcript pages compressed 2.11x
 // to 4.43x, median ~2.8x. The generated fixtures compress ~7x, which
@@ -143,8 +142,10 @@ try {
     for (const name of b4Fixtures) followRows.push(await follow(name));
   }
   if (PHASES.has("growth")) {
-    if (!fixtures.includes(GROW_FIXTURE)) over.push(`B4 growth: ${GROW_FIXTURE} was not written, so nothing was measured`);
-    else for (const scenario of ["live edge", "parked on a new turn"]) growthRows.push(await growth(GROW_FIXTURE, scenario));
+    for (const name of GROW_FIXTURES) {
+      if (!fixtures.includes(name)) over.push(`B4 growth: ${name} was not written, so nothing was measured`);
+      else for (const scenario of ["live edge", "parked on a new turn"]) growthRows.push(await growth(name, scenario));
+    }
   }
 } finally {
   await browser.close();
@@ -190,7 +191,7 @@ async function measure(name) {
     }).observe({ type: "longtask" });
     new PerformanceObserver((l) => {
       for (const e of l.getEntries()) {
-        if (e.identifier === "newest" && w.__element === null) w.__element = e.renderTime || e.loadTime;
+        if (e.identifier === "newest" && e.renderTime > 0 && w.__element === null) w.__element = e.renderTime;
       }
     }).observe({ type: "element", buffered: true });
     const seen = new MutationObserver(() => {
@@ -217,6 +218,7 @@ async function measure(name) {
       viewportOverflow: vp ? vp.scrollWidth - vp.clientWidth : null,
     };
   });
+  if (open.element === null) over.push(`${name}: B1 missing exact Element Timing for newest message`);
   const heapOpen = await heap(cdp);
 
   // B2: wheel to the oldest message and back, a frame between steps.
@@ -261,12 +263,12 @@ async function measure(name) {
   await context.close();
 
   const messages = JSON.parse(readFileSync(join(dir, `${name}.json`), "utf8")).messages.length;
-  const b1 = open.element ?? open.frame;
+  const b1 = open.element;
   const maxLong = (xs) => (xs.length === 0 ? 0 : Math.max(...xs));
   const p95 = pct(scroll.frames, 95);
   const check = (bad, what) => bad && over.push(`${name}: ${what}`);
   check(errors.length > 0, `page errors: ${errors.join("; ")}`);
-  check(b1 > B1_MS, `B1 ${b1.toFixed(1)} ms > ${B1_MS} ms`);
+  check(b1 !== null && b1 > B1_MS, `B1 ${ms(b1)} > ${B1_MS} ms`);
   check(maxLong(scroll.longTasks) > LONG_TASK_MS, `B2 long task ${maxLong(scroll.longTasks).toFixed(0)} ms while scrolling`);
   check(Math.max(heapOpen, heapScrolled) > HEAP_MB * 1024 * 1024, `B3 heap ${mb(Math.max(heapOpen, heapScrolled))} > ${HEAP_MB} MB`);
   check(open.pageOverflow > 0 || (open.viewportOverflow ?? 0) > 0, "a row widens the page");
@@ -276,7 +278,7 @@ async function measure(name) {
     name,
     messages,
     rows: open.rows,
-    b1: `${b1.toFixed(1)} ms (${open.element === null ? "2nd frame" : "element timing"})`,
+    b1: b1 === null ? `not measured (2nd-frame diagnostic: ${ms(open.frame)})` : `${ms(b1)} (element timing)`,
     openLong: `${open.longTasks.length} (max ${maxLong(open.longTasks).toFixed(0)} ms)`,
     scrollLong: `${scroll.longTasks.length} (max ${maxLong(scroll.longTasks).toFixed(0)} ms)`,
     frames: `${ms(p95)} p95, ${ms(pct(scroll.frames, 50))} median over ${scroll.frames.length} frames (${steps} wheel steps)`,
@@ -526,6 +528,7 @@ async function growth(name, scenario) {
     await page.click('button[aria-label^="Jump to the latest message"]');
     await page.waitForTimeout(1_000);
   }
+  await page.evaluate(() => { window.__longTasks = []; });
   const perChunk = [];
   const heaps = [];
   let rowsMax = 0;
@@ -576,11 +579,14 @@ async function growth(name, scenario) {
   // Detached: the status line offers the way back, and it works.
   let rejoined = null;
   if (detachedAfter !== null) {
+    // The file can keep growing while the detached viewer does not read.
+    await page.evaluate(() => window.__harness.grow(2, true));
     await page.click('[data-testid="transcript-read-status"] button:has-text("Jump to the latest")');
     try {
       await page.waitForFunction(
-        () => document.querySelector('[data-testid="transcript-read-status"]')?.dataset.state === "following",
-        null,
+        (generation) => document.querySelector('[data-testid="transcript-read-status"]')?.dataset.state === "following"
+          && document.querySelector(`[data-message-id$="-g${generation}"]`) !== null,
+        detachedAfter + 2,
         { timeout: 5_000 },
       );
       rejoined = true;
@@ -622,7 +628,7 @@ function growthTables() {
     for (const h of g.heaps) console.log(`| ${h.appended} | ${mb(h.heap)} | ${h.mounted} | ${Math.round(h.bottomGap)} px |`);
     const ids = [...g.held].sort((a, b) => a - b);
     console.log(
-      `\nappended pages whose messages are still in the heap: ${g.held.size} of ${GROW_CHUNKS}${ids.length ? ` (pages ${ids[0]} to ${ids[ids.length - 1]})` : ""}; the bound allows ${g.bound}. Long tasks while growing: ${lt.length}${lt.length ? ` (max ${Math.max(...lt).toFixed(0)} ms)` : ""}; most rows mounted: ${g.rowsMax}.`,
+      `\nappended pages whose messages are still in the heap: ${g.held.size} of ${GROW_CHUNKS}${ids.length ? ` (pages ${ids.join(", ")})` : ""}; the bound allows ${g.bound}. Long tasks while growing: ${lt.length}${lt.length ? ` (max ${Math.max(...lt).toFixed(0)} ms)` : ""}; most rows mounted: ${g.rowsMax}.`,
     );
     console.log(
       g.detachedAfter === null
