@@ -12,6 +12,7 @@ import { current } from "../lib/ariaCurrent";
 import { PrRow } from "./PrRow";
 import { ViewSwitcher } from "./ViewSwitcher";
 import { ExternalLink } from "./ExternalLink";
+import { PrDetailNavigation } from "./PrDetailNavigation";
 import { relativeSeconds } from "../lib/time";
 import { useFilters, useActiveFilters, type View } from "../store/filters";
 import { applyFilters, deriveStacked, type Filters } from "../lib/derive";
@@ -126,7 +127,7 @@ export function GitLabSummary({ identity, mr, onBack }: { identity: PrIdentity; 
   const url = core?.url ?? mr?.url ?? `https://${identity.source?.host ?? "gitlab.com"}/${identity.repo.split("/").map(encodeURIComponent).join("/")}/-/merge_requests/${identity.number}`;
   return (
     <div className="rounded-md border border-[#30363d] bg-[#161b22] p-4 [&_button]:min-h-11 sm:[&_button]:min-h-0">
-      <button type="button" onClick={onBack} className="mb-3 text-sm text-[#4493f8]">← Back to list</button>
+      <PrDetailNavigation provider="GitLab" repo={identity.repo} number={identity.number} href={url} onBack={onBack} />
       <div className="text-xs text-[#8b949e]">GitLab · {identity.source?.host} · {identity.repo} !{identity.number}</div>
       {title ? <>
         <h2 className="mt-1 text-lg font-semibold">{title}</h2>
@@ -135,7 +136,6 @@ export function GitLabSummary({ identity, mr, onBack }: { identity: PrIdentity; 
       {/* The open queue may omit a selected MR after a close or partial poll.
           Identity keeps detail, drafts and action receipts mounted until Back. */}
       <GitLabDetail key={`${prKey(identity)}:${viewer}`} identity={identity} />
-      {url ? <ExternalLink href={url} className="mt-3 inline-block text-sm text-[#4493f8] hover:underline">Open on GitLab</ExternalLink> : null}
     </div>
   );
 }

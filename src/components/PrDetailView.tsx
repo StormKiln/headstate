@@ -1,4 +1,5 @@
 import { ExternalLink } from "./ExternalLink";
+import { PrDetailNavigation } from "./PrDetailNavigation";
 import { ArrowLeft, Trash2, Check, CircleDot, CircleSlash, ExternalLink as ExternalLinkIcon, X } from "lucide-react";
 import { toast } from "sonner";
 import {
@@ -323,15 +324,9 @@ export function PrDetailView({
     );
   };
 
-  const back = (
-    <button
-      type="button"
-      onClick={onBack}
-      className="mb-3 flex items-center gap-1.5 text-sm text-[#8b949e] hover:text-[#e6edf3]"
-    >
-      <ArrowLeft className="h-4 w-4" aria-hidden="true" />
-      Back to list
-    </button>
+  const fallbackNavigation = (
+    <PrDetailNavigation provider="GitHub" repo={repo} number={number}
+      href={`https://github.com/${repo}/pull/${number}`} onBack={onBack} />
   );
 
   // Only reachable with NO cached row to seed from: a cold launch
@@ -341,8 +336,7 @@ export function PrDetailView({
   if (isLoading) {
     return (
       <div>
-        {back}
-        <ExternalLink href={`https://github.com/${repo}/pull/${number}`}>Open on GitHub</ExternalLink>
+        {fallbackNavigation}
         <div className="rounded-md border border-[#30363d] px-4 py-12 text-center text-sm text-[#8b949e]">
           Loading pull request…
         </div>
@@ -353,8 +347,7 @@ export function PrDetailView({
   if (isError || !pr) {
     return (
       <div>
-        {back}
-        <ExternalLink href={`https://github.com/${repo}/pull/${number}`}>Open on GitHub</ExternalLink>
+        {fallbackNavigation}
         <QueryError
           title="Could not load this pull request"
           message={errorMessage(error)}
@@ -447,8 +440,8 @@ export function PrDetailView({
       {/* NOTE: the body's own `back` button is deliberately not rendered
           here. The sticky header carries one that is always visible, and
           two "back" controls a few pixels apart is worse than one. The
-          loading and error branches above still use `back`, since they
-          have no header to hang it on. */}
+          loading and error branches above use shared browser navigation
+          that does not depend on detail data. */}
       {/* Sticky, because the actions were unreachable from where the
           decision gets made. Reading a long PR put "Back to list" far
           above the viewport and "View on GitHub" far below it, so

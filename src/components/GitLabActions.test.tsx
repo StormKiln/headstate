@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import type { GitLabCapabilities, GitLabDetail as Detail } from "../types/gitlabActions";
@@ -10,7 +10,8 @@ import { GitLabBulkActions } from "./GitLabBulkActions";
 import { getGitLabActionCapabilities, getGitLabDetail, gitLabAction } from "../api/tauri";
 
 vi.mock("../api/tauri", async (original) => ({ ...await original<Record<string, unknown>>(), getGitLabActionCapabilities: vi.fn(), getGitLabDetail: vi.fn(), gitLabAction: vi.fn() }));
-vi.mock("./ExternalLink", () => ({ ExternalLink: ({ children }: { children: ReactNode }) => <span>{children}</span> }));
+const openUrl = vi.hoisted(() => vi.fn(() => Promise.resolve()));
+vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl }));
 
 const identity = { source: { provider: "gitlab" as const, host: "gitlab.com" }, repo: "group/subgroup/project", number: 7 };
 const capabilities: GitLabCapabilities = {
@@ -166,4 +167,23 @@ it("keeps the selected detail draft and action receipt after the open queue drop
   expect(screen.getByText("Close MR: GitLab action verified.")).toBeTruthy();
   expect((screen.getByLabelText("MR comment") as HTMLTextAreaElement).value).toBe("Keep this unsent draft");
   expect(getGitLabDetail).toHaveBeenCalledWith(identity);
+});
+
+
+it.each(["loading", "failed"])("keeps GitLab browser navigation above %s details", async (state) => {
+  const target = { ...identity, source: { provider: "gitlab" as const, host: "gitlab.example.com" } };
+  if (state === "failed") vi.mocked(getGitLabDetail).mockRejectedValue(new Error("GitLab refresh delayed"));
+  else vi.mocked(getGitLabDetail).mockImplementation(() => new Promise(() => {}));
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  render(<QueryClientProvider client={client}><GitLabSummary identity={target} onBack={() => {}} /></QueryClientProvider>);
+  const notice = state === "failed" ? await screen.findByRole("alert") : screen.getByRole("status");
+  const navigation = screen.getByRole("navigation", { name: "Merge request navigation" });
+  const link = within(navigation).getByRole("link", { name: "Open on GitLab" });
+  expect(link.compareDocumentPosition(notice) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  expect(link.classList.contains("tap-target")).toBe(true);
+  const requests = vi.mocked(getGitLabDetail).mock.calls.length;
+  fireEvent.click(link);
+  expect(openUrl).toHaveBeenCalledExactlyOnceWith("https://gitlab.example.com/group/subgroup/project/-/merge_requests/7");
+  expect(getGitLabDetail).toHaveBeenCalledTimes(requests);
+  client.clear();
 });
