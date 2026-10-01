@@ -42,6 +42,7 @@ import { assertRemoteReply, isRemoteEvent, remoteEventError } from "./wireContra
 /// page's return to the foreground asks again: iOS ends the stream when
 /// the app suspends, and re-subscribing is how the phone catches up.
 const CLIENT_COMMANDS = new Set([
+  "save_markdown",
   "pair_from_qr",
   "unpair",
   "connection_state",

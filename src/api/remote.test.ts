@@ -31,6 +31,11 @@ afterEach(() => {
 });
 
 describe("remote transport: commands", () => {
+  it("keeps native markdown export on the phone, never remote_call", async () => {
+    tauri.invoke.mockResolvedValueOnce("presented");
+    await expect(remote.call("save_markdown", {markdown: "# masked"})).resolves.toBe("presented");
+    expect(tauri.invoke).toHaveBeenCalledExactlyOnceWith("save_markdown", {markdown: "# masked"});
+  });
   it("rejects a malformed remote reply before the caller receives it", async () => {
     tauri.invoke.mockResolvedValueOnce([{ number: 1347 }]);
     await expect(remote.call("get_cached")).rejects.toThrow(/get_cached.*incompatible|incompatible.*get_cached/);

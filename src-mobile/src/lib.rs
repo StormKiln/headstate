@@ -230,7 +230,9 @@ pub fn run() {
         // The client (#514) reaches it through
         // `tauri_plugin_headstate_keys::HeadstateKeysExt::headstate_keys`.
         .plugin(tauri_plugin_headstate_keys::init())
+        .plugin(tauri_plugin_headstate_export::init())
         .invoke_handler(tauri::generate_handler![
+            save_markdown,
             pair_from_qr,
             unpair,
             connection_state,
@@ -248,6 +250,11 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Headstate Companion");
+}
+
+#[tauri::command]
+async fn save_markdown(app: tauri::AppHandle, markdown: String) -> Result<String, String> {
+    tauri_plugin_headstate_export::share(app, markdown).await
 }
 
 #[cfg(test)]

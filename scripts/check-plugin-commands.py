@@ -4,10 +4,9 @@
 Tauri's Android `PluginHandle` dispatches on the **literal** `@Command`
 method name -- `commands[method.name]`, with no case conversion. So a
 Kotlin `fun acquire_lock` where Rust calls `acquireLock` is a runtime
-`InvokeException` and nothing at compile time. Nothing at all catches it
-today: the `mobile-android` job cross-compiles the Rust, generates the
-Android Studio project, asserts `build.gradle.kts` exists, and stops. It
-never runs Gradle, so no Kotlin is compiled in CI.
+`InvokeException` even when both native modules compile. CI now compiles
+actual Kotlin/Swift packages separately; this literal-name check remains
+necessary because compilers cannot compare Rust dispatch strings to methods.
 
 That was nearly shipped in #696, whose first draft used snake_case wire
 names. The failure mode would have been an mDNS browse that silently
@@ -20,20 +19,11 @@ names as constants in a `pub mod cmd` (`cmd::ACQUIRE_MULTICAST =
 spelling them at each call site. This compares that set against the
 Kotlin methods, in both directions.
 
-What it does NOT do is compile Kotlin. A `./gradlew :app:compileDebugKotlin`
-step would catch typos, wrong API members, and missing imports as well --
-strictly stronger, and issue #698 raises it. It is not here because it
-needs a full Android SDK plus a Gradle run on a job that already takes
-minutes, to catch a class of error that a reviewer reading a diff can see,
-whereas the name mismatch is invisible in review precisely because both
-sides look correct in isolation. This check costs milliseconds and needs
-no JVM. If the Kotlin grows past two plugins' worth, revisit.
-
-iOS is deliberately not checked here: `mobile-ios` builds the IPA, and
-that compiles Swift, so a Swift selector mismatch is a build failure
-already. Swift is also allowed to implement FEWER commands than Rust
-names -- `acquireMulticast` is Android-only, since the Wi-Fi multicast
-lock has no iOS equivalent.
+`make check-native-android` and `make check-native-ios` compile actual
+modules against the resolved Tauri API, without claiming app packaging or
+runtime selector coverage. Swift may implement fewer commands than Rust
+names (`acquireMulticast` is Android-only); native bridge runtime verification
+remains separate from compilation.
 
 Parses with regexes rather than a Kotlin or Rust parser, the same
 tradeoff `check-workflow-shells.py` makes: the lint runner has no

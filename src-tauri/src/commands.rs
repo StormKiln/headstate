@@ -2,6 +2,14 @@
 //! calls these commands and listens for the `prs-updated` event that
 //! [`crate::poll`] emits in the background.
 
+#[tauri::command]
+pub async fn save_markdown(
+    window: tauri::WebviewWindow,
+    markdown: String,
+) -> Result<String, String> {
+    crate::markdown_export::save_markdown(window, markdown).await
+}
+
 use crate::github::client::{ClientError, GitHubClient};
 use crate::github::model::{
     CycleTrend, History, MergedDetail, Periods, PrDetail, PullRequest, Stats,

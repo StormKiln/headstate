@@ -96,6 +96,8 @@ function windowOf(p: RemoteTranscriptPage): RemoteTranscriptWindow {
   };
 }
 
+const saveExport = vi.hoisted(() => vi.fn().mockResolvedValue("presented"));
+vi.mock("../../../api/markdownExport", () => ({saveMarkdown: saveExport}));
 const { PhoneTranscript } = await import("./PhoneTranscript");
 
 function msg(id: string, over: Partial<TranscriptMessage> = {}): TranscriptMessage {
@@ -157,6 +159,29 @@ async function show(masked: Answer, revealed: Answer = {}) {
 }
 
 describe("masked secrets and Reveal (#1488)", () => {
+  it("blocks clipboard and sharing while revealed, then shares the visible masked owner", async () => {
+    saveExport.mockClear();
+    const row = (text: string) => msg("export", {blocks:[{kind:"text",index:0,text,clip:null}]});
+    await show({data:page([row("key ⟦hidden:token⟧")],MASKED)}, {data:page([row("synthetic-raw-export-secret")],{...MASKED,hidden:0,revealed:true})});
+    fireEvent.click(screen.getByRole("button",{name:"Reveal"}));
+    await shim.flush();
+    fireEvent.click(screen.getByRole("button",{name:"Options"}));
+    await shim.flush();
+    expect(screen.getByText("Hide revealed text to export a masked transcript")).toBeTruthy();
+    for (const button of within(screen.getByTestId("export-controls")).getAllByRole("button")) expect(button).toHaveProperty("disabled",true);
+    expect(saveExport).not.toHaveBeenCalled();
+    fireEvent.keyDown(screen.getByRole("dialog"), {key:"Escape"});
+    await shim.flush();
+    fireEvent.click(screen.getByRole("button",{name:"Hide it again"}));
+    await shim.flush();
+    fireEvent.click(screen.getByRole("button",{name:"Options"}));
+    await shim.flush();
+    fireEvent.click(screen.getByRole("button",{name:/Share.*markdown/}));
+    await shim.flush();
+    expect(saveExport).toHaveBeenCalledTimes(1);
+    expect(saveExport.mock.calls[0][0]).toContain("⟦hidden:token⟧");
+    expect(saveExport.mock.calls[0][0]).not.toContain("synthetic-raw-export-secret");
+  });
   it("saves the active revealed page cursor and switches back to the masked owner", async () => {
     const row = msg("same", { offset: 50 });
     await show({ data: page([row], MASKED) });

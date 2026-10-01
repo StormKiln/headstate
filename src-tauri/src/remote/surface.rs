@@ -62,6 +62,7 @@ pub enum Class {
 /// Command name to class. The order is the spec's; keep it that way so a
 /// diff against the design document is a line-by-line comparison.
 pub const SURFACE: &[(&str, Class)] = &[
+    ("save_markdown", Class::Local),
     // read: no side effects on GitHub or disk.
     // Read: the phone asking whether the DESKTOP's background work died
     // is a question about state, not an action on the machine. The

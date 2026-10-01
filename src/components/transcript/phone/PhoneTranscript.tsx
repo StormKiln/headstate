@@ -477,6 +477,7 @@ export function PhoneTranscript({
               <div className="flex flex-col gap-4">
                 <ShowControls show={show} hidden={hidden} />
                 <ExportControls
+                  revealed={showingRevealed}
                   messages={messages}
                   hasOlder={active.hasOlder}
                   atLiveEdge={active.atLiveEdge}

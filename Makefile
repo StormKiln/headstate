@@ -1,5 +1,5 @@
 .PHONY: dev build test test-rust test-ui lint lint-rust lint-ui lint-deps fmt icons \
-	mobile-frontend lint-mobile test-mobile check-mobile-ios check-mobile-android \
+	mobile-frontend lint-mobile test-mobile check-mobile-ios check-mobile-android check-native-ios check-native-android \
 	deny-mobile deny-stepup ios-init android-init icons-mobile ios-device android-device \
 	deny test-race check-intel doctor bench-transcript bench-transcript-browser bench-worktrees-browser \
 	check-shell-scroll shadcn-add
@@ -29,12 +29,8 @@ mobile-frontend:
 lint-mobile:
 	cd src-mobile && cargo fmt --check
 	cd src-mobile && cargo clippy --workspace --all-targets -- -D warnings
-	# No Kotlin is compiled anywhere -- not by this target, not in CI, which
-	# generates the Android Studio project and never runs Gradle. Tauri
-	# dispatches on the LITERAL @Command method name, so a name that does not
-	# match what Rust invokes fails on a device and nowhere else (#698).
-	# Not prefixed with `cd src-mobile`: each recipe line is its own shell,
-	# so this one starts at the repo root like the rest.
+	# Native compilation has separate platform gates; literal bridge names
+	# still need this check because native compilation cannot compare Rust strings.
 	python3 scripts/check-plugin-commands.py
 
 test-mobile:
@@ -53,6 +49,13 @@ check-mobile-ios:
 check-mobile-android:
 	rustup target add aarch64-linux-android
 	cd src-mobile && cargo check --target aarch64-linux-android
+
+# Actual plugin packages, isolated from generated app projects and source caches.
+check-native-android:
+	python3 scripts/check-native.py android
+
+check-native-ios:
+	python3 scripts/check-native.py ios
 
 deny-mobile:
 	cd src-mobile && cargo deny check
@@ -393,6 +396,7 @@ lint-deps:
 	python3 scripts/check-frontend-report.test.py
 	python3 scripts/test-frontend-ci.test.py
 	python3 scripts/check-release-artifacts.test.py
+	python3 scripts/check-native.test.py
 	python3 scripts/check-workflow-shells.test.py
 	python3 scripts/check-workflow-shells.py
 	# actionlint, and it does NOT replace the script above it. That was

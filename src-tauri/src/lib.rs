@@ -19,6 +19,7 @@ pub mod identity;
 /// here so `cargo test` compiles it.
 #[cfg(test)]
 mod invariants;
+mod markdown_export;
 mod notification_navigation;
 pub mod packages;
 pub mod panic_hook;
@@ -262,6 +263,7 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(log::LevelFilter::Info)
@@ -290,6 +292,7 @@ pub fn run() {
                 .build(),
         )
         .invoke_handler(tauri::generate_handler![
+            commands::save_markdown,
             notification_navigation::take_notification_pr,
             commands::diag_log,
             commands::background_panicked,

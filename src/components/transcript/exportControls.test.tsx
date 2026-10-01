@@ -1,0 +1,54 @@
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { afterEach, expect, it, vi } from 'vitest';
+import { ExportControls } from './navigation';
+import { everyRecord } from './fixtures';
+import type { TranscriptBlock } from '../../types/transcript';
+const message = (blocks: TranscriptBlock[]) => ({...everyRecord()[0], blocks});
+import { messagesMarkdown } from './transcriptCopy';
+const mocks = vi.hoisted(() => ({call: vi.fn(), success: vi.fn(), error: vi.fn()}));
+vi.mock('../../api/transport', () => ({call: mocks.call, listen: vi.fn()}));
+vi.mock('sonner', () => ({toast: {success: mocks.success, error: mocks.error}}));
+afterEach(() => { cleanup(); vi.clearAllMocks(); });
+it('saves exact loaded Markdown once, cancels quietly, then allows retry', async () => {
+  const messages = [message([{kind:'text', index:0,text:'Masked [secret] café 😀',clip:null}])];
+  let finish!: (s:string) => void;
+  mocks.call.mockImplementationOnce(() => new Promise(resolve => {finish=resolve;})).mockResolvedValue('saved');
+  render(<ExportControls messages={messages} hasOlder atLiveEdge={false} />);
+  const button=screen.getByRole('button',{name:/Save.*markdown/});
+  fireEvent.click(button); fireEvent.click(button);
+  expect(mocks.call).toHaveBeenCalledTimes(1);
+  expect(mocks.call).toHaveBeenCalledWith('save_markdown',{markdown:messagesMarkdown(messages,{earlierUnloaded:true,laterUnloaded:true})});
+  await act(async () => finish('cancelled'));
+  expect(mocks.success).not.toHaveBeenCalled();
+  await act(async () => fireEvent.click(button));
+  expect(mocks.success).toHaveBeenCalledTimes(1);
+});
+it('disables native and clipboard export while revealed', () => {
+  render(<ExportControls messages={[message([])]} hasOlder={false} atLiveEdge revealed />);
+  expect(screen.getByText('Hide revealed text to export a masked transcript')).toBeTruthy();
+  for(const button of screen.getAllByRole('button')) expect(button).toHaveProperty('disabled',true);
+  expect(mocks.call).not.toHaveBeenCalled();
+});
+it('rejects UTF-8 overflow before IPC and restores controls after native failure', async () => {
+  const messages=[message([{kind:'text',index:0,text:'é'.repeat(4*1024*1024+1),clip:null}])];
+  const view=render(<ExportControls messages={messages} hasOlder={false} atLiveEdge />);
+  await act(async()=>fireEvent.click(screen.getByRole('button',{name:/Save.*markdown/})));
+  expect(mocks.call).not.toHaveBeenCalled();
+  expect(mocks.error).toHaveBeenCalled();
+  mocks.call.mockRejectedValueOnce(new Error('Choose another destination')).mockResolvedValueOnce('saved');
+  view.rerender(<ExportControls messages={[message([])]} hasOlder={false} atLiveEdge />);
+  const button=screen.getByRole('button',{name:/Save.*markdown/});
+  await act(async()=>fireEvent.click(button));
+  expect(button).toHaveProperty('disabled',false);
+  await act(async()=>fireEvent.click(button));
+  expect(mocks.success).toHaveBeenCalledTimes(1);
+});
+it('exports only selected loaded turns with the exact trailing qualification', async () => {
+  const a={...message([{kind:'text',index:0,text:'first',clip:null}]),id:'a',turn_id:'a',kind:{kind:'user_prompt' as const,origin:null}};
+  const b={...a,id:'b',turn_id:'b',blocks:[{kind:'text' as const,index:0,text:'second café',clip:null}]};
+  mocks.call.mockResolvedValue('saved');
+  render(<ExportControls messages={[a,b]} hasOlder atLiveEdge={false} />);
+  fireEvent.change(screen.getByLabelText('Turns from'),{target:{value:'1'}});
+  await act(async()=>fireEvent.click(screen.getByRole('button',{name:'Save these turns as markdown…'})));
+  expect(mocks.call).toHaveBeenCalledWith('save_markdown',{markdown:messagesMarkdown([b],{earlierUnloaded:false,laterUnloaded:true})});
+});
