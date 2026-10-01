@@ -391,6 +391,7 @@ lint-deps:
 	python3 scripts/ci-command.test.py
 	python3 scripts/check-frontend-report.test.py
 	python3 scripts/test-frontend-ci.test.py
+	python3 scripts/check-release-artifacts.test.py
 	python3 scripts/check-workflow-shells.test.py
 	python3 scripts/check-workflow-shells.py
 	# actionlint, and it does NOT replace the script above it. That was

@@ -57,6 +57,8 @@ jobs:
           rust-components: clippy, rustfmt
       - name: Privacy guard
         run: ./scripts/check-privacy.sh
+      - name: Release artifact selection
+        run: python3 scripts/check-release-artifacts.test.py
       # The self-test first, as the symlink and mobile-gate guards do.
       # #892 recorded this script as already having one; it did not, and
       # writing it found a live bug -- the platform test matched the label

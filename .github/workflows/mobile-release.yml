@@ -965,6 +965,8 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: release-assets
+          # The setup action also uploads diagnostics; publish only app bundles.
+          pattern: mobile-*
           merge-multiple: true
 
       - name: Publish pre-release
