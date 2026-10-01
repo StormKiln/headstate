@@ -123,9 +123,9 @@ export function deriveTaskChecklist(
       const resultKey = result ? `${result.message_id}#${result.index}#${result.tool_use_id ?? ""}` : null;
       if (b.kind === "tool_result" && b.tool_use_id && calls.has(b.tool_use_id)) {
         const owner = calls.get(b.tool_use_id)!;
-        // Attached copies are folded with their call. A background tool's
+        // Result identity below deduplicates attached copies. A background tool's
         // metadata must never become a numbered checklist observation.
-        if (owner.result || !["task_list", "task_get"].includes(owner.args.tool)) continue;
+        if (!["task_list", "task_get"].includes(owner.args.tool)) continue;
       }
       const key = b.kind === "tool_call" ? b.id ?? `${m.id}#${b.index}` : resultKey!;
       if (b.kind === "tool_call") {

@@ -1,0 +1,5 @@
+[
+  {"source":"completed_future","remaining":9,"status":null,"truncated":true},
+  {"source":"deleted_future","remaining":7,"status":null,"truncated":true},
+  {"source":"completed_future","remaining":30,"status":"completed_future","truncated":false}
+]

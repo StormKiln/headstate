@@ -178,6 +178,14 @@ it("keeps task result positions across pairing and child provenance across dupli
   const block = paired.find(m=>m.id === "list-call")!.blocks[0];
   expect(block.kind === "tool_call" && block.result?.offset).toBe(200);
   expect(deriveTaskChecklist(paired,{truncated:true}).tasks[0].subject).toBe("From snapshot");
+  const earlier = {...result,message_id:"earlier",offset:100};
+  const later = {...result,task:{...result.task!,snapshots:{...result.task!.snapshots!,items:[{task_id:"1",subject:"Later title",status:"completed"}]}}};
+  const answered = {...first,page:{...first.page,messages:[{...message,blocks:[call("TaskList",{tool:"task_list"},earlier,"list")]}]}};
+  const duplicateCall = {...second,page:{...second.page,messages:[{...message,blocks:[call("TaskList",{tool:"task_list"},later,"list")]}]}};
+  const merged = mergeWindows([answered,duplicateCall,{...duplicateCall,start:duplicateCall.end,end:{offset:duplicateCall.end.offset+100,behind_digest:"third"}}]);
+  const checklist = deriveTaskChecklist(merged,{truncated:true});
+  expect(checklist.tasks).toHaveLength(1);
+  expect(checklist.tasks[0]).toMatchObject({subject:"Later title",status:"completed"});
   // The same synthetic call ID appearing on a sidechain must not absorb
   // the other chain's result or stand it up as a parent result on dedup.
   const child = {...message,is_sidechain:true};

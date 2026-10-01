@@ -1002,6 +1002,58 @@ mod tests {
     }
 
     #[test]
+    fn task_snapshot_clipped_credentials_never_cross_the_masked_boundary() {
+        use crate::claude::transcript_model::{build, parse, Line, Seed, WindowStart};
+        let credential = format!("AIza{}", "a".repeat(35));
+        for mode in ["field", "aggregate", "skimmer"] {
+            let subject = format!(
+                "{} {credential}",
+                "x".repeat(if mode == "aggregate" { 366 } else { 3966 })
+            );
+            let mut items = Vec::new();
+            if mode == "aggregate" {
+                for i in 1..=3 {
+                    items.push(json!({"id":i.to_string(),"subject":"x".repeat(4000)}));
+                }
+                items.push(json!({"id":"4","subject":"x".repeat(3596)}));
+            }
+            items.push(json!({"id":"5","subject":subject,"status":"pending"}));
+            let record = json!({"type":"user","uuid":"r","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"task"}]},"toolUseResult":{"tasks":items}});
+            let raw = record.to_string();
+            let parsed = if mode == "skimmer" {
+                let skim =
+                    crate::claude::transcript_skim::skim(raw.as_bytes(), 4000, 100_000).unwrap();
+                assert!(!skim.cut.is_empty());
+                build(
+                    &[Line::skimmed(Ok(skim), 0, raw.len() as u64, "")],
+                    Seed::at(WindowStart::FileStart),
+                    None,
+                )
+            } else {
+                parse(&raw, WindowStart::FileStart, None)
+            };
+            let (_, plan) = admit("claude_transcript_page", json!({"path":"p"}), ON).unwrap();
+            let out = plan.finish("claude_transcript_page", json!({"page":parsed}));
+            assert!(
+                !out.to_string().contains("AIza"),
+                "{mode} leaked a credential prefix"
+            );
+            let snapshots = &out["page"]["messages"][0]["blocks"][0]["task"]["snapshots"];
+            assert_eq!(snapshots["truncated"], true, "{mode}");
+            let items = snapshots["items"].as_array().unwrap();
+            assert!(items.last().unwrap()["subject"].is_null(), "{mode}");
+            let chars: usize = items
+                .iter()
+                .flat_map(|v| {
+                    ["task_id", "subject", "status"]
+                        .map(|k| v[k].as_str().unwrap_or("").chars().count())
+                })
+                .sum();
+            assert!(chars <= 16_000);
+        }
+    }
+
+    #[test]
     fn a_transcript_page_is_masked_and_its_cursors_still_work() {
         use crate::claude::transcript_page::{self, PageAnchor, PageDirection};
         use std::io::Write;

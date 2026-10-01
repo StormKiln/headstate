@@ -1462,7 +1462,7 @@ fn attach_record_result(rec: &serde_json::Value, blocks: &mut [TranscriptBlock],
             agent_type: str_of(tur, "agentType"),
         });
     }
-    out.task = task_result(tur);
+    out.task = task_result(tur, ctx.cut);
     if let Some(snapshots) = out.task.as_mut().and_then(|t| t.snapshots.as_mut()) {
         // The bounded JSON skimmer may already have clipped these fields.
         snapshots.truncated |= !ctx.cut.is_empty();
@@ -1480,8 +1480,8 @@ fn attach_record_result(rec: &serde_json::Value, blocks: &mut [TranscriptBlock],
 /// beside `updatedFields`. Both keys are required for an update so that
 /// another tool's result carrying a `taskId` is not read as a task
 /// change.
-fn task_result(tur: &serde_json::Value) -> Option<TranscriptTaskResult> {
-    let snapshots = task_snapshots(tur);
+fn task_result(tur: &serde_json::Value, cuts: &[(String, usize)]) -> Option<TranscriptTaskResult> {
+    let snapshots = task_snapshots(tur, cuts);
     let change = tur.get("statusChange");
     let (task_id, is_task) = if let Some(task) = tur.get("task").filter(|t| t.is_object()) {
         (preview::task_id(task.get("id")), true)
@@ -1502,7 +1502,10 @@ fn task_result(tur: &serde_json::Value) -> Option<TranscriptTaskResult> {
 const TASK_SNAPSHOT_ITEMS: usize = 100;
 const TASK_SNAPSHOT_CHARS: usize = 16_000;
 
-fn task_snapshots(tur: &serde_json::Value) -> Option<TranscriptTaskSnapshots> {
+fn task_snapshots(
+    tur: &serde_json::Value,
+    cuts: &[(String, usize)],
+) -> Option<TranscriptTaskSnapshots> {
     let values = if let Some(items) = tur.get("tasks").and_then(serde_json::Value::as_array) {
         items.as_slice()
     } else {
@@ -1518,9 +1521,11 @@ fn task_snapshots(tur: &serde_json::Value) -> Option<TranscriptTaskSnapshots> {
     for value in values.iter().take(TASK_SNAPSHOT_ITEMS) {
         // The observed checklist IDs are numbered. Do not turn arbitrary
         // nested task objects or background task IDs into checklist rows.
-        let Some(id) = preview::task_id(value.get("id"))
-            .filter(|id| id.len() <= 20 && id.bytes().all(|b| b.is_ascii_digit()))
-        else {
+        let Some(id) = preview::task_id(value.get("id")).filter(|id| {
+            id.len() <= 20
+                && id.bytes().all(|b| b.is_ascii_digit())
+                && !cuts.iter().any(|(prefix, _)| prefix == id)
+        }) else {
             continue;
         };
         if remaining < id.len() {
@@ -1528,12 +1533,18 @@ fn task_snapshots(tur: &serde_json::Value) -> Option<TranscriptTaskSnapshots> {
         }
         remaining -= id.len();
         let mut field = |key: &str, cap: usize| {
-            value.get(key).and_then(serde_json::Value::as_str).map(|s| {
-                let (text, cut) = clip_chars(s, remaining.min(cap));
-                remaining -= text.chars().count();
-                out.truncated |= cut.is_some();
-                text
-            })
+            let s = value.get(key).and_then(serde_json::Value::as_str)?;
+            // Incomplete status prefixes can impersonate known states, and
+            // incomplete credentials may no longer be recognizable to masking.
+            // Keep only whole fields, including through the JSON skimmer.
+            if cuts.iter().any(|(prefix, _)| prefix == s)
+                || s.chars().take(remaining.min(cap) + 1).count() > remaining.min(cap)
+            {
+                out.truncated = true;
+                return None;
+            }
+            remaining -= s.chars().count();
+            Some(s.to_owned())
         };
         let subject = field("subject", preview::MAX_TEXT_CHARS);
         let status = field("status", 128);
@@ -2454,9 +2465,54 @@ mod tests {
     }
 
     #[test]
+    fn task_snapshot_boundary_contract_matches_the_reducer_fixture() {
+        let cases: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../src/components/transcript/taskSnapshotBoundaries.json"
+        ))
+        .unwrap();
+        for case in cases.as_array().unwrap() {
+            let source = case["source"].as_str().unwrap();
+            let remaining = case["remaining"].as_u64().unwrap() as usize;
+            let mut r = result("r", "t");
+            r["toolUseResult"] = serde_json::json!({"tasks":[
+                {"id":"1","subject":"x".repeat(4000)},
+                {"id":"2","subject":"x".repeat(4000)},
+                {"id":"3","subject":"x".repeat(4000)},
+                {"id":"4","subject":"x".repeat(3996-remaining),"status":source}
+            ]});
+            let m = one(r);
+            let TranscriptBlock::ToolResult(out) = &m.blocks[0] else {
+                panic!()
+            };
+            let snapshots = out.task.as_ref().unwrap().snapshots.as_ref().unwrap();
+            assert_eq!(
+                serde_json::to_value(&snapshots.items[3].status).unwrap(),
+                case["status"],
+                "{source}"
+            );
+            assert_eq!(snapshots.truncated, case["truncated"].as_bool().unwrap());
+        }
+        // A skimmer-retained prefix fits the metadata cap, but is still incomplete.
+        let mut r = result("r", "t");
+        r["toolUseResult"] =
+            serde_json::json!({"tasks":[{"id":"1","status":"completed_future_state"}]});
+        let raw = r.to_string();
+        let skim = super::super::transcript_skim::skim(raw.as_bytes(), 16, 100_000).unwrap();
+        assert!(!skim.cut.is_empty());
+        let line = Line::skimmed(Ok(skim), 0, raw.len() as u64, "");
+        let page = build(&[line], Seed::at(WindowStart::FileStart), None);
+        let TranscriptBlock::ToolResult(out) = &page.messages[0].blocks[0] else {
+            panic!()
+        };
+        let snapshots = out.task.as_ref().unwrap().snapshots.as_ref().unwrap();
+        assert_eq!(snapshots.items[0].status, None);
+        assert!(snapshots.truncated);
+    }
+
+    #[test]
     fn task_snapshots_bound_items_text_and_reject_arbitrary_ids() {
         let items: Vec<_> = (0..150).map(|i| serde_json::json!({"id":i.to_string(), "subject":"é".repeat(5000), "status":"future_state"})).collect();
-        let snapshots = task_result(&serde_json::json!({"tasks":items}))
+        let snapshots = task_result(&serde_json::json!({"tasks":items}), &[])
             .unwrap()
             .snapshots
             .unwrap();
@@ -2472,7 +2528,7 @@ mod tests {
                 .sum::<usize>()
                 <= 16_000
         );
-        let rejected = task_result(&serde_json::json!({"tasks":[{"id":"secret-text", "subject":"title"}, {"id":"1", "status":"future_state"}]})).unwrap().snapshots.unwrap();
+        let rejected = task_result(&serde_json::json!({"tasks":[{"id":"secret-text", "subject":"title"}, {"id":"1", "status":"future_state"}]}), &[]).unwrap().snapshots.unwrap();
         assert_eq!(rejected.omitted, 1);
         assert_eq!(rejected.items[0].subject, None);
         let mut r = result("r", "t");

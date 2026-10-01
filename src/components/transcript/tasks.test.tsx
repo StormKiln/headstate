@@ -1,3 +1,4 @@
+import snapshotBoundaries from "./taskSnapshotBoundaries.json";
 /// #1504: the task checklist folded across messages. Generic fixtures cut
 /// to the measured record shapes -- no real task text.
 
@@ -367,4 +368,14 @@ it("exposes omitted snapshot details without turning an unmeasured status into p
   render(<TaskChecklist checklist={c} variant="terminal" />);
   expect(screen.getByText("Some recorded task details were omitted or clipped.")).toBeTruthy();
   expect(screen.getByText("status not recorded:")).toBeTruthy();
+});
+
+// Rust's parser test verifies these boundary statuses against actual parsed records.
+it.each(snapshotBoundaries)("does not promote incomplete $source ($remaining characters left)", ({ status, truncated }) => {
+  const r = output({task:{task_id:null,success:null,status_from:null,status_to:null,snapshots:{items:[{task_id:"4",subject:null,status}],omitted:0,truncated}}});
+  const state = deriveTaskChecklist([message([{kind:"tool_result",...r}])],{truncated:false});
+  expect(state.tasks[0].status).toBe(status);
+  expect(taskSummary(state)).toMatchObject({done:0,total:1});
+  expect(state.tasks).toHaveLength(1);
+  expect(state.snapshotIncomplete).toBe(truncated);
 });
