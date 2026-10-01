@@ -555,6 +555,8 @@ pub fn run() {
             // to signal even when nothing is listening for it.
             let waker = Arc::new(tokio::sync::Notify::new());
             app.manage(poll::Waker(waker.clone()));
+            let backfill_waker = Arc::new(tokio::sync::Notify::new());
+            app.manage(poll::BackfillWaker(backfill_waker.clone()));
             app.manage(source_poll::SourcePolls::default());
 
             // Managed unconditionally, like the Waker: the settings command
@@ -1077,7 +1079,7 @@ pub fn run() {
                 // would both spend the margin and make the protection
                 // self-referential. `spawn_backfill`'s own docs carry the
                 // argument in full.
-                poll::spawn_backfill(handle.clone(), client.clone());
+                poll::spawn_backfill(handle.clone(), client.clone(), backfill_waker);
                 poll::spawn(handle, client, focused, waker, interval, needs_gh, github_source_enabled);
             }
 

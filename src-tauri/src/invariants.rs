@@ -3469,11 +3469,11 @@ static TABLE: &str = HIT_none_3;
             );
         }
 
-        // And the clears are reached only on a real identity change rather
-        // than on every read: `note_viewer` returning 0 means the same
-        // account, and that arm must stay empty.
+        // Compare identity itself, not the number of cache rows deleted:
+        // store-first scopes can retain history with an empty cache.
         assert!(
-            code.contains("Ok(0) => {}"),
+            code.contains("let changed = previous.as_deref() != Some(viewer);")
+                && code.contains("if changed {"),
             "the clears must sit under the arm that fires on a CHANGED \
              identity; clearing on every read would drop the accumulated \
              corpus on each page load"

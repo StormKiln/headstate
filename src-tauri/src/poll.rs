@@ -1460,6 +1460,10 @@ fn truncation_payload(fetched: u64, total: u64) -> u64 {
     }
 }
 
+/// A dedicated demand signal: stats clicks must not consume the poll loop's
+/// own wake-up permit.
+pub struct BackfillWaker(pub Arc<Notify>);
+
 /// Spawn the PR Stats backfill worker (#1092, #1093).
 ///
 /// # Why this is a SIBLING of [`spawn`] and not part of its tick
@@ -1487,16 +1491,18 @@ fn truncation_payload(fetched: u64, total: u64) -> u64 {
 /// Nothing is written before the fetch, which is what makes a crash
 /// mid-tick leave no stuck row: there is no `pending` state to be stuck
 /// in.
-pub fn spawn_backfill(app: AppHandle, client: Arc<GitHubClient>) {
+pub fn spawn_backfill(app: AppHandle, client: Arc<GitHubClient>, waker: Arc<Notify>) {
     tauri::async_runtime::spawn(async move {
-        // The first tick waits a full interval rather than firing at
-        // launch. Startup is the busiest moment the app has -- the poll
+        // The first tick waits a full interval unless a Stats click nudges
+        // it. Startup is the busiest moment the app has -- the poll
         // loop's first tick, the window's first render and whatever the
         // user clicks are all competing -- and a backfill is the one
         // consumer that can always wait.
+        let mut last_started: Option<tokio::time::Instant> = None;
         loop {
-            tokio::time::sleep(crate::github::stats::backfill::BACKFILL_INTERVAL).await;
-            let tick = backfill_tick(&app, &client).await;
+            wait_backfill_tick(&waker, last_started).await;
+            last_started = Some(tokio::time::Instant::now());
+            let tick = backfill_tick(crate::commands::db_path(&app), &client).await;
             match &tick.outcome {
                 crate::github::stats::backfill::TickOutcome::Advanced { days, prs } => {
                     crate::diag!("[diag] stats backfill advanced {days} days, {prs} pull requests");
@@ -1551,6 +1557,18 @@ pub fn spawn_backfill(app: AppHandle, client: Arc<GitHubClient>) {
     });
 }
 
+/// Coalesced demand can wake an idle worker, but cannot spend faster than
+/// the established cadence. The caller awaits each tick before waiting again.
+async fn wait_backfill_tick(waker: &Notify, last_started: Option<tokio::time::Instant>) {
+    tokio::select! {
+        _ = tokio::time::sleep(crate::github::stats::backfill::BACKFILL_INTERVAL) => {},
+        _ = waker.notified() => {},
+    }
+    if let Some(last) = last_started {
+        tokio::time::sleep_until(last + crate::github::stats::backfill::BACKFILL_INTERVAL).await;
+    }
+}
+
 /// A tick's outcome, plus the scope window it applies to.
 ///
 /// The window travels back to the LOOP so the loop can emit exactly one
@@ -1591,7 +1609,7 @@ impl From<crate::github::stats::backfill::TickOutcome> for Tick {
 ///
 /// Separated from the loop so the sequencing is readable and so the loop
 /// itself holds no state that a failure could corrupt.
-async fn backfill_tick(app: &AppHandle, client: &Arc<GitHubClient>) -> Tick {
+async fn backfill_tick(db: std::path::PathBuf, client: &Arc<GitHubClient>) -> Tick {
     use crate::github::stats::backfill::{self as bf, TickOutcome};
 
     // The gate, BEFORE any request. `None` means skip -- deliberately the
@@ -1620,7 +1638,6 @@ async fn backfill_tick(app: &AppHandle, client: &Arc<GitHubClient>) -> Tick {
         .into();
     }
 
-    let db = crate::commands::db_path(app);
     let now = chrono::Utc::now();
 
     // Which scope, and what it still owes -- off the runtime, because this
@@ -1861,6 +1878,111 @@ async fn emit_backfill(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn backfill_nudge_wakes_idle_worker_but_preserves_tick_floor() {
+        let waker = std::sync::Arc::new(tokio::sync::Notify::new());
+        waker.notify_one();
+        let start = tokio::time::Instant::now();
+        super::wait_backfill_tick(&waker, None).await;
+        assert_eq!(tokio::time::Instant::now(), start);
+        let second_waker = waker.clone();
+        let second = tokio::spawn(async move {
+            super::wait_backfill_tick(&second_waker, Some(start)).await;
+        });
+        for _ in 0..100 {
+            waker.notify_one();
+        }
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(59)).await;
+        assert!(!second.is_finished());
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        second.await.unwrap();
+        assert_eq!(
+            tokio::time::Instant::now() - start,
+            crate::github::stats::backfill::BACKFILL_INTERVAL
+        );
+    }
+
+    #[test]
+    fn backfill_large_fixture_converges_and_stops_requesting_covered_days() {
+        use crate::github::stats::{backfill as bf, budget};
+        let _observed = budget::observed_test_lock();
+        let _restore = budget::RestoreObserved::capture();
+        budget::note_remaining(5000);
+        tauri::async_runtime::block_on(async {
+            let _permits = budget::READ_PERMIT_TEST_LOCK.lock().await;
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(|req: &wiremock::Request| {
+                    let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                    let doc = body["query"].as_str().unwrap();
+                    let mut data = serde_json::Map::new();
+                    for i in 0..bf::GROUP_SLICES {
+                        let Some((_, tail)) = doc.split_once(&format!("s{i}: search(")) else { continue; };
+                        let day = &tail.split_once("merged:").unwrap().1[..10];
+                        let base: u64 = day.replace('-', "").parse().unwrap();
+                        let nodes: Vec<_> = (0..50).map(|n| serde_json::json!({
+                            "number": base * 100 + n, "title":"fixture", "url":"https://example.com/pr",
+                            "repository":{"nameWithOwner":"fixture/repo"}, "author":{"login":"fixture-author"},
+                            "createdAt":format!("{day}T00:00:00Z"), "mergedAt":format!("{day}T01:00:00Z"),
+                            "additions":10,"deletions":2,"changedFiles":1,"reviews":{"totalCount":1}
+                        })).collect();
+                        data.insert(format!("s{i}"), serde_json::json!({"issueCount":50,"nodes":nodes}));
+                    }
+                    wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"data":data}))
+                }).mount(&server).await;
+            let client = std::sync::Arc::new(crate::github::client::GitHubClient::new(
+                octocrab::Octocrab::builder()
+                    .base_uri(server.uri())
+                    .unwrap()
+                    .personal_token("fixture-token".to_string())
+                    .build()
+                    .unwrap(),
+            ));
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("backfill.db");
+            let conn = crate::store::open_db(&db).unwrap();
+            let key = bf::query_for("org", "fixture", "merged")
+                .unwrap()
+                .cache_key("fixture-viewer");
+            crate::store::pr_backfill_scope::note_seen(
+                &conn,
+                &crate::store::pr_backfill_scope::BackfillScope {
+                    scope_key: key.clone(),
+                    scope_kind: "org".into(),
+                    scope_value: "fixture".into(),
+                    measure: "merged".into(),
+                    horizon_days: 30,
+                },
+                chrono::Utc::now(),
+            )
+            .unwrap();
+            let (from, to) = bf::horizon_window(chrono::Utc::now(), 30).unwrap();
+            let ticks = 30usize.div_ceil(bf::GROUP_SLICES);
+            for pass in 1..=ticks {
+                let tick = super::backfill_tick(db.clone(), &client).await;
+                assert!(
+                    !matches!(tick.outcome, bf::TickOutcome::Failed(_)),
+                    "{:?}",
+                    tick.outcome
+                );
+                let coverage = crate::store::pr_slice::coverage(&conn, &key, &from, &to).unwrap();
+                assert_eq!(coverage.days_covered(), (pass * bf::GROUP_SLICES).min(30));
+            }
+            assert_eq!(
+                crate::store::pr_history::count(&conn, &key, &from, &to).unwrap(),
+                1500
+            );
+            let issued = server.received_requests().await.unwrap().len();
+            assert_eq!(issued, ticks);
+            assert!(matches!(
+                super::backfill_tick(db, &client).await.outcome,
+                bf::TickOutcome::Complete
+            ));
+            assert_eq!(server.received_requests().await.unwrap().len(), issued);
+        });
+    }
+
     /// The worst case in the six-day log: 8 fetched of 29 open (#745).
     #[test]
     fn a_short_list_reports_githubs_own_count() {

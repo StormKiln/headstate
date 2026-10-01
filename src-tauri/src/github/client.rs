@@ -325,6 +325,7 @@ fn server_gave_up(e: &ClientError) -> bool {
 pub struct GitHubClient {
     octocrab: Octocrab,
     searches: Arc<Searches>,
+    viewer: Arc<tokio::sync::OnceCell<String>>,
     read_transport: Arc<super::read_transport::ReadTransport>,
 }
 
@@ -417,6 +418,7 @@ impl GitHubClient {
         Self {
             octocrab,
             searches: Arc::new(Searches::default()),
+            viewer: Arc::default(),
             read_transport: Arc::default(),
         }
     }
@@ -1395,7 +1397,10 @@ impl GitHubClient {
         if let Some((remaining, _)) = map_rate_limit(&v) {
             crate::github::stats::budget::note_remaining(remaining);
         }
-        map_viewer(&v).ok_or_else(|| ClientError::Graphql("no viewer login in response".into()))
+        let login = map_viewer(&v)
+            .ok_or_else(|| ClientError::Graphql("no viewer login in response".into()))?;
+        let _ = self.viewer.set(login.clone());
+        Ok(login)
     }
 
     /// [`Self::fetch_viewer`], reported into a load's accumulator.
@@ -1426,6 +1431,18 @@ impl GitHubClient {
         // but carried no login still counts the point it spent.
         budget.record(&v);
         map_viewer(&v).ok_or_else(|| ClientError::Graphql("no viewer login in response".into()))
+    }
+
+    pub async fn stats_viewer_metered(
+        &self,
+        budget: &crate::github::stats::Budget,
+    ) -> Result<String, ClientError> {
+        // The immutable client owns the token. Never reuse disk identity or
+        // another client's login, and never cache a failed lookup.
+        self.viewer
+            .get_or_try_init(|| self.fetch_viewer_metered(budget))
+            .await
+            .cloned()
     }
 
     /// One chunk of the worktree view's merged-PR lookup (#1440), raw.
@@ -2021,6 +2038,30 @@ mod tests {
             .build()
             .unwrap();
         GitHubClient::new(oc)
+    }
+
+    #[tokio::test]
+    async fn stats_viewer_reuses_only_this_clients_verified_identity() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data":{"viewer":{"login":"alice"}}})),
+            )
+            .mount(&server)
+            .await;
+        let client = client_for(&server).await;
+        assert_eq!(client.fetch_viewer().await.unwrap(), "alice");
+        let before = server.received_requests().await.unwrap().len();
+        let budget = crate::github::stats::Budget::new();
+        assert_eq!(
+            client.clone().stats_viewer_metered(&budget).await.unwrap(),
+            "alice"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), before);
+        let other = client_for(&server).await;
+        other.stats_viewer_metered(&budget).await.unwrap();
+        assert_eq!(server.received_requests().await.unwrap().len(), before + 1);
     }
 
     /// The verification must be wired into the CALLER, not merely exist.
