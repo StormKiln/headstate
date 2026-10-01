@@ -547,6 +547,7 @@ fn map_node(node: &Value) -> Option<PullRequest> {
     let is_draft = node["isDraft"].as_bool().unwrap_or(false);
 
     Some(PullRequest {
+        observation: Some(crate::inventory::github_observation(node, false)),
         source: Default::default(),
         id: node["id"].as_str().unwrap_or_default().to_string(),
         number: node["number"].as_u64()?,
@@ -612,7 +613,15 @@ pub fn map_list(v: &Value, alias: &str) -> Vec<PullRequest> {
     v[alias]["nodes"]
         .as_array()
         .map(|a| {
-            let mapped: Vec<PullRequest> = a.iter().filter_map(map_node).collect();
+            let partial = v["__readiness_unknown"] == true;
+            let mapped: Vec<PullRequest> = a
+                .iter()
+                .filter_map(|node| {
+                    let mut row = map_node(node)?;
+                    row.observation = Some(crate::inventory::github_observation(node, partial));
+                    Some(row)
+                })
+                .collect();
             // Dropping a node is SILENT and it is how a refused field
             // empties a list: GitHub nulls the fields it could not
             // compute, `map_node` requires title/url/repository, and

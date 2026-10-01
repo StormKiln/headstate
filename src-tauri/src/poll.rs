@@ -9,7 +9,7 @@ use crate::github::client::{ClientError, FetchedList, GitHubClient};
 use crate::github::model::{needs_attention_count, CiState, MergeState, PullRequest, ReviewState};
 use crate::identity::Source;
 use crate::source_poll;
-use crate::store::source_cache::{save_source_snapshot, Coverage};
+use crate::store::source_cache::Coverage;
 use crate::store::{open_db, CachedList};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -592,7 +592,12 @@ impl NotifyPrefs {
 /// has nothing to wait for. `Pending` does NOT -- ready means the checks
 /// passed, not that they have not failed yet.
 fn ready_for_review(pr: &PullRequest) -> bool {
-    !pr.is_draft
+    !pr.observation.as_ref().is_some_and(|o| {
+        o.confirmed_review.is_some()
+            || !o.unknown_fields.is_empty()
+            || o.state == crate::inventory::ObservationState::Retained
+            || !o.retained_fields.is_empty()
+    }) && !pr.is_draft
         && (pr.ci == CiState::Success || pr.ci == CiState::None)
         && pr.merge != MergeState::Conflicted
         && pr.review != ReviewState::Approved
@@ -706,18 +711,6 @@ pub fn newly_broken(previous: &[PullRequest], current: &[PullRequest]) -> Vec<Br
         .collect()
 }
 
-fn merge_by_identity(base: &[PullRequest], updates: &[PullRequest]) -> Vec<PullRequest> {
-    base.iter()
-        .map(|pr| {
-            updates
-                .iter()
-                .find(|u| u.identity() == pr.identity())
-                .cloned()
-                .unwrap_or_else(|| pr.clone())
-        })
-        .collect()
-}
-
 /// Persists a snapshot and emits `prs-updated`, matching every fallible
 /// step rather than unwrapping -- shared by both the regular poll tick and
 /// the #22 one-shot recheck so the "never panic, never blank the UI on
@@ -803,7 +796,7 @@ async fn read_notify_prefs(app: &AppHandle) -> NotifyPrefs {
 pub(crate) fn emit_reviewing(app: &AppHandle, result: &FetchedList) {
     let short = result
         .total
-        .map(|total| total.saturating_sub(result.prs.len() as u64));
+        .map(|total| total.saturating_sub(crate::inventory::observed_count(&result.prs)));
     let _ = app.emit("reviewing-short", short);
     let _ = app.emit("reviewing-updated", &result.prs);
 }
@@ -811,18 +804,20 @@ pub(crate) fn emit_reviewing(app: &AppHandle, result: &FetchedList) {
 async fn persist_reviewing(app: &AppHandle, result: &FetchedList) {
     let prs = &result.prs;
     let coverage = result.coverage.clone();
+    let owner = result.viewer.clone();
     let Ok(dir) = app.path().app_data_dir() else {
         return;
     };
     let owned: Vec<PullRequest> = prs.to_vec();
     let written = tauri::async_runtime::spawn_blocking(move || {
         let conn = open_db(&dir.join("headstate.db")).map_err(|e| format!("{e}"))?;
-        save_source_snapshot(
+        crate::store::source_cache::save_owned_source_snapshot(
             &conn,
             &Source::default(),
             CachedList::Reviewing,
             &owned,
             &coverage,
+            owner.as_deref(),
         )
         .map_err(|e| format!("{e}"))
     })
@@ -834,19 +829,25 @@ async fn persist_reviewing(app: &AppHandle, result: &FetchedList) {
     }
 }
 
-async fn persist_and_emit(app: &AppHandle, prs: &[PullRequest], coverage: Coverage) {
+async fn persist_and_emit(
+    app: &AppHandle,
+    prs: &[PullRequest],
+    coverage: Coverage,
+    owner: Option<String>,
+) {
     match app.path().app_data_dir() {
         Ok(dir) => {
             let owned: Vec<PullRequest> = prs.to_vec();
             let written = tauri::async_runtime::spawn_blocking(move || {
                 let conn =
                     open_db(&dir.join("headstate.db")).map_err(|e| (true, format!("{e}")))?;
-                save_source_snapshot(
+                crate::store::source_cache::save_owned_source_snapshot(
                     &conn,
                     &Source::default(),
                     CachedList::Authored,
                     &owned,
                     &coverage,
+                    owner.as_deref(),
                 )
                 .map_err(|e| (false, format!("{e}")))
             })
@@ -905,26 +906,24 @@ async fn persist_and_emit(app: &AppHandle, prs: &[PullRequest], coverage: Covera
 fn spawn_recheck(
     app: AppHandle,
     client: Arc<GitHubClient>,
-    last_known: Vec<PullRequest>,
+    _last_known: Vec<PullRequest>,
     attempt: source_poll::Attempt,
 ) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(RECHECK_DELAY).await;
 
-        match client.fetch_prs().await {
+        match client.fetch_prs_snapshot().await {
             Ok(fresh) => {
                 if let Some(publication) = source_poll::publication(&app, &attempt).await {
-                    let merged = merge_by_identity(&last_known, &fresh);
-                    persist_and_emit(&app, &merged, Coverage::Unknown).await;
-                    source_poll::complete(
+                    let result = source_poll::reconcile_github(&app, &publication, fresh).await;
+                    persist_and_emit(
                         &app,
-                        publication,
-                        Ok(FetchedList {
-                            prs: merged,
-                            total: None,
-                            coverage: Coverage::Unknown,
-                        }),
-                    );
+                        &result.prs,
+                        result.coverage.clone(),
+                        result.viewer.clone(),
+                    )
+                    .await;
+                    source_poll::complete(&app, publication, Ok(result));
                 }
             }
             Err(e) => {
@@ -1225,8 +1224,11 @@ pub fn spawn(
                 if let Some(publication) = authored_publication {
                     match fetched {
                         Ok(result) => {
+                            let result =
+                                source_poll::reconcile_github(&app, &publication, result).await;
                             let receipt = result.clone();
                             let FetchedList {
+                                viewer,
                                 prs,
                                 total,
                                 coverage,
@@ -1275,8 +1277,9 @@ pub fn spawn(
 
                             previous = prs.clone();
                             // Null replaces stale numeric advice with unknown completeness.
-                            let truncated =
-                                total.map(|total| truncation_payload(prs.len() as u64, total));
+                            let truncated = total.map(|total| {
+                                truncation_payload(crate::inventory::observed_count(&prs), total)
+                            });
                             if let Err(e) = app.emit("prs-truncated", truncated) {
                                 log::warn!("failed to emit prs-truncated: {e}");
                             }
@@ -1302,7 +1305,7 @@ pub fn spawn(
                             }
 
                             consecutive_failures = 0;
-                            persist_and_emit(&app, &prs, coverage.clone()).await;
+                            persist_and_emit(&app, &prs, coverage.clone(), viewer).await;
                             let _ = app.emit("poll-state", tick_state(None));
                             source_poll::complete(&app, publication, Ok(receipt));
                             if has_checking(&prs) {
@@ -1368,6 +1371,7 @@ pub fn spawn(
                 if let Some(publication) = review_publication {
                     match reviewing_now {
                         Ok(now) => {
+                            let now = source_poll::reconcile_github(&app, &publication, now).await;
                             let prefs = read_notify_prefs(&app).await;
                             if let Some(before) = &previous_reviewing {
                                 for b in newly_ready(before, &now.prs) {
@@ -2548,6 +2552,7 @@ mod tests {
 
     fn pr(repo: &str, number: u64, merge: MergeState) -> PullRequest {
         PullRequest {
+            observation: None,
             source: Default::default(),
             id: "PR_test".into(),
             number,
@@ -3286,6 +3291,7 @@ mod tests {
             .unwrap()
             .with_timezone(&chrono::Utc);
         PullRequest {
+            observation: None,
             source: Default::default(),
             id: "PR_test".into(),
             number,
@@ -3479,63 +3485,16 @@ mod tests {
                 newly_appeared(std::slice::from_ref(&gh), std::slice::from_ref(&other))[0].source,
                 other.source
             );
-            assert_eq!(
-                merge_by_identity(std::slice::from_ref(&gh), &[other]),
-                vec![gh.clone()]
+            let merged = crate::inventory::reconcile(
+                vec![gh.clone()],
+                vec![other],
+                false,
+                chrono::Utc::now(),
             );
+            assert!(merged
+                .iter()
+                .any(|row| row.identity() == gh.identity() && row.ci == gh.ci));
         }
-    }
-
-    #[test]
-    fn merge_by_identity_replaces_only_matching_prs() {
-        let base = vec![
-            pr("octocat/hello-world", 1, MergeState::Checking),
-            pr("octocat/hello-world", 2, MergeState::Mergeable),
-            pr("octocat/spoon-knife", 7, MergeState::Checking),
-        ];
-        let updates = vec![
-            pr("octocat/hello-world", 1, MergeState::Mergeable),
-            pr("octocat/spoon-knife", 7, MergeState::Conflicted),
-        ];
-
-        let merged = merge_by_identity(&base, &updates);
-
-        assert_eq!(merged[0].merge, MergeState::Mergeable); // resolved
-        assert_eq!(merged[1].merge, MergeState::Mergeable); // untouched, unchanged
-        assert_eq!(merged[2].merge, MergeState::Conflicted); // resolved
-    }
-
-    /// A PR present in the base snapshot but absent from the recheck's
-    /// results (e.g. it was closed between the two fetches) must be kept,
-    /// not dropped -- the recheck only ever narrows toward "resolved,"
-    /// never toward "gone," since that would blank part of the UI on a
-    /// mismatch that isn't even an error.
-    #[test]
-    fn merge_by_identity_keeps_prs_absent_from_the_update_set() {
-        let base = vec![pr("octocat/hello-world", 1, MergeState::Checking)];
-        let updates: Vec<PullRequest> = vec![];
-
-        let merged = merge_by_identity(&base, &updates);
-
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].merge, MergeState::Checking);
-    }
-
-    /// Distinct repos can legally share a PR number -- identity must be the
-    /// (repo, number) pair, not the number alone, or a recheck could
-    /// overwrite the wrong repo's PR.
-    #[test]
-    fn merge_by_identity_disambiguates_same_number_in_different_repos() {
-        let base = vec![
-            pr("octocat/hello-world", 7, MergeState::Checking),
-            pr("octocat/spoon-knife", 7, MergeState::Checking),
-        ];
-        let updates = vec![pr("octocat/hello-world", 7, MergeState::Mergeable)];
-
-        let merged = merge_by_identity(&base, &updates);
-
-        assert_eq!(merged[0].merge, MergeState::Mergeable);
-        assert_eq!(merged[1].merge, MergeState::Checking); // different repo, untouched
     }
 }
 

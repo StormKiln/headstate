@@ -1,3 +1,4 @@
+import { observationLabel } from "./rowObservation";
 import type { PullRequest } from "@/types/pr";
 import { readyAge } from "./readyAge";
 import type { Pusher } from "./readyPusher";
@@ -148,6 +149,8 @@ function pusherText(p: LastPusher | undefined): string {
 function entryLine(row: ReadyRow, now: Date): string {
   const { pr } = row;
   const parts: string[] = [`${pr.repo} #${pr.number}`];
+  const qualification = observationLabel(pr);
+  if (qualification) parts.push(qualification);
   if (pr.author) parts.push(`by @${pr.author}`);
   if (pr.head_ref && pr.base_ref) {
     parts.push(`${codeSpan(pr.head_ref)} → ${codeSpan(pr.base_ref)}`);

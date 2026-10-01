@@ -71,7 +71,7 @@ const DELETE_REF_DOC: &str = "mutation($id: ID!) { \
 const ADD_REVIEW_DOC: &str =
     "mutation($id: ID!, $event: PullRequestReviewEvent!, $body: String) { \
      addPullRequestReview(input: { pullRequestId: $id, event: $event, body: $body }) \
-     { pullRequestReview { state } } }";
+     { pullRequestReview { state commit { oid } pullRequest { id } author { login } } } }";
 
 /// Comment on a pull request.
 ///
@@ -210,6 +210,7 @@ impl PrAction {
     fn result_selection(self) -> &'static str {
         match self {
             PrAction::Enqueue => "mergeQueueEntry { state }",
+            PrAction::Merge | PrAction::Close => "pullRequest { id headRefOid state }",
             _ => "clientMutationId",
         }
     }
@@ -328,6 +329,70 @@ fn verify_resolved(thread: &serde_json::Value, want: bool) -> Result<(), ClientE
     }
 }
 
+/// A legacy successful return is not automatically proof for an inventory effect.
+fn confirmed_review_receipt(
+    v: &serde_json::Value,
+    id: &str,
+    verdict: ReviewVerdict,
+) -> Option<(String, crate::inventory::ConfirmedReview)> {
+    let receipt = &v["addPullRequestReview"]["pullRequestReview"];
+    let state = receipt["state"].as_str();
+    let review = match (verdict, state) {
+        (ReviewVerdict::Approve, Some("APPROVED")) => Some(super::model::ReviewState::Approved),
+        (ReviewVerdict::RequestChanges, Some("CHANGES_REQUESTED")) => {
+            Some(super::model::ReviewState::ChangesRequested)
+        }
+        _ => None,
+    };
+    review.and_then(|review| {
+        let head_oid = receipt["commit"]["oid"]
+            .as_str()
+            .filter(|s| !s.is_empty())?;
+        let viewer = receipt["author"]["login"]
+            .as_str()
+            .filter(|s| !s.is_empty())?;
+        (receipt["pullRequest"]["id"].as_str() == Some(id)).then(|| {
+            (
+                viewer.to_owned(),
+                crate::inventory::ConfirmedReview {
+                    head_oid: head_oid.into(),
+                    review,
+                    confirmed_at: chrono::Utc::now(),
+                },
+            )
+        })
+    })
+}
+
+/// Internal proof for removing an owned cached row; not a transport-success flag.
+#[derive(Debug)]
+pub struct ConfirmedRemoval {
+    pub viewer: String,
+    pub id: String,
+    pub head_oid: String,
+}
+fn confirmed_removal(
+    data: &serde_json::Value,
+    id: &str,
+    action: PrAction,
+    viewer: Option<&str>,
+) -> Option<ConfirmedRemoval> {
+    let expected = match action {
+        PrAction::Merge => "MERGED",
+        PrAction::Close => "CLOSED",
+        _ => return None,
+    };
+    let row = &data[action.field()]["pullRequest"];
+    if row["id"].as_str() != Some(id) || row["state"].as_str() != Some(expected) {
+        return None;
+    }
+    Some(ConfirmedRemoval {
+        viewer: viewer.filter(|v| !v.is_empty())?.into(),
+        id: id.into(),
+        head_oid: row["headRefOid"].as_str().filter(|h| !h.is_empty())?.into(),
+    })
+}
+
 impl GitHubClient {
     /// Re-run the failed jobs of an Actions workflow run.
     ///
@@ -402,7 +467,11 @@ impl GitHubClient {
     /// ("base branch was modified", "required status check failed") is
     /// already display-ready prose, and rewording it would lose the
     /// specifics the user needs.
-    pub async fn mutate_pr(&self, id: &str, action: PrAction) -> Result<(), ClientError> {
+    pub async fn mutate_pr(
+        &self,
+        id: &str,
+        action: PrAction,
+    ) -> Result<Option<ConfirmedRemoval>, ClientError> {
         let query = format!(
             "mutation($id: ID!) {{ {}(input: {{ pullRequestId: $id }}) {{ {} }} }}",
             action.field(),
@@ -419,10 +488,11 @@ impl GitHubClient {
             // Asking for a state that already holds is not a failure --
             // see `is_already_satisfied` for why only this one refusal
             // is forgiven.
-            Err(e) if action.is_already_satisfied(&e) => return Ok(()),
+            Err(e) if action.is_already_satisfied(&e) => return Ok(None),
             Err(e) => return Err(e),
         };
-        action.verify(&data[action.field()])
+        action.verify(&data[action.field()])?;
+        Ok(confirmed_removal(&data, id, action, self.known_viewer()))
     }
 
     /// Submit a review on a pull request.
@@ -436,7 +506,7 @@ impl GitHubClient {
         id: &str,
         verdict: ReviewVerdict,
         body: &str,
-    ) -> Result<(), ClientError> {
+    ) -> Result<Option<(String, crate::inventory::ConfirmedReview)>, ClientError> {
         let v = self
             .graphql_mutation_data(&json!({
                 "query": ADD_REVIEW_DOC,
@@ -462,7 +532,7 @@ impl GitHubClient {
                     .into(),
             ));
         }
-        Ok(())
+        Ok(confirmed_review_receipt(&v, id, verdict))
     }
 
     /// Comment on a pull request without reviewing it.
@@ -614,6 +684,39 @@ mod tests {
     /// `PullRequestReviewEvent` is exactly COMMENT / APPROVE /
     /// REQUEST_CHANGES / DISMISS.
     #[test]
+    fn removal_needs_terminal_state_matching_identity_head_and_known_account() {
+        let data = json!({"mergePullRequest": {"pullRequest": {"id": "PR-a", "headRefOid": "head-a", "state": "MERGED"}}});
+        let proof = confirmed_removal(&data, "PR-a", PrAction::Merge, Some("fixture")).unwrap();
+        assert_eq!(proof.id, "PR-a");
+        assert_eq!(proof.head_oid, "head-a");
+        assert!(confirmed_removal(&data, "PR-b", PrAction::Merge, Some("fixture")).is_none());
+        assert!(confirmed_removal(&data, "PR-a", PrAction::Merge, None).is_none());
+        for key in ["id", "headRefOid", "state"] {
+            let mut absent = data.clone();
+            absent["mergePullRequest"]["pullRequest"][key] = serde_json::Value::Null;
+            assert!(confirmed_removal(&absent, "PR-a", PrAction::Merge, Some("fixture")).is_none());
+        }
+        let open = json!({"closePullRequest": {"pullRequest": {"id": "PR-a", "headRefOid": "head-a", "state": "OPEN"}}});
+        assert!(confirmed_removal(&open, "PR-a", PrAction::Close, Some("fixture")).is_none());
+    }
+
+    #[test]
+    fn inventory_review_effect_requires_matching_semantic_receipt() {
+        let valid = json!({"addPullRequestReview": {"pullRequestReview": {"state": "APPROVED", "commit": {"oid": "head-a"}, "pullRequest": {"id": "PR-a"}, "author": {"login": "fixture"}}}});
+        let (viewer, effect) =
+            confirmed_review_receipt(&valid, "PR-a", ReviewVerdict::Approve).unwrap();
+        assert_eq!(viewer, "fixture");
+        assert_eq!(effect.head_oid, "head-a");
+        assert!(confirmed_review_receipt(&valid, "PR-b", ReviewVerdict::Approve).is_none());
+        assert!(confirmed_review_receipt(&valid, "PR-a", ReviewVerdict::RequestChanges).is_none());
+        for key in ["commit", "pullRequest", "author", "state"] {
+            let mut absent = valid.clone();
+            absent["addPullRequestReview"]["pullRequestReview"][key] = serde_json::Value::Null;
+            assert!(confirmed_review_receipt(&absent, "PR-a", ReviewVerdict::Approve).is_none());
+        }
+    }
+
+    #[test]
     fn every_verdict_names_a_real_event() {
         assert_eq!(ReviewVerdict::Approve.event(), "APPROVE");
         assert_eq!(ReviewVerdict::RequestChanges.event(), "REQUEST_CHANGES");
@@ -690,11 +793,14 @@ mod tests {
             PrAction::Enqueue.result_selection(),
             "mergeQueueEntry { state }"
         );
-        // Every other action has no such field; the echo is all GitHub
-        // offers and the absence of an error really is the answer.
+        for action in [PrAction::Merge, PrAction::Close] {
+            assert_eq!(
+                action.result_selection(),
+                "pullRequest { id headRefOid state }"
+            );
+        }
+        // Other actions retain their existing legacy receipt contract.
         for a in [
-            PrAction::Merge,
-            PrAction::Close,
             PrAction::Reopen,
             PrAction::ConvertToDraft,
             PrAction::MarkReady,

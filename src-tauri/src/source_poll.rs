@@ -126,6 +126,15 @@ impl SourcePolls {
                 .insert((source.clone(), list), minimum);
         }
     }
+    /// Caller holds the publication gate; the effect retires pre-write work.
+    fn effect_generation(&self, source: &Source, list: CachedList) -> u64 {
+        let (generation, _) = self.begin_request(source, list, None);
+        self.5
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((source.clone(), list), generation);
+        generation
+    }
     fn gate(&self, source: &Source, list: CachedList) -> Arc<tokio::sync::Mutex<()>> {
         self.1
             .lock()
@@ -498,6 +507,358 @@ pub fn winner_gitlab(
     app.state::<SourcePolls>().winner_gitlab(attempt, fallback)
 }
 
+/// Called with the source publication permit held, before persistence and emission.
+/// The last committed receipt wins over disk; disk is only the restart baseline.
+pub async fn reconcile_github(
+    app: &AppHandle,
+    publication: &Publication,
+    mut result: FetchedList,
+) -> FetchedList {
+    let list = publication.attempt.list;
+    let source = publication.attempt.source.clone();
+    let previous = app
+        .state::<SourcePolls>()
+        .2
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(source.clone(), list))
+        .filter(|(_, receipt)| result.viewer.is_some() && receipt.viewer == result.viewer)
+        .map(|(_, receipt)| receipt.prs.clone());
+    let previous = if let Some(rows) = previous {
+        rows
+    } else {
+        let path = crate::commands::db_path(app);
+        let owner = result.viewer.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let conn = crate::store::open_db(&path).ok()?;
+            if owner.is_none()
+                || crate::store::source_cache::snapshot_owner(&conn, &source, list).ok()? != owner
+            {
+                return None;
+            }
+            match crate::store::source_cache::load_source_snapshot(&conn, &source, list)
+                .ok()?
+                .data
+            {
+                crate::store::source_cache::SnapshotData::Available { prs, .. } => Some(prs),
+                _ => None,
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+    };
+    result.prs = crate::inventory::reconcile(
+        previous,
+        result.prs,
+        matches!(result.coverage, Coverage::Complete),
+        chrono::Utc::now(),
+    );
+    result
+}
+
+/// GitLab uses the same qualified inventory semantics as GitHub.
+pub async fn reconcile_gitlab(
+    app: &AppHandle,
+    publication: &Publication,
+    mut result: crate::gitlab::queues::FetchedList,
+) -> crate::gitlab::queues::FetchedList {
+    let source = &publication.attempt.source;
+    let list = publication.attempt.list;
+    let previous = app
+        .state::<SourcePolls>()
+        .4
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(source.clone(), list))
+        .filter(|(_, receipt)| result.viewer.is_some() && receipt.viewer == result.viewer)
+        .map(|(_, receipt)| receipt.mrs.clone());
+    let previous = if let Some(rows) = previous {
+        rows
+    } else {
+        let path = crate::commands::db_path(app);
+        let owner = result.viewer.clone();
+        let source = source.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let conn = crate::store::open_db(&path).ok()?;
+            if owner.is_none()
+                || crate::store::source_cache::snapshot_owner(&conn, &source, list).ok()? != owner
+            {
+                return None;
+            }
+            match crate::store::source_cache::load_source_snapshot(&conn, &source, list)
+                .ok()?
+                .data
+            {
+                crate::store::source_cache::SnapshotData::GitLabAvailable { mrs, .. } => Some(mrs),
+                _ => None,
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+    };
+    let previous = previous
+        .into_iter()
+        .filter(|row| result.viewer.is_some() && row.viewer == result.viewer)
+        .collect();
+    for row in &mut result.mrs {
+        row.observation = Some(crate::inventory::gitlab_observation(row));
+    }
+    result.mrs = crate::inventory::reconcile(
+        previous,
+        result.mrs,
+        matches!(result.coverage, Coverage::Complete),
+        chrono::Utc::now(),
+    );
+    result
+}
+
+/// Verified, head-bound review evidence for the existing inventory. Task7 can
+/// consume this seam without replaying writes or trusting a cached head.
+enum GithubEffect {
+    Review(crate::inventory::ConfirmedReview),
+    Remove(crate::github::mutate::ConfirmedRemoval),
+}
+pub async fn record_confirmed_review(
+    app: &AppHandle,
+    repo: &str,
+    number: u64,
+    viewer: &str,
+    effect: crate::inventory::ConfirmedReview,
+) {
+    record_github_effect(app, repo, number, viewer, GithubEffect::Review(effect)).await;
+}
+pub async fn record_confirmed_removal(
+    app: &AppHandle,
+    repo: &str,
+    number: u64,
+    effect: crate::github::mutate::ConfirmedRemoval,
+) {
+    let viewer = effect.viewer.clone();
+    record_github_effect(app, repo, number, &viewer, GithubEffect::Remove(effect)).await;
+}
+
+async fn record_github_effect(
+    app: &AppHandle,
+    repo: &str,
+    number: u64,
+    viewer: &str,
+    effect: GithubEffect,
+) {
+    let source = Source::default();
+    let polls = app.state::<SourcePolls>();
+    for list in [CachedList::Authored, CachedList::Reviewing] {
+        let _guard = polls.gate(&source, list).lock_owned().await;
+        let existing = polls
+            .2
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(source.clone(), list))
+            .filter(|(_, r)| r.viewer.as_deref() == Some(viewer))
+            .map(|(_, r)| r.clone());
+        let mut receipt = if let Some(receipt) = existing {
+            receipt
+        } else {
+            let path = crate::commands::db_path(app);
+            let source = source.clone();
+            let owner = viewer.to_string();
+            let rows = tauri::async_runtime::spawn_blocking(move || {
+                let conn = crate::store::open_db(&path).ok()?;
+                if crate::store::source_cache::snapshot_owner(&conn, &source, list)
+                    .ok()?
+                    .as_deref()
+                    != Some(&owner)
+                {
+                    return None;
+                }
+                match crate::store::source_cache::load_source_snapshot(&conn, &source, list)
+                    .ok()?
+                    .data
+                {
+                    crate::store::source_cache::SnapshotData::Available {
+                        prs, coverage, ..
+                    } => Some((prs, coverage)),
+                    _ => None,
+                }
+            })
+            .await
+            .ok()
+            .flatten();
+            let Some((prs, coverage)) = rows else {
+                continue;
+            };
+            FetchedList {
+                viewer: Some(viewer.into()),
+                prs,
+                total: None,
+                coverage,
+            }
+        };
+        let changed = match &effect {
+            GithubEffect::Review(effect) => {
+                let mut changed = false;
+                for row in &mut receipt.prs {
+                    if row.repo == repo && row.number == number {
+                        changed |= crate::inventory::apply_confirmed_review(row, effect);
+                    }
+                }
+                changed
+            }
+            GithubEffect::Remove(effect) => {
+                crate::inventory::apply_github_removal(&mut receipt.prs, repo, number, effect)
+            }
+        };
+        if !changed {
+            continue;
+        }
+        // The effect itself advances generation before any old request can publish.
+        let generation = polls.effect_generation(&source, list);
+        let path = crate::commands::db_path(app);
+        let saved = receipt.clone();
+        let saved_source = source.clone();
+        let persisted = tauri::async_runtime::spawn_blocking(move || {
+            let conn = crate::store::open_db(&path)?;
+            crate::store::source_cache::save_owned_source_snapshot(
+                &conn,
+                &saved_source,
+                list,
+                &saved.prs,
+                &saved.coverage,
+                saved.viewer.as_deref(),
+            )
+        })
+        .await;
+        if !matches!(persisted, Ok(Ok(()))) {
+            let _ = app.emit(
+                "store-error",
+                "The confirmed review could not be saved for offline use.",
+            );
+        }
+        polls
+            .2
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((source.clone(), list), (generation, receipt.clone()));
+        let mut entries = polls.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, status)) = entries.get_mut(&(source.clone(), list)) {
+            status.revision += 1;
+            status.receipt_revision = Some(status.revision);
+            status.coverage = Some(receipt.coverage);
+            status.phase = Phase::Unknown;
+            let update = polls.update(status.clone(), None);
+            let _ = app.emit("source-poll-status", update);
+        }
+    }
+}
+
+/// GitLab execute has already validated expected viewer/head and read back the
+/// write. Unverified receipts do not modify durable inventory.
+pub async fn record_gitlab_action(
+    app: &AppHandle,
+    request: &crate::gitlab::actions::ActionRequest,
+    action: &crate::gitlab::actions::Receipt,
+) {
+    if action.outcome != crate::gitlab::actions::Outcome::Verified {
+        return;
+    }
+    let Some(viewer) = request.expected_viewer.as_ref().filter(|v| !v.is_empty()) else {
+        return;
+    };
+    let source = &request.identity.source;
+    let polls = app.state::<SourcePolls>();
+    for list in [CachedList::Authored, CachedList::Reviewing] {
+        let _guard = polls.gate(source, list).lock_owned().await;
+        let existing = polls
+            .4
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(source.clone(), list))
+            .filter(|(_, r)| r.viewer.as_ref() == Some(viewer))
+            .map(|(_, r)| r.clone());
+        let mut receipt = if let Some(receipt) = existing {
+            receipt
+        } else {
+            let path = crate::commands::db_path(app);
+            let source = source.clone();
+            let owner = viewer.clone();
+            let cached = tauri::async_runtime::spawn_blocking(move || {
+                let conn = crate::store::open_db(&path).ok()?;
+                if crate::store::source_cache::snapshot_owner(&conn, &source, list)
+                    .ok()?
+                    .as_ref()
+                    != Some(&owner)
+                {
+                    return None;
+                }
+                match crate::store::source_cache::load_source_snapshot(&conn, &source, list)
+                    .ok()?
+                    .data
+                {
+                    crate::store::source_cache::SnapshotData::GitLabAvailable {
+                        mrs,
+                        coverage,
+                        ..
+                    } => Some((mrs, coverage)),
+                    _ => None,
+                }
+            })
+            .await
+            .ok()
+            .flatten();
+            let Some((mrs, coverage)) = cached else {
+                continue;
+            };
+            crate::gitlab::queues::FetchedList {
+                viewer: Some(viewer.clone()),
+                mrs,
+                total: None,
+                coverage,
+            }
+        };
+        if !crate::inventory::apply_gitlab_action(&mut receipt.mrs, request, action) {
+            continue;
+        }
+        let generation = polls.effect_generation(source, list);
+        let path = crate::commands::db_path(app);
+        let saved_source = source.clone();
+        let saved = receipt.clone();
+        let persisted = tauri::async_runtime::spawn_blocking(move || {
+            let conn = crate::store::open_db(&path)?;
+            crate::store::source_cache::save_owned_gitlab_snapshot(
+                &conn,
+                &saved_source,
+                list,
+                &saved.mrs,
+                &saved.coverage,
+                saved.viewer.as_deref(),
+            )
+        })
+        .await;
+        if !matches!(persisted, Ok(Ok(()))) {
+            let _ = app.emit(
+                "store-error",
+                "The confirmed action could not be saved for offline use.",
+            );
+        }
+        polls
+            .4
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((source.clone(), list), (generation, receipt.clone()));
+        let mut entries = polls.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, status)) = entries.get_mut(&(source.clone(), list)) {
+            status.revision += 1;
+            status.receipt_revision = Some(status.revision);
+            status.coverage = Some(receipt.coverage);
+            status.phase = Phase::Unknown;
+            let _ = app.emit("source-poll-status", polls.update(status.clone(), None));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,6 +888,7 @@ mod tests {
         }))
         .unwrap();
         FetchedList {
+            viewer: None,
             prs: vec![pr],
             total: Some(1),
             coverage: Coverage::Complete,
@@ -593,6 +955,32 @@ mod tests {
         );
         assert_eq!(snapshot.mrs, Some(vec![gitlab_mr(&source)]));
         assert!(snapshot.prs.is_none());
+    }
+
+    #[tokio::test]
+    async fn confirmed_effect_retires_old_success_without_blocking_the_next_attempt() {
+        for source in [
+            Source::default(),
+            Source {
+                provider: Provider::Gitlab,
+                host: "gitlab.com".into(),
+            },
+        ] {
+            let polls = SourcePolls::default();
+            let (old, _) = polls
+                .begin_attempt(source.clone(), CachedList::Reviewing)
+                .await;
+            {
+                let _guard = polls
+                    .gate(&source, CachedList::Reviewing)
+                    .lock_owned()
+                    .await;
+                polls.effect_generation(&source, CachedList::Reviewing);
+            }
+            assert!(polls.success_publication(&old).await.is_none());
+            let (new, _) = polls.begin_attempt(source, CachedList::Reviewing).await;
+            assert!(polls.success_publication(&new).await.is_some());
+        }
     }
 
     #[tokio::test]

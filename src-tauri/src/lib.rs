@@ -19,6 +19,7 @@ pub mod identity;
 /// here so `cargo test` compiles it.
 #[cfg(test)]
 mod invariants;
+pub mod inventory;
 mod markdown_export;
 mod notification_navigation;
 pub mod packages;

@@ -730,3 +730,9 @@ describe("Ready stack context (#1602)", () => {
     view.unmount();
   });
 });
+
+it("keeps an omitted last-known Ready row visibly qualified", async () => {
+  render(<ReadyStrip prs={[{ ...ready, observation: { state: "retained", last_observed_at: null, unknown_fields: [], retained_fields: [] } }]} />);
+  expect(screen.getByText("Ready one")).toBeTruthy();
+  expect(screen.getByText("Last known — not confirmed by latest refresh")).toBeTruthy();
+});

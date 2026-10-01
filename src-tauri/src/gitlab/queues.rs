@@ -31,6 +31,8 @@ pub fn invalidate() {
 /// deserialized as a GitHub PullRequest or sent through GitHub row events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<crate::inventory::RowObservation>,
     #[serde(default)]
     pub viewer: Option<String>,
     pub source: Source,
@@ -408,6 +410,7 @@ fn map_row(v: &Value, source: &Source) -> Option<MergeRequest> {
     let comment_count = v.get("user_notes_count")?.as_u64()?;
     let id = v.get("id")?.as_u64()?;
     Some(MergeRequest {
+        observation: None,
         viewer: None,
         source: source.clone(),
         id,

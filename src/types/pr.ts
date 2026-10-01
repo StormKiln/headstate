@@ -16,7 +16,17 @@ export interface Label {
   color: string;
 }
 
+export type ReadinessField = "draft" | "ci" | "merge" | "review" | "queue";
+export interface RowObservation {
+  state: "observed" | "retained";
+  last_observed_at: string | null;
+  unknown_fields: ReadinessField[];
+  retained_fields: ReadinessField[];
+  confirmed_review?: { head_oid: string; review: ReviewState; confirmed_at: string } | null;
+}
+
 export interface PullRequest extends PrIdentity {
+  observation?: RowObservation | null;
   /// GraphQL node ID, so a row can act without opening the detail view.
   id: string;
   title: string;

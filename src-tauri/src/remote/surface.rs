@@ -1361,6 +1361,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
 
         // ---- write ------------------------------------------------------
         "act_on_pr" => res(commands::act_on_pr(
+            app.clone(),
             app.state(),
             app.state(),
             a.get("id")?,
@@ -1369,14 +1370,16 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             a.get("action")?,
         )
         .await),
-        "act_on_prs" => {
-            res(
-                commands::act_on_prs(app.state(), app.state(), a.get("prs")?, a.get("action")?)
-                    .await,
-            )
-        }
-        "review_pr" => res(commands::review_pr(
+        "act_on_prs" => res(commands::act_on_prs(
+            app.clone(),
             app.state(),
+            app.state(),
+            a.get("prs")?,
+            a.get("action")?,
+        )
+        .await),
+        "review_pr" => res(commands::review_pr(
+            app.clone(),
             app.state(),
             a.get("id")?,
             a.get("repo")?,

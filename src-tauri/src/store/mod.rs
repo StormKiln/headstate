@@ -61,6 +61,7 @@ mod tests {
 
     fn sample() -> PullRequest {
         PullRequest {
+            observation: None,
             source: Default::default(),
             id: "PR_test".into(),
             number: 42,

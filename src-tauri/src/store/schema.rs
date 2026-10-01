@@ -1282,6 +1282,8 @@ const MIGRATIONS: &[&str] = &[
     );",
     // 36: same-Notification permission context; old rows remain unknown.
     "ALTER TABLE claude_hook_event ADD COLUMN permission_summary TEXT;",
+    // Queue ownership must survive even a measured empty inventory.
+    "ALTER TABLE snapshot ADD COLUMN owner TEXT;",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {

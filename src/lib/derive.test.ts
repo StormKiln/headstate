@@ -4,7 +4,7 @@ import { PR_FIXTURES, prWithState } from "../fixtures/prs";
 import {
   applyFilters, awaitingReview, changesRequested, deriveStacked, deriveStats,
   isStale, needsAttention, pendingReview, pendingReviewers, readyToQueue, sortPrs, STALE_DAYS,
-  sortReadyForReview,
+  sortReadyForReview, readyForReview,
 } from "./derive";
 
 const [approved, broken, checking] = PR_FIXTURES;
@@ -765,4 +765,17 @@ describe("deriveStacked", () => {
     });
     expect(deriveStacked([a, b]).size).toBe(0);
   });
+});
+
+// Unknown cannot create a new Ready verdict; last-known evidence remains usable with qualification.
+it("keeps retained known Ready rows but excludes unknown readiness", () => {
+  const row = { ...approved, review: "review_required" as const, ci: "success" as const, in_merge_queue: false };
+  expect(readyForReview({ ...row, observation: { state: "retained", last_observed_at: null, unknown_fields: [], retained_fields: [] } })).toBe(true);
+  expect(readyForReview({ ...row, observation: { state: "observed", last_observed_at: null, unknown_fields: ["ci"], retained_fields: [] } })).toBe(false);
+});
+
+it("own confirmed review suppresses Ready without changing aggregate requirements", () => {
+  const row = { ...approved, review: "review_required" as const, ci: "success" as const, in_merge_queue: false, observation: { state: "observed" as const, last_observed_at: null, unknown_fields: [], retained_fields: [], confirmed_review: { head_oid: "fixture-head", review: "approved" as const, confirmed_at: "2026-10-01T00:00:00Z" } } };
+  expect(readyForReview(row)).toBe(false);
+  expect(row.review).toBe("review_required");
 });

@@ -383,6 +383,7 @@ fn refused_fields(v: &serde_json::Value) -> usize {
 /// List evidence retained before legacy numeric wrappers apply defaults.
 #[derive(Clone)]
 pub struct FetchedList {
+    pub viewer: Option<String>,
     pub prs: Vec<PullRequest>,
     pub total: Option<u64>,
     pub coverage: crate::store::source_cache::Coverage,
@@ -390,15 +391,25 @@ pub struct FetchedList {
 
 fn list_evidence(v: &serde_json::Value, prs: Vec<PullRequest>) -> FetchedList {
     use crate::store::source_cache::Coverage;
-    let total = v["headstate_paging"]["truest_total"]
-        .as_u64()
-        .or_else(|| v["authored"]["issueCount"].as_u64());
-    let refused = refused_fields(v) > 0;
+    let total = (!v["headstate_paging"]["count_conflict"]
+        .as_bool()
+        .unwrap_or(false))
+    .then(|| {
+        v["headstate_paging"]["truest_total"]
+            .as_u64()
+            .or_else(|| v["authored"]["issueCount"].as_u64())
+    })
+    .flatten();
+    let refused = refused_fields(v) > 0 || v["__partial_errors"].as_u64().unwrap_or(0) > 0;
     let failed = v["headstate_paging"]["failed_pages"].as_u64().unwrap_or(0) > 0;
     let malformed = v["authored"]["nodes"]
         .as_array()
         .is_none_or(|nodes| nodes.len() != prs.len());
-    let coverage = if refused || failed || malformed || total.is_some_and(|n| n > prs.len() as u64)
+    let coverage = if refused
+        || failed
+        || malformed
+        || v["headstate_paging"]["count_conflict"] == true
+        || total.is_some_and(|n| n != prs.len() as u64)
     {
         Coverage::Partial { total }
     } else if total.is_none() || v["headstate_paging"]["count_unknown"] == true {
@@ -407,6 +418,10 @@ fn list_evidence(v: &serde_json::Value, prs: Vec<PullRequest>) -> FetchedList {
         Coverage::Complete
     };
     FetchedList {
+        viewer: v["viewer"]["login"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
         prs,
         total,
         coverage,
@@ -564,12 +579,19 @@ impl GitHubClient {
         // every approval removes one.
         let mut truest_total = total;
         let mut count_unknown = false;
+        let mut count_conflict = false;
+        let mut partial_errors = merged["__partial_errors"].as_u64().unwrap_or(0);
         let mut all_refused = refused_fields(&merged);
         for page in rest {
             match page {
                 Ok(v) => {
                     all_refused += refused_fields(&v);
+                    if v["__readiness_unknown"] == true {
+                        merged["__readiness_unknown"] = true.into();
+                    }
+                    partial_errors += v["__partial_errors"].as_u64().unwrap_or(0);
                     if let Some(t) = v["authored"]["issueCount"].as_u64() {
+                        count_conflict |= t != u64::from(total);
                         truest_total = truest_total.min(t as u32);
                     } else {
                         count_unknown = true;
@@ -611,8 +633,10 @@ impl GitHubClient {
         // than the number of boundaries is ordinary drift and not worth
         // a warning; anything beyond that is worth seeing.
         merged["__refused"] = json!(all_refused);
+        merged["__partial_errors"] = json!(partial_errors);
         merged["headstate_paging"] = json!({
             "count_unknown": count_unknown,
+            "count_conflict": count_conflict,
             "boundaries": pages.saturating_sub(1),
             "failed_pages": failed_pages,
             "truest_total": truest_total,
@@ -743,6 +767,10 @@ impl GitHubClient {
         })
     }
 
+    pub(crate) fn known_viewer(&self) -> Option<&str> {
+        self.viewer.get().map(String::as_str)
+    }
+
     pub async fn fetch_reviewing_snapshot(&self) -> Result<FetchedList, ClientError> {
         self.fetch_reviewing_snapshot_with_budget(SEARCH_BUDGET)
             .await
@@ -767,6 +795,9 @@ impl GitHubClient {
         // DIAGNOSTIC LOGGING (Settings > diagnostic log).
         let started = std::time::Instant::now();
         let v = self.search_with_budget(REVIEW_REQUESTED, budget).await?;
+        if let Some(viewer) = map_viewer(&v) {
+            let _ = self.viewer.set(viewer);
+        }
         // Counted from THIS response, not from shared state. A global
         // counter raced the next poll -- and, in the test suite, other
         // tests running in parallel.
@@ -1494,6 +1525,9 @@ impl GitHubClient {
     ) -> Result<FetchedList, ClientError> {
         let started = std::time::Instant::now();
         let v = self.search_with_budget(AUTHORED_OPEN, budget).await?;
+        if let Some(viewer) = map_viewer(&v) {
+            let _ = self.viewer.set(viewer);
+        }
         // How long GitHub took, and what it was asked for. A slow
         // response is the leading indicator of the timeout that follows,
         // and neither was recorded anywhere. Counts and timings only --
@@ -1853,6 +1887,7 @@ async fn graphql_with_transport(
                 // Also on the response, so a caller can read the count
                 // for the request it actually made.
                 let mut d = d.clone();
+                crate::inventory::mark_readiness_errors(&mut d, errs);
                 if let Some(obj) = d.as_object_mut() {
                     obj.insert("__refused".into(), errs.len().into());
                 }
@@ -1864,6 +1899,7 @@ async fn graphql_with_transport(
             // fields look well formed (#1626). Separate from the existing
             // permission-refusal count so other callers keep their messaging.
             let mut data = d.clone();
+            crate::inventory::mark_readiness_errors(&mut data, errs);
             if let Some(obj) = data.as_object_mut() {
                 obj.insert("__partial_errors".into(), errs.len().into());
             }
@@ -1917,6 +1953,27 @@ mod tests {
     /// Offset cursors index a live list, so an item entering mid-fetch
     /// shifts the boundary and hands the same node to two pages. The
     /// merge used to keep both.
+    #[test]
+    fn conflicting_page_counts_do_not_authorize_removal() {
+        let response = json!({"authored": {"nodes": [], "issueCount": 0},
+            "headstate_paging": {"count_conflict": true, "truest_total": 0}});
+        let result = list_evidence(&response, vec![]);
+        assert_eq!(result.total, None);
+        assert_eq!(
+            result.coverage,
+            crate::store::source_cache::Coverage::Partial { total: None }
+        );
+    }
+
+    #[test]
+    fn resolver_errors_never_prove_complete_inventory() {
+        let response = json!({"authored": {"nodes": [], "issueCount": 0}, "__partial_errors": 1});
+        assert_eq!(
+            list_evidence(&response, vec![]).coverage,
+            crate::store::source_cache::Coverage::Partial { total: Some(0) }
+        );
+    }
+
     #[test]
     fn source_coverage_distinguishes_missing_totals_from_measured_zero() {
         use crate::store::source_cache::Coverage;
@@ -2560,6 +2617,49 @@ mod tests {
             .unwrap();
         assert_eq!(total, 30, "the true total comes from issueCount");
         assert_eq!(prs.len(), 2, "both pages are merged: {prs:?}");
+    }
+
+    #[tokio::test]
+    async fn later_page_resolver_evidence_survives_aggregation() {
+        let server = MockServer::start().await;
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/search.json")).unwrap();
+        let first = fixture["authored"]["nodes"][0].clone();
+        let mut second = first.clone();
+        second["number"] = 999.into();
+        second["id"] = "PR-second".into();
+        second["commits"] = serde_json::Value::Null;
+        Mock::given(method("POST")).and(path("/graphql")).and(body_string_contains("\"after\":null"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {"viewer": {"login": "fixture"}, "authored": {"issueCount": 26, "nodes": [first]}}})))
+            .mount(&server).await;
+        Mock::given(method("POST")).and(path("/graphql")).and(body_string_contains("Y3Vyc29yOjI1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {"authored": {"issueCount": 27, "nodes": [second]}}, "errors": [{"type": "INTERNAL", "path": ["authored", "nodes", 0, "commits"]}]})))
+            .mount(&server).await;
+        let raw = client_for(&server)
+            .await
+            .collect_search_pages(
+                REVIEW_REQUESTED,
+                tokio::time::Instant::now() + SEARCH_BUDGET,
+                SEARCH_BUDGET,
+            )
+            .await
+            .unwrap();
+        assert_eq!(raw["__partial_errors"], 1);
+        assert_eq!(raw["headstate_paging"]["count_conflict"], true);
+        let rows = map_list(&raw, "authored");
+        assert!(rows[1]
+            .observation
+            .as_ref()
+            .unwrap()
+            .unknown_fields
+            .contains(&crate::inventory::ReadinessField::Ci));
+        let evidence = list_evidence(&raw, rows);
+        assert_eq!(evidence.total, None);
+        assert_eq!(evidence.viewer.as_deref(), Some("fixture"));
+        assert_eq!(
+            evidence.coverage,
+            crate::store::source_cache::Coverage::Partial { total: None }
+        );
     }
 
     /// A page that FAILS is a short list, not a failed fetch.

@@ -75,6 +75,8 @@ pub struct Label {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<crate::inventory::RowObservation>,
     /// Absent only in snapshots written before provider identity was added.
     #[serde(default)]
     pub source: Source,
@@ -692,6 +694,7 @@ mod attention_tests {
             .unwrap()
             .with_timezone(&Utc);
         PullRequest {
+            observation: None,
             source: Default::default(),
             id: "PR_test".into(),
             number: 1,

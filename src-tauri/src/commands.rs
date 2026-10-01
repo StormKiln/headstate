@@ -425,8 +425,10 @@ async fn refresh_source_request(
                     coverage: winner.coverage,
                 });
             };
+            let result = source_poll::reconcile_github(&app, &publication, result).await;
             let receipt = result.clone();
             let crate::github::client::FetchedList {
+                viewer,
                 prs,
                 total,
                 coverage,
@@ -437,12 +439,13 @@ async fn refresh_source_request(
             let owned_coverage = coverage.clone();
             let saved = tauri::async_runtime::spawn_blocking(move || {
                 let conn = open_db(&path).map_err(|e| e.to_string())?;
-                crate::store::source_cache::save_source_snapshot(
+                crate::store::source_cache::save_owned_source_snapshot(
                     &conn,
                     &owned_source,
                     list,
                     &owned,
                     &owned_coverage,
+                    viewer.as_deref(),
                 )
                 .map_err(|e| e.to_string())
             })
@@ -456,7 +459,13 @@ async fn refresh_source_request(
             if list == CachedList::Reviewing {
                 crate::poll::emit_reviewing(&app, &receipt);
             } else {
-                let truncated = total.map(|total| if total > prs.len() as u64 { total } else { 0 });
+                let truncated = total.map(|total| {
+                    if total > crate::inventory::observed_count(&prs) {
+                        total
+                    } else {
+                        0
+                    }
+                });
                 let _ = app.emit("prs-truncated", truncated);
             }
             source_poll::complete(&app, publication, Ok(receipt));
@@ -512,19 +521,22 @@ async fn refresh_gitlab_request(
                     coverage: winner.coverage,
                 });
             };
+            let result = source_poll::reconcile_gitlab(&app, &publication, result).await;
             let receipt = result.clone();
             let path = db_path(&app);
             let owned_source = source.clone();
             let owned = result.mrs.clone();
             let owned_coverage = result.coverage.clone();
+            let owner = result.viewer.clone();
             let saved = tauri::async_runtime::spawn_blocking(move || {
                 let conn = open_db(&path).map_err(|e| e.to_string())?;
-                crate::store::source_cache::save_gitlab_snapshot(
+                crate::store::source_cache::save_owned_gitlab_snapshot(
                     &conn,
                     &owned_source,
                     list,
                     &owned,
                     &owned_coverage,
+                    owner.as_deref(),
                 )
                 .map_err(|e| e.to_string())
             })
@@ -604,6 +616,7 @@ pub async fn get_cycle_trend(client: State<'_, GhClient>) -> Result<CycleTrend, 
 /// so "did I merge that?" has an answer.
 #[tauri::command]
 pub async fn act_on_pr(
+    app: AppHandle,
     client: State<'_, GhClient>,
     waker: State<'_, crate::poll::Waker>,
     id: String,
@@ -615,7 +628,10 @@ pub async fn act_on_pr(
     let act = parse_action(&action)?;
 
     match client.mutate_pr(&id, act).await {
-        Ok(()) => {
+        Ok(effect) => {
+            if let Some(effect) = effect {
+                crate::source_poll::record_confirmed_removal(&app, &repo, number, effect).await;
+            }
             log::info!("{repo}#{number} {}", act.describe());
             // Refresh promptly rather than waiting out the poll interval:
             // the list would otherwise keep showing a PR as open for up
@@ -742,8 +758,8 @@ pub async fn get_viewer(client: State<'_, GhClient>) -> Result<String, String> {
 /// worse error than refusing it before one.
 #[tauri::command]
 pub async fn review_pr(
+    app: AppHandle,
     client: State<'_, GhClient>,
-    waker: State<'_, crate::poll::Waker>,
     id: String,
     repo: String,
     number: u64,
@@ -763,11 +779,15 @@ pub async fn review_pr(
     }
 
     match client.add_review(&id, v, &body).await {
-        Ok(()) => {
+        Ok(effect) => {
+            if let Some((viewer, effect)) = effect {
+                crate::source_poll::record_confirmed_review(&app, &repo, number, &viewer, effect)
+                    .await;
+            }
             // Never log the body: review text is the user's words about
             // someone else's work, and logs are not the place for it.
             log::info!("{repo}#{number} {}", v.describe());
-            waker.0.notify_one();
+            app.state::<crate::poll::Waker>().0.notify_one();
             Ok(())
         }
         Err(e) => {
@@ -942,6 +962,7 @@ const BATCH_CONCURRENCY: usize = 4;
 /// would fire every mutation at once and wake the poll loop once per
 /// success. This bounds concurrency and wakes once at the end.
 pub async fn act_on_prs(
+    app: AppHandle,
     client: State<'_, GhClient>,
     waker: State<'_, crate::poll::Waker>,
     prs: Vec<(String, String, u64)>,
@@ -955,9 +976,16 @@ pub async fn act_on_prs(
         let mut set = tokio::task::JoinSet::new();
         for (id, repo, number) in chunk {
             let (client, id, repo, number) = (client.clone(), id.clone(), repo.clone(), *number);
+            let app = app.clone();
             set.spawn(async move {
                 let error = match client.mutate_pr(&id, act).await {
-                    Ok(()) => {
+                    Ok(effect) => {
+                        if let Some(effect) = effect {
+                            crate::source_poll::record_confirmed_removal(
+                                &app, &repo, number, effect,
+                            )
+                            .await;
+                        }
                         log::info!("{repo}#{number} {}", act.describe());
                         None
                     }
@@ -10844,6 +10872,9 @@ pub async fn gitlab_action(
     crate::gitlab::poll::after_mutation(
         async {
             let result = crate::gitlab::actions::execute(&request).await;
+            if let Ok(receipt) = &result {
+                crate::source_poll::record_gitlab_action(&app, &request, receipt).await;
+            }
             crate::source_poll::invalidate_gitlab(&app, &request.identity.source).await;
             crate::gitlab::queues::invalidate_identity(&request.identity);
             crate::gitlab::stats::invalidate(request.identity.source.host.clone(), db_path(&app))

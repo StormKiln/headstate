@@ -107,3 +107,10 @@ it("preserves legacy waiting payloads and validates optional permission context"
     }
   }
 });
+
+it("accepts legacy and qualified inventory events but rejects invented readiness evidence", () => {
+  expect(remoteEventError("reviewing-updated", PR_FIXTURES)).toBeNull();
+  const row = { ...PR_FIXTURES[0], observation: { state: "retained", last_observed_at: null, unknown_fields: [], retained_fields: ["ci"], confirmed_review: { head_oid: "fixture-head", review: "approved", confirmed_at: "2026-10-01T00:00:00Z" } } };
+  expect(remoteEventError("reviewing-updated", [row])).toBeNull();
+  expect(remoteEventError("reviewing-updated", [{ ...row, observation: { ...row.observation, unknown_fields: ["invented"] } }])).not.toBeNull();
+});

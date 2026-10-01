@@ -243,12 +243,13 @@ async fn persist(app: &AppHandle, source: &Source, list: CachedList, result: &Fe
             let receipt = result.clone();
             tauri::async_runtime::spawn_blocking(move || {
                 let conn = open_db(&dir.join("headstate.db"))?;
-                crate::store::source_cache::save_gitlab_snapshot(
+                crate::store::source_cache::save_owned_gitlab_snapshot(
                     &conn,
                     &source,
                     list,
                     &receipt.mrs,
                     &receipt.coverage,
+                    receipt.viewer.as_deref(),
                 )
             })
             .await
@@ -274,6 +275,8 @@ async fn fetch_and_persist(
     // timeout/select would throw away pages that already arrived.
     match queues::fetch(source, list, |receipt| async {
         if let Some(publication) = source_poll::success_publication(app, &attempt).await {
+            let receipt = source_poll::reconcile_gitlab(app, &publication, receipt).await;
+            persist(app, source, list, &receipt).await;
             source_poll::complete_gitlab(app, publication, Ok(receipt));
         }
     })
@@ -281,6 +284,7 @@ async fn fetch_and_persist(
     {
         Ok(receipt) => {
             let publication = source_poll::success_publication(app, &attempt).await?;
+            let receipt = source_poll::reconcile_gitlab(app, &publication, receipt).await;
             persist(app, source, list, &receipt).await;
             Some((publication, receipt))
         }
