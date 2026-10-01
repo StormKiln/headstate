@@ -23,9 +23,16 @@ const invoke = vi.hoisted(() =>
   vi.fn<(cmd: string, args?: Record<string, unknown>) => Promise<unknown>>(),
 );
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
-vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(() => Promise.resolve(() => {})) }));
+const eventHandlers = vi.hoisted(() => new Map<string, (event: { payload: unknown }) => void>());
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn((name: string, handler: (event: { payload: unknown }) => void) => {
+  eventHandlers.set(name, handler);
+  return Promise.resolve(() => eventHandlers.delete(name));
+}) }));
 
 import { ReadyStrip } from "./ReadyStrip";
+import { useSourceRefresh } from "@/api/sourceRefreshHooks";
+import { remoteEventError } from "@/api/wireContract";
+import headTransitions from "../../src-tauri/tests/fixtures/inventory-head-transitions.json";
 import { PR_FIXTURES } from "../fixtures/prs";
 import { useFilters } from "@/store/filters";
 import type { PullRequest, RowPusher } from "@/types/pr";
@@ -36,6 +43,7 @@ let stackAnswers: { repo: string; number: number; stack: unknown }[] = [];
 let viewerLogin: Promise<unknown> = Promise.resolve("me");
 
 beforeEach(() => {
+  eventHandlers.clear();
   pusherAnswers = [];
   stackAnswers = [];
   viewerLogin = Promise.resolve("me");
@@ -76,6 +84,33 @@ const ready: PullRequest = {
 };
 
 describe("ReadyStrip", () => {
+  it("keeps unread-head transport receipts out of Ready until a positively changed head", async () => {
+    function FromSource() {
+      const state = useSourceRefresh("reviewing");
+      return <ReadyStrip prs={state.prs ?? []} onOpen={vi.fn()} />;
+    }
+    render(<FromSource />);
+    await waitFor(() => expect(eventHandlers.has("source-poll-status")).toBe(true));
+    let revision = 0;
+    for (const [stage, fields] of Object.entries(headTransitions.expected)) {
+      // Rust's mapper→reconcile regression pins every readiness input here.
+      const row = { ...ready, ...fields };
+      const payload = {
+        source: { provider: "github", host: "github.com" }, list: "reviewing",
+        phase: "partial", revision: ++revision, receipt_revision: revision,
+        session: "synthetic-desktop", request_id: null, completed_request: null,
+        consecutive_failures: 0, last_received_at: headTransitions.time,
+        coverage: { partial: { total: 1 } }, error: null, prs: [row], mrs: null,
+      };
+      expect(remoteEventError("source-poll-status", payload)).toBeNull();
+      act(() => eventHandlers.get("source-poll-status")!({ payload }));
+      if (stage === "changed_head" || stage === "retained_unread_without_effect") {
+        await waitFor(() => expect(screen.getByText("Ready one")).toBeTruthy());
+        if (stage === "retained_unread_without_effect") expect(screen.getByText(/Last known — not confirmed/)).toBeTruthy();
+      } else expect(screen.queryByText("Ready one")).toBeNull();
+    }
+  });
+
   it("lists what a reviewer can pick up", () => {
     render(<ReadyStrip prs={[ready]} onOpen={vi.fn()} />);
     expect(screen.getByText("Ready one")).toBeTruthy();

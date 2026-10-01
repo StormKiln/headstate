@@ -425,7 +425,14 @@ async fn refresh_source_request(
                     coverage: winner.coverage,
                 });
             };
-            let result = source_poll::reconcile_github(&app, &publication, result).await;
+            let result = match source_poll::reconcile_github(&app, &publication, result).await {
+                Ok(result) => result,
+                Err(failure) => {
+                    let message = failure.message.clone();
+                    source_poll::complete(&app, publication, Err(failure));
+                    return Err(message);
+                }
+            };
             let receipt = result.clone();
             let crate::github::client::FetchedList {
                 viewer,

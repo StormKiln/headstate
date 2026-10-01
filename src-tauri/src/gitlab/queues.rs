@@ -482,6 +482,69 @@ mod tests {
     }
 
     #[test]
+    fn unread_mr_head_preserves_confirmed_review_until_a_real_change() {
+        use crate::inventory::{
+            gitlab_observation, reconcile, ConfirmedReview, ObservationState, ReadinessField,
+        };
+        let source = Source {
+            provider: crate::identity::Provider::Gitlab,
+            host: "gitlab.com".into(),
+        };
+        let mut raw = row("gitlab.com", "group/project", 7);
+        raw["sha"] = json!("head-a");
+        let mut old = map_row(&raw, &source).unwrap();
+        old.observation = Some(gitlab_observation(&old));
+        old.needs_my_review = Some(false);
+        old.observation.as_mut().unwrap().confirmed_review = Some(ConfirmedReview {
+            head_oid: "head-a".into(),
+            review: crate::github::model::ReviewState::Approved,
+            confirmed_at: chrono::Utc::now(),
+        });
+        for head in [None, Some(Value::Null), Some(json!(""))] {
+            let mut unread = raw.clone();
+            if let Some(head) = head {
+                unread["sha"] = head;
+            } else {
+                unread.as_object_mut().unwrap().remove("sha");
+            }
+            let mapped = map_row(&unread, &source).unwrap();
+            let fresh = reconcile(vec![], vec![mapped.clone()], false, chrono::Utc::now());
+            assert!(fresh[0]
+                .observation
+                .as_ref()
+                .unwrap()
+                .unknown_fields
+                .contains(&ReadinessField::Head));
+            let retained = reconcile(vec![old.clone()], vec![mapped], false, chrono::Utc::now());
+            assert_eq!(retained[0].head_oid.as_deref(), Some("head-a"));
+            assert_eq!(
+                retained[0].observation.as_ref().unwrap().state,
+                ObservationState::Retained
+            );
+            assert_eq!(retained[0].needs_my_review, Some(false));
+            let mut lagging = map_row(&raw, &source).unwrap();
+            lagging.needs_my_review = Some(true);
+            let same = reconcile(retained, vec![lagging.clone()], true, chrono::Utc::now());
+            assert!(same[0]
+                .observation
+                .as_ref()
+                .unwrap()
+                .confirmed_review
+                .is_some());
+            assert_eq!(same[0].needs_my_review, Some(false));
+            lagging.head_oid = Some("head-b".into());
+            let changed = reconcile(same, vec![lagging], true, chrono::Utc::now());
+            assert!(changed[0]
+                .observation
+                .as_ref()
+                .unwrap()
+                .confirmed_review
+                .is_none());
+            assert_eq!(changed[0].needs_my_review, Some(true));
+        }
+    }
+
+    #[test]
     fn nested_paths_and_hosts_remain_distinct() {
         let first = map_row(
             &row("gitlab.com", "group/subgroup/project", 7),

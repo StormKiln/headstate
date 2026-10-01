@@ -1,0 +1,87 @@
+{
+  "time": "2026-10-01T00:00:00Z",
+  "expected": {
+    "new_unread": {
+      "is_draft": false,
+      "ci": "success",
+      "merge": "mergeable",
+      "review": "review_required",
+      "in_merge_queue": false,
+      "head_oid": "",
+      "observation": {
+        "state": "observed",
+        "last_observed_at": "2026-10-01T00:00:00Z",
+        "unknown_fields": [
+          "head"
+        ],
+        "retained_fields": []
+      }
+    },
+    "retained_unread": {
+      "is_draft": false,
+      "ci": "success",
+      "merge": "mergeable",
+      "review": "review_required",
+      "in_merge_queue": false,
+      "head_oid": "head-a",
+      "observation": {
+        "state": "retained",
+        "last_observed_at": null,
+        "unknown_fields": [],
+        "retained_fields": [],
+        "confirmed_review": {
+          "head_oid": "head-a",
+          "review": "approved",
+          "confirmed_at": "2026-10-01T00:00:00Z"
+        }
+      }
+    },
+    "same_head": {
+      "is_draft": false,
+      "ci": "success",
+      "merge": "mergeable",
+      "review": "review_required",
+      "in_merge_queue": false,
+      "head_oid": "head-a",
+      "observation": {
+        "state": "observed",
+        "last_observed_at": "2026-10-01T00:00:00Z",
+        "unknown_fields": [],
+        "retained_fields": [],
+        "confirmed_review": {
+          "head_oid": "head-a",
+          "review": "approved",
+          "confirmed_at": "2026-10-01T00:00:00Z"
+        }
+      }
+    },
+    "changed_head": {
+      "is_draft": false,
+      "ci": "success",
+      "merge": "mergeable",
+      "review": "review_required",
+      "in_merge_queue": false,
+      "head_oid": "head-b",
+      "observation": {
+        "state": "observed",
+        "last_observed_at": "2026-10-01T00:00:00Z",
+        "unknown_fields": [],
+        "retained_fields": []
+      }
+    },
+    "retained_unread_without_effect": {
+      "is_draft": false,
+      "ci": "success",
+      "merge": "mergeable",
+      "review": "review_required",
+      "in_merge_queue": false,
+      "head_oid": "head-a",
+      "observation": {
+        "state": "retained",
+        "last_observed_at": null,
+        "unknown_fields": [],
+        "retained_fields": []
+      }
+    }
+  }
+}

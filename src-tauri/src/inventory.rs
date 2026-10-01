@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReadinessField {
+    Head,
     Draft,
     Ci,
     Merge,
@@ -59,6 +60,7 @@ impl InventoryRow for crate::github::model::PullRequest {
     }
     fn copy_field(&mut self, old: &Self, field: ReadinessField) {
         match field {
+            ReadinessField::Head => {}
             ReadinessField::Draft => self.is_draft = old.is_draft,
             ReadinessField::Ci => self.ci = old.ci,
             ReadinessField::Merge => self.merge = old.merge,
@@ -96,6 +98,7 @@ impl InventoryRow for crate::gitlab::queues::MergeRequest {
     }
     fn copy_field(&mut self, old: &Self, field: ReadinessField) {
         match field {
+            ReadinessField::Head => {}
             ReadinessField::Draft => self.is_draft = old.is_draft,
             ReadinessField::Ci => self.ci = old.ci,
             ReadinessField::Merge => self.detailed_merge_status = old.detailed_merge_status.clone(),
@@ -116,6 +119,23 @@ pub fn reconcile<T: InventoryRow>(
     let mut output = Vec::with_capacity(incoming.len() + prior.len());
     for mut row in incoming {
         let old = prior.remove(&row.identity());
+        // Missing identity is not evidence of a new head. Preserve the last
+        // established head and its effects, explicitly as last-known data.
+        if row.head().is_none() {
+            if let Some(mut old) = old.clone().filter(|old| old.head().is_some()) {
+                old.observation_mut()
+                    .get_or_insert(RowObservation {
+                        state: ObservationState::Retained,
+                        last_observed_at: None,
+                        unknown_fields: vec![],
+                        retained_fields: vec![],
+                        confirmed_review: None,
+                    })
+                    .state = ObservationState::Retained;
+                output.push(old);
+                continue;
+            }
+        }
         let mut observation = row.observation().clone().unwrap_or(RowObservation {
             state: ObservationState::Observed,
             last_observed_at: Some(now),
@@ -123,6 +143,9 @@ pub fn reconcile<T: InventoryRow>(
             retained_fields: vec![],
             confirmed_review: None,
         });
+        if row.head().is_none() && !observation.unknown_fields.contains(&ReadinessField::Head) {
+            observation.unknown_fields.push(ReadinessField::Head);
+        }
         observation.state = ObservationState::Observed;
         observation.last_observed_at = Some(now);
         observation.retained_fields.clear();
@@ -185,6 +208,9 @@ pub fn observed_count<T: InventoryRow>(rows: &[T]) -> u64 {
 pub fn github_observation(node: &serde_json::Value, partial: bool) -> RowObservation {
     use ReadinessField::*;
     let mut unknown = vec![];
+    if node["headRefOid"].as_str().is_none_or(str::is_empty) {
+        unknown.push(Head);
+    }
     let errored = |field: &str| {
         partial
             || node["__readiness_errors"]
@@ -309,6 +335,9 @@ pub fn mark_readiness_errors(data: &mut serde_json::Value, errors: &[serde_json:
 
 pub fn gitlab_observation(row: &crate::gitlab::queues::MergeRequest) -> RowObservation {
     let mut unknown_fields = vec![];
+    if row.head().is_none() {
+        unknown_fields.push(ReadinessField::Head);
+    }
     if row.ci.is_none() {
         unknown_fields.push(ReadinessField::Ci);
     }
@@ -413,6 +442,110 @@ mod tests {
             &serde_json::from_str(include_str!("../tests/fixtures/search.json")).unwrap(),
             "authored",
         )
+    }
+    #[test]
+    fn unread_head_keeps_effect_until_positive_head_evidence() {
+        let contract: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/inventory-head-transitions.json"
+        ))
+        .unwrap();
+        let now = contract["time"]
+            .as_str()
+            .unwrap()
+            .parse::<DateTime<Utc>>()
+            .unwrap();
+        let assert_contract = |name: &str, row: &crate::github::model::PullRequest| {
+            let actual = serde_json::to_value(row).unwrap();
+            for (key, expected) in contract["expected"][name].as_object().unwrap() {
+                assert_eq!(&actual[key], expected, "{name}.{key}");
+            }
+        };
+        let mut response: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/search.json")).unwrap();
+        let node = &mut response["authored"]["nodes"][0];
+        node["headRefOid"] = serde_json::json!("head-a");
+        node["isDraft"] = serde_json::json!(false);
+        node["isInMergeQueue"] = serde_json::json!(false);
+        node["mergeable"] = serde_json::json!("MERGEABLE");
+        node["reviewDecision"] = serde_json::json!("REVIEW_REQUIRED");
+        node["commits"]["nodes"][0]["commit"]["statusCheckRollup"] =
+            serde_json::json!({"state":"SUCCESS"});
+        let mapped = |v: &serde_json::Value| crate::github::map::map_list(v, "authored").remove(0);
+        let mut old = mapped(&response);
+        assert!(apply_confirmed_review(
+            &mut old,
+            &ConfirmedReview {
+                head_oid: "head-a".into(),
+                review: crate::github::model::ReviewState::Approved,
+                confirmed_at: now,
+            }
+        ));
+        for head in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!("")),
+        ] {
+            let mut unread = response.clone();
+            if let Some(head) = head {
+                unread["authored"]["nodes"][0]["headRefOid"] = head;
+            } else {
+                unread["authored"]["nodes"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("headRefOid");
+            }
+            let fresh = mapped(&unread);
+            let new = reconcile(vec![], vec![fresh.clone()], false, now);
+            assert!(!new[0]
+                .observation
+                .as_ref()
+                .unwrap()
+                .unknown_fields
+                .is_empty());
+            assert_contract("new_unread", &new[0]);
+            let mut unreviewed = old.clone();
+            unreviewed.observation.as_mut().unwrap().confirmed_review = None;
+            let unreviewed = reconcile(vec![unreviewed], vec![fresh.clone()], false, now);
+            assert_contract("retained_unread_without_effect", &unreviewed[0]);
+            assert_eq!(observed_count(&unreviewed), 0);
+            let retained = reconcile(vec![old.clone()], vec![fresh], false, now);
+            assert_eq!(retained[0].head_oid, "head-a");
+            assert_eq!(
+                retained[0].observation.as_ref().unwrap().state,
+                ObservationState::Retained
+            );
+            assert!(retained[0]
+                .observation
+                .as_ref()
+                .unwrap()
+                .confirmed_review
+                .is_some());
+            assert_contract("retained_unread", &retained[0]);
+            let lagging = reconcile(retained, vec![mapped(&response)], true, now);
+            assert!(lagging[0]
+                .observation
+                .as_ref()
+                .unwrap()
+                .confirmed_review
+                .is_some());
+            assert_contract("same_head", &lagging[0]);
+            let mut changed = response.clone();
+            changed["authored"]["nodes"][0]["headRefOid"] = serde_json::json!("head-b");
+            let changed = reconcile(lagging, vec![mapped(&changed)], true, now);
+            assert_contract("changed_head", &changed[0]);
+            assert!(changed[0]
+                .observation
+                .as_ref()
+                .unwrap()
+                .confirmed_review
+                .is_none());
+            assert!(changed[0]
+                .observation
+                .as_ref()
+                .unwrap()
+                .unknown_fields
+                .is_empty());
+        }
     }
     #[test]
     fn verified_removal_cannot_return_through_partial_omission() {

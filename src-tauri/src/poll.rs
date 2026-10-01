@@ -915,7 +915,14 @@ fn spawn_recheck(
         match client.fetch_prs_snapshot().await {
             Ok(fresh) => {
                 if let Some(publication) = source_poll::publication(&app, &attempt).await {
-                    let result = source_poll::reconcile_github(&app, &publication, fresh).await;
+                    let result =
+                        match source_poll::reconcile_github(&app, &publication, fresh).await {
+                            Ok(result) => result,
+                            Err(failure) => {
+                                source_poll::complete(&app, publication, Err(failure));
+                                return;
+                            }
+                        };
                     persist_and_emit(
                         &app,
                         &result.prs,
@@ -1225,7 +1232,17 @@ pub fn spawn(
                     match fetched {
                         Ok(result) => {
                             let result =
-                                source_poll::reconcile_github(&app, &publication, result).await;
+                                match source_poll::reconcile_github(&app, &publication, result)
+                                    .await
+                                {
+                                    Ok(result) => result,
+                                    Err(failure) => {
+                                        let message = failure.message.clone();
+                                        consecutive_failures += 1;
+                                        source_poll::complete(&app, publication, Err(failure));
+                                        return (fetch_ms, Some((message, None)));
+                                    }
+                                };
                             let receipt = result.clone();
                             let FetchedList {
                                 viewer,
@@ -1371,7 +1388,15 @@ pub fn spawn(
                 if let Some(publication) = review_publication {
                     match reviewing_now {
                         Ok(now) => {
-                            let now = source_poll::reconcile_github(&app, &publication, now).await;
+                            let now = match source_poll::reconcile_github(&app, &publication, now)
+                                .await
+                            {
+                                Ok(now) => now,
+                                Err(failure) => {
+                                    source_poll::complete(&app, publication, Err(failure));
+                                    return "failed";
+                                }
+                            };
                             let prefs = read_notify_prefs(&app).await;
                             if let Some(before) = &previous_reviewing {
                                 for b in newly_ready(before, &now.prs) {

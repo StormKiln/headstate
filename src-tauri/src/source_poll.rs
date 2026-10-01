@@ -512,8 +512,8 @@ pub fn winner_gitlab(
 pub async fn reconcile_github(
     app: &AppHandle,
     publication: &Publication,
-    mut result: FetchedList,
-) -> FetchedList {
+    result: FetchedList,
+) -> Result<FetchedList, Failure> {
     let list = publication.attempt.list;
     let source = publication.attempt.source.clone();
     let previous = app
@@ -522,32 +522,62 @@ pub async fn reconcile_github(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&(source.clone(), list))
-        .filter(|(_, receipt)| result.viewer.is_some() && receipt.viewer == result.viewer)
-        .map(|(_, receipt)| receipt.prs.clone());
-    let previous = if let Some(rows) = previous {
-        rows
+        .map(|(_, receipt)| receipt.clone());
+    let path = crate::commands::db_path(app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = crate::store::open_db(&path)
+            .map_err(|_| inventory_failure("The saved inventory could not be read."))?;
+        reconcile_github_snapshot(&conn, &source, list, result, previous)
+    })
+    .await
+    .map_err(|_| inventory_failure("The inventory refresh could not be completed."))?
+}
+
+fn inventory_failure(message: &str) -> Failure {
+    Failure {
+        message: message.into(),
+        transient: true,
+        not_asked: false,
+    }
+}
+
+/// Publication preparation is shared by foreground, background and recheck.
+/// Never guess ownership from disk: an unverified response is an error, not a
+/// replacement receipt. The caller completes that failure without saving rows.
+fn reconcile_github_snapshot(
+    conn: &rusqlite::Connection,
+    source: &Source,
+    list: CachedList,
+    mut result: FetchedList,
+    previous: Option<FetchedList>,
+) -> Result<FetchedList, Failure> {
+    let owner = result
+        .viewer
+        .as_deref()
+        .filter(|viewer| !viewer.is_empty())
+        .ok_or_else(|| {
+            inventory_failure(
+                "The account could not be confirmed. Showing the last known inventory.",
+            )
+        })?;
+    let previous = if let Some(receipt) =
+        previous.filter(|receipt| receipt.viewer.as_deref() == Some(owner))
+    {
+        receipt.prs
+    } else if crate::store::source_cache::snapshot_owner(conn, source, list)
+        .map_err(|_| inventory_failure("The saved inventory owner could not be read."))?
+        .as_deref()
+        == Some(owner)
+    {
+        match crate::store::source_cache::load_source_snapshot(conn, source, list)
+            .map_err(|_| inventory_failure("The saved inventory could not be read."))?
+            .data
+        {
+            crate::store::source_cache::SnapshotData::Available { prs, .. } => prs,
+            _ => vec![],
+        }
     } else {
-        let path = crate::commands::db_path(app);
-        let owner = result.viewer.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            let conn = crate::store::open_db(&path).ok()?;
-            if owner.is_none()
-                || crate::store::source_cache::snapshot_owner(&conn, &source, list).ok()? != owner
-            {
-                return None;
-            }
-            match crate::store::source_cache::load_source_snapshot(&conn, &source, list)
-                .ok()?
-                .data
-            {
-                crate::store::source_cache::SnapshotData::Available { prs, .. } => Some(prs),
-                _ => None,
-            }
-        })
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_default()
+        vec![]
     };
     result.prs = crate::inventory::reconcile(
         previous,
@@ -555,7 +585,7 @@ pub async fn reconcile_github(
         matches!(result.coverage, Coverage::Complete),
         chrono::Utc::now(),
     );
-    result
+    Ok(result)
 }
 
 /// GitLab uses the same qualified inventory semantics as GitHub.
@@ -907,6 +937,150 @@ mod tests {
             "review": null, "unresolved_threads": null
         }))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn unread_viewer_cannot_destroy_owned_publication_or_restart_baseline() {
+        use crate::store::source_cache::{
+            load_source_snapshot, save_owned_source_snapshot, snapshot_owner, SnapshotData,
+        };
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+        for known in [false, true] {
+            for empty in [false, true] {
+                let server = MockServer::start().await;
+                let client = crate::github::client::GitHubClient::new(
+                    octocrab::Octocrab::builder()
+                        .base_uri(server.uri())
+                        .unwrap()
+                        .personal_token("synthetic")
+                        .build()
+                        .unwrap(),
+                );
+                if known {
+                    Mock::given(method("POST"))
+                        .respond_with(ResponseTemplate::new(200).set_body_json(
+                            serde_json::json!({"data":{"viewer":{"login":"fixture"}}}),
+                        ))
+                        .mount(&server)
+                        .await;
+                    assert_eq!(client.fetch_viewer().await.unwrap(), "fixture");
+                    server.reset().await;
+                }
+                let mut raw: serde_json::Value =
+                    serde_json::from_str(include_str!("../tests/fixtures/search.json")).unwrap();
+                for node in raw["authored"]["nodes"].as_array_mut().unwrap() {
+                    node["headRefOid"] = serde_json::json!("head-a");
+                }
+                let mut baseline = FetchedList {
+                    viewer: Some("fixture".into()),
+                    prs: crate::github::map::map_list(&raw, "authored"),
+                    total: Some(3),
+                    coverage: Coverage::Complete,
+                };
+                crate::inventory::apply_confirmed_review(
+                    &mut baseline.prs[1],
+                    &crate::inventory::ConfirmedReview {
+                        head_oid: "head-a".into(),
+                        review: crate::github::model::ReviewState::Approved,
+                        confirmed_at: chrono::Utc::now(),
+                    },
+                );
+                if empty {
+                    baseline.prs.clear();
+                    baseline.total = Some(0);
+                }
+                let nodes = if empty {
+                    vec![]
+                } else {
+                    vec![raw["authored"]["nodes"][0].clone()]
+                };
+                let mut response = serde_json::json!({
+                    "data": {"viewer":null, "authored":{"nodes":nodes,"issueCount":3}}, "errors":[{"path":["viewer"]}]
+                });
+                if empty {
+                    response["data"].as_object_mut().unwrap().remove("viewer");
+                }
+                Mock::given(method("POST"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(response))
+                    .mount(&server)
+                    .await;
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("inventory.db");
+                let conn = crate::store::open_db(&path).unwrap();
+                let source = Source::default();
+                let list = CachedList::Reviewing;
+                save_owned_source_snapshot(
+                    &conn,
+                    &source,
+                    list,
+                    &baseline.prs,
+                    &baseline.coverage,
+                    baseline.viewer.as_deref(),
+                )
+                .unwrap();
+                let polls = SourcePolls::default();
+                let first = attempt(&polls, &source, list);
+                polls.complete(
+                    polls.publication(&first).await.unwrap(),
+                    Ok(baseline.clone()),
+                    |_| {},
+                );
+                // Deliberately use disk as the preparation baseline, as after a restart.
+                let next = attempt(&polls, &source, list);
+                let permit = polls.publication(&next).await.unwrap();
+                let fetched = client.fetch_reviewing_snapshot().await.unwrap();
+                let prepared = reconcile_github_snapshot(&conn, &source, list, fetched, None);
+                assert_eq!(prepared.is_ok(), known);
+                if let Ok(receipt) = &prepared {
+                    save_owned_source_snapshot(
+                        &conn,
+                        &source,
+                        list,
+                        &receipt.prs,
+                        &receipt.coverage,
+                        receipt.viewer.as_deref(),
+                    )
+                    .unwrap();
+                }
+                let mut emitted = None;
+                polls.complete(permit, prepared, |status| {
+                    let update = polls.update(status, None);
+                    let rows = update.prs.unwrap();
+                    assert_eq!(rows.len(), baseline.prs.len());
+                    if !empty {
+                        assert!(rows.iter().any(|r| r
+                            .observation
+                            .as_ref()
+                            .is_some_and(|o| o.confirmed_review.is_some())));
+                    }
+                    assert_eq!(update.status.error.is_some(), !known);
+                    emitted = Some(serde_json::to_value(rows).unwrap());
+                });
+                drop(conn);
+                let restarted = crate::store::open_db(&path).unwrap();
+                assert_eq!(
+                    snapshot_owner(&restarted, &source, list)
+                        .unwrap()
+                        .as_deref(),
+                    Some("fixture")
+                );
+                let SnapshotData::Available { prs, .. } =
+                    load_source_snapshot(&restarted, &source, list)
+                        .unwrap()
+                        .data
+                else {
+                    panic!("lost owned snapshot")
+                };
+                assert_eq!(serde_json::to_value(&prs).unwrap(), emitted.unwrap());
+                assert_eq!(prs.len(), baseline.prs.len());
+                if !empty {
+                    assert!(prs.iter().any(|r| r
+                        .observation
+                        .as_ref()
+                        .is_some_and(|o| o.confirmed_review.is_some())));
+                }
+            }
+        }
     }
 
     #[tokio::test]

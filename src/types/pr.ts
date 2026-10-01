@@ -16,7 +16,7 @@ export interface Label {
   color: string;
 }
 
-export type ReadinessField = "draft" | "ci" | "merge" | "review" | "queue";
+export type ReadinessField = "head" | "draft" | "ci" | "merge" | "review" | "queue";
 export interface RowObservation {
   state: "observed" | "retained";
   last_observed_at: string | null;

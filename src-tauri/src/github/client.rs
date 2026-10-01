@@ -767,6 +767,19 @@ impl GitHubClient {
         })
     }
 
+    fn owned_list_evidence(&self, value: &serde_json::Value, prs: Vec<PullRequest>) -> FetchedList {
+        let mut result = list_evidence(value, prs);
+        // This cell belongs to the immutable authenticated client, not to a
+        // previous on-disk account. A refused viewer field cannot erase it.
+        if result.viewer.is_none() {
+            result.viewer = self
+                .known_viewer()
+                .filter(|viewer| !viewer.is_empty())
+                .map(str::to_owned);
+        }
+        result
+    }
+
     pub(crate) fn known_viewer(&self) -> Option<&str> {
         self.viewer.get().map(String::as_str)
     }
@@ -795,7 +808,7 @@ impl GitHubClient {
         // DIAGNOSTIC LOGGING (Settings > diagnostic log).
         let started = std::time::Instant::now();
         let v = self.search_with_budget(REVIEW_REQUESTED, budget).await?;
-        if let Some(viewer) = map_viewer(&v) {
+        if let Some(viewer) = map_viewer(&v).filter(|viewer| !viewer.is_empty()) {
             let _ = self.viewer.set(viewer);
         }
         // Counted from THIS response, not from shared state. A global
@@ -848,7 +861,8 @@ impl GitHubClient {
             );
         }
         let refused = refused_fields(&v);
-        Self::reject_empty_after_refusals(mapped, refused).map(|prs| list_evidence(&v, prs))
+        Self::reject_empty_after_refusals(mapped, refused)
+            .map(|prs| self.owned_list_evidence(&v, prs))
     }
 
     /// How many pull requests await the user's review.
@@ -1525,7 +1539,7 @@ impl GitHubClient {
     ) -> Result<FetchedList, ClientError> {
         let started = std::time::Instant::now();
         let v = self.search_with_budget(AUTHORED_OPEN, budget).await?;
-        if let Some(viewer) = map_viewer(&v) {
+        if let Some(viewer) = map_viewer(&v).filter(|viewer| !viewer.is_empty()) {
             let _ = self.viewer.set(viewer);
         }
         // How long GitHub took, and what it was asked for. A slow
@@ -1557,7 +1571,7 @@ impl GitHubClient {
             // from the other at different moments.
             crate::github::stats::budget::note_remaining(remaining);
         }
-        Ok(list_evidence(&v, map_search(&v)))
+        Ok(self.owned_list_evidence(&v, map_search(&v)))
     }
 
     /// The two historical counters. The other five dashboard numbers are
@@ -2103,6 +2117,35 @@ mod tests {
             .build()
             .unwrap();
         GitHubClient::new(oc)
+    }
+
+    #[tokio::test]
+    async fn partial_lists_reuse_only_the_same_clients_verified_viewer() {
+        let server = MockServer::start().await;
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/search.json")).unwrap();
+        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"viewer": null, "authored": {"issueCount": 3, "nodes": [fixture["authored"]["nodes"][0].clone()]}},
+            "errors": [{"path": ["viewer"]}]
+        }))).mount(&server).await;
+        let client = client_for(&server).await;
+        client.viewer.set("fixture".into()).unwrap();
+        for result in [
+            client.fetch_prs_snapshot().await.unwrap(),
+            client.fetch_reviewing_snapshot().await.unwrap(),
+        ] {
+            assert_eq!(result.viewer.as_deref(), Some("fixture"));
+            assert_eq!(result.prs.len(), 1);
+            assert!(matches!(
+                result.coverage,
+                crate::store::source_cache::Coverage::Partial { .. }
+            ));
+        }
+        let unknown = client_for(&server).await;
+        assert_eq!(
+            unknown.fetch_reviewing_snapshot().await.unwrap().viewer,
+            None
+        );
     }
 
     #[tokio::test]
