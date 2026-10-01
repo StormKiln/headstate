@@ -25,7 +25,7 @@ pub fn setup(app: &tauri::AppHandle) -> tauri::Result<()> {
             // and first in Help on other platforms.
             for child in submenu.items()? {
                 if let MenuItemKind::Predefined(predefined) = &child {
-                    if predefined.text()?.starts_with("About") {
+                    if is_about_label(&predefined.text()?) {
                         submenu.remove(&child)?;
                         #[cfg(target_os = "macos")]
                         submenu.insert(
@@ -74,5 +74,24 @@ fn about_metadata(app: &tauri::AppHandle) -> AboutMetadata<'static> {
         website: Some(REPOSITORY.into()),
         website_label: Some("Headstate on GitHub".into()),
         ..Default::default()
+    }
+}
+
+// Windows retains the accelerator marker; Linux may normalize it to &.
+fn is_about_label(label: &str) -> bool {
+    label.trim_start_matches(['&', '_']).starts_with("About")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn recognizes_native_about_mnemonics() {
+        for label in ["About", "About Headstate", "&About", "_About"] {
+            assert!(is_about_label(label), "{label}");
+        }
+        for label in ["Help", "Services", "Hide Headstate"] {
+            assert!(!is_about_label(label), "{label}");
+        }
     }
 }

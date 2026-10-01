@@ -1,5 +1,7 @@
 //! Notification clicks are retained until the app shell is ready. An event is
 //! only a wakeup: consuming the pending identity makes duplicate wakeups safe.
+//! Native click routing needs macOS 10.14+. macOS 10.13 keeps legacy plugin
+//! delivery and its existing click behavior; no routing claim applies there.
 use crate::identity::PrIdentity;
 use std::sync::Mutex;
 
@@ -22,6 +24,7 @@ mod macos {
     unsafe extern "C" {
         fn headstate_notifications_init(callback: extern "C" fn(*const c_char));
         fn headstate_notify(title: *const c_char, body: *const c_char, identity: *const c_char);
+        fn headstate_notifications_supported() -> bool;
         pub fn headstate_about();
     }
     extern "C" fn clicked(payload: *const c_char) {
@@ -47,6 +50,9 @@ mod macos {
             headstate_notifications_init(clicked);
         }
     }
+    pub fn supported() -> bool {
+        unsafe { headstate_notifications_supported() }
+    }
     pub fn notify(title: &str, body: &str, identity: &PrIdentity) {
         let strings = (
             CString::new(title),
@@ -61,7 +67,7 @@ mod macos {
     }
 }
 #[cfg(target_os = "macos")]
-pub use macos::{headstate_about, notify, setup};
+pub use macos::{headstate_about, notify, setup, supported};
 
 #[cfg(test)]
 mod tests {

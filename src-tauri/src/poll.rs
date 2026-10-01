@@ -135,23 +135,10 @@ fn has_checking(prs: &[PullRequest]) -> bool {
 /// Send one desktop notification for a newly-broken PR.
 ///
 /// Failure is logged and swallowed: a notification is an affordance, and
-/// losing one must never take down polling. macOS clicks carry the complete
+/// losing one must never take down polling. macOS 10.14+ clicks carry the complete
 /// provider-qualified identity through the native notification delegate.
 fn notify_breakage(app: &AppHandle, b: &Breakage) {
-    #[cfg(not(target_os = "macos"))]
     use tauri_plugin_notification::NotificationExt;
-
-    // Ask ONCE, before the first notification rather than at whatever
-    // arbitrary moment a PR happens to break. Left implicit, the OS
-    // prompt appeared hours in and possibly while the window was hidden;
-    // if it was missed or dismissed, `show()` failed forever after and
-    // the failure was swallowed by design ("a notification is an
-    // affordance"). So a headline feature could be permanently dead with
-    // no user-visible signal at all.
-    #[cfg(not(target_os = "macos"))]
-    if !notification_allowed(app) {
-        return;
-    }
 
     let body = format!(
         "{}: {}#{} {}",
@@ -161,8 +148,7 @@ fn notify_breakage(app: &AppHandle, b: &Breakage) {
         b.kind.reason()
     );
     #[cfg(target_os = "macos")]
-    {
-        let _ = app;
+    if crate::notification_navigation::supported() {
         crate::notification_navigation::notify(
             &b.title,
             &body,
@@ -172,8 +158,13 @@ fn notify_breakage(app: &AppHandle, b: &Breakage) {
                 number: b.number,
             },
         );
+        return;
     }
-    #[cfg(not(target_os = "macos"))]
+    // Keep legacy delivery on macOS 10.13, where UserNotifications is absent.
+    // Its notifications retain the platform plugin's existing click behavior.
+    if !notification_allowed(app) {
+        return;
+    }
     if let Err(e) = app
         .notification()
         .builder()
