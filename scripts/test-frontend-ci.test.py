@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """CI diagnostics must retain output without hiding a failing test process."""
 import os
+import json
 from pathlib import Path
 import subprocess
 import signal
@@ -15,9 +16,17 @@ class FrontendDiagnostics(unittest.TestCase):
         for status in (0, 1, 137):
             with self.subTest(status=status), tempfile.TemporaryDirectory(prefix="frontend diagnostics ") as tmp:
                 directory = Path(tmp)
+                (directory / 'discovery.json').write_text(json.dumps([{'file': 'src/a.test.ts'}]))
+                (directory / 'report.json').write_text(json.dumps({
+                    'success': True, 'numFailedTests': 0, 'numFailedTestSuites': 0,
+                    'numTotalTests': 1, 'numPassedTests': 1, 'numPendingTests': 0, 'numTodoTests': 0,
+                    'testResults': [{'name': 'src/a.test.ts', 'status': 'passed', 'assertionResults': [{'status': 'passed'}]}],
+                }))
                 node = directory / "node"
                 node.write_text(
                     '#!/bin/bash\n'
+                    'if [[ "$2" == "list" ]]; then cp "$RUNNER_TEMP/discovery.json" "$RUNNER_TEMP/frontend-diagnostics/files.json"; exit 0; fi\n'
+                    'cp "$RUNNER_TEMP/report.json" "$RUNNER_TEMP/frontend-diagnostics/vitest.json"\n'
                     'echo "synthetic test output"\n'
                     'echo "synthetic worker failure" >&2\n'
                     'printf "%s\\n" "$@" > "$RUNNER_TEMP/args"\n'
@@ -34,7 +43,8 @@ class FrontendDiagnostics(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, status, result.stderr)
                 self.assertEqual((directory / "frontend-diagnostics/exit-code.txt").read_text(), f"{status}\n")
-                self.assertIn("Vitest did not write its JSON result", result.stdout)
+                if status == 0:
+                    self.assertIn("Frontend report verified", result.stdout)
                 log = (directory / "frontend-diagnostics/vitest.log").read_text()
                 self.assertIn("synthetic test output", log)
                 self.assertIn("synthetic worker failure", log)
@@ -48,6 +58,18 @@ class FrontendDiagnostics(unittest.TestCase):
                 self.assertIn("--report-exclude-network", options)
                 self.assertIn("--no-warnings", options)
 
+    def test_zero_exit_without_a_report_is_not_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            node = Path(tmp) / "node"
+            node.write_text("#!/bin/bash\nexit 0\n")
+            node.chmod(0o755)
+            result = subprocess.run(
+                ["bash", str(ROOT / "scripts/test-frontend-ci.sh")],
+                env={**os.environ, "PATH": f"{tmp}:{os.environ['PATH']}", "RUNNER_TEMP": tmp},
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(result.returncode, 0, "an incomplete test run must not pass")
+
     def test_preserves_native_signal(self):
         # Yarn 4.18's binary launcher maps an unrecognized native signal to
         # exit 1 (verified with a real Vitest config sending SIGSEGV). The
@@ -57,7 +79,7 @@ class FrontendDiagnostics(unittest.TestCase):
             with self.subTest(signal=name), tempfile.TemporaryDirectory() as tmp:
                 directory = Path(tmp)
                 child = directory / "node"
-                child.write_text(f"#!/bin/bash\nulimit -c 0\nkill -{name} $$\n")
+                child.write_text(f'#!/bin/bash\nif [[ "$2" == "list" ]]; then exit 0; fi\nulimit -c 0\nkill -{name} $$\n')
                 child.chmod(0o755)
                 yarn = directory / "yarn"
                 yarn.write_text(f"#!/bin/bash\nexit {137 if name == 'SIGKILL' else 1}\n")

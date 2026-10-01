@@ -387,6 +387,10 @@ lint-deps:
 	# false positives and a real windows-latest job with a bash body,
 	# because a fix that quietened the noise by checking less would be
 	# worse than the bug.
+	python3 scripts/install-dependencies.test.py
+	python3 scripts/ci-command.test.py
+	python3 scripts/check-frontend-report.test.py
+	python3 scripts/test-frontend-ci.test.py
 	python3 scripts/check-workflow-shells.test.py
 	python3 scripts/check-workflow-shells.py
 	# actionlint, and it does NOT replace the script above it. That was
