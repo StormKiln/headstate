@@ -15,6 +15,12 @@ function utility(token) {
     }
     return { value: token.slice(last + 1), state: token.slice(0, last + 1) };
 }
+// Apply one effective-state policy to class pairs and to the literal
+// surfaces discovered for inline foregrounds (including ancestors).
+function activeUtilities(text) {
+    const tokens = text.split(/\s+/).filter(Boolean).map(utility);
+    return tokens.filter(t => !/(?:disabled|after:|before:|data-starting-style|data-ending-style|data-\[active=false\])/.test(t.state)).filter(t => !tokens.some(d => d.state === `dark:${t.state}` && d.value.split('-')[0] === t.value.split('-')[0]));
+}
 const sizes = /^(?:xs|sm|base|lg|xl|[2-9]xl|left|right|center|justify|start|end|wrap|nowrap|balance|pretty|ellipsis|clip)$/;
 function foreground(c) {
     if (!c.startsWith('text-') && !c.startsWith('placeholder:'))
@@ -56,7 +62,7 @@ export function scanSource(file, source) {
         if (inlineOnly) return [];
         const attr = el.attributes.properties.find(a => ts.isJsxAttribute(a) && a.name.text === 'className');
         const value = attr?.initializer && ts.isJsxExpression(attr.initializer) ? attr.initializer.expression : attr?.initializer;
-        return value && ts.isStringLiteral(value) ? value.text.split(/\s+/).map(utility).filter(t => background(t.value)) : [];
+        return value && ts.isStringLiteral(value) ? activeUtilities(value.text).filter(t => background(t.value)) : [];
     }
     function knownSurfaces(el, local) {
         const own = el ? literalBackgrounds(el, local !== undefined) : [];
@@ -101,8 +107,7 @@ export function scanSource(file, source) {
             const disabled = /(?:^|\s)disabled(?:$|\s|=\{true\})/.test(attrs);
             const decorative = /aria-hidden=(?:"true"|\{true\})/.test(attrs);
             const icon = el && icons.has(el.tagName.getText(ast));
-            const tokens = text.split(/\s+/).filter(Boolean).map(utility);
-            const active = tokens.filter(t => !/(?:disabled|after:|before:|data-starting-style|data-ending-style|data-\[active=false\])/.test(t.state)).filter(t => !tokens.some(d => d.state === `dark:${t.state}` && d.value.split('-')[0] === t.value.split('-')[0]));
+            const active = activeUtilities(text);
             for (const t of active) {
                 if (/^opacity-(?!100$)\d+/.test(t.value) && !disabled && !decorative)
                     errors.push(`${where}: inherited ${t.value} needs a disabled/decorative element, not faded information`);

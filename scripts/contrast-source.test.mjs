@@ -50,3 +50,22 @@ test('resolves inline and mixed literal surfaces before the unknown-surface fall
     const dynamic = scanSource('inline.tsx', '<p className="text-white" style={{backgroundColor:unknownColor}}>Needs contract</p>');
     assert.ok(dynamic.errors.some(e => e.includes('named contrast contract')));
 });
+
+test('inline foregrounds use effective active surfaces locally and on ancestors', () => {
+    for (const source of [
+        '<button style={{color:"#ffffff"}} className="bg-black disabled:bg-white">Enabled</button>',
+        '<button disabled={busy} style={{color:"#ffffff"}} className="bg-black disabled:bg-white">Enabled when idle</button>',
+        '<div className="bg-black disabled:bg-white"><span style={{color:"#ffffff"}}>Enabled</span></div>',
+        '<button style={{color:"#ffffff"}} className="bg-white dark:bg-black disabled:bg-white">Dark theme</button>',
+    ]) {
+        const scan = scanSource('states.tsx', source);
+        assert.deepEqual(scan.errors, []);
+        assert.ok(scan.pairs.some(p => p.bg === 'bg-black'), source);
+        assert.ok(!scan.pairs.some(p => p.bg === 'bg-white'), source);
+    }
+    // Conditional disabling must not erase an unreadable enabled/hover state.
+    for (const classes of ['bg-white disabled:bg-black', 'bg-black hover:bg-white disabled:bg-black']) {
+        const scan = scanSource('states.tsx', `<button disabled={busy} style={{color:"#ffffff"}} className="${classes}">Active information</button>`);
+        assert.ok(scan.pairs.some(p => p.fg === 'text-[#ffffff]' && p.bg === 'bg-white'));
+    }
+});
