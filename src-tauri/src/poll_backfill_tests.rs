@@ -32,7 +32,7 @@ impl Rig {
             let body: Value = serde_json::from_slice(&req.body).unwrap();
             let doc = body["query"].as_str().unwrap();
             let fault = response_fault.lock().unwrap().clone();
-            let mut data = json!({"viewer":{"login":"fixture-viewer"}});
+            let mut data = json!({"viewer":{"login":"fixture-viewer"},"rateLimit":{"remaining":if fault == "low-budget" {1} else {5000}}});
             for i in 0..5 {
                 let Some((_,tail)) = doc.split_once(&format!("s{i}: search(")) else {continue};
                 let day = &tail.split_once("merged:").unwrap().1[..10];
@@ -282,7 +282,8 @@ fn dense_backfill_budget_gate_does_not_issue_or_advance_pages() {
     let _restore = budget::RestoreObserved::capture();
     run(|| async {
         let r = Rig::new(120, 1).await;
-        budget::note_remaining(1);
+        r.fault("low-budget");
+        r.client.fetch_viewer().await.unwrap();
         let n = r.server.received_requests().await.unwrap().len();
         assert!(matches!(r.tick().await, bf::TickOutcome::Skipped { .. }));
         assert_eq!(r.server.received_requests().await.unwrap().len(), n);

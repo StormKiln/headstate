@@ -248,7 +248,7 @@ impl GitHubClient {
     /// Where `number` sits in a stack. Never an error: every failure is
     /// `PrStack::Unknown`, or a partial answer qualified as one.
     pub async fn fetch_pr_stack(&self, owner: &str, name: &str, number: u64) -> PrStack {
-        self.fetch_stack_with_budget(owner, name, number, &Budget::new(), false)
+        self.fetch_stack_with_budget(owner, name, number, &self.request_budget(), false)
             .await
     }
 

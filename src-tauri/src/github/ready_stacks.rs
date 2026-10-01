@@ -21,10 +21,15 @@ pub async fn ready_stacks(
     client: &GitHubClient,
     rows: Vec<PrIdentity>,
 ) -> Result<Vec<RowStack>, String> {
+    let scoped = client.with_read_context(super::admission::ReadContext::new(
+        super::admission::ReadClass::Advisory,
+        Duration::from_secs(10),
+    ));
+    let client = &scoped;
     if rows.len() > 8 {
         return Err("Stack metadata accepts at most 8 pull requests per batch".into());
     }
-    let budget = Budget::new();
+    let budget = client.request_budget();
     let mut seen = HashSet::new();
     let rows = rows.into_iter().filter(|row| seen.insert(row.clone()));
     Ok(stream::iter(rows.map(|identity| {

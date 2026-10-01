@@ -679,8 +679,8 @@ pub async fn merge_stack(
     use crate::github::stack_merge::{StackMergeAction, StackMergeOutcome};
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
     let action = StackMergeAction::parse(&action)?;
-    let budget = crate::github::stats::Budget::new();
-    if !budget.permits_rest(1) {
+    let budget = client.request_budget();
+    if !client.rest_reserve_allows() {
         return Err(
             "Not submitted: GitHub's REST rate limit is nearly spent. Try again after it resets."
                 .into(),
@@ -1226,7 +1226,7 @@ pub async fn get_review_gates(
     crate::diag!("[diag] cmd get_review_gates start");
     let started = std::time::Instant::now();
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
-    let budget = crate::github::stats::Budget::new();
+    let budget = client.request_budget();
     let out = crate::github::gates::review_gates(
         &client,
         &budget,
@@ -1272,7 +1272,7 @@ pub async fn get_ready_pushers(
     crate::diag!("[diag] cmd get_ready_pushers start rows={}", rows.len());
     let started = std::time::Instant::now();
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
-    let budget = crate::github::stats::Budget::new();
+    let budget = client.request_budget();
     let out = crate::github::gates::strip_pushers(&client, &budget, &rows, STRIP_PER_REQUEST).await;
     crate::diag!(
         "[diag] cmd get_ready_pushers end {}ms rest_requests={}",
@@ -4696,7 +4696,7 @@ pub async fn stats_count(
     measure: String,
     days: i64,
 ) -> Result<crate::github::stats::Outcome, String> {
-    use crate::github::stats::{Budget, Measure, Scope, Slice, StatsQuery, Subject};
+    use crate::github::stats::{Measure, Scope, Slice, StatsQuery, Subject};
 
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
     let days = clamp_days(days);
@@ -4748,7 +4748,7 @@ pub async fn stats_count(
     // constructing the accumulator afterwards meant the point was spent
     // outside anything that could count it -- so `Spend.points` understated
     // by one per call while `is_exact()` returned true.
-    let budget = Budget::new();
+    let budget = client.request_budget();
     // The cache key needs `@me` RESOLVED, because two accounts on one
     // machine share this database and a row keyed on the literal would be
     // served to whichever asked second. `fetch_viewer_metered` is one cheap
@@ -5320,7 +5320,7 @@ async fn stats_board_for_client(
     measure: String,
     days: i64,
 ) -> Result<StatsBoard, String> {
-    use crate::github::stats::{Budget, Measure};
+    use crate::github::stats::Measure;
 
     let measure = match measure.as_str() {
         "merged" => Measure::Merged,
@@ -5346,7 +5346,7 @@ async fn stats_board_for_client(
     // land outside any accumulator (#844) -- `board_projection` already
     // budgeted for it (`// +1 for fetch_viewer.`), so the projection knew
     // about a request the accounting did not.
-    let budget = Budget::new();
+    let budget = client.request_budget();
     // Reuse this immutable client's verified identity (normally resolved
     // at startup). A new client must verify its own token once; subsequent
     // covered clicks issue no provider requests, including viewer lookups.
@@ -5467,7 +5467,7 @@ async fn stats_board_for_client(
         log::warn!("discarding an unreadable stats board cache row");
     }
 
-    let budget = Budget::new();
+    let budget = client.request_budget();
     let projected = board_projection(clamp_days(days));
     if !budget.permits(projected) {
         return Err(format!(
@@ -5895,7 +5895,7 @@ pub async fn stats_series(
     scope_value: Option<String>,
     days: i64,
 ) -> Result<crate::github::stats::Series, String> {
-    use crate::github::stats::{Budget, Measure, StatsQuery, Subject};
+    use crate::github::stats::{Measure, StatsQuery, Subject};
 
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
     let subject = match subject {
@@ -5910,7 +5910,7 @@ pub async fn stats_series(
     let now = chrono::Utc::now();
     let req = parse_scope_request(&scope_kind, scope_value, days, now)?;
 
-    let budget = Budget::new();
+    let budget = client.request_budget();
     // One request per `ALIAS_CHUNK` days, at the measured 1 point each,
     // plus slack. Far cheaper than a board, and gated anyway: the check
     // exists for the case where something else has already spent the
@@ -6120,7 +6120,7 @@ pub async fn stats_reviewers(
     logins: Vec<String>,
     days: i64,
 ) -> Result<crate::github::stats::Reviewers, String> {
-    use crate::github::stats::{Budget, Measure, StatsQuery};
+    use crate::github::stats::{Measure, StatsQuery};
 
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
     let now = chrono::Utc::now();
@@ -6143,7 +6143,7 @@ pub async fn stats_reviewers(
         return Err("no reviewer logins to count".into());
     }
 
-    let budget = Budget::new();
+    let budget = client.request_budget();
     // One request per `ALIAS_CHUNK` logins at 1 point each, plus slack.
     let projected =
         (logins.len() as u64).div_ceil(crate::github::stats::query::ALIAS_CHUNK as u64) + 1;

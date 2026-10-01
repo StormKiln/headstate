@@ -912,6 +912,10 @@ fn spawn_recheck(
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(RECHECK_DELAY).await;
 
+        let client = client.with_read_context(crate::github::admission::ReadContext::new(
+            crate::github::admission::ReadClass::Background,
+            FETCH_TIMEOUT,
+        ));
         match client.fetch_prs_snapshot().await {
             Ok(fresh) => {
                 if let Some(publication) = source_poll::publication(&app, &attempt).await {
@@ -1209,7 +1213,11 @@ pub fn spawn(
                 let authored_attempt =
                     source_poll::begin(&app, Source::default(), CachedList::Authored).await;
                 let started = std::time::Instant::now();
-                let fetched = client.fetch_prs_snapshot_with_budget(budget).await;
+                let scoped = client.with_read_context(crate::github::admission::ReadContext::new(
+                    crate::github::admission::ReadClass::Background,
+                    budget,
+                ));
+                let fetched = scoped.fetch_prs_snapshot_with_budget(budget).await;
                 let fetch_ms = started.elapsed().as_millis() as u64;
                 // This report is readable from a paired phone; redact the
                 // failure while retaining its timeout as a separate measure.
@@ -1370,7 +1378,11 @@ pub fn spawn(
             let reviewing_work = async |budget| {
                 let reviewing_attempt =
                     source_poll::begin(&app, Source::default(), CachedList::Reviewing).await;
-                let reviewing_now = client
+                let scoped = client.with_read_context(crate::github::admission::ReadContext::new(
+                    crate::github::admission::ReadClass::Background,
+                    budget,
+                ));
+                let reviewing_now = scoped
                     .fetch_reviewing_snapshot_with_budget(budget)
                     .await
                     .map_err(|e| source_poll::Failure::from(&e));
@@ -1649,7 +1661,7 @@ async fn backfill_tick(db: std::path::PathBuf, client: &Arc<GitHubClient>) -> Ti
         crate::diag!("[diag] stats backfill deferred: user-facing read active");
         return TickOutcome::ForegroundBusy.into();
     }
-    let observed = crate::github::stats::budget::observed_remaining();
+    let observed = client.observed_remaining();
     if !bf::affordable(observed, bf::TICK_PROJECTION) {
         // Logged, not just returned: this gate fires BEFORE any request,
         // so nothing else in the log would show that a tick happened at
@@ -1668,7 +1680,12 @@ async fn backfill_tick(db: std::path::PathBuf, client: &Arc<GitHubClient>) -> Ti
     }
 
     let now = chrono::Utc::now();
-    let budget = bf::tick_budget();
+    let budget = client.request_budget();
+    let scoped = client.with_read_context(crate::github::admission::ReadContext::new(
+        crate::github::admission::ReadClass::Background,
+        std::time::Duration::from_secs(60),
+    ));
+    let client = &scoped;
     let viewer = match client.stats_viewer_metered(&budget).await {
         Ok(viewer) => viewer,
         Err(_) => return TickOutcome::Failed("could not verify the stats account".into()).into(),
@@ -1900,7 +1917,7 @@ mod tests {
                     let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
                     let doc = body["query"].as_str().unwrap();
                     if !doc.contains("search(") {
-                        return wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"data":{"viewer":{"login":"fixture-viewer"}}}));
+                        return wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"data":{"viewer":{"login":"fixture-viewer"},"rateLimit":{"remaining":5000}}}));
                     }
                     let offset = if doc.contains("after: \"100\"") {100} else if doc.contains("after: \"50\"") {50} else {0};
                     let end = (offset + 50).min(120);
@@ -2017,6 +2034,7 @@ mod tests {
                     let doc = body["query"].as_str().unwrap();
                     let mut data = serde_json::Map::new();
                     data.insert("viewer".into(),serde_json::json!({"login":"fixture-viewer"}));
+                    data.insert("rateLimit".into(),serde_json::json!({"remaining":5000}));
                     for i in 0..bf::GROUP_SLICES {
                         let Some((_, tail)) = doc.split_once(&format!("s{i}: search(")) else { continue; };
                         let day = &tail.split_once("merged:").unwrap().1[..10];
@@ -2064,6 +2082,7 @@ mod tests {
             )
             .unwrap();
             let (from, to) = bf::horizon_window(chrono::Utc::now(), 30).unwrap();
+            client.fetch_viewer().await.unwrap();
             let ticks = 30usize.div_ceil(bf::GROUP_SLICES);
             for pass in 1..=ticks {
                 let tick = super::backfill_tick(db.clone(), &client).await;

@@ -467,6 +467,7 @@ impl Drop for RestoreObserved {
 /// separate ones that somebody then has to remember to add up.
 #[derive(Debug, Clone)]
 pub struct Budget {
+    transport: Option<Arc<crate::github::read_transport::ReadTransport>>,
     spent: Arc<AtomicU64>,
     requests: Arc<AtomicU64>,
     /// The LOWEST `remaining` any response reported, or `u64::MAX` if
@@ -501,6 +502,7 @@ impl Default for Budget {
 impl Budget {
     pub fn new() -> Self {
         Self {
+            transport: None,
             spent: Arc::new(AtomicU64::new(0)),
             requests: Arc::new(AtomicU64::new(0)),
             lowest_remaining: Arc::new(AtomicU64::new(u64::MAX)),
@@ -508,6 +510,24 @@ impl Budget {
             reset_at: Arc::new(AtomicU64::new(0)),
             rest_requests: Arc::new(AtomicU64::new(0)),
             rest_lowest_remaining: Arc::new(AtomicU64::new(u64::MAX)),
+        }
+    }
+
+    /// A per-load accumulator gated by this authenticated client.
+    pub(in crate::github) fn with_transport(
+        transport: Arc<crate::github::read_transport::ReadTransport>,
+    ) -> Self {
+        Self {
+            transport: Some(transport),
+            ..Self::new()
+        }
+    }
+
+    /// Client-owned transport accounting; never seeds the legacy process gate.
+    pub fn record_rest_local(&self, remaining: Option<u64>) {
+        self.rest_requests.fetch_add(1, Ordering::Relaxed);
+        if let Some(r) = remaining {
+            self.rest_lowest_remaining.fetch_min(r, Ordering::Relaxed);
         }
     }
 
@@ -541,10 +561,14 @@ impl Budget {
             u64::MAX => None,
             n => Some(n),
         };
-        let floor = [local, observed_rest_remaining()]
-            .into_iter()
-            .flatten()
-            .min();
+        let shared = self
+            .transport
+            .as_ref()
+            .map_or_else(observed_rest_remaining, |t| {
+                t.admission
+                    .remaining(crate::github::admission::Bucket::Rest)
+            });
+        let floor = [local, shared].into_iter().flatten().min();
         match floor {
             None => true,
             Some(remaining) => remaining.saturating_sub(requests) >= RESERVE,
@@ -694,10 +718,14 @@ impl Budget {
         // The pessimistic figure: whichever is lower of what this load has
         // seen and what the process has seen. `min` over two `Option`s via
         // `chain`, so "one of them knows" is not the same as "neither does".
-        let floor = [self.remaining(), observed_remaining()]
-            .into_iter()
-            .flatten()
-            .min();
+        let shared = self
+            .transport
+            .as_ref()
+            .map_or_else(observed_remaining, |t| {
+                t.admission
+                    .remaining(crate::github::admission::Bucket::Graphql)
+            });
+        let floor = [self.remaining(), shared].into_iter().flatten().min();
         match floor {
             None => true,
             Some(remaining) => remaining.saturating_sub(projected) >= RESERVE,

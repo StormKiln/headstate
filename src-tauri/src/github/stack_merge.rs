@@ -193,7 +193,7 @@ impl GitHubClient {
             tokio::time::sleep(interval).await;
             // Headstate declining to spend the last of the REST pool is not
             // GitHub failing the merge; say which it is.
-            if !budget.permits_rest(1) {
+            if !self.rest_reserve_allows() {
                 return Ok(still_running(
                     "Submitted to GitHub; Headstate stopped checking to save its REST rate limit",
                 ));

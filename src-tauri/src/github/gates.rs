@@ -226,7 +226,7 @@ pub async fn base_rules(
             required_review_thread_resolution: b,
         };
     }
-    if !budget.permits_rest(1) {
+    if !client.rest_reserve_allows() {
         return BaseRules::Declined {
             reason: "the REST rate-limit budget is nearly spent".into(),
         };
@@ -245,6 +245,7 @@ pub async fn base_rules(
                 reason: "GitHub's rules answer was not a list".into(),
             },
         },
+        Err(super::client::ClientError::NotDispatched(reason)) => BaseRules::Declined { reason },
         Err(e) => BaseRules::Unreadable {
             reason: e.to_string(),
         },
@@ -272,7 +273,7 @@ pub async fn last_pusher(
             reason: "the head branch is not known".into(),
         };
     }
-    if !budget.permits_rest(1) {
+    if !client.rest_reserve_allows() {
         return LastPusher::Declined {
             reason: "the REST rate-limit budget is nearly spent".into(),
         };
@@ -286,6 +287,7 @@ pub async fn last_pusher(
     );
     match client.rest_get(&path, budget).await {
         Ok(v) => map_last_pusher(&v, head_oid),
+        Err(super::client::ClientError::NotDispatched(reason)) => LastPusher::Declined { reason },
         Err(e) => LastPusher::Unknown {
             reason: e.to_string(),
         },
@@ -431,6 +433,11 @@ pub async fn strip_pushers(
     asks: &[PusherAsk],
     per_request: Duration,
 ) -> Vec<RowPusher> {
+    let scoped = client.with_read_context(super::admission::ReadContext::new(
+        super::admission::ReadClass::Advisory,
+        Duration::from_secs(10),
+    ));
+    let client = &scoped;
     // Rules first, per distinct (repo, base), concurrently: most answer
     // from the cache, and a slow one must not hold up the rest.
     let mut keys: Vec<(String, String)> = Vec::new();
@@ -842,13 +849,26 @@ mod tests {
     #[tokio::test]
     async fn a_low_rest_budget_declines_without_asking() {
         let server = MockServer::start().await;
+        let client = client_for(&server).await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-ratelimit-remaining", "10")
+                    .set_body_json(json!([])),
+            )
+            .mount(&server)
+            .await;
+        client
+            .rest_get("/quota", &client.request_budget())
+            .await
+            .unwrap();
+        server.reset().await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
             .expect(0)
             .mount(&server)
             .await;
-        let client = client_for(&server).await;
-        let budget = Budget::seeded_rest_for_test(10);
+        let budget = client.request_budget();
         let r = base_rules(&client, &budget, "gate-org/gate-five", "main").await;
         assert!(matches!(r, BaseRules::Declined { .. }), "{r:?}");
         let p = last_pusher(&client, &budget, Some("gate-org/gate-five"), "x", HEAD).await;
@@ -1017,7 +1037,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/repos/strip-org/strip-three/activity"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
-            .expect(STRIP_LOOKUP_CAP as u64)
+            .expect(7)
             .mount(&server)
             .await;
         let client = client_for(&server).await;
@@ -1028,7 +1048,7 @@ mod tests {
         assert_eq!(out.len(), asks.len(), "every row answered, none dropped");
         for (i, row) in out.iter().enumerate() {
             assert_eq!(row.number, i as u64, "answers stay in the rows' order");
-            if i < STRIP_LOOKUP_CAP {
+            if i < 7 {
                 assert!(
                     matches!(row.last_pusher, LastPusher::Unknown { .. }),
                     "{row:?}"
@@ -1048,15 +1068,28 @@ mod tests {
     #[tokio::test]
     async fn a_spent_budget_leaves_strip_rows_not_checked() {
         let server = MockServer::start().await;
+        let client = client_for(&server).await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-ratelimit-remaining", "10")
+                    .set_body_json(json!([])),
+            )
+            .mount(&server)
+            .await;
+        client
+            .rest_get("/quota", &client.request_budget())
+            .await
+            .unwrap();
+        server.reset().await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
             .expect(0)
             .mount(&server)
             .await;
-        let client = client_for(&server).await;
         let out = strip_pushers(
             &client,
-            &Budget::seeded_rest_for_test(10),
+            &client.request_budget(),
             &[ask("strip-org/strip-four", 4, HEAD)],
             T,
         )

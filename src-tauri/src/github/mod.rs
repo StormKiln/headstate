@@ -12,4 +12,5 @@ pub mod stack;
 pub mod stack_merge;
 pub mod stats;
 
+pub mod admission;
 mod read_transport;

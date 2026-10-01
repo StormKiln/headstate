@@ -554,7 +554,7 @@ pub async fn load_tree(client: &GitHubClient) -> Result<Tree, ClientError> {
 }
 
 async fn load_tree_inner(client: &GitHubClient) -> Result<Tree, ClientError> {
-    let budget = super::budget::Budget::new();
+    let budget = client.request_budget();
 
     // Through `fetch::metered_read`, which holds a process-wide permit and
     // records the spend -- so the sidebar tree counts against the same

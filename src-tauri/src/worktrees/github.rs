@@ -255,7 +255,7 @@ pub async fn lookup(
         .split_once('/')
         .ok_or_else(|| "the repository's GitHub name could not be read".to_string())?;
     let chunks: Vec<&[String]> = branches.chunks(MERGED_HEADS_CHUNK).collect();
-    let budget = crate::github::stats::Budget::new();
+    let budget = client.request_budget();
     // The poll loop is what the reserve protects. Refusing here is "we
     // did not ask", and says so -- it is not a GitHub failure.
     if !budget.permits(chunks.len() as u64 * COST_PER_CHUNK) {
@@ -836,14 +836,25 @@ mod tests {
     async fn the_budget_reserve_means_not_asked() {
         use wiremock::matchers::method;
         use wiremock::{Mock, ResponseTemplate};
-        let _scope = crate::github::stats::budget::scoped::enter(100);
         let server = wiremock::MockServer::start().await;
+        let client = client_for(&server).await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data":{"rateLimit":{"remaining":100}}})),
+            )
+            .mount(&server)
+            .await;
+        client
+            .stats_graphql(&serde_json::json!({"query":"query { rateLimit { remaining } }"}))
+            .await
+            .unwrap();
+        server.reset().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200))
             .expect(0)
             .mount(&server)
             .await;
-        let client = client_for(&server).await;
         let err = lookup(&client, "octo-org/octo-app", &["feature".to_string()])
             .await
             .unwrap_err();

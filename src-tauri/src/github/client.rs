@@ -60,6 +60,8 @@ pub enum ClientError {
     /// wait rather than implying a network fault the user might chase.
     #[error("GitHub rate limit reached — polling will resume automatically ({0})")]
     RateLimited(String),
+    #[error("headstate:not-asked {0}")]
+    NotDispatched(String),
     /// GitHub refused the token: HTTP 401, or a GraphQL body saying so.
     ///
     /// # Why this is a variant rather than a message the UI recognises
@@ -112,6 +114,7 @@ impl ClientError {
             Self::Timeout(seconds) => Self::Timeout(*seconds),
             Self::Graphql(message) => Self::Graphql(message.clone()),
             Self::RateLimited(message) => Self::RateLimited(message.clone()),
+            Self::NotDispatched(message) => Self::NotDispatched(message.clone()),
             Self::TokenRejected { said } => Self::TokenRejected { said: said.clone() },
             Self::UnconfirmedWrite => Self::UnconfirmedWrite,
         }
@@ -132,7 +135,7 @@ impl ClientError {
     pub fn is_transient(&self) -> bool {
         match self {
             Self::Shared(error) => error.is_transient(),
-            Self::UnconfirmedWrite => false,
+            Self::UnconfirmedWrite | Self::NotDispatched(_) => false,
             // The request never reached GitHub, or the response never
             // came back. Retrying is exactly the right response.
             ClientError::Timeout(_) => true,
@@ -327,6 +330,7 @@ pub struct GitHubClient {
     searches: Arc<Searches>,
     viewer: Arc<tokio::sync::OnceCell<String>>,
     read_transport: Arc<super::read_transport::ReadTransport>,
+    read_context: Option<super::admission::ReadContext>,
 }
 
 // Client-local: separate accounts never share a result. Only callers which
@@ -429,12 +433,41 @@ fn list_evidence(v: &serde_json::Value, prs: Vec<PullRequest>) -> FetchedList {
 }
 
 impl GitHubClient {
+    /// Immutable operation view. Account/cache/admission owners remain shared.
+    pub fn with_read_context(&self, mut context: super::admission::ReadContext) -> Self {
+        if let Some(parent) = self.read_context {
+            context.deadline = context.deadline.min(parent.deadline);
+        }
+        let mut view = self.clone();
+        view.read_context = Some(context);
+        view
+    }
+    pub(crate) fn read_context(&self) -> super::admission::ReadContext {
+        self.read_context.unwrap_or_else(|| {
+            super::admission::ReadContext::new(
+                super::admission::ReadClass::Foreground,
+                SEARCH_BUDGET,
+            )
+        })
+    }
+    pub(crate) fn request_budget(&self) -> super::stats::Budget {
+        super::stats::Budget::with_transport(self.read_transport.clone())
+    }
+    pub(crate) fn observed_remaining(&self) -> Option<u64> {
+        self.read_transport
+            .admission
+            .remaining(super::admission::Bucket::Graphql)
+    }
+    pub(crate) fn rest_reserve_allows(&self) -> bool {
+        self.read_transport.admission.rest_available()
+    }
     pub fn new(octocrab: Octocrab) -> Self {
         Self {
             octocrab,
             searches: Arc::new(Searches::default()),
             viewer: Arc::default(),
             read_transport: Arc::default(),
+            read_context: None,
         }
     }
 
@@ -457,7 +490,13 @@ impl GitHubClient {
         &self,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, ClientError> {
-        graphql_with_transport(&self.octocrab, body, &self.read_transport).await
+        graphql_with_transport(
+            &self.octocrab,
+            body,
+            &self.read_transport,
+            self.read_context(),
+        )
+        .await
     }
 
     /// Share overlapping equivalent searches, with a deadline that includes
@@ -963,6 +1002,10 @@ impl GitHubClient {
     /// bytes and discards them rather than trying to deserialise
     /// nothing, which is what a plain `post::<_, T>` would do and fail.
     pub(super) async fn rest_post(&self, path: &str) -> Result<(), ClientError> {
+        let mut admission = self
+            .read_transport
+            .admission
+            .write(super::admission::Bucket::Rest)?;
         let _epoch = MutationEpoch::new(&self.searches.generation);
         tokio::time::timeout(SEARCH_BUDGET, async {
             let response = self
@@ -970,6 +1013,14 @@ impl GitHubClient {
                 ._post(path, None::<&()>)
                 .await
                 .map_err(write_error)?;
+            self.read_transport.observe_headers(
+                super::admission::Bucket::Rest,
+                response.status().as_u16(),
+                response.headers(),
+            );
+            if response.status().as_u16() < 500 {
+                admission.complete();
+            }
             octocrab::map_github_error(response)
                 .await
                 .map_err(write_error)?;
@@ -989,6 +1040,10 @@ impl GitHubClient {
         path: &str,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, ClientError> {
+        let mut admission = self
+            .read_transport
+            .admission
+            .write(super::admission::Bucket::Rest)?;
         let _epoch = MutationEpoch::new(&self.searches.generation);
         tokio::time::timeout(SEARCH_BUDGET, async {
             let response = self
@@ -996,6 +1051,14 @@ impl GitHubClient {
                 ._post(path, Some(body))
                 .await
                 .map_err(write_error)?;
+            self.read_transport.observe_headers(
+                super::admission::Bucket::Rest,
+                response.status().as_u16(),
+                response.headers(),
+            );
+            if response.status().as_u16() < 500 {
+                admission.complete();
+            }
             let response = octocrab::map_github_error(response)
                 .await
                 .map_err(write_error)?;
@@ -1037,7 +1100,9 @@ impl GitHubClient {
         path: &str,
         budget: &crate::github::stats::Budget,
     ) -> Result<serde_json::Value, ClientError> {
-        self.read_transport.get(&self.octocrab, path, budget).await
+        self.read_transport
+            .get(&self.octocrab, path, budget, self.read_context())
+            .await
     }
 
     /// A REST PUT with a JSON body, metered into `budget`, returning the
@@ -1059,6 +1124,10 @@ impl GitHubClient {
         body: &serde_json::Value,
         budget: &crate::github::stats::Budget,
     ) -> Result<(u16, serde_json::Value), ClientError> {
+        let mut admission = self
+            .read_transport
+            .admission
+            .write(super::admission::Bucket::Rest)?;
         let _epoch = MutationEpoch::new(&self.searches.generation);
         tokio::time::timeout(SEARCH_BUDGET, async {
             let response = self
@@ -1066,12 +1135,20 @@ impl GitHubClient {
                 ._put(path, Some(body))
                 .await
                 .map_err(write_error)?;
+            self.read_transport.observe_headers(
+                super::admission::Bucket::Rest,
+                response.status().as_u16(),
+                response.headers(),
+            );
+            if response.status().as_u16() < 500 {
+                admission.complete();
+            }
             let remaining = response
                 .headers()
                 .get("x-ratelimit-remaining")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.trim().parse::<u64>().ok());
-            budget.record_rest(remaining);
+            budget.record_rest_local(remaining);
             let status = response.status().as_u16();
             if status >= 500 {
                 return Err(ClientError::UnconfirmedWrite);
@@ -1114,10 +1191,26 @@ impl GitHubClient {
         &self,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, ClientError> {
+        let mut admission = self
+            .read_transport
+            .admission
+            .write(super::admission::Bucket::Graphql)?;
         let _epoch = MutationEpoch::new(&self.searches.generation);
         let started = std::time::Instant::now();
-        let posted =
-            tokio::time::timeout(SEARCH_BUDGET, self.octocrab.post("/graphql", Some(body))).await;
+        let posted = tokio::time::timeout(SEARCH_BUDGET, async {
+            let response = self.octocrab._post("/graphql", Some(body)).await?;
+            self.read_transport.observe_headers(
+                super::admission::Bucket::Graphql,
+                response.status().as_u16(),
+                response.headers(),
+            );
+            if response.status().as_u16() < 500 {
+                admission.complete();
+            }
+            let response = octocrab::map_github_error(response).await?;
+            <serde_json::Value as octocrab::FromResponse>::from_response(response).await
+        })
+        .await;
         crate::diag!(
             "[diag] provider mutation elapsed_ms={} acknowledged={}",
             started.elapsed().as_millis(),
@@ -1134,6 +1227,7 @@ impl GitHubClient {
             Err(_) => return Err(ClientError::UnconfirmedWrite),
         };
 
+        self.read_transport.observe_graphql(&raw);
         if let Some(errs) = raw.get("errors").and_then(|e| e.as_array()) {
             if !errs.is_empty() {
                 let msg = errs
@@ -1463,8 +1557,7 @@ impl GitHubClient {
     /// answers the UI, the remote gate authenticates, startup probes the token
     /// -- so there is nothing for them to report into, and inventing a
     /// throwaway `Budget` to discard would be accounting theatre. They still
-    /// feed the process-wide figure, which is the part that matters outside a
-    /// load.
+    /// feed their authenticated client transport quota observations.
     pub async fn fetch_viewer_metered(
         &self,
         budget: &crate::github::stats::Budget,
@@ -1813,6 +1906,7 @@ async fn graphql_partial_ok(
         octocrab,
         body,
         &super::read_transport::ReadTransport::default(),
+        super::admission::ReadContext::new(super::admission::ReadClass::Foreground, SEARCH_BUDGET),
     )
     .await
 }
@@ -1821,8 +1915,9 @@ async fn graphql_with_transport(
     octocrab: &Octocrab,
     body: &serde_json::Value,
     transport: &super::read_transport::ReadTransport,
+    context: super::admission::ReadContext,
 ) -> Result<serde_json::Value, ClientError> {
-    let raw = transport.post(octocrab, body).await?;
+    let raw = transport.post_with(octocrab, body, context).await?;
 
     let errors = raw.get("errors").and_then(|e| e.as_array());
     let data = raw.get("data").filter(|d| !d.is_null());
@@ -2117,6 +2212,29 @@ mod tests {
             .build()
             .unwrap();
         GitHubClient::new(oc)
+    }
+
+    #[tokio::test]
+    async fn mutation_body_limit_prevents_the_next_dispatch() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"errors":[{"type":"RATE_LIMITED","message":"rate limit exceeded"}]}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_for(&server).await;
+        assert!(client
+            .graphql_mutation_inner(&json!({"query":"mutation Synthetic {}"}))
+            .await
+            .is_err());
+        assert!(matches!(
+            client
+                .graphql_mutation_inner(&json!({"query":"mutation Synthetic {}"}))
+                .await,
+            Err(ClientError::NotDispatched(_))
+        ));
     }
 
     #[tokio::test]

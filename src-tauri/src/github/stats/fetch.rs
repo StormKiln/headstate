@@ -114,65 +114,16 @@ use serde_json::json;
 /// Four rather than three: three is no faster within measurement noise, and
 /// four keeps more of the headroom the secondary-limit argument above was
 /// written to preserve.
-pub const READ_CONCURRENCY: usize = 4;
+pub const READ_CONCURRENCY: usize = crate::github::admission::READ_LIMIT;
 
-/// The process-wide permits that make [`READ_CONCURRENCY`] real.
-///
-/// # Why a static semaphore and not a parameter
-///
-/// The cap has to hold across COMMANDS, and commands have no shared object to
-/// hang it on: each `#[tauri::command]` is entered independently with a
-/// cloned client. A permit threaded in as an argument would be a permit a new
-/// call site could decline to take -- and "the cap is a local variable" is
-/// precisely the defect (#844). A static cannot be forgotten.
-///
-/// Acquired INSIDE each spawned task rather than around a wave, so a wave
-/// that is wider than the cap simply queues rather than deadlocking, and so
-/// the permit is held for exactly the duration of the POST. `tokio`'s
-/// semaphore is fair (FIFO), so one command cannot starve another
-/// indefinitely: five commands contending for six permits interleave instead
-/// of the first to arrive holding them until it finishes.
-///
-/// # Why this does not make the page slower than it was
-///
-/// It changes the page from ~30 concurrent requests to 6, which sounds like
-/// a 5x serialisation and is not: the five commands were never independent in
-/// wall-clock terms, because they contend for one connection pool and for
-/// GitHub's own serial evaluation of search aliases. `client.rs:564`'s
-/// diagnostic comment records the same effect for two concurrent searches
-/// ("a total far above the slower of the two means they are NOT actually
-/// overlapping"), and #844 measured the poll loop's two searches at 3.5s
-/// sequential against 5.6s concurrent -- GitHub contends on simultaneous
-/// node-heavy queries. Bounded concurrency is what the latency figures in
-/// this module were measured under in the first place.
-///
-/// `const_new` so there is no lazy initialisation and no `OnceLock` to reason
-/// about: the permits exist for the life of the process.
-static READ_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(READ_CONCURRENCY);
-
-/// Run one stats read, holding a process-wide permit for its duration.
-///
-/// Every POST this module issues goes through here, which is what makes
-/// [`READ_CONCURRENCY`] a property of the app rather than of one command.
-///
-/// The permit is released when the future completes, including on error: it
-/// is held in a local that drops at the end of this function. `acquire` fails
-/// only if the semaphore has been CLOSED, which nothing closes -- mapped to an
-/// error rather than unwrapped, because a panic inside a Tauri command aborts
-/// the whole app (`board.rs`'s `total_cmp` comment makes the same call).
-/// `pub(super)` so `tree.rs`'s two reads go through it too. Every stats POST
-/// in the module has to, or the cap is a property of this file rather than of
-/// the feature -- and the sidebar tree is one of the things a Stats page
-/// render has in flight (`StatsPage.tsx` reads `useStatsTree`).
+/// Run one metered stats read. Shared admission is acquired by the client's
+/// raw transport, so foreground Stats does not wait behind a second global
+/// stats-only semaphore. The caller's scoped client carries its class/deadline.
 pub(super) async fn metered_read(
     client: &GitHubClient,
     budget: &Budget,
     body: serde_json::Value,
 ) -> Result<serde_json::Value, ClientError> {
-    let _permit = READ_PERMITS
-        .acquire()
-        .await
-        .map_err(|_| ClientError::Graphql("the stats read semaphore is closed".into()))?;
     let v = client.stats_graphql(&body).await?;
     // Recorded HERE rather than at each call site, so a new read cannot be
     // added that takes a permit and then forgets to meter itself -- which is
@@ -2169,7 +2120,7 @@ mod tests {
     /// permit and then forget to meter itself, the `fetch_viewer` half of
     /// #844.
     #[test]
-    fn every_stats_read_goes_through_the_process_wide_permit() {
+    fn every_stats_read_goes_through_the_metered_chokepoint() {
         // The permit COUNT asserted at the end of this test reads
         // process-wide state, so it is false for as long as any other test
         // has a load in flight -- which #1044's timeout tests deliberately
@@ -2200,17 +2151,16 @@ mod tests {
                 assert!(
                     inside_chokepoint || is_comment,
                     "{file}:{} calls `stats_graphql` directly, bypassing the \
-                     process-wide READ_PERMITS. A Stats page fires five \
+                     client-owned transport admission. A Stats page fires five \
                      independent commands, so a per-call cap is not a cap \
-                     (#844) -- route it through `metered_read`, which holds a \
-                     permit and records the spend.\n    {line}",
+                     (#844) -- route it through `metered_read`, which records the spend.\n    {line}",
                     i + 1
                 );
             }
         }
         // And the permit count IS the documented cap, rather than a second
         // number that could drift from it.
-        assert_eq!(READ_PERMITS.available_permits(), READ_CONCURRENCY);
+        assert_eq!(READ_CONCURRENCY, 4);
     }
 
     /// A whole-load ceiling exists, and it is NOT `poll::FETCH_TIMEOUT`
