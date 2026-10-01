@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useFilters } from "../store/filters";
 import type { PrDetail, ReviewGates } from "@/types/pr";
+import { NOT_ASKED } from "../lib/notAsked";
 import { stubViewport } from "@/test-utils";
 import { scopeEffect } from "@/lib/branchDelete";
 import { matchPrLinks } from "@/lib/claudePrs";
@@ -18,11 +19,15 @@ const state = vi.hoisted(() => ({
   // exercises the LOADED view exactly as before.
   isPlaceholderData: false,
   isError: false,
+  error: "boom",
   /// The review gates (#1451, #1454). Undefined by default -- pending and
   /// unreadable both render nothing new -- so every existing test sees
   /// the view exactly as before.
   gates: undefined as ReviewGates | undefined,
 }));
+
+const browserFallback = vi.hoisted(() => ({ openUrl: vi.fn(() => Promise.resolve()), refetch: vi.fn() }));
+vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: browserFallback.openUrl }));
 
 const deleteBranch = vi.hoisted(() =>
   vi.fn<(r: string, repo: string, n: number, b: string, m: boolean) => Promise<void>>(
@@ -57,7 +62,7 @@ vi.mock("../api/hooks", () => ({
     state.prSessionsFailed
       ? { state: "failed", error: "database is locked" }
       : { state: "done", ...matchPrLinks(state.prSessions, { repo, number }) },
-  usePrDetail: () => ({ ...state, error: "boom", refetch: vi.fn() }),
+  usePrDetail: () => ({ ...state, refetch: browserFallback.refetch }),
   useActOnPr: () => vi.fn(() => Promise.resolve()),
   useDeleteHeadBranch: () => deleteBranch,
   useReviewPr: () => reviewPr,
@@ -401,10 +406,13 @@ describe("PrDetailView", () => {
       isLoading: false,
       isPlaceholderData: false,
       isError: false,
+      error: "boom",
     });
     // The mutation mocks are module-level, so without this a later test
     // sees calls made by an earlier one -- which is exactly how the
     // "not called" assertion below failed while passing in isolation.
+    browserFallback.openUrl.mockClear();
+    browserFallback.refetch.mockClear();
     reviewPr.mockClear();
     rerunChecks.mockClear();
     commentOnPr.mockClear();
@@ -952,6 +960,31 @@ describe("PrDetailView", () => {
     render(<PrDetailView repo="octocat/hello-world" number={42} onBack={onBack} />);
     fireEvent.click(screen.getByRole("button", { name: /back to list/i }));
     expect(onBack).toHaveBeenCalled();
+  });
+
+  it.each([
+    ["loading", false, true, ""],
+    ["cooldown", true, false, "GitHub rate limit reached — polling will resume automatically (retry in 49 seconds)"],
+    ["offline", true, false, "Network unavailable"],
+    ["signed out", true, false, `${NOT_ASKED} not authenticated`],
+  ] as const)("keeps browser navigation usable during %s without retrying the API", (_name, failed, loading, error) => {
+    state.isError = failed;
+    state.isLoading = loading;
+    state.error = error;
+    const onBack = vi.fn();
+    render(<PrDetailView repo="octocat/hello-world" number={42} onBack={onBack} />);
+    const navigation = screen.getByRole("navigation", { name: "Pull request navigation" });
+    expect(within(navigation).getByText("octocat/hello-world #42")).toBeTruthy();
+    const link = within(navigation).getByRole("link", { name: "Open on GitHub" });
+    expect(link.getAttribute("href")).toBe("https://github.com/octocat/hello-world/pull/42");
+    // The fallback is a visible action with a finger-sized target, even
+    // before any detail data arrives (#1623).
+    expect(link.classList.contains("tap-target")).toBe(true);
+    fireEvent.click(link);
+    expect(browserFallback.openUrl).toHaveBeenCalledExactlyOnceWith("https://github.com/octocat/hello-world/pull/42");
+    expect(browserFallback.refetch).not.toHaveBeenCalled();
+    fireEvent.click(within(navigation).getByRole("button", { name: "Back to list" }));
+    expect(onBack).toHaveBeenCalledOnce();
   });
 
   it("shows an error rather than a blank page", () => {
