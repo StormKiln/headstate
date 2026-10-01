@@ -1,3 +1,6 @@
+import { connectNotificationNavigation } from "./lib/notificationNavigation";
+import { listen } from "./api/transport";
+import { takeNotificationPr } from "./api/tauri";
 import type { PullRequest } from "./types/pr";
 import { useGitLabInvalidation } from "./api/gitlabInvalidation";
 import { prIdentity, prKey } from "./lib/prIdentity";
@@ -269,6 +272,18 @@ function ViewLoading() {
 /// `get_auth_state` query and one `usePollError` subscription (and
 /// therefore one error banner) per window.
 export default function App() {
+  useEffect(() => {
+    if (!IS_DESKTOP_BUILD) return;
+    let disposed = false;
+    const controller = new AbortController();
+    let stop: (() => void) | undefined;
+    void connectNotificationNavigation(
+      (wake) => listen("notification-pr-pending", wake),
+      takeNotificationPr,
+      controller.signal,
+    ).then((disconnect) => { if (disposed) disconnect(); else stop = disconnect; }).catch((error: unknown) => console.error("Could not listen for notification clicks", error));
+    return () => { disposed = true; controller.abort(); stop?.(); };
+  }, []);
   useGitLabInvalidation();
   const selection = useSourceSelection((s) => s.selection);
   const setSelection = useSourceSelection((s) => s.setSelection);
@@ -299,8 +314,9 @@ export default function App() {
   const previousGitLabViewer = useRef(gitlabViewer);
   useEffect(() => {
     if (previousGitLabViewer.current !== gitlabViewer) {
+      const hadVerifiedViewer = previousGitLabViewer.current != null;
       previousGitLabViewer.current = gitlabViewer;
-      if (useFilters.getState().selectedPr?.source?.provider === "gitlab") useFilters.getState().selectPr(null);
+      if (hadVerifiedViewer && useFilters.getState().selectedPr?.source?.provider === "gitlab") useFilters.getState().selectPr(null);
       useSourceSelection.getState().setRepoKey(null);
     }
   }, [gitlabViewer]);

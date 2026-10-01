@@ -892,3 +892,43 @@ fn unreadable_runs_are_not_read_as_not_running() {
         other => panic!("expected RunsUnreadable, got {other:?}"),
     }
 }
+
+#[test]
+fn unknown_liveness_never_claims_there_is_no_process_to_stop() {
+    let probe = TableProbe(HashMap::from([(KEY_PID, PROC_START_EPOCH)]));
+    let refusal =
+        confirm(&probe, &key_only(Registry::default()), Ok(&no_runs()), "s1").unwrap_err();
+    assert!(
+        matches!(refusal, Refusal::Unconfirmable { .. }),
+        "{refusal:?}"
+    );
+    let why = refusal.why();
+    assert!(
+        why.contains("could not determine whether this session is running"),
+        "{why}"
+    );
+    assert!(!why.contains("no process to stop"), "{why}");
+    let rows = propose(
+        &probe,
+        &key_only(Registry::default()),
+        Ok(&no_runs()),
+        &["s1".to_string()],
+        no_evidence,
+    );
+    assert_eq!(rows[0].action, "refused");
+    assert!(rows[0].pid.is_none());
+    assert_eq!(rows[0].refusal, Some(refusal));
+    assert_eq!(rows[0].why.as_deref(), Some(why.as_str()));
+}
+
+#[test]
+fn unreadable_records_do_not_claim_a_recycled_pid() {
+    let mut registry = Registry::default();
+    registry.unreadable.push("broken.json".into());
+    let why = confirm(&FakeProbe(Ok(None)), &registry, Ok(&no_runs()), "s1")
+        .unwrap_err()
+        .why();
+    assert!(why.contains("record(s) could not be read"), "{why}");
+    assert!(!why.contains("recycled pid"), "{why}");
+    assert!(why.contains("nothing was signalled"), "{why}");
+}

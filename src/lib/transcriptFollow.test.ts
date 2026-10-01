@@ -632,6 +632,24 @@ describe("TranscriptFollower: bounded memory", () => {
     expect(s.hasOlder).toBe(true);
   });
 
+  it("keeps following when the older end can be dropped even if the viewport is nearer it", async () => {
+    const file = new FakeFile(15, 3);
+    const f = follower(file, { maxResident: 15 });
+    f.setLive("running");
+    f.start();
+    await settle();
+    for (let i = 0; i < 4; i++) await f.loadOlder();
+    f.setViewport("r3", "r5");
+    file.add(3);
+    await vi.advanceTimersByTimeAsync(FAST_MS);
+    const s = f.getSnapshot();
+    expect(s.atLiveEdge).toBe(true);
+    expect(s.status).toBe("following");
+    expect(ids(s)).toContain("r3");
+    expect(ids(s).at(-1)).toBe("r17");
+    expect(s.messages).toHaveLength(15);
+  });
+
   it("live growth past the bound, the reader on the oldest page: the newest goes and the follow detaches (#1524)", async () => {
     const file = new FakeFile(12, 3);
     const f = follower(file, { maxResident: 9 });

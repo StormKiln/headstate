@@ -1,3 +1,4 @@
+import { GitLabViewerProvider } from "./api/authAvailability";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -717,4 +718,49 @@ describe("review request source scope", () => {
     await act(async () => useSourceSelection.setState({ selection: "both", repoKey: null, query: "" }));
     expect(screen.getByRole("button", { name: "Request reviews" })).toBeTruthy();
   });
+});
+
+describe("notification click in the assembled shell", () => {
+  afterEach(() => {
+    clearMocks();
+    useSourceSelection.getState().setSelection("github");
+    useFilters.getState().setView("my-prs");
+  });
+
+  it("opens the clicked GitHub PR from a local view even before its details load", async () => {
+    useFilters.getState().setView("worktrees");
+    let pending: { source: { provider: string; host: string }; repo: string; number: number } | null = {
+      source: { provider: "github", host: "github.com" }, repo: "octocat/hello-world", number: 42,
+    };
+    mockIPC((cmd) => {
+      if (cmd === "take_notification_pr") { const next = pending; pending = null; return next; }
+      if (cmd === "get_gitlab_host") return "gitlab.com";
+      return undefined;
+    }, { shouldMockEvents: true });
+    renderApp();
+    expect((await screen.findByRole("link", { name: "Open on GitHub" })).getAttribute("href")).toBe("https://github.com/octocat/hello-world/pull/42");
+    expect(useFilters.getState().view).toBe("my-prs");
+    expect(useFilters.getState().selectedPr?.number).toBe(42);
+  });
+  it("keeps a GitLab notification through initial authentication but clears it on account switch", async () => {
+    useFilters.getState().setView("my-prs");
+    const target = { source: { provider: "gitlab" as const, host: "gitlab.com" }, repo: "example/sub/project", number: 7 };
+    let pending: typeof target | null = target;
+    mockIPC((cmd) => {
+      if (cmd === "take_notification_pr") { const next = pending; pending = null; return next; }
+      if (cmd === "get_gitlab_host") return "gitlab.com";
+      if (cmd === "get_gitlab_detail") throw new Error("Offline");
+      return undefined;
+    }, { shouldMockEvents: true });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    qc.setQueryData(["gitlab-host"], "gitlab.com");
+    const shell = (viewer: string | null) => <QueryClientProvider client={qc}><GitLabViewerProvider viewer={viewer}><App /></GitLabViewerProvider></QueryClientProvider>;
+    const mounted = render(shell(null));
+    expect((await screen.findByRole("link", { name: "Open on GitLab" })).getAttribute("href")).toBe("https://gitlab.com/example/sub/project/-/merge_requests/7");
+    mounted.rerender(shell("first-viewer"));
+    expect(useFilters.getState().selectedPr).toEqual(target);
+    mounted.rerender(shell("second-viewer"));
+    expect(useFilters.getState().selectedPr).toBeNull();
+  });
+
 });

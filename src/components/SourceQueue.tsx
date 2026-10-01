@@ -123,7 +123,7 @@ export function GitLabSummary({ identity, mr, onBack }: { identity: PrIdentity; 
   const detail = useQuery({ queryKey: ["gitlab-detail", prKey(identity), viewer], queryFn: async () => { const result = await getGitLabDetail(identity); if (viewer !== undefined && result.viewer !== viewer) throw new Error("GitLab account changed. Refresh account status."); return result; }, enabled: viewer !== null, staleTime: 60_000, retry: false });
   const core = detail.data?.core;
   const title = core?.title ?? mr?.title;
-  const url = core?.url ?? mr?.url;
+  const url = core?.url ?? mr?.url ?? `https://${identity.source?.host ?? "gitlab.com"}/${identity.repo.split("/").map(encodeURIComponent).join("/")}/-/merge_requests/${identity.number}`;
   return (
     <div className="rounded-md border border-[#30363d] bg-[#161b22] p-4 [&_button]:min-h-11 sm:[&_button]:min-h-0">
       <button type="button" onClick={onBack} className="mb-3 text-sm text-[#4493f8]">← Back to list</button>

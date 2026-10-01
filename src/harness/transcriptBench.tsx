@@ -34,26 +34,9 @@ import { SESSION_ACTIVITY_EVENT } from "../api/hooks";
 import { DesktopTranscript } from "../components/transcript/DesktopTranscript";
 import "../index.css";
 import type { Liveness } from "../types/pr";
-import type { PageCursor, TranscriptPage, TranscriptWindow } from "../types/transcript";
-
-function windowOf(
-  page: TranscriptPage,
-  start: PageCursor,
-  end: PageCursor,
-  atStart: boolean,
-): TranscriptWindow {
-  return {
-    page,
-    start,
-    end,
-    at_start: atStart,
-    at_end: true,
-    rewritten: false,
-    position: { first: null, last: null, total: null, exact: false, basis: "bytes" },
-    seam: { first_model: null, last_model: null },
-    bytes_scanned: 0,
-  };
-}
+import { markNewestText } from "./elementTiming";
+import { SyntheticTranscript } from "./transcriptFile";
+import type { TranscriptPage, TranscriptWindow } from "../types/transcript";
 
 const PATH = "/harness/fixture.jsonl";
 const SESSION = "harness-session";
@@ -108,29 +91,32 @@ async function main() {
   const raw = await (await fetch(`/fixtures/${fixture}.json`)).text();
   const base = JSON.parse(raw) as TranscriptPage;
 
+  const file = new SyntheticTranscript(base);
+  let consumed = file.size;
   const probe: HarnessProbe = {
     reads: [],
     refused: [],
-    size: base.file_bytes,
+    size: file.size,
     queued: 0,
     appended: 0,
     grow(n, turns = false, take = Infinity) {
+      for (let i = 0; i < n; i++) {
+        const g = ++generation;
+        const page = chunk(g, turns, take);
+        file.append(page, () => chunk(g, turns, take));
+        probe.appended += page.messages.length;
+      }
+      probe.size = file.size;
       probe.queued += n;
-      newTurns = turns;
-      keep = take;
     },
     async nudge(size) {
       await emit(SESSION_ACTIVITY_EVENT, { session_id: SESSION, size, seq: 0 });
     },
   };
   let generation = 0;
-  let newTurns = false;
-  let keep = Infinity;
   // One chunk of growth: the fixture's messages under ids no earlier
   // chunk used, costing the bytes of the JSON they came from.
-  const chunk = (): TranscriptPage => {
-    generation += 1;
-    const g = generation;
+  const chunk = (g: number, newTurns: boolean, keep: number): TranscriptPage => {
     const page = JSON.parse(raw.replace(IDS, (id) => `${id}-g${g}`)) as TranscriptPage;
     // Continuing the turn in progress: no opener, and every message's
     // turn is the one the merge carries in from the page before.
@@ -156,24 +142,15 @@ async function main() {
       const a = args as { anchor: { kind: string; offset?: number }; direction: string };
       let w: TranscriptWindow;
       if (a.anchor.kind === "end") {
-        const page = JSON.parse(raw) as TranscriptPage;
-        const end = { offset: page.file_bytes, behind_digest: "harness" };
-        const start = { offset: page.file_bytes - page.bytes_read, behind_digest: "harness" };
-        w = windowOf(page, start, end, !page.truncated);
+        w = file.end();
+        consumed = file.size;
+        probe.queued = 0;
       } else if (a.direction === "after") {
-        const from = a.anchor.offset ?? probe.size;
-        const at = { offset: from, behind_digest: "harness" };
-        if (probe.queued > 0 && from === probe.size) {
-          probe.queued -= 1;
-          const page = chunk();
-          probe.size = from + page.bytes_read;
-          probe.appended += page.messages.length;
-          const end = { offset: probe.size, behind_digest: "harness" };
-          w = windowOf({ ...page, truncated: false, file_bytes: probe.size }, at, end, false);
-        } else {
-          // Nothing new: what a follow tick gets from an idle file.
-          const page = { ...base, messages: [], bytes_read: 0, file_bytes: probe.size };
-          w = windowOf(page, at, at, false);
+        const from = a.anchor.offset ?? consumed;
+        w = file.after(from);
+        if (w.end.offset > consumed) {
+          consumed = w.end.offset;
+          probe.queued = Math.max(0, probe.queued - 1);
         }
       } else {
         probe.refused.push(`${cmd} before`);
@@ -200,6 +177,12 @@ async function main() {
   const liveness: Liveness = follow
     ? { state: "running", pid: 1, status: "busy" }
     : { state: "dead", why: "harness" };
+  // Element Timing observes directly contained text, not an ancestor
+  // with only child elements. Move the probe before the next paint.
+  const root = document.getElementById("root")!;
+  new MutationObserver(() => markNewestText(root)).observe(root, {
+    childList: true, subtree: true, attributes: true,
+  });
   createRoot(document.getElementById("root")!).render(
     <StrictMode>
       <QueryClientProvider client={new QueryClient()}>

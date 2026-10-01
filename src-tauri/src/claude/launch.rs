@@ -699,7 +699,8 @@ mod tests {
     fn a_program_that_does_not_exist_reports_spawn_and_names_it() {
         // Reached only with a real cwd, so this also proves the cwd
         // check passes a directory that IS there.
-        let dir = std::env::temp_dir();
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path();
         let e = launch(
             "headstate-no-such-terminal-xyz {command}",
             "c",
@@ -754,7 +755,8 @@ mod tests {
         // A REAL directory, because the `&&` below short-circuits on a
         // failed `cd` -- which would leave the shell check asserting
         // nothing at all while still passing.
-        let dir = std::env::temp_dir();
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path();
         let command = prompt_command(brief, &dir.to_string_lossy());
 
         // Through the template, into argv. `bash -lc` is the shape three
@@ -925,7 +927,8 @@ mod tests {
 
     #[test]
     fn a_program_that_exits_non_zero_at_once_is_reported_not_called_success() {
-        let dir = std::env::temp_dir();
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path();
         let e = launch(SHELL, FAILS_FAST, Some(&dir.to_string_lossy())).unwrap_err();
         match &e {
             LaunchError::ExitedImmediately { status, .. } => {
@@ -945,7 +948,8 @@ mod tests {
     /// stderr nobody read.
     #[test]
     fn the_stderr_of_an_instant_failure_reaches_the_message() {
-        let dir = std::env::temp_dir();
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path();
         let e = launch(SHELL, TALKS_THEN_FAILS, Some(&dir.to_string_lossy())).unwrap_err();
         match &e {
             LaunchError::ExitedImmediately { stderr, status } => {
@@ -965,7 +969,8 @@ mod tests {
     /// which is why the check is on the status and not on the speed.
     #[test]
     fn a_launcher_that_hands_off_and_exits_zero_is_a_success() {
-        let dir = std::env::temp_dir();
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path();
         launch(SHELL, HANDS_OFF, Some(&dir.to_string_lossy()))
             .expect("a clean instant exit is a handoff, not a failure");
     }
@@ -980,7 +985,8 @@ mod tests {
     /// elapsed-time assertion, which is the regression that matters.
     #[test]
     fn a_terminal_that_stays_open_is_not_waited_on() {
-        let dir = std::env::temp_dir();
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path();
         let start = std::time::Instant::now();
         launch(SHELL, STAYS_OPEN, Some(&dir.to_string_lossy()))
             .expect("a still-running terminal is a successful launch");
@@ -1132,12 +1138,9 @@ mod tests {
             // Through the real launcher, so `watch_briefly` gets a say:
             // `open -a` exits 1 in milliseconds and this is now an
             // `ExitedImmediately` error rather than a silent success.
-            launch(
-                &retargeted,
-                &command,
-                Some(&std::env::temp_dir().to_string_lossy()),
-            )
-            .unwrap_or_else(|e| panic!("{app} preset shape failed to launch: {e}\n{retargeted}"));
+            launch(&retargeted, &command, Some(&tmp.path().to_string_lossy())).unwrap_or_else(
+                |e| panic!("{app} preset shape failed to launch: {e}\n{retargeted}"),
+            );
 
             // `do shell script` is synchronous inside `osascript`, but
             // `launch` deliberately does not wait on its child, so the
@@ -1245,12 +1248,8 @@ mod tests {
                 super::super::sessions::shell_quote(&canary.to_string_lossy(),)
             );
 
-            launch(
-                &tpl,
-                &command,
-                Some(&std::env::temp_dir().to_string_lossy()),
-            )
-            .unwrap_or_else(|e| panic!("{app} preset failed to launch: {e}"));
+            launch(&tpl, &command, Some(&tmp.path().to_string_lossy()))
+                .unwrap_or_else(|e| panic!("{app} preset failed to launch: {e}"));
 
             // The terminal runs the line asynchronously once its window
             // exists, so the canary appears strictly after `launch`

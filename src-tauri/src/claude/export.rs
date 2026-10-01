@@ -250,9 +250,12 @@ mod tests {
     ///
     /// `"/tmp"` does not exist on Windows, where `check_cwd` correctly
     /// returns `Gone` -- which has failed tests on the `windows-latest`
-    /// job before. `temp_dir()` is `TEMP` there and `/tmp` here.
+    /// job before. The test checkout is an existing directory on every platform.
     fn real_dir() -> String {
-        std::env::temp_dir().to_string_lossy().into_owned()
+        std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
     }
 
     fn row(session_id: &str, cwd: Option<&str>, liveness: ListLiveness) -> ListRow {

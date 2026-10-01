@@ -7,6 +7,17 @@ diagnostics="${RUNNER_TEMP:?RUNNER_TEMP must be set}/frontend-diagnostics"
 mkdir -p "$diagnostics"
 export NODE_OPTIONS="${NODE_OPTIONS:-} --trace-exit --report-on-fatalerror --report-uncaught-exception --report-exclude-env --report-exclude-network --report-directory=\"$diagnostics\""
 
+# A stale report must never certify a later early exit.
+rm -f "$diagnostics/vitest.json" "$diagnostics/files.json"
+set +e
+node ./node_modules/vitest/vitest.mjs list --filesOnly --json="$diagnostics/files.json" 2>&1 | tee "$diagnostics/discovery.log"
+status=$?
+set -e
+if [[ "$status" -ne 0 ]]; then
+  printf '%s\n' "$status" > "$diagnostics/exit-code.txt"
+  exit "$status"
+fi
+
 set +e
 # Yarn maps native signals it does not recognize (including SIGSEGV) to
 # exit 1 without a message. Invoke the pinned Node and local Vitest entry
@@ -20,4 +31,7 @@ printf '%s\n' "$status" > "$diagnostics/exit-code.txt"
 if [[ ! -s "$diagnostics/vitest.json" ]]; then
   echo '::warning::Vitest did not write its JSON result; inspect frontend diagnostics for an incomplete run.'
 fi
-exit "$status"
+if [[ "$status" -ne 0 ]]; then
+  exit "$status"
+fi
+python3 scripts/check-frontend-report.py "$diagnostics/files.json" "$diagnostics/vitest.json"

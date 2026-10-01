@@ -13,9 +13,9 @@
 //!
 //! The Rust-to-Rust pairs were never in scope of that file, and
 //! `invariants::tests::every_cross_crate_constant_is_read_from_both_sides`
-//! in the desktop crate found eleven of them. This is their assertion.
+//! in the desktop crate finds them. This is their assertion.
 //!
-//! Worst of the eleven, and the reason this is a file rather than a
+//! Most consequential, and the reason this is a file rather than a
 //! footnote: `ECDSA_SIG_LEN` and `MLDSA_SIG_LEN` live in
 //! `crates/headstate-stepup`, whose module doc says in so many words that
 //! it holds what "both ends must agree on" -- and `keys.rs` DECLARES THEM

@@ -237,8 +237,17 @@ jobs:
       - name: Clippy
         shell: bash
         run: |
-          (cd crates/headstate-stepup && cargo clippy --all-targets -- -D warnings)
-          (cd src-tauri && cargo clippy --all-targets -- -D warnings)
+          (cd crates/headstate-stepup && python3 ../../scripts/ci-command.py run clippy-stepup -- cargo clippy --all-targets -- -D warnings)
+          (cd src-tauri && python3 ../scripts/ci-command.py run clippy-desktop -- cargo clippy --all-targets -- -D warnings)
+
+      - name: Retain command diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: command-diagnostics-${{ github.job }}-${{ runner.os }}
+          path: ${{ runner.temp }}/ci-diagnostics/
+          if-no-files-found: warn
+          retention-days: 7
 
   test-rust:
     # 4m measured, incl. the 3x race check. Generous on purpose: this must never fire on a slow but
@@ -630,11 +639,19 @@ jobs:
       # exists to police on the one we already have. Not worth it.
       - name: Clippy
         shell: bash
-        run: (cd src-tauri && cargo clippy --all-targets -- -D warnings)
+        run: (cd src-tauri && python3 ../scripts/ci-command.py run clippy-desktop -- cargo clippy --all-targets -- -D warnings)
 
       - name: Build the app
         shell: bash
         run: yarn tauri build --no-bundle
+      - name: Retain command diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: command-diagnostics-${{ github.job }}-${{ runner.os }}
+          path: ${{ runner.temp }}/ci-diagnostics/
+          if-no-files-found: warn
+          retention-days: 7
 
   # Does this change touch anything a mobile job could possibly break?
   #

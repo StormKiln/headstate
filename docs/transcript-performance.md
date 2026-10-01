@@ -10,9 +10,9 @@ numbers.
 and the browser harness are in place. The harness measures B1 to B4 in
 Chromium and estimates B5 from real-text compression ratios. Nothing is
 yet confirmed in WKWebView, and every phone figure is still **not
-measured**, not "passing". Two desktop defects are open: the residency
-bound does not bind while the reader's window holds the oldest page, and an
-idle read is never shown ("Findings, 2026-09-27").
+measured**, not "passing". The 8.1 corrections and retest below cover exact
+paint timing, grown-file reads, idle controls, large-page mounting, and
+retention during eviction. The dated 2026-09-27 tables are historical.
 
 ## Where each budget stands (2026-09-27)
 
@@ -299,14 +299,14 @@ How it is built:
   on a row that widens the page, or on a scroll that did not reach both ends.
 
 The design it implements:
-- **B1, first paint.** The newest message carries `elementtiming="newest"`
-  (set by the shell).
-  A `PerformanceObserver({ type: "element" })` reports its `renderTime`,
-  measured from the selection that opened the fixture (`performance.mark`
-  in the same task as the click). **Chromium reports no element entry for
-  that row** -- its text is in descendants, not in the row itself -- so every
-  figure below is the fallback: the second animation frame after the row is
-  in the DOM. The table says which was used.
+- **B1, first paint.** The shell identifies the newest row; the harness
+  tags its first directly contained content text with `elementtiming="newest"`
+  before paint. A `PerformanceObserver({ type: "element" })` reports its
+  `renderTime`, measured from the selection that opened the fixture
+  (`performance.mark` in the same task as the click). Missing Element Timing
+  is a failure, with the second-frame value printed only as a diagnostic.
+  The historical tables below predate this correction (#1539) and used the
+  approximate second-frame measurement; they are not exact paint times.
 - **B2, scrolling.** A `PerformanceObserver({ type: "longtask" })` is installed
   before a scripted scroll: `page.mouse.wheel` in fixed steps from newest to
   oldest and back, awaiting a frame between steps. Frame intervals are
@@ -627,3 +627,85 @@ installed as sessions. Copy them into a scratch project directory under
    deadline, the 1,000-line cap and the 60,000-character cap from these.
 9. Record the device, iOS version, build number and every figure in the PR.
    Mark a figure you could not take as not measured, never as zero.
+
+
+## 8.1 follow and harness corrections (#1538, #1539)
+
+The synthetic file now grows before the read. Both `end` and cursor reads
+serve that grown history, including a lagging cursor across several pages.
+The history retains replay recipes (generation and slicing parameters), so
+the eviction heap probe counts parsed messages retained by the viewer,
+rather than copies retained by the fixture server. Whole parser fixtures
+with zero filesystem sizes receive synthetic byte spans, so their growth
+advances cursors rather than being mistaken for an unchanged file.
+Rejoining after a parked detach must render the grown generation as well as
+say “Following”. The harness no longer accepts a two-frame approximation as
+B1. The default growth run covers both page-sized chunks and a deliberate
+400-message whole-fixture stress case. `GROW_FIXTURE` selects one for a
+focused comparison. Growth long tasks exclude the initial open.
+
+Live growth now drops an unseen oldest page first, even if the viewer is
+closer to it than to the tail. A viewer actually holding the oldest page
+still detaches explicitly when the bound binds, protecting its place and
+the 2,000-message residency limit. Reader-driven paging and memory-pressure
+eviction retain their farthest-end policy.
+
+The shared desktop/phone mounted window is 200 rows (previously 400), with
+the existing 100-row step and slack. Pages and resident data are unchanged;
+older rows remain reachable by scrolling, and a long turn's prompt may
+initially be outside this smaller window. The Show checkboxes are memoized
+on their settings and hidden count, while the status continues to receive
+every successful idle read's fresh timestamp.
+
+
+The corrected whole-page stress also exposed retained old messages in the
+host: callbacks created when `hasOlder` first changed shared their render's
+closure context with other handlers. A heap retaining path ran through
+`DesktopTranscript.onKeyDown`, the render context, and `onLoadEarlier` to
+the obsolete message array. Moving the load-earlier factory outside the
+host (shared with the phone) and keeping the desktop message getter stable
+from the initial render removed that old snapshot. The stress regression
+held generations 1–5 and 25–30 before the fix (11 pages, allowance 7), then
+only 25–30 afterward (6 pages). This was bounded stale retention, not an
+unbounded leak. The browser benchmark now exercises it by default.
+
+### Before/after on 2026-09-30
+
+The baseline uses the corrected harness with the original 400-row viewer;
+the after run is the full `make bench-transcript-browser`, with retained
+synthetic fixtures. Both use local headless Chromium at 1280×800. These are
+samples from this host, not device certification or a guaranteed speedup.
+
+| 400-message fixture | exact B1 before → after | open task before → after | heap after scrolling before → after |
+|---|---:|---:|---:|
+| messages-1k whole | 155.4 → 116.7 ms | 109 → 78 ms | 10.4 → 8.8 MB |
+| messages-10k whole | 164.3 → 117.9 ms | 114 → 78 ms | 10.6 → 8.9 MB |
+| tool-heavy-70mb whole | 160.0 → 116.9 ms | 110 → 79 ms | 11.4 → 9.6 MB |
+
+All eight final fixtures returned exact Element Timing (66.0–117.9 ms),
+with no scrolling long tasks, no horizontal overflow, and scrolling frame
+p95 16.7–16.8 ms. The mount target is 200, with up to 100 rows of slack.
+
+For 27 active-cadence reads on the whole tool-heavy fixture, outside-row
+mutations fell from 345 to 21: exactly 12 checkbox mutations removed per
+read. Row mutations and idle long tasks stayed at zero. Successful read
+status remains fresh. Main-thread time/read was 7.09 → 4.42 ms on that
+fixture, but the smaller fixture varied in the other direction (1.56 →
+4.41 ms); these timing samples do not establish a universal idle speedup.
+A brief unrelated compile may have overlapped the final follow phase.
+Both fixtures passed hidden/same-size-nudge suppression and new-byte nudge
+latency (3.6 and 11.6 ms).
+
+The 30-chunk whole-page live stress fell from 30 growth long tasks (maximum
+92 ms) to 2 (maximum 62 ms), and its sampled heap plateau fell from 18.4 to
+15.9 MB. It retained 6 generations against an allowance of 7 and stayed at
+the live edge. The ordinary-page live stress had no growth long tasks,
+peaked at 12.4 MB, and retained 19 generations against an allowance of 20.
+Parked readers detached after 16 ordinary chunks or 5 whole chunks, stayed
+bounded, and rejoined content grown while detached. One 67 ms task remained
+in the whole-page parked/rejoin scenario; opening and large appends are
+cheaper, not free of long tasks.
+
+The full make target exited successfully: all eight B1/B2/B3 fixtures, both
+B4 follow fixtures, and all four residency scenarios passed. B5 remains a
+compression estimate; WKWebView and iOS device timings remain unmeasured.

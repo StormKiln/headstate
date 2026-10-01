@@ -1,5 +1,6 @@
 import { type CSSProperties, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { claudeTranscriptBlockText } from "@/api/tauri";
+import { earlierCallLoader } from "../loadEarlier";
 import { useClaudeTranscriptLive } from "@/api/hooks";
 import { PullIndicator } from "@/components/PullIndicator";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
@@ -159,15 +160,7 @@ export function PhoneTranscript({
   const loadOlderUntil = active.loadOlderUntil;
   // Pages back until the call is held, not one page per tap (#1484).
   const onLoadEarlier = useMemo(
-    () =>
-      active.hasOlder
-        ? (toolUseId: string | null) =>
-            void loadOlderUntil((m) =>
-              toolUseId === null
-                ? true
-                : m.blocks.some((b) => b.kind === "tool_call" && b.id === toolUseId),
-            )
-        : undefined,
+    () => earlierCallLoader(active.hasOlder, loadOlderUntil),
     [active.hasOlder, loadOlderUntil],
   );
   const ctx = useMemo<PhoneTranscriptContext>(

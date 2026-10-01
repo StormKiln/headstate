@@ -342,6 +342,7 @@ export function PrDetailView({
     return (
       <div>
         {back}
+        <ExternalLink href={`https://github.com/${repo}/pull/${number}`}>Open on GitHub</ExternalLink>
         <div className="rounded-md border border-[#30363d] px-4 py-12 text-center text-sm text-[#8b949e]">
           Loading pull request…
         </div>
@@ -353,6 +354,7 @@ export function PrDetailView({
     return (
       <div>
         {back}
+        <ExternalLink href={`https://github.com/${repo}/pull/${number}`}>Open on GitHub</ExternalLink>
         <QueryError
           title="Could not load this pull request"
           message={errorMessage(error)}

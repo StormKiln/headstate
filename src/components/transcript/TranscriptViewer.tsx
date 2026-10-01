@@ -415,8 +415,8 @@ function ViewerBody({
                   scrollAnchor={arrivals.anchors.has(m.id)}
                   // Budget B1's probe (docs/transcript-performance.md): the
                   // browser harness times first paint of the newest message
-                  // through Element Timing, which reads this attribute.
-                  {...(atTail && i === shown.length - 1 ? { elementtiming: "newest" } : {})}
+                  // by tagging directly contained text in this marked row.
+                  {...(atTail && i === shown.length - 1 ? { "data-newest-message": "true" } : {})}
                 >
                   {renderMessage(m)}
                 </MessageScrollerItem>

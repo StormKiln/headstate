@@ -96,8 +96,10 @@ gh run download RUN_ID -R StormKiln/headstate \
 
 Read `exit-code.txt` with `vitest.log`. A completed run also writes
 `vitest.json`; a missing JSON file means the result is incomplete, not that
-zero tests failed. Compare the JSON test totals and `success` field with the
-exit status. The wrapper invokes Node directly to preserve native signal
+zero tests failed. The wrapper also discovers the expected files through Vitest and rejects
+missing, duplicate, unsuccessful or incomplete report results even if Node
+returns zero. `exit-code.txt` remains the native test-process exit, so a zero
+there plus a failed step can mean the report completeness check rejected it. The wrapper invokes Node directly to preserve native signal
 statuses (for example, 139 for SIGSEGV); Yarn can collapse those into exit 1.
 Explicit `process.exit()` calls include a trace. The log includes per-file
 heap measurements, and Node may write
@@ -112,6 +114,22 @@ alone does not establish an out-of-memory cause. A later passing run is useful
 reproduction evidence, but does not explain the original failure. For a
 release, also follow the [release check-run policy](.claude/skills/release/SKILL.md):
 a passing rerun does not erase earlier failed or cancelled attempts.
+
+Setup and Clippy diagnostics (#1361/#1614) are retained for seven days in
+`setup-diagnostics-JOB-OS` and `command-diagnostics-JOB-OS`. The command JSON
+records stage, timestamps, elapsed time, output byte count and exit status;
+its matching log contains the command's existing output. No arguments or
+environment are copied into metadata. During a quiet command, a 30-second
+heartbeat records time since output. Check annotations also record stage
+starts and completions, including the third-party Node/toolchain/cache setup
+boundaries, so a missing final log need not erase the last known stage.
+
+The recorder forwards cancellation to its own process group and retains the
+signal status. It does not add retries, change compiler budgets, or make a
+failed command pass. A disconnected or destroyed runner can still lose local
+artifacts; breadcrumbs cannot prove the cause of the original missing-log
+incidents. If an annotation exists without a completion or artifact, report
+that limit rather than infer a compiler deadlock or an out-of-memory event.
 
 Two guards that used to be CI-only now run in `make lint` (via
 `lint-deps`): `scripts/check-privacy.sh` and

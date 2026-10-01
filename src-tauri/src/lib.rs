@@ -19,9 +19,11 @@ pub mod identity;
 /// here so `cargo test` compiles it.
 #[cfg(test)]
 mod invariants;
+mod notification_navigation;
 pub mod packages;
 pub mod panic_hook;
 pub mod poll;
+mod project_menu;
 pub mod redact;
 pub mod release_notes;
 pub mod remote;
@@ -288,6 +290,7 @@ pub fn run() {
                 .build(),
         )
         .invoke_handler(tauri::generate_handler![
+            notification_navigation::take_notification_pr,
             commands::diag_log,
             commands::background_panicked,
             commands::background_health,
@@ -482,6 +485,9 @@ pub fn run() {
             remote::gate::set_remote_enabled,
         ])
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            notification_navigation::setup(app.handle());
+            project_menu::setup(app.handle())?;
             let handle = app.handle().clone();
 
             // Before anything that logs. The stored preference decides
