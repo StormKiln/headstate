@@ -11,7 +11,9 @@ excluded. New CSS files require adding their compiled entry to the guard.
 There is no production file exemption list or parallel test palette.
 
 Literal text/background pairs, explicit hover/selected states and literal
-ancestor backgrounds are checked at 4.5:1. Meaningful imported Lucide icons
+ancestor backgrounds are checked at 4.5:1. Literal inline `backgroundColor`
+on the element or nearest known ancestor is included, also when foreground
+and surface mix style objects and classes; inline surfaces override classes. Meaningful imported Lucide icons
 use 3:1. Unknown inherited surfaces use the raised `#21262d` contract; this
 is a conservative default for the current dark surfaces, not a proof of
 arbitrary React inheritance. Tailwind resolves named, semantic, hex and

@@ -751,7 +751,7 @@ describe("StatsPage honesty", () => {
     const failure = screen.getByText(/remaining days are not being collected/);
     expect(failure.textContent).toContain("database error: disk I/O error");
     // Styled as a failure, not as the amber partiality around it.
-    expect(failure.className).toContain("text-[#f85149]");
+    expect(failure.className).toContain("text-[#ff7b72]");
     expect(screen.queryByRole("button", { name: /retry|try again/i })).toBeNull();
   });
 

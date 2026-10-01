@@ -26,3 +26,27 @@ test('pairs literal inherited surfaces and refuses faded text and inline opacity
     const disabled = scanSource('new.tsx', '<button disabled={busy} className="text-[#777] hover:bg-white disabled:opacity-50">Go</button>');
     assert.ok(disabled.pairs.some(p => p.fg === 'text-[#777]' && p.bg === 'bg-white'));
 });
+
+test('resolves inline and mixed literal surfaces before the unknown-surface fallback', () => {
+    for (const source of [
+        '<p style={{color:"#ffffff",backgroundColor:"#ffffff"}}>Unreadable</p>',
+        '<div style={{backgroundColor:"#ffffff"}}><p style={{color:"#ffffff"}}>Unreadable</p></div>',
+        '<p className="bg-white" style={{color:"#ffffff"}}>Unreadable</p>',
+        '<p className="text-white" style={{backgroundColor:"#ffffff"}}>Unreadable</p>',
+        '<div style={{backgroundColor:"#ffffff"}}><p className="text-white">Unreadable</p></div>',
+        '<div className="bg-black"><p className="bg-black text-white" style={{backgroundColor:"#ffffff"}}>Unreadable</p></div>',
+    ]) {
+        const s = scanSource('inline.tsx', source);
+        assert.deepEqual(s.errors, []);
+        assert.ok(s.pairs.some(p => ['text-[#ffffff]', 'text-white'].includes(p.fg) && ['bg-[#ffffff]', 'bg-white'].includes(p.bg)), source);
+        assert.ok(!s.pairs.some(p => p.bg === 'bg-[#21262d]'), source);
+    }
+    const disabledSurface = scanSource('inline.tsx', '<button className="text-white disabled:bg-white">Enabled</button>');
+    assert.ok(!disabledSurface.pairs.some(p => p.bg === 'bg-white'));
+    const valid = scanSource('inline.tsx', '<p style={{color:"#ffffff",backgroundColor:"#000000"}}>Readable</p>');
+    assert.ok(valid.pairs.some(p => p.fg === 'text-[#ffffff]' && p.bg === 'bg-[#000000]'));
+    const unknown = scanSource('inline.tsx', '<Component><p style={{color:"#ffffff"}}>Unknown inherited surface</p></Component>');
+    assert.ok(unknown.pairs.some(p => p.bg === 'bg-[#21262d]'));
+    const dynamic = scanSource('inline.tsx', '<p className="text-white" style={{backgroundColor:unknownColor}}>Needs contract</p>');
+    assert.ok(dynamic.errors.some(e => e.includes('named contrast contract')));
+});

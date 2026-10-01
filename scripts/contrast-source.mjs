@@ -42,6 +42,33 @@ export function scanSource(file, source) {
             if (bindings && ts.isNamedImports(bindings))
                 bindings.elements.forEach(e => icons.add(e.name.text));
         }
+    // A literal inline background wins over classes on the same element.
+    // Walk known ancestors only; component/conditional inheritance retains
+    // the documented raised-surface contract and rendered-matrix coverage.
+    function literalBackgrounds(el, inlineOnly = false) {
+        const style = el.attributes.properties.find(a => ts.isJsxAttribute(a) && a.name.text === 'style');
+        const object = style?.initializer && ts.isJsxExpression(style.initializer) ? style.initializer.expression : undefined;
+        if (object && ts.isObjectLiteralExpression(object)) {
+            const bg = object.properties.find(p => ts.isPropertyAssignment(p) && p.name.getText(ast).replace(/^["']|["']$/g, '') === 'backgroundColor');
+            if (bg && ts.isStringLiteral(bg.initializer))
+                return [{ value: `bg-[${bg.initializer.text.replaceAll(' ', '_')}]`, state: '' }];
+        }
+        if (inlineOnly) return [];
+        const attr = el.attributes.properties.find(a => ts.isJsxAttribute(a) && a.name.text === 'className');
+        const value = attr?.initializer && ts.isJsxExpression(attr.initializer) ? attr.initializer.expression : attr?.initializer;
+        return value && ts.isStringLiteral(value) ? value.text.split(/\s+/).map(utility).filter(t => background(t.value)) : [];
+    }
+    function knownSurfaces(el, local) {
+        const own = el ? literalBackgrounds(el, local !== undefined) : [];
+        if (own.length) return own;
+        if (local?.length) return local;
+        for (let parent = el?.parent?.parent; parent; parent = parent.parent) {
+            if (!ts.isJsxElement(parent)) continue;
+            const inherited = literalBackgrounds(parent.openingElement);
+            if (inherited.length) return inherited;
+        }
+        return [{ value: 'bg-[#21262d]', state: '' }];
+    }
     function visit(n) {
         if (ts.isPropertyAssignment(n) && n.name.getText(ast) === 'opacity' && n.initializer.getText(ast) !== '1') {
             errors.push(`${file}:${ast.getLineAndCharacterOfPosition(n.getStart()).line + 1}: inline opacity needs an explicit disabled/decorative class state`);
@@ -52,8 +79,12 @@ export function scanSource(file, source) {
                 const color = n.initializer.text.replaceAll(' ', '_');
                 const c = `${n.name.getText(ast) === 'color' ? 'text' : 'bg'}-[${color}]`;
                 classes.add(c);
-                if (n.name.getText(ast) === 'color')
-                    pairs.push({ where, fg: c, bg: 'bg-[#21262d]', min: 4.5 });
+                if (n.name.getText(ast) === 'color') {
+                    for (const surface of knownSurfaces(owner(n))) {
+                        classes.add(surface.value);
+                        pairs.push({ where, fg: c, bg: surface.value, min: 4.5 });
+                    }
+                }
             }
             else if (/^(?:fg|TONE(?:_COLOUR)?\[.*\])$/.test(expr) && /from ["'][^"']*palette["']/.test(source)) {
                 // Finite palette-based tone maps are checked by palette.test.ts.
@@ -80,22 +111,7 @@ export function scanSource(file, source) {
             for (const f of fg)
                 if (/\/\d+$/.test(f.value) && !disabled && !decorative)
                     errors.push(`${where}: ${f.value}: use an opaque readable text tone; alpha inherits the parent's surface`);
-            const bg = active.filter(t => background(t.value));
-            // Literal ancestor surfaces are knowable; conditional React branches
-            // need mounted fixtures instead of inventing a cross-branch cascade.
-            if (bg.length === 0 && el)
-                for (let parent = el.parent?.parent; parent; parent = parent.parent) {
-                    if (!ts.isJsxElement(parent))
-                        continue;
-                    const attr = parent.openingElement.attributes.properties.find(a => ts.isJsxAttribute(a) && a.name.text === 'className');
-                    if (attr?.initializer && ts.isStringLiteral(attr.initializer)) {
-                        const inherited = attr.initializer.text.split(/\s+/).map(utility).filter(t => background(t.value));
-                        if (inherited.length) {
-                            bg.push(...inherited);
-                            break;
-                        }
-                    }
-                }
+            const bg = knownSurfaces(el, active.filter(t => background(t.value)));
             for (const t of [...fg, ...bg])
                 classes.add(t.value);
             if (!disabled && !decorative)
