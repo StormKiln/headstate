@@ -5213,24 +5213,127 @@ fn round_trip_on_a_copy() {
 
     // ---- Invariant: no test names a path in the shared temp dir (#1554) --
 
-    /// Every test line in `lines` (per `mask`) that joins a name onto the
-    /// shared `std::env::temp_dir()`, including a bare binding that might
-    /// later be joined. Use an owned TempDir even for an existing cwd.
-    fn shared_temp_offenders(rel: &str, lines: &[&str], mask: &[bool]) -> Vec<String> {
-        let mut out = Vec::new();
-        for (n, line) in lines.iter().enumerate() {
-            if !mask.get(n).copied().unwrap_or(false) || is_comment(line) {
+    /// Mask Rust comments and literals while preserving byte offsets and lines.
+    /// Needed here because fixtures often mention the forbidden API as text.
+    fn temp_guard_code(src: &str) -> String {
+        let bytes = src.as_bytes();
+        let mut code = bytes.to_vec();
+        let mut i = 0;
+        while i < bytes.len() {
+            let start = i;
+            if bytes[i..].starts_with(b"//") {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            } else if bytes[i..].starts_with(b"/*") {
+                i += 2;
+                let mut depth = 1;
+                while i < bytes.len() && depth > 0 {
+                    if bytes[i..].starts_with(b"/*") {
+                        depth += 1;
+                        i += 2;
+                    } else if bytes[i..].starts_with(b"*/") {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            } else if bytes[i] == b'r' && {
+                let mut quote = i + 1;
+                while bytes.get(quote) == Some(&b'#') {
+                    quote += 1;
+                }
+                bytes.get(quote) == Some(&b'"')
+            } {
+                let mut quote = i + 1;
+                while bytes.get(quote) == Some(&b'#') {
+                    quote += 1;
+                }
+                let end = format!("\"{}", "#".repeat(quote - i - 1));
+                i = src[quote + 1..]
+                    .find(&end)
+                    .map_or(bytes.len(), |at| quote + 1 + at + end.len());
+            } else if bytes[i] == b'"' {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i = (i + 2).min(bytes.len());
+                    } else if bytes[i] == b'"' {
+                        i += 1;
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+            } else if bytes[i] == b'\''
+                && (bytes.get(i + 1) == Some(&b'\\')
+                    || src[i + 1..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| bytes.get(i + 1 + c.len_utf8()) == Some(&b'\'')))
+            {
+                // A character literal, not a lifetime such as 'static.
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i = (i + 2).min(bytes.len());
+                    } else if bytes[i] == b'\'' {
+                        i += 1;
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+            } else {
+                // Skip a whole UTF-8 character so string slicing stays valid.
+                i += src[i..].chars().next().unwrap().len_utf8();
                 continue;
             }
-            // Ban the root itself: a binding or alias can be joined later.
-            if line
-                .split(|c: char| !c.is_alphanumeric() && c != '_')
-                .any(|word| word == "temp_dir")
-            {
-                out.push(format!("{rel}:{}: {}", n + 1, line.trim()));
+            for b in &mut code[start..i] {
+                if *b != b'\n' {
+                    *b = b' ';
+                }
             }
         }
-        out
+        String::from_utf8(code).expect("masked complete literals and comments")
+    }
+
+    /// Test lines that call or import the shared temp root, or take a qualified
+    /// reference to it. Bare bindings are forbidden before a later join can hide
+    /// their origin; an owned TempDir variable may still be named `temp_dir`.
+    fn shared_temp_offenders(rel: &str, lines: &[&str], mask: &[bool]) -> Vec<String> {
+        let code = temp_guard_code(&lines.join("\n"));
+        let tokens: Vec<_> = regex::Regex::new(r"[\p{L}_][\p{L}\p{N}_]*|::|[^\s]")
+            .unwrap()
+            .find_iter(&code)
+            .map(|m| (m.as_str(), m.start()))
+            .collect();
+        let mut found = std::collections::BTreeSet::new();
+        let mut in_use = false;
+        for (i, &(token, offset)) in tokens.iter().enumerate() {
+            if token == "use" {
+                in_use = true;
+            }
+            if token == ";" {
+                in_use = false;
+            }
+            if token != "temp_dir" {
+                continue;
+            }
+            let previous = i.checked_sub(1).map(|n| tokens[n].0);
+            let next = tokens.get(i + 1).map(|t| t.0);
+            if in_use || previous == Some("::") || next == Some("(") {
+                let line = code[..offset].bytes().filter(|b| *b == b'\n').count();
+                if mask.get(line).copied().unwrap_or(false) {
+                    found.insert(line);
+                }
+            }
+        }
+        found
+            .into_iter()
+            .map(|n| format!("{rel}:{}: {}", n + 1, lines[n].trim()))
+            .collect()
     }
 
     /// No test builds a path in the SHARED temp directory (#1554).
@@ -5254,6 +5357,9 @@ fn round_trip_on_a_copy() {
     /// - **Production code.** Only test lines are scanned; nothing in
     ///   production joins onto the temp dir today.
     /// - **Another spelling of a shared location**: a literal `/tmp/…`.
+    /// - **Aliases introduced outside test code**, glob imports and macros.
+    ///   This recognizes calls/references named `temp_dir` and explicit test
+    ///   imports (including `as`); it does not resolve arbitrary Rust names.
     #[test]
     fn no_test_names_a_path_in_the_shared_temp_dir() {
         let (mut files, mut test_lines) = (0usize, 0usize);
@@ -5342,6 +5448,34 @@ mod tests {
             // The fixed name (9), wrapped call (14), and bare binding (23).
             // Not production (2), the comment (20), or owned TempDir (21-22).
             assert_eq!(at, ["9", "14", "23"], "{found:#?}");
+        }
+    }
+
+    #[test]
+    fn shared_temp_scan_ignores_names_and_literals_but_catches_split_calls_and_imports() {
+        let fixture = r###"
+let temp_dir = tempfile::TempDir::new().unwrap();
+let path = temp_dir.path().join("temp_dir");
+let mention = "std::env::temp_dir()";
+let raw = r#"temp_dir()"#;
+let multiline = "first line
+    std::env::temp_dir()";
+let safe = 0; // std::env::temp_dir()
+/* std::env::temp_dir() */
+let bare = std::env::temp_dir();
+let split = std::env::temp_dir
+    ();
+use std::env::temp_dir as shared;
+use std::env::{temp_dir as other};
+let d = temp_dir();
+let f = std::env::temp_dir;
+"###;
+        for src in [fixture.to_string(), fixture.replace('\n', "\r\n")] {
+            let src = src.replace("\r\n", "\n");
+            let lines: Vec<_> = src.lines().collect();
+            let found = shared_temp_offenders("fixture.rs", &lines, &vec![true; lines.len()]);
+            let at: Vec<_> = found.iter().map(|f| f.split(':').nth(1).unwrap()).collect();
+            assert_eq!(at, ["10", "11", "13", "14", "15", "16"], "{found:#?}");
         }
     }
 
