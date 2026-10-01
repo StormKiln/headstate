@@ -1,0 +1,67 @@
+[
+  {
+    "type": "user",
+    "message": {
+      "role": "user",
+      "content": [
+        {
+          "tool_use_id": "toolu_017pHnxPLXyfkLiWQ6cvWFTS",
+          "type": "tool_result",
+          "content": "Task #1 created successfully: Verify synthetic transcript export"
+        }
+      ]
+    },
+    "toolUseResult": {
+      "task": {
+        "id": "1",
+        "subject": "Verify synthetic transcript export"
+      }
+    }
+  },
+  {
+    "type": "user",
+    "message": {
+      "role": "user",
+      "content": [
+        {
+          "tool_use_id": "toolu_01F6n53AxSTAg3Z2vBwyBFhT",
+          "type": "tool_result",
+          "content": "#1 [pending] Verify synthetic transcript export"
+        }
+      ]
+    },
+    "toolUseResult": {
+      "tasks": [
+        {
+          "id": "1",
+          "subject": "Verify synthetic transcript export",
+          "status": "pending",
+          "blockedBy": []
+        }
+      ]
+    }
+  },
+  {
+    "type": "user",
+    "message": {
+      "role": "user",
+      "content": [
+        {
+          "tool_use_id": "toolu_0115F73MToKkxBDJygiu2Hgv",
+          "type": "tool_result",
+          "content": "Task #1: Verify synthetic transcript export\nStatus: pending\nDescription: Check a generic markdown export fixture."
+        }
+      ]
+    },
+    "toolUseResult": {
+      "task": {
+        "id": "1",
+        "subject": "Verify synthetic transcript export",
+        "description": "Check a generic markdown export fixture.",
+        "status": "pending",
+        "blocks": [],
+        "blockedBy": []
+      }
+    }
+  }
+]

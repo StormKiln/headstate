@@ -389,7 +389,7 @@ export function PhoneTranscript({
                 : `The hidden text could not be revealed: ${commandError(revealed.error).message}`}
             </span>
           ) : null}
-          {checklist.tasks.length > 0 ? (
+          {checklist.tasks.length > 0 || checklist.snapshotIncomplete ? (
             <button
               type="button"
               aria-haspopup="dialog"

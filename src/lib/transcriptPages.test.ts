@@ -1,3 +1,5 @@
+import { deriveTaskChecklist } from "../components/transcript/tasks";
+import { call, output } from "../components/transcript/fixtures";
 import { describe, expect, it } from "vitest";
 
 import type {
@@ -162,4 +164,29 @@ describe("positionLabel", () => {
       "messages ~3–5 (estimate)",
     );
   });
+});
+
+
+it("keeps task result positions across pairing and child provenance across duplicate pages", () => {
+  const template = G.cases[0].windows[0];
+  const base = G.whole.find(m => m.kind.kind === "assistant")!;
+  const result = output({message_id:"snapshot-result",tool_use_id:"list",offset:200,task:{task_id:null,success:null,status_from:null,status_to:null,snapshots:{items:[{task_id:"1",subject:"From snapshot",status:"pending"}],omitted:0,truncated:false}}});
+  const message: TranscriptMessage = {...base,id:"list-call",is_sidechain:false,offset:10,blocks:[call("TaskList",{tool:"task_list"},null,"list")]};
+  const first = {...template, page:{...template.page,messages:[message]}};
+  const second = {...template,start:first.end,end:{offset:first.end.offset+100,behind_digest:"next"},page:{...template.page,messages:[{...base,id:result.message_id,is_sidechain:false,kind:{kind:"tool_results" as const},offset:200,blocks:[{kind:"tool_result" as const,...result}]}]}};
+  const paired = mergeWindows([first,second]);
+  const block = paired.find(m=>m.id === "list-call")!.blocks[0];
+  expect(block.kind === "tool_call" && block.result?.offset).toBe(200);
+  expect(deriveTaskChecklist(paired,{truncated:true}).tasks[0].subject).toBe("From snapshot");
+  // The same synthetic call ID appearing on a sidechain must not absorb
+  // the other chain's result or stand it up as a parent result on dedup.
+  const child = {...message,is_sidechain:true};
+  const childFirst = {...first,page:{...first.page,messages:[child]}};
+  const cross = mergeWindows([childFirst,second]);
+  expect(cross.find(m=>m.id === "list-call")!.blocks[0]).toMatchObject({result:null});
+  const repeated = {...second,page:{...second.page,messages:[{...child,blocks:[call("TaskList",{tool:"task_list"},result,"list")]}]}};
+  const filledChild = {...childFirst,page:{...childFirst.page,messages:[{...child,blocks:[call("TaskList",{tool:"task_list"},output({message_id:"earlier-result",tool_use_id:"list"}),"list")]}]}};
+  const childMerged = mergeWindows([filledChild,repeated]);
+  expect(childMerged.find(m=>m.id === result.message_id)?.is_sidechain).toBe(true);
+  expect(deriveTaskChecklist(childMerged,{truncated:true}).tasks).toEqual([]);
 });

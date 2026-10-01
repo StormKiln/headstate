@@ -28,6 +28,7 @@
 
 import type { TranscriptMessage, TranscriptToolOutput } from "../../types/transcript";
 import type { ToolCallBlock } from "./types";
+import type { ClaudeToolArgs } from "../../types/pr";
 
 /// One task as the loaded messages leave it.
 export interface ChecklistTask {
@@ -63,6 +64,7 @@ export interface TaskListState {
   /// a task is known only by id, the two may be the same task, so a
   /// total would be possibly wrong -- `taskSummary` suppresses it.
   unlinked: number;
+  snapshotIncomplete?: boolean;
 }
 
 const CREATED_TEXT = /^Task #(\S+) created\b/;
@@ -96,67 +98,138 @@ export function deriveTaskChecklist(
   const seenCalls = new Set<string>();
   let unlinked = 0;
   let orphaned = false;
+  let snapshotIncomplete = false;
 
+  const observations: {
+    call?: ToolCallBlock;
+    result: TranscriptToolOutput | null;
+    key: string;
+    offset: number | null;
+    index: number;
+  }[] = [];
+  const seenResults = new Set<string>();
+  const calls = new Map<string, ToolCallBlock>();
   for (const m of messages) {
     if (m.is_sidechain) continue;
     for (const b of m.blocks) {
-      if (b.kind !== "tool_call") continue;
-      const callKey = b.id ?? `${m.id}#${b.index}`;
-      if (seenCalls.has(callKey)) continue;
-      seenCalls.add(callKey);
-      const args = b.args;
-      if (args.tool === "task_create") {
-        if (refused(b.result)) continue;
-        const id = createdId(b.result);
-        const task: ChecklistTask = {
-          key: id ?? `call:${callKey}`,
-          id,
-          subject: args.subject,
-          active_form: args.active_form,
-          status: "pending",
-          created: true,
-          confirmed: b.result !== null,
-        };
-        if (id === null) {
-          unlinked += 1;
-        } else {
-          const old = byId.get(id);
-          // The same id created again: the later create is the task
-          // now, in its own place in the order.
-          if (old) order.splice(order.indexOf(old), 1);
-          byId.set(id, task);
-        }
-        order.push(task);
-      } else if (args.tool === "task_update") {
-        if (args.task_id === null || refused(b.result)) continue;
-        let task = byId.get(args.task_id);
+      if (b.kind === "tool_call" && b.id && !calls.has(b.id)) calls.set(b.id, b);
+    }
+  }
+  for (const m of messages) {
+    if (m.is_sidechain) continue;
+    for (const b of m.blocks) {
+      if (b.kind !== "tool_call" && b.kind !== "tool_result") continue;
+      const result = b.kind === "tool_call" ? b.result : b;
+      const resultKey = result ? `${result.message_id}#${result.index}#${result.tool_use_id ?? ""}` : null;
+      if (b.kind === "tool_result" && b.tool_use_id && calls.has(b.tool_use_id)) {
+        const owner = calls.get(b.tool_use_id)!;
+        // Attached copies are folded with their call. A background tool's
+        // metadata must never become a numbered checklist observation.
+        if (owner.result || !["task_list", "task_get"].includes(owner.args.tool)) continue;
+      }
+      const key = b.kind === "tool_call" ? b.id ?? `${m.id}#${b.index}` : resultKey!;
+      if (b.kind === "tool_call") {
+        if (seenCalls.has(key)) continue;
+        seenCalls.add(key);
+      }
+      if (result?.task?.snapshots && resultKey) {
+        if (seenResults.has(resultKey)) continue;
+        seenResults.add(resultKey);
+      }
+      observations.push({
+        call: b.kind === "tool_call" ? b : undefined,
+        result,
+        key,
+        offset: result?.offset ?? m.offset,
+        index: result?.index ?? b.index,
+      });
+    }
+  }
+  // Output offsets survive call/result pairing and page merging. Unknown
+  // positions retain loaded order; snapshots with no position only fill gaps.
+  observations.sort((a, b) =>
+    (a.offset ?? Number.MAX_SAFE_INTEGER) - (b.offset ?? Number.MAX_SAFE_INTEGER) ||
+    (a.offset !== null && b.offset !== null ? a.index - b.index : 0),
+  );
+  for (const observation of observations) {
+    const b = observation.call;
+    const result = observation.result;
+    const snapshots = result?.task?.snapshots;
+    if (snapshots && !refused(result) && (!b || b.args.tool === "task_list" || b.args.tool === "task_get")) {
+      snapshotIncomplete ||= snapshots.omitted > 0 || snapshots.truncated;
+      orphaned = true; // a read is never evidence the whole history is held
+      for (const item of snapshots.items) {
+        let task = byId.get(item.task_id);
         if (!task) {
-          orphaned = true;
           task = {
-            key: args.task_id,
-            id: args.task_id,
-            subject: null,
-            active_form: null,
-            status: null,
-            created: false,
-            confirmed: true,
+            key: item.task_id, id: item.task_id, subject: null, active_form: null,
+            status: null, created: false, confirmed: true,
           };
-          byId.set(args.task_id, task);
+          byId.set(item.task_id, task);
           order.push(task);
         }
-        if (args.subject !== null) task.subject = args.subject;
-        if (args.active_form !== null) task.active_form = args.active_form;
-        const status = b.result?.task?.status_to ?? args.status;
-        if (status !== null) {
-          task.status = status;
-          task.confirmed = b.result !== null;
+        const positioned = result?.offset != null;
+        if (item.subject !== null && (positioned || task.subject === null)) task.subject = item.subject;
+        if (item.status !== null && (positioned || task.status === null)) {
+          task.status = item.status;
+          task.confirmed = true;
         }
+      }
+    }
+    if (!b) continue;
+    const callKey = observation.key;
+    const args = b.args;
+    if (args.tool === "task_create") {
+      if (refused(b.result)) continue;
+      const id = createdId(b.result);
+      const task: ChecklistTask = {
+        key: id ?? `call:${callKey}`,
+        id,
+        subject: args.subject,
+        active_form: args.active_form,
+        status: "pending",
+        created: true,
+        confirmed: b.result !== null,
+      };
+      if (id === null) {
+        unlinked += 1;
+      } else {
+        const old = byId.get(id);
+        // The same id created again: the later create is the task
+        // now, in its own place in the order.
+        if (old) order.splice(order.indexOf(old), 1);
+        byId.set(id, task);
+      }
+      order.push(task);
+    } else if (args.tool === "task_update") {
+      if (args.task_id === null || refused(b.result)) continue;
+      let task = byId.get(args.task_id);
+      if (!task) {
+        orphaned = true;
+        task = {
+          key: args.task_id,
+          id: args.task_id,
+          subject: null,
+          active_form: null,
+          status: null,
+          created: false,
+          confirmed: true,
+        };
+        byId.set(args.task_id, task);
+        order.push(task);
+      }
+      if (args.subject !== null) task.subject = args.subject;
+      if (args.active_form !== null) task.active_form = args.active_form;
+      const status = b.result?.task?.status_to ?? args.status;
+      if (status !== null) {
+        task.status = status;
+        task.confirmed = b.result !== null;
       }
     }
   }
 
   const tasks = [...order.filter((t) => !t.created), ...order.filter((t) => t.created)];
-  return { tasks, partial: truncated || orphaned, truncated, unlinked };
+  return { tasks, partial: truncated || orphaned, truncated, unlinked, snapshotIncomplete };
 }
 
 /// "2 of 5 tasks done", qualified by what the checklist knows.
@@ -224,4 +297,16 @@ export function taskIdOfCall(call: ToolCallBlock): string | null {
 /// Whether a task call's result says it was refused.
 export function taskCallRefused(call: ToolCallBlock): boolean {
   return refused(call.result);
+}
+
+
+export function backgroundTaskSummary(
+  args: Extract<ClaudeToolArgs, { tool: "task_stop" | "task_output" }>,
+): string {
+  const target = args.task_id ?? "task not recorded";
+  if (args.tool === "task_stop") return `Stop requested · ${target}`;
+  const wait = args.block === null
+    ? "wait mode not recorded"
+    : args.block ? "wait for completion" : "without waiting";
+  return `Output requested · ${target} · ${wait}${args.timeout === null ? "" : ` · timeout ${args.timeout} ms`}`;
 }

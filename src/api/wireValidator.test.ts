@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { PR_FIXTURES } from "../fixtures/prs";
-import { everyRecord } from "../components/transcript/fixtures";
+import { everyRecord, output } from "../components/transcript/fixtures";
 import type { Worktree } from "../types/pr";
 import type { TranscriptWindow } from "../types/transcript";
 import { wireGraph } from "./wireContract.generated";
@@ -29,6 +29,17 @@ describe("generated remote contracts", () => {
     expect(() => assertRemoteReply("claude_transcript_page", malformed)).toThrow(/claude_transcript_page.*page.messages\[\].blocks\[\]/);
     try { assertRemoteReply("claude_transcript_page", malformed); }
     catch (e) { expect(String(e)).not.toContain("DO-NOT-LOG"); }
+  });
+
+  it("accepts older task results and validates optional snapshot metadata", () => {
+    const old = output({task:{task_id:"1",success:null,status_from:null,status_to:null}});
+    const row = {...everyRecord()[0], kind:{kind:"tool_results" as const}, blocks:[{kind:"tool_result" as const,...old}]};
+    expect(() => assertRemoteReply("claude_transcript_page", window([row]))).not.toThrow();
+    const snapshots = {items:[{task_id:"1",subject:"Fixture",status:null}],omitted:0,truncated:false};
+    row.blocks[0].task = {...old.task!,snapshots};
+    expect(() => assertRemoteReply("claude_transcript_page", window([row]))).not.toThrow();
+    const malformed = {...row,blocks:[{...row.blocks[0],task:{...old.task,snapshots:{...snapshots,items:"DO-NOT-LOG"}}}]};
+    expect(() => assertRemoteReply("claude_transcript_page", window([malformed as unknown as typeof row]))).toThrow(/snapshots/);
   });
 
   it("checks tuple length and finite numbers, retaining optional older worktree data", () => {

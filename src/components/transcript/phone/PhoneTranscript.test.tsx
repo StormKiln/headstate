@@ -370,6 +370,27 @@ describe("the task list (#1504)", () => {
     expect(within(sheet).getByText("Write the parser")).toBeTruthy();
   });
 
+  it("opens a snapshot-only checklist and discards revealed titles after hiding", async () => {
+    const row = (subject: string) => msg("result", {kind:{kind:"tool_results"}, blocks:[{kind:"tool_result", ...output({task:{task_id:null,success:null,status_from:null,status_to:null,snapshots:{items:[{task_id:"1",subject,status:"pending"}],omitted:0,truncated:false}}})}]});
+    await show({data:page([row("[hidden]")],MASKED)}, {data:page([row("synthetic revealed title")],{...MASKED,hidden:0,revealed:true})});
+    fireEvent.click(screen.getByRole("button",{name:/^Tasks/}));
+    await shim.flush();
+    expect(within(screen.getByRole("dialog")).getByText("[hidden]")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", {name:"Close"}));
+    fireEvent.click(screen.getByRole("button",{name:"Reveal"}));
+    await shim.flush();
+    fireEvent.click(screen.getByRole("button",{name:/^Tasks/}));
+    await shim.flush();
+    expect(within(screen.getByRole("dialog")).getByText("synthetic revealed title")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", {name:"Close"}));
+    fireEvent.click(screen.getByRole("button",{name:"Hide it again"}));
+    await shim.flush();
+    fireEvent.click(screen.getByRole("button",{name:/^Tasks/}));
+    await shim.flush();
+    expect(screen.queryByText("synthetic revealed title")).toBeNull();
+    expect(within(screen.getByRole("dialog")).getByText("[hidden]")).toBeTruthy();
+  });
+
   it("offers no Tasks button when the session has no tasks", async () => {
     await show({ data: page([msg("a")]) });
     expect(screen.queryByRole("button", { name: /^Tasks/ })).toBeNull();

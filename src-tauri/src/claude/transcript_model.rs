@@ -307,7 +307,7 @@ pub struct TranscriptToolOutput {
     pub images: Vec<TranscriptImage>,
     /// Set when this output is a subagent's.
     pub subagent: Option<TranscriptSubagent>,
-    /// Set when this output is a `TaskCreate`'s or `TaskUpdate`'s (#1504).
+    /// A recorded create/update or bounded list/get snapshot (#1504, #1537).
     pub task: Option<TranscriptTaskResult>,
     /// The record's `oversized_bytes`, carried with the output (#1476):
     /// merging absorbs the record, and without this a call answered by a
@@ -336,6 +336,24 @@ pub struct TranscriptTaskResult {
     /// `statusChange.from` / `.to`, when the update changed the status.
     pub status_from: Option<String>,
     pub status_to: Option<String>,
+    /// Optional for independently shipped peers predating task snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshots: Option<TranscriptTaskSnapshots>,
+}
+
+/// Only checklist fields, bounded together, from persisted task results.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptTaskSnapshots {
+    pub items: Vec<TranscriptTaskSnapshot>,
+    pub omitted: usize,
+    pub truncated: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptTaskSnapshot {
+    // Deliberately not `id`: privacy's opaque `id` exemption must not apply.
+    pub task_id: String,
+    pub subject: Option<String>,
+    pub status: Option<String>,
 }
 
 /// One content block.
@@ -866,6 +884,9 @@ fn pair(messages: &mut Vec<TranscriptMessage>) {
             let Some(&(cm, cb)) = calls.get(tid) else {
                 continue;
             };
+            if m.is_sidechain != messages[cm].is_sidechain {
+                continue;
+            }
             let filled = matches!(
                 &messages[cm].blocks[cb],
                 TranscriptBlock::ToolCall {
@@ -1442,6 +1463,10 @@ fn attach_record_result(rec: &serde_json::Value, blocks: &mut [TranscriptBlock],
         });
     }
     out.task = task_result(tur);
+    if let Some(snapshots) = out.task.as_mut().and_then(|t| t.snapshots.as_mut()) {
+        // The bounded JSON skimmer may already have clipped these fields.
+        snapshots.truncated |= !ctx.cut.is_empty();
+    }
     if let Some(dims) = tur.get("file").and_then(|f| f.get("dimensions")) {
         if let Some(img) = out.images.first_mut() {
             img.width = u64_of(dims, "originalWidth");
@@ -1451,25 +1476,75 @@ fn attach_record_result(rec: &serde_json::Value, blocks: &mut [TranscriptBlock],
 }
 
 /// A task tool's recorded result, when `toolUseResult` has either
-/// measured shape: a create's `task` object, or an update's `taskId`
+/// measured shape: a create/get `task`, list `tasks`, or an update's `taskId`
 /// beside `updatedFields`. Both keys are required for an update so that
 /// another tool's result carrying a `taskId` is not read as a task
 /// change.
 fn task_result(tur: &serde_json::Value) -> Option<TranscriptTaskResult> {
+    let snapshots = task_snapshots(tur);
     let change = tur.get("statusChange");
     let (task_id, is_task) = if let Some(task) = tur.get("task").filter(|t| t.is_object()) {
         (preview::task_id(task.get("id")), true)
     } else if tur.get("updatedFields").is_some() && tur.get("taskId").is_some() {
         (preview::task_id(tur.get("taskId")), true)
     } else {
-        (None, false)
+        (None, snapshots.is_some())
     };
     is_task.then(|| TranscriptTaskResult {
         task_id,
         success: tur.get("success").and_then(serde_json::Value::as_bool),
         status_from: change.and_then(|c| str_of(c, "from")),
         status_to: change.and_then(|c| str_of(c, "to")),
+        snapshots,
     })
+}
+
+const TASK_SNAPSHOT_ITEMS: usize = 100;
+const TASK_SNAPSHOT_CHARS: usize = 16_000;
+
+fn task_snapshots(tur: &serde_json::Value) -> Option<TranscriptTaskSnapshots> {
+    let values = if let Some(items) = tur.get("tasks").and_then(serde_json::Value::as_array) {
+        items.as_slice()
+    } else {
+        let task = tur.get("task").filter(|t| t.is_object())?;
+        std::slice::from_ref(task)
+    };
+    let mut out = TranscriptTaskSnapshots {
+        items: Vec::new(),
+        omitted: values.len(),
+        truncated: false,
+    };
+    let mut remaining = TASK_SNAPSHOT_CHARS;
+    for value in values.iter().take(TASK_SNAPSHOT_ITEMS) {
+        // The observed checklist IDs are numbered. Do not turn arbitrary
+        // nested task objects or background task IDs into checklist rows.
+        let Some(id) = preview::task_id(value.get("id"))
+            .filter(|id| id.len() <= 20 && id.bytes().all(|b| b.is_ascii_digit()))
+        else {
+            continue;
+        };
+        if remaining < id.len() {
+            break;
+        }
+        remaining -= id.len();
+        let mut field = |key: &str, cap: usize| {
+            value.get(key).and_then(serde_json::Value::as_str).map(|s| {
+                let (text, cut) = clip_chars(s, remaining.min(cap));
+                remaining -= text.chars().count();
+                out.truncated |= cut.is_some();
+                text
+            })
+        };
+        let subject = field("subject", preview::MAX_TEXT_CHARS);
+        let status = field("status", 128);
+        out.items.push(TranscriptTaskSnapshot {
+            task_id: id,
+            subject,
+            status,
+        });
+        out.omitted -= 1;
+    }
+    Some(out)
 }
 
 /// Where a subagent's transcript lives, relative to its parent's.
@@ -2378,6 +2453,87 @@ mod tests {
         );
     }
 
+    #[test]
+    fn task_snapshots_bound_items_text_and_reject_arbitrary_ids() {
+        let items: Vec<_> = (0..150).map(|i| serde_json::json!({"id":i.to_string(), "subject":"é".repeat(5000), "status":"future_state"})).collect();
+        let snapshots = task_result(&serde_json::json!({"tasks":items}))
+            .unwrap()
+            .snapshots
+            .unwrap();
+        assert!(snapshots.items.len() <= 100);
+        assert!(snapshots.omitted > 0 && snapshots.truncated);
+        assert!(
+            snapshots
+                .items
+                .iter()
+                .map(|i| i.task_id.chars().count()
+                    + i.subject.as_deref().unwrap_or("").chars().count()
+                    + i.status.as_deref().unwrap_or("").chars().count())
+                .sum::<usize>()
+                <= 16_000
+        );
+        let rejected = task_result(&serde_json::json!({"tasks":[{"id":"secret-text", "subject":"title"}, {"id":"1", "status":"future_state"}]})).unwrap().snapshots.unwrap();
+        assert_eq!(rejected.omitted, 1);
+        assert_eq!(rejected.items[0].subject, None);
+        let mut r = result("r", "t");
+        r["tool_use_result"] = serde_json::json!({"tasks":[{"id":"1"}]});
+        let page = parse(&body(&[r]), WindowStart::FileStart, None);
+        assert!(
+            matches!(&page.messages[0].blocks[0], TranscriptBlock::ToolResult(o) if o.task.is_none())
+        );
+    }
+
+    #[test]
+    fn task_snapshot_results_never_cross_sidechains_or_repeat_record_metadata() {
+        let c = assistant(
+            "a",
+            "model",
+            serde_json::json!([{"type":"tool_use","id":"t","name":"TaskList","input":{}}]),
+        );
+        let mut r = result("r", "t");
+        r["isSidechain"] = true.into();
+        r["toolUseResult"] =
+            serde_json::json!({"tasks":[{"id":"1","subject":"child","status":"pending"}]});
+        let page = parse(&body(&[c, r.clone()]), WindowStart::FileStart, None);
+        assert!(matches!(
+            &page.messages[0].blocks[0],
+            TranscriptBlock::ToolCall { result: None, .. }
+        ));
+        r["message"]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"type":"tool_result","tool_use_id":"second","content":"ok"}));
+        let page = parse(&body(&[r]), WindowStart::FileStart, None);
+        assert!(
+            matches!(&page.messages[0].blocks[1], TranscriptBlock::ToolResult(o) if o.task.is_none())
+        );
+    }
+
+    #[test]
+    fn task_snapshots_use_persisted_records_and_background_contracts() {
+        let records: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("fixtures/task-results.json")).unwrap();
+        let page = parse(&body(&records), WindowStart::FileStart, None);
+        let value = serde_json::to_value(&page).unwrap();
+        assert_eq!(
+            value["messages"][1]["blocks"][0]["task"]["snapshots"]["items"][0]["subject"],
+            "Verify synthetic transcript export"
+        );
+        assert_eq!(
+            value["messages"][2]["blocks"][0]["task"]["snapshots"]["items"][0]["status"],
+            "pending"
+        );
+        let stop: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("fixtures/task-stop.json")).unwrap();
+        let value =
+            serde_json::to_value(parse(&body(&stop), WindowStart::FileStart, None)).unwrap();
+        assert_eq!(
+            value["messages"][0]["blocks"][0]["args"]["tool"],
+            "task_stop"
+        );
+        assert!(value["messages"][0]["blocks"][0]["result"]["task"].is_null());
+    }
+
     /// #1504: a task tool's result carries the id a create was given --
     /// its input has none -- and an update's recorded success and
     /// status change. `success: false` with no `is_error` is kept as
@@ -2427,6 +2583,15 @@ mod tests {
                 success: None,
                 status_from: None,
                 status_to: None,
+                snapshots: Some(TranscriptTaskSnapshots {
+                    items: vec![TranscriptTaskSnapshot {
+                        task_id: "1".into(),
+                        subject: Some("Write it".into()),
+                        status: None
+                    }],
+                    omitted: 0,
+                    truncated: false,
+                }),
             })
         );
         assert_eq!(
@@ -2436,6 +2601,7 @@ mod tests {
                 success: Some(true),
                 status_from: Some("pending".into()),
                 status_to: Some("in_progress".into()),
+                snapshots: None,
             })
         );
         assert_eq!(outs[2].task.as_ref().unwrap().success, Some(false));

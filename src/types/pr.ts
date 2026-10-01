@@ -2472,6 +2472,8 @@ export type ClaudeToolArgs =
     }
   | { tool: "task_get"; task_id: string | null }
   | { tool: "task_list" }
+  | { tool: "task_stop"; task_id: string | null }
+  | { tool: "task_output"; task_id: string | null; block: boolean | null; timeout: number | null }
   /// A tool whose shape this build does not know: its argument keys, so
   /// the reader can see Headstate is behind rather than that the call
   /// was empty.

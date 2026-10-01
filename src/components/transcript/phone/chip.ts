@@ -16,7 +16,7 @@
 import type { ClaudeFileChange, Liveness } from "../../../types/pr";
 import { changeFromArgs, diffStat, linesOf } from "../diff";
 import { bashOutcome, callState, countLabel, isClipped, mcpName, searchSummary } from "../summary";
-import { taskCallRefused, taskIdOfCall, taskStatusWords, type TaskListState } from "../tasks";
+import { backgroundTaskSummary, taskCallRefused, taskIdOfCall, taskStatusWords, type TaskListState } from "../tasks";
 import type { ToolCallBlock } from "../types";
 
 export type ChipTone = "ok" | "error" | "warn" | "muted";
@@ -161,6 +161,10 @@ export function toolChip(call: ToolCallBlock, liveness: Liveness, tasks?: TaskLi
       }
       break;
     }
+    case "task_stop":
+    case "task_output":
+      text = backgroundTaskSummary(args);
+      break;
     case "other":
     case "none": {
       const mcp = mcpName(call.name);

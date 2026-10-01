@@ -380,7 +380,7 @@ function Loaded({
           {jumps.note}
         </p>
       ) : null}
-      {tasks.tasks.length > 0 ? (
+      {tasks.tasks.length > 0 || tasks.snapshotIncomplete ? (
         // Narrow panes (the session detail) fold the checklist above the
         // transcript; wide ones pin it beside it. A container query, not
         // the viewport: the same window holds both hosts.
@@ -443,7 +443,7 @@ function Loaded({
             )}
           </aside>
         ) : null}
-        {tasks.tasks.length > 0 ? (
+        {tasks.tasks.length > 0 || tasks.snapshotIncomplete ? (
           <aside
             className="hidden w-64 shrink-0 overflow-y-auto rounded border p-2 @2xl:block"
             style={{ background: palette.surface, borderColor: palette.border }}

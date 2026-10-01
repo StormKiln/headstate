@@ -578,12 +578,17 @@ pub enum ToolArgs {
         fields: Vec<String>,
         truncated: bool,
     },
-    /// `TaskGet`: one task read back, by id. Absent from this machine's
-    /// corpus; parsed to Claude Code's documented `taskId` input.
+    /// `TaskGet`: one task read back, by its documented `taskId` input.
     TaskGet { task_id: Option<String> },
-    /// `TaskList`: the task list read back. Absent from this machine's
-    /// corpus; takes no arguments.
+    /// `TaskList`: the task list read back; takes no arguments.
     TaskList,
+    /// Background tasks; independent of the numbered task checklist.
+    TaskStop { task_id: Option<String> },
+    TaskOutput {
+        task_id: Option<String>,
+        block: Option<bool>,
+        timeout: Option<u64>,
+    },
     /// A tool whose argument shape this build does not know.
     ///
     /// The KEYS, not the values: the keys are what tell a reader whether
@@ -1374,6 +1379,17 @@ pub(crate) fn tool_args(name: &str, input: Option<&serde_json::Value>) -> ToolAr
             task_id: task_id(map.get("taskId")),
         },
         "TaskList" => ToolArgs::TaskList,
+        "TaskStop" => ToolArgs::TaskStop {
+            task_id: background_task_id(map.get("task_id").or_else(|| map.get("shell_id"))),
+        },
+        "TaskOutput" => ToolArgs::TaskOutput {
+            task_id: background_task_id(map.get("task_id")),
+            block: map.get("block").and_then(serde_json::Value::as_bool),
+            timeout: map
+                .get("timeout")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|v| *v <= 9_007_199_254_740_991),
+        },
         // Everything else -- 18 distinct tool names appear in the sample,
         // most of them MCP tools. The KEYS, so a reader can see that
         // Headstate is behind rather than that the call was empty; not
@@ -1570,15 +1586,22 @@ fn clamp_opt(s: Option<String>) -> (Option<String>, bool) {
     }
 }
 
+/// IDs are shown as text and pass through remote masking, never opaque `id`.
+fn background_task_id(v: Option<&serde_json::Value>) -> Option<String> {
+    v?.as_str()
+        .filter(|s| !s.is_empty() && s.len() <= 256 && !s.chars().any(char::is_control))
+        .map(str::to_owned)
+}
+
 /// A task id as the record spelled it.
 ///
 /// Every measured `taskId` is a numeric STRING. A bare number is taken
 /// too, as its digits: the same id written another way, not a guess.
-/// Anything else -- absent, empty, an object -- is `None`: the call named
+/// Strings over 256 bytes and absent, empty or object values are `None`: the call named
 /// no task this build can match.
 pub(crate) fn task_id(v: Option<&serde_json::Value>) -> Option<String> {
     match v? {
-        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+        serde_json::Value::String(s) if !s.is_empty() && s.len() <= 256 => Some(s.clone()),
         serde_json::Value::Number(n) => Some(n.to_string()),
         _ => None,
     }
@@ -1589,6 +1612,39 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::path::PathBuf;
+
+    #[test]
+    fn background_task_args_preserve_the_published_contract_without_checklist_updates() {
+        let arg = |name, value| serde_json::to_value(tool_args(name, Some(&value))).unwrap();
+        assert_eq!(
+            arg("TaskStop", serde_json::json!({"shell_id":"legacy"}))["task_id"],
+            "legacy"
+        );
+        assert_eq!(
+            arg(
+                "TaskStop",
+                serde_json::json!({"task_id":"current","shell_id":"legacy"})
+            )["task_id"],
+            "current"
+        );
+        let out = arg(
+            "TaskOutput",
+            serde_json::json!({"task_id":"bg1","block":false,"timeout":0}),
+        );
+        assert_eq!(
+            out,
+            serde_json::json!({"tool":"task_output","task_id":"bg1","block":false,"timeout":0})
+        );
+        let out = arg(
+            "TaskOutput",
+            serde_json::json!({"task_id":42,"block":"false","timeout":-1}),
+        );
+        assert!(out["task_id"].is_null() && out["block"].is_null() && out["timeout"].is_null());
+        assert!(
+            arg("TaskStop", serde_json::json!({"task_id":"x".repeat(257)}))["task_id"].is_null()
+        );
+        assert!(arg("TaskStop", serde_json::json!({"task_id":"bad\nname"}))["task_id"].is_null());
+    }
 
     /// A `TempDir` no other run can name, removed when dropped (#1554).
     struct Tmp(tempfile::TempDir);

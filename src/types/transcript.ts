@@ -113,7 +113,7 @@ export interface TranscriptToolOutput {
   change: ClaudeFileChange | null;
   images: TranscriptImage[];
   subagent: TranscriptSubagent | null;
-  /// Set when this is a `TaskCreate`'s or `TaskUpdate`'s output (#1504).
+  /// Recorded create/update or bounded list/get snapshot (#1504, #1537).
   task: TranscriptTaskResult | null;
   /// The record's `oversized_bytes`, carried with the output so it
   /// survives being merged into its call (#1476). `null` when the record
@@ -134,6 +134,11 @@ export interface TranscriptTaskResult {
   success: boolean | null;
   status_from: string | null;
   status_to: string | null;
+  snapshots?: {
+    items: { task_id: string; subject: string | null; status: string | null }[];
+    omitted: number;
+    truncated: boolean;
+  } | null;
 }
 
 /// One content block. `index` is the block's position in the record it

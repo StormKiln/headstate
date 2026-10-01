@@ -981,6 +981,27 @@ mod tests {
     /// masked, and its cursors survive intact -- handed back, they still
     /// anchor the next page rather than reading as a rewritten file.
     #[test]
+    fn task_snapshot_subjects_and_background_ids_stay_in_the_masking_boundary() {
+        use crate::claude::transcript_model::{parse, WindowStart};
+        let record = json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"task"}]},"toolUseResult":{"tasks":[{"id":"1","subject":"API_KEY=abcd1234efgh","status":"pending"},{"id":"ghp_abcdefABCDEF0123456789abcdefABCDEF01","subject":"invalid identifier"}]}});
+        let parsed = parse(&format!("{record}\n"), WindowStart::FileStart, None);
+        let (_, plan) = admit("claude_transcript_page", json!({"path":"p"}), ON).unwrap();
+        let out = plan.finish("claude_transcript_page", json!({"page":parsed}));
+        let text = out.to_string();
+        assert!(!text.contains("abcd1234efgh") && !text.contains("ghp_abcdef"));
+        assert_eq!(
+            out["page"]["messages"][0]["blocks"][0]["task"]["snapshots"]["items"][0]["task_id"],
+            "1"
+        );
+        assert_eq!(
+            out["page"]["messages"][0]["blocks"][0]["task"]["snapshots"]["omitted"],
+            1
+        );
+        let out = plan.finish("claude_transcript_page", json!({"page":{"messages":[{"blocks":[{"args":{"tool":"task_stop","task_id":"ghp_abcdefABCDEF0123456789abcdefABCDEF01"}}]}]}}));
+        assert!(!out.to_string().contains("ghp_abcdef"));
+    }
+
+    #[test]
     fn a_transcript_page_is_masked_and_its_cursors_still_work() {
         use crate::claude::transcript_page::{self, PageAnchor, PageDirection};
         use std::io::Write;
