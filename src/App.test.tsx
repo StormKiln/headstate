@@ -730,7 +730,7 @@ describe("notification click in the assembled shell", () => {
   it("opens the clicked GitHub PR from a local view even before its details load", async () => {
     useFilters.getState().setView("worktrees");
     let pending: { source: { provider: string; host: string }; repo: string; number: number } | null = {
-      source: { provider: "github", host: "github.com" }, repo: "example/project", number: 42,
+      source: { provider: "github", host: "github.com" }, repo: "octocat/hello-world", number: 42,
     };
     mockIPC((cmd) => {
       if (cmd === "take_notification_pr") { const next = pending; pending = null; return next; }
@@ -738,7 +738,7 @@ describe("notification click in the assembled shell", () => {
       return undefined;
     }, { shouldMockEvents: true });
     renderApp();
-    expect((await screen.findByRole("link", { name: "Open on GitHub" })).getAttribute("href")).toBe("https://github.com/example/project/pull/42");
+    expect((await screen.findByRole("link", { name: "Open on GitHub" })).getAttribute("href")).toBe("https://github.com/octocat/hello-world/pull/42");
     expect(useFilters.getState().view).toBe("my-prs");
     expect(useFilters.getState().selectedPr?.number).toBe(42);
   });

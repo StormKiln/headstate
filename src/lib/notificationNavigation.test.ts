@@ -45,7 +45,7 @@ describe("notification navigation", () => {
 
   it("keeps a click already taken while its effect is being torn down", async () => {
     const controller = new AbortController();
-    const target = { repo: "example/project", number: 9 };
+    const target = { repo: "octocat/hello-world", number: 9 };
     await connectNotificationNavigation(async () => () => {}, async () => {
       controller.abort();
       return target;

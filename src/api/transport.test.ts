@@ -498,6 +498,7 @@ const ROWS: Row[] = [
   row(api.updateAllRepositories, [], "update_all_repositories"),
   row(api.cancelUpdateAll, [], "cancel_update_all"),
   row(api.updateAllState, [], "update_all_state"),
+  row(api.takeNotificationPr, [], "take_notification_pr"),
 ];
 
 describe("tauri.ts wrappers through the transport", () => {

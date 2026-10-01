@@ -4755,11 +4755,11 @@ fn suggestion(f: &Finding) -> String {
                     continue;
                 }
                 let owner = fn_declared(lines[start]).unwrap_or(probe);
-                for n in start..end {
-                    if is_comment(lines[n]) {
+                for (n, line) in lines.iter().enumerate().take(end).skip(start) {
+                    if is_comment(line) {
                         continue;
                     }
-                    let compact: String = lines[n].chars().filter(|c| !c.is_whitespace()).collect();
+                    let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
                     for w in PROBE_WRITES.iter().filter(|w| has_token(&compact, w)) {
                         if let Some(&(f, root, g, api, _)) =
                             PROBE_AUDITED_EFFECTS.iter().find(|(f, root, g, t, _)| {
@@ -4772,7 +4772,7 @@ fn suggestion(f: &Finding) -> String {
                                 "{rel}:{}: `{w}` in `{owner}`, reachable from real-home probe \
                                  `{probe}`; audit the write destination: {}",
                                 n + 1,
-                                lines[n].trim()
+                                line.trim()
                             ));
                         }
                     }
