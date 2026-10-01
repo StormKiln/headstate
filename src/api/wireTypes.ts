@@ -1,7 +1,7 @@
 import type { BranchDeleteFrame, BranchScanFrame, PullRequest, StatsBackfillFrame, Worktree, WorktreeRemovalFrame } from "../types/pr";
 import type { MergeRequest } from "../types/gitlab";
 import type { PrIdentity } from "../types/identity";
-import type { SessionActivity } from "../types/transcript";
+import type { TranscriptActivity, SessionActivity } from "../types/transcript";
 import type { SourceStatus } from "./sourceRefresh";
 import type { SourcePollUpdate, UpdateRunDone } from "./tauri";
 
@@ -37,6 +37,7 @@ export interface RemoteEvents {
   "worktree-safety": Worktree;
   "stats-backfill-progress": StatsBackfillFrame;
   "claude-session-activity": SessionActivity;
+  "claude-transcript-activity": TranscriptActivity;
 }
 
 /// Existing remote command without a frontend wrapper. Mirrors ClaudeLiveState

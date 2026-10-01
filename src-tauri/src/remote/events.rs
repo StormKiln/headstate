@@ -184,6 +184,8 @@ pub const EVENT_NAMES: &[&str] = &[
     // the follow keeps its own poll. `claude::activity`'s module docs
     // carry the worst case against `CAPACITY`.
     "claude-session-activity",
+    // Opaque watch ID, byte size, sequence only; shares the main activity event cap.
+    "claude-transcript-activity",
 ];
 
 /// The event name the opening snapshot frame is sent under, so the

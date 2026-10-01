@@ -7274,7 +7274,10 @@ fn claude_transcript_path(path: &str) -> Result<std::path::PathBuf, String> {
 /// for the settings installer, and for the same reason: a guard tested
 /// against the real home directory is a guard tested on one machine's
 /// accidents.
-fn transcript_path_in(root: &std::path::Path, path: &str) -> Result<std::path::PathBuf, String> {
+pub(crate) fn transcript_path_in(
+    root: &std::path::Path,
+    path: &str,
+) -> Result<std::path::PathBuf, String> {
     // The ROOT is canonicalized too: on macOS `/Users/...` resolves
     // through `/System/Volumes/Data`, so comparing a resolved path
     // against an unresolved root fails on every real machine.
@@ -7393,6 +7396,22 @@ pub async fn claude_transcript_block_text(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Renew a bounded, expiring metadata observation for an explicitly viewed
+/// transcript. Read-class: no durable write, same path and privacy admission
+/// as a page read. Errors never include the requested path.
+#[tauri::command]
+pub async fn claude_transcript_watch(
+    app: AppHandle,
+    path: String,
+) -> Result<crate::claude::activity::WatchLease, String> {
+    if !read_ui_prefs(&app).claude_integrations_enabled {
+        return Err("Transcript watch refused: integration disabled".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || crate::claude::activity::register(&path))
+        .await
+        .map_err(|_| "Transcript activity watch unavailable".to_string())?
 }
 
 /// One bounded page of a transcript, before or after a cursor (#1220).

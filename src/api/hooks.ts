@@ -1,3 +1,4 @@
+import { useTranscriptWatch } from "./useTranscriptWatch";
 import { DetailPollBackoff } from "./detailPolling";
 import { type QueryClient, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -1699,8 +1700,8 @@ function followLive(liveness: Liveness): FollowLive {
 /// `sessionId` is the session whose MAIN transcript `path` is: a
 /// `claude-session-activity` nudge for it reads at once (#1477), and a
 /// nudge for any other session is ignored here. Omitted for a subagent's
-/// transcript, which the desktop does not stat -- that one follows on
-/// its cadence alone, as every transcript does when a nudge is lost.
+/// transcript. Explicit child views opt into an expiring opaque watch;
+/// ordinary polling remains the fallback whenever a nudge is lost.
 export function useClaudeTranscriptLive(
   path: string | null,
   options: {
@@ -1712,9 +1713,11 @@ export function useClaudeTranscriptLive(
     openAtCursor?: PageCursor | null;
     /// The session `path` belongs to, for its activity nudges (#1477).
     sessionId?: string | null;
+    /// Explicit child view, paused when covered by a nested child.
+    watchActivity?: boolean;
   },
 ) {
-  const { liveness, enabled = true, reveal = false, openAt = null, openAtCursor = null, sessionId = null } = options;
+  const { liveness, enabled = true, reveal = false, openAt = null, openAtCursor = null, sessionId = null, watchActivity = false } = options;
   const on = enabled && path !== null && path !== "";
   const key = `${reveal ? "reveal" : "masked"}:${path ?? ""}`;
   const make = () =>
@@ -1768,6 +1771,7 @@ export function useClaudeTranscriptLive(
   }, [follower, on, sessionId]);
 
   const snapshot = useSyncExternalStore(follower.subscribe, follower.getSnapshot);
+  useTranscriptWatch(follower, path, on && visible && watchActivity && snapshot.messages !== undefined);
   const actions = useMemo(
     () => ({
       loadOlder: () => void follower.loadOlder(),

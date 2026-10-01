@@ -343,6 +343,8 @@ pub const SURFACE: &[(&str, Class)] = &[
     // and for the three transcript commands #1514 retired.
     ("claude_transcript_block_text", Class::Read),
     ("claude_transcript_page", Class::Read),
+    // Ephemeral bounded metadata interest; same transcript admission, no durable write.
+    ("claude_transcript_watch", Class::Read),
     // Find messages anywhere in that transcript (#1484). Read on the
     // same grounds, bounded inside the command; see the desktop copy.
     ("claude_transcript_find", Class::Read),

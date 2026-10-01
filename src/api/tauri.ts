@@ -1,3 +1,4 @@
+import type { TranscriptWatch } from "../types/transcript";
 /// Typed wrappers around the Tauri command surface in
 /// `src-tauri/src/commands.rs`. Every command returns `Result<T, String>` on
 /// the Rust side, which Tauri surfaces as a *rejected* promise (not a
@@ -1573,6 +1574,9 @@ export const claudeTranscriptBlockText = (
 /// inside the command however large the file.
 ///
 /// `reveal` as `claudeTranscriptBlockText`: sent only when true.
+export const claudeTranscriptWatch = (path: string) =>
+  call<TranscriptWatch>("claude_transcript_watch", { path });
+
 export const claudeTranscriptPage = (
   path: string,
   anchor: TranscriptPageAnchor,

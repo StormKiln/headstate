@@ -423,3 +423,7 @@ export interface TranscriptFind {
 /// A find as it reaches the webview: on a paired phone, with the masking
 /// summary the remote boundary attaches (#1488).
 export type RemoteTranscriptFind = TranscriptFind & { masking?: TranscriptMasking };
+
+/// Content-free acceleration for an explicitly viewed child transcript.
+export interface TranscriptActivity { watch_id: string; size: number; seq: number }
+export interface TranscriptWatch { watch_id: string; expires_in_ms: number }

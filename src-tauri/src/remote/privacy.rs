@@ -160,6 +160,8 @@ pub const TRANSCRIPT_TEXT: &[(&str, Carries)] = &[
     // (#1220). Whole: every message string is transcript text. Its
     // `start`/`end` cursors round-trip through `behind_digest` below.
     ("claude_transcript_page", Carries::Whole),
+    // Metadata-only, but registration must still require transcript access.
+    ("claude_transcript_watch", Carries::Whole),
     // A find in one transcript (#1484): its snippets are transcript
     // text. Each hit's `cursor` round-trips unread (`OPAQUE_KEYS`) as a
     // page anchor, and its `message_id` is an id.
@@ -257,6 +259,7 @@ pub fn needle_could_touch_a_marker(needle: &str) -> bool {
 /// future hex-shaped pattern from breaking paging.
 pub const OPAQUE_KEYS: &[&str] = &[
     "behind_digest",
+    "watch_id",
     "id",
     "message_id",
     "turn_id",
@@ -1083,6 +1086,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(args, json!({"path": "p"}));
+    }
+
+    #[test]
+    fn active_transcript_observation_requires_transcript_access() {
+        let off = Access {
+            transcripts: false,
+            reveal: true,
+        };
+        assert_eq!(
+            admit("claude_transcript_watch", json!({"path": "fixture"}), off).unwrap_err(),
+            Refusal::TranscriptsOff
+        );
+        let (_, plan) = admit("claude_transcript_watch", json!({"path": "fixture"}), ON).unwrap();
+        let id = "ghp_abcdefABCDEF0123456789abcdefABCDEF01";
+        let out = plan.finish(
+            "claude_transcript_watch",
+            json!({"watch_id": id, "expires_in_ms": 30000}),
+        );
+        assert_eq!(out["watch_id"], id);
     }
 
     #[test]

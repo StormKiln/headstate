@@ -79,7 +79,7 @@ export function DesktopTranscript({
   label?: string;
   /// The session `path` is the main transcript of, so the desktop's
   /// activity nudge for it reads at once (#1477). A subagent's
-  /// transcript below is not nudged and follows on its cadence.
+  /// transcript below uses an expiring opaque activity watch.
   sessionId?: string | null;
   /// Whether the session is waiting on the reader, for the "while you
   /// were away" card (#1484). Absent: not said.
@@ -115,6 +115,7 @@ export function DesktopTranscript({
           // one's messages under a new name.
           key={open.transcript_path}
           path={open.transcript_path}
+          watchActivity
           // From its session's: see `subagentLiveness`.
           liveness={subagentLiveness(liveness, open)}
           label={`Subagent transcript${open.agent_type ? `: ${open.agent_type}` : ""}`}
@@ -140,6 +141,7 @@ export function DesktopTranscript({
 type Panel = "turns" | "find" | null;
 
 function Loaded({
+  watchActivity = false,
   path,
   liveness,
   label,
@@ -148,6 +150,7 @@ function Loaded({
   waiting,
   openAt = "latest",
 }: {
+  watchActivity?: boolean;
   path: string;
   liveness: Liveness;
   label: string;
@@ -159,6 +162,7 @@ function Loaded({
   const marker = useOpenedMarker(path);
   const live = useClaudeTranscriptLive(path, {
     liveness,
+    watchActivity,
     sessionId,
     openAt: openAt === "marker" ? (marker?.id ?? null) : null,
     openAtCursor: openAt === "marker" ? (marker?.cursor ?? null) : null,

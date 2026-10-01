@@ -248,3 +248,21 @@ describe("remote GitLab queue event contract", () => {
     expect(model.snapshot().error).toBe("Latest valid provider status");
   });
 });
+
+
+it("validates watch replies and drops malformed activity frames without retiring the listener", async () => {
+  tauri.invoke.mockResolvedValueOnce({ watch_id: "opaque", expires_in_ms: 30000 });
+  await expect(remote.call("claude_transcript_watch", { path: "/generic/child.jsonl" })).resolves.toEqual({ watch_id: "opaque", expires_in_ms: 30000 });
+  expect(tauri.invoke).toHaveBeenLastCalledWith("remote_call", { command: "claude_transcript_watch", args: { path: "/generic/child.jsonl" } });
+  tauri.invoke.mockResolvedValueOnce({ watch_id: "opaque" });
+  await expect(remote.call("claude_transcript_watch")).rejects.toThrow();
+  const cb = vi.fn();
+  const stop = await remote.listen("claude-transcript-activity", cb);
+  const deliver = tauri.listen.mock.calls.find(([name]) => name === "claude-transcript-activity")![1] as (e: { payload: unknown }) => void;
+  deliver({ payload: { watch_id: "opaque", size: 10, seq: 1 } });
+  deliver({ payload: { watch_id: "opaque", size: "private-text", seq: 2 } });
+  deliver({ payload: { watch_id: "opaque", size: 11, seq: 3 } });
+  expect(cb).toHaveBeenCalledTimes(2);
+  expect(cb).toHaveBeenLastCalledWith({ payload: { watch_id: "opaque", size: 11, seq: 3 } });
+  stop();
+});

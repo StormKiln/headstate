@@ -709,3 +709,52 @@ cheaper, not free of long tasks.
 The full make target exited successfully: all eight B1/B2/B3 fixtures, both
 B4 follow fixtures, and all four residency scenarios passed. B5 remains a
 compression estimate; WKWebView and iOS device timings remain unmeasured.
+
+
+### Child activity watch tick (#1536, 2026-10-01)
+
+This measures the desktop metadata loop, separately from the B4 page-read and
+browser measurements above. The explicit-view registry holds at most 64
+canonical files, with 30-second leases renewed every 10 seconds by visible
+child views. Closing/backgrounding/covering a view stops renewal; the desktop
+may retain its metadata interest for the remaining lease. Duplicate viewers
+share a random opaque ID; no path, path hash or transcript content enters the
+new event. Main and child events share the existing eight-event-per-tick cap;
+rotating priority prevents continuous early writers starving later files.
+
+On this macOS arm64 host, using the **debug Rust test profile**, the opt-in
+`claude::activity::tests::synthetic_watch_tick_measurement` ran the actual
+`observe_tick` path over 200 main files and 64 nested child files. Each case
+used 10 warmups and 100 measured samples. Synthetic fixture creation, reset,
+and growth/shrink/removal happened outside timing. Each timed tick included
+lease expiry/snapshot sorting, canonical containment revalidation for children,
+metadata observations, baseline retention, fairness, and event payload creation.
+It excluded the 1-second sleep, global-registry mutex contention, Tauri emission,
+network/UI delivery, and the existing five-tick main registry/process refresh.
+There is no private corpus or native-device timing in these results.
+
+| Case | Median ms | p95 ms | Metadata observations* | Changed | Emitted | Deferred | Retained baselines |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Unchanged | 2.510 | 2.945 | 264 | 0 | 0 | 0 | 264 |
+| All grow | 3.194 | 3.847 | 264 | 264 | 8 | 256 | 264 |
+| All shrink | 3.443 | 4.203 | 264 | 264 | 8 | 256 | 264 |
+| All missing | 3.090 | 3.905 | 200 | 0 | 0 | 0 | 200 |
+
+*These are the tracker metadata operations, not total filesystem syscalls:
+child path admission additionally canonicalizes root and file and checks file
+metadata. In the missing case all 64 child admissions fail and are returned for
+lease removal; they produce no false zero-size nudge. Steady-state missing main
+baselines are unknown and the resolver may refresh them on its ordinary cadence.
+
+A separate batch of **64 admission/renewal calls** (same canonical validation
+and bounded registry insertion/renewal; 10 warmups, 100 samples) measured
+**1.424 ms median / 1.559 ms p95**. It excludes IPC, preferences and remote privacy
+admission. These synthetic warm-filesystem results support a small tick cost
+under this load, not a universal latency guarantee. Release-profile, cold or
+remote filesystem, native emission, and physical-phone latency remain unmeasured.
+
+Reproduce without regenerating any saved benchmark fixtures:
+
+```sh
+CARGO_TARGET_DIR=/private/tmp/headstate-pr1596-review/src-tauri/target cargo test --manifest-path src-tauri/Cargo.toml --lib synthetic_watch_tick_measurement -- --ignored --nocapture
+```

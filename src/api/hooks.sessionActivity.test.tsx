@@ -60,9 +60,11 @@ const pageRead = vi.hoisted(() =>
     return { ...onePage, start: onePage.end };
   }),
 );
+const watchRead = vi.hoisted(() => vi.fn(async (path: string) => { void path; return { watch_id: "opaque-child", expires_in_ms: 30000 }; }));
 vi.mock("./tauri", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   claudeTranscriptPage: pageRead,
+  claudeTranscriptWatch: watchRead,
 }));
 
 const { ACTIVE_NOW_MS, SESSION_ACTIVITY_EVENT, useClaudeTranscriptLive, useSessionActivity } =
@@ -84,6 +86,9 @@ beforeEach(() => {
   vi.useFakeTimers();
   bus.listeners.clear();
   pageRead.mockClear();
+  watchRead.mockReset();
+  watchRead.mockResolvedValue({ watch_id: "opaque-child", expires_in_ms: 30000 });
+  Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
 });
 afterEach(() => {
   vi.useRealTimers();
@@ -172,4 +177,101 @@ describe("useSessionActivity: the list's active-now set (#1477)", () => {
     nudge("s-a", 11, 2);
     expect(result.current).toBe(held);
   });
+});
+
+describe("actively viewed child transcript watches", () => {
+  const event = "claude-transcript-activity";
+  const childNudge = (watch_id: string, size: number) => act(() => bus.emit(event, { watch_id, size, seq: 1 }));
+  async function child() {
+    const hook = renderHook(() => useClaudeTranscriptLive("/child.jsonl", { liveness: UNKNOWN, watchActivity: true }));
+    await settle();
+    return hook;
+  }
+  it("registers only explicit child views and routes only the matching opaque ID", async () => {
+    await child();
+    expect(watchRead).toHaveBeenCalledWith("/child.jsonl");
+    expect(bus.listeners.get(SESSION_ACTIVITY_EVENT)?.size ?? 0).toBe(0);
+    childNudge("another-watch", FILE_BYTES + 1);
+    await settle();
+    expect(reads()).toBe(1);
+    childNudge("opaque-child", FILE_BYTES);
+    await settle();
+    expect(reads()).toBe(1);
+    childNudge("opaque-child", FILE_BYTES + 1);
+    await settle();
+    expect(reads()).toBe(2);
+  });
+  it.each(["`claude_transcript_watch` is not a Headstate command", "This computer does not allow this phone to read session transcripts."])("keeps polling without registration retries for permanent refusal: %s", async (error) => {
+    watchRead.mockRejectedValue(error);
+    await child();
+    await act(() => vi.advanceTimersByTimeAsync(60_000));
+    expect(watchRead).toHaveBeenCalledTimes(1);
+    expect(reads()).toBeGreaterThan(1);
+  });
+  it("retries transient registration failures only at the renewal cadence", async () => {
+    watchRead.mockRejectedValueOnce("connection unavailable");
+    await child();
+    await act(() => vi.advanceTimersByTimeAsync(9_000));
+    expect(watchRead).toHaveBeenCalledTimes(1);
+    await act(() => vi.advanceTimersByTimeAsync(1_100));
+    expect(watchRead).toHaveBeenCalledTimes(2);
+    const before = reads();
+    childNudge("opaque-child", FILE_BYTES + 1);
+    await settle();
+    expect(reads()).toBe(before + 1);
+  });
+  it("stops renewing and listening while hidden", async () => {
+    const { unmount } = await child();
+    act(() => {
+      Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await act(() => vi.advanceTimersByTimeAsync(40_000));
+    expect(watchRead).toHaveBeenCalledTimes(1);
+    expect(bus.listeners.get(event)?.size ?? 0).toBe(0);
+    unmount();
+  });
+  it("deduplicated watch IDs can nudge two viewers independently", async () => {
+    const a = await child();
+    const b = await child();
+    expect(watchRead).toHaveBeenCalledTimes(2);
+    a.unmount();
+    const before = reads();
+    childNudge("opaque-child", FILE_BYTES + 1);
+    await settle();
+    expect(reads()).toBe(before + 1);
+    b.unmount();
+  });
+  it("ignores a pending old-path lease reply", async () => {
+    let answer!: (lease: { watch_id: string; expires_in_ms: number }) => void;
+    watchRead.mockImplementationOnce(() => new Promise((resolve) => { answer = resolve; }));
+    const view = renderHook(({ path }) => useClaudeTranscriptLive(path, { liveness: UNKNOWN, watchActivity: true }), { initialProps: { path: "/old.jsonl" } });
+    await settle();
+    view.rerender({ path: "/new.jsonl" }); await settle();
+    await act(async () => { answer({ watch_id: "old", expires_in_ms: 30000 }); });
+    const before = reads(); childNudge("old", FILE_BYTES + 1); await settle();
+    expect(reads()).toBe(before);
+    view.unmount();
+    await act(() => vi.advanceTimersByTimeAsync(40000));
+    expect(watchRead).toHaveBeenCalledTimes(2);
+    expect(bus.listeners.get(event)?.size ?? 0).toBe(0);
+  });
+  it("ignores an expired lease during transient renewal failures", async () => {
+    await child(); watchRead.mockRejectedValue("disconnected");
+    await act(() => vi.advanceTimersByTimeAsync(31000));
+    const before = reads(); childNudge("opaque-child", FILE_BYTES + 1); await settle();
+    expect(reads()).toBe(before);
+    expect(watchRead).toHaveBeenCalledTimes(4);
+  });
+
+  it("does not resurrect an unmounted watch after its pending lease returns", async () => {
+    let answer!: (lease: { watch_id: string; expires_in_ms: number }) => void;
+    watchRead.mockImplementationOnce(() => new Promise((resolve) => { answer = resolve; }));
+    const view = await child(); view.unmount();
+    await act(async () => { answer({ watch_id: "late", expires_in_ms: 30000 }); });
+    await act(() => vi.advanceTimersByTimeAsync(40000));
+    expect(watchRead).toHaveBeenCalledTimes(1);
+    expect(bus.listeners.get(event)?.size ?? 0).toBe(0);
+  });
+
 });
