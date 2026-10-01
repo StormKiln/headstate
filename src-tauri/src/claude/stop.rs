@@ -148,8 +148,9 @@ pub enum Refusal {
     /// Since #1534 `liveness` reads `Running` from a hook-recorded run,
     /// or from a `.key`-only process such a run names by an exact start
     /// time. [`confirm`] accepts only the session's own registry `.json`
-    /// as proof of which process to signal, and widening that is a
-    /// separate decision because a stop is destructive. So this is NOT
+    /// as proof of which process to signal, and deliberately keeps that
+    /// boundary (#1573): hook runs and named keys inform liveness but
+    /// do not authorize a destructive signal. So this is NOT
     /// `NotRunning`: the process is there, and Headstate declines to
     /// signal it. Reporting it as "not running" was "we did not ask"
     /// worded as "they did not answer".
@@ -162,8 +163,9 @@ pub enum Refusal {
     /// process is wearing the number. **This is the refusal that matters
     /// most**: signalling here destroys unrelated work.
     PidReused { pid: u32, drift_secs: i64 },
-    /// The start time could not be established either way. NOT a shade of
-    /// `NotRunning`, for `liveness`'s stated reason: a check that could
+    /// Whether this is the session's process could not be established:
+    /// unreadable evidence, an unconfirmed start time, or Unknown liveness.
+    /// NOT a shade of `NotRunning`: a check that could
     /// not be COMPLETED is not a check that came back negative.
     Unconfirmable { why: String },
     /// The per-run cap was reached before this one was considered.
@@ -192,9 +194,7 @@ impl Refusal {
                 "pid {pid} is running but started {drift_secs}s from the recorded time, so the \
                  number has been reused by a different process -- nothing was signalled"
             ),
-            Refusal::Unconfirmable { why } => format!(
-                "{why}, so this could not be told from a recycled pid and nothing was signalled"
-            ),
+            Refusal::Unconfirmable { why } => format!("{why}; nothing was signalled"),
             Refusal::CapReached { cap } => format!(
                 "only {cap} stops are proposed at a time, so this one was not considered in \
                  this pass"
@@ -280,7 +280,8 @@ pub fn confirm<P: ProcessProbe>(
     let Some(text) = entry.proc_start.as_deref() else {
         return Err(Refusal::Unconfirmable {
             why: format!(
-                "the registry lists pid {} for this session but no start time",
+                "the registry lists pid {} for this session but no start time, so a \
+                 recycled pid could not be told from the original",
                 entry.pid
             ),
         });
@@ -288,7 +289,8 @@ pub fn confirm<P: ProcessProbe>(
     let Some(recorded) = super::liveness::parse_proc_start(text) else {
         return Err(Refusal::Unconfirmable {
             why: format!(
-                "the recorded start time {text:?} for pid {} could not be read",
+                "the recorded start time {text:?} for pid {} could not be read, so a \
+                 recycled pid could not be told from the original",
                 entry.pid
             ),
         });
@@ -334,7 +336,7 @@ pub fn confirm<P: ProcessProbe>(
 /// The refusal for a session the registry does not show running: either
 /// `NotRunning` with `why`, or -- when `liveness` says it IS running from
 /// a source Stop does not confirm from -- [`Refusal::RunningUnconfirmable`]
-/// (#1569).
+/// (#1569), or [`Refusal::Unconfirmable`] when liveness is Unknown (#1573).
 ///
 /// Derived through `liveness`'s own [`Unnamed::resolve`] and [`derive_at`],
 /// over every session's runs, so this cannot disagree with the badge the
@@ -359,7 +361,10 @@ fn not_running<P: ProcessProbe>(
     let own = runs.get(session_id).map(Vec::as_slice).unwrap_or(&[]);
     match derive_at(probe, registry, &unnamed, session_id, None, own) {
         Liveness::Running { pid, .. } => Refusal::RunningUnconfirmable { pid },
-        _ => Refusal::NotRunning { why },
+        Liveness::Unknown { why } => Refusal::Unconfirmable {
+            why: format!("Headstate could not determine whether this session is running: {why}"),
+        },
+        Liveness::Dead { .. } => Refusal::NotRunning { why },
     }
 }
 

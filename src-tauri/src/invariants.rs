@@ -4555,11 +4555,9 @@ fn suggestion(f: &Finding) -> String {
     /// might spell them (#1554): the filesystem's, and the store's --
     /// `open_db` migrates the file it opens, so it is a write too.
     ///
-    /// Matched in the probe's OWN body only. A write inside a function the
-    /// probe calls is invisible, which is why a probe that must write
-    /// hands a real path to a helper that COPIES it into a `TempDir` first
-    /// (`store::settings`' `live_settings_round_trip`), and that helper is
-    /// tested against a fixture like any other code.
+    /// Matched in the probe and statically named same-file helpers (#1571).
+    /// This is a bounded source guard, not a Rust effect system: see the
+    /// limitations on `no_test_resolves_the_real_home_directory`.
     const PROBE_WRITES: &[&str] = &[
         "fs::write(",
         "File::create(",
@@ -4577,18 +4575,92 @@ fn suggestion(f: &Finding) -> String {
         ".execute_batch(",
         "set(&conn",
         "settings::set(",
+        "Command::new(",
     ];
 
-    /// Live probes whose flagged write goes to a `TempDir` the probe made,
-    /// as `(file, probe, call, why)`, each read and verified. Each must
-    /// still match, so an entry cannot outlive the line it excuses.
-    const PROBE_WRITES_TO_A_TEMPDIR: &[(&str, &str, &str, &str)] = &[(
-        "src-tauri/claude/search.rs",
-        "real_corpus",
-        ".execute_batch(",
-        "checkpoints the bench's own index database, built in a TempDir, \
-         before measuring its size; the real corpus is only read",
-    )];
+    /// Audited effects, keyed by file, ROOT PROBE, owning function and API.
+    /// SQL targets a probe-owned database; existing Git queries are read-only.
+    /// These are review exceptions, not a dataflow proof. A changed destination
+    /// or Git argv still requires review. Every tuple must match live source.
+    const PROBE_AUDITED_EFFECTS: &[(&str, &str, &str, &str, &str)] = &[
+        (
+            "src-tauri/claude/search.rs",
+            "real_corpus",
+            "real_corpus",
+            ".execute_batch(",
+            "checkpoints the probe-owned TempDir database",
+        ),
+        (
+            "src-tauri/claude/search.rs",
+            "real_corpus",
+            "index_pass",
+            ".execute(",
+            "indexes into the probe-owned TempDir database",
+        ),
+        (
+            "src-tauri/claudemd/advice/transcripts.rs",
+            "real_corpus",
+            "store_rows",
+            ".execute(",
+            "db() creates the probe-owned in-memory database",
+        ),
+        (
+            "src-tauri/store/settings.rs",
+            "live_settings_round_trip",
+            "round_trip_on_a_copy",
+            "fs::copy(",
+            "copies real database files into a TempDir; opens and writes only the copy",
+        ),
+        (
+            "src-tauri/store/settings.rs",
+            "live_settings_round_trip",
+            "round_trip_on_a_copy",
+            "open_db(",
+            "copies real database files into a TempDir; opens and writes only the copy",
+        ),
+        (
+            "src-tauri/store/settings.rs",
+            "live_settings_round_trip",
+            "round_trip_on_a_copy",
+            "set(&conn",
+            "copies real database files into a TempDir; opens and writes only the copy",
+        ),
+        (
+            "src-tauri/store/settings.rs",
+            "live_settings_round_trip",
+            "set",
+            ".execute(",
+            "connection came from round_trip_on_a_copy, never the original database",
+        ),
+        (
+            "src-tauri/docker/origin.rs",
+            "live_origin_resolves_real_tags",
+            "resolve_in_repo",
+            "Command::new(",
+            "audited git cat-file, log and merge-base queries; no modifying subcommands",
+        ),
+        (
+            "src-tauri/worktrees/scan.rs",
+            "live_scan_classifies_real_worktrees",
+            "git_output_with",
+            "Command::new(",
+            "audited read-only scan Git queries; generic wrapper itself is not a read-only proof",
+        ),
+        (
+            "src-tauri/worktrees/scan.rs",
+            "live_sidebar_versus_rollup_counts",
+            "git_output_with",
+            "Command::new(",
+            "audited read-only scan Git queries; generic wrapper itself is not a read-only proof",
+        ),
+        (
+            "src-tauri/worktrees/scan.rs",
+            "live_cost_of_sizing_every_repo",
+            "git_output_with",
+            "Command::new(",
+            "audited read-only scan Git queries; generic wrapper itself is not a read-only proof",
+        ),
+    ];
 
     /// Whether `line` contains `token` as a whole path segment: `dirs::`
     /// must not match `scan_dirs::`, which is a module in this tree.
@@ -4637,18 +4709,35 @@ fn suggestion(f: &Finding) -> String {
     fn home_offenders(
         rel: &str,
         src: &str,
-        used: &mut std::collections::BTreeSet<(&'static str, &'static str)>,
+        used: &mut std::collections::BTreeSet<(
+            &'static str,
+            &'static str,
+            &'static str,
+            &'static str,
+        )>,
     ) -> (Vec<String>, usize) {
         // `\r\n` first: the spans are found line by line.
         let src = src.replace("\r\n", "\n");
         let lines: Vec<&str> = src.lines().collect();
+        let functions: Vec<_> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(i, line)| {
+                if is_comment(line) {
+                    return None;
+                }
+                fn_declared(line)?;
+                let (name, first, last) = fn_around(&lines, i)?;
+                (first == i).then(|| (format!("{name}("), first, last))
+            })
+            .collect();
         let ignored = ignored_test_spans(&lines);
         let in_ignored = |n: usize| ignored.iter().any(|(a, b)| (*a..*b).contains(&n));
         let mut out = Vec::new();
         // An `#[ignore]` probe may READ the real home, never write it
         // (#1554). One that reaches the real home -- the opt-in, or a
         // home token read directly -- is flagged for any write API in
-        // its own body.
+        // its body and directly named same-file helpers.
         for &(a, b) in &ignored {
             let code = || (a..b).filter(|&n| !is_comment(lines[n]));
             let real = code().any(|n| {
@@ -4659,24 +4748,57 @@ fn suggestion(f: &Finding) -> String {
                 continue;
             }
             let probe = fn_declared(lines[a]).unwrap_or("");
-            for n in code() {
-                if let Some(w) = PROBE_WRITES.iter().find(|w| has_token(lines[n], w)) {
-                    if let Some(&(f, g, _, _)) = PROBE_WRITES_TO_A_TEMPDIR
-                        .iter()
-                        .find(|(f, g, t, _)| *f == rel && *g == probe && t == w)
-                    {
-                        used.insert((f, g));
+            let mut pending = vec![(a, b)];
+            let mut visited = std::collections::BTreeSet::new();
+            while let Some((start, end)) = pending.pop() {
+                if !visited.insert(start) {
+                    continue;
+                }
+                let owner = fn_declared(lines[start]).unwrap_or(probe);
+                for n in start..end {
+                    if is_comment(lines[n]) {
                         continue;
                     }
-                    out.push(format!(
-                        "{rel}:{}: `{w}` in an #[ignore] probe that reaches the real home, \
-                         which it may only read: {}",
-                        n + 1,
-                        lines[n].trim()
-                    ));
+                    let compact: String = lines[n].chars().filter(|c| !c.is_whitespace()).collect();
+                    for w in PROBE_WRITES.iter().filter(|w| has_token(&compact, w)) {
+                        if let Some(&(f, root, g, api, _)) =
+                            PROBE_AUDITED_EFFECTS.iter().find(|(f, root, g, t, _)| {
+                                *f == rel && *root == probe && *g == owner && t == w
+                            })
+                        {
+                            used.insert((f, root, g, api));
+                        } else {
+                            out.push(format!(
+                                "{rel}:{}: `{w}` in `{owner}`, reachable from real-home probe \
+                                 `{probe}`; audit the write destination: {}",
+                                n + 1,
+                                lines[n].trim()
+                            ));
+                        }
+                    }
+                    // Follow statically named functions in this source file.
+                    // Methods, cross-module resolution, aliases and callbacks are
+                    // not a call graph this textual guard can prove (see below).
+                    let calls = if n == start {
+                        compact.split_once('{').map_or("", |(_, body)| body)
+                    } else {
+                        &compact
+                    };
+                    for (token, first, last) in &functions {
+                        let called = calls.match_indices(token.as_str()).any(|(at, _)| {
+                            at == 0
+                                || !calls[..at].chars().next_back().is_some_and(|c| {
+                                    c.is_alphanumeric() || c == '_' || c == '.' || c == ':'
+                                })
+                        });
+                        if called {
+                            pending.push((*first, *last));
+                        }
+                    }
                 }
             }
         }
+
         for (n, line) in lines.iter().enumerate() {
             if is_comment(line) || in_ignored(n) {
                 continue;
@@ -4704,7 +4826,7 @@ fn suggestion(f: &Finding) -> String {
                 .iter()
                 .find(|(f, g, _)| *f == rel && *g == name)
             {
-                used.insert((f, g));
+                used.insert((f, g, "", ""));
                 continue;
             }
             out.push(format!("{rel}:{}: in `{name}`: {}", n + 1, line.trim()));
@@ -4750,8 +4872,8 @@ fn suggestion(f: &Finding) -> String {
     ///    never CI or the merge queue. The opt-in that gives such a probe
     ///    the real home, `test_home::real_for_a_live_probe`, may appear
     ///    ONLY in an `#[ignore]` test. And such a probe may only READ:
-    ///    one that reaches the real home and writes in its own body is
-    ///    flagged (#1554), because `store::settings`' probe once overwrote
+    ///    one that reaches the real home and writes in its own body or a
+    ///    directly named same-file helper is flagged (#1554, #1571), because `store::settings`' probe once overwrote
     ///    a setting in the owner's app database and restored it after an
     ///    assertion that could panic.
     ///
@@ -4764,13 +4886,13 @@ fn suggestion(f: &Finding) -> String {
     ///   sees no home rather than the fixture. That fails safe -- nothing
     ///   real is reached -- but such a test sees "no home", not its
     ///   fixture.
-    /// - **A write an `#[ignore]` probe makes out of sight.** A probe that
-    ///   reaches the real home is flagged for any [`PROBE_WRITES`] call in
-    ///   its own body (#1554), but not for one in a function it calls, one
-    ///   spelled otherwise (a `std::process::Command`, a crate's own
-    ///   save), or one aimed at a `TempDir` it made -- that last is a
-    ///   false positive, and the way out is a copying helper tested on a
-    ///   fixture, as `store::settings` does.
+    /// - **Cross-module, method, aliased or dynamic helper calls.** We follow
+    ///   direct unqualified function calls within the same file, terminating
+    ///   cycles, and flag known writes and Command launches on those paths.
+    ///   This is not Rust name resolution or an arbitrary read-only proof.
+    ///   Unknown APIs, function pointers and macros can still hide effects.
+    ///   Existing write exceptions name the owning helper and API after an
+    ///   audit of its TempDir destination; they do not exempt other APIs.
     /// - **The allowlisted readers' callers.** A test reaching
     ///   `auth::user_fallback_dirs` still reads real PATH candidate
     ///   directories on Windows. Read-only, and nothing under `.claude`.
@@ -4822,15 +4944,17 @@ fn suggestion(f: &Finding) -> String {
         assert!(ignored >= 40, "found only {ignored} #[ignore] tests");
         let stale: Vec<_> = HOME_READERS
             .iter()
-            .map(|(f, g, _)| (f, g))
-            .chain(PROBE_WRITES_TO_A_TEMPDIR.iter().map(|(f, g, _, _)| (f, g)))
-            .filter(|(f, g)| !used.contains(&(**f, **g)))
-            .map(|(f, g)| format!("{f}::{g}"))
+            .map(|&(f, g, _)| (f, g, "", ""))
+            .chain(
+                PROBE_AUDITED_EFFECTS
+                    .iter()
+                    .map(|&(f, root, g, api, _)| (f, root, g, api)),
+            )
+            .filter(|entry| !used.contains(entry))
             .collect();
         assert!(
             stale.is_empty(),
-            "these HOME_READERS or PROBE_WRITES_TO_A_TEMPDIR entries no longer match; \
-             delete them: {stale:?}"
+            "these home/effect exceptions no longer match; delete them: {stale:?}"
         );
         assert!(
             offenders.is_empty(),
@@ -4937,7 +5061,7 @@ mod tests {
             // `env_home` (10), the comment and the safe calls (14-16), and
             // both probes.
             assert_eq!(lines, ["2", "6", "23", "28"], "{found:#?}");
-            assert!(used.contains(&("src-tauri/auth.rs", "env_home")));
+            assert!(used.contains(&("src-tauri/auth.rs", "env_home", "", "")));
         }
         // The allowlist is by file AND function: the same `env_home`
         // elsewhere is flagged.
@@ -5002,22 +5126,107 @@ mod tests {
         }
     }
 
+    #[test]
+    fn live_probe_scan_follows_local_helpers_and_command_wrappers() {
+        let fixture = r#"
+#[test]
+#[ignore]
+fn probe() {
+    let _home = crate::auth::test_home::real_for_a_live_probe();
+    first();
+    command_wrapper();
+    safe_reader();
+}
+fn first() {
+    second();
+}
+fn second() {
+    first(); // a cycle must terminate
+    std::fs::remove_file(path).unwrap();
+}
+fn command_wrapper() {
+    std::process::Command::new("sh").arg("-c").arg("rm file").status();
+}
+fn safe_reader() {
+    std::fs::read_to_string(path).unwrap();
+    // std::fs::write(path, bytes); is only a comment
+}
+fn unreachable_writer() {
+    std::fs::write(path, bytes).unwrap();
+}
+"#;
+        for src in [fixture.to_string(), fixture.replace('\n', "\r\n")] {
+            let (found, _) = home_offenders("src-tauri/x.rs", &src, &mut Default::default());
+            assert_eq!(found.len(), 2, "{found:#?}");
+            assert!(
+                found.iter().any(|s| s.contains("remove_file")),
+                "{found:#?}"
+            );
+            assert!(found.iter().any(|s| s.contains("Command")), "{found:#?}");
+        }
+    }
+
+    #[test]
+    fn probe_effect_exceptions_are_scoped_to_root_helper_and_api() {
+        let fixture = r#"
+#[test]
+#[ignore]
+fn live_settings_round_trip() {
+    let _home = crate::auth::test_home::real_for_a_live_probe();
+    round_trip_on_a_copy();
+}
+fn round_trip_on_a_copy() {
+    std::fs::copy(from, copy.path().join("db"));
+}
+"#;
+        let file = "src-tauri/store/settings.rs";
+        let scan = |src: &str| home_offenders(file, src, &mut Default::default()).0;
+        assert!(scan(fixture).is_empty());
+        // Same helper/API under a different probe must be reviewed afresh.
+        assert_eq!(
+            scan(&fixture.replace("live_settings_round_trip", "different_probe")).len(),
+            1
+        );
+        // The approved copy does not bless deletion or a shell command.
+        for call in [
+            "std::fs::remove_file(from);",
+            "std::process::Command::new(\"sh\");",
+        ] {
+            let changed =
+                fixture.replace("    std::fs::copy(from, copy.path().join(\"db\"));", call);
+            assert_eq!(scan(&changed).len(), 1, "{changed}");
+        }
+        assert_eq!(
+            scan(&fixture.replace("round_trip_on_a_copy", "other_helper")).len(),
+            1
+        );
+        let extra = fixture.replace(
+            "std::fs::copy(from, copy.path().join(\"db\"));",
+            "std::fs::copy(from, copy.path().join(\"db\")); std::fs::remove_file(from);",
+        );
+        assert_eq!(
+            scan(&extra).len(),
+            1,
+            "an allowed effect must not mask another on the same line"
+        );
+    }
+
     // ---- Invariant: no test names a path in the shared temp dir (#1554) --
 
     /// Every test line in `lines` (per `mask`) that joins a name onto the
-    /// shared `std::env::temp_dir()`, whether `rustfmt` kept the call on
-    /// one line or broke it before `.join(`.
+    /// shared `std::env::temp_dir()`, including a bare binding that might
+    /// later be joined. Use an owned TempDir even for an existing cwd.
     fn shared_temp_offenders(rel: &str, lines: &[&str], mask: &[bool]) -> Vec<String> {
         let mut out = Vec::new();
         for (n, line) in lines.iter().enumerate() {
             if !mask.get(n).copied().unwrap_or(false) || is_comment(line) {
                 continue;
             }
-            let split = line.trim_end().ends_with("temp_dir()")
-                && lines
-                    .get(n + 1)
-                    .is_some_and(|next| next.trim_start().starts_with(".join("));
-            if line.contains("temp_dir().join(") || split {
+            // Ban the root itself: a binding or alias can be joined later.
+            if line
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .any(|word| word == "temp_dir")
+            {
                 out.push(format!("{rel}:{}: {}", n + 1, line.trim()));
             }
         }
@@ -5042,11 +5251,6 @@ mod tests {
     ///
     /// # What it cannot see
     ///
-    /// - **The temp dir held in a variable first**: `let d =
-    ///   std::env::temp_dir();` and then `d.join(…)`. Bare `temp_dir()`
-    ///   used as an existing directory to run in -- `launch.rs` and
-    ///   `overview.rs` do -- is safe and is not flagged, so the join on a
-    ///   variable cannot be told from it by text.
     /// - **Production code.** Only test lines are scanned; nothing in
     ///   production joins onto the temp dir today.
     /// - **Another spelling of a shared location**: a literal `/tmp/…`.
@@ -5120,7 +5324,7 @@ mod tests {
     }
 
     #[test]
-    fn safe() {
+    fn owned_and_bare() {
         // std::env::temp_dir().join(\"x\") in a comment is a mention
         let t = tempfile::TempDir::new().unwrap();
         let d = t.path().join(\"x\");
@@ -5135,9 +5339,9 @@ mod tests {
             let mask = test_mask(file, &src);
             let found = shared_temp_offenders("x.rs", &lines, &mask);
             let at: Vec<&str> = found.iter().map(|f| f.split(':').nth(1).unwrap()).collect();
-            // The fixed name (9) and the wrapped call (14). Not production
-            // (2), the comment (20) or the safe shapes (21-23).
-            assert_eq!(at, ["9", "14"], "{found:#?}");
+            // The fixed name (9), wrapped call (14), and bare binding (23).
+            // Not production (2), the comment (20), or owned TempDir (21-22).
+            assert_eq!(at, ["9", "14", "23"], "{found:#?}");
         }
     }
 

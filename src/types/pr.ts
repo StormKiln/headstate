@@ -2013,8 +2013,8 @@ export interface ClaudeSessionDetail {
 /// `~/.claude/sessions`, and `not_running` needs no remedy at all.
 ///
 /// `unconfirmable` is the arm that must never be collapsed into
-/// `not_running`. It is "we could not establish the start time", and the
-/// stop is refused on it -- signalling on a guess is how an unrelated
+/// `not_running`. It includes an unconfirmed start time, unreadable
+/// evidence and Unknown liveness (#1573). Signalling on a guess is how an unrelated
 /// process that inherited the pid gets killed.
 ///
 /// `running_unconfirmable` must never be collapsed into `not_running`

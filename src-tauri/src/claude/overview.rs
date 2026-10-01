@@ -709,7 +709,8 @@ mod tests {
     #[test]
     fn a_running_session_is_never_offered_as_resumable() {
         let conn = db();
-        let dir = std::env::temp_dir();
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path();
         let cwd = dir.to_str().unwrap();
         insert(
             &conn,
@@ -754,7 +755,8 @@ mod tests {
     #[test]
     fn a_session_the_list_could_not_decide_is_never_offered_as_resumable() {
         let conn = db();
-        let dir = std::env::temp_dir();
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path();
         let cwd = dir.to_str().unwrap();
         for id in ["could-not-tell", "no-verdict"] {
             insert(
@@ -922,7 +924,8 @@ mod tests {
     #[test]
     fn the_resumable_list_is_a_stated_subset_newest_first() {
         let conn = db();
-        let dir = std::env::temp_dir();
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path();
         let cwd = dir.to_str().unwrap();
         for i in 0..RESUMABLE_SHOWN + 5 {
             insert(
@@ -956,7 +959,8 @@ mod tests {
     #[test]
     fn a_session_with_no_activity_sorts_last_in_the_resumable_list() {
         let conn = db();
-        let dir = std::env::temp_dir();
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path();
         let cwd = dir.to_str().unwrap();
         insert(&conn, "timeless", Some(cwd), "2026-09-10T00:00:00Z", None);
         insert(

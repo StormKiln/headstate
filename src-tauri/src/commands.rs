@@ -4128,6 +4128,7 @@ fn last_turn_text(preview: &crate::claude::preview::Preview) -> Option<String> {
 /// It signals a process and waits on it. A sync command doing either is
 /// the freeze `no_sync_command_reaches_a_subprocess_or_a_whole_file`
 /// exists to prevent.
+///
 /// # Two whole functions rather than one with a `cfg` block inside
 ///
 /// `health::runaway::nice_of` is the house pattern and this follows it.

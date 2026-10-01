@@ -1453,10 +1453,12 @@ mod tests {
     /// These tests used the literal `"/tmp"`, which does not exist on
     /// Windows -- so `check_cwd` correctly returned `Gone` and two tests
     /// failed on the `platform (windows-latest)` job while passing
-    /// locally. `temp_dir()` is what the rest of this module's tests
-    /// already use, and it is `TEMP` on Windows and `/tmp` here.
+    /// locally. The test checkout is an existing directory on every platform.
     fn real_dir() -> String {
-        std::env::temp_dir().to_string_lossy().into_owned()
+        std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
     }
 
     fn insert(conn: &Connection, id: &str, cwd: Option<&str>, last: Option<&str>) {
