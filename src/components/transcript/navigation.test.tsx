@@ -54,10 +54,11 @@ const pageRead = vi.hoisted(() =>
       direction: TranscriptPageDirection,
     ): Promise<RemoteTranscriptWindow> => {
       const n = file.n;
-      const at =
+      const rewritten = anchor.kind === "cursor" && anchor.behind_digest !== `d${anchor.offset}`;
+      const at = rewritten ? n :
         anchor.kind === "start" ? 0 : anchor.kind === "end" ? n : anchor.offset / 100;
       const [from, to] =
-        direction === "before" ? [Math.max(0, at - 5), at] : [at, Math.min(n, at + 5)];
+        (rewritten || direction === "before") ? [Math.max(0, at - 5), at] : [at, Math.min(n, at + 5)];
       const messages = [];
       for (let i = from; i < to; i++) messages.push(message(i));
       return {
@@ -74,7 +75,7 @@ const pageRead = vi.hoisted(() =>
         end: cursorAt(to),
         at_start: from === 0,
         at_end: to === n,
-        rewritten: false,
+        rewritten,
         position: { first: null, last: null, total: null, exact: false, basis: "bytes" },
         seam: { first_model: null, last_model: null },
         bytes_scanned: 0,
@@ -103,6 +104,8 @@ vi.mock("../../api/tauri", async (importOriginal) => ({
 }));
 
 const { DesktopTranscript } = await import("./DesktopTranscript");
+const { PhoneTranscript } = await import("./phone/PhoneTranscript");
+const { readMarker } = await import("./sinceYouLeft");
 const { useFilters } = await import("../../store/filters");
 
 const PATH = "/tmp/projects/p/session.jsonl";
@@ -342,3 +345,53 @@ describe("the keyboard (#1489)", () => {
     expect(screen.getByRole("complementary")).toBeTruthy();
   });
 });
+
+for (const [host, Host] of [["desktop", DesktopTranscript], ["phone", PhoneTranscript]] as const) {
+  describe(`${host} saved cursor wiring`, () => {
+    async function mount(openAt: "latest" | "marker") {
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(<QueryClientProvider client={qc}><Host path={PATH} liveness={DEAD} openAt={openAt} /></QueryClientProvider>);
+      await shim.flush();
+      await shim.flush();
+    }
+    it.each(["marker", "latest"] as const)("reaches a far marker using its page cursor from %s", async (openAt) => {
+      file.n = 10_000;
+      localStorage.setItem(`headstate.transcript.read:${PATH}`, JSON.stringify({ id: "p10", offset: 1000, cursor: cursorAt(9) }));
+      await mount(openAt);
+      if (openAt === "latest") {
+        fireEvent.click(screen.getByRole("button", { name: /load back to where you left off/i }));
+        await shim.flush();
+        await shim.flush();
+      }
+      expect(mounted("p10") || mounted("p11")).toBe(true);
+      expect(pageRead.mock.calls.some((c) => c[1].kind === "cursor" && c[1].offset === 900 && c[2] === "after")).toBe(true);
+      expect(pageRead.mock.calls.length).toBeLessThanOrEqual(5);
+    });
+    it.each(["marker", "latest"] as const)("keeps a successful stale-cursor fallback notice after landing from %s", async (openAt) => {
+      file.n = 10_000;
+      localStorage.setItem(`headstate.transcript.read:${PATH}`, JSON.stringify({ id: "p9970", offset: 997000, cursor: { offset: 900, behind_digest: "stale" } }));
+      await mount(openAt);
+      if (openAt === "latest") {
+        fireEvent.click(screen.getByRole("button", { name: /load back to where you left off/i }));
+        await shim.flush();
+        await shim.flush();
+      }
+      expect(mounted("p9970") || mounted("p9971")).toBe(true);
+      expect(screen.getByTestId("jump-note-announce").textContent).toMatch(/changed.*found the saved message/i);
+      expect(screen.getAllByText(/changed; found the saved message/i).some((el) => el.tagName === "P")).toBe(true);
+    });
+    it("shows an honest bounded failure when the rewritten file no longer contains the marker", async () => {
+      file.n = 10_000;
+      localStorage.setItem(`headstate.transcript.read:${PATH}`, JSON.stringify({ id: "gone", offset: 1000, cursor: { offset: 900, behind_digest: "stale" } }));
+      await mount("marker");
+      expect(mounted("gone")).toBe(false);
+      expect(screen.getByTestId("jump-note-announce").textContent).toMatch(/changed.*could not be found.*Turns or Find/i);
+      expect(pageRead.mock.calls.length).toBeLessThanOrEqual(405);
+    });
+    it("persists the real containing page start from the mounted viewer", async () => {
+      await mount("latest");
+      expect(readMarker(PATH)).toMatchObject({ cursor: cursorAt(55) });
+      expect(readMarker(PATH)!.offset).toBeGreaterThan(5500);
+    });
+  });
+}

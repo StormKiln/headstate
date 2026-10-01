@@ -158,6 +158,8 @@ export type FollowLive = "running" | "unknown" | "not-running";
 type OlderState = { state: "idle" } | { state: "loading" } | { state: "failed"; error: unknown };
 
 export interface FollowSnapshot {
+  /// A saved position could not be trusted or reached; separate from read errors.
+  navigationNotice: string | null;
   /// `undefined` until the first page has been read -- Pending, which is
   /// not an empty transcript.
   messages: readonly TranscriptMessage[] | undefined;
@@ -188,8 +190,10 @@ export interface FollowConfig {
   maxResident?: number;
   /// What `relievePressure` keeps.
   pressureResident?: number;
-  /// Open at this message id when it is within reach (#1486's deep link).
+  /// Open at this message, using its saved page cursor when available.
   openAt?: string | null;
+  /// The real containing-page start, not the message offset.
+  openAtCursor?: PageCursor | null;
   now?: () => number;
 }
 
@@ -240,6 +244,7 @@ export class TranscriptFollower {
   /// A nudge arrived while a read was queued or in flight.
   private nudged = false;
   private snap: FollowSnapshot = {
+    navigationNotice: null,
     messages: undefined,
     status: "loading",
     error: null,
@@ -262,6 +267,7 @@ export class TranscriptFollower {
   private readonly pressure: number;
   private readonly now: () => number;
   private openAt: string | null;
+  private readonly openAtCursor: PageCursor | null;
 
   constructor(
     private readonly fetchPage: FetchPage,
@@ -271,6 +277,7 @@ export class TranscriptFollower {
     this.pressure = config.pressureResident ?? PRESSURE_RESIDENT;
     this.now = config.now ?? Date.now;
     this.openAt = config.openAt ?? null;
+    this.openAtCursor = config.openAtCursor ?? null;
   }
 
   // ---- the store, for `useSyncExternalStore` ----
@@ -366,6 +373,12 @@ export class TranscriptFollower {
     });
   }
 
+  /// A copy of the real page boundary; unavailable after its page is evicted.
+  cursorFor(id: string): PageCursor | null {
+    const i = pageOf(this.pages, id);
+    return i < 0 ? null : { ...this.pages[i].start };
+  }
+
   /// Hold the message `id` (#1484): a turn chosen from the outline, a
   /// find's hit, the "since you left" marker. Resolves to whether it is
   /// held once the read settles, so the caller scrolls only to a row
@@ -380,28 +393,46 @@ export class TranscriptFollower {
   /// longer matches comes back `rewritten`, which is a replacement from
   /// the end as any other.
   seek(id: string, at: PageCursor | null): Promise<boolean> {
-    return this.enqueue(async () => {
-      if (this.pages.length === 0) return;
-      if (pageOf(this.pages, id) >= 0) return;
-      const first = this.pages[0];
-      const near =
-        at === null || (at.offset < first.start.offset && first.start.offset - at.offset <= SEEK_NEAR_BYTES);
-      if (near) await this.reachBack(id);
-      if (pageOf(this.pages, id) < 0 && at !== null) {
-        const w = await this.read(cursor(at), "after");
-        if (w === null) return;
-        if (w.rewritten) {
-          await this.replace(w);
-          await this.reachBack(id);
-        } else {
-          this.pages = [w];
-          this.attached = w.at_end;
-          this.viewport = null;
-          this.bump();
-        }
-      }
+    return this.enqueue(() => this.seekHeld(id, at))
+      .then(() => this.pages.length > 0 && pageOf(this.pages, id) >= 0);
+  }
+
+  /// Shared by opening and explicit navigation. Never enqueue from inside
+  /// the queue: opening would wait for itself to finish.
+  private async seekHeld(id: string, at: PageCursor | null): Promise<void> {
+    this.snap = { ...this.snap, navigationNotice: null };
+    if (this.pages.length === 0 || pageOf(this.pages, id) >= 0) {
       this.publish();
-    }).then(() => this.pages.length > 0 && pageOf(this.pages, id) >= 0);
+      return;
+    }
+    const first = this.pages[0];
+    const near = at === null ||
+      (at.offset < first.start.offset && first.start.offset - at.offset <= SEEK_NEAR_BYTES);
+    if (near) await this.reachBack(id);
+    let stale = false;
+    if (pageOf(this.pages, id) < 0 && at !== null) {
+      const w = await this.read(cursor(at), "after");
+      if (w !== null) {
+        stale = w.rewritten;
+        this.pages = [w];
+        this.attached = w.at_end;
+        this.viewport = null;
+        this.bump();
+        if (stale) await this.reachBack(id);
+      }
+    }
+    const found = pageOf(this.pages, id) >= 0;
+    const navigationNotice = stale
+      ? this.snap.error !== null
+        ? "The transcript changed and recent history could not be read. Try again."
+        : found
+          ? "The transcript changed; found the saved message in recent history."
+          : "The transcript changed and the saved message could not be found in the recent history loaded. Use Turns or Find to locate it."
+      : !found && this.snap.error === null
+        ? "The saved message could not be found in the history loaded. Use Turns or Find to locate it."
+        : null;
+    this.snap = { ...this.snap, navigationNotice };
+    this.publish();
   }
 
   /// Read older pages until one holds a message `wanted` accepts, the
@@ -592,7 +623,7 @@ export class TranscriptFollower {
     if (this.live === "running") this.lastGrowthAt = this.now();
     const target = this.openAt;
     this.openAt = null;
-    if (target !== null) await this.reachBack(target);
+    if (target !== null) await this.seekHeld(target, this.openAtCursor);
     this.publish();
   }
 
@@ -610,10 +641,18 @@ export class TranscriptFollower {
   /// the bound would bind. Does not publish: the caller publishes once,
   /// so no intermediate list is ever seen.
   private async reachBack(id: string): Promise<void> {
-    while (pageOf(this.pages, id) < 0 && !this.pages[0].at_start && count(this.pages) < this.max) {
+    // Even bookkeeping-only pages must consume the finite search budget.
+    for (
+      let reads = 0;
+      reads < this.max && pageOf(this.pages, id) < 0 && !this.pages[0].at_start && count(this.pages) < this.max;
+      reads++
+    ) {
       const first = this.pages[0];
       const w = await this.read(cursor(first.start), "before");
-      if (w === null || w.rewritten || w.end.offset !== first.start.offset) return;
+      if (
+        w === null || w.rewritten || w.end.offset !== first.start.offset ||
+        w.start.offset >= first.start.offset || count(this.pages) + w.page.messages.length > this.max
+      ) return;
       this.pages = [w, ...this.pages];
     }
   }

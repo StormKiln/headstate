@@ -106,6 +106,8 @@ export function liveOf(
     fileBytes: read?.file_bytes ?? null,
     masking: undefined,
     replacements: 0,
+    navigationNotice: null,
+    cursorFor: () => null,
     position:
       read === undefined
         ? null

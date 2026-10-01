@@ -129,11 +129,15 @@ describe("useClaudeTranscriptLive", () => {
     );
     await settle();
     expect(result.current.messages?.[0].id).toMatch(/^\/a\.jsonl#/);
+    expect(result.current.cursorFor("/a.jsonl#199")).toEqual({ offset: 0, behind_digest: "d" });
     rerender({ path: "/b.jsonl" });
+    expect(result.current.cursorFor("/a.jsonl#199")).toBeNull();
     expect(result.current.messages).toBeUndefined();
     await settle();
     expect(result.current.messages?.[0].id).toMatch(/^\/b\.jsonl#/);
     expect(pageRead.mock.calls.at(-1)?.[0]).toBe("/b.jsonl");
+    expect(result.current.cursorFor("/a.jsonl#199")).toBeNull();
+    expect(result.current.cursorFor("/b.jsonl#199")).toEqual({ offset: 0, behind_digest: "d" });
   });
 
   it("on the phone, backgrounding lets go of all but the reader's own pages", async () => {

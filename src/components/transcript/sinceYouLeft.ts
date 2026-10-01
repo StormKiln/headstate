@@ -22,7 +22,7 @@
 /// floor and says "at least" (the root rule: qualify, or suppress).
 
 import type { ClaudeWaiting } from "../../types/pr";
-import type { TranscriptMessage } from "../../types/transcript";
+import type { PageCursor, TranscriptMessage } from "../../types/transcript";
 import { changeFromArgs, creationFromWrite, diffStat } from "./diff";
 import { type TaskListState, taskSummary } from "./tasks";
 import { isOpener } from "./turnNav";
@@ -33,12 +33,25 @@ export interface ReadMarker {
   id: string;
   /// Where its record starts: what orders two markers.
   offset: number;
+  /// Start of the page that contains this message; its digest belongs to this offset.
+  cursor?: PageCursor;
 }
 
 const PREFIX = "headstate.transcript.read:";
 
 function key(path: string): string {
   return `${PREFIX}${path}`;
+}
+
+function storedCursor(value: unknown, messageOffset: number): PageCursor | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const c = value as PageCursor;
+  if (
+    !Number.isSafeInteger(c.offset) || c.offset < 0 || c.offset > messageOffset ||
+    typeof c.behind_digest !== "string" || c.behind_digest.length > 128 ||
+    (c.offset > 0 && c.behind_digest.length === 0)
+  ) return undefined;
+  return { offset: c.offset, behind_digest: c.behind_digest };
 }
 
 /// The stored marker for `path`, or `null` when none was stored, the
@@ -52,9 +65,11 @@ export function readMarker(path: string): ReadMarker | null {
       typeof v === "object" &&
       v !== null &&
       typeof (v as ReadMarker).id === "string" &&
-      typeof (v as ReadMarker).offset === "number"
+      Number.isSafeInteger((v as ReadMarker).offset) && (v as ReadMarker).offset >= 0
     ) {
-      return { id: (v as ReadMarker).id, offset: (v as ReadMarker).offset };
+      const { id, offset, cursor } = v as ReadMarker;
+      const saved = storedCursor(cursor, offset);
+      return { id, offset, ...(saved ? { cursor: saved } : {}) };
     }
     return null;
   } catch {
@@ -63,13 +78,21 @@ export function readMarker(path: string): ReadMarker | null {
 }
 
 /// Move the marker to `m` if that is forward of where it is. Returns
-/// whether it moved. A message without an offset never moves it.
-export function advanceMarker(path: string, m: TranscriptMessage): boolean {
+/// whether storage changed. An existing position can gain or refresh its
+/// page cursor without moving backward. A message without an offset is ignored.
+export function advanceMarker(path: string, m: TranscriptMessage, cursor: PageCursor | null = null): boolean {
   if (m.offset === null) return false;
   const held = readMarker(path);
-  if (held !== null && held.offset >= m.offset) return false;
+  const saved = storedCursor(cursor, m.offset);
+  if (held !== null) {
+    if (held.offset > m.offset) return false;
+    if (held.offset === m.offset) {
+      if (held.id !== m.id || saved === undefined) return false;
+      if (held.cursor?.offset === saved.offset && held.cursor.behind_digest === saved.behind_digest) return false;
+    }
+  }
   try {
-    globalThis.localStorage?.setItem(key(path), JSON.stringify({ id: m.id, offset: m.offset }));
+    globalThis.localStorage?.setItem(key(path), JSON.stringify({ id: m.id, offset: m.offset, ...(saved ? { cursor: saved } : {}) }));
     return true;
   } catch {
     return false;

@@ -16,6 +16,7 @@ import {
   type RefObject,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -76,6 +77,7 @@ export function useSinceYouLeft({
   path,
   marker,
   messages,
+  cursorFor,
   shown,
   hasOlder,
   tasks,
@@ -83,6 +85,7 @@ export function useSinceYouLeft({
 }: {
   path: string;
   marker: ReadMarker | null;
+  cursorFor: (id: string) => PageCursor | null;
   messages: readonly TranscriptMessage[];
   shown: readonly TranscriptMessage[];
   hasOlder: boolean;
@@ -90,22 +93,27 @@ export function useSinceYouLeft({
   waiting?: ClaudeWaiting;
 }): SinceYouLeft {
   const held = useRef(messages);
-  useEffect(() => {
+  // The viewer reports the newest row in a passive effect. Publish the
+  // current rows first, including on the first page and a Reveal switch.
+  useLayoutEffect(() => {
     held.current = messages;
   }, [messages]);
   // How far this visit has already moved the marker: a scroll reports
-  // on every frame, and only a row past it is worth touching storage for.
-  const reached = useRef<{ path: string; offset: number } | null>(null);
+  // on every frame. A same-position cursor can be enriched or refreshed.
+  const reached = useRef<{ path: string; offset: number; cursor: PageCursor | null } | null>(null);
   const onRead = useCallback(
     (id: string) => {
       const row = held.current.find((m) => m.id === id);
       if (!row || row.offset === null) return;
       const r = reached.current;
-      if (r !== null && r.path === path && r.offset >= row.offset) return;
-      advanceMarker(path, row);
-      reached.current = { path, offset: row.offset };
+      if (r !== null && r.path === path && r.offset > row.offset) return;
+      const cursor = cursorFor(id);
+      if (r !== null && r.path === path && r.offset === row.offset &&
+          r.cursor?.offset === cursor?.offset && r.cursor?.behind_digest === cursor?.behind_digest) return;
+      advanceMarker(path, row, cursor);
+      reached.current = { path, offset: row.offset, cursor };
     },
-    [path],
+    [path, cursorFor],
   );
   const summary = useMemo(
     () => (marker === null ? null : awaySummary(messages, marker, { hasOlder, tasks, waiting })),
@@ -154,7 +162,7 @@ export function useJumps({
   shown,
   handle,
 }: {
-  live: Pick<TranscriptLive, "seek" | "loadOlderUntil" | "loadNewer" | "hasOlder" | "atLiveEdge">;
+  live: Pick<TranscriptLive, "seek" | "loadOlderUntil" | "loadNewer" | "hasOlder" | "atLiveEdge" | "navigationNotice">;
   messages: readonly TranscriptMessage[];
   shown: readonly TranscriptMessage[];
   handle: RefObject<TranscriptViewerHandle | null>;
@@ -257,7 +265,9 @@ export function useJumps({
     [handle, shown, land, live, messages],
   );
 
-  return { jumpTo, step, note };
+  // Landing clears the jump/filter note, but must retain a stale saved
+  // position's explanation even when the fallback found the message.
+  return { jumpTo, step, note: [live.navigationNotice, note].filter(Boolean).join(" ") || null };
 }
 
 /// `j`/`k` on the desktop: the next and previous prompt, from anywhere

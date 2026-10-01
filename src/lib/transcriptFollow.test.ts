@@ -226,6 +226,93 @@ describe("TranscriptFollower: opening", () => {
   });
 });
 
+describe("saved page cursors (#1530)", () => {
+  it("returns the containing page boundary, never the interior message offset, and forgets evicted pages", async () => {
+    const file = new FakeFile(10_000);
+    const f = follower(file, { maxResident: 12 });
+    f.setLive("not-running");
+    f.start();
+    await settle();
+    expect(f.cursorFor("r9998")).toEqual({ offset: 999700, behind_digest: "g0@999700" });
+    const saved = f.cursorFor("r9998")!;
+    saved.offset = 0;
+    expect(f.cursorFor("r9998")?.offset).toBe(999700);
+    await f.seek("r10", { offset: 900, behind_digest: "g0@900" });
+    expect(f.cursorFor("r9998")).toBeNull();
+    expect(f.cursorFor("r10")).toEqual({ offset: 900, behind_digest: "g0@900" });
+  });
+
+  it("opens beyond resident history in two reads without waiting on its own queue", async () => {
+    const file = new FakeFile(10_000);
+    const f = follower(file, { openAt: "r10", openAtCursor: { offset: 900, behind_digest: "g0@900" } });
+    f.setLive("not-running");
+    f.start();
+    await settle();
+    expect(ids(f.getSnapshot())).toEqual(["r9", "r10", "r11"]);
+    expect(file.calls).toEqual([
+      { anchor: { kind: "end" }, direction: "before" },
+      { anchor: { kind: "cursor", offset: 900, behind_digest: "g0@900" }, direction: "after" },
+    ]);
+    await expect(f.seek("r10", null)).resolves.toBe(true);
+  });
+
+  it("does not exceed resident capacity when fallback pages do not divide the bound", async () => {
+    const file = new FakeFile(10_000);
+    const f = follower(file, { maxResident: 10, openAt: "saved", openAtCursor: { offset: 900, behind_digest: "old" } });
+    f.setLive("not-running");
+    f.start();
+    await settle();
+    expect(ids(f.getSnapshot()).length).toBeLessThanOrEqual(10);
+  });
+
+  it("stops a fallback page that makes no backward progress", async () => {
+    const file = new FakeFile(10_000);
+    let reads = 0;
+    const f = new TranscriptFollower(async (anchor, direction) => {
+      if (++reads > 20) throw new Error("test sentinel: unbounded fallback");
+      const w = await file.page(anchor, direction);
+      if (anchor.kind === "cursor" && direction === "before") {
+        return { ...w, start: { offset: anchor.offset, behind_digest: anchor.behind_digest }, page: { ...w.page, messages: [] } };
+      }
+      return w;
+    }, { openAt: "missing", openAtCursor: { offset: 900, behind_digest: "old" } });
+    f.setLive("not-running");
+    f.start();
+    await settle();
+    expect(reads).toBe(3);
+    expect(f.getSnapshot().error).toBeNull();
+  });
+
+  it("bounds fallback reads even across pages containing only bookkeeping", async () => {
+    const file = new FakeFile(10_000);
+    let reads = 0;
+    const f = new TranscriptFollower(async (anchor, direction) => {
+      if (++reads > 20) throw new Error("test sentinel: unbounded fallback");
+      const w = await file.page(anchor, direction);
+      return anchor.kind === "cursor" && direction === "before"
+        ? { ...w, page: { ...w.page, messages: [] } } : w;
+    }, { maxResident: 12, openAt: "missing", openAtCursor: { offset: 900, behind_digest: "old" } });
+    f.setLive("not-running");
+    f.start();
+    await settle();
+    expect(reads).toBeLessThanOrEqual(14);
+    expect(f.getSnapshot().error).toBeNull();
+  });
+
+  it.each([true, false])("discloses stale saved cursors even when fallback finds the message: %s", async (found) => {
+    const file = new FakeFile(10_000);
+    if (found) file.recs[9995] = { id: "saved" };
+    const f = follower(file, { maxResident: 12, openAt: "saved", openAtCursor: { offset: 900, behind_digest: "old" } });
+    f.setLive("not-running");
+    f.start();
+    await settle();
+    expect(ids(f.getSnapshot()).includes("saved")).toBe(found);
+    expect(f.getSnapshot().navigationNotice).toMatch(found ? /changed.*found/i : /changed.*could not be found/i);
+    expect(file.calls.length).toBeLessThanOrEqual(5);
+    expect(ids(f.getSnapshot()).length).toBeLessThanOrEqual(12);
+  });
+});
+
 describe("TranscriptFollower: cadence (mocked clock)", () => {
   it("reads fast while the session writes, backs off when idle, and resumes on growth", async () => {
     const file = new FakeFile(3);

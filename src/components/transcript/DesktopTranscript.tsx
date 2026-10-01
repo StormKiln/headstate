@@ -161,6 +161,7 @@ function Loaded({
     liveness,
     sessionId,
     openAt: openAt === "marker" ? (marker?.id ?? null) : null,
+    openAtCursor: openAt === "marker" ? (marker?.cursor ?? null) : null,
   });
   const density = useFilters((f) => f.transcriptDensity);
   const setDensity = useFilters((f) => f.setTranscriptDensity);
@@ -213,6 +214,7 @@ function Loaded({
   const since = useSinceYouLeft({
     path,
     marker,
+    cursorFor: live.cursorFor,
     messages: all,
     shown,
     hasOlder: live.hasOlder,
@@ -301,7 +303,7 @@ function Loaded({
     marker === null
       ? undefined
       : since.beforeHeld
-        ? () => jumps.jumpTo(marker.id, null)
+        ? () => jumps.jumpTo(marker.id, marker.cursor ?? null)
         : dividerAt !== null
           ? () => void handle.current?.scrollTo(dividerAt)
           : undefined;

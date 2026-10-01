@@ -122,6 +122,7 @@ export function PhoneTranscript({
     enabled: reveal,
     sessionId,
     openAt: openAtId,
+    openAtCursor: openAt === "marker" ? (marker?.cursor ?? null) : null,
   });
   // Refused or failed before it read anything: the masked text stays.
   const revealFailed =
@@ -133,6 +134,7 @@ export function PhoneTranscript({
     enabled: !reveal || revealFailed,
     sessionId,
     openAt: openAtId,
+    openAtCursor: openAt === "marker" ? (marker?.cursor ?? null) : null,
   });
   const showingRevealed = reveal && revealed.messages !== undefined;
   const active = showingRevealed ? revealed : masked;
@@ -206,6 +208,7 @@ export function PhoneTranscript({
   const since = useSinceYouLeft({
     path,
     marker,
+    cursorFor: active.cursorFor,
     messages,
     shown,
     hasOlder: active.hasOlder,
@@ -248,7 +251,7 @@ export function PhoneTranscript({
     marker === null
       ? undefined
       : since.beforeHeld
-        ? () => jumps.jumpTo(marker.id, null)
+        ? () => jumps.jumpTo(marker.id, marker.cursor ?? null)
         : dividerAt !== null
           ? () => void handle.current?.scrollTo(dividerAt)
           : undefined;

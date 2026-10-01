@@ -6,6 +6,7 @@ import type {
   RemoteTranscriptWindow,
   TranscriptMessage,
 } from "../../../types/transcript";
+import { readMarker } from "../sinceYouLeft";
 import { DEAD, output } from "../fixtures";
 import { installScrollShim, type ScrollShim } from "../scrollShim";
 
@@ -139,6 +140,7 @@ beforeEach(() => {
   state.revealed = {};
   state.waiting = [];
   state.book = null;
+  localStorage.clear();
   pageRead.mockClear();
 });
 afterEach(() => {
@@ -155,6 +157,24 @@ async function show(masked: Answer, revealed: Answer = {}) {
 }
 
 describe("masked secrets and Reveal (#1488)", () => {
+  it("saves the active revealed page cursor and switches back to the masked owner", async () => {
+    const row = msg("same", { offset: 50 });
+    await show({ data: page([row], MASKED) });
+    await shim.flush();
+    expect(readMarker("/p.jsonl")?.cursor).toEqual({ offset: 0, behind_digest: "" });
+    const w = windowOf(page([row], { ...MASKED, hidden: 0, revealed: true }));
+    pageRead.mockImplementationOnce(async (_path, _anchor, _direction, _limit, reveal) => {
+      expect(reveal).toBe(true);
+      return { ...w, start: { offset: 20, behind_digest: "revealed-page" }, at_start: false };
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Reveal" }));
+    await shim.flush();
+    expect(readMarker("/p.jsonl")?.cursor).toEqual({ offset: 20, behind_digest: "revealed-page" });
+    fireEvent.click(screen.getByRole("button", { name: "Hide it again" }));
+    await shim.flush();
+    expect(readMarker("/p.jsonl")?.cursor).toEqual({ offset: 0, behind_digest: "" });
+  });
+
   it("says how many were hidden and offers Reveal when the desktop allows it", async () => {
     await show(
       { data: page([msg("a", { blocks: [{ kind: "text", index: 0, text: "key ⟦hidden:token⟧", clip: null }] })], MASKED) },

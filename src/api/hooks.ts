@@ -1707,19 +1707,20 @@ export function useClaudeTranscriptLive(
     liveness: Liveness;
     enabled?: boolean;
     reveal?: boolean;
-    /// Open at this message id when it is within reach (#1486).
+    /// Open at this message, using its saved page cursor when available.
     openAt?: string | null;
+    openAtCursor?: PageCursor | null;
     /// The session `path` belongs to, for its activity nudges (#1477).
     sessionId?: string | null;
   },
 ) {
-  const { liveness, enabled = true, reveal = false, openAt = null, sessionId = null } = options;
+  const { liveness, enabled = true, reveal = false, openAt = null, openAtCursor = null, sessionId = null } = options;
   const on = enabled && path !== null && path !== "";
   const key = `${reveal ? "reveal" : "masked"}:${path ?? ""}`;
   const make = () =>
     new TranscriptFollower(
       (anchor, direction) => claudeTranscriptPage(path as string, anchor, direction, null, reveal),
-      { openAt },
+      { openAt, openAtCursor },
     );
   // A follower belongs to ONE file: a cursor is an offset into it. A new
   // path is a new follower, swapped during render so the pane never
@@ -1775,6 +1776,7 @@ export function useClaudeTranscriptLive(
       refresh: () => follower.refresh(),
       setViewport: (first: string, last: string) => follower.setViewport(first, last),
       seek: (id: string, at: PageCursor | null) => follower.seek(id, at),
+      cursorFor: (id: string) => follower.cursorFor(id),
       loadOlderUntil: (wanted: (m: TranscriptMessage) => boolean) =>
         follower.loadOlderUntil(wanted),
     }),
