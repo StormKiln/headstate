@@ -174,8 +174,14 @@ pub fn commit(
             sound &= page.ids.insert((row.repo.clone(), row.number));
         }
         sound &= page.ids.len() <= CAP && page.ids.len() as u64 <= count.unwrap_or(0);
+        // A terminal page is still a page in this pass: its new rows
+        // need a fresh cursor before they can certify complete coverage.
+        // Null remains valid for a genuinely empty result.
+        if !rows.is_empty() {
+            sound &= cursor.is_some_and(|c| page.cursors.insert(c.to_string()));
+        }
         if more == Some(true) {
-            sound &= !rows.is_empty() && cursor.is_some_and(|c| page.cursors.insert(c.to_string()));
+            sound &= !rows.is_empty();
         }
         if more == Some(false) && count.is_some_and(|n| n <= CAP as u64) {
             sound &= page.ids.len() as u64 == count.unwrap();

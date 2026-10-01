@@ -56,6 +56,10 @@ impl Rig {
                     "changed-count" => page["issueCount"] = json!(total+1),
                     "repeated-cursor" => page["pageInfo"]["endCursor"] = json!(after.to_string()),
                     "missing-cursor" => page["pageInfo"]["endCursor"] = Value::Null,
+                    "cursor-absent" => {page["pageInfo"].as_object_mut().unwrap().remove("endCursor");},
+                    "cursor-cycle" => page["pageInfo"]["endCursor"] = json!("50"),
+                    "cursor-empty" => page["pageInfo"]["endCursor"] = json!(""),
+                    "cursor-number" => page["pageInfo"]["endCursor"] = json!(120),
                     "duplicate" if after>0 => page["nodes"][0]["number"] = json!(base+1),
                     "short-terminal" => page["pageInfo"]["hasNextPage"] = json!(false),
                     "bad-node" => {page["nodes"][0].as_object_mut().unwrap().remove("number");},
@@ -332,5 +336,49 @@ fn dense_backfill_cancellation_keeps_the_last_committed_cursor() {
         r.tick().await;
         assert_eq!(r.count(), 100);
         assert!(matches!(r.tick().await, bf::TickOutcome::Complete));
+    });
+}
+
+#[test]
+fn dense_backfill_terminal_cursor_must_be_fresh_and_present() {
+    let _observed = budget::observed_test_lock();
+    let _restore = budget::RestoreObserved::capture();
+    run(|| async {
+        for fault in [
+            "repeated-cursor",
+            "missing-cursor",
+            "cursor-absent",
+            "cursor-cycle",
+            "cursor-empty",
+            "cursor-number",
+        ] {
+            let r = Rig::new(120, 1).await;
+            for _ in 0..2 {
+                assert!(matches!(r.tick().await, bf::TickOutcome::Advanced { .. }));
+            }
+            assert_eq!(r.count(), 100);
+            r.fault(fault);
+            assert!(
+                matches!(r.tick().await, bf::TickOutcome::Failed(_)),
+                "terminal {fault} must not settle coverage"
+            );
+            assert_eq!(r.count(), 120, "useful terminal rows survive {fault}");
+            let conn = crate::store::open_db(&r.db).unwrap();
+            let coverage =
+                crate::store::pr_slice::coverage(&conn, "merged|*|org:fixture", &r.from, &r.to)
+                    .unwrap();
+            assert_eq!(coverage.days_covered(), 0, "terminal {fault}");
+            r.fault("");
+            // Inconsistency resets the pass, preserving rows. Only a new
+            // sound pass can certify the terminal receipt.
+            for _ in 0..2 {
+                assert!(matches!(r.tick().await, bf::TickOutcome::Advanced { .. }));
+            }
+            assert!(matches!(r.tick().await, bf::TickOutcome::Complete));
+            assert_eq!(r.count(), 120);
+        }
+        let empty = Rig::new(0, 1).await;
+        empty.fault("missing-cursor"); // GraphQL legitimately returns null for an empty result.
+        assert!(matches!(empty.tick().await, bf::TickOutcome::Complete));
     });
 }
