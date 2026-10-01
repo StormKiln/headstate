@@ -1,3 +1,4 @@
+import { commandError } from "@/lib/errorKind";
 import { ExternalLink } from "./ExternalLink";
 import { PrDetailNavigation } from "./PrDetailNavigation";
 import { ArrowLeft, Trash2, Check, CircleDot, CircleSlash, ExternalLink as ExternalLinkIcon, X } from "lucide-react";
@@ -230,6 +231,7 @@ export function PrDetailView({
     data: pr,
     isLoading,
     isPlaceholderData,
+    isFetching,
     isError,
     error,
     refetch,
@@ -282,7 +284,7 @@ export function PrDetailView({
   /// branch), but this closure is defined above the guard, so the guard
   /// is restated rather than asserted away.
   const submitReview = (verdict: ReviewVerdictName, body: string) => {
-    if (!pr) return;
+    if (!pr || isError) return;
     setReviewing(verdict);
     const done = () => setReviewing(null);
     const label =
@@ -344,7 +346,7 @@ export function PrDetailView({
     );
   }
 
-  if (isError || !pr) {
+  if (!pr) {
     return (
       <div>
         {fallbackNavigation}
@@ -387,15 +389,17 @@ export function PrDetailView({
       {viewer !== undefined && viewer !== pr.author ? (
         <button
           type="button"
-          disabled={approvedByViewer || reviewing !== null}
+          disabled={isError || approvedByViewer || reviewing !== null}
           onClick={() => submitReview("approve", "")}
           title={
-            approvedByViewer
+            isError
+              ? "Refresh the pull request before reviewing"
+              : approvedByViewer
               ? "You have already approved this pull request"
               : (gate.approveWontCount ?? "Approve without a comment")
           }
           className={`rounded px-2.5 py-1 text-sm font-medium ${
-            approvedByViewer || reviewing !== null
+            isError || approvedByViewer || reviewing !== null
               ? "border border-[#30363d] text-[#8b949e] disabled:opacity-50"
               : "bg-[#238636] text-white hover:bg-[#1a7f37]"
           }`}
@@ -415,7 +419,7 @@ export function PrDetailView({
           Won't count toward merging
         </span>
       ) : null}
-      <PrActions pr={pr} compact conversations={gate.mergeBlocked} />
+      {!isError && <PrActions pr={pr} compact conversations={gate.mergeBlocked} />}
       {/* Claudify (#1455), which replaced "Copy for agent", pinned here
           since #1580: it sat at the very bottom, below every comment,
           so reaching it on a long pull request meant scrolling the whole
@@ -426,7 +430,7 @@ export function PrDetailView({
 
           `compact` on the desktop's one-line bar only; the phone's
           second line wraps, so it has room for the full reason. */}
-      <PrClaudifyButton pr={pr} compact={!isMobile} />
+      {!isError && <PrClaudifyButton pr={pr} compact={!isMobile} />}
     </>
   );
 
@@ -437,6 +441,15 @@ export function PrDetailView({
     // against its neighbour. The sticky header opts out via `-mx-4` so
     // it still spans the panel.
     <div className="mx-auto flex max-w-4xl flex-col gap-3">
+      {isError ? <div role="alert" className="rounded border border-[#30363d] p-3 text-sm">
+        <p className="font-medium">Could not refresh this pull request. Showing previously loaded details.</p>
+        <p>{commandError(errorMessage(error) ?? "Refresh unavailable").message}</p>
+        <p>Refresh before acting on these details, or open GitHub for the current state.</p>
+        <button type="button" disabled={isFetching} onClick={() => void refetch({ cancelRefetch: false })}
+          className="tap-target mt-2 rounded border border-[#30363d] px-3 py-1.5 disabled:opacity-50">
+          {isFetching ? "Refreshing…" : "Retry refresh"}
+        </button>
+      </div> : null}
       {/* NOTE: the body's own `back` button is deliberately not rendered
           here. The sticky header carries one that is always visible, and
           two "back" controls a few pixels apart is worse than one. The
@@ -581,7 +594,7 @@ export function PrDetailView({
         </p>
       </div>
 
-      <PrActions pr={pr} conversations={gate.mergeBlocked} />
+      {!isError && <PrActions pr={pr} conversations={gate.mergeBlocked} />}
 
       {/* Available on EVERY pull request, not only the review queue.
           Gating this on which list you arrived from would mean the same
@@ -589,15 +602,17 @@ export function PrDetailView({
           navigated to it -- and commenting on your own work is normal.
           Approving your own is the one case GitHub refuses, and
           ReviewBox handles that itself. */}
-      <ReviewBox
-        viewer={viewer}
-        author={pr.author}
-        latestReviews={pr.latest_reviews}
-        approveWontCount={gate.approveWontCount}
-        approveCaveat={gate.approveCaveat}
-        busy={reviewing}
-        onSubmit={submitReview}
-      />
+      <fieldset disabled={isError} className="min-w-0">
+        <ReviewBox
+          viewer={viewer}
+          author={pr.author}
+          latestReviews={pr.latest_reviews}
+          approveWontCount={gate.approveWontCount}
+          approveCaveat={gate.approveCaveat}
+          busy={reviewing}
+          onSubmit={submitReview}
+        />
+      </fieldset>
 
       {pr.body.trim() ? (
         // Open by default: the description is what the pull request IS,
@@ -644,7 +659,7 @@ export function PrDetailView({
             rerunnable !== null ? (
               <button
                 type="button"
-                disabled={rerunning}
+                disabled={isError || rerunning}
                 onClick={() => {
                   setRerunning(true);
                   rerun(pr.repo, pr.number, rerunnable).then(
@@ -707,6 +722,7 @@ export function PrDetailView({
         total={pr.review_threads_total}
         repo={pr.repo}
         number={pr.number}
+        actionsDisabled={isError}
       />
 
       {/* WHICH SESSION WROTE THIS (#1211). The reverse of the link the
@@ -789,7 +805,7 @@ export function PrDetailView({
           Delete branch stays below the evidence because it is
           destructive, and the row is not rendered at all when there is
           nothing to put in it. */}
-      {pr.state === "MERGED" && pr.head_ref_id ? (
+      {!isError && pr.state === "MERGED" && pr.head_ref_id ? (
         <div className="flex items-center gap-2">
           <button
             type="button"
@@ -834,7 +850,7 @@ export function PrDetailView({
           the remote -- and a question with one answer trains people to
           click through questions that have several. What it borrows is
           the WARNING, not the form. */}
-      {deleting && pr.head_ref_id ? (
+      {!isError && deleting && pr.head_ref_id ? (
         <Dialog open onOpenChange={(o) => !o && setDeleting(false)}>
           <DialogContent className="max-w-lg">
             <DialogTitle>Delete {pr.head_ref} on the remote?</DialogTitle>

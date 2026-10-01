@@ -34,13 +34,14 @@ function location(t: ReviewThread): string {
 /// object: inline threads anchored to a file and line, and the only ones
 /// that can be resolved. Merging them into the comment list would imply a
 /// Resolve button on comments that have no such concept.
-export function ReviewThreads({ threads, total, repo, number }: {
+export function ReviewThreads({ threads, total, repo, number, actionsDisabled = false }: {
   threads: ReviewThread[];
   /// GitHub's own count, which `threads` can be short of. See
   /// `PrDetail.review_threads_total`.
   total: number;
   repo: string;
   number: number;
+  actionsDisabled?: boolean;
 }) {
   if (threads.length === 0) return null;
 
@@ -71,7 +72,7 @@ export function ReviewThreads({ threads, total, repo, number }: {
       </h2>
       <div className="flex flex-col gap-2 p-3">
         {actionable.map((t) => (
-          <ThreadCard key={t.id} thread={t} repo={repo} number={number} />
+          <ThreadCard key={t.id} thread={t} repo={repo} number={number} actionsDisabled={actionsDisabled} />
         ))}
         {settled.map((t) => (
           // FORCED OPEN when the list is truncated, settled or not. A
@@ -88,6 +89,7 @@ export function ReviewThreads({ threads, total, repo, number }: {
             repo={repo}
             number={number}
             forceOpen={truncated}
+            actionsDisabled={actionsDisabled}
           />
         ))}
         {/* HONEST TRUNCATION, the same shape as the Checks panel's
@@ -113,13 +115,14 @@ export function ReviewThreads({ threads, total, repo, number }: {
   );
 }
 
-function ThreadCard({ thread, repo, number, forceOpen = false }: {
+function ThreadCard({ thread, repo, number, forceOpen = false, actionsDisabled = false }: {
   thread: ReviewThread;
   repo: string;
   number: number;
   /// Start open even when the thread is settled, because the LIST it sits
   /// in is incomplete. See the call site.
   forceOpen?: boolean;
+  actionsDisabled?: boolean;
 }) {
   const actionable = isActionable(thread);
   // Unresolved threads start OPEN: they are the ones needing an answer,
@@ -239,7 +242,7 @@ function ThreadCard({ thread, repo, number, forceOpen = false }: {
                 // Empty replies are refused by the command too; disabling
                 // here means the button never looks available for an
                 // action that cannot happen.
-                disabled={busy || reply.trim() === ""}
+                disabled={actionsDisabled || busy || reply.trim() === ""}
                 onClick={() =>
                   run(
                     sendReply(thread.id, repo, number, reply),
@@ -256,7 +259,7 @@ function ThreadCard({ thread, repo, number, forceOpen = false }: {
             {!thread.is_resolved && thread.viewer_can_resolve ? (
               <button
                 type="button"
-                disabled={busy}
+                disabled={actionsDisabled || busy}
                 onClick={() =>
                   run(
                     resolve(thread.id, repo, number),
@@ -275,7 +278,7 @@ function ThreadCard({ thread, repo, number, forceOpen = false }: {
             {thread.is_resolved && thread.viewer_can_unresolve ? (
               <button
                 type="button"
-                disabled={busy}
+                disabled={actionsDisabled || busy}
                 onClick={() =>
                   run(
                     unresolve(thread.id, repo, number),
