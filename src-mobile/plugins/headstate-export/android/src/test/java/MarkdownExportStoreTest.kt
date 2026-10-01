@@ -3,6 +3,35 @@ import org.junit.Assert.*
 import org.junit.Test
 import java.nio.file.Files
 class MarkdownExportStoreTest {
+    @Test fun interruptedFinalWriteIsRepairedWithoutReplacingValidLeasedExports() {
+        val root=Files.createTempDirectory("export-interrupted").toFile()
+        try {
+            val store=MarkdownExportStore(root)
+            val valid=store.prepare("valid leased export")
+            val modified=valid.lastModified()
+            val text="# café 😀\nEarlier messages were not loaded.\n[masked]\n"
+            val file=store.prepare(text)
+            repeat(6) { store.prepare("other leased $it") } // Repair at the entry cap.
+            file.writeText("# café") // Seed a previous version's interrupted final write.
+            assertArrayEquals(text.toByteArray(Charsets.UTF_8),store.prepare(text).readBytes())
+            assertArrayEquals("valid leased export".toByteArray(),valid.readBytes())
+            assertEquals(modified,valid.lastModified())
+        } finally { root.deleteRecursively() }
+    }
+    @Test fun abandonedEmptyDirectoryAndStagingWriteRecoverOnRetry() {
+        val root=Files.createTempDirectory("export-abandoned").toFile()
+        try {
+            val store=MarkdownExportStore(root)
+            val text="complete 😀 markdown"
+            val file=store.prepare(text)
+            assertTrue(file.delete()) // Kill after mkdir, before final publication.
+            assertArrayEquals(text.toByteArray(Charsets.UTF_8),store.prepare(text).readBytes())
+            assertTrue(file.delete())
+            java.io.File(file.parentFile,".transcript.pending").writeText("partial")
+            assertArrayEquals(text.toByteArray(Charsets.UTF_8),store.prepare(text).readBytes())
+            assertEquals(listOf("transcript.md"),file.parentFile!!.list()!!.toList())
+        } finally { root.deleteRecursively() }
+    }
     @Test fun exactUtf8ReuseCapacityAndExpiry() {
         val root=Files.createTempDirectory("export-test").toFile()
         try {

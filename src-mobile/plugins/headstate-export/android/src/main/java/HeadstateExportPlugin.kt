@@ -34,15 +34,26 @@ class MarkdownExportStore(private val root: File) {
         val hash = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
         val folder = File(root, hash)
         val file = File(folder, "transcript.md")
-        if (file.isFile) { check(folder.setLastModified(now)); return file }
-        val live = entries()
-        if (live.size >= 8 || live.sumOf { File(it, "transcript.md").length() } + bytes.size > 32 * 1024 * 1024) throw ExportCapacityException()
-        check(folder.mkdir())
-        try {
-            file.outputStream().use { it.write(bytes); it.fd.sync() }
+        val staged = File(folder, ".transcript.pending")
+        // Validate older cache entries too: a previous process may have died
+        // while writing the final filename before atomic publication existed.
+        if (file.isFile && file.length() == bytes.size.toLong() && file.readBytes().contentEquals(bytes)) {
+            check(!staged.exists() || staged.delete())
             check(folder.setLastModified(now))
             return file
-        } catch (error: Exception) { folder.deleteRecursively(); throw error }
+        }
+        val live = entries().filter { it != folder }
+        if (live.size >= 8 || live.sumOf { File(it, "transcript.md").length() } + bytes.size > 32 * 1024 * 1024) throw ExportCapacityException()
+        check(folder.isDirectory || folder.mkdir())
+        try {
+            // A retry truncates an abandoned stage. Android's same-directory
+            // rename publishes complete synced bytes atomically; never stream
+            // directly into a filename that can be shared or reused.
+            staged.outputStream().use { it.write(bytes); it.fd.sync() }
+            check(staged.renameTo(file)) { "Export publication unavailable" }
+            check(folder.setLastModified(now))
+            return file
+        } catch (error: Exception) { staged.delete(); throw error }
     }
 }
 
