@@ -137,6 +137,7 @@ describe("useRemoveWorktrees, row by row", () => {
 
     frame({ run: run + 1, done: 1, total: 3, removed: true });
     frame({ run: null, done: 2, total: 3, removed: true });
+    frame({ done: 1, total: 3 }); // Legacy desktop: counts cannot remove a row.
 
     expect(rows()).toEqual([A, B, C]);
     expect(removed).toEqual([]);

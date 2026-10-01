@@ -2983,10 +2983,11 @@ export type BranchDeleteFrame =
 /// caller's own token echoed back; a frame whose `run` is not yours is
 /// another run's, and its index means nothing against your list.
 export interface WorktreeRemovalFrame {
-  run: number | null;
+  /// Older desktops emitted counts only. Missing correlation must never remove a row.
+  run?: number | null;
   done: number;
   total: number;
-  removed: boolean;
+  removed?: boolean;
 }
 
 /// One moment of the machine's health, mirroring the Rust

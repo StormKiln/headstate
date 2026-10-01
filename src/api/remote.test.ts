@@ -12,6 +12,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: tauri.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: tauri.listen }));
 
 import { remote } from "./remote";
+import { PR_FIXTURES } from "../fixtures/prs";
 
 function setVisibility(state: DocumentVisibilityState) {
   Object.defineProperty(document, "visibilityState", { value: state, configurable: true });
@@ -28,11 +29,17 @@ afterEach(() => {
 });
 
 describe("remote transport: commands", () => {
-  it("forwards a desktop command through remote_call with an object of args", async () => {
+  it("rejects a malformed remote reply before the caller receives it", async () => {
     tauri.invoke.mockResolvedValueOnce([{ number: 1347 }]);
-    await expect(remote.call("get_cached")).resolves.toEqual([{ number: 1347 }]);
+    await expect(remote.call("get_cached")).rejects.toThrow(/get_cached.*incompatible|incompatible.*get_cached/);
+  });
+
+  it("forwards a desktop command through remote_call with an object of args", async () => {
+    tauri.invoke.mockResolvedValueOnce(PR_FIXTURES);
+    await expect(remote.call("get_cached")).resolves.toBe(PR_FIXTURES);
     expect(tauri.invoke).toHaveBeenCalledWith("remote_call", { command: "get_cached", args: {} });
 
+    tauri.invoke.mockResolvedValueOnce({ points: [], week_current: 0, week_previous: 0, opened_week_current: 0, opened_week_previous: 0, month_current: 0, month_previous: 0 });
     await remote.call("get_history", { days: 14 });
     expect(tauri.invoke).toHaveBeenLastCalledWith("remote_call", {
       command: "get_history",
@@ -74,8 +81,8 @@ describe("remote transport: events", () => {
     const cb = () => {};
     const un = await remote.listen("prs-updated", cb);
     await remote.listen("poll-state", cb);
-    expect(tauri.listen).toHaveBeenNthCalledWith(1, "prs-updated", cb);
-    expect(tauri.listen).toHaveBeenNthCalledWith(2, "poll-state", cb);
+    expect(tauri.listen).toHaveBeenNthCalledWith(1, "prs-updated", expect.any(Function));
+    expect(tauri.listen).toHaveBeenNthCalledWith(2, "poll-state", expect.any(Function));
     expect(typeof un).toBe("function");
     const subscribes = () =>
       tauri.invoke.mock.calls.filter(([cmd]) => cmd === "subscribe_events").length;
@@ -92,5 +99,106 @@ describe("remote transport: events", () => {
     setVisibility("visible");
     await Promise.resolve();
     expect(tauri.invoke).toHaveBeenCalledWith("subscribe_events");
+  });
+});
+
+
+describe("remote response compatibility", () => {
+  it("preserves optional omissions and future fields without cloning", async () => {
+    const value = [{ ...PR_FIXTURES[0], future_desktop_field: { secret: "not logged" } }];
+    delete value[0].ready_at;
+    tauri.invoke.mockResolvedValueOnce(value);
+    expect(await remote.call("get_cached")).toBe(value);
+  });
+
+  it("rejects nested optional/array/union errors and account error envelopes safely", async () => {
+    const secret = "/private/token-DO-NOT-LOG";
+    for (const value of [
+      [{ ...PR_FIXTURES[0], ready_at: 123 }],
+      [{ ...PR_FIXTURES[0], labels: [{ name: secret, color: 9 }] }],
+      [{ ...PR_FIXTURES[0], ci: secret }],
+      { error: secret },
+    ]) {
+      tauri.invoke.mockResolvedValueOnce(value);
+      const error = await remote.call("get_cached").catch(e => e as Error);
+      expect(error).toBeInstanceOf(Error);
+      expect(String(error)).toContain("get_cached");
+      expect(String(error)).not.toContain(secret);
+    }
+  });
+
+  it("accepts both supported refresh shapes", async () => {
+    for (const name of ["refresh_now", "get_reviewing"]) {
+      for (const value of [PR_FIXTURES, { request_id: "r", update: {
+        source: { provider: "github", host: "github.com" }, list: "authored", phase: "ready", error: null,
+      } }]) {
+        tauri.invoke.mockResolvedValueOnce(value);
+        expect(await remote.call(name)).toBe(value);
+      }
+    }
+  });
+
+  it("accepts null/undefined void acknowledgements but rejects an error object", async () => {
+    for (const value of [null, undefined]) {
+      tauri.invoke.mockResolvedValueOnce(value);
+      expect(await remote.call("remove_worktree")).toBe(value);
+    }
+    tauri.invoke.mockResolvedValueOnce({ error: "bad" });
+    await expect(remote.call("remove_worktree")).rejects.toThrow(/remove_worktree/);
+  });
+
+  it("does not echo unknown command names", async () => {
+    tauri.invoke.mockResolvedValueOnce({});
+    await expect(remote.call("secret-command-name")).rejects.toThrow("no remote response contract");
+  });
+});
+
+describe("remote event validation", () => {
+  it("drops malformed frames, accepts the next valid frame, and returns the actual unlisten", async () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const unlisten = vi.fn();
+    tauri.listen.mockResolvedValueOnce(unlisten);
+    const consumer = vi.fn();
+    expect(await remote.listen("prs-updated", consumer)).toBe(unlisten);
+    const callback = tauri.listen.mock.calls.at(-1)![1] as (e: { payload: unknown }) => void;
+    const secret = "/private/secret-prompt";
+    callback({ payload: [{ title: secret }] });
+    callback({ payload: [{ title: secret }] });
+    expect(consumer).not.toHaveBeenCalled();
+    const event = { payload: PR_FIXTURES };
+    callback(event);
+    expect(consumer).toHaveBeenCalledExactlyOnceWith(event);
+    expect(warning).toHaveBeenCalledTimes(1);
+    expect(warning.mock.calls.flat().join(" ")).not.toContain(secret);
+  });
+
+  it("retains old progress and source shapes but checks present optional fields", async () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    for (const [event, valid, invalid] of [
+      ["worktree-removal-progress", { done: 1, total: 2 }, { done: 1, total: 2, removed: "yes" }],
+      ["source-poll-status", { source: { provider: "github", host: "github.com" }, list: "authored", phase: "ready", error: null },
+        { source: { provider: "github", host: "github.com" }, list: "authored", phase: "ready", error: null, mrs: "wrong" }],
+    ] as const) {
+      const consumer = vi.fn();
+      await remote.listen(event, consumer);
+      const callback = tauri.listen.mock.calls.at(-1)![1] as (e: { payload: unknown }) => void;
+      callback({ payload: valid });
+      callback({ payload: invalid });
+      expect(consumer).toHaveBeenCalledTimes(1);
+    }
+    expect(warning).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves synchronous listener-install errors and local events", async () => {
+    const error = new Error("no webview");
+    tauri.listen.mockImplementationOnce(() => { throw error; });
+    expect(() => remote.listen("poll-state", () => {})).toThrow(error);
+    const consumer = vi.fn();
+    await remote.listen("connection-state", consumer);
+    expect(tauri.listen).toHaveBeenLastCalledWith("connection-state", consumer);
+    const callback = tauri.listen.mock.calls.at(-1)![1] as (e: { payload: unknown }) => void;
+    const frame = { payload: { arbitrary_local_shape: true } };
+    callback(frame);
+    expect(consumer).toHaveBeenCalledExactlyOnceWith(frame);
   });
 });

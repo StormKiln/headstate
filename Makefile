@@ -131,7 +131,7 @@ test-rust:
 	cd crates/headstate-stepup && cargo test
 	cd src-tauri && cargo test
 
-test-ui:
+test-ui: check-wire-contract
 	yarn vitest run
 
 # ---- Transcript performance (#1487) --------------------------------------
@@ -487,7 +487,7 @@ lint-rust:
 	cd src-tauri && cargo fmt --check
 	cd src-tauri && cargo clippy --all-targets -- -D warnings
 
-lint-ui:
+lint-ui: check-wire-contract
 	yarn tsc -b --force
 	yarn eslint .
 	yarn knip
@@ -549,3 +549,12 @@ icons:
 	rm -f src-tauri/icons/StoreLogo.png
 	rm -f src-tauri/icons/Square*.png src-tauri/icons/64x64.png
 	python3 scripts/make-icons.py --restore-icns-if-unchanged
+
+# Independently shipped phones must not consume unchecked desktop shapes (#711).
+.PHONY: wire-contract check-wire-contract
+wire-contract:
+	node scripts/wire-contract.mjs
+
+check-wire-contract:
+	node --test scripts/wire-contract.test.mjs
+	node scripts/wire-contract.mjs --check

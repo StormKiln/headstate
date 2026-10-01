@@ -230,6 +230,8 @@ jobs:
         run: |
           (cd crates/headstate-stepup && cargo fmt --check)
           (cd src-tauri && cargo fmt --check)
+      - name: Remote wire contract
+        run: make check-wire-contract
       - name: Typecheck
         run: yarn tsc -b --force
       - name: ESLint
@@ -295,6 +297,8 @@ jobs:
       - uses: ./.github/actions/setup
       - name: Frontend diagnostic wrapper self-test
         run: python3 scripts/test-frontend-ci.test.py
+      - name: Remote wire contract
+        run: make check-wire-contract
       - name: Frontend tests
         shell: bash
         run: bash scripts/test-frontend-ci.sh
