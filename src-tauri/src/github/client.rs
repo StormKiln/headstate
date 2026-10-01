@@ -1013,17 +1013,33 @@ impl GitHubClient {
                 ._post(path, None::<&()>)
                 .await
                 .map_err(write_error)?;
-            self.read_transport.observe_headers(
+            let status = response.status().as_u16();
+            let retry = super::read_transport::response_retry(response.headers());
+            let current_window = self.read_transport.observe_headers(
                 super::admission::Bucket::Rest,
                 response.status().as_u16(),
                 response.headers(),
             );
-            if response.status().as_u16() < 500 {
-                admission.complete();
-            }
-            octocrab::map_github_error(response)
+            let response = octocrab::map_github_error(response)
+                .await
+                .map_err(|error| {
+                    if current_window {
+                        self.read_transport.observe_error(
+                            super::admission::Bucket::Rest,
+                            &error,
+                            retry,
+                        );
+                    }
+                    if status < 500 && matches!(&error, octocrab::Error::GitHub { .. }) {
+                        admission.complete();
+                    }
+                    write_error(error)
+                })?;
+            self.octocrab
+                .body_to_string(response)
                 .await
                 .map_err(write_error)?;
+            admission.complete();
             Ok(())
         })
         .await
@@ -1051,23 +1067,36 @@ impl GitHubClient {
                 ._post(path, Some(body))
                 .await
                 .map_err(write_error)?;
-            self.read_transport.observe_headers(
+            let status = response.status().as_u16();
+            let retry = super::read_transport::response_retry(response.headers());
+            let current_window = self.read_transport.observe_headers(
                 super::admission::Bucket::Rest,
                 response.status().as_u16(),
                 response.headers(),
             );
-            if response.status().as_u16() < 500 {
-                admission.complete();
-            }
             let response = octocrab::map_github_error(response)
                 .await
-                .map_err(write_error)?;
+                .map_err(|error| {
+                    if current_window {
+                        self.read_transport.observe_error(
+                            super::admission::Bucket::Rest,
+                            &error,
+                            retry,
+                        );
+                    }
+                    if status < 500 && matches!(&error, octocrab::Error::GitHub { .. }) {
+                        admission.complete();
+                    }
+                    write_error(error)
+                })?;
             let text = self
                 .octocrab
                 .body_to_string(response)
                 .await
                 .map_err(write_error)?;
-            serde_json::from_str(&text).map_err(|_| ClientError::UnconfirmedWrite)
+            let value = serde_json::from_str(&text).map_err(|_| ClientError::UnconfirmedWrite)?;
+            admission.complete();
+            Ok(value)
         })
         .await
         .map_err(|_| ClientError::UnconfirmedWrite)?
@@ -1116,8 +1145,7 @@ impl GitHubClient {
     /// judges the status. Metered before anything else, for `rest_get`'s
     /// reason: a refusal still spent a `core` request.
     ///
-    /// A body that is not JSON comes back as `Null`, and the caller reads
-    /// the status alone.
+    /// An unreadable body leaves the dispatched write unconfirmed.
     pub(super) async fn rest_put(
         &self,
         path: &str,
@@ -1135,21 +1163,19 @@ impl GitHubClient {
                 ._put(path, Some(body))
                 .await
                 .map_err(write_error)?;
-            self.read_transport.observe_headers(
+            let status = response.status().as_u16();
+            let retry = super::read_transport::response_retry(response.headers());
+            let current_window = self.read_transport.observe_headers(
                 super::admission::Bucket::Rest,
                 response.status().as_u16(),
                 response.headers(),
             );
-            if response.status().as_u16() < 500 {
-                admission.complete();
-            }
             let remaining = response
                 .headers()
                 .get("x-ratelimit-remaining")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.trim().parse::<u64>().ok());
             budget.record_rest_local(remaining);
-            let status = response.status().as_u16();
             if status >= 500 {
                 return Err(ClientError::UnconfirmedWrite);
             }
@@ -1158,10 +1184,14 @@ impl GitHubClient {
                 .body_to_string(response)
                 .await
                 .map_err(write_error)?;
-            Ok((
-                status,
-                serde_json::from_str(&text).unwrap_or(serde_json::Value::Null),
-            ))
+            let value: serde_json::Value =
+                serde_json::from_str(&text).map_err(|_| ClientError::UnconfirmedWrite)?;
+            // PUT's non-success JSON is a semantic answer consumed by its caller.
+            if current_window {
+                self.read_transport.observe_rest_body(&value, retry);
+            }
+            admission.complete();
+            Ok((status, value))
         })
         .await
         .map_err(|_| ClientError::UnconfirmedWrite)?
@@ -1199,16 +1229,34 @@ impl GitHubClient {
         let started = std::time::Instant::now();
         let posted = tokio::time::timeout(SEARCH_BUDGET, async {
             let response = self.octocrab._post("/graphql", Some(body)).await?;
-            self.read_transport.observe_headers(
+            let status = response.status().as_u16();
+            let retry = super::read_transport::response_retry(response.headers());
+            let current_window = self.read_transport.observe_headers(
                 super::admission::Bucket::Graphql,
                 response.status().as_u16(),
                 response.headers(),
             );
-            if response.status().as_u16() < 500 {
-                admission.complete();
+            let response = octocrab::map_github_error(response)
+                .await
+                .inspect_err(|error| {
+                    if current_window {
+                        self.read_transport.observe_error(
+                            super::admission::Bucket::Graphql,
+                            error,
+                            retry,
+                        );
+                    }
+                    if status < 500 && matches!(error, octocrab::Error::GitHub { .. }) {
+                        admission.complete();
+                    }
+                })?;
+            let value =
+                <serde_json::Value as octocrab::FromResponse>::from_response(response).await?;
+            if current_window {
+                self.read_transport.observe_graphql(&value, retry);
             }
-            let response = octocrab::map_github_error(response).await?;
-            <serde_json::Value as octocrab::FromResponse>::from_response(response).await
+            admission.complete();
+            Ok(value)
         })
         .await;
         crate::diag!(
@@ -1227,7 +1275,6 @@ impl GitHubClient {
             Err(_) => return Err(ClientError::UnconfirmedWrite),
         };
 
-        self.read_transport.observe_graphql(&raw);
         if let Some(errs) = raw.get("errors").and_then(|e| e.as_array()) {
             if !errs.is_empty() {
                 let msg = errs
@@ -2212,6 +2259,268 @@ mod tests {
             .build()
             .unwrap();
         GitHubClient::new(oc)
+    }
+
+    #[tokio::test]
+    async fn secondary_body_retry_deadline_is_shared_by_reads_and_writes() {
+        use super::super::admission::Bucket;
+        for mutation in [false, true] {
+            for (status, retry, secondary) in [
+                (200, Some("300"), true),
+                (403, None, true),
+                (403, None, false),
+            ] {
+                let server = MockServer::start().await;
+                let message = if secondary {
+                    "You have exceeded a secondary rate limit"
+                } else {
+                    "Resource not accessible by integration"
+                };
+                let body = if status == 200 {
+                    json!({"errors":[{"message":message}]})
+                } else {
+                    json!({"message":message})
+                };
+                let mut response = ResponseTemplate::new(status).set_body_json(body);
+                if let Some(retry) = retry {
+                    response = response.insert_header("retry-after", retry);
+                }
+                Mock::given(method("POST"))
+                    .respond_with(response)
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let client = client_for(&server).await;
+                let query = json!({"query":"synthetic"});
+                if mutation {
+                    assert!(client.graphql_mutation_inner(&query).await.is_err());
+                } else {
+                    assert!(client.stats_graphql(&query).await.is_err());
+                }
+                tokio::time::pause();
+                if secondary {
+                    assert!(client.stats_graphql(&query).await.is_err());
+                    assert!(client
+                        .rest_get("/synthetic", &client.request_budget())
+                        .await
+                        .is_err());
+                    assert!(matches!(
+                        client.graphql_mutation_inner(&query).await,
+                        Err(ClientError::NotDispatched(_))
+                    ));
+                    assert!(matches!(
+                        client.rest_post("/synthetic").await,
+                        Err(ClientError::NotDispatched(_))
+                    ));
+                    tokio::time::advance(std::time::Duration::from_secs(if retry.is_some() {
+                        299
+                    } else {
+                        59
+                    }))
+                    .await;
+                    assert!(client.read_transport.admission.write(Bucket::Rest).is_err());
+                    assert!(client
+                        .read_transport
+                        .admission
+                        .write(Bucket::Graphql)
+                        .is_err());
+                    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+                    let probe = client.read_transport.admission.write(Bucket::Rest).unwrap();
+                    assert!(client
+                        .read_transport
+                        .admission
+                        .write(Bucket::Graphql)
+                        .is_err());
+                    drop(probe);
+                } else {
+                    assert!(client.read_transport.admission.write(Bucket::Rest).is_ok());
+                    assert!(client
+                        .read_transport
+                        .admission
+                        .write(Bucket::Graphql)
+                        .is_ok());
+                }
+                assert_eq!(
+                    server.received_requests().await.unwrap().len(),
+                    1,
+                    "blocked cross-protocol calls must not dispatch"
+                );
+                tokio::time::resume();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_write_bodies_keep_recovery_closed_after_cancellation() {
+        use super::super::admission::Bucket;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for kind in 0..4 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (headers_tx, headers_rx) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; 4096];
+                let received = socket.read(&mut bytes).await.unwrap();
+                assert!(received > 0, "the server must receive a real write");
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nContent-Type: application/json\r\n\r\n{").await.unwrap();
+                headers_tx.send(()).unwrap();
+                std::future::pending::<()>().await;
+            });
+            let client = GitHubClient::new(
+                Octocrab::builder()
+                    .base_uri(format!("http://{address}"))
+                    .unwrap()
+                    .personal_token("synthetic")
+                    .add_retry_config(octocrab::service::middleware::retry::RetryConfig::None)
+                    .build()
+                    .unwrap(),
+            );
+            client
+                .read_transport
+                .admission
+                .limit(Bucket::Graphql, 1, true);
+            tokio::time::pause();
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            tokio::time::resume();
+            let worker_client = client.clone();
+            let worker = tokio::spawn(async move {
+                match kind {
+                    0 => worker_client
+                        .graphql_mutation_inner(&json!({"query":"mutation Synthetic {}"}))
+                        .await
+                        .map(|_| ()),
+                    1 => worker_client
+                        .rest_post_json("/synthetic", &json!({}))
+                        .await
+                        .map(|_| ()),
+                    2 => worker_client
+                        .rest_put("/synthetic", &json!({}), &worker_client.request_budget())
+                        .await
+                        .map(|_| ()),
+                    _ => worker_client.rest_post("/synthetic").await,
+                }
+            });
+            headers_rx.await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert!(
+                !worker.is_finished(),
+                "write kind {kind} must consume its body"
+            );
+            assert!(client.read_transport.admission.write(Bucket::Rest).is_err());
+            tokio::time::pause();
+            if kind == 0 {
+                tokio::time::advance(SEARCH_BUDGET).await;
+                assert!(matches!(
+                    worker.await.unwrap(),
+                    Err(ClientError::UnconfirmedWrite)
+                ));
+            } else {
+                worker.abort();
+                assert!(worker.await.unwrap_err().is_cancelled());
+            }
+            assert!(
+                client.read_transport.admission.write(Bucket::Rest).is_err(),
+                "kind {kind}"
+            );
+            assert!(
+                client
+                    .read_transport
+                    .admission
+                    .write(Bucket::Graphql)
+                    .is_err(),
+                "kind {kind}"
+            );
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            let probe = client.read_transport.admission.write(Bucket::Rest).unwrap();
+            assert!(client
+                .read_transport
+                .admission
+                .write(Bucket::Graphql)
+                .is_err());
+            drop(probe);
+            server.abort();
+            tokio::time::resume();
+        }
+    }
+
+    #[tokio::test]
+    async fn consumed_write_responses_recover_but_malformed_json_does_not() {
+        use super::super::admission::Bucket;
+        for kind in 0..4 {
+            for case in 0..3 {
+                if kind == 3 && case == 1 {
+                    continue;
+                }
+                let malformed = case == 1;
+                let server = MockServer::start().await;
+                let text = if case == 2 {
+                    r#"{"message":"Resource not accessible by integration"}"#
+                } else if malformed {
+                    "{"
+                } else {
+                    r#"{"data":{"accepted":true}}"#
+                };
+                Mock::given(wiremock::matchers::any())
+                    .respond_with(
+                        ResponseTemplate::new(if case == 2 { 403 } else { 200 })
+                            .set_body_string(text),
+                    )
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let client = client_for(&server).await;
+                client
+                    .read_transport
+                    .admission
+                    .limit(Bucket::Graphql, 1, true);
+                tokio::time::pause();
+                tokio::time::advance(std::time::Duration::from_secs(1)).await;
+                tokio::time::resume();
+                let result = match kind {
+                    0 => client
+                        .graphql_mutation_inner(&json!({"query":"mutation Synthetic {}"}))
+                        .await
+                        .map(|_| ()),
+                    1 => client
+                        .rest_post_json("/synthetic", &json!({}))
+                        .await
+                        .map(|_| ()),
+                    2 => client
+                        .rest_put("/synthetic", &json!({}), &client.request_budget())
+                        .await
+                        .map(|_| ()),
+                    _ => client.rest_post("/synthetic").await,
+                };
+                tokio::time::pause();
+                if malformed {
+                    assert!(
+                        matches!(result, Err(ClientError::UnconfirmedWrite)),
+                        "kind {kind}: {result:?}"
+                    );
+                    assert!(client.read_transport.admission.write(Bucket::Rest).is_err());
+                    assert!(client
+                        .read_transport
+                        .admission
+                        .write(Bucket::Graphql)
+                        .is_err());
+                } else {
+                    if case == 2 && kind != 2 {
+                        assert!(matches!(result, Err(ClientError::Api(_))));
+                    } else {
+                        result.unwrap();
+                    }
+                    let a = client.read_transport.admission.write(Bucket::Rest).unwrap();
+                    let b = client
+                        .read_transport
+                        .admission
+                        .write(Bucket::Graphql)
+                        .unwrap();
+                    drop((a, b));
+                }
+                tokio::time::resume();
+            }
+        }
     }
 
     #[tokio::test]

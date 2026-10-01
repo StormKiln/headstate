@@ -116,7 +116,12 @@ impl ReadTransport {
         self.read(client, Read::Rest { path, budget }, "rest-read", context)
             .await
     }
-    pub(super) fn observe_headers(&self, bucket: Bucket, status: u16, headers: &hyper::HeaderMap) {
+    pub(super) fn observe_headers(
+        &self,
+        bucket: Bucket,
+        status: u16,
+        headers: &hyper::HeaderMap,
+    ) -> bool {
         let number = |key| {
             headers
                 .get(key)
@@ -126,7 +131,7 @@ impl ReadTransport {
         let remaining = number("x-ratelimit-remaining");
         let reset = number("x-ratelimit-reset");
         if !self.admission.observe(bucket, remaining, reset) {
-            return;
+            return false;
         }
         let retry = headers
             .get("retry-after")
@@ -141,8 +146,9 @@ impl ReadTransport {
                 refused && !exhausted,
             );
         }
+        true
     }
-    pub(super) fn observe_graphql(&self, value: &Value) {
+    pub(super) fn observe_graphql(&self, value: &Value, retry: Option<u64>) {
         let quota = &value["data"]["rateLimit"];
         let reset = quota["resetAt"]
             .as_str()
@@ -155,9 +161,37 @@ impl ReadTransport {
         {
             self.admission.limit(
                 Bucket::Graphql,
-                reset.map(seconds_until).unwrap_or(60),
-                false,
+                retry.or(reset.map(seconds_until)).unwrap_or(60),
+                value
+                    .get("errors")
+                    .and_then(Value::as_array)
+                    .is_some_and(|errors| {
+                        errors.iter().any(|error| {
+                            secondary_message(error["message"].as_str().unwrap_or_default())
+                        })
+                    }),
             );
+        }
+    }
+
+    pub(super) fn observe_rest_body(&self, value: &Value, retry: Option<u64>) {
+        if secondary_message(value["message"].as_str().unwrap_or_default()) {
+            self.admission
+                .limit(Bucket::Rest, retry.unwrap_or(60), true);
+        }
+    }
+    pub(super) fn observe_error(
+        &self,
+        bucket: Bucket,
+        error: &octocrab::Error,
+        retry: Option<u64>,
+    ) -> bool {
+        if matches!(error, octocrab::Error::GitHub { source, .. } if secondary_message(&source.message))
+        {
+            self.admission.limit(bucket, retry.unwrap_or(60), true);
+            true
+        } else {
+            false
         }
     }
 
@@ -260,7 +294,7 @@ impl ReadTransport {
                                 match Value::from_response(response).await.map_err(map_error) {
                                     Ok(value) => {
                                         if matches!(read, Read::Graphql(_)) && current_window {
-                                            self.observe_graphql(&value);
+                                            self.observe_graphql(&value, retry_after);
                                             if graphql_exhausted(&value)
                                                 && value.get("data").is_none_or(Value::is_null)
                                             {
@@ -274,7 +308,17 @@ impl ReadTransport {
                                     Err(error) => Err(error),
                                 }
                             }
-                            Err(error) => Err(map_error(error)),
+                            Err(error) => {
+                                if current_window
+                                    && self.observe_error(read.bucket(), &error, retry_after)
+                                {
+                                    Err(ClientError::RateLimited(
+                                        "provider retry deadline is active".into(),
+                                    ))
+                                } else {
+                                    Err(map_error(error))
+                                }
+                            }
                         }
                     }
                 }
@@ -295,6 +339,17 @@ impl ReadTransport {
         }
         unreachable!("the second attempt always returns")
     }
+}
+
+pub(super) fn response_retry(headers: &hyper::HeaderMap) -> Option<u64> {
+    headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| retry_seconds(v, chrono::Utc::now()))
+}
+fn secondary_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("secondary rate limit") || message.contains("abuse detection")
 }
 
 fn seconds_until(epoch: u64) -> u64 {
