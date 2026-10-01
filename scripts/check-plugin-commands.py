@@ -58,7 +58,10 @@ RUST_CMD_CONST = re.compile(r'\bconst\s+\w+\s*:\s*&\'?\w*\s*str\s*=\s*"([^"]+)"'
 def kotlin_commands(plugin: pathlib.Path) -> dict[str, str]:
     """`@Command` method name -> the file it is declared in."""
     found: dict[str, str] = {}
-    android = plugin / "android"
+    # Native builds populate android/.tauri with dependency commands. Only
+    # the plugin's production source set owns its Rust bridge; include both
+    # java/ and kotlin/ layouts, excluding generated and test sources.
+    android = plugin / "android" / "src" / "main"
     for path in sorted(android.rglob("*.kt")):
         for name in KOTLIN_COMMAND.findall(path.read_text()):
             found[name] = str(path)

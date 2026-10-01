@@ -1580,7 +1580,7 @@ mod tests {
             );
             payload["cwd"] = serde_json::json!("/fixture/".repeat(15));
             let r = record_from(&payload, u32::MAX, TS);
-            assert!(serde_json::to_vec(&r).unwrap().len() + 1 <= 512);
+            assert!(serde_json::to_vec(&r).unwrap().len() < 512);
             assert_eq!(r.event, "Notification");
             if let Some(summary) = r.permission_summary {
                 assert!(summary.len() <= TEXT_FIELD_CAP);

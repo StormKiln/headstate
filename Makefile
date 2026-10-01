@@ -31,6 +31,7 @@ lint-mobile:
 	cd src-mobile && cargo clippy --workspace --all-targets -- -D warnings
 	# Native compilation has separate platform gates; literal bridge names
 	# still need this check because native compilation cannot compare Rust strings.
+	python3 scripts/check-plugin-commands.test.py
 	python3 scripts/check-plugin-commands.py
 
 test-mobile:
